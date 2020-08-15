@@ -144,8 +144,13 @@ CLEANDIRS+=	common c-family
 dossier:
 	mkdir -p common c-family
 
+.if defined(LIBGCC_ONLY)
+genfiles: ${GENTOOLS:Mgcov-iov*} ${GENFILES:Mgcov-io*}
+.else
 genfiles: ${GENTOOLS} ${GENFILES}
+.endif
 depend all: dossier genfiles
 
 .include <bsd.obj.mk>
 .include <bsd.dep.mk>
+.include <bsd.sys.mk>

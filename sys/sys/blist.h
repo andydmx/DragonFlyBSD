@@ -55,7 +55,6 @@
  *		eats around 32 KBytes of memory. 
  *
  * $FreeBSD: src/sys/sys/blist.h,v 1.2.2.1 2003/01/12 09:23:12 dillon Exp $
- * $DragonFly: src/sys/sys/blist.h,v 1.7 2008/08/10 22:09:51 dillon Exp $
  */
 
 #ifndef _SYS_BLIST_H_
@@ -65,8 +64,9 @@
 #include <sys/types.h>
 #endif
 
-typedef int32_t		swblk_t;
-typedef u_int32_t	u_swblk_t;
+#define SWBLK_BITS	64
+typedef int64_t		swblk_t;
+typedef u_int64_t	u_swblk_t;
 
 /*
  * note: currently use SWAPBLK_NONE as an absolute value rather then
@@ -96,30 +96,39 @@ typedef struct blist {
 	swblk_t		bl_rootblks;	/* swblk_t blks allocated for tree */
 } *blist_t;
 
-#define BLIST_META_RADIX	16
-#define BLIST_BMAP_RADIX	(sizeof(u_swblk_t)*8)
+#define BLIST_META_RADIX	(sizeof(u_swblk_t)*8/2)	/* 2 bits per */
+#define BLIST_BMAP_RADIX	(sizeof(u_swblk_t)*8)	/* 1 bit per */
 
 /*
- * The radix can be up to x BLIST_BMAP_RADIX the largest skip,
- * based on the initial skip calculation in blist_create().
+ * The radix may exceed the size of a 64 bit signed (or unsigned) int
+ * when the maximal number of blocks is allocated.  With a 32-bit swblk_t
+ * this corresponds to ~1G x PAGE_SIZE = 4096GB.  The swap code usually
+ * divides this by 4, leaving us with a capability of up to four 1TB swap
+ * devices.
  *
- * The radix will exceed the size of a 32 bit signed (or unsigned) int
- * when the maximal number of blocks is allocated.  This corresponds
- * to ~1G x PAGE_SIZE = 4096GB.  The swap code usually divides this
- * by 4, leaving us with a capability of up to four 1TB swap devices.
+ * With a 64-bit swblk_t the limitation is some insane number.
+ *
+ * NOTE: For now I don't trust that we overflow-detect properly so we divide
+ *	 out to ensure that no overflow occurs.
  */
+
+#if SWBLK_BITS == 64
+#define BLIST_MAXBLKS		(0x4000000000000000LL /		\
+				 (BLIST_BMAP_RADIX / BLIST_META_RADIX))
+#else
 #define BLIST_MAXBLKS		(0x40000000 /		\
 				 (BLIST_BMAP_RADIX / BLIST_META_RADIX))
+#endif
 
 #define BLIST_MAX_ALLOC		BLIST_BMAP_RADIX
 
-extern blist_t blist_create(swblk_t blocks);
-extern void blist_destroy(blist_t blist);
-extern swblk_t blist_alloc(blist_t blist, swblk_t count);
-extern swblk_t blist_allocat(blist_t blist, swblk_t count, swblk_t blkat);
-extern void blist_free(blist_t blist, swblk_t blkno, swblk_t count);
-extern swblk_t blist_fill(blist_t blist, swblk_t blkno, swblk_t count);
-extern void blist_print(blist_t blist);
-extern void blist_resize(blist_t *pblist, swblk_t count, int freenew);
+blist_t blist_create(swblk_t);
+void blist_destroy(blist_t);
+swblk_t blist_alloc(blist_t, swblk_t);
+swblk_t blist_allocat(blist_t, swblk_t, swblk_t);
+void blist_free(blist_t, swblk_t, swblk_t);
+swblk_t blist_fill(blist_t, swblk_t, swblk_t);
+void blist_print(blist_t);
+void blist_resize(blist_t *, swblk_t, int);
 
 #endif	/* _SYS_BLIST_H_ */

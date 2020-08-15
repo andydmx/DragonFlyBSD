@@ -1,6 +1,8 @@
 /*	$NetBSD: mount_msdos.c,v 1.18 1997/09/16 12:24:18 lukem Exp $	*/
 
-/*
+/*-
+ * SPDX-License-Identifier: BSD-4-Clause
+ *
  * Copyright (c) 1994 Christopher G. Demetriou
  * All rights reserved.
  *
@@ -28,8 +30,6 @@
  * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
  * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
  * THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- *
- * $FreeBSD: src/sbin/mount_msdos/mount_msdos.c,v 1.19.2.1 2000/07/20 10:35:13 kris Exp $
  */
 
 #include <sys/param.h>
@@ -43,12 +43,11 @@
 #include <ctype.h>
 #include <err.h>
 #include <grp.h>
+#include <libutil.h>
 #include <locale.h>
 #include <mntopts.h>
 #include <pwd.h>
 #include <stdio.h>
-/* must be after stdio to declare fparseln */
-#include <libutil.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sysexits.h>
@@ -56,50 +55,42 @@
 
 /*
  * XXX - no way to specify "foo=<bar>"-type options; that's what we'd
- * want for "-u", "-g", "-m", "-L", and "-D".
+ * want for "-u", "-g", "-m", "-M", "-L", and "-D".
  */
 static struct mntopt mopts[] = {
 	MOPT_STDOPTS,
 	MOPT_FORCE,
 	MOPT_SYNC,
+	MOPT_ASYNC,
 	MOPT_UPDATE,
-#ifdef MSDOSFSMNT_GEMDOSFS
-	{ "gemdosfs", 0, MSDOSFSMNT_GEMDOSFS, 1 },
-#endif
 	{ "shortnames", 0, MSDOSFSMNT_SHORTNAME, 1 },
 	{ "longnames", 0, MSDOSFSMNT_LONGNAME, 1 },
 	{ "nowin95", 0, MSDOSFSMNT_NOWIN95, 1 },
 	MOPT_NULL
 };
 
-static gid_t	a_gid(char *);
-static uid_t	a_uid(char *);
-static mode_t	a_mask(char *);
-static void	usage(void) __dead2;
-int set_charset(struct msdosfs_args*, const char*, const char*);
+static gid_t a_gid(char *);
+static uid_t a_uid(char *);
+static mode_t a_mask(char *);
+static void usage(void) __dead2;
+int set_charset(struct msdosfs_args *, const char *, const char *);
 
 int
 main(int argc, char **argv)
 {
 	struct msdosfs_args args;
 	struct stat sb;
-	int c, error, mntflags, set_gid, set_uid, set_mask;
+	int c, error, mntflags, set_gid, set_uid, set_mask, set_dirmask;
 	char *dev, *dir, mntpath[MAXPATHLEN], *csp;
 	const char *quirk = NULL;
-        char *cs_local = NULL;
-        char *cs_dos = NULL;
+	char *cs_local = NULL;
+	char *cs_dos = NULL;
 	struct vfsconf vfc;
-	mntflags = set_gid = set_uid = set_mask = 0;
+	mntflags = set_gid = set_uid = set_mask = set_dirmask = 0;
 	memset(&args, '\0', sizeof(args));
-	args.magic = MSDOSFS_ARGSMAGIC;
 
-	while ((c = getopt(argc, argv, "sl9u:g:m:o:L:D:")) != -1) {
+	while ((c = getopt(argc, argv, "sl9u:g:m:M:o:L:D:")) != -1) {
 		switch (c) {
-#ifdef MSDOSFSMNT_GEMDOSFS
-		case 'G':
-			args.flags |= MSDOSFSMNT_GEMDOSFS;
-			break;
-#endif
 		case 's':
 			args.flags |= MSDOSFSMNT_SHORTNAME;
 			break;
@@ -121,12 +112,16 @@ main(int argc, char **argv)
 			args.mask = a_mask(optarg);
 			set_mask = 1;
 			break;
+		case 'M':
+			args.dirmask = a_mask(optarg);
+			set_dirmask = 1;
+			break;
 		case 'L':
-                        if (setlocale(LC_CTYPE, optarg) == NULL)
-                                err(EX_CONFIG, "%s", optarg);
-                        csp = strchr(optarg,'.');
-                        if (!csp)
-                                err(EX_CONFIG, "%s", optarg);
+			if (setlocale(LC_CTYPE, optarg) == NULL)
+				err(EX_CONFIG, "%s", optarg);
+			csp = strchr(optarg,'.');
+			if (!csp)
+				err(EX_CONFIG, "%s", optarg);
 			quirk = kiconv_quirkcs(csp + 1, KICONV_VENDOR_MICSFT);
 			cs_local = strdup(quirk);
 			args.flags |= MSDOSFSMNT_KICONV;
@@ -149,6 +144,15 @@ main(int argc, char **argv)
 	if (optind + 2 != argc)
 		usage();
 
+	if (set_mask && !set_dirmask) {
+		args.dirmask = args.mask;
+		set_dirmask = 1;
+	}
+	else if (set_dirmask && !set_mask) {
+		args.mask = args.dirmask;
+		set_mask = 1;
+	}
+
 	dev = argv[optind];
 	dir = argv[optind + 1];
 
@@ -162,13 +166,13 @@ main(int argc, char **argv)
 	args.fspec = dev;
 	args.export.ex_root = -2;	/* unchecked anyway on DOS fs */
 
-        if (cs_local != NULL) {
-                if (set_charset(&args, cs_local, cs_dos) == -1)
-                        err(EX_OSERR, "msdos_iconv");
-        } else if (cs_dos != NULL) {
-                if (set_charset(&args, "ISO8859-1", cs_dos) == -1)
-                        err(EX_OSERR, "msdos_iconv");
-        }
+	if (cs_local != NULL) {
+		if (set_charset(&args, cs_local, cs_dos) == -1)
+			err(EX_OSERR, "msdos_iconv");
+	} else if (cs_dos != NULL) {
+		if (set_charset(&args, "ISO8859-1", cs_dos) == -1)
+			err(EX_OSERR, "msdos_iconv");
+	}
 
 	if (mntflags & MNT_RDONLY)
 		args.export.ex_flags = MNT_EXRDONLY;
@@ -183,7 +187,8 @@ main(int argc, char **argv)
 		if (!set_gid)
 			args.gid = sb.st_gid;
 		if (!set_mask)
-			args.mask = sb.st_mode & (S_IRWXU | S_IRWXG | S_IRWXO);
+			args.mask = args.dirmask =
+				sb.st_mode & (S_IRWXU | S_IRWXG | S_IRWXO);
 	}
 
 	error = getvfsbyname("msdos", &vfc);
@@ -260,32 +265,32 @@ a_mask(char *s)
 static void
 usage(void)
 {
-	fprintf(stderr, "%s\n%s\n", 
+	fprintf(stderr, "%s\n%s\n%s\n",
 	    "usage: mount_msdos [-9ls] [-D DOS_codepage] [-g gid] [-L locale]",
-	    "                   [-m mask] [-o options] [-u uid] special node");
+	    "                   [-M mask] [-m mask] [-o options] [-u uid]",
+	    "                   special node");
 	exit(EX_USAGE);
 }
 
 int
 set_charset(struct msdosfs_args *args, const char *cs_local, const char *cs_dos)
 {
-        int error;
-        if (modfind("msdos_iconv") < 0) {
-                if (kldload("msdos_iconv") < 0 || modfind("msdos_iconv") < 0)
-		{
-                        warnx("cannot find or load \"msdos_iconv\" kernel module");
-                        return (-1);
-                }
+	int error;
+	if (modfind("msdos_iconv") < 0) {
+		if (kldload("msdos_iconv") < 0 || modfind("msdos_iconv") < 0) {
+			warnx("cannot find or load \"msdos_iconv\" kernel module");
+			return (-1);
+		}
 	}
 	snprintf(args->cs_local, ICONV_CSNMAXLEN, "%s", cs_local);
-        error = kiconv_add_xlat16_cspairs(ENCODING_UNICODE, cs_local);
-        if (error)
-                return (-1);
-        if (!cs_dos)
+	error = kiconv_add_xlat16_cspairs(ENCODING_UNICODE, cs_local);
+	if (error)
+		return (-1);
+	if (!cs_dos)
 		cs_dos = strdup("CP437");
 	snprintf(args->cs_dos, ICONV_CSNMAXLEN, "%s", cs_dos);
 	error = kiconv_add_xlat16_cspairs(cs_dos, cs_local);
 	if (error)
 		return (-1);
-        return (0);
+	return (0);
 }

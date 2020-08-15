@@ -10,10 +10,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by John Birrell.
- * 4. Neither the name of the author nor the names of any co-contributors
+ * 3. Neither the name of the author nor the names of any co-contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -29,7 +26,6 @@
  * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
  *
- * $DragonFly: src/lib/libthread_xu/thread/thr_suspend_np.c,v 1.5 2006/04/06 13:03:09 davidxu Exp $
  */
 
 #include "namespace.h"
@@ -82,7 +78,7 @@ _pthread_suspend_all_np(void)
 		if (thread != curthread) {
 			THR_THREAD_LOCK(curthread, thread);
 			if (thread->state != PS_DEAD &&
-	      		   !(thread->flags & THR_FLAGS_SUSPENDED))
+			   !(thread->flags & THR_FLAGS_SUSPENDED))
 			    thread->flags |= THR_FLAGS_NEED_SUSPEND;
 			THR_THREAD_UNLOCK(curthread, thread);
 		}
@@ -143,4 +139,3 @@ suspend_common(struct pthread *curthread, struct pthread *thread,
 
 __strong_reference(_pthread_suspend_np, pthread_suspend_np);
 __strong_reference(_pthread_suspend_all_np, pthread_suspend_all_np);
-

@@ -1,16 +1,24 @@
 CONTRIBDIR=	${.CURDIR}/../../../contrib/flex
-.PATH:		${CONTRIBDIR}
+.PATH:		${CONTRIBDIR}/src
 
-LIB=    fl
+LIB=    l
 SRCS=   libmain.c libyywrap.c
 NOPIC=	yes
 
-LINKS=  ${LIBDIR}/libfl.a ${LIBDIR}/libl.a
-LINKS+=	${LIBDIR}/libfl.a ${LIBDIR}/libln.a
+# for now do not let the use of -flto, clang has issues
+.if ${CFLAGS:M-flto}
+CFLAGS+=	-fno-lto
+.endif
+
+# Do not install these compat libraries during {build,quick}world.
+.if !${INSTALL:M*/tools/install.sh}
+LINKS=  ${LIBDIR}/libl.a ${LIBDIR}/libfl.a
+LINKS+=	${LIBDIR}/libl.a ${LIBDIR}/libln.a
 
 .if !defined(NOPROFILE)
-LINKS+= ${PROFLIBDIR}/libfl.a ${PROFLIBDIR}/libl.a
-LINKS+=	${PROFLIBDIR}/libfl.a ${PROFLIBDIR}/libln.a
+LINKS+= ${PROFLIBDIR}/libl.a ${PROFLIBDIR}/libfl.a
+LINKS+=	${PROFLIBDIR}/libl.a ${PROFLIBDIR}/libln.a
+.endif
 .endif
 
 .include <bsd.lib.mk>

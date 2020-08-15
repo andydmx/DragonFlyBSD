@@ -32,7 +32,6 @@
 
 /*
  * $FreeBSD: src/sys/net/if_tap.h,v 1.1.2.1 2000/07/27 13:57:05 nsayer Exp $
- * $DragonFly: src/sys/net/tap/if_tap.h,v 1.2 2003/06/17 04:28:48 dillon Exp $
  * $Id: if_tap.h,v 0.7 2000/07/12 04:12:51 max Exp $
  */
 
@@ -41,36 +40,23 @@
 
 #include <sys/ioccom.h>
 
-/* refer to if_tapvar.h for the softc stuff */
-
 /* maximum receive packet size (hard limit) */
 #define	TAPMRU		16384
 
 struct tapinfo {
-	int	baudrate;	/* linespeed                 */
+	int	baudrate;	/* linespeed */
 	short	mtu;		/* maximum transmission unit */
-	u_char	type;		/* ethernet, tokenring, etc. */
-	u_char	dummy;		/* place holder              */
+	u_char	type;		/* IFT_ETHER only */
+	u_char	dummy;		/* place holder */
 };
 
-/* ioctl's for get/set debug */
-#define	TAPSDEBUG		_IOW('t', 90, int)
+/* get/set internal debug variable */
 #define	TAPGDEBUG		_IOR('t', 89, int)
+#define	TAPSDEBUG		_IOW('t', 90, int)
+/* get/set network interface information */
 #define	TAPSIFINFO		_IOW('t', 91, struct tapinfo)
 #define	TAPGIFINFO		_IOR('t', 92, struct tapinfo)
-
-/* VMware ioctl's */
-#define VMIO_SIOCSIFFLAGS	_IO('V', 0)
-#define VMIO_SIOCSKEEP		_IO('V', 1)
-#define VMIO_SIOCSIFBR		_IO('V', 2)
-#define VMIO_SIOCSLADRF		_IO('V', 3)
-
-/* XXX -- unimplemented */
-#define VMIO_SIOCSETMACADDR	_IO('V', 4)
-
-/* XXX -- not used? */
-#define VMIO_SIOCPORT		_IO('V', 5)
-#define VMIO_SIOCBRIDGE		_IO('V', 6)
-#define VMIO_SIOCNETIF		_IO('V', 7)
+/* get the network interface name */
+#define	TAPGIFNAME		_IOR('t', 93, struct ifreq)
 
 #endif /* !_NET_IF_TAP_H_ */

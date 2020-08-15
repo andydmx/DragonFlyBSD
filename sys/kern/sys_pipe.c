@@ -1,6 +1,10 @@
 /*
  * Copyright (c) 1996 John S. Dyson
  * All rights reserved.
+ * Copyright (c) 2003-2017 The DragonFly Project.  All rights reserved.
+ *
+ * This code is derived from software contributed to The DragonFly Project
+ * by Matthew Dillon <dillon@backplane.com>
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -15,8 +19,6 @@
  *    John S. Dyson.
  * 4. Modifications may be freely made to this file if the above conditions
  *    are met.
- *
- * $FreeBSD: src/sys/kern/sys_pipe.c,v 1.60.2.13 2002/08/05 15:05:15 des Exp $
  */
 
 /*
@@ -36,7 +38,7 @@
 #include <sys/ttycom.h>
 #include <sys/stat.h>
 #include <sys/signalvar.h>
-#include <sys/sysproto.h>
+#include <sys/sysmsg.h>
 #include <sys/pipe.h>
 #include <sys/vnode.h>
 #include <sys/uio.h>
@@ -46,10 +48,12 @@
 #include <sys/malloc.h>
 #include <sys/sysctl.h>
 #include <sys/socket.h>
+#include <sys/kern_syscall.h>
+#include <sys/lock.h>
+#include <sys/mutex.h>
 
 #include <vm/vm.h>
 #include <vm/vm_param.h>
-#include <sys/lock.h>
 #include <vm/vm_object.h>
 #include <vm/vm_kern.h>
 #include <vm/vm_extern.h>
@@ -60,8 +64,13 @@
 
 #include <sys/file2.h>
 #include <sys/signal2.h>
+#include <sys/mutex2.h>
 
 #include <machine/cpufunc.h>
+
+struct pipegdlock {
+	struct mtx	mtx;
+} __cachealign;
 
 /*
  * interfaces to the outside world
@@ -77,7 +86,7 @@ static int pipe_stat (struct file *fp, struct stat *sb, struct ucred *cred);
 static int pipe_ioctl (struct file *fp, u_long cmd, caddr_t data,
 		struct ucred *cred, struct sysmsg *msg);
 
-static struct fileops pipeops = {
+__read_mostly static struct fileops pipeops = {
 	.fo_read = pipe_read, 
 	.fo_write = pipe_write,
 	.fo_ioctl = pipe_ioctl,
@@ -91,58 +100,45 @@ static void	filt_pipedetach(struct knote *kn);
 static int	filt_piperead(struct knote *kn, long hint);
 static int	filt_pipewrite(struct knote *kn, long hint);
 
-static struct filterops pipe_rfiltops =
+__read_mostly static struct filterops pipe_rfiltops =
 	{ FILTEROP_ISFD|FILTEROP_MPSAFE, NULL, filt_pipedetach, filt_piperead };
-static struct filterops pipe_wfiltops =
+__read_mostly static struct filterops pipe_wfiltops =
 	{ FILTEROP_ISFD|FILTEROP_MPSAFE, NULL, filt_pipedetach, filt_pipewrite };
 
 MALLOC_DEFINE(M_PIPE, "pipe", "pipe structures");
 
-/*
- * Default pipe buffer size(s), this can be kind-of large now because pipe
- * space is pageable.  The pipe code will try to maintain locality of
- * reference for performance reasons, so small amounts of outstanding I/O
- * will not wipe the cache.
- */
-#define MINPIPESIZE (PIPE_SIZE/3)
-#define MAXPIPESIZE (2*PIPE_SIZE/3)
-
-/*
- * Limit the number of "big" pipes
- */
-#define LIMITBIGPIPES	64
 #define PIPEQ_MAX_CACHE 16      /* per-cpu pipe structure cache */
 
-static int pipe_maxbig = LIMITBIGPIPES;
-static int pipe_maxcache = PIPEQ_MAX_CACHE;
-static int pipe_bigcount;
-static int pipe_nbig;
-static int pipe_bcache_alloc;
-static int pipe_bkmem_alloc;
-static int pipe_rblocked_count;
-static int pipe_wblocked_count;
+__read_mostly static int pipe_maxcache = PIPEQ_MAX_CACHE;
+__read_mostly static struct pipegdlock *pipe_gdlocks;
 
 SYSCTL_NODE(_kern, OID_AUTO, pipe, CTLFLAG_RW, 0, "Pipe operation");
-SYSCTL_INT(_kern_pipe, OID_AUTO, nbig,
-        CTLFLAG_RD, &pipe_nbig, 0, "number of big pipes allocated");
-SYSCTL_INT(_kern_pipe, OID_AUTO, bigcount,
-        CTLFLAG_RW, &pipe_bigcount, 0, "number of times pipe expanded");
-SYSCTL_INT(_kern_pipe, OID_AUTO, rblocked,
-        CTLFLAG_RW, &pipe_rblocked_count, 0, "number of times pipe expanded");
-SYSCTL_INT(_kern_pipe, OID_AUTO, wblocked,
-        CTLFLAG_RW, &pipe_wblocked_count, 0, "number of times pipe expanded");
 SYSCTL_INT(_kern_pipe, OID_AUTO, maxcache,
         CTLFLAG_RW, &pipe_maxcache, 0, "max pipes cached per-cpu");
-SYSCTL_INT(_kern_pipe, OID_AUTO, maxbig,
-        CTLFLAG_RW, &pipe_maxbig, 0, "max number of big pipes");
-static int pipe_delay = 5000;	/* 5uS default */
+
+/*
+ * The pipe buffer size can be changed at any time.  Only new pipe()s
+ * are affected.  Note that due to cpu cache effects, you do not want
+ * to make this value too large.
+ */
+__read_mostly static int pipe_size = 32768;
+SYSCTL_INT(_kern_pipe, OID_AUTO, size,
+        CTLFLAG_RW, &pipe_size, 0, "Pipe buffer size (16384 minimum)");
+
+/*
+ * Reader/writer delay loop.  When the reader exhausts the pipe buffer
+ * or the write completely fills the pipe buffer and would otherwise sleep,
+ * it first busy-loops for a few microseconds waiting for data or buffer
+ * space.  This eliminates IPIs for most high-bandwidth writer/reader pipes
+ * and also helps when the user program uses a large data buffer in its
+ * UIOs.
+ *
+ * This defaults to 4uS.
+ */
+#ifdef _RDTSC_SUPPORTED_
+__read_mostly static int pipe_delay = 4000;	/* 4uS default */
 SYSCTL_INT(_kern_pipe, OID_AUTO, delay,
         CTLFLAG_RW, &pipe_delay, 0, "SMP delay optimization in ns");
-#if !defined(NO_PIPE_SYSCTL_STATS)
-SYSCTL_INT(_kern_pipe, OID_AUTO, bcache_alloc,
-        CTLFLAG_RW, &pipe_bcache_alloc, 0, "pipe buffer from pcpu cache");
-SYSCTL_INT(_kern_pipe, OID_AUTO, bkmem_alloc,
-        CTLFLAG_RW, &pipe_bkmem_alloc, 0, "pipe buffer from kmem");
 #endif
 
 /*
@@ -153,36 +149,70 @@ void
 pipeinit(void *dummy)
 {
 	size_t mbytes = kmem_lim_size();
+	int n;
 
-	if (pipe_maxbig == LIMITBIGPIPES) {
-		if (mbytes >= 7 * 1024)
-			pipe_maxbig *= 2;
-		if (mbytes >= 15 * 1024)
-			pipe_maxbig *= 2;
-	}
 	if (pipe_maxcache == PIPEQ_MAX_CACHE) {
 		if (mbytes >= 7 * 1024)
 			pipe_maxcache *= 2;
 		if (mbytes >= 15 * 1024)
 			pipe_maxcache *= 2;
 	}
+
+	/*
+	 * Detune the pcpu caching a bit on systems with an insane number
+	 * of cpu threads to reduce memory waste.
+	 */
+	if (ncpus > 64) {
+		pipe_maxcache = pipe_maxcache * 64 / ncpus;
+		if (pipe_maxcache < PIPEQ_MAX_CACHE)
+			pipe_maxcache = PIPEQ_MAX_CACHE;
+	}
+
+	pipe_gdlocks = kmalloc(sizeof(*pipe_gdlocks) * ncpus,
+			     M_PIPE, M_WAITOK | M_ZERO);
+	for (n = 0; n < ncpus; ++n)
+		mtx_init(&pipe_gdlocks[n].mtx, "pipekm");
 }
-SYSINIT(kmem, SI_BOOT2_MACHDEP, SI_ORDER_ANY, pipeinit, NULL)
+SYSINIT(kmem, SI_BOOT2_MACHDEP, SI_ORDER_ANY, pipeinit, NULL);
 
-static void pipeclose (struct pipe *cpipe);
-static void pipe_free_kmem (struct pipe *cpipe);
-static int pipe_create (struct pipe **cpipep);
-static int pipespace (struct pipe *cpipe, int size);
+static void pipeclose (struct pipe *pipe,
+		struct pipebuf *pbr, struct pipebuf *pbw);
+static void pipe_free_kmem (struct pipebuf *buf);
+static int pipe_create (struct pipe **pipep);
 
+/*
+ * Test and clear the specified flag, wakeup(pb) if it was set.
+ * This function must also act as a memory barrier.
+ */
 static __inline void
-pipewakeup(struct pipe *cpipe, int dosigio)
+pipesignal(struct pipebuf *pb, uint32_t flags)
 {
-	if (dosigio && (cpipe->pipe_state & PIPE_ASYNC) && cpipe->pipe_sigio) {
+	uint32_t oflags;
+	uint32_t nflags;
+
+	for (;;) {
+		oflags = pb->state;
+		cpu_ccfence();
+		nflags = oflags & ~flags;
+		if (atomic_cmpset_int(&pb->state, oflags, nflags))
+			break;
+	}
+	if (oflags & flags)
+		wakeup(pb);
+}
+
+/*
+ *
+ */
+static __inline void
+pipewakeup(struct pipebuf *pb, int dosigio)
+{
+	if (dosigio && (pb->state & PIPE_ASYNC) && pb->sigio) {
 		lwkt_gettoken(&sigio_token);
-		pgsigio(cpipe->pipe_sigio, SIGIO, 0);
+		pgsigio(pb->sigio, SIGIO, 0);
 		lwkt_reltoken(&sigio_token);
 	}
-	KNOTE(&cpipe->pipe_kq.ki_note, 0);
+	KNOTE(&pb->kq.ki_note, 0);
 }
 
 /*
@@ -192,10 +222,10 @@ pipewakeup(struct pipe *cpipe, int dosigio)
  * We use these routines to serialize reads against other reads
  * and writes against other writes.
  *
- * The read token is held on entry so *ipp does not race.
+ * The appropriate token is held on entry so *ipp does not race.
  */
 static __inline int
-pipe_start_uio(struct pipe *cpipe, int *ipp)
+pipe_start_uio(int *ipp)
 {
 	int error;
 
@@ -210,7 +240,7 @@ pipe_start_uio(struct pipe *cpipe, int *ipp)
 }
 
 static __inline void
-pipe_end_uio(struct pipe *cpipe, int *ipp)
+pipe_end_uio(int *ipp)
 {
 	if (*ipp < 0) {
 		*ipp = 0;
@@ -229,28 +259,40 @@ pipe_end_uio(struct pipe *cpipe, int *ipp)
  * MPSAFE
  */
 int
-sys_pipe(struct pipe_args *uap)
+sys_pipe(struct sysmsg *sysmsg, const struct pipe_args *uap)
+{
+	return kern_pipe(sysmsg->sysmsg_fds, 0);
+}
+
+int
+sys_pipe2(struct sysmsg *sysmsg, const struct pipe2_args *uap)
+{
+	return kern_pipe(sysmsg->sysmsg_fds, uap->flags);
+}
+
+int
+kern_pipe(long *fds, int flags)
 {
 	struct thread *td = curthread;
 	struct filedesc *fdp = td->td_proc->p_fd;
 	struct file *rf, *wf;
-	struct pipe *rpipe, *wpipe;
+	struct pipe *pipe;
 	int fd1, fd2, error;
 
-	rpipe = wpipe = NULL;
-	if (pipe_create(&rpipe) || pipe_create(&wpipe)) {
-		pipeclose(rpipe); 
-		pipeclose(wpipe); 
+	pipe = NULL;
+	if (pipe_create(&pipe)) {
+		pipeclose(pipe, &pipe->bufferA, &pipe->bufferB);
+		pipeclose(pipe, &pipe->bufferB, &pipe->bufferA);
 		return (ENFILE);
 	}
 	
 	error = falloc(td->td_lwp, &rf, &fd1);
 	if (error) {
-		pipeclose(rpipe);
-		pipeclose(wpipe);
+		pipeclose(pipe, &pipe->bufferA, &pipe->bufferB);
+		pipeclose(pipe, &pipe->bufferB, &pipe->bufferA);
 		return (error);
 	}
-	uap->sysmsg_fds[0] = fd1;
+	fds[0] = fd1;
 
 	/*
 	 * Warning: once we've gotten past allocation of the fd for the
@@ -261,27 +303,31 @@ sys_pipe(struct pipe_args *uap)
 	rf->f_type = DTYPE_PIPE;
 	rf->f_flag = FREAD | FWRITE;
 	rf->f_ops = &pipeops;
-	rf->f_data = rpipe;
+	rf->f_data = (void *)((intptr_t)pipe | 0);
+	if (flags & O_NONBLOCK)
+		rf->f_flag |= O_NONBLOCK;
+	if (flags & O_CLOEXEC)
+		fdp->fd_files[fd1].fileflags |= UF_EXCLOSE;
+
 	error = falloc(td->td_lwp, &wf, &fd2);
 	if (error) {
 		fsetfd(fdp, NULL, fd1);
 		fdrop(rf);
-		/* rpipe has been closed by fdrop(). */
-		pipeclose(wpipe);
+		/* pipeA has been closed by fdrop() */
+		/* close pipeB here */
+		pipeclose(pipe, &pipe->bufferB, &pipe->bufferA);
 		return (error);
 	}
 	wf->f_type = DTYPE_PIPE;
 	wf->f_flag = FREAD | FWRITE;
 	wf->f_ops = &pipeops;
-	wf->f_data = wpipe;
-	uap->sysmsg_fds[1] = fd2;
+	wf->f_data = (void *)((intptr_t)pipe | 1);
+	if (flags & O_NONBLOCK)
+		wf->f_flag |= O_NONBLOCK;
+	if (flags & O_CLOEXEC)
+		fdp->fd_files[fd2].fileflags |= UF_EXCLOSE;
 
-	rpipe->pipe_slock = kmalloc(sizeof(struct lock),
-				    M_PIPE, M_WAITOK|M_ZERO);
-	wpipe->pipe_slock = rpipe->pipe_slock;
-	rpipe->pipe_peer = wpipe;
-	wpipe->pipe_peer = rpipe;
-	lockinit(rpipe->pipe_slock, "pipecl", 0, 0);
+	fds[1] = fd2;
 
 	/*
 	 * Once activated the peer relationship remains valid until
@@ -296,20 +342,29 @@ sys_pipe(struct pipe_args *uap)
 }
 
 /*
- * Allocate kva for pipe circular buffer, the space is pageable
- * This routine will 'realloc' the size of a pipe safely, if it fails
- * it will retain the old buffer.
- * If it fails it will return ENOMEM.
+ * [re]allocates KVA for the pipe's circular buffer.  The space is
+ * pageable.  Called twice to setup full-duplex communications.
+ *
+ * NOTE: Independent vm_object's are used to improve performance.
+ *
+ * Returns 0 on success, ENOMEM on failure.
  */
 static int
-pipespace(struct pipe *cpipe, int size)
+pipespace(struct pipe *pipe, struct pipebuf *pb, size_t size)
 {
 	struct vm_object *object;
 	caddr_t buffer;
-	int npages, error;
+	vm_pindex_t npages;
+	int error;
+
+	size = (size + PAGE_MASK) & ~(size_t)PAGE_MASK;
+	if (size < 16384)
+		size = 16384;
+	if (size > 1024*1024)
+		size = 1024*1024;
 
 	npages = round_page(size) / PAGE_SIZE;
-	object = cpipe->pipe_buffer.object;
+	object = pb->object;
 
 	/*
 	 * [re]create the object if necessary and reserve space for it
@@ -323,85 +378,103 @@ pipespace(struct pipe *cpipe, int size)
 
 		error = vm_map_find(&kernel_map, object, NULL,
 				    0, (vm_offset_t *)&buffer, size,
-				    PAGE_SIZE,
-				    1, VM_MAPTYPE_NORMAL,
+				    PAGE_SIZE, TRUE,
+				    VM_MAPTYPE_NORMAL, VM_SUBSYS_PIPE,
 				    VM_PROT_ALL, VM_PROT_ALL, 0);
 
 		if (error != KERN_SUCCESS) {
 			vm_object_deallocate(object);
 			return (ENOMEM);
 		}
-		pipe_free_kmem(cpipe);
-		cpipe->pipe_buffer.object = object;
-		cpipe->pipe_buffer.buffer = buffer;
-		cpipe->pipe_buffer.size = size;
-		++pipe_bkmem_alloc;
-	} else {
-		++pipe_bcache_alloc;
+		pipe_free_kmem(pb);
+		pb->object = object;
+		pb->buffer = buffer;
+		pb->size = size;
 	}
-	cpipe->pipe_buffer.rindex = 0;
-	cpipe->pipe_buffer.windex = 0;
+	pb->rindex = 0;
+	pb->windex = 0;
+
 	return (0);
 }
 
 /*
  * Initialize and allocate VM and memory for pipe, pulling the pipe from
- * our per-cpu cache if possible.  For now make sure it is sized for the
- * smaller PIPE_SIZE default.
+ * our per-cpu cache if possible.
+ *
+ * Returns 0 on success, else an error code (typically ENOMEM).  Caller
+ * must still deallocate the pipe on failure.
  */
 static int
-pipe_create(struct pipe **cpipep)
+pipe_create(struct pipe **pipep)
 {
 	globaldata_t gd = mycpu;
-	struct pipe *cpipe;
+	struct pipe *pipe;
 	int error;
 
-	if ((cpipe = gd->gd_pipeq) != NULL) {
-		gd->gd_pipeq = cpipe->pipe_peer;
+	if ((pipe = gd->gd_pipeq) != NULL) {
+		gd->gd_pipeq = pipe->next;
 		--gd->gd_pipeqcount;
-		cpipe->pipe_peer = NULL;
-		cpipe->pipe_wantwcnt = 0;
+		pipe->next = NULL;
 	} else {
-		cpipe = kmalloc(sizeof(struct pipe), M_PIPE, M_WAITOK|M_ZERO);
+		pipe = kmalloc(sizeof(*pipe), M_PIPE, M_WAITOK | M_ZERO);
+		pipe->inum = gd->gd_anoninum++ * ncpus + gd->gd_cpuid + 2;
+		lwkt_token_init(&pipe->bufferA.rlock, "piper");
+		lwkt_token_init(&pipe->bufferA.wlock, "pipew");
+		lwkt_token_init(&pipe->bufferB.rlock, "piper");
+		lwkt_token_init(&pipe->bufferB.wlock, "pipew");
 	}
-	*cpipep = cpipe;
-	if ((error = pipespace(cpipe, PIPE_SIZE)) != 0)
+	*pipep = pipe;
+	if ((error = pipespace(pipe, &pipe->bufferA, pipe_size)) != 0) {
 		return (error);
-	vfs_timestamp(&cpipe->pipe_ctime);
-	cpipe->pipe_atime = cpipe->pipe_ctime;
-	cpipe->pipe_mtime = cpipe->pipe_ctime;
-	lwkt_token_init(&cpipe->pipe_rlock, "piper");
-	lwkt_token_init(&cpipe->pipe_wlock, "pipew");
+	}
+	if ((error = pipespace(pipe, &pipe->bufferB, pipe_size)) != 0) {
+		return (error);
+	}
+	vfs_timestamp(&pipe->ctime);
+	pipe->bufferA.atime = pipe->ctime;
+	pipe->bufferA.mtime = pipe->ctime;
+	pipe->bufferB.atime = pipe->ctime;
+	pipe->bufferB.mtime = pipe->ctime;
+	pipe->open_count = 2;
+
 	return (0);
 }
 
+/*
+ * Read data from a pipe
+ */
 static int
 pipe_read(struct file *fp, struct uio *uio, struct ucred *cred, int fflags)
 {
-	struct pipe *rpipe;
-	struct pipe *wpipe;
-	int error;
+	struct pipebuf *rpb;
+	struct pipebuf *wpb;
+	struct pipe *pipe;
 	size_t nread = 0;
-	int nbio;
-	u_int size;	/* total bytes available */
-	u_int nsize;	/* total bytes to read */
-	u_int rindex;	/* contiguous bytes available */
+	size_t size;	/* total bytes available */
+	size_t nsize;	/* total bytes to read */
+	size_t rindex;	/* contiguous bytes available */
 	int notify_writer;
 	int bigread;
 	int bigcount;
+	int error;
+	int nbio;
 
+	pipe = (struct pipe *)((intptr_t)fp->f_data & ~(intptr_t)1);
+	if ((intptr_t)fp->f_data & 1) {
+		rpb = &pipe->bufferB;
+		wpb = &pipe->bufferA;
+	} else {
+		rpb = &pipe->bufferA;
+		wpb = &pipe->bufferB;
+	}
 	atomic_set_int(&curthread->td_mpflags, TDF_MP_BATCH_DEMARC);
 
 	if (uio->uio_resid == 0)
 		return(0);
 
 	/*
-	 * Setup locks, calculate nbio
+	 * Calculate nbio
 	 */
-	rpipe = (struct pipe *)fp->f_data;
-	wpipe = rpipe->pipe_peer;
-	lwkt_gettoken(&rpipe->pipe_rlock);
-
 	if (fflags & O_FBLOCKING)
 		nbio = 0;
 	else if (fflags & O_FNONBLOCKING)
@@ -412,14 +485,23 @@ pipe_read(struct file *fp, struct uio *uio, struct ucred *cred, int fflags)
 		nbio = 0;
 
 	/*
-	 * Reads are serialized.  Note however that pipe_buffer.buffer and
-	 * pipe_buffer.size can change out from under us when the number
+	 * 'quick' NBIO test before things get expensive.
+	 */
+	if (nbio && rpb->rindex == rpb->windex &&
+	    (rpb->state & PIPE_REOF) == 0) {
+		return EAGAIN;
+	}
+
+	/*
+	 * Reads are serialized.  Note however that buffer.buffer and
+	 * buffer.size can change out from under us when the number
 	 * of bytes in the buffer are zero due to the write-side doing a
 	 * pipespace().
 	 */
-	error = pipe_start_uio(rpipe, &rpipe->pipe_rip);
+	lwkt_gettoken(&rpb->rlock);
+	error = pipe_start_uio(&rpb->rip);
 	if (error) {
-		lwkt_reltoken(&rpipe->pipe_rlock);
+		lwkt_reltoken(&rpb->rlock);
 		return (error);
 	}
 	notify_writer = 0;
@@ -440,61 +522,53 @@ pipe_read(struct file *fp, struct uio *uio, struct ucred *cred, int fflags)
 			}
 		}
 
-		size = rpipe->pipe_buffer.windex - rpipe->pipe_buffer.rindex;
+		/*
+		 * lfence required to avoid read-reordering of buffer
+		 * contents prior to validation of size.
+		 */
+		size = rpb->windex - rpb->rindex;
 		cpu_lfence();
 		if (size) {
-			rindex = rpipe->pipe_buffer.rindex &
-				 (rpipe->pipe_buffer.size - 1);
+			rindex = rpb->rindex & (rpb->size - 1);
 			nsize = size;
-			if (nsize > rpipe->pipe_buffer.size - rindex)
-				nsize = rpipe->pipe_buffer.size - rindex;
+			if (nsize > rpb->size - rindex)
+				nsize = rpb->size - rindex;
 			nsize = szmin(nsize, uio->uio_resid);
 
-			error = uiomove(&rpipe->pipe_buffer.buffer[rindex],
-					nsize, uio);
+			/*
+			 * Limit how much we move in one go so we have a
+			 * chance to kick the writer while data is still
+			 * available in the pipe.  This avoids getting into
+			 * a ping-pong with the writer.
+			 */
+			if (nsize > (rpb->size >> 1))
+				nsize = rpb->size >> 1;
+
+			error = uiomove(&rpb->buffer[rindex], nsize, uio);
 			if (error)
 				break;
-			cpu_mfence();
-			rpipe->pipe_buffer.rindex += nsize;
+			rpb->rindex += nsize;
 			nread += nsize;
 
 			/*
 			 * If the FIFO is still over half full just continue
-			 * and do not try to notify the writer yet.
+			 * and do not try to notify the writer yet.  If
+			 * less than half full notify any waiting writer.
 			 */
-			if (size - nsize >= (rpipe->pipe_buffer.size >> 1)) {
+			if (size - nsize > (rpb->size >> 1)) {
 				notify_writer = 0;
-				continue;
+			} else {
+				notify_writer = 1;
+				pipesignal(rpb, PIPE_WANTW);
 			}
-
-			/*
-			 * When the FIFO is less then half full notify any
-			 * waiting writer.  WANTW can be checked while
-			 * holding just the rlock.
-			 */
-			notify_writer = 1;
-			if ((rpipe->pipe_state & PIPE_WANTW) == 0)
-				continue;
+			continue;
 		}
 
 		/*
 		 * If the "write-side" was blocked we wake it up.  This code
-		 * is reached either when the buffer is completely emptied
-		 * or if it becomes more then half-empty.
-		 *
-		 * Pipe_state can only be modified if both the rlock and
-		 * wlock are held.
+		 * is reached when the buffer is completely emptied.
 		 */
-		if (rpipe->pipe_state & PIPE_WANTW) {
-			lwkt_gettoken(&rpipe->pipe_wlock);
-			if (rpipe->pipe_state & PIPE_WANTW) {
-				rpipe->pipe_state &= ~PIPE_WANTW;
-				lwkt_reltoken(&rpipe->pipe_wlock);
-				wakeup(rpipe);
-			} else {
-				lwkt_reltoken(&rpipe->pipe_wlock);
-			}
-		}
+		pipesignal(rpb, PIPE_WANTW);
 
 		/*
 		 * Pick up our copy loop again if the writer sent data to
@@ -512,7 +586,7 @@ pipe_read(struct file *fp, struct uio *uio, struct ucred *cred, int fflags)
 		 * where as miss requiring a tsleep/wakeup sequence
 		 * will take 7uS or more.
 		 */
-		if (rpipe->pipe_buffer.windex != rpipe->pipe_buffer.rindex)
+		if (rpb->windex != rpb->rindex)
 			continue;
 
 #ifdef _RDTSC_SUPPORTED_
@@ -522,11 +596,12 @@ pipe_read(struct file *fp, struct uio *uio, struct ucred *cred, int fflags)
 
 			tsc_target = tsc_get_target(pipe_delay);
 			while (tsc_test_target(tsc_target) == 0) {
-				if (rpipe->pipe_buffer.windex !=
-				    rpipe->pipe_buffer.rindex) {
+				cpu_lfence();
+				if (rpb->windex != rpb->rindex) {
 					good = 1;
 					break;
 				}
+				cpu_pause();
 			}
 			if (good)
 				continue;
@@ -536,7 +611,7 @@ pipe_read(struct file *fp, struct uio *uio, struct ucred *cred, int fflags)
 		/*
 		 * Detect EOF condition, do not set error.
 		 */
-		if (rpipe->pipe_state & PIPE_REOF)
+		if (rpb->state & PIPE_REOF)
 			break;
 
 		/*
@@ -552,65 +627,40 @@ pipe_read(struct file *fp, struct uio *uio, struct ucred *cred, int fflags)
 		}
 
 		/*
-		 * Last chance, interlock with WANTR.
+		 * Last chance, interlock with WANTR
 		 */
-		lwkt_gettoken(&rpipe->pipe_wlock);
-		size = rpipe->pipe_buffer.windex - rpipe->pipe_buffer.rindex;
-		if (size) {
-			lwkt_reltoken(&rpipe->pipe_wlock);
+		tsleep_interlock(rpb, PCATCH);
+		atomic_set_int(&rpb->state, PIPE_WANTR);
+
+		/*
+		 * Retest bytes available after memory barrier above.
+		 */
+		size = rpb->windex - rpb->rindex;
+		if (size)
 			continue;
-		}
 
 		/*
-		 * Retest EOF - acquiring a new token can temporarily release
-		 * tokens already held.
+		 * Retest EOF after memory barrier above.
 		 */
-		if (rpipe->pipe_state & PIPE_REOF) {
-			lwkt_reltoken(&rpipe->pipe_wlock);
+		if (rpb->state & PIPE_REOF)
 			break;
-		}
 
 		/*
-		 * If there is no more to read in the pipe, reset its
-		 * pointers to the beginning.  This improves cache hit
-		 * stats.
-		 *
-		 * We need both locks to modify both pointers, and there
-		 * must also not be a write in progress or the uiomove()
-		 * in the write might block and temporarily release
-		 * its wlock, then reacquire and update windex.  We are
-		 * only serialized against reads, not writes.
-		 *
-		 * XXX should we even bother resetting the indices?  It
-		 *     might actually be more cache efficient not to.
+		 * Wait for more data or state change
 		 */
-		if (rpipe->pipe_buffer.rindex == rpipe->pipe_buffer.windex &&
-		    rpipe->pipe_wip == 0) {
-			rpipe->pipe_buffer.rindex = 0;
-			rpipe->pipe_buffer.windex = 0;
-		}
-
-		/*
-		 * Wait for more data.
-		 *
-		 * Pipe_state can only be set if both the rlock and wlock
-		 * are held.
-		 */
-		rpipe->pipe_state |= PIPE_WANTR;
-		tsleep_interlock(rpipe, PCATCH);
-		lwkt_reltoken(&rpipe->pipe_wlock);
-		error = tsleep(rpipe, PCATCH | PINTERLOCKED, "piperd", 0);
-		++pipe_rblocked_count;
+		error = tsleep(rpb, PCATCH | PINTERLOCKED, "piperd", 0);
 		if (error)
 			break;
 	}
-	pipe_end_uio(rpipe, &rpipe->pipe_rip);
+	pipe_end_uio(&rpb->rip);
 
 	/*
 	 * Uptime last access time
 	 */
-	if (error == 0 && nread)
-		vfs_timestamp(&rpipe->pipe_atime);
+	if (error == 0 && nread && rpb->lticks != ticks) {
+		vfs_timestamp(&rpb->atime);
+		rpb->lticks = ticks;
+	}
 
 	/*
 	 * If we drained the FIFO more then half way then handle
@@ -624,16 +674,7 @@ pipe_read(struct file *fp, struct uio *uio, struct ucred *cred, int fflags)
 		/*
 		 * Synchronous blocking is done on the pipe involved
 		 */
-		if (rpipe->pipe_state & PIPE_WANTW) {
-			lwkt_gettoken(&rpipe->pipe_wlock);
-			if (rpipe->pipe_state & PIPE_WANTW) {
-				rpipe->pipe_state &= ~PIPE_WANTW;
-				lwkt_reltoken(&rpipe->pipe_wlock);
-				wakeup(rpipe);
-			} else {
-				lwkt_reltoken(&rpipe->pipe_wlock);
-			}
-		}
+		pipesignal(rpb, PIPE_WANTW);
 
 		/*
 		 * But we may also have to deal with a kqueue which is
@@ -641,12 +682,10 @@ pipe_read(struct file *fp, struct uio *uio, struct ucred *cred, int fflags)
 		 * EVFILT_WRITE event waiting for our side to drain will
 		 * be on the other side.
 		 */
-		lwkt_gettoken(&wpipe->pipe_wlock);
-		pipewakeup(wpipe, 0);
-		lwkt_reltoken(&wpipe->pipe_wlock);
+		pipewakeup(wpb, 0);
 	}
-	/*size = rpipe->pipe_buffer.windex - rpipe->pipe_buffer.rindex;*/
-	lwkt_reltoken(&rpipe->pipe_rlock);
+	/*size = rpb->windex - rpb->rindex;*/
+	lwkt_reltoken(&rpb->rlock);
 
 	return (error);
 }
@@ -654,45 +693,30 @@ pipe_read(struct file *fp, struct uio *uio, struct ucred *cred, int fflags)
 static int
 pipe_write(struct file *fp, struct uio *uio, struct ucred *cred, int fflags)
 {
-	int error;
-	int orig_resid;
-	int nbio;
-	struct pipe *wpipe;
-	struct pipe *rpipe;
-	u_int windex;
-	u_int space;
-	u_int wcount;
+	struct pipebuf *rpb;
+	struct pipebuf *wpb;
+	struct pipe *pipe;
+	size_t windex;
+	size_t space;
+	size_t wcount;
+	size_t orig_resid;
 	int bigwrite;
 	int bigcount;
+	int error;
+	int nbio;
 
-	/*
-	 * Writes go to the peer.  The peer will always exist.
-	 */
-	rpipe = (struct pipe *) fp->f_data;
-	wpipe = rpipe->pipe_peer;
-	lwkt_gettoken(&wpipe->pipe_wlock);
-	if (wpipe->pipe_state & PIPE_WEOF) {
-		lwkt_reltoken(&wpipe->pipe_wlock);
-		return (EPIPE);
+	pipe = (struct pipe *)((intptr_t)fp->f_data & ~(intptr_t)1);
+	if ((intptr_t)fp->f_data & 1) {
+		rpb = &pipe->bufferB;
+		wpb = &pipe->bufferA;
+	} else {
+		rpb = &pipe->bufferA;
+		wpb = &pipe->bufferB;
 	}
 
 	/*
-	 * Degenerate case (EPIPE takes prec)
+	 * Calculate nbio
 	 */
-	if (uio->uio_resid == 0) {
-		lwkt_reltoken(&wpipe->pipe_wlock);
-		return(0);
-	}
-
-	/*
-	 * Writes are serialized (start_uio must be called with wlock)
-	 */
-	error = pipe_start_uio(wpipe, &wpipe->pipe_wip);
-	if (error) {
-		lwkt_reltoken(&wpipe->pipe_wlock);
-		return (error);
-	}
-
 	if (fflags & O_FBLOCKING)
 		nbio = 0;
 	else if (fflags & O_FNONBLOCKING)
@@ -703,27 +727,37 @@ pipe_write(struct file *fp, struct uio *uio, struct ucred *cred, int fflags)
 		nbio = 0;
 
 	/*
-	 * If it is advantageous to resize the pipe buffer, do
-	 * so.  We are write-serialized so we can block safely.
+	 * 'quick' NBIO test before things get expensive.
 	 */
-	if ((wpipe->pipe_buffer.size <= PIPE_SIZE) &&
-	    (pipe_nbig < pipe_maxbig) &&
-	    wpipe->pipe_wantwcnt > 4 &&
-	    (wpipe->pipe_buffer.rindex == wpipe->pipe_buffer.windex)) {
-		/* 
-		 * Recheck after lock.
-		 */
-		lwkt_gettoken(&wpipe->pipe_rlock);
-		if ((wpipe->pipe_buffer.size <= PIPE_SIZE) &&
-		    (pipe_nbig < pipe_maxbig) &&
-		    (wpipe->pipe_buffer.rindex == wpipe->pipe_buffer.windex)) {
-			atomic_add_int(&pipe_nbig, 1);
-			if (pipespace(wpipe, BIG_PIPE_SIZE) == 0)
-				++pipe_bigcount;
-			else
-				atomic_subtract_int(&pipe_nbig, 1);
-		}
-		lwkt_reltoken(&wpipe->pipe_rlock);
+	if (nbio && wpb->size == (wpb->windex - wpb->rindex) &&
+	    uio->uio_resid && (wpb->state & PIPE_WEOF) == 0) {
+		return EAGAIN;
+	}
+
+	/*
+	 * Writes go to the peer.  The peer will always exist.
+	 */
+	lwkt_gettoken(&wpb->wlock);
+	if (wpb->state & PIPE_WEOF) {
+		lwkt_reltoken(&wpb->wlock);
+		return (EPIPE);
+	}
+
+	/*
+	 * Degenerate case (EPIPE takes prec)
+	 */
+	if (uio->uio_resid == 0) {
+		lwkt_reltoken(&wpb->wlock);
+		return(0);
+	}
+
+	/*
+	 * Writes are serialized (start_uio must be called with wlock)
+	 */
+	error = pipe_start_uio(&wpb->wip);
+	if (error) {
+		lwkt_reltoken(&wpb->wlock);
+		return (error);
 	}
 
 	orig_resid = uio->uio_resid;
@@ -733,7 +767,7 @@ pipe_write(struct file *fp, struct uio *uio, struct ucred *cred, int fflags)
 	bigcount = 10;
 
 	while (uio->uio_resid) {
-		if (wpipe->pipe_state & PIPE_WEOF) {
+		if (wpb->state & PIPE_WEOF) {
 			error = EPIPE;
 			break;
 		}
@@ -750,13 +784,12 @@ pipe_write(struct file *fp, struct uio *uio, struct ucred *cred, int fflags)
 			}
 		}
 
-		windex = wpipe->pipe_buffer.windex &
-			 (wpipe->pipe_buffer.size - 1);
-		space = wpipe->pipe_buffer.size -
-			(wpipe->pipe_buffer.windex - wpipe->pipe_buffer.rindex);
-		cpu_lfence();
+		windex = wpb->windex & (wpb->size - 1);
+		space = wpb->size - (wpb->windex - wpb->rindex);
 
-		/* Writes of size <= PIPE_BUF must be atomic. */
+		/*
+		 * Writes of size <= PIPE_BUF must be atomic.
+		 */
 		if ((space < uio->uio_resid) && (orig_resid <= PIPE_BUF))
 			space = 0;
 
@@ -766,22 +799,17 @@ pipe_write(struct file *fp, struct uio *uio, struct ucred *cred, int fflags)
 		 * writes to spin.
 		 */
 		if (space > 0) {
-			u_int segsize;
+			size_t segsize;
 
 			/*
-			 * Transfer size is minimum of uio transfer
-			 * and free space in pipe buffer.
-			 *
-			 * Limit each uiocopy to no more then PIPE_SIZE
-			 * so we can keep the gravy train going on a
-			 * SMP box.  This doubles the performance for
-			 * write sizes > 16K.  Otherwise large writes
-			 * wind up doing an inefficient synchronous
-			 * ping-pong.
+			 * We want to notify a potentially waiting reader
+			 * before we exhaust the write buffer for SMP
+			 * pipelining.  Otherwise the write/read will begin
+			 * to ping-pong.
 			 */
 			space = szmin(space, uio->uio_resid);
-			if (space > PIPE_SIZE)
-				space = PIPE_SIZE;
+			if (space > (wpb->size >> 1))
+				space = (wpb->size >> 1);
 
 			/*
 			 * First segment to transfer is minimum of
@@ -790,7 +818,7 @@ pipe_write(struct file *fp, struct uio *uio, struct ucred *cred, int fflags)
 			 * is less than the transfer size, we've got
 			 * a wraparound in the buffer.
 			 */
-			segsize = wpipe->pipe_buffer.size - windex;
+			segsize = wpb->size - windex;
 			if (segsize > space)
 				segsize = space;
 
@@ -802,78 +830,94 @@ pipe_write(struct file *fp, struct uio *uio, struct ucred *cred, int fflags)
 			 * on the reader side is the fastest way to get the
 			 * reader going.  (The scheduler will hard loop on
 			 * lock tokens).
-			 *
-			 * NOTE: We can't clear WANTR here without acquiring
-			 * the rlock, which we don't want to do here!
 			 */
-			if ((wpipe->pipe_state & PIPE_WANTR))
-				wakeup(wpipe);
+			if (wcount == 0)
+				pipesignal(wpb, PIPE_WANTR);
 
 			/*
 			 * Transfer segment, which may include a wrap-around.
 			 * Update windex to account for both all in one go
 			 * so the reader can read() the data atomically.
 			 */
-			error = uiomove(&wpipe->pipe_buffer.buffer[windex],
-					segsize, uio);
+			error = uiomove(&wpb->buffer[windex], segsize, uio);
 			if (error == 0 && segsize < space) {
 				segsize = space - segsize;
-				error = uiomove(&wpipe->pipe_buffer.buffer[0],
-						segsize, uio);
+				error = uiomove(&wpb->buffer[0], segsize, uio);
 			}
 			if (error)
 				break;
-			cpu_mfence();
-			wpipe->pipe_buffer.windex += space;
+
+			/*
+			 * Memory fence prior to windex updating (note: not
+			 * needed so this is a NOP on Intel).
+			 */
+			cpu_sfence();
+			wpb->windex += space;
+
+			/*
+			 * Signal reader
+			 */
+			if (wcount != 0)
+				pipesignal(wpb, PIPE_WANTR);
 			wcount += space;
 			continue;
 		}
 
 		/*
-		 * We need both the rlock and the wlock to interlock against
-		 * the EOF, WANTW, and size checks, and to modify pipe_state.
-		 *
-		 * These are token locks so we do not have to worry about
-		 * deadlocks.
+		 * Wakeup any pending reader
 		 */
-		lwkt_gettoken(&wpipe->pipe_rlock);
-
-		/*
-		 * If the "read-side" has been blocked, wake it up now
-		 * and yield to let it drain synchronously rather
-		 * then block.
-		 */
-		if (wpipe->pipe_state & PIPE_WANTR) {
-			wpipe->pipe_state &= ~PIPE_WANTR;
-			wakeup(wpipe);
-		}
+		pipesignal(wpb, PIPE_WANTR);
 
 		/*
 		 * don't block on non-blocking I/O
 		 */
 		if (nbio) {
-			lwkt_reltoken(&wpipe->pipe_rlock);
 			error = EAGAIN;
 			break;
 		}
 
+#ifdef _RDTSC_SUPPORTED_
+		if (pipe_delay) {
+			int64_t tsc_target;
+			int good = 0;
+
+			tsc_target = tsc_get_target(pipe_delay);
+			while (tsc_test_target(tsc_target) == 0) {
+				cpu_lfence();
+				space = wpb->size - (wpb->windex - wpb->rindex);
+				if ((space < uio->uio_resid) &&
+				    (orig_resid <= PIPE_BUF)) {
+					space = 0;
+				}
+				if (space) {
+					good = 1;
+					break;
+				}
+				cpu_pause();
+			}
+			if (good)
+				continue;
+		}
+#endif
+
 		/*
-		 * re-test whether we have to block in the writer after
-		 * acquiring both locks, in case the reader opened up
-		 * some space.
+		 * Interlocked test.   Atomic op enforces the memory barrier.
 		 */
-		space = wpipe->pipe_buffer.size -
-			(wpipe->pipe_buffer.windex - wpipe->pipe_buffer.rindex);
-		cpu_lfence();
+		tsleep_interlock(wpb, PCATCH);
+		atomic_set_int(&wpb->state, PIPE_WANTW);
+
+		/*
+		 * Retest space available after memory barrier above.
+		 * Writes of size <= PIPE_BUF must be atomic.
+		 */
+		space = wpb->size - (wpb->windex - wpb->rindex);
 		if ((space < uio->uio_resid) && (orig_resid <= PIPE_BUF))
 			space = 0;
 
 		/*
-		 * Retest EOF - acquiring a new token can temporarily release
-		 * tokens already held.
+		 * Retest EOF after memory barrier above.
 		 */
-		if (wpipe->pipe_state & PIPE_WEOF) {
-			lwkt_reltoken(&wpipe->pipe_rlock);
+		if (wpb->state & PIPE_WEOF) {
 			error = EPIPE;
 			break;
 		}
@@ -883,14 +927,9 @@ pipe_write(struct file *fp, struct uio *uio, struct ucred *cred, int fflags)
 		 * wake up select/poll/kq.
 		 */
 		if (space == 0) {
-			wpipe->pipe_state |= PIPE_WANTW;
-			++wpipe->pipe_wantwcnt;
-			pipewakeup(wpipe, 1);
-			if (wpipe->pipe_state & PIPE_WANTW)
-				error = tsleep(wpipe, PCATCH, "pipewr", 0);
-			++pipe_wblocked_count;
+			pipewakeup(wpb, 1);
+			error = tsleep(wpb, PCATCH | PINTERLOCKED, "pipewr", 0);
 		}
-		lwkt_reltoken(&wpipe->pipe_rlock);
 
 		/*
 		 * Break out if we errored or the read side wants us to go
@@ -898,12 +937,12 @@ pipe_write(struct file *fp, struct uio *uio, struct ucred *cred, int fflags)
 		 */
 		if (error)
 			break;
-		if (wpipe->pipe_state & PIPE_WEOF) {
+		if (wpb->state & PIPE_WEOF) {
 			error = EPIPE;
 			break;
 		}
 	}
-	pipe_end_uio(wpipe, &wpipe->pipe_wip);
+	pipe_end_uio(&wpb->wip);
 
 	/*
 	 * If we have put any characters in the buffer, we wake up
@@ -911,95 +950,92 @@ pipe_write(struct file *fp, struct uio *uio, struct ucred *cred, int fflags)
 	 *
 	 * Both rlock and wlock are required to be able to modify pipe_state.
 	 */
-	if (wpipe->pipe_buffer.windex != wpipe->pipe_buffer.rindex) {
-		if (wpipe->pipe_state & PIPE_WANTR) {
-			lwkt_gettoken(&wpipe->pipe_rlock);
-			if (wpipe->pipe_state & PIPE_WANTR) {
-				wpipe->pipe_state &= ~PIPE_WANTR;
-				lwkt_reltoken(&wpipe->pipe_rlock);
-				wakeup(wpipe);
-			} else {
-				lwkt_reltoken(&wpipe->pipe_rlock);
-			}
-		}
-		lwkt_gettoken(&wpipe->pipe_rlock);
-		pipewakeup(wpipe, 1);
-		lwkt_reltoken(&wpipe->pipe_rlock);
+	if (wpb->windex != wpb->rindex) {
+		pipesignal(wpb, PIPE_WANTR);
+		pipewakeup(wpb, 1);
 	}
 
 	/*
 	 * Don't return EPIPE if I/O was successful
 	 */
-	if ((wpipe->pipe_buffer.rindex == wpipe->pipe_buffer.windex) &&
+	if ((wpb->rindex == wpb->windex) &&
 	    (uio->uio_resid == 0) &&
 	    (error == EPIPE)) {
 		error = 0;
 	}
 
-	if (error == 0)
-		vfs_timestamp(&wpipe->pipe_mtime);
+	if (error == 0 && wpb->lticks != ticks) {
+		vfs_timestamp(&wpb->mtime);
+		wpb->lticks = ticks;
+	}
 
 	/*
 	 * We have something to offer,
 	 * wake up select/poll/kq.
 	 */
-	/*space = wpipe->pipe_buffer.windex - wpipe->pipe_buffer.rindex;*/
-	lwkt_reltoken(&wpipe->pipe_wlock);
+	/*space = wpb->windex - wpb->rindex;*/
+	lwkt_reltoken(&wpb->wlock);
+
 	return (error);
 }
 
 /*
  * we implement a very minimal set of ioctls for compatibility with sockets.
  */
-int
+static int
 pipe_ioctl(struct file *fp, u_long cmd, caddr_t data,
 	   struct ucred *cred, struct sysmsg *msg)
 {
-	struct pipe *mpipe;
+	struct pipebuf *rpb;
+	struct pipe *pipe;
 	int error;
 
-	mpipe = (struct pipe *)fp->f_data;
+	pipe = (struct pipe *)((intptr_t)fp->f_data & ~(intptr_t)1);
+	if ((intptr_t)fp->f_data & 1) {
+		rpb = &pipe->bufferB;
+	} else {
+		rpb = &pipe->bufferA;
+	}
 
-	lwkt_gettoken(&mpipe->pipe_rlock);
-	lwkt_gettoken(&mpipe->pipe_wlock);
+	lwkt_gettoken(&rpb->rlock);
+	lwkt_gettoken(&rpb->wlock);
 
 	switch (cmd) {
 	case FIOASYNC:
 		if (*(int *)data) {
-			mpipe->pipe_state |= PIPE_ASYNC;
+			atomic_set_int(&rpb->state, PIPE_ASYNC);
 		} else {
-			mpipe->pipe_state &= ~PIPE_ASYNC;
+			atomic_clear_int(&rpb->state, PIPE_ASYNC);
 		}
 		error = 0;
 		break;
 	case FIONREAD:
-		*(int *)data = mpipe->pipe_buffer.windex -
-				mpipe->pipe_buffer.rindex;
+		*(int *)data = (int)(rpb->windex - rpb->rindex);
 		error = 0;
 		break;
 	case FIOSETOWN:
-		error = fsetown(*(int *)data, &mpipe->pipe_sigio);
+		error = fsetown(*(int *)data, &rpb->sigio);
 		break;
 	case FIOGETOWN:
-		*(int *)data = fgetown(&mpipe->pipe_sigio);
+		*(int *)data = fgetown(&rpb->sigio);
 		error = 0;
 		break;
 	case TIOCSPGRP:
 		/* This is deprecated, FIOSETOWN should be used instead. */
-		error = fsetown(-(*(int *)data), &mpipe->pipe_sigio);
+		error = fsetown(-(*(int *)data), &rpb->sigio);
 		break;
 
 	case TIOCGPGRP:
 		/* This is deprecated, FIOGETOWN should be used instead. */
-		*(int *)data = -fgetown(&mpipe->pipe_sigio);
+		*(int *)data = -fgetown(&rpb->sigio);
 		error = 0;
 		break;
 	default:
 		error = ENOTTY;
 		break;
 	}
-	lwkt_reltoken(&mpipe->pipe_wlock);
-	lwkt_reltoken(&mpipe->pipe_rlock);
+	lwkt_reltoken(&rpb->wlock);
+	lwkt_reltoken(&rpb->rlock);
 
 	return (error);
 }
@@ -1010,36 +1046,57 @@ pipe_ioctl(struct file *fp, u_long cmd, caddr_t data,
 static int
 pipe_stat(struct file *fp, struct stat *ub, struct ucred *cred)
 {
+	struct pipebuf *rpb;
 	struct pipe *pipe;
 
-	pipe = (struct pipe *)fp->f_data;
+	pipe = (struct pipe *)((intptr_t)fp->f_data & ~(intptr_t)1);
+	if ((intptr_t)fp->f_data & 1) {
+		rpb = &pipe->bufferB;
+	} else {
+		rpb = &pipe->bufferA;
+	}
 
 	bzero((caddr_t)ub, sizeof(*ub));
 	ub->st_mode = S_IFIFO;
-	ub->st_blksize = pipe->pipe_buffer.size;
-	ub->st_size = pipe->pipe_buffer.windex - pipe->pipe_buffer.rindex;
+	ub->st_blksize = rpb->size;
+	ub->st_size = rpb->windex - rpb->rindex;
 	ub->st_blocks = (ub->st_size + ub->st_blksize - 1) / ub->st_blksize;
-	ub->st_atimespec = pipe->pipe_atime;
-	ub->st_mtimespec = pipe->pipe_mtime;
-	ub->st_ctimespec = pipe->pipe_ctime;
+	ub->st_atimespec = rpb->atime;
+	ub->st_mtimespec = rpb->mtime;
+	ub->st_ctimespec = pipe->ctime;
+	ub->st_uid = fp->f_cred->cr_uid;
+	ub->st_gid = fp->f_cred->cr_gid;
+	ub->st_ino = pipe->inum;
 	/*
-	 * Left as 0: st_dev, st_ino, st_nlink, st_uid, st_gid, st_rdev,
+	 * Left as 0: st_dev, st_nlink, st_rdev,
 	 * st_flags, st_gen.
 	 * XXX (st_dev, st_ino) should be unique.
 	 */
+
 	return (0);
 }
 
 static int
 pipe_close(struct file *fp)
 {
-	struct pipe *cpipe;
+	struct pipebuf *rpb;
+	struct pipebuf *wpb;
+	struct pipe *pipe;
 
-	cpipe = (struct pipe *)fp->f_data;
+	pipe = (struct pipe *)((intptr_t)fp->f_data & ~(intptr_t)1);
+	if ((intptr_t)fp->f_data & 1) {
+		rpb = &pipe->bufferB;
+		wpb = &pipe->bufferA;
+	} else {
+		rpb = &pipe->bufferA;
+		wpb = &pipe->bufferB;
+	}
+
 	fp->f_ops = &badfileops;
 	fp->f_data = NULL;
-	funsetown(&cpipe->pipe_sigio);
-	pipeclose(cpipe);
+	funsetown(&rpb->sigio);
+	pipeclose(pipe, rpb, wpb);
+
 	return (0);
 }
 
@@ -1049,167 +1106,175 @@ pipe_close(struct file *fp)
 static int
 pipe_shutdown(struct file *fp, int how)
 {
-	struct pipe *rpipe;
-	struct pipe *wpipe;
+	struct pipebuf *rpb;
+	struct pipebuf *wpb;
+	struct pipe *pipe;
 	int error = EPIPE;
 
-	rpipe = (struct pipe *)fp->f_data;
-	wpipe = rpipe->pipe_peer;
+	pipe = (struct pipe *)((intptr_t)fp->f_data & ~(intptr_t)1);
+	if ((intptr_t)fp->f_data & 1) {
+		rpb = &pipe->bufferB;
+		wpb = &pipe->bufferA;
+	} else {
+		rpb = &pipe->bufferA;
+		wpb = &pipe->bufferB;
+	}
 
 	/*
 	 * We modify pipe_state on both pipes, which means we need
 	 * all four tokens!
 	 */
-	lwkt_gettoken(&rpipe->pipe_rlock);
-	lwkt_gettoken(&rpipe->pipe_wlock);
-	lwkt_gettoken(&wpipe->pipe_rlock);
-	lwkt_gettoken(&wpipe->pipe_wlock);
+	lwkt_gettoken(&rpb->rlock);
+	lwkt_gettoken(&rpb->wlock);
+	lwkt_gettoken(&wpb->rlock);
+	lwkt_gettoken(&wpb->wlock);
 
 	switch(how) {
 	case SHUT_RDWR:
 	case SHUT_RD:
-		rpipe->pipe_state |= PIPE_REOF;		/* my reads */
-		rpipe->pipe_state |= PIPE_WEOF;		/* peer writes */
-		if (rpipe->pipe_state & PIPE_WANTR) {
-			rpipe->pipe_state &= ~PIPE_WANTR;
-			wakeup(rpipe);
+		/*
+		 * EOF on my reads and peer writes
+		 */
+		atomic_set_int(&rpb->state, PIPE_REOF | PIPE_WEOF);
+		if (rpb->state & PIPE_WANTR) {
+			rpb->state &= ~PIPE_WANTR;
+			wakeup(rpb);
 		}
-		if (rpipe->pipe_state & PIPE_WANTW) {
-			rpipe->pipe_state &= ~PIPE_WANTW;
-			wakeup(rpipe);
+		if (rpb->state & PIPE_WANTW) {
+			rpb->state &= ~PIPE_WANTW;
+			wakeup(rpb);
 		}
 		error = 0;
 		if (how == SHUT_RD)
 			break;
 		/* fall through */
 	case SHUT_WR:
-		wpipe->pipe_state |= PIPE_REOF;		/* peer reads */
-		wpipe->pipe_state |= PIPE_WEOF;		/* my writes */
-		if (wpipe->pipe_state & PIPE_WANTR) {
-			wpipe->pipe_state &= ~PIPE_WANTR;
-			wakeup(wpipe);
+		/*
+		 * EOF on peer reads and my writes
+		 */
+		atomic_set_int(&wpb->state, PIPE_REOF | PIPE_WEOF);
+		if (wpb->state & PIPE_WANTR) {
+			wpb->state &= ~PIPE_WANTR;
+			wakeup(wpb);
 		}
-		if (wpipe->pipe_state & PIPE_WANTW) {
-			wpipe->pipe_state &= ~PIPE_WANTW;
-			wakeup(wpipe);
+		if (wpb->state & PIPE_WANTW) {
+			wpb->state &= ~PIPE_WANTW;
+			wakeup(wpb);
 		}
 		error = 0;
 		break;
 	}
-	pipewakeup(rpipe, 1);
-	pipewakeup(wpipe, 1);
+	pipewakeup(rpb, 1);
+	pipewakeup(wpb, 1);
 
-	lwkt_reltoken(&wpipe->pipe_wlock);
-	lwkt_reltoken(&wpipe->pipe_rlock);
-	lwkt_reltoken(&rpipe->pipe_wlock);
-	lwkt_reltoken(&rpipe->pipe_rlock);
+	lwkt_reltoken(&wpb->wlock);
+	lwkt_reltoken(&wpb->rlock);
+	lwkt_reltoken(&rpb->wlock);
+	lwkt_reltoken(&rpb->rlock);
 
 	return (error);
 }
 
+/*
+ * Destroy the pipe buffer.
+ */
 static void
-pipe_free_kmem(struct pipe *cpipe)
+pipe_free_kmem(struct pipebuf *pb)
 {
-	if (cpipe->pipe_buffer.buffer != NULL) {
-		if (cpipe->pipe_buffer.size > PIPE_SIZE)
-			atomic_subtract_int(&pipe_nbig, 1);
-		kmem_free(&kernel_map,
-			(vm_offset_t)cpipe->pipe_buffer.buffer,
-			cpipe->pipe_buffer.size);
-		cpipe->pipe_buffer.buffer = NULL;
-		cpipe->pipe_buffer.object = NULL;
+	if (pb->buffer != NULL) {
+		kmem_free(&kernel_map, (vm_offset_t)pb->buffer, pb->size);
+		pb->buffer = NULL;
+		pb->object = NULL;
 	}
 }
 
 /*
- * Close the pipe.  The slock must be held to interlock against simultanious
- * closes.  The rlock and wlock must be held to adjust the pipe_state.
+ * Close one half of the pipe.  We are closing the pipe for reading on rpb
+ * and writing on wpb.  This routine must be called twice with the pipebufs
+ * reversed to close both directions.
  */
 static void
-pipeclose(struct pipe *cpipe)
+pipeclose(struct pipe *pipe, struct pipebuf *rpb, struct pipebuf *wpb)
 {
 	globaldata_t gd;
-	struct pipe *ppipe;
 
-	if (cpipe == NULL)
+	if (pipe == NULL)
 		return;
 
 	/*
-	 * The slock may not have been allocated yet (close during
-	 * initialization)
-	 *
 	 * We need both the read and write tokens to modify pipe_state.
 	 */
-	if (cpipe->pipe_slock)
-		lockmgr(cpipe->pipe_slock, LK_EXCLUSIVE);
-	lwkt_gettoken(&cpipe->pipe_rlock);
-	lwkt_gettoken(&cpipe->pipe_wlock);
+	lwkt_gettoken(&rpb->rlock);
+	lwkt_gettoken(&rpb->wlock);
 
 	/*
 	 * Set our state, wakeup anyone waiting in select/poll/kq, and
-	 * wakeup anyone blocked on our pipe.
+	 * wakeup anyone blocked on our pipe.  No action if our side
+	 * is already closed.
 	 */
-	cpipe->pipe_state |= PIPE_CLOSED | PIPE_REOF | PIPE_WEOF;
-	pipewakeup(cpipe, 1);
-	if (cpipe->pipe_state & (PIPE_WANTR | PIPE_WANTW)) {
-		cpipe->pipe_state &= ~(PIPE_WANTR | PIPE_WANTW);
-		wakeup(cpipe);
+	if (rpb->state & PIPE_CLOSED) {
+		lwkt_reltoken(&rpb->wlock);
+		lwkt_reltoken(&rpb->rlock);
+		return;
 	}
+
+	atomic_set_int(&rpb->state, PIPE_CLOSED | PIPE_REOF | PIPE_WEOF);
+	pipewakeup(rpb, 1);
+	if (rpb->state & (PIPE_WANTR | PIPE_WANTW)) {
+		rpb->state &= ~(PIPE_WANTR | PIPE_WANTW);
+		wakeup(rpb);
+	}
+	lwkt_reltoken(&rpb->wlock);
+	lwkt_reltoken(&rpb->rlock);
 
 	/*
 	 * Disconnect from peer.
 	 */
-	if ((ppipe = cpipe->pipe_peer) != NULL) {
-		lwkt_gettoken(&ppipe->pipe_rlock);
-		lwkt_gettoken(&ppipe->pipe_wlock);
-		ppipe->pipe_state |= PIPE_REOF | PIPE_WEOF;
-		pipewakeup(ppipe, 1);
-		if (ppipe->pipe_state & (PIPE_WANTR | PIPE_WANTW)) {
-			ppipe->pipe_state &= ~(PIPE_WANTR | PIPE_WANTW);
-			wakeup(ppipe);
-		}
-		if (SLIST_FIRST(&ppipe->pipe_kq.ki_note))
-			KNOTE(&ppipe->pipe_kq.ki_note, 0);
-		lwkt_reltoken(&ppipe->pipe_wlock);
-		lwkt_reltoken(&ppipe->pipe_rlock);
+	lwkt_gettoken(&wpb->rlock);
+	lwkt_gettoken(&wpb->wlock);
+
+	atomic_set_int(&wpb->state, PIPE_REOF | PIPE_WEOF);
+	pipewakeup(wpb, 1);
+	if (wpb->state & (PIPE_WANTR | PIPE_WANTW)) {
+		wpb->state &= ~(PIPE_WANTR | PIPE_WANTW);
+		wakeup(wpb);
 	}
+	if (SLIST_FIRST(&wpb->kq.ki_note))
+		KNOTE(&wpb->kq.ki_note, 0);
+	lwkt_reltoken(&wpb->wlock);
+	lwkt_reltoken(&wpb->rlock);
 
 	/*
-	 * If the peer is also closed we can free resources for both
-	 * sides, otherwise we leave our side intact to deal with any
-	 * races (since we only have the slock).
+	 * Free resources once both sides are closed.  We maintain a pcpu
+	 * cache to improve performance, so the actual tear-down case is
+	 * limited to bulk situations.
+	 *
+	 * However, the bulk tear-down case can cause intense contention
+	 * on the kernel_map when, e.g. hundreds to hundreds of thousands
+	 * of processes are killed at the same time.  To deal with this we
+	 * use a pcpu mutex to maintain concurrency but also limit the
+	 * number of threads banging on the map and pmap.
+	 *
+	 * We use the mtx mechanism instead of the lockmgr mechanism because
+	 * the mtx mechanism utilizes a queued design which will not break
+	 * down in the face of thousands to hundreds of thousands of
+	 * processes trying to free pipes simultaneously.  The lockmgr
+	 * mechanism will wind up waking them all up each time a lock
+	 * cycles.
 	 */
-	if (ppipe && (ppipe->pipe_state & PIPE_CLOSED)) {
-		cpipe->pipe_peer = NULL;
-		ppipe->pipe_peer = NULL;
-		ppipe->pipe_slock = NULL;	/* we will free the slock */
-		pipeclose(ppipe);
-		ppipe = NULL;
-	}
-
-	lwkt_reltoken(&cpipe->pipe_wlock);
-	lwkt_reltoken(&cpipe->pipe_rlock);
-	if (cpipe->pipe_slock)
-		lockmgr(cpipe->pipe_slock, LK_RELEASE);
-
-	/*
-	 * If we disassociated from our peer we can free resources
-	 */
-	if (ppipe == NULL) {
+	if (atomic_fetchadd_int(&pipe->open_count, -1) == 1) {
 		gd = mycpu;
-		if (cpipe->pipe_slock) {
-			kfree(cpipe->pipe_slock, M_PIPE);
-			cpipe->pipe_slock = NULL;
-		}
-		if (gd->gd_pipeqcount >= pipe_maxcache ||
-		    cpipe->pipe_buffer.size != PIPE_SIZE
-		) {
-			pipe_free_kmem(cpipe);
-			kfree(cpipe, M_PIPE);
+		if (gd->gd_pipeqcount >= pipe_maxcache) {
+			mtx_lock(&pipe_gdlocks[gd->gd_cpuid].mtx);
+			pipe_free_kmem(rpb);
+			pipe_free_kmem(wpb);
+			mtx_unlock(&pipe_gdlocks[gd->gd_cpuid].mtx);
+			kfree(pipe, M_PIPE);
 		} else {
-			cpipe->pipe_state = 0;
-			cpipe->pipe_peer = gd->gd_pipeq;
-			gd->gd_pipeq = cpipe;
+			rpb->state = 0;
+			wpb->state = 0;
+			pipe->next = gd->gd_pipeq;
+			gd->gd_pipeq = pipe;
 			++gd->gd_pipeqcount;
 		}
 	}
@@ -1218,9 +1283,18 @@ pipeclose(struct pipe *cpipe)
 static int
 pipe_kqfilter(struct file *fp, struct knote *kn)
 {
-	struct pipe *cpipe;
+	struct pipebuf *rpb;
+	struct pipebuf *wpb;
+	struct pipe *pipe;
 
-	cpipe = (struct pipe *)kn->kn_fp->f_data;
+	pipe = (struct pipe *)((intptr_t)fp->f_data & ~(intptr_t)1);
+	if ((intptr_t)fp->f_data & 1) {
+		rpb = &pipe->bufferB;
+		wpb = &pipe->bufferA;
+	} else {
+		rpb = &pipe->bufferA;
+		wpb = &pipe->bufferB;
+	}
 
 	switch (kn->kn_filter) {
 	case EVFILT_READ:
@@ -1228,7 +1302,7 @@ pipe_kqfilter(struct file *fp, struct knote *kn)
 		break;
 	case EVFILT_WRITE:
 		kn->kn_fop = &pipe_wfiltops;
-		if (cpipe->pipe_peer == NULL) {
+		if (wpb->state & PIPE_CLOSED) {
 			/* other end of pipe has been closed */
 			return (EPIPE);
 		}
@@ -1236,9 +1310,13 @@ pipe_kqfilter(struct file *fp, struct knote *kn)
 	default:
 		return (EOPNOTSUPP);
 	}
-	kn->kn_hook = (caddr_t)cpipe;
 
-	knote_insert(&cpipe->pipe_kq.ki_note, kn);
+	if (rpb == &pipe->bufferA)
+		kn->kn_hook = (caddr_t)(void *)((intptr_t)pipe | 0);
+	else
+		kn->kn_hook = (caddr_t)(void *)((intptr_t)pipe | 1);
+
+	knote_insert(&rpb->kq.ki_note, kn);
 
 	return (0);
 }
@@ -1246,24 +1324,54 @@ pipe_kqfilter(struct file *fp, struct knote *kn)
 static void
 filt_pipedetach(struct knote *kn)
 {
-	struct pipe *cpipe = (struct pipe *)kn->kn_hook;
+	struct pipebuf *rpb;
+	struct pipebuf *wpb;
+	struct pipe *pipe;
 
-	knote_remove(&cpipe->pipe_kq.ki_note, kn);
+	pipe = (struct pipe *)((intptr_t)kn->kn_hook & ~(intptr_t)1);
+	if ((intptr_t)kn->kn_hook & 1) {
+		rpb = &pipe->bufferB;
+		wpb = &pipe->bufferA;
+	} else {
+		rpb = &pipe->bufferA;
+		wpb = &pipe->bufferB;
+	}
+	knote_remove(&rpb->kq.ki_note, kn);
 }
 
 /*ARGSUSED*/
 static int
 filt_piperead(struct knote *kn, long hint)
 {
-	struct pipe *rpipe = (struct pipe *)kn->kn_fp->f_data;
+	struct pipebuf *rpb;
+	struct pipebuf *wpb;
+	struct pipe *pipe;
 	int ready = 0;
 
-	lwkt_gettoken(&rpipe->pipe_rlock);
-	lwkt_gettoken(&rpipe->pipe_wlock);
+	pipe = (struct pipe *)((intptr_t)kn->kn_fp->f_data & ~(intptr_t)1);
+	if ((intptr_t)kn->kn_fp->f_data & 1) {
+		rpb = &pipe->bufferB;
+		wpb = &pipe->bufferA;
+	} else {
+		rpb = &pipe->bufferA;
+		wpb = &pipe->bufferB;
+	}
 
-	kn->kn_data = rpipe->pipe_buffer.windex - rpipe->pipe_buffer.rindex;
+	/*
+	 * We shouldn't need the pipe locks because the knote itself is
+	 * locked via KN_PROCESSING.  If we lose a race against the writer,
+	 * the writer will just issue a KNOTE() after us.
+	 */
+#if 0
+	lwkt_gettoken(&rpb->rlock);
+	lwkt_gettoken(&rpb->wlock);
+#endif
 
-	if (rpipe->pipe_state & PIPE_REOF) {
+	kn->kn_data = rpb->windex - rpb->rindex;
+	if (kn->kn_data < 0)
+		kn->kn_data = 0;
+
+	if (rpb->state & PIPE_REOF) {
 		/*
 		 * Only set NODATA if all data has been exhausted
 		 */
@@ -1273,8 +1381,10 @@ filt_piperead(struct knote *kn, long hint)
 		ready = 1;
 	}
 
-	lwkt_reltoken(&rpipe->pipe_wlock);
-	lwkt_reltoken(&rpipe->pipe_rlock);
+#if 0
+	lwkt_reltoken(&rpb->wlock);
+	lwkt_reltoken(&rpb->rlock);
+#endif
 
 	if (!ready)
 		ready = kn->kn_data > 0;
@@ -1286,31 +1396,51 @@ filt_piperead(struct knote *kn, long hint)
 static int
 filt_pipewrite(struct knote *kn, long hint)
 {
-	struct pipe *rpipe = (struct pipe *)kn->kn_fp->f_data;
-	struct pipe *wpipe = rpipe->pipe_peer;
+	struct pipebuf *rpb;
+	struct pipebuf *wpb;
+	struct pipe *pipe;
 	int ready = 0;
 
+	pipe = (struct pipe *)((intptr_t)kn->kn_fp->f_data & ~(intptr_t)1);
+	if ((intptr_t)kn->kn_fp->f_data & 1) {
+		rpb = &pipe->bufferB;
+		wpb = &pipe->bufferA;
+	} else {
+		rpb = &pipe->bufferA;
+		wpb = &pipe->bufferB;
+	}
+
 	kn->kn_data = 0;
-	if (wpipe == NULL) {
+	if (wpb->state & PIPE_CLOSED) {
 		kn->kn_flags |= (EV_EOF | EV_NODATA);
 		return (1);
 	}
 
-	lwkt_gettoken(&wpipe->pipe_rlock);
-	lwkt_gettoken(&wpipe->pipe_wlock);
+	/*
+	 * We shouldn't need the pipe locks because the knote itself is
+	 * locked via KN_PROCESSING.  If we lose a race against the reader,
+	 * the writer will just issue a KNOTE() after us.
+	 */
+#if 0
+	lwkt_gettoken(&wpb->rlock);
+	lwkt_gettoken(&wpb->wlock);
+#endif
 
-	if (wpipe->pipe_state & PIPE_WEOF) {
+	if (wpb->state & PIPE_WEOF) {
 		kn->kn_flags |= (EV_EOF | EV_NODATA);
 		ready = 1;
 	}
 
-	if (!ready)
-		kn->kn_data = wpipe->pipe_buffer.size -
-			      (wpipe->pipe_buffer.windex -
-			       wpipe->pipe_buffer.rindex);
+	if (!ready) {
+		kn->kn_data = wpb->size - (wpb->windex - wpb->rindex);
+		if (kn->kn_data < 0)
+			kn->kn_data = 0;
+	}
 
-	lwkt_reltoken(&wpipe->pipe_wlock);
-	lwkt_reltoken(&wpipe->pipe_rlock);
+#if 0
+	lwkt_reltoken(&wpb->wlock);
+	lwkt_reltoken(&wpb->rlock);
+#endif
 
 	if (!ready)
 		ready = kn->kn_data >= PIPE_BUF;

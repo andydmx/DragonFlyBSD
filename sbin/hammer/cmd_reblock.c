@@ -54,54 +54,67 @@ hammer_cmd_reblock(char **av, int ac, int flags)
 
 	bzero(&reblock, sizeof(reblock));
 
-	reblock.key_beg.localization = HAMMER_MIN_LOCALIZATION;
 	reblock.key_beg.obj_id = HAMMER_MIN_OBJID;
+	reblock.key_end.obj_id = HAMMER_MAX_OBJID;
 	hammer_get_cycle(&reblock.key_beg, NULL);
 
-	reblock.key_end.localization = HAMMER_MAX_LOCALIZATION;
-	reblock.key_end.obj_id = HAMMER_MAX_OBJID;
-
 	reblock.head.flags = flags & HAMMER_IOC_DO_FLAGS;
+	reblock.allpfs = AllPFS;
+	reblock.vol_no = -1;	/* Don't select a volume */
 
 	/*
 	 * Restrict the localization domain if asked to do inodes or data,
-	 * but not both.
+	 * but not both.  Note that using INODE or MISC for localization
+	 * adds a limitation to reblock range of B-Tree node, if BTREE is
+	 * used with INODES or (DATA and/or DIRS) but not both.
 	 */
 	switch(flags & (HAMMER_IOC_DO_INODES|HAMMER_IOC_DO_DATA|HAMMER_IOC_DO_DIRS)) {
 	case HAMMER_IOC_DO_INODES:
 		reblock.key_beg.localization = HAMMER_LOCALIZE_INODE;
 		reblock.key_end.localization = HAMMER_LOCALIZE_INODE;
 		break;
-	case HAMMER_IOC_DO_DIRS:
 	case HAMMER_IOC_DO_DATA:
+	case HAMMER_IOC_DO_DIRS:
+	case HAMMER_IOC_DO_DATA | HAMMER_IOC_DO_DIRS:
 		reblock.key_beg.localization = HAMMER_LOCALIZE_MISC;
 		reblock.key_end.localization = HAMMER_LOCALIZE_MISC;
 		break;
+	default:
+		reblock.key_beg.localization = HAMMER_MIN_LOCALIZATION;
+		reblock.key_end.localization = HAMMER_MAX_LOCALIZATION;
+		break;
 	}
 
-	if (ac == 0)
+	if (ac == 0) {
 		reblock_usage(1);
+		/* not reached */
+	}
 	filesystem = av[0];
 	if (ac == 1) {
 		perc = 100;
 	} else {
 		perc = strtol(av[1], NULL, 0);
-		if (perc < 0 || perc > 100)
+		if (perc < 0 || perc > 100) {
 			reblock_usage(1);
+			/* not reached */
+		}
 	}
 	reblock.free_level = (int)((int64_t)perc *
-				   HAMMER_LARGEBLOCK_SIZE / 100);
-	reblock.free_level = HAMMER_LARGEBLOCK_SIZE - reblock.free_level;
+				   HAMMER_BIGBLOCK_SIZE / 100);
+	reblock.free_level = HAMMER_BIGBLOCK_SIZE - reblock.free_level;
 	if (reblock.free_level < 0)
 		reblock.free_level = 0;
-	printf("reblock start %016jx:%04x free level %d\n",
+	printf("reblock start %016jx:%04x\nfree level %d/%d\n",
 		(uintmax_t)reblock.key_beg.obj_id,
 		reblock.key_beg.localization,
-		reblock.free_level);
+		reblock.free_level,
+		HAMMER_BIGBLOCK_SIZE);
 
 	fd = open(filesystem, O_RDONLY);
-	if (fd < 0)
+	if (fd < 0) {
 		err(1, "Unable to open %s", filesystem);
+		/* not reached */
+	}
 	RunningIoctl = 1;
 	if (ioctl(fd, HAMMERIOC_REBLOCK, &reblock) < 0) {
 		printf("Reblock %s failed: %s\n", filesystem, strerror(errno));
@@ -110,9 +123,8 @@ hammer_cmd_reblock(char **av, int ac, int flags)
 			filesystem,
 			(uintmax_t)reblock.key_cur.obj_id,
 			reblock.key_cur.localization);
-		if (CyclePath) {
+		if (CyclePath)
 			hammer_set_cycle(&reblock.key_cur, 0);
-		}
 	} else {
 		if (CyclePath)
 			hammer_reset_cycle();
@@ -121,10 +133,15 @@ hammer_cmd_reblock(char **av, int ac, int flags)
 	RunningIoctl = 0;
 	close(fd);
 	printf("Reblocked:\n"
-	       "    %jd/%jd btree nodes\n"
+	       "    %jd/%jd B-Tree nodes\n"
+	       "    %jd/%jd B-Tree bytes\n"
 	       "    %jd/%jd data elements\n"
 	       "    %jd/%jd data bytes\n",
 	       (intmax_t)reblock.btree_moves, (intmax_t)reblock.btree_count,
+	       (intmax_t)(reblock.btree_moves *
+		       sizeof(struct hammer_node_ondisk)),
+	       (intmax_t)(reblock.btree_count *
+		       sizeof(struct hammer_node_ondisk)),
 	       (intmax_t)reblock.data_moves, (intmax_t)reblock.data_count,
 	       (intmax_t)reblock.data_byte_moves,
 	       (intmax_t)reblock.data_byte_count

@@ -39,11 +39,12 @@
 #include <sys/systm.h>
 #include <sys/kernel.h>
 #include <sys/sysent.h>
+#include <sys/malloc.h>
 #include <sys/posix4.h>
 #include <sys/proc.h>
 #include <sys/syslog.h>
 #include <sys/module.h>
-#include <sys/sysproto.h>
+#include <sys/sysmsg.h>
 #include <sys/sysctl.h>
 #include <sys/unistd.h>
 
@@ -190,7 +191,8 @@ static int sched_attach(void)
 }
 
 int
-sys_sched_setparam(struct sched_setparam_args *uap)
+sys_sched_setparam(struct sysmsg *sysmsg,
+		   const struct sched_setparam_args *uap)
 {
 	struct proc *p;
 	struct lwp *lp;
@@ -204,7 +206,7 @@ sys_sched_setparam(struct sched_setparam_args *uap)
 		if (lp) {
 			LWPHOLD(lp);
 			lwkt_gettoken(&lp->lwp_token);
-			e = ksched_setparam(&uap->sysmsg_reg, ksched, lp,
+			e = ksched_setparam(&sysmsg->sysmsg_reg, ksched, lp,
 				    (const struct sched_param *)&sched_param);
 			lwkt_reltoken(&lp->lwp_token);
 			LWPRELE(lp);
@@ -217,19 +219,20 @@ sys_sched_setparam(struct sched_setparam_args *uap)
 }
 
 int
-sys_sched_getparam(struct sched_getparam_args *uap)
+sys_sched_getparam(struct sysmsg *sysmsg,
+		   const struct sched_getparam_args *uap)
 {
 	struct proc *targetp;
 	struct lwp *lp;
 	struct sched_param sched_param;
 	int e;
- 
+
 	if ((e = p31b_proc(uap->pid, &targetp)) == 0) {
 		lp = FIRST_LWP_IN_PROC(targetp); /* XXX lwp */
 		if (lp) {
 			LWPHOLD(lp);
 			lwkt_gettoken(&lp->lwp_token);
-			e = ksched_getparam(&uap->sysmsg_reg, ksched,
+			e = ksched_getparam(&sysmsg->sysmsg_reg, ksched,
 					    lp, &sched_param);
 			lwkt_reltoken(&lp->lwp_token);
 			LWPRELE(lp);
@@ -244,7 +247,8 @@ sys_sched_getparam(struct sched_getparam_args *uap)
 }
 
 int
-sys_sched_setscheduler(struct sched_setscheduler_args *uap)
+sys_sched_setscheduler(struct sysmsg *sysmsg,
+		       const struct sched_setscheduler_args *uap)
 {
 	struct proc *p;
 	struct lwp *lp;
@@ -258,7 +262,7 @@ sys_sched_setscheduler(struct sched_setscheduler_args *uap)
 		if (lp) {
 			LWPHOLD(lp);
 			lwkt_gettoken(&lp->lwp_token);
-			e = ksched_setscheduler(&uap->sysmsg_reg, ksched,
+			e = ksched_setscheduler(&sysmsg->sysmsg_reg, ksched,
 						lp, uap->policy,
 				    (const struct sched_param *)&sched_param);
 			lwkt_reltoken(&lp->lwp_token);
@@ -272,18 +276,19 @@ sys_sched_setscheduler(struct sched_setscheduler_args *uap)
 }
 
 int
-sys_sched_getscheduler(struct sched_getscheduler_args *uap)
+sys_sched_getscheduler(struct sysmsg *sysmsg,
+		       const struct sched_getscheduler_args *uap)
 {
 	struct proc *targetp;
 	struct lwp *lp;
 	int e;
- 
+
 	if ((e = p31b_proc(uap->pid, &targetp)) == 0) {
 		lp = FIRST_LWP_IN_PROC(targetp); /* XXX lwp */
 		if (lp) {
 			LWPHOLD(lp);
 			lwkt_gettoken(&lp->lwp_token);
-			e = ksched_getscheduler(&uap->sysmsg_reg, ksched, lp);
+			e = ksched_getscheduler(&sysmsg->sysmsg_reg, ksched, lp);
 			lwkt_reltoken(&lp->lwp_token);
 			LWPRELE(lp);
 		} else {
@@ -298,31 +303,35 @@ sys_sched_getscheduler(struct sched_getscheduler_args *uap)
  * MPSAFE
  */
 int
-sys_sched_yield(struct sched_yield_args *uap)
+sys_sched_yield(struct sysmsg *sysmsg,
+		const struct sched_yield_args *uap)
 {
-	return ksched_yield(&uap->sysmsg_reg, ksched);
+	return ksched_yield(&sysmsg->sysmsg_reg, ksched);
 }
 
 /*
  * MPSAFE
  */
 int
-sys_sched_get_priority_max(struct sched_get_priority_max_args *uap)
+sys_sched_get_priority_max(struct sysmsg *sysmsg,
+			   const struct sched_get_priority_max_args *uap)
 {
-	return ksched_get_priority_max(&uap->sysmsg_reg, ksched, uap->policy);
+	return ksched_get_priority_max(&sysmsg->sysmsg_reg, ksched, uap->policy);
 }
 
 /*
  * MPSAFE
  */
 int
-sys_sched_get_priority_min(struct sched_get_priority_min_args *uap)
+sys_sched_get_priority_min(struct sysmsg *sysmsg,
+			   const struct sched_get_priority_min_args *uap)
 {
-	return ksched_get_priority_min(&uap->sysmsg_reg, ksched, uap->policy);
+	return ksched_get_priority_min(&sysmsg->sysmsg_reg, ksched, uap->policy);
 }
 
 int
-sys_sched_rr_get_interval(struct sched_rr_get_interval_args *uap)
+sys_sched_rr_get_interval(struct sysmsg *sysmsg,
+			  const struct sched_rr_get_interval_args *uap)
 {
 	int e;
 	struct proc *p;
@@ -334,7 +343,7 @@ sys_sched_rr_get_interval(struct sched_rr_get_interval_args *uap)
 		if (lp) {
 			LWPHOLD(lp);
 			lwkt_gettoken(&lp->lwp_token);
-			e = ksched_rr_get_interval(&uap->sysmsg_reg, ksched,
+			e = ksched_rr_get_interval(&sysmsg->sysmsg_reg, ksched,
 						   lp, &ts);
 			if (e == 0)
 				e = copyout(&ts, uap->interval, sizeof(ts));
@@ -353,10 +362,34 @@ sys_sched_rr_get_interval(struct sched_rr_get_interval_args *uap)
 static void
 p31binit(void *notused)
 {
-	(void) sched_attach();
-	p31b_setcfg(CTL_P1003_1B_PAGESIZE, PAGE_SIZE);
+	sched_attach();
 	p31b_setcfg(CTL_P1003_1B_ASYNCHRONOUS_IO, -1);
+	p31b_setcfg(CTL_P1003_1B_FSYNC, _POSIX_FSYNC);
+	p31b_setcfg(CTL_P1003_1B_MAPPED_FILES, _POSIX_MAPPED_FILES);
 	p31b_setcfg(CTL_P1003_1B_MESSAGE_PASSING, _POSIX_MESSAGE_PASSING);
+	p31b_setcfg(CTL_P1003_1B_PAGESIZE, PAGE_SIZE);
+	p31b_setcfg(CTL_P1003_1B_SEMAPHORES, _POSIX_SEMAPHORES);
+	p31b_setcfg(CTL_P1003_1B_SEM_NSEMS_MAX, 256);
+	p31b_setcfg(CTL_P1003_1B_SHARED_MEMORY_OBJECTS,
+	    _POSIX_SHARED_MEMORY_OBJECTS);
+
+#if 0 /* XXX missing */
+	p31b_setcfg(CTL_P1003_1B_ASYNCHRONOUS_IO, _POSIX_ASYNCHRONOUS_IO);
+	p31b_setcfg(CTL_P1003_1B_AIO_PRIO_DELTA_MAX, 0);
+	p31b_setcfg(CTL_P1003_1B_AIO_MAX, 0);
+	p31b_setcfg(CTL_P1003_1B_AIO_LISTIO_MAX, 0);
+	p31b_setcfg(CTL_P1003_1B_DELAYTIMER_MAX, 0);
+	p31b_setcfg(CTL_P1003_1B_MEMLOCK, 0);
+	p31b_setcfg(CTL_P1003_1B_MEMLOCK_RANGE, 0);
+	p31b_setcfg(CTL_P1003_1B_MEMORY_PROTECTION, 0);
+	p31b_setcfg(CTL_P1003_1B_PRIORITIZED_IO, _POSIX_PRIORITIZED_IO);
+	p31b_setcfg(CTL_P1003_1B_REALTIME_SIGNALS, _POSIX_REALTIME_SIGNALS);
+	p31b_setcfg(CTL_P1003_1B_RTSIG_MAX, SIGRTMAX - SIGRTMIN + 1);
+	p31b_setcfg(CTL_P1003_1B_SIGQUEUE_MAX, 0);
+	p31b_setcfg(CTL_P1003_1B_SYNCHRONIZED_IO, _POSIX_SYNCHRONIZED_IO);
+	p31b_setcfg(CTL_P1003_1B_TIMERS, _POSIX_TIMERS);
+	p31b_setcfg(CTL_P1003_1B_TIMER_MAX, 0);
+#endif
 }
 
 SYSINIT(p31b, SI_SUB_P1003_1B, SI_ORDER_FIRST, p31binit, NULL);

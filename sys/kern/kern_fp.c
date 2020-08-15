@@ -45,8 +45,9 @@
 #include <sys/param.h>
 #include <sys/kernel.h>
 #include <sys/systm.h>
+#include <sys/uio.h>
 #include <sys/malloc.h>
-#include <sys/sysproto.h>
+#include <sys/sysmsg.h>
 #include <sys/conf.h>
 #include <sys/filedesc.h>
 #include <sys/sysctl.h>
@@ -155,7 +156,7 @@ fp_vpopen(struct vnode *vp, int flags, file_t *fpp)
 	    error = EISDIR;
 	    goto bad2;
 	}
-	error = vn_writechk(vp, NULL);
+	error = vn_writechk(vp);
 	if (error)
 	    goto bad2;
 	vmode |= VWRITE;
@@ -527,7 +528,7 @@ fp_mmap(void *addr_arg, size_t size, int prot, int flags, struct file *fp,
 	) {
 	    if ((fp->f_flag & FWRITE) != 0) {
 		struct vattr va;
-		if ((error = VOP_GETATTR(vp, &va))) {
+		if ((error = VOP_GETATTR_FP(vp, &va, fp))) {
 		    goto done;
 		}
 		if ((va.va_flags & (IMMUTABLE|APPEND)) == 0) {

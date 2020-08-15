@@ -30,6 +30,7 @@
 #include <sys/kernel.h>
 #include <sys/bus.h>
 #include <sys/machintr.h>
+#include <sys/malloc.h>
 #include <sys/thread2.h>
 
 #include <machine/pmap.h>
@@ -466,9 +467,9 @@ ioapic_pin_setup(void *addr, int pin, int vec,
 	 * vector any EOI from pending ints on this pin could be lost and
 	 * IRR might never get reset.
 	 *
-	 * To fix this problem, clear the vector and make sure it is 
+	 * To fix this problem, clear the vector and make sure it is
 	 * programmed as an edge interrupt.  This should theoretically
-	 * clear IRR so we can later, safely program it as a level 
+	 * clear IRR so we can later, safely program it as a level
 	 * interrupt.
 	 */
 	ioapic_pin_prog(addr, pin, vec, INTR_TRIGGER_EDGE, INTR_POLARITY_HIGH,
@@ -622,4 +623,4 @@ ioapic_sysinit(void *dummy __unused)
 		lapic_fixup_noioapic();
 	}
 }
-SYSINIT(ioapic, SI_BOOT2_IOAPIC, SI_ORDER_FIRST, ioapic_sysinit, NULL)
+SYSINIT(ioapic, SI_BOOT2_IOAPIC, SI_ORDER_FIRST, ioapic_sysinit, NULL);

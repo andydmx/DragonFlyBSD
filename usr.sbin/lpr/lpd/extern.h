@@ -10,11 +10,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -32,20 +28,19 @@
  *
  *      From: @(#)extern.h	8.1 (Berkeley) 6/6/93
  * $FreeBSD: src/usr.sbin/lpr/lpd/extern.h,v 1.5.2.3 2001/06/25 01:01:00 gad Exp $
- * $DragonFly: src/usr.sbin/lpr/lpd/extern.h,v 1.2 2003/06/17 04:29:56 dillon Exp $
  */
 
 #include <sys/cdefs.h>
 
-extern char scnkey[][HEIGHT];	/* in lpdchar.c */
+extern const char scnkey[][HEIGHT];	/* in lpdchar.c */
 extern int lflag;		/* in lpd.c */
 
 struct	printer;
 struct termios;
 
 __BEGIN_DECLS
-void	 printjob(struct printer *_pp);
-void	 startprinting(const char *_printer);
+void	 printjob(struct printer *_pp) __dead2;
+void	 startprinting(const char *_printer) __dead2;
 void	 recvjob(const char *_printer);
 int	 msearch(char *_str, struct termios *_ip);
 __END_DECLS

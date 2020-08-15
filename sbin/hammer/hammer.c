@@ -30,19 +30,18 @@
  * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT
  * OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
- *
- * $DragonFly: src/sbin/hammer/hammer.c,v 1.44 2008/11/13 02:04:27 dillon Exp $
  */
 
 #include "hammer.h"
-#include <signal.h>
-#include <math.h>
+
 #include <fstab.h>
 
-static void hammer_parsedevs(const char *blkdevs);
+static __inline void hammer_parse_blkdevs(const char *blkdevs, int oflags);
+static void __hammer_parse_blkdevs(const char *blkdevs, int oflags,
+		int verify_volume, int verify_count);
 static void sigalrm(int signo);
 static void sigintr(int signo);
-static void usage(int exit_code);
+static void usage(int exit_code) __dead2;
 
 int RecurseOpt;
 int VerboseOpt;
@@ -52,19 +51,18 @@ int TwoWayPipeOpt;
 int TimeoutOpt;
 int DelayOpt = 5;
 char *SshPort;
-int ForceYesOpt = 0;
+int ForceYesOpt;
 int CompressOpt;
 int ForceOpt;
 int RunningIoctl;
 int DidInterrupt;
 int BulkOpt;
-u_int64_t BandwidthOpt;
-u_int64_t SplitupOpt = 4ULL * 1024ULL * 1024ULL * 1024ULL;
-u_int64_t MemoryLimit = 1024LLU * 1024 * 1024;
+int AllPFS;
+uint64_t BandwidthOpt;
+uint64_t SplitupOpt = 4ULL * 1024ULL * 1024ULL * 1024ULL;
+uint64_t MemoryLimit = 1024LLU * 1024 * 1024;
 const char *SplitupOptStr;
 const char *CyclePath;
-const char *LinkPath;
-const char *RestrictTarget;
 
 int
 main(int ac, char **av)
@@ -72,12 +70,10 @@ main(int ac, char **av)
 	char *blkdevs = NULL;
 	char *ptr;
 	char *restrictcmd = NULL;
-	u_int32_t status;
 	int ch;
-	int cacheSize = 0;
 
 	while ((ch = getopt(ac, av,
-			    "b:c:de:hf:i:m:p:qrs:t:v2yBC:FR:S:T:X")) != -1) {
+			    "b:c:de:hf:i:m:p:qrt:v2yABC:FR:S:T:X")) != -1) {
 		switch(ch) {
 		case '2':
 			TwoWayPipeOpt = 1;
@@ -105,6 +101,7 @@ main(int ac, char **av)
 				break;
 			default:
 				usage(1);
+				/* not reached */
 			}
 			break;
 		case 'S':
@@ -128,6 +125,7 @@ main(int ac, char **av)
 				break;
 			default:
 				usage(1);
+				/* not reached */
 			}
 			break;
 		case 'c':
@@ -181,9 +179,6 @@ main(int ac, char **av)
 		case 'f':
 			blkdevs = optarg;
 			break;
-		case 's':
-			LinkPath = optarg;
-			break;
 		case 't':
 			TimeoutOpt = strtol(optarg, NULL, 0);
 			break;
@@ -199,41 +194,17 @@ main(int ac, char **av)
 			else
 				++QuietOpt;
 			break;
+		case 'A':
+			AllPFS = 1;
+			break;
 		case 'B':
 			BulkOpt = 1;
 			break;
 		case 'C':
-			cacheSize = strtol(optarg, &ptr, 0);
-			switch(*ptr) {
-			case 'm':
-			case 'M':
-				cacheSize *= 1024;
-				/* fall through */
-			case 'k':
-			case 'K':
-				cacheSize *= 1024;
-				++ptr;
-				break;
-			case '\0':
-			case ':':
-				/* bytes if no suffix */
-				break;
-			default:
+			if (hammer_parse_cache_size(optarg) == -1) {
 				usage(1);
+				/* not reached */
 			}
-			if (*ptr == ':') {
-				UseReadAhead = strtol(ptr + 1, NULL, 0);
-				UseReadBehind = -UseReadAhead;
-			}
-			if (cacheSize < 1024 * 1024)
-				cacheSize = 1024 * 1024;
-			if (UseReadAhead < 0)
-				usage(1);
-			if (UseReadAhead * HAMMER_BUFSIZE / cacheSize / 16) {
-				UseReadAhead = cacheSize / 16 / HAMMER_BUFSIZE;
-				UseReadBehind = -UseReadAhead;
-			}
-			hammer_cache_set(cacheSize);
 			break;
 		case 'F':
 			ForceOpt = 1;
@@ -269,19 +240,28 @@ main(int ac, char **av)
 	 * commands may be iterated with a comma.
 	 */
 	if (restrictcmd) {
-		char *elm;
+		char *elm, *dup;
 
-		ptr = strdup(restrictcmd);
+		dup = ptr = strdup(restrictcmd);
 		while ((elm = strsep(&ptr, ",")) != NULL) {
 			if (strcmp(av[0], elm) == 0)
 				break;
 		}
 		if (elm == NULL) {
-			fprintf(stderr, "hammer-remote: request does not match "
-					"restricted command\n");
-			exit(1);
+			errx(1, "hammer-remote: request does not match "
+				"restricted command");
+			/* not reached */
 		}
-		free(ptr);
+		free(dup);
+	}
+
+	/*
+	 * Lookup the filesystem type
+	 */
+	if (hammer_uuid_name_lookup(&Hammer_FSType, HAMMER_FSTYPE_STRING)) {
+		errx(1, "uuids file does not have the DragonFly "
+			"HAMMER filesystem type");
+		/* not reached */
 	}
 
 	/*
@@ -297,10 +277,12 @@ main(int ac, char **av)
 		int len;
 		const char *aname = av[1];
 
-		if (aname == NULL)
+		if (aname == NULL) {
 			usage(1);
+			/* not reached */
+		}
 		len = strlen(aname);
-		key = (u_int32_t)crc32(aname, len) & 0xFFFFFFFEU;
+		key = (uint32_t)crc32(aname, len) & 0xFFFFFFFEU;
 
 		switch(len) {
 		default:
@@ -333,8 +315,10 @@ main(int ac, char **av)
 	if (strcmp(av[0], "namekey1") == 0) {
 		int64_t key;
 
-		if (av[1] == NULL)
+		if (av[1] == NULL) {
 			usage(1);
+			/* not reached */
+		}
 		key = (int64_t)(crc32(av[1], strlen(av[1])) & 0x7FFFFFFF) << 32;
 		if (key == 0)
 			key |= 0x100000000LL;
@@ -344,8 +328,10 @@ main(int ac, char **av)
 	if (strcmp(av[0], "namekey32") == 0) {
 		int32_t key;
 
-		if (av[1] == NULL)
+		if (av[1] == NULL) {
 			usage(1);
+			/* not reached */
+		}
 		key = crc32(av[1], strlen(av[1])) & 0x7FFFFFFF;
 		if (key == 0)
 			++key;
@@ -384,6 +370,10 @@ main(int ac, char **av)
 		hammer_cmd_softprune(av + 1, ac - 1, 0);
 		exit(0);
 	}
+	if (strcmp(av[0], "prune-everything") == 0) {
+		hammer_cmd_softprune(av + 1, ac - 1, 1);
+		exit(0);
+	}
 	if (strcmp(av[0], "config") == 0) {
 		hammer_cmd_config(av + 1, ac - 1);
 		exit(0);
@@ -396,17 +386,19 @@ main(int ac, char **av)
 		hammer_cmd_cleanup(av + 1, ac - 1);
 		exit(0);
 	}
+	if (strcmp(av[0], "abort-cleanup") == 0) {
+		hammer_cmd_abort_cleanup(av + 1, ac - 1);
+		exit(0);
+	}
 	if (strcmp(av[0], "info") == 0) {
 		hammer_cmd_info(av + 1, ac - 1);
 		exit(0);
 	}
-	if (strcmp(av[0], "prune-everything") == 0) {
-		hammer_cmd_softprune(av + 1, ac - 1, 1);
-		exit(0);
-	}
 	if (strcmp(av[0], "ssh-remote") == 0) {
-		if (ac != 3)
+		if (ac != 3) {
 			usage(1);
+			/* not reached */
+		}
 		hammer_cmd_sshremote(av[1], av[2]);
 		exit(0);
 	}
@@ -442,6 +434,10 @@ main(int ac, char **av)
 		hammer_cmd_iostats(av + 1, ac - 1);
 		exit(0);
 	}
+	if (strcmp(av[0], "stats") == 0) {
+		hammer_cmd_stats(av + 1, ac - 1);
+		exit(0);
+	}
 
 	if (strncmp(av[0], "history", 7) == 0) {
 		hammer_cmd_history(av[0] + 7, av + 1, ac - 1);
@@ -455,7 +451,7 @@ main(int ac, char **av)
 	if (strncmp(av[0], "reblock", 7) == 0) {
 		signal(SIGINT, sigalrm);
 		if (strcmp(av[0], "reblock") == 0)
-			hammer_cmd_reblock(av + 1, ac - 1, -1);
+			hammer_cmd_reblock(av + 1, ac - 1, HAMMER_IOC_DO_FLAGS);
 		else if (strcmp(av[0], "reblock-btree") == 0)
 			hammer_cmd_reblock(av + 1, ac - 1, HAMMER_IOC_DO_BTREE);
 		else if (strcmp(av[0], "reblock-inodes") == 0)
@@ -464,8 +460,10 @@ main(int ac, char **av)
 			hammer_cmd_reblock(av + 1, ac - 1, HAMMER_IOC_DO_DIRS);
 		else if (strcmp(av[0], "reblock-data") == 0)
 			hammer_cmd_reblock(av + 1, ac - 1, HAMMER_IOC_DO_DATA);
-		else
+		else {
 			usage(1);
+			/* not reached */
+		}
 		exit(0);
 	}
 	if (strncmp(av[0], "mirror", 6) == 0) {
@@ -481,8 +479,10 @@ main(int ac, char **av)
 			hammer_cmd_mirror_copy(av + 1, ac - 1, 1);
 		else if (strcmp(av[0], "mirror-dump") == 0)
 			hammer_cmd_mirror_dump(av + 1, ac - 1);
-		else
+		else {
 			usage(1);
+			/* not reached */
+		}
 		exit(0);
 	}
 	if (strcmp(av[0], "dedup-simulate") == 0) {
@@ -513,45 +513,68 @@ main(int ac, char **av)
 		hammer_cmd_volume_list(av + 1, ac - 1);
 		exit(0);
 	}
-
-	uuid_name_lookup(&Hammer_FSType, "DragonFly HAMMER", &status);
-	if (status != uuid_s_ok) {
-		errx(1, "uuids file does not have the DragonFly "
-			"HAMMER filesystem type");
+	if (strcmp(av[0], "volume-blkdevs") == 0) {
+		hammer_cmd_volume_blkdevs(av + 1, ac - 1);
+		exit(0);
 	}
 
 	if (strcmp(av[0], "show") == 0) {
-		u_int32_t lo = 0;
-		intmax_t obj_id = (int64_t)HAMMER_MIN_OBJID;
+		const char *arg = NULL;
+		char *p, *dup;
+		int filter = -1;
+		int obfuscate = 0;
+		int indent = 0;
 
-		hammer_parsedevs(blkdevs);
+		hammer_parse_blkdevs(blkdevs, O_RDONLY);
+		if (ac > 3) {
+			errx(1, "Too many options specified");
+			/* not reached */
+		}
 		if (ac > 1)
-			sscanf(av[1], "%08x:%jx", &lo, &obj_id);
-		hammer_cmd_show(-1, lo, (int64_t)obj_id, 0, NULL, NULL);
+			arg = av[1];
+		if (ac > 2) {
+			dup = ptr = strdup(av[2]);
+			while ((p = strsep(&ptr, ",")) != NULL) {
+				if (strcmp(p, "filter") == 0)
+					filter = 1;
+				else if (strcmp(p, "nofilter") == 0)
+					filter = 0;
+				else if (strcmp(p, "obfuscate") == 0)
+					obfuscate = 1;
+				else if (strcmp(p, "indent") == 0)
+					indent = 1;
+			}
+			free(dup);
+		}
+		hammer_cmd_show(arg, filter, obfuscate, indent);
 		exit(0);
 	}
 	if (strcmp(av[0], "show-undo") == 0) {
-		hammer_parsedevs(blkdevs);
+		hammer_parse_blkdevs(blkdevs, O_RDONLY);
 		hammer_cmd_show_undo();
 		exit(0);
 	}
 	if (strcmp(av[0], "recover") == 0) {
-		hammer_parsedevs(blkdevs);
-		if (ac <= 1)
-			errx(1, "hammer recover required target directory");
-		hammer_cmd_recover(av[1]);
+		__hammer_parse_blkdevs(blkdevs, O_RDONLY, 0, 1);
+		hammer_cmd_recover(av + 1, ac - 1);
 		exit(0);
 	}
 	if (strcmp(av[0], "blockmap") == 0) {
-		hammer_parsedevs(blkdevs);
+		hammer_parse_blkdevs(blkdevs, O_RDONLY);
 		hammer_cmd_blockmap();
 		exit(0);
 	}
 	if (strcmp(av[0], "checkmap") == 0) {
-		hammer_parsedevs(blkdevs);
+		hammer_parse_blkdevs(blkdevs, O_RDONLY);
 		hammer_cmd_checkmap();
 		exit(0);
 	}
+	if (strcmp(av[0], "strip") == 0) {
+		__hammer_parse_blkdevs(blkdevs, O_RDWR, 0, 0);
+		hammer_cmd_strip();
+		exit(0);
+	}
+
 	usage(1);
 	/* not reached */
 	return(0);
@@ -567,14 +590,18 @@ main(int ac, char **av)
  */
 static
 void
-hammer_parsedevs(const char *blkdevs)
+__hammer_parse_blkdevs(const char *blkdevs, int oflags, int verify_volume,
+	int verify_count)
 {
+	volume_info_t volume = NULL;
 	char *copy;
 	char *volname;
+	int vol_count = 0;
 
 	if (blkdevs == NULL) {
 		errx(1, "A -f blkdevs specification is required "
 			"for this command");
+		/* not reached */
 	}
 
 	copy = strdup(blkdevs);
@@ -582,11 +609,37 @@ hammer_parsedevs(const char *blkdevs)
 		if ((copy = strchr(copy, ':')) != NULL)
 			*copy++ = 0;
 		volname = getdevpath(volname, 0);
-		if (strchr(volname, ':'))
-			hammer_parsedevs(volname);
-		else
-			setup_volume(-1, volname, 0, O_RDONLY);
+		if (strchr(volname, ':')) {
+			__hammer_parse_blkdevs(volname, oflags, verify_volume,
+				verify_count);
+		} else {
+			volume = load_volume(volname, oflags, verify_volume);
+			assert(volume);
+			++vol_count;
+		}
+		free(volname);
 	}
+	free(copy);
+
+	assert(volume);
+	if (verify_count) {
+		if (vol_count != volume->ondisk->vol_count) {
+			errx(1, "Volume header says %d volumes, but %d specified.",
+				volume->ondisk->vol_count, vol_count);
+			/* not reached */
+		}
+		if (get_root_volume() == NULL) {
+			errx(1, "No root volume found");
+			/* not reached */
+		}
+	}
+}
+
+static __inline
+void
+hammer_parse_blkdevs(const char *blkdevs, int oflags)
+{
+	__hammer_parse_blkdevs(blkdevs, oflags, 1, 1);
 }
 
 static
@@ -612,17 +665,20 @@ usage(int exit_code)
 {
 	fprintf(stderr,
 		"hammer -h\n"
-		"hammer [-2BqrvXy] [-b bandwidth] [-C cachesize[:readahead]] [-c cyclefile]\n"
-		"       [-f blkdevs] [-i delay] [-t seconds] [-S splitup]\n"
-		"	command [argument ...]\n"
+		"hammer [-2ABFqrvXy] [-b bandwidth] [-C cachesize[:readahead]] \n"
+		"       [-R restrictcmd] [-T restrictpath] [-c cyclefile]\n"
+		"       [-e scoreboardfile] [-f blkdevs] [-i delay] [-p ssh-port]\n"
+		"       [-S splitsize] [-t seconds] [-m memlimit] command [argument ...]\n"
 		"hammer synctid <filesystem> [quick]\n"
 		"hammer bstats [interval]\n"
 		"hammer iostats [interval]\n"
+		"hammer stats [interval]\n"
 		"hammer history[@offset[,len]] <file> ...\n"
 		"hammer namekey1 <path>\n"
 		"hammer namekey2 <path>\n"
 		"hammer namekey32 <path>\n"
 		"hammer cleanup [<filesystem> ...]\n"
+		"hammer abort-cleanup\n"
 		"hammer info [<dirpath> ...]\n"
 		"hammer snapshot [<filesystem>] <snapshot-dir>\n"
 		"hammer snapshot <filesystem> <snapshot-dir> [<note>]\n"
@@ -652,6 +708,7 @@ usage(int exit_code)
 		"hammer volume-add <device> <filesystem>\n"
 		"hammer volume-del <device> <filesystem>\n"
 		"hammer volume-list <filesystem>\n"
+		"hammer volume-blkdevs <filesystem>\n"
 	);
 
 	fprintf(stderr, "\nHAMMER utility version 3+ commands:\n");
@@ -675,7 +732,8 @@ usage(int exit_code)
 		"hammer -f blkdevs checkmap\n"
 		"hammer -f blkdevs [-qqq] show [lo:objid]\n"
 		"hammer -f blkdevs show-undo\n"
-		"hammer -f blkdevs recover <target_dir>\n"
+		"hammer -f blkdevs recover <target_dir> [full|quick]\n"
+		"hammer -f blkdevs strip\n"
 	);
 
 	fprintf(stderr, "\nHAMMER utility version 5+ commands:\n");

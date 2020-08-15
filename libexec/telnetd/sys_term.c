@@ -34,30 +34,18 @@
 #include <sys/tty.h>
 #include <libutil.h>
 #include <stdlib.h>
-#include <utmp.h>
+#include <utmpx.h>
 
 #include "telnetd.h"
 #include "pathnames.h"
 
 #ifdef	AUTHENTICATION
 #include <libtelnet/auth.h>
+extern int	auth_level;
 #endif
 
 int cleanopen(char *);
 void scrub_env(void);
-
-struct	utmp wtmp;
-
-#ifdef _PATH_WTMP
-char    wtmpf[] = _PATH_WTMP;
-#else
-char	wtmpf[]	= "/var/log/wtmp";
-#endif
-#ifdef _PATH_UTMP
-char    utmpf[] = _PATH_UTMP;
-#else
-char	utmpf[] = "/var/run/utmp";
-#endif
 
 char	*envinit[3];
 extern char **environ;
@@ -996,7 +984,7 @@ startslave(char *host, int autologin, char *autoname)
 		autologin = 0;
 
 	if (autologin < auth_level) {
-		fatal(net, "Authorization failed");
+		fatalmsg(net, "Authorization failed");
 		exit(1);
 	}
 #endif
@@ -1328,14 +1316,14 @@ cleanup(int sig __unused)
 
 	p = line + sizeof(_PATH_DEV) - 1;
 	/*
-	 * Block all signals before clearing the utmp entry.  We don't want to
-	 * be called again after calling logout() and then not add the wtmp
-	 * entry because of not finding the corresponding entry in utmp.
+	 * Block all signals before clearing the utmpx entry.  We don't want to
+	 * be called again after calling logout() and then not add the wtmpx
+	 * entry because of not finding the corresponding entry in utmpx.
 	 */
 	sigfillset(&mask);
 	sigprocmask(SIG_SETMASK, &mask, NULL);
-	if (logout(p))
-		logwtmp(p, "", "");
+	if (logoutx(p, 0, DEAD_PROCESS))
+		logwtmpx(p, "", "", 0, DEAD_PROCESS);
 	(void)chmod(line, 0666);
 	(void)chown(line, 0, 0);
 	*p = 'p';

@@ -14,11 +14,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -39,32 +35,11 @@
  */
 
 #ifndef _CPU_PARAM_H_
-
-/*
- * Do not prevent re-includes of <machine/param.h> if the file was included
- * with NO_NAMESPACE_POLLUTION, or expected macros will not exist.
- */
-#ifndef _NO_NAMESPACE_POLLUTION
 #define _CPU_PARAM_H_
-#endif
 
 /*
  * Machine dependent constants for x86_64.
  */
-#ifndef _CPU_PARAM_H1_
-#define _CPU_PARAM_H1_
-
-/*
- * Round p (pointer or byte index) up to a correctly-aligned value
- * for all data types (int, long, ...).   The result is unsigned int
- * and must be cast to any desired pointer type.
- */
-#ifndef _ALIGNBYTES
-#define _ALIGNBYTES	(sizeof(long) - 1)
-#endif
-#ifndef _ALIGN
-#define _ALIGN(p)	(((unsigned long)(p) + _ALIGNBYTES) & ~_ALIGNBYTES)
-#endif
 
 #ifndef _MACHINE
 #define	_MACHINE	x86_64
@@ -72,10 +47,6 @@
 #ifndef _MACHINE_ARCH
 #define	_MACHINE_ARCH	x86_64
 #endif
-
-#endif	/* _CPU_PARAM_H1_ */
-
-#ifndef _NO_NAMESPACE_POLLUTION
 
 #ifndef MACHINE
 #define MACHINE		"x86_64"
@@ -88,8 +59,8 @@
  * Use SMP_MAXCPU instead of MAXCPU for structures that are intended to
  * remain compatible between UP and SMP builds.
  *
- * WARNING!  CPUMASK macros in include/types.h must also be adjusted,
- *	     as well as any assembly.  Be sure that CPUMASK_ELEMENTS
+ * WARNING!  CPUMASK macros in include/cpumask.h must also be adjusted,
+ *	     as well as any assembly.  Be sure that _CPUMASK_ELEMENTS
  *	     is always correct so incompatible assembly #error's out
  *	     during the kernel compile.
  *
@@ -100,30 +71,27 @@
 #define SMP_MAXCPU	256
 #define MAXCPU		SMP_MAXCPU
 
-#define ALIGNBYTES	_ALIGNBYTES
-#define ALIGN(p)	_ALIGN(p)
-
-/* JG license? from fbsd/src/sys/amd64/include/param.h */
+/* Constants derived from sizeof() that need recalculation. */
 /* level 1 == page table */
 #define	NPTEPGSHIFT	9		/* LOG2(NPTEPG) */
 #define PAGE_SHIFT	12		/* LOG2(PAGE_SIZE) */
 #define PAGE_SIZE	(1<<PAGE_SHIFT)	/* bytes/page */
 #define PAGE_MASK	(PAGE_SIZE-1)
-#define NPTEPG		(PAGE_SIZE/(sizeof (pt_entry_t)))
+#define NPTEPG		(PAGE_SIZE/8LU)	/* PAGE_SIZE/sizeof(pt_entry_t) */
 
 /* level 2 == page directory */
 #define	NPDEPGSHIFT	9		/* LOG2(NPDEPG) */
 #define PDRSHIFT	21		/* LOG2(NBPDR) */
 #define NBPDR		(1<<PDRSHIFT)	/* bytes/page dir */
 #define PDRMASK		(NBPDR-1)
-#define NPDEPG		(PAGE_SIZE/(sizeof (pd_entry_t)))
+#define NPDEPG		(PAGE_SIZE/8LU)	/* PAGE_SIZE/sizeof(pd_entry_t) */
 
 /* level 3 == page directory pointer table */
 #define	NPDPEPGSHIFT	9		/* LOG2(NPDPEPG) */
 #define PDPSHIFT	30		/* LOG2(NBPDP) */
 #define NBPDP		(1<<PDPSHIFT)	/* bytes/page dir ptr table */
 #define PDPMASK		(NBPDP-1)
-#define NPDPEPG		(PAGE_SIZE/(sizeof (pdp_entry_t)))
+#define NPDPEPG		(PAGE_SIZE/8LU)	/* PAGE_SIZE/sizeof(pdp_entry_t) */
 
 /* level 4 */
 #define	NPML4EPGSHIFT	9		/* LOG2(NPML4EPG) */
@@ -131,7 +99,7 @@
 #define NPML4		(1UL<<PML4SHIFT)/* bytes/page map level4 table */
 #define	NBPML4		(1ul<<PML4SHIFT)/* bytes/page map lev4 table */
 #define PML4MASK	(NPML4-1)
-#define NPML4EPG	(PAGE_SIZE/(sizeof (pml4_entry_t)))
+#define NPML4EPG	(PAGE_SIZE/8LU)	/* PAGE_SIZE/sizeof(pml4_entry_t) */
 
 /*
  * Virtual address sign-extension and mask.  If bit 47 is set then
@@ -161,16 +129,16 @@
 /*
  * Ceiling on amount of swblock kva space, can be changed via
  * kern.maxswzone /boot/loader.conf variable.  On 64 bit machines
- * the kernel has a 512G address space so reserving 512M of KVM
- * is not a big deal.
+ * the kernel has a 512G address space, and we do not want to allow
+ * more than half of that to be used for this purpose.
  *
- * Approximately (size / 160 x 32 x PAGE_SIZE) bytes of swap.  This
+ * Approximately (size / 192 x 16 x PAGE_SIZE) bytes of swap.  This
  * comes to approximately 1GB of swap space per 1MB of kernel memory.
  * Actually using 512G of swap will tie up a big chunk (512M) of physical
  * memory.
  */
 #ifndef VM_SWZONE_SIZE_MAX
-#define VM_SWZONE_SIZE_MAX	(512L * 1024 * 1024)
+#define VM_SWZONE_SIZE_MAX	(256L * 1024L * 1024 * 1024)
 #endif
 
 /*
@@ -214,18 +182,16 @@
  */
 #define	round_page(x)	((((unsigned long)(x)) + PAGE_MASK) & ~(unsigned long)(PAGE_MASK))
 #define	trunc_page(x)	((unsigned long)(x) & ~(unsigned long)(PAGE_MASK))
-#define trunc_2mpage(x)	((unsigned long)(x) & ~(unsigned long)PDRMASK)
-#define round_2mpage(x)	((((unsigned long)(x)) + PDRMASK) & ~(unsigned long)PDRMASK)
 
 #if defined(_KERNEL) || defined(_KERNEL_STRUCTURES)
 #define	atop(x)		((vm_pindex_t)((x) >> PAGE_SHIFT))
-#endif
 #define	ptoa(x)		((vm_paddr_t)(x) << PAGE_SHIFT)
 
 #define	x86_64_btop(x)	((vm_pindex_t)((x) >> PAGE_SHIFT))
 #define	x86_64_ptob(x)	((vm_paddr_t)(x) << PAGE_SHIFT)
 
 #define	pgtok(x)		((x) * (PAGE_SIZE / 1024))
+#endif	/* _KERNEL || _KERNEL_STRUCTURES */
 
 #ifdef _KERNEL
 
@@ -249,7 +215,7 @@
  */
 
 #ifdef KERN_TIMESTAMP
-extern void _TSTMP(u_int32_t argument);
+void _TSTMP(u_int32_t);
 #define TSTMP(class, unit, event, par)	_TSTMP(	\
 	(((class) &   0x0f) << 28 ) |		\
 	(((unit)  &   0x0f) << 24 ) |		\
@@ -262,5 +228,4 @@ extern void _TSTMP(u_int32_t argument);
 #endif /* !KERN_TIMESTAMP */
 #endif /* _KERNEL */
 
-#endif /* !_NO_NAMESPACE_POLLUTION */
 #endif /* !_CPU_PARAM_H_ */

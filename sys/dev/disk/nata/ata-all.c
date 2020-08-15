@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 1998 - 2006 Søren Schmidt <sos@FreeBSD.org>
+ * Copyright (c) 1998 - 2008 Søren Schmidt <sos@FreeBSD.org>
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -46,7 +46,6 @@
 #include <sys/sysctl.h>
 #include <sys/systm.h>
 
-#include <sys/spinlock2.h>
 #include <sys/mplock2.h>
 
 #include "ata-all.h"
@@ -121,8 +120,8 @@ ata_attach(device_t dev)
     /* initialize the softc basics */
     ch->dev = dev;
     ch->state = ATA_IDLE;
-    spin_init(&ch->state_mtx, "ataattach_state");
-    spin_init(&ch->queue_mtx, "ataattach_queue");
+    lockinit(&ch->state_mtx, "ataattach_state", 0, 0);
+    lockinit(&ch->queue_mtx, "ataattach_queue", 0, 0);
     ata_queue_init(ch);
 
     /* reset the controller HW, the channel and device(s) */
@@ -163,9 +162,9 @@ ata_detach(device_t dev)
 	return ENXIO;
 
     /* grap the channel lock so no new requests gets launched */
-    spin_lock(&ch->state_mtx);
+    lockmgr(&ch->state_mtx, LK_EXCLUSIVE);
     ch->state |= ATA_STALL_QUEUE;
-    spin_unlock(&ch->state_mtx);
+    lockmgr(&ch->state_mtx, LK_RELEASE);
 
     /* detach & delete all children */
     if (!device_get_children(dev, &children, &nchildren)) {
@@ -179,8 +178,8 @@ ata_detach(device_t dev)
     bus_teardown_intr(dev, ch->r_irq, ch->ih);
     bus_release_resource(dev, SYS_RES_IRQ, ATA_IRQ_RID, ch->r_irq);
     ch->r_irq = NULL;
-    spin_uninit(&ch->state_mtx);
-    spin_uninit(&ch->queue_mtx);
+    lockuninit(&ch->state_mtx);
+    lockuninit(&ch->queue_mtx);
     return 0;
 }
 
@@ -204,14 +203,14 @@ ata_reinit(device_t dev)
 	tsleep(&dev, 0, "atarini", 1);
 
     /* catch eventual request in ch->running */
-    spin_lock(&ch->state_mtx);
+    lockmgr(&ch->state_mtx, LK_EXCLUSIVE);
     if ((request = ch->running))
-	callout_stop(&request->callout);
+	callout_cancel(&request->callout);
     ch->running = NULL;
 
     /* unconditionally grap the channel lock */
     ch->state |= ATA_STALL_QUEUE;
-    spin_unlock(&ch->state_mtx);
+    lockmgr(&ch->state_mtx, LK_RELEASE);
 
     /* reset the controller HW, the channel and device(s) */
     ATA_RESET(dev);
@@ -257,9 +256,9 @@ ata_reinit(device_t dev)
     }
 
     /* we're done release the channel for new work */
-    spin_lock(&ch->state_mtx);
+    lockmgr(&ch->state_mtx, LK_EXCLUSIVE);
     ch->state = ATA_IDLE;
-    spin_unlock(&ch->state_mtx);
+    lockmgr(&ch->state_mtx, LK_RELEASE);
     ATA_LOCKING(dev, ATA_LF_UNLOCK);
 
     if (bootverbose)
@@ -281,13 +280,13 @@ ata_suspend(device_t dev)
 
     /* wait for the channel to be IDLE or detached before suspending */
     while (ch->r_irq) {
-	spin_lock(&ch->state_mtx);
+	lockmgr(&ch->state_mtx, LK_EXCLUSIVE);
 	if (ch->state == ATA_IDLE) {
 	    ch->state = ATA_ACTIVE;
-	    spin_unlock(&ch->state_mtx);
+	    lockmgr(&ch->state_mtx, LK_RELEASE);
 	    break;
 	}
-	spin_unlock(&ch->state_mtx);
+	lockmgr(&ch->state_mtx, LK_RELEASE);
 	tsleep(ch, 0, "atasusp", hz/10);
     }
     ATA_LOCKING(dev, ATA_LF_UNLOCK);
@@ -297,11 +296,10 @@ ata_suspend(device_t dev)
 int
 ata_resume(device_t dev)
 {
-    struct ata_channel *ch;
     int error;
 
     /* check for valid device */
-    if (!dev || !(ch = device_get_softc(dev)))
+    if (!dev || !device_get_softc(dev))
 	return ENXIO;
 
     /* reinit the devices, we dont know what mode/state they are in */
@@ -318,7 +316,7 @@ ata_interrupt(void *data)
     struct ata_channel *ch = (struct ata_channel *)data;
     struct ata_request *request;
 
-    spin_lock(&ch->state_mtx);
+    lockmgr(&ch->state_mtx, LK_EXCLUSIVE);
     do {
 	/*
 	 * Ignore interrupt if its not for us.  This may also have the
@@ -355,13 +353,13 @@ ata_interrupt(void *data)
 	    ch->running = NULL;
 	    if (ch->state == ATA_ACTIVE)
 		ch->state = ATA_IDLE;
-	    spin_unlock(&ch->state_mtx);
+	    lockmgr(&ch->state_mtx, LK_RELEASE);
 	    ATA_LOCKING(ch->dev, ATA_LF_UNLOCK);
 	    ata_finish(request);
 	    return 1;
 	}
     } while (0);
-    spin_unlock(&ch->state_mtx);
+    lockmgr(&ch->state_mtx, LK_RELEASE);
     return 0;
 }
 
@@ -378,12 +376,13 @@ ata_ioctl(struct dev_ioctl_args *ap)
 
     switch (ap->a_cmd) {
     case IOCATAGMAXCHANNEL:
+	/* In case we have channel 0..n this will return n+1. */
 	*value = devclass_get_maxunit(ata_devclass);
 	error = 0;
 	break;
 
     case IOCATAREINIT:
-	if (*value > devclass_get_maxunit(ata_devclass) ||
+	if (*value >= devclass_get_maxunit(ata_devclass) ||
 	    !(device = devclass_get_device(ata_devclass, *value)))
 	    return ENXIO;
 	error = ata_reinit(device);
@@ -391,7 +390,7 @@ ata_ioctl(struct dev_ioctl_args *ap)
 	break;
 
     case IOCATAATTACH:
-	if (*value > devclass_get_maxunit(ata_devclass) ||
+	if (*value >= devclass_get_maxunit(ata_devclass) ||
 	    !(device = devclass_get_device(ata_devclass, *value)))
 	    return ENXIO;
 	/* XXX SOS should enable channel HW on controller */
@@ -399,7 +398,7 @@ ata_ioctl(struct dev_ioctl_args *ap)
 	break;
 
     case IOCATADETACH:
-	if (*value > devclass_get_maxunit(ata_devclass) ||
+	if (*value >= devclass_get_maxunit(ata_devclass) ||
 	    !(device = devclass_get_device(ata_devclass, *value)))
 	    return ENXIO;
 	error = ata_detach(device);
@@ -407,7 +406,7 @@ ata_ioctl(struct dev_ioctl_args *ap)
 	break;
 
     case IOCATADEVICES:
-	if (devices->channel > devclass_get_maxunit(ata_devclass) ||
+	if (devices->channel >= devclass_get_maxunit(ata_devclass) ||
 	    !(device = devclass_get_device(ata_devclass, devices->channel)))
 	    return ENXIO;
 	bzero(devices->name[0], 32);
@@ -467,6 +466,7 @@ ata_device_ioctl(device_t dev, u_long cmd, caddr_t data)
 	    kfree(buf, M_ATA);
 	    return  ENOMEM;
 	}
+	request->dev = atadev->dev;
 	if (ioc_request->flags & ATA_CMD_WRITE) {
 	    error = copyin(ioc_request->data, buf, ioc_request->count);
 	    if (error) {
@@ -475,7 +475,6 @@ ata_device_ioctl(device_t dev, u_long cmd, caddr_t data)
 		return error;
 	    }
 	}
-	request->dev = dev;
 	if (ioc_request->flags & ATA_CMD_ATAPI) {
 	    request->flags = ATA_R_ATAPI;
 	    bcopy(ioc_request->u.atapi.ccb, request->u.atapi.ccb, 16);
@@ -529,6 +528,12 @@ ata_device_ioctl(device_t dev, u_long cmd, caddr_t data)
     case IOCATAGMODE:
 	*mode = atadev->mode;
 	return 0;
+    case IOCATASSPINDOWN:
+	atadev->spindown = *mode;
+	return 0;
+    case IOCATAGSPINDOWN:
+	*mode = atadev->spindown;
+	return 0;
     default:
 	return ENOTTY;
     }
@@ -556,6 +561,12 @@ ata_boot_attach(void)
 
 #endif
 
+void
+ata_print_cable(device_t dev, u_int8_t *who)
+{
+    device_printf(dev,
+		  "DMA limited to UDMA33, %s found non-ATA66 cable\n", who);
+}
 
 /*
  * misc support functions
@@ -583,11 +594,9 @@ ata_getparam(struct ata_device *atadev, int init)
     u_int8_t command = 0;
     int error = ENOMEM, retries = 2;
 
-    if (ch->devices &
-	(atadev->unit == ATA_MASTER ? ATA_ATA_MASTER : ATA_ATA_SLAVE))
+    if (ch->devices & (ATA_ATA_MASTER << atadev->unit))
 	command = ATA_ATA_IDENTIFY;
-    if (ch->devices &
-	(atadev->unit == ATA_MASTER ? ATA_ATAPI_MASTER : ATA_ATAPI_SLAVE))
+    if (ch->devices & (ATA_ATAPI_MASTER << atadev->unit))
 	command = ATA_ATAPI_IDENTIFY;
     if (!command)
 	return ENXIO;
@@ -612,7 +621,6 @@ ata_getparam(struct ata_device *atadev, int init)
     if (!error && (isprint(atadev->param.model[0]) ||
 		   isprint(atadev->param.model[1]))) {
 	struct ata_params *atacap = &atadev->param;
-	char buffer[64];
 	int16_t *ptr;
 
 	for (ptr = (int16_t *)atacap;
@@ -637,13 +645,15 @@ ata_getparam(struct ata_device *atadev, int init)
 	if (bootverbose)
 	    kprintf("ata%d-%s: pio=%s wdma=%s udma=%s cable=%s wire\n",
 		   device_get_unit(ch->dev),
-		   atadev->unit == ATA_MASTER ? "master" : "slave",
+		   ata_unit2str(atadev),
 		   ata_mode2str(ata_pmode(atacap)),
 		   ata_mode2str(ata_wmode(atacap)),
 		   ata_mode2str(ata_umode(atacap)),
 		   (atacap->hwres & ATA_CABLE_ID) ? "80":"40");
 
 	if (init) {
+	    char buffer[64];
+
 	    ksprintf(buffer, "%.40s/%.8s", atacap->model, atacap->revision);
 	    device_set_desc_copy(atadev->dev, buffer);
 	    if ((atadev->param.config & ATA_PROTO_ATAPI) &&
@@ -673,54 +683,37 @@ int
 ata_identify(device_t dev)
 {
     struct ata_channel *ch = device_get_softc(dev);
-    struct ata_device *master = NULL, *slave = NULL;
-    device_t master_child = NULL, slave_child = NULL;
-    int master_unit = -1, slave_unit = -1;
+    struct ata_device *atadev;
+    device_t child;
+    int i;
 
-    if (ch->devices & (ATA_ATA_MASTER | ATA_ATAPI_MASTER)) {
-	if (!(master = kmalloc(sizeof(struct ata_device),
-			      M_ATA, M_INTWAIT | M_ZERO))) {
-	    device_printf(dev, "out of memory\n");
-	    return ENOMEM;
-	}
-	master->unit = ATA_MASTER;
-    }
-    if (ch->devices & (ATA_ATA_SLAVE | ATA_ATAPI_SLAVE)) {
-	if (!(slave = kmalloc(sizeof(struct ata_device),
-			     M_ATA, M_INTWAIT | M_ZERO))) {
-	    kfree(master, M_ATA);
-	    device_printf(dev, "out of memory\n");
-	    return ENOMEM;
-	}
-	slave->unit = ATA_SLAVE;
-    }
+    if (bootverbose)
+	device_printf(dev, "identify ch->devices=%08x\n", ch->devices);
 
+    for (i = 0; i < ATA_PM; ++i) {
+	if (ch->devices & (((ATA_ATA_MASTER | ATA_ATAPI_MASTER) << i))) {
+	    int unit = -1;
+
+	    if (!(atadev = kmalloc(sizeof(struct ata_device),
+				   M_ATA, M_INTWAIT | M_ZERO))) {
+		device_printf(dev, "out of memory\n");
+		return ENOMEM;
+	    }
+	    atadev->unit = i;
 #ifdef ATA_STATIC_ID
-    if (ch->devices & ATA_ATA_MASTER)
-	master_unit = (device_get_unit(dev) << 1);
+	    if (ch->devices & ((ATA_ATA_MASTER << i)))
+		unit = (device_get_unit(dev) << 1) + i;
 #endif
-    if (master && !(master_child = ata_add_child(dev, master, master_unit))) {
-	kfree(master, M_ATA);
-	master = NULL;
+	    if ((child = ata_add_child(dev, atadev, unit))) {
+		if (ata_getparam(atadev, 1)) {
+		    device_delete_child(dev, child);
+		    kfree(atadev, M_ATA);
+		}
+	    }
+	    else
+		kfree(atadev, M_ATA);
+	}
     }
-#ifdef ATA_STATIC_ID
-    if (ch->devices & ATA_ATA_SLAVE)
-	slave_unit = (device_get_unit(dev) << 1) + 1;
-#endif
-    if (slave && !(slave_child = ata_add_child(dev, slave, slave_unit))) {
-	kfree(slave, M_ATA);
-	slave = NULL;
-    }
-
-    if (slave && ata_getparam(slave, 1)) {
-	device_delete_child(dev, slave_child);
-	kfree(slave, M_ATA);
-    }
-    if (master && ata_getparam(master, 1)) {
-	device_delete_child(dev, master_child);
-	kfree(master, M_ATA);
-    }
-
     bus_generic_probe(dev);
     bus_generic_attach(dev);
     return 0;
@@ -750,7 +743,7 @@ ata_modify_if_48bit(struct ata_request *request)
 
     atadev->flags &= ~ATA_D_48BIT_ACTIVE;
 
-    if ((request->u.ata.lba + request->u.ata.count >= ATA_MAX_28BIT_LBA ||
+    if (((request->u.ata.lba + request->u.ata.count) >= ATA_MAX_28BIT_LBA ||
 	 request->u.ata.count > 256) &&
 	atadev->param.support.command2 & ATA_SUPPORT_ADDRESS48) {
 
@@ -816,8 +809,8 @@ ata_modify_if_48bit(struct ata_request *request)
 	case ATA_FLUSHCACHE:
 	    request->u.ata.command = ATA_FLUSHCACHE48;
 	    break;
-	case ATA_READ_NATIVE_MAX_ADDDRESS:
-	    request->u.ata.command = ATA_READ_NATIVE_MAX_ADDDRESS48;
+	case ATA_READ_NATIVE_MAX_ADDRESS:
+	    request->u.ata.command = ATA_READ_NATIVE_MAX_ADDRESS48;
 	    break;
 	case ATA_SET_MAX_ADDRESS:
 	    request->u.ata.command = ATA_SET_MAX_ADDRESS48;
@@ -842,7 +835,16 @@ ata_udelay(int interval)
 	tsleep(&interval, 0, "ataslp", 1 + interval / (1000000 / hz));
 }
 
-char *
+const char *
+ata_unit2str(struct ata_device *atadev)
+{
+    static char str[8];
+
+    ksprintf(str, "%s", atadev->unit == ATA_MASTER ? "master" : "slave");
+    return str;
+}
+
+const char *
 ata_mode2str(int mode)
 {
     switch (mode) {
@@ -873,6 +875,16 @@ ata_mode2str(int mode)
 	else
 	    return "BIOSPIO";
     }
+}
+
+int
+ata_atapi(device_t dev)
+{
+    struct ata_channel *ch = device_get_softc(device_get_parent(dev));
+    struct ata_device *atadev = device_get_softc(dev);
+
+    return ((atadev->unit == ATA_MASTER && ch->devices & ATA_ATAPI_MASTER) ||
+	    (atadev->unit == ATA_SLAVE && ch->devices & ATA_ATAPI_SLAVE));
 }
 
 int

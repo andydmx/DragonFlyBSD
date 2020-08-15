@@ -28,7 +28,6 @@
  *
  * @(#)symtab.c	8.3 (Berkeley) 4/28/95
  * $FreeBSD: src/sbin/restore/symtab.c,v 1.7.2.1 2001/12/19 14:54:14 tobez Exp $
- * $DragonFly: src/sbin/restore/symtab.c,v 1.8 2005/11/06 12:49:25 swildner Exp $
  */
 
 /*
@@ -67,7 +66,7 @@ static struct entry **entry;
 static long entrytblsize;
 
 static void		 addino(ufs1_ino_t, struct entry *);
-static struct entry	*lookupparent(char *);
+static struct entry	*lookupparent(const char *);
 static void		 removeentry(struct entry *);
 
 /*
@@ -78,7 +77,7 @@ lookupino(ufs1_ino_t inum)
 {
 	struct entry *ep;
 
-	if (inum < WINO || inum >= maxino)
+	if (inum < UFS_WINO || inum >= maxino)
 		return (NULL);
 	for (ep = entry[inum % entrytblsize]; ep != NULL; ep = ep->e_next)
 		if (ep->e_ino == inum)
@@ -94,7 +93,7 @@ addino(ufs1_ino_t inum, struct entry *np)
 {
 	struct entry **epp;
 
-	if (inum < WINO || inum >= maxino)
+	if (inum < UFS_WINO || inum >= maxino)
 		panic("addino: out of range %d\n", inum);
 	epp = &entry[inum % entrytblsize];
 	np->e_ino = inum;
@@ -115,7 +114,7 @@ deleteino(ufs1_ino_t inum)
 	struct entry *next;
 	struct entry **prev;
 
-	if (inum < WINO || inum >= maxino)
+	if (inum < UFS_WINO || inum >= maxino)
 		panic("deleteino: out of range %d\n", inum);
 	prev = &entry[inum % entrytblsize];
 	for (next = *prev; next != NULL; next = next->e_next) {
@@ -133,14 +132,15 @@ deleteino(ufs1_ino_t inum)
  * Look up an entry by name
  */
 struct entry *
-lookupname(char *name)
+lookupname(const char *name)
 {
 	struct entry *ep;
-	char *np, *cp;
+	const char *cp;
+	char *np;
 	char buf[MAXPATHLEN];
 
 	cp = name;
-	for (ep = lookupino(ROOTINO); ep != NULL; ep = ep->e_entries) {
+	for (ep = lookupino(UFS_ROOTINO); ep != NULL; ep = ep->e_entries) {
 		for (np = buf; *cp != '/' && *cp != '\0' &&
 				np < &buf[sizeof(buf)]; )
 			*np++ = *cp++;
@@ -162,7 +162,7 @@ lookupname(char *name)
  * Look up the parent of a pathname
  */
 static struct entry *
-lookupparent(char *name)
+lookupparent(const char *name)
 {
 	struct entry *ep;
 	char *tailindex;
@@ -192,7 +192,7 @@ myname(struct entry *ep)
 	for (cp = &namebuf[MAXPATHLEN - 2]; cp > &namebuf[ep->e_namlen]; ) {
 		cp -= ep->e_namlen;
 		memmove(cp, ep->e_name, (long)ep->e_namlen);
-		if (ep == lookupino(ROOTINO))
+		if (ep == lookupino(UFS_ROOTINO))
 			return (cp);
 		*(--cp) = '/';
 		ep = ep->e_parent;
@@ -211,7 +211,7 @@ static struct entry *freelist = NULL;
  * add an entry to the symbol table
  */
 struct entry *
-addentry(char *name, ufs1_ino_t inum, int type)
+addentry(const char *name, ufs1_ino_t inum, int type)
 {
 	struct entry *np, *ep;
 
@@ -227,12 +227,12 @@ addentry(char *name, ufs1_ino_t inum, int type)
 	np->e_type = type & ~LINK;
 	ep = lookupparent(name);
 	if (ep == NULL) {
-		if (inum != ROOTINO || lookupino(ROOTINO) != NULL)
+		if (inum != UFS_ROOTINO || lookupino(UFS_ROOTINO) != NULL)
 			panic("bad name to addentry %s\n", name);
 		np->e_name = savename(name);
 		np->e_namlen = strlen(name);
 		np->e_parent = np;
-		addino(ROOTINO, np);
+		addino(UFS_ROOTINO, np);
 		return (np);
 	}
 	np->e_name = savename(strrchr(name, '/') + 1);
@@ -302,7 +302,7 @@ freeentry(struct entry *ep)
  * Relocate an entry in the tree structure
  */
 void
-moveentry(struct entry *ep, char *newname)
+moveentry(struct entry *ep, const char *newname)
 {
 	struct entry *np;
 	char *cp;
@@ -366,7 +366,7 @@ struct strhdr {
 };
 
 #define STRTBLINCR	(sizeof(struct strhdr))
-#define allocsize(size)	(((size) + 1 + STRTBLINCR - 1) & ~(STRTBLINCR - 1))
+#define allocsize(size)	roundup2((size) + 1, STRTBLINCR)
 
 static struct strhdr strtblhdr[allocsize(NAME_MAX) / STRTBLINCR];
 
@@ -375,7 +375,7 @@ static struct strhdr strtblhdr[allocsize(NAME_MAX) / STRTBLINCR];
  * has an appropriate sized entry, and if not allocates a new one.
  */
 char *
-savename(char *name)
+savename(const char *name)
 {
 	struct strhdr *np;
 	long len;
@@ -429,7 +429,7 @@ struct symtableheader {
  * dump a snapshot of the symbol table
  */
 void
-dumpsymtable(char *filename, long checkpt)
+dumpsymtable(const char *filename, long checkpt)
 {
 	struct entry *ep, *tep;
 	ufs1_ino_t i;
@@ -452,7 +452,7 @@ dumpsymtable(char *filename, long checkpt)
 	 * Assign indices to each entry
 	 * Write out the string entries
 	 */
-	for (i = WINO; i <= maxino; i++) {
+	for (i = UFS_WINO; i <= maxino; i++) {
 		for (ep = lookupino(i); ep != NULL; ep = ep->e_links) {
 			ep->e_index = mynum++;
 			fwrite(ep->e_name, sizeof(char),
@@ -464,7 +464,7 @@ dumpsymtable(char *filename, long checkpt)
 	 */
 	tep = &temp;
 	stroff = 0;
-	for (i = WINO; i <= maxino; i++) {
+	for (i = UFS_WINO; i <= maxino; i++) {
 		for (ep = lookupino(i); ep != NULL; ep = ep->e_links) {
 			memmove(tep, ep, (long)sizeof(struct entry));
 			tep->e_name = (char *)stroff;
@@ -515,7 +515,7 @@ dumpsymtable(char *filename, long checkpt)
  * Initialize a symbol table from a file
  */
 void
-initsymtable(char *filename)
+initsymtable(const char *filename)
 {
 	char *base;
 	long tblsize;
@@ -533,7 +533,7 @@ initsymtable(char *filename)
 			calloc((unsigned)entrytblsize, sizeof(struct entry *));
 		if (entry == NULL)
 			panic("no memory for entry table\n");
-		ep = addentry(".", ROOTINO, NODE);
+		ep = addentry(".", UFS_ROOTINO, NODE);
 		ep->e_flags |= NEW;
 		return;
 	}

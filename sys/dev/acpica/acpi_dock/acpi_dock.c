@@ -31,7 +31,6 @@
 #include <sys/bus.h>
 #include <sys/kernel.h>
 #include <sys/module.h>
-#include <sys/mplock2.h>
 
 #include <contrib/dev/acpica/source/include/acpi.h>
 #include <contrib/dev/acpica/source/include/accommon.h>
@@ -192,9 +191,9 @@ acpi_dock_attach_later(void *context)
 	if (!device_is_enabled(dev))
 		device_enable(dev);
 
-	get_mplock();
+	lwkt_gettoken(&acpi_token);
 	device_probe_and_attach(dev);
-	rel_mplock();
+	lwkt_reltoken(&acpi_token);
 }
 
 static ACPI_STATUS
@@ -299,9 +298,9 @@ acpi_dock_eject_child(ACPI_HANDLE handle, UINT32 level, void *context,
 
 	dev = acpi_get_device(handle);
 	if (dev != NULL && device_is_attached(dev)) {
-		get_mplock();
+		lwkt_gettoken(&acpi_token);
 		device_detach(dev);
-		rel_mplock();
+		lwkt_reltoken(&acpi_token);
 	}
 
 	acpi_SetInteger(handle, "_EJ0", 0);
@@ -400,7 +399,7 @@ acpi_dock_notify_handler(ACPI_HANDLE h, UINT32 notify, void *context)
 		acpi_dock_removal(dev);
 		break;
 	default:
-		device_printf(dev, "unknown notify %#x\n", notify);
+		device_printf(dev, "unknown notify: %#x\n", notify);
 		break;
 	}
 	ACPI_SERIAL_END(dock);
@@ -483,6 +482,7 @@ acpi_dock_attach(device_t dev)
 
 	AcpiEvaluateObject(h, "_INI", NULL, NULL);
 
+	ACPI_SERIAL_INIT(dock);
 	ACPI_SERIAL_BEGIN(dock);
 
 	acpi_dock_device_check(dev);

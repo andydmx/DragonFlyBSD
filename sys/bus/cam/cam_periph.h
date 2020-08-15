@@ -26,7 +26,6 @@
  * SUCH DAMAGE.
  *
  * $FreeBSD: src/sys/cam/cam_periph.h,v 1.18 2007/04/19 22:46:26 scottl Exp $
- * $DragonFly: src/sys/bus/cam/cam_periph.h,v 1.12 2008/07/18 00:07:21 dillon Exp $
  */
 
 #ifndef _CAM_CAM_PERIPH_H
@@ -43,6 +42,12 @@ extern struct periph_driver **periph_drivers;
 void periphdriver_register(void *);
 
 #include <sys/module.h>
+
+/*
+ * Declare a peripheral type driver (da, cd, etc).  This must be third in
+ * the module order to ensure that peripherals have registered their async
+ * callbacks before hardware drivers probe.
+ */
 #define PERIPHDRIVER_DECLARE(name, driver) \
 	static int name ## _modevent(module_t mod, int type, void *data) \
 	{ \
@@ -63,7 +68,7 @@ void periphdriver_register(void *);
 		name ## _modevent, \
 		(void *)&driver \
 	}; \
-	DECLARE_MODULE(name, name ## _mod, SI_SUB_DRIVERS, SI_ORDER_ANY); \
+	DECLARE_MODULE(name, name ## _mod, SI_SUB_DRIVERS, SI_ORDER_THIRD); \
 	MODULE_DEPEND(name, cam, 1, 1, 1)
 
 typedef void (periph_init_t)(void); /*
@@ -132,15 +137,15 @@ struct cam_periph_map_info {
 	struct buf	*bp[CAM_PERIPH_MAXMAPS];
 	caddr_t		saved_ptrs[CAM_PERIPH_MAXMAPS];
 	u_int32_t	dirs[CAM_PERIPH_MAXMAPS];
-	int		bounce[CAM_PERIPH_MAXMAPS];
 };
 
 cam_status cam_periph_alloc(periph_ctor_t *periph_ctor,
 			    periph_oninv_t *periph_oninvalidate,
 			    periph_dtor_t *periph_dtor,
 			    periph_start_t *periph_start,
-			    char *name, cam_periph_type type, struct cam_path *,
-			    ac_callback_t *, ac_code, void *arg);
+			    char *name, cam_periph_type type,
+			    struct cam_path *path, ac_callback_t *ac_callback,
+			    ac_code code, void *arg);
 struct cam_periph *cam_periph_find(struct cam_path *path, char *name);
 cam_status	cam_periph_acquire(struct cam_periph *periph);
 void		cam_periph_release(struct cam_periph *periph);
@@ -160,7 +165,7 @@ int		cam_periph_runccb(union ccb *ccb,
 						       u_int32_t sense_flags),
 				  cam_flags camflags, u_int32_t sense_flags,
 				  struct devstat *ds);
-int		cam_periph_ioctl(struct cam_periph *periph, int cmd, 
+int		cam_periph_ioctl(struct cam_periph *periph, u_long cmd, 
 				 caddr_t addr,
 				 int (*error_routine)(union ccb *ccb,
 						      cam_flags camflags,

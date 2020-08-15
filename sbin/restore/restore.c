@@ -28,7 +28,6 @@
  *
  * @(#)restore.c	8.3 (Berkeley) 9/13/94
  * $FreeBSD: src/sbin/restore/restore.c,v 1.7.2.1 2002/03/01 21:32:28 iedowse Exp $
- * $DragonFly: src/sbin/restore/restore.c,v 1.9 2008/06/05 18:06:31 swildner Exp $
  */
 
 #include <sys/types.h>
@@ -74,7 +73,7 @@ addfile(char *name, ufs1_ino_t ino, int type)
 		dprintf(stdout, "%s: not on the tape\n", name);
 		return (descend);
 	}
-	if (ino == WINO && command == 'i' && !vflag)
+	if (ino == UFS_WINO && command == 'i' && !vflag)
 		return (descend);
 	if (!mflag) {
 		sprintf(buf, "./%u", ino);
@@ -105,7 +104,7 @@ addfile(char *name, ufs1_ino_t ino, int type)
  */
 /* ARGSUSED */
 long
-deletefile(char *name, ufs1_ino_t ino, int type)
+deletefile(char *name, ufs1_ino_t ino, int type __unused)
 {
 	long descend = hflag ? GOOD : FAIL;
 	struct entry *ep;
@@ -149,7 +148,7 @@ removeoldleaves(void)
 	ufs1_ino_t i, mydirino;
 
 	vprintf(stdout, "Mark entries to be removed.\n");
-	if ((ep = lookupino(WINO))) {
+	if ((ep = lookupino(UFS_WINO))) {
 		vprintf(stdout, "Delete whiteouts\n");
 		for ( ; ep != NULL; ep = nextep) {
 			nextep = ep->e_links;
@@ -165,7 +164,7 @@ removeoldleaves(void)
 			freeentry(ep);
 		}
 	}
-	for (i = ROOTINO + 1; i < maxino; i++) {
+	for (i = UFS_ROOTINO + 1; i < maxino; i++) {
 		ep = lookupino(i);
 		if (ep == NULL)
 			continue;
@@ -509,7 +508,7 @@ findunreflinks(void)
 	ufs1_ino_t i;
 
 	vprintf(stdout, "Find unreferenced names.\n");
-	for (i = ROOTINO; i < maxino; i++) {
+	for (i = UFS_ROOTINO; i < maxino; i++) {
 		ep = lookupino(i);
 		if (ep == NULL || ep->e_type == LEAF || TSTINO(i, dumpmap) == 0)
 			continue;
@@ -580,7 +579,7 @@ removeoldnodes(void)
  * Extract new leaves.
  */
 void
-createleaves(char *symtabfile)
+createleaves(const char *symtabfile)
 {
 	struct entry *ep;
 	ufs1_ino_t first;
@@ -592,7 +591,7 @@ createleaves(char *symtabfile)
 		vprintf(stdout, "Extract new leaves.\n");
 		dumpsymtable(symtabfile, volno);
 	}
-	first = lowerbnd(ROOTINO);
+	first = lowerbnd(UFS_ROOTINO);
 	curvol = volno;
 	while (curfile.ino < maxino) {
 		first = lowerbnd(first);
@@ -670,7 +669,7 @@ createfiles(void)
 	getvol((long)1);
 	skipmaps();
 	skipdirs();
-	first = lowerbnd(ROOTINO);
+	first = lowerbnd(UFS_ROOTINO);
 	last = upperbnd(maxino - 1);
 	for (;;) {
 		curvol = volno;
@@ -761,7 +760,7 @@ createlinks(void)
 	ufs1_ino_t i;
 	char name[BUFSIZ];
 
-	if ((ep = lookupino(WINO))) {
+	if ((ep = lookupino(UFS_WINO))) {
 		vprintf(stdout, "Add whiteouts\n");
 		for ( ; ep != NULL; ep = ep->e_links) {
 			if ((ep->e_flags & NEW) == 0)
@@ -771,7 +770,7 @@ createlinks(void)
 		}
 	}
 	vprintf(stdout, "Add links\n");
-	for (i = ROOTINO; i < maxino; i++) {
+	for (i = UFS_ROOTINO; i < maxino; i++) {
 		ep = lookupino(i);
 		if (ep == NULL)
 			continue;
@@ -801,7 +800,7 @@ checkrestore(void)
 	ufs1_ino_t i;
 
 	vprintf(stdout, "Check the symbol table.\n");
-	for (i = WINO; i < maxino; i++) {
+	for (i = UFS_WINO; i < maxino; i++) {
 		for (ep = lookupino(i); ep != NULL; ep = ep->e_links) {
 			ep->e_flags &= ~KEEP;
 			if (ep->e_type == NODE)
@@ -834,7 +833,7 @@ verifyfile(char *name, ufs1_ino_t ino, int type)
 		if (np == ep)
 			break;
 	if (np == NULL)
-		panic("missing inumber %d\n", ino);
+		panic("missing inumber %ju\n", (uintmax_t)ino);
 	if (ep->e_type == LEAF && type != LEAF)
 		badentry(ep, "type should be LEAF");
 	return (descend);

@@ -10,11 +10,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -32,31 +28,28 @@
  *
  *	@(#)select.h	8.2 (Berkeley) 1/4/94
  * $FreeBSD: src/sys/sys/select.h,v 1.6.2.1 2000/05/05 03:50:02 jlemon Exp $
- * $DragonFly: src/sys/sys/select.h,v 1.12 2008/06/18 09:36:07 hasso Exp $
  */
 
 #ifndef _SYS_SELECT_H_
 #define	_SYS_SELECT_H_
 
 #include <sys/cdefs.h>
-
-#ifndef _SYS_SIGNAL_H_
-#include <sys/signal.h>
-#endif
-#ifndef _SYS_TIME_H_
-#include <sys/time.h>
-#endif
-
-#include <sys/fd_set.h>
+#include <sys/_fd_set.h>
+#include <sys/_sigset.h>
+#include <sys/_timespec.h>
 #include <sys/_timeval.h>
+
+#ifndef _SIGSET_T_DECLARED
+typedef	struct __sigset	sigset_t;
+#define	_SIGSET_T_DECLARED
+#endif
 
 __BEGIN_DECLS
 int	select(int, fd_set * __restrict, fd_set * __restrict,
-	       fd_set * __restrict, struct timeval * __restrict);
-struct timespec;
-int	 pselect(int, fd_set * __restrict, fd_set * __restrict,
-		fd_set * __restrict, const struct timespec * __restrict,
-		const sigset_t * __restrict);
+	    fd_set * __restrict, struct timeval * __restrict);
+int	pselect(int, fd_set * __restrict, fd_set * __restrict,
+	    fd_set * __restrict, const struct timespec * __restrict,
+	    const sigset_t * __restrict);
 __END_DECLS
 
 #endif	/* !_SYS_SELECT_H_ */

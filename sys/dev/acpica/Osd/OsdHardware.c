@@ -28,7 +28,7 @@
  */
 
 /*
- * 6.7 : Hardware Abstraction
+ * Hardware Abstraction
  */
 
 #include "acpi.h"
@@ -48,10 +48,6 @@
  * XXX use an intermediate #define for the tag/handle
  */
 
-#ifdef __i386__
-#define ACPI_BUS_SPACE_IO	I386_BUS_SPACE_IO
-#define ACPI_BUS_HANDLE		0
-#endif
 #ifdef __x86_64__
 #define ACPI_BUS_SPACE_IO	X86_64_BUS_SPACE_IO
 #define ACPI_BUS_HANDLE		0
@@ -126,5 +122,14 @@ AcpiOsWritePciConfiguration(ACPI_PCI_ID *PciId, UINT32 Register,
     pci_cfgregwrite(PciId->Bus, PciId->Device, PciId->Function, Register,
     		    (uint32_t)Value, Width / 8); /* XXX casting */
 
+    return (AE_OK);
+}
+
+ACPI_STATUS
+AcpiOsEnterSleep (
+    UINT8                   SleepState,
+    UINT32                  RegaValue,
+    UINT32                  RegbValue)
+{
     return (AE_OK);
 }

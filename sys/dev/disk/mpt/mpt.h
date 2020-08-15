@@ -736,9 +736,6 @@ struct mpt_softc {
 	/* Userland management interface. */
 	struct cdev		*cdev;
 
-	struct sysctl_ctx_list		mpt_sysctl_ctx;
-	struct sysctl_oid		*mpt_sysctl_tree;
-
 	TAILQ_ENTRY(mpt_softc)	links;
 };
 
@@ -776,7 +773,7 @@ mpt_assign_serno(struct mpt_softc *mpt, request_t *req)
 #define mpt_callout_init(mpt, c) \
 	callout_init_mp(c)
 #define mpt_callout_drain(mpt, c) \
-	callout_stop_sync(c)
+	callout_drain(c)
 
 /******************************* Register Access ******************************/
 static __inline void mpt_write(struct mpt_softc *, size_t, uint32_t);
@@ -919,7 +916,7 @@ enum {
 
 #define mpt_lprt(mpt, level, ...)		\
 do {						\
-	if (level <= (mpt)->verbose)		\
+	if ((level) <= (mpt)->verbose)		\
 		mpt_prt(mpt, __VA_ARGS__);	\
 } while (0)
 

@@ -27,8 +27,6 @@
 /*
  * Authors: Thomas Hellstrom <thellstrom-at-vmware-dot-com>
  *          Keith Packard.
- *
- * $FreeBSD: head/sys/dev/drm2/ttm/ttm_agp_backend.c 247835 2013-03-05 09:49:34Z kib $
  */
 
 #define pr_fmt(fmt) "[TTM] " fmt
@@ -36,8 +34,12 @@
 #include <drm/ttm/ttm_module.h>
 #include <drm/ttm/ttm_bo_driver.h>
 #include <drm/ttm/ttm_page_alloc.h>
-#ifdef TTM_HAS_AGP
 #include <drm/ttm/ttm_placement.h>
+#include <linux/agp_backend.h>
+#include <linux/module.h>
+#include <linux/slab.h>
+#include <linux/io.h>
+#include <asm/agp.h>
 
 struct ttm_agp_backend {
 	struct ttm_tt ttm;
@@ -59,7 +61,7 @@ static int ttm_agp_bind(struct ttm_tt *ttm, struct ttm_mem_reg *bo_mem)
 
 	mem->page_count = 0;
 	for (i = 0; i < ttm->num_pages; i++) {
-		vm_page_t page = ttm->pages[i];
+		struct page *page = ttm->pages[i];
 
 		if (!page)
 			page = ttm->dummy_read_page;
@@ -98,7 +100,7 @@ static void ttm_agp_destroy(struct ttm_tt *ttm)
 	if (agp_be->mem)
 		ttm_agp_unbind(ttm);
 	ttm_tt_fini(ttm);
-	drm_free(agp_be, M_DRM);
+	kfree(agp_be);
 }
 
 static struct ttm_backend_func ttm_agp_func = {
@@ -110,11 +112,11 @@ static struct ttm_backend_func ttm_agp_func = {
 struct ttm_tt *ttm_agp_tt_create(struct ttm_bo_device *bdev,
 				 device_t bridge,
 				 unsigned long size, uint32_t page_flags,
-				 vm_page_t dummy_read_page)
+				 struct page *dummy_read_page)
 {
 	struct ttm_agp_backend *agp_be;
 
-	agp_be = kmalloc(sizeof(*agp_be), M_DRM, M_WAITOK | M_ZERO);
+	agp_be = kmalloc(sizeof(*agp_be), M_DRM, M_WAITOK);
 	if (!agp_be)
 		return NULL;
 
@@ -145,5 +147,3 @@ void ttm_agp_tt_unpopulate(struct ttm_tt *ttm)
 	ttm_pool_unpopulate(ttm);
 }
 EXPORT_SYMBOL(ttm_agp_tt_unpopulate);
-
-#endif

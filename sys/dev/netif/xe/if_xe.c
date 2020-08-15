@@ -96,6 +96,7 @@
 #include <sys/param.h>
 #include <sys/errno.h>
 #include <sys/kernel.h>
+#include <sys/malloc.h>	/* for M_NOWAIT */
 #include <sys/mbuf.h>
 #include <sys/select.h>
 #include <sys/socket.h>
@@ -765,14 +766,14 @@ xe_intr(void *xscp)
 	 * packet length (we always read 16-bit words).
 	 * XXX - Surely there's a better way to do this alignment?
 	 */
-	MGETHDR(mbp, MB_DONTWAIT, MT_DATA);
+	MGETHDR(mbp, M_NOWAIT, MT_DATA);
 	if (mbp == NULL) {
 	  IFNET_STAT_INC(ifp, iqdrops, 1);
 	  continue;
 	}
 
 	if (len + 3 > MHLEN) {
-	  MCLGET(mbp, MB_DONTWAIT);
+	  MCLGET(mbp, M_NOWAIT);
 	  if ((mbp->m_flags & M_EXT) == 0) {
 	    m_freem(mbp);
 	    IFNET_STAT_INC(ifp, iqdrops, 1);
@@ -1923,7 +1924,7 @@ xe_activate(device_t dev)
 			sc->port_res = bus_alloc_resource(dev,
 			    SYS_RES_IOPORT, &sc->port_rid, start, 0x3ff, 16,
 			    RF_ACTIVE);
-			if (sc->port_res == 0)
+			if (sc->port_res == NULL)
 				break;		/* we failed */
 			if ((rman_get_start(sc->port_res) & 0xf) == 0)
 				break;		/* good */
@@ -1961,7 +1962,7 @@ xe_activate(device_t dev)
 		sc->port_res = bus_alloc_resource(dev, SYS_RES_IOPORT,
 						  &sc->port_rid, start,
 						  start + 18, 18, RF_ACTIVE);
-		if (sc->port_res == 0)
+		if (sc->port_res == NULL)
 		    continue;	/* Failed, try again if possible */
 		if (bus_get_resource_start(dev, SYS_RES_IOPORT,
 					   sc->port_rid) == start)

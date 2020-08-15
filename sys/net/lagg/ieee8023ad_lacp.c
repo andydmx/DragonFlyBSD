@@ -189,7 +189,7 @@ static const char *lacp_format_systemid(const struct lacp_systemid *, char *,
 static const char *lacp_format_portid(const struct lacp_portid *, char *,
 		    size_t);
 static void	lacp_dprintf(const struct lacp_port *, const char *, ...)
-		    __attribute__((__format__(__printf__, 2, 3)));
+		    __printflike(2, 3);
 
 static int lacp_debug = 0;
 SYSCTL_NODE(_net_link_lagg, OID_AUTO, lacp, CTLFLAG_RD, 0, "ieee802.3ad");
@@ -590,7 +590,7 @@ lacp_port_destroy(struct lagg_port *lgp)
 	lacp_unselect(lp);
 
 	/* The address may have already been removed by if_purgemaddrs() */
-#if XXX
+#if 0 /* XXX */
 	if (!lgp->lp_detaching)
 		if_delmulti_ifma(lp->lp_ifma);
 #endif
@@ -820,7 +820,7 @@ lacp_attach(struct lagg_softc *sc)
 	lacp_attach_sysctl(lsc, oid);
 	lacp_attach_sysctl_debug(lsc, oid);
 
-#if XXX
+#if 0 /* XXX */
 	callout_init_mtx(&lsc->lsc_transit_callout, &lsc->lsc_lock, 0);
 	callout_init_mtx(&lsc->lsc_callout, &lsc->lsc_lock, 0);
 #endif
@@ -894,7 +894,7 @@ lacp_select_tx_port(struct lagg_softc *sc, struct mbuf *m)
 		return (NULL);
 	}
 
-#if XXX
+#if 0 /* XXX */
 	if (sc->use_flowid && (m->m_flags & M_FLOWID))
 		hash = m->m_pkthdr.flowid;
 	else
@@ -2045,7 +2045,7 @@ lacp_format_lagid_aggregator(const struct lacp_aggregator *la,
 const char *
 lacp_format_state(uint8_t state, char *buf, size_t buflen)
 {
-	ksnprintf(buf, buflen, "%b", state, LACP_STATE_BITS);
+	ksnprintf(buf, buflen, "%pb%i", LACP_STATE_BITS, state);
 	return (buf);
 }
 

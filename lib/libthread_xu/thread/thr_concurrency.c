@@ -25,7 +25,6 @@
  * SUCH DAMAGE.
  *
  * $FreeBSD: src/lib/libpthread/thread/thr_concurrency.c,v 1.8 2004/03/14 05:24:27 bde Exp $
- * $DragonFly: src/lib/libthread_xu/thread/thr_concurrency.c,v 1.4 2006/04/06 13:03:09 davidxu Exp $
  */
 
 #include "namespace.h"
@@ -33,12 +32,14 @@
 #include <pthread.h>
 #include "un-namespace.h"
 
-static int level = 0;
+#include "thr_private.h"
+
+static int current_concurrency = 0;
 
 int
 _pthread_getconcurrency(void)
 {
-	return (level);
+	return current_concurrency;
 }
 
 int
@@ -46,7 +47,8 @@ _pthread_setconcurrency(int new_level)
 {
 	if (new_level < 0)
 		return (EINVAL);
-	level = new_level;
+
+	current_concurrency = new_level;
 	return 0;
 }
 

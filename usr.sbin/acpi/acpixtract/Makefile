@@ -11,17 +11,19 @@ MAN=	acpixtract.8
 
 SRCS=	\
 	acpixtract.c \
-	axmain.c
+	axmain.c \
+	axutils.c
 
 SRCS+=	\
 	getopt.c \
-	oslibcfs.c \
 	osunixxf.c \
+	utascii.c \
 	utdebug.c \
 	utexcep.c \
 	utglobal.c \
+	uthex.c \
 	utmath.c \
-	utprint.c \
+	utnonansi.c \
 	utxferror.c
 
 CFLAGS+= \

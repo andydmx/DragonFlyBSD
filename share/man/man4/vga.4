@@ -26,55 +26,36 @@
 .\"
 .\" $FreeBSD: src/share/man/man4/vga.4,v 1.7.2.10 2002/12/20 18:03:05 trhodes Exp $
 .\"
-.Dd December 14, 2009
+.Dd March 3, 2020
 .Dt VGA 4
 .Os
 .Sh NAME
-.Nm vga ,
-.Nm vesa
+.Nm vga
 .Nd generic video card interface
 .Sh SYNOPSIS
-.Cd "options VESA"
-.Cd "options VESA_DEBUG=N"
+.Cd "device vga0 at isa? port ?"
+.Pp
 .Cd "options VGA_KEEP_POWERON_MODE"
 .Cd "options VGA_NO_FONT_LOADING"
 .Cd "options VGA_NO_MODE_CHANGE"
 .Cd "options VGA_DEBUG=N"
 .Cd "options VGA_WIDTH90"
-.Cd "device vga0 at isa? port ?"
 .Sh DESCRIPTION
 The
 .Nm
 driver is a generic video card driver which provides access to
 video cards.
-This driver is required for the console driver
-.Xr syscons 4 .
-The console driver will call the
+This driver is required for the
+.Xr syscons 4
+console driver which will call the
 .Nm
-driver to manipulate video hardware (changing video modes, loading font, etc).
+driver to manipulate video hardware (changing video modes, loading fonts, etc).
 .Pp
 The
 .Nm
 driver supports the standard VGA video cards.
-In addition, the driver can utilize the VESA BIOS Extension if the video card
-supports it.
-VESA support can either be statically included in the kernel
-or can be loaded as a separate module.
-.Pp
-In order to statically link the VESA support into the kernel, the
-.Dv VESA
-option (see below) must be defined in the kernel configuration file.
-.Pp
-The
-.Nm vesa
-module can be dynamically loaded into the kernel using
-.Xr kldload 8 .
 .Sh DRIVER CONFIGURATION
-.Ss Kernel Configuration Options
-The following kernel configuration options
-(see
-.Xr config 8 )
-can be used to control the
+The following kernel configuration options can be used to control the
 .Nm
 driver.
 These options provide compatibility with certain VGA cards.
@@ -93,7 +74,7 @@ These modes are not always supported by the video card and the display.
 It is highly likely that LCD display cannot work with these modes.
 .El
 .Pp
-The following options will remove some features from the
+The following option will remove some features from the
 .Nm
 driver and save kernel memory.
 .Bl -tag -width ".Dv VGA_KEEP_POWERON_MODE"
@@ -108,44 +89,9 @@ See
 .It Dv VGA_NO_MODE_CHANGE
 This option prevents the driver from changing video modes.
 .El
-.Pp
-The following options add optional features to the driver.
-.Bl -tag -width ".Dv VGA_KEEP_POWERON_MODE"
-.It Dv VESA
-Add VESA BIOS Extension support to the driver.
-If the VGA card has the VESA BIOS Extension 1.2 or later,
-this option will utilize it to switch to high resolution modes.
-.It Dv VESA_DEBUG=N
-Set the VESA support debug level to
-.Fa N .
-The default value is 0, which suppresses all debugging output.
-A value of 2 gives maximum verbosity.
-.El
-.Sh EXAMPLES
-Your kernel configuration should normally have:
-.Pp
-.D1 Cd "device vga0 at isa? port ?"
-.Pp
-The following line should be included in the kernel configuration file
-in order to enable the VESA BIOS Extension support.
-.Pp
-.D1 Cd "options VESA"
-.Pp
-If you do not want VESA support included in the kernel, but
-want to use occasionally, do not add the
-.Dv VESA
-option.
-And load the
-.Nm vesa
-module as desired:
-.Pp
-.Dl kldload vesa
 .Sh SEE ALSO
 .Xr vgl 3 ,
-.Xr syscons 4 ,
-.Xr config 8 ,
-.Xr kldload 8 ,
-.Xr kldunload 8
+.Xr syscons 4
 .Sh STANDARDS
 .Rs
 .%A "Apple, IBM, Motorola"
@@ -153,11 +99,6 @@ module as desired:
 .%B "Appendix A: VGA Programming Model"
 .%P "p. 195"
 .%O "ftp://ftp.software.ibm.com/rs6000/technology/spec/chrp/"
-.Re
-.Pp
-.Rs
-.%T "VESA BIOS Extension (VBE)"
-.%A Video Electronics Standards Association
 .Re
 .Sh HISTORY
 The

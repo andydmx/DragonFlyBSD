@@ -68,7 +68,6 @@
 #include <sys/socket.h>
 #include <sys/sysctl.h>
 #include <sys/serialize.h>
-#include <sys/thread2.h>
 #include <sys/bus.h>
 #include <sys/rman.h>
 #include <sys/interrupt.h>
@@ -136,7 +135,7 @@ static void	sis_eeprom_idle(struct sis_softc *);
 static void	sis_eeprom_putbyte(struct sis_softc *, int);
 static void	sis_eeprom_getword(struct sis_softc *, int, uint16_t *);
 static void	sis_read_eeprom(struct sis_softc *, caddr_t, int, int, int);
-#ifdef __i386__
+#ifdef __x86_64__
 static void	sis_read_cmos(struct sis_softc *, device_t, caddr_t, int, int);
 static void	sis_read_mac(struct sis_softc *, device_t, caddr_t);
 static device_t	sis_find_bridge(device_t);
@@ -350,7 +349,7 @@ sis_read_eeprom(struct sis_softc *sc, caddr_t dest, int off, int cnt, int swap)
 	}
 }
 
-#ifdef __i386__
+#ifdef __x86_64__
 static device_t
 sis_find_bridge(device_t dev)
 {
@@ -403,7 +402,7 @@ sis_read_cmos(struct sis_softc *sc, device_t dev, caddr_t dest, int off,
 	pci_write_config(bridge, 0x48, reg|0x40, 1);
 
 	/* XXX */
-	btag = I386_BUS_SPACE_IO;
+	btag = X86_64_BUS_SPACE_IO;
 
 	for (i = 0; i < cnt; i++) {
 		bus_space_write_1(btag, 0x0, 0x70, i + off);
@@ -1064,7 +1063,7 @@ sis_attach(device_t dev)
 		break;
 	case PCI_VENDOR_SIS:
 	default:
-#ifdef __i386__
+#ifdef __x86_64__
 		/*
 		 * If this is a SiS 630E chipset with an embedded
 		 * SiS 900 controller, we have to read the MAC address
@@ -1072,7 +1071,7 @@ sis_attach(device_t dev)
 		 * is very ugly since we have to reach out and grab
 		 * ahold of hardware for which we cannot properly
 		 * allocate resources. This code is only compiled on
-		 * the i386 architecture since the SiS 630E chipset
+		 * the x86_64 architecture since the SiS 630E chipset
 		 * is for x86 motherboards only. Note that there are
 		 * a lot of magic numbers in this hack. These are
 		 * taken from SiS's Linux driver. I'd like to replace
@@ -1293,7 +1292,7 @@ sis_newbuf(struct sis_softc *sc, int idx, int init)
 	struct mbuf *m;
 	int nseg, error;
 
-	m = m_getcl(init ? MB_WAIT : MB_DONTWAIT, MT_DATA, M_PKTHDR);
+	m = m_getcl(init ? M_WAITOK : M_NOWAIT, MT_DATA, M_PKTHDR);
 	if (m == NULL) {
 		if (init)
 			if_printf(&sc->arpcom.ac_if, "can't alloc RX mbuf\n");

@@ -24,12 +24,10 @@
  * SUCH DAMAGE.
  *
  * $FreeBSD: src/lib/libpthread/thread/thr_barrier.c,v 1.1 2003/09/04 14:06:43 davidxu Exp $
- * $DragonFly: src/lib/libthread_xu/thread/thr_barrier.c,v 1.6 2006/04/06 13:03:09 davidxu Exp $
  */
 
 #include "namespace.h"
 #include <machine/tls.h>
-
 #include <errno.h>
 #include <stdlib.h>
 #include <pthread.h>
@@ -40,7 +38,7 @@
 int
 _pthread_barrier_destroy(pthread_barrier_t *barrier)
 {
-	pthread_barrier_t	bar;
+	pthread_barrier_t bar;
 
 	if (barrier == NULL || *barrier == NULL)
 		return (EINVAL);
@@ -49,20 +47,21 @@ _pthread_barrier_destroy(pthread_barrier_t *barrier)
 	if (bar->b_waiters > 0)
 		return (EBUSY);
 	*barrier = NULL;
-	free(bar);
+	__free(bar);
 	return (0);
 }
 
 int
-_pthread_barrier_init(pthread_barrier_t *barrier,
-	const pthread_barrierattr_t *attr __unused, unsigned count)
+_pthread_barrier_init(pthread_barrier_t * __restrict barrier,
+		      const pthread_barrierattr_t * __restrict attr __unused,
+		      unsigned count)
 {
-	pthread_barrier_t	bar;
+	pthread_barrier_t bar;
 
-	if (barrier == NULL || count <= 0)
+	if (barrier == NULL || count == 0 || count > INT_MAX)
 		return (EINVAL);
 
-	bar = malloc(sizeof(struct pthread_barrier));
+	bar = __malloc(sizeof(struct pthread_barrier));
 	if (bar == NULL)
 		return (ENOMEM);
 
@@ -78,21 +77,22 @@ _pthread_barrier_init(pthread_barrier_t *barrier,
 int
 _pthread_barrier_wait(pthread_barrier_t *barrier)
 {
-	struct pthread *curthread = tls_get_curthread();
+	struct pthread *curthread;
 	pthread_barrier_t bar;
-	long cycle;
+	int64_t cycle;
 	int ret;
 
 	if (barrier == NULL || *barrier == NULL)
 		return (EINVAL);
 
 	bar = *barrier;
+	curthread = tls_get_curthread();
 	THR_UMTX_LOCK(curthread, &bar->b_lock);
 	if (++bar->b_waiters == bar->b_count) {
 		/* Current thread is lastest thread */
 		bar->b_waiters = 0;
 		bar->b_cycle++;
-		_thr_umtx_wake(&bar->b_cycle, bar->b_count);
+		_thr_umtx_wake(&bar->b_cycle, 0);
 		THR_UMTX_UNLOCK(curthread, &bar->b_lock);
 		ret = PTHREAD_BARRIER_SERIAL_THREAD;
 	} else {

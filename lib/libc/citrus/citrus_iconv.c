@@ -1,5 +1,5 @@
-/* $FreeBSD: head/lib/libc/iconv/citrus_iconv.c 254080 2013-08-08 01:53:27Z peter $ */
-/* $NetBSD: citrus_iconv.c,v 1.7 2008/07/25 14:05:25 christos Exp $ */
+/* $FreeBSD: head/lib/libc/iconv/citrus_iconv.c 279404 2015-02-28 20:30:25Z kan $ */
+/*	$NetBSD: citrus_iconv.c,v 1.10 2011/11/19 18:34:21 tnozaki Exp $	*/
 
 /*-
  * Copyright (c)2003 Citrus Project,
@@ -27,6 +27,7 @@
  * SUCH DAMAGE.
  */
 
+#include "namespace.h"
 #include <sys/cdefs.h>
 #include <sys/types.h>
 #include <sys/queue.h>
@@ -55,6 +56,7 @@
 #include "citrus_lookup.h"
 #include "citrus_hash.h"
 #include "citrus_iconv.h"
+#include "un-namespace.h"
 
 #define _CITRUS_ICONV_DIR	"iconv.dir"
 #define _CITRUS_ICONV_ALIAS	"iconv.alias"
@@ -169,8 +171,10 @@ open_shared(struct _citrus_iconv_shared * __restrict * __restrict rci,
 	    ci->ci_ops->io_uninit_shared == NULL ||
 	    ci->ci_ops->io_init_context == NULL ||
 	    ci->ci_ops->io_uninit_context == NULL ||
-	    ci->ci_ops->io_convert == NULL)
+	    ci->ci_ops->io_convert == NULL) {
+		ret = EINVAL;
 		goto err;
+	}
 
 	/* initialize the converter */
 	ret = (*ci->ci_ops->io_init_shared)(ci, src, dst);
@@ -276,7 +280,9 @@ _citrus_iconv_open(struct _citrus_iconv * __restrict * __restrict rcv,
 	struct _citrus_iconv *cv = NULL;
 	struct _citrus_iconv_shared *ci = NULL;
 	char realdst[PATH_MAX], realsrc[PATH_MAX];
+#ifdef _PATH_ICONV
 	char buf[PATH_MAX], path[PATH_MAX];
+#endif
 	int ret;
 
 	init_cache();
@@ -288,10 +294,16 @@ _citrus_iconv_open(struct _citrus_iconv * __restrict * __restrict rcv,
 		dst = nl_langinfo(CODESET);
 
 	/* resolve codeset name aliases */
+#ifdef _PATH_ICONV
+	snprintf(path, sizeof(path), "%s/%s", _PATH_ICONV, _CITRUS_ICONV_ALIAS);
 	strlcpy(realsrc, _lookup_alias(path, src, buf, (size_t)PATH_MAX,
 	    _LOOKUP_CASE_IGNORE), (size_t)PATH_MAX);
 	strlcpy(realdst, _lookup_alias(path, dst, buf, (size_t)PATH_MAX,
 	    _LOOKUP_CASE_IGNORE), (size_t)PATH_MAX);
+#else
+	strlcpy(realsrc, src, (size_t)PATH_MAX);
+	strlcpy(realdst, dst, (size_t)PATH_MAX);
+#endif
 
 	/* sanity check */
 	if (strchr(realsrc, '/') != NULL || strchr(realdst, '/'))
@@ -342,9 +354,8 @@ const char
 {
 	char *buf;
 
-	if ((buf = malloc((size_t)PATH_MAX)) == NULL)
+	if ((buf = calloc((size_t)PATH_MAX, sizeof(*buf))) == NULL)
 		return (NULL);
-	memset((void *)buf, 0, (size_t)PATH_MAX);
 	_citrus_esdb_alias(name, buf, (size_t)PATH_MAX);
 	return (buf);
 }

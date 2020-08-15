@@ -41,7 +41,6 @@
 #include "virtio.h"
 #include "virtqueue.h"
 
-#include "virtio_if.h"
 #include "virtio_bus_if.h"
 
 static int virtio_modevent(module_t, int, void *);
@@ -57,6 +56,7 @@ static struct virtio_ident {
 	{ VIRTIO_ID_ENTROPY,	"Entropy"	},
 	{ VIRTIO_ID_BALLOON,	"Balloon"	},
 	{ VIRTIO_ID_IOMEMORY,	"IOMemory"	},
+	{ VIRTIO_ID_SCSI,	"SCSI"		},
 	{ VIRTIO_ID_9P,		"9P Transport"	},
 
 	{ 0, NULL }
@@ -65,6 +65,8 @@ static struct virtio_ident {
 /* Device independent features. */
 static struct virtio_feature_desc virtio_common_feature_desc[] = {
 	{ VIRTIO_F_NOTIFY_ON_EMPTY,	"NotifyOnEmpty"	},
+	{ VIRTIO_F_ANY_LAYOUT, 		"AnyLayout"	},
+	{ VIRTIO_RING_F_INDIRECT_DESC,	"RingIndirect"	},
 	{ VIRTIO_RING_F_EVENT_IDX,	"EventIdx"	},
 	{ VIRTIO_F_BAD_FEATURE,		"BadFeature"	},
 
@@ -116,7 +118,7 @@ virtio_describe(device_t dev, const char *msg,
 	const char *name;
 	int n;
 
-	if ((buf = kmalloc(512, M_TEMP, M_NOWAIT)) == NULL) {
+	if ((buf = kmalloc(512, M_TEMP, M_INTWAIT)) == NULL) {
 		device_printf(dev, "%s features: 0x%"PRIx64"\n", msg,
 		    features);
 		return;
@@ -187,17 +189,55 @@ virtio_negotiate_features(device_t dev, uint64_t child_features)
 }
 
 int
-virtio_alloc_virtqueues(device_t dev, int flags, int nvqs,
-    struct vq_alloc_info *info)
+virtio_alloc_virtqueues(device_t dev, int nvqs, struct vq_alloc_info *info)
 {
-	return (VIRTIO_BUS_ALLOC_VIRTQUEUES(device_get_parent(dev), flags,
+	return (VIRTIO_BUS_ALLOC_VIRTQUEUES(device_get_parent(dev),
 		nvqs, info));
 }
 
 int
-virtio_setup_intr(device_t dev, lwkt_serialize_t slz)
+virtio_setup_intr(device_t dev, uint irq, lwkt_serialize_t slz)
 {
-	return (VIRTIO_BUS_SETUP_INTR(device_get_parent(dev), slz));
+	return (VIRTIO_BUS_SETUP_INTR(device_get_parent(dev), irq, slz));
+}
+
+int
+virtio_teardown_intr(device_t dev, uint irq)
+{
+	return (VIRTIO_BUS_TEARDOWN_INTR(device_get_parent(dev), irq));
+}
+
+int
+virtio_intr_count(device_t dev)
+{
+	return (VIRTIO_BUS_INTR_COUNT(device_get_parent(dev)));
+}
+
+int
+virtio_intr_alloc(device_t dev, int *cnt, int use_config, int *cpus)
+{
+	return (VIRTIO_BUS_INTR_ALLOC(device_get_parent(dev), cnt, use_config,
+				      cpus));
+}
+
+int
+virtio_intr_release(device_t dev)
+{
+	return (VIRTIO_BUS_INTR_RELEASE(device_get_parent(dev)));
+}
+
+int
+virtio_bind_intr(device_t dev, uint irq, int what,
+    driver_intr_t handler, void *arg)
+{
+	return (VIRTIO_BUS_BIND_INTR(device_get_parent(dev), irq, what,
+				     handler, arg));
+}
+
+int
+virtio_unbind_intr(device_t dev, int what)
+{
+	return (VIRTIO_BUS_UNBIND_INTR(device_get_parent(dev), what));
 }
 
 int
@@ -264,5 +304,5 @@ static moduledata_t virtio_mod = {
 	0
 };
 
-DECLARE_MODULE(virtio, virtio_mod, SI_SUB_DRIVERS, SI_ORDER_FIRST);
+DECLARE_MODULE(virtio, virtio_mod, SI_SUB_DRIVERS, SI_ORDER_EARLIER);
 MODULE_VERSION(virtio, 1);

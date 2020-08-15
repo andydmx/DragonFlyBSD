@@ -27,9 +27,8 @@
 .\"
 .\"     From: @(#)tcp.4	8.1 (Berkeley) 6/5/93
 .\" $FreeBSD: src/share/man/man4/tcp.4,v 1.11.2.14 2002/12/29 16:35:38 schweikh Exp $
-.\" $DragonFly: src/share/man/man4/tcp.4,v 1.9 2008/10/17 11:30:24 swildner Exp $
 .\"
-.Dd February 14, 1995
+.Dd April 21, 2018
 .Dt TCP 4
 .Os
 .Sh NAME
@@ -152,31 +151,31 @@ option is set to a non-zero value,
 .Tn TCP
 will delay sending any data at all until either the socket is closed,
 or the internal send buffer is filled.
-.It Dv TCP_SIGNATURE_ENABLE
-This option enables the use of MD5 digests (also known as TCP-MD5)
-on writes to the specified socket.
-In the current release, only outgoing traffic is digested;
-digests on incoming traffic are not verified.
-The current default behavior for the system is to respond to a system
-advertising this option with TCP-MD5; this may change.
-.Pp
-One common use for this in a DragonFlyBSD router deployment is to enable
-based routers to interwork with Cisco equipment at peering points.
-Support for this feature conforms to RFC 2385.
-Only IPv4 (AF_INET) sessions are supported.
-.Pp
-In order for this option to function correctly, it is necessary for the
-administrator to add a tcp-md5 key entry to the system's security
-associations database (SADB) using the
-.Xr setkey 8
-utility.
-This entry must have an SPI of 0x1000 and can therefore only be specified
-on a per-host basis at this time.
-.Pp
-If an SADB entry cannot be found for the destination, the outgoing traffic
-will have an invalid digest option prepended, and the following error message
-will be visible on the system console:
-.Em "tcpsignature_compute: SADB lookup failed for %d.%d.%d.%d" .
+.\".It Dv TCP_SIGNATURE_ENABLE
+.\"This option enables the use of MD5 digests (also known as TCP-MD5)
+.\"on writes to the specified socket.
+.\"In the current release, only outgoing traffic is digested;
+.\"digests on incoming traffic are not verified.
+.\"The current default behavior for the system is to respond to a system
+.\"advertising this option with TCP-MD5; this may change.
+.\".Pp
+.\"One common use for this in a DragonFlyBSD router deployment is to enable
+.\"based routers to interwork with Cisco equipment at peering points.
+.\"Support for this feature conforms to RFC 2385.
+.\"Only IPv4 (AF_INET) sessions are supported.
+.\".Pp
+.\"In order for this option to function correctly, it is necessary for the
+.\"administrator to add a tcp-md5 key entry to the system's security
+.\"associations database (SADB) using the
+.\".Xr setkey 8
+.\"utility.
+.\"This entry must have an SPI of 0x1000 and can therefore only be specified
+.\"on a per-host basis at this time.
+.\".Pp
+.\"If an SADB entry cannot be found for the destination, the outgoing traffic
+.\"will have an invalid digest option prepended, and the following error message
+.\"will be visible on the system console:
+.\".Em "tcpsignature_compute: SADB lookup failed for %d.%d.%d.%d" .
 .It Dv TCP_KEEPINIT
 If a
 .Tn TCP
@@ -185,11 +184,11 @@ connection cannot be established within a period of time,
 will time out the connection attempt.
 The
 .Dv TCP_KEEPINIT
-option specifies the number of milliseconds to wait
+option specifies the number of seconds to wait
 before the connection attempt times out.
 The default value for
 .Dv TCP_KEEPINIT
-is tcp.keepinit milliseconds.
+is tcp.keepinit seconds.
 For the accepted sockets, the
 .Dv TCP_KEEPINIT
 option value is inherited from the listening socket.
@@ -202,12 +201,12 @@ sends a keepalive probe to the remote system of a connection
 that has been idle for a period of time.
 The
 .Dv TCP_KEEPIDLE
-specifies the number of milliseconds before
+specifies the number of seconds before
 .Tn TCP
 will send the initial keepalive probe.
 The default value for
 .Dv TCP_KEEPIDLE
-is tcp.keepidle milliseconds.
+is tcp.keepidle seconds.
 For the accepted sockets,
 the
 .Dv TCP_KEEPIDLE
@@ -221,11 +220,11 @@ sends a keepalive probe to the remote system of a connection
 that has been idle for a period of time.
 The
 .Dv TCP_KEEPINTVL
-option specifies the number of milliseconds to wait
+option specifies the number of seconds to wait
 before retransmitting a keepalive probe.
 The default value for
 .Dv TCP_KEEPINTVL
-is tcp.keepintvl milliseconds.
+is tcp.keepintvl seconds.
 For the accepted sockets,
 the
 .Dv TCP_KEEPINTVL
@@ -243,7 +242,7 @@ option specifies the maximum number of keepalive
 probes to be sent before dropping the connection.
 The default value for
 .Dv TCP_KEEPCNT
-is tcp.keepcnt milliseconds.
+is tcp.keepcnt seconds.
 For the accepted sockets,
 the
 .Dv TCP_KEEPCNT
@@ -340,7 +339,7 @@ to a port where there is not a socket accepting connections.
 See
 .Xr blackhole 4 .
 .It tcp.delayed_ack
-Delay ACK to try and piggyback it onto a data packet.
+Delay ACK to try to piggyback it onto a data packet.
 .It tcp.delacktime
 Maximum amount of time before a delayed ACK is sent.
 .It tcp.newreno
@@ -476,8 +475,7 @@ address.
 .Xr blackhole 4 ,
 .Xr inet 4 ,
 .Xr intro 4 ,
-.Xr ip 4 ,
-.Xr setkey 8
+.Xr ip 4
 .Rs
 .%A V. Jacobson
 .%A R. Braden

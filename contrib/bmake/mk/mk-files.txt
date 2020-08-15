@@ -25,7 +25,8 @@ of mk-files (mk.tar.gz_).  NetBSD provided much of the original structure.
 
 Since then I've added a lot of features to NetBSD's make and hence to
 bmake which is kept closely in sync.  The mk-files however have 
-diverged quite a bit, though ideas are still picked up from NetBSD.
+diverged quite a bit, though ideas are still picked up from NetBSD
+and FreeBSD.
 
 Basics
 ------
@@ -295,7 +296,7 @@ That is::
 is equivalent to::
 
 	DPADD += ${LIBCRYPTO}
-	LDADD += -lcrypto
+	LDADD += -lprivate_crypto
 
 obj.mk
 ------
@@ -399,6 +400,20 @@ to avoid possible conflicts during parallel builds.
 This precludes the use of suffix rules to drive ``make depend``, so 
 dep.mk_ handles that if specifically requested.
 
+options.mk
+----------
+
+Inspired by FreeBSD's ``bsd.own.mk`` more flexible.
+FreeBSD now have similar functionality in ``bsd.mkopt.mk``.
+
+It allows users to express their intent with respect to options
+``MK_*`` by setting ``WITH_*`` or ``WITHOUT_*``.
+
+Note: ``WITHOUT_*`` wins if both are set, and makefiles can set
+``NO_*`` to say they cannot handle that option, or even ``MK_*`` if
+they really need to.
+
+
 own.mk
 ------
 
@@ -406,6 +421,13 @@ Normally included by ``init.mk`` (included by ``lib.mk`` and
 ``prog.mk`` etc), sets macros for default ownership  etc.
 
 It includes ``${MAKECONF}`` if it is defined and exists.
+
+ldorder.mk
+----------
+
+Leverages ``bmake`` to compute optimal link order for libraries.
+This works nicely and makes refactoring a breeze - so long as you
+have not (or few) cicular dependencies between libraries.
 
 man.mk
 ------
@@ -432,13 +454,27 @@ You should never need to edit ``warnings.mk``, it will include
 ``warnings-sets.mk`` if it exists and you use that to make any local
 customizations. 
 
+rst2htm.mk
+----------
+
+Logic to simplify generating HTML (and PDF) documents from ReStructuredText.
+
+cython.mk
+---------
+
+Logic to build Python C interface modules using Cython_
+
+.. _Cython: http://www.cython.org/
+
 Meta mode
 =========
 
 The 20110505 and later versions of ``mk-files`` include a number of
-makefile contributed by Juniper Networks, Inc.  
-These allow the latest version of bmake_ to run in `meta mode`_.
+makefiles contributed by Juniper Networks, Inc.  
+These allow the latest version of bmake_ to run in `meta mode`_
+see `dirdeps.mk`_
 
+.. _`dirdeps.mk`: /help/sjg/dirdeps.htm
 .. _`meta mode`: bmake-meta-mode.htm
 
 Install
@@ -463,5 +499,5 @@ where you unpacked the tar file, you can::
 .. _mk.tar.gz: http://www.crufty.net/ftp/pub/sjg/mk.tar.gz
 
 :Author: sjg@crufty.net
-:Revision: $Id: mk-files.txt,v 1.15 2011/06/08 07:06:18 sjg Exp $
+:Revision: $Id: mk-files.txt,v 1.18 2018/12/08 07:27:15 sjg Exp $
 :Copyright: Crufty.NET

@@ -8,25 +8,25 @@
 
 CLEANFILES= osreldate.h version vers.c vers.txt
 SUBDIR= arpa protocols rpc rpcsvc xlocale
-INCS=	a.out.h ar.h assert.h bitstring.h cpio.h ctype.h db.h \
+INCS=	a.out.h alloca.h ar.h assert.h bitstring.h cpio.h ctype.h db.h \
 	dirent.h disktab.h \
 	dlfcn.h elf.h elf-hints.h err.h float.h fmtmsg.h fnmatch.h fstab.h \
-	fts.h ftw.h getopt.h glob.h grp.h histedit.h \
-	iconv.h ieeefp.h ifaddrs.h iso646.h inttypes.h \
-	langinfo.h libgen.h limits.h link.h locale.h malloc.h memory.h \
+	fts.h ftw.h getopt.h glob.h grp.h \
+	iconv.h ieeefp.h ifaddrs.h iso646.h inttypes.h kenv.h \
+	langinfo.h libgen.h limits.h link.h locale.h memory.h \
 	mntopts.h mpool.h mqueue.h monetary.h ndbm.h netconfig.h \
 	netdb.h nl_types.h nlist.h nss.h nsswitch.h objformat.h \
 	paths.h printf.h pthread.h pthread_np.h pwd.h \
-	ranlib.h readpassphrase.h regex.h \
-	res_update.h resolv.h re_comp.h rmd160.h \
-	runetype.h search.h setjmp.h sgtty.h \
-	signal.h spawn.h stab.h stdalign.h stdarg.h stdbool.h \
+	ranlib.h readpassphrase.h \
+	re_comp.h resolv.h res_update.h runetype.h \
+	search.h semaphore.h setjmp.h signal.h spawn.h \
+	stdalign.h stdarg.h stdbool.h \
 	stddef.h stdint.h stdio.h stdlib.h stdnoreturn.h \
-	string.h stringlist.h strings.h struct.h sysexits.h \
-	tar.h tgmath.h time.h \
+	string.h stringlist.h strings.h sysexits.h \
+	tar.h termios.h time.h \
 	timeconv.h \
 	timers.h ttyent.h \
-	uchar.h unistd.h ulimit.h utime.h utmp.h utmpx.h \
+	uchar.h unistd.h ulimit.h utime.h utmpx.h \
 	uuid.h vis.h \
 	wchar.h wctype.h wordexp.h xlocale.h
 
@@ -34,13 +34,10 @@ INCS=	a.out.h ar.h assert.h bitstring.h cpio.h ctype.h db.h \
 INCS+=	hesiod.h
 .endif
 
-MHDRS=	varargs.h
-
 # Only for default SHARED=copies case
 SHDRS=	soundcard.h joystick.h
 
-LHDRS=	aio.h errno.h fcntl.h linker_set.h poll.h sched.h \
-	semaphore.h syslog.h termios.h ucontext.h
+LHDRS=	aio.h errno.h fcntl.h linker_set.h poll.h sched.h syslog.h ucontext.h
 
 # directories which also contain header files that need to be copied.
 # Other directories, like 'bus' and 'netproto', are created using mtree.
@@ -48,7 +45,7 @@ LHDRS=	aio.h errno.h fcntl.h linker_set.h poll.h sched.h \
 # XXX allow these directories to not contain header files.
 LDIRS=	net netbt netgraph netgraph7 netinet netinet6 sys vm
 
-# Subdirectories containing header files to copy.  In symlink mode 
+# Subdirectories containing header files to copy.  In symlink mode
 # the subdirectory will be symlinked.  Care must be taken to adjust
 # LSYMSUBDIRS below to remove subdirectories whos parent directories.
 # If you make a mistake, part of your source tree might get overwritten
@@ -59,17 +56,18 @@ LSUBDIRS= \
 	bus/cam bus/pccard bus/pci bus/isa bus/ppbus bus/smbus bus/u4b \
 	dev/disk/dm \
 	dev/disk/mpt/mpilib \
-	dev/misc/lpt dev/misc/ppi dev/misc/putter \
+	dev/misc/lpt dev/misc/ppi \
 	dev/netif/wi \
 	dev/raid/ciss dev/raid/mfi \
 	dev/smbus/smb \
 	dev/video/bktr dev/video/meteor \
-	emulation/linux \
 	gnu/vfs/ext2fs \
 	libprop \
-	net/bridge net/tap net/tun net/ppp net/ppp_layer net/sl \
+	net/bridge net/tap net/tun net/ppp_layer net/sl \
 	net/pf net/altq \
 	net/vlan net/ipfw net/ip6fw net/dummynet net/sppp net/ip_mroute \
+	net/ipfw3 net/ipfw3_basic net/ipfw3_layer2 net/ipfw3_layer4 \
+	net/ipfw3_nat net/dummynet3 \
 	net/lagg \
 	netgraph/UI netgraph/async netgraph/bpf netgraph/bridge \
 	netgraph/cisco netgraph/echo netgraph/eiface netgraph/etf \
@@ -86,11 +84,11 @@ LSUBDIRS= \
 	netgraph7/mppc netgraph7/one2many netgraph7/ppp netgraph7/pppoe \
 	netgraph7/pptpgre netgraph7/rfc1490 netgraph7/socket \
 	netgraph7/tcpmss netgraph7/tee netgraph7/tty netgraph7/vjc \
-	netproto/ipsec netproto/802_11 netproto/mpls \
-	netproto/key netproto/smb \
-	vfs/isofs/cd9660 vfs/puffs \
+	netproto/802_11 netproto/mpls netproto/smb \
+	vfs/isofs/cd9660 \
 	vfs/msdosfs vfs/nfs vfs/ntfs \
-	vfs/smbfs vfs/udf vfs/ufs vfs/hammer vfs/hammer2
+	vfs/smbfs vfs/udf vfs/ufs vfs/hammer vfs/hammer2 \
+	vfs/autofs vfs/fuse vfs/tmpfs
 
 # For SHARED=symlinks, bus/cam is a symlink, so cam/scsi is taken care of
 LSYMSUBDIRS=	${LSUBDIRS:Nbus/cam/scsi:Nnet/*:Nnetgraph/*:Nnetgraph7/*}
@@ -111,7 +109,7 @@ osreldate.h:	${.CURDIR}/../sys/conf/newvers.sh \
 		${.CURDIR}/../sys/sys/param.h
 	@${ECHO} creating osreldate.h from newvers.sh
 	setvar PARAMFILE ${.CURDIR}/../sys/sys/param.h; \
-	. ${.CURDIR}/../sys/conf/newvers.sh;			\
+	. ${.CURDIR}/../sys/conf/newvers.sh "${.CURDIR}/.." ;	\
 	echo "$$COPYRIGHT" > osreldate.h;			\
 	echo "#ifdef _KERNEL" >> osreldate.h;			\
 	echo '#error "osreldate.h must not be used in the kernel, use sys/param.h"' >> osreldate.h; \
@@ -126,22 +124,8 @@ INCSLINKS+=	sys/$i ${INCLUDEDIR}/$i
 .for i in ${MHDRS}
 INCSLINKS+=	machine/$i ${INCLUDEDIR}/$i
 .endfor
-INCSLINKS+=	bus/cam ${INCLUDEDIR}/cam
-INCSLINKS+=	vfs/msdosfs ${INCLUDEDIR}/msdosfs
-INCSLINKS+=	vfs/isofs ${INCLUDEDIR}/isofs
-INCSLINKS+=	vfs/mfs ${INCLUDEDIR}/mfs
-INCSLINKS+=	vfs/nfs ${INCLUDEDIR}/nfs
-INCSLINKS+=	vfs/ntfs ${INCLUDEDIR}/ntfs
-INCSLINKS+=	vfs ${INCLUDEDIR}/fs
-# this is for <ufs/ufs/...> and <ufs/ffs/...> paths used by ports
-# It is hopefully a temporary hack until we have environments working.
-INCSLINKS+=	vfs ${INCLUDEDIR}/ufs
-INCSLINKS+=	ufs ${INCLUDEDIR}/vfs/ffs
-INCSLINKS+=	emulation ${INCLUDEDIR}/compat
-INCSLINKS+=	netproto/ipsec ${INCLUDEDIR}/netipsec
-INCSLINKS+=	netproto/key ${INCLUDEDIR}/netkey
+# For smbfs contrib.
 INCSLINKS+=	netproto/smb ${INCLUDEDIR}/netsmb
-INCSLINKS+=	bus/pccard ${INCLUDEDIR}/pccard
 # Some 3rd party software looks for <floatingpoint.h>
 INCSLINKS+=	ieeefp.h ${INCLUDEDIR}/floatingpoint.h
 
@@ -150,7 +134,7 @@ INCSLINKS+=	ieeefp.h ${INCLUDEDIR}/floatingpoint.h
 # machine/ header files come from the platform architecture and
 # cpu/ header files come from the cpu architecture.  All code outside
 # of the machine header files ALWAYS #include's <machine/blah.h>.  So
-# if the platform architecture is missing a header file we have to 
+# if the platform architecture is missing a header file we have to
 # copy it in from the cpu architecture.  This way we do not have to
 # create dozens of pure forwarding headers for files that platform
 # architecture does not need to enhance.
@@ -178,6 +162,42 @@ copies:		mtree_setup
 	cd ${.CURDIR}/../sys/dev/acpica; \
 		${INSTALL} -C -o ${BINOWN} -g ${BINGRP} -m 444 acpiio.h \
 		${DESTDIR}/usr/include/dev/acpica
+	cd ${.CURDIR}/../sys/dev/misc/evdev; \
+		${INSTALL} -C -o ${BINOWN} -g ${BINGRP} -m 444 input.h \
+		${DESTDIR}/usr/include/dev/misc/evdev
+	cd ${.CURDIR}/../sys/dev/misc/evdev; \
+		${INSTALL} -C -o ${BINOWN} -g ${BINGRP} -m 444 input-event-codes.h \
+		${DESTDIR}/usr/include/dev/misc/evdev
+	cd ${.CURDIR}/../sys/dev/misc/evdev; \
+		${INSTALL} -C -o ${BINOWN} -g ${BINGRP} -m 444 input.h \
+		${DESTDIR}/usr/include/compat/linux
+	cd ${.CURDIR}/../sys/dev/misc/evdev; \
+		${INSTALL} -C -o ${BINOWN} -g ${BINGRP} -m 444 input-event-codes.h \
+		${DESTDIR}/usr/include/compat/linux
+	cd ${.CURDIR}/../sys/dev/drm/include/linux; \
+		${INSTALL} -C -o ${BINOWN} -g ${BINGRP} -m 444 compiler.h \
+		${DESTDIR}/usr/include/compat/linux
+	cd ${.CURDIR}/../sys/dev/drm/include/linux; \
+		${INSTALL} -C -o ${BINOWN} -g ${BINGRP} -m 444 posix_types.h \
+		${DESTDIR}/usr/include/compat/linux
+	cd ${.CURDIR}/../sys/dev/drm/include/linux; \
+		${INSTALL} -C -o ${BINOWN} -g ${BINGRP} -m 444 types.h \
+		${DESTDIR}/usr/include/compat/linux
+	cd ${.CURDIR}/../sys/dev/drm/include/uapi; \
+		${INSTALL} -C -o ${BINOWN} -g ${BINGRP} -m 444 asm-generic/int-ll64.h \
+		${DESTDIR}/usr/include/compat/uapi/asm-generic
+	cd ${.CURDIR}/../sys/dev/drm/include/uapi; \
+		${INSTALL} -C -o ${BINOWN} -g ${BINGRP} -m 444 linux/types.h \
+		${DESTDIR}/usr/include/compat/uapi/linux
+	cd ${.CURDIR}/../sys/dev/drm/include/asm; \
+		${INSTALL} -C -o ${BINOWN} -g ${BINGRP} -m 444 bitsperlong.h \
+		${DESTDIR}/usr/include/compat/asm
+	cd ${.CURDIR}/../sys/dev/drm/include/asm; \
+		${INSTALL} -C -o ${BINOWN} -g ${BINGRP} -m 444 int-ll64.h \
+		${DESTDIR}/usr/include/compat/asm
+	cd ${.CURDIR}/../sys/dev/drm/include/asm; \
+		${INSTALL} -C -o ${BINOWN} -g ${BINGRP} -m 444 ioctl.h \
+		${DESTDIR}/usr/include/compat/asm
 .if exists(${.CURDIR}/../sys/cpu/${MACHINE_ARCH}/include)
 	cd ${.CURDIR}/../sys/cpu/${MACHINE_ARCH}/include; \
 		${INSTALL} -C -o ${BINOWN} -g ${BINGRP} -m 444 *.h \

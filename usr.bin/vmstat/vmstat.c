@@ -36,7 +36,7 @@
 #include <sys/time.h>
 #include <sys/uio.h>
 #include <sys/namei.h>
-#include <sys/malloc.h>
+#include <sys/objcache.h>
 #include <sys/signal.h>
 #include <sys/fcntl.h>
 #include <sys/ioctl.h>
@@ -45,6 +45,7 @@
 #include <sys/interrupt.h>
 
 #include <vm/vm_param.h>
+#include <vm/vm_zone.h>
 
 #include <ctype.h>
 #include <err.h>
@@ -67,27 +68,34 @@ static struct nlist namelist[] = {
 	{ "_boottime",	0, 0, 0, 0 },
 #define X_NCHSTATS	1
 	{ "_nchstats",	0, 0, 0, 0 },
-#define	X_KMEMSTATISTICS	2
+#define	X_KMEMSTATISTICS 2
 	{ "_kmemstatistics",	0, 0, 0, 0 },
-#define	X_ZLIST		3
+#define	X_NCPUS		3
+	{ "_ncpus",	0, 0, 0, 0 },
+#define	X_ZLIST		4
 	{ "_zlist",	0, 0, 0, 0 },
 #ifdef notyet
-#define	X_DEFICIT	4
+#define	X_DEFICIT	5
 	{ "_deficit",	0, 0, 0, 0 },
-#define	X_FORKSTAT	5
+#define	X_FORKSTAT	6
 	{ "_forkstat",	0, 0, 0, 0 },
-#define X_REC		6
+#define X_REC		7
 	{ "_rectime",	0, 0, 0, 0 },
-#define X_PGIN		7
+#define X_PGIN		8
 	{ "_pgintime",	0, 0, 0, 0 },
-#define	X_XSTATS	8
+#define	X_XSTATS	9
 	{ "_xstats",	0, 0, 0, 0 },
-#define X_END		9
+#define X_END		10
 #else
-#define X_END		4
+#define X_END		5
 #endif
 	{ "", 0, 0, 0, 0 },
 };
+
+#define ONEMB	(1024L * 1024L)
+#define ONEKB	(1024L)
+
+LIST_HEAD(zlist, vm_zone);
 
 struct statinfo cur, last;
 int num_devices, maxshowdevs;
@@ -107,6 +115,9 @@ struct	vmstats vms, ovms;
 int	winlines = 20;
 int	nflag = 0;
 int	verbose = 0;
+int	unformatted_opt = 0;
+int	brief_opt = 0;
+int	ncpus;
 
 kvm_t *kd;
 
@@ -119,12 +130,14 @@ struct kinfo_cputime cp_time, old_cp_time, diff_cp_time;
 #define	TIMESTAT	0x10
 #define	VMSTAT		0x20
 #define ZMEMSTAT	0x40
+#define OCSTAT		0x80
 
 static void cpustats(void);
 static void dointr(void);
 static void domem(void);
+static void dooc(void);
 static void dosum(void);
-static void dozmem(void);
+static void dozmem(u_int interval, int reps);
 static void dovmstat(u_int, int);
 static void kread(int, void *, size_t);
 static void usage(void);
@@ -138,7 +151,8 @@ static void dotimes(void); /* Not implemented */
 static void doforkst(void);
 #endif
 static void printhdr(void);
-static void devstats(void);
+static const char *formatnum(intmax_t value, int width, int do10s);
+static void devstats(int dooutput);
 
 int
 main(int argc, char **argv)
@@ -152,8 +166,11 @@ main(int argc, char **argv)
 	memf = nlistf = NULL;
 	interval = reps = todo = 0;
 	maxshowdevs = 2;
-	while ((c = getopt(argc, argv, "c:fiM:mN:n:p:stvw:z")) != -1) {
+	while ((c = getopt(argc, argv, "bc:fiM:mN:n:op:stuvw:z")) != -1) {
 		switch (c) {
+		case 'b':
+			brief_opt = 1;
+			break;
 		case 'c':
 			reps = atoi(optarg);
 			break;
@@ -183,6 +200,9 @@ main(int argc, char **argv)
 				errx(1, "number of devices %d is < 0",
 				     maxshowdevs);
 			break;
+		case 'o':
+			todo |= OCSTAT;
+			break;
 		case 'p':
 			if (buildmatch(optarg, &matches, &num_matches) != 0)
 				errx(1, "%s", devstat_errbuf);
@@ -196,6 +216,9 @@ main(int argc, char **argv)
 #else
 			errx(EX_USAGE, "sorry, -t is not (re)implemented yet");
 #endif
+			break;
+		case 'u':
+			unformatted_opt = 1;
 			break;
 		case 'v':
 			++verbose;
@@ -220,8 +243,13 @@ main(int argc, char **argv)
 	 * Discard setgid privileges if not the running kernel so that bad
 	 * guys can't print interesting stuff from kernel memory.
 	 */
-	if (nlistf != NULL || memf != NULL)
+	if (nlistf != NULL || memf != NULL) {
 		setgid(getgid());
+		if (todo & OCSTAT) {
+			errx(1, "objcache stats can only be gathered on "
+			    "the running system");
+		}
+	}
 
 	kd = kvm_openfiles(nlistf, memf, NULL, O_RDONLY, errbuf);
 	if (kd == NULL)
@@ -230,7 +258,7 @@ main(int argc, char **argv)
 	if ((c = kvm_nlist(kd, namelist)) != 0) {
 		if (c > 0) {
 			warnx("undefined symbols:");
-			for (c = 0; c < (int)__arysize(namelist); c++)
+			for (c = 0; c < (int)NELEM(namelist); c++)
 				if (namelist[c].n_type == 0)
 					fprintf(stderr, " %s",
 					    namelist[c].n_name);
@@ -239,6 +267,8 @@ main(int argc, char **argv)
 			warnx("kvm_nlist: %s", kvm_geterr(kd));
 		exit(1);
 	}
+
+	kread(X_NCPUS, &ncpus, sizeof(ncpus));
 
 	if (todo & VMSTAT) {
 		struct winsize winsize;
@@ -283,7 +313,7 @@ main(int argc, char **argv)
 	if (todo & MEMSTAT)
 		domem();
 	if (todo & ZMEMSTAT)
-		dozmem();
+		dozmem(interval, reps);
 	if (todo & SUMSTAT)
 		dosum();
 #ifdef notyet
@@ -294,6 +324,8 @@ main(int argc, char **argv)
 		dointr();
 	if (todo & VMSTAT)
 		dovmstat(interval, reps);
+	if (todo & OCSTAT)
+		dooc();
 	exit(0);
 }
 
@@ -388,8 +420,11 @@ dovmstat(u_int interval, int reps)
 	size_t vms_size = sizeof(vms);
 	size_t vmt_size = sizeof(total);
 	int initial = 1;
+	int dooutput = 1;
 
 	signal(SIGCONT, needhdr);
+	if (reps != 0)
+		dooutput = 0;
 
 	for (hdrcnt = 1;;) {
 		if (!--hdrcnt)
@@ -448,51 +483,196 @@ dovmstat(u_int interval, int reps)
 		if (sysctlbyname("vm.vmmeter", &vmm, &vmm_size, NULL, 0)) {
 			perror("sysctlbyname: vm.vmmeter");
 			exit(1);
-		} 
+		}
 		if (sysctlbyname("vm.vmtotal", &total, &vmt_size, NULL, 0)) {
 			perror("sysctlbyname: vm.vmtotal");
 			exit(1);
-		} 
-		printf("%2ld %1ld %1ld",
-		    total.t_rq - 1, total.t_dw + total.t_pw, total.t_sw);
+		}
 
-#define vmstat_pgtok(a)	\
-	(intmax_t)(((intmax_t)(a) * vms.v_page_size) >> 10)
+		/*
+		 * Be a little inventive so we can squeeze everything into
+		 * 80 columns.  These days the run queue can trivially be
+		 * into the three digits and under heavy paging loads the
+		 * blocked (d+p) count can as well.
+		 */
+		if (dooutput) {
+			char b1[4];
+			char b2[4];
+			char b3[2];
+
+			strcpy(b1, "***");
+			strcpy(b2, "***");
+			strcpy(b3, "*");
+			if (total.t_rq - 1 < 1000) {
+				snprintf(b1, sizeof(b1),
+					 "%3ld", total.t_rq - 1);
+			}
+			if (total.t_dw + total.t_pw < 1000) {
+				snprintf(b2, sizeof(b2),
+					 "%3ld", total.t_dw + total.t_pw);
+			}
+			if (total.t_sw < 10) {
+				snprintf(b3, sizeof(b3), "%ld", total.t_sw);
+			}
+			printf("%s %s %s", b1, b2, b3);
+		}
+
 #define rate(x)		\
 	(intmax_t)(initial ? (x) : ((intmax_t)(x) * 1000 + interval / 2) \
 				   / interval)
 
-		printf(" %7jd %6jd ",
-		       vmstat_pgtok(total.t_avm),
-		       vmstat_pgtok(total.t_free));
-		printf("%4ju ",
-		       rate(vmm.v_vm_faults - ovmm.v_vm_faults));
-		printf("%3ju ",
-		       rate(vmm.v_reactivated - ovmm.v_reactivated));
-		printf("%3ju ",
-		       rate(vmm.v_swapin + vmm.v_vnodein -
-			    (ovmm.v_swapin + ovmm.v_vnodein)));
-		printf("%3ju ",
-		       rate(vmm.v_swapout + vmm.v_vnodeout -
-			    (ovmm.v_swapout + ovmm.v_vnodeout)));
-		printf("%3ju ",
-		       rate(vmm.v_tfree - ovmm.v_tfree));
-		printf("%3ju ",
-		       rate(vmm.v_pdpages - ovmm.v_pdpages));
-		devstats();
-		printf("%4ju %4ju %3ju ",
-		       rate(vmm.v_intr - ovmm.v_intr),
-		       rate(vmm.v_syscall - ovmm.v_syscall),
-		       rate(vmm.v_swtch - ovmm.v_swtch));
-		cpustats();
-		printf("\n");
-		fflush(stdout);
+		if (dooutput) {
+			printf(" %s ",
+			       formatnum((int64_t)total.t_free *
+					 vms.v_page_size,
+					 5, 1));
+			printf("%s ",
+			       formatnum(rate(vmm.v_vm_faults -
+					      ovmm.v_vm_faults),
+					 5, 1));
+			printf("%s ",
+			       formatnum(rate((vmm.v_reactivated -
+					      ovmm.v_reactivated) *
+					      vms.v_page_size),
+					 4, 1));
+			printf("%s ",
+			       formatnum(rate((vmm.v_swappgsin +
+					       vmm.v_vnodepgsin -
+					       ovmm.v_swappgsin -
+					       ovmm.v_vnodepgsin) *
+					      vms.v_page_size),
+					 4, 1));
+			printf("%s ",
+			       formatnum(rate((vmm.v_swappgsout +
+					       vmm.v_vnodepgsout -
+					       ovmm.v_swappgsout -
+					       ovmm.v_vnodepgsout) *
+					      vms.v_page_size),
+					 4, 1));
+			printf("%s ",
+			       formatnum(rate((vmm.v_tfree - ovmm.v_tfree) *
+					      vms.v_page_size), 4, 1));
+		}
+		devstats(dooutput);
+		if (dooutput) {
+			printf("%s ",
+			       formatnum(rate(vmm.v_intr - ovmm.v_intr),
+					 5, 1));
+			printf("%s ",
+			       formatnum(rate(vmm.v_syscall -
+					      ovmm.v_syscall),
+					 5, 1));
+			printf("%s ",
+			       formatnum(rate(vmm.v_swtch -
+					      ovmm.v_swtch),
+					 5, 1));
+			cpustats();
+			printf("\n");
+			fflush(stdout);
+		}
 		if (reps >= 0 && --reps <= 0)
 			break;
 		ovmm = vmm;
 		usleep(interval * 1000);
 		initial = 0;
+		dooutput = 1;
 	}
+}
+
+static const char *
+formatnum(intmax_t value, int width, int do10s)
+{
+	static char buf[16][64];
+	static int bi;
+	const char *fmt;
+	double d;
+
+	if (brief_opt)
+		do10s = 0;
+
+	bi = (bi + 1) % 16;
+
+	if (unformatted_opt) {
+		switch(width) {
+		case 4:
+			snprintf(buf[bi], sizeof(buf[bi]), "%4jd", value);
+			break;
+		case 5:
+			snprintf(buf[bi], sizeof(buf[bi]), "%5jd", value);
+			break;
+		default:
+			snprintf(buf[bi], sizeof(buf[bi]), "%jd", value);
+			break;
+		}
+		return buf[bi];
+	}
+
+	d = (double)value;
+	fmt = "n/a";
+
+	switch(width) {
+	case 4:
+		if (value < 1024) {
+			fmt = "%4.0f";
+		} else if (value < 10*1024) {
+			fmt = "%3.1fK";
+			d = d / 1024;
+		} else if (value < 1000*1024) {
+			fmt = "%3.0fK";
+			d = d / 1024;
+		} else if (value < 10*1024*1024) {
+			fmt = "%3.1fM";
+			d = d / (1024 * 1024);
+		} else if (value < 1000*1024*1024) {
+			fmt = "%3.0fM";
+			d = d / (1024 * 1024);
+		} else {
+			fmt = "%3.1fG";
+			d = d / (1024.0 * 1024.0 * 1024.0);
+		}
+		break;
+	case 5:
+		if (value < 1024) {
+			fmt = "%5.0f";
+		} else if (value < 10*1024) {
+			fmt = "%4.2fK";
+			d = d / 1024;
+		} else if (value < 100*1024 && do10s) {
+			fmt = "%4.1fK";
+			d = d / 1024;
+		} else if (value < 1000*1024) {
+			fmt = "%4.0fK";
+			d = d / 1024;
+		} else if (value < 10*1024*1024) {
+			fmt = "%4.2fM";
+			d = d / (1024 * 1024);
+		} else if (value < 100*1024*1024 && do10s) {
+			fmt = "%4.1fM";
+			d = d / (1024 * 1024);
+		} else if (value < 1000*1024*1024) {
+			fmt = "%4.0fM";
+			d = d / (1024 * 1024);
+		} else if (value < 10LL*1024*1024*1024) {
+			fmt = "%4.2fG";
+			d = d / (1024.0 * 1024.0 * 1024.0);
+		} else if (value < 100LL*1024*1024*1024 && do10s) {
+			fmt = "%4.1fG";
+			d = d / (1024.0 * 1024.0 * 1024.0);
+		} else if (value < 1000LL*1024*1024*1024) {
+			fmt = "%4.0fG";
+			d = d / (1024.0 * 1024.0 * 1024.0);
+		} else {
+			fmt = "%4.2fT";
+			d = d / (1024.0 * 1024.0 * 1024.0 * 1024.0);
+		}
+		break;
+	default:
+		fprintf(stderr, "formatnum: unsupported width %d\n", width);
+		exit(1);
+		break;
+	}
+	snprintf(buf[bi], sizeof(buf[bi]), fmt, d);
+	return buf[bi];
 }
 
 static void
@@ -501,20 +681,22 @@ printhdr(void)
 	int i, num_shown;
 
 	num_shown = (num_selected < maxshowdevs) ? num_selected : maxshowdevs;
-	printf(" procs      memory      page%*s", 19, "");
+	printf("--procs-- ---memory-- -------paging------ ");
 	if (num_shown > 1)
-		printf(" disks %*s", num_shown * 4 - 7, "");
+		printf("--disks%.*s",
+		       num_shown * 4 - 6,
+		       "---------------------------------");
 	else if (num_shown == 1)
 		printf("disk");
-	printf("   faults      cpu\n");
-	printf(" r b w     avm    fre  flt  re  pi  po  fr  sr ");
+	printf(" -----faults------ ---cpu---\n");
+	printf("  r   b w   fre   flt   re   pi   po   fr ");
 	for (i = 0; i < num_devices; i++)
 		if ((dev_select[i].selected)
 		 && (dev_select[i].selected <= maxshowdevs))
-			printf("%c%c%d ", dev_select[i].device_name[0],
+			printf(" %c%c%d ", dev_select[i].device_name[0],
 				     dev_select[i].device_name[1],
 				     dev_select[i].unit_number);
-	printf("  in   sy  cs us sy id\n");
+	printf("  int   sys   ctx us sy id\n");
 	hdrcnt = winlines - 2;
 }
 
@@ -594,14 +776,14 @@ dosum(void)
 	printf("%9u pages freed\n", vmm.v_tfree);
 	printf("%9u pages freed by daemon\n", vmm.v_dfree);
 	printf("%9u pages freed by exiting processes\n", vmm.v_pfree);
-	printf("%9u pages active\n", vms.v_active_count);
-	printf("%9u pages inactive\n", vms.v_inactive_count);
-	printf("%9u pages in VM cache\n", vms.v_cache_count);
-	printf("%9u pages wired down\n", vms.v_wire_count);
-	printf("%9u pages free\n", vms.v_free_count);
+	printf("%9lu pages active\n", vms.v_active_count);
+	printf("%9lu pages inactive\n", vms.v_inactive_count);
+	printf("%9lu pages in VM cache\n", vms.v_cache_count);
+	printf("%9lu pages wired down\n", vms.v_wire_count);
+	printf("%9lu pages free\n", vms.v_free_count);
 	printf("%9u bytes per page\n", vms.v_page_size);
 	printf("%9u global smp invltlbs\n", vmm.v_smpinvltlb);
-	
+
 	if ((nch_tmp = malloc(nch_size)) == NULL) {
 		perror("malloc");
 		exit(1);
@@ -617,7 +799,7 @@ dosum(void)
 			}
 		}
 	}
-	
+
 	cpucnt = nch_size / sizeof(struct nchstats);
 	kvm_nch_cpuagg(nch_tmp, &nchstats, cpucnt);
 
@@ -652,7 +834,7 @@ doforkst(void)
 #endif
 
 static void
-devstats(void)
+devstats(int dooutput)
 {
 	int dn;
 	long double transfers_per_second;
@@ -683,7 +865,8 @@ devstats(void)
 				  NULL, NULL) != 0)
 			errx(1, "%s", devstat_errbuf);
 
-		printf("%3.0Lf ", transfers_per_second);
+		if (dooutput)
+			printf("%s ", formatnum(transfers_per_second, 4, 0));
 	}
 }
 
@@ -773,27 +956,43 @@ dointr(void)
 				}
 				infop = irqinfo;
 			}
-			printf("%-*.*s %11lu %10lu\n", 
+			printf("%-*.*s %11lu %10lu\n",
 				nwidth, nwidth, infop,
 				intrcnt[i], intrcnt[i] / uptime);
 		}
 		inttotal += intrcnt[i];
 	}
-	printf("%-*.*s %11llu %10llu\n", 
+	printf("%-*.*s %11llu %10llu\n",
 		nwidth, nwidth, "Total",
 		(long long)inttotal, (long long)(inttotal / uptime));
 }
 
-#define	MAX_KMSTATS	1024
+#define	MAX_KMSTATS	16384
+
+enum ksuse { KSINUSE, KSMEMUSE, KSCALLS };
 
 static long
-cpuagg(size_t *ary)
+cpuagg(struct malloc_type *ks, enum ksuse use)
 {
     int i;
     long ttl;
 
-    for (i = ttl = 0; i < SMP_MAXCPU; ++i)
-	ttl += ary[i];
+    ttl = 0;
+
+    switch(use) {
+    case KSINUSE:
+	for (i = 0; i < ncpus; ++i)
+	    ttl += ks->ks_use[i].inuse;
+	break;
+    case KSMEMUSE:
+	for (i = 0; i < ncpus; ++i)
+	    ttl += ks->ks_use[i].memuse;
+	break;
+    case KSCALLS:
+	for (i = 0; i < ncpus; ++i)
+	    ttl += ks->ks_use[i].calls;
+    	break;
+    }
     return(ttl);
 }
 
@@ -801,9 +1000,9 @@ static void
 domem(void)
 {
 	struct malloc_type *ks;
-	int i, j;
-	int first, nkms;
-	long totuse = 0, totfree = 0, totreq = 0;
+	int i;
+	int nkms;
+	long totuse = 0, totreq = 0;
 	struct malloc_type kmemstats[MAX_KMSTATS], *kmsp;
 	char buf[1024];
 
@@ -812,73 +1011,181 @@ domem(void)
 		if (sizeof(kmemstats[0]) != kvm_read(kd, (u_long)kmsp,
 		    &kmemstats[nkms], sizeof(kmemstats[0])))
 			err(1, "kvm_read(%p)", (void *)kmsp);
-		if (sizeof(buf) !=  kvm_read(kd, 
+		if (sizeof(buf) !=  kvm_read(kd,
 	            (u_long)kmemstats[nkms].ks_shortdesc, buf, sizeof(buf)))
-			err(1, "kvm_read(%p)", 
+			err(1, "kvm_read(%p)",
 			    kmemstats[nkms].ks_shortdesc);
 		buf[sizeof(buf) - 1] = '\0';
 		kmemstats[nkms].ks_shortdesc = strdup(buf);
+		if (kmemstats[nkms].ks_use) {
+			size_t usebytes;
+			void *use;
+
+			usebytes = ncpus * sizeof(kmemstats[nkms].ks_use[0]);
+			use = malloc(usebytes);
+			if (kvm_read(kd, (u_long)kmemstats[nkms].ks_use,
+				     use, usebytes) != (ssize_t)usebytes) {
+				err(1, "kvm_read(%p)", kmemstats[nkms].ks_use);
+			}
+			kmemstats[nkms].ks_use = use;
+		}
 		kmsp = kmemstats[nkms].ks_next;
 	}
 	if (kmsp != NULL)
 		warnx("truncated to the first %d memory types", nkms);
 
 	printf(
-	    "\nMemory statistics by type                          Type  Kern\n");
-	printf(
-"              Type   InUse  MemUse HighUse       Limit  Requests  Limit Limit\n");
+	    "\nMemory statistics by type\n");
+	printf("               Type   Count  MemUse   Limit Requests\n");
 	for (i = 0, ks = &kmemstats[0]; i < nkms; i++, ks++) {
-		if (ks->ks_calls == 0)
+		long ks_inuse;
+		long ks_memuse;
+		long ks_calls;
+
+		ks_calls = cpuagg(ks, KSCALLS);
+		if (ks_calls == 0 && verbose == 0)
 			continue;
-		printf("%19s%7ld%7ldK%7ldK%11zuK%10jd%5u%6u",
-		    ks->ks_shortdesc,
-		    cpuagg(ks->ks_inuse), (cpuagg(ks->ks_memuse) + 1023) / 1024,
-		    (ks->ks_maxused + 1023) / 1024,
-		    (ks->ks_limit + 1023) / 1024, (intmax_t)ks->ks_calls,
-		    ks->ks_limblocks, ks->ks_mapblocks);
-		first = 1;
-		for (j =  1 << MINBUCKET; j < 1 << (MINBUCKET + 16); j <<= 1) {
-			if ((ks->ks_size & j) == 0)
-				continue;
-			if (first)
-				printf("  ");
-			else
-				printf(",");
-			if(j<1024)
-				printf("%d",j);
-			else
-				printf("%dK",j>>10);
-			first = 0;
-		}
-		printf("\n");
-		totuse += cpuagg(ks->ks_memuse);
-		totreq += ks->ks_calls;
+
+		ks_inuse = cpuagg(ks, KSINUSE);
+		ks_memuse = cpuagg(ks, KSMEMUSE);
+
+		printf("%19s   %s   %s   %s    %s\n",
+			ks->ks_shortdesc,
+			formatnum(ks_inuse, 5, 1),
+			formatnum(ks_memuse, 5, 1),
+			formatnum(ks->ks_limit, 5, 1),
+			formatnum(ks_calls, 5, 1));
+
+		totuse += ks_memuse;
+		totreq += ks_calls;
 	}
-	printf("\nMemory Totals:  In Use    Free    Requests\n");
-	printf("              %7ldK %6ldK    %8ld\n",
-	     (totuse + 1023) / 1024, (totfree + 1023) / 1024, totreq);
+	printf("\nMemory Totals:  In Use  Requests\n");
+	printf("                 %s  %s\n",
+		formatnum(totuse, 5, 1),
+		formatnum(totreq, 5, 1));
 }
 
 static void
-dozmem(void)
+dooc(void)
 {
-	char *buf;
-	size_t bufsize;
+	struct objcache_stats *stat, *s;
+	size_t len, count;
 
-	buf = NULL;
-	bufsize = 1024;
-	for (;;) {
-		if ((buf = realloc(buf, bufsize)) == NULL)
-			err(1, "realloc()");
-		if (sysctlbyname("vm.zone", buf, &bufsize, NULL, 0) == 0)
-			break;
-		if (errno != ENOMEM)
-			err(1, "sysctl()");
-		bufsize *= 2;
+	if (sysctlbyname("kern.objcache.stats", NULL, &len, NULL, 0) < 0)
+		errx(1, "objcache stats sysctl failed\n");
+
+	/* Add some extra space. */
+	stat = malloc(len + (8 * sizeof(*stat)));
+	if (sysctlbyname("kern.objcache.stats", stat, &len, NULL, 0) < 0)
+		errx(1, "objcache stats sysctl failed\n");
+
+	printf(
+	    "\nObjcache statistics by name\n");
+	printf("                 Name    Used  Cached   Limit Requests  Allocs Fails  Exhausts\n");
+	for (s = stat, count = 0; count < len; ++s) {
+		printf("%21s   %s   %s   %s    %s   %s  %s  %s\n",
+		    s->oc_name,
+		    formatnum(s->oc_used, 5, 1),
+		    formatnum(s->oc_cached, 5, 1),
+		    s->oc_limit < OBJCACHE_UNLIMITED ?
+		    formatnum(s->oc_limit, 5, 1) : "unlim",
+		    formatnum(s->oc_requested, 5, 1),
+		    formatnum(s->oc_allocated, 5, 1),
+		    formatnum(s->oc_failed, 4, 1),
+		    formatnum(s->oc_exhausted, 4, 1));
+
+		count += sizeof(*s);
 	}
-	buf[bufsize] = '\0'; /* play it safe */
-	printf("%s\n\n", buf);
-	free(buf);
+	free(stat);
+}
+
+#define MAXSAVE	16
+
+static void
+dozmem(u_int interval, int reps)
+{
+	struct zlist	zlist;
+	struct vm_zone	*kz;
+	struct vm_zone	zone;
+	struct vm_zone	save[MAXSAVE];
+	long zfreecnt_prev;
+	long znalloc_prev;
+	long zfreecnt_next;
+	long znalloc_next;
+	char name[64];
+	size_t namesz;
+	int first = 1;
+	int i;
+	int n;
+
+	bzero(save, sizeof(save));
+
+again:
+	kread(X_ZLIST, &zlist, sizeof(zlist));
+	kz = LIST_FIRST(&zlist);
+	i = 0;
+
+	while (kz) {
+		if (kvm_read(kd, (intptr_t)kz, &zone, sizeof(zone)) !=
+		    (ssize_t)sizeof(zone)) {
+			perror("kvm_read");
+			break;
+		}
+		zfreecnt_prev = save[i].zfreecnt;
+		znalloc_prev = save[i].znalloc;
+		for (n = 0; n < ncpus; ++n) {
+			zfreecnt_prev += save[i].zpcpu[n].zfreecnt;
+			znalloc_prev += save[i].zpcpu[n].znalloc;
+		}
+
+		zfreecnt_next = zone.zfreecnt;
+		znalloc_next = zone.znalloc;
+		for (n = 0; n < ncpus; ++n) {
+			zfreecnt_next += zone.zpcpu[n].zfreecnt;
+			znalloc_next += zone.zpcpu[n].znalloc;
+		}
+		save[i] = zone;
+
+		namesz = sizeof(name);
+		if (kvm_readstr(kd, (intptr_t)zone.zname, name, &namesz) == NULL) {
+			perror("kvm_read");
+			break;
+		}
+		if (first && interval) {
+			/* do nothing */
+		} else if (zone.zmax) {
+			printf("%-10s %9ld / %-9ld %5ldM used"
+			       " %6.2f%% ",
+				name,
+				(long)(zone.ztotal - zfreecnt_next),
+				(long)zone.zmax,
+				(long)zone.zpagecount * 4096 / (1024 * 1024),
+				(double)(zone.ztotal - zfreecnt_next) *
+					100.0 / (double)zone.zmax);
+		} else {
+			printf("%-10s %9ld             %5ldM used"
+			       "         ",
+				name,
+				(long)(zone.ztotal - zfreecnt_next),
+				(long)(zone.ztotal - zfreecnt_next) *
+					zone.zsize / (1024 * 1024));
+		}
+		if (first == 0) {
+			printf("use=%ld\n", znalloc_next - znalloc_prev);
+		} else if (interval == 0)
+			printf("\n");
+
+		kz = LIST_NEXT(&zone, zlink);
+		++i;
+	}
+	if (reps) {
+		first = 0;
+		fflush(stdout);
+		usleep(interval * 1000);
+		--reps;
+		printf("\n");
+		goto again;
+	}
 }
 
 /*
@@ -907,7 +1214,8 @@ static void
 usage(void)
 {
 	fprintf(stderr, "%s%s",
-		"usage: vmstat [-imsvz] [-c count] [-M core] [-N system] [-w wait]\n",
+		"usage: vmstat [-imsuvz] [-c count] [-M core] "
+		"[-N system] [-w wait]\n",
 		"              [-n devs] [disks]\n");
 	exit(1);
 }

@@ -10,11 +10,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -37,16 +33,17 @@
 #ifndef _SYS_SOCKET_H_
 #define	_SYS_SOCKET_H_
 
+#ifndef _SYS_CDEFS_H_
+#include <sys/cdefs.h>
+#endif
+
 #include <sys/_iovec.h>
 
 #ifndef _SYS_TYPES_H_
 #include <sys/types.h>
 #endif
+#include <machine/alignbytes.h>
 #include <machine/stdint.h>
-
-#define _NO_NAMESPACE_POLLUTION
-#include <machine/param.h>
-#undef _NO_NAMESPACE_POLLUTION
 
 /*
  * Definitions related to sockets: types, address families, options.
@@ -55,14 +52,16 @@
 /*
  * Data types.
  */
+#ifndef _SA_FAMILY_T_DECLARED
 typedef __uint8_t	sa_family_t;
+#define	_SA_FAMILY_T_DECLARED
+#endif
 
 #ifndef _SOCKLEN_T_DECLARED
-#define _SOCKLEN_T_DECLARED
+#define	_SOCKLEN_T_DECLARED
 typedef __socklen_t	socklen_t;
 #endif
 
- 
 /*
  * Types
  */
@@ -71,6 +70,18 @@ typedef __socklen_t	socklen_t;
 #define	SOCK_RAW	3		/* raw-protocol interface */
 #define	SOCK_RDM	4		/* reliably-delivered message */
 #define	SOCK_SEQPACKET	5		/* sequenced packet stream */
+
+/*
+ * Creation flags, OR'ed into socket() and socketpair() type argument.
+ */
+#define SOCK_CLOEXEC	0x10000000
+#define SOCK_NONBLOCK	0x20000000
+#ifdef _KERNEL
+/*
+ * For kern_accept(): don't inherit FNONBLOCK or FASYNC.
+ */
+#define SOCK_KERN_NOINHERIT 0x00100000
+#endif
 
 /*
  * Option flags per-socket.
@@ -88,16 +99,18 @@ typedef __socklen_t	socklen_t;
 #define	SO_TIMESTAMP	0x0400		/* timestamp received dgram traffic */
 #define	SO_NOSIGPIPE	0x0800		/* no SIGPIPE from EPIPE */
 #define	SO_ACCEPTFILTER	0x1000		/* there is an accept filter */
+#define	SO_RERROR	0x2000		/* Keep track of receive errors */
+#define SO_PASSCRED	0x4000		/* receive credentials */
 
 /*
  * Additional options, not kept in so_options.
  */
-#define SO_SNDBUF	0x1001		/* send buffer size */
-#define SO_RCVBUF	0x1002		/* receive buffer size */
-#define SO_SNDLOWAT	0x1003		/* send low-water mark */
-#define SO_RCVLOWAT	0x1004		/* receive low-water mark */
-#define SO_SNDTIMEO	0x1005		/* send timeout */
-#define SO_RCVTIMEO	0x1006		/* receive timeout */
+#define	SO_SNDBUF	0x1001		/* send buffer size */
+#define	SO_RCVBUF	0x1002		/* receive buffer size */
+#define	SO_SNDLOWAT	0x1003		/* send low-water mark */
+#define	SO_RCVLOWAT	0x1004		/* receive low-water mark */
+#define	SO_SNDTIMEO	0x1005		/* send timeout */
+#define	SO_RCVTIMEO	0x1006		/* receive timeout */
 #define	SO_ERROR	0x1007		/* get error status and clear */
 #define	SO_TYPE		0x1008		/* get socket type */
 /* 0x1009 reserved for FreeBSD compat */
@@ -140,9 +153,9 @@ struct	accept_filter_arg {
 #define	AF_DATAKIT	9		/* datakit protocols */
 #define	AF_CCITT	10		/* CCITT protocols, X.25 etc */
 #define	AF_SNA		11		/* IBM SNA */
-#define AF_DECnet	12		/* DECnet */
-#define AF_DLI		13		/* DEC Direct data link interface */
-#define AF_LAT		14		/* LAT */
+#define	AF_DECnet	12		/* DECnet */
+#define	AF_DLI		13		/* DEC Direct data link interface */
+#define	AF_LAT		14		/* LAT */
 #define	AF_HYLINK	15		/* NSC Hyperchannel */
 #define	AF_APPLETALK	16		/* Apple Talk */
 #define	AF_ROUTE	17		/* Internal Routing Protocol */
@@ -150,7 +163,7 @@ struct	accept_filter_arg {
 #define	pseudo_AF_XTP	19		/* eXpress Transfer Protocol (no AF) */
 #define	AF_COIP		20		/* connection-oriented IP, aka ST II */
 #define	AF_CNT		21		/* Computer Network Technology */
-#define pseudo_AF_RTIP	22		/* Help Identify RTIP packets */
+#define	pseudo_AF_RTIP	22		/* Help Identify RTIP packets */
 #define	AF_IPX		23		/* Novell Internet Protocol */
 #define	AF_SIP		24		/* Simple Internet Protocol */
 #define	pseudo_AF_PIP	25		/* Help Identify PIP packets */
@@ -160,7 +173,7 @@ struct	accept_filter_arg {
 #define	AF_INET6	28		/* IPv6 */
 #define	AF_NATM		29		/* native ATM access */
 #define	AF_ATM		30		/* ATM */
-#define pseudo_AF_HDRCMPLT 31		/* Used by BPF to not rewrite headers
+#define	pseudo_AF_HDRCMPLT 31		/* Used by BPF to not rewrite headers
 					 * in interface output routine
 					 */
 #define	AF_NETGRAPH	32		/* Netgraph sockets */
@@ -207,7 +220,7 @@ struct sockproto {
  * RFC 2553: protocol-independent placeholder for socket addresses
  */
 #define	_SS_MAXSIZE	128
-#define	_SS_ALIGNSIZE	(sizeof(int64_t))
+#define	_SS_ALIGNSIZE	(sizeof(__int64_t))
 #define	_SS_PAD1SIZE	(_SS_ALIGNSIZE - sizeof(unsigned char) - sizeof(sa_family_t))
 #define	_SS_PAD2SIZE	(_SS_MAXSIZE - sizeof(unsigned char) - sizeof(sa_family_t) - \
 				_SS_PAD1SIZE - _SS_ALIGNSIZE)
@@ -237,9 +250,9 @@ struct sockaddr_storage {
 #define	PF_DATAKIT	AF_DATAKIT
 #define	PF_CCITT	AF_CCITT
 #define	PF_SNA		AF_SNA
-#define PF_DECnet	AF_DECnet
-#define PF_DLI		AF_DLI
-#define PF_LAT		AF_LAT
+#define	PF_DECnet	AF_DECnet
+#define	PF_DLI		AF_DLI
+#define	PF_LAT		AF_LAT
 #define	PF_HYLINK	AF_HYLINK
 #define	PF_APPLETALK	AF_APPLETALK
 #define	PF_ROUTE	AF_ROUTE
@@ -249,8 +262,8 @@ struct sockaddr_storage {
 #define	PF_CNT		AF_CNT
 #define	PF_SIP		AF_SIP
 #define	PF_IPX		AF_IPX		/* same format as AF_NS */
-#define PF_RTIP		pseudo_AF_RTIP	/* same format as AF_INET */
-#define PF_PIP		pseudo_AF_PIP
+#define	PF_RTIP		pseudo_AF_RTIP	/* same format as AF_INET */
+#define	PF_PIP		pseudo_AF_PIP
 #define	PF_ISDN		AF_ISDN
 #define	PF_KEY		pseudo_AF_KEY
 #define	PF_INET6	AF_INET6
@@ -269,9 +282,9 @@ struct sockaddr_storage {
  *
  * Further levels are defined by the individual families below.
  */
-#define NET_MAXID	AF_MAX
+#define	NET_MAXID	AF_MAX
 
-#define CTL_NET_NAMES { \
+#define	CTL_NET_NAMES { \
 	{ 0, 0 }, \
 	{ "unix", CTLTYPE_NODE }, \
 	{ "inet", CTLTYPE_NODE }, \
@@ -316,12 +329,12 @@ struct sockaddr_storage {
  *	Fifth: type of info, defined below
  *	Sixth: flag(s) to mask with for NET_RT_FLAGS
  */
-#define NET_RT_DUMP	1		/* dump; may limit to a.f. */
-#define NET_RT_FLAGS	2		/* by flags, e.g. RESOLVING */
-#define NET_RT_IFLIST	3		/* survey interface list */
+#define	NET_RT_DUMP	1		/* dump; may limit to a.f. */
+#define	NET_RT_FLAGS	2		/* by flags, e.g. RESOLVING */
+#define	NET_RT_IFLIST	3		/* survey interface list */
 #define	NET_RT_MAXID	4
 
-#define CTL_NET_RT_NAMES { \
+#define	CTL_NET_RT_NAMES { \
 	{ 0, 0 }, \
 	{ "dump", CTLTYPE_STRUCT }, \
 	{ "flags", CTLTYPE_STRUCT }, \
@@ -336,7 +349,8 @@ struct sockaddr_storage {
 /*
  * Maximum setsockopt buffer size
  */
-#define SOMAXOPT_SIZE	65536
+#define	SOMAXOPT_SIZE	65536
+#define	SOMAXOPT_SIZE0	(32 * 1024 * 1024)	/* for root getsockopt */
 
 /*
  * Message header for recvmsg and sendmsg calls.
@@ -361,18 +375,20 @@ struct msghdr {
 #define	MSG_WAITALL	0x00000040	/* wait for full request or error */
 #define	MSG_DONTWAIT	0x00000080	/* this message should be nonblocking */
 #define	MSG_EOF		0x00000100	/* data completes connection */
-#define	MSG_NOTIFICATION 0x00000200	/* notification message */
+#define	MSG_UNUSED09	0x00000200	/* was: notification message (SCTP) */
 #define	MSG_NOSIGNAL	0x00000400	/* No SIGPIPE to unconnected socket stream */
 #define	MSG_SYNC	0x00000800	/* No asynchronized pru_send */
-
+#define	MSG_CMSG_CLOEXEC 0x00001000	/* make received fds close-on-exec */
+/* 0x2000 unused */
+/* 0x4000 unused */
+/* 0x8000 unused */
 /*
  * These override FIONBIO.  MSG_FNONBLOCKING is functionally equivalent to
  * MSG_DONTWAIT.
  */
-#define MSG_FBLOCKING	0x00010000	/* force blocking operation */
-#define MSG_FNONBLOCKING 0x00020000	/* force non-blocking operation */
-
-#define MSG_FMASK	0xFFFF0000	/* force mask */
+#define	MSG_FBLOCKING	0x00010000	/* force blocking operation */
+#define	MSG_FNONBLOCKING 0x00020000	/* force non-blocking operation */
+#define	MSG_FMASK	0xFFFF0000	/* force mask */
 
 /*
  * Header for ancillary data objects in msg_control buffer.
@@ -392,7 +408,7 @@ struct cmsghdr {
  * be able to fit in an mbuf, and NGROUPS_MAX is too large to allow
  * this.
 */
-#define CMGROUP_MAX 16
+#define	CMGROUP_MAX 16
 
 /*
  * Credentials structure, used to verify the identity of a peer
@@ -411,10 +427,10 @@ struct cmsgcred {
 };
 
 /* Alignment requirement for CMSG struct manipulation */
-#define _CMSG_ALIGN(n)		(((n) + 3) & ~3)
+#define	_CMSG_ALIGN(n)		(((n) + __ALIGNBYTES) & ~__ALIGNBYTES)
 
 #ifdef _KERNEL
-#define CMSG_ALIGN(n)		_CMSG_ALIGN(n)
+#define	CMSG_ALIGN(n)		_CMSG_ALIGN(n)
 #endif
 
 /* given pointer to struct cmsghdr, return pointer to data */
@@ -423,11 +439,11 @@ struct cmsgcred {
 
 /* given pointer to struct cmsghdr, return pointer to next cmsghdr */
 #define	CMSG_NXTHDR(mhdr, cmsg)	\
-	(((caddr_t)(cmsg) + _CMSG_ALIGN((cmsg)->cmsg_len) + \
+	(((char *)(cmsg) + _CMSG_ALIGN((cmsg)->cmsg_len) + \
 	  _CMSG_ALIGN(sizeof(struct cmsghdr)) > \
-	    (caddr_t)(mhdr)->msg_control + (mhdr)->msg_controllen) ? \
+	    (char *)(mhdr)->msg_control + (mhdr)->msg_controllen) ? \
 	    NULL : \
-	    (struct cmsghdr *)((caddr_t)(cmsg) + _CMSG_ALIGN((cmsg)->cmsg_len)))
+	    (struct cmsghdr *)((char *)(cmsg) + _CMSG_ALIGN((cmsg)->cmsg_len)))
 
 /*
  * RFC 2292 requires to check msg_controllen, in case that the kernel returns
@@ -439,7 +455,7 @@ struct cmsgcred {
 	 NULL)
 
 /* RFC 2292 additions */
-	
+
 #define	CMSG_SPACE(l)		(_CMSG_ALIGN(sizeof(struct cmsghdr)) + _CMSG_ALIGN(l))
 #define	CMSG_LEN(l)		(_CMSG_ALIGN(sizeof(struct cmsghdr)) + (l))
 
@@ -467,46 +483,35 @@ struct sf_hdtr {
 
 #if !defined(_KERNEL) || defined(_KERNEL_VIRTUAL)
 
-#ifndef _SYS_CDEFS_H_
-#include <sys/cdefs.h>
-#endif
-
 __BEGIN_DECLS
-int	accept (int, struct sockaddr *, socklen_t *);
-int	extaccept (int, int, struct sockaddr *, socklen_t *);
-int	bind (int, const struct sockaddr *, socklen_t);
-int	connect (int, const struct sockaddr *, socklen_t);
-int	extconnect (int, int, struct sockaddr *, socklen_t);
-int	getpeername (int, struct sockaddr *, socklen_t *);
-int	getsockname (int, struct sockaddr *, socklen_t *);
-int	getsockopt (int, int, int, void *, socklen_t *);
-int	listen (int, int);
-ssize_t	recv (int, void *, size_t, int);
-ssize_t	recvfrom (int, void *, size_t, int, struct sockaddr *, socklen_t *);
-ssize_t	recvmsg (int, struct msghdr *, int);
-ssize_t	send (int, const void *, size_t, int);
-ssize_t	sendto (int, const void *,
+int	accept(int, struct sockaddr * __restrict, socklen_t * __restrict);
+int	accept4(int, struct sockaddr *, socklen_t *, int);
+int	extaccept(int, int, struct sockaddr *, socklen_t *);
+int	bind(int, const struct sockaddr *, socklen_t);
+int	connect(int, const struct sockaddr *, socklen_t);
+int	extconnect(int, int, struct sockaddr *, socklen_t);
+int	getpeername(int, struct sockaddr * __restrict, socklen_t * __restrict);
+int	getsockname(int, struct sockaddr * __restrict, socklen_t * __restrict);
+int	getsockopt(int, int, int, void * __restrict, socklen_t * __restrict);
+int	listen(int, int);
+ssize_t	recv(int, void *, size_t, int);
+ssize_t	recvfrom(int, void * __restrict, size_t, int,
+	    struct sockaddr * __restrict, socklen_t * __restrict);
+ssize_t	recvmsg(int, struct msghdr *, int);
+ssize_t	send(int, const void *, size_t, int);
+ssize_t	sendto(int, const void *,
 	    size_t, int, const struct sockaddr *, socklen_t);
-ssize_t	sendmsg (int, const struct msghdr *, int);
-int	sendfile (int, int, off_t, size_t, struct sf_hdtr *, off_t *, int);
-int	setsockopt (int, int, int, const void *, socklen_t);
-int	shutdown (int, int);
+ssize_t	sendmsg(int, const struct msghdr *, int);
+int	sendfile(int, int, off_t, size_t, struct sf_hdtr *, off_t *, int);
+int	setsockopt(int, int, int, const void *, socklen_t);
+int	shutdown(int, int);
 int	sockatmark(int);
-int	socketpair (int, int, int, int *);
+int	socket(int, int, int);
+int	socketpair(int, int, int, int *);
 
-void	pfctlinput (int, struct sockaddr *);
+void	pfctlinput(int, struct sockaddr *);
 __END_DECLS
 
-#endif /* !_KERNEL */
-
-#if !defined(_KERNEL) || defined(_KERNEL_VIRTUAL)
-#ifndef _SYS_CDEFS_H_
-#include <sys/cdefs.h>
-#endif
-
-__BEGIN_DECLS
-int	socket (int, int, int);
-__END_DECLS
 #endif	/* !_KERNEL || _KERNEL_VIRTUAL */
 
 #endif /* !_SYS_SOCKET_H_ */

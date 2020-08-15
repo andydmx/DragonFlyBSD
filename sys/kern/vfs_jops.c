@@ -30,8 +30,6 @@
  * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT
  * OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
- *
- * $DragonFly: src/sys/kern/vfs_jops.c,v 1.36 2007/08/21 17:43:52 dillon Exp $
  */
 /*
  * Each mount point may have zero or more independantly configured journals
@@ -73,7 +71,6 @@
 #include <vm/vnode_pager.h>
 
 #include <sys/file2.h>
-#include <sys/thread2.h>
 
 static int journal_attach(struct mount *mp);
 static void journal_detach(struct mount *mp);
@@ -703,7 +700,7 @@ jrecord_undo_file(struct jrecord *jrec, struct vnode *vp, int jrflags,
 	if ((jrflags & JRUNDO_FLAGS) && attr.va_flags != VNOVAL)
 	    jrecord_leaf(jrec, JLEAF_FLAGS, &attr.va_flags, sizeof(attr.va_flags));
 	if ((jrflags & JRUNDO_UDEV) && attr.va_rmajor != VNOVAL) {
-	    udev_t rdev = makeudev(attr.va_rmajor, attr.va_rminor);
+	    dev_t rdev = makeudev(attr.va_rmajor, attr.va_rminor);
 	    jrecord_leaf(jrec, JLEAF_UDEV, &rdev, sizeof(rdev));
 	    jrecord_leaf(jrec, JLEAF_UMAJOR, &attr.va_rmajor, sizeof(attr.va_rmajor));
 	    jrecord_leaf(jrec, JLEAF_UMINOR, &attr.va_rminor, sizeof(attr.va_rminor));
@@ -939,7 +936,7 @@ journal_fsync(struct vop_fsync_args *ap)
 }
 
 /*
- * Journal vop_putpages { a_vp, a_m, a_count, a_sync, a_rtvals, a_offset }
+ * Journal vop_putpages { a_vp, a_m, a_count, a_flags, a_rtvals, a_offset }
  *
  * note: a_count is in bytes.
  */

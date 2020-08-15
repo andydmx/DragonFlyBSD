@@ -46,6 +46,7 @@ unsigned char	dont[] = { IAC, DONT, '%', 'c', 0 };
 unsigned char	will[] = { IAC, WILL, '%', 'c', 0 };
 unsigned char	wont[] = { IAC, WONT, '%', 'c', 0 };
 int	not42 = 1;
+char	*terminaltype;
 
 /*
  * Buffer for sub-options, and macros
@@ -521,6 +522,7 @@ willoption(int option)
 			slctab[SLC_XON].defset.flag |= SLC_DEFAULT;
 			slctab[SLC_XOFF].defset.flag &= ~SLC_LEVELBITS;
 			slctab[SLC_XOFF].defset.flag |= SLC_DEFAULT;
+			/* FALLTHROUGH */
 		case TELOPT_TTYPE:
 		case TELOPT_SGA:
 		case TELOPT_NAWS:
@@ -1638,8 +1640,10 @@ output_data(const char *format, ...)
 	char *buf;
 
 	va_start(args, format);
-	if ((len = vasprintf(&buf, format, args)) == -1)
+	if ((len = vasprintf(&buf, format, args)) == -1) {
+		va_end(args);
 		return -1;
+	}
 	output_datalen(buf, len);
 	va_end(args);
 	free(buf);

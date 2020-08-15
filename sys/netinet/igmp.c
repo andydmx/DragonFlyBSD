@@ -71,6 +71,9 @@
 #include <netinet/igmp.h>
 #include <netinet/igmp_var.h>
 
+#define IGMP_FASTTIMO		(hz / PR_FASTHZ)
+#define IGMP_SLOWTIMO		(hz / PR_SLOWHZ)
+
 static MALLOC_DEFINE(M_IGMP, "igmp", "igmp state");
 
 static struct router_info *
@@ -87,12 +90,16 @@ static u_long igmp_all_rtrs_group;
 static struct mbuf *router_alert;
 static struct router_info *Head;
 
-static struct netmsg_base igmp_slowtimo_netmsg;
-static struct netmsg_base igmp_fasttimo_netmsg;
-
 static void igmp_sendpkt (struct in_multi *, int, unsigned long);
-static void igmp_slowtimo_dispatch(netmsg_t);
 static void igmp_fasttimo_dispatch(netmsg_t);
+static void igmp_fasttimo(void *);
+static void igmp_slowtimo_dispatch(netmsg_t);
+static void igmp_slowtimo(void *);
+
+static struct netmsg_base igmp_slowtimo_netmsg;
+static struct callout igmp_slowtimo_ch;
+static struct netmsg_base igmp_fasttimo_netmsg;
+static struct callout igmp_fasttimo_ch;
 
 void
 igmp_init(void)
@@ -110,7 +117,7 @@ igmp_init(void)
 	/*
 	 * Construct a Router Alert option to use in outgoing packets
 	 */
-	MGET(router_alert, MB_DONTWAIT, MT_DATA);
+	MGET(router_alert, M_NOWAIT, MT_DATA);
 	ra = mtod(router_alert, struct ipoption *);
 	ra->ipopt_dst.s_addr = 0;
 	ra->ipopt_list[0] = IPOPT_RA;	/* Router Alert Option */
@@ -121,10 +128,18 @@ igmp_init(void)
 
 	Head = NULL;
 
+	callout_init_mp(&igmp_slowtimo_ch);
 	netmsg_init(&igmp_slowtimo_netmsg, NULL, &netisr_adone_rport,
 	    MSGF_PRIORITY, igmp_slowtimo_dispatch);
+
+	callout_init_mp(&igmp_fasttimo_ch);
 	netmsg_init(&igmp_fasttimo_netmsg, NULL, &netisr_adone_rport,
 	    MSGF_PRIORITY, igmp_fasttimo_dispatch);
+
+	callout_reset_bycpu(&igmp_slowtimo_ch, IGMP_SLOWTIMO,
+	    igmp_slowtimo, NULL, 0);
+	callout_reset_bycpu(&igmp_fasttimo_ch, IGMP_FASTTIMO,
+	    igmp_fasttimo, NULL, 0);
 }
 
 static struct router_info *
@@ -383,20 +398,16 @@ igmp_leavegroup(struct in_multi *inm)
 }
 
 static void
-igmp_fasttimo_ipi(void *arg __unused)
+igmp_fasttimo(void *dummy __unused)
 {
-	struct lwkt_msg *msg = &igmp_fasttimo_netmsg.lmsg;
+	struct netmsg_base *msg = &igmp_fasttimo_netmsg;
+
+	KKASSERT(mycpuid == 0);
 
 	crit_enter();
-	if (msg->ms_flags & MSGF_DONE)
-		lwkt_sendmsg_oncpu(netisr_cpuport(0), msg);
+	if (msg->lmsg.ms_flags & MSGF_DONE)
+		netisr_sendmsg_oncpu(msg);
 	crit_exit();
-}
-
-void
-igmp_fasttimo(void)
-{
-	lwkt_send_ipiq_bycpu(0, igmp_fasttimo_ipi, NULL);
 }
 
 static void
@@ -405,8 +416,10 @@ igmp_fasttimo_dispatch(netmsg_t nmsg)
 	struct in_multi *inm;
 	struct in_multistep step;
 
+	ASSERT_NETISR0;
+
 	crit_enter();
-	lwkt_replymsg(&nmsg->lmsg, 0);	/* reply ASAP */
+	netisr_replymsg(&nmsg->base, 0);	/* reply ASAP */
 	crit_exit();
 
 	/*
@@ -415,7 +428,7 @@ igmp_fasttimo_dispatch(netmsg_t nmsg)
 	 */
 
 	if (!igmp_timers_are_running)
-		return;
+		goto done;
 
 	igmp_timers_are_running = 0;
 	IN_FIRST_MULTI(step, inm);
@@ -430,23 +443,21 @@ igmp_fasttimo_dispatch(netmsg_t nmsg)
 		}
 		IN_NEXT_MULTI(step, inm);
 	}
+done:
+	callout_reset(&igmp_fasttimo_ch, IGMP_FASTTIMO, igmp_fasttimo, NULL);
 }
 
 static void
-igmp_slowtimo_ipi(void *arg __unused)
+igmp_slowtimo(void *dummy __unused)
 {
-	struct lwkt_msg *msg = &igmp_slowtimo_netmsg.lmsg;
+	struct netmsg_base *msg = &igmp_slowtimo_netmsg;
+
+	KKASSERT(mycpuid == 0);
 
 	crit_enter();
-	if (msg->ms_flags & MSGF_DONE)
-		lwkt_sendmsg_oncpu(netisr_cpuport(0), msg);
+	if (msg->lmsg.ms_flags & MSGF_DONE)
+		netisr_sendmsg_oncpu(msg);
 	crit_exit();
-}
-
-void
-igmp_slowtimo(void)
-{
-	lwkt_send_ipiq_bycpu(0, igmp_slowtimo_ipi, NULL);
 }
 
 static void
@@ -454,8 +465,10 @@ igmp_slowtimo_dispatch(netmsg_t nmsg)
 {
 	struct router_info *rti = Head;
 
+	ASSERT_NETISR0;
+
 	crit_enter();
-	lwkt_replymsg(&nmsg->lmsg, 0);	/* reply ASAP */
+	netisr_replymsg(&nmsg->base, 0);	/* reply ASAP */
 	crit_exit();
 
 #ifdef IGMP_DEBUG
@@ -473,6 +486,7 @@ igmp_slowtimo_dispatch(netmsg_t nmsg)
 #ifdef IGMP_DEBUG	
 	kprintf("[igmp.c,_slowtimo] -- > exiting \n");
 #endif
+	callout_reset(&igmp_slowtimo_ch, IGMP_SLOWTIMO, igmp_slowtimo, NULL);
 }
 
 static struct route igmprt;
@@ -485,7 +499,7 @@ igmp_sendpkt(struct in_multi *inm, int type, unsigned long addr)
 	struct ip *ip;
 	struct ip_moptions imo;
 
-	MGETHDR(m, MB_DONTWAIT, MT_HEADER);
+	MGETHDR(m, M_NOWAIT, MT_HEADER);
 	if (m == NULL)
 		return;
 

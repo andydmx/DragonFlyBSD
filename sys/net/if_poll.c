@@ -42,6 +42,7 @@
 #include <sys/msgport2.h>
 
 #include <net/if.h>
+#include <net/if_var.h>
 #include <net/if_poll.h>
 #include <net/netmsg2.h>
 #include <net/netisr2.h>
@@ -62,6 +63,13 @@
  *   ifpoll_info.ifpi_tx[n].poll_func == NULL
  *     No TX polling handler will be installed on CPU(n)
  *
+ * Serializer field of ifpoll_info.ifpi_status and ifpoll_info.ifpi_tx[n]
+ * must _not_ be NULL.  The serializer will be held before the status_func
+ * and poll_func being called.  Serializer field of ifpoll_info.ifpi_rx[n]
+ * can be NULL, but the interface's if_flags must have IFF_IDIRECT set,
+ * which indicates that the network processing of the input packets is
+ * running directly instead of being redispatched.
+ *
  * RX is polled at the specified polling frequency (net.ifpoll.X.pollhz).
  * TX and status polling could be done at lower frequency than RX frequency
  * (net.ifpoll.0.status_frac and net.ifpoll.X.tx_frac).  To avoid systimer
@@ -69,9 +77,9 @@
  * piggyback (XXX).
  *
  * All of the registered polling handlers are called only if the interface
- * is marked as 'IFF_RUNNING and IFF_NPOLLING'.  However, the interface's
- * register and deregister function (ifnet.if_npoll) will be called even
- * if interface is not marked with 'IFF_RUNNING'.
+ * is marked as IFF_UP, IFF_RUNNING and IFF_NPOLLING.  However, the
+ * interface's register and deregister function (ifnet.if_npoll) will be
+ * called even if interface is not marked with IFF_RUNNING or IFF_UP.
  *
  * If registration is successful, the driver must disable interrupts,
  * and further I/O is performed through the TX/RX polling handler, which
@@ -153,7 +161,7 @@ struct iopoll_ctx {
 
 	struct sysctl_ctx_list	poll_sysctl_ctx;
 	struct sysctl_oid	*poll_sysctl_tree;
-} __cachealign;
+};
 
 struct poll_comm {
 	struct systimer		pollclock;
@@ -169,7 +177,7 @@ struct poll_comm {
 
 	struct sysctl_ctx_list	sysctl_ctx;
 	struct sysctl_oid	*sysctl_tree;
-} __cachealign;
+};
 
 struct stpoll_rec {
 	struct lwkt_serialize	*serializer;
@@ -192,7 +200,7 @@ struct iopoll_sysctl_netmsg {
 	struct iopoll_ctx	*ctx;
 };
 
-void		ifpoll_init_pcpu(int);
+static void	ifpoll_init_pcpu(int);
 static void	ifpoll_register_handler(netmsg_t);
 static void	ifpoll_deregister_handler(netmsg_t);
 
@@ -300,7 +308,7 @@ static __inline void
 ifpoll_sendmsg_oncpu(netmsg_t msg)
 {
 	if (msg->lmsg.ms_flags & MSGF_DONE)
-		lwkt_sendmsg_oncpu(netisr_cpuport(mycpuid), &msg->lmsg);
+		netisr_sendmsg_oncpu(&msg->base);
 }
 
 static __inline void
@@ -316,19 +324,27 @@ sched_iopoll(struct iopoll_ctx *io_ctx)
 }
 
 static __inline void
-sched_iopollmore(struct iopoll_ctx *io_ctx)
+sched_iopollmore(struct iopoll_ctx *io_ctx, boolean_t direct)
 {
-	ifpoll_sendmsg_oncpu((netmsg_t)&io_ctx->poll_more_netmsg);
+
+	if (!direct) {
+		ifpoll_sendmsg_oncpu((netmsg_t)&io_ctx->poll_more_netmsg);
+	} else {
+		struct netmsg_base *nmsg = &io_ctx->poll_more_netmsg;
+
+		nmsg->lmsg.ms_flags &= ~(MSGF_REPLY | MSGF_DONE);
+		nmsg->lmsg.ms_flags |= MSGF_SYNC;
+		nmsg->nm_dispatch((netmsg_t)nmsg);
+		KKASSERT(nmsg->lmsg.ms_flags & MSGF_DONE);
+	}
 }
 
 /*
- * Initialize per-cpu polling(4) context.  Called from kern_clock.c:
+ * Initialize per-cpu polling(4) context.
  */
-void
+static void
 ifpoll_init_pcpu(int cpuid)
 {
-	if (cpuid >= ncpus2)
-		return;
 
 	poll_comm_init(cpuid);
 
@@ -338,6 +354,25 @@ ifpoll_init_pcpu(int cpuid)
 
 	poll_comm_start(cpuid);
 }
+
+static void
+ifpoll_init_handler(netmsg_t msg)
+{
+	int cpu = mycpuid;
+
+	ifpoll_init_pcpu(cpu);
+	netisr_forwardmsg(&msg->base, cpu + 1);
+}
+
+static void
+ifpoll_sysinit(void *dummy __unused)
+{
+	struct netmsg_base msg;
+
+	netmsg_init(&msg, NULL, &curthread->td_msgport, 0, ifpoll_init_handler);
+	netisr_domsg_global(&msg);
+}
+SYSINIT(ifpoll, SI_SUB_PRE_DRIVERS, SI_ORDER_ANY, ifpoll_sysinit, NULL);
 
 int
 ifpoll_register(struct ifnet *ifp)
@@ -377,7 +412,7 @@ ifpoll_register(struct ifnet *ifp)
 		    0, ifpoll_register_handler);
 	nmsg.lmsg.u.ms_resultp = info;
 
-	error = lwkt_domsg(netisr_cpuport(0), &nmsg.lmsg, 0);
+	error = netisr_domsg_global(&nmsg);
 	if (error) {
 		if (!ifpoll_deregister(ifp)) {
 			if_printf(ifp, "ifpoll_register: "
@@ -412,7 +447,7 @@ ifpoll_deregister(struct ifnet *ifp)
 		    0, ifpoll_deregister_handler);
 	nmsg.lmsg.u.ms_resultp = ifp;
 
-	error = lwkt_domsg(netisr_cpuport(0), &nmsg.lmsg, 0);
+	error = netisr_domsg_global(&nmsg);
 	if (!error) {
 		ifnet_serialize_all(ifp);
 		ifp->if_npoll(ifp, NULL);
@@ -425,10 +460,10 @@ static void
 ifpoll_register_handler(netmsg_t nmsg)
 {
 	const struct ifpoll_info *info = nmsg->lmsg.u.ms_resultp;
-	int cpuid = mycpuid, nextcpu;
+	int cpuid = mycpuid;
 	int error;
 
-	KKASSERT(cpuid < ncpus2);
+	KKASSERT(cpuid < netisr_ncpus);
 	KKASSERT(&curthread->td_msgport == netisr_cpuport(cpuid));
 
 	if (cpuid == 0) {
@@ -450,23 +485,19 @@ ifpoll_register_handler(netmsg_t nmsg)
 	/* Adjust polling frequency, after all registration is done */
 	poll_comm_adjust_pollhz(poll_common[cpuid]);
 
-	nextcpu = cpuid + 1;
-	if (nextcpu < ncpus2)
-		lwkt_forwardmsg(netisr_cpuport(nextcpu), &nmsg->lmsg);
-	else
-		lwkt_replymsg(&nmsg->lmsg, 0);
+	netisr_forwardmsg(&nmsg->base, cpuid + 1);
 	return;
 failed:
-	lwkt_replymsg(&nmsg->lmsg, error);
+	netisr_replymsg(&nmsg->base, error);
 }
 
 static void
 ifpoll_deregister_handler(netmsg_t nmsg)
 {
 	struct ifnet *ifp = nmsg->lmsg.u.ms_resultp;
-	int cpuid = mycpuid, nextcpu;
+	int cpuid = mycpuid;
 
-	KKASSERT(cpuid < ncpus2);
+	KKASSERT(cpuid < netisr_ncpus);
 	KKASSERT(&curthread->td_msgport == netisr_cpuport(cpuid));
 
 	/* Ignore errors */
@@ -478,11 +509,7 @@ ifpoll_deregister_handler(netmsg_t nmsg)
 	/* Adjust polling frequency, after all deregistration is done */
 	poll_comm_adjust_pollhz(poll_common[cpuid]);
 
-	nextcpu = cpuid + 1;
-	if (nextcpu < ncpus2)
-		lwkt_forwardmsg(netisr_cpuport(nextcpu), &nmsg->lmsg);
-	else
-		lwkt_replymsg(&nmsg->lmsg, 0);
+	netisr_forwardmsg(&nmsg->base, cpuid + 1);
 }
 
 static void
@@ -517,12 +544,12 @@ stpoll_handler(netmsg_t msg)
 	struct thread *td = curthread;
 	int i;
 
-	KKASSERT(&td->td_msgport == netisr_cpuport(0));
+	ASSERT_NETISR0;
 
 	crit_enter_quick(td);
 
 	/* Reply ASAP */
-	lwkt_replymsg(&msg->lmsg, 0);
+	netisr_replymsg(&msg->base, 0);
 
 	if (st_ctx->poll_handlers == 0) {
 		crit_exit_quick(td);
@@ -566,7 +593,7 @@ stpoll_register(struct ifnet *ifp, const struct ifpoll_status *st_rec)
 	struct stpoll_ctx *st_ctx = &stpoll_context;
 	int error;
 
-	KKASSERT(&curthread->td_msgport == netisr_cpuport(0));
+	ASSERT_NETISR0;
 
 	if (st_rec->status_func == NULL)
 		return 0;
@@ -609,7 +636,7 @@ stpoll_deregister(struct ifnet *ifp)
 	struct stpoll_ctx *st_ctx = &stpoll_context;
 	int i, error;
 
-	KKASSERT(&curthread->td_msgport == netisr_cpuport(0));
+	ASSERT_NETISR0;
 
 	for (i = 0; i < st_ctx->poll_handlers; ++i) {
 		if (st_ctx->pr[i].ifp == ifp) /* Found it */
@@ -645,7 +672,7 @@ iopoll_reset_state(struct iopoll_ctx *io_ctx)
 static void
 iopoll_init(int cpuid)
 {
-	KKASSERT(cpuid < ncpus2);
+	KKASSERT(cpuid < netisr_ncpus);
 
 	rxpoll_context[cpuid] = iopoll_ctx_create(cpuid, IFPOLL_RX);
 	txpoll_context[cpuid] = iopoll_ctx_create(cpuid, IFPOLL_TX);
@@ -677,8 +704,7 @@ iopoll_ctx_create(int cpuid, int poll_type)
 	/*
 	 * Create the per-cpu polling context
 	 */
-	io_ctx = kmalloc_cachealign(sizeof(*io_ctx), M_DEVBUF,
-	    M_WAITOK | M_ZERO);
+	io_ctx = kmalloc(sizeof(*io_ctx), M_DEVBUF, M_WAITOK | M_ZERO);
 
 	io_ctx->poll_each_burst = iopoll_each_burst;
 	io_ctx->poll_burst_max = iopoll_burst_max;
@@ -795,6 +821,7 @@ rxpoll_handler(netmsg_t msg)
 {
 	struct iopoll_ctx *io_ctx;
 	struct thread *td = curthread;
+	boolean_t direct = TRUE, crit;
 	int i, cycles;
 
 	logpoll(rx_start);
@@ -802,10 +829,11 @@ rxpoll_handler(netmsg_t msg)
 	io_ctx = msg->lmsg.u.ms_resultp;
 	KKASSERT(&td->td_msgport == netisr_cpuport(io_ctx->poll_cpuid));
 
+	crit = TRUE;
 	crit_enter_quick(td);
 
 	/* Reply ASAP */
-	lwkt_replymsg(&msg->lmsg, 0);
+	netisr_replymsg(&msg->base, 0);
 
 	if (io_ctx->poll_handlers == 0) {
 		crit_exit_quick(td);
@@ -827,25 +855,57 @@ rxpoll_handler(netmsg_t msg)
 		const struct iopoll_rec *rec = &io_ctx->pr[i];
 		struct ifnet *ifp = rec->ifp;
 
-		if (!lwkt_serialize_try(rec->serializer))
-			continue;
+		if (rec->serializer != NULL) {
+			if (!crit) {
+				crit = TRUE;
+				crit_enter_quick(td);
+			}
+			if (__predict_false(
+			    !lwkt_serialize_try(rec->serializer))) {
+				/* RX serializer generally will not fail. */
+				continue;
+			}
+		} else if (crit) {
+			/*
+			 * Exit critical section, if the RX polling
+			 * handler does not require serialization,
+			 * i.e. RX polling is doing direct input.
+			 */
+			crit_exit_quick(td);
+			crit = FALSE;
+		}
 
-		if ((ifp->if_flags & (IFF_RUNNING | IFF_NPOLLING)) ==
-		    (IFF_RUNNING | IFF_NPOLLING))
+		if ((ifp->if_flags & IFF_IDIRECT) == 0) {
+			direct = FALSE;
+			KASSERT(rec->serializer != NULL,
+			    ("rx polling handler is not serialized"));
+		}
+#ifdef INVARIANTS
+		else {
+			KASSERT(rec->serializer == NULL,
+			    ("serialized direct input"));
+		}
+#endif
+
+		if ((ifp->if_flags & (IFF_UP | IFF_RUNNING | IFF_NPOLLING)) ==
+		    (IFF_UP | IFF_RUNNING | IFF_NPOLLING))
 			rec->poll_func(ifp, rec->arg, cycles);
 
-		lwkt_serialize_exit(rec->serializer);
+		if (rec->serializer != NULL)
+			lwkt_serialize_exit(rec->serializer);
 	}
 
-	/*
-	 * Do a quick exit/enter to catch any higher-priority
-	 * interrupt sources.
-	 */
-	crit_exit_quick(td);
+	if (crit) {
+		/*
+		 * Do a quick exit/enter to catch any higher-priority
+		 * interrupt sources.
+		 */
+		crit_exit_quick(td);
+	}
 	crit_enter_quick(td);
 
-	sched_iopollmore(io_ctx);
 	io_ctx->phase = 4;
+	sched_iopollmore(io_ctx, direct);
 
 	crit_exit_quick(td);
 
@@ -867,7 +927,7 @@ txpoll_handler(netmsg_t msg)
 	crit_enter_quick(td);
 
 	/* Reply ASAP */
-	lwkt_replymsg(&msg->lmsg, 0);
+	netisr_replymsg(&msg->base, 0);
 
 	if (io_ctx->poll_handlers == 0) {
 		crit_exit_quick(td);
@@ -884,8 +944,8 @@ txpoll_handler(netmsg_t msg)
 		if (!lwkt_serialize_try(rec->serializer))
 			continue;
 
-		if ((ifp->if_flags & (IFF_RUNNING | IFF_NPOLLING)) ==
-		    (IFF_RUNNING | IFF_NPOLLING))
+		if ((ifp->if_flags & (IFF_UP | IFF_RUNNING | IFF_NPOLLING)) ==
+		    (IFF_UP | IFF_RUNNING | IFF_NPOLLING))
 			rec->poll_func(ifp, rec->arg, -1);
 
 		lwkt_serialize_exit(rec->serializer);
@@ -898,8 +958,8 @@ txpoll_handler(netmsg_t msg)
 	crit_exit_quick(td);
 	crit_enter_quick(td);
 
-	sched_iopollmore(io_ctx);
 	io_ctx->phase = 4;
+	sched_iopollmore(io_ctx, TRUE);
 
 	crit_exit_quick(td);
 
@@ -936,7 +996,7 @@ rxpollmore_handler(netmsg_t msg)
 	crit_enter_quick(td);
 
 	/* Replay ASAP */
-	lwkt_replymsg(&msg->lmsg, 0);
+	netisr_replymsg(&msg->base, 0);
 
 	if (io_ctx->poll_handlers == 0) {
 		crit_exit_quick(td);
@@ -1007,7 +1067,7 @@ txpollmore_handler(netmsg_t msg)
 	crit_enter_quick(td);
 
 	/* Replay ASAP */
-	lwkt_replymsg(&msg->lmsg, 0);
+	netisr_replymsg(&msg->base, 0);
 
 	if (io_ctx->poll_handlers == 0) {
 		crit_exit_quick(td);
@@ -1105,7 +1165,7 @@ sysctl_burstmax_handler(netmsg_t nmsg)
 	if (io_ctx->residual_burst > io_ctx->poll_burst_max)
 		io_ctx->residual_burst = io_ctx->poll_burst_max;
 
-	lwkt_replymsg(&nmsg->lmsg, 0);
+	netisr_replymsg(&nmsg->base, 0);
 }
 
 static int
@@ -1130,8 +1190,7 @@ sysctl_burstmax(SYSCTL_HANDLER_ARGS)
 	msg.base.lmsg.u.ms_result = burst_max;
 	msg.ctx = io_ctx;
 
-	return lwkt_domsg(netisr_cpuport(io_ctx->poll_cpuid),
-	    &msg.base.lmsg, 0);
+	return netisr_domsg(&msg.base, io_ctx->poll_cpuid);
 }
 
 static void
@@ -1151,7 +1210,7 @@ sysctl_eachburst_handler(netmsg_t nmsg)
 		each_burst = 1;
 	io_ctx->poll_each_burst = each_burst;
 
-	lwkt_replymsg(&nmsg->lmsg, 0);
+	netisr_replymsg(&nmsg->base, 0);
 }
 
 static int
@@ -1172,8 +1231,7 @@ sysctl_eachburst(SYSCTL_HANDLER_ARGS)
 	msg.base.lmsg.u.ms_result = each_burst;
 	msg.ctx = io_ctx;
 
-	return lwkt_domsg(netisr_cpuport(io_ctx->poll_cpuid),
-	    &msg.base.lmsg, 0);
+	return netisr_domsg(&msg.base, io_ctx->poll_cpuid);
 }
 
 static int
@@ -1252,7 +1310,7 @@ poll_comm_init(int cpuid)
 	struct poll_comm *comm;
 	char cpuid_str[16];
 
-	comm = kmalloc_cachealign(sizeof(*comm), M_DEVBUF, M_WAITOK | M_ZERO);
+	comm = kmalloc(sizeof(*comm), M_DEVBUF, M_WAITOK | M_ZERO);
 
 	if (ifpoll_stfrac < 1)
 		ifpoll_stfrac = IFPOLL_STFRAC_DEFAULT;
@@ -1395,7 +1453,7 @@ sysctl_pollhz(SYSCTL_HANDLER_ARGS)
 		    0, sysctl_pollhz_handler);
 	nmsg.lmsg.u.ms_result = phz;
 
-	return lwkt_domsg(netisr_cpuport(comm->poll_cpuid), &nmsg.lmsg, 0);
+	return netisr_domsg(&nmsg, comm->poll_cpuid);
 }
 
 static void
@@ -1420,7 +1478,7 @@ sysctl_pollhz_handler(netmsg_t nmsg)
 	 */
 	poll_comm_adjust_pollhz(comm);
 
-	lwkt_replymsg(&nmsg->lmsg, 0);
+	netisr_replymsg(&nmsg->base, 0);
 }
 
 static int
@@ -1443,7 +1501,7 @@ sysctl_stfrac(SYSCTL_HANDLER_ARGS)
 		    0, sysctl_stfrac_handler);
 	nmsg.lmsg.u.ms_result = stfrac - 1;
 
-	return lwkt_domsg(netisr_cpuport(comm->poll_cpuid), &nmsg.lmsg, 0);
+	return netisr_domsg(&nmsg, comm->poll_cpuid);
 }
 
 static void
@@ -1460,7 +1518,7 @@ sysctl_stfrac_handler(netmsg_t nmsg)
 		comm->stfrac_count = comm->poll_stfrac;
 	crit_exit();
 
-	lwkt_replymsg(&nmsg->lmsg, 0);
+	netisr_replymsg(&nmsg->base, 0);
 }
 
 static int
@@ -1481,7 +1539,7 @@ sysctl_txfrac(SYSCTL_HANDLER_ARGS)
 		    0, sysctl_txfrac_handler);
 	nmsg.lmsg.u.ms_result = txfrac - 1;
 
-	return lwkt_domsg(netisr_cpuport(comm->poll_cpuid), &nmsg.lmsg, 0);
+	return netisr_domsg(&nmsg, comm->poll_cpuid);
 }
 
 static void
@@ -1498,7 +1556,7 @@ sysctl_txfrac_handler(netmsg_t nmsg)
 		comm->txfrac_count = comm->poll_txfrac;
 	crit_exit();
 
-	lwkt_replymsg(&nmsg->lmsg, 0);
+	netisr_replymsg(&nmsg->base, 0);
 }
 
 void
@@ -1511,7 +1569,7 @@ ifpoll_compat_setup(struct ifpoll_compat *cp,
 	cp->ifpc_stfrac = ((poll_common[0]->poll_stfrac + 1) *
 	    howmany(IOPOLL_BURST_MAX, IOPOLL_EACH_BURST)) - 1;
 
-	cp->ifpc_cpuid = unit % ncpus2;
+	cp->ifpc_cpuid = unit % netisr_ncpus;
 	cp->ifpc_serializer = slz;
 
 	if (sysctl_ctx != NULL && sysctl_tree != NULL) {
@@ -1561,7 +1619,7 @@ sysctl_compat_npoll_cpuid(SYSCTL_HANDLER_ARGS)
 	cpuid = cp->ifpc_cpuid;
 	error = sysctl_handle_int(oidp, &cpuid, 0, req);
 	if (!error && req->newptr != NULL) {
-		if (cpuid < 0 || cpuid >= ncpus2)
+		if (cpuid < 0 || cpuid >= netisr_ncpus)
 			error = EINVAL;
 		else
 			cp->ifpc_cpuid = cpuid;

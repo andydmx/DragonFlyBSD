@@ -13,7 +13,7 @@
  * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  *
- * $FreeBSD: head/sys/dev/iwn/if_iwn_devid.h 257607 2013-11-04 05:40:19Z adrian $
+ * $FreeBSD$
  */
 
 #ifndef	__IF_IWN_DEVID_H__
@@ -170,6 +170,7 @@
 #define	IWN_SDID_6035_2		0x4260
 #define	IWN_SDID_6035_3		0x4460
 #define	IWN_SDID_6035_4		0x4860
+#define	IWN_SDID_6035_5		0x5260
 /*
  * --------------------------------------------------------------------------
  * Device ID for 1030 and 6030 Series

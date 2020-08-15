@@ -35,10 +35,6 @@
 #ifndef _SYS_KINFO_H_
 #define _SYS_KINFO_H_
 
-#ifndef _KERNEL_STRUCTURES
-#define _KERNEL_STRUCTURES
-#endif
-
 #ifndef _SYS_TYPES_H_
 #include <sys/types.h>
 #endif
@@ -47,7 +43,15 @@
 #endif
 #include <sys/resource.h>
 #include <sys/rtprio.h>
+#include <sys/proc_common.h>
+#ifdef _KERNEL
 #include <sys/proc.h>
+#endif
+
+/*
+ * NOTE: correct way to use this header from non kernel code is to include
+ * the <sys/user.h> first!
+ */
 
 struct kinfo_file {
 	size_t	 f_size;	/* size of struct kinfo_file */
@@ -74,8 +78,8 @@ struct kinfo_cputime {
 	uint64_t	cp_idle;
 	uint64_t	cp_unused01;
 	uint64_t	cp_unused02;
-	uint64_t	cp_unused03;
-	uint64_t	cp_stallpc;	/* code stall address */
+	uint64_t	cp_sample_pc;
+	uint64_t	cp_sample_sp;
 	char		cp_msg[32];	/* code stall token or mplock */
 };
 
@@ -141,6 +145,8 @@ struct kinfo_lwp {
 #define WMESGLEN 8
 	uintptr_t	kl_wchan;	/* waiting channel */
 	char		kl_wmesg[WMESGLEN+1];	/* waiting message */
+
+	char		kl_comm[MAXCOMLEN+1];	/* lwp name */
 };
 
 /*
@@ -175,12 +181,13 @@ struct kinfo_proc {
 	gid_t		kp_rgid;
 	gid_t		kp_svgid;
 
-	pid_t		kp_pid;	/* process id */
+	pid_t		kp_pid;		/* process id */
 	pid_t		kp_ppid;	/* parent process id */
 	pid_t		kp_pgid;	/* process group id */
 	int		kp_jobc;	/* job control counter */
-	pid_t		kp_sid;	/* session id */
-	char		kp_login[roundup(MAXLOGNAME, sizeof(long))];	/* setlogin() name */
+	pid_t		kp_sid;		/* session id */
+	char		kp_login[roundup(MAXLOGNAME, sizeof(long))];
+					/* setlogin() name */
 	dev_t		kp_tdev;	/* controlling tty dev */
 	pid_t		kp_tpgid;	/* tty process group id */
 	pid_t		kp_tsid;	/* tty session id */
@@ -190,13 +197,13 @@ struct kinfo_proc {
 	int		kp_nice;
 	unsigned int	kp_swtime;
 
-	vm_size_t	kp_vm_map_size;	/* vmmap virtual size in bytes */
+	size_t		kp_vm_map_size;		/* vmmap virtual size in bytes */
 	segsz_t		kp_vm_rssize;		/* resident set size in pages */
 	segsz_t		kp_vm_swrss;		/* rss before last swap in pages */
 	segsz_t		kp_vm_tsize;		/* text size in pages */
 	segsz_t		kp_vm_dsize;		/* data size in pages */
 	segsz_t		kp_vm_ssize;		/* stack size in pages */
-        u_int		kp_vm_prssize;		/* proportional rss in pages */
+	u_int		kp_vm_prssize;		/* proportional rss in pages */
 
 	int		kp_jailid;
 
@@ -209,26 +216,34 @@ struct kinfo_proc {
 
 	struct kinfo_lwp kp_lwp;
 
-	int		kp_spare[4];
+	uintptr_t	kp_ktaddr;	/* address of this kernel thread */
+	int		kp_spare[2];
 };
 
+/*
+ * KERN_SIGTRAMP, public, KERN_PROC_SIGTRAMP used in external codes
+ */
+struct kinfo_sigtramp {
+	void		*ksigtramp_start;
+	void		*ksigtramp_end;
+	void		*ksigtramp_spare[4];
+};
+
+#if defined(_KERNEL) || defined(_KERNEL_STRUCTURES)
 struct proc;
 struct lwp;
 struct thread;
 
+__BEGIN_DECLS
 void fill_kinfo_proc(struct proc *, struct kinfo_proc *);
 void fill_kinfo_lwp(struct lwp *, struct kinfo_lwp *);
 void fill_kinfo_proc_kthread(struct thread *, struct kinfo_proc *);
+__END_DECLS
+#endif	/* defined(_KERNEL) || defined(_KERNEL_STRUCTURES) */
 
-#define KINFO_NEXT(kp)	((union kinfo *)((uintptr_t)kp + kp->gen.len))
-#define KINFO_END(kp)	(kp->gen.type == KINFO_TYPE_END)
-
-#if defined(_KERNEL)
+#ifdef _KERNEL
 #define cpu_time	cputime_percpu[mycpuid]
-#endif
-
-#if defined(_KERNEL)
 extern struct kinfo_cputime cputime_percpu[MAXCPU];
-#endif
+#endif	/* _KERNEL */
 
-#endif /* !_SYS_KINFO_H_ */
+#endif	/* !_SYS_KINFO_H_ */

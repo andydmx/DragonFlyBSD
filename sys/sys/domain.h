@@ -10,11 +10,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -32,7 +28,6 @@
  *
  *	@(#)domain.h	8.1 (Berkeley) 6/2/93
  * $FreeBSD: src/sys/sys/domain.h,v 1.14 1999/12/29 04:24:40 peter Exp $
- * $DragonFly: src/sys/sys/domain.h,v 1.6 2005/03/04 02:21:49 hsu Exp $
  */
 
 #ifndef _SYS_DOMAIN_H_
@@ -56,7 +51,7 @@ struct	domain {
 	int	dom_family;		/* AF_xxx */
 	char	*dom_name;
 	void	(*dom_init)(void);	/* initialize domain data structures */
-	int	(*dom_externalize)(struct mbuf *);	/* externalize access
+	int	(*dom_externalize)(struct mbuf *, int);	/* externalize access
 							 * rights */
 	void	(*dom_dispose)(struct mbuf *);	/* dispose of internalized
 						 * rights */
@@ -68,6 +63,8 @@ struct	domain {
 	int	dom_maxrtkey;		/* for routing layer */
 	void	*(*dom_ifattach)(struct ifnet *);
 	void	(*dom_ifdetach)(struct ifnet *, void *);
+	void	(*dom_if_up)(struct ifnet *);
+	void	(*dom_if_down)(struct ifnet *);
 					/* af-dependent data on ifnet */
 };
 
@@ -75,7 +72,7 @@ struct	domain {
 extern struct domainlist domains;
 extern struct domain	 localdomain;
 
-extern void		net_add_domain(void *);
+void		net_add_domain(void *);
 
 #define DOMAIN_SET(name) \
 	SYSINIT(domain_ ## name, SI_SUB_PROTO_DOMAIN, SI_ORDER_SECOND, net_add_domain, & name ## domain)

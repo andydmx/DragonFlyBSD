@@ -10,11 +10,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -31,7 +27,6 @@
  * SUCH DAMAGE.
  *
  * $FreeBSD: src/lib/libc/gen/closedir.c,v 1.6.2.1 2001/03/05 08:29:56 obrien Exp $
- * $DragonFly: src/lib/libc/gen/closedir.c,v 1.5 2005/04/26 15:04:59 joerg Exp $
  *
  * @(#)closedir.c	8.1 (Berkeley) 6/10/93
  */
@@ -44,6 +39,7 @@
 #include "un-namespace.h"
 
 #include "libc_private.h"
+#include "gen_private.h"
 
 /*
  * close a directory.
@@ -54,7 +50,7 @@ closedir(DIR *dirp)
 	int fd;
 
 	if (__isthreaded)
-		_pthread_mutex_lock((pthread_mutex_t *)&dirp->dd_lock);
+		_pthread_mutex_lock(&dirp->dd_lock);
 	_seekdir(dirp, dirp->dd_rewind);	/* free seekdir storage */
 	fd = dirp->dd_fd;
 	dirp->dd_fd = -1;
@@ -62,8 +58,8 @@ closedir(DIR *dirp)
 	free(dirp->dd_buf);
 	_reclaim_telldir(dirp);
 	if (__isthreaded) {
-		_pthread_mutex_unlock((pthread_mutex_t *)&dirp->dd_lock);
-		_pthread_mutex_destroy((pthread_mutex_t *)&dirp->dd_lock);
+		_pthread_mutex_unlock(&dirp->dd_lock);
+		_pthread_mutex_destroy(&dirp->dd_lock);
 	}
 	free(dirp);
 	return(_close(fd));

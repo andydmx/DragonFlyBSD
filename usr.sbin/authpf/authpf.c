@@ -20,7 +20,6 @@
 
 #include <sys/param.h>
 #include <sys/types.h>
-#include <sys/file.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -33,6 +32,7 @@
 
 #include <err.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <login_cap.h>
 #include <pwd.h>
 #include <signal.h>
@@ -607,7 +607,7 @@ remove_stale_rulesets(void)
 			struct pfioc_trans_e	t_e[PF_RULESET_MAX+1];
 			struct pfioc_trans	t_local;
 
-			bzero(&t, sizeof(t_local));
+			bzero(&t_local, sizeof(t_local));
 			bzero(t_e, sizeof(t_e));
 			t_local.size = PF_RULESET_MAX+1;
 			t_local.esize = sizeof(t_e[0]);

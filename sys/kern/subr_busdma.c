@@ -36,6 +36,7 @@
 #include <sys/systm.h>
 #include <sys/bus_dma.h>
 #include <sys/mbuf.h>
+#include <sys/malloc.h>
 
 static void
 _bus_dmamem_coherent_cb(void *arg, bus_dma_segment_t *segs, int nseg, int error)
@@ -129,7 +130,7 @@ bus_dmamap_load_mbuf_defrag(bus_dma_tag_t dmat, bus_dmamap_t map,
 	if (error == EFBIG) {
 		struct mbuf *m_new;
 
-		m_new = m_defrag(m, MB_DONTWAIT);
+		m_new = m_defrag(m, M_NOWAIT);
 		if (m_new == NULL)
 			return ENOBUFS;
 		else

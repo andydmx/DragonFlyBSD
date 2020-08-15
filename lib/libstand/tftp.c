@@ -146,7 +146,7 @@ recvtftp(struct iodesc *d, void *pkt, size_t max_len, time_t tleft)
 	case DATA: {
 		int got;
 
-		if (htons(t->th_block) != d->xid) {
+		if (htons(t->th_block) != (uint16_t)d->xid) {
 			/*
 			 * Expected block?
 			 */
@@ -275,6 +275,12 @@ tftp_open(const char *path, struct open_file *f)
 	struct iodesc  *io;
 	int             res;
 
+	/* Avoid trying out tftp_open for disk devices in the EFI loader */
+#ifndef __i386__
+	if (strcmp(f->f_dev->dv_name, "net") != 0)
+		return (EINVAL);
+#endif
+
 	tftpfile = (struct tftp_handle *) malloc(sizeof(*tftpfile));
 	if (!tftpfile)
 		return (ENOMEM);
@@ -318,7 +324,7 @@ tftp_read(struct open_file *f, void *addr, size_t size, size_t *resid)
 	while (size > 0) {
 		int needblock, count;
 
-		if (!(tc++ % 16))
+		if (!(tc++ % 256))
 			twiddle();
 
 		needblock = tftpfile->off / SEGSIZE + 1;

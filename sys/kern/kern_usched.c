@@ -1,13 +1,13 @@
 /*
  * Copyright (c) 2005 The DragonFly Project.  All rights reserved.
- * 
+ *
  * This code is derived from software contributed to The DragonFly Project
  * by Sergey Glushchenko <deen@smz.com.ua>
- * 
+ *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
  * are met:
- * 
+ *
  * 1. Redistributions of source code must retain the above copyright
  *    notice, this list of conditions and the following disclaimer.
  * 2. Redistributions in binary form must reproduce the above copyright
@@ -17,7 +17,7 @@
  * 3. Neither the name of The DragonFly Project nor the names of its
  *    contributors may be used to endorse or promote products derived
  *    from this software without specific, prior written permission.
- * 
+ *
  * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
  * ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
  * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
@@ -30,19 +30,17 @@
  * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT
  * OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
- * 
- * $DragonFly: src/sys/kern/kern_usched.c,v 1.9 2007/07/02 17:06:55 dillon Exp $
+ *
  */
 
+#include <sys/cpumask.h>
 #include <sys/errno.h>
 #include <sys/globaldata.h>		/* curthread */
 #include <sys/proc.h>
 #include <sys/priv.h>
-#include <sys/sysproto.h>		/* struct usched_set_args */
+#include <sys/sysmsg.h>			/* struct usched_set_args */
 #include <sys/systm.h>			/* strcmp() */
-#include <sys/usched.h>	
-
-#include <sys/mplock2.h>
+#include <sys/usched.h>
 
 #include <machine/smp.h>
 
@@ -50,9 +48,11 @@ static TAILQ_HEAD(, usched) usched_list = TAILQ_HEAD_INITIALIZER(usched_list);
 
 cpumask_t usched_mastermask = CPUMASK_INITIALIZER_ALLONES;
 
+static int setaffinity_lp(struct lwp *lp, cpumask_t *mask);
+
 /*
- * Called from very low level boot code, i386/i386/machdep.c/init386().
- * We cannot do anything fancy.  no malloc's, no nothing other then 
+ * Called from very low level boot code, sys/kern/init_main.c:mi_proc0init().
+ * We cannot do anything fancy.  no malloc's, no nothing other then
  * static initialization.
  */
 struct usched *
@@ -83,7 +83,7 @@ usched_init(void)
  *
  * SYNOPSIS:
  * 	Add/remove usched to/from list.
- * 	
+ *
  * ARGUMENTS:
  * 	usched - pointer to target scheduler
  * 	action - addition or removal ?
@@ -170,16 +170,18 @@ usched_schedulerclock(struct lwp *lp, sysclock_t periodic, sysclock_t time)
  * ARGUMENTS:
  *	pid	-
  *	cmd	-
- * 	data	- 
+ * 	data	-
  *	bytes	-
  * RETURN VALUES:
  * 	0 - success
- * 	EINVAL - error
+ * 	EFBIG  - error (invalid cpu#)
+ * 	EPERM  - error (failed to delete cpu#)
+ * 	EINVAL - error (other reasons)
  *
  * MPALMOSTSAFE
  */
 int
-sys_usched_set(struct usched_set_args *uap)
+sys_usched_set(struct sysmsg *sysmsg, const struct usched_set_args *uap)
 {
 	struct proc *p = curthread->td_proc;
 	struct usched *item;	/* temporaly for TAILQ processing */
@@ -193,7 +195,7 @@ sys_usched_set(struct usched_set_args *uap)
 		return (EINVAL);
 
 	lp = curthread->td_lwp;
-	get_mplock();
+	lwkt_gettoken(&lp->lwp_token);
 
 	switch (uap->cmd) {
 	case USCHED_SET_SCHEDULER:
@@ -209,7 +211,7 @@ sys_usched_set(struct usched_set_args *uap)
 
 		/*
 		 * If the scheduler for a process is being changed, disassociate
-		 * the old scheduler before switching to the new one.  
+		 * the old scheduler before switching to the new one.
 		 *
 		 * XXX we might have to add an additional ABI call to do a 'full
 		 * disassociation' and another ABI call to do a 'full
@@ -260,6 +262,16 @@ sys_usched_set(struct usched_set_args *uap)
 			break;
 		}
 		error = copyout(&(mycpu->gd_cpuid), uap->data, sizeof(int));
+		break;
+	case USCHED_GET_CPUMASK:
+		/* USCHED_GET_CPUMASK doesn't require special privileges. */
+		if (uap->bytes != sizeof(cpumask_t)) {
+			error = EINVAL;
+			break;
+		}
+		mask = lp->lwp_cpumask;
+		CPUMASK_ANDMASK(mask, smp_active_mask);
+		error = copyout(&mask, uap->data, sizeof(cpumask_t));
 		break;
 	case USCHED_ADD_CPU:
 		if ((error = priv_check(curthread, PRIV_SCHED_CPUSET)) != 0)
@@ -312,11 +324,171 @@ sys_usched_set(struct usched_set_args *uap)
 			}
 		}
 		break;
+	case USCHED_SET_CPUMASK:
+		if ((error = priv_check(curthread, PRIV_SCHED_CPUSET)) != 0)
+			break;
+		if (uap->bytes != sizeof(mask)) {
+			error = EINVAL;
+			break;
+		}
+		error = copyin(uap->data, &mask, sizeof(mask));
+		if (error)
+			break;
+
+		CPUMASK_ANDMASK(mask, smp_active_mask);
+		if (CPUMASK_TESTZERO(mask)) {
+			error = EPERM;
+			break;
+		}
+		/* Commit the new cpumask. */
+		lp->lwp_cpumask = mask;
+
+		/* Migrate if necessary. */
+		if (CPUMASK_TESTMASK(lp->lwp_cpumask, mycpu->gd_cpumask) == 0) {
+			cpuid = BSFCPUMASK(lp->lwp_cpumask);
+			lwkt_migratecpu(cpuid);
+			p->p_usched->changedcpu(lp);
+		}
+		break;
 	default:
 		error = EINVAL;
 		break;
 	}
-	rel_mplock();
+	lwkt_reltoken(&lp->lwp_token);
+
 	return (error);
 }
 
+int
+sys_lwp_getaffinity(struct sysmsg *sysmsg,
+		    const struct lwp_getaffinity_args *uap)
+{
+	struct proc *p;
+	cpumask_t mask;
+	struct lwp *lp;
+	int error = 0;
+
+	if (uap->pid < 0)
+		return (EINVAL);
+
+	if (uap->pid == 0) {
+		p = curproc;
+		PHOLD(p);
+	} else {
+		p = pfind(uap->pid);	/* pfind() holds (p) */
+		if (p == NULL)
+			return (ESRCH);
+	}
+	lwkt_gettoken(&p->p_token);
+
+	if (uap->tid < 0) {
+		lp = RB_FIRST(lwp_rb_tree, &p->p_lwp_tree);
+	} else {
+		lp = lwp_rb_tree_RB_LOOKUP(&p->p_lwp_tree, uap->tid);
+	}
+	if (lp == NULL) {
+		error = ESRCH;
+	} else {
+		/* Take a snapshot for copyout, which may block. */
+		LWPHOLD(lp);
+		lwkt_gettoken(&lp->lwp_token);
+		mask = lp->lwp_cpumask;
+		CPUMASK_ANDMASK(mask, smp_active_mask);
+		lwkt_reltoken(&lp->lwp_token);
+		LWPRELE(lp);
+	}
+
+	lwkt_reltoken(&p->p_token);
+	PRELE(p);
+
+	if (error == 0)
+		error = copyout(&mask, uap->mask, sizeof(cpumask_t));
+
+	return (error);
+}
+
+int
+sys_lwp_setaffinity(struct sysmsg *sysmsg,
+		    const struct lwp_setaffinity_args *uap)
+{
+	struct proc *p;
+	cpumask_t mask;
+	struct lwp *lp;
+	int error;
+
+	/*
+	 * NOTE:
+	 * Always allow change self CPU affinity.
+	 */
+	if ((error = priv_check(curthread, PRIV_SCHED_CPUSET)) != 0 &&
+	    uap->pid != 0)
+		return (error);
+
+	error = copyin(uap->mask, &mask, sizeof(mask));
+	if (error)
+		return (error);
+
+	CPUMASK_ANDMASK(mask, smp_active_mask);
+	if (CPUMASK_TESTZERO(mask))
+		return (EPERM);
+	if (uap->pid < 0)
+		return (EINVAL);
+
+	/*
+	 * Locate the process
+	 */
+	if (uap->pid == 0) {
+		p = curproc;
+		PHOLD(p);
+	} else {
+		p = pfind(uap->pid);	/* pfind() holds (p) */
+		if (p == NULL)
+			return (ESRCH);
+	}
+	lwkt_gettoken(&p->p_token);
+
+	if (uap->tid < 0) {
+		FOREACH_LWP_IN_PROC(lp, p) {
+			error = setaffinity_lp(lp, &mask);
+		}
+		/* not an error if no LPs left in process */
+	} else {
+		lp = lwp_rb_tree_RB_LOOKUP(&p->p_lwp_tree, uap->tid);
+		error = setaffinity_lp(lp, &mask);
+	}
+	lwkt_reltoken(&p->p_token);
+	PRELE(p);
+
+	return (error);
+}
+
+static int
+setaffinity_lp(struct lwp *lp, cpumask_t *mask)
+{
+	if (lp == NULL)
+		return ESRCH;
+
+	LWPHOLD(lp);
+	lwkt_gettoken(&lp->lwp_token);
+	lp->lwp_cpumask = *mask;
+
+	/*
+	 * NOTE: When adjusting a thread that is not our own the migration
+	 *	 will occur at the next reschedule.
+	 */
+	if (lp == curthread->td_lwp) {
+		/*
+		 * Self migration can be done immediately,
+		 * if necessary.
+		 */
+		if (CPUMASK_TESTBIT(lp->lwp_cpumask,
+		    mycpu->gd_cpuid) == 0) {
+			lwkt_migratecpu(BSFCPUMASK(lp->lwp_cpumask));
+			lp->lwp_proc->p_usched->changedcpu(lp);
+		}
+	}
+	lwkt_reltoken(&lp->lwp_token);
+	LWPRELE(lp);
+
+	return 0;
+}

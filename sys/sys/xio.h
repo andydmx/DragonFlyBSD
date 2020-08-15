@@ -30,8 +30,6 @@
  * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT
  * OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
- * 
- * $DragonFly: src/sys/sys/xio.h,v 1.10 2007/08/13 17:20:05 dillon Exp $
  */
 
 /*
@@ -55,8 +53,8 @@
 #ifndef _SYS_TYPES_H_
 #include <sys/types.h>
 #endif
-#ifndef _SYS_UIO_H_
-#include <sys/uio.h>
+#ifndef _SYS__UIO_H_
+#include <sys/_uio.h>
 #endif
 #ifndef _SYS_MSGPORT_H_
 #include <sys/msgport.h>
@@ -91,7 +89,6 @@ typedef struct xio *xio_t;
 #if defined(_KERNEL)
 
 void xio_init(xio_t xio);
-int xio_init_ubuf(xio_t xio, void *ubase, size_t ubytes, int vmprot);
 int xio_init_kbuf(xio_t xio, void *kbase, size_t kbytes);
 int xio_init_pages(xio_t xio, struct vm_page **mbase, int npages, int xflags);
 void xio_release(xio_t xio);

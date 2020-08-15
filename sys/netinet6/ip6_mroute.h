@@ -1,5 +1,4 @@
 /*	$FreeBSD: src/sys/netinet6/ip6_mroute.h,v 1.2.2.3 2002/04/28 05:40:27 suz Exp $	*/
-/*	$DragonFly: src/sys/netinet6/ip6_mroute.h,v 1.4 2006/05/20 02:42:12 dillon Exp $	*/
 /*	$KAME: ip6_mroute.h,v 1.19 2001/06/14 06:12:55 suz Exp $	*/
 
 /*
@@ -216,7 +215,7 @@ struct sioc_mif_req6 {
 	u_quad_t obytes;	/* Output byte count on mif		*/
 };
 
-#if defined(_KERNEL) || defined(_KERNEL_STRUCTURES) || defined(KERNEL)
+#if defined(_KERNEL) || defined(_KERNEL_STRUCTURES)
 /*
  * The kernel's multicast-interface structure.
  */
@@ -288,7 +287,7 @@ struct socket;
 int	ip6_mrouter_set (struct socket *so, struct sockopt *sopt);
 int	ip6_mrouter_get (struct socket *so, struct sockopt *sopt);
 int	ip6_mrouter_done (void);
-int	mrt6_ioctl (int, caddr_t);
+int	mrt6_ioctl (u_long, caddr_t);
 #endif /* _KERNEL */
 
 #endif /* !_NETINET6_IP6_MROUTE_H_ */

@@ -1,4 +1,6 @@
-/*
+/*-
+ * SPDX-License-Identifier: BSD-3-Clause
+ *
  * Copyright (c) 1983, 1993
  *	The Regents of the University of California.  All rights reserved.
  *
@@ -26,14 +28,15 @@
  * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
  *
- * $FreeBSD: head/sbin/ifconfig/ifclone.c 194799 2009-06-23 23:49:52Z delphij $
+ * $FreeBSD: head/sbin/ifconfig/ifclone.c 326025 2017-11-20 19:49:47Z pfg $
  */
 
+#include <sys/param.h>
 #include <sys/queue.h>
-#include <sys/types.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <net/if.h>
+#include <net/if_clone.h>
 
 #include <err.h>
 #include <stdio.h>
@@ -51,9 +54,9 @@ list_cloners(void)
 	int idx;
 	int s;
 
-	s = socket(AF_INET, SOCK_DGRAM, 0);
+	s = socket(AF_LOCAL, SOCK_DGRAM, 0);
 	if (s == -1)
-		err(1, "socket(AF_INET,SOCK_DGRAM)");
+		err(1, "socket(AF_LOCAL,SOCK_DGRAM)");
 
 	memset(&ifcr, 0, sizeof(ifcr));
 
@@ -84,6 +87,7 @@ list_cloners(void)
 
 	putchar('\n');
 	free(buf);
+	close(s);
 }
 
 struct clone_defcb {
@@ -113,14 +117,14 @@ clone_setdefcallback(const char *ifprefix, clone_callback_func *p)
  * no parameters.
  */
 static void
-ifclonecreate(int s, void *arg)
+ifclonecreate(int s, __unused void *arg)
 {
 	struct ifreq ifr;
 	struct clone_defcb *dcp;
 	clone_callback_func *clone_cb = NULL;
 
 	memset(&ifr, 0, sizeof(ifr));
-	(void) strlcpy(ifr.ifr_name, name, sizeof(ifr.ifr_name));
+	strlcpy(ifr.ifr_name, name, sizeof(ifr.ifr_name));
 
 	if (clone_cb == NULL) {
 		/* Try to find a default callback */
@@ -141,11 +145,12 @@ ifclonecreate(int s, void *arg)
 	}
 
 	/*
-	 * If we get a different name back than we put in, print it.
+	 * If we get a different name back than we put in, update record and
+	 * indicate it should be printed later.
 	 */
 	if (strncmp(name, ifr.ifr_name, sizeof(name)) != 0) {
 		strlcpy(name, ifr.ifr_name, sizeof(name));
-		printf("%s\n", name);
+		printifname = 1;
 	}
 }
 
@@ -158,7 +163,7 @@ DECL_CMD_FUNC(clone_create, arg, d)
 static
 DECL_CMD_FUNC(clone_destroy, arg, d)
 {
-	(void) strncpy(ifr.ifr_name, name, sizeof(ifr.ifr_name));
+	strlcpy(ifr.ifr_name, name, sizeof(ifr.ifr_name));
 	if (ioctl(s, SIOCIFDESTROY, &ifr) < 0)
 		err(1, "SIOCIFDESTROY");
 }
@@ -174,18 +179,21 @@ static void
 clone_Copt_cb(const char *optarg __unused)
 {
 	list_cloners();
-	exit(0);
+	exit(exit_code);
 }
-static struct option clone_Copt = { .opt = "C", .opt_usage = "[-C]", .cb = clone_Copt_cb };
+
+static struct option clone_Copt = {
+	.opt = "C",
+	.opt_usage = "[-C]",
+	.cb = clone_Copt_cb,
+};
 
 static __constructor(101) void
 clone_ctor(void)
 {
-#define	N(a)	(sizeof(a) / sizeof(a[0]))
 	size_t i;
 
-	for (i = 0; i < N(clone_cmds);  i++)
+	for (i = 0; i < nitems(clone_cmds); i++)
 		cmd_register(&clone_cmds[i]);
 	opt_register(&clone_Copt);
-#undef N
 }

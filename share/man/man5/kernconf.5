@@ -29,7 +29,7 @@
 .\" OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
 .\" SUCH DAMAGE.
 .\"
-.Dd March 28, 2010
+.Dd June 20, 2015
 .Dt KERNCONF 5
 .Os
 .Sh NAME
@@ -75,17 +75,7 @@ The following keywords are recognized in a configuration file:
 .It Sy cpu Ar name
 This system is to run on the CPU type
 .Ar name .
-Legal types are, for
-.Sy i386 :
-.Sy I486_CPU
-(i486),
-.Sy I586_CPU
-.Tn ( Pentium ) ,
-and
-.Sy I686_CPU
-.Tn ( Pentium Pro ) ;
-for
-.Sy x86_64 :
+Legal types are:
 .Sy HAMMER_CPU
 .Tn ( x86-64 ) .
 More than one CPU type specification can appear in a configuration file.
@@ -137,9 +127,7 @@ This is a legacy keyword, it is normally set to same value as
 .It Sy machine_arch Ar name
 The system is to run on the machine architecture
 .Ar name .
-The legal architectures are
-.Sy i386 ,
-and
+Currently, the only legal architecture is
 .Sy x86_64 .
 .Pp
 .It Sy makeoptions Ar name Ns Sy = Ns Ar value
@@ -172,16 +160,10 @@ of that language apply.
 Sets the platform of this kernel to
 .Ar name .
 Legal platforms are
-.Sy pc32
-(32 bit
-.Tn Intel
-architecture),
 .Sy pc64
 (64 bit
 .Tn AMD
 architecture),
-.Sy vkernel
-(32 bit virtual kernel),
 and
 .Sy vkernel64
 (64 bit virtual kernel).
@@ -196,21 +178,9 @@ instances.
 .\".Sh OPTIONS
 .Sh FILES
 .Bl -tag -width ".Pa /sys/config/X86_64_GENERIC"
-.It Pa /sys/config/GENERIC
-default
-.Sy i386
-kernel configuration file
-.It Pa /sys/config/LINT
+.It Pa /sys/config/LINT64
 kernel configuration file for checking all the sources,
 includes description of kernel configuration options
-.It Pa /sys/config/SOEKRIS
-kernel configuration file for the
-.Tn Soekris Engineering net5501
-board
-.It Pa /sys/config/VKERNEL
-default 32 bit
-.Xr vkernel 7
-kernel configuration file
 .It Pa /sys/config/VKERNEL64
 default 64 bit
 .Xr vkernel 7

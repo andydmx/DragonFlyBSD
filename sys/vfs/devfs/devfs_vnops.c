@@ -46,7 +46,6 @@
 #include <sys/uio.h>
 #include <sys/mount.h>
 #include <sys/file.h>
-#include <sys/namei.h>
 #include <sys/dirent.h>
 #include <sys/malloc.h>
 #include <sys/stat.h>
@@ -66,8 +65,6 @@
 #include <machine/limits.h>
 
 #include <sys/buf2.h>
-#include <sys/sysref2.h>
-#include <sys/mplock2.h>
 #include <vm/vm_page2.h>
 
 #ifndef SPEC_CHAIN_DEBUG
@@ -148,6 +145,7 @@ struct vop_ops devfs_vnode_norm_vops = {
 	.vop_read =		DEVFS_BADOP,
 	.vop_readdir =		devfs_vop_readdir,
 	.vop_readlink =		devfs_vop_readlink,
+	.vop_reallocblks =	DEVFS_BADOP,
 	.vop_reclaim =		devfs_vop_reclaim,
 	.vop_setattr =		devfs_vop_setattr,
 	.vop_write =		DEVFS_BADOP,
@@ -175,6 +173,7 @@ struct vop_ops devfs_vnode_dev_vops = {
 	.vop_read =		devfs_spec_read,
 	.vop_readdir =		DEVFS_BADOP,
 	.vop_readlink =		DEVFS_BADOP,
+	.vop_reallocblks =	DEVFS_BADOP,
 	.vop_reclaim =		devfs_vop_reclaim,
 	.vop_setattr =		devfs_vop_setattr,
 	.vop_strategy =		devfs_spec_strategy,
@@ -287,14 +286,25 @@ devfs_vop_reclaim(struct vop_reclaim_args *ap)
 
 	/*
 	 * Get rid of the devfs_node if it is no longer linked into the
-	 * topology.
+	 * topology.  Interlocked by devfs_lock.  However, be careful
+	 * interposing other operations between cleaning out v_data and
+	 * devfs_freep() as the node is only protected by devfs_lock
+	 * once the vnode is disassociated.
 	 */
 	vp = ap->a_vp;
-	if ((node = DEVFS_NODE(vp)) != NULL) {
+	node = DEVFS_NODE(vp);
+
+	if (node) {
+		if (node->v_node != vp) {
+			kprintf("NODE->V_NODE MISMATCH VP=%p NODEVP=%p\n",
+				vp, node->v_node);
+		}
+		vp->v_data = NULL;
 		node->v_node = NULL;
 		if ((node->flags & DEVFS_NODE_LINKED) == 0)
 			devfs_freep(node);
 	}
+	v_release_rdev(vp);
 
 	if (locked)
 		lockmgr(&devfs_lock, LK_RELEASE);
@@ -303,8 +313,6 @@ devfs_vop_reclaim(struct vop_reclaim_args *ap)
 	 * v_rdev needs to be properly released using v_release_rdev
 	 * Make sure v_data is NULL as well.
 	 */
-	vp->v_data = NULL;
-	v_release_rdev(vp);
 	return 0;
 }
 
@@ -351,7 +359,7 @@ devfs_vop_readdir(struct vop_readdir_args *ap)
 		cookie_index = 0;
 	}
 
-	nanotime(&dnode->atime);
+	vfs_timestamp(&dnode->atime);
 
 	if (saveoff == 0) {
 		r = vop_write_dirent(&error, ap->a_uio, dnode->d_dir.d_ino,
@@ -531,6 +539,9 @@ devfs_vop_nlookupdotdot(struct vop_nlookupdotdot_args *ap)
 }
 
 
+/*
+ * getattr() - Does not need a lock since the vp is refd
+ */
 static int
 devfs_vop_getattr(struct vop_getattr_args *ap)
 {
@@ -543,9 +554,16 @@ devfs_vop_getattr(struct vop_getattr_args *ap)
 	if (!devfs_node_is_accessible(node))
 		return ENOENT;
 #endif
-	node_sync_dev_get(node);
 
-	lockmgr(&devfs_lock, LK_EXCLUSIVE);
+	/*
+	 * XXX This is a temporary hack to prevent crashes when the device is
+	 * being destroyed (and so the underlying node will be gone) while
+	 * a userland program is blocked in a read().
+	 */
+	if (node == NULL)
+		return EIO;
+
+	node_sync_dev_get(node);
 
 	/* start by zeroing out the attributes */
 	VATTR_NULL(vap);
@@ -599,11 +617,8 @@ devfs_vop_getattr(struct vop_getattr_args *ap)
 		}
 	}
 
-	lockmgr(&devfs_lock, LK_RELEASE);
-
 	return (error);
 }
-
 
 static int
 devfs_vop_setattr(struct vop_setattr_args *ap)
@@ -618,8 +633,6 @@ devfs_vop_setattr(struct vop_setattr_args *ap)
 	if (!devfs_node_is_accessible(node))
 		return ENOENT;
 	node_sync_dev_get(node);
-
-	lockmgr(&devfs_lock, LK_EXCLUSIVE);
 
 	vap = ap->a_vap;
 
@@ -650,8 +663,7 @@ devfs_vop_setattr(struct vop_setattr_args *ap)
 
 out:
 	node_sync_dev_set(node);
-	nanotime(&node->ctime);
-	lockmgr(&devfs_lock, LK_RELEASE);
+	vfs_timestamp(&node->ctime);
 
 	return error;
 }
@@ -666,7 +678,7 @@ devfs_vop_readlink(struct vop_readlink_args *ap)
 	if (!devfs_node_is_accessible(node))
 		return ENOENT;
 
-	lockmgr(&devfs_lock, LK_EXCLUSIVE);
+	lockmgr(&devfs_lock, LK_SHARED);
 	ret = uiomove(node->symlink_name, node->symlink_namelen, ap->a_uio);
 	lockmgr(&devfs_lock, LK_RELEASE);
 
@@ -862,24 +874,43 @@ devfs_spec_open(struct vop_open_args *ap)
 	if ((dev = vp->v_rdev) == NULL)
 		return ENXIO;
 
-	vn_lock(vp, LK_UPGRADE | LK_RETRY);
+	/*
+	 * Simple devices that don't care.  Retain the shared lock.
+	 */
+	if (dev_dflags(dev) & D_QUICK) {
+		vn_unlock(vp);
+		error = dev_dopen(dev, ap->a_mode, S_IFCHR,
+				  ap->a_cred, ap->a_fp, vp);
+		vn_lock(vp, LK_SHARED | LK_RETRY);
+		vop_stdopen(ap);
+		goto skip;
+	}
 
+	/*
+	 * Slow code
+	 */
+	vn_lock(vp, LK_UPGRADE | LK_RETRY);
 	if (node && ap->a_fp) {
+		int exists;
+
 		devfs_debug(DEVFS_DEBUG_DEBUG, "devfs_spec_open: -1.1-\n");
-		lockmgr(&devfs_lock, LK_EXCLUSIVE);
+		lockmgr(&devfs_lock, LK_SHARED);
 
 		ndev = devfs_clone(dev, node->d_dir.d_name,
 				   node->d_dir.d_namlen,
 				   ap->a_mode, ap->a_cred);
 		if (ndev != NULL) {
+			lockmgr(&devfs_lock, LK_RELEASE);
+			lockmgr(&devfs_lock, LK_EXCLUSIVE);
 			newnode = devfs_create_device_node(
 					DEVFS_MNTDATA(vp->v_mount)->root_node,
-					ndev, NULL, NULL);
+					ndev, &exists, NULL, NULL);
 			/* XXX: possibly destroy device if this happens */
 
 			if (newnode != NULL) {
 				dev = ndev;
-				devfs_link_dev(dev);
+				if (exists == 0)
+					devfs_link_dev(dev);
 
 				devfs_debug(DEVFS_DEBUG_DEBUG,
 						"parent here is: %s, node is: |%s|\n",
@@ -891,7 +922,8 @@ devfs_spec_open(struct vop_open_args *ap)
 						((struct devfs_node *)(TAILQ_LAST(DEVFS_DENODE_HEAD(node->parent), devfs_node_head)))->d_dir.d_name);
 
 				/*
-				 * orig_vp is set to the original vp if we cloned.
+				 * orig_vp is set to the original vp if we
+				 * cloned.
 				 */
 				/* node->flags |= DEVFS_CLONED; */
 				devfs_allocv(&vp, newnode);
@@ -900,11 +932,12 @@ devfs_spec_open(struct vop_open_args *ap)
 			}
 		}
 		lockmgr(&devfs_lock, LK_RELEASE);
+
 		/*
-		 * Synchronize devfs here to make sure that, if the cloned device
-		 * creates other device nodes in addition to the cloned one,
-		 * all of them are created by the time we return from opening
-		 * the cloned one.
+		 * Synchronize devfs here to make sure that, if the cloned
+		 * device creates other device nodes in addition to the
+		 * cloned one, all of them are created by the time we return
+		 * from opening the cloned one.
 		 */
 		if (ndev)
 			devfs_config();
@@ -916,6 +949,9 @@ devfs_spec_open(struct vop_open_args *ap)
 
 	/*
 	 * Make this field valid before any I/O in ->d_open
+	 *
+	 * NOTE: Shared vnode lock probably held, but its ok as long
+	 *	 as assignments are consistent.
 	 */
 	if (!dev->si_iosize_max)
 		/* XXX: old DFLTPHYS == 64KB dependency */
@@ -925,10 +961,10 @@ devfs_spec_open(struct vop_open_args *ap)
 		vsetflags(vp, VISTTY);
 
 	/*
-	 * Open underlying device
+	 * Open the underlying device
 	 */
 	vn_unlock(vp);
-	error = dev_dopen(dev, ap->a_mode, S_IFCHR, ap->a_cred, ap->a_fp);
+	error = dev_dopen(dev, ap->a_mode, S_IFCHR, ap->a_cred, ap->a_fp, vp);
 	vn_lock(vp, LK_EXCLUSIVE | LK_RETRY);
 
 	/*
@@ -968,6 +1004,10 @@ devfs_spec_open(struct vop_open_args *ap)
 		}
 	}
 
+	/*
+	 * NOTE: vnode is still locked shared.  t_stop assignment should
+	 *	 remain consistent so we should be ok.
+	 */
 	if (dev_dflags(dev) & D_TTY) {
 		if (dev->si_tty) {
 			struct tty *tp;
@@ -980,7 +1020,11 @@ devfs_spec_open(struct vop_open_args *ap)
 		}
 	}
 
-
+	/*
+	 * NOTE: vnode is still locked shared.  assignments should
+	 *	 remain consistent so we should be ok.  However,
+	 *	 upgrade to exclusive if we need a VM object.
+	 */
 	if (vn_isdisk(vp, NULL)) {
 		if (!dev->si_bsize_phys)
 			dev->si_bsize_phys = DEV_BSIZE;
@@ -990,9 +1034,8 @@ devfs_spec_open(struct vop_open_args *ap)
 	vop_stdopen(ap);
 #if 0
 	if (node)
-		nanotime(&node->atime);
+		vfs_timestamp(&node->atime);
 #endif
-
 	/*
 	 * If we replaced the vp the vop_stdopen() call will have loaded
 	 * it into fp->f_data and vref()d the vp, giving us two refs.  So
@@ -1002,9 +1045,12 @@ devfs_spec_open(struct vop_open_args *ap)
 		vput(vp);
 
 	/* Ugly pty magic, to make pty devices appear once they are opened */
-	if (node && (node->flags & DEVFS_PTY) == DEVFS_PTY)
-		node->flags &= ~DEVFS_INVISIBLE;
+	if (node && (node->flags & DEVFS_PTY) == DEVFS_PTY) {
+		if (node->flags & DEVFS_INVISIBLE)
+			node->flags &= ~DEVFS_INVISIBLE;
+	}
 
+skip:
 	if (ap->a_fp) {
 		KKASSERT(ap->a_fp->f_type == DTYPE_VNODE);
 		KKASSERT((ap->a_fp->f_flag & FMASK) == (ap->a_mode & FMASK));
@@ -1025,6 +1071,23 @@ devfs_spec_close(struct vop_close_args *ap)
 	int error = 0;
 	int needrelock;
 	int opencount;
+
+	/*
+	 * Devices flagged D_QUICK require no special handling.
+	 */
+	if (dev && dev_dflags(dev) & D_QUICK) {
+		opencount = vp->v_opencount;
+		if (opencount <= 1)
+			opencount = count_dev(dev);   /* XXX NOT SMP SAFE */
+		if (((vp->v_flag & VRECLAIMED) ||
+		    (dev_dflags(dev) & D_TRACKCLOSE) ||
+		    (opencount == 1))) {
+			vn_unlock(vp);
+			error = dev_dclose(dev, ap->a_fflag, S_IFCHR, ap->a_fp);
+			vn_lock(vp, LK_SHARED | LK_RETRY);
+		}
+		goto skip;
+	}
 
 	/*
 	 * We do special tests on the opencount so unfortunately we need
@@ -1083,8 +1146,8 @@ devfs_spec_close(struct vop_close_args *ap)
 	 */
 	devfs_debug(DEVFS_DEBUG_DEBUG, "devfs_spec_close() -1- \n");
 	if (dev && ((vp->v_flag & VRECLAIMED) ||
-	    (dev_dflags(dev) & D_TRACKCLOSE) ||
-	    (opencount == 1))) {
+		    (dev_dflags(dev) & D_TRACKCLOSE) ||
+		    (opencount == 1))) {
 		/*
 		 * Ugly pty magic, to make pty devices disappear again once
 		 * they are closed.
@@ -1135,6 +1198,7 @@ devfs_spec_close(struct vop_close_args *ap)
 	 */
 	if (dev)
 		release_dev(dev);
+skip:
 	if (vp->v_opencount > 0)
 		vop_stdclose(ap);
 	return(error);
@@ -1161,8 +1225,6 @@ devfs_fo_close(struct file *fp)
  *
  * This bypasses the VOP table and talks directly to the device.  Most
  * filesystems just route to specfs and can make this optimization.
- *
- * MPALMOSTSAFE - acquires mplock
  */
 static int
 devfs_fo_read(struct file *fp, struct uio *uio,
@@ -1202,11 +1264,7 @@ devfs_fo_read(struct file *fp, struct uio *uio,
 	} else if (fp->f_flag & FNONBLOCK) {
 		ioflag |= IO_NDELAY;
 	}
-	if (flags & O_FBUFFERED) {
-		/* ioflag &= ~IO_DIRECT; */
-	} else if (flags & O_FUNBUFFERED) {
-		ioflag |= IO_DIRECT;
-	} else if (fp->f_flag & O_DIRECT) {
+	if (fp->f_flag & O_DIRECT) {
 		ioflag |= IO_DIRECT;
 	}
 	ioflag |= sequential_heuristic(uio, fp);
@@ -1215,7 +1273,7 @@ devfs_fo_read(struct file *fp, struct uio *uio,
 
 	release_dev(dev);
 	if (node)
-		nanotime(&node->atime);
+		vfs_timestamp(&node->atime);
 	if ((flags & O_FOFFSET) == 0)
 		fp->f_offset = uio->uio_offset;
 	fp->f_nextoff = uio->uio_offset;
@@ -1269,11 +1327,7 @@ devfs_fo_write(struct file *fp, struct uio *uio,
 	} else if (fp->f_flag & FNONBLOCK) {
 		ioflag |= IO_NDELAY;
 	}
-	if (flags & O_FBUFFERED) {
-		/* ioflag &= ~IO_DIRECT; */
-	} else if (flags & O_FUNBUFFERED) {
-		ioflag |= IO_DIRECT;
-	} else if (fp->f_flag & O_DIRECT) {
+	if (fp->f_flag & O_DIRECT) {
 		ioflag |= IO_DIRECT;
 	}
 	if (flags & O_FASYNCWRITE) {
@@ -1292,8 +1346,8 @@ devfs_fo_write(struct file *fp, struct uio *uio,
 
 	release_dev(dev);
 	if (node) {
-		nanotime(&node->atime);
-		nanotime(&node->mtime);
+		vfs_timestamp(&node->atime);
+		vfs_timestamp(&node->mtime);
 	}
 
 	if ((flags & O_FOFFSET) == 0)
@@ -1331,7 +1385,6 @@ devfs_fo_stat(struct file *fp, struct stat *sb, struct ucred *cred)
 	 * Zero the spare stat fields
 	 */
 	sb->st_lspare = 0;
-	sb->st_qspare1 = 0;
 	sb->st_qspare2 = 0;
 
 	/*
@@ -1355,7 +1408,7 @@ devfs_fo_stat(struct file *fp, struct stat *sb, struct ucred *cred)
 
 	sb->st_uid = vap->va_uid;
 	sb->st_gid = vap->va_gid;
-	sb->st_rdev = dev2udev(DEVFS_NODE(vp)->d_dev);
+	sb->st_rdev = devid_from_dev(DEVFS_NODE(vp)->d_dev);
 	sb->st_size = vap->va_bytes;
 	sb->st_atimespec = vap->va_atime;
 	sb->st_mtimespec = vap->va_mtime;
@@ -1404,6 +1457,12 @@ devfs_fo_stat(struct file *fp, struct stat *sb, struct ucred *cred)
 
 	sb->st_blocks = vap->va_bytes / S_BLKSIZE;
 
+	/*
+	 * This is for ABI compatibility <= 5.7 (for ABI change made in
+	 * 5.7 master).
+	 */
+	sb->__old_st_blksize = sb->st_blksize;
+
 	return (0);
 }
 
@@ -1434,9 +1493,6 @@ done:
 	return (error);
 }
 
-/*
- * MPALMOSTSAFE - acquires mplock
- */
 static int
 devfs_fo_ioctl(struct file *fp, u_long com, caddr_t data,
 		  struct ucred *ucred, struct sysmsg *msg)
@@ -1493,8 +1549,8 @@ devfs_fo_ioctl(struct file *fp, u_long com, caddr_t data,
 
 #if 0
 	if (node) {
-		nanotime(&node->atime);
-		nanotime(&node->mtime);
+		vfs_timestamp(&node->atime);
+		vfs_timestamp(&node->mtime);
 	}
 #endif
 	if (com == TIOCSCTTY) {
@@ -1577,10 +1633,10 @@ devfs_spec_read(struct vop_read_args *ap)
 
 	vn_unlock(vp);
 	error = dev_dread(dev, uio, ap->a_ioflag, NULL);
-	vn_lock(vp, LK_EXCLUSIVE | LK_RETRY);
+	vn_lock(vp, LK_SHARED | LK_RETRY);
 
 	if (node)
-		nanotime(&node->atime);
+		vfs_timestamp(&node->atime);
 
 	return (error);
 }
@@ -1615,8 +1671,8 @@ devfs_spec_write(struct vop_write_args *ap)
 	vn_lock(vp, LK_EXCLUSIVE | LK_RETRY);
 
 	if (node) {
-		nanotime(&node->atime);
-		nanotime(&node->mtime);
+		vfs_timestamp(&node->atime);
+		vfs_timestamp(&node->mtime);
 	}
 
 	return (error);
@@ -1643,8 +1699,8 @@ devfs_spec_ioctl(struct vop_ioctl_args *ap)
 	node = DEVFS_NODE(vp);
 
 	if (node) {
-		nanotime(&node->atime);
-		nanotime(&node->mtime);
+		vfs_timestamp(&node->atime);
+		vfs_timestamp(&node->mtime);
 	}
 #endif
 
@@ -1671,7 +1727,7 @@ devfs_spec_kqfilter(struct vop_kqfilter_args *ap)
 	node = DEVFS_NODE(vp);
 
 	if (node)
-		nanotime(&node->atime);
+		vfs_timestamp(&node->atime);
 #endif
 
 	return (dev_dkqfilter(dev, ap->a_kn, NULL));
@@ -1746,7 +1802,8 @@ devfs_spec_strategy(struct vop_strategy_args *ap)
 	BUF_LOCK(nbp, LK_EXCLUSIVE);
 	BUF_KERNPROC(nbp);
 	nbp->b_vp = vp;
-	nbp->b_flags = B_PAGING | (bp->b_flags & B_BNOCLIP);
+	nbp->b_flags = B_PAGING | B_KVABIO | (bp->b_flags & B_BNOCLIP);
+	nbp->b_cpumask = bp->b_cpumask;
 	nbp->b_data = bp->b_data;
 	nbp->b_bio1.bio_done = devfs_spec_strategy_done;
 	nbp->b_bio1.bio_offset = bio->bio_offset;
@@ -1759,7 +1816,7 @@ devfs_spec_strategy(struct vop_strategy_args *ap)
 		chunksize = vp->v_rdev->si_bsize_phys;
 	else
 		chunksize = DEV_BSIZE;
-	chunksize = maxiosize / chunksize * chunksize;
+	chunksize = rounddown(maxiosize, chunksize);
 #if SPEC_CHAIN_DEBUG & 1
 	devfs_debug(DEVFS_DEBUG_DEBUG,
 		    "spec_strategy chained I/O chunksize=%d\n",
@@ -1779,8 +1836,8 @@ devfs_spec_strategy(struct vop_strategy_args *ap)
 	dev_dstrategy(vp->v_rdev, &nbp->b_bio1);
 
 	if (DEVFS_NODE(vp)) {
-		nanotime(&DEVFS_NODE(vp)->atime);
-		nanotime(&DEVFS_NODE(vp)->mtime);
+		vfs_timestamp(&DEVFS_NODE(vp)->atime);
+		vfs_timestamp(&DEVFS_NODE(vp)->mtime);
 	}
 
 	return (0);
@@ -1894,17 +1951,21 @@ devfs_spec_freeblks(struct vop_freeblks_args *ap)
 	struct buf *bp;
 
 	/*
-	 * XXX: This assumes that strategy does the deed right away.
-	 * XXX: this may not be TRTTD.
+	 * Must be a synchronous operation
 	 */
 	KKASSERT(ap->a_vp->v_rdev != NULL);
 	if ((ap->a_vp->v_rdev->si_flags & SI_CANFREE) == 0)
 		return (0);
-	bp = geteblk(ap->a_length);
+	bp = getpbuf(NULL);
 	bp->b_cmd = BUF_CMD_FREEBLKS;
+	bp->b_bio1.bio_flags |= BIO_SYNC;
 	bp->b_bio1.bio_offset = ap->a_offset;
+	bp->b_bio1.bio_done = biodone_sync;
 	bp->b_bcount = ap->a_length;
 	dev_dstrategy(ap->a_vp->v_rdev, &bp->b_bio1);
+	biowait(&bp->b_bio1, "TRIM");
+	relpbuf(bp, NULL);
+
 	return (0);
 }
 
@@ -1998,7 +2059,7 @@ devfs_spec_getpages(struct vop_getpages_args *ap)
 	else
 		blksiz = DEV_BSIZE;
 
-	size = (ap->a_count + blksiz - 1) & ~(blksiz - 1);
+	size = roundup2(ap->a_count, blksiz);
 
 	bp = getpbuf_kva(NULL);
 	kva = (vm_offset_t)bp->b_data;
@@ -2006,10 +2067,11 @@ devfs_spec_getpages(struct vop_getpages_args *ap)
 	/*
 	 * Map the pages to be read into the kva.
 	 */
-	pmap_qenter(kva, ap->a_m, pcount);
+	pmap_qenter_noinval(kva, ap->a_m, pcount);
 
 	/* Build a minimal buffer header. */
 	bp->b_cmd = BUF_CMD_READ;
+	bp->b_flags |= B_KVABIO;
 	bp->b_bcount = size;
 	bp->b_resid = 0;
 	bsetrunningbufspace(bp, size);
@@ -2046,16 +2108,16 @@ devfs_spec_getpages(struct vop_getpages_args *ap)
 	 * might indicate an EOF with b_resid instead of truncating b_bcount.
 	 */
 	nread = bp->b_bcount - bp->b_resid;
-	if (nread < ap->a_count)
+	if (nread < ap->a_count) {
+		bkvasync(bp);
 		bzero((caddr_t)kva + nread, ap->a_count - nread);
-	pmap_qremove(kva, pcount);
+	}
+	pmap_qremove_noinval(kva, pcount);
 
 	gotreqpage = 0;
 	for (i = 0, toff = 0; i < pcount; i++, toff = nextoff) {
 		nextoff = toff + PAGE_SIZE;
 		m = ap->a_m[i];
-
-		m->flags &= ~PG_ZERO;
 
 		/*
 		 * NOTE: vm_page_undirty/clear_dirty etc do not clear the
@@ -2129,7 +2191,7 @@ devfs_spec_getpages(struct vop_getpages_args *ap)
 	 */
 	relpbuf(bp, NULL);
 	if (DEVFS_NODE(ap->a_vp))
-		nanotime(&DEVFS_NODE(ap->a_vp)->mtime);
+		vfs_timestamp(&DEVFS_NODE(ap->a_vp)->mtime);
 	return VM_PAGER_OK;
 }
 
@@ -2150,7 +2212,7 @@ sequential_heuristic(struct uio *uio, struct file *fp)
 		 */
 		int tmpseq = fp->f_seqcount;
 
-		tmpseq += (uio->uio_resid + BKVASIZE - 1) / BKVASIZE;
+		tmpseq += (uio->uio_resid + MAXBSIZE - 1) / MAXBSIZE;
 		if (tmpseq > IO_SEQMAX)
 			tmpseq = IO_SEQMAX;
 		fp->f_seqcount = tmpseq;

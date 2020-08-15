@@ -45,6 +45,8 @@
 #define _COMPONENT	ACPI_BUTTON
 ACPI_MODULE_NAME("LID")
 
+#define	ACPI_NOTIFY_STATUS_CHANGED	0x80
+
 struct acpi_lid_softc {
     device_t	lid_dev;
     ACPI_HANDLE	lid_handle;
@@ -75,6 +77,7 @@ static driver_t acpi_lid_driver = {
     "acpi_lid",
     acpi_lid_methods,
     sizeof(struct acpi_lid_softc),
+    .gpri = KOBJ_GPRI_ACPI
 };
 
 static devclass_t acpi_lid_devclass;
@@ -178,9 +181,6 @@ out:
     return_VOID;
 }
 
-/* XXX maybe not here */
-#define	ACPI_NOTIFY_STATUS_CHANGED	0x80
-
 static void 
 acpi_lid_notify_handler(ACPI_HANDLE h, UINT32 notify, void *context)
 {
@@ -195,7 +195,7 @@ acpi_lid_notify_handler(ACPI_HANDLE h, UINT32 notify, void *context)
 		      acpi_lid_notify_status_changed, sc);
 	break;
     default:
-	device_printf(sc->lid_dev, "unknown notify %#x\n", notify);
+	device_printf(sc->lid_dev, "unknown notify: %#x\n", notify);
 	break;
     }
 

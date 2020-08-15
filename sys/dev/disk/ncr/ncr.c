@@ -196,8 +196,11 @@
 #include <bus/cam/cam.h>
 #include <bus/cam/cam_ccb.h>
 #include <bus/cam/cam_sim.h>
+#include <bus/cam/cam_xpt.h>
 #include <bus/cam/cam_xpt_sim.h>
+#include <bus/cam/cam_xpt_periph.h>
 #include <bus/cam/cam_debug.h>
+
 
 #include <bus/cam/scsi/scsi_all.h>
 #include <bus/cam/scsi/scsi_message.h>
@@ -1297,16 +1300,6 @@ static	int	ncr_attach	(device_t dev);
 **
 **==========================================================
 */
-
-
-/*
- * $FreeBSD: src/sys/pci/ncr.c,v 1.155.2.3 2001/03/05 13:09:10 obrien Exp $
- */
-static const u_long	ncr_version = NCR_VERSION	* 11
-	+ (u_long) sizeof (struct ncb)	*  7
-	+ (u_long) sizeof (struct nccb)	*  5
-	+ (u_long) sizeof (struct lcb)	*  3
-	+ (u_long) sizeof (struct tcb)	*  2;
 
 #ifdef _KERNEL
 
@@ -2921,7 +2914,8 @@ static	struct scripth scripth0 = {
 **==========================================================
 */
 
-void ncr_script_fill (struct script * scr, struct scripth * scrh)
+static void
+ncr_script_fill (struct script * scr, struct scripth * scrh)
 {
 	int	i;
 	ncrcmd	*p;
@@ -4109,7 +4103,6 @@ ncr_action (struct cam_sim *sim, union ccb *ccb)
 		*/
 		cp->sensecmd[0]			= 0x03;
 		cp->sensecmd[1]			= ccb->ccb_h.target_lun << 5;
-		cp->sensecmd[4]			= sizeof(struct scsi_sense_data);
 		cp->sensecmd[4]			= csio->sense_len;
 		/*
 		**	sense data
@@ -4422,7 +4415,7 @@ ncr_action (struct cam_sim *sim, union ccb *ccb)
 **==========================================================
 */
 
-void
+static void
 ncr_complete (ncb_p np, nccb_p cp)
 {
 	union ccb *ccb;
@@ -4592,7 +4585,7 @@ ncr_complete (ncb_p np, nccb_p cp)
 **==========================================================
 */
 
-void
+static void
 ncr_wakeup (ncb_p np, u_long code)
 {
 	/*
@@ -4722,7 +4715,7 @@ ncr_freeze_devq (ncb_p np, struct cam_path *path)
 **==========================================================
 */
 
-void
+static void
 ncr_init(ncb_p np, char * msg, u_long code)
 {
 	int	i;
@@ -4919,7 +4912,7 @@ static void
 ncr_setsync(ncb_p np, nccb_p cp, u_char scntl3, u_char sxfer, u_char period)
 {
 	union	ccb *ccb;
-	struct	ccb_trans_settings neg;	
+	struct	ccb_trans_settings *neg;
 	tcb_p	tp;
 	int	div;
 	u_int	target = INB (nc_sdid) & 0x0f;
@@ -4975,18 +4968,17 @@ ncr_setsync(ncb_p np, nccb_p cp, u_char scntl3, u_char sxfer, u_char period)
 	** Tell the SCSI layer about the
 	** new transfer parameters.
 	*/
-	memset(&neg, 0, sizeof (neg));
-	neg.protocol = PROTO_SCSI;
-	neg.protocol_version = SCSI_REV_2;
-	neg.transport = XPORT_SPI;
-	neg.transport_version = 2;
-	neg.xport_specific.spi.sync_period = period;
-	neg.xport_specific.spi.sync_offset = sxfer & 0x1f;
-	neg.xport_specific.spi.valid = CTS_SPI_VALID_SYNC_RATE
+	neg = &xpt_alloc_ccb()->cts;
+	neg->protocol = PROTO_SCSI;
+	neg->protocol_version = SCSI_REV_2;
+	neg->transport = XPORT_SPI;
+	neg->transport_version = 2;
+	neg->xport_specific.spi.sync_period = period;
+	neg->xport_specific.spi.sync_offset = sxfer & 0x1f;
+	neg->xport_specific.spi.valid = CTS_SPI_VALID_SYNC_RATE
 		| CTS_SPI_VALID_SYNC_OFFSET;
-	xpt_setup_ccb(&neg.ccb_h, ccb->ccb_h.path,
-		      /*priority*/1);
-	xpt_async(AC_TRANSFER_NEG, ccb->ccb_h.path, &neg);
+	xpt_setup_ccb(&neg->ccb_h, ccb->ccb_h.path, /*priority*/1);
+	xpt_async(AC_TRANSFER_NEG, ccb->ccb_h.path, neg);
 	
 	/*
 	**	set actual value and sync_status
@@ -5005,6 +4997,8 @@ ncr_setsync(ncb_p np, nccb_p cp, u_char scntl3, u_char sxfer, u_char period)
 		cp->sync_status = sxfer;
 		cp->wide_status = scntl3;
 	}
+
+	xpt_free_ccb(&neg->ccb_h);
 }
 
 /*==========================================================
@@ -5020,7 +5014,7 @@ ncr_setsync(ncb_p np, nccb_p cp, u_char scntl3, u_char sxfer, u_char period)
 static void ncr_setwide (ncb_p np, nccb_p cp, u_char wide, u_char ack)
 {
 	union	ccb *ccb;
-	struct	ccb_trans_settings neg;		
+	struct	ccb_trans_settings *neg;
 	u_int	target = INB (nc_sdid) & 0x0f;
 	tcb_p	tp;
 	u_char	scntl3;
@@ -5052,20 +5046,21 @@ static void ncr_setwide (ncb_p np, nccb_p cp, u_char wide, u_char ack)
 	tp->tinfo.wval = scntl3;
 
 	/* Tell the SCSI layer about the new transfer params */
-	memset(&neg, 0, sizeof (neg));
-	neg.protocol = PROTO_SCSI;
-	neg.protocol_version = SCSI_REV_2;
-	neg.transport = XPORT_SPI;
-	neg.transport_version = 2;
-	neg.xport_specific.spi.bus_width = (scntl3 & EWS) ?
+	neg = &xpt_alloc_ccb()->cts;
+
+	neg->protocol = PROTO_SCSI;
+	neg->protocol_version = SCSI_REV_2;
+	neg->transport = XPORT_SPI;
+	neg->transport_version = 2;
+	neg->xport_specific.spi.bus_width = (scntl3 & EWS) ?
 	    MSG_EXT_WDTR_BUS_16_BIT : MSG_EXT_WDTR_BUS_8_BIT;
-	neg.xport_specific.spi.sync_period = 0;
-	neg.xport_specific.spi.sync_offset = 0;
-	neg.xport_specific.spi.valid = CTS_SPI_VALID_SYNC_RATE
+	neg->xport_specific.spi.sync_period = 0;
+	neg->xport_specific.spi.sync_offset = 0;
+	neg->xport_specific.spi.valid = CTS_SPI_VALID_SYNC_RATE
 		| CTS_SPI_VALID_SYNC_OFFSET
 		| CTS_SPI_VALID_BUS_WIDTH;
-	xpt_setup_ccb(&neg.ccb_h, ccb->ccb_h.path, /*priority*/1);
-	xpt_async(AC_TRANSFER_NEG, ccb->ccb_h.path, &neg);	
+	xpt_setup_ccb(&neg->ccb_h, ccb->ccb_h.path, /*priority*/1);
+	xpt_async(AC_TRANSFER_NEG, ccb->ccb_h.path, neg);
 
 	/*
 	**	set actual value and sync_status
@@ -5084,6 +5079,8 @@ static void ncr_setwide (ncb_p np, nccb_p cp, u_char wide, u_char ack)
 		cp->sync_status = sxfer;
 		cp->wide_status = scntl3;
 	}
+
+	xpt_free_ccb(&neg->ccb_h);
 }
 
 /*==========================================================
@@ -5106,8 +5103,7 @@ ncr_timeout (void *arg)
 	ncb_p	np = arg;
 	time_t	thistime = time_uptime;
 	ticks_t	step  = np->ticks;
-	u_long	count = 0;
-	long signed   t;
+	long t;
 	nccb_p cp;
 
 	if (np->lasttime != thistime) {
@@ -5154,7 +5150,6 @@ ncr_timeout (void *arg)
 			**	look for timed out nccbs.
 			*/
 			if (!cp->host_status) continue;
-			count++;
 			if (cp->tlimit > thistime) continue;
 
 			/*
@@ -5292,7 +5287,7 @@ static void ncr_log_hard_error(ncb_p np, u_short sist, u_char dstat)
 **==========================================================
 */
 
-void ncr_exception (ncb_p np)
+static void ncr_exception (ncb_p np)
 {
 	u_char	istat, dstat;
 	u_short	sist;
@@ -5591,7 +5586,7 @@ void ncr_exception (ncb_p np)
 **----------------------------------------------------------
 */
 
-void ncr_int_sto (ncb_p np)
+static void ncr_int_sto (ncb_p np)
 {
 	u_long dsa, scratcha, diff;
 	nccb_p cp;
@@ -5859,7 +5854,7 @@ static int ncr_show_msg (u_char * msg)
 	return (1);
 }
 
-void ncr_int_sir (ncb_p np)
+static void ncr_int_sir (ncb_p np)
 {
 	u_char scntl3;
 	u_char chg, ofs, per, fak, wide;
@@ -6467,7 +6462,7 @@ static	nccb_p ncr_get_nccb
 **==========================================================
 */
 
-void ncr_free_nccb (ncb_p np, nccb_p cp)
+static void ncr_free_nccb (ncb_p np, nccb_p cp)
 {
 	/*
 	**    sanity

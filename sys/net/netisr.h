@@ -43,11 +43,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -153,18 +149,27 @@ struct netisr {
 
 #ifdef _KERNEL
 
+/* NOTE: MUST be power-of-2 */
+#define NETISR_CPUMAX			128	/* supported by most NICs */
+#define NETISR_CPUMASK			(NETISR_CPUMAX - 1)
+
 #define NETISR_ROLLUP_PRIO_TCP		200
 #define NETISR_ROLLUP_PRIO_IFSTART	50
 
+extern int	 netisr_ncpus;
 extern lwkt_port netisr_adone_rport;
 extern lwkt_port netisr_afree_rport;
 extern lwkt_port netisr_afree_free_so_rport;
 extern lwkt_port netisr_apanic_rport;
 extern lwkt_port netisr_sync_port;
 
+struct netisr_rollup;
+
 void		netisr_register(int, netisr_fn_t, netisr_hashfn_t);
 void		netisr_register_hashcheck(int, netisr_hashck_t);
-void		netisr_register_rollup(netisr_ru_t ru_func, int ru_prio);
+struct netisr_rollup
+		*netisr_register_rollup(netisr_ru_t ru_func, int ru_prio);
+void		netisr_unregister_rollup(struct netisr_rollup *key);
 
 void		netisr_characterize(int num, struct mbuf **mp, int hoff);
 void		netisr_hashcheck(int num, struct mbuf *m,
@@ -176,7 +181,6 @@ struct netisr_barrier *netisr_barrier_create(void);
 void		netisr_barrier_set(struct netisr_barrier *);
 void		netisr_barrier_rem(struct netisr_barrier *);
 
-void		netmsg_service_port_init(lwkt_port_t);
 void		netmsg_service_sync(void);
 void		netmsg_sync_handler(netmsg_t);
 void		schednetisr(int);

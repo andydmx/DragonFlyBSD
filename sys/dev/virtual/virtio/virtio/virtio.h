@@ -43,20 +43,25 @@ struct vq_alloc_info;
 #define VIRTIO_ID_ENTROPY	0x04
 #define VIRTIO_ID_BALLOON	0x05
 #define VIRTIO_ID_IOMEMORY	0x06
+#define VIRTIO_ID_SCSI		0x08
 #define VIRTIO_ID_9P		0x09
 
 /* Status byte for guest to report progress. */
-#define VIRTIO_CONFIG_STATUS_RESET	0x00
-#define VIRTIO_CONFIG_STATUS_ACK	0x01
-#define VIRTIO_CONFIG_STATUS_DRIVER	0x02
-#define VIRTIO_CONFIG_STATUS_DRIVER_OK	0x04
-#define VIRTIO_CONFIG_STATUS_FAILED	0x80
+#define VIRTIO_CONFIG_STATUS_RESET		0x00
+#define VIRTIO_CONFIG_STATUS_ACK		0x01
+#define VIRTIO_CONFIG_STATUS_DRIVER		0x02
+#define VIRTIO_CONFIG_STATUS_DRIVER_OK		0x04
+#define VIRTIO_CONFIG_STATUS_DEVICE_NEEDS_RESET	0x40
+#define VIRTIO_CONFIG_STATUS_FAILED		0x80
 
 /*
  * Generate interrupt when the virtqueue ring is
  * completely used, even if we've suppressed them.
  */
 #define VIRTIO_F_NOTIFY_ON_EMPTY (1 << 24)
+
+/* The device accepts arbitrary descriptor layouts */
+#define VIRTIO_F_ANY_LAYOUT (1 << 27)
 
 /*
  * The guest should never negotiate this feature; it
@@ -76,6 +81,19 @@ struct vq_alloc_info;
  * Maximum number of virtqueues per device.
  */
 #define VIRTIO_MAX_VIRTQUEUES 8
+
+/*
+ * XXX malloc(9) comment not correct on DragonFly
+ * Each virtqueue indirect descriptor list must be physically contiguous.
+ * To allow us to malloc(9) each list individually, limit the number
+ * supported to what will fit in one page. With 4KB pages, this is a limit
+ * of 256 descriptors. If there is ever a need for more, we can switch to
+ * contigmalloc(9) for the larger allocations, similar to what
+ * bus_dmamem_alloc(9) does.
+ *
+ * Note the sizeof(struct vring_desc) is 16 bytes.
+ */
+#define VIRTIO_MAX_INDIRECT ((int) (PAGE_SIZE / 16))
 
 /*
  * VirtIO instance variables indices.
@@ -99,10 +117,47 @@ void	 virtio_describe(device_t dev, const char *msg,
  * VirtIO Bus Methods.
  */
 uint64_t virtio_negotiate_features(device_t dev, uint64_t child_features);
-int	 virtio_alloc_virtqueues(device_t dev, int flags, int nvqs,
+int	 virtio_alloc_virtqueues(device_t dev, int nvqs,
 	     struct vq_alloc_info *info);
-int	 virtio_setup_intr(device_t dev, lwkt_serialize_t);
+/* Allocate the interrupt resources. */
+/*
+ * The cpus array must be allocated, and contains -1 or cpuid for each IRQ.
+ *
+ * This will either allocate all the irqs, and fill in the actual cpus, and
+ * return 0, or it will fail and return the number of irq vectors that it
+ * managed to get before aborting in "int *cnt".
+ * The driver is supposed to check whether the chosen cpu cores match
+ * the expectations.
+ *
+ * Driver should specify use_config as 1, if a configuration should be
+ * preferred, where the configuration change notification can be handled
+ * efficiently. This only takes effect when a more efficient
+ *
+ * Fails if any interrupts are already allocated.
+ * Caller should check *cnt value after call, to check if all requested IRQS
+ * were actually allocated.
+ */
+int	 virtio_intr_alloc(device_t dev, int *cnt, int use_config, int *cpus);
+/* Release all the interrupts, fails if any is currently in use */
+int	 virtio_intr_release(device_t dev);
+/* Activate a hardware interrupt. */
+int	 virtio_setup_intr(device_t dev, uint irq, lwkt_serialize_t);
+int	 virtio_teardown_intr(device_t dev, uint irq);
+/*
+ * Bind the config-notification (-1), or a virtqueue (>= 0) to the irq.
+ *
+ * If the IRQ is an MSI-X, which is also mapped to a virtqueue, the driver
+ * will get a notification callback on each interrupt, whereas if irq is a
+ * legacy IRQ, the virtio device can check the ISR to determine if the
+ * configuration was updated.
+ */
+int	 virtio_bind_intr(device_t dev, uint irq, int what,
+	     driver_intr_t handler, void *arg);
+/* Similarly, -1 is the notification IRQ, >= 0 are the virtqueues. */
+int	 virtio_unbind_intr(device_t dev, int what);
 int	 virtio_with_feature(device_t dev, uint64_t feature);
+/* Get number of interrupts that can probably be allocated. */
+int	 virtio_intr_count(device_t dev);
 void	 virtio_stop(device_t dev);
 int	 virtio_reinit(device_t dev, uint64_t features);
 void	 virtio_reinit_complete(device_t dev);

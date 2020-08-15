@@ -1,4 +1,6 @@
 /*-
+ * SPDX-License-Identifier: BSD-3-Clause
+ *
  * Copyright (c) 1991, 1993, 1994
  *	The Regents of the University of California.  All rights reserved.
  *
@@ -30,17 +32,17 @@
  * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
  *
- * @(#) Copyright (c) 1991, 1993, 1994 The Regents of the University of California.  All rights reserved.
  * @(#)dd.c	8.5 (Berkeley) 4/2/94
- * $FreeBSD: src/bin/dd/dd.c,v 1.27.2.3 2001/08/01 01:37:35 obrien Exp $
+ * $FreeBSD: head/bin/dd/dd.c 341257 2018-11-29 19:28:01Z sobomax $
  */
 
 #include <sys/param.h>
 #include <sys/stat.h>
+#ifndef BOOTSTRAPPING
 #include <sys/conf.h>
 #include <sys/device.h>
 #include <sys/filio.h>
-#include <sys/time.h>
+#endif
 
 #include <ctype.h>
 #include <err.h>
@@ -50,34 +52,55 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <signal.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "dd.h"
 #include "extern.h"
 
-static void dd_close (void);
-static void dd_in (void);
-static void getfdtype (IO *);
-static void setup (void);
+#ifndef SIGINFO
+#define	SIGINFO	SIGUSR1
+#endif
+
+static void dd_close(void);
+static void dd_in(void);
+static void getfdtype(IO *);
+static int  parity(u_char);
+static void setup(void);
+static void speed_limit(void);
+static void swapbytes(void *, size_t);
 
 IO	in, out;		/* input/output state */
 STAT	st;			/* statistics */
-void	(*cfunc) (void);	/* conversion function */
-quad_t	cpy_cnt;		/* # of blocks to copy */
-off_t	pending = 0;		/* pending seek if sparse */
-u_int	ddflags;		/* conversion options */
+void	(*cfunc)(void);		/* conversion function */
+uintmax_t cpy_cnt;		/* # of blocks to copy */
+u_int	ddflags = 0;		/* conversion options */
 size_t	cbsz;			/* conversion block size */
-quad_t	files_cnt = 1;		/* # of files to copy */
+uintmax_t files_cnt = 1;	/* # of files to copy */
 const	u_char *ctab;		/* conversion table */
+char	fill_char;		/* Character to fill with if defined */
+size_t	speed = 0;		/* maximum speed, in bytes per second */
+volatile sig_atomic_t need_summary;
+volatile sig_atomic_t need_progress;
+
+static off_t pending = 0;	/* pending seek if sparse */
 
 int
-main(int argc __unused, char **argv)
+main(int argc __unused, char *argv[])
 {
+	/* SIGALRM every second, if needed */
+	struct itimerval itv = { { 1, 0 }, { 1, 0 } };
+
 	setlocale(LC_CTYPE, "");
 	jcl(argv);
 	setup();
 
-	signal(SIGINFO, summaryx);
+	signal(SIGINFO, siginfo_handler);
+	if (ddflags & C_PROGRESS) {
+		signal(SIGALRM, sigalarm_handler);
+		setitimer(ITIMER_REAL, &itv, NULL);
+	}
 	signal(SIGINT, terminate);
 
 	atexit(summary);
@@ -86,14 +109,30 @@ main(int argc __unused, char **argv)
 		dd_in();
 
 	dd_close();
+	/*
+	 * Some devices such as cfi(4) may perform significant amounts
+	 * of work when a write descriptor is closed.  Close the out
+	 * descriptor explicitly so that the summary handler (called
+	 * from an atexit() hook) includes this work.
+	 */
+	close(out.fd);
 	exit(0);
+}
+
+static int
+parity(u_char c)
+{
+	int i;
+
+	i = c ^ (c >> 1) ^ (c >> 2) ^ (c >> 3) ^ 
+	    (c >> 4) ^ (c >> 5) ^ (c >> 6) ^ (c >> 7);
+	return (i & 1);
 }
 
 static void
 setup(void)
 {
 	u_int cnt;
-	struct timeval tv;
 
 	if (in.name == NULL) {
 		in.name = "stdin";
@@ -137,12 +176,15 @@ setup(void)
 	 * record oriented I/O, only need a single buffer.
 	 */
 	if (!(ddflags & (C_BLOCK | C_UNBLOCK))) {
-		if ((in.db = malloc(out.dbsz + in.dbsz - 1)) == NULL)
+		if ((in.db = malloc((size_t)out.dbsz + in.dbsz - 1)) == NULL)
 			err(1, "input buffer");
 		out.db = in.db;
-	} else if ((in.db = malloc(MAX(in.dbsz, cbsz) + cbsz)) == NULL ||
-	    (out.db = malloc(out.dbsz + cbsz)) == NULL)
+	} else if ((in.db = malloc(MAX((size_t)in.dbsz, cbsz) + cbsz)) == NULL ||
+	    (out.db = malloc(out.dbsz + cbsz)) == NULL) {
 		err(1, "output buffer");
+	}
+
+	/* dbp is the first free position in each buffer. */
 	in.dbp = in.db;
 	out.dbp = out.db;
 
@@ -161,47 +203,75 @@ setup(void)
 		if (ftruncate(out.fd, out.offset * out.dbsz) == -1)
 			err(1, "truncating %s", out.name);
 
-	/*
-	 * If converting case at the same time as another conversion, build a
-	 * table that does both at once.  If just converting case, use the
-	 * built-in tables.
-	 */
-	if (ddflags & (C_LCASE | C_UCASE)) {
-		if (ddflags & (C_ASCII | C_EBCDIC)) {
-			if (ddflags & C_LCASE) {
-				for (cnt = 0; cnt <= 0377; ++cnt)
-					casetab[cnt] = tolower(ctab[cnt]);
-			} else {
-				for (cnt = 0; cnt <= 0377; ++cnt)
-					casetab[cnt] = toupper(ctab[cnt]);
-			}
+	if (ddflags & (C_LCASE  | C_UCASE | C_ASCII | C_EBCDIC | C_PARITY)) {
+		if (ctab != NULL) {
+			for (cnt = 0; cnt <= 0377; ++cnt)
+				casetab[cnt] = ctab[cnt];
 		} else {
-			if (ddflags & C_LCASE) {
-				for (cnt = 0; cnt <= 0377; ++cnt)
-					casetab[cnt] = tolower((int)cnt);
-			} else {
-				for (cnt = 0; cnt <= 0377; ++cnt)
-					casetab[cnt] = toupper((int)cnt);
-			}
+			for (cnt = 0; cnt <= 0377; ++cnt)
+				casetab[cnt] = cnt;
 		}
+		if ((ddflags & C_PARITY) && !(ddflags & C_ASCII)) {
+			/*
+			 * If the input is not EBCDIC, and we do parity
+			 * processing, strip input parity.
+			 */
+			for (cnt = 200; cnt <= 0377; ++cnt)
+				casetab[cnt] = casetab[cnt & 0x7f];
+		}
+		if (ddflags & C_LCASE) {
+			for (cnt = 0; cnt <= 0377; ++cnt)
+				casetab[cnt] = tolower(casetab[cnt]);
+		} else if (ddflags & C_UCASE) {
+			for (cnt = 0; cnt <= 0377; ++cnt)
+				casetab[cnt] = toupper(casetab[cnt]);
+		}
+		if ((ddflags & C_PARITY)) {
+			/*
+			 * This should strictly speaking be a no-op, but I
+			 * wonder what funny LANG settings could get us.
+			 */
+			for (cnt = 0; cnt <= 0377; ++cnt)
+				casetab[cnt] = casetab[cnt] & 0x7f;
+		}
+		if ((ddflags & C_PARSET)) {
+			for (cnt = 0; cnt <= 0377; ++cnt)
+				casetab[cnt] = casetab[cnt] | 0x80;
+		}
+		if ((ddflags & C_PAREVEN)) {
+			for (cnt = 0; cnt <= 0377; ++cnt)
+				if (parity(casetab[cnt]))
+					casetab[cnt] = casetab[cnt] | 0x80;
+		}
+		if ((ddflags & C_PARODD)) {
+			for (cnt = 0; cnt <= 0377; ++cnt)
+				if (!parity(casetab[cnt]))
+					casetab[cnt] = casetab[cnt] | 0x80;
+		}
+
 		ctab = casetab;
 	}
 
-	gettimeofday(&tv, NULL);
-	st.start = tv.tv_sec + tv.tv_usec * 1e-6; 
+	if (clock_gettime(CLOCK_MONOTONIC, &st.start))
+		err(1, "clock_gettime");
 }
 
 static void
 getfdtype(IO *io)
 {
 	struct stat sb;
+#ifndef BOOTSTRAPPING
 	int type;
+#endif
 
 	if (fstat(io->fd, &sb) == -1)
 		err(1, "%s", io->name);
 	if (S_ISREG(sb.st_mode))
 		io->flags |= ISTRUNC;
-	if (S_ISCHR(sb.st_mode) || S_ISBLK(sb.st_mode)) { 
+	if (S_ISCHR(sb.st_mode) || S_ISBLK(sb.st_mode)) {
+#ifdef BOOTSTRAPPING
+		io->flags |= ISSEEK;	/* assume D_DISK|D_MEM in btools */
+#else
 		if (ioctl(io->fd, FIODTYPE, &type) == -1) {
 			err(1, "%s", io->name);
 		} else {
@@ -212,6 +282,7 @@ getfdtype(IO *io)
 			if (S_ISCHR(sb.st_mode) && (type & D_TAPE) == 0)
 				io->flags |= ISCHR;
 		}
+#endif
 		return;
 	}
 	errno = 0;
@@ -219,6 +290,44 @@ getfdtype(IO *io)
 		io->flags |= ISPIPE;
 	else
 		io->flags |= ISSEEK;
+}
+
+/*
+ * Limit the speed by adding a delay before every block read.
+ * The delay (t_usleep) is equal to the time computed from block
+ * size and the specified speed limit (t_target) minus the time
+ * spent on actual read and write operations (t_io).
+ */
+static void
+speed_limit(void)
+{
+	static double t_prev, t_usleep;
+	double t_now, t_io, t_target;
+
+	t_now = secs_elapsed();
+	t_io = t_now - t_prev - t_usleep;
+	t_target = (double)in.dbsz / (double)speed;
+	t_usleep = t_target - t_io;
+	if (t_usleep > 0)
+		usleep(t_usleep * 1000000);
+	else
+		t_usleep = 0;
+	t_prev = t_now;
+}
+
+static void
+swapbytes(void *v, size_t len)
+{
+	unsigned char *p = v;
+	unsigned char t;
+
+	while (len > 1) {
+		t = p[0];
+		p[0] = p[1];
+		p[1] = t;
+		p += 2;
+		len -= 2;
+	}
 }
 
 static void
@@ -233,17 +342,22 @@ dd_in(void)
 		case 0:
 			break;
 		default:
-			if (st.in_full + st.in_part >= (u_quad_t)cpy_cnt)
+			if (st.in_full + st.in_part >= (uintmax_t)cpy_cnt)
 				return;
 			break;
 		}
+
+		if (speed > 0)
+			speed_limit();
 
 		/*
 		 * Zero the buffer first if sync; if doing block operations,
 		 * use spaces.
 		 */
 		if (ddflags & C_SYNC) {
-			if (ddflags & (C_BLOCK | C_UNBLOCK))
+			if (ddflags & C_FILL)
+				memset(in.dbp, fill_char, in.dbsz);
+			else if (ddflags & (C_BLOCK | C_UNBLOCK))
 				memset(in.dbp, ' ', in.dbsz);
 			else
 				memset(in.dbp, 0, in.dbsz);
@@ -285,7 +399,7 @@ dd_in(void)
 			++st.in_full;
 
 		/* Handle full input blocks. */
-		} else if ((size_t)n == in.dbsz) {
+		} else if (n == in.dbsz) {
 			in.dbcnt += in.dbrcnt = n;
 			++st.in_full;
 
@@ -304,7 +418,7 @@ dd_in(void)
 		 * than noerror, notrunc or sync are specified, the block
 		 * is output without buffering as it is read.
 		 */
-		if (ddflags & C_BS) {
+		if ((ddflags & ~(C_NOERROR | C_NOTRUNC | C_SYNC)) == C_BS) {
 			out.dbcnt = in.dbcnt;
 			dd_out(1);
 			in.dbcnt = 0;
@@ -316,11 +430,15 @@ dd_in(void)
 				++st.swab;
 				--n;
 			}
-			swab(in.dbp, in.dbp, (size_t)n);
+			swapbytes(in.dbp, (size_t)n);
 		}
 
 		in.dbp += in.dbrcnt;
 		(*cfunc)();
+		if (need_summary)
+			summary();
+		if (need_progress)
+			progress();
 	}
 }
 
@@ -338,7 +456,9 @@ dd_close(void)
 	else if (cfunc == unblock)
 		unblock_close();
 	if (ddflags & C_OSYNC && out.dbcnt && out.dbcnt < out.dbsz) {
-		if (ddflags & (C_BLOCK | C_UNBLOCK))
+		if (ddflags & C_FILL)
+			memset(out.dbp, fill_char, out.dbsz - out.dbcnt);
+		else if (ddflags & (C_BLOCK | C_UNBLOCK))
 			memset(out.dbp, ' ', out.dbsz - out.dbcnt);
 		else
 			memset(out.dbp, 0, out.dbsz - out.dbcnt);
@@ -346,13 +466,22 @@ dd_close(void)
 	}
 	if (out.dbcnt || pending)
 		dd_out(1);
+
+	/*
+	 * If the file ends with a hole, ftruncate it to extend its size
+	 * up to the end of the hole (without having to write any data).
+	 */
+	if (out.seek_offset > 0 && (out.flags & ISTRUNC)) {
+		if (ftruncate(out.fd, out.seek_offset) == -1)
+			err(1, "truncating %s", out.name);
+	}
 }
 
 void
 dd_out(int force)
 {
 	u_char *outp;
-	size_t cnt, i, n;
+	size_t cnt, n;
 	ssize_t nw;
 	static int warned;
 	int sparse;
@@ -374,36 +503,43 @@ dd_out(int force)
 	 * we play games with the buffer size, and it's usually a partial write.
 	 */
 	outp = out.db;
+
+	/*
+	 * If force, first try to write all pending data, else try to write
+	 * just one block. Subsequently always write data one full block at
+	 * a time at most.
+	 */
 	for (n = force ? out.dbcnt : out.dbsz;; n = out.dbsz) {
-		for (cnt = n;; cnt -= nw) {
+		cnt = n;
+		do {
 			sparse = 0;
 			if (ddflags & C_SPARSE) {
-				sparse = 1;	/* Is buffer sparse? */
-				for (i = 0; i < cnt; i++)
-					if (outp[i] != 0) {
-						sparse = 0;
-						break;
-					}
+				/* Is buffer sparse? */
+				sparse = BISZERO(outp, cnt);
 			}
 			if (sparse && !force) {
 				pending += cnt;
 				nw = cnt;
 			} else {
 				if (pending != 0) {
-					if (force)
-						pending--;
-					if (lseek(out.fd, pending, SEEK_CUR) ==
-					    -1)
+					/*
+					 * Seek past hole.  Note that we need to record the
+					 * reached offset, because we might have no more data
+					 * to write, in which case we'll need to call
+					 * ftruncate to extend the file size.
+					 */
+					out.seek_offset = lseek(out.fd, pending, SEEK_CUR);
+					if (out.seek_offset == -1)
 						err(2, "%s: seek error creating sparse file",
 						    out.name);
-					if (force)
-						write(out.fd, outp, 1);
 					pending = 0;
 				}
-				if (cnt)
+				if (cnt) {
 					nw = write(out.fd, outp, cnt);
-				else
+					out.seek_offset = 0;
+				} else {
 					return;
+				}
 			}
 
 			if (nw <= 0) {
@@ -413,27 +549,29 @@ dd_out(int force)
 					err(1, "%s", out.name);
 				nw = 0;
 			}
+
 			outp += nw;
 			st.bytes += nw;
-			if ((size_t)nw == n) {
-				if (n != out.dbsz)
-					++st.out_part;
-				else
-					++st.out_full;
-				break;
+
+			if ((size_t)nw == n && n == (size_t)out.dbsz)
+				++st.out_full;
+			else
+				++st.out_part;
+
+			if ((size_t) nw != cnt) {
+				if (out.flags & ISTAPE)
+					errx(1, "%s: short write on tape device",
+				    	out.name);
+				if (out.flags & ISCHR && !warned) {
+					warned = 1;
+					warnx("%s: short write on character device",
+				    	out.name);
+				}
 			}
-			++st.out_part;
-			if ((size_t)nw == cnt)
-				break;
-			if (out.flags & ISTAPE)
-				errx(1, "%s: short write on tape device",
-				    out.name);
-			if (out.flags & ISCHR && !warned) {
-				warned = 1;
-				warnx("%s: short write on character device",
-				    out.name);
-			}
-		}
+
+			cnt -= nw;
+		} while (cnt != 0);
+
 		if ((out.dbcnt -= n) < out.dbsz)
 			break;
 	}

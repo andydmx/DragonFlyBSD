@@ -1,4 +1,4 @@
-/* $FreeBSD$ */
+/* $FreeBSD: head/sys/dev/usb/usb_bus.h 276717 2015-01-05 20:22:18Z hselasky $ */
 /*-
  * Copyright (c) 2008 Hans Petter Selasky. All rights reserved.
  *
@@ -26,6 +26,8 @@
 
 #ifndef _USB_BUS_H_
 #define	_USB_BUS_H_
+
+struct usb_fs_privdata;
 
 /*
  * The following structure defines the USB explore message sent to the USB
@@ -83,10 +85,19 @@ struct usb_bus {
 	struct usb_bus_msg resume_msg[2];
 	struct usb_bus_msg reset_msg[2];
 	struct usb_bus_msg shutdown_msg[2];
+#if USB_HAVE_UGEN
+	struct usb_bus_msg cleanup_msg[2];
+	LIST_HEAD(,usb_fs_privdata) pd_cleanup_list;
+#endif
 	/*
 	 * This mutex protects the USB hardware:
 	 */
 	struct lock bus_lock;
+	/*
+	 * mpf: this is only used in ARM embedded USB controllers
+	 *      up to this point. Why is it not a spinlock?
+	struct lock bus_spin_lock; 
+	 */
 	struct usb_xfer_queue intr_q;
 	struct usb_callout power_wdog;	/* power management */
 
@@ -112,9 +123,11 @@ struct usb_bus {
 	enum usb_revision usbrev;	/* USB revision. See "USB_REV_XXX". */
 
 	uint8_t	devices_max;		/* maximum number of USB devices */
-	uint8_t	reserved01;
+	uint8_t	do_hook;		/* intr_config_hook */
 	uint8_t	do_probe;		/* set if USB should be re-probed */
 	uint8_t no_explore;		/* don't explore USB ports */
+	uint8_t dma_bits;		/* number of DMA address bits */
+	struct intr_config_hook hook;
 };
 
 #endif					/* _USB_BUS_H_ */

@@ -30,7 +30,6 @@
  * SUCH DAMAGE.
  *
  * $FreeBSD: src/usr.sbin/ypserv/yp_main.c,v 1.29 2008/02/03 17:39:37 matteo Exp $
- * $DragonFly: src/usr.sbin/ypserv/yp_main.c,v 1.5 2005/11/24 22:23:02 swildner Exp $
  */
 
 /*
@@ -80,7 +79,7 @@ extern int _rpc_dtablesize(void);
 extern int _rpcsvcstate;	 /* Set when a request is serviced */
 char *progname = "ypserv";
 const char *yp_dir = _PATH_YP;
-/*int debug = 0;*/
+int debug = 0;
 int do_dns = 0;
 int resfd;
 
@@ -232,7 +231,7 @@ closedown(int sig)
 }
 
 int
-main(int argc, char **argv)
+main(int argc, char *argv[])
 {
 	SVCXPRT *transp = NULL;
 	int sock;

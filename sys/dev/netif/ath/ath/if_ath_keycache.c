@@ -28,6 +28,7 @@
  */
 
 #include <sys/cdefs.h>
+__FBSDID("$FreeBSD$");
 
 /*
  * Driver for the Atheros Wireless LAN controller.
@@ -46,7 +47,6 @@
 #include <sys/mbuf.h>
 #include <sys/malloc.h>
 #include <sys/lock.h>
-#include <sys/mutex.h>
 #include <sys/kernel.h>
 #include <sys/socket.h>
 #include <sys/sockio.h>
@@ -57,6 +57,12 @@
 #include <sys/kthread.h>
 #include <sys/taskqueue.h>
 #include <sys/priv.h>
+
+#if defined(__DragonFly__)
+/* empty */
+#else
+#include <machine/bus.h>
+#endif
 
 #include <net/if.h>
 #include <net/if_var.h>
@@ -77,8 +83,6 @@
 #include <dev/netif/ath/ath/if_ath_keycache.h>
 #include <dev/netif/ath/ath/if_ath_misc.h>
 
-extern  const char* ath_hal_ether_sprintf(const uint8_t *mac);
-
 #ifdef ATH_DEBUG
 static void
 ath_keyprint(struct ath_softc *sc, const char *tag, u_int ix,
@@ -97,7 +101,7 @@ ath_keyprint(struct ath_softc *sc, const char *tag, u_int ix,
 	kprintf("%s: [%02u] %-7s ", tag, ix, ciphers[hk->kv_type]);
 	for (i = 0, n = hk->kv_len; i < n; i++)
 		kprintf("%02x", hk->kv_val[i]);
-	kprintf(" mac %s", ath_hal_ether_sprintf(mac));
+	kprintf(" mac %s", ether_sprintf(mac));
 	if (hk->kv_type == HAL_CIPHER_TKIP) {
 		kprintf(" %s ", sc->sc_splitmic ? "mic" : "rxmic");
 		for (i = 0; i < sizeof(hk->kv_mic); i++)
@@ -183,7 +187,6 @@ ath_keyset(struct ath_softc *sc, struct ieee80211vap *vap,
 	const struct ieee80211_key *k,
 	struct ieee80211_node *bss)
 {
-#define	N(a)	(sizeof(a)/sizeof(a[0]))
 	static const u_int8_t ciphermap[] = {
 		HAL_CIPHER_WEP,		/* IEEE80211_CIPHER_WEP */
 		HAL_CIPHER_TKIP,	/* IEEE80211_CIPHER_TKIP */
@@ -207,7 +210,7 @@ ath_keyset(struct ath_softc *sc, struct ieee80211vap *vap,
 	 * so that rx frames have an entry to match.
 	 */
 	if ((k->wk_flags & IEEE80211_KEY_SWCRYPT) == 0) {
-		KASSERT(cip->ic_cipher < N(ciphermap),
+		KASSERT(cip->ic_cipher < nitems(ciphermap),
 			("invalid cipher type %u", cip->ic_cipher));
 		hk.kv_type = ciphermap[cip->ic_cipher];
 		hk.kv_len = k->wk_keylen;
@@ -252,6 +255,7 @@ ath_keyset(struct ath_softc *sc, struct ieee80211vap *vap,
 	} else
 		mac = k->wk_macaddr;
 
+	ATH_LOCK(sc);
 	ath_power_set_power_state(sc, HAL_PM_AWAKE);
 	if (hk.kv_type == HAL_CIPHER_TKIP &&
 	    (k->wk_flags & IEEE80211_KEY_SWMIC) == 0) {
@@ -261,9 +265,9 @@ ath_keyset(struct ath_softc *sc, struct ieee80211vap *vap,
 		ret = ath_hal_keyset(ah, k->wk_keyix, &hk, mac);
 	}
 	ath_power_restore_power_state(sc);
+	ATH_UNLOCK(sc);
 
 	return (ret);
-#undef N
 }
 
 /*
@@ -274,12 +278,11 @@ static u_int16_t
 key_alloc_2pair(struct ath_softc *sc,
 	ieee80211_keyix *txkeyix, ieee80211_keyix *rxkeyix)
 {
-#define	N(a)	(sizeof(a)/sizeof(a[0]))
 	u_int i, keyix;
 
 	KASSERT(sc->sc_splitmic, ("key cache !split"));
 	/* XXX could optimize */
-	for (i = 0; i < N(sc->sc_keymap)/4; i++) {
+	for (i = 0; i < nitems(sc->sc_keymap)/4; i++) {
 		u_int8_t b = sc->sc_keymap[i];
 		if (b != 0xff) {
 			/*
@@ -318,7 +321,6 @@ key_alloc_2pair(struct ath_softc *sc,
 	}
 	DPRINTF(sc, ATH_DEBUG_KEYCACHE, "%s: out of pair space\n", __func__);
 	return 0;
-#undef N
 }
 
 /*
@@ -329,12 +331,11 @@ static u_int16_t
 key_alloc_pair(struct ath_softc *sc,
 	ieee80211_keyix *txkeyix, ieee80211_keyix *rxkeyix)
 {
-#define	N(a)	(sizeof(a)/sizeof(a[0]))
 	u_int i, keyix;
 
 	KASSERT(!sc->sc_splitmic, ("key cache split"));
 	/* XXX could optimize */
-	for (i = 0; i < N(sc->sc_keymap)/4; i++) {
+	for (i = 0; i < nitems(sc->sc_keymap)/4; i++) {
 		u_int8_t b = sc->sc_keymap[i];
 		if (b != 0xff) {
 			/*
@@ -366,7 +367,6 @@ key_alloc_pair(struct ath_softc *sc,
 	}
 	DPRINTF(sc, ATH_DEBUG_KEYCACHE, "%s: out of pair space\n", __func__);
 	return 0;
-#undef N
 }
 
 /*
@@ -376,7 +376,6 @@ static int
 key_alloc_single(struct ath_softc *sc,
 	ieee80211_keyix *txkeyix, ieee80211_keyix *rxkeyix)
 {
-#define	N(a)	(sizeof(a)/sizeof(a[0]))
 	u_int i, keyix;
 
 	if (sc->sc_hasclrkey == 0) {
@@ -388,7 +387,7 @@ key_alloc_single(struct ath_softc *sc,
 	}
 
 	/* XXX try i,i+32,i+64,i+32+64 to minimize key pair conflicts */
-	for (i = 0; i < N(sc->sc_keymap); i++) {
+	for (i = 0; i < nitems(sc->sc_keymap); i++) {
 		u_int8_t b = sc->sc_keymap[i];
 		if (b != 0xff) {
 			/*
@@ -406,7 +405,6 @@ key_alloc_single(struct ath_softc *sc,
 	}
 	DPRINTF(sc, ATH_DEBUG_KEYCACHE, "%s: out of space\n", __func__);
 	return 0;
-#undef N
 }
 
 /*
@@ -422,7 +420,7 @@ int
 ath_key_alloc(struct ieee80211vap *vap, struct ieee80211_key *k,
 	ieee80211_keyix *keyix, ieee80211_keyix *rxkeyix)
 {
-	struct ath_softc *sc = vap->iv_ic->ic_ifp->if_softc;
+	struct ath_softc *sc = vap->iv_ic->ic_softc;
 
 	/*
 	 * Group key allocation must be handled specially for
@@ -490,13 +488,14 @@ ath_key_alloc(struct ieee80211vap *vap, struct ieee80211_key *k,
 int
 ath_key_delete(struct ieee80211vap *vap, const struct ieee80211_key *k)
 {
-	struct ath_softc *sc = vap->iv_ic->ic_ifp->if_softc;
+	struct ath_softc *sc = vap->iv_ic->ic_softc;
 	struct ath_hal *ah = sc->sc_ah;
 	const struct ieee80211_cipher *cip = k->wk_cipher;
 	u_int keyix = k->wk_keyix;
 
 	DPRINTF(sc, ATH_DEBUG_KEYCACHE, "%s: delete key %u\n", __func__, keyix);
 
+	ATH_LOCK(sc);
 	ath_power_set_power_state(sc, HAL_PM_AWAKE);
 	ath_hal_keyreset(ah, keyix);
 	/*
@@ -522,6 +521,7 @@ ath_key_delete(struct ieee80211vap *vap, const struct ieee80211_key *k)
 		}
 	}
 	ath_power_restore_power_state(sc);
+	ATH_UNLOCK(sc);
 	return 1;
 }
 
@@ -530,10 +530,9 @@ ath_key_delete(struct ieee80211vap *vap, const struct ieee80211_key *k)
  * slot(s) must already have been allocated by ath_key_alloc.
  */
 int
-ath_key_set(struct ieee80211vap *vap, const struct ieee80211_key *k,
-	const u_int8_t mac[IEEE80211_ADDR_LEN])
+ath_key_set(struct ieee80211vap *vap, const struct ieee80211_key *k)
 {
-	struct ath_softc *sc = vap->iv_ic->ic_ifp->if_softc;
+	struct ath_softc *sc = vap->iv_ic->ic_softc;
 
 	return ath_keyset(sc, vap, k, vap->iv_bss);
 }

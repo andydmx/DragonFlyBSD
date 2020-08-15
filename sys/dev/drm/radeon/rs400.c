@@ -24,10 +24,7 @@
  * Authors: Dave Airlie
  *          Alex Deucher
  *          Jerome Glisse
- *
- * $FreeBSD: head/sys/dev/drm2/radeon/rs400.c 254885 2013-08-25 19:37:15Z dumbbell $
  */
-
 #include <drm/drmP.h>
 #include "radeon.h"
 #include "radeon_asic.h"
@@ -79,7 +76,7 @@ int rs400_gart_init(struct radeon_device *rdev)
 	int r;
 
 	if (rdev->gart.ptr) {
-		DRM_ERROR("RS400 GART already initialized\n");
+		WARN(1, "RS400 GART already initialized\n");
 		return 0;
 	}
 	/* Check gart size */
@@ -110,7 +107,6 @@ int rs400_gart_enable(struct radeon_device *rdev)
 	uint32_t size_reg;
 	uint32_t tmp;
 
-	radeon_gart_restore(rdev);
 	tmp = RREG32_MC(RS690_AIC_CTRL_SCRATCH);
 	tmp |= RS690_DIS_OUT_OF_PCI_GART_ACCESS;
 	WREG32_MC(RS690_AIC_CTRL_SCRATCH, tmp);
@@ -172,16 +168,16 @@ int rs400_gart_enable(struct radeon_device *rdev)
 	WREG32_MC(RS480_AGP_MODE_CNTL,
 		  (1 << RS480_REQ_TYPE_SNOOP_SHIFT) | RS480_REQ_TYPE_SNOOP_DIS);
 	/* Disable AGP mode */
+	/* FIXME: according to doc we should set HIDE_MMCFG_BAR=0,
+	 * AGPMODE30=0 & AGP30ENHANCED=0 in NB_CNTL */
 	if ((rdev->family == CHIP_RS690) || (rdev->family == CHIP_RS740)) {
-		tmp = RREG32_MC(RS690_MC_NB_CNTL);
-		tmp &= ~(RS690_HIDE_MMCFG_BAR |
-		    RS690_AGPMODE30 |
-		    RS690_AGP30ENHANCED);
-		WREG32_MC(RS690_MC_NB_CNTL, tmp);
-		WREG32_MC(RS480_MC_MISC_CNTL,
-			  (RS480_GART_INDEX_REG_EN | RS690_BLOCK_GFX_D3_EN));
+		tmp = RREG32_MC(RS480_MC_MISC_CNTL);
+		tmp |= RS480_GART_INDEX_REG_EN | RS690_BLOCK_GFX_D3_EN;
+		WREG32_MC(RS480_MC_MISC_CNTL, tmp);
 	} else {
-		WREG32_MC(RS480_MC_MISC_CNTL, RS480_GART_INDEX_REG_EN);
+		tmp = RREG32_MC(RS480_MC_MISC_CNTL);
+		tmp |= RS480_GART_INDEX_REG_EN;
+		WREG32_MC(RS480_MC_MISC_CNTL, tmp);
 	}
 	/* Enable gart */
 	WREG32_MC(RS480_AGP_ADDRESS_SPACE_SIZE, (RS480_GART_EN | size_reg));
@@ -210,24 +206,30 @@ void rs400_gart_fini(struct radeon_device *rdev)
 	radeon_gart_table_ram_free(rdev);
 }
 
+#define RS400_PTE_UNSNOOPED (1 << 0)
 #define RS400_PTE_WRITEABLE (1 << 2)
 #define RS400_PTE_READABLE  (1 << 3)
 
-int rs400_gart_set_page(struct radeon_device *rdev, int i, uint64_t addr)
+uint64_t rs400_gart_get_page_entry(uint64_t addr, uint32_t flags)
 {
 	uint32_t entry;
+
+	entry = (lower_32_bits(addr) & LINUX_PAGE_MASK) |
+		((upper_32_bits(addr) & 0xff) << 4);
+	if (flags & RADEON_GART_PAGE_READ)
+		entry |= RS400_PTE_READABLE;
+	if (flags & RADEON_GART_PAGE_WRITE)
+		entry |= RS400_PTE_WRITEABLE;
+	if (!(flags & RADEON_GART_PAGE_SNOOP))
+		entry |= RS400_PTE_UNSNOOPED;
+	return entry;
+}
+
+void rs400_gart_set_page(struct radeon_device *rdev, unsigned i,
+			 uint64_t entry)
+{
 	u32 *gtt = rdev->gart.ptr;
-
-	if (i < 0 || i > rdev->gart.num_gpu_pages) {
-		return -EINVAL;
-	}
-
-	entry = (lower_32_bits(addr) & 0xfffff000) |
-		((upper_32_bits(addr) & 0xff) << 4) |
-		RS400_PTE_WRITEABLE | RS400_PTE_READABLE;
-	entry = cpu_to_le32(entry);
-	gtt[i] = entry;
-	return 0;
+	gtt[i] = cpu_to_le32(lower_32_bits(entry));
 }
 
 int rs400_mc_wait_for_idle(struct radeon_device *rdev)
@@ -251,8 +253,8 @@ static void rs400_gpu_init(struct radeon_device *rdev)
 	/* FIXME: is this correct ? */
 	r420_pipes_init(rdev);
 	if (rs400_mc_wait_for_idle(rdev)) {
-		DRM_ERROR("rs400: Failed to wait MC idle while "
-		       "programming pipes. Bad things might happen. %08x\n", RREG32(RADEON_MC_STATUS));
+		pr_warn("rs400: Failed to wait MC idle while programming pipes. Bad things might happen. %08x\n",
+			RREG32(RADEON_MC_STATUS));
 	}
 }
 
@@ -277,17 +279,21 @@ uint32_t rs400_mc_rreg(struct radeon_device *rdev, uint32_t reg)
 {
 	uint32_t r;
 
+	lockmgr(&rdev->mc_idx_lock, LK_EXCLUSIVE);
 	WREG32(RS480_NB_MC_INDEX, reg & 0xff);
 	r = RREG32(RS480_NB_MC_DATA);
 	WREG32(RS480_NB_MC_INDEX, 0xff);
+	lockmgr(&rdev->mc_idx_lock, LK_RELEASE);
 	return r;
 }
 
 void rs400_mc_wreg(struct radeon_device *rdev, uint32_t reg, uint32_t v)
 {
+	lockmgr(&rdev->mc_idx_lock, LK_EXCLUSIVE);
 	WREG32(RS480_NB_MC_INDEX, ((reg) & 0xff) | RS480_NB_MC_IND_WR_EN);
 	WREG32(RS480_NB_MC_DATA, (v));
 	WREG32(RS480_NB_MC_INDEX, 0xff);
+	lockmgr(&rdev->mc_idx_lock, LK_RELEASE);
 }
 
 #if defined(CONFIG_DEBUG_FS)
@@ -421,6 +427,12 @@ static int rs400_startup(struct radeon_device *rdev)
 	}
 
 	/* Enable IRQ */
+	if (!rdev->irq.installed) {
+		r = radeon_irq_kms_init(rdev);
+		if (r)
+			return r;
+	}
+
 	r100_irq_set(rdev);
 	rdev->config.r300.hdp_cntl = RREG32(RADEON_HOST_PATH_CNTL);
 	/* 1M ring buffer */
@@ -472,6 +484,7 @@ int rs400_resume(struct radeon_device *rdev)
 
 int rs400_suspend(struct radeon_device *rdev)
 {
+	radeon_pm_suspend(rdev);
 	r100_cp_disable(rdev);
 	radeon_wb_disable(rdev);
 	r100_irq_disable(rdev);
@@ -481,6 +494,7 @@ int rs400_suspend(struct radeon_device *rdev)
 
 void rs400_fini(struct radeon_device *rdev)
 {
+	radeon_pm_fini(rdev);
 	r100_cp_fini(rdev);
 	radeon_wb_fini(rdev);
 	radeon_ib_pool_fini(rdev);
@@ -490,7 +504,7 @@ void rs400_fini(struct radeon_device *rdev)
 	radeon_fence_driver_fini(rdev);
 	radeon_bo_fini(rdev);
 	radeon_atombios_fini(rdev);
-	drm_free(rdev->bios, M_DRM);
+	kfree(rdev->bios);
 	rdev->bios = NULL;
 }
 
@@ -539,9 +553,6 @@ int rs400_init(struct radeon_device *rdev)
 	r = radeon_fence_driver_init(rdev);
 	if (r)
 		return r;
-	r = radeon_irq_kms_init(rdev);
-	if (r)
-		return r;
 	/* Memory manager */
 	r = radeon_bo_init(rdev);
 	if (r)
@@ -550,6 +561,9 @@ int rs400_init(struct radeon_device *rdev)
 	if (r)
 		return r;
 	r300_set_reg_safe(rdev);
+
+	/* Initialize power management */
+	radeon_pm_init(rdev);
 
 	rdev->accel_working = true;
 	r = rs400_startup(rdev);

@@ -1,4 +1,4 @@
-/*	$FreeBSD: head/sys/dev/ral/rt2661var.h 192468 2009-05-20 20:00:40Z sam $	*/
+/*	$FreeBSD$	*/
 
 /*-
  * Copyright (c) 2005
@@ -97,8 +97,13 @@ struct rt2661_vap {
 #define	RT2661_VAP(vap)		((struct rt2661_vap *)(vap))
 
 struct rt2661_softc {
-	struct arpcom			arpcom;
-	struct ifnet			*sc_ifp;
+	struct ieee80211com		sc_ic;
+#if defined(__DragonFly__)
+	struct lock			sc_mtx;
+#else
+	struct mtx			sc_mtx;
+#endif
+	struct mbufq			sc_snd;
 	device_t			sc_dev;
 	bus_space_tag_t			sc_st;
 	bus_space_handle_t		sc_sh;
@@ -116,6 +121,7 @@ struct rt2661_softc {
 	int                             sc_flags;
 #define	RAL_FW_LOADED		0x1
 #define	RAL_INPUT_RUNNING	0x2
+#define	RAL_RUNNING		0x4
 	int				sc_id;
 	struct ieee80211_channel	*sc_curchan;
 
@@ -155,11 +161,7 @@ struct rt2661_softc {
 	int				dwelltime;
 
 	struct rt2661_rx_radiotap_header sc_rxtap;
-	int				sc_rxtap_len;
 	struct rt2661_tx_radiotap_header sc_txtap;
-	int				sc_txtap_len;
-
-	struct sysctl_ctx_list  sc_sysctl_ctx;
 };
 
 int	rt2661_attach(device_t, int);
@@ -168,3 +170,17 @@ void	rt2661_shutdown(void *);
 void	rt2661_suspend(void *);
 void	rt2661_resume(void *);
 void	rt2661_intr(void *);
+
+#if defined(__DragonFly__)
+
+#define RAL_LOCK(sc)		lockmgr(&(sc)->sc_mtx, LK_EXCLUSIVE)
+#define RAL_LOCK_ASSERT(sc)	KKASSERT(lockstatus(&(sc)->sc_mtx, curthread) == LK_EXCLUSIVE)
+#define RAL_UNLOCK(sc)		lockmgr(&(sc)->sc_mtx, LK_RELEASE)
+
+#else
+
+#define RAL_LOCK(sc)		mtx_lock(&(sc)->sc_mtx)
+#define RAL_LOCK_ASSERT(sc)	mtx_assert(&(sc)->sc_mtx, MA_OWNED)
+#define RAL_UNLOCK(sc)		mtx_unlock(&(sc)->sc_mtx)
+
+#endif

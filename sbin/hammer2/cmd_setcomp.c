@@ -149,7 +149,8 @@ cmd_setcomp_core(uint8_t comp_algo, const char *path_str, struct stat *st)
 		goto failed;
 	}
 	printf("%s\tcomp_algo=0x%02x\n", path_str, comp_algo);
-	inode.ip_data.comp_algo = comp_algo;
+	inode.flags |= HAMMER2IOC_INODE_FLAG_COMP;
+	inode.ip_data.meta.comp_algo = comp_algo;
 	res = ioctl(fd, HAMMER2IOC_INODE_SET, &inode);
 	if (res < 0) {
 		fprintf(stderr,
@@ -254,19 +255,19 @@ setcomp_recursive_call(char *directory, int comp_method, int set_files)
 		return 3;
     }
     struct dirent *dent;
-    int lenght;
-    lenght = strlen(directory);
+    int length;
+    length = strlen(directory);
     char name[HAMMER2_INODE_MAXNAME];
     strcpy(name, directory);
-    name[lenght] = '/';
-    ++lenght;
+    name[length] = '/';
+    ++length;
     errno = 0;
     dent = readdir(dir);
     while (dent != NULL && ecode == 0) {
 		if ((strcmp(dent->d_name, ".") != 0) &&
 		 (strcmp(dent->d_name, "..") != 0)) {
-			strncpy(name + lenght, dent->d_name, HAMMER2_INODE_MAXNAME -
-				lenght);
+			strncpy(name + length, dent->d_name, HAMMER2_INODE_MAXNAME -
+				length);
 			int fd = hammer2_ioctl_handle(name);
 			hammer2_ioc_inode_t inode;
 			int res = ioctl(fd, HAMMER2IOC_INODE_GET, &inode);

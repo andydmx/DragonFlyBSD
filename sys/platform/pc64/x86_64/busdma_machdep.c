@@ -36,9 +36,7 @@
 #include <sys/sysctl.h>
 #include <sys/lock.h>
 
-#include <sys/thread2.h>
 #include <sys/spinlock2.h>
-#include <sys/mplock2.h>
 
 #include <vm/vm.h>
 #include <vm/vm_page.h>
@@ -48,6 +46,10 @@
 #include <vm/vm_map.h>
 
 #include <machine/md_var.h>
+#include <machine/pmap.h>
+
+#include <bus/cam/cam.h>
+#include <bus/cam/cam_ccb.h>
 
 #define MAX_BPAGES	1024
 
@@ -475,7 +477,7 @@ bus_dmamap_create(bus_dma_tag_t dmat, int flags, bus_dmamap_t *mapp)
 int
 bus_dmamap_destroy(bus_dma_tag_t dmat, bus_dmamap_t map)
 {
-	if (map != NULL) {
+	if (map != NULL && map != (void *)-1) {
 		if (STAILQ_FIRST(&map->bpages) != NULL)
 			return (EBUSY);
 		kfree(map, M_DEVBUF);
@@ -493,15 +495,11 @@ check_kmalloc(bus_dma_tag_t dmat, const void *vaddr0, int verify)
 	if ((vaddr ^ (vaddr + dmat->maxsize - 1)) & ~PAGE_MASK) {
 		if (verify)
 			panic("boundary check failed\n");
-		if (bootverbose)
-			kprintf("boundary check failed\n");
 		maxsize = dmat->maxsize;
 	}
 	if (vaddr & (dmat->alignment - 1)) {
 		if (verify)
 			panic("alignment check failed\n");
-		if (bootverbose)
-			kprintf("alignment check failed\n");
 		if (dmat->maxsize < dmat->alignment)
 			maxsize = dmat->alignment;
 		else
@@ -514,8 +512,8 @@ check_kmalloc(bus_dma_tag_t dmat, const void *vaddr0, int verify)
  * Allocate a piece of memory that can be efficiently mapped into
  * bus device space based on the constraints lited in the dma tag.
  *
- * mapp is degenerate.  By definition this allocation should not require
- * bounce buffers so do not allocate a dma map.
+ * Use *mapp to record whether we were able to use kmalloc()
+ * or whether we had to use contigmalloc().
  */
 int
 bus_dmamem_alloc(bus_dma_tag_t dmat, void **vaddr, int flags,
@@ -545,7 +543,7 @@ bus_dmamem_alloc(bus_dma_tag_t dmat, void **vaddr, int flags,
 		attr = VM_MEMATTR_DEFAULT;
 
 	/* XXX must alloc with correct mem attribute here */
-	if (BUS_DMAMEM_KMALLOC(dmat)) {
+	if (BUS_DMAMEM_KMALLOC(dmat) && attr == VM_MEMATTR_DEFAULT) {
 		bus_size_t maxsize;
 
 		*vaddr = kmalloc(dmat->maxsize, M_DEVBUF, mflags);
@@ -561,7 +559,7 @@ bus_dmamem_alloc(bus_dma_tag_t dmat, void **vaddr, int flags,
 		if (maxsize) {
 			kfree(*vaddr, M_DEVBUF);
 			*vaddr = kmalloc(maxsize, M_DEVBUF,
-			    mflags | M_POWEROF2);
+					 mflags | M_POWEROF2);
 			check_kmalloc(dmat, *vaddr, 1);
 		}
 	} else {
@@ -571,13 +569,17 @@ bus_dmamem_alloc(bus_dma_tag_t dmat, void **vaddr, int flags,
 		 *     multi-seg allocations yet though.
 		 */
 		*vaddr = contigmalloc(dmat->maxsize, M_DEVBUF, mflags,
-		    0ul, dmat->lowaddr, dmat->alignment, dmat->boundary);
+				      0ul, dmat->lowaddr,
+				      dmat->alignment, dmat->boundary);
+		*mapp = (void  *)-1;
 	}
 	if (*vaddr == NULL)
 		return (ENOMEM);
 
-	if (attr != VM_MEMATTR_DEFAULT)
-		pmap_change_attr((vm_offset_t)(*vaddr), dmat->maxsize / PAGE_SIZE, attr);
+	if (attr != VM_MEMATTR_DEFAULT) {
+		pmap_change_attr((vm_offset_t)(*vaddr),
+				 dmat->maxsize / PAGE_SIZE, attr);
+	}
 	return (0);
 }
 
@@ -592,9 +594,9 @@ bus_dmamem_free(bus_dma_tag_t dmat, void *vaddr, bus_dmamap_t map)
 	 * dmamem does not need to be bounced, so the map should be
 	 * NULL
 	 */
-	if (map != NULL)
+	if (map != NULL && map != (void *)-1)
 		panic("bus_dmamem_free: Invalid map freed");
-	if (BUS_DMAMEM_KMALLOC(dmat))
+	if (map == NULL)
 		kfree(vaddr, M_DEVBUF);
 	else
 		contigfree(vaddr, dmat->maxsize, M_DEVBUF);
@@ -604,7 +606,7 @@ static __inline vm_paddr_t
 _bus_dma_extract(pmap_t pmap, vm_offset_t vaddr)
 {
 	if (pmap)
-		return pmap_extract(pmap, vaddr);
+		return pmap_extract(pmap, vaddr, NULL);
 	else
 		return pmap_kextract(vaddr);
 }
@@ -634,7 +636,7 @@ _bus_dmamap_load_buffer(bus_dma_tag_t dmat,
 	bus_addr_t bmask;
 	int seg, error = 0;
 
-	if (map == NULL)
+	if (map == NULL || map == (void *)-1)
 		map = &nobounce_dmamap;
 
 #ifdef INVARIANTS
@@ -809,7 +811,7 @@ bus_dmamap_load(bus_dma_tag_t dmat, bus_dmamap_t map, void *buf,
 	vm_paddr_t lastaddr = 0;
 	int error, nsegs = 1;
 
-	if (map != NULL) {
+	if (map != NULL && map != (void *)-1) {
 		/*
 		 * XXX
 		 * Follow old semantics.  Once all of the callers are fixed,
@@ -840,6 +842,24 @@ bus_dmamap_load(bus_dma_tag_t dmat, bus_dmamap_t map, void *buf,
 	callback(callback_arg, segments, nsegs, error);
 	bus_dma_tag_unlock(dmat);
 	return 0;
+}
+
+/*
+ * Like _bus_dmamap_load(), but for ccb.
+ */
+int
+bus_dmamap_load_ccb(bus_dma_tag_t dmat, bus_dmamap_t map, union ccb *ccb,
+    bus_dmamap_callback_t *callback, void *callback_arg, int flags)
+{
+	const struct ccb_scsiio *csio;
+
+	KASSERT(ccb->ccb_h.func_code == XPT_SCSI_IO ||
+	    ccb->ccb_h.func_code == XPT_CONT_TARGET_IO,
+	    ("invalid ccb func_code %u", ccb->ccb_h.func_code));
+	csio = &ccb->csio;
+
+	return (bus_dmamap_load(dmat, map, csio->data_ptr, csio->dxfer_len,
+	    callback, callback_arg, flags));
 }
 
 /*
@@ -1412,7 +1432,7 @@ free_bounce_page(bus_dma_tag_t dmat, struct bounce_page *bpage)
 
 	BZ_UNLOCK(bz);
 
-	if (map != NULL)
+	if (map != NULL && map != (void *)-1)
 		add_map_callback(map);
 }
 
@@ -1424,7 +1444,7 @@ get_map_waiting(bus_dma_tag_t dmat)
 	bus_dmamap_t map;
 
 	map = STAILQ_FIRST(&bz->bounce_map_waitinglist);
-	if (map != NULL) {
+	if (map != NULL && map != (void *)-1) {
 		if (reserve_bounce_pages(map->dmat, map, 1) == 0) {
 			STAILQ_REMOVE_HEAD(&bz->bounce_map_waitinglist, links);
 			bz->total_deferred++;
@@ -1459,4 +1479,23 @@ busdma_swi(void)
 		spin_lock(&bounce_map_list_spin);
 	}
 	spin_unlock(&bounce_map_list_spin);
+}
+
+int
+bus_space_map(bus_space_tag_t t __unused, bus_addr_t addr, bus_size_t size,
+    int flags __unused, bus_space_handle_t *bshp)
+{
+
+	if (t == X86_64_BUS_SPACE_MEM)
+		*bshp = (uintptr_t)pmap_mapdev(addr, size);
+	else
+		*bshp = addr;
+	return (0);
+}
+
+void
+bus_space_unmap(bus_space_tag_t t, bus_space_handle_t bsh, bus_size_t size)
+{
+	if (t == X86_64_BUS_SPACE_MEM)
+		pmap_unmapdev(bsh, size);
 }

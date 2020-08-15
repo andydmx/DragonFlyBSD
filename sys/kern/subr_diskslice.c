@@ -59,7 +59,6 @@
 #include <sys/proc.h>
 #include <sys/vnode.h>
 #include <sys/device.h>
-#include <sys/thread2.h>
 
 #include <vfs/ufs/dinode.h>	/* XXX used only for fs.h */
 #include <vfs/ufs/fs.h>		/* XXX used only to get BBSIZE/SBSIZE */
@@ -778,9 +777,11 @@ dsreadandsetlabel(cdev_t dev, u_int flags,
 		lp = ops->op_clone_label(info, sp);
 	}
 	if (msg != NULL) {
-		if (sp->ds_type == DOSPTYP_386BSD /* XXX */)
+		if (sp->ds_type == DOSPTYP_386BSD ||
+		    sp->ds_type == DOSPTYP_DFLYBSD) {
 			log(LOG_WARNING, "%s: cannot find label (%s)\n",
 			    sname, msg);
+		}
 		if (lp.opaque)
 			kfree(lp.opaque, M_DEVBUF);
 	} else {
@@ -806,7 +807,7 @@ dssize(cdev_t dev, struct diskslices **sspp)
 	ssp = *sspp;
 	if (ssp == NULL || slice >= ssp->dss_nslices
 	    || !dschkmask(&ssp->dss_slices[slice], part)) {
-		if (dev_dopen(dev, FREAD, S_IFCHR, proc0.p_ucred, NULL) != 0)
+		if (dev_dopen(dev, FREAD, S_IFCHR, proc0.p_ucred, NULL, NULL) != 0)
 			return (-1);
 		dev_dclose(dev, FREAD, S_IFCHR, NULL);
 		ssp = *sspp;

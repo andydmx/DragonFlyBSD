@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2014 François Tigeot
+ * Copyright (c) 2014-2020 François Tigeot <ftigeot@wolfpond.org>
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -27,17 +27,28 @@
 #ifndef _LINUX_JIFFIES_H_
 #define _LINUX_JIFFIES_H_
 
-#include <linux/time.h>
 #include <sys/kernel.h>
 #include <machine/limits.h>
 
+#include <linux/math64.h>
+#include <linux/time.h>
+
 #define HZ			hz
+
+#define MAX_JIFFY_OFFSET	((LONG_MAX >> 1) - 1)
 
 #define jiffies_to_msecs(x)	(((int64_t)(x)) * 1000 / hz)
 #define msecs_to_jiffies(x)	(((int64_t)(x)) * hz / 1000)
 #define jiffies			ticks
+#define jiffies_64		ticks /* XXX hmmm */
 #define time_after(a,b)		((long)(b) - (long)(a) < 0)
 #define time_after_eq(a,b)	((long)(b) - (long)(a) <= 0)
+
+#define time_before(a,b)	time_after(b,a)
+#define time_before_eq(a,b)	time_after_eq(b,a)
+
+#define time_in_range(a,b,c)	\
+	time_after_eq(a,b) && time_before_eq(a,c)
 
 static inline unsigned long
 timespec_to_jiffies(const struct timespec *ts)
@@ -49,6 +60,45 @@ timespec_to_jiffies(const struct timespec *ts)
 		result = LONG_MAX;
 
 	return result;
+}
+
+static inline
+unsigned long usecs_to_jiffies(const unsigned int u)
+{
+	unsigned long jiffies;
+
+	jiffies = (u * hz) / 1000000;
+	if (jiffies < 1)
+		return 1;
+	else
+		return jiffies;
+}
+
+static inline u64 get_jiffies_64(void)
+{
+	return (u64)ticks;
+}
+
+static inline u64 nsecs_to_jiffies(u64 n)
+{
+	return (n * hz) / NSEC_PER_SEC;
+}
+
+static inline u64 nsecs_to_jiffies64(u64 n)
+{
+	return nsecs_to_jiffies(n);
+}
+
+static inline
+unsigned int jiffies_to_usecs(const unsigned long j)
+{
+	return j * (USEC_PER_SEC / HZ);
+}
+
+static inline u64
+jiffies_to_nsecs(const unsigned long j)
+{
+	return j * (NSEC_PER_SEC / HZ);
 }
 
 #endif	/* _LINUX_JIFFIES_H_ */

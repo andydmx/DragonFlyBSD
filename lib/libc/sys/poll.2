@@ -1,6 +1,5 @@
 .\"	$NetBSD: poll.2,v 1.3 1996/09/07 21:53:08 mycroft Exp $
 .\" $FreeBSD: src/lib/libc/sys/poll.2,v 1.4.2.3 2001/12/14 18:34:01 ru Exp $
-.\" $DragonFly: src/lib/libc/sys/poll.2,v 1.7 2008/05/25 14:04:32 swildner Exp $
 .\"
 .\" Copyright (c) 1996 Charles M. Hannum.  All rights reserved.
 .\"
@@ -29,11 +28,12 @@
 .\" (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
 .\" THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 .\"
-.Dd January 12, 2008
+.Dd December 1, 2016
 .Dt POLL 2
 .Os
 .Sh NAME
-.Nm poll
+.Nm poll ,
+.Nm ppoll
 .Nd synchronous I/O multiplexing
 .Sh LIBRARY
 .Lb libc
@@ -41,10 +41,23 @@
 .In sys/types.h
 .In poll.h
 .Ft int
-.Fn poll "struct pollfd *fds" "nfds_t nfds" "int timeout"
+.Fo poll
+.Fa "struct pollfd *fds"
+.Fa "nfds_t nfds"
+.Fa "int timeout"
+.Fc
+.Ft int
+.Fo ppoll
+.Fa "struct pollfd *fds"
+.Fa "nfds_t nfds"
+.Fa "const struct timespec *timeout"
+.Fa "const sigset_t *newsigmask"
+.Fc
 .Sh DESCRIPTION
 .Fn Poll
-examines a set of file descriptors to see if some of them are ready for
+and
+.Fn ppoll
+examine a set of file descriptors to see if some of them are ready for
 I/O.
 The
 .Fa fds
@@ -140,6 +153,30 @@ If
 is zero, then
 .Fn poll
 will return without blocking.
+.Pp
+The
+.Fn ppoll
+system call can be used to safely wait until either a set of file
+descriptors becomes ready, or until a signal is caught.
+The
+.Fa timeout
+argument in
+.Fn ppoll
+points to a
+.Vt "const struct timespec"
+rather than the
+.Vt "int timeout"
+used by
+.Fn poll .
+A null pointer may be passed to indicate that
+.Fn ppoll
+should wait indefinitely.
+Finally,
+.Fa newsigmask
+specifies a signal mask which is set while waiting for input.
+When
+.Fn ppoll
+returns, the original signal mask is restored.
 .Sh RETURN VALUES
 .Fn Poll
 returns the number of descriptors that are ready for I/O, or -1 if an
@@ -169,6 +206,11 @@ bitmask to the
 bitmask.
 Attempting to perform I/O on this descriptor will then return an error.
 This behaviour is believed to be more useful.
+.Pp
+The
+.Fn ppoll
+implementation uses a precise timeout which is intended to mimic the
+behaviour of this syscall in Linux.
 .Sh ERRORS
 An error return from
 .Fn poll
@@ -186,6 +228,7 @@ The specified time limit is negative.
 .Sh SEE ALSO
 .Xr accept 2 ,
 .Xr connect 2 ,
+.Xr pselect 2 ,
 .Xr read 2 ,
 .Xr recv 2 ,
 .Xr select 2 ,
@@ -198,6 +241,10 @@ function call appeared in
 .At V .
 This manual page was taken from
 .Nx .
+The
+.Fn ppoll
+function first appeared in
+.Dx 4.6 .
 .Sh BUGS
 The distinction between some of the fields in the
 .Fa events

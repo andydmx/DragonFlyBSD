@@ -104,13 +104,13 @@
 #include <sys/systm.h>
 #include <sys/sockio.h>
 #include <sys/endian.h>
+#include <sys/malloc.h>	/* for M_NOWAIT */
 #include <sys/mbuf.h>
 #include <sys/kernel.h>
 #include <sys/socket.h>
 #include <sys/serialize.h>
 #include <sys/bus.h>
 #include <sys/rman.h>
-#include <sys/thread2.h>
 #include <sys/interrupt.h>
 
 #include <net/if.h>
@@ -1065,6 +1065,7 @@ xl_choose_xcvr(struct xl_softc *sc, int verbose)
 	 * This is what's loaded into the PCI device ID register, so it has
 	 * to be correct otherwise we wouldn't have gotten this far.
 	 */
+	devid = 0;	/* silence gcc warnings */
 	xl_read_eeprom(sc, (caddr_t)&devid, XL_EE_PRODID, 1, 0);
 
 	switch(devid) {
@@ -1881,7 +1882,7 @@ xl_newbuf(struct xl_softc *sc, struct xl_chain_onefrag *c, int init)
 	int			error, nsegs;
 	bus_dma_segment_t	seg;
 
-	m_new = m_getcl(init ? MB_WAIT : MB_DONTWAIT, MT_DATA, M_PKTHDR);
+	m_new = m_getcl(init ? M_WAITOK : M_NOWAIT, MT_DATA, M_PKTHDR);
 	if (m_new == NULL)
 		return(ENOBUFS);
 

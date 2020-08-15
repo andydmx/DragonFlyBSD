@@ -1,5 +1,4 @@
 # $FreeBSD: src/share/mk/bsd.own.mk,v 1.27.2.4 2002/07/22 14:21:51 ru Exp $
-# $DragonFly: src/share/mk/bsd.own.mk,v 1.17 2008/09/02 11:50:45 matthias Exp $
 #
 # The include file <bsd.own.mk> set common variables for owner,
 # group, mode, and directories. Defaults are in brackets.
@@ -69,8 +68,6 @@
 #
 # LIBDIR	Base path for libraries. [/usr/lib]
 #
-# LIBCOMPATDIR	Base path for compat libraries. [/usr/lib/compat]
-#
 # LIBDATADIR	Base path for misc. utility data files. [/usr/libdata]
 #
 # LINTLIBDIR	Base path for lint libraries. [/usr/libdata/lint]
@@ -124,7 +121,7 @@
 #
 #
 # NLSDIR	Base path for National Language Support files
-#		installation (see mklocale(1)). [${SHAREDIR}/nls]
+#		installation (see localedef(1)). [${SHAREDIR}/nls]
 #
 # NLSGRP	National Language Support files group. [${SHAREOWN}]
 #
@@ -143,7 +140,6 @@ NOBINMODE?=	444
 
 LIBDIR?=	/usr/lib
 GCCLIBDIR?=	${LIBDIR}/${CCVER}
-LIBCOMPATDIR?=	/usr/lib/compat
 LIBDATADIR?=	/usr/libdata
 LINTLIBDIR?=	/usr/libdata/lint
 DEBUGLIBDIR?=	${LIBDIR}/debug

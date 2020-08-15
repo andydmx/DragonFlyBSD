@@ -1,8 +1,11 @@
-DF306.0 {
-    _Exit;
+DF404.0 {
     __cxa_atexit;
     __cxa_finalize;
-    __isthreaded;
+    _Exit;
+    _nmalloc_thr_prepfork;
+    _nmalloc_thr_parentfork;
+    _nmalloc_thr_childfork;
+    _system;
     a64l;
     abort;
     abs;
@@ -10,13 +13,16 @@ DF306.0 {
     at_quick_exit;
     atexit;
     atof;
+    atof_l;
     atoi;
+    atoi_l;
     atol;
+    atol_l;
     atoll;
+    atoll_l;
     bsearch;
     calloc;
     div;
-    exit;
     free;
     getenv;
     getopt;
@@ -70,14 +76,21 @@ DF306.0 {
     srandom;
     srandomdev;
     strfmon;
+    strfmon_l;
     strtoimax;
+    strtoimax_l;
     strtol;
+    strtol_l;
     strtoll;
+    strtoll_l;
     strtonum;
     strtoq;
     strtoul;
+    strtoul_l;
     strtoull;
+    strtoull_l;
     strtoumax;
+    strtoumax_l;
     strtouq;
     suboptarg;
     system;
@@ -89,9 +102,40 @@ DF306.0 {
     unsetenv;
 };
 
+DF410.0 {
+    __calloc;
+    __free;
+    __malloc;
+    __posix_memalign;
+    __realloc;
+};
+
+DF504.0 {
+    strsuftoll;
+    strsuftollx;
+};
+
+DF506.0 {
+    __aligned_alloc;
+    __cxa_thread_atexit_impl;
+    freezero;
+    posix_fadvise;
+    reallocarray;
+    recallocarray;
+};
+
+DF508.0 {
+    abort_handler_s;
+    ignore_handler_s;
+    _libc_thr_init;
+    set_constraint_handler_s;
+};
+
+/*
+ * ignore WEAK:  __pthread_cxa_finalize;
+ */
+
 DFprivate_1.0 {
     __cleanup;
     __system;
-    _nmalloc_thr_init;
-    _system;
 };

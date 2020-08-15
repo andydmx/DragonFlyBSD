@@ -1,4 +1,6 @@
-/*
+/*-
+ * SPDX-License-Identifier: BSD-2-Clause-FreeBSD
+ *
  * Copyright (C) 1995, 1996, 1997 Wolfgang Solfrank
  * Copyright (c) 1995 Martin Husemann
  *
@@ -10,13 +12,6 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by Martin Husemann
- *	and Wolfgang Solfrank.
- * 4. Neither the name of the University nor the names of its contributors
- *    may be used to endorse or promote products derived from this software
- *    without specific prior written permission.
  *
  * THIS SOFTWARE IS PROVIDED BY THE AUTHORS ``AS IS'' AND ANY EXPRESS OR
  * IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
@@ -28,17 +23,14 @@
  * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
  * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
  * THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- *
- * $NetBSD: check.c,v 1.10 2000/04/25 23:02:51 jdolecek Exp $
- * $FreeBSD: src/sbin/fsck_msdosfs/check.c,v 1.1.2.1 2001/08/01 05:47:55 obrien Exp $
  */
 
 #include <stdlib.h>
 #include <string.h>
-#include <ctype.h>
 #include <stdio.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <libutil.h>
 
 #include "ext.h"
 #include "fsutil.h"
@@ -48,10 +40,12 @@ checkfilesys(const char *fname)
 {
 	int dosfs;
 	struct bootblock boot;
-	struct fatEntry *fat = NULL;
-	int i, finish_dosdirsection=0;
+	struct fat_descriptor *fat = NULL;
+	int finish_dosdirsection=0;
 	int mod = 0;
 	int ret = 8;
+	int64_t freebytes;
+	int64_t badbytes;
 
 	rdonly = alwaysno;
 	if (!preen)
@@ -69,91 +63,85 @@ checkfilesys(const char *fname)
 		printf("\n");
 
 	if (dosfs < 0) {
-		perror("Can't open");
+		perr("Can't open `%s'", fname);
+		printf("\n");
 		return 8;
 	}
 
-	if (readboot(dosfs, &boot) != FSOK) {
+	if (readboot(dosfs, &boot) == FSFATAL) {
 		close(dosfs);
 		printf("\n");
 		return 8;
 	}
 
 	if (!preen)  {
-		if (boot.ValidFat < 0)
-			printf("** Phase 1 - Read and Compare FATs\n");
-		else
-			printf("** Phase 1 - Read FAT\n");
+		printf("** Phase 1 - Read FAT and checking connectivity\n");
 	}
 
-	mod |= readfat(dosfs, &boot, boot.ValidFat >= 0 ? boot.ValidFat : 0, &fat);
+	mod |= readfat(dosfs, &boot, &fat);
 	if (mod & FSFATAL) {
 		close(dosfs);
 		return 8;
 	}
 
-	if (boot.ValidFat < 0)
-		for (i = 1; i < boot.FATs; i++) {
-			struct fatEntry *currentFat;
-
-			mod |= readfat(dosfs, &boot, i, &currentFat);
-
-			if (mod & FSFATAL)
-				goto out;
-
-			mod |= comparefat(&boot, fat, currentFat, i);
-			free(currentFat);
-			if (mod & FSFATAL)
-				goto out;
-		}
-
 	if (!preen)
-		printf("** Phase 2 - Check Cluster Chains\n");
+		printf("** Phase 2 - Checking Directories\n");
 
-	mod |= checkfat(&boot, fat);
-	if (mod & FSFATAL)
-		goto out;
-	/* delay writing FATs */
-
-	if (!preen)
-		printf("** Phase 3 - Checking Directories\n");
-
-	mod |= resetDosDirSection(&boot, fat);
+	mod |= resetDosDirSection(fat);
 	finish_dosdirsection = 1;
 	if (mod & FSFATAL)
 		goto out;
 	/* delay writing FATs */
 
-	mod |= handleDirTree(dosfs, &boot, fat);
+	mod |= handleDirTree(fat);
 	if (mod & FSFATAL)
 		goto out;
 
 	if (!preen)
-		printf("** Phase 4 - Checking for Lost Files\n");
+		printf("** Phase 3 - Checking for Lost Files\n");
 
-	mod |= checklost(dosfs, &boot, fat);
+	mod |= checklost(fat);
 	if (mod & FSFATAL)
 		goto out;
 
 	/* now write the FATs */
 	if (mod & FSFATMOD) {
 		if (ask(1, "Update FATs")) {
-			mod |= writefat(dosfs, &boot, fat, mod & FSFIXFAT);
+			mod |= writefat(fat);
 			if (mod & FSFATAL)
 				goto out;
 		} else
 			mod |= FSERROR;
 	}
 
+	freebytes = (int64_t)boot.NumFree * boot.ClusterSize;
+	badbytes = (int64_t)boot.NumBad * boot.ClusterSize;
+
+#if 1
+	char freestr[7], badstr[7];
+
+	humanize_number(freestr, sizeof(freestr), freebytes, "",
+	    HN_AUTOSCALE, HN_DECIMAL | HN_IEC_PREFIXES);
+	if (boot.NumBad) {
+		humanize_number(badstr, sizeof(badstr), badbytes, "",
+		    HN_AUTOSCALE, HN_B | HN_DECIMAL | HN_IEC_PREFIXES);
+
+		pwarn("%d files, %sB free (%d clusters), %sB bad (%d clusters)\n",
+		      boot.NumFiles, freestr, boot.NumFree,
+		      badstr, boot.NumBad);
+	} else {
+		pwarn("%d files, %sB free (%d clusters)\n",
+		      boot.NumFiles, freestr, boot.NumFree);
+	}
+#else
 	if (boot.NumBad)
-		pwarn("%d files, %d free (%d clusters), %d bad (%d clusters)\n",
-		      boot.NumFiles,
-		      boot.NumFree * boot.ClusterSize / 1024, boot.NumFree,
-		      boot.NumBad * boot.ClusterSize / 1024, boot.NumBad);
+		pwarn("%d files, %jd KiB free (%d clusters), %jd KiB bad (%d clusters)\n",
+		      boot.NumFiles, (intmax_t)freebytes / 1024, boot.NumFree,
+		      (intmax_t)badbytes / 1024, boot.NumBad);
 	else
-		pwarn("%d files, %d free (%d clusters)\n",
-		      boot.NumFiles,
-		      boot.NumFree * boot.ClusterSize / 1024, boot.NumFree);
+		pwarn("%d files, %jd KiB free (%d clusters)\n",
+		      boot.NumFiles, (intmax_t)freebytes / 1024, boot.NumFree);
+#endif
 
 	if (mod && (mod & FSERROR) == 0) {
 		if (mod & FSDIRTY) {
@@ -162,7 +150,7 @@ checkfilesys(const char *fname)
 
 			if (mod & FSDIRTY) {
 				pwarn("MARKING FILE SYSTEM CLEAN\n");
-				mod |= writefat(dosfs, &boot, fat, 1);
+				mod |= cleardirty(fat);
 			} else {
 				pwarn("\n***** FILE SYSTEM IS LEFT MARKED AS DIRTY *****\n");
 				mod |= FSERROR; /* file system not clean */
@@ -175,7 +163,7 @@ checkfilesys(const char *fname)
 
 	ret = 0;
 
-    out:
+out:
 	if (finish_dosdirsection)
 		finishDosDirSection();
 	free(fat);

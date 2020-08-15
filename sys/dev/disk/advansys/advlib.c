@@ -61,6 +61,7 @@
 #include <bus/cam/scsi/scsi_message.h>
 #include <bus/cam/scsi/scsi_da.h>
 #include <bus/cam/scsi/scsi_cd.h>
+#include <bus/cam/cam_xpt_periph.h>
 
 #include <vm/vm.h>
 #include <vm/vm_param.h>
@@ -509,7 +510,7 @@ adv_get_eeprom_config(struct adv_softc *adv, struct
 	for (s_addr = cfg_beg; s_addr <= (cfg_end - 1); s_addr++, wbuf++) {
 		*wbuf = adv_read_eeprom_16(adv, s_addr);
 		sum += *wbuf;
-#if ADV_DEBUG_EEPROM
+#ifdef ADV_DEBUG_EEPROM
 		kprintf("Addr 0x%x: 0x%04x\n", s_addr, *wbuf);
 #endif
 	}
@@ -1016,7 +1017,7 @@ adv_isr_chip_halted(struct adv_softc *adv)
 		 * Ensure we have enough time to actually
 		 * retrieve the sense.
 		 */
-		callout_reset(&ccb->ccb_h.timeout_ch, 5 * hz, adv_timeout, ccb);
+		callout_reset(ccb->ccb_h.timeout_ch, 5 * hz, adv_timeout, ccb);
 	} else if (int_halt_code == ADV_HALT_SDTR_REJECTED) {
 		struct	ext_msg out_msg;
 
@@ -1126,22 +1127,24 @@ adv_set_syncrate(struct adv_softc *adv, struct cam_path *path,
 			 * Tell the SCSI layer about the
 			 * new transfer parameters.
 			 */
-			struct	ccb_trans_settings neg;
-			memset(&neg, 0, sizeof (neg));
-			struct ccb_trans_settings_spi *spi =
-			    &neg.xport_specific.spi;
+			struct ccb_trans_settings *neg;
+			struct ccb_trans_settings_spi *spi;
 
-			neg.protocol = PROTO_SCSI;
-			neg.protocol_version = SCSI_REV_2;
-			neg.transport = XPORT_SPI;
-			neg.transport_version = 2;
+			neg = &xpt_alloc_ccb()->cts;
+			spi = &neg->xport_specific.spi;
+
+			neg->protocol = PROTO_SCSI;
+			neg->protocol_version = SCSI_REV_2;
+			neg->transport = XPORT_SPI;
+			neg->transport_version = 2;
 
 			spi->sync_offset = offset;
 			spi->sync_period = period;
 			spi->valid |= CTS_SPI_VALID_SYNC_OFFSET;
 			spi->valid |= CTS_SPI_VALID_SYNC_RATE;
-			xpt_setup_ccb(&neg.ccb_h, path, /*priority*/1);
-			xpt_async(AC_TRANSFER_NEG, path, &neg);
+			xpt_setup_ccb(&neg->ccb_h, path, /*priority*/1);
+			xpt_async(AC_TRANSFER_NEG, path, neg);
+			xpt_free_ccb(&neg->ccb_h);
 		}
 	}
 
@@ -1822,12 +1825,12 @@ adv_put_ready_queue(struct adv_softc *adv, struct adv_scsi_q *scsiq,
 		      (u_int16_t *) &scsiq->q1.cntl,
 		      ((sizeof(scsiq->q1) + sizeof(scsiq->q2)) / 2) - 1);
 
-#if CC_WRITE_IO_COUNT
+#if defined(CC_WRITE_IO_COUNT) && CC_WRITE_IO_COUNT
 	adv_write_lram_16(adv, q_addr + ADV_SCSIQ_W_REQ_COUNT,
 			  adv->req_count);
 #endif
 
-#if CC_CLEAR_DMA_REMAIN
+#if defined(CC_CLEAR_DMA_REMAIN) && CC_CLEAR_DMA_REMAIN
 
 	adv_write_lram_32(adv, q_addr + ADV_SCSIQ_DW_REMAIN_XFER_ADDR, 0);
 	adv_write_lram_32(adv, q_addr + ADV_SCSIQ_DW_REMAIN_XFER_CNT, 0);

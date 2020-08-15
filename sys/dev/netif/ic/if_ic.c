@@ -30,7 +30,6 @@
  * I2C bus IP driver
  */
 
-#ifdef _KERNEL
 #include <sys/param.h>
 #include <sys/systm.h>
 #include <sys/proc.h>
@@ -50,9 +49,6 @@
 #include <net/if_types.h>
 #include <net/netisr.h>
 
-#endif
-#include <sys/mbuf.h>
-#include <sys/socket.h>
 #include <net/route.h>
 #include <netinet/in.h>
 #include <netinet/in_systm.h>
@@ -291,7 +287,7 @@ icintr (device_t dev, int event, char *ptr)
 
 	  BPF_TAP(&sc->ic_if, sc->ic_ifbuf, len + ICHDRLEN);
 
-	  top = m_devget(sc->ic_ifbuf + ICHDRLEN, len, 0, &sc->ic_if, 0);
+	  top = m_devget(sc->ic_ifbuf + ICHDRLEN, len, 0, &sc->ic_if);
 
 	  if (top)
 	    netisr_queue(NETISR_IP, top);

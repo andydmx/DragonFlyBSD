@@ -12,11 +12,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -39,13 +35,15 @@
 #ifndef _CPU_SIGNAL_H_
 #define	_CPU_SIGNAL_H_
 
+#include <sys/cdefs.h>
+
 /*
  * Machine-dependent signal definitions
  */
 
 typedef int sig_atomic_t;
 
-#if !defined(_ANSI_SOURCE) && !defined(_POSIX_SOURCE)
+#if __BSD_VISIBLE
 
 #include <machine/trap.h>	/* codes for SIGILL, SIGFPE */
 
@@ -97,8 +95,17 @@ struct	sigcontext {
 
 	/* 64 byte aligned */
 	int             sc_fpregs[256]; /* 1024 bytes */
-} __attribute__((aligned(64)));
+} __aligned(64);
 
-#endif /* !_ANSI_SOURCE && !_POSIX_SOURCE */
+#endif /* __BSD_VISIBLE */
+
+/*
+ * Tells the kernel how many pages to drop the signal trampoline down
+ * when mapping it.  Must be at least 1 page because kern_exec mprotects
+ * it to R+X (making it unwritable).
+ */
+#if defined(_KERNEL) || defined(_KERNEL_STRUCTURES)
+#define SZSIGCODE_EXTRA_BYTES	(1*PAGE_SIZE)
+#endif
 
 #endif /* !_CPU_SIGNAL_H_ */

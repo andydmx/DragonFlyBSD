@@ -36,8 +36,6 @@
 #include <sys/cons.h>	/* cngetc() */
 #include <sys/machintr.h>
 
-#include <sys/mplock2.h>
-
 #include <vm/vm.h>
 #include <vm/vm_param.h>
 #include <vm/pmap.h>
@@ -45,10 +43,6 @@
 #include <vm/vm_extern.h>
 #include <sys/lock.h>
 #include <vm/vm_map.h>
-#include <sys/user.h>
-#ifdef GPROF 
-#include <sys/gmon.h>
-#endif
 
 #include <machine/smp.h>
 #include <machine_base/isa/isa_intr.h>
@@ -727,7 +721,7 @@ mptable_lapic_default(void)
 	/* Map local apic before the id field is accessed */
 	lapic_map(DEFAULT_APIC_BASE);
 
-	bsp_apicid = APIC_ID(lapic->id);
+	bsp_apicid = LAPIC_READID;
 	ap_apicid = (bsp_apicid == 0) ? 1 : 0;
 
 	/* BSP */
@@ -1042,8 +1036,22 @@ mptable_pci_int_callback(void *xarg, const void *pos, int type)
 			break;
 	}
 	if (ioapic == NULL) {
-		kprintf("MPTABLE: warning PCI int dst apic id %d "
-			"does not exist\n", ent->dst_apic_id);
+		if (bootverbose) {
+			static char intdis_warned[64];
+			int apic_id = ent->dst_apic_id;
+			int warn = 0;
+
+			if (apic_id < 0 || apic_id >= sizeof(intdis_warned)) {
+				warn = 1;
+			} else if (intdis_warned[apic_id] == 0) {
+				intdis_warned[apic_id] = 1;
+				warn = 1;
+			}
+			if (warn) {
+				kprintf("MPTABLE: warning PCI int dst apic id "
+				    "%d does not exist\n", apic_id);
+			}
+		}
 		return 0;
 	}
 

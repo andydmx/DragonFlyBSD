@@ -18,6 +18,8 @@
 /set mode=0750
     backups
     ..
+    cache               mode=0755
+    ..
     crash
     ..
     cron
@@ -26,6 +28,10 @@
     ..
 /set mode=0755
     db
+        entropy         uname=operator gname=operator mode=0700
+        ..
+        dhcpcd
+        ..
     ..
     empty               mode=0555 flags=schg
     ..
@@ -50,11 +56,19 @@
     preserve
     ..
     run
+        dhcpcd
+        ..
         ppp             gname=network mode=0770
+        ..
+        resolvconf
         ..
         wpa_supplicant
         ..
         sem             mode=01777
+        ..
+        shm             mode=01777
+            tmp         mode=01777
+            ..
         ..
     ..
     rwho            gname=daemon mode=0775
@@ -69,27 +83,9 @@
         ..
         mqueue
         ..
-        opielocks       mode=0700
-        ..
         output
             lpd
             ..
-        ..
-/set gname=wheel
-/set uname=uucp gname=uucp mode=0775
-        uucp
-            .Preserve
-            ..
-            .Sequence
-            ..
-            .Status
-            ..
-            .Temp
-            ..
-            .Xqtdir
-            ..
-        ..
-        uucppublic      mode=0777
         ..
 /set uname=root gname=wheel mode=0755
     ..

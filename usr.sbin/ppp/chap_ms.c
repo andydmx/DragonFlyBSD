@@ -27,24 +27,18 @@
  * SUCH DAMAGE.
  *
  * $FreeBSD: src/usr.sbin/ppp/chap_ms.c,v 1.9.2.6 2002/09/01 02:12:23 brian Exp $
- * $DragonFly: src/usr.sbin/ppp/chap_ms.c,v 1.4 2004/03/27 01:39:13 cpressey Exp $
  */
 
 #include <ctype.h>
-#ifdef __DragonFly__
-#include <openssl/des.h>
-#include <sha.h>
-#else
 #include <sys/types.h>
 #include <stdlib.h>
-#ifdef __NetBSD__
+#if defined(__DragonFly__) || defined(__NetBSD__)
 #include <openssl/des.h>
 #else
 #include <des.h>
 #endif
 #include <openssl/sha.h>
-#endif
-#include <md4.h>
+#include <openssl/md4.h>
 #include <string.h>
 
 #include "chap_ms.h"
@@ -104,18 +98,18 @@ MakeKey(u_char *key, u_char *des_key)
     des_key[6] = Get7Bits(key, 42);
     des_key[7] = Get7Bits(key, 49);
 
-    des_set_odd_parity((des_cblock *)des_key);
+    DES_set_odd_parity((DES_cblock *)des_key);
 }
 
 static void /* IN 8 octets IN 7 octest OUT 8 octets */
 DesEncrypt(u_char *clear, u_char *key, u_char *cipher)
 {
-    des_cblock		des_key;
-    des_key_schedule	key_schedule;
+    DES_cblock		des_key;
+    DES_key_schedule	key_schedule;
 
     MakeKey(key, des_key);
-    des_set_key(&des_key, key_schedule);
-    des_ecb_encrypt((des_cblock *)clear, (des_cblock *)cipher, key_schedule, 1);
+    DES_set_key(&des_key, &key_schedule);
+    DES_ecb_encrypt((DES_cblock *)clear, (DES_cblock *)cipher, &key_schedule, 1);
 }
 
 static void      /* IN 8 octets      IN 16 octets     OUT 24 octets */
@@ -136,9 +130,9 @@ NtPasswordHash(char *key, int keylen, char *hash)
 {
   MD4_CTX MD4context;
 
-  MD4Init(&MD4context);
-  MD4Update(&MD4context, key, keylen);
-  MD4Final(hash, &MD4context);
+  MD4_Init(&MD4context);
+  MD4_Update(&MD4context, key, keylen);
+  MD4_Final(hash, &MD4context);
 }
 
 void
@@ -146,9 +140,9 @@ HashNtPasswordHash(char *hash, char *hashhash)
 {
   MD4_CTX MD4context;
 
-  MD4Init(&MD4context);
-  MD4Update(&MD4context, hash, 16);
-  MD4Final(hashhash, &MD4context);
+  MD4_Init(&MD4context);
+  MD4_Update(&MD4context, hash, 16);
+  MD4_Final(hashhash, &MD4context);
 }
 
 static void
@@ -188,7 +182,6 @@ GenerateNTResponse(char *AuthenticatorChallenge, char *PeerChallenge,
   ChallengeResponse(Challenge, PasswordHash, Response);
 }
 
-#ifndef __DragonFly__
 #define LENGTH 20
 static char *
 SHA1_End(SHA_CTX *ctx, char *buf)
@@ -209,7 +202,6 @@ SHA1_End(SHA_CTX *ctx, char *buf)
     buf[i+i] = '\0';
     return buf;
 }
-#endif
 
 void
 GenerateAuthenticatorResponse(char *Password, int PasswordLen,

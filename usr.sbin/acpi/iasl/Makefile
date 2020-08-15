@@ -8,33 +8,44 @@ UTILDIR=${.CURDIR}/../../../sys/contrib/dev/acpica/source/compiler
 
 PROG=	iasl
 MAN=	iasl.8
+WARNS?=	2
 
 SRCS=	\
 	aslcompiler.y.h \
 	aslcompilerlex.c \
 	aslcompilerparse.c \
 	aslmessages.c \
+	dtcompilerparser.y.h \
+	dtcompilerparserlex.c \
+	dtcompilerparserparse.c \
 	dtparser.y.h \
 	dtparserlex.c \
 	dtparserparse.c \
 	prparser.y.h \
 	prparserlex.c \
 	prparserparse.c \
+	acfileio.c \
 	adfile.c \
 	adisasm.c \
 	adwalk.c \
 	ahids.c \
 	ahpredef.c \
+	ahtable.c \
 	ahuuids.c \
+	aslallocate.c \
 	aslanalyze.c \
 	aslascii.c \
 	aslbtypes.c \
+	aslcache.c \
 	aslcodegen.c \
 	aslcompile.c \
+	asldebug.c \
 	aslerror.c \
+	aslexternal.c \
 	aslfiles.c \
 	aslfileio.c \
 	aslfold.c \
+	aslhelp.c \
 	aslhex.c \
 	asllength.c \
 	asllisting.c \
@@ -53,6 +64,8 @@ SRCS=	\
 	asloperands.c \
 	aslopt.c \
 	asloptions.c \
+	aslparseop.c \
+	aslpld.c \
 	aslpredef.c \
 	aslprepkg.c \
 	aslprintf.c \
@@ -74,6 +87,10 @@ SRCS=	\
 	asluuid.c \
 	aslwalks.c \
 	aslxref.c \
+	aslxrefout.c \
+	cvcompiler.c \
+	cvdisasm.c \
+	cvparser.c \
 	cmfsize.c \
 	dbfileio.c \
 	dmbuffer.c \
@@ -81,16 +98,23 @@ SRCS=	\
 	dmdeferred.c \
 	dmextern.c \
 	dmnames.c \
-	dmobject.c \
 	dmopcode.c \
 	dmresrc.c \
 	dmresrcl.c \
 	dmresrcl2.c \
 	dmresrcs.c \
 	dmrestag.c \
+	dmswitch.c \
 	dmtable.c \
+	dmtables.c \
 	dmtbdump.c \
+	dmtbdump1.c \
+	dmtbdump2.c \
+	dmtbdump3.c \
 	dmtbinfo.c \
+	dmtbinfo1.c \
+	dmtbinfo2.c \
+	dmtbinfo3.c \
 	dmutils.c \
 	dmwalk.c \
 	dsargs.c \
@@ -98,6 +122,7 @@ SRCS=	\
 	dsfield.c \
 	dsobject.c \
 	dsopcode.c \
+	dspkginit.c \
 	dsutils.c \
 	dswexec.c \
 	dswload.c \
@@ -110,8 +135,11 @@ SRCS=	\
 	dtio.c \
 	dtsubtable.c \
 	dttable.c \
+	dttable1.c \
+	dttable2.c \
 	dttemplate.c \
 	dtutils.c \
+	exconcat.c \
 	exconvrt.c \
 	excreate.c \
 	exdump.c \
@@ -144,7 +172,6 @@ SRCS=	\
 	nswalk.c \
 	nsxfobj.c \
 	osunixxf.c \
-	oslibcfs.c \
 	prexpress.c \
 	prmacros.c \
 	prscan.c \
@@ -165,8 +192,10 @@ SRCS=	\
 	tbprint.c \
 	tbutils.c \
 	tbxface.c \
+	tbxfload.c \
 	utaddress.c \
 	utalloc.c \
+	utascii.c \
 	utbuffer.c \
 	utcache.c \
 	utcopy.c \
@@ -175,7 +204,6 @@ SRCS=	\
 	utdelete.c \
 	uterror.c \
 	utexcep.c \
-	utfileio.c \
 	utglobal.c \
 	uthex.c \
 	utinit.c \
@@ -183,13 +211,16 @@ SRCS=	\
 	utmath.c \
 	utmisc.c \
 	utmutex.c \
+	utnonansi.c \
 	utobject.c \
 	utownerid.c \
 	utpredef.c \
-	utprint.c \
+	utresdecode.c \
 	utresrc.c \
 	utstate.c \
 	utstring.c \
+	utstrsuppt.c \
+	utstrtoul64.c \
 	utuuid.c \
 	utxface.c \
 	utxferror.c
@@ -200,10 +231,21 @@ CFLAGS+= \
 	-I${.CURDIR}
 
 LFLAGS=	-i -s
-YFLAGS=	-d
+DLFLAGS=-i
 
-aslcompiler.y: aslparser.y
-	m4 -P -I${UTILDIR} ${.ALLSRC} >${.TARGET}
+ASLPARSER_M4INC = \
+	aslcstyle.y \
+	aslhelpers.y \
+	aslkeywords.y \
+	aslprimaries.y \
+	aslresources.y \
+	aslrules.y \
+	aslsupport.y \
+	asltokens.y \
+	asltypes.y
+
+aslcompiler.y: aslparser.y ${ASLPARSER_M4INC}
+	m4 -P -I${UTILDIR} aslparser.y >${.TARGET}
 
 aslcompilerlex.c: aslcompiler.l
 	${LEX} ${LFLAGS} -PAslCompiler -o${.TARGET} ${.ALLSRC}
@@ -214,8 +256,17 @@ aslcompilerparse.c: aslcompiler.y
 aslcompiler.y.h: aslcompilerparse.c
 	mv -f aslcompilerparse.h ${.TARGET}
 
+dtcompilerparserlex.c: dtcompilerparser.l
+	${LEX} ${DLFLAGS} -PDtCompilerParser -o${.TARGET} ${.ALLSRC}
+
+dtcompilerparserparse.c: dtcompilerparser.y
+	${YACC} ${YFLAGS} -pDtCompilerParser -o${.TARGET} ${.ALLSRC}
+
+dtcompilerparser.y.h: dtcompilerparserparse.c
+	mv -f dtcompilerparserparse.h ${.TARGET}
+
 dtparserlex.c: dtparser.l
-	${LEX} ${LFLAGS} -PDtParser -o${.TARGET} ${.ALLSRC}
+	${LEX} ${DLFLAGS} -PDtParser -o${.TARGET} ${.ALLSRC}
 
 dtparserparse.c: dtparser.y
 	${YACC} ${YFLAGS} -pDtParser -o${.TARGET} ${.ALLSRC}
@@ -238,6 +289,10 @@ CLEANFILES+=	\
 		aslcompilerparse.c \
 		aslcompilerparse.h \
 		aslcompiler.y.h \
+		dtcompilerparserlex.c \
+		dtcompilerparserparse.c \
+		dtcompilerparserparse.h \
+		dtcompilerparser.y.h \
 		dtparserlex.c \
 		dtparserparse.c \
 		dtparserparse.h \

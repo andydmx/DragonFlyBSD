@@ -50,6 +50,7 @@ $FreeBSD: head/sys/dev/mxge/if_mxge.c 254263 2013-08-12 23:30:01Z scottl $
 #include <net/if.h>
 #include <net/if_arp.h>
 #include <net/ifq_var.h>
+#include <net/if_ringmap.h>
 #include <net/ethernet.h>
 #include <net/if_dl.h>
 #include <net/if_media.h>
@@ -77,13 +78,15 @@ $FreeBSD: head/sys/dev/mxge/if_mxge.c 254263 2013-08-12 23:30:01Z scottl $
 #include <vm/vm.h>		/* for pmap_mapdev() */
 #include <vm/pmap.h>
 
-#if defined(__i386__) || defined(__x86_64__)
+#if defined(__x86_64__)
 #include <machine/specialreg.h>
 #endif
 
 #include <dev/netif/mxge/mxge_mcp.h>
 #include <dev/netif/mxge/mcp_gen_header.h>
 #include <dev/netif/mxge/if_mxge_var.h>
+
+#define MXGE_IFM	(IFM_ETHER | IFM_FDX | IFM_ETH_FORCEPAUSE)
 
 #define MXGE_RX_SMALL_BUFLEN		(MHLEN - MXGEFW_PAD)
 #define MXGE_HWRSS_KEYLEN		16
@@ -93,7 +96,6 @@ static int mxge_nvidia_ecrc_enable = 1;
 static int mxge_force_firmware = 0;
 static int mxge_intr_coal_delay = MXGE_INTR_COAL_DELAY;
 static int mxge_deassert_wait = 1;
-static int mxge_flow_control = 1;
 static int mxge_ticks;
 static int mxge_num_slices = 0;
 static int mxge_always_promisc = 0;
@@ -106,13 +108,14 @@ static int mxge_multi_tx = 1;
  */
 static int mxge_use_rss = 0;
 
+static char mxge_flowctrl[IFM_ETH_FC_STRLEN] = IFM_ETH_FC_FORCE_NONE;
+
 static const char *mxge_fw_unaligned = "mxge_ethp_z8e";
 static const char *mxge_fw_aligned = "mxge_eth_z8e";
 static const char *mxge_fw_rss_aligned = "mxge_rss_eth_z8e";
 static const char *mxge_fw_rss_unaligned = "mxge_rss_ethp_z8e";
 
 TUNABLE_INT("hw.mxge.num_slices", &mxge_num_slices);
-TUNABLE_INT("hw.mxge.flow_control_enabled", &mxge_flow_control);
 TUNABLE_INT("hw.mxge.intr_coal_delay", &mxge_intr_coal_delay);	
 TUNABLE_INT("hw.mxge.nvidia_ecrc_enable", &mxge_nvidia_ecrc_enable);	
 TUNABLE_INT("hw.mxge.force_firmware", &mxge_force_firmware);	
@@ -124,6 +127,7 @@ TUNABLE_INT("hw.mxge.multi_tx", &mxge_multi_tx);
 TUNABLE_INT("hw.mxge.use_rss", &mxge_use_rss);
 TUNABLE_INT("hw.mxge.msi.enable", &mxge_msi_enable);
 TUNABLE_INT("hw.mxge.msix.enable", &mxge_msix_enable);
+TUNABLE_STR("hw.mxge.flow_ctrl", mxge_flowctrl, sizeof(mxge_flowctrl));
 
 static int mxge_probe(device_t dev);
 static int mxge_attach(device_t dev);
@@ -193,7 +197,7 @@ mxge_probe(device_t dev)
 static void
 mxge_enable_wc(mxge_softc_t *sc)
 {
-#if defined(__i386__) || defined(__x86_64__)
+#if defined(__x86_64__)
 	vm_offset_t len;
 
 	sc->wc = 1;
@@ -289,7 +293,7 @@ abort:
 	return ENXIO;
 }
 
-#if defined(__i386__) || defined(__x86_64__)
+#if defined(__x86_64__)
 
 static void
 mxge_enable_nvidia_ecrc(mxge_softc_t *sc)
@@ -413,7 +417,7 @@ mxge_enable_nvidia_ecrc(mxge_softc_t *sc)
 	}
 }
 
-#else	/* __i386__ || __x86_64__ */
+#else	/* __x86_64__ */
 
 static void
 mxge_enable_nvidia_ecrc(mxge_softc_t *sc)
@@ -998,6 +1002,7 @@ mxge_change_pause(mxge_softc_t *sc, int pause)
 	mxge_cmd_t cmd;
 	int status;
 
+	bzero(&cmd, sizeof(cmd));	/* silence gcc warning */
 	if (pause)
 		status = mxge_send_cmd(sc, MXGEFW_ENABLE_FLOW_CONTROL, &cmd);
 	else
@@ -1016,6 +1021,7 @@ mxge_change_promisc(mxge_softc_t *sc, int promisc)
 	mxge_cmd_t cmd;
 	int status;
 
+	bzero(&cmd, sizeof(cmd));	/* avoid gcc warning */
 	if (mxge_always_promisc)
 		promisc = 1;
 
@@ -1040,6 +1046,7 @@ mxge_set_multicast_list(mxge_softc_t *sc)
 		return;
 
 	/* Disable multicast filtering while we play with the lists*/
+	bzero(&cmd, sizeof(cmd));	/* silence gcc warning */
 	err = mxge_send_cmd(sc, MXGEFW_ENABLE_ALLMULTI, &cmd);
 	if (err != 0) {
 		if_printf(ifp, "Failed MXGEFW_ENABLE_ALLMULTI, "
@@ -1337,29 +1344,6 @@ mxge_change_intr_coal(SYSCTL_HANDLER_ARGS)
 }
 
 static int
-mxge_change_flow_control(SYSCTL_HANDLER_ARGS)
-{
-	mxge_softc_t *sc;
-	unsigned int enabled;
-	int err;
-
-	sc = arg1;
-	enabled = sc->pause;
-	err = sysctl_handle_int(oidp, &enabled, arg2, req);
-	if (err != 0)
-		return err;
-
-	if (enabled == sc->pause)
-		return 0;
-
-	ifnet_serialize_all(sc->ifp);
-	err = mxge_change_pause(sc, enabled);
-	ifnet_deserialize_all(sc->ifp);
-
-	return err;
-}
-
-static int
 mxge_handle_be32(SYSCTL_HANDLER_ARGS)
 {
 	int err;
@@ -1393,11 +1377,6 @@ mxge_rem_sysctls(mxge_softc_t *sc)
 		sysctl_ctx_free(&sc->slice_sysctl_ctx);
 		sc->slice_sysctl_tree = NULL;
 	}
-
-	if (sc->sysctl_tree != NULL) {
-		sysctl_ctx_free(&sc->sysctl_ctx);
-		sc->sysctl_tree = NULL;
-	}
 }
 
 static void
@@ -1410,16 +1389,8 @@ mxge_add_sysctls(mxge_softc_t *sc)
 	int slice;
 	char slice_num[8];
 
-	ctx = &sc->sysctl_ctx;
-	sysctl_ctx_init(ctx);
-	sc->sysctl_tree = SYSCTL_ADD_NODE(ctx, SYSCTL_STATIC_CHILDREN(_hw),
-	    OID_AUTO, device_get_nameunit(sc->dev), CTLFLAG_RD, 0, "");
-	if (sc->sysctl_tree == NULL) {
-		device_printf(sc->dev, "can't add sysctl node\n");
-		return;
-	}
-
-	children = SYSCTL_CHILDREN(sc->sysctl_tree);
+	ctx = device_get_sysctl_ctx(sc->dev);
+	children = SYSCTL_CHILDREN(device_get_sysctl_tree(sc->dev));
 	fw = sc->ss[0].fw_stats;
 
 	/*
@@ -1457,6 +1428,12 @@ mxge_add_sysctls(mxge_softc_t *sc)
 	    CTLFLAG_RD, &sc->watchdog_resets, 0,
 	    "Number of times NIC was reset");
 
+	if (sc->num_slices > 1) {
+		SYSCTL_ADD_PROC(ctx, children, OID_AUTO, "slice_cpumap",
+		    CTLTYPE_OPAQUE | CTLFLAG_RD, sc->ring_map, 0,
+		    if_ringmap_cpumap_sysctl, "I", "slice CPU map");
+	}
+
 	/*
 	 * Performance related tunables
 	 */
@@ -1467,10 +1444,6 @@ mxge_add_sysctls(mxge_softc_t *sc)
 	SYSCTL_ADD_PROC(ctx, children, OID_AUTO, "throttle",
 	    CTLTYPE_INT|CTLFLAG_RW, sc, 0, mxge_change_throttle, "I",
 	    "Transmit throttling");
-
-	SYSCTL_ADD_PROC(ctx, children, OID_AUTO, "flow_control_enabled",
-	    CTLTYPE_INT|CTLFLAG_RW, sc, 0, mxge_change_flow_control, "I",
-	    "Interrupt coalescing delay in usecs");
 
 	SYSCTL_ADD_PROC(ctx, children, OID_AUTO, "use_rss",
 	    CTLTYPE_INT|CTLFLAG_RW, sc, 0, mxge_change_use_rss, "I",
@@ -2071,9 +2044,9 @@ mxge_get_buf_small(mxge_rx_ring_t *rx, bus_dmamap_t map, int idx,
 	struct mbuf *m;
 	int cnt, err, mflag;
 
-	mflag = MB_DONTWAIT;
+	mflag = M_NOWAIT;
 	if (__predict_false(init))
-		mflag = MB_WAIT;
+		mflag = M_WAITOK;
 
 	m = m_gethdr(mflag, MT_DATA);
 	if (m == NULL) {
@@ -2121,9 +2094,9 @@ mxge_get_buf_big(mxge_rx_ring_t *rx, bus_dmamap_t map, int idx,
 	struct mbuf *m;
 	int cnt, err, mflag;
 
-	mflag = MB_DONTWAIT;
+	mflag = M_NOWAIT;
 	if (__predict_false(init))
-		mflag = MB_WAIT;
+		mflag = M_WAITOK;
 
 	if (rx->cl_size == MCLBYTES)
 		m = m_getcl(mflag, MT_DATA, M_PKTHDR);
@@ -2445,17 +2418,17 @@ static struct mxge_media_type mxge_xfp_media_types[] = {
 	{IFM_10G_CX4,	0x7f, 		"10GBASE-CX4 (module)"},
 	{IFM_10G_SR, 	(1 << 7),	"10GBASE-SR"},
 	{IFM_10G_LR, 	(1 << 6),	"10GBASE-LR"},
-	{0,		(1 << 5),	"10GBASE-ER"},
+	{IFM_NONE,	(1 << 5),	"10GBASE-ER"},
 	{IFM_10G_LRM,	(1 << 4),	"10GBASE-LRM"},
-	{0,		(1 << 3),	"10GBASE-SW"},
-	{0,		(1 << 2),	"10GBASE-LW"},
-	{0,		(1 << 1),	"10GBASE-EW"},
-	{0,		(1 << 0),	"Reserved"}
+	{IFM_NONE,	(1 << 3),	"10GBASE-SW"},
+	{IFM_NONE,	(1 << 2),	"10GBASE-LW"},
+	{IFM_NONE,	(1 << 1),	"10GBASE-EW"},
+	{IFM_NONE,	(1 << 0),	"Reserved"}
 };
 
 static struct mxge_media_type mxge_sfp_media_types[] = {
 	{IFM_10G_TWINAX,      0,	"10GBASE-Twinax"},
-	{0,		(1 << 7),	"Reserved"},
+	{IFM_NONE,	(1 << 7),	"Reserved"},
 	{IFM_10G_LRM,	(1 << 6),	"10GBASE-LRM"},
 	{IFM_10G_LR, 	(1 << 5),	"10GBASE-LR"},
 	{IFM_10G_SR,	(1 << 4),	"10GBASE-SR"},
@@ -2465,10 +2438,25 @@ static struct mxge_media_type mxge_sfp_media_types[] = {
 static void
 mxge_media_set(mxge_softc_t *sc, int media_type)
 {
-	ifmedia_add(&sc->media, IFM_ETHER | IFM_FDX | media_type, 0, NULL);
-	ifmedia_set(&sc->media, IFM_ETHER | IFM_FDX | media_type);
+	int fc_opt = 0;
+
+	if (media_type == IFM_NONE)
+		return;
+
+	if (sc->pause)
+		fc_opt = IFM_ETH_RXPAUSE | IFM_ETH_TXPAUSE;
+
+	ifmedia_add(&sc->media, MXGE_IFM | media_type, 0, NULL);
+	ifmedia_set(&sc->media, MXGE_IFM | media_type | fc_opt);
+
 	sc->current_media = media_type;
-	sc->media.ifm_media = sc->media.ifm_cur->ifm_media;
+}
+
+static void
+mxge_media_unset(mxge_softc_t *sc)
+{
+	ifmedia_removeall(&sc->media);
+	sc->current_media = IFM_NONE;
 }
 
 static void
@@ -2477,8 +2465,7 @@ mxge_media_init(mxge_softc_t *sc)
 	const char *ptr;
 	int i;
 
-	ifmedia_removeall(&sc->media);
-	mxge_media_set(sc, IFM_AUTO);
+	mxge_media_unset(sc);
 
 	/* 
 	 * Parse the product code to deterimine the interface type
@@ -2511,10 +2498,13 @@ mxge_media_init(mxge_softc_t *sc)
 	} else if (*ptr == 'R') {
 		/* -R is XFP */
 		sc->connector = MXGE_XFP;
+		/* NOTE: ifmedia will be installed later */
 	} else if (*ptr == 'S' || *(ptr +1) == 'S') {
 		/* -S or -2S is SFP+ */
 		sc->connector = MXGE_SFP;
+		/* NOTE: ifmedia will be installed later */
 	} else {
+		sc->connector = MXGE_UNK;
 		if_printf(sc->ifp, "Unknown media type: %c\n", *ptr);
 	}
 }
@@ -2562,15 +2552,20 @@ mxge_media_probe(mxge_softc_t *sc)
 	 * a millisecond
 	 */
 
+	bzero(&cmd, sizeof(cmd));	/* silence gcc warning */
 	cmd.data0 = 0;	 /* just fetch 1 byte, not all 256 */
 	cmd.data1 = byte;
 	err = mxge_send_cmd(sc, MXGEFW_CMD_I2C_READ, &cmd);
-	if (err == MXGEFW_CMD_ERROR_I2C_FAILURE)
-		if_printf(sc->ifp, "failed to read XFP\n");
-	if (err == MXGEFW_CMD_ERROR_I2C_ABSENT)
-		if_printf(sc->ifp, "Type R/S with no XFP!?!?\n");
-	if (err != MXGEFW_CMD_OK)
+	if (err != MXGEFW_CMD_OK) {
+		if (err == MXGEFW_CMD_ERROR_I2C_FAILURE)
+			if_printf(sc->ifp, "failed to read XFP\n");
+		else if (err == MXGEFW_CMD_ERROR_I2C_ABSENT)
+			if_printf(sc->ifp, "Type R/S with no XFP!?!?\n");
+		else
+			if_printf(sc->ifp, "I2C read failed, err: %d", err);
+		mxge_media_unset(sc);
 		return;
+	}
 
 	/* Now we wait for the data to be cached */
 	cmd.data0 = byte;
@@ -2583,6 +2578,7 @@ mxge_media_probe(mxge_softc_t *sc)
 	if (err != MXGEFW_CMD_OK) {
 		if_printf(sc->ifp, "failed to read %s (%d, %dms)\n",
 		    cage_type, err, ms);
+		mxge_media_unset(sc);
 		return;
 	}
 
@@ -2592,7 +2588,7 @@ mxge_media_probe(mxge_softc_t *sc)
 			    mxge_media_types[0].name);
 		}
 		if (sc->current_media != mxge_media_types[0].flag) {
-			mxge_media_init(sc);
+			mxge_media_unset(sc);
 			mxge_media_set(sc, mxge_media_types[0].flag);
 		}
 		return;
@@ -2605,12 +2601,13 @@ mxge_media_probe(mxge_softc_t *sc)
 			}
 
 			if (sc->current_media != mxge_media_types[i].flag) {
-				mxge_media_init(sc);
+				mxge_media_unset(sc);
 				mxge_media_set(sc, mxge_media_types[i].flag);
 			}
 			return;
 		}
 	}
+	mxge_media_unset(sc);
 	if (bootverbose) {
 		if_printf(sc->ifp, "%s media 0x%x unknown\n", cage_type,
 		    cmd.data0);
@@ -3129,8 +3126,9 @@ mxge_alloc_slice_rings(struct mxge_slice_state *ss, int rx_ring_entries,
 	 * aligned
 	 */
 	bytes = sizeof(*ss->tx.req_list) * (ss->tx.max_desc + 4);
-	ss->tx.req_list = kmalloc_cachealign(__VM_CACHELINE_ALIGN(bytes),
-	    M_DEVBUF, M_WAITOK);
+	ss->tx.req_list = kmalloc(__VM_CACHELINE_ALIGN(bytes),
+				  M_DEVBUF,
+				  M_WAITOK | M_CACHEALIGN);
 
 	/* Allocate the tx busdma segment list */
 	bytes = sizeof(*ss->tx.seg_list) * ss->tx.max_desc;
@@ -3206,13 +3204,16 @@ mxge_alloc_rings(mxge_softc_t *sc)
 		    tx_ring_entries, rx_ring_entries);
 	}
 
+	sc->ifp->if_nmbclusters = rx_ring_entries * sc->num_slices;
+	sc->ifp->if_nmbjclusters = sc->ifp->if_nmbclusters;
+
 	ifq_set_maxlen(&sc->ifp->if_snd, tx_ring_entries - 1);
 	ifq_set_ready(&sc->ifp->if_snd);
 	ifq_set_subq_cnt(&sc->ifp->if_snd, sc->num_tx_rings);
 
 	if (sc->num_tx_rings > 1) {
-		sc->ifp->if_mapsubq = ifq_mapsubq_mask;
-		ifq_set_subq_mask(&sc->ifp->if_snd, sc->num_tx_rings - 1);
+		sc->ifp->if_mapsubq = ifq_mapsubq_modulo;
+		ifq_set_subq_divisor(&sc->ifp->if_snd, sc->num_tx_rings);
 	}
 
 	for (slice = 0; slice < sc->num_slices; slice++) {
@@ -3253,6 +3254,7 @@ mxge_slice_open(struct mxge_slice_state *ss, int cl_size)
 	 */
 	err = 0;
 
+	bzero(&cmd, sizeof(cmd));	/* silence gcc warning */
 	if (ss->sc->num_tx_rings == 1) {
 		if (slice == 0) {
 			cmd.data0 = slice;
@@ -3346,8 +3348,12 @@ mxge_open(mxge_softc_t *sc)
 	}
 
 	if (sc->num_slices > 1) {
-		/* Setup the indirection table */
-		cmd.data0 = sc->num_slices;
+		/*
+		 * Setup the indirect table.
+		 */
+		if_ringmap_rdrtable(sc->ring_map, sc->rdr_table, NETISR_CPUMAX);
+
+		cmd.data0 = NETISR_CPUMAX;
 		err = mxge_send_cmd(sc, MXGEFW_CMD_SET_RSS_TABLE_SIZE, &cmd);
 
 		err |= mxge_send_cmd(sc, MXGEFW_CMD_GET_RSS_TABLE_OFFSET, &cmd);
@@ -3356,15 +3362,17 @@ mxge_open(mxge_softc_t *sc)
 			return err;
 		}
 
-		/* Just enable an identity mapping */
 		itable = sc->sram + cmd.data0;
-		for (i = 0; i < sc->num_slices; i++)
-			itable[i] = (uint8_t)i;
+		for (i = 0; i < NETISR_CPUMAX; i++)
+			itable[i] = sc->rdr_table[i];
 
 		if (sc->use_rss) {
 			volatile uint8_t *hwkey;
 			uint8_t swkey[MXGE_HWRSS_KEYLEN];
 
+			/*
+			 * Setup Toeplitz key.
+			 */
 			err = mxge_send_cmd(sc, MXGEFW_CMD_GET_RSS_KEY_OFFSET,
 			    &cmd);
 			if (err != 0) {
@@ -3747,7 +3755,20 @@ mxge_tick(void *arg)
 static int
 mxge_media_change(struct ifnet *ifp)
 {
-	return EINVAL;
+	mxge_softc_t *sc = ifp->if_softc;
+	const struct ifmedia *ifm = &sc->media;
+	int pause;
+
+	if (IFM_OPTIONS(ifm->ifm_media) & (IFM_ETH_RXPAUSE | IFM_ETH_TXPAUSE)) {
+		if (sc->pause)
+			return 0;
+		pause = 1;
+	} else {
+		if (!sc->pause)
+			return 0;
+		pause = 0;
+	}
+	return mxge_change_pause(sc, pause);
 }
 
 static int
@@ -3779,14 +3800,23 @@ static void
 mxge_media_status(struct ifnet *ifp, struct ifmediareq *ifmr)
 {
 	mxge_softc_t *sc = ifp->if_softc;
-	
 
-	if (sc == NULL)
-		return;
 	ifmr->ifm_status = IFM_AVALID;
-	ifmr->ifm_active = IFM_ETHER | IFM_FDX;
-	ifmr->ifm_status |= sc->link_state ? IFM_ACTIVE : 0;
+	ifmr->ifm_active = IFM_ETHER;
+
+	if (sc->link_state)
+		ifmr->ifm_status |= IFM_ACTIVE;
+
+	/*
+	 * Autoselect is not supported, so the current media
+	 * should be delivered.
+	 */
 	ifmr->ifm_active |= sc->current_media;
+	if (sc->current_media != IFM_NONE) {
+		ifmr->ifm_active |= MXGE_IFM;
+		if (sc->pause)
+			ifmr->ifm_active |= IFM_ETH_RXPAUSE | IFM_ETH_TXPAUSE;
+	}
 }
 
 static int
@@ -3855,7 +3885,7 @@ mxge_ioctl(struct ifnet *ifp, u_long command, caddr_t data,
 		break;
 
 	case SIOCGIFMEDIA:
-		mxge_media_probe(sc);
+	case SIOCSIFMEDIA:
 		err = ifmedia_ioctl(ifp, (struct ifreq *)data,
 		    &sc->media, command);
 		break;
@@ -3870,6 +3900,8 @@ mxge_ioctl(struct ifnet *ifp, u_long command, caddr_t data,
 static void
 mxge_fetch_tunables(mxge_softc_t *sc)
 {
+	int ifm;
+
 	sc->intr_coal_delay = mxge_intr_coal_delay;
 	if (sc->intr_coal_delay < 0 || sc->intr_coal_delay > (10 * 1000))
 		sc->intr_coal_delay = MXGE_INTR_COAL_DELAY;
@@ -3878,7 +3910,10 @@ mxge_fetch_tunables(mxge_softc_t *sc)
 	if (mxge_ticks == 0)
 		mxge_ticks = hz / 2;
 
-	sc->pause = mxge_flow_control;
+	ifm = ifmedia_str2ethfc(mxge_flowctrl);
+	if (ifm & (IFM_ETH_RXPAUSE | IFM_ETH_TXPAUSE))
+		sc->pause = 1;
+
 	sc->use_rss = mxge_use_rss;
 
 	sc->throttle = mxge_throttle;
@@ -3929,7 +3964,8 @@ mxge_alloc_slices(mxge_softc_t *sc)
 	sc->rx_intr_slots = 2 * (rx_ring_size / sizeof (mcp_dma_addr_t));
 
 	bytes = sizeof(*sc->ss) * sc->num_slices;
-	sc->ss = kmalloc_cachealign(bytes, M_DEVBUF, M_WAITOK | M_ZERO);
+	sc->ss = kmalloc(bytes, M_DEVBUF,
+			 M_WAITOK | M_ZERO | M_CACHEALIGN);
 
 	for (i = 0; i < sc->num_slices; i++) {
 		ss = &sc->ss[i];
@@ -3973,7 +4009,7 @@ static void
 mxge_slice_probe(mxge_softc_t *sc)
 {
 	int status, max_intr_slots, max_slices, num_slices;
-	int msix_cnt, msix_enable, i, multi_tx;
+	int msix_cnt, msix_enable, multi_tx;
 	mxge_cmd_t cmd;
 	const char *old_fw;
 
@@ -3984,7 +4020,7 @@ mxge_slice_probe(mxge_softc_t *sc)
 	if (num_slices == 1)
 		return;
 
-	if (ncpus2 == 1)
+	if (netisr_ncpus == 1)
 		return;
 
 	msix_enable = device_getenv_int(sc->dev, "msix.enable",
@@ -3995,14 +4031,8 @@ mxge_slice_probe(mxge_softc_t *sc)
 	msix_cnt = pci_msix_count(sc->dev);
 	if (msix_cnt < 2)
 		return;
-
-	/*
-	 * Round down MSI-X vector count to the nearest power of 2
-	 */
-	i = 0;
-	while ((1 << (i + 1)) <= msix_cnt)
-		++i;
-	msix_cnt = 1 << i;
+	if (bootverbose)
+		device_printf(sc->dev, "MSI-X count %d\n", msix_cnt);
 
 	/*
 	 * Now load the slice aware firmware see what it supports
@@ -4058,20 +4088,14 @@ mxge_slice_probe(mxge_softc_t *sc)
 		goto abort_with_fw;
 	}
 	max_slices = cmd.data0;
-
-	/*
-	 * Round down max slices count to the nearest power of 2
-	 */
-	i = 0;
-	while ((1 << (i + 1)) <= max_slices)
-		++i;
-	max_slices = 1 << i;
+	if (bootverbose)
+		device_printf(sc->dev, "max slices %d\n", max_slices);
 
 	if (max_slices > msix_cnt)
 		max_slices = msix_cnt;
 
-	sc->num_slices = num_slices;
-	sc->num_slices = if_ring_count2(sc->num_slices, max_slices);
+	sc->ring_map = if_ringmap_alloc(sc->dev, num_slices, max_slices);
+	sc->num_slices = if_ringmap_count(sc->ring_map);
 
 	multi_tx = device_getenv_int(sc->dev, "multi_tx", mxge_multi_tx);
 	if (multi_tx)
@@ -4200,12 +4224,12 @@ mxge_npoll(struct ifnet *ifp, struct ifpoll_info *info)
 	 */
 	for (i = 0; i < sc->num_slices; ++i) {
 		struct mxge_slice_state *ss = &sc->ss[i];
-		int idx = ss->intr_cpuid;
+		int cpu = ss->intr_cpuid;
 
-		KKASSERT(idx < ncpus2);
-		info->ifpi_rx[idx].poll_func = mxge_npoll_rx;
-		info->ifpi_rx[idx].arg = ss;
-		info->ifpi_rx[idx].serializer = &ss->rx_data.rx_serialize;
+		KKASSERT(cpu < netisr_ncpus);
+		info->ifpi_rx[cpu].poll_func = mxge_npoll_rx;
+		info->ifpi_rx[cpu].arg = ss;
+		info->ifpi_rx[cpu].serializer = &ss->rx_data.rx_serialize;
 	}
 }
 
@@ -4225,7 +4249,10 @@ mxge_attach(device_t dev)
 	sc->ifp = ifp;
 	sc->dev = dev;
 	if_initname(ifp, device_get_name(dev), device_get_unit(dev));
-	ifmedia_init(&sc->media, 0, mxge_media_change, mxge_media_status);
+
+	/* IFM_ETH_FORCEPAUSE can't be changed */
+	ifmedia_init(&sc->media, IFM_ETH_RXPAUSE | IFM_ETH_TXPAUSE,
+	    mxge_media_change, mxge_media_status);
 
 	lwkt_serialize_init(&sc->main_serialize);
 
@@ -4416,6 +4443,9 @@ mxge_attach(device_t dev)
 
 	mxge_add_sysctls(sc);
 
+	/* Increase non-cluster mbuf limit; used by small RX rings */
+	mb_inclimit(ifp->if_nmbclusters);
+
 	callout_reset_bycpu(&sc->co_hdl, mxge_ticks, mxge_tick, sc,
 	    sc->ss[0].intr_cpuid);
 	return 0;
@@ -4432,6 +4462,7 @@ mxge_detach(device_t dev)
 
 	if (device_is_attached(dev)) {
 		struct ifnet *ifp = sc->ifp;
+		int mblimit = ifp->if_nmbclusters;
 
 		ifnet_serialize_all(ifp);
 
@@ -4447,6 +4478,9 @@ mxge_detach(device_t dev)
 		callout_terminate(&sc->co_hdl);
 
 		ether_ifdetach(ifp);
+
+		/* Decrease non-cluster mbuf limit increased by us */
+		mb_inclimit(-mblimit);
 	}
 	ifmedia_removeall(&sc->media);
 
@@ -4479,6 +4513,9 @@ mxge_detach(device_t dev)
 
 	if (sc->parent_dmat != NULL)
 		bus_dma_tag_destroy(sc->parent_dmat);
+
+	if (sc->ring_map != NULL)
+		if_ringmap_free(sc->ring_map);
 
 	return 0;
 }
@@ -4514,27 +4551,10 @@ static int
 mxge_alloc_msix(struct mxge_softc *sc)
 {
 	struct mxge_slice_state *ss;
-	int offset, rid, error, i;
+	int rid, error, i;
 	boolean_t setup = FALSE;
 
 	KKASSERT(sc->num_slices > 1);
-
-	if (sc->num_slices == ncpus2) {
-		offset = 0;
-	} else {
-		int offset_def;
-
-		offset_def = (sc->num_slices * device_get_unit(sc->dev)) %
-		    ncpus2;
-
-		offset = device_getenv_int(sc->dev, "msix.offset", offset_def);
-		if (offset >= ncpus2 ||
-		    offset % sc->num_slices != 0) {
-			device_printf(sc->dev, "invalid msix.offset %d, "
-			    "use %d\n", offset, offset_def);
-			offset = offset_def;
-		}
-	}
 
 	ss = &sc->ss[0];
 
@@ -4543,7 +4563,7 @@ mxge_alloc_msix(struct mxge_softc *sc)
 	ksnprintf(ss->intr_desc0, sizeof(ss->intr_desc0),
 	    "%s comb", device_get_nameunit(sc->dev));
 	ss->intr_desc = ss->intr_desc0;
-	ss->intr_cpuid = offset;
+	ss->intr_cpuid = if_ringmap_cpumap(sc->ring_map, 0);
 
 	for (i = 1; i < sc->num_slices; ++i) {
 		ss = &sc->ss[i];
@@ -4552,14 +4572,14 @@ mxge_alloc_msix(struct mxge_softc *sc)
 		if (sc->num_tx_rings == 1) {
 			ss->intr_func = mxge_msix_rx;
 			ksnprintf(ss->intr_desc0, sizeof(ss->intr_desc0),
-			    "%s rx", device_get_nameunit(sc->dev));
+			    "%s rx%d", device_get_nameunit(sc->dev), i);
 		} else {
 			ss->intr_func = mxge_msix_rxtx;
 			ksnprintf(ss->intr_desc0, sizeof(ss->intr_desc0),
-			    "%s rxtx", device_get_nameunit(sc->dev));
+			    "%s rxtx%d", device_get_nameunit(sc->dev), i);
 		}
 		ss->intr_desc = ss->intr_desc0;
-		ss->intr_cpuid = offset + i;
+		ss->intr_cpuid = if_ringmap_cpumap(sc->ring_map, i);
 	}
 
 	rid = PCIR_BAR(2);

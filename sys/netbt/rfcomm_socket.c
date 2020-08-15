@@ -41,6 +41,7 @@
 #include <sys/param.h>
 #include <sys/domain.h>
 #include <sys/kernel.h>
+#include <sys/malloc.h>	/* for M_NOWAIT */
 #include <sys/mbuf.h>
 #include <sys/proc.h>
 #include <sys/protosw.h>
@@ -439,7 +440,7 @@ rfcomm_ssend(netmsg_t msg)
 		control = NULL;
 	}
 
-	m0 = m_copym(m, 0, M_COPYALL, MB_DONTWAIT);
+	m0 = m_copym(m, 0, M_COPYALL, M_NOWAIT);
 	if (m0) {
 		sbappendstream(&so->so_snd.sb, m);
 		error = rfcomm_send(pcb, m0);

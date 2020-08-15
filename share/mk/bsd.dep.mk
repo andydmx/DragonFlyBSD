@@ -17,7 +17,11 @@
 #
 # MKDEP		Options for ${MKDEPCMD} [not set]
 #
+# MKDEPCC	CC to be used in ${MKDEPCMD} script [cc]
+#
 # MKDEPCMD	Makefile dependency list program [mkdep]
+#
+# MKDEPINTDEPS	Extra internal dependencies for intermediates [not set]
 #
 # SRCS          List of source files (c, c++, assembler)
 #
@@ -47,7 +51,15 @@ GTAGSFLAGS?=	-o
 HTAGSFLAGS?=
 
 MKDEPCMD?=	mkdep
+MKDEPCC?=	${CC}
 DEPENDFILE?=	.depend
+
+# Support better dependencies tracking for both host cc and target cc.
+.if defined(__USE_HOST_CCVER)
+_MKDEPENV=	${NXENV:NPATH=*}
+.else
+_MKDEPENV=	CCVER=${CCVER}
+.endif
 
 # Keep `tags' here, before SRCS are mangled below for `depend'.
 .if !target(tags) && defined(SRCS) && !defined(NOTAGS)
@@ -143,8 +155,9 @@ _ALL_DEPENDS=${__FLAGS_FILES:N*.[sS]:N*.c:N*.cc:N*.C:N*.cpp:N*.cpp:N*.cxx:N*.m}
 	-rm -f ${.TARGET}
 	-> ${.TARGET}
 .if ${${_FG}_FLAGS_FILES:M*.[csS]} != ""
-	${MKDEPCMD} -f ${.TARGET} -a ${MKDEP} \
+	${_MKDEPENV} CC=${MKDEPCC} ${MKDEPCMD} -f ${.TARGET} -a ${MKDEP} \
 	    ${${_FG}_FLAGS} \
+	    ${CFLAGS:M--sysroot=*} \
 	    ${CFLAGS:M-nostdinc*} ${CFLAGS:M-[BID]*} \
 	    ${CFLAGS:M-std=*} \
 	    ${.ALLSRC:M*.[csS]}
@@ -153,8 +166,9 @@ _ALL_DEPENDS=${__FLAGS_FILES:N*.[sS]:N*.c:N*.cc:N*.C:N*.cpp:N*.cpp:N*.cxx:N*.m}
     ${${_FG}_FLAGS_FILES:M*.C} != "" || \
     ${${_FG}_FLAGS_FILES:M*.cpp} != "" || \
     ${${_FG}_FLAGS_FILES:M*.cxx} != ""
-	${MKDEPCMD} -f ${.TARGET} -a ${MKDEP} \
+	${_MKDEPENV} CC=${CXX} ${MKDEPCMD} -f ${.TARGET} -a ${MKDEP} \
 	    ${${_FG}_FLAGS} \
+	    ${CXXFLAGS:M--sysroot=*} \
 	    ${CXXFLAGS:M-nostdinc*} ${CXXFLAGS:M-[BID]*} \
 	    ${CXXFLAGS:M-std=*} \
 	    ${.ALLSRC:M*.cc} ${.ALLSRC:M*.C} ${.ALLSRC:M*.cpp} ${.ALLSRC:M*.cxx}
@@ -168,6 +182,13 @@ _ALL_DEPENDS=${__FLAGS_FILES:N*.[sS]:N*.c:N*.cc:N*.C:N*.cpp:N*.cpp:N*.cxx:N*.m}
 .endif
 .if !empty(${_FG:M_}) && !empty(_DEPENDFILES)
 	cat ${_DEPENDFILES} >> ${.TARGET}
+.endif
+.if defined(MKDEPINTDEPS) && !empty(MKDEPINTDEPS)
+. for _ITD in ${MKDEPINTDEPS:O:u}
+	TMP=_depend$$$$; \
+	sed -e "s,${_ITD:C/^(.*:)(.*)/\1,\2 \1/},g" < ${.TARGET} > $$TMP; \
+	mv $$TMP ${.TARGET}
+. endfor
 .endif
 .endfor
 

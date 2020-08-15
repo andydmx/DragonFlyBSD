@@ -544,7 +544,7 @@ fdc_alloc_resources(struct fdc_data *fdc)
 					     &fdc->rid_ioport, 0ul, ~0ul, 
 					     ispcmcia ? 8 : (ispnp ? 1 : 6),
 					     RF_ACTIVE);
-	if (fdc->res_ioport == 0) {
+	if (fdc->res_ioport == NULL) {
 		device_printf(dev, "cannot reserve I/O port range\n");
 		return ENXIO;
 	}
@@ -592,7 +592,7 @@ fdc_alloc_resources(struct fdc_data *fdc)
 		fdc->res_ctl = bus_alloc_resource(dev, SYS_RES_IOPORT,
 						  &fdc->rid_ctl,
 						  0ul, ~0ul, 1, RF_ACTIVE);
-		if (fdc->res_ctl == 0) {
+		if (fdc->res_ctl == NULL) {
 			device_printf(dev,
 				      "cannot reserve control I/O port range\n");
 			return ENXIO;
@@ -604,7 +604,7 @@ fdc_alloc_resources(struct fdc_data *fdc)
 	fdc->res_irq = bus_alloc_resource(dev, SYS_RES_IRQ,
 					  &fdc->rid_irq, 0ul, ~0ul, 1, 
 					  RF_ACTIVE);
-	if (fdc->res_irq == 0) {
+	if (fdc->res_irq == NULL) {
 		device_printf(dev, "cannot reserve interrupt line\n");
 		return ENXIO;
 	}
@@ -613,7 +613,7 @@ fdc_alloc_resources(struct fdc_data *fdc)
 		fdc->res_drq = bus_alloc_resource(dev, SYS_RES_DRQ,
 						  &fdc->rid_drq, 0ul, ~0ul, 1, 
 						  RF_ACTIVE);
-		if (fdc->res_drq == 0) {
+		if (fdc->res_drq == NULL) {
 			device_printf(dev, "cannot reserve DMA request line\n");
 			return ENXIO;
 		}
@@ -629,25 +629,25 @@ fdc_release_resources(struct fdc_data *fdc)
 	device_t dev;
 
 	dev = fdc->fdc_dev;
-	if (fdc->res_irq != 0) {
+	if (fdc->res_irq != NULL) {
 		bus_deactivate_resource(dev, SYS_RES_IRQ, fdc->rid_irq,
 					fdc->res_irq);
 		bus_release_resource(dev, SYS_RES_IRQ, fdc->rid_irq,
 				     fdc->res_irq);
 	}
-	if (fdc->res_ctl != 0) {
+	if (fdc->res_ctl != NULL) {
 		bus_deactivate_resource(dev, SYS_RES_IOPORT, fdc->rid_ctl,
 					fdc->res_ctl);
 		bus_release_resource(dev, SYS_RES_IOPORT, fdc->rid_ctl,
 				     fdc->res_ctl);
 	}
-	if (fdc->res_ioport != 0) {
+	if (fdc->res_ioport != NULL) {
 		bus_deactivate_resource(dev, SYS_RES_IOPORT, fdc->rid_ioport,
 					fdc->res_ioport);
 		bus_release_resource(dev, SYS_RES_IOPORT, fdc->rid_ioport,
 				     fdc->res_ioport);
 	}
-	if (fdc->res_drq != 0) {
+	if (fdc->res_drq != NULL) {
 		bus_deactivate_resource(dev, SYS_RES_DRQ, fdc->rid_drq,
 					fdc->res_drq);
 		bus_release_resource(dev, SYS_RES_DRQ, fdc->rid_drq,
@@ -795,8 +795,16 @@ fdc_attach(device_t dev)
 	if ((fdc->flags & FDC_NODMA) == 0) {
 		/* Acquire the DMA channel forever, The driver will do the rest */
 				/* XXX should integrate with rman */
-		isa_dma_acquire(fdc->dmachan);
-		isa_dmainit(fdc->dmachan, 128 << 3 /* XXX max secsize */);
+		error = isa_dma_acquire(fdc->dmachan);
+		if (!error) {
+			error = isa_dma_init(fdc->dmachan, 128 << 3 /* XXX max secsize */,
+					     M_WAITOK);
+			if (error) {
+				isa_dma_release(fdc->dmachan);
+				device_printf(dev, "disabling dma\n");
+				fdc->flags |= FDC_NODMA;
+			}
+		}
 	}
 	fdc->state = DEVIDLE;
 
@@ -853,7 +861,9 @@ static driver_t fdc_driver = {
 };
 
 DRIVER_MODULE(fdc, isa, fdc_driver, fdc_devclass, NULL, NULL);
+#if 0
 DRIVER_MODULE(fdc, acpi, fdc_driver, fdc_devclass, NULL, NULL);
+#endif
 
 /******************************************************************/
 /*
@@ -879,7 +889,7 @@ fd_probe(device_t dev)
 	fd->fdsu = fdsu;
 	fd->fdu = device_get_unit(dev);
 
-#ifdef __i386__
+#ifdef __x86_64__
 	/* look up what bios thinks we have */
 	switch (fd->fdu) {
 	case 0:
@@ -1306,7 +1316,7 @@ Fdopen(struct dev_open_args *ap)
 	fdc_p	fdc;
 
 	/* check bounds */
-	if ((fd = devclass_get_softc(fd_devclass, fdu)) == 0)
+	if ((fd = devclass_get_softc(fd_devclass, fdu)) == NULL)
 		return (ENXIO);
 	fdc = fd->fdc;
 	if ((fdc == NULL) || (fd->type == NO_TYPE))
@@ -1461,7 +1471,7 @@ fdstrategy(struct dev_strategy_args *ap)
 
  	fdu = dkunit(dev);
 	fd = devclass_get_softc(fd_devclass, fdu);
-	if (fd == 0)
+	if (fd == NULL)
 		panic("fdstrategy: buf for nonexistent device (%#lx, %#lx)",
 		      (u_long)major(dev), (u_long)minor(dev));
 	fdc = fd->fdc;
@@ -1807,8 +1817,8 @@ fdstate(fdc_p fdc)
 					failed = 1;
 				if ((st3 & NE7_ST3_T0) == 0) {
 					kprintf(
-		"fd%d: Seek to cyl 0, but not really there (ST3 = %b)\n",
-					       fdu, st3, NE7_ST3BITS);
+		"fd%d: Seek to cyl 0, but not really there (ST3 = %pb%i)\n",
+					       fdu, NE7_ST3BITS, st3);
 					failed = 1;
 				}
 
@@ -2101,8 +2111,8 @@ fdstate(fdc_p fdc)
 				 * this one if it seems to be the first
 				 * time in a line
 				 */
-				kprintf("fd%d: recal failed ST0 %b cyl %d\n",
-				       fdu, st0, NE7_ST0BITS, cyl);
+				kprintf("fd%d: recal failed ST0 %pb%i cyl %d\n",
+				       fdu, NE7_ST0BITS, st0, cyl);
 			if(fdc->retry < 3) fdc->retry = 3;
 			return (retrier(fdc));
 		}
@@ -2201,10 +2211,10 @@ retrier(struct fdc_data *fdc)
 			if (printerror) {
 				if (fdc->flags & FDC_STAT_VALID)
 					kprintf(
-			" (ST0 %b ST1 %b ST2 %b cyl %u hd %u sec %u)\n",
-					       fdc->status[0], NE7_ST0BITS,
-					       fdc->status[1], NE7_ST1BITS,
-					       fdc->status[2], NE7_ST2BITS,
+			" (ST0 %pb%i ST1 %pb%i ST2 %pb%i cyl %u hd %u sec %u)\n",
+					       NE7_ST0BITS, fdc->status[0],
+					       NE7_ST1BITS, fdc->status[1],
+					       NE7_ST2BITS, fdc->status[2],
 					       fdc->status[3], fdc->status[4],
 					       fdc->status[5]);
 				else

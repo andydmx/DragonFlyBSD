@@ -28,21 +28,37 @@
  *
  * $FreeBSD: head/lib/libc/include/libc_private.h 213153 2010-09-25 01:57:47Z davidxu $
  *
- * Private definitions for libc, libc_r and libpthread.
- *
+ * Private definitions for libc and libpthread.
  */
 
 #ifndef _LIBC_PRIVATE_H_
 #define _LIBC_PRIVATE_H_
 
 #include <sys/_pthreadtypes.h>
+#include <machine/stdint.h>
+
+/*
+ * With this attribute set, do not require a function call for accessing
+ * this variable when the code is compiled -fPIC.  Use in combination
+ * with __thread.
+ *
+ * Must be empty for libc_rtld.
+ */
+#ifdef __LIBC_RTLD
+#define TLS_ATTRIBUTE
+#else
+#define TLS_ATTRIBUTE __attribute__ ((tls_model ("initial-exec")))
+#endif
 
 /*
  * This global flag is non-zero when a process has created one
  * or more threads. It is used to avoid calling locking functions
  * when they are not required.
  */
+#ifndef __LIBC_ISTHREADED_DECLARED
+#define __LIBC_ISTHREADED_DECLARED
 extern int	__isthreaded;
+#endif
 
 /*
  * File lock contention is difficult to diagnose without knowing
@@ -82,7 +98,13 @@ int _yp_check(char **);
  * This is a pointer in the C run-time startup code. It is used
  * by getprogname() and setprogname().
  */
-const char *__progname;
+extern const char *__progname;
+extern int	__isexiting;
+
+/*
+ * Notify libc that thread is exiting and its TLS destructors can be called.
+ */
+void _thread_finalize(void);
 
 /*
  * Function to clean up streams, called from abort() and exit().
@@ -91,10 +113,17 @@ extern void (*__cleanup)(void);
 
 /* execve() with PATH processing to implement posix_spawnp() */
 int _execvpe(const char *, char * const *, char * const *);
+void _libc_thr_init(void);
 void _nmalloc_thr_init(void);
+void _upmap_thr_init(void);
+void _nmalloc_thr_prepfork(void);
+void _nmalloc_thr_parentfork(void);
+void _nmalloc_thr_childfork(void);
 
 struct dl_phdr_info;
 int __elf_phdr_match_addr(struct dl_phdr_info *, void *);
+void __libc_distribute_static_tls(__size_t, void *, __size_t, __size_t);
+__uintptr_t __libc_static_tls_base(__size_t);
 
 /*
  * libc should use libc_dlopen internally, which respects a global
@@ -112,5 +141,7 @@ void _rtld_error(const char *fmt, ...);
  * and multi-threaded applications
  */
 int _once(pthread_once_t *, void (*)(void));
+
+void __throw_constraint_handler_s(const char * restrict msg, int error);
 
 #endif /* _LIBC_PRIVATE_H_ */

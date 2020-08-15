@@ -29,7 +29,7 @@
  * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF
  * THE POSSIBILITY OF SUCH DAMAGE.
  *
- * $FreeBSD: head/sys/dev/wi/if_wavelan_ieee.h 192492 2009-05-20 22:28:55Z imp $
+ * $FreeBSD: head/sys/dev/wi/if_wavelan_ieee.h 298955 2016-05-03 03:41:25Z pfg $
  */
 
 #ifndef _IF_WAVELAN_IEEE_H
@@ -59,11 +59,13 @@
  */
 #define WI_MAX_DATALEN	512
 
+#if 0
 struct wi_req {
 	u_int16_t	wi_len;
 	u_int16_t	wi_type;
 	u_int16_t	wi_val[WI_MAX_DATALEN];
 };
+#endif
 
 /*
  * Private LTV records (interpreted only by the driver). This is
@@ -429,7 +431,7 @@ struct wi_apinfo {
  */
 
 /*
- * standard hermes recieve frame used by wavelan/prism2 cards
+ * standard hermes receive frame used by wavelan/prism2 cards
  */
 struct wi_rx_frame {
 	/*
@@ -726,11 +728,13 @@ struct wi_scan_p2_hdr {
 #define WI_PRISM2_RES_SIZE	62
 
 
+#if 0 /* unimplemented */
 /*
  * prism2 debug mode definitions
  */
 #define SIOCSPRISM2DEBUG	_IOW('i', 137, struct ifreq)
 #define SIOCGPRISM2DEBUG	_IOWR('i', 138, struct ifreq)
+#endif
 
 #define WI_DEBUG_RESET		0x00
 #define WI_DEBUG_INIT		0x01

@@ -24,12 +24,14 @@
  * SUCH DAMAGE.
  *
  * $FreeBSD: src/sys/boot/common/bootstrap.h,v 1.38 2003/05/01 03:56:29 peter Exp $
- * $DragonFly: src/sys/boot/common/bootstrap.h,v 1.4 2008/09/02 17:21:12 dillon Exp $
  */
 
 #include <sys/types.h>
 #include <sys/queue.h>
 #include <sys/linker_set.h>
+#include <machine/types.h>	/* XXX for vm_offset_t */
+
+struct stat;
 
 /*
  * Generic device specifier; architecture-dependant 
@@ -48,8 +50,9 @@ struct devdesc
 
 /* Commands and return values; nonzero return sets command_errmsg != NULL */
 typedef int	(bootblk_cmd_t)(int argc, char *argv[]);
+#define	COMMAND_ERRBUFSZ	(256)
 extern char	*command_errmsg;	
-extern char	command_errbuf[];	/* XXX blah, length */
+extern char	command_errbuf[COMMAND_ERRBUFSZ];
 extern int	CurrentCondition;
 #define CMD_OK		0
 #define CMD_ERROR	1

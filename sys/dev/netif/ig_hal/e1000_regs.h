@@ -1,6 +1,6 @@
 /******************************************************************************
 
-  Copyright (c) 2001-2012, Intel Corporation 
+  Copyright (c) 2001-2016, Intel Corporation
   All rights reserved.
   
   Redistribution and use in source and binary forms, with or without 
@@ -30,7 +30,7 @@
   POSSIBILITY OF SUCH DAMAGE.
 
 ******************************************************************************/
-/*$FreeBSD:$*/
+/*$FreeBSD$*/
 
 #ifndef _E1000_REGS_H_
 #define _E1000_REGS_H_
@@ -59,11 +59,15 @@
 #define E1000_SCTL	0x00024  /* SerDes Control - RW */
 #define E1000_FCAL	0x00028  /* Flow Control Address Low - RW */
 #define E1000_FCAH	0x0002C  /* Flow Control Address High -RW */
+#define E1000_FEXT	0x0002C  /* Future Extended - RW */
 #define E1000_FEXTNVM	0x00028  /* Future Extended NVM - RW */
 #define E1000_FEXTNVM3	0x0003C  /* Future Extended NVM 3 - RW */
 #define E1000_FEXTNVM4	0x00024  /* Future Extended NVM 4 - RW */
 #define E1000_FEXTNVM6	0x00010  /* Future Extended NVM 6 - RW */
 #define E1000_FEXTNVM7	0x000E4  /* Future Extended NVM 7 - RW */
+#define E1000_FEXTNVM9	0x5BB4  /* Future Extended NVM 9 - RW */
+#define E1000_FEXTNVM11	0x5BBC  /* Future Extended NVM 11 - RW */
+#define E1000_PCIEANACFG	0x00F18 /* PCIE Analog Config */
 #define E1000_FCT	0x00030  /* Flow Control Type - RW */
 #define E1000_CONNSW	0x00034  /* Copper/Fiber switch control - RW */
 #define E1000_VET	0x00038  /* VLAN Ether Type - RW */
@@ -106,9 +110,12 @@
 #define E1000_PBA	0x01000  /* Packet Buffer Allocation - RW */
 #define E1000_PBS	0x01008  /* Packet Buffer Size */
 #define E1000_PBECCSTS	0x0100C  /* Packet Buffer ECC Status - RW */
+#define E1000_IOSFPC	0x00F28  /* TX corrupted data  */
 #define E1000_EEMNGCTL	0x01010  /* MNG EEprom Control */
-#define E1000_EEARBC	0x01024  /* EEPROM Auto Read Bus Control */
 #define E1000_FLASHT	0x01028  /* FLASH Timer Register */
+#define E1000_EEMNGCTL_I210	0x01010  /* i210 MNG EEprom Mode Control */
+#define E1000_EEARBC	0x01024  /* EEPROM Auto Read Bus Control */
+#define E1000_EEARBC_I210	0x12024 /* EEPROM Auto Read Bus Control */
 #define E1000_EEWR	0x0102C  /* EEPROM Write Register - RW */
 #define E1000_FLSWCTL	0x01030  /* FLASH control register */
 #define E1000_FLSWDATA	0x01034  /* FLASH data register */
@@ -200,7 +207,7 @@
 /* Queues fetch arbitration priority control register */
 #define E1000_I210_TQAVARBCTRL			0x3574
 /* Queues priority masks where _n and _p can be 0-3. */
-#define E1000_TQAVARBCTRL_QUEUE_PRI(_n, _p)	((_p) << (2 * _n))
+#define E1000_TQAVARBCTRL_QUEUE_PRI(_n, _p)	((_p) << (2 * (_n)))
 /* QAV Tx mode control registers where _n can be 0 or 1. */
 #define E1000_I210_TQAVCC(_n)			(0x3004 + 0x40 * (_n))
 
@@ -213,7 +220,7 @@
 #define E1000_PQGPTC(_n)		(0x010014 + (0x100 * (_n)))
 
 /* Queues packet buffer size masks where _n can be 0-3 and _s 0-63 [kB] */
-#define E1000_I210_TXPBS_SIZE(_n, _s)	((_s) << (6 * _n))
+#define E1000_I210_TXPBS_SIZE(_n, _s)	((_s) << (6 * (_n)))
 
 #define E1000_MMDAC			13 /* MMD Access Control */
 #define E1000_MMDAAD			14 /* MMD Access Address/Data */
@@ -494,8 +501,6 @@
 #define E1000_PBACL	0x05B68  /* MSIx PBA Clear - Read/Write 1's to clear */
 #define E1000_FFLT	0x05F00  /* Flexible Filter Length Table - RW Array */
 #define E1000_HOST_IF	0x08800  /* Host Interface */
-#define E1000_FFMT	0x09000  /* Flexible Filter Mask Table - RW Array */
-#define E1000_FFVT	0x09800  /* Flexible Filter Value Table - RW Array */
 #define E1000_HIBBA	0x8F40   /* Host Interface Buffer Base Address */
 /* Flexible Host Filter Table */
 #define E1000_FHFT(_n)	(0x09000 + ((_n) * 0x100))
@@ -536,15 +541,6 @@
 #define E1000_IMIREXT(_i)	(0x05AA0 + ((_i) * 4)) /* Immediate INTR Ext*/
 #define E1000_IMIRVP		0x05AC0 /* Immediate INT Rx VLAN Priority -RW */
 #define E1000_MSIXBM(_i)	(0x01600 + ((_i) * 4)) /* MSI-X Alloc Reg -RW */
-/* MSI-X Table entry addr low reg - RW */
-#define E1000_MSIXTADD(_i)	(0x0C000 + ((_i) * 0x10))
-/* MSI-X Table entry addr upper reg - RW */
-#define E1000_MSIXTUADD(_i)	(0x0C004 + ((_i) * 0x10))
-/* MSI-X Table entry message reg - RW */
-#define E1000_MSIXTMSG(_i)	(0x0C008 + ((_i) * 0x10))
-/* MSI-X Table entry vector ctrl reg - RW */
-#define E1000_MSIXVCTRL(_i)	(0x0C00C + ((_i) * 0x10))
-#define E1000_MSIXPBA	0x0E000 /* MSI-X Pending bit array */
 #define E1000_RETA(_i)	(0x05C00 + ((_i) * 4)) /* Redirection Table - RW */
 #define E1000_RSSRK(_i)	(0x05C80 + ((_i) * 4)) /* RSS Random Key - RW */
 #define E1000_RSSIM	0x05864 /* RSS Interrupt Mask */
@@ -597,6 +593,10 @@
 #define E1000_TIMADJL	0x0B60C /* Time sync time adjustment offset Low - RW */
 #define E1000_TIMADJH	0x0B610 /* Time sync time adjustment offset High - RW */
 #define E1000_TSAUXC	0x0B640 /* Timesync Auxiliary Control register */
+#define	E1000_SYSSTMPL	0x0B648 /* HH Timesync system stamp low register */
+#define	E1000_SYSSTMPH	0x0B64C /* HH Timesync system stamp hi register */
+#define	E1000_PLTSTMPL	0x0B640 /* HH Timesync platform stamp low register */
+#define	E1000_PLTSTMPH	0x0B644 /* HH Timesync platform stamp hi register */
 #define E1000_RXMTRL	0x0B634 /* Time sync Rx EtherType and Msg Type - RW */
 #define E1000_RXUDP	0x0B638 /* Time Sync Rx UDP Port - RW */
 #define E1000_SYSTIMR	0x0B6F8 /* System time register Residue */

@@ -1,7 +1,9 @@
-/* $FreeBSD: src/sys/msdosfs/msdosfs_denode.c,v 1.47.2.3 2002/08/22 16:20:15 trhodes Exp $ */
+/* $FreeBSD$ */
 /*	$NetBSD: msdosfs_denode.c,v 1.28 1998/02/10 14:10:00 mrg Exp $	*/
 
 /*-
+ * SPDX-License-Identifier: BSD-4-Clause
+ *
  * Copyright (C) 1994, 1995, 1997 Wolfgang Solfrank.
  * Copyright (C) 1994, 1995, 1997 TooLs GmbH.
  * All rights reserved.
@@ -32,7 +34,7 @@
  * OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF
  * ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
-/*
+/*-
  * Written by Paul Popelka (paulp@uts.amdahl.com)
  *
  * You can do anything you want with this software, just don't say you wrote
@@ -50,26 +52,25 @@
 
 #include <sys/param.h>
 #include <sys/systm.h>
+#include <sys/buf.h>
 #include <sys/kernel.h>
-#include <sys/mount.h>
 #include <sys/malloc.h>
 #include <sys/proc.h>
-#include <sys/buf.h>
+#include <sys/mount.h>
 #include <sys/vnode.h>
+#include <sys/time.h>
 
 #include <vm/vm.h>
 #include <vm/vm_extern.h>
+#include <vm/vm_page2.h>
 
 #include <sys/buf2.h>
 
-#include "bpb.h"
-#include "msdosfsmount.h"
-#include "direntry.h"
-#include "denode.h"
-#include "fat.h"
-
-static int msdosfs_hashins (struct denode *dep);
-static void msdosfs_hashrem (struct denode *dep);
+#include <vfs/msdosfs/bpb.h>
+#include <vfs/msdosfs/direntry.h>
+#include <vfs/msdosfs/denode.h>
+#include <vfs/msdosfs/fat.h>
+#include <vfs/msdosfs/msdosfsmount.h>
 
 static MALLOC_DEFINE(M_MSDOSFSNODE, "MSDOSFS node", "MSDOSFS vnode private part");
 
@@ -89,48 +90,27 @@ static MALLOC_DEFINE(M_MSDOSFSNODE, "MSDOSFS node", "MSDOSFS vnode private part"
  */
 static struct denode **dehashtbl;
 static u_long dehash;			/* size of hash table - 1 */
-#define	DEHASH(dev, dcl, doff)	(dehashtbl[(minor(dev) + (dcl) + (doff) / 	\
-				sizeof(struct direntry)) & dehash])
 static struct lwkt_token dehash_token;
 
-union _qcvt {
-	quad_t qcvt;
-	long val[2];
-};
-#define SETHIGH(q, h) { \
-	union _qcvt tmp; \
-	tmp.qcvt = (q); \
-	tmp.val[_QUAD_HIGHWORD] = (h); \
-	(q) = tmp.qcvt; \
-}
-#define SETLOW(q, l) { \
-	union _qcvt tmp; \
-	tmp.qcvt = (q); \
-	tmp.val[_QUAD_LOWWORD] = (l); \
-	(q) = tmp.qcvt; \
-}
-
-static struct denode *
-		msdosfs_hashget (cdev_t dev, u_long dirclust, u_long diroff);
+#define	DEHASH(dev, dcl, doff)	(dehashtbl[(minor(dev) + (dcl) + (doff) / \
+				sizeof(struct direntry)) & dehash])
 
 /*ARGSUSED*/
-int 
+int
 msdosfs_init(struct vfsconf *vfsp)
 {
-	dehash = 16;
-	while (dehash < desiredvnodes)
-		dehash <<= 1;
-	dehashtbl = kmalloc(sizeof(void *) * dehash, M_MSDOSFSMNT,
-			   M_WAITOK|M_ZERO);
+	dehash = vfs_inodehashsize();
+	dehashtbl = kmalloc(sizeof(void *) * dehash,
+			    M_MSDOSFSMNT, M_WAITOK|M_ZERO);
 	--dehash;
 	lwkt_token_init(&dehash_token, "msdosihash");
+
 	return (0);
 }
 
-int 
+int
 msdosfs_uninit(struct vfsconf *vfsp)
 {
-
 	if (dehashtbl)
 		kfree(dehashtbl, M_MSDOSFSMNT);
 	return (0);
@@ -159,7 +139,8 @@ loop:
 		 * We must check to see if the inode has been ripped
 		 * out from under us after blocking.
 		 */
-		for (dep = DEHASH(dev, dirclust, diroff); dep; dep = dep->de_next) {
+		for (dep = DEHASH(dev, dirclust, diroff); dep;
+		     dep = dep->de_next) {
 			if (dirclust == dep->de_dirclust
 			    && diroff == dep->de_diroffset
 			    && dev == dep->de_dev
@@ -243,7 +224,7 @@ msdosfs_reinsert(struct denode *ip, u_long new_dirclust, u_long new_diroffset)
  * If deget() succeeds it returns with the gotten denode locked().
  *
  * pmp	     - address of msdosfsmount structure of the filesystem containing
- *	       the denode of interest.  The pm_dev field and the address of
+ *	       the denode of interest.  The address of
  *	       the msdosfsmount structure are used.
  * dirclust  - which cluster bp contains, if dirclust is 0 (root directory)
  *	       diroffset is relative to the beginning of the root directory,
@@ -252,10 +233,8 @@ msdosfs_reinsert(struct denode *ip, u_long new_dirclust, u_long new_diroffset)
  * depp	     - returns the address of the gotten denode.
  */
 int
-deget(struct msdosfsmount *pmp,	/* so we know the maj/min number */
-      u_long dirclust,		/* cluster this dir entry came from */
-      u_long diroffset,		/* index of entry within the cluster */
-      struct denode **depp)	/* returns the addr of the gotten denode */
+deget(struct msdosfsmount *pmp, u_long dirclust, u_long diroffset,
+    struct denode **depp)
 {
 	int error;
 	cdev_t dev = pmp->pm_dev;
@@ -264,12 +243,9 @@ deget(struct msdosfsmount *pmp,	/* so we know the maj/min number */
 	struct denode *ldep;
 	struct vnode *nvp;
 	struct buf *bp;
-	struct timeval tv;
 
-#ifdef MSDOSFS_DEBUG
-	kprintf("deget(pmp %p, dirclust %lu, diroffset %lx, depp %p)\n",
+	mprintf("deget(pmp %p, dirclust %lu, diroffset %lx, depp %p)\n",
 	    pmp, dirclust, diroffset, depp);
-#endif
 
 	/*
 	 * On FAT32 filesystems, root is a (more or less) normal
@@ -302,8 +278,7 @@ again:
 	 * might cause a bogus v_data pointer to get dereferenced
 	 * elsewhere if MALLOC should block.
 	 */
-	ldep = kmalloc(sizeof(struct denode), M_MSDOSFSNODE,
-		       M_WAITOK | M_ZERO);
+	ldep = kmalloc(sizeof(struct denode), M_MSDOSFSNODE, M_WAITOK | M_ZERO);
 
 	/*
 	 * Directory entry was not in cache, have to create a vnode and
@@ -363,15 +338,15 @@ again:
 
 		ldep->de_Attributes = ATTR_DIRECTORY;
 		ldep->de_LowerCase = 0;
-		if (FAT32(pmp))
+		if (FAT32(pmp)) {
 			ldep->de_StartCluster = pmp->pm_rootdirblk;
 			/* de_FileSize will be filled in further down */
-		else {
+		} else {
 			ldep->de_StartCluster = MSDOSFSROOT;
 			ldep->de_FileSize = pmp->pm_rootdirsize * DEV_BSIZE;
 		}
 		/*
-		 * fill in time and date so that dos2unixtime() doesn't
+		 * fill in time and date so that fattime2timespec() doesn't
 		 * spit up when called from msdosfs_getattr() with root
 		 * denode
 		 */
@@ -417,13 +392,13 @@ again:
 		u_long size;
 
 		/*
-		 * XXX Sometimes, these arrives that . entry have cluster
-		 * number 0, when it shouldn't.  Use real cluster number
+		 * XXX it sometimes happens that the "." entry has cluster
+		 * number 0 when it shouldn't.  Use the actual cluster number
 		 * instead of what is written in directory entry.
 		 */
-		if ((diroffset == 0) && (ldep->de_StartCluster != dirclust)) {
-			kprintf("deget(): . entry at clust %ld != %ld\n",
-					dirclust, ldep->de_StartCluster);
+		if (diroffset == 0 && ldep->de_StartCluster != dirclust) {
+			kprintf("deget(): \".\" entry at clust %lu != %lu\n",
+			    dirclust, ldep->de_StartCluster);
 			ldep->de_StartCluster = dirclust;
 		}
 
@@ -436,12 +411,10 @@ again:
 			} else
 				kprintf("deget(): pcbmap returned %d\n", error);
 		}
-	} else {
+	} else
 		nvp->v_type = VREG;
-	}
-	getmicrouptime(&tv);
-	SETHIGH(ldep->de_modrev, tv.tv_sec);
-	SETLOW(ldep->de_modrev, tv.tv_usec * 4294);
+
+	ldep->de_modrev = init_va_filerev();
 	ldep->de_devvp = pmp->pm_devvp;
 	vref(ldep->de_devvp);
 	vinitvmio(nvp, ldep->de_FileSize, PAGE_SIZE, -1);
@@ -449,6 +422,7 @@ again:
 	 * Leave nvp locked and refd so the returned inode is effectively
 	 * locked and refd.
 	 */
+	vx_downgrade(nvp);
 	*depp = ldep;
 	return (0);
 }
@@ -456,32 +430,46 @@ again:
 int
 deupdat(struct denode *dep, int waitfor)
 {
-	int error;
+	struct direntry dir;
+	struct timespec ts;
 	struct buf *bp;
 	struct direntry *dirp;
-	struct timespec ts;
+	int error;
 
-	if (DETOV(dep)->v_mount->mnt_flag & MNT_RDONLY)
+	if (DETOV(dep)->v_mount->mnt_flag & MNT_RDONLY) {
+		dep->de_flag &= ~(DE_UPDATE | DE_CREATE | DE_ACCESS |
+		    DE_MODIFIED);
 		return (0);
-	getnanotime(&ts);
+	}
+	vfs_timestamp(&ts);
 	DETIMES(dep, &ts, &ts, &ts);
-	if ((dep->de_flag & DE_MODIFIED) == 0)
+	if ((dep->de_flag & DE_MODIFIED) == 0 && waitfor == 0)
 		return (0);
 	dep->de_flag &= ~DE_MODIFIED;
-	if (dep->de_Attributes & ATTR_DIRECTORY)
-		return (0);
+	if (DETOV(dep)->v_flag & VROOT)
+		return (EINVAL);
 	if (dep->de_refcnt <= 0)
 		return (0);
 	error = readde(dep, &bp, &dirp);
 	if (error)
 		return (error);
-	DE_EXTERNALIZE(dirp, dep);
+	DE_EXTERNALIZE(&dir, dep);
+	if (bcmp(dirp, &dir, sizeof(dir)) == 0) {
+		if (waitfor == 0 || (bp->b_flags & B_DELWRI) == 0) {
+			brelse(bp);
+			return (0);
+		}
+	} else
+		*dirp = dir;
+	if ((DETOV(dep)->v_mount->mnt_flag & MNT_NOCLUSTERW) == 0)
+		bp->b_flags |= B_CLUSTEROK;
 	if (waitfor)
-		return (bwrite(bp));
-	else {
+		error = bwrite(bp);
+	else if (vm_page_count_severe() || buf_dirty_count_severe())
+		bawrite(bp);
+	else
 		bdwrite(bp);
-		return (0);
-	}
+	return (error);
 }
 
 /*
@@ -494,15 +482,14 @@ detrunc(struct denode *dep, u_long length, int flags)
 	int allerror;
 	u_long eofentry;
 	u_long chaintofree;
-	daddr_t bn, cn;
+	daddr_t bn;
 	int boff;
 	int isadir = dep->de_Attributes & ATTR_DIRECTORY;
 	struct buf *bp;
 	struct msdosfsmount *pmp = dep->de_pmp;
 
-#ifdef MSDOSFS_DEBUG
-	kprintf("detrunc(): file %s, length %lu, flags %x\n", dep->de_Name, length, flags);
-#endif
+	mprintf("detrunc(): file %s, length %lu, flags %x\n", dep->de_Name,
+		length, flags);
 
 	/*
 	 * Disallow attempts to truncate the root directory since it is of
@@ -513,11 +500,11 @@ detrunc(struct denode *dep, u_long length, int flags)
 	 * directory's life.
 	 */
 	if ((DETOV(dep)->v_flag & VROOT) && !FAT32(pmp)) {
-		kprintf("detrunc(): can't truncate root directory, clust %ld, offset %ld\n",
-		    dep->de_dirclust, dep->de_diroffset);
+		kprintf("detrunc(): can't truncate root directory, clust %ld, "
+			"offset %ld\n",
+			dep->de_dirclust, dep->de_diroffset);
 		return (EINVAL);
 	}
-
 
 	if (dep->de_FileSize < length) {
 		vnode_pager_setsize(DETOV(dep), length);
@@ -541,9 +528,7 @@ detrunc(struct denode *dep, u_long length, int flags)
 		error = pcbmap(dep, de_clcount(pmp, length) - 1,
 			       NULL, &eofentry, NULL);
 		if (error) {
-#ifdef MSDOSFS_DEBUG
-			kprintf("detrunc(): pcbmap fails %d\n", error);
-#endif
+			mprintf("detrunc(): pcbmap fails %d\n", error);
 			return (error);
 		}
 	}
@@ -557,24 +542,21 @@ detrunc(struct denode *dep, u_long length, int flags)
 	 */
 	if ((boff = length & pmp->pm_crbomask) != 0) {
 		if (isadir) {
-			bn = xcntobn(pmp, eofentry);
-			error = bread(pmp->pm_devvp, de_bntodoff(pmp, bn), pmp->pm_bpcluster, &bp);
+			bn = cntobn(pmp, eofentry);
+			error = bread(pmp->pm_devvp, de_bn2doff(pmp, bn),
+				      pmp->pm_bpcluster, &bp);
 		} else {
-			cn = de_cluster(pmp, length);
-			error = bread(DETOV(dep), de_cn2doff(pmp, cn), pmp->pm_bpcluster, &bp);
+			u_long cn = de_cluster(pmp, length);
+			error = bread(DETOV(dep), de_cn2doff(pmp, cn),
+				      pmp->pm_bpcluster, &bp);
 		}
 		if (error) {
 			brelse(bp);
-#ifdef MSDOSFS_DEBUG
-			kprintf("detrunc(): bread fails %d\n", error);
-#endif
+			mprintf("detrunc(): bread fails %d\n", error);
 			return (error);
 		}
-		/*
-		 * is this the right place for it?
-		 */
-		bzero(bp->b_data + boff, pmp->pm_bpcluster - boff);
-		if (flags & IO_SYNC)
+		memset(bp->b_data + boff, 0, pmp->pm_bpcluster - boff);
+		if ((flags & IO_SYNC) != 0)
 			bwrite(bp);
 		else
 			bdwrite(bp);
@@ -586,19 +568,17 @@ detrunc(struct denode *dep, u_long length, int flags)
 	 */
 	dep->de_FileSize = length;
 	if (!isadir)
-		dep->de_flag |= DE_UPDATE|DE_MODIFIED;
+		dep->de_flag |= DE_UPDATE | DE_MODIFIED;
 	allerror = vtruncbuf(DETOV(dep), length, pmp->pm_bpcluster);
 #ifdef MSDOSFS_DEBUG
 	if (allerror)
 		kprintf("detrunc(): vtruncbuf error %d\n", allerror);
 #endif
-	error = deupdat(dep, 1);
-	if (error && (allerror == 0))
+	error = deupdat(dep, !DOINGASYNC((DETOV(dep))));
+	if (error != 0 && allerror == 0)
 		allerror = error;
-#ifdef MSDOSFS_DEBUG
-	kprintf("detrunc(): allerror %d, eofentry %lu\n",
-	       allerror, eofentry);
-#endif
+	mprintf("detrunc(): allerror %d, eofentry %lu\n",
+		allerror, eofentry);
 
 	/*
 	 * If we need to break the cluster chain for the file then do it
@@ -608,9 +588,7 @@ detrunc(struct denode *dep, u_long length, int flags)
 		error = fatentry(FAT_GET_AND_SET, pmp, eofentry,
 				 &chaintofree, CLUST_EOFE);
 		if (error) {
-#ifdef MSDOSFS_DEBUG
-			kprintf("detrunc(): fatentry errors %d\n", error);
-#endif
+			mprintf("detrunc(): fatentry errors %d\n", error);
 			return (error);
 		}
 		fc_setcache(dep, FC_LASTFC, de_cluster(pmp, length - 1),
@@ -667,23 +645,18 @@ deextend(struct denode *dep, u_long length)
 		}
 	}
 	dep->de_FileSize = length;
-	dep->de_flag |= DE_UPDATE|DE_MODIFIED;
-	return (deupdat(dep, 1));
+	dep->de_flag |= DE_UPDATE | DE_MODIFIED;
+	return (deupdat(dep, !DOINGASYNC(DETOV(dep))));
 }
 
-/*
- * msdosfs_reclaim(struct vnode *a_vp)
- */
 int
 msdosfs_reclaim(struct vop_reclaim_args *ap)
 {
 	struct vnode *vp = ap->a_vp;
 	struct denode *dep = VTODE(vp);
 
-#ifdef MSDOSFS_DEBUG
-	kprintf("msdosfs_reclaim(): dep %p, file %s, refcnt %ld\n",
+	mprintf("msdosfs_reclaim(): dep %p, file %s, refcnt %ld\n",
 	    dep, dep ? (char *)dep->de_Name : "?", dep ? dep->de_refcnt : -1);
-#endif
 
 	if (prtactive && VREFCNT(vp) > 1)
 		vprint("msdosfs_reclaim(): pushing active", vp);
@@ -702,9 +675,6 @@ msdosfs_reclaim(struct vop_reclaim_args *ap)
 	return (0);
 }
 
-/*
- * msdosfs_inactive(struct vnode *a_vp)
- */
 int
 msdosfs_inactive(struct vop_inactive_args *ap)
 {
@@ -712,10 +682,8 @@ msdosfs_inactive(struct vop_inactive_args *ap)
 	struct denode *dep = VTODE(vp);
 	int error = 0;
 
-#ifdef MSDOSFS_DEBUG
-	kprintf("msdosfs_inactive(): dep %p, de_Name[0] %x\n",
+	mprintf("msdosfs_inactive(): dep %p, de_Name[0] %x\n",
 		dep, (dep ? dep->de_Name[0] : 0));
-#endif
 
 	if (prtactive && VREFCNT(vp) > 1)
 		vprint("msdosfs_inactive(): pushing active", vp);
@@ -723,7 +691,7 @@ msdosfs_inactive(struct vop_inactive_args *ap)
 	/*
 	 * Ignore denodes related to stale file handles.
 	 */
-	if (dep == NULL || dep->de_Name[0] == SLOT_DELETED)
+	if (dep == NULL || dep->de_Name[0] == SLOT_DELETED || dep->de_Name[0] == SLOT_EMPTY)
 		goto out;
 
 	/*
@@ -731,10 +699,9 @@ msdosfs_inactive(struct vop_inactive_args *ap)
 	 * filesystem, then truncate the file, and mark the directory slot
 	 * as empty.  (This may not be necessary for the dos filesystem.)
 	 */
-#ifdef MSDOSFS_DEBUG
-	kprintf("msdosfs_inactive(): dep %p, refcnt %ld, mntflag %x, MNT_RDONLY %x\n",
-	       dep, dep->de_refcnt, vp->v_mount->mnt_flag, MNT_RDONLY);
-#endif
+	mprintf("msdosfs_inactive(): dep %p, refcnt %ld, mntflag %llx, MNT_RDONLY %llx\n",
+	    dep, dep->de_refcnt, (unsigned long long)vp->v_mount->mnt_flag,
+	    (unsigned long long)MNT_RDONLY);
 	if (dep->de_refcnt <= 0 && (vp->v_mount->mnt_flag & MNT_RDONLY) == 0) {
 		error = detrunc(dep, (u_long) 0, 0);
 		dep->de_flag |= DE_UPDATE;
@@ -747,11 +714,9 @@ out:
 	 * If we are done with the denode, reclaim it
 	 * so that it can be reused immediately.
 	 */
-#ifdef MSDOSFS_DEBUG
-	kprintf("msdosfs_inactive(): v_refcnt 0x%08x, de_Name[0] %x\n",
+	mprintf("msdosfs_inactive(): v_refcnt 0x%08x, de_Name[0] %x\n",
 		vp->v_refcnt, (dep ? dep->de_Name[0] : 0));
-#endif
-	if (dep == NULL || dep->de_Name[0] == SLOT_DELETED)
+	if (dep == NULL || dep->de_Name[0] == SLOT_DELETED || dep->de_Name[0] == SLOT_EMPTY)
 		vrecycle(vp);
 	return (error);
 }

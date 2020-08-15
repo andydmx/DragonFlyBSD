@@ -515,6 +515,8 @@ link_elf_obj_load_file(const char *filename, linker_file_t * result)
 	symtabindex = -1;
 	symstrindex = -1;
 	for (i = 0; i < hdr->e_shnum; i++) {
+		if (shdr[i].sh_size == 0)
+			continue;
 		switch (shdr[i].sh_type) {
 		case SHT_PROGBITS:
 		case SHT_NOBITS:
@@ -617,6 +619,8 @@ link_elf_obj_load_file(const char *filename, linker_file_t * result)
 	/* Size up code/data(progbits) and bss(nobits). */
 	alignmask = 0;
 	for (i = 0; i < hdr->e_shnum; i++) {
+		if (shdr[i].sh_size == 0)
+			continue;
 		switch (shdr[i].sh_type) {
 		case SHT_PROGBITS:
 		case SHT_NOBITS:
@@ -658,8 +662,8 @@ link_elf_obj_load_file(const char *filename, linker_file_t * result)
 	mapbase = KERNBASE;
 	error = vm_map_find(&kernel_map, ef->object, NULL,
 			    0, &mapbase, round_page(mapsize),
-			    PAGE_SIZE,
-			    TRUE, VM_MAPTYPE_NORMAL,
+			    PAGE_SIZE, TRUE,
+			    VM_MAPTYPE_NORMAL, VM_SUBSYS_IMGACT,
 			    VM_PROT_ALL, VM_PROT_ALL, FALSE);
 	vm_object_drop(ef->object);
 	if (error) {
@@ -689,6 +693,8 @@ link_elf_obj_load_file(const char *filename, linker_file_t * result)
 	ra = 0;
 	alignmask = 0;
 	for (i = 0; i < hdr->e_shnum; i++) {
+		if (shdr[i].sh_size == 0)
+			continue;
 		switch (shdr[i].sh_type) {
 		case SHT_PROGBITS:
 		case SHT_NOBITS:

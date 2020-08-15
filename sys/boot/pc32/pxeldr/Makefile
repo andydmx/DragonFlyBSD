@@ -1,5 +1,4 @@
 # $FreeBSD: src/sys/boot/i386/pxeldr/Makefile,v 1.9 2003/09/03 08:12:20 phk Exp $
-# $DragonFly: src/sys/boot/pc32/pxeldr/Makefile,v 1.5 2004/07/18 23:40:09 dillon Exp $
 
 ORG=		0x7c00
 
@@ -42,11 +41,11 @@ ${BOOT}: ${LDR} ${LOADER}
 	rm ${.TARGET}.tmp
 
 ${LOADER}: ${LOADERBIN} ${BTXLDR} ${BTXKERN} ${BTXCRT}
-	btxld -v -f aout -e ${LOADER_ADDRESS} -o ${.TARGET} -l ${BTXLDR} \
-	    -b ${BTXKERN} ${LOADERBIN}
+	${.OBJDIR}/../btxld/btxld.nx -v -f aout -e ${LOADER_ADDRESS} \
+	    -o ${.TARGET} -l ${BTXLDR} -b ${BTXKERN} ${LOADERBIN}
 
 ${LDR}: ${LDR}.o
-	${LD} ${LDFLAGS} -N -e start -Ttext ${ORG} -o ${LDR}.out ${LDR}.o
+	${LD} ${LDFLAGS:N-Wl,*} -N -e start -Ttext ${ORG} -o ${LDR}.out ${LDR}.o
 	objcopy -S -O binary ${LDR}.out ${.TARGET}
 
 ${LDR}.o: ${LDR}.S

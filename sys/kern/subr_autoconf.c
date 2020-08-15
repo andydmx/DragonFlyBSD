@@ -38,14 +38,12 @@
  *	@(#)subr_autoconf.c	8.1 (Berkeley) 6/10/93
  *
  * $FreeBSD: src/sys/kern/subr_autoconf.c,v 1.14 1999/10/05 21:19:41 n_hibma Exp $
- * $DragonFly: src/sys/kern/subr_autoconf.c,v 1.9 2007/07/28 23:24:33 dillon Exp $
  */
 
 #include <sys/param.h>
 #include <sys/kernel.h>
 #include <sys/systm.h>
 #include <sys/thread.h>
-#include <sys/thread2.h>
 
 /*
  * Autoconfiguration subroutines.
@@ -61,23 +59,25 @@ static TAILQ_HEAD(, intr_config_hook) intr_config_hook_list =
 /* ARGSUSED */
 static void run_interrupt_driven_config_hooks (void *dummy);
 static int ran_config_hooks;
+static struct lock intr_config_lk = LOCK_INITIALIZER("intrcfg", 0, 0);
 
 static void
 run_interrupt_driven_config_hooks(void *dummy)
 {
 	struct intr_config_hook *hook_entry;
-	int waiting;
-#ifndef _KERNEL_VIRTUAL
 	int save_ticks = ticks;
-#endif
-	waiting = 0;
+	int save_count;
+	int waiting;
 
-	ran_config_hooks = 1;
+	lockmgr(&intr_config_lk, LK_EXCLUSIVE);
+	save_count = ran_config_hooks++;
 	while (!TAILQ_EMPTY(&intr_config_hook_list)) {
 		TAILQ_FOREACH(hook_entry, &intr_config_hook_list, ich_links) {
 			if (hook_entry->ich_ran == 0) {
 				hook_entry->ich_ran = 1;
+				lockmgr(&intr_config_lk, LK_RELEASE);
 				(*hook_entry->ich_func)(hook_entry->ich_arg);
+				lockmgr(&intr_config_lk, LK_EXCLUSIVE);
 				break;
 			}
 		}
@@ -86,8 +86,9 @@ run_interrupt_driven_config_hooks(void *dummy)
 		if (TAILQ_EMPTY(&intr_config_hook_list))
 			break;
 
-		if (waiting >= 20 && (waiting % 10) == 0) {
-			crit_enter();
+		waiting = (ticks - save_ticks + 1) / hz;
+
+		if (waiting >= 10 && (waiting % 10) == 0) {
 			kprintf("**WARNING** waiting for the following device "
 				"to finish configuring:\n");
 			TAILQ_FOREACH(hook_entry, &intr_config_hook_list,
@@ -98,16 +99,17 @@ run_interrupt_driven_config_hooks(void *dummy)
 				hook_entry->ich_func,
 				hook_entry->ich_arg);
 			}
-			crit_exit();
-			if (waiting >= 60) {
+			if (save_count || waiting >= 30) {
 				kprintf("Giving up, interrupt routing is "
 					"probably hosed\n");
 				break;
 			}
 		}
-		tsleep(&intr_config_hook_list, 0, "conifhk", hz);
+		lksleep(&intr_config_hook_list, &intr_config_lk,
+			0, "conifhk", hz);
 		++waiting;
 	}
+	lockmgr(&intr_config_lk, LK_RELEASE);
 
 	/*
 	 * Terrible hack to give U4B (usb) a chance to configure, else
@@ -116,13 +118,15 @@ run_interrupt_driven_config_hooks(void *dummy)
 	 * before the usb ports are even registered.
 	 */
 #ifndef _KERNEL_VIRTUAL
-	while (ticks - save_ticks < 5*hz)
-		tsleep(&intr_config_hook_list, 0, "delay", hz / 10);
+	if (save_count == 0) {
+		while (ticks - save_ticks < 5*hz)
+			tsleep(&intr_config_hook_list, 0, "delay", hz / 10);
+	}
 #endif
 
 }
 SYSINIT(intr_config_hooks, SI_SUB_INT_CONFIG_HOOKS, SI_ORDER_FIRST,
-	run_interrupt_driven_config_hooks, NULL)
+	run_interrupt_driven_config_hooks, NULL);
 
 /*
  * Register a hook that will be called after "cold"
@@ -134,6 +138,7 @@ config_intrhook_establish(struct intr_config_hook *hook)
 {
 	struct intr_config_hook *hook_entry;
 
+	lockmgr(&intr_config_lk, LK_EXCLUSIVE);
 	for (hook_entry = TAILQ_FIRST(&intr_config_hook_list);
 	     hook_entry != NULL;
 	     hook_entry = TAILQ_NEXT(hook_entry, ich_links)) {
@@ -145,9 +150,14 @@ config_intrhook_establish(struct intr_config_hook *hook)
 	if (hook_entry == hook) {
 		kprintf("config_intrhook_establish: establishing an "
 		       "already established hook.\n");
+		lockmgr(&intr_config_lk, LK_RELEASE);
 		return (1);
 	}
 	hook->ich_ran = 0;
+
+	/*
+	 * Insert
+	 */
 	if (hook_entry)
 		TAILQ_INSERT_BEFORE(hook_entry, hook, ich_links);
 	else
@@ -156,8 +166,13 @@ config_intrhook_establish(struct intr_config_hook *hook)
 	/*
 	 * Late hook, run immediately.
 	 */
-	if (ran_config_hooks)
-		run_interrupt_driven_config_hooks(NULL);	
+	if (ran_config_hooks) {
+		lockmgr(&intr_config_lk, LK_RELEASE);
+		run_interrupt_driven_config_hooks(NULL);
+		lockmgr(&intr_config_lk, LK_EXCLUSIVE);
+	}
+	lockmgr(&intr_config_lk, LK_RELEASE);
+
 	return (0);
 }
 
@@ -166,16 +181,21 @@ config_intrhook_disestablish(struct intr_config_hook *hook)
 {
 	struct intr_config_hook *hook_entry;
 
+	lockmgr(&intr_config_lk, LK_EXCLUSIVE);
 	for (hook_entry = TAILQ_FIRST(&intr_config_hook_list);
 	     hook_entry != NULL;
-	     hook_entry = TAILQ_NEXT(hook_entry, ich_links))
+	     hook_entry = TAILQ_NEXT(hook_entry, ich_links)) {
 		if (hook_entry == hook)
 			break;
-	if (hook_entry == NULL)
+	}
+	if (hook_entry == NULL) {
+		lockmgr(&intr_config_lk, LK_RELEASE);
 		panic("config_intrhook_disestablish: disestablishing an "
-		    "unestablished hook");
+		      "unestablished hook (%p)", hook);
+	}
 
 	TAILQ_REMOVE(&intr_config_hook_list, hook, ich_links);
 	/* Wakeup anyone watching the list */
 	wakeup(&intr_config_hook_list);
+	lockmgr(&intr_config_lk, LK_RELEASE);
 }

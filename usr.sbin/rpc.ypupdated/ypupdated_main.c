@@ -73,6 +73,8 @@ static int _rpcfdtype;
 
 extern int _rpcsvcstate;	 /* Set when a request is serviced */
 
+int debug;
+
 char *progname = "rpc.ypupdated";
 const char *yp_dir = "/var/yp/";
 
@@ -174,7 +176,7 @@ reaper(int sig)
 	}
 }
 
-void
+__dead2 void
 usage(void)
 {
 	fprintf(stderr, "rpc.ypupdatedd [-p path]\n");

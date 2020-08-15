@@ -13,11 +13,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -75,13 +71,32 @@
 #include <vm/vm_map.h>
 #endif
 
+struct vm_object;
+
+/*
+ * Anonymous swap-backed kernel memory descriptor
+ */
+struct kmem_anon_desc {
+	struct vm_map	*map;
+	vm_size_t	size;
+	vm_offset_t	data;
+	struct vm_object *object;
+};
+
+typedef struct kmem_anon_desc kmem_anon_desc_t;
+
 /*
  * kmem_alloc3() flags
  */
-#define KM_PAGEABLE	0x0001
-#define KM_KRESERVE	0x0002
-#define KM_STACK	0x0004
-#define KM_NOTLBSYNC	0x0008
+#define KM_PAGEABLE	0x00000001
+#define KM_KRESERVE	0x00000002
+#define KM_STACK	0x00000004
+#define KM_NOTLBSYNC	0x00000008
+#define KM_CPU_SPEC	0x00000010
+
+#define KM_CPU_SHIFT	16
+#define KM_CPU(n)	(((n) << KM_CPU_SHIFT) | KM_CPU_SPEC)
+#define KM_GETCPU(flags) ((flags) >> KM_CPU_SHIFT)
 
 /* Kernel memory management definitions. */
 extern struct vm_map buffer_map;
@@ -93,6 +108,6 @@ extern vm_offset_t kernel_vm_end;
 /* XXX - elsewhere? */
 struct malloc_type;
 extern void *contigmalloc_map(u_long, struct malloc_type *, int,
-		vm_paddr_t, vm_paddr_t, u_long, u_long, vm_map_t);
+		vm_paddr_t, vm_paddr_t, u_long, u_long, struct vm_map *);
 
 #endif				/* _VM_VM_KERN_H_ */

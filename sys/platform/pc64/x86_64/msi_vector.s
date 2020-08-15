@@ -22,7 +22,7 @@
 #define IRQ_LIDX(irq_num)	((irq_num) >> 6)
 
 #define MSI_PUSH_FRAME							\
-	PUSH_FRAME ;		/* 15 regs + space for 5 extras */	\
+	PUSH_FRAME_TFRIP ;	/* 15 regs + space for 5 extras */	\
 	movq $0,TF_XFLAGS(%rsp) ;					\
 	movq $0,TF_TRAPNO(%rsp) ;					\
 	movq $0,TF_ADDR(%rsp) ;						\
@@ -48,8 +48,8 @@
 IDTVEC(msi_intr##irq_num) ;						\
 	MSI_PUSH_FRAME ;						\
 	FAKE_MCOUNT(TF_RIP(%rsp)) ;					\
-	movq	lapic, %rax ;						\
-	movl	$0, LA_EOI(%rax) ;					\
+	movq	lapic_eoi, %rax ;					\
+	callq	*%rax ;							\
 	movq	PCPU(curthread),%rbx ;					\
 	testl	$-1,TD_NEST_COUNT(%rbx) ;				\
 	jne	1f ;							\

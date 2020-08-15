@@ -13,11 +13,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -35,14 +31,13 @@
  *
  *	@(#)glob.h	8.1 (Berkeley) 6/2/93
  * $FreeBSD: src/include/glob.h,v 1.10 2006/05/22 05:57:39 ache Exp $
- * $DragonFly: src/include/glob.h,v 1.4 2005/12/07 02:28:15 corecode Exp $
  */
 
 #ifndef _GLOB_H_
 #define	_GLOB_H_
 
 #include <sys/cdefs.h>
-#include <sys/types.h>
+#include <machine/stdint.h>
 
 #ifndef	_SIZE_T_DECLARED
 typedef	__size_t	size_t;
@@ -85,8 +80,11 @@ typedef struct {
 #define	GLOB_NOSPACE	(-1)	/* Malloc call failed. */
 #define	GLOB_ABORTED	(-2)	/* Unignored error. */
 #define	GLOB_NOMATCH	(-3)	/* No match and GLOB_NOCHECK was not set. */
-#define	GLOB_NOSYS	(-4)	/* Obsolete: source comptability only. */
 #endif /* __POSIX_VISIBLE >= 199209 */
+
+#if __BSD_VISIBLE || (__POSIX_VISIBLE && __POSIX_VISIBLE < 200809)
+#define	GLOB_NOSYS	(-4)	/* Obsolete: source compatibility only. */
+#endif
 
 #if __BSD_VISIBLE
 #define	GLOB_ALTDIRFUNC	0x0040	/* Use alternately specified directory funcs. */
@@ -99,12 +97,13 @@ typedef struct {
 #define	GLOB_PERIOD	0x4000	/* Names with leading dots match as well */
 
 /* source compatibility, these are the old names */
-#define GLOB_MAXPATH	GLOB_LIMIT
+#define	GLOB_MAXPATH	GLOB_LIMIT
 #define	GLOB_ABEND	GLOB_ABORTED
 #endif /* __BSD_VISIBLE */
 
 __BEGIN_DECLS
-int	glob(const char *, int, int (*)(const char *, int), glob_t *);
+int	glob(const char * __restrict, int, int (*)(const char *, int),
+	    glob_t * __restrict);
 void	globfree(glob_t *);
 __END_DECLS
 

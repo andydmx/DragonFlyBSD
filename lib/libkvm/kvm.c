@@ -36,7 +36,6 @@
 
 #include <sys/user.h>	/* MUST BE FIRST */
 #include <sys/param.h>
-#include <sys/proc.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/sysctl.h>
@@ -50,7 +49,6 @@
 
 #include <ctype.h>
 #include <fcntl.h>
-#include <kvm.h>
 #include <limits.h>
 #include <nlist.h>
 #include <paths.h>
@@ -60,10 +58,17 @@
 #include <stdarg.h>
 #include <unistd.h>
 
+#include "kvm.h"
 #include "kvm_private.h"
 
 /* from src/lib/libc/gen/nlist.c */
 int __fdnlist		(int, struct nlist *);
+
+static int
+kvm_notrans(kvm_t *kd)
+{
+	return kvm_ishost(kd) || kvm_isvkernel(kd);
+}
 
 char *
 kvm_geterr(kvm_t *kd)
@@ -89,7 +94,7 @@ _kvm_err(kvm_t *kd, const char *program, const char *fmt, ...)
 		(void)fputc('\n', stderr);
 	} else
 		(void)vsnprintf(kd->errbuf,
-		    sizeof(kd->errbuf), (char *)fmt, ap);
+		    sizeof(kd->errbuf), fmt, ap);
 
 	va_end(ap);
 }
@@ -108,7 +113,7 @@ _kvm_syserr(kvm_t *kd, const char *program, const char *fmt, ...)
 	} else {
 		char *cp = kd->errbuf;
 
-		(void)vsnprintf(cp, sizeof(kd->errbuf), (char *)fmt, ap);
+		(void)vsnprintf(cp, sizeof(kd->errbuf), fmt, ap);
 		n = strlen(cp);
 		(void)snprintf(&cp[n], sizeof(kd->errbuf) - n, ": %s",
 		    strerror(errno));
@@ -135,7 +140,7 @@ is_proc_mem(const char *p)
 	if (strncmp(proc, p, sizeof(proc) - 1))
 		return 0;
 	p += sizeof(proc) - 1;
-	for (; p != '\0'; ++p)
+	for (; *p != '\0'; ++p)
 		if (!isdigit(*p))
 			break;
 	if (!isdigit(*(p - 1)))
@@ -230,7 +235,7 @@ _kvm_open(kvm_t *kd, const char *uf, const char *mf, int flag, char *errout)
 				_kvm_syserr(kd, kd->program, "empty file");
 				goto failed;
 			}
-			
+
 			/*
 			 * This is a crash dump.
 			 * Initialize the virtual address translation machinery,
@@ -252,7 +257,7 @@ failed:
 }
 
 kvm_t *
-kvm_openfiles(const char *uf, const char *mf, const char *sf, int flag,
+kvm_openfiles(const char *uf, const char *mf, const char *sf __unused, int flag,
 	      char *errout)
 {
 	kvm_t *kd;
@@ -267,7 +272,7 @@ kvm_openfiles(const char *uf, const char *mf, const char *sf, int flag,
 }
 
 kvm_t *
-kvm_open(const char *uf, const char *mf, const char *sf, int flag,
+kvm_open(const char *uf, const char *mf, const char *sf __unused, int flag,
 	 const char *errstr)
 {
 	kvm_t *kd;
@@ -382,7 +387,7 @@ kvm_read(kvm_t *kd, u_long kva, void *buf, size_t len)
 		if (cc < 0) {
 			_kvm_syserr(kd, 0, "kvm_read");
 			return (-1);
-		} else if (cc < len)
+		} else if (cc < (ssize_t)len)
 			_kvm_err(kd, kd->program, "short read");
 		return (cc);
 	} else {
@@ -393,7 +398,7 @@ kvm_read(kvm_t *kd, u_long kva, void *buf, size_t len)
 			cc = _kvm_kvatop(kd, kva, &pa);
 			if (cc == 0)
 				return (-1);
-			if (cc > len)
+			if (cc > (ssize_t)len)
 				cc = len;
 			errno = 0;
 			if (lseek(kd->pmfd, pa, 0) == -1 && errno != 0) {
@@ -459,7 +464,7 @@ kvm_readstr(kvm_t *kd, u_long kva, char *buf, size_t *lenp)
 				return NULL;
 			} else if (cc < 1)
 				_kvm_err(kd, kd->program, "short read");
-			if (pos == asize) {
+			if (asize > 0 && asize == (ssize_t)pos) {
 				buf = realloc(buf, asize *= 2);
 				if (buf == NULL) {
 					_kvm_syserr(kd, kd->program, "kvm_readstr");
@@ -498,7 +503,7 @@ kvm_readstr(kvm_t *kd, u_long kva, char *buf, size_t *lenp)
 				return NULL;
 			} else if (cc < 1)
 				_kvm_err(kd, kd->program, "short read");
-			if (pos == asize) {
+			if (asize > 0 && asize == (ssize_t)pos) {
 				buf = realloc(buf, asize *= 2);
 				if (buf == NULL) {
 					_kvm_syserr(kd, kd->program, "kvm_readstr");
@@ -538,7 +543,7 @@ kvm_write(kvm_t *kd, u_long kva, const void *buf, size_t len)
 		if (cc < 0) {
 			_kvm_syserr(kd, 0, "kvm_write");
 			return (-1);
-		} else if (cc < len)
+		} else if (cc < (ssize_t)len)
 			_kvm_err(kd, kd->program, "short write");
 		return (cc);
 	} else {

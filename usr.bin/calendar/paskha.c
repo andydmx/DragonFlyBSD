@@ -1,4 +1,6 @@
-/*
+/*-
+ * SPDX-License-Identifier: BSD-2-Clause-FreeBSD
+ *
  * Copyright (C) 1993-1996 by Andrey A. Chernov, Moscow, Russia.
  * All rights reserved.
  *
@@ -23,71 +25,48 @@
  * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
  *
- * $FreeBSD: src/usr.bin/calendar/paskha.c,v 1.8 2007/05/07 11:18:30 dwmalone Exp $
- * $DragonFly: src/usr.bin/calendar/paskha.c,v 1.5 2007/09/24 20:31:44 pavalos Exp $
+ * $FreeBSD: head/usr.bin/calendar/paskha.c 326276 2017-11-27 15:37:16Z pfg $
  */
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
 
 #include "calendar.h"
 
-#define PASKHA "paskha"
-#define PASKHALEN (sizeof(PASKHA) - 1)
+#define	PASKHA		"paskha"
+#define	PASKHALEN	(sizeof(PASKHA) - 1)
 
-static int paskha(int);
+static int	j2g(int year);
 
-/* return year day for Orthodox Easter using Gauss formula */
-/* (old style result) */
-
-/* R: year */
+/*
+ * Return difference in days between Julian and Gregorian calendars
+ */
 static int
-paskha(int R)
+j2g(int year)
+{
+	return (year < 1500) ?
+		0 :
+		10 + (year/100 - 16) - ((year/100 - 16) / 4);
+}
+
+/*
+ * Return year day for Orthodox Easter using Gauss formula
+ * (new style result)
+ */
+int
+paskha(int R) /*year*/
 {
 	int a, b, c, d, e;
 	static int x = 15;
 	static int y = 6;
+	int *cumday;
 
 	a = R % 19;
 	b = R % 4;
 	c = R % 7;
-	d = (19*a + x) % 30;
-	e = (2*b + 4*c + 6*d + y) % 7;
-	return(((cumdays[3] + 1) + 22) + (d + e));
-}
-
-/* return year day for Orthodox Easter depending days */
-
-int
-getpaskha(char *s, int year)
-{
-	int offset;
-
-	if (strncasecmp(s, PASKHA, PASKHALEN) == 0)
-	    s += PASKHALEN;
-	else if (npaskha.name != NULL
-		 && strncasecmp(s, npaskha.name, npaskha.len) == 0
-		)
-	    s += npaskha.len;
-	else
-	    return(0);
-
-
-	/* Paskha+1  or Paskha-2
-	 *       ^            ^   */
-
-	switch(*s) {
-	case '-':
-	case '+':
-	    offset = atoi(s);
-	    break;
-
-	default:
-	    offset = 0;
-	    break;
-	}
-	    
-	return(paskha(year) + offset + 13/* new style */);
+	d = (19 * a + x) % 30;
+	e = (2 * b + 4 * c + 6 * d + y) % 7;
+	cumday = cumdaytab[isleap(R)];
+	return (((cumday[3] + 1) + 22) + (d + e) + j2g(R));
 }

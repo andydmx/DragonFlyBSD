@@ -10,11 +10,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -63,10 +59,10 @@ static struct lwkt_token ext2_ihash_token;
 void
 ext2_ihashinit(void)
 {
-	ext2_ihash = 16;
-	while (ext2_ihash < desiredvnodes)
-		ext2_ihash <<= 1;
-	ext2_ihashtbl = kmalloc(sizeof(void *) * ext2_ihash, M_EXT2IHASH, M_WAITOK|M_ZERO);
+	ext2_ihash = vfs_inodehashsize();
+	ext2_ihashtbl = kmalloc(sizeof(void *) * ext2_ihash,
+				M_EXT2IHASH,
+				M_WAITOK|M_ZERO);
 	--ext2_ihash;
 	lwkt_token_init(&ext2_ihash_token, "ext2ihash");
 }

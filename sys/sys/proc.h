@@ -15,11 +15,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -44,7 +40,8 @@
 
 #else
 
-#include <sys/callout.h>		/* For struct callout_handle. */
+#include <sys/callout.h>		/* For struct callout. */
+#include <sys/cpumask.h>
 #include <sys/filedesc.h>
 #include <sys/queue.h>
 #include <sys/tree.h>
@@ -58,6 +55,7 @@
 #include <sys/ucred.h>
 #include <sys/event.h>			/* For struct klist */
 #include <sys/eventvar.h>
+#include <sys/proc_common.h>		/* For struct proc enums */
 #include <sys/sysent.h>			/* For struct sysentvec */
 #include <sys/thread.h>
 #include <sys/varsym.h>
@@ -77,6 +75,9 @@ struct proc;
 struct pgrp;
 struct session;
 struct lwp;
+struct uidcount;
+struct procglob;
+struct vm_map_backing;
 
 LIST_HEAD(proclist, proc);
 LIST_HEAD(pgrplist, pgrp);
@@ -93,6 +94,7 @@ RB_PROTOTYPE2(lwp_rb_tree, lwp, u.lwp_rbnode, rb_lwp_compare, lwpid_t);
 struct	session {
 	LIST_ENTRY(session) s_list;	/* Hash chain. */
 	int	s_count;		/* Ref cnt; pgrps in session. */
+	struct	procglob *s_prg;
 	struct	proc *s_leader;		/* Session leader. */
 	struct	vnode *s_ttyvp;		/* Vnode of controlling terminal. */
 	struct	tty *s_ttyp;		/* Controlling terminal. */
@@ -152,19 +154,6 @@ struct vmspace_entry;
 struct ktrace_node;
 struct sem_undo;
 
-enum lwpstat {
-	LSRUN = 1,
-	LSSTOP = 2,
-	LSSLEEP = 3,
-};
-
-enum procstat {
-	SIDL = 1,
-	SACTIVE = 2,
-	SSTOP = 3,
-	SZOMB = 4,
-};
-
 struct lwp {
 	TAILQ_ENTRY(lwp) lwp_procq;	/* run/sleep queue. */
 	union {
@@ -176,7 +165,7 @@ struct lwp {
 	struct vmspace	*lwp_vmspace;	/* Inherited from p_vmspace */
 	struct vkernel_lwp *lwp_vkernel;/* VKernel support, lwp part */
 
-	lwpid_t		lwp_tid;	/* Our thread id */
+	lwpid_t		lwp_tid;	/* Our thread id, >= 1 */
 
 	u_int		lwp_flags;	/* LWP_*    flags */
 	u_int		lwp_mpflags;	/* LWP_MP_* flags */
@@ -202,7 +191,6 @@ struct lwp {
 	 * Scheduling.
 	 */
 	sysclock_t	lwp_cpticks;	/* cpu used in sched clock ticks */
-	sysclock_t	lwp_cpbase;	/* Measurement base */
 	fixpt_t		lwp_pctcpu;	/* %cpu for this process */
 	u_int		lwp_slptime;	/* Time since last blocked. */
 	u_int		lwp_rebal_ticks; /* Timestamp sched on current cpu */
@@ -226,13 +214,13 @@ struct lwp {
 	struct mdproc	lwp_md;		/* Any machine-dependent fields. */
 
 	struct thread	*lwp_thread;	/* backpointer to proc's thread */
-	void		*lwp_unused01;	/* for future fields */
+	struct sys_lpmap *lwp_lpmap;	/* user RW mappable per-thread page */
 	struct kqueue	lwp_kqueue;	/* for select/poll */
-	u_int		lwp_kqueue_serial;
+	uint64_t	lwp_kqueue_serial; /* for select/poll */
 	struct lwkt_token lwp_token;	/* per-lwp token for signal/state */
 	struct spinlock lwp_spin;	/* spinlock for signal handling */
-	void		*lwp_reserveds1; /* reserved for lwp_saveusp */
-	void		*lwp_reserveds2; /* reserved for lwp_saveupc */
+	TAILQ_HEAD(, vm_map_backing) lwp_lpmap_backing_list;
+	sysclock_t	lwp_cpbase;	/* Measurement base */
 };
 
 struct	proc {
@@ -253,9 +241,11 @@ struct	proc {
 
 	int		p_flags;	/* P_* flags. */
 	enum procstat	p_stat;		/* S* process status. */
-	char		p_pad1[3];
+	char		p_advlock_flag;	/* replaces P_ADVLOCK */
+	char		p_pad1[2];
 
 	pid_t		p_pid;		/* Process identifier. */
+	pid_t		p_ppid;		/* Current parent pid */
 	LIST_ENTRY(proc) p_pglist;	/* List of processes in pgrp. */
 	struct proc	*p_pptr;	/* Pointer to parent process. */
 	LIST_ENTRY(proc) p_sibling;	/* List of sibling processes. */
@@ -294,7 +284,7 @@ struct	proc {
 
 	struct rusage	p_ru;		/* stats for this proc */
 	struct rusage	p_cru;		/* sum of stats for reaped children */
-	void		*p_dsched_priv1;
+	void		*p_linux_mm;	/* helper for drm */
 
 /* The following fields are all copied upon creation in fork. */
 #define	p_startcopy	p_comm
@@ -313,11 +303,12 @@ struct	proc {
 	struct rtprio	p_rtprio;	/* Realtime priority. */
 	struct pargs	*p_args;
 	u_short		p_xstat;	/* Exit status or last stop signal */
+	u_short		p_depth;	/* Used to downscale resource limits */
 
 	int		p_ionice;
-	void		*p_dsched_priv2;
+	void		*p_unused02;
 /* End area that is copied on creation. */
-#define	p_endcopy	p_dsched_priv2
+#define	p_endcopy	p_unused02
 	u_short		p_acflag;	/* Accounting flags. */
 
 	int		p_lock;		/* Prevent proc destruction */
@@ -332,7 +323,7 @@ struct	proc {
 	void		*p_emuldata;	/* process-specific emulator state */
 	struct usched	*p_usched;	/* Userland scheduling control */
 	struct vkernel_proc *p_vkernel; /* VKernel support, proc part */
-	int		p_numposixlocks; /* number of POSIX locks */
+	struct uidcount *p_uidpcpu;
 	void		(*p_userret)(void);/* p: return-to-user hook */
 
 	struct spinlock p_spin;		/* Spinlock for LWP access to proc */
@@ -342,7 +333,7 @@ struct	proc {
 	void		*p_vmm;
 	cpulock_t	p_vmm_cpulock;	/* count cpus in and kickout lock */
 	cpumask_t	p_vmm_cpumask;	/* cpus entering or in vmm */
-	struct sys_upmap *p_upmap;	/* user RO mappable per-process page */
+	struct sys_upmap *p_upmap;	/* user RW mappable per-process page */
 	forkid_t	p_forkid;	/* unique forkid */
 	struct sysreaper *p_reaper;	/* reaper control */
 	void		*p_reserveds[3]; /* reserved for future */
@@ -354,9 +345,9 @@ struct	proc {
 #define	p_pgid		p_pgrp->pg_id
 
 /* These flags are kept in p_flags. */
-#define	P_ADVLOCK	0x00001	/* Process may hold a POSIX advisory lock */
+#define	P_UNUSED00	0x00001
 #define	P_CONTROLT	0x00002	/* Has a controlling terminal */
-#define	P_SWAPPEDOUT	0x00004	/* Swapped out of memory */
+#define	P_SWAPPEDOUT	0x00004	/* Deprecated (port compatibility) */
 #define P_SYSVSEM	0x00008	/* Might have SysV semaphores */
 #define	P_PPWAIT	0x00010	/* Parent is waiting for child to exec/exit */
 #define	P_PROFIL	0x00020	/* Has started profiling */
@@ -372,10 +363,10 @@ struct	proc {
 #define	P_EXEC		0x04000	/* Process called exec */
 #define	P_CONTINUED	0x08000	/* Proc has continued from a stopped state */
 
-#define P_UNUSED16	0x00010000
+#define P_LOWMEMKILL	0x00010000 /* trying to kill due to low memory */
 #define	P_UNUSED17	0x00020000
 
-#define	P_SWAPWAIT	0x00040000 /* Waiting for a swapin */
+#define	P_UNUSED18	0x00040000
 #define	P_UNUSED19	0x00080000 /* was: Now in a zombied state */
 
 /* Marked a kernel thread */
@@ -387,7 +378,7 @@ struct	proc {
 #define	P_SIGVTALRM	0x02000000 /* signal SIGVTALRM pending due to itimer */
 #define	P_SIGPROF	0x04000000 /* signal SIGPROF pending due to itimer */
 #define	P_INEXEC	0x08000000 /* Process is in execve(). */
-#define P_UNUSED28	0x10000000
+#define P_DIDCHROOT	0x10000000 /* Did at least one chroot */
 #define	P_UNUSED29	0x20000000
 #define P_XCPU		0x40000000 /* SIGXCPU */
 
@@ -424,6 +415,14 @@ struct	proc {
 	RB_FOREACH(lp, lwp_rb_tree, &(p)->p_lwp_tree)
 #define	ONLY_LWP_IN_PROC(p)		_only_lwp_in_proc(p, __func__)
 
+struct procglob {
+	struct lwkt_token proc_token;
+	struct proclist allproc;	/* locked by proc_token */
+	struct pgrplist allpgrp;	/* locked by proc_token */
+	struct sesslist allsess;	/* locked by proc_token */
+	void    *pad01;			/* pad for clarity */
+} __cachealign;
+
 #ifdef _KERNEL
 static inline struct lwp *
 _only_lwp_in_proc(struct proc *p, const char *caller)
@@ -458,20 +457,23 @@ MALLOC_DECLARE(M_PARGS);
 /* for priv_check_cred() */
 #define	NULL_CRED_OKAY	0x2
 
-/* Handy macro to determine if p1 can mangle p2 */
-
+/*
+ * Handy macro to determine if p1 can mangle p2.
+ *
+ * Must be spin-safe.
+ */
 #define PRISON_CHECK(cr1, cr2) \
 	((!(cr1)->cr_prison) || (cr1)->cr_prison == (cr2)->cr_prison)
 
 /*
  * STOPEVENT
  */
-extern void stopevent(struct proc*, unsigned int, unsigned int);
-#define	STOPEVENT(p,e,v)			\
-	do {					\
-		if ((p)->p_stops & (e)) {	\
-			stopevent(p,e,v);	\
-		}				\
+void stopevent(struct proc *, unsigned int, unsigned int);
+#define	STOPEVENT(p,e,v)					\
+	do {							\
+		if (__predict_false((p)->p_stops & (e))) {	\
+			stopevent(p,e,v);			\
+		}						\
 	} while (0)
 
 /*
@@ -484,8 +486,15 @@ extern void stopevent(struct proc*, unsigned int, unsigned int);
 #define PRELE(p)	prele((p))
 #define PHOLDZOMB(p)	pholdzomb((p))
 #define PRELEZOMB(p)	prelezomb((p))
+#define PWAITRES_PENDING(p)	pwaitres_pending((p))
+#define PWAITRES_SET(p)		pwaitres_set((p))
+
 #define PSTALL(p, msg, n) \
 	do { if ((p)->p_lock > (n)) pstall((p), (msg), (n)); } while (0)
+
+#define STOPLWP(p, lp)						\
+	(((p)->p_stat == SSTOP || (p)->p_stat == SCORE) &&	\
+	 ((lp)->lwp_mpflags & LWP_MP_WEXIT) == 0)
 
 /*
  * Hold lwp in memory, don't destruct, normally for ptrace/procfs work
@@ -498,13 +507,13 @@ extern void stopevent(struct proc*, unsigned int, unsigned int);
 extern struct proc proc0;		/* Process slot for swapper. */
 extern struct lwp lwp0;			/* LWP slot for swapper. */
 extern struct thread thread0;		/* Thread slot for swapper. */
-extern int hogticks;			/* Limit on kernel cpu hogs. */
 extern int nprocs, maxproc;		/* Current and max number of procs. */
 extern int maxprocperuid;		/* Max procs per uid. */
-extern int sched_quantum;		/* Scheduling quantum in ticks */
 
 extern struct proc *initproc;		/* Process slot for init */
-extern struct thread *pagethread, *updatethread;
+extern struct thread *pagethread;
+extern struct thread *emergpager;
+extern struct thread *updatethread;
 
 /*
  * Scheduler independant variables.  The primary scheduler polling frequency,
@@ -517,6 +526,7 @@ extern	u_long ps_arg_cache_limit;
 extern	int ps_argsopen;
 extern	int ps_showallprocs;
 
+struct lwp *lwpfind (struct proc *, lwpid_t);	/* Find thread in process */
 struct proc *pfind (pid_t);	/* Find process by id w/ref */
 struct proc *pfindn (pid_t);	/* Find process by id wo/ref */
 struct pgrp *pgfind (pid_t);	/* Find process group by id w/ref */
@@ -531,8 +541,10 @@ int	enterpgrp (struct proc *p, pid_t pgid, int mksess);
 void	proc_add_allproc(struct proc *p);
 void	proc_move_allproc_zombie(struct proc *);
 void	proc_remove_zombie(struct proc *);
-void	allproc_scan(int (*callback)(struct proc *, void *), void *data);
-void	alllwp_scan(int (*callback)(struct lwp *, void *), void *data);
+void	allproc_scan(int (*callback)(struct proc *, void *), void *data,
+			int segmented);
+void	alllwp_scan(int (*callback)(struct lwp *, void *), void *data,
+			int segmented);
 void	zombproc_scan(int (*callback)(struct proc *, void *), void *data);
 void	fixjobc (struct proc *p, struct pgrp *pgrp, int entering);
 void	updatepcpu(struct lwp *, int, int);
@@ -547,12 +559,14 @@ void	pgrpinsertinit(struct pgrp *pg);
 void	relscurproc(struct proc *curp);
 int	p_trespass (struct ucred *cr1, struct ucred *cr2);
 void	setrunnable (struct lwp *);
-void	proc_stop (struct proc *);
-void	proc_unstop (struct proc *);
+void	proc_stop (struct proc *, int);
+void	proc_unstop (struct proc *, int);
+void	sleep_early_gdinit (struct globaldata *);
 void	sleep_gdinit (struct globaldata *);
 thread_t cpu_heavy_switch (struct thread *);
 thread_t cpu_lwkt_switch (struct thread *);
 
+int	cpu_interrupt_running(struct thread *);
 void	cpu_lwp_exit (void) __dead2;
 void	cpu_thread_exit (void) __dead2;
 void	lwp_exit (int masterexit, void *waddr) __dead2;
@@ -569,18 +583,22 @@ int	trace_req (struct proc *);
 void	cpu_thread_wait (struct thread *);
 void	setsugid (void);
 void	faultin (struct proc *p);
-void	swapin_request (void);
 void	phold (struct proc *);
 void	prele (struct proc *);
+int	pwaitres_pending (struct proc *);
+void	pwaitres_set (struct proc *);
 int	pholdzomb (struct proc *);
 void	prelezomb (struct proc *);
 void	pstall (struct proc *, const char *, int);
 void	lwpuserret(struct lwp *);
 void	lwpkthreaddeferred(void);
+void	lwp_usermap(struct lwp *lp, int invfork);
+void	lwp_userunmap(struct lwp *lp);
 void	proc_usermap(struct proc *p, int invfork);
 void	proc_userunmap(struct proc *p);
 void	reaper_hold(struct sysreaper *reap);
 void	reaper_drop(struct sysreaper *reap);
+int	reaper_sigtest(struct proc *sender, struct proc *target, int reaper_ok);
 struct sysreaper *reaper_exit(struct proc *p);
 void	reaper_init(struct proc *p, struct sysreaper *reap);
 struct proc *reaper_get(struct sysreaper *reap);

@@ -1,13 +1,13 @@
 /*
  * Copyright (c) 2007 The DragonFly Project.  All rights reserved.
- * 
+ *
  * This code is derived from software contributed to The DragonFly Project
  * by Matthew Dillon <dillon@backplane.com>
- * 
+ *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
  * are met:
- * 
+ *
  * 1. Redistributions of source code must retain the above copyright
  *    notice, this list of conditions and the following disclaimer.
  * 2. Redistributions in binary form must reproduce the above copyright
@@ -17,7 +17,7 @@
  * 3. Neither the name of The DragonFly Project nor the names of its
  *    contributors may be used to endorse or promote products derived
  *    from this software without specific, prior written permission.
- * 
+ *
  * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
  * ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
  * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
@@ -30,12 +30,14 @@
  * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT
  * OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
- * 
+ *
  * $DragonFly: src/sys/vfs/hammer/hammer_disk.h,v 1.55 2008/11/13 02:18:43 dillon Exp $
  */
 
 #ifndef VFS_HAMMER_DISK_H_
 #define VFS_HAMMER_DISK_H_
+
+#include <sys/endian.h>
 
 #ifndef _SYS_UUID_H_
 #include <sys/uuid.h>
@@ -44,8 +46,8 @@
 /*
  * The structures below represent the on-disk format for a HAMMER
  * filesystem.  Note that all fields for on-disk structures are naturally
- * aligned.  The host endian format is used - compatibility is possible
- * if the implementation detects reversed endian and adjusts data accordingly.
+ * aligned.  HAMMER uses little endian for fields in on-disk structures.
+ * HAMMER doesn't support big endian arch, but is planned.
  *
  * Most of HAMMER revolves around the concept of an object identifier.  An
  * obj_id is a 64 bit quantity which uniquely identifies a filesystem object
@@ -56,42 +58,43 @@
  * A HAMMER filesystem may span multiple volumes.
  *
  * A HAMMER filesystem uses a 16K filesystem buffer size.  All filesystem
- * I/O is done in multiples of 16K.  Most buffer-sized headers such as those
- * used by volumes, super-clusters, clusters, and basic filesystem buffers
- * use fixed-sized A-lists which are heavily dependant on HAMMER_BUFSIZE.
+ * I/O is done in multiples of 16K.
  *
  * 64K X-bufs are used for blocks >= a file's 1MB mark.
  *
  * Per-volume storage limit: 52 bits		4096 TB
- * Per-Zone storage limit: 59 bits		512 KTB (due to blockmap)
+ * Per-Zone storage limit: 60 bits		1 MTB
  * Per-filesystem storage limit: 60 bits	1 MTB
  */
 #define HAMMER_BUFSIZE		16384
 #define HAMMER_XBUFSIZE		65536
+#define HAMMER_HBUFSIZE		(HAMMER_BUFSIZE / 2)
 #define HAMMER_XDEMARC		(1024 * 1024)
 #define HAMMER_BUFMASK		(HAMMER_BUFSIZE - 1)
 #define HAMMER_XBUFMASK		(HAMMER_XBUFSIZE - 1)
-#define HAMMER_BUFFER_BITS	14
 
-#if (1 << HAMMER_BUFFER_BITS) != HAMMER_BUFSIZE
-#error "HAMMER_BUFFER_BITS BROKEN"
-#endif
+#define HAMMER_BUFSIZE64	((uint64_t)HAMMER_BUFSIZE)
+#define HAMMER_BUFMASK64	((uint64_t)HAMMER_BUFMASK)
 
-#define HAMMER_BUFSIZE64	((u_int64_t)HAMMER_BUFSIZE)
-#define HAMMER_BUFMASK64	((u_int64_t)HAMMER_BUFMASK)
-
-#define HAMMER_XBUFSIZE64	((u_int64_t)HAMMER_XBUFSIZE)
-#define HAMMER_XBUFMASK64	((u_int64_t)HAMMER_XBUFMASK)
+#define HAMMER_XBUFSIZE64	((uint64_t)HAMMER_XBUFSIZE)
+#define HAMMER_XBUFMASK64	((uint64_t)HAMMER_XBUFMASK)
 
 #define HAMMER_OFF_ZONE_MASK	0xF000000000000000ULL /* zone portion */
 #define HAMMER_OFF_VOL_MASK	0x0FF0000000000000ULL /* volume portion */
 #define HAMMER_OFF_SHORT_MASK	0x000FFFFFFFFFFFFFULL /* offset portion */
 #define HAMMER_OFF_LONG_MASK	0x0FFFFFFFFFFFFFFFULL /* offset portion */
-#define HAMMER_OFF_SHORT_REC_MASK 0x000FFFFFFF000000ULL /* recovery boundary */
-#define HAMMER_OFF_LONG_REC_MASK 0x0FFFFFFFFF000000ULL /* recovery boundary */
-#define HAMMER_RECOVERY_BND	0x0000000001000000ULL
 
 #define HAMMER_OFF_BAD		((hammer_off_t)-1)
+
+#define HAMMER_BUFSIZE_DOALIGN(offset)				\
+	(((offset) + HAMMER_BUFMASK) & ~HAMMER_BUFMASK)
+#define HAMMER_BUFSIZE64_DOALIGN(offset)			\
+	(((offset) + HAMMER_BUFMASK64) & ~HAMMER_BUFMASK64)
+
+#define HAMMER_XBUFSIZE_DOALIGN(offset)				\
+	(((offset) + HAMMER_XBUFMASK) & ~HAMMER_XBUFMASK)
+#define HAMMER_XBUFSIZE64_DOALIGN(offset)			\
+	(((offset) + HAMMER_XBUFMASK64) & ~HAMMER_XBUFMASK64)
 
 /*
  * The current limit of volumes that can make up a HAMMER FS
@@ -99,17 +102,24 @@
 #define HAMMER_MAX_VOLUMES	256
 
 /*
- * Hammer transction ids are 64 bit unsigned integers and are usually
+ * Reserved space for (future) header junk after the volume header.
+ */
+#define HAMMER_MIN_VOL_JUNK	(HAMMER_BUFSIZE * 16)	/* 256 KB */
+#define HAMMER_MAX_VOL_JUNK	HAMMER_MIN_VOL_JUNK
+#define HAMMER_VOL_JUNK_SIZE	HAMMER_MIN_VOL_JUNK
+
+/*
+ * Hammer transaction ids are 64 bit unsigned integers and are usually
  * synchronized with the time of day in nanoseconds.
  *
  * Hammer offsets are used for FIFO indexing and embed a cycle counter
  * and volume number in addition to the offset.  Most offsets are required
- * to be 64-byte aligned.
+ * to be 16 KB aligned.
  */
-typedef u_int64_t hammer_tid_t;
-typedef u_int64_t hammer_off_t;
-typedef u_int32_t hammer_seq_t;
-typedef u_int32_t hammer_crc_t;
+typedef uint64_t hammer_tid_t;
+typedef uint64_t hammer_off_t;
+typedef uint32_t hammer_crc_t;
+typedef uuid_t hammer_uuid_t;
 
 #define HAMMER_MIN_TID		0ULL			/* unsigned */
 #define HAMMER_MAX_TID		0xFFFFFFFFFFFFFFFFULL	/* unsigned */
@@ -124,37 +134,104 @@ typedef u_int32_t hammer_crc_t;
 
 /*
  * hammer_off_t has several different encodings.  Note that not all zones
- * encode a vol_no.
+ * encode a vol_no.  Zone bits are not a part of filesystem capacity as
+ * the zone bits aren't directly or indirectly mapped to physical volumes.
  *
- * zone 0:		reserved for sanity
+ * In other words, HAMMER's logical filesystem offset consists of 64 bits,
+ * but the filesystem is considered 60 bits filesystem, not 64 bits.
+ * The maximum filesystem capacity is 1EB, not 16EB.
+ *
+ * zone 0:		available, a big-block that contains the offset is unused
  * zone 1 (z,v,o):	raw volume relative (offset 0 is the volume header)
  * zone 2 (z,v,o):	raw buffer relative (offset 0 is the first buffer)
- * zone 3 (z,o):	undo fifo	- actually fixed phys array in vol hdr
+ * zone 3 (z,o):	undo/redo fifo	- fixed zone-2 offset array in volume header
  * zone 4 (z,v,o):	freemap		- only real blockmap
  * zone 8 (z,v,o):	B-Tree		- actually zone-2 address
- * zone 9 (z,v,o):	Record		- actually zone-2 address
- * zone 10 (z,v,o):	Large-data	- actually zone-2 address
- * zone 15:		reserved for sanity
+ * zone 9 (z,v,o):	meta		- actually zone-2 address
+ * zone 10 (z,v,o):	large-data	- actually zone-2 address
+ * zone 11 (z,v,o):	small-data	- actually zone-2 address
+ * zone 15:		unavailable, usually the offset is beyond volume size
  *
  * layer1/layer2 direct map:
+ *	     Maximum HAMMER filesystem capacity from volume aspect
+ *	     2^8(max volumes) * 2^52(max volume size) = 2^60 = 1EB (long offset)
+ *	    <------------------------------------------------------------->
+ *	     8bits   52bits (short offset)
+ *	    <------><----------------------------------------------------->
  *	zzzzvvvvvvvvoooo oooooooooooooooo oooooooooooooooo oooooooooooooooo
  *	----111111111111 1111112222222222 222222222ooooooo oooooooooooooooo
+ *	    <-----------------><------------------><---------------------->
+ *	     18bits             19bits              23bits
+ *	    <------------------------------------------------------------->
+ *	     2^18(layer1) * 2^19(layer2) * 2^23(big-block) = 2^60 = 1EB
+ *	     Maximum HAMMER filesystem capacity from blockmap aspect
+ *
+ * volume#0 layout
+ *	+-------------------------> offset 0 of a device/partition
+ *	| volume header (1928 bytes)
+ *	| the rest of header junk space (HAMMER_BUFSIZE aligned)
+ *	+-------------------------> vol_bot_beg
+ *	| boot area (HAMMER_BUFSIZE aligned)
+ *	+-------------------------> vol_mem_beg
+ *	| memory log (HAMMER_BUFSIZE aligned)
+ *	+-------------------------> vol_buf_beg (physical offset of zone-2)
+ *	| zone-4 big-block for layer1
+ *	+-------------------------> vol_buf_beg + HAMMER_BIGBLOCK_SIZE
+ *	| zone-4 big-blocks for layer2
+ *	| ... (1 big-block per 4TB space)
+ *	+-------------------------> vol_buf_beg + HAMMER_BIGBLOCK_SIZE * ...
+ *	| zone-3 big-blocks for UNDO/REDO FIFO
+ *	| ... (max 128 big-blocks)
+ *	+-------------------------> vol_buf_beg + HAMMER_BIGBLOCK_SIZE * ...
+ *	| zone-8 big-block for root B-Tree node/etc
+ *	+-------------------------> vol_buf_beg + HAMMER_BIGBLOCK_SIZE * ...
+ *	| zone-9 big-block for root inode/PFS/etc
+ *	+-------------------------> vol_buf_beg + HAMMER_BIGBLOCK_SIZE * ...
+ *	| zone-X big-blocks
+ *	| ... (big-blocks for new zones after newfs_hammer)
+ *	| ...
+ *	| ...
+ *	| ...
+ *	| ...
+ *	+-------------------------> vol_buf_end (HAMMER_BUFSIZE aligned)
+ *	+-------------------------> end of a device/partition
+ *
+ * volume#N layout (0<N<256)
+ *	+-------------------------> offset 0 of a device/partition
+ *	| volume header (1928 bytes)
+ *	| the rest of header junk space (HAMMER_BUFSIZE aligned)
+ *	+-------------------------> vol_bot_beg
+ *	| boot area (HAMMER_BUFSIZE aligned)
+ *	+-------------------------> vol_mem_beg
+ *	| memory log (HAMMER_BUFSIZE aligned)
+ *	+-------------------------> vol_buf_beg (physical offset of zone-2)
+ *	| zone-4 big-blocks for layer2
+ *	| ... (1 big-block per 4TB space)
+ *	+-------------------------> vol_buf_beg + HAMMER_BIGBLOCK_SIZE * ...
+ *	| zone-X big-blocks
+ *	| ... (unused until volume#(N-1) runs out of space)
+ *	| ...
+ *	| ...
+ *	| ...
+ *	| ...
+ *	+-------------------------> vol_buf_end (HAMMER_BUFSIZE aligned)
+ *	+-------------------------> end of a device/partition
  */
 
 #define HAMMER_ZONE_RAW_VOLUME		0x1000000000000000ULL
 #define HAMMER_ZONE_RAW_BUFFER		0x2000000000000000ULL
 #define HAMMER_ZONE_UNDO		0x3000000000000000ULL
 #define HAMMER_ZONE_FREEMAP		0x4000000000000000ULL
-#define HAMMER_ZONE_RESERVED05		0x5000000000000000ULL
-#define HAMMER_ZONE_RESERVED06		0x6000000000000000ULL
-#define HAMMER_ZONE_RESERVED07		0x7000000000000000ULL
+#define HAMMER_ZONE_RESERVED05		0x5000000000000000ULL  /* not used */
+#define HAMMER_ZONE_RESERVED06		0x6000000000000000ULL  /* not used */
+#define HAMMER_ZONE_RESERVED07		0x7000000000000000ULL  /* not used */
 #define HAMMER_ZONE_BTREE		0x8000000000000000ULL
 #define HAMMER_ZONE_META		0x9000000000000000ULL
 #define HAMMER_ZONE_LARGE_DATA		0xA000000000000000ULL
 #define HAMMER_ZONE_SMALL_DATA		0xB000000000000000ULL
-#define HAMMER_ZONE_RESERVED0C		0xC000000000000000ULL
-#define HAMMER_ZONE_RESERVED0D		0xD000000000000000ULL
-#define HAMMER_ZONE_RESERVED0E		0xE000000000000000ULL
+#define HAMMER_ZONE_RESERVED0C		0xC000000000000000ULL  /* not used */
+#define HAMMER_ZONE_RESERVED0D		0xD000000000000000ULL  /* not used */
+#define HAMMER_ZONE_RESERVED0E		0xE000000000000000ULL  /* not used */
 #define HAMMER_ZONE_UNAVAIL		0xF000000000000000ULL
 
 #define HAMMER_ZONE_RAW_VOLUME_INDEX	1
@@ -165,96 +242,155 @@ typedef u_int32_t hammer_crc_t;
 #define HAMMER_ZONE_META_INDEX		9
 #define HAMMER_ZONE_LARGE_DATA_INDEX	10
 #define HAMMER_ZONE_SMALL_DATA_INDEX	11
-#define HAMMER_ZONE_UNAVAIL_INDEX	15	/* unavailable */
+#define HAMMER_ZONE_UNAVAIL_INDEX	15
 
 #define HAMMER_MAX_ZONES		16
+
+#define HAMMER_ZONE(offset)		((offset) & HAMMER_OFF_ZONE_MASK)
+
+#define hammer_is_zone_raw_volume(offset)		\
+	(HAMMER_ZONE(offset) == HAMMER_ZONE_RAW_VOLUME)
+#define hammer_is_zone_raw_buffer(offset)		\
+	(HAMMER_ZONE(offset) == HAMMER_ZONE_RAW_BUFFER)
+#define hammer_is_zone_undo(offset)			\
+	(HAMMER_ZONE(offset) == HAMMER_ZONE_UNDO)
+#define hammer_is_zone_freemap(offset)			\
+	(HAMMER_ZONE(offset) == HAMMER_ZONE_FREEMAP)
+#define hammer_is_zone_btree(offset)			\
+	(HAMMER_ZONE(offset) == HAMMER_ZONE_BTREE)
+#define hammer_is_zone_meta(offset)			\
+	(HAMMER_ZONE(offset) == HAMMER_ZONE_META)
+#define hammer_is_zone_large_data(offset)		\
+	(HAMMER_ZONE(offset) == HAMMER_ZONE_LARGE_DATA)
+#define hammer_is_zone_small_data(offset)		\
+	(HAMMER_ZONE(offset) == HAMMER_ZONE_SMALL_DATA)
+#define hammer_is_zone_unavail(offset)			\
+	(HAMMER_ZONE(offset) == HAMMER_ZONE_UNAVAIL)
+#define hammer_is_zone_data(offset)			\
+	(hammer_is_zone_large_data(offset) || hammer_is_zone_small_data(offset))
+
+#define hammer_is_index_record(zone)			\
+	((zone) >= HAMMER_ZONE_BTREE_INDEX &&		\
+	 (zone) < HAMMER_MAX_ZONES)
+
+#define hammer_is_zone_record(offset)			\
+	hammer_is_index_record(HAMMER_ZONE_DECODE(offset))
+
+#define hammer_is_index_direct_xlated(zone)		\
+	(((zone) == HAMMER_ZONE_RAW_BUFFER_INDEX) ||	\
+	 ((zone) == HAMMER_ZONE_FREEMAP_INDEX) ||	\
+	 hammer_is_index_record(zone))
+
+#define hammer_is_zone_direct_xlated(offset)		\
+	hammer_is_index_direct_xlated(HAMMER_ZONE_DECODE(offset))
+
+#define HAMMER_ZONE_ENCODE(zone, ham_off)		\
+	(((hammer_off_t)(zone) << 60) | (ham_off))
+#define HAMMER_ZONE_DECODE(ham_off)			\
+	((int)(((hammer_off_t)(ham_off) >> 60)))
 
 #define HAMMER_VOL_ENCODE(vol_no)			\
 	((hammer_off_t)((vol_no) & 255) << 52)
 #define HAMMER_VOL_DECODE(ham_off)			\
-	(int32_t)(((hammer_off_t)(ham_off) >> 52) & 255)
-#define HAMMER_ZONE_DECODE(ham_off)			\
-	(int32_t)(((hammer_off_t)(ham_off) >> 60))
-#define HAMMER_ZONE_ENCODE(zone, ham_off)		\
-	(((hammer_off_t)(zone) << 60) | (ham_off))
-#define HAMMER_SHORT_OFF_ENCODE(offset)			\
+	((int)(((hammer_off_t)(ham_off) >> 52) & 255))
+
+#define HAMMER_OFF_SHORT_ENCODE(offset)			\
 	((hammer_off_t)(offset) & HAMMER_OFF_SHORT_MASK)
-#define HAMMER_LONG_OFF_ENCODE(offset)			\
+#define HAMMER_OFF_LONG_ENCODE(offset)			\
 	((hammer_off_t)(offset) & HAMMER_OFF_LONG_MASK)
 
+#define HAMMER_ENCODE(zone, vol_no, offset)		\
+	(((hammer_off_t)(zone) << 60) |			\
+	HAMMER_VOL_ENCODE(vol_no) |			\
+	HAMMER_OFF_SHORT_ENCODE(offset))
 #define HAMMER_ENCODE_RAW_VOLUME(vol_no, offset)	\
-	(HAMMER_ZONE_RAW_VOLUME |			\
-	HAMMER_VOL_ENCODE(vol_no) |			\
-	HAMMER_SHORT_OFF_ENCODE(offset))
-
+	HAMMER_ENCODE(HAMMER_ZONE_RAW_VOLUME_INDEX, vol_no, offset)
 #define HAMMER_ENCODE_RAW_BUFFER(vol_no, offset)	\
-	(HAMMER_ZONE_RAW_BUFFER |			\
-	HAMMER_VOL_ENCODE(vol_no) |			\
-	HAMMER_SHORT_OFF_ENCODE(offset))
-
+	HAMMER_ENCODE(HAMMER_ZONE_RAW_BUFFER_INDEX, vol_no, offset)
+#define HAMMER_ENCODE_UNDO(offset)			\
+	HAMMER_ENCODE(HAMMER_ZONE_UNDO_INDEX, HAMMER_ROOT_VOLNO, offset)
 #define HAMMER_ENCODE_FREEMAP(vol_no, offset)		\
-	(HAMMER_ZONE_FREEMAP |				\
-	HAMMER_VOL_ENCODE(vol_no) |			\
-	HAMMER_SHORT_OFF_ENCODE(offset))
+	HAMMER_ENCODE(HAMMER_ZONE_FREEMAP_INDEX, vol_no, offset)
 
 /*
- * Large-Block backing store
+ * Translate a zone address to zone-X address.
+ */
+#define hammer_xlate_to_zoneX(zone, offset)		\
+	HAMMER_ZONE_ENCODE((zone), (offset) & ~HAMMER_OFF_ZONE_MASK)
+#define hammer_xlate_to_zone2(offset)			\
+	hammer_xlate_to_zoneX(HAMMER_ZONE_RAW_BUFFER_INDEX, (offset))
+
+#define hammer_data_zone(data_len)			\
+	(((data_len) >= HAMMER_BUFSIZE) ?		\
+	 HAMMER_ZONE_LARGE_DATA :			\
+	 HAMMER_ZONE_SMALL_DATA)
+#define hammer_data_zone_index(data_len)		\
+	(((data_len) >= HAMMER_BUFSIZE) ?		\
+	 HAMMER_ZONE_LARGE_DATA_INDEX :			\
+	 HAMMER_ZONE_SMALL_DATA_INDEX)
+
+/*
+ * Big-Block backing store
  *
  * A blockmap is a two-level map which translates a blockmap-backed zone
- * offset into a raw zone 2 offset.  Each layer handles 18 bits.  The 8M
- * large-block size is 23 bits so two layers gives us 23+18+18 = 59 bits
- * of address space.
+ * offset into a raw zone 2 offset.  The layer 1 handles 18 bits and the
+ * layer 2 handles 19 bits.  The 8M big-block size is 23 bits so two
+ * layers gives us 18+19+23 = 60 bits of address space.
  *
  * When using hinting for a blockmap lookup, the hint is lost when the
- * scan leaves the HINTBLOCK, which is typically several LARGEBLOCK's.
+ * scan leaves the HINTBLOCK, which is typically several BIGBLOCK's.
  * HINTBLOCK is a heuristic.
  */
-#define HAMMER_HINTBLOCK_SIZE		(HAMMER_LARGEBLOCK_SIZE * 4)
-#define HAMMER_HINTBLOCK_MASK64		((u_int64_t)HAMMER_HINTBLOCK_SIZE - 1)
-#define HAMMER_LARGEBLOCK_SIZE		(8192 * 1024)
-#define HAMMER_LARGEBLOCK_OVERFILL	(6144 * 1024)
-#define HAMMER_LARGEBLOCK_SIZE64	((u_int64_t)HAMMER_LARGEBLOCK_SIZE)
-#define HAMMER_LARGEBLOCK_MASK		(HAMMER_LARGEBLOCK_SIZE - 1)
-#define HAMMER_LARGEBLOCK_MASK64	((u_int64_t)HAMMER_LARGEBLOCK_SIZE - 1)
-#define HAMMER_LARGEBLOCK_BITS		23
-#if (1 << HAMMER_LARGEBLOCK_BITS) != HAMMER_LARGEBLOCK_SIZE
-#error "HAMMER_LARGEBLOCK_BITS BROKEN"
+#define HAMMER_HINTBLOCK_SIZE		(HAMMER_BIGBLOCK_SIZE * 4)
+#define HAMMER_HINTBLOCK_MASK64		((uint64_t)HAMMER_HINTBLOCK_SIZE - 1)
+#define HAMMER_BIGBLOCK_SIZE		(8192 * 1024)
+#define HAMMER_BIGBLOCK_SIZE64		((uint64_t)HAMMER_BIGBLOCK_SIZE)
+#define HAMMER_BIGBLOCK_MASK		(HAMMER_BIGBLOCK_SIZE - 1)
+#define HAMMER_BIGBLOCK_MASK64		((uint64_t)HAMMER_BIGBLOCK_SIZE - 1)
+#define HAMMER_BIGBLOCK_BITS		23
+#if 0
+#define HAMMER_BIGBLOCK_OVERFILL	(6144 * 1024)
+#endif
+#if (1 << HAMMER_BIGBLOCK_BITS) != HAMMER_BIGBLOCK_SIZE
+#error "HAMMER_BIGBLOCK_BITS BROKEN"
 #endif
 
-#define HAMMER_BUFFERS_PER_LARGEBLOCK			\
-	(HAMMER_LARGEBLOCK_SIZE / HAMMER_BUFSIZE)
-#define HAMMER_BUFFERS_PER_LARGEBLOCK_MASK		\
-	(HAMMER_BUFFERS_PER_LARGEBLOCK - 1)
-#define HAMMER_BUFFERS_PER_LARGEBLOCK_MASK64		\
-	((hammer_off_t)HAMMER_BUFFERS_PER_LARGEBLOCK_MASK)
+#define HAMMER_BUFFERS_PER_BIGBLOCK			\
+	(HAMMER_BIGBLOCK_SIZE / HAMMER_BUFSIZE)
+#define HAMMER_BUFFERS_PER_BIGBLOCK_MASK		\
+	(HAMMER_BUFFERS_PER_BIGBLOCK - 1)
+#define HAMMER_BUFFERS_PER_BIGBLOCK_MASK64		\
+	((hammer_off_t)HAMMER_BUFFERS_PER_BIGBLOCK_MASK)
+
+#define HAMMER_BIGBLOCK_DOALIGN(offset)				\
+	(((offset) + HAMMER_BIGBLOCK_MASK64) & ~HAMMER_BIGBLOCK_MASK64)
 
 /*
  * Maximum number of mirrors operating in master mode (multi-master
- * clustering and mirroring).
+ * clustering and mirroring). Note that HAMMER1 does not support
+ * multi-master clustering as of 2015.
  */
 #define HAMMER_MAX_MASTERS		16
 
 /*
  * The blockmap is somewhat of a degenerate structure.  HAMMER only actually
- * uses it in its original incarnation to implement the free-map.
+ * uses it in its original incarnation to implement the freemap.
  *
  * zone:1	raw volume (no blockmap)
  * zone:2	raw buffer (no blockmap)
- * zone:3	undo-map   (direct layer2 array in volume header)
- * zone:4	free-map   (the only real blockmap)
+ * zone:3	undomap    (direct layer2 array in volume header)
+ * zone:4	freemap    (the only real blockmap)
  * zone:8-15	zone id used to classify big-block only, address is actually
  *		a zone-2 address.
  */
-struct hammer_blockmap {
-	hammer_off_t	phys_offset;    /* zone-2 physical offset */
-	hammer_off_t	first_offset;	/* zone-X logical offset (zone 3) */
-	hammer_off_t	next_offset;	/* zone-X logical offset */
-	hammer_off_t	alloc_offset;	/* zone-X logical offset */
-	u_int32_t	reserved01;
+typedef struct hammer_blockmap {
+	hammer_off_t	phys_offset;  /* zone-2 offset only used by zone-4 */
+	hammer_off_t	first_offset; /* zone-X offset only used by zone-3 */
+	hammer_off_t	next_offset;  /* zone-X offset for allocation */
+	hammer_off_t	alloc_offset; /* zone-X offset only used by zone-3 */
+	uint32_t	reserved01;
 	hammer_crc_t	entry_crc;
-};
-
-typedef struct hammer_blockmap *hammer_blockmap_t;
+} *hammer_blockmap_t;
 
 #define HAMMER_BLOCKMAP_CRCSIZE	\
 	offsetof(struct hammer_blockmap, entry_crc)
@@ -273,84 +409,108 @@ typedef struct hammer_blockmap *hammer_blockmap_t;
  * thus any space allocated via the freemap can be directly translated
  * to a zone:2 (or zone:8-15) address.
  *
- * zone-X blockmap offset: [z:4][layer1:18][layer2:19][bigblock:23]
+ * zone-X blockmap offset: [zone:4][layer1:18][layer2:19][big-block:23]
  */
-struct hammer_blockmap_layer1 {
+
+/*
+ * 32 bytes layer1 entry for 8MB big-block.
+ * A big-block can hold 2^23 / 2^5 = 2^18 layer1 entries,
+ * which equals bits assigned for layer1 in zone-2 address.
+ */
+typedef struct hammer_blockmap_layer1 {
 	hammer_off_t	blocks_free;	/* big-blocks free */
 	hammer_off_t	phys_offset;	/* UNAVAIL or zone-2 */
 	hammer_off_t	reserved01;
 	hammer_crc_t	layer2_crc;	/* xor'd crc's of HAMMER_BLOCKSIZE */
 					/* (not yet used) */
 	hammer_crc_t	layer1_crc;	/* MUST BE LAST FIELD OF STRUCTURE*/
-};
-
-typedef struct hammer_blockmap_layer1 *hammer_blockmap_layer1_t;
+} *hammer_blockmap_layer1_t;
 
 #define HAMMER_LAYER1_CRCSIZE	\
 	offsetof(struct hammer_blockmap_layer1, layer1_crc)
 
 /*
- * layer2 entry for 8MB bigblock.
+ * 16 bytes layer2 entry for 8MB big-blocks.
+ * A big-block can hold 2^23 / 2^4 = 2^19 layer2 entries,
+ * which equals bits assigned for layer2 in zone-2 address.
  *
  * NOTE: bytes_free is signed and can legally go negative if/when data
  *	 de-dup occurs.  This field will never go higher than
- *	 HAMMER_LARGEBLOCK_SIZE.  If exactly HAMMER_LARGEBLOCK_SIZE
+ *	 HAMMER_BIGBLOCK_SIZE.  If exactly HAMMER_BIGBLOCK_SIZE
  *	 the big-block is completely free.
  */
-struct hammer_blockmap_layer2 {
-	u_int8_t	zone;		/* typed allocation zone */
-	u_int8_t	unused01;
-	u_int16_t	unused02;
-	u_int32_t	append_off;	/* allocatable space index */
-	int32_t		bytes_free;	/* bytes free within this bigblock */
+typedef struct hammer_blockmap_layer2 {
+	uint8_t		zone;		/* typed allocation zone */
+	uint8_t		reserved01;
+	uint16_t	reserved02;
+	uint32_t	append_off;	/* allocatable space index */
+	int32_t		bytes_free;	/* bytes free within this big-block */
 	hammer_crc_t	entry_crc;
-};
-
-typedef struct hammer_blockmap_layer2 *hammer_blockmap_layer2_t;
+} *hammer_blockmap_layer2_t;
 
 #define HAMMER_LAYER2_CRCSIZE	\
 	offsetof(struct hammer_blockmap_layer2, entry_crc)
 
-#define HAMMER_BLOCKMAP_FREE	0ULL
 #define HAMMER_BLOCKMAP_UNAVAIL	((hammer_off_t)-1LL)
 
-#define HAMMER_BLOCKMAP_RADIX1	/* 262144 (18) */	\
-	(HAMMER_LARGEBLOCK_SIZE / sizeof(struct hammer_blockmap_layer1))
-#define HAMMER_BLOCKMAP_RADIX2	/* 524288 (19) */	\
-	(HAMMER_LARGEBLOCK_SIZE / sizeof(struct hammer_blockmap_layer2))
+#define HAMMER_BLOCKMAP_RADIX1	/* 2^18 = 262144 */	\
+	((int)(HAMMER_BIGBLOCK_SIZE / sizeof(struct hammer_blockmap_layer1)))
+#define HAMMER_BLOCKMAP_RADIX2	/* 2^19 = 524288 */	\
+	((int)(HAMMER_BIGBLOCK_SIZE / sizeof(struct hammer_blockmap_layer2)))
 
-#define HAMMER_BLOCKMAP_RADIX1_PERBUFFER	\
-	(HAMMER_BLOCKMAP_RADIX1 / (HAMMER_LARGEBLOCK_SIZE / HAMMER_BUFSIZE))
-#define HAMMER_BLOCKMAP_RADIX2_PERBUFFER	\
-	(HAMMER_BLOCKMAP_RADIX2 / (HAMMER_LARGEBLOCK_SIZE / HAMMER_BUFSIZE))
-
-#define HAMMER_BLOCKMAP_LAYER1	/* 18+19+23 */		\
+#define HAMMER_BLOCKMAP_LAYER1	/* 2^(18+19+23) = 1EB */	\
 	(HAMMER_BLOCKMAP_RADIX1 * HAMMER_BLOCKMAP_LAYER2)
-#define HAMMER_BLOCKMAP_LAYER2	/* 19+23 - 4TB */		\
-	(HAMMER_BLOCKMAP_RADIX2 * HAMMER_LARGEBLOCK_SIZE64)
+#define HAMMER_BLOCKMAP_LAYER2	/* 2^(19+23) = 4TB */		\
+	(HAMMER_BLOCKMAP_RADIX2 * HAMMER_BIGBLOCK_SIZE64)
 
 #define HAMMER_BLOCKMAP_LAYER1_MASK	(HAMMER_BLOCKMAP_LAYER1 - 1)
 #define HAMMER_BLOCKMAP_LAYER2_MASK	(HAMMER_BLOCKMAP_LAYER2 - 1)
 
-/*
- * byte offset within layer1 or layer2 big-block for the entry representing
- * a zone-2 physical offset. 
- */
-#define HAMMER_BLOCKMAP_LAYER1_OFFSET(zone2_offset)	\
-	(((zone2_offset) & HAMMER_BLOCKMAP_LAYER1_MASK) / 	\
-	 HAMMER_BLOCKMAP_LAYER2 * sizeof(struct hammer_blockmap_layer1))
+#define HAMMER_BLOCKMAP_LAYER2_DOALIGN(offset)			\
+	(((offset) + HAMMER_BLOCKMAP_LAYER2_MASK) &		\
+	 ~HAMMER_BLOCKMAP_LAYER2_MASK)
 
-#define HAMMER_BLOCKMAP_LAYER2_OFFSET(zone2_offset)	\
-	(((zone2_offset) & HAMMER_BLOCKMAP_LAYER2_MASK) /	\
-	HAMMER_LARGEBLOCK_SIZE64 * sizeof(struct hammer_blockmap_layer2))
+/*
+ * Index within layer1 or layer2 big-block for the entry representing
+ * a zone-2 physical offset.
+ */
+#define HAMMER_BLOCKMAP_LAYER1_INDEX(zone2_offset)		\
+	((int)(((zone2_offset) & HAMMER_BLOCKMAP_LAYER1_MASK) /	\
+	 HAMMER_BLOCKMAP_LAYER2))
+
+#define HAMMER_BLOCKMAP_LAYER2_INDEX(zone2_offset)		\
+	((int)(((zone2_offset) & HAMMER_BLOCKMAP_LAYER2_MASK) /	\
+	HAMMER_BIGBLOCK_SIZE64))
+
+/*
+ * Byte offset within layer1 or layer2 big-block for the entry representing
+ * a zone-2 physical offset.  Multiply the index by sizeof(blockmap_layer).
+ */
+#define HAMMER_BLOCKMAP_LAYER1_OFFSET(zone2_offset)		\
+	(HAMMER_BLOCKMAP_LAYER1_INDEX(zone2_offset) *		\
+	 sizeof(struct hammer_blockmap_layer1))
+
+#define HAMMER_BLOCKMAP_LAYER2_OFFSET(zone2_offset)		\
+	(HAMMER_BLOCKMAP_LAYER2_INDEX(zone2_offset) *		\
+	 sizeof(struct hammer_blockmap_layer2))
+
+/*
+ * Move on to offset 0 of the next layer1 or layer2.
+ */
+#define HAMMER_ZONE_LAYER1_NEXT_OFFSET(offset)			\
+	(((offset) + HAMMER_BLOCKMAP_LAYER2) & ~HAMMER_BLOCKMAP_LAYER2_MASK)
+
+#define HAMMER_ZONE_LAYER2_NEXT_OFFSET(offset)			\
+	(((offset) + HAMMER_BIGBLOCK_SIZE) & ~HAMMER_BIGBLOCK_MASK64)
 
 /*
  * HAMMER UNDO parameters.  The UNDO fifo is mapped directly in the volume
- * header with an array of layer2 structures.  A maximum of (128x8MB) = 1GB
- * may be reserved.  The size of the undo fifo is usually set a newfs time
- * but can be adjusted if the filesystem is taken offline.
+ * header with an array of zone-2 offsets.  A maximum of (128x8MB) = 1GB,
+ * and minimum of (64x8MB) = 512MB may be reserved.  The size of the undo
+ * fifo is usually set a newfs time.
  */
-#define HAMMER_UNDO_LAYER2	128	/* max layer2 undo mapping entries */
+#define HAMMER_MIN_UNDO_BIGBLOCKS		64
+#define HAMMER_MAX_UNDO_BIGBLOCKS		128
 
 /*
  * All on-disk HAMMER structures which make up elements of the UNDO FIFO
@@ -379,8 +539,8 @@ typedef struct hammer_blockmap_layer2 *hammer_blockmap_layer2_t;
  *
  * In HAMMER version 4 the undo structure alignment is reduced from 16384
  * to 512 bytes in order to ensure that each 512 byte sector begins with
- * a header.  The reserved01 field in the header is now a 32 bit sequence
- * number.  This allows the recovery code to detect missing sectors
+ * a header.  The hdr_seq field in the header is a 32 bit sequence number
+ * which allows the recovery code to detect missing sectors
  * without relying on the 32-bit crc and to definitively identify the current
  * undo sequence space without having to rely on information from the volume
  * header.  In addition, new REDO entries in the undo space are used to
@@ -402,68 +562,61 @@ typedef struct hammer_blockmap_layer2 *hammer_blockmap_layer2_t;
  * Hammer version 5 contains a minor adjustment making layer2's bytes_free
  * field signed, allowing dedup to push it into the negative domain.
  */
-#define HAMMER_HEAD_ONDISK_SIZE		32
 #define HAMMER_HEAD_ALIGN		8
 #define HAMMER_HEAD_ALIGN_MASK		(HAMMER_HEAD_ALIGN - 1)
-#define HAMMER_TAIL_ONDISK_SIZE		8
 #define HAMMER_HEAD_DOALIGN(bytes)	\
 	(((bytes) + HAMMER_HEAD_ALIGN_MASK) & ~HAMMER_HEAD_ALIGN_MASK)
 
 #define HAMMER_UNDO_ALIGN		512
-#define HAMMER_UNDO_ALIGN64		((u_int64_t)512)
+#define HAMMER_UNDO_ALIGN64		((uint64_t)512)
 #define HAMMER_UNDO_MASK		(HAMMER_UNDO_ALIGN - 1)
 #define HAMMER_UNDO_MASK64		(HAMMER_UNDO_ALIGN64 - 1)
+#define HAMMER_UNDO_DOALIGN(offset)	\
+	(((offset) + HAMMER_UNDO_MASK) & ~HAMMER_UNDO_MASK64)
 
-struct hammer_fifo_head {
-	u_int16_t hdr_signature;
-	u_int16_t hdr_type;
-	u_int32_t hdr_size;	/* Aligned size of the whole mess */
-	u_int32_t hdr_seq;	/* Sequence number */
+typedef struct hammer_fifo_head {
+	uint16_t hdr_signature;
+	uint16_t hdr_type;
+	uint32_t hdr_size;	/* Aligned size of the whole mess */
+	uint32_t hdr_seq;	/* Sequence number */
 	hammer_crc_t hdr_crc;	/* XOR crc up to field w/ crc after field */
-};
+} *hammer_fifo_head_t;
 
 #define HAMMER_FIFO_HEAD_CRCOFF	offsetof(struct hammer_fifo_head, hdr_crc)
 
-struct hammer_fifo_tail {
-	u_int16_t tail_signature;
-	u_int16_t tail_type;
-	u_int32_t tail_size;	/* aligned size of the whole mess */
-};
-
-typedef struct hammer_fifo_head *hammer_fifo_head_t;
-typedef struct hammer_fifo_tail *hammer_fifo_tail_t;
+typedef struct hammer_fifo_tail {
+	uint16_t tail_signature;
+	uint16_t tail_type;
+	uint32_t tail_size;	/* aligned size of the whole mess */
+} *hammer_fifo_tail_t;
 
 /*
  * Fifo header types.
+ *
+ * NOTE: 0x8000U part of HAMMER_HEAD_TYPE_PAD can be removed if the HAMMER
+ * version ever gets bumped again. It exists only to keep compatibility with
+ * older versions.
  */
-#define HAMMER_HEAD_TYPE_PAD	(0x0040U|HAMMER_HEAD_FLAG_FREE)
+#define HAMMER_HEAD_TYPE_PAD	(0x0040U | 0x8000U)
 #define HAMMER_HEAD_TYPE_DUMMY	0x0041U		/* dummy entry w/seqno */
-#define HAMMER_HEAD_TYPE_42	0x0042U
 #define HAMMER_HEAD_TYPE_UNDO	0x0043U		/* random UNDO information */
 #define HAMMER_HEAD_TYPE_REDO	0x0044U		/* data REDO / fast fsync */
-#define HAMMER_HEAD_TYPE_45	0x0045U
-
-#define HAMMER_HEAD_FLAG_FREE	0x8000U		/* Indicates object freed */
 
 #define HAMMER_HEAD_SIGNATURE	0xC84EU
 #define HAMMER_TAIL_SIGNATURE	0xC74FU
-
-#define HAMMER_HEAD_SEQ_BEG	0x80000000U
-#define HAMMER_HEAD_SEQ_END	0x40000000U
-#define HAMMER_HEAD_SEQ_MASK	0x3FFFFFFFU
 
 /*
  * Misc FIFO structures.
  *
  * UNDO - Raw meta-data media updates.
  */
-struct hammer_fifo_undo {
+typedef struct hammer_fifo_undo {
 	struct hammer_fifo_head	head;
-	hammer_off_t		undo_offset;	/* zone-1 offset */
+	hammer_off_t		undo_offset;	/* zone-1,2 offset */
 	int32_t			undo_data_bytes;
 	int32_t			undo_reserved01;
 	/* followed by data */
-};
+} *hammer_fifo_undo_t;
 
 /*
  * REDO (HAMMER version 4+) - Logical file writes/truncates.
@@ -503,16 +656,17 @@ struct hammer_fifo_undo {
  *	 TRUNCSs do not always have matching TERMs because several
  *	 truncations may be aggregated together into a single TERM.
  */
-struct hammer_fifo_redo {
+typedef struct hammer_fifo_redo {
 	struct hammer_fifo_head	head;
 	int64_t			redo_objid;	/* file being written */
 	hammer_off_t		redo_offset;	/* logical offset in file */
 	int32_t			redo_data_bytes;
-	u_int32_t		redo_flags;
-	u_int32_t		redo_localization;
-	u_int32_t		redo_reserved;
-	u_int64_t		redo_mtime;	/* set mtime */
-};
+	uint32_t		redo_flags;
+	uint32_t		redo_localization;
+	uint32_t		redo_reserved01;
+	uint64_t		redo_reserved02;
+	/* followed by data */
+} *hammer_fifo_redo_t;
 
 #define HAMMER_REDO_WRITE	0x00000001
 #define HAMMER_REDO_TRUNC	0x00000002
@@ -520,15 +674,11 @@ struct hammer_fifo_redo {
 #define HAMMER_REDO_TERM_TRUNC	0x00000008
 #define HAMMER_REDO_SYNC	0x00000010
 
-union hammer_fifo_any {
+typedef union hammer_fifo_any {
 	struct hammer_fifo_head	head;
 	struct hammer_fifo_undo	undo;
 	struct hammer_fifo_redo	redo;
-};
-
-typedef struct hammer_fifo_redo *hammer_fifo_redo_t;
-typedef struct hammer_fifo_undo *hammer_fifo_undo_t;
-typedef union hammer_fifo_any *hammer_fifo_any_t;
+} *hammer_fifo_any_t;
 
 /*
  * Volume header types
@@ -537,36 +687,47 @@ typedef union hammer_fifo_any *hammer_fifo_any_t;
 #define HAMMER_FSBUF_VOLUME_REV	0x313052C54D4D41C8ULL	/* (reverse endian) */
 
 /*
- * The B-Tree structures need hammer_fsbuf_head.
- */
-#include "hammer_btree.h"
-
-/*
  * HAMMER Volume header
  *
- * A HAMMER filesystem is built from any number of block devices,  Each block
+ * A HAMMER filesystem can be built from 1-256 block devices, each block
  * device contains a volume header followed by however many buffers fit
  * into the volume.
  *
- * One of the volumes making up a HAMMER filesystem is the master, the
- * rest are slaves.  It does not have to be volume #0.
- *
- * The volume header takes up an entire 16K filesystem buffer and may
- * represent up to 64KTB (65536 TB) of space.
+ * One of the volumes making up a HAMMER filesystem is the root volume.
+ * The root volume is always volume #0 which is the first block device path
+ * specified by newfs_hammer(8).  All HAMMER volumes have a volume header,
+ * however the root volume may be the only volume that has valid values for
+ * some fields in the header.
  *
  * Special field notes:
  *
  *	vol_bot_beg - offset of boot area (mem_beg - bot_beg bytes)
- *	vol_mem_beg - offset of memory log (clu_beg - mem_beg bytes)
- *	vol_buf_beg - offset of the first buffer.
+ *	vol_mem_beg - offset of memory log (buf_beg - mem_beg bytes)
+ *	vol_buf_beg - offset of the first buffer in volume
+ *	vol_buf_end - offset of volume EOF (on buffer boundary)
  *
  *	The memory log area allows a kernel to cache new records and data
  *	in memory without allocating space in the actual filesystem to hold
  *	the records and data.  In the event that a filesystem becomes full,
  *	any records remaining in memory can be flushed to the memory log
  *	area.  This allows the kernel to immediately return success.
+ *
+ *	The buffer offset is a physical offset of zone-2 offset. The lower
+ *	52 bits of the zone-2 offset is added to the buffer offset of each
+ *	volume to generate an actual I/O offset within the block device.
+ *
+ *	NOTE: boot area and memory log are currently not used.
  */
 
+/*
+ * Filesystem type string
+ */
+#define HAMMER_FSTYPE_STRING		"DragonFly HAMMER"
+
+/*
+ * These macros are only used by userspace when userspace commands either
+ * initialize or add a new HAMMER volume.
+ */
 #define HAMMER_BOOT_MINBYTES		(32*1024)
 #define HAMMER_BOOT_NOMBYTES		(64LL*1024*1024)
 #define HAMMER_BOOT_MAXBYTES		(256LL*1024*1024)
@@ -575,49 +736,47 @@ typedef union hammer_fifo_any *hammer_fifo_any_t;
 #define HAMMER_MEM_NOMBYTES		(1LL*1024*1024*1024)
 #define HAMMER_MEM_MAXBYTES		(64LL*1024*1024*1024)
 
-struct hammer_volume_ondisk {
-	u_int64_t vol_signature;/* Signature */
+typedef struct hammer_volume_ondisk {
+	uint64_t vol_signature;	/* HAMMER_FSBUF_VOLUME for a valid header */
 
-	int64_t vol_bot_beg;	/* byte offset of boot area or 0 */
-	int64_t vol_mem_beg;	/* byte offset of memory log or 0 */
-	int64_t vol_buf_beg;	/* byte offset of first buffer in volume */
-	int64_t vol_buf_end;	/* byte offset of volume EOF (on buf bndry) */
-	int64_t vol_locked;	/* reserved clusters are >= this offset */
+	/*
+	 * These are relative to block device offset, not zone offsets.
+	 */
+	int64_t vol_bot_beg;	/* offset of boot area */
+	int64_t vol_mem_beg;	/* offset of memory log */
+	int64_t vol_buf_beg;	/* offset of the first buffer in volume */
+	int64_t vol_buf_end;	/* offset of volume EOF (on buffer boundary) */
+	int64_t vol_reserved01;
 
-	uuid_t    vol_fsid;	/* identify filesystem */
-	uuid_t    vol_fstype;	/* identify filesystem type */
-	char	  vol_name[64];	/* Name of volume */
+	hammer_uuid_t vol_fsid;	/* identify filesystem */
+	hammer_uuid_t vol_fstype; /* identify filesystem type */
+	char vol_label[64];	/* filesystem label */
 
 	int32_t vol_no;		/* volume number within filesystem */
-	int32_t vol_count;	/* number of volumes making up FS */
+	int32_t vol_count;	/* number of volumes making up filesystem */
 
-	u_int32_t vol_version;	/* version control information */
+	uint32_t vol_version;	/* version control information */
 	hammer_crc_t vol_crc;	/* header crc */
-	u_int32_t vol_flags;	/* volume flags */
-	u_int32_t vol_rootvol;	/* which volume is the root volume? */
+	uint32_t vol_flags;	/* volume flags */
+	uint32_t vol_rootvol;	/* the root volume number (must be 0) */
 
-	int32_t vol_reserved04;
-	int32_t vol_reserved05;
-	u_int32_t vol_reserved06;
-	u_int32_t vol_reserved07;
-
-	int32_t vol_blocksize;		/* for statfs only */
-	int32_t vol_reserved08;
-	int64_t vol_nblocks;		/* total allocatable hammer bufs */
+	uint32_t vol_reserved[8];
 
 	/*
 	 * These fields are initialized and space is reserved in every
-	 * volume making up a HAMMER filesytem, but only the master volume
-	 * contains valid data.
+	 * volume making up a HAMMER filesytem, but only the root volume
+	 * contains valid data.  Note that vol0_stat_bigblocks does not
+	 * include big-blocks for freemap and undomap initially allocated
+	 * by newfs_hammer(8).
 	 */
-	int64_t vol0_stat_bigblocks;	/* total bigblocks when fs is empty */
-	int64_t vol0_stat_freebigblocks;/* number of free bigblocks */
-	int64_t	vol0_stat_bytes;	/* for statfs only */
+	int64_t vol0_stat_bigblocks;	/* total big-blocks when fs is empty */
+	int64_t vol0_stat_freebigblocks;/* number of free big-blocks */
+	int64_t	vol0_reserved01;
 	int64_t vol0_stat_inodes;	/* for statfs only */
-	int64_t vol0_stat_records;	/* total records in filesystem */
-	hammer_off_t vol0_btree_root;	/* B-Tree root */
+	int64_t vol0_reserved02;
+	hammer_off_t vol0_btree_root;	/* B-Tree root offset in zone-8 */
 	hammer_tid_t vol0_next_tid;	/* highest partially synchronized TID */
-	hammer_off_t vol0_unused03;
+	hammer_off_t vol0_reserved03;
 
 	/*
 	 * Blockmaps for zones.  Not all zones use a blockmap.  Note that
@@ -628,14 +787,11 @@ struct hammer_volume_ondisk {
 	/*
 	 * Array of zone-2 addresses for undo FIFO.
 	 */
-	hammer_off_t		vol0_undo_array[HAMMER_UNDO_LAYER2];
+	hammer_off_t		vol0_undo_array[HAMMER_MAX_UNDO_BIGBLOCKS];
+} *hammer_volume_ondisk_t;
 
-};
+#define HAMMER_ROOT_VOLNO		0
 
-typedef struct hammer_volume_ondisk *hammer_volume_ondisk_t;
-
-#define HAMMER_VOLF_VALID		0x0001	/* valid entry */
-#define HAMMER_VOLF_OPEN		0x0002	/* volume is open */
 #define HAMMER_VOLF_NEEDFLUSH		0x0004	/* volume needs flush */
 
 #define HAMMER_VOL_CRCSIZE1	\
@@ -645,9 +801,9 @@ typedef struct hammer_volume_ondisk *hammer_volume_ondisk_t;
 	 sizeof(hammer_crc_t))
 
 #define HAMMER_VOL_VERSION_MIN		1	/* minimum supported version */
-#define HAMMER_VOL_VERSION_DEFAULT	6	/* newfs default version */
-#define HAMMER_VOL_VERSION_WIP		7	/* version >= this is WIP */
-#define HAMMER_VOL_VERSION_MAX		6	/* maximum supported version */
+#define HAMMER_VOL_VERSION_DEFAULT	7	/* newfs default version */
+#define HAMMER_VOL_VERSION_WIP		8	/* version >= this is WIP */
+#define HAMMER_VOL_VERSION_MAX		7	/* maximum supported version */
 
 #define HAMMER_VOL_VERSION_ONE		1
 #define HAMMER_VOL_VERSION_TWO		2	/* new dirent layout (2.3+) */
@@ -655,16 +811,36 @@ typedef struct hammer_volume_ondisk *hammer_volume_ondisk_t;
 #define HAMMER_VOL_VERSION_FOUR		4	/* new undo/flush (2.5+) */
 #define HAMMER_VOL_VERSION_FIVE		5	/* dedup (2.9+) */
 #define HAMMER_VOL_VERSION_SIX		6	/* DIRHASH_ALG1 */
+#define HAMMER_VOL_VERSION_SEVEN	7	/* use the faster iscsi_crc */
+
+/*
+ * Translate a zone-2 address to physical address
+ */
+#define hammer_xlate_to_phys(volume, zone2_offset)	\
+	((volume)->vol_buf_beg + HAMMER_OFF_SHORT_ENCODE(zone2_offset))
+
+/*
+ * Translate a zone-3 address to zone-2 address
+ */
+#define HAMMER_UNDO_INDEX(zone3_offset)			\
+	(HAMMER_OFF_SHORT_ENCODE(zone3_offset) / HAMMER_BIGBLOCK_SIZE)
+
+#define hammer_xlate_to_undo(volume, zone3_offset)			\
+	((volume)->vol0_undo_array[HAMMER_UNDO_INDEX(zone3_offset)] +	\
+	 (zone3_offset & HAMMER_BIGBLOCK_MASK64))
+
+/*
+ * Effective per-volume filesystem capacity including big-blocks for layer1/2
+ */
+#define HAMMER_VOL_BUF_SIZE(volume)			\
+	((volume)->vol_buf_end - (volume)->vol_buf_beg)
 
 /*
  * Record types are fairly straightforward.  The B-Tree includes the record
  * type in its index sort.
  */
-#define HAMMER_RECTYPE_UNKNOWN		0
-#define HAMMER_RECTYPE_LOWEST		1	/* lowest record type avail */
-#define HAMMER_RECTYPE_INODE		1	/* inode in obj_id space */
-#define HAMMER_RECTYPE_UNUSED02		2
-#define HAMMER_RECTYPE_UNUSED03		3
+#define HAMMER_RECTYPE_UNKNOWN		0x0000
+#define HAMMER_RECTYPE_INODE		0x0001	/* inode in obj_id space */
 #define HAMMER_RECTYPE_DATA		0x0010
 #define HAMMER_RECTYPE_DIRENTRY		0x0011
 #define HAMMER_RECTYPE_DB		0x0012
@@ -673,14 +849,14 @@ typedef struct hammer_volume_ondisk *hammer_volume_ondisk_t;
 #define HAMMER_RECTYPE_PFS		0x0015	/* PFS management */
 #define HAMMER_RECTYPE_SNAPSHOT		0x0016	/* Snapshot management */
 #define HAMMER_RECTYPE_CONFIG		0x0017	/* hammer cleanup config */
-#define HAMMER_RECTYPE_MOVED		0x8000	/* special recovery flag */
 #define HAMMER_RECTYPE_MAX		0xFFFF
 
+#define HAMMER_RECTYPE_ENTRY_START	(HAMMER_RECTYPE_INODE + 1)
 #define HAMMER_RECTYPE_CLEAN_START	HAMMER_RECTYPE_EXT
 
 #define HAMMER_FIXKEY_SYMLINK		1
 
-#define HAMMER_OBJTYPE_UNKNOWN		0	/* (never exists on-disk) */
+#define HAMMER_OBJTYPE_UNKNOWN		0	/* never exists on-disk as unknown */
 #define HAMMER_OBJTYPE_DIRECTORY	1
 #define HAMMER_OBJTYPE_REGFILE		2
 #define HAMMER_OBJTYPE_DBFILE		3
@@ -703,61 +879,51 @@ typedef struct hammer_volume_ondisk *hammer_volume_ondisk_t;
  * for non-directory inodes as a recovery aid, but can wind up holding
  * stale information.  However, since object id's are not reused, the worse
  * that happens is that the recovery code is unable to use it.
+ * A parent_obj_id of 0 means it's a root inode of root or non-root PFS.
  *
  * NOTE: Future note on directory hardlinks.  We can implement a record type
  * which allows us to point to multiple parent directories.
- *
- * NOTE: atime is stored in the inode's B-Tree element and not in the inode
- * data.  This allows the atime to be updated without having to lay down a
- * new record.
  */
-struct hammer_inode_data {
-	u_int16_t version;	/* inode data version */
-	u_int16_t mode;		/* basic unix permissions */
-	u_int32_t uflags;	/* chflags */
-	u_int32_t rmajor;	/* used by device nodes */
-	u_int32_t rminor;	/* used by device nodes */
-	u_int64_t ctime;
+typedef struct hammer_inode_data {
+	uint16_t version;	/* inode data version */
+	uint16_t mode;		/* basic unix permissions */
+	uint32_t uflags;	/* chflags */
+	uint32_t rmajor;	/* used by device nodes */
+	uint32_t rminor;	/* used by device nodes */
+	uint64_t ctime;
 	int64_t parent_obj_id;	/* parent directory obj_id */
-	uuid_t	  uid;
-	uuid_t	  gid;
+	hammer_uuid_t uid;
+	hammer_uuid_t gid;
 
-	u_int8_t  obj_type;
-	u_int8_t  cap_flags;	/* capability support flags (extension) */
-	u_int16_t reserved02;
-	u_int32_t reserved03;	/* RESERVED FOR POSSIBLE FUTURE BIRTHTIME */
-	u_int64_t nlinks;	/* hard links */
-	u_int64_t size;		/* filesystem object size */
+	uint8_t obj_type;
+	uint8_t cap_flags;	/* capability support flags (extension) */
+	uint16_t reserved01;
+	uint32_t reserved02;
+	uint64_t nlinks;	/* hard links */
+	uint64_t size;		/* filesystem object size */
 	union {
-		struct {
-			char	reserved06[16];
-			u_int32_t parent_obj_localization;
-			u_int32_t integrity_crc;
-		} obj;
 		char	symlink[24];	/* HAMMER_INODE_BASESYMLEN */
 	} ext;
-	u_int64_t mtime;	/* mtime must be second-to-last */
-	u_int64_t atime;	/* atime must be last */
-};
+	uint64_t mtime;	/* mtime must be second-to-last */
+	uint64_t atime;	/* atime must be last */
+} *hammer_inode_data_t;
 
 /*
  * Neither mtime nor atime upates are CRCd by the B-Tree element.
  * mtime updates have UNDO, atime updates do not.
  */
-#define HAMMER_ITIMES_BASE(ino_data)	(&(ino_data)->mtime)
-#define HAMMER_ITIMES_BYTES		(sizeof(u_int64_t) * 2)
-
 #define HAMMER_INODE_CRCSIZE	\
 	offsetof(struct hammer_inode_data, mtime)
 
 #define HAMMER_INODE_DATA_VERSION	1
-#define HAMMER_OBJID_ROOT		1
+#define HAMMER_OBJID_ROOT		1	/* root inodes # */
 #define HAMMER_INODE_BASESYMLEN		24	/* see ext.symlink */
 
 /*
  * Capability & implementation flags.
  *
- * DIR_LOCAL_INO - Use inode B-Tree localization for directory entries.
+ * HAMMER_INODE_CAP_DIR_LOCAL_INO - Use inode B-Tree localization
+ * for directory entries.  Also see HAMMER_DIR_INODE_LOCALIZATION().
  */
 #define HAMMER_INODE_CAP_DIRHASH_MASK	0x03	/* directory: hash algorithm */
 #define HAMMER_INODE_CAP_DIRHASH_ALG0	0x00
@@ -766,47 +932,52 @@ struct hammer_inode_data {
 #define HAMMER_INODE_CAP_DIRHASH_ALG3	0x03
 #define HAMMER_INODE_CAP_DIR_LOCAL_INO	0x04	/* use inode localization */
 
+#define HAMMER_DATA_DOALIGN(offset)				\
+	(((offset) + 15) & ~15)
+#define HAMMER_DATA_DOALIGN_WITH(type, offset)			\
+	(((type)(offset) + 15) & (~(type)15))
+
 /*
  * A HAMMER directory entry associates a HAMMER filesystem object with a
- * namespace.  It is possible to hook into a pseudo-filesystem (with its
- * own inode numbering space) in the filesystem by setting the high
- * 16 bits of the localization field.  The low 16 bits must be 0 and
- * are reserved for future use.
+ * namespace.  It is hooked into a pseudo-filesystem (with its own inode
+ * numbering space) in the filesystem by setting the high 16 bits of the
+ * localization field.  The low 16 bits must be 0 and are reserved for
+ * future use.
  *
  * Directory entries are indexed with a 128 bit namekey rather then an
  * offset.  A portion of the namekey is an iterator/randomizer to deal
  * with collisions.
  *
- * NOTE: base.base.obj_type from the related B-Tree leaf entry holds
+ * NOTE: leaf.base.obj_type from the related B-Tree leaf entry holds
  * the filesystem object type of obj_id, e.g. a den_type equivalent.
- * It is not stored in hammer_entry_data.
+ * It is not stored in hammer_direntry_data.
  *
- * NOTE: den_name / the filename data reference is NOT terminated with \0.
+ * NOTE: name field / the filename data reference is NOT terminated with \0.
  */
-struct hammer_entry_data {
+typedef struct hammer_direntry_data {
 	int64_t obj_id;			/* object being referenced */
-	u_int32_t localization;		/* identify pseudo-filesystem */
-	u_int32_t reserved02;
+	uint32_t localization;		/* identify pseudo-filesystem */
+	uint32_t reserved01;
 	char	name[16];		/* name (extended) */
-};
+} *hammer_direntry_data_t;
 
-#define HAMMER_ENTRY_NAME_OFF	offsetof(struct hammer_entry_data, name[0])
-#define HAMMER_ENTRY_SIZE(nlen)	offsetof(struct hammer_entry_data, name[nlen])
+#define HAMMER_ENTRY_NAME_OFF	offsetof(struct hammer_direntry_data, name[0])
+#define HAMMER_ENTRY_SIZE(nlen)	offsetof(struct hammer_direntry_data, name[nlen])
 
 /*
- * Symlink data which does not fit in the inode is stored in a separte
+ * Symlink data which does not fit in the inode is stored in a separate
  * FIX type record.
  */
-struct hammer_symlink_data {
-	char	name[16];
-};
+typedef struct hammer_symlink_data {
+	char	name[16];		/* name (extended) */
+} *hammer_symlink_data_t;
 
 #define HAMMER_SYMLINK_NAME_OFF	offsetof(struct hammer_symlink_data, name[0])
 
 /*
  * The root inode for the primary filesystem and root inode for any
  * pseudo-fs may be tagged with an optional data structure using
- * HAMMER_RECTYPE_FIX/HAMMER_FIXKEY_PSEUDOFS.  This structure allows
+ * HAMMER_RECTYPE_PFS and localization id.  This structure allows
  * the node to be used as a mirroring master or slave.
  *
  * When operating as a slave CD's into the node automatically become read-only
@@ -830,19 +1001,17 @@ struct hammer_pseudofs_data {
 	hammer_tid_t	sync_low_tid;	/* full history beyond this point */
 	hammer_tid_t	sync_beg_tid;	/* earliest tid w/ full history avail */
 	hammer_tid_t	sync_end_tid;	/* current synchronizatoin point */
-	u_int64_t	sync_beg_ts;	/* real-time of last completed sync */
-	u_int64_t	sync_end_ts;	/* initiation of current sync cycle */
-	uuid_t		shared_uuid;	/* shared uuid (match required) */
-	uuid_t		unique_uuid;	/* unique uuid of this master/slave */
+	uint64_t	sync_beg_ts;	/* real-time of last completed sync */
+	uint64_t	sync_end_ts;	/* initiation of current sync cycle */
+	hammer_uuid_t	shared_uuid;	/* shared uuid (match required) */
+	hammer_uuid_t	unique_uuid;	/* unique uuid of this master/slave */
 	int32_t		reserved01;	/* reserved for future master_id */
 	int32_t		mirror_flags;	/* misc flags */
 	char		label[64];	/* filesystem space label */
 	char		snapshots[64];	/* softlink dir for pruning */
-	int16_t		prune_time;	/* how long to spend pruning */
-	int16_t		prune_freq;	/* how often we prune */
-	int16_t		reblock_time;	/* how long to spend reblocking */
-	int16_t		reblock_freq;	/* how often we reblock */
-	int32_t		snapshot_freq;	/* how often we create a snapshot */
+	int32_t		reserved02;	/* was prune_{time,freq} */
+	int32_t		reserved03;	/* was reblock_{time,freq} */
+	int32_t		reserved04;	/* was snapshot_freq */
 	int32_t		prune_min;	/* do not prune recent history */
 	int32_t		prune_max;	/* do not retain history beyond here */
 	int32_t		reserved[16];
@@ -852,6 +1021,17 @@ typedef struct hammer_pseudofs_data *hammer_pseudofs_data_t;
 
 #define HAMMER_PFSD_SLAVE	0x00000001
 #define HAMMER_PFSD_DELETED	0x80000000
+
+#define hammer_is_pfs_slave(pfsd)			\
+	(((pfsd)->mirror_flags & HAMMER_PFSD_SLAVE) != 0)
+#define hammer_is_pfs_master(pfsd)			\
+	(!hammer_is_pfs_slave(pfsd))
+#define hammer_is_pfs_deleted(pfsd)			\
+	(((pfsd)->mirror_flags & HAMMER_PFSD_DELETED) != 0)
+
+#define HAMMER_MAX_PFS		65536
+#define HAMMER_MAX_PFSID	(HAMMER_MAX_PFS - 1)
+#define HAMMER_ROOT_PFSID	0
 
 /*
  * Snapshot meta-data { Objid = HAMMER_OBJID_ROOT, Key = tid, rectype = SNAPSHOT }.
@@ -865,36 +1045,44 @@ typedef struct hammer_pseudofs_data *hammer_pseudofs_data_t;
  *
  * NOTE: Reserved fields must be zero (as usual)
  */
-struct hammer_snapshot_data {
+typedef struct hammer_snapshot_data {
 	hammer_tid_t	tid;		/* the snapshot TID itself (== key) */
-	u_int64_t	ts;		/* real-time when snapshot was made */
-	u_int64_t	reserved01;
-	u_int64_t	reserved02;
+	uint64_t	ts;		/* real-time when snapshot was made */
+	uint64_t	reserved01;
+	uint64_t	reserved02;
 	char		label[64];	/* user-supplied description */
-	u_int64_t	reserved03[4];
-};
+	uint64_t	reserved03[4];
+} *hammer_snapshot_data_t;
 
 /*
  * Config meta-data { ObjId = HAMMER_OBJID_ROOT, Key = 0, rectype = CONFIG }.
  *
  * Used to store the hammer cleanup config.  This data is not mirrored.
  */
-struct hammer_config_data {
+typedef struct hammer_config_data {
 	char		text[1024];
-};
+} *hammer_config_data_t;
 
 /*
  * Rollup various structures embedded as record data
  */
-union hammer_data_ondisk {
-	struct hammer_entry_data entry;
+typedef union hammer_data_ondisk {
+	struct hammer_direntry_data entry;
 	struct hammer_inode_data inode;
 	struct hammer_symlink_data symlink;
 	struct hammer_pseudofs_data pfsd;
 	struct hammer_snapshot_data snap;
 	struct hammer_config_data config;
-};
+} *hammer_data_ondisk_t;
 
-typedef union hammer_data_ondisk *hammer_data_ondisk_t;
+/*
+ * Ondisk layout of B-Tree related structures
+ */
+#include "hammer_btree.h"
 
-#endif
+#define HAMMER_DIR_INODE_LOCALIZATION(ino_data)				\
+	(((ino_data)->cap_flags & HAMMER_INODE_CAP_DIR_LOCAL_INO) ?	\
+	 HAMMER_LOCALIZE_INODE :					\
+	 HAMMER_LOCALIZE_MISC)
+
+#endif /* !VFS_HAMMER_DISK_H_ */

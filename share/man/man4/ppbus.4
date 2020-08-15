@@ -97,13 +97,12 @@ functions to initialize the ppbus system.
 .Sh PARALLEL PORT MODEL
 The logical parallel port model chosen for the ppbus system is the PC's
 parallel port model.
-Consequently, for the i386 implementation of ppbus,
-most of the services provided by ppc are macros for
+Consequently, most of the services provided by ppc are macros for
 .Fn inb
 and
 .Fn outb
 calls.
-But, for an other architecture, accesses to one of our logical
+But, for another architecture, accesses to one of our logical
 registers (data, status, control...) may require more than one I/O access.
 .Ss Description
 The parallel port may operate in the following modes:
@@ -307,7 +306,7 @@ This mode will be saved in the context structure and
 returned each time the driver requests the ppbus.
 .Ss Bus allocation and interrupts
 ppbus allocation is mandatory not to corrupt I/O of other devices.
-An other
+Another
 usage of ppbus allocation is to reserve the port and receive incoming
 interrupts.
 .Pp

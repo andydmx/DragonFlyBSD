@@ -3,12 +3,10 @@
 
 PROG=	netstat
 SRCS=	if.c inet.c inet6.c main.c mbuf.c mroute.c route.c \
-	unix.c netgraph.c mroute6.c ipsec.c # iso.c tp_astring.c
-CFLAGS+=-DIPSEC
+	unix.c netgraph.c mroute6.c
 CFLAGS+=-DINET6
+NO_STRICT_ALIASING=
 
-#CFLAGS+=-g
-#.PATH:	${.CURDIR}/../../sys/netiso
 BINGRP=	kmem
 BINMODE=2555
 DPADD=	${LIBKVM} ${LIBKINFO} ${LIBNETGRAPH} ${LIBUTIL}

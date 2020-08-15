@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013 François Tigeot
+ * Copyright (c) 2013-2016 François Tigeot
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -27,6 +27,94 @@
 #ifndef _LINUX_IDR_H_
 #define _LINUX_IDR_H_
 
+#include <linux/slab.h>
+
 #include <sys/idr.h>
+
+#ifdef MALLOC_DECLARE
+MALLOC_DECLARE(M_IDR);
+#endif
+
+#define	IDA_CHUNK_SIZE		128	/* 128 bytes per chunk */
+#define	IDA_BITMAP_LONGS	(IDA_CHUNK_SIZE / sizeof(long) - 1)
+#define	IDA_BITMAP_BITS 	(IDA_BITMAP_LONGS * sizeof(long) * 8)
+
+struct ida_bitmap {
+	long			nr_busy;
+	unsigned long		bitmap[IDA_BITMAP_LONGS];
+};
+
+struct ida {
+	struct idr		idr;
+	struct ida_bitmap	*free_bitmap;
+};
+
+static inline void
+ida_init(struct ida *ida)
+{
+	idr_init(&ida->idr);
+}
+
+static inline void
+ida_simple_remove(struct ida *ida, unsigned int id)
+{
+	idr_remove(&ida->idr, id);
+}
+
+static inline void
+ida_remove(struct ida *ida, int id)
+{
+	idr_remove(&ida->idr, id);
+}
+
+static inline void
+ida_destroy(struct ida *ida)
+{
+	idr_destroy(&ida->idr);
+	if (ida->free_bitmap != NULL) {
+		/* kfree() is a linux macro! Work around the cpp pass */
+		(kfree)(ida->free_bitmap, M_IDR);
+	}
+}
+
+static inline int
+ida_simple_get(struct ida *ida, unsigned int start, unsigned int end, gfp_t gfp_mask)
+{
+	int id;
+	unsigned int lim;
+
+	if ((end == 0) || (end > 0x80000000))
+		lim = 0x80000000;
+	else
+		lim = end - 1;
+
+	idr_preload(gfp_mask);
+	id = idr_alloc(&ida->idr, NULL, start, lim, gfp_mask);
+	idr_preload_end();
+
+	return id;
+}
+
+static inline void *
+idr_get_next(struct idr *idp, int *nextid)
+{
+	void *res = NULL;
+
+	lwkt_gettoken(&idp->idr_token);
+
+	for (int id = *nextid; id < idp->idr_count; id++) {
+		res = idr_find(idp, id);
+		if (res == NULL)
+			continue;
+		*nextid = id;
+		break;
+	}
+
+	lwkt_reltoken(&idp->idr_token);
+	return res;
+}
+
+#define idr_for_each_entry(idp, entry, id)			\
+	for (id = 0; ((entry) = idr_get_next(idp, &(id))) != NULL; ++id)
 
 #endif	/* _LINUX_IDR_H_ */

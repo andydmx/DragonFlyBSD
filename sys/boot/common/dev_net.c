@@ -83,7 +83,7 @@ static int netdev_opens;
 static int	net_init(void);
 static int	net_open(struct open_file *, ...);
 static int	net_close(struct open_file *);
-static int	net_strategy();
+static int	net_strategy(void *, int, daddr_t, size_t, char *, size_t *);
 static void	net_print(int);
 
 static int net_getparams(int sock);
@@ -146,13 +146,12 @@ net_open(struct open_file *f, ...)
 	netdev_opens++;
     }
     netdev_opens++;
-    f->f_devdata = &netdev_sock;
+    devreplace(f, &netdev_sock);
     return (error);
 }
 
 int
-net_close(f)
-    struct open_file *f;
+net_close(struct open_file *f)
 {
 
 #ifdef	NETIF_DEBUG
@@ -180,7 +179,8 @@ net_close(f)
 }
 
 int
-net_strategy()
+net_strategy(void *devdata, int rw, daddr_t blk, size_t size, char *buf,
+    size_t *rsize)
 {
     return EIO;
 }
@@ -205,8 +205,7 @@ int try_bootp = 1;
 extern n_long ip_convertaddr(char *p);
 
 static int
-net_getparams(sock)
-    int sock;
+net_getparams(int sock)
 {
     char buf[MAXHOSTNAMELEN];
     char temp[FNAME_SIZE];

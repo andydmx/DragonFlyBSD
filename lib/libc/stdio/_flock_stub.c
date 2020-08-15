@@ -43,14 +43,8 @@
 
 #include "local.h"
 
-
-/*
- * Weak symbols for externally visible functions in this file:
- */
-__weak_reference(_flockfile, flockfile);
-__weak_reference(_flockfile_debug_stub, _flockfile_debug);
-__weak_reference(_ftrylockfile, ftrylockfile);
-__weak_reference(_funlockfile, funlockfile);
+void _flockfile_debug_stub(FILE *, char *, int);
+int _ftrylockfile(FILE *);
 
 void
 _flockfile(FILE *fp)
@@ -71,7 +65,7 @@ _flockfile(FILE *fp)
 }
 
 /*
- * This can be overriden by the threads library if it is linked in.
+ * This can be overridden by the threads library if it is linked in.
  */
 void
 _flockfile_debug_stub(FILE *fp, char *fname __unused, int lineno __unused)
@@ -131,3 +125,11 @@ _funlockfile(FILE *fp)
 		}
 	}
 }
+
+/*
+ * Weak symbols for externally visible functions in this file:
+ */
+__weak_reference(_flockfile, flockfile);
+__weak_reference(_flockfile_debug_stub, _flockfile_debug);
+__weak_reference(_ftrylockfile, ftrylockfile);
+__weak_reference(_funlockfile, funlockfile);

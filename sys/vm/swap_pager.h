@@ -15,11 +15,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -58,16 +54,24 @@
 #endif
 
 /*
- * SWB_NPAGES must be a power of 2.  It may be set to 1, 2, 4, 8, or 16
- * pages per allocation.  We recommend you stick with the default of 8.
- * The 16-page limit is due to the radix code (kern/subr_blist.c).
+ * SWB_NPAGES must be a power of 2.  Note that DMMAX may not exceed
+ * SWBLK_BITS, so the limit for SWB_NPAGES is (SWBLK_BITS / 2).
  */
 #define SWB_NPAGES	16
 
 /*
- * Piecemeal swap metadata structure.  Swap is stored in a hash table.
+ * DMMAX is the stripe size and must be a power of 2 >= SWBLK_BITS to ensure
+ * that the blist code does not allocate a contiguous range that crosses a
+ * stripe.
+ */
+#define SWB_DMMAX	SWBLK_BITS
+#define SWB_DMMASK	(SWB_DMMAX - 1)
+
+/*
+ * Piecemeal swap metadata structure.  Swap is stored in a RBTREE.  Swap
+ * blocks are page-sized.  e.g. block 1 is offset +4096 from block 0.
  *
- * Storage use is ~1:16384 or so.
+ * ram:swap is around 1:341
  *
  * Overall memory utilization is about the same as the old swap structure.
  */
@@ -84,12 +88,14 @@ struct swblock {
 
 #ifdef _KERNEL
 extern int swap_pager_full;
-extern int vm_swap_size;
-extern int vm_swap_max;
-extern int vm_swap_cache_use;
-extern int vm_swap_anon_use;
+extern int swap_pager_almost_full;
+extern int swap_fail_ticks;
+extern int swap_user_async;
+extern swblk_t vm_swap_size;
+extern swblk_t vm_swap_max;
+extern swblk_t vm_swap_cache_use;
+extern swblk_t vm_swap_anon_use;
 extern int vm_swapcache_read_enable;
-extern int vm_swapcache_inactive_heuristic;
 extern int vm_swapcache_use_chflags;
 
 extern struct blist *swapblist;
@@ -97,6 +103,7 @@ extern int nswap_lowat, nswap_hiwat;
 
 void swap_pager_putpages (vm_object_t, struct vm_page **, int, int, int *);
 boolean_t swap_pager_haspage (vm_object_t object, vm_pindex_t pindex);
+boolean_t swap_pager_haspage_locked (vm_object_t object, vm_pindex_t pindex);
 int swap_pager_swapoff (int devidx);
 
 int swap_pager_swp_alloc (vm_object_t, int);

@@ -174,12 +174,12 @@ do_announce(CTL_MSG *mp, CTL_RESPONSE *rp)
 }
 
 /*
- * Search utmp for the local user
+ * Search utmpx for the local user
  */
 int
 find_user(const char *name, char *tty)
 {
-	struct utmpentry *ep;
+	struct utmpentry *ep = NULL;	/* avoid gcc warnings */
 	int status;
 	struct stat statb;
 	time_t best = 0;

@@ -31,7 +31,7 @@
 .\"     @(#)ls.1	8.7 (Berkeley) 7/29/94
 .\" $FreeBSD: src/bin/ls/ls.1,v 1.86 2005/02/13 22:25:09 ru Exp $
 .\"
-.Dd March 4, 2014
+.Dd December 26, 2017
 .Dt LS 1
 .Os
 .Sh NAME
@@ -39,7 +39,8 @@
 .Nd list directory contents
 .Sh SYNOPSIS
 .Nm
-.Op Fl ABCFGHILPRTWabcdfghiklmnopqrstuwxy1
+.Op Fl 1ABCFGHILPRSTW_abcdfghiklmnopqrstuwxy
+.Op Fl D Ar format
 .Op Ar
 .Sh DESCRIPTION
 For each operand that names a
@@ -81,6 +82,21 @@ where
 is the numeric value of the character in octal.
 .It Fl C
 Force multi-column output; this is the default when output is to a terminal.
+.It Fl D Ar format
+When printing in the long
+.Pq Fl l
+format, use
+.Ar format
+to format the date and time output.
+The argument
+.Ar format
+is a string used by
+.Xr strftime 3 .
+Depending on the choice of format string, this may result in a
+different number of columns in the output.
+This option overrides the
+.Fl T
+option.
 .It Fl F
 Display a slash
 .Pq Ql /
@@ -107,6 +123,8 @@ This option is equivalent to defining
 .Ev CLICOLOR
 in the environment.
 (See below.)
+This functionality can be compiled out by removing the definition of
+.Ev COLORLS .
 .It Fl H
 Symbolic links on the command line are followed.
 This option is assumed if
@@ -142,15 +160,16 @@ options.
 .It Fl R
 Recursively list subdirectories encountered.
 .It Fl S
-Use the size of a file for sorting
-.Pq Fl t .
+Sort by size (largest file first) before sorting the operands in
+lexicographical order.
 .It Fl T
 When used with the
 .Fl l
 (lowercase letter
 .Dq ell )
 option, display complete time information for the file, including
-month, day, hour, minute, second, and year.
+month, day, hour, minute, second, and year (named locales use the
+ISO 8601 extended format).
 .It Fl W
 Display whiteouts when scanning directories.
 .It Fl a
@@ -272,6 +291,10 @@ Force output to be
 one entry per line.
 This is the default when
 output is not to a terminal.
+.It Fl _
+(underscore) When printing in the long
+.Pq Fl l
+format, use GMT based date and time output with nanotime timestamp.
 .El
 .Pp
 The
@@ -287,6 +310,13 @@ and
 .Fl u
 options override each other; the last one specified determines
 the file time used.
+.Pp
+The
+.Fl S
+and
+.Fl t
+options override each other; the last one specified determines
+the sort order used.
 .Pp
 The
 .Fl B , b , w ,
@@ -325,17 +355,16 @@ option is given, the following information
 is displayed for each file:
 file mode,
 number of links, owner name, group name,
-number of bytes in the file, abbreviated
-month, day-of-month file was last modified,
-hour file last modified, minute file last
-modified, and the pathname.
+number of bytes in the file,
+last modified time in either per POSIX requirements or
+using the format DD-MMM-YYYY hh:ss, and the pathname.
 In addition, for each directory whose contents are displayed, the total
 number of 512-byte blocks used by the files in the directory is displayed
 on a line by itself immediately before the information for the files in the
 directory.
 .Pp
-If the modification time of the file is more than 6 months
-in the past or future, then the year of the last modification
+In the POSIX locale, If the modification time of the file is in the future,
+or more than 6 months in the past, then the year of the last modification
 is displayed in place of the hour and minute fields.
 .Pp
 If the owner or group names are not a known user or group name,
@@ -481,7 +510,7 @@ variable is defined.
 .It Ev CLICOLOR_FORCE
 Color sequences are normally disabled if the output is not directed to
 a terminal.
-This can be overridden by setting this flag.
+This can be overridden by setting this variable.
 The
 .Ev TERM
 variable still needs to reference a color capable terminal however
@@ -627,6 +656,7 @@ specification.
 .Xr chmod 1 ,
 .Xr sort 1 ,
 .Xr xterm 1 Pq Pa x11/xterm ,
+.Xr strftime 3 ,
 .Xr termcap 5 ,
 .Xr symlink 7 ,
 .Xr sticky 8
@@ -639,6 +669,12 @@ and
 the
 .Nm
 utility conforms to
+.St -p1003.1-2001 .
+The options
+.Fl B , D , G , I , T , W , b , h , w , y
+and
+.Fl _
+are compatible extensions not defined in
 .St -p1003.1-2001 .
 .Sh HISTORY
 An

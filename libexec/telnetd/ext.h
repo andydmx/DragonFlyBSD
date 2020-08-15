@@ -10,11 +10,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -32,7 +28,6 @@
  *
  *	@(#)ext.h	8.2 (Berkeley) 12/15/93
  * $FreeBSD: src/crypto/telnet/telnetd/ext.h,v 1.2.8.4 2002/04/13 10:59:08 markm Exp $
- * $DragonFly: src/crypto/telnet/telnetd/ext.h,v 1.3 2006/01/17 23:50:35 dillon Exp $
  */
 
 /*
@@ -57,15 +52,10 @@ extern int	diagnostic;	/* telnet diagnostic capabilities */
 #ifdef BFTPDAEMON
 extern int	bftpd;		/* behave as bftp daemon */
 #endif /* BFTPDAEMON */
-#ifdef	AUTHENTICATION
-extern int	auth_level;
-#endif
 
 extern slcfun	slctab[NSLC + 1];	/* slc mapping table */
 
 #define TERMINAL_TYPE_SIZE	41	/* allocated space for terminaltype */
-
-char	*terminaltype;
 
 /*
  * I/O data buffers, pointers, and counters.
@@ -80,7 +70,6 @@ extern char	*neturg;		/* one past last bye of urgent data */
 extern int	pcc, ncc;
 
 extern int	pty, net;
-extern char	line[16];
 extern int	SYNCHing;		/* we are in TELNET SYNCH mode */
 
 extern void
@@ -88,7 +77,7 @@ extern void
 	add_slc(char, char, cc_t),
 	check_slc(void),
 	change_slc(char, char, cc_t),
-	cleanup(int),
+	cleanup(int) __dead2,
 	clientstat(int, int, int),
 	copy_termbuf(char *, size_t),
 	deferslc(void),
@@ -98,8 +87,8 @@ extern void
 	dooption(int),
 	dontoption(int),
 	edithost(char *, char *),
-	fatal(int, const char *),
-	fatalperror(int, const char *),
+	fatalmsg(int, const char *) __dead2,
+	fatalperror(int, const char *) __dead2,
 	get_slc_defaults(void),
 	init_env(void),
 	init_termbuf(void),
@@ -127,7 +116,7 @@ extern void
 	sendbrk(void),
 	sendsusp(void),
 	set_termbuf(void),
-	start_login(char *, int, char *),
+	start_login(char *, int, char *) __dead2,
 	start_slc(int),
 #ifdef	AUTHENTICATION
 	start_slave(char *),
@@ -182,8 +171,6 @@ void	output_datalen(const char *, int);
 void	startslave(char *, int, char *);
 
 #ifdef	ENCRYPTION
-extern void	(*encrypt_output)(unsigned char *, int);
-extern int	(*decrypt_input)(int);
 extern char	*nclearto;
 #endif	/* ENCRYPTION */
 

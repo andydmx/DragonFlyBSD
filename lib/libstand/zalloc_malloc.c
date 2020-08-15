@@ -99,7 +99,7 @@ free(void *ptr)
 #endif
 #ifdef USEENDGUARD
 	if (*((char *)res + res->ga_Bytes - 1) != -2) {
-	    panic("free: guard2 fail @ %p + %d %d/-2",
+	    panic("free: guard2 fail @ %p + %zu %d/-2",
 		  ptr,
 		  res->ga_Bytes - MALLOCALIGN - 1,
 		  *((char *)res + res->ga_Bytes - 1));
@@ -124,10 +124,6 @@ calloc(size_t n1, size_t n2)
 
     if ((res = malloc(bytes)) != NULL) {
 	bzero(res, bytes);
-#ifdef DMALLOCDEBUG
-	if (++MallocCount > MallocMax)
-	    MallocMax = MallocCount;
-#endif
     }
     return(res);
 }
@@ -157,8 +153,6 @@ realloc(void *ptr, size_t size)
 	    free(ptr);
 	} else {
 #ifdef DMALLOCDEBUG
-	    if (++MallocCount > MallocMax)
-		MallocMax = MallocCount;
 #ifdef EXITSTATS
 	    if (DidAtExit == 0) {
 		DidAtExit = 1;

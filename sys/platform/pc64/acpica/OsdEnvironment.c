@@ -28,18 +28,21 @@
  */
 
 /*
- * 6.1 : Environmental support
+ * Environmental and ACPI Tables (partial)
  */
+
 #include <sys/types.h>
 #include <sys/linker_set.h>
 #include <sys/sysctl.h>
 
+#include <machine/vmparam.h>
+
 #include "acpi.h"
 
-static u_long i386_acpi_root;
+static u_long acpi_root_phys;
 
-SYSCTL_ULONG(_machdep, OID_AUTO, acpi_root, CTLFLAG_RD, &i386_acpi_root, 0,
-	     "The physical address of the RSDP");
+SYSCTL_ULONG(_machdep, OID_AUTO, acpi_root, CTLFLAG_RD, &acpi_root_phys, 0,
+    "The physical address of the RSDP");
 
 ACPI_STATUS
 AcpiOsInitialize(void)
@@ -58,17 +61,22 @@ AcpiOsGetRootPointer(void)
 {
 	ACPI_SIZE ptr;
 	ACPI_STATUS status;
+	u_long acpi_root;
 
-	if (i386_acpi_root == 0) {
+	if (acpi_root_phys == 0) {
 		/*
 		 * The loader passes the physical address at which it found the
-		 * RSDP in a hint.  We could recover this rather than searching
+		 * RSDP in a hint.  We try to recover this before searching
 		 * manually here.
 		 */
-		status = AcpiFindRootPointer(&ptr);
-		if (ACPI_SUCCESS(status))
-			i386_acpi_root = ptr;
+		if (kgetenv_ulong("hint.acpi.0.rsdp", &acpi_root) == 1) {
+			acpi_root_phys = acpi_root;
+		} else {
+			status = AcpiFindRootPointer(&ptr);
+			if (ACPI_SUCCESS(status))
+				acpi_root_phys = ptr;
+		}
 	}
 
-	return (i386_acpi_root);
+	return (acpi_root_phys);
 }

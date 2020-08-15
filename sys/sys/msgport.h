@@ -10,20 +10,10 @@
 #ifndef _SYS_QUEUE_H_
 #include <sys/queue.h>		/* TAILQ_* macros */
 #endif
-#ifndef _SYS_STDINT_H_
-#include <sys/stdint.h>
-#endif
 #ifndef _SYS_SPINLOCK_H_
 #include <sys/spinlock.h>
 #endif
-
-#ifdef _KERNEL
-
-#ifndef _SYS_MALLOC_H_
-#include <sys/malloc.h>
-#endif
-
-#endif
+#include <machine/stdint.h>
 
 struct lwkt_msg;
 struct lwkt_port;
@@ -112,10 +102,6 @@ typedef struct lwkt_msg {
 #define MSG_CMD_SYSCALL	0x00030000
 #define MSG_SUBCMD_MASK	0x0000FFFF
 
-#ifdef _KERNEL
-MALLOC_DECLARE(M_LWKTMSG);
-#endif
-
 /*
  * Notes on port processing requirements:
  *
@@ -175,6 +161,8 @@ typedef struct lwkt_port {
 
 #ifdef _KERNEL
 
+#include <sys/stdint.h>	/* for boolean_t */
+
 #define mpu_spin	mp_u.spin
 #define mpu_serialize	mp_u.serialize
 #define mpu_data	mp_u.data
@@ -208,6 +196,7 @@ void lwkt_sendmsg(lwkt_port_t, lwkt_msg_t);
 void lwkt_sendmsg_oncpu(lwkt_port_t, lwkt_msg_t);
 void lwkt_sendmsg_prepare(lwkt_port_t, lwkt_msg_t);
 void lwkt_sendmsg_start(lwkt_port_t, lwkt_msg_t);
+void lwkt_sendmsg_start_oncpu(lwkt_port_t, lwkt_msg_t);
 int lwkt_domsg(lwkt_port_t, lwkt_msg_t, int);
 int lwkt_forwardmsg(lwkt_port_t, lwkt_msg_t);
 void lwkt_abortmsg(lwkt_msg_t);

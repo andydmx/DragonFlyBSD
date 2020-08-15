@@ -41,6 +41,7 @@
 	char secret[HEXKEYBYTES + 1];
  */
 
+#include <sys/param.h>
 #include <sys/time.h>
 #include <err.h>
 #include <fcntl.h>
@@ -145,7 +146,7 @@ common_key(char *xsecret, char *xpublic, IdeaData *ideakey, DesData *deskey)
 	BN_mod_exp(common, public, secret, modulus, ctx);
         extractdeskey(common, deskey);
         extractideakey(common, ideakey);
-	des_set_odd_parity(deskey);
+	DES_set_odd_parity(deskey);
 	BN_free(common);
 	BN_free(secret);
 	BN_free(public);
@@ -272,14 +273,14 @@ pk_encode(char *in, char *out, DesData *key)
 {
 	char buf[256];
 	DesData i;
-	des_key_schedule k;
+	DES_key_schedule k;
 	int l,op,deslen;
 
 	memset(&i,0,sizeof(i));
 	memset(buf,0,sizeof(buf));
-	deslen = ((strlen(in) + 7)/8)*8;
-	des_key_sched(key, k);
-	des_cbc_encrypt(in,buf,deslen, k,&i,DES_ENCRYPT);
+	deslen = rounddown(strlen(in) + 7, 8);
+	DES_key_sched(key, &k);
+	DES_cbc_encrypt(in,buf,deslen, &k,&i,DES_ENCRYPT);
 	for (l=0,op=0;l<deslen;l++) {
 		out[op++] = hextab[(buf[l] & 0xf0) >> 4];
 		out[op++] = hextab[(buf[l] & 0x0f)];
@@ -293,7 +294,7 @@ pk_decode(char *in, char *out, DesData *key)
 {
 	char buf[256];
 	DesData i;
-	des_key_schedule k;
+	DES_key_schedule k;
 	int n1,n2,op;
 	size_t l;
 
@@ -310,7 +311,7 @@ pk_decode(char *in, char *out, DesData *key)
 			n2 = in[op+1] - '0';
 		buf[l] = n1*16 +n2;
 	}
-	des_key_sched(key, k);
-	des_cbc_encrypt(buf,out,strlen(in)/2, k,&i,DES_DECRYPT);
+	DES_key_sched(key, &k);
+	DES_cbc_encrypt(buf,out,strlen(in)/2, &k,&i,DES_DECRYPT);
 	out[strlen(in)/2] = '\0';
 }

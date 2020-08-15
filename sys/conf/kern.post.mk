@@ -1,4 +1,4 @@
-# 
+#
 # This Makefile covers the bottom part of the MI build instructions
 #
 
@@ -43,18 +43,11 @@ ${mfile:T:S/.m$/.h/}: ${mfile}
 .endfor
 
 kernel-clean:
-	rm -f *.o *.so *.So *.ko *.s eddep errs \
+	rm -f *.o *.so *.So *.ko *.s errs \
 	      ${KERNEL} ${KERNEL}.debug ${KERNEL}.nodebug ${KERNEL}.stripped \
-	      linterrs setdef[01].c setdefs.h tags \
-	      vers.c vnode_if.c vnode_if.h \
+	      tags vers.c \
 	      ${MFILES:T:S/.m$/.c/} ${MFILES:T:S/.m$/.h/} \
 	      ${CLEAN}
-
-#lint: /tmp
-#	@lint -hbxn -DGENERIC -Dvolatile= ${COPTS} \
-#	  $S/platform/$P/$M/Locore.c ${CFILES} ioconf.c | \
-#	    grep -v 'struct/union .* never defined' | \
-#	    grep -v 'possible pointer alignment problem'
 
 locore.o: $S/platform/$P/$M/locore.s assym.s
 	${NORMAL_S}
@@ -75,8 +68,8 @@ assym.s: $S/kern/genassym.sh genassym.o
 
 genassym.o: $S/platform/$P/$M/genassym.c ${FORWARD_HEADERS_COOKIE} \
 	    ${MFILES:T:S/.m$/.h/}
-	${CC} -c ${CFLAGS:N-fno-common:N-mcmodel=small} ${WERROR} \
-	$S/platform/$P/$M/genassym.c
+	${CC} -c ${CFLAGS:N-fno-common:N-flto:N-mcmodel=small} -fcommon \
+	${WERROR} $S/platform/$P/$M/genassym.c
 
 ${SYSTEM_OBJS} genassym.o vers.o: opt_global.h
 
@@ -85,6 +78,12 @@ ${SYSTEM_OBJS} genassym.o vers.o: opt_global.h
 kernel-depend: assym.s ${BEFORE_DEPEND} \
 	    ${CFILES} ${SYSTEM_CFILES} ${GEN_CFILES} ${SFILES} \
 	    ${SYSTEM_SFILES} ${MFILES:T:S/.m$/.h/}
+.if defined(FASTER_DEPEND)
+.if exists(hack.So)
+	@cat ${SYSTEM_OBJS:M*\.o$:S/.o$/.d/} genassym.d > .depend || \
+	    echo "There were missing deps"
+.endif
+.else
 	rm -f .newdep
 	${MAKE} -V CFILES -V SYSTEM_CFILES -V GEN_CFILES | xargs \
 		mkdep -a -f .newdep ${CFLAGS}
@@ -92,8 +91,12 @@ kernel-depend: assym.s ${BEFORE_DEPEND} \
 	    env MKDEP_CPP="${CC} -E" mkdep -a -f .newdep ${ASM_CFLAGS}
 	rm -f .depend
 	mv -f .newdep .depend
+.endif
 
 kernel-cleandepend:
+.if defined(FASTER_DEPEND)
+	rm -f *.d
+.endif
 	rm -f .depend
 
 kernel-tags:
@@ -158,7 +161,7 @@ kernel-installable:
 		/usr/bin/false; \
 	fi
 # Skip this step for vkernels
-.if ${MACHINE_PLATFORM} != vkernel && ${MACHINE_PLATFORM} != vkernel64
+.if ${MACHINE_PLATFORM} != vkernel64
 	@if [ ! -f ${DESTDIR}/boot/dloader.rc ]; then \
 		echo "You need to install a new ${DESTDIR}/boot before you"; \
 		echo "can install a new kernel, kernels are now installed"; \
@@ -263,8 +266,6 @@ ioconf.o:
 vers.c: $S/conf/newvers.sh $S/sys/param.h ${SYSTEM_DEP}
 	sh $S/conf/newvers.sh $S/..
 
-# XXX strictly, everything depends on Makefile because changes to ${PROF}
-# only appear there, but we don't handle that.
 vers.o:
 	${NORMAL_C} ${WERROR}
 

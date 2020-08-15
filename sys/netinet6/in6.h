@@ -1,5 +1,4 @@
 /*	$FreeBSD: src/sys/netinet6/in6.h,v 1.7.2.7 2002/08/01 19:38:50 ume Exp $	*/
-/*	$DragonFly: src/sys/netinet6/in6.h,v 1.12 2008/09/14 08:58:33 hasso Exp $	*/
 /*	$KAME: in6.h,v 1.89 2001/05/27 13:28:35 itojun Exp $	*/
 
 /*
@@ -43,11 +42,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -153,7 +148,7 @@ struct in6_addr {
 #endif
 struct sockaddr_in6 {
 	uint8_t		sin6_len;	/* length of this struct(sa_family_t)*/
-	uint8_t		sin6_family;	/* AF_INET6 (sa_family_t) */
+	sa_family_t	sin6_family;	/* AF_INET6 */
 	uint16_t	sin6_port;	/* Transport layer port # (in_port_t)*/
 	uint32_t	sin6_flowinfo;	/* IP6 flow information */
 	struct in6_addr	sin6_addr;	/* IP6 address */
@@ -230,12 +225,18 @@ extern const struct in6_addr in6mask128;
 #define IN6ADDR_NODELOCAL_ALLNODES_INIT					\
 	{{{ 0xff, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,		\
 	    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01 }}}
+#define IN6ADDR_INTFACELOCAL_ALLNODES_INIT				\
+	{{{ 0xff, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,		\
+	    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01 }}}
 #define IN6ADDR_LINKLOCAL_ALLNODES_INIT					\
 	{{{ 0xff, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,		\
 	    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01 }}}
 #define IN6ADDR_LINKLOCAL_ALLROUTERS_INIT				\
 	{{{ 0xff, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,		\
 	    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02 }}}
+#define IN6ADDR_LINKLOCAL_ALLMDNS_INIT					\
+	{{{ 0xff, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,		\
+	    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xfb }}}
 
 #ifdef _KERNEL
 extern const struct in6_addr kin6addr_any;
@@ -296,6 +297,7 @@ extern const struct in6_addr in6addr_linklocal_allnodes;
  */
 
 #define __IPV6_ADDR_SCOPE_NODELOCAL	0x01
+#define __IPV6_ADDR_SCOPE_INTFACELOCAL	0x01
 #define __IPV6_ADDR_SCOPE_LINKLOCAL	0x02
 #define __IPV6_ADDR_SCOPE_SITELOCAL	0x05
 #define __IPV6_ADDR_SCOPE_ORGLOCAL	0x08	/* just used in this file */
@@ -424,11 +426,6 @@ struct route_in6 {
 #define IPV6_BINDV6ONLY		IPV6_V6ONLY
 #endif
 
-#if 1 /* IPSEC */
-#define IPV6_IPSEC_POLICY	28 /* struct; get/set security policy */
-#endif
-#define IPV6_FAITH		29 /* bool; accept FAITH'ed connections */
-
 #if 1 /* IPV6FIREWALL */
 #define IPV6_FW_ADD		30 /* add a firewall rule to chain */
 #define IPV6_FW_DEL		31 /* delete a firewall rule from chain */
@@ -538,53 +535,6 @@ struct ip6_mtuinfo {
  */
 #define IPV6PROTO_MAXID	(IPPROTO_PIM + 1)	/* don't list to IPV6PROTO_MAX */
 
-#define CTL_IPV6PROTO_NAMES {					\
-	{ 0, 0 }, { 0, 0 }, { 0, 0 }, { 0, 0 }, { 0, 0 },	\
-	{ 0, 0 },						\
-	{ "tcp6", CTLTYPE_NODE },				\
-	{ 0, 0 },						\
-	{ 0, 0 },						\
-	{ 0, 0 },						\
-	{ 0, 0 }, { 0, 0 }, { 0, 0 }, { 0, 0 }, { 0, 0 },	\
-	{ 0, 0 },						\
-	{ 0, 0 },						\
-	{ "udp6", CTLTYPE_NODE },				\
-	{ 0, 0 },						\
-	{ 0, 0 },						\
-	{ 0, 0 }, { 0, 0 }, { 0, 0 }, { 0, 0 }, { 0, 0 },	\
-	{ 0, 0 }, { 0, 0 }, { 0, 0 }, { 0, 0 }, { 0, 0 },	\
-	{ 0, 0 }, { 0, 0 }, { 0, 0 }, { 0, 0 }, { 0, 0 },	\
-	{ 0, 0 }, { 0, 0 }, { 0, 0 }, { 0, 0 }, { 0, 0 },	\
-	{ 0, 0 },						\
-	{ "ip6", CTLTYPE_NODE },				\
-	{ 0, 0 },						\
-	{ 0, 0 },						\
-	{ 0, 0 },						\
-	{ 0, 0 }, { 0, 0 }, { 0, 0 }, { 0, 0 }, { 0, 0 },	\
-	{ 0, 0 },						\
-	{ "ipsec6", CTLTYPE_NODE },				\
-	{ 0, 0 },						\
-	{ 0, 0 },						\
-	{ 0, 0 },						\
-	{ 0, 0 },						\
-	{ 0, 0 },						\
-	{ 0, 0 },						\
-	{ "icmp6", CTLTYPE_NODE },				\
-	{ 0, 0 },						\
-	{ 0, 0 }, { 0, 0 }, { 0, 0 }, { 0, 0 }, { 0, 0 },	\
-	{ 0, 0 }, { 0, 0 }, { 0, 0 }, { 0, 0 }, { 0, 0 },	\
-	{ 0, 0 }, { 0, 0 }, { 0, 0 }, { 0, 0 }, { 0, 0 },	\
-	{ 0, 0 }, { 0, 0 }, { 0, 0 }, { 0, 0 }, { 0, 0 },	\
-	{ 0, 0 }, { 0, 0 }, { 0, 0 }, { 0, 0 }, { 0, 0 },	\
-	{ 0, 0 }, { 0, 0 }, { 0, 0 }, { 0, 0 }, { 0, 0 },	\
-	{ 0, 0 }, { 0, 0 }, { 0, 0 }, { 0, 0 }, { 0, 0 },	\
-	{ 0, 0 }, { 0, 0 }, { 0, 0 }, { 0, 0 }, { 0, 0 },	\
-	{ 0, 0 },						\
-	{ 0, 0 },						\
-	{ 0, 0 },						\
-	{ "pim6", CTLTYPE_NODE },				\
-}
-
 /*
  * Names for IP sysctl objects
  */
@@ -602,7 +552,6 @@ struct ip6_mtuinfo {
 #define IPV6CTL_SOURCECHECK	10	/* verify source route and intf */
 #define IPV6CTL_SOURCECHECK_LOGINT 11	/* minimume logging interval */
 #define IPV6CTL_ACCEPT_RTADV	12
-#define IPV6CTL_KEEPFAITH	13
 #define IPV6CTL_LOG_INTERVAL	14
 #define IPV6CTL_HDRNESTLIMIT	15
 #define IPV6CTL_DAD_COUNT	16
@@ -614,8 +563,8 @@ struct ip6_mtuinfo {
 #define IPV6CTL_RR_PRUNE	22	/* walk timer for router renumbering */
 #if 0	/* obsolete */
 #define IPV6CTL_MAPPED_ADDR	23
-#endif
 #define IPV6CTL_V6ONLY		24
+#endif
 #define IPV6CTL_RTEXPIRE	25	/* cloned route expiration time */
 #define IPV6CTL_RTMINEXPIRE	26	/* min value for expiration time */
 #define IPV6CTL_RTMAXCACHE	27	/* trigger level for dynamic expire */
@@ -627,11 +576,15 @@ struct ip6_mtuinfo {
 #define IPV6CTL_RIP6STATS	36	/* raw_ip6 stats */
 
 #define IPV6CTL_ADDRCTLPOLICY	38	/* get/set address selection policy */
+#define IPV6CTL_MINHLIM		39	/* minimum Hop-Limit */
+
+#define IPV6CTL_MAXFRAGS	41	/* max fragments */
 
 /* New entries should be added here from current IPV6CTL_MAXID value. */
 /* to define items, should talk with KAME guys first, for *BSD compatibility */
-#define IPV6CTL_MAXID		42
 
+#define	ICMPV6CTL_ND6_ONLINKNSRFC4861	47
+#define IPV6CTL_MAXID		48
 #endif /* !_XOPEN_SOURCE */
 
 /*
@@ -655,19 +608,12 @@ int	in6_localaddr (struct in6_addr *);
 int	in6_addrscope (struct in6_addr *);
 struct	in6_ifaddr *in6_ifawithscope (struct ifnet *, struct in6_addr *, struct ucred *);
 struct	in6_ifaddr *in6_ifawithifp (struct ifnet *, struct in6_addr *);
-void	in6_if_up (struct ifnet *);
 
-void	in6_sin6_2_sin (struct sockaddr_in *sin, struct sockaddr_in6 *sin6);
-void	in6_sin_2_v4mapsin6(struct sockaddr_in *sin, struct sockaddr_in6 *sin6);
-void	in6_sin6_2_sin_in_sock (struct sockaddr *nam);
-void	in6_sin_2_v4mapsin6_in_sock (struct sockaddr **nam);
 void	addrsel_policy_init (void);
 
 #define	satosin6(sa)	((struct sockaddr_in6 *)(sa))
 #define	sin6tosa(sin6)	((struct sockaddr *)(sin6))
 #define	ifatoia6(ifa)	((struct in6_ifaddr *)(ifa))
-
-extern int (*faithprefix_p)(struct in6_addr *);
 #endif /* _KERNEL */
 
 #include <sys/cdefs.h>		/* for __BEGIN_DECLS and __END_DECLS */
@@ -703,9 +649,7 @@ struct in6_addr *inet6_rthdr_getaddr (struct cmsghdr *, int);
 int		 inet6_rthdr_getflags (const struct cmsghdr *, int);
 struct cmsghdr	*inet6_rthdr_init (void *, int);
 int		 inet6_rthdr_lasthop (struct cmsghdr *, unsigned int);
-#if 0					/* not implemented yet */
 int		 inet6_rthdr_reverse (const struct cmsghdr *, struct cmsghdr *);
-#endif
 int		 inet6_rthdr_segments (const struct cmsghdr *);
 size_t		 inet6_rthdr_space (int, int);
 __END_DECLS

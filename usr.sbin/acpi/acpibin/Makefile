@@ -17,6 +17,7 @@ SRCS+=	\
 	cmfsize.c \
 	getopt.c \
 	utalloc.c \
+	utascii.c \
 	utbuffer.c \
 	utcache.c \
 	utdebug.c \
@@ -27,11 +28,9 @@ SRCS+=	\
 	utmath.c \
 	utmisc.c \
 	utmutex.c \
-	utprint.c \
 	utstate.c \
 	utstring.c \
 	utxferror.c \
-	oslibcfs.c \
 	osunixxf.c
 
 CFLAGS+= \

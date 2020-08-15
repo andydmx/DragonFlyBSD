@@ -901,7 +901,7 @@ ufsdirhash_getprev(struct direct *dirp, doff_t offset)
 	doff_t blkoff, prevoff;
 	int entrypos, i;
 
-	blkoff = offset & ~(DIRBLKSIZ - 1);	/* offset of start of block */
+	blkoff = rounddown2(offset, DIRBLKSIZ);	/* offset of start of block */
 	entrypos = offset & (DIRBLKSIZ - 1);	/* entry relative to block */
 	blkbuf = (char *)dirp - entrypos;
 	prevoff = blkoff;
@@ -977,7 +977,7 @@ ufsdirhash_init(void)
 	    DH_NBLKOFF * sizeof(daddr_t));
 	TAILQ_INIT(&ufsdirhash_list);
 }
-SYSINIT(ufsdirhash, SI_SUB_PSEUDO, SI_ORDER_ANY, ufsdirhash_init, NULL)
+SYSINIT(ufsdirhash, SI_SUB_PSEUDO, SI_ORDER_ANY, ufsdirhash_init, NULL);
 
 
 #endif /* UFS_DIRHASH */

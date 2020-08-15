@@ -26,7 +26,6 @@
  * CRC32 code derived from work by Gary S. Brown.
  *
  * $FreeBSD: src/sbin/gpt/gpt.c,v 1.16 2006/07/07 02:44:23 marcel Exp $
- * $DragonFly: src/sbin/gpt/gpt.c,v 1.5 2008/07/30 00:45:26 dillon Exp $
  */
 
 #include <sys/param.h>
@@ -284,6 +283,16 @@ parse_uuid(const char *s, uuid_t *uuid)
 		}
 		break;
 	case 'h':
+		if (strcmp(s, "hammer2") == 0) {
+			uuid_t hammer2 = GPT_ENT_TYPE_DRAGONFLY_HAMMER2;
+			*uuid = hammer2;
+			return (0);
+		}
+		if (strcmp(s, "hammer") == 0) {
+			uuid_t hammer = GPT_ENT_TYPE_DRAGONFLY_HAMMER;
+			*uuid = hammer;
+			return (0);
+		}
 		if (strcmp(s, "hfs") == 0) {
 			uuid_t hfs = GPT_ENT_TYPE_APPLE_HFS;
 			*uuid = hfs;
@@ -622,6 +631,7 @@ gpt_close(int fd)
 	close(fd);
 }
 
+#ifndef _LIBEFIVAR
 static struct {
 	int (*fptr)(int, char *[]);
 	const char *name;
@@ -631,6 +641,7 @@ static struct {
 	{ cmd_create, "create" },
 	{ cmd_destroy, "destroy" },
 	{ NULL, "help" },
+	{ cmd_init, "init" },
 	{ cmd_label, "label" },
 	{ cmd_migrate, "migrate" },
 	{ cmd_recover, "recover" },
@@ -710,3 +721,4 @@ main(int argc, char *argv[])
 	prefix(cmd);
 	return ((*cmdsw[i].fptr)(argc, argv));
 }
+#endif /* !_LIBEFIVAR */

@@ -78,7 +78,7 @@ struct cdce_ncm {
 
 struct cdce_softc {
 	struct usb_ether	sc_ue;
-	struct mtx		sc_mtx;
+	struct lock		sc_lock;
 #if CDCE_HAVE_NCM
 	struct cdce_ncm		sc_ncm;
 #endif
@@ -93,9 +93,13 @@ struct cdce_softc {
 
 	uint8_t sc_eaddr_str_index;
 	uint8_t	sc_ifaces_index[2];
+	uint8_t sc_notify_state;
+#define	CDCE_NOTIFY_NETWORK_CONNECTION	0
+#define	CDCE_NOTIFY_SPEED_CHANGE	1
+#define	CDCE_NOTIFY_DONE		2
 };
 
-#define	CDCE_LOCK(_sc)			mtx_lock(&(_sc)->sc_mtx)
-#define	CDCE_UNLOCK(_sc)		mtx_unlock(&(_sc)->sc_mtx)
-#define	CDCE_LOCK_ASSERT(_sc, t)	mtx_assert(&(_sc)->sc_mtx, t)
+#define	CDCE_LOCK(_sc)			lockmgr(&(_sc)->sc_lock, LK_EXCLUSIVE)
+#define	CDCE_UNLOCK(_sc)		lockmgr(&(_sc)->sc_lock, LK_RELEASE)
+#define	CDCE_LOCK_ASSERT(_sc, t)	KKASSERT(lockowned(&(_sc)->sc_lock))
 #endif					/* _USB_IF_CDCEREG_H_ */

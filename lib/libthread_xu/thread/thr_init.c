@@ -34,13 +34,12 @@
 #include "namespace.h"
 #include <sys/param.h>
 #include <sys/signalvar.h>
-
 #include <sys/ioctl.h>
 #include <sys/sysctl.h>
 #include <sys/time.h>
 #include <sys/ttycom.h>
 #include <sys/mman.h>
-
+#include <stdio.h>
 #include <fcntl.h>
 #include <paths.h>
 #include <pthread.h>
@@ -52,6 +51,32 @@
 
 #include "libc_private.h"
 #include "thr_private.h"
+
+/* Default thread attributes: */
+struct pthread_attr _pthread_attr_default = {
+	.sched_policy = SCHED_OTHER,
+	.sched_inherit = 0,
+	.prio = THR_DEFAULT_PRIORITY,
+	.suspend = THR_CREATE_RUNNING,
+	.flags = PTHREAD_SCOPE_SYSTEM,
+	.stackaddr_attr = NULL,
+	.stacksize_attr = THR_STACK_DEFAULT,
+	.guardsize_attr = 0
+};
+
+/* Default mutex attributes: */
+struct pthread_mutex_attr _pthread_mutexattr_default = {
+	.m_type = PTHREAD_MUTEX_DEFAULT,
+	.m_protocol = PTHREAD_PRIO_NONE,
+	.m_ceiling = 0,
+	.m_flags = 0
+};
+
+/* Default condition variable attributes: */
+struct pthread_cond_attr _pthread_condattr_default = {
+	.c_pshared = PTHREAD_PROCESS_PRIVATE,
+	.c_clockid = CLOCK_REALTIME
+};
 
 /* thr_attr.c */
 STATIC_LIB_REQUIRE(_pthread_attr_init);
@@ -81,10 +106,18 @@ STATIC_LIB_REQUIRE(_pthread_exit);
 /* thr_fork.c */
 STATIC_LIB_REQUIRE(_pthread_atfork);
 STATIC_LIB_REQUIRE(_fork);
+/* thr_affinity.c */
+STATIC_LIB_REQUIRE(_pthread_getaffinity_np);
+/* thr_getcpuclockid.c */
+STATIC_LIB_REQUIRE(_pthread_getcpuclockid);
 /* thr_getprio.c */
 STATIC_LIB_REQUIRE(_pthread_getprio);
 /* thr_getschedparam.c */
 STATIC_LIB_REQUIRE(_pthread_getschedparam);
+/* thr_getthreadid_np.c */
+STATIC_LIB_REQUIRE(_pthread_getthreadid_np);
+/* thr_info.c */
+STATIC_LIB_REQUIRE(_pthread_get_name_np);
 /* thr_info.c */
 STATIC_LIB_REQUIRE(_pthread_set_name_np);
 /* thr_init.c */
@@ -119,6 +152,8 @@ STATIC_LIB_REQUIRE(_pthread_rwlockattr_init);
 STATIC_LIB_REQUIRE(_pthread_self);
 /* thr_sem.c */
 STATIC_LIB_REQUIRE(_sem_init);
+/* thr_affinity.c */
+STATIC_LIB_REQUIRE(_pthread_setaffinity_np);
 /* thr_setprio.c */
 STATIC_LIB_REQUIRE(_pthread_setprio);
 /* thr_setschedparam.c */
@@ -144,7 +179,6 @@ STATIC_LIB_REQUIRE(_pthread_yield);
 
 char		*_usrstack;
 struct pthread	*_thr_initial;
-int		_thread_scope_system;
 static void	*_thr_main_redzone;
 
 pid_t		_thr_pid;
@@ -156,13 +190,13 @@ int		_thr_page_size;
 static void	init_private(void);
 static void	_libpthread_uninit(void);
 static void	init_main_thread(struct pthread *thread);
-static int	init_once = 0;
 
 void	_thread_init(void) __attribute__ ((constructor));
 void
 _thread_init(void)
 {
 	_libpthread_init(NULL);
+	_libc_thr_init();
 }
 
 void	_thread_uninit(void) __attribute__ ((destructor));
@@ -256,6 +290,9 @@ _libpthread_init(struct pthread *curthread)
 		__sys_sigprocmask(SIG_SETMASK, &oldset, NULL);
 		if (td_eventismember(&_thread_event_mask, TD_CREATE))
 			_thr_report_creation(curthread, curthread);
+		_thr_rtld_init();
+		_thr_malloc_init();
+		_thr_sem_init();
 	}
 }
 
@@ -318,7 +355,8 @@ init_main_thread(struct pthread *thread)
 	thread->magic = THR_MAGIC;
 
 	thread->cancelflags = PTHREAD_CANCEL_ENABLE | PTHREAD_CANCEL_DEFERRED;
-	thread->name = strdup("initial thread");
+	thread->name = __malloc(16);
+	snprintf(thread->name, 16, "initial thread");
 
 	/* Default the priority of the initial thread: */
 	thread->base_priority = THR_DEFAULT_PRIORITY;
@@ -337,21 +375,15 @@ init_main_thread(struct pthread *thread)
 static void
 init_private(void)
 {
+	static int init_once = 0;
 	size_t len;
 	int mib[2];
-
-	_thr_umtx_init(&_mutex_static_lock);
-	_thr_umtx_init(&_cond_static_lock);
-	_thr_umtx_init(&_rwlock_static_lock);
-	_thr_umtx_init(&_keytable_lock);
-	_thr_umtx_init(&_thr_atfork_lock);
-	_thr_umtx_init(&_thr_event_lock);
-	_thr_spinlock_init();
-	_thr_list_init();
 
 	/*
 	 * Avoid reinitializing some things if they don't need to be,
 	 * e.g. after a fork().
+	 *
+	 * NOTE: _thr_atfork_*list must remain intact after a fork.
 	 */
 	if (init_once == 0) {
 		/* Find the stack top */
@@ -363,18 +395,19 @@ init_private(void)
 		_thr_page_size = getpagesize();
 		_thr_guard_default = _thr_page_size;
 		_pthread_attr_default.guardsize_attr = _thr_guard_default;
-		
 		TAILQ_INIT(&_thr_atfork_list);
-#ifdef SYSTEM_SCOPE_ONLY
-		_thread_scope_system = 1;
-#else
-		if (getenv("LIBPTHREAD_SYSTEM_SCOPE") != NULL)
-			_thread_scope_system = 1;
-		else if (getenv("LIBPTHREAD_PROCESS_SCOPE") != NULL)
-			_thread_scope_system = -1;
-#endif
+		TAILQ_INIT(&_thr_atfork_kern_list);
+		init_once = 1;
 	}
-	init_once = 1;
+
+	_thr_umtx_init(&_mutex_static_lock);
+	_thr_umtx_init(&_cond_static_lock);
+	_thr_umtx_init(&_rwlock_static_lock);
+	_thr_umtx_init(&_keytable_lock);
+	_thr_umtx_init(&_thr_atfork_lock);
+	_thr_umtx_init(&_thr_event_lock);
+	_thr_spinlock_init();
+	_thr_list_init();
 }
 
 __strong_reference(_pthread_init_early, pthread_init_early);

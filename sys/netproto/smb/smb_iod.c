@@ -260,6 +260,8 @@ smb_iod_sendrq(struct smbiod *iod, struct smb_rq *rqp)
 		*rqp->sr_rqtid = htole16(ssp ? ssp->ss_tid : SMB_TID_UNKNOWN);
 		*rqp->sr_rquid = htole16(vcp ? vcp->vc_smbuid : 0);
 		mb_fixhdr(&rqp->sr_rq);
+		if (vcp->vc_hflags2 & SMB_FLAGS2_SECURITY_SIGNATURE)
+			smb_rq_sign(rqp);
 	}
 	if (rqp->sr_sendcnt++ > 5) {
 		rqp->sr_flags |= SMBR_RESTART;
@@ -272,7 +274,7 @@ smb_iod_sendrq(struct smbiod *iod, struct smb_rq *rqp)
 	}
 	SMBSDEBUG("M:%04x, P:%04x, U:%04x, T:%04x\n", rqp->sr_mid, 0, 0, 0);
 	m_dumpm(rqp->sr_rq.mb_top);
-	m = m_copym(rqp->sr_rq.mb_top, 0, M_COPYALL, MB_WAIT);
+	m = m_copym(rqp->sr_rq.mb_top, 0, M_COPYALL, M_WAITOK);
 	error = rqp->sr_lerror = m ? SMB_TRAN_SEND(vcp, m, td) : ENOBUFS;
 	if (error == 0) {
 		getnanotime(&rqp->sr_timesent);
@@ -572,9 +574,9 @@ smb_iod_sendall(struct smbiod *iod)
 			break;
 		    case SMBRQ_SENT:
 			SMB_TRAN_GETPARAM(vcp, SMBTP_TIMEOUT, &tstimeout);
-			timespecadd(&tstimeout, &tstimeout);
+			timespecadd(&tstimeout, &tstimeout, &tstimeout);
 			getnanotime(&ts);
-			timespecsub(&ts, &tstimeout);
+			timespecsub(&ts, &tstimeout, &ts);
 			if (timespeccmp(&ts, &rqp->sr_timesent, >)) {
 				smb_iod_rqprocessed(rqp, ETIMEDOUT);
 			}
@@ -645,7 +647,7 @@ smb_iod_main(struct smbiod *iod)
 #if 0
 	if (iod->iod_state == SMBIOD_ST_VCACTIVE) {
 		getnanotime(&tsnow);
-		timespecsub(&tsnow, &iod->iod_pingtimo);
+		timespecsub(&tsnow, &iod->iod_pingtimo, &tsnow);
 		if (timespeccmp(&tsnow, &iod->iod_lastrqsent, >)) {
 			smb_smb_echo(vcp, &iod->iod_scred);
 		}
@@ -659,7 +661,7 @@ smb_iod_main(struct smbiod *iod)
 #define	kthread_create_compat	smb_kthread_create
 #define kthread_exit_compat	smb_kthread_exit
 
-void
+static void
 smb_iod_thread(void *arg)
 {
 	struct smbiod *iod = arg;

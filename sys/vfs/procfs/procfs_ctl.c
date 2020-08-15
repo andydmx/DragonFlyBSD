@@ -34,7 +34,6 @@
  *
  * From:
  * $FreeBSD: src/sys/miscfs/procfs/procfs_ctl.c,v 1.20.2.2 2002/01/22 17:22:59 nectar Exp $
- * $DragonFly: src/sys/vfs/procfs/procfs_ctl.c,v 1.16 2007/03/12 21:08:15 corecode Exp $
  */
 
 #include <sys/param.h>
@@ -47,8 +46,6 @@
 #include <vfs/procfs/procfs.h>
 
 #include <sys/signal2.h>
-#include <sys/thread2.h>
-#include <sys/mplock2.h>
 #include <sys/spinlock2.h>
 
 #include <vm/vm.h>
@@ -152,13 +149,12 @@ procfs_control(struct proc *curp, struct lwp *lp, int op)
 		 * Stop the target.
 		 */
 		p->p_flags |= P_TRACED;
-		faultin(p);
 		p->p_xstat = 0;		/* XXX ? */
 		if (p->p_pptr != curp) {
 			p->p_oppid = p->p_pptr->p_pid;
 			proc_reparent(p, curp);
 		}
-		proc_stop(p);
+		proc_stop(p, SSTOP);
 		return (0);
 	}
 
@@ -208,7 +204,7 @@ procfs_control(struct proc *curp, struct lwp *lp, int op)
 
 		/* remove pending SIGTRAP, else the process will die */
 		spin_lock(&lp->lwp_spin);
-		lwp_delsig(lp, SIGTRAP);
+		lwp_delsig(lp, SIGTRAP, 1);
 		spin_unlock(&lp->lwp_spin);
 
 		/* give process back to original parent */
@@ -281,7 +277,7 @@ procfs_control(struct proc *curp, struct lwp *lp, int op)
 	 * that might be in progress.
 	 */
 	if (p->p_stat == SSTOP)
-		proc_unstop(p);
+		proc_unstop(p, SSTOP);
 	return (0);
 }
 
@@ -331,7 +327,7 @@ procfs_doctl(struct proc *curp, struct lwp *lp, struct pfsnode *pfs,
 				 * Make the process runnable but do not
 				 * break its tsleep.
 				 */
-				proc_unstop(p);
+				proc_unstop(p, SSTOP);
 			} else {
 				ksignal(p, nm->nm_val);
 			}

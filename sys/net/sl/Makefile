@@ -4,9 +4,9 @@
 KMOD=   if_sl
 SRCS=   if_sl.c slcompress.c opt_inet.h use_sl.h
 
-NSL?=		2
+NSL?=		4
 
-CFLAGS+=	-DINET
+KCFLAGS+=	-DINET
 
 .if !defined(BUILDING_WITH_KERNEL)
 opt_inet.h:

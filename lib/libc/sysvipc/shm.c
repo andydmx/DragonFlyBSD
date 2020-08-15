@@ -33,6 +33,7 @@
 #include <sys/queue.h>
 #include <sys/mman.h>
 #include <sys/shm.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <errno.h>
@@ -48,7 +49,7 @@
 #include "sysvipc_shm.h"
 #include "sysvipc_hash.h"
 
-#define SYSV_MUTEX_LOCK(x)		if (__isthreaded) _pthread_mutex_lock(x)
+#define SYSV_MUTEX_LOCK(x)	if (__isthreaded) _pthread_mutex_lock(x)
 #define SYSV_MUTEX_UNLOCK(x)	if (__isthreaded) _pthread_mutex_unlock(x)
 #define SYSV_MUTEX_DESTROY(x)	if (__isthreaded) _pthread_mutex_destroy(x)
 
@@ -62,7 +63,8 @@ extern int daemon_fd;
 extern struct sem_undo *undos;
 
 static int
-shminit(void) {
+shminit(void)
+{
 	if (shmres) {
 		errno = EPERM;
 		return (-1);
@@ -85,7 +87,8 @@ out_resources:
 }
 
 /*static int
-shmexit(void) {
+shmexit(void)
+{
 	if (!shmres)
 		return -EPERM;
 
@@ -98,7 +101,8 @@ shmexit(void) {
 
 /* Init sysv ipc resources and those used for shared memory. */
 static int
-shmcheck(void) {
+shmcheck(void)
+{
 	int ret;
 
 	/* Init sysv resources. */
@@ -112,7 +116,8 @@ shmcheck(void) {
 
 /* Check if sysv ipc resources are initialized. */
 static int
-is_shm_started(void) {
+is_shm_started(void)
+{
 	if (!is_sysvinit())
 		return (0);
 	if (!shmres)
@@ -132,7 +137,8 @@ is_shm_started(void) {
  * The undo segment is used for sem ops with UNDO flag set.
  */
 int
-_shmget(key_t key, size_t size, int shmflg, int type) {
+_shmget(key_t key, size_t size, int shmflg, int type)
+{
 	struct shmget_msg msg;
 	struct shm_data *data;
 	int shmid, fd;
@@ -198,12 +204,14 @@ done:
 }
 
 int
-sysvipc_shmget(key_t key, size_t size, int shmflg) {
+sysvipc_shmget(key_t key, size_t size, int shmflg)
+{
 	return (_shmget(key, size, shmflg, SHMGET));
 }
 
 void *
-sysvipc_shmat(int shmid, const void *shmaddr, int shmflg) {
+sysvipc_shmat(int shmid, const void *shmaddr, int shmflg)
+{
 	struct shmat_msg msg;
 	void *addr = NULL;
 	int error;
@@ -237,8 +245,8 @@ sysvipc_shmat(int shmid, const void *shmaddr, int shmflg) {
 	flags = MAP_SHARED;
 	if (shmaddr) {
 		if (shmflg & SHM_RND) {
-			addr = (void *)((vm_offset_t)shmaddr & ~(SHMLBA-1));
-		} else if (((vm_offset_t)shmaddr & (SHMLBA-1)) == 0) {
+			addr = (void *)(rounddown2((uintptr_t)shmaddr, SHMLBA));
+		} else if (((uintptr_t)shmaddr & (SHMLBA-1)) == 0) {
 			addr = __DECONST(void *, shmaddr);
 		} else {
 			errno = EINVAL;
@@ -278,7 +286,8 @@ done:
 
 /* Remove a sysv ipc resource. */
 static
-void shmremove(int shmid) {
+void shmremove(int shmid)
+{
 	struct shm_data *data;
 	data = _hash_remove(shmres, shmid);
 
@@ -289,7 +298,8 @@ void shmremove(int shmid) {
 }
 
 int
-sysvipc_shmctl(int shmid, int cmd, struct shmid_ds *buf) {
+sysvipc_shmctl(int shmid, int cmd, struct shmid_ds *buf)
+{
 	int size, ret;
 	struct shmctl_msg *msg;
 
@@ -339,7 +349,8 @@ done:
  * occurs and the daemon doesn't know that the process is attaced.
  */
 static int
-_shmdt(const void *shmaddr, int send_to_daemon) {
+_shmdt(const void *shmaddr, int send_to_daemon)
+{
 	int ret;
 	size_t size;
 	struct shm_data *data;
@@ -377,12 +388,14 @@ done:
 }
 
 int
-sysvipc_shmdt(const void *shmaddr) {
+sysvipc_shmdt(const void *shmaddr)
+{
 	return (_shmdt(shmaddr, 1));
 }
 
 void
-shmchild(void) {
+shmchild(void)
+{
 	int i;
 	struct entries_list *list;
 	struct hashentry *tmp, *ttmp;
@@ -443,8 +456,9 @@ shmchild(void) {
  * It is used in order to protect data against its removal
  * by another thread.
  */
-struct shm_data*
-get_shmdata(int id, int to_remove, int shm_access) {
+struct shm_data *
+get_shmdata(int id, int to_remove, int shm_access)
+{
 	struct shm_data *data = NULL;
 
 	SYSV_MUTEX_LOCK(&lock_resources);
@@ -507,7 +521,8 @@ done:
 
 /* Set the shm_access type (IPC_R, IPC_W) for sem/msg. */
 int
-set_shmdata_access(int id, int shm_access) {
+set_shmdata_access(int id, int shm_access)
+{
 	struct shm_data *data;
 	int ret = -1;
 

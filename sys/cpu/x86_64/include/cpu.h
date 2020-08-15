@@ -13,11 +13,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -63,7 +59,6 @@
 #define cpu_setstack(lp, ap)		((lp)->lwp_md.md_regs[SP] = (ap))
 
 #define CLKF_INTR(intr_nest)	((intr_nest) > 1)
-#define CLKF_INTR_TD(td)	((td)->td_flags & TDF_INTTHREAD)
 #define	CLKF_PC(framep)		((framep)->if_rip)
 
 /*
@@ -82,6 +77,12 @@
     atomic_set_int(&mycpu->gd_reqflags, RQF_AST_OWEUPC)
 #define	need_ipiq()		\
     atomic_set_int(&mycpu->gd_reqflags, RQF_IPIQ)
+#define	need_timer()		\
+    atomic_set_int(&mycpu->gd_reqflags, RQF_TIMER)
+#ifdef _KERNEL_VIRTUAL
+#define	need_kqueue()		\
+    atomic_set_int(&mycpu->gd_reqflags, RQF_KQUEUE)
+#endif
 #define	signotify()		\
     atomic_set_int(&mycpu->gd_reqflags, RQF_AST_SIGNAL)
 #define	clear_user_resched()	\
@@ -96,6 +97,11 @@
     (mycpu->gd_reqflags & RQF_AST_LWKT_RESCHED)
 #define	any_resched_wanted()	\
     (mycpu->gd_reqflags & (RQF_AST_LWKT_RESCHED|RQF_AST_USER_RESCHED))
+
+#define any_action_wanted_gd(gd)			\
+    ((gd)->gd_reqflags & (RQF_AST_LWKT_RESCHED |	\
+			  RQF_AST_USER_RESCHED |	\
+			  RQF_IDLECHECK_MASK))
 
 /*
  * CTL_MACHDEP definitions.

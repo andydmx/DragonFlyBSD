@@ -1,13 +1,13 @@
 /*
  * Copyright (c) 2008 The DragonFly Project.  All rights reserved.
- * 
+ *
  * This code is derived from software contributed to The DragonFly Project
  * by Matthew Dillon <dillon@backplane.com>
- * 
+ *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
  * are met:
- * 
+ *
  * 1. Redistributions of source code must retain the above copyright
  *    notice, this list of conditions and the following disclaimer.
  * 2. Redistributions in binary form must reproduce the above copyright
@@ -17,7 +17,7 @@
  * 3. Neither the name of The DragonFly Project nor the names of its
  *    contributors may be used to endorse or promote products derived
  *    from this software without specific, prior written permission.
- * 
+ *
  * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
  * ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
  * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
@@ -38,7 +38,15 @@
 
 #include "hammer.h"
 
-static int hammer_und_rb_compare(hammer_undo_t node1, hammer_undo_t node2);
+static int
+hammer_und_rb_compare(hammer_undo_t node1, hammer_undo_t node2)
+{
+        if (node1->offset < node2->offset)
+                return(-1);
+        if (node1->offset > node2->offset)
+                return(1);
+        return(0);
+}
 
 RB_GENERATE2(hammer_und_rb_tree, hammer_undo, rb_node,
              hammer_und_rb_compare, hammer_off_t, offset);
@@ -52,19 +60,16 @@ hammer_undo_lookup(hammer_mount_t hmp, hammer_off_t zone3_off, int *errorp)
 	hammer_volume_t root_volume;
 	hammer_blockmap_t undomap __debugvar;
 	hammer_off_t result_offset;
-	int i;
 
-	KKASSERT((zone3_off & HAMMER_OFF_ZONE_MASK) == HAMMER_ZONE_UNDO);
+	KKASSERT(hammer_is_zone_undo(zone3_off));
 	root_volume = hammer_get_root_volume(hmp, errorp);
 	if (*errorp)
 		return(0);
 	undomap = &hmp->blockmap[HAMMER_ZONE_UNDO_INDEX];
-	KKASSERT(HAMMER_ZONE_DECODE(undomap->alloc_offset) == HAMMER_ZONE_UNDO_INDEX);
+	KKASSERT(hammer_is_zone_undo(undomap->alloc_offset));
 	KKASSERT(zone3_off < undomap->alloc_offset);
 
-	i = (zone3_off & HAMMER_OFF_SHORT_MASK) / HAMMER_LARGEBLOCK_SIZE;
-	result_offset = root_volume->ondisk->vol0_undo_array[i] +
-			(zone3_off & HAMMER_LARGEBLOCK_MASK64);
+	result_offset = hammer_xlate_to_undo(root_volume->ondisk, zone3_off);
 
 	hammer_rel_volume(root_volume, 0);
 	return(result_offset);
@@ -124,12 +129,12 @@ hammer_generate_undo(hammer_transaction_t trans,
 	undomap = &hmp->blockmap[HAMMER_ZONE_UNDO_INDEX];
 
 	/* no undo recursion */
-	hammer_modify_volume(NULL, root_volume, NULL, 0);
+	hammer_modify_volume_noundo(NULL, root_volume);
 	hammer_lock_ex(&hmp->undo_lock);
 
 	/* undo had better not roll over (loose test) */
 	if (hammer_undo_space(trans) < len + HAMMER_BUFSIZE*3)
-		panic("hammer: insufficient undo FIFO space!");
+		hpanic("insufficient UNDO/REDO FIFO space for undo!");
 
 	/*
 	 * Loop until the undo for the entire range has been laid down.
@@ -139,10 +144,8 @@ hammer_generate_undo(hammer_transaction_t trans,
 		 * Fetch the layout offset in the UNDO FIFO, wrap it as
 		 * necessary.
 		 */
-		if (undomap->next_offset == undomap->alloc_offset) {
-			undomap->next_offset =
-				HAMMER_ZONE_ENCODE(HAMMER_ZONE_UNDO_INDEX, 0);
-		}
+		if (undomap->next_offset == undomap->alloc_offset)
+			undomap->next_offset = HAMMER_ENCODE_UNDO(0);
 		next_offset = undomap->next_offset;
 
 		/*
@@ -151,13 +154,15 @@ hammer_generate_undo(hammer_transaction_t trans,
 		 */
 		if ((next_offset & HAMMER_BUFMASK) == 0) {
 			undo = hammer_bnew(hmp, next_offset, &error, &buffer);
-			hammer_format_undo(undo, hmp->undo_seqno ^ 0x40000000);
+			hammer_format_undo(hmp, undo,
+					   hmp->undo_seqno ^ 0x40000000);
 		} else {
 			undo = hammer_bread(hmp, next_offset, &error, &buffer);
 		}
 		if (error)
 			break;
-		hammer_modify_buffer(NULL, buffer, NULL, 0);
+		/* no undo recursion */
+		hammer_modify_buffer_noundo(NULL, buffer);
 
 		/*
 		 * Calculate how big a media structure fits up to the next
@@ -210,14 +215,13 @@ hammer_generate_undo(hammer_transaction_t trans,
 		 */
 		if (n > len) {
 			n = len;
-			bytes = ((n + HAMMER_HEAD_ALIGN_MASK) &
-				 ~HAMMER_HEAD_ALIGN_MASK) +
+			bytes = HAMMER_HEAD_DOALIGN(n) +
 				(int)sizeof(struct hammer_fifo_undo) +
 				(int)sizeof(struct hammer_fifo_tail);
 		}
 		if (hammer_debug_general & 0x0080) {
-			kprintf("undo %016llx %d %d\n",
-				(long long)next_offset, bytes, n);
+			hdkprintf("undo %016jx %d %d\n",
+				(intmax_t)next_offset, bytes, n);
 		}
 
 		undo->head.hdr_signature = HAMMER_HEAD_SIGNATURE;
@@ -235,8 +239,7 @@ hammer_generate_undo(hammer_transaction_t trans,
 		tail->tail_size = bytes;
 
 		KKASSERT(bytes >= sizeof(undo->head));
-		undo->head.hdr_crc = crc32(undo, HAMMER_FIFO_HEAD_CRCOFF) ^
-			     crc32(&undo->head + 1, bytes - sizeof(undo->head));
+		hammer_crc_set_fifo_head(hmp->version, &undo->head, bytes);
 		undomap->next_offset += bytes;
 		hammer_stats_undo += bytes;
 
@@ -299,7 +302,7 @@ hammer_generate_undo(hammer_transaction_t trans,
  * NOTE: Also used by the REDO code.
  */
 void
-hammer_format_undo(void *base, u_int32_t seqno)
+hammer_format_undo(hammer_mount_t hmp, void *base, uint32_t seqno)
 {
 	hammer_fifo_head_t head;
 	hammer_fifo_tail_t tail;
@@ -322,8 +325,7 @@ hammer_format_undo(void *base, u_int32_t seqno)
 		tail->tail_type = HAMMER_HEAD_TYPE_DUMMY;
 		tail->tail_size = bytes;
 
-		head->hdr_crc = crc32(head, HAMMER_FIFO_HEAD_CRCOFF) ^
-			     crc32(head + 1, bytes - sizeof(*head));
+		hammer_crc_set_fifo_head(hmp->version, head, bytes);
 	}
 }
 
@@ -345,7 +347,7 @@ hammer_upgrade_undo_4(hammer_transaction_t trans)
 	hammer_fifo_head_t head;
 	hammer_fifo_tail_t tail;
 	hammer_off_t next_offset;
-	u_int32_t seqno;
+	uint32_t seqno;
 	int error;
 	int bytes;
 
@@ -355,12 +357,12 @@ hammer_upgrade_undo_4(hammer_transaction_t trans)
 
 	/* no undo recursion */
 	hammer_lock_ex(&hmp->undo_lock);
-	hammer_modify_volume(NULL, root_volume, NULL, 0);
+	hammer_modify_volume_noundo(NULL, root_volume);
 
 	/*
 	 * Adjust the in-core undomap and the on-disk undomap.
 	 */
-	next_offset = HAMMER_ZONE_ENCODE(HAMMER_ZONE_UNDO_INDEX, 0);
+	next_offset = HAMMER_ENCODE_UNDO(0);
 	undomap = &hmp->blockmap[HAMMER_ZONE_UNDO_INDEX];
 	undomap->next_offset = next_offset;
 	undomap->first_offset = next_offset;
@@ -380,7 +382,7 @@ hammer_upgrade_undo_4(hammer_transaction_t trans)
 		head = hammer_bnew(hmp, next_offset, &error, &buffer);
 		if (error)
 			break;
-		hammer_modify_buffer(NULL, buffer, NULL, 0);
+		hammer_modify_buffer_noundo(NULL, buffer);
 		tail = (void *)((char *)head + bytes - sizeof(*tail));
 
 		head->hdr_signature = HAMMER_HEAD_SIGNATURE;
@@ -394,8 +396,7 @@ hammer_upgrade_undo_4(hammer_transaction_t trans)
 		tail->tail_type = HAMMER_HEAD_TYPE_DUMMY;
 		tail->tail_size = bytes;
 
-		head->hdr_crc = crc32(head, HAMMER_FIFO_HEAD_CRCOFF) ^
-			     crc32(head + 1, bytes - sizeof(*head));
+		hammer_crc_set_fifo_head(hmp->version, head, bytes);
 		hammer_modify_buffer_done(buffer);
 
 		hammer_stats_undo += bytes;
@@ -407,7 +408,7 @@ hammer_upgrade_undo_4(hammer_transaction_t trans)
 	 * The sequence number will be the next sequence number to lay down.
 	 */
 	hmp->undo_seqno = seqno;
-	kprintf("version upgrade seqno start %08x\n", seqno);
+	hmkprintf(hmp, "version upgrade seqno start %08x\n", seqno);
 
 	hammer_modify_volume_done(root_volume);
 	hammer_unlock(&hmp->undo_lock);
@@ -489,9 +490,9 @@ hammer_undo_used(hammer_transaction_t trans)
 		bytes = cundomap->next_offset - dundomap->first_offset;
 	} else {
 		bytes = cundomap->alloc_offset - dundomap->first_offset +
-		        (cundomap->next_offset & HAMMER_OFF_LONG_MASK);
+			HAMMER_OFF_LONG_ENCODE(cundomap->next_offset);
 	}
-	max_bytes = cundomap->alloc_offset & HAMMER_OFF_SHORT_MASK;
+	max_bytes = HAMMER_OFF_SHORT_ENCODE(cundomap->alloc_offset);
 	KKASSERT(bytes <= max_bytes);
 	return(bytes);
 }
@@ -506,7 +507,7 @@ hammer_undo_space(hammer_transaction_t trans)
 	int64_t max_bytes;
 
 	rootmap = &trans->hmp->blockmap[HAMMER_ZONE_UNDO_INDEX];
-	max_bytes = rootmap->alloc_offset & HAMMER_OFF_SHORT_MASK;
+	max_bytes = HAMMER_OFF_SHORT_ENCODE(rootmap->alloc_offset);
 	return(max_bytes - hammer_undo_used(trans));
 }
 
@@ -517,7 +518,7 @@ hammer_undo_max(hammer_mount_t hmp)
 	int64_t max_bytes;
 
 	rootmap = &hmp->blockmap[HAMMER_ZONE_UNDO_INDEX];
-	max_bytes = rootmap->alloc_offset & HAMMER_OFF_SHORT_MASK;
+	max_bytes = HAMMER_OFF_SHORT_ENCODE(rootmap->alloc_offset);
 
 	return(max_bytes);
 }
@@ -535,18 +536,7 @@ hammer_undo_reclaim(hammer_io_t io)
 
 	undomap = &io->hmp->blockmap[HAMMER_ZONE_UNDO_INDEX];
 	next_offset = undomap->next_offset & ~HAMMER_BUFMASK64;
-	if (((struct hammer_buffer *)io)->zoneX_offset == next_offset)
+	if (HAMMER_ITOB(io)->zoneX_offset == next_offset)
 		return(0);
 	return(1);
 }
-
-static int
-hammer_und_rb_compare(hammer_undo_t node1, hammer_undo_t node2)
-{
-        if (node1->offset < node2->offset)
-                return(-1);
-        if (node1->offset > node2->offset)
-                return(1);
-        return(0);
-}
-

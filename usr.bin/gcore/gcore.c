@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 1992, 1993
+ * Copyright (c) 1992, 1993, 2019
  *	The Regents of the University of California.  All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -29,7 +29,6 @@
  * @(#) Copyright (c) 1992, 1993 The Regents of the University of California.  All rights reserved.
  * @(#)gcore.c	8.2 (Berkeley) 9/23/93
  * $FreeBSD: src/usr.bin/gcore/gcore.c,v 1.15.2.2 2001/08/17 20:56:22 mikeh Exp $
- * $DragonFly: src/usr.bin/gcore/gcore.c,v 1.11 2007/02/25 23:07:08 corecode Exp $
  */
 
 /*
@@ -43,7 +42,6 @@
  * Engineering group at Lawrence Berkeley Laboratory under DARPA
  * contract BG 91-66 and contributed to Berkeley.
  */
-#include <sys/user.h>
 #include <sys/param.h>
 #include <sys/time.h>
 #include <sys/stat.h>
@@ -52,8 +50,8 @@
 
 #include <machine/vmparam.h>
 
-#include <a.out.h>
 #include <err.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <kvm.h>
 #include <limits.h>
@@ -72,24 +70,56 @@ static void	usage(void) __dead2;
 kvm_t *kd;
 
 static pid_t pid;
+ssize_t gcore_seg_limit = -1;
+int gcore_verbose;
 
 int
 main(int argc, char **argv)
 {
-	struct exec exec;
+	void *exec;
 	int ch, cnt, efd, fd, sflag;
 	char *binfile, *corefile;
+	char *eptr;
 	char fname[MAXPATHLEN + 1];
 
 	sflag = 0;
 	corefile = NULL;
-        while ((ch = getopt(argc, argv, "c:s")) != -1) {
+        while ((ch = getopt(argc, argv, "c:l:sv")) != -1) {
                 switch (ch) {
                 case 'c':
 			corefile = optarg;
                         break;
+		case 'l':
+			gcore_seg_limit = strtol(optarg, &eptr, 0);
+			switch(*eptr) {
+			case 0:
+				break;
+			case 't':
+			case 'T':
+				gcore_seg_limit *= 1024;
+				/* fall through */
+			case 'g':
+			case 'G':
+				gcore_seg_limit *= 1024;
+				/* fall through */
+			case 'm':
+			case 'M':
+				gcore_seg_limit *= 1024;
+				/* fall through */
+			case 'k':
+			case 'K':
+				gcore_seg_limit *= 1024;
+				break;
+			default:
+				usage();
+				break;
+			}
+			break;
 		case 's':
 			sflag = 1;
+			break;
+		case 'v':
+			gcore_verbose = 1;
 			break;
 		default:
 			usage();
@@ -119,8 +149,8 @@ main(int argc, char **argv)
 	if (efd < 0)
 		err(1, "%s", binfile);
 
-	cnt = read(efd, &exec, sizeof(exec));
-	if (cnt != sizeof(exec))
+	cnt = read(efd, &exec, sizeof(Elf_Ehdr));
+	if (cnt != sizeof(Elf_Ehdr))
 		errx(1, "%s exec header: %s",
 		    binfile, cnt > 0 ? strerror(EIO) : strerror(errno));
 	if (IS_ELF(*(Elf_Ehdr *)&exec)) {
@@ -129,7 +159,7 @@ main(int argc, char **argv)
 		errx(1, "Invalid executable file");
 
 	if (corefile == NULL) {
-		(void)snprintf(fname, sizeof(fname), "core.%d", pid);
+		snprintf(fname, sizeof(fname), "core.%d", pid);
 		corefile = fname;
 	}
 	fd = open(corefile, O_RDWR|O_CREAT|O_TRUNC, DEFFILEMODE);
@@ -147,7 +177,7 @@ main(int argc, char **argv)
 
 	elf_coredump(fd, pid);
 
-	(void)close(fd);
+	close(fd);
 	exit(0);
 }
 
@@ -168,6 +198,7 @@ restart_target(void)
 void
 usage(void)
 {
-	(void)fprintf(stderr, "usage: gcore [-s] [-c core] [executable] pid\n");
+	fprintf(stderr,
+	    "usage: gcore [-sv] [-c core] [-l seglimit] [executable] pid\n");
 	exit(1);
 }

@@ -17,9 +17,8 @@
 .\" PERFORMANCE OF THIS SOFTWARE.
 .\"
 .\" $FreeBSD: src/lib/libc/net/getnameinfo.3,v 1.25 2007/02/28 21:28:33 bms Exp $
-.\" $DragonFly: src/lib/libc/net/getnameinfo.3,v 1.5 2007/08/18 20:48:47 swildner Exp $
 .\"
-.Dd February 28, 2007
+.Dd February 22, 2018
 .Dt GETNAMEINFO 3
 .Os
 .Sh NAME
@@ -33,8 +32,8 @@
 .In netdb.h
 .Ft int
 .Fo getnameinfo
-.Fa "const struct sockaddr *sa" "socklen_t salen" "char *host"
-.Fa "size_t hostlen" "char *serv" "size_t servlen" "int flags"
+.Fa "const struct sockaddr * restrict sa" "socklen_t salen" "char * restrict host"
+.Fa "size_t hostlen" "char * restrict serv" "size_t servlen" "int flags"
 .Fc
 .Sh DESCRIPTION
 The
@@ -106,7 +105,7 @@ The
 argument is formed by
 .Tn OR Ns 'ing
 the following values:
-.Bl -tag -width "NI_NUMERICHOSTXX"
+.Bl -tag -width ".Dv NI_NUMERICSCOPE"
 .It Dv NI_NOFQDN
 A fully qualified domain name is not required for local hosts.
 The local part of the fully qualified domain name is returned instead.
@@ -120,9 +119,12 @@ If the host name cannot be found in DNS and this flag is set,
 a non-zero error code is returned.
 If the host name is not found and the flag is not set, the
 address is returned in numeric form.
-.It NI_NUMERICSERV
+.It Dv NI_NUMERICSERV
 The service name is returned as a digit string representing the port number.
-.It NI_DGRAM
+.It Dv NI_NUMERICSCOPE
+For IPv6 addresses, scope identifier is returned as a digit string instead
+of its name.
+.It Dv NI_DGRAM
 Specifies that the service being looked up is a datagram
 service, and causes
 .Xr getservbyport 3

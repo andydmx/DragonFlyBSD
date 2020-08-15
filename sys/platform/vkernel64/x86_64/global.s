@@ -24,7 +24,6 @@
  * SUCH DAMAGE.
  *
  * $FreeBSD: src/sys/i386/i386/globals.s,v 1.13.2.1 2000/05/16 06:58:06 dillon Exp $
- * $DragonFly: src/sys/platform/vkernel/i386/global.s,v 1.2 2007/01/05 22:18:18 dillon Exp $
  */
 
 #include <machine/asmacros.h>
@@ -96,3 +95,35 @@
 	.set	gd_ipending,globaldata + GD_IPENDING
 	.set	gd_spending,globaldata + GD_SPENDING
 	.set	gd_cnt,globaldata + GD_CNT
+
+	/*
+	 * This is a hack to allow us to use builtins for
+	 * these functions.  We need the underscore version
+	 * in situations where a function pointer is required.
+	 */
+	.text
+	.globl	_bzero
+	.globl	_bcopy
+	.globl	_memcmp
+	.globl	_memmove
+	.globl	_memcpy
+
+	ALIGN_TEXT
+_bzero:
+	jmp	bzero
+
+	ALIGN_TEXT
+_bcopy:
+	jmp	bcopy
+
+	ALIGN_TEXT
+_memcmp:
+	jmp	memcmp
+
+	ALIGN_TEXT
+_memmove:
+	jmp	memmove
+
+	ALIGN_TEXT
+_memcpy:
+	jmp	memcpy

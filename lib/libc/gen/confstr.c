@@ -28,7 +28,6 @@
  *
  * @(#)confstr.c	8.1 (Berkeley) 6/4/93
  * $FreeBSD: src/lib/libc/gen/confstr.c,v 1.10 2007/01/09 00:27:53 imp Exp $
- * $DragonFly: src/lib/libc/gen/confstr.c,v 1.5 2006/12/06 16:33:29 tgen Exp $
  */
 
 #include <sys/param.h>
@@ -38,7 +37,6 @@
 #include <paths.h>
 #include <string.h>
 #include <unistd.h>
-
 
 size_t
 confstr(int name, char *buf, size_t len)
@@ -51,25 +49,31 @@ confstr(int name, char *buf, size_t len)
 		p = _PATH_STDPATH;
 		goto docopy;
 
-		/*
-		 * POSIX/SUS ``Programming Environments'' stuff
-		 *
-		 * We don't support more than one programming environment
-		 * on any platform (yet), so we just return the empty
-		 * string for the environment we are compiled for,
-		 * and the string "unsupported programming environment"
-		 * for anything else.  (The Standard says that if these
-		 * values are used on a system which does not support
-		 * this environment -- determined via sysconf() -- then
-		 * the value we return is unspecified.  So, we return
-		 * something which will cause obvious breakage.)
-		 */
+	/*
+	 * POSIX/SUS ``Programming Environments'' stuff
+	 *
+	 * We don't support more than one programming environment
+	 * on any platform (yet), so we just return the empty
+	 * string for the environment we are compiled for,
+	 * and the string "unsupported programming environment"
+	 * for anything else.  (The Standard says that if these
+	 * values are used on a system which does not support
+	 * this environment -- determined via sysconf() -- then
+	 * the value we return is unspecified.  So, we return
+	 * something which will cause obvious breakage.)
+	 */
 	case _CS_POSIX_V6_ILP32_OFF32_CFLAGS:
 	case _CS_POSIX_V6_ILP32_OFF32_LDFLAGS:
 	case _CS_POSIX_V6_ILP32_OFF32_LIBS:
 	case _CS_POSIX_V6_LPBIG_OFFBIG_CFLAGS:
 	case _CS_POSIX_V6_LPBIG_OFFBIG_LDFLAGS:
 	case _CS_POSIX_V6_LPBIG_OFFBIG_LIBS:
+	case _CS_POSIX_V7_ILP32_OFF32_CFLAGS:
+	case _CS_POSIX_V7_ILP32_OFF32_LDFLAGS:
+	case _CS_POSIX_V7_ILP32_OFF32_LIBS:
+	case _CS_POSIX_V7_LPBIG_OFFBIG_CFLAGS:
+	case _CS_POSIX_V7_LPBIG_OFFBIG_LDFLAGS:
+	case _CS_POSIX_V7_LPBIG_OFFBIG_LIBS:
 		/*
 		 * These two environments are never supported.
 		 */
@@ -79,6 +83,9 @@ confstr(int name, char *buf, size_t len)
 	case _CS_POSIX_V6_ILP32_OFFBIG_CFLAGS:
 	case _CS_POSIX_V6_ILP32_OFFBIG_LDFLAGS:
 	case _CS_POSIX_V6_ILP32_OFFBIG_LIBS:
+	case _CS_POSIX_V7_ILP32_OFFBIG_CFLAGS:
+	case _CS_POSIX_V7_ILP32_OFFBIG_LDFLAGS:
+	case _CS_POSIX_V7_ILP32_OFFBIG_LIBS:
 		if (sizeof(long) * CHAR_BIT == 32 &&
 		    sizeof(off_t) > sizeof(long))
 			p = "";
@@ -89,6 +96,9 @@ confstr(int name, char *buf, size_t len)
 	case _CS_POSIX_V6_LP64_OFF64_CFLAGS:
 	case _CS_POSIX_V6_LP64_OFF64_LDFLAGS:
 	case _CS_POSIX_V6_LP64_OFF64_LIBS:
+	case _CS_POSIX_V7_LP64_OFF64_CFLAGS:
+	case _CS_POSIX_V7_LP64_OFF64_LDFLAGS:
+	case _CS_POSIX_V7_LP64_OFF64_LIBS:
 		if (sizeof(long) * CHAR_BIT >= 64 &&
 		    sizeof(void *) * CHAR_BIT >= 64 &&
 		    sizeof(int) * CHAR_BIT >= 32 &&
@@ -104,6 +114,14 @@ confstr(int name, char *buf, size_t len)
 			p = "_POSIX_V6_LP64_OFF64";
 		else
 			p = "_POSIX_V6_ILP32_OFFBIG";
+		goto docopy;
+
+	case _CS_POSIX_V7_WIDTH_RESTRICTED_ENVS:
+		/* XXX - should have more complete coverage */
+		if (sizeof(long) * CHAR_BIT >= 64)
+			p = "_POSIX_V7_LP64_OFF64";
+		else
+			p = "_POSIX_V7_ILP32_OFFBIG";
 		goto docopy;
 
 docopy:

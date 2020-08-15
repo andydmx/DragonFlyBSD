@@ -1,18 +1,15 @@
-# The libobjc header conflict between base compilers has been resolved
-# Maximum parallelism can be restored by setting SUBDIR_ORDERED to null
 
-.if !defined(NO_GCC44)
-SUBDIR= gcc44
+# gcc80 is now the default.  See sys.mk for WORLD_ALTCOMPILER default.
+#
+SUBDIR+= gcc80
+
+.if !defined(NO_ALTCOMPILER)
+. if defined(WORLD_ALTCOMPILER) && (${WORLD_ALTCOMPILER} == "all" || ${WORLD_ALTCOMPILER:Mgcc47})
+SUBDIR+= gcc47
+. endif
 .endif
 
-SUBDIR+= gcc47
-
-SUBDIR+= libcryptsetup
-SUBDIR+= libdevmapper
-SUBDIR+= libdialog
-SUBDIR+= libluks
-SUBDIR+= liblvm
-
+SUBDIR+= libcryptsetup libdevmapper libdialog libluks liblvm
 SUBDIR_ORDERED=
 
 .include <bsd.subdir.mk>

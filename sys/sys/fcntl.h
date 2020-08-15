@@ -15,11 +15,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -42,6 +38,7 @@
 #ifndef _SYS_FCNTL_H_
 #define	_SYS_FCNTL_H_
 
+#include <sys/cdefs.h>
 #ifndef _SYS_TYPES_H_
 #include <sys/types.h>
 #endif
@@ -67,20 +64,22 @@
  * FREAD and FWRITE are excluded from the #ifdef _KERNEL so that TIOCFLUSH,
  * which was documented to use FREAD/FWRITE, continues to work.
  */
-#ifndef _POSIX_SOURCE
+#if __BSD_VISIBLE
 #define	FREAD		0x0001
 #define	FWRITE		0x0002
 #endif
 #define	O_NONBLOCK	0x0004		/* no delay */
 #define	O_APPEND	0x0008		/* set append mode */
-#ifndef _POSIX_SOURCE
+#if __BSD_VISIBLE
 #define	O_SHLOCK	0x0010		/* open with shared file lock */
 #define	O_EXLOCK	0x0020		/* open with exclusive file lock */
 #define	O_ASYNC		0x0040		/* signal pgrp when data ready */
 #define	O_FSYNC		0x0080		/* synchronous writes */
-#define	O_NOFOLLOW	0x0100		/* don't follow symlinks */
 #endif
 #define	O_SYNC		0x0080		/* Same as O_FSYNC, but POSIX */
+#if __POSIX_VISIBLE >= 200809
+#define	O_NOFOLLOW	0x0100		/* don't follow symlinks */
+#endif
 #define	O_CREAT		0x0200		/* create if nonexistent */
 #define	O_TRUNC		0x0400		/* truncate to zero length */
 #define	O_EXCL		0x0800		/* error if already exists */
@@ -93,48 +92,53 @@
 /* Defined by POSIX 1003.1; BSD default, but must be distinct from O_RDONLY. */
 #define	O_NOCTTY	0x8000		/* don't assign controlling terminal */
 
+#if __BSD_VISIBLE
 /* Attempt to bypass the buffer cache */
-#define O_DIRECT	0x00010000
-
-#if __BSD_VISIBLE || __POSIX_VISIBLE >= 200809
-#define O_CLOEXEC	0x00020000	/* atomically set FD_CLOEXEC */
+#define	O_DIRECT	0x00010000
 #endif
-#define O_FBLOCKING	0x00040000	/* force blocking I/O */
-#define O_FNONBLOCKING	0x00080000	/* force non-blocking I/O */
-#define O_FAPPEND	0x00100000	/* force append mode for write */
-#define O_FOFFSET	0x00200000	/* force specific offset */
-#define O_FSYNCWRITE	0x00400000	/* force synchronous write */
-#define O_FASYNCWRITE	0x00800000	/* force asynchronous write */
-#define O_FUNBUFFERED	0x01000000	/* force unbuffered (direct) I/O */
-#define O_FBUFFERED	0x02000000	/* force buffered I/O */
-#define O_MAPONREAD	0x04000000	/* memory map read buffer */
 
-#if __BSD_VISIBLE || __POSIX_VISIBLE >= 200809
-#define O_DIRECTORY	0x08000000	/* error if not a directory */
+#if __POSIX_VISIBLE >= 200809
+#define	O_CLOEXEC	0x00020000	/* atomically set FD_CLOEXEC */
+#endif
+#define	O_FBLOCKING	0x00040000	/* force blocking I/O */
+#define	O_FNONBLOCKING	0x00080000	/* force non-blocking I/O */
+#define	O_FAPPEND	0x00100000	/* force append mode for write */
+#define	O_FOFFSET	0x00200000	/* force specific offset */
+#define	O_FSYNCWRITE	0x00400000	/* force synchronous write */
+#define	O_FASYNCWRITE	0x00800000	/* force asynchronous write */
+#if defined(_KERNEL) || defined(_KERNEL_STRUCTURES)
+#define	O_UNUSED24	0x01000000
+#define	O_UNUSED25	0x02000000
+#define	O_UNUSED26	0x04000000
+#endif
+
+#if __POSIX_VISIBLE >= 200809
+#define	O_DIRECTORY	0x08000000	/* error if not a directory */
 #endif
 
 #if defined(_KERNEL) || defined(_KERNEL_STRUCTURES)
-#define FREVOKED	0x10000000	/* revoked by fdrevoke() */
-#define FAPPENDONLY	0x20000000	/* O_APPEND cannot be changed */
-#define FOFFSETLOCK	0x40000000	/* f_offset locked */
-#define FOFFSETWAKE	0x80000000	/* f_offset wakeup */
+#define	FREVOKED	0x10000000	/* revoked by fdrevoke() */
+#define	FAPPENDONLY	0x20000000	/* O_APPEND cannot be changed */
+#define	FOFFSETLOCK	0x40000000	/* f_offset locked */
+#define	FOFFSETWAKE	0x80000000	/* f_offset wakeup */
 #endif
 
-#define O_FMASK		(O_FBLOCKING|O_FNONBLOCKING|O_FAPPEND|O_FOFFSET|\
-			 O_FSYNCWRITE|O_FASYNCWRITE|O_FUNBUFFERED|O_FBUFFERED|\
-			 O_MAPONREAD)
+#define	O_FMASK		(O_FBLOCKING|O_FNONBLOCKING|O_FAPPEND|O_FOFFSET|\
+			 O_FSYNCWRITE|O_FASYNCWRITE)
 
 #ifdef _KERNEL
 /* convert from open() flags to/from fflags; convert O_RD/WR to FREAD/FWRITE */
 #define	FFLAGS(oflags)	((oflags) + 1)
 #define	OFLAGS(fflags)	((fflags) - 1)
 
-/* bits to save after open */
+/*
+ * Bits to save after open from the ap.  Remaining bits are retained.
+ */
 #define	FMASK		(FREAD|FWRITE|FAPPEND|FASYNC|FFSYNC|FNONBLOCK|\
-			 FAPPENDONLY|FREVOKED|O_DIRECT|O_MAPONREAD)
+			 FAPPENDONLY|FREVOKED|O_DIRECT)
 /* bits settable by fcntl(F_SETFL, ...) */
 #define	FCNTLFLAGS	(FAPPEND|FASYNC|FFSYNC|FNONBLOCK|FPOSIXSHM|\
-			 O_DIRECT|O_MAPONREAD)
+			 O_DIRECT)
 #endif
 
 /*
@@ -142,7 +146,7 @@
  * and by fcntl.  We retain the F* names for the kernel f_flag field
  * and for backward compatibility for fcntl.
  */
-#ifndef _POSIX_SOURCE
+#if __BSD_VISIBLE
 #define	FAPPEND		O_APPEND	/* kernel/compat */
 #define	FASYNC		O_ASYNC		/* kernel/compat */
 #define	FFSYNC		O_FSYNC		/* kernel */
@@ -157,7 +161,7 @@
  * initial open syscall.  Those bits can thus be given a
  * different meaning for fcntl(2).
  */
-#ifndef _POSIX_SOURCE
+#if __BSD_VISIBLE
 
 /*
  * Set by shm_open(3) to get automatic MAP_ASYNC behavior
@@ -167,14 +171,16 @@
 #define	FPOSIXSHM	O_NOFOLLOW
 #endif
 
+#if __POSIX_VISIBLE >= 200809
 /*
  * Constants used by "at" family of system calls.
  */
-#define AT_FDCWD		0xFFFAFDCD	/* invalid file descriptor */
-#define AT_SYMLINK_NOFOLLOW	1
-#define AT_REMOVEDIR		2
-#define AT_EACCESS		4
-#define AT_SYMLINK_FOLLOW	8
+#define	AT_FDCWD		0xFFFAFDCD	/* invalid file descriptor */
+#define	AT_SYMLINK_NOFOLLOW	1
+#define	AT_REMOVEDIR		2
+#define	AT_EACCESS		4
+#define	AT_SYMLINK_FOLLOW	8
+#endif
 
 /*
  * Constants used for fcntl(2)
@@ -186,15 +192,17 @@
 #define	F_SETFD		2		/* set file descriptor flags */
 #define	F_GETFL		3		/* get file status flags */
 #define	F_SETFL		4		/* set file status flags */
-#ifndef _POSIX_SOURCE
+#if __XSI_VISIBLE || __POSIX_VISIBLE >= 200112
 #define	F_GETOWN	5		/* get SIGIO/SIGURG proc/pgrp */
 #define	F_SETOWN	6		/* set SIGIO/SIGURG proc/pgrp */
 #endif
 #define	F_GETLK		7		/* get record locking information */
 #define	F_SETLK		8		/* set record locking information */
 #define	F_SETLKW	9		/* F_SETLK; wait if blocked */
+#if __BSD_VISIBLE
 #define	F_DUP2FD	10		/* duplicate file descriptor to arg */
-#if __BSD_VISIBLE || __POSIX_VISIBLE >= 200809
+#endif
+#if __POSIX_VISIBLE >= 200809
 #define	F_DUPFD_CLOEXEC	17		/* Like F_DUPFD with FD_CLOEXEC set */
 #endif
 #if __BSD_VISIBLE
@@ -239,7 +247,7 @@ union fcntl_dat {
 #endif /* _KERNEL */
 
 
-#ifndef _POSIX_SOURCE
+#if __BSD_VISIBLE
 /* lock operations for flock(2) */
 #define	LOCK_SH		0x01		/* shared file lock */
 #define	LOCK_EX		0x02		/* exclusive file lock */
@@ -247,19 +255,91 @@ union fcntl_dat {
 #define	LOCK_UN		0x08		/* unlock file */
 #endif
 
-#if !defined(_KERNEL) || defined(_KERNEL_VIRTUAL)
-#include <sys/cdefs.h>
-
-__BEGIN_DECLS
-int	open (const char *, int, ...);
-#if __BSD_VISIBLE || __POSIX_VISIBLE >= 200809
-int	openat (int, const char *, int, ...);
+/* Always ensure that these are consistent with <stdio.h> and <unistd.h>! */
+#ifndef SEEK_SET
+#define	SEEK_SET	0	/* set file offset to offset */
 #endif
-int	creat (const char *, mode_t);
-int	fcntl (int, int, ...);
-#ifndef _POSIX_SOURCE
-int	flock (int, int);
-#endif /* !_POSIX_SOURCE */
+#ifndef SEEK_CUR
+#define	SEEK_CUR	1	/* set file offset to current plus offset */
+#endif
+#ifndef SEEK_END
+#define	SEEK_END	2	/* set file offset to EOF plus offset */
+#endif
+
+/* Always ensure that these are consistent with <stat.h>! */
+#ifndef S_ISUID
+#define	S_ISUID	0004000			/* set user id on execution */
+#endif
+#ifndef S_ISGID
+#define	S_ISGID	0002000			/* set group id on execution */
+#endif
+#ifndef S_IRWXU
+#define	S_IRWXU	0000700			/* RWX mask for owner */
+#endif
+#ifndef S_IRUSR
+#define	S_IRUSR	0000400			/* R for owner */
+#endif
+#ifndef S_IWUSR
+#define	S_IWUSR	0000200			/* W for owner */
+#endif
+#ifndef S_IXUSR
+#define	S_IXUSR	0000100			/* X for owner */
+#endif
+#ifndef S_IRWXG
+#define	S_IRWXG	0000070			/* RWX mask for group */
+#endif
+#ifndef S_IRGRP
+#define	S_IRGRP	0000040			/* R for group */
+#endif
+#ifndef S_IWGRP
+#define	S_IWGRP	0000020			/* W for group */
+#endif
+#ifndef S_IXGRP
+#define	S_IXGRP	0000010			/* X for group */
+#endif
+#ifndef S_IRWXO
+#define	S_IRWXO	0000007			/* RWX mask for other */
+#endif
+#ifndef S_IROTH
+#define	S_IROTH	0000004			/* R for other */
+#endif
+#ifndef S_IWOTH
+#define	S_IWOTH	0000002			/* W for other */
+#endif
+#ifndef S_IXOTH
+#define	S_IXOTH	0000001			/* X for other */
+#endif
+
+#if !defined(_KERNEL) && __POSIX_VISIBLE >= 200112
+/*
+ * Advice to be applied to the file data
+ * For POSIX compliance only. DragonFly does not use this information.
+ */
+#define	POSIX_FADV_NORMAL	0	/* no advice */
+#define	POSIX_FADV_SEQUENTIAL	1	/* expect sequential access */
+#define	POSIX_FADV_RANDOM	2	/* expect random access */
+#define	POSIX_FADV_WILLNEED	3	/* expect access in the near future */
+#define	POSIX_FADV_DONTNEED	4	/* expect no access in the near future */
+#define	POSIX_FADV_NOREUSE	5	/* expect access only once */
+#endif
+
+#if !defined(_KERNEL) || defined(_KERNEL_VIRTUAL)
+__BEGIN_DECLS
+int	open(const char *, int, ...);
+#if __POSIX_VISIBLE >= 200809
+int	openat(int, const char *, int, ...);
+#endif
+int	creat(const char *, mode_t);
+int	fcntl(int, int, ...);
+#if __BSD_VISIBLE
+int	flock(int, int);
+#endif /* __BSD_VISIBLE */
+#if __POSIX_VISIBLE >= 200112
+int	posix_fadvise(int, off_t, off_t, int);
+#if 0 /* XXX missing */
+int	posix_fallocate(int, off_t, off_t);
+#endif
+#endif
 __END_DECLS
 #endif
 

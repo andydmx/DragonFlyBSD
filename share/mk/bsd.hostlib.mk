@@ -1,6 +1,8 @@
-# $DragonFly: src/share/mk/bsd.hostlib.mk,v 1.2 2007/08/25 15:22:30 corecode Exp $
-
 .include <bsd.init.mk>
+
+# Hint HOST_CCVER handling.
+__USE_HOST_CCVER=
+NO_WERROR=
 
 # prefer .s to a .c, add .po, remove stuff not used in the BSD libraries
 # .So used for PIC object files
@@ -8,24 +10,21 @@
 .SUFFIXES: .out .no .c .cc .cpp .cxx .C .y .l
 
 .c.no:
-	${NXCC} ${_${.IMPSRC}_FLAGS} ${NXCFLAGS} -c ${.IMPSRC} -o ${.TARGET}
+	${NXCC} ${_${.IMPSRC}_FLAGS} ${NXCFLAGS:N-flto} -c ${.IMPSRC} -o ${.TARGET}
 	@${NXLD} -o ${.TARGET}.tmp -x -r ${.TARGET}
 	@mv ${.TARGET}.tmp ${.TARGET}
 
 .cc.no .C.no .cpp.no .cxx.no:
-	${NXCXX} ${_${.IMPSRC}_FLAGS} ${NXCXXFLAGS} -c ${.IMPSRC} -o ${.TARGET}
+	${NXCXX} ${_${.IMPSRC}_FLAGS} ${NXCXXFLAGS:N-flto} -c ${.IMPSRC} -o ${.TARGET}
 	@${NXLD} -o ${.TARGET}.tmp -x -r ${.TARGET}
 	@mv ${.TARGET}.tmp ${.TARGET}
 
 all: objwarn
 
 .if defined(LIB) && !empty(LIB)
-OBJS+=  ${SRCS:N*.h:N*.patch:R:S/$/.no/g}
-.for _PATCH in ${SRCS:T:N*.no_obj.patch:N*.h.patch:M*.patch}
-.for _OBJ in ${_PATCH:R:R:S/$/.no/}
-OBJS:=	${OBJS:N${_OBJ}} ${_OBJ}
-.endfor
-.endfor
+. if !empty(SRCS)
+OBJS+=  ${SRCS:N*.h:R:S/$/.no/g}
+. endif
 .endif
 
 .if defined(LIB) && !empty(LIB)

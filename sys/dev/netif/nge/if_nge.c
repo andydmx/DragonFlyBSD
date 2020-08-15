@@ -100,7 +100,6 @@
 #include <sys/serialize.h>
 #include <sys/bus.h>
 #include <sys/rman.h>
-#include <sys/thread2.h>
 
 #include <net/if.h>
 #include <net/ifq_var.h>
@@ -1038,7 +1037,7 @@ nge_newbuf(struct nge_softc *sc, struct nge_desc *c, struct mbuf *m)
 	struct nge_jslot *buf;
 
 	if (m == NULL) {
-		MGETHDR(m_new, MB_DONTWAIT, MT_DATA);
+		MGETHDR(m_new, M_NOWAIT, MT_DATA);
 		if (m_new == NULL) {
 			kprintf("nge%d: no memory for rx list "
 			    "-- packet dropped!\n", sc->nge_unit);
@@ -1241,7 +1240,7 @@ nge_rxeof(struct nge_softc *sc)
 		 * only gigE chip I know of with alignment constraints
 		 * on receive buffers. RX buffers must be 64-bit aligned.
 		 */
-#ifdef __i386__
+#ifdef __x86_64__
 		/*
 		 * By popular demand, ignore the alignment problems
 		 * on the Intel x86 platform. The performance hit
@@ -1253,7 +1252,7 @@ nge_rxeof(struct nge_softc *sc)
 		if (nge_newbuf(sc, cur_rx, NULL) == ENOBUFS) {
 #endif
 			m0 = m_devget(mtod(m, char *) - ETHER_ALIGN,
-			    total_len + ETHER_ALIGN, 0, ifp, NULL);
+				      total_len + ETHER_ALIGN, 0, ifp);
 			nge_newbuf(sc, cur_rx, m);
 			if (m0 == NULL) {
 				kprintf("nge%d: no receive buffers "
@@ -1264,7 +1263,7 @@ nge_rxeof(struct nge_softc *sc)
 			}
 			m_adj(m0, ETHER_ALIGN);
 			m = m0;
-#ifdef __i386__
+#ifdef __x86_64__
 		} else {
 			m->m_pkthdr.rcvif = ifp;
 			m->m_pkthdr.len = m->m_len = total_len;
@@ -1669,7 +1668,7 @@ again:
 				break;
 			}
 
-			m_defragged = m_defrag(m_head, MB_DONTWAIT);
+			m_defragged = m_defrag(m_head, M_NOWAIT);
 			if (m_defragged == NULL) {
 				m_freem(m_head);
 				continue;

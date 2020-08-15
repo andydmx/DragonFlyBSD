@@ -39,7 +39,7 @@
 
 #include <sys/param.h>
 #include <sys/systm.h>
-#include <sys/sysproto.h>
+#include <sys/sysmsg.h>
 #include <sys/event.h>
 #include <sys/filedesc.h>
 #include <sys/filio.h>
@@ -48,10 +48,10 @@
 #include <sys/proc.h>
 #include <sys/signalvar.h>
 #include <sys/socketvar.h>
+#include <sys/malloc.h>
 #include <sys/uio.h>
 #include <sys/kernel.h>
 #include <sys/kern_syscall.h>
-#include <sys/malloc.h>
 #include <sys/mapped_ioctl.h>
 #include <sys/poll.h>
 #include <sys/queue.h>
@@ -67,7 +67,6 @@
 #include <vm/vm_page.h>
 
 #include <sys/file2.h>
-#include <sys/mplock2.h>
 #include <sys/spinlock2.h>
 
 #include <machine/limits.h>
@@ -108,7 +107,7 @@ static struct lwkt_token mioctl_token = LWKT_TOKEN_INITIALIZER(mioctl_token);
 static int 	doselect(int nd, fd_set *in, fd_set *ou, fd_set *ex,
 			 struct timespec *ts, int *res);
 static int	dopoll(int nfds, struct pollfd *fds, struct timespec *ts,
-		       int *res);
+		       int *res, int flags);
 static int	dofileread(int, struct file *, struct uio *, int, size_t *);
 static int	dofilewrite(int, struct file *, struct uio *, int, size_t *);
 
@@ -118,7 +117,7 @@ static int	dofilewrite(int, struct file *, struct uio *, int, size_t *);
  * MPSAFE
  */
 int
-sys_read(struct read_args *uap)
+sys_read(struct sysmsg *sysmsg, const struct read_args *uap)
 {
 	struct thread *td = curthread;
 	struct uio auio;
@@ -138,7 +137,7 @@ sys_read(struct read_args *uap)
 	auio.uio_segflg = UIO_USERSPACE;
 	auio.uio_td = td;
 
-	error = kern_preadv(uap->fd, &auio, 0, &uap->sysmsg_szresult);
+	error = kern_preadv(uap->fd, &auio, 0, &sysmsg->sysmsg_szresult);
 	return(error);
 }
 
@@ -148,7 +147,7 @@ sys_read(struct read_args *uap)
  * MPSAFE
  */
 int
-sys_extpread(struct extpread_args *uap)
+sys_extpread(struct sysmsg *sysmsg, const struct extpread_args *uap)
 {
 	struct thread *td = curthread;
 	struct uio auio;
@@ -173,7 +172,7 @@ sys_extpread(struct extpread_args *uap)
 	if (uap->offset != (off_t)-1)
 		flags |= O_FOFFSET;
 
-	error = kern_preadv(uap->fd, &auio, flags, &uap->sysmsg_szresult);
+	error = kern_preadv(uap->fd, &auio, flags, &sysmsg->sysmsg_szresult);
 	return(error);
 }
 
@@ -183,7 +182,7 @@ sys_extpread(struct extpread_args *uap)
  * MPSAFE
  */
 int
-sys_readv(struct readv_args *uap)
+sys_readv(struct sysmsg *sysmsg, const struct readv_args *uap)
 {
 	struct thread *td = curthread;
 	struct uio auio;
@@ -201,7 +200,7 @@ sys_readv(struct readv_args *uap)
 	auio.uio_segflg = UIO_USERSPACE;
 	auio.uio_td = td;
 
-	error = kern_preadv(uap->fd, &auio, 0, &uap->sysmsg_szresult);
+	error = kern_preadv(uap->fd, &auio, 0, &sysmsg->sysmsg_szresult);
 
 	iovec_free(&iov, aiov);
 	return (error);
@@ -214,7 +213,7 @@ sys_readv(struct readv_args *uap)
  * MPSAFE
  */
 int
-sys_extpreadv(struct extpreadv_args *uap)
+sys_extpreadv(struct sysmsg *sysmsg, const struct extpreadv_args *uap)
 {
 	struct thread *td = curthread;
 	struct uio auio;
@@ -237,7 +236,7 @@ sys_extpreadv(struct extpreadv_args *uap)
 	if (uap->offset != (off_t)-1)
 		flags |= O_FOFFSET;
 
-	error = kern_preadv(uap->fd, &auio, flags, &uap->sysmsg_szresult);
+	error = kern_preadv(uap->fd, &auio, flags, &sysmsg->sysmsg_szresult);
 
 	iovec_free(&iov, aiov);
 	return(error);
@@ -250,13 +249,10 @@ int
 kern_preadv(int fd, struct uio *auio, int flags, size_t *res)
 {
 	struct thread *td = curthread;
-	struct proc *p = td->td_proc;
 	struct file *fp;
 	int error;
 
-	KKASSERT(p);
-
-	fp = holdfp(p->p_fd, fd, FREAD);
+	fp = holdfp(td, fd, FREAD);
 	if (fp == NULL)
 		return (EBADF);
 	if (flags & O_FOFFSET && fp->f_type != DTYPE_VNODE) {
@@ -264,7 +260,8 @@ kern_preadv(int fd, struct uio *auio, int flags, size_t *res)
 	} else {
 		error = dofileread(fd, fp, auio, flags, res);
 	}
-	fdrop(fp);
+	dropfp(td, fd, fp);
+
 	return(error);
 }
 
@@ -309,9 +306,7 @@ dofileread(int fd, struct file *fp, struct uio *auio, int flags, size_t *res)
 		if (error == 0) {
 			ktruio.uio_iov = ktriov;
 			ktruio.uio_resid = len - auio->uio_resid;
-			get_mplock();
 			ktrgenio(td->td_lwp, fd, UIO_READ, &ktruio, error);
-			rel_mplock();
 		}
 		kfree(ktriov, M_TEMP);
 	}
@@ -328,7 +323,7 @@ dofileread(int fd, struct file *fp, struct uio *auio, int flags, size_t *res)
  * MPSAFE
  */
 int
-sys_write(struct write_args *uap)
+sys_write(struct sysmsg *sysmsg, const struct write_args *uap)
 {
 	struct thread *td = curthread;
 	struct uio auio;
@@ -348,7 +343,7 @@ sys_write(struct write_args *uap)
 	auio.uio_segflg = UIO_USERSPACE;
 	auio.uio_td = td;
 
-	error = kern_pwritev(uap->fd, &auio, 0, &uap->sysmsg_szresult);
+	error = kern_pwritev(uap->fd, &auio, 0, &sysmsg->sysmsg_szresult);
 
 	return(error);
 }
@@ -359,7 +354,7 @@ sys_write(struct write_args *uap)
  * MPSAFE
  */
 int
-sys_extpwrite(struct extpwrite_args *uap)
+sys_extpwrite(struct sysmsg *sysmsg, const struct extpwrite_args *uap)
 {
 	struct thread *td = curthread;
 	struct uio auio;
@@ -383,7 +378,7 @@ sys_extpwrite(struct extpwrite_args *uap)
 	flags = uap->flags & O_FMASK;
 	if (uap->offset != (off_t)-1)
 		flags |= O_FOFFSET;
-	error = kern_pwritev(uap->fd, &auio, flags, &uap->sysmsg_szresult);
+	error = kern_pwritev(uap->fd, &auio, flags, &sysmsg->sysmsg_szresult);
 	return(error);
 }
 
@@ -391,7 +386,7 @@ sys_extpwrite(struct extpwrite_args *uap)
  * MPSAFE
  */
 int
-sys_writev(struct writev_args *uap)
+sys_writev(struct sysmsg *sysmsg, const struct writev_args *uap)
 {
 	struct thread *td = curthread;
 	struct uio auio;
@@ -409,7 +404,7 @@ sys_writev(struct writev_args *uap)
 	auio.uio_segflg = UIO_USERSPACE;
 	auio.uio_td = td;
 
-	error = kern_pwritev(uap->fd, &auio, 0, &uap->sysmsg_szresult);
+	error = kern_pwritev(uap->fd, &auio, 0, &sysmsg->sysmsg_szresult);
 
 	iovec_free(&iov, aiov);
 	return (error);
@@ -422,7 +417,7 @@ sys_writev(struct writev_args *uap)
  * MPSAFE
  */
 int
-sys_extpwritev(struct extpwritev_args *uap)
+sys_extpwritev(struct sysmsg *sysmsg, const struct extpwritev_args *uap)
 {
 	struct thread *td = curthread;
 	struct uio auio;
@@ -445,7 +440,7 @@ sys_extpwritev(struct extpwritev_args *uap)
 	if (uap->offset != (off_t)-1)
 		flags |= O_FOFFSET;
 
-	error = kern_pwritev(uap->fd, &auio, flags, &uap->sysmsg_szresult);
+	error = kern_pwritev(uap->fd, &auio, flags, &sysmsg->sysmsg_szresult);
 
 	iovec_free(&iov, aiov);
 	return(error);
@@ -458,13 +453,10 @@ int
 kern_pwritev(int fd, struct uio *auio, int flags, size_t *res)
 {
 	struct thread *td = curthread;
-	struct proc *p = td->td_proc;
 	struct file *fp;
 	int error;
 
-	KKASSERT(p);
-
-	fp = holdfp(p->p_fd, fd, FWRITE);
+	fp = holdfp(td, fd, FWRITE);
 	if (fp == NULL)
 		return (EBADF);
 	else if ((flags & O_FOFFSET) && fp->f_type != DTYPE_VNODE) {
@@ -472,9 +464,9 @@ kern_pwritev(int fd, struct uio *auio, int flags, size_t *res)
 	} else {
 		error = dofilewrite(fd, fp, auio, flags, res);
 	}
-	
-	fdrop(fp);
-	return (error);
+	dropfp(td, fd, fp);
+
+	return(error);
 }
 
 /*
@@ -522,9 +514,7 @@ dofilewrite(int fd, struct file *fp, struct uio *auio, int flags, size_t *res)
 		if (error == 0) {
 			ktruio.uio_iov = ktriov;
 			ktruio.uio_resid = len - auio->uio_resid;
-			get_mplock();
 			ktrgenio(lp, fd, UIO_WRITE, &ktruio, error);
-			rel_mplock();
 		}
 		kfree(ktriov, M_TEMP);
 	}
@@ -541,11 +531,11 @@ dofilewrite(int fd, struct file *fp, struct uio *auio, int flags, size_t *res)
  * MPSAFE
  */
 int
-sys_ioctl(struct ioctl_args *uap)
+sys_ioctl(struct sysmsg *sysmsg, const struct ioctl_args *uap)
 {
 	int error;
 
-	error = mapped_ioctl(uap->fd, uap->com, uap->data, NULL, &uap->sysmsg);
+	error = mapped_ioctl(uap->fd, uap->com, uap->data, NULL, sysmsg);
 	return (error);
 }
 
@@ -586,7 +576,7 @@ mapped_ioctl(int fd, u_long com, caddr_t uspc_data, struct ioctl_map *map,
 	cred = td->td_ucred;
 	memp = NULL;
 
-	fp = holdfp(p->p_fd, fd, FREAD|FWRITE);
+	fp = holdfp(td, fd, FREAD|FWRITE);
 	if (fp == NULL)
 		return(EBADF);
 
@@ -736,7 +726,8 @@ mapped_ioctl(int fd, u_long com, caddr_t uspc_data, struct ioctl_map *map,
 done:
 	if (memp != NULL)
 		kfree(memp, M_IOCTLOPS);
-	fdrop(fp);
+	dropfp(td, fd, fp);
+
 	return(error);
 }
 
@@ -788,9 +779,6 @@ mapped_ioctl_unregister_handler(struct ioctl_map_handler *he)
 	return(error);
 }
 
-static int	nselcoll;	/* Select collisions since boot */
-int	selwait;
-SYSCTL_INT(_kern, OID_AUTO, nselcoll, CTLFLAG_RD, &nselcoll, 0, "");
 static int	nseldebug;
 SYSCTL_INT(_kern, OID_AUTO, nseldebug, CTLFLAG_RW, &nseldebug, 0, "");
 
@@ -800,7 +788,7 @@ SYSCTL_INT(_kern, OID_AUTO, nseldebug, CTLFLAG_RW, &nseldebug, 0, "");
  * MPSAFE
  */
 int
-sys_select(struct select_args *uap)
+sys_select(struct sysmsg *sysmsg, const struct select_args *uap)
 {
 	struct timeval ktv;
 	struct timespec *ktsp, kts;
@@ -823,7 +811,7 @@ sys_select(struct select_args *uap)
 	 * Do real work.
 	 */
 	error = doselect(uap->nd, uap->in, uap->ou, uap->ex, ktsp,
-			 &uap->sysmsg_result);
+			 &sysmsg->sysmsg_result);
 
 	return (error);
 }
@@ -833,7 +821,7 @@ sys_select(struct select_args *uap)
  * Pselect system call.
  */
 int
-sys_pselect(struct pselect_args *uap)
+sys_pselect(struct sysmsg *sysmsg, const struct pselect_args *uap)
 {
 	struct thread *td = curthread;
 	struct lwp *lp = td->td_lwp;
@@ -871,7 +859,7 @@ sys_pselect(struct pselect_args *uap)
 	 * Do real job.
 	 */
 	error = doselect(uap->nd, uap->in, uap->ou, uap->ex, ktsp,
-			 &uap->sysmsg_result);
+			 &sysmsg->sysmsg_result);
 
 	if (uap->sigmask != NULL) {
 		lwkt_gettoken(&lp->lwp_proc->p_token);
@@ -970,9 +958,12 @@ select_copyin(void *arg, struct kevent *kevp, int maxevents, int *events)
 				FD_CLR(fd, fdp);
 				++*events;
 
-				if (nseldebug)
-					kprintf("select fd %d filter %d serial %d\n",
-						fd, filter, skap->lwp->lwp_kqueue_serial);
+				if (nseldebug) {
+					kprintf("select fd %d filter %d "
+					    "serial %ju\n", fd, filter,
+					    (uintmax_t)
+					    skap->lwp->lwp_kqueue_serial);
+				}
 			}
 			++skap->proc_fds;
 			if (*events == maxevents)
@@ -990,7 +981,8 @@ select_copyout(void *arg, struct kevent *kevp, int count, int *res)
 {
 	struct select_kevent_copyin_args *skap;
 	struct kevent kev;
-	int i = 0;
+	int i;
+	int n;
 
 	skap = (struct select_kevent_copyin_args *)arg;
 
@@ -998,15 +990,18 @@ select_copyout(void *arg, struct kevent *kevp, int count, int *res)
 		/*
 		 * Filter out and delete spurious events
 		 */
-		if ((u_int)(uintptr_t)kevp[i].udata !=
+		if ((uint64_t)(uintptr_t)kevp[i].udata !=
 		    skap->lwp->lwp_kqueue_serial) {
+deregister:
 			kev = kevp[i];
 			kev.flags = EV_DISABLE|EV_DELETE;
-			kqueue_register(&skap->lwp->lwp_kqueue, &kev);
-			if (nseldebug)
-				kprintf("select fd %ju mismatched serial %d\n",
-					(uintmax_t)kevp[i].ident,
-					skap->lwp->lwp_kqueue_serial);
+			n = 1;
+			kqueue_register(&skap->lwp->lwp_kqueue, &kev, &n);
+			if (nseldebug) {
+				kprintf("select fd %ju mismatched serial %ju\n",
+				    (uintmax_t)kevp[i].ident,
+				    (uintmax_t)skap->lwp->lwp_kqueue_serial);
+			}
 			continue;
 		}
 
@@ -1051,11 +1046,17 @@ select_copyout(void *arg, struct kevent *kevp, int count, int *res)
 				}
 				break;
 			}
-			if (nseldebug)
+
+			/*
+			 * We must deregister any unsupported select events
+			 * to avoid a live-lock.
+			 */
+			if (nseldebug) {
 				kprintf("select fd %ju filter %d error %d\n",
 					(uintmax_t)kevp[i].ident,
 					kevp[i].filter, error);
-			continue;
+			}
+			goto deregister;
 		}
 
 		switch (kevp[i].filter) {
@@ -1180,7 +1181,7 @@ doselect(int nd, fd_set *read, fd_set *write, fd_set *except,
 	 *	 loaded in.
 	 */
 	error = kern_kevent(&kap->lwp->lwp_kqueue, 0x7FFFFFFF, res, kap,
-			    select_copyin, select_copyout, ts);
+			    select_copyin, select_copyout, ts, 0);
 	if (error == 0)
 		error = putbits(bytes, kap->read_set, read);
 	if (error == 0)
@@ -1217,12 +1218,14 @@ done:
  * MPSAFE
  */
 int
-sys_poll(struct poll_args *uap)
+sys_poll(struct sysmsg *sysmsg, const struct poll_args *uap)
 {
 	struct timespec ts, *tsp;
 	int error;
 
 	if (uap->timeout != INFTIM) {
+		if (uap->timeout < 0)
+			return (EINVAL);
 		ts.tv_sec = uap->timeout / 1000;
 		ts.tv_nsec = (uap->timeout % 1000) * 1000 * 1000;
 		tsp = &ts;
@@ -1230,7 +1233,74 @@ sys_poll(struct poll_args *uap)
 		tsp = NULL;
 	}
 
-	error = dopoll(uap->nfds, uap->fds, tsp, &uap->sysmsg_result);
+	error = dopoll(uap->nfds, uap->fds, tsp, &sysmsg->sysmsg_result, 0);
+
+	return (error);
+}
+
+/*
+ * Ppoll system call.
+ *
+ * MPSAFE
+ */
+int
+sys_ppoll(struct sysmsg *sysmsg, const struct ppoll_args *uap)
+{
+	struct thread *td = curthread;
+	struct lwp *lp = td->td_lwp;
+	struct timespec *ktsp, kts;
+	sigset_t sigmask;
+	int error;
+
+	/*
+	 * Get timeout if any.
+	 */
+	if (uap->ts != NULL) {
+		error = copyin(uap->ts, &kts, sizeof (kts));
+		if (error)
+			return (error);
+		ktsp = &kts;
+	} else {
+		ktsp = NULL;
+	}
+
+	/*
+	 * Install temporary signal mask if any provided.
+	 */
+	if (uap->sigmask != NULL) {
+		error = copyin(uap->sigmask, &sigmask, sizeof(sigmask));
+		if (error)
+			return (error);
+		lwkt_gettoken(&lp->lwp_proc->p_token);
+		lp->lwp_oldsigmask = lp->lwp_sigmask;
+		SIG_CANTMASK(sigmask);
+		lp->lwp_sigmask = sigmask;
+		lwkt_reltoken(&lp->lwp_proc->p_token);
+	}
+
+	error = dopoll(uap->nfds, uap->fds, ktsp, &sysmsg->sysmsg_result,
+	    ktsp != NULL ? KEVENT_TIMEOUT_PRECISE : 0);
+
+	if (uap->sigmask != NULL) {
+		lwkt_gettoken(&lp->lwp_proc->p_token);
+		/* dopoll() responsible for turning ERESTART into EINTR */
+		KKASSERT(error != ERESTART);
+		if (error == EINTR) {
+			/*
+			 * We can't restore the previous signal mask now
+			 * because it could block the signal that interrupted
+			 * us.  So make a note to restore it after executing
+			 * the handler.
+			 */
+			lp->lwp_flags |= LWP_OLDMASK;
+		} else {
+			/*
+			 * No handler to run. Restore previous mask immediately.
+			 */
+			lp->lwp_sigmask = lp->lwp_oldsigmask;
+		}
+		lwkt_reltoken(&lp->lwp_proc->p_token);
+	}
 
 	return (error);
 }
@@ -1291,9 +1361,10 @@ poll_copyin(void *arg, struct kevent *kevp, int maxevents, int *events)
 		}
 
 		if (nseldebug) {
-			kprintf("poll index %d/%d fd %d events %08x serial %d\n",
-				pkap->pfds, pkap->nfds-1, pfd->fd, pfd->events,
-				pkap->lwp->lwp_kqueue_serial);
+			kprintf("poll index %d/%d fd %d events %08x "
+			    "serial %ju\n", pkap->pfds, pkap->nfds-1,
+			    pfd->fd, pfd->events,
+			    (uintmax_t)pkap->lwp->lwp_kqueue_serial);
 		}
 
 		++pkap->pfds;
@@ -1311,7 +1382,8 @@ poll_copyout(void *arg, struct kevent *kevp, int count, int *res)
 	struct kevent kev;
 	int count_res;
 	int i;
-	u_int pi;
+	int n;
+	uint64_t pi;
 
 	pkap = (struct poll_kevent_copyin_args *)arg;
 
@@ -1321,18 +1393,26 @@ poll_copyout(void *arg, struct kevent *kevp, int count, int *res)
 		 * We can easily tell if the serial number is incorrect
 		 * by checking whether the extracted index is out of range.
 		 */
-		pi = (u_int)(uintptr_t)kevp[i].udata -
-		     (u_int)pkap->lwp->lwp_kqueue_serial;
+		pi = (uint64_t)(uintptr_t)kevp[i].udata -
+		     pkap->lwp->lwp_kqueue_serial;
 
 		if (pi >= pkap->nfds) {
+deregister:
 			kev = kevp[i];
 			kev.flags = EV_DISABLE|EV_DELETE;
-			kqueue_register(&pkap->lwp->lwp_kqueue, &kev);
-			if (nseldebug)
-				kprintf("poll index %d out of range against serial %d\n",
-					pi, pkap->lwp->lwp_kqueue_serial);
+			n = 1;
+			kqueue_register(&pkap->lwp->lwp_kqueue, &kev, &n);
+			if (nseldebug) {
+				kprintf("poll index %ju out of range against "
+				    "serial %ju\n", (uintmax_t)pi,
+				    (uintmax_t)pkap->lwp->lwp_kqueue_serial);
+			}
 			continue;
 		}
+
+		/*
+		 * Locate the pollfd and process events
+		 */
 		pfd = &pkap->fds[pi];
 		if (kevp[i].ident == pfd->fd) {
 			/*
@@ -1362,8 +1442,9 @@ poll_copyout(void *arg, struct kevent *kevp, int count, int *res)
 					 * set POLLPRI|POLLRDBAND and most
 					 * filters do not support EVFILT_EXCEPT.
 					 *
-					 * We also filter out ENODEV since dev_dkqfilter
-					 * returns ENODEV if EOPNOTSUPP is returned in an
+					 * We also filter out ENODEV since
+					 * dev_dkqfilter returns ENODEV if
+					 * EOPNOTSUPP is returned in an
 					 * inner call.
 					 *
 					 * XXX: fix this
@@ -1372,34 +1453,45 @@ poll_copyout(void *arg, struct kevent *kevp, int count, int *res)
 					    kevp[i].filter != EVFILT_WRITE &&
 					    kevp[i].data != EOPNOTSUPP &&
 					    kevp[i].data != ENODEV) {
-						if (count_res == 0)
+						if (count_res)
 							++*res;
 						pfd->revents |= POLLERR;
 					}
 					break;
 				}
-				if (nseldebug) {
-					kprintf("poll index %d fd %d "
+				if (pfd->revents == 0 && nseldebug) {
+					kprintf("poll index EV_ERROR %ju fd %d "
 						"filter %d error %jd\n",
-						pi, pfd->fd,
+						(uintmax_t)pi, pfd->fd,
 						kevp[i].filter,
 						(intmax_t)kevp[i].data);
 				}
+
+				/*
+				 * Silently deregister any unhandled EV_ERROR
+				 * condition (usually EOPNOTSUPP).
+				 */
+				if (pfd->revents == 0)
+					goto deregister;
 				continue;
 			}
 
 			switch (kevp[i].filter) {
 			case EVFILT_READ:
-#if 0
 				/*
 				 * NODATA on the read side can indicate a
 				 * half-closed situation and not necessarily
 				 * a disconnect, so depend on the user
 				 * issuing a read() and getting 0 bytes back.
+				 *
+				 * If EV_HUP is set the peer completely
+				 * disconnected and we can set POLLHUP
+				 * once data is exhausted.
 				 */
-				if (kevp[i].flags & EV_NODATA)
-					pfd->revents |= POLLHUP;
-#endif
+				if (kevp[i].flags & EV_NODATA) {
+					if (kevp[i].flags & EV_HUP)
+						pfd->revents |= POLLHUP;
+				}
 				if ((kevp[i].flags & EV_EOF) &&
 				    kevp[i].fflags != 0)
 					pfd->revents |= POLLERR;
@@ -1441,17 +1533,26 @@ poll_copyout(void *arg, struct kevent *kevp, int count, int *res)
 			}
 
 			if (nseldebug) {
-				kprintf("poll index %d/%d fd %d revents %08x\n",
-					pi, pkap->nfds, pfd->fd, pfd->revents);
+				kprintf("poll index %ju/%d fd %d "
+				    "revents %08x\n", (uintmax_t)pi, pkap->nfds,
+				    pfd->fd, pfd->revents);
 			}
 
 			if (count_res && pfd->revents)
 				++*res;
-		} else {
-			if (nseldebug) {
-				kprintf("poll index %d mismatch %ju/%d\n",
-					pi, (uintmax_t)kevp[i].ident, pfd->fd);
-			}
+		}
+
+		/*
+		 * We must deregister any kqueue poll event that does not
+		 * set poll return bits to prevent a live-lock.
+		 */
+		if (pfd->revents == 0) {
+			kprintf("poll index %ju no-action %ju/%d "
+				"events=%08x kevpfilt=%d/%08x\n",
+			    (uintmax_t)pi, (uintmax_t)kevp[i].ident,
+			    pfd->fd, pfd->events,
+			    kevp[i].filter, kevp[i].flags);
+			goto deregister;
 		}
 	}
 
@@ -1459,7 +1560,7 @@ poll_copyout(void *arg, struct kevent *kevp, int count, int *res)
 }
 
 static int
-dopoll(int nfds, struct pollfd *fds, struct timespec *ts, int *res)
+dopoll(int nfds, struct pollfd *fds, struct timespec *ts, int *res, int flags)
 {
 	struct poll_kevent_copyin_args ka;
 	struct pollfd sfds[64];
@@ -1493,7 +1594,7 @@ dopoll(int nfds, struct pollfd *fds, struct timespec *ts, int *res)
 	error = copyin(fds, ka.fds, bytes);
 	if (error == 0)
 		error = kern_kevent(&ka.lwp->lwp_kqueue, 0x7FFFFFFF, res, &ka,
-				    poll_copyin, poll_copyout, ts);
+				    poll_copyin, poll_copyout, ts, flags);
 
 	if (error == 0)
 		error = copyout(ka.fds, fds, bytes);
@@ -1533,6 +1634,7 @@ socket_wait(struct socket *so, struct timespec *ts, int *res)
 	struct kqueue kq;
 	struct kevent kev;
 	int error, fd;
+	int n;
 
 	if ((error = falloc(td->td_lwp, &fp, &fd)) != 0)
 		return (error);
@@ -1542,19 +1644,23 @@ socket_wait(struct socket *so, struct timespec *ts, int *res)
 	fp->f_ops = &socketops;
 	fp->f_data = so;
 	fsetfd(td->td_lwp->lwp_proc->p_fd, fp, fd);
+	fsetfdflags(td->td_proc->p_fd, fd, UF_EXCLOSE);
 
+	bzero(&kq, sizeof(kq));
 	kqueue_init(&kq, td->td_lwp->lwp_proc->p_fd);
 	EV_SET(&kev, fd, EVFILT_READ, EV_ADD|EV_ENABLE, 0, 0, NULL);
-	if ((error = kqueue_register(&kq, &kev)) != 0) {
+	n = 1;
+	if ((error = kqueue_register(&kq, &kev, &n)) != 0) {
 		fdrop(fp);
 		return (error);
 	}
 
 	error = kern_kevent(&kq, 1, res, NULL, socket_wait_copyin,
-			    socket_wait_copyout, ts);
+			    socket_wait_copyout, ts, 0);
 
-	EV_SET(&kev, fd, EVFILT_READ, EV_DELETE, 0, 0, NULL);
-	kqueue_register(&kq, &kev);
+	EV_SET(&kev, fd, EVFILT_READ, EV_DELETE|EV_DISABLE, 0, 0, NULL);
+	n = 1;
+	kqueue_register(&kq, &kev, &n);
 	fp->f_ops = &badfileops;
 	fdrop(fp);
 
@@ -1568,9 +1674,9 @@ socket_wait(struct socket *so, struct timespec *ts, int *res)
  * MPSAFE
  */
 int
-sys_openbsd_poll(struct openbsd_poll_args *uap)
+sys_openbsd_poll(struct sysmsg *sysmsg, const struct openbsd_poll_args *uap)
 {
-	return (sys_poll((struct poll_args *)uap));
+	return (sys_poll(sysmsg, (const struct poll_args *)uap));
 }
 
 /*ARGSUSED*/

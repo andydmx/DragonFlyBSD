@@ -41,6 +41,15 @@ typedef void isa_config_cb(void *arg, struct isa_config *config, int enable);
 #ifdef _KERNEL
 
 /*
+ * The intrmask_t has to be wide enough to hold any value used by the platform,
+ * u_long would be best type, but use fixed 32bit type for historic reasons.
+ */
+#ifndef _INTRMASK_T_DECLARED
+#define _INTRMASK_T_DECLARED
+typedef __uint32_t	intrmask_t; /* Interrupt mask (spl, xxx_imask, etc) */
+#endif
+
+/*
  * ISA devices are partially ordered to ensure that devices which are
  * sensitive to other driver probe routines are probed first. Plug and
  * Play devices are added after devices with speculative probes so that
@@ -164,7 +173,7 @@ extern void	isa_probe_children(device_t dev);
 
 extern void	isa_dmacascade (int chan);
 extern void	isa_dmadone (int flags, caddr_t addr, int nbytes, int chan);
-extern void	isa_dmainit (int chan, u_int bouncebufsize);
+extern int	isa_dma_init (int chan, u_int bouncebufsize, int flags);
 extern void	isa_dmastart (int flags, caddr_t addr, u_int nbytes, int chan);
 extern int	isa_dma_acquire (int chan);
 extern void	isa_dma_release (int chan);
@@ -173,6 +182,12 @@ extern int	isa_dmastop (int chan);
 unsigned isa_dmabp (struct buf *);
 
 int isab_attach(device_t dev);
+
+#define isa_dmainit(chan, size) do {					\
+	if (isa_dma_init(chan, size, M_NOWAIT))				\
+		kprintf("WARNING: isa_dma_init(%d, %ju) failed\n",	\
+		        (int)(chan), (uintmax_t)(size));		\
+	} while (0)
 
 #endif /* _KERNEL */
 

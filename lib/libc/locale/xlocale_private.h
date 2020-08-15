@@ -26,8 +26,12 @@
  * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
  *
- * $FreeBSD: head/lib/libc/locale/xlocale_private.h 250883 2013-05-21 19:59:37Z ed $
+ * $FreeBSD: head/lib/libc/locale/xlocale_private.h 326193 2017-11-25 17:12:48Z pfg $
  */
+
+#ifndef __LIBC
+#error "Userland tools should not use this private header."
+#endif
 
 #ifndef _XLOCALE_PRIVATE__H_
 #define _XLOCALE_PRIVATE__H_
@@ -38,8 +42,17 @@
 #include <stdint.h>
 #include <sys/types.h>
 #include <machine/atomic.h>
+#include <machine/wchar.h>		/* for __mbstate_t, XXX use mbstate_t here? */
 #include "setlocale.h"
 
+/**
+ * The XLC_ values are indexes into the components array.  They are defined in
+ * the same order as the LC_ values in locale.h, but without the LC_ALL zero
+ * value.  Translating from LC_X to XLC_X is done by subtracting one.
+ *
+ * Any reordering of this enum should ensure that these invariants are not
+ * violated.
+ */
 enum {
 	XLC_COLLATE = 0,
 	XLC_CTYPE,
@@ -50,6 +63,19 @@ enum {
 	XLC_LAST
 };
 
+_Static_assert(XLC_LAST - XLC_COLLATE == 6, "XLC values should be contiguous");
+_Static_assert(XLC_COLLATE == LC_COLLATE - 1,
+               "XLC_COLLATE doesn't match the LC_COLLATE value.");
+_Static_assert(XLC_CTYPE == LC_CTYPE - 1,
+               "XLC_CTYPE doesn't match the LC_CTYPE value.");
+_Static_assert(XLC_MONETARY == LC_MONETARY - 1,
+               "XLC_MONETARY doesn't match the LC_MONETARY value.");
+_Static_assert(XLC_NUMERIC == LC_NUMERIC - 1,
+               "XLC_NUMERIC doesn't match the LC_NUMERIC value.");
+_Static_assert(XLC_TIME == LC_TIME - 1,
+               "XLC_TIME doesn't match the LC_TIME value.");
+_Static_assert(XLC_MESSAGES == LC_MESSAGES - 1,
+               "XLC_MESSAGES doesn't match the LC_MESSAGES value.");
 
 /**
  * Header used for objects that are reference counted.  Objects may optionally
@@ -79,7 +105,7 @@ struct xlocale_component {
 };
 
 /**
- * xlocale structure, stores per-thread locale information.  
+ * xlocale structure, stores per-thread locale information.
  */
 struct _xlocale {
 	struct xlocale_refcounted header;
@@ -155,17 +181,16 @@ __attribute__((unused)) static void
 xlocale_release(void *val)
 {
 	struct xlocale_refcounted *obj = val;
-	long count = atomic_fetchadd_long(&(obj->retain_count), -1) - 1;
-	if (count < 0) {
-		if (0 != obj->destructor) {
-			obj->destructor(obj);
-		}
-	}
+	long count;
+
+	count = atomic_fetchadd_long(&(obj->retain_count), -1) - 1;
+	if (count < 0 && obj->destructor != NULL)
+		obj->destructor(obj);
 }
 
 /**
  * Load functions.  Each takes the name of a locale and a pointer to the data
- * to be initialised as arguments.  Two special values are allowed for the 
+ * to be initialised as arguments.  Two special values are allowed for the
  */
 extern void* __collate_load(const char*, locale_t);
 extern void* __ctype_load(const char*, locale_t);

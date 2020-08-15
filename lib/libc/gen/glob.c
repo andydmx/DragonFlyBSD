@@ -73,6 +73,7 @@
  * 3. State-dependent encodings are not currently supported.
  */
 
+#include "namespace.h"
 #include <sys/param.h>
 #include <sys/stat.h>
 
@@ -90,6 +91,7 @@
 #include <wchar.h>
 
 #include "collate.h"
+#include "un-namespace.h"
 
 /*
  * glob(3) expansion limits. Stop the expansion if any of these limits
@@ -423,7 +425,7 @@ globtilde(const Char *pattern, Char *patbuf, size_t patbuf_len, glob_t *pglob)
 		 */
 		if (issetugid() != 0 ||
 		    (h = getenv("HOME")) == NULL) {
-			if (((h = getlogin()) != NULL &&
+			if (((h = _getlogin()) != NULL &&
 			     (pwd = getpwnam(h)) != NULL) ||
 			    (pwd = getpwuid(getuid())) != NULL)
 				h = pwd->pw_dir;
@@ -647,13 +649,7 @@ glob3(Char *pathbuf, Char *pathend, Char *pathend_last,
 	int err;
 	char buf[MAXPATHLEN];
 
-	/*
-	 * The readdirfunc declaration can't be prototyped, because it is
-	 * assigned, below, to two functions which are prototyped in glob.h
-	 * and dirent.h as taking pointers to differently typed opaque
-	 * structures.
-	 */
-	struct dirent *(*readdirfunc)();
+	struct dirent *(*readdirfunc)(DIR *);
 
 	if (pathend > pathend_last)
 		return (GLOB_ABORTED);
@@ -674,12 +670,14 @@ glob3(Char *pathbuf, Char *pathend, Char *pathend_last,
 
 	err = 0;
 
-	/* Search directory for matching names. */
+	/* pglob->gl_readdir takes a void *, fix this manually */
 	if (pglob->gl_flags & GLOB_ALTDIRFUNC)
-		readdirfunc = pglob->gl_readdir;
+		readdirfunc = (struct dirent *(*)(DIR *))pglob->gl_readdir;
 	else
 		readdirfunc = readdir;
-	while ((dp = (*readdirfunc)(dirp))) {
+
+	/* Search directory for matching names. */
+	while ((dp = (*readdirfunc)(dirp)) != NULL) {
 		char *sc;
 		Char *dc;
 		wchar_t wc;
@@ -833,8 +831,8 @@ match(Char *name, Char *pat, Char *patend)
 				if ((*pat & M_MASK) == M_RNG) {
 					if (table->__collate_load_error ?
 					    CHAR(c) <= CHAR(k) && CHAR(k) <= CHAR(pat[1]) :
-					       __collate_range_cmp(table, CHAR(c), CHAR(k)) <= 0
-					    && __collate_range_cmp(table, CHAR(k), CHAR(pat[1])) <= 0
+					       __wcollate_range_cmp(CHAR(c), CHAR(k)) <= 0 &&
+					       __wcollate_range_cmp(CHAR(k), CHAR(pat[1])) <= 0
 					   )
 						ok = 1;
 					pat += 2;

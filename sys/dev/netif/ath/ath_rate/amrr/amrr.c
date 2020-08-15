@@ -37,6 +37,7 @@
  */
 
 #include <sys/cdefs.h>
+__FBSDID("$FreeBSD$");
 
 /*
  * AMRR rate control. See:
@@ -53,9 +54,16 @@
 #include <sys/sysctl.h>
 #include <sys/kernel.h>
 #include <sys/lock.h>
-#include <sys/mutex.h>
 #include <sys/errno.h>
+
+#if defined(__DragonFly__)
+/* empty */
+#else
+#include <machine/bus.h>
+#include <machine/resource.h>
+#endif
 #include <sys/bus.h>
+
 #include <sys/socket.h>
  
 #include <net/if.h>
@@ -427,8 +435,8 @@ ath_rate_fetch_node_stats(struct ath_softc *sc, struct ath_node *an,
 static void
 ath_rate_sysctlattach(struct ath_softc *sc)
 {
-	struct sysctl_ctx_list *ctx = &sc->sc_sysctl_ctx;
-	struct sysctl_oid *tree = sc->sc_sysctl_tree;
+	struct sysctl_ctx_list *ctx = device_get_sysctl_ctx(sc->sc_dev);
+	struct sysctl_oid *tree = device_get_sysctl_tree(sc->sc_dev);
 
 	SYSCTL_ADD_INT(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
 		"rate_interval", CTLFLAG_RW, &ath_rateinterval, 0,
@@ -464,43 +472,47 @@ ath_rate_detach(struct ath_ratectrl *arc)
 	kfree(asc, M_DEVBUF);
 }
 
+#if defined(__DragonFly__)
+
 /*
  * Module glue.
  */
 static int
 amrr_modevent(module_t mod, int type, void *unused)
 {
-	int error;
+       int error;
 
-	wlan_serialize_enter();
+       wlan_serialize_enter();
 
-	switch (type) {
-	case MOD_LOAD:
-		if (bootverbose) {
-			kprintf("ath_rate: <AMRR rate control "
-				"algorithm> version 0.1\n");
-		}
-		error = 0;
-		break;
-	case MOD_UNLOAD:
-		error = 0;
-		break;
-	default:
-		error = EINVAL;
-		break;
-	}
-	wlan_serialize_exit();
+       switch (type) {
+       case MOD_LOAD:
+	       if (bootverbose) {
+		       kprintf("ath_rate: <AMRR rate control "
+			       "algorithm> version 0.1\n");
+	       }
+	       error = 0;
+	       break;
+       case MOD_UNLOAD:
+	       error = 0;
+	       break;
+       default:
+	       error = EINVAL;
+	       break;
+       }
+       wlan_serialize_exit();
 
-	return error;
+       return error;
 }
 
 static moduledata_t amrr_mod = {
-        "ath_rate",
-	amrr_modevent,
-	0
+	"ath_rate",
+       amrr_modevent,
+       0
 };
 
 DECLARE_MODULE(ath_rate, amrr_mod, SI_SUB_DRIVERS, SI_ORDER_FIRST);
 MODULE_VERSION(ath_rate, 1);
 MODULE_DEPEND(ath_rate, ath_hal, 1, 1, 1);
 MODULE_DEPEND(ath_rate, wlan, 1, 1, 1);
+
+#endif

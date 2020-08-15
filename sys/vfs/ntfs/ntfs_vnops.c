@@ -37,6 +37,7 @@
 
 #include <sys/param.h>
 #include <sys/systm.h>
+#include <sys/uio.h>
 #include <sys/kernel.h>
 #include <sys/time.h>
 #include <sys/types.h>
@@ -177,7 +178,7 @@ ntfs_getattr(struct vop_getattr_args *ap)
 	dprintf(("ntfs_getattr: %ju, flags: %d\n", (uintmax_t)ip->i_number,
 		ip->i_flag));
 
-	vap->va_fsid = dev2udev(ip->i_dev);
+	vap->va_fsid = devid_from_dev(ip->i_dev);
 	vap->va_fileid = ip->i_number;
 	vap->va_mode = ip->i_mp->ntm_mode;
 	vap->va_nlink = ip->i_nlink;
@@ -487,7 +488,7 @@ ntfs_open(struct vop_open_args *ap)
 static int
 ntfs_close(struct vop_close_args *ap)
 {
-#if NTFS_DEBUG
+#ifdef NTFS_DEBUG
 	struct vnode *vp = ap->a_vp;
 	struct ntnode *ip = VTONT(vp);
 
@@ -658,7 +659,7 @@ ntfs_lookup(struct vop_old_lookup_args *ap)
 	struct componentname *cnp = ap->a_cnp;
 	int error;
 	int lockparent = cnp->cn_flags & CNP_LOCKPARENT;
-#if NTFS_DEBUG
+#ifdef NTFS_DEBUG
 	int wantparent = cnp->cn_flags & (CNP_LOCKPARENT | CNP_WANTPARENT);
 #endif
 	dprintf(("ntfs_lookup: \"%.*s\" (%ld bytes) in %ju, lp: %d, wp: %d \n",

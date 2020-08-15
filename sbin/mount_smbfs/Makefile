@@ -13,7 +13,9 @@ DPADD+= ${LIBSMB}
 # Needs to be dynamically linked for optional dlopen() access to
 # userland libiconv (see the -E option).
 #
-NOSHARED?=	NO
+.if !defined(REALLY_NOSHARED)
+.undef NOSHARED
+.endif
 
 .PATH:	${CONTRIBDIR}/mount_smbfs
 

@@ -28,7 +28,6 @@
  *
  * @(#)move.c	8.1 (Berkeley) 5/31/93
  * $FreeBSD: src/games/mille/move.c,v 1.6 1999/12/12 06:17:24 billf Exp $
- * $DragonFly: src/games/mille/move.c,v 1.5 2006/08/27 17:17:23 pavalos Exp $
  */
 
 #include <termios.h>
@@ -43,10 +42,6 @@
 
 #undef	CTRL
 #define	CTRL(c)		(c - 'A' + 1)
-
-const char	*Movenames[] = {
-		"M_DISCARD", "M_DRAW", "M_PLAY", "M_ORDER"
-	};
 
 static void check_go(void);
 static void getmove(void);
@@ -70,12 +65,12 @@ domove(void)
 	switch (Movetype) {
 	  case M_DISCARD:
 		if (haspicked(pp)) {
-			if (pp->hand[Card_no] == C_INIT)
+			if (pp->hand[Card_no] == C_INIT) {
 				if (Card_no == 6)
 					Finished = TRUE;
 				else
 					error("no card there");
-			else {
+			} else {
 				if (issafety(pp->hand[Card_no])) {
 					error("discard a safety?");
 					goodplay = FALSE;
@@ -140,7 +135,7 @@ acc:
 		for (i = 1; i < HAND_SZ; i++)
 			if (pp->hand[i] == C_INIT) {
 				for (j = 0; pp->hand[j] == C_INIT; j++)
-					if (j >= HAND_SZ) {
+					if (j == HAND_SZ - 1) {
 						j = 0;
 						break;
 					}
@@ -193,6 +188,7 @@ playcard(PLAY *pp)
 {
 	int	v;
 	CARD	card;
+	bool	blockNext;
 
 	/*
 	 * check and see if player has picked
@@ -212,17 +208,20 @@ mustpick:
 	if (Debug)
 		fprintf(outf, "PLAYCARD: Card = %s\n", C_name[card]);
 #endif
-	Next = FALSE;
+	blockNext = FALSE;
 	switch (card) {
 	  case C_200:
 		if (pp->nummiles[C_200] == 2)
 			return error("only two 200's per hand");
+		/* FALLTHROUGH */
 	  case C_100:	case C_75:
 		if (pp->speed == C_LIMIT)
 			return error("limit of 50");
+		/* FALLTHROUGH */
 	  case C_50:
 		if (pp->mileage + Value[card] > End)
 			return error("puts you over %d", End);
+		/* FALLTHROUGH */
 	  case C_25:
 		if (!pp->can_go)
 			return error("cannot move now");
@@ -322,18 +321,18 @@ protected:
 			if (!pp->can_go && isrepair(pp->battle))
 				pp->can_go = TRUE;
 		}
-		Next = -1;
+		blockNext = TRUE;
 		break;
 
 	  case C_INIT:
 		error("no card there");
-		Next = -1;
+		blockNext = TRUE;
 		break;
 	}
 	if (pp == &Player[PLAYER])
 		account(card);
 	pp->hand[Card_no] = C_INIT;
-	Next = (Next == -1 ? FALSE : TRUE);
+	Next = !blockNext;
 	return TRUE;
 }
 
@@ -519,7 +518,7 @@ account(CARD card)
 void
 prompt(int promptno)
 {
-	static const char	*names[] = {
+	static const char	*const names[] = {
 				">>:Move:",
 				"Really?",
 				"Another hand?",

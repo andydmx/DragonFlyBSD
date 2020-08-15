@@ -1,30 +1,30 @@
 /*
- * Copyright (c) 2001-2013, Intel Corporation 
+ * Copyright (c) 2001-2017, Intel Corporation
  * All rights reserved.
  *
- * Redistribution and use in source and binary forms, with or without 
+ * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions are met:
  *
- *  1. Redistributions of source code must retain the above copyright notice, 
+ *  1. Redistributions of source code must retain the above copyright notice,
  *     this list of conditions and the following disclaimer.
  *
- *  2. Redistributions in binary form must reproduce the above copyright 
- *     notice, this list of conditions and the following disclaimer in the 
+ *  2. Redistributions in binary form must reproduce the above copyright
+ *     notice, this list of conditions and the following disclaimer in the
  *     documentation and/or other materials provided with the distribution.
  *
- *  3. Neither the name of the Intel Corporation nor the names of its 
- *     contributors may be used to endorse or promote products derived from 
+ *  3. Neither the name of the Intel Corporation nor the names of its
+ *     contributors may be used to endorse or promote products derived from
  *     this software without specific prior written permission.
  *
  * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
- * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE 
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE 
- * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE 
- * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR 
- * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF 
- * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS 
- * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN 
- * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) 
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
  * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
  * POSSIBILITY OF SUCH DAMAGE.
  */
@@ -47,6 +47,7 @@
 #include <sys/sockio.h>
 #include <sys/sysctl.h>
 #include <sys/systm.h>
+#include <sys/taskqueue.h>
 
 #include <net/bpf.h>
 #include <net/ethernet.h>
@@ -55,6 +56,7 @@
 #include <net/if_dl.h>
 #include <net/if_media.h>
 #include <net/ifq_var.h>
+#include <net/if_ringmap.h>
 #include <net/toeplitz.h>
 #include <net/toeplitz2.h>
 #include <net/vlan/if_vlan_var.h>
@@ -68,8 +70,11 @@
 #include <bus/pci/pcivar.h>
 #include <bus/pci/pcireg.h>
 
+#include <dev/netif/ix/ixgbe_common.h>
 #include <dev/netif/ix/ixgbe_api.h>
 #include <dev/netif/ix/if_ix.h>
+
+#define IX_IFM_DEFAULT		(IFM_ETHER | IFM_AUTO)
 
 #ifdef IX_RSS_DEBUG
 #define IX_RSS_DPRINTF(sc, lvl, fmt, ...) \
@@ -83,7 +88,7 @@ do { \
 
 #define IX_NAME			"Intel(R) PRO/10GbE "
 #define IX_DEVICE(id) \
-	{ IXGBE_VENDOR_ID, IXGBE_DEV_ID_##id, IX_NAME #id }
+	{ IXGBE_INTEL_VENDOR_ID, IXGBE_DEV_ID_##id, IX_NAME #id }
 #define IX_DEVICE_NULL		{ 0, 0, NULL }
 
 static struct ix_device {
@@ -114,7 +119,29 @@ static struct ix_device {
 	IX_DEVICE(82599_SFP_FCOE),
 	IX_DEVICE(82599EN_SFP),
 	IX_DEVICE(82599_SFP_SF_QP),
+	IX_DEVICE(82599_QSFP_SF_QP),
 	IX_DEVICE(X540T),
+	IX_DEVICE(X540T1),
+	IX_DEVICE(X550T),
+	IX_DEVICE(X550T1),
+	IX_DEVICE(X550EM_X_KR),
+	IX_DEVICE(X550EM_X_KX4),
+	IX_DEVICE(X550EM_X_10G_T),
+	IX_DEVICE(X550EM_X_1G_T),
+	IX_DEVICE(X550EM_X_SFP),
+	IX_DEVICE(X550EM_A_KR),
+	IX_DEVICE(X550EM_A_KR_L),
+	IX_DEVICE(X550EM_A_SFP),
+	IX_DEVICE(X550EM_A_SFP_N),
+	IX_DEVICE(X550EM_A_SGMII),
+	IX_DEVICE(X550EM_A_SGMII_L),
+	IX_DEVICE(X550EM_A_10G_T),
+	IX_DEVICE(X550EM_A_1G_T),
+	IX_DEVICE(X550EM_A_1G_T_L),
+#if 0
+	IX_DEVICE(X540_BYPASS),
+	IX_DEVICE(82599_BYPASS),
+#endif
 
 	/* required last entry */
 	IX_DEVICE_NULL
@@ -140,9 +167,11 @@ static void	ix_stop(struct ix_softc *);
 static void	ix_media_status(struct ifnet *, struct ifmediareq *);
 static int	ix_media_change(struct ifnet *);
 static void	ix_timer(void *);
+static void	ix_fw_timer(void *);
 #ifdef IFPOLL_ENABLE
 static void	ix_npoll(struct ifnet *, struct ifpoll_info *);
 static void	ix_npoll_rx(struct ifnet *, void *, int);
+static void	ix_npoll_rx_direct(struct ifnet *, void *, int);
 static void	ix_npoll_tx(struct ifnet *, void *, int);
 static void	ix_npoll_status(struct ifnet *);
 #endif
@@ -151,6 +180,7 @@ static void	ix_add_sysctl(struct ix_softc *);
 static void	ix_add_intr_rate_sysctl(struct ix_softc *, int,
 		    const char *, int (*)(SYSCTL_HANDLER_ARGS), const char *);
 static int	ix_sysctl_tx_wreg_nsegs(SYSCTL_HANDLER_ARGS);
+static int	ix_sysctl_tx_nmbuf(SYSCTL_HANDLER_ARGS);
 static int	ix_sysctl_rx_wreg_nsegs(SYSCTL_HANDLER_ARGS);
 static int	ix_sysctl_txd(SYSCTL_HANDLER_ARGS);
 static int	ix_sysctl_rxd(SYSCTL_HANDLER_ARGS);
@@ -160,32 +190,33 @@ static int	ix_sysctl_rxtx_intr_rate(SYSCTL_HANDLER_ARGS);
 static int	ix_sysctl_rx_intr_rate(SYSCTL_HANDLER_ARGS);
 static int	ix_sysctl_tx_intr_rate(SYSCTL_HANDLER_ARGS);
 static int	ix_sysctl_sts_intr_rate(SYSCTL_HANDLER_ARGS);
-static int	ix_sysctl_flowctrl(SYSCTL_HANDLER_ARGS);
-#ifdef foo
-static int	ix_sysctl_advspeed(SYSCTL_HANDLER_ARGS);
-#endif
 #if 0
 static void     ix_add_hw_stats(struct ix_softc *);
 #endif
-#ifdef IFPOLL_ENABLE
-static int	ix_sysctl_npoll_rxoff(SYSCTL_HANDLER_ARGS);
-static int	ix_sysctl_npoll_txoff(SYSCTL_HANDLER_ARGS);
-#endif
 
+static void	ix_watchdog_reset(struct ix_softc *);
+static void	ix_watchdog_task(void *, int);
+static void	ix_sync_netisr(struct ix_softc *, int);
 static void	ix_slot_info(struct ix_softc *);
 static int	ix_alloc_rings(struct ix_softc *);
 static void	ix_free_rings(struct ix_softc *);
 static void	ix_setup_ifp(struct ix_softc *);
 static void	ix_setup_serialize(struct ix_softc *);
+static void	ix_setup_caps(struct ix_softc *);
 static void	ix_set_ring_inuse(struct ix_softc *, boolean_t);
-static void	ix_set_timer_cpuid(struct ix_softc *, boolean_t);
+static int	ix_get_timer_cpuid(const struct ix_softc *, boolean_t);
 static void	ix_update_stats(struct ix_softc *);
+static void	ix_detect_fanfail(struct ix_softc *, uint32_t, boolean_t);
 
 static void	ix_set_promisc(struct ix_softc *);
 static void	ix_set_multi(struct ix_softc *);
 static void	ix_set_vlan(struct ix_softc *);
 static uint8_t	*ix_mc_array_itr(struct ixgbe_hw *, uint8_t **, uint32_t *);
+static enum ixgbe_fc_mode ix_ifmedia2fc(int);
+static const char *ix_ifmedia2str(int);
+static const char *ix_fc2str(enum ixgbe_fc_mode);
 
+static void	ix_get_txring_cnt(const struct ix_softc *, int *, int *);
 static int	ix_get_txring_inuse(const struct ix_softc *, boolean_t);
 static void	ix_init_tx_ring(struct ix_tx_ring *);
 static void	ix_free_tx_ring(struct ix_tx_ring *);
@@ -199,13 +230,16 @@ static int	ix_tx_ctx_setup(struct ix_tx_ring *,
 static int	ix_tso_ctx_setup(struct ix_tx_ring *,
 		    const struct mbuf *, uint32_t *, uint32_t *);
 static void	ix_txeof(struct ix_tx_ring *, int);
+static void	ix_txgc(struct ix_tx_ring *);
+static void	ix_txgc_timer(void *);
 
+static void	ix_get_rxring_cnt(const struct ix_softc *, int *, int *);
 static int	ix_get_rxring_inuse(const struct ix_softc *, boolean_t);
 static int	ix_init_rx_ring(struct ix_rx_ring *);
 static void	ix_free_rx_ring(struct ix_rx_ring *);
 static int	ix_create_rx_ring(struct ix_rx_ring *);
 static void	ix_destroy_rx_ring(struct ix_rx_ring *, int);
-static void	ix_init_rx_unit(struct ix_softc *);
+static void	ix_init_rx_unit(struct ix_softc *, boolean_t);
 #if 0
 static void	ix_setup_hw_rsc(struct ix_rx_ring *);
 #endif
@@ -215,10 +249,9 @@ static void	ix_rx_discard(struct ix_rx_ring *, int, boolean_t);
 static void	ix_enable_rx_drop(struct ix_softc *);
 static void	ix_disable_rx_drop(struct ix_softc *);
 
+static void	ix_config_gpie(struct ix_softc *);
 static void	ix_alloc_msix(struct ix_softc *);
 static void	ix_free_msix(struct ix_softc *, boolean_t);
-static void	ix_conf_rx_msix(struct ix_softc *, int, int *, int);
-static void	ix_conf_tx_msix(struct ix_softc *, int, int *, int);
 static void	ix_setup_msix_eims(const struct ix_softc *, int,
 		    uint32_t *, uint32_t *);
 static int	ix_alloc_intr(struct ix_softc *);
@@ -230,6 +263,7 @@ static void	ix_disable_intr(struct ix_softc *);
 static void	ix_set_ivar(struct ix_softc *, uint8_t, uint8_t, int8_t);
 static void	ix_set_eitr(struct ix_softc *, int, int);
 static void	ix_intr_status(struct ix_softc *, uint32_t);
+static void	ix_intr_82598(void *);
 static void	ix_intr(void *);
 static void	ix_msix_rxtx(void *);
 static void	ix_msix_rx(void *);
@@ -238,15 +272,19 @@ static void	ix_msix_status(void *);
 
 static void	ix_config_link(struct ix_softc *);
 static boolean_t ix_sfp_probe(struct ix_softc *);
-static boolean_t ix_is_sfp(const struct ixgbe_hw *);
-static void	ix_setup_optics(struct ix_softc *);
+static boolean_t ix_is_sfp(struct ixgbe_hw *);
 static void	ix_update_link_status(struct ix_softc *);
 static void	ix_handle_link(struct ix_softc *);
 static void	ix_handle_mod(struct ix_softc *);
 static void	ix_handle_msf(struct ix_softc *);
+static void	ix_handle_phy(struct ix_softc *);
+static int	ix_powerdown(struct ix_softc *);
+static void	ix_config_flowctrl(struct ix_softc *);
+static void	ix_config_dmac(struct ix_softc *);
+static void	ix_init_media(struct ix_softc *);
 
-/* XXX Shared code structure requires this for the moment */
-extern void ixgbe_stop_mac_link_on_d3_82599(struct ixgbe_hw *);
+static void	ix_serialize_skipmain(struct ix_softc *);
+static void	ix_deserialize_skipmain(struct ix_softc *);
 
 static device_method_t ix_methods[] = {
 	/* Device interface */
@@ -270,21 +308,24 @@ DRIVER_MODULE(if_ix, pci, ix_driver, ix_devclass, NULL, NULL);
 
 static int	ix_msi_enable = 1;
 static int	ix_msix_enable = 1;
-static int	ix_msix_agg_rxtx = 1;
 static int	ix_rxr = 0;
 static int	ix_txr = 0;
 static int	ix_txd = IX_PERF_TXD;
 static int	ix_rxd = IX_PERF_RXD;
 static int	ix_unsupported_sfp = 0;
+static int	ix_direct_input = 1;
+
+static char	ix_flowctrl[IFM_ETH_FC_STRLEN] = IFM_ETH_FC_NONE;
 
 TUNABLE_INT("hw.ix.msi.enable", &ix_msi_enable);
 TUNABLE_INT("hw.ix.msix.enable", &ix_msix_enable);
-TUNABLE_INT("hw.ix.msix.agg_rxtx", &ix_msix_agg_rxtx);
 TUNABLE_INT("hw.ix.rxr", &ix_rxr);
 TUNABLE_INT("hw.ix.txr", &ix_txr);
 TUNABLE_INT("hw.ix.txd", &ix_txd);
 TUNABLE_INT("hw.ix.rxd", &ix_rxd);
 TUNABLE_INT("hw.ix.unsupported_sfp", &ix_unsupported_sfp);
+TUNABLE_STR("hw.ix.flow_ctrl", ix_flowctrl, sizeof(ix_flowctrl));
+TUNABLE_INT("hw.ix.direct_input", &ix_direct_input);
 
 /*
  * Smart speed setting, default to on.  This only works
@@ -293,6 +334,66 @@ TUNABLE_INT("hw.ix.unsupported_sfp", &ix_unsupported_sfp);
  */
 static const enum ixgbe_smart_speed ix_smart_speed =
     ixgbe_smart_speed_on;
+
+static __inline void
+ix_try_txgc(struct ix_tx_ring *txr, int8_t dec)
+{
+
+	if (txr->tx_running > 0) {
+		txr->tx_running -= dec;
+		if (txr->tx_running <= 0 && txr->tx_nmbuf &&
+		    txr->tx_avail < txr->tx_ndesc &&
+		    txr->tx_avail + txr->tx_intr_nsegs > txr->tx_ndesc)
+			ix_txgc(txr);
+	}
+}
+
+static void
+ix_txgc_timer(void *xtxr)
+{
+	struct ix_tx_ring *txr = xtxr;
+	struct ifnet *ifp = &txr->tx_sc->arpcom.ac_if;
+
+	if ((ifp->if_flags & (IFF_RUNNING | IFF_UP | IFF_NPOLLING)) !=
+	    (IFF_RUNNING | IFF_UP))
+		return;
+
+	if (!lwkt_serialize_try(&txr->tx_serialize))
+		goto done;
+
+	if ((ifp->if_flags & (IFF_RUNNING | IFF_UP | IFF_NPOLLING)) !=
+	    (IFF_RUNNING | IFF_UP)) {
+		lwkt_serialize_exit(&txr->tx_serialize);
+		return;
+	}
+	ix_try_txgc(txr, IX_TX_RUNNING_DEC);
+
+	lwkt_serialize_exit(&txr->tx_serialize);
+done:
+	callout_reset(&txr->tx_gc_timer, 1, ix_txgc_timer, txr);
+}
+
+static __inline void
+ix_tx_intr(struct ix_tx_ring *txr, int hdr)
+{
+
+	ix_txeof(txr, hdr);
+	if (!ifsq_is_empty(txr->tx_ifsq))
+		ifsq_devstart(txr->tx_ifsq);
+}
+
+static __inline void
+ix_free_txbuf(struct ix_tx_ring *txr, struct ix_tx_buf *txbuf)
+{
+
+	KKASSERT(txbuf->m_head != NULL);
+	KKASSERT(txr->tx_nmbuf > 0);
+	txr->tx_nmbuf--;
+
+	bus_dmamap_unload(txr->tx_tag, txbuf->map);
+	m_freem(txbuf->m_head);
+	txbuf->m_head = NULL;
+}
 
 static int
 ix_probe(device_t dev)
@@ -312,29 +413,79 @@ ix_probe(device_t dev)
 	return ENXIO;
 }
 
+static void
+ix_get_rxring_cnt(const struct ix_softc *sc, int *ring_cnt, int *ring_cntmax)
+{
+
+	switch (sc->hw.mac.type) {
+	case ixgbe_mac_X550:
+	case ixgbe_mac_X550EM_x:
+	case ixgbe_mac_X550EM_a:
+		*ring_cntmax = IX_MAX_RXRING_X550;
+		break;
+
+	default:
+		*ring_cntmax = IX_MAX_RXRING;
+		break;
+	}
+	*ring_cnt = device_getenv_int(sc->dev, "rxr", ix_rxr);
+}
+
+static void
+ix_get_txring_cnt(const struct ix_softc *sc, int *ring_cnt, int *ring_cntmax)
+{
+
+	switch (sc->hw.mac.type) {
+	case ixgbe_mac_82598EB:
+		*ring_cntmax = IX_MAX_TXRING_82598;
+		break;
+
+	case ixgbe_mac_82599EB:
+		*ring_cntmax = IX_MAX_TXRING_82599;
+		break;
+
+	case ixgbe_mac_X540:
+		*ring_cntmax = IX_MAX_TXRING_X540;
+		break;
+
+	case ixgbe_mac_X550:
+	case ixgbe_mac_X550EM_x:
+	case ixgbe_mac_X550EM_a:
+		*ring_cntmax = IX_MAX_TXRING_X550;
+		break;
+
+	default:
+		*ring_cntmax = IX_MAX_TXRING;
+		break;
+	}
+	*ring_cnt = device_getenv_int(sc->dev, "txr", ix_txr);
+}
+
 static int
 ix_attach(device_t dev)
 {
 	struct ix_softc *sc = device_get_softc(dev);
 	struct ixgbe_hw *hw;
-	int error, ring_cnt_max;
-	uint16_t csum;
+	int error, ring_cnt, ring_cntmax;
 	uint32_t ctrl_ext;
-#ifdef IFPOLL_ENABLE
-	int offset, offset_def;
-#endif
+	char flowctrl[IFM_ETH_FC_STRLEN];
 
-	sc->dev = sc->osdep.dev = dev;
+	sc->dev = dev;
 	hw = &sc->hw;
+	hw->back = sc;
 
 	if_initname(&sc->arpcom.ac_if, device_get_name(dev),
 	    device_get_unit(dev));
-	ifmedia_init(&sc->media, IFM_IMASK,
+	ifmedia_init(&sc->media, IFM_IMASK | IFM_ETH_FCMASK,
 	    ix_media_change, ix_media_status);
 
 	/* Save frame size */
 	sc->max_frame_size = ETHERMTU + ETHER_HDR_LEN + ETHER_CRC_LEN;
 
+	sc->direct_input = ix_direct_input;
+	TASK_INIT(&sc->wdog_task, 0, ix_watchdog_task, sc);
+
+	callout_init_mp(&sc->fw_timer);
 	callout_init_mp(&sc->timer);
 	lwkt_serialize_init(&sc->main_serialize);
 
@@ -346,12 +497,6 @@ ix_attach(device_t dev)
 	hw->revision_id = pci_read_config(dev, PCIR_REVID, 1);
 	hw->subsystem_vendor_id = pci_read_config(dev, PCIR_SUBVEND_0, 2);
 	hw->subsystem_device_id = pci_read_config(dev, PCIR_SUBDEV_0, 2);
-
-	ixgbe_set_mac_type(hw);
-
-	/* Pick up the 82599 and VF settings */
-	if (hw->mac.type != ixgbe_mac_82598EB)
-		hw->phy.smart_speed = ix_smart_speed;
 
 	/* Enable bus mastering */
 	pci_enable_busmaster(dev);
@@ -372,76 +517,71 @@ ix_attach(device_t dev)
 	sc->osdep.mem_bus_space_handle = rman_get_bushandle(sc->mem_res);
 
 	sc->hw.hw_addr = (uint8_t *)&sc->osdep.mem_bus_space_handle;
-	sc->hw.back = &sc->osdep;
+
+	/* Let hardware know driver is loaded */
+	ctrl_ext = IXGBE_READ_REG(hw, IXGBE_CTRL_EXT);
+	ctrl_ext |= IXGBE_CTRL_EXT_DRV_LOAD;
+	IXGBE_WRITE_REG(hw, IXGBE_CTRL_EXT, ctrl_ext);
+
+	/*
+	 * Initialize the shared code
+	 */
+	if (ixgbe_init_shared_code(hw)) {
+		device_printf(dev, "Unable to initialize the shared code\n");
+		error = ENXIO;
+		goto failed;
+	}
+
+	if (hw->mbx.ops.init_params)
+		hw->mbx.ops.init_params(hw);
+
+	hw->allow_unsupported_sfp = ix_unsupported_sfp;
+
+	/* Pick up the 82599 settings */
+	if (hw->mac.type != ixgbe_mac_82598EB)
+		hw->phy.smart_speed = ix_smart_speed;
+
+	/* Setup hardware capabilities */
+	ix_setup_caps(sc);
+
+	/* Allocate multicast array memory. */
+	sc->mta = kmalloc(sizeof(*sc->mta) * IX_MAX_MCASTADDR,
+	    M_DEVBUF, M_WAITOK);
+
+	/* Save initial wake up filter configuration; WOL is disabled. */
+	sc->wufc = IXGBE_READ_REG(hw, IXGBE_WUFC);
+
+	/* Verify adapter fan is still functional (if applicable) */
+	if (sc->caps & IX_CAP_DETECT_FANFAIL)
+		ix_detect_fanfail(sc, IXGBE_READ_REG(hw, IXGBE_ESDP), FALSE);
+
+	/* Ensure SW/FW semaphore is free */
+	ixgbe_init_swfw_semaphore(hw);
+
+#ifdef notyet
+	/* Enable EEE power saving */
+	if (sc->caps & IX_CAP_EEE)
+		hw->mac.ops.setup_eee(hw, true);
+#endif
 
 	/*
 	 * Configure total supported RX/TX ring count
 	 */
-	sc->rx_ring_cnt = device_getenv_int(dev, "rxr", ix_rxr);
-	sc->rx_ring_cnt = if_ring_count2(sc->rx_ring_cnt, IX_MAX_RXRING);
+	ix_get_rxring_cnt(sc, &ring_cnt, &ring_cntmax);
+	sc->rx_rmap = if_ringmap_alloc(dev, ring_cnt, ring_cntmax);
+	ix_get_txring_cnt(sc, &ring_cnt, &ring_cntmax);
+	sc->tx_rmap = if_ringmap_alloc(dev, ring_cnt, ring_cntmax);
+	if_ringmap_match(dev, sc->rx_rmap, sc->tx_rmap);
+
+	sc->rx_ring_cnt = if_ringmap_count(sc->rx_rmap);
 	sc->rx_ring_inuse = sc->rx_ring_cnt;
-
-	switch (hw->mac.type) {
-	case ixgbe_mac_82598EB:
-		ring_cnt_max = IX_MAX_TXRING_82598;
-		break;
-
-	case ixgbe_mac_82599EB:
-		ring_cnt_max = IX_MAX_TXRING_82599;
-		break;
-
-	case ixgbe_mac_X540:
-		ring_cnt_max = IX_MAX_TXRING_X540;
-		break;
-
-	default:
-		ring_cnt_max = 1;
-		break;
-	}
-	sc->tx_ring_cnt = device_getenv_int(dev, "txr", ix_txr);
-	sc->tx_ring_cnt = if_ring_count2(sc->tx_ring_cnt, ring_cnt_max);
+	sc->tx_ring_cnt = if_ringmap_count(sc->tx_rmap);
 	sc->tx_ring_inuse = sc->tx_ring_cnt;
 
 	/* Allocate TX/RX rings */
 	error = ix_alloc_rings(sc);
 	if (error)
 		goto failed;
-
-#ifdef IFPOLL_ENABLE
-	/*
-	 * NPOLLING RX CPU offset
-	 */
-	if (sc->rx_ring_cnt == ncpus2) {
-		offset = 0;
-	} else {
-		offset_def = (sc->rx_ring_cnt * device_get_unit(dev)) % ncpus2;
-		offset = device_getenv_int(dev, "npoll.rxoff", offset_def);
-		if (offset >= ncpus2 ||
-		    offset % sc->rx_ring_cnt != 0) {
-			device_printf(dev, "invalid npoll.rxoff %d, use %d\n",
-			    offset, offset_def);
-			offset = offset_def;
-		}
-	}
-	sc->rx_npoll_off = offset;
-
-	/*
-	 * NPOLLING TX CPU offset
-	 */
-	if (sc->tx_ring_cnt == ncpus2) {
-		offset = 0;
-	} else {
-		offset_def = (sc->tx_ring_cnt * device_get_unit(dev)) % ncpus2;
-		offset = device_getenv_int(dev, "npoll.txoff", offset_def);
-		if (offset >= ncpus2 ||
-		    offset % sc->tx_ring_cnt != 0) {
-			device_printf(dev, "invalid npoll.txoff %d, use %d\n",
-			    offset, offset_def);
-			offset = offset_def;
-		}
-	}
-	sc->tx_npoll_off = offset;
-#endif
 
 	/* Allocate interrupt */
 	error = ix_alloc_intr(sc);
@@ -451,13 +591,9 @@ ix_attach(device_t dev)
 	/* Setup serializes */
 	ix_setup_serialize(sc);
 
-	/* Allocate multicast array memory. */
-	sc->mta = kmalloc(IXGBE_ETH_LENGTH_OF_ADDRESS * IX_MAX_MCASTADDR,
-	    M_DEVBUF, M_WAITOK);
-
-	/* Initialize the shared code */
-	hw->allow_unsupported_sfp = ix_unsupported_sfp;
-	error = ixgbe_init_shared_code(hw);
+	hw->phy.reset_if_overtemp = TRUE;
+	error = ixgbe_reset_hw(hw);
+	hw->phy.reset_if_overtemp = FALSE;
 	if (error == IXGBE_ERR_SFP_NOT_PRESENT) {
 		/*
 		 * No optics in this port; ask timer routine
@@ -470,19 +606,19 @@ ix_attach(device_t dev)
 		error = EIO;
 		goto failed;
 	} else if (error) {
-		device_printf(dev, "Unable to initialize the shared code\n");
+		device_printf(dev, "Hardware initialization failed\n");
 		error = EIO;
 		goto failed;
 	}
 
 	/* Make sure we have a good EEPROM before we read from it */
-	if (ixgbe_validate_eeprom_checksum(&sc->hw, &csum) < 0) {
+	if (ixgbe_validate_eeprom_checksum(&sc->hw, NULL) < 0) {
 		device_printf(dev, "The EEPROM Checksum Is Not Valid\n");
 		error = EIO;
 		goto failed;
 	}
 
-	error = ixgbe_init_hw(hw);
+	error = ixgbe_start_hw(hw);
 	if (error == IXGBE_ERR_EEPROM_VERSION) {
 		device_printf(dev, "Pre-production device detected\n");
 	} else if (error == IXGBE_ERR_SFP_NOT_SUPPORTED) {
@@ -493,8 +629,18 @@ ix_attach(device_t dev)
 		device_printf(dev, "No SFP+ Module found\n");
 	}
 
-	/* Detect and set physical type */
-	ix_setup_optics(sc);
+	/* Enable the optics for 82599 SFP+ fiber */
+	ixgbe_enable_tx_laser(hw);
+
+	/* Enable power to the phy. */
+	ixgbe_set_phy_power(hw, TRUE);
+
+	sc->ifm_media = IX_IFM_DEFAULT;
+	/* Get default flow control settings */
+	device_getenv_string(dev, "flow_ctrl", flowctrl, sizeof(flowctrl),
+	    ix_flowctrl);
+	sc->ifm_media |= ifmedia_str2ethfc(flowctrl);
+	sc->advspeed = IXGBE_LINK_SPEED_UNKNOWN;
 
 	/* Setup OS specific network interface */
 	ix_setup_ifp(sc);
@@ -511,18 +657,14 @@ ix_attach(device_t dev)
 	/* Initialize statistics */
 	ix_update_stats(sc);
 
-	/*
-	 * Check PCIE slot type/speed/width
-	 */
+	/* Check PCIE slot type/speed/width */
 	ix_slot_info(sc);
 
-	/* Set an initial default flow control value */
-	sc->fc = ixgbe_fc_full;
-
-	/* Let hardware know driver is loaded */
-	ctrl_ext = IXGBE_READ_REG(hw, IXGBE_CTRL_EXT);
-	ctrl_ext |= IXGBE_CTRL_EXT_DRV_LOAD;
-	IXGBE_WRITE_REG(hw, IXGBE_CTRL_EXT, ctrl_ext);
+	if (sc->caps & IX_CAP_FW_RECOVERY) {
+		device_printf(dev, "start fw timer\n");
+		callout_reset_bycpu(&sc->fw_timer, hz,
+		    ix_fw_timer, sc, ix_get_timer_cpuid(sc, FALSE));
+	}
 
 	return 0;
 failed:
@@ -537,17 +679,24 @@ ix_detach(device_t dev)
 
 	if (device_is_attached(dev)) {
 		struct ifnet *ifp = &sc->arpcom.ac_if;
-		uint32_t ctrl_ext;
+
+		ix_sync_netisr(sc, IFF_UP);
+		taskqueue_drain(taskqueue_thread[0], &sc->wdog_task);
 
 		ifnet_serialize_all(ifp);
 
-		ix_stop(sc);
+		ix_powerdown(sc);
 		ix_teardown_intr(sc, sc->intr_cnt);
 
 		ifnet_deserialize_all(ifp);
 
 		callout_terminate(&sc->timer);
 		ether_ifdetach(ifp);
+	}
+	callout_terminate(&sc->fw_timer);
+
+	if (sc->mem_res != NULL) {
+		uint32_t ctrl_ext;
 
 		/* Let hardware know driver is unloading */
 		ctrl_ext = IXGBE_READ_REG(&sc->hw, IXGBE_CTRL_EXT);
@@ -557,9 +706,6 @@ ix_detach(device_t dev)
 
 	ifmedia_removeall(&sc->media);
 	bus_generic_detach(dev);
-
-	if (sc->sysctl_tree != NULL)
-		sysctl_ctx_free(&sc->sysctl_ctx);
 
 	ix_free_intr(sc);
 
@@ -579,6 +725,15 @@ ix_detach(device_t dev)
 	if (sc->serializes != NULL)
 		kfree(sc->serializes, M_DEVBUF);
 
+	if (sc->rx_rmap != NULL)
+		if_ringmap_free(sc->rx_rmap);
+	if (sc->rx_rmap_intr != NULL)
+		if_ringmap_free(sc->rx_rmap_intr);
+	if (sc->tx_rmap != NULL)
+		if_ringmap_free(sc->tx_rmap);
+	if (sc->tx_rmap_intr != NULL)
+		if_ringmap_free(sc->tx_rmap_intr);
+
 	return 0;
 }
 
@@ -588,8 +743,11 @@ ix_shutdown(device_t dev)
 	struct ix_softc *sc = device_get_softc(dev);
 	struct ifnet *ifp = &sc->arpcom.ac_if;
 
+	ix_sync_netisr(sc, IFF_UP);
+	taskqueue_drain(taskqueue_thread[0], &sc->wdog_task);
+
 	ifnet_serialize_all(ifp);
-	ix_stop(sc);
+	ix_powerdown(sc);
 	ifnet_deserialize_all(ifp);
 
 	return 0;
@@ -632,6 +790,14 @@ ix_start(struct ifnet *ifp, struct ifaltq_subque *ifsq)
 			continue;
 		}
 
+		/*
+		 * TX interrupt are aggressively aggregated, so increasing
+		 * opackets at TX interrupt time will make the opackets
+		 * statistics vastly inaccurate; we do the opackets increment
+		 * now.
+		 */
+		IFNET_STAT_INC(ifp, opackets, 1);
+
 		if (nsegs >= txr->tx_wreg_nsegs) {
 			IXGBE_WRITE_REG(&sc->hw, IXGBE_TDT(txr->tx_idx), idx);
 			nsegs = 0;
@@ -642,6 +808,7 @@ ix_start(struct ifnet *ifp, struct ifaltq_subque *ifsq)
 	}
 	if (idx >= 0)
 		IXGBE_WRITE_REG(&sc->hw, IXGBE_TDT(txr->tx_idx), idx);
+	txr->tx_running = IX_TX_RUNNING;
 }
 
 static int
@@ -655,12 +822,11 @@ ix_ioctl(struct ifnet *ifp, u_long command, caddr_t data, struct ucred *cr)
 
 	switch (command) {
 	case SIOCSIFMTU:
-		if (ifr->ifr_mtu > IX_MAX_FRAME_SIZE - ETHER_HDR_LEN) {
+		if (ifr->ifr_mtu > IX_MAX_MTU) {
 			error = EINVAL;
 		} else {
 			ifp->if_mtu = ifr->ifr_mtu;
-			sc->max_frame_size =
-			    ifp->if_mtu + ETHER_HDR_LEN + ETHER_CRC_LEN;
+			sc->max_frame_size = ifp->if_mtu + IX_MTU_HDR;
 			ix_init(sc);
 		}
 		break;
@@ -761,14 +927,16 @@ ix_init(void *xsc)
 	struct ix_softc *sc = xsc;
 	struct ifnet *ifp = &sc->arpcom.ac_if;
 	struct ixgbe_hw *hw = &sc->hw;
-	uint32_t rxpb, frame, size, tmp;
-	uint32_t gpie, rxctrl;
+	uint32_t rxctrl;
 	int i, error;
 	boolean_t polling;
 
 	ASSERT_IFNET_SERIALIZED_ALL(ifp);
 
 	ix_stop(sc);
+
+	if (sc->flags & IX_FLAG_FW_RECOVERY)
+		return;
 
 	polling = FALSE;
 #ifdef IFPOLL_ENABLE
@@ -778,7 +946,7 @@ ix_init(void *xsc)
 
 	/* Configure # of used RX/TX rings */
 	ix_set_ring_inuse(sc, polling);
-	ifq_set_subq_mask(&ifp->if_snd, sc->tx_ring_inuse - 1);
+	ifq_set_subq_divisor(&ifp->if_snd, sc->tx_ring_inuse);
 
 	/* Get the latest mac address, User can use a LAA */
 	bcopy(IF_LLADDR(ifp), hw->mac.addr, IXGBE_ETH_LENGTH_OF_ADDRESS);
@@ -806,33 +974,16 @@ ix_init(void *xsc)
 	}
 
 	/* Configure RX settings */
-	ix_init_rx_unit(sc);
+	ix_init_rx_unit(sc, polling);
 
-	gpie = IXGBE_READ_REG(hw, IXGBE_GPIE);
-
-	/* Enable Fan Failure Interrupt */
-	gpie |= IXGBE_SDP1_GPIEN;
-
-	/* Add for Module detection */
-	if (hw->mac.type == ixgbe_mac_82599EB)
-		gpie |= IXGBE_SDP2_GPIEN;
-
-	/* Thermal Failure Detection */
-	if (hw->mac.type == ixgbe_mac_X540)
-		gpie |= IXGBE_SDP0_GPIEN;
-
-	if (sc->intr_type == PCI_INTR_TYPE_MSIX) {
-		/* Enable Enhanced MSIX mode */
-		gpie |= IXGBE_GPIE_MSIX_MODE;
-		gpie |= IXGBE_GPIE_EIAME | IXGBE_GPIE_PBA_SUPPORT |
-		    IXGBE_GPIE_OCD;
-	}
-	IXGBE_WRITE_REG(hw, IXGBE_GPIE, gpie);
+	/* Enable SDP & MSI-X interrupts based on adapter */
+	ix_config_gpie(sc);
 
 	/* Set MTU size */
 	if (ifp->if_mtu > ETHERMTU) {
 		uint32_t mhadd;
 
+		/* aka IXGBE_MAXFRS on 82599 and newer */
 		mhadd = IXGBE_READ_REG(hw, IXGBE_MHADD);
 		mhadd &= ~IXGBE_MHADD_MFS_MASK;
 		mhadd |= sc->max_frame_size << IXGBE_MHADD_MFS_SHIFT;
@@ -895,9 +1046,6 @@ ix_init(void *xsc)
 		    sc->rx_rings[0].rx_ndesc - 1);
 	}
 
-	/* Set up VLAN support and filter */
-	ix_set_vlan(sc);
-
 	/* Enable Receive engine */
 	rxctrl = IXGBE_READ_REG(hw, IXGBE_RXCTRL);
 	if (hw->mac.type == ixgbe_mac_82598EB)
@@ -910,23 +1058,22 @@ ix_init(void *xsc)
 
 		if (txr->tx_intr_vec >= 0) {
 			ix_set_ivar(sc, i, txr->tx_intr_vec, 1);
-		} else {
+		} else if (!polling) {
 			/*
 			 * Unconfigured TX interrupt vector could only
 			 * happen for MSI-X.
 			 */
 			KASSERT(sc->intr_type == PCI_INTR_TYPE_MSIX,
 			    ("TX intr vector is not set"));
-			KASSERT(i < sc->rx_ring_inuse,
-			    ("invalid TX ring %d, no piggyback RX ring", i));
-			KASSERT(sc->rx_rings[i].rx_txr == txr,
-			    ("RX ring %d piggybacked TX ring mismatch", i));
 			if (bootverbose)
 				if_printf(ifp, "IVAR skips TX ring %d\n", i);
 		}
 	}
 	for (i = 0; i < sc->rx_ring_inuse; ++i) {
 		const struct ix_rx_ring *rxr = &sc->rx_rings[i];
+
+		if (polling && rxr->rx_intr_vec < 0)
+			continue;
 
 		KKASSERT(rxr->rx_intr_vec >= 0);
 		ix_set_ivar(sc, i, rxr->rx_intr_vec, 0);
@@ -937,10 +1084,8 @@ ix_init(void *xsc)
 			 */
 			KASSERT(rxr->rx_txr->tx_intr_vec < 0,
 			    ("piggybacked TX ring configured intr vector"));
-			KASSERT(rxr->rx_txr->tx_idx == i,
-			    ("RX ring %d piggybacked TX ring %u",
-			     i, rxr->rx_txr->tx_idx));
-			ix_set_ivar(sc, i, rxr->rx_intr_vec, 1);
+			ix_set_ivar(sc, rxr->rx_txr->tx_idx,
+			    rxr->rx_intr_vec, 1);
 			if (bootverbose) {
 				if_printf(ifp, "IVAR RX ring %d piggybacks "
 				    "TX ring %u\n", i, rxr->rx_txr->tx_idx);
@@ -980,33 +1125,17 @@ ix_init(void *xsc)
 	/* Config/Enable Link */
 	ix_config_link(sc);
 
-	/*
-	 * Hardware Packet Buffer & Flow Control setup
-	 */
-	frame = sc->max_frame_size;
-
-	/* Calculate High Water */
-	if (hw->mac.type == ixgbe_mac_X540)
-		tmp = IXGBE_DV_X540(frame, frame);
-	else
-		tmp = IXGBE_DV(frame, frame);
-	size = IXGBE_BT2KB(tmp);
-	rxpb = IXGBE_READ_REG(hw, IXGBE_RXPBSIZE(0)) >> 10;
-	hw->fc.high_water[0] = rxpb - size;
-
-	/* Now calculate Low Water */
-	if (hw->mac.type == ixgbe_mac_X540)
-		tmp = IXGBE_LOW_DV_X540(frame);
-	else
-		tmp = IXGBE_LOW_DV(frame);
-	hw->fc.low_water[0] = IXGBE_BT2KB(tmp);
-
-	hw->fc.requested_mode = sc->fc;
-	hw->fc.pause_time = IX_FC_PAUSE;
-	hw->fc.send_xon = TRUE;
+	/* Hardware Packet Buffer & Flow Control setup */
+	ix_config_flowctrl(sc);
 
 	/* Initialize the FC settings */
 	ixgbe_start_hw(hw);
+
+	/* Set up VLAN support and filter */
+	ix_set_vlan(sc);
+
+	/* Setup DMA Coalescing */
+	ix_config_dmac(sc);
 
 	/*
 	 * Only enable interrupts if we are not polling, make sure
@@ -1019,11 +1148,18 @@ ix_init(void *xsc)
 
 	ifp->if_flags |= IFF_RUNNING;
 	for (i = 0; i < sc->tx_ring_inuse; ++i) {
-		ifsq_clr_oactive(sc->tx_rings[i].tx_ifsq);
-		ifsq_watchdog_start(&sc->tx_rings[i].tx_watchdog);
+		struct ix_tx_ring *txr = &sc->tx_rings[i];
+
+		ifsq_clr_oactive(txr->tx_ifsq);
+		ifsq_watchdog_start(&txr->tx_watchdog);
+
+		if (!polling) {
+			callout_reset_bycpu(&txr->tx_gc_timer, 1,
+			    ix_txgc_timer, txr, txr->tx_intr_cpuid);
+		}
 	}
 
-	ix_set_timer_cpuid(sc, polling);
+	sc->timer_cpuid = ix_get_timer_cpuid(sc, polling);
 	callout_reset_bycpu(&sc->timer, hz, ix_timer, sc, sc->timer_cpuid);
 }
 
@@ -1064,9 +1200,7 @@ ix_intr(void *xsc)
 		struct ix_tx_ring *txr = &sc->tx_rings[0];
 
 		lwkt_serialize_enter(&txr->tx_serialize);
-		ix_txeof(txr, *(txr->tx_hdr));
-		if (!ifsq_is_empty(txr->tx_ifsq))
-			ifsq_devstart(txr->tx_ifsq);
+		ix_tx_intr(txr, *(txr->tx_hdr));
 		lwkt_serialize_exit(&txr->tx_serialize);
 	}
 
@@ -1077,29 +1211,160 @@ ix_intr(void *xsc)
 }
 
 static void
+ix_intr_82598(void *xsc)
+{
+	struct ix_softc *sc = xsc;
+
+	ASSERT_SERIALIZED(&sc->main_serialize);
+
+	/* Software workaround for 82598 errata #26 */
+	IXGBE_WRITE_REG(&sc->hw, IXGBE_EIMC, IXGBE_IRQ_CLEAR_MASK);
+
+	ix_intr(sc);
+}
+
+static void
 ix_media_status(struct ifnet *ifp, struct ifmediareq *ifmr)
 {
 	struct ix_softc *sc = ifp->if_softc;
+	struct ifmedia *ifm = &sc->media;
+	int layer;
+	boolean_t link_active;
 
-	ix_update_link_status(sc);
+	if (sc->flags & IX_FLAG_FW_RECOVERY) {
+		link_active = FALSE;
+	} else {
+		ix_update_link_status(sc);
+		link_active = sc->link_active;
+	}
 
 	ifmr->ifm_status = IFM_AVALID;
 	ifmr->ifm_active = IFM_ETHER;
 
-	if (!sc->link_active)
+	if (!link_active) {
+		if (IFM_SUBTYPE(ifm->ifm_media) != IFM_AUTO)
+			ifmr->ifm_active |= ifm->ifm_media;
+		else
+			ifmr->ifm_active |= IFM_NONE;
 		return;
-
+	}
 	ifmr->ifm_status |= IFM_ACTIVE;
 
-	switch (sc->link_speed) {
-	case IXGBE_LINK_SPEED_100_FULL:
-		ifmr->ifm_active |= IFM_100_TX | IFM_FDX;
+	layer = sc->phy_layer;
+
+	if ((layer & IXGBE_PHYSICAL_LAYER_10GBASE_T) ||
+	    (layer & IXGBE_PHYSICAL_LAYER_1000BASE_T) ||
+	    (layer & IXGBE_PHYSICAL_LAYER_100BASE_TX) ||
+	    (layer & IXGBE_PHYSICAL_LAYER_10BASE_T)) {
+		switch (sc->link_speed) {
+		case IXGBE_LINK_SPEED_10GB_FULL:
+			ifmr->ifm_active |= IFM_10G_T | IFM_FDX;
+			break;
+		case IXGBE_LINK_SPEED_1GB_FULL:
+			ifmr->ifm_active |= IFM_1000_T | IFM_FDX;
+			break;
+		case IXGBE_LINK_SPEED_100_FULL:
+			ifmr->ifm_active |= IFM_100_TX | IFM_FDX;
+			break;
+		case IXGBE_LINK_SPEED_10_FULL:
+			ifmr->ifm_active |= IFM_10_T | IFM_FDX;
+			break;
+		}
+	} else if ((layer & IXGBE_PHYSICAL_LAYER_SFP_PLUS_CU) ||
+	    (layer & IXGBE_PHYSICAL_LAYER_SFP_ACTIVE_DA)) {
+		switch (sc->link_speed) {
+		case IXGBE_LINK_SPEED_10GB_FULL:
+			ifmr->ifm_active |= IFM_10G_TWINAX | IFM_FDX;
+			break;
+		}
+	} else if (layer & IXGBE_PHYSICAL_LAYER_10GBASE_LR) {
+		switch (sc->link_speed) {
+		case IXGBE_LINK_SPEED_10GB_FULL:
+			ifmr->ifm_active |= IFM_10G_LR | IFM_FDX;
+			break;
+		case IXGBE_LINK_SPEED_1GB_FULL:
+			ifmr->ifm_active |= IFM_1000_LX | IFM_FDX;
+			break;
+		}
+	} else if (layer & IXGBE_PHYSICAL_LAYER_10GBASE_LRM) {
+		switch (sc->link_speed) {
+		case IXGBE_LINK_SPEED_10GB_FULL:
+			ifmr->ifm_active |= IFM_10G_LRM | IFM_FDX;
+			break;
+		case IXGBE_LINK_SPEED_1GB_FULL:
+			ifmr->ifm_active |= IFM_1000_LX | IFM_FDX;
+			break;
+		}
+	} else if ((layer & IXGBE_PHYSICAL_LAYER_10GBASE_SR) ||
+	    (layer & IXGBE_PHYSICAL_LAYER_1000BASE_SX)) {
+		switch (sc->link_speed) {
+		case IXGBE_LINK_SPEED_10GB_FULL:
+			ifmr->ifm_active |= IFM_10G_SR | IFM_FDX;
+			break;
+		case IXGBE_LINK_SPEED_1GB_FULL:
+			ifmr->ifm_active |= IFM_1000_SX | IFM_FDX;
+			break;
+		}
+	} else if (layer & IXGBE_PHYSICAL_LAYER_10GBASE_CX4) {
+		switch (sc->link_speed) {
+		case IXGBE_LINK_SPEED_10GB_FULL:
+			ifmr->ifm_active |= IFM_10G_CX4 | IFM_FDX;
+			break;
+		}
+	} else if (layer & IXGBE_PHYSICAL_LAYER_10GBASE_KR) {
+		/*
+		 * XXX: These need to use the proper media types once
+		 * they're added.
+		 */
+		switch (sc->link_speed) {
+		case IXGBE_LINK_SPEED_10GB_FULL:
+			ifmr->ifm_active |= IFM_10G_SR | IFM_FDX;
+			break;
+		case IXGBE_LINK_SPEED_2_5GB_FULL:
+			ifmr->ifm_active |= IFM_2500_SX | IFM_FDX;
+			break;
+		case IXGBE_LINK_SPEED_1GB_FULL:
+			ifmr->ifm_active |= IFM_1000_CX | IFM_FDX;
+			break;
+		}
+	} else if ((layer & IXGBE_PHYSICAL_LAYER_10GBASE_KX4) ||
+	    (layer & IXGBE_PHYSICAL_LAYER_2500BASE_KX) ||
+	    (layer & IXGBE_PHYSICAL_LAYER_1000BASE_KX)) {
+		/*
+		 * XXX: These need to use the proper media types once
+		 * they're added.
+		 */
+		switch (sc->link_speed) {
+		case IXGBE_LINK_SPEED_10GB_FULL:
+			ifmr->ifm_active |= IFM_10G_CX4 | IFM_FDX;
+			break;
+		case IXGBE_LINK_SPEED_2_5GB_FULL:
+			ifmr->ifm_active |= IFM_2500_SX | IFM_FDX;
+			break;
+		case IXGBE_LINK_SPEED_1GB_FULL:
+			ifmr->ifm_active |= IFM_1000_CX | IFM_FDX;
+			break;
+		}
+	}
+
+	/* If nothing is recognized... */
+	if (IFM_SUBTYPE(ifmr->ifm_active) == 0)
+		ifmr->ifm_active |= IFM_NONE;
+
+	if (sc->ifm_media & IFM_ETH_FORCEPAUSE)
+		ifmr->ifm_active |= (sc->ifm_media & IFM_ETH_FCMASK);
+
+	switch (sc->hw.fc.current_mode) {
+	case ixgbe_fc_full:
+		ifmr->ifm_active |= IFM_ETH_RXPAUSE | IFM_ETH_TXPAUSE;
 		break;
-	case IXGBE_LINK_SPEED_1GB_FULL:
-		ifmr->ifm_active |= IFM_1000_SX | IFM_FDX;
+	case ixgbe_fc_rx_pause:
+		ifmr->ifm_active |= IFM_ETH_RXPAUSE;
 		break;
-	case IXGBE_LINK_SPEED_10GB_FULL:
-		ifmr->ifm_active |= sc->optics | IFM_FDX;
+	case ixgbe_fc_tx_pause:
+		ifmr->ifm_active |= IFM_ETH_TXPAUSE;
+		break;
+	default:
 		break;
 	}
 }
@@ -1109,21 +1374,62 @@ ix_media_change(struct ifnet *ifp)
 {
 	struct ix_softc *sc = ifp->if_softc;
 	struct ifmedia *ifm = &sc->media;
+	struct ixgbe_hw *hw = &sc->hw;
 
 	if (IFM_TYPE(ifm->ifm_media) != IFM_ETHER)
-		return EINVAL;
+		return (EINVAL);
+
+	if (hw->phy.media_type == ixgbe_media_type_backplane ||
+	    hw->mac.ops.setup_link == NULL) {
+		if ((ifm->ifm_media ^ sc->ifm_media) & IFM_ETH_FCMASK) {
+			/* Only flow control setting changes are allowed */
+			return (EOPNOTSUPP);
+		}
+	}
 
 	switch (IFM_SUBTYPE(ifm->ifm_media)) {
 	case IFM_AUTO:
-		sc->hw.phy.autoneg_advertised =
-		    IXGBE_LINK_SPEED_100_FULL |
-		    IXGBE_LINK_SPEED_1GB_FULL |
-		    IXGBE_LINK_SPEED_10GB_FULL;
+		sc->advspeed = IXGBE_LINK_SPEED_UNKNOWN;
 		break;
+
+	case IFM_10G_T:
+	case IFM_10G_LRM:
+	case IFM_10G_SR:	/* XXX also KR */
+	case IFM_10G_LR:
+	case IFM_10G_CX4:	/* XXX also KX4 */
+	case IFM_10G_TWINAX:
+		sc->advspeed = IXGBE_LINK_SPEED_10GB_FULL;
+		break;
+
+	case IFM_1000_T:
+	case IFM_1000_LX:
+	case IFM_1000_SX:
+	case IFM_1000_CX:	/* XXX is KX */
+		sc->advspeed = IXGBE_LINK_SPEED_1GB_FULL;
+		break;
+
+	case IFM_100_TX:
+		sc->advspeed = IXGBE_LINK_SPEED_100_FULL;
+		break;
+
 	default:
-		if_printf(ifp, "Only auto media type\n");
+		if (bootverbose) {
+			if_printf(ifp, "Invalid media type %d!\n",
+			    ifm->ifm_media);
+		}
 		return EINVAL;
 	}
+	sc->ifm_media = ifm->ifm_media;
+
+#if 0
+	if (hw->mac.ops.setup_link != NULL) {
+		hw->mac.autotry_restart = TRUE;
+		hw->mac.ops.setup_link(hw, sc->advspeed, TRUE);
+	}
+#else
+	if (ifp->if_flags & IFF_RUNNING)
+		ix_init(sc);
+#endif
 	return 0;
 }
 
@@ -1250,6 +1556,7 @@ ix_encap(struct ix_tx_ring *txr, struct mbuf **m_headp,
 
 	txr->tx_avail -= nsegs;
 	txr->tx_next_avail = i;
+	txr->tx_nmbuf++;
 
 	txbuf->m_head = m_head;
 	txr->tx_buf[first].map = txbuf->map;
@@ -1305,11 +1612,11 @@ ix_set_multi(struct ix_softc *sc)
 	struct ifnet *ifp = &sc->arpcom.ac_if;
 	struct ifmultiaddr *ifma;
 	uint32_t fctrl;
-	uint8_t	*mta;
+	struct ix_mc_addr *mta;
 	int mcnt = 0;
 
 	mta = sc->mta;
-	bzero(mta, IXGBE_ETH_LENGTH_OF_ADDRESS * IX_MAX_MCASTADDR);
+	bzero(mta, sizeof(*mta) * IX_MAX_MCASTADDR);
 
 	TAILQ_FOREACH(ifma, &ifp->if_multiaddrs, ifma_link) {
 		if (ifma->ifma_addr->sa_family != AF_LINK)
@@ -1317,8 +1624,7 @@ ix_set_multi(struct ix_softc *sc)
 		if (mcnt == IX_MAX_MCASTADDR)
 			break;
 		bcopy(LLADDR((struct sockaddr_dl *)ifma->ifma_addr),
-		    &mta[mcnt * IXGBE_ETH_LENGTH_OF_ADDRESS],
-		    IXGBE_ETH_LENGTH_OF_ADDRESS);
+		    mta[mcnt].addr, IXGBE_ETH_LENGTH_OF_ADDRESS);
 		mcnt++;
 	}
 
@@ -1336,7 +1642,7 @@ ix_set_multi(struct ix_softc *sc)
 
 	if (mcnt < IX_MAX_MCASTADDR) {
 		ixgbe_update_mc_addr_list(&sc->hw,
-		    mta, mcnt, ix_mc_array_itr, TRUE);
+		    (uint8_t *)mta, mcnt, ix_mc_array_itr, TRUE);
 	}
 }
 
@@ -1348,13 +1654,12 @@ ix_set_multi(struct ix_softc *sc)
 static uint8_t *
 ix_mc_array_itr(struct ixgbe_hw *hw, uint8_t **update_ptr, uint32_t *vmdq)
 {
-	uint8_t *addr = *update_ptr;
-	uint8_t *newptr;
-	*vmdq = 0;
+	struct ix_mc_addr *mta = (struct ix_mc_addr *)*update_ptr;
 
-	newptr = addr + IXGBE_ETH_LENGTH_OF_ADDRESS;
-	*update_ptr = newptr;
-	return addr;
+	*vmdq = mta->vmdq;
+	*update_ptr = (uint8_t *)(mta + 1);
+
+	return (mta->addr);
 }
 
 static void
@@ -1395,10 +1700,33 @@ ix_update_link_status(struct ix_softc *sc)
 				    sc->link_speed == 128 ? 10 : 1,
 				    "Full Duplex");
 			}
-			sc->link_active = TRUE;
 
-			/* Update any Flow Control changes */
+			/*
+			 * Update any Flow Control changes
+			 */
 			ixgbe_fc_enable(&sc->hw);
+			/* MUST after ixgbe_fc_enable() */
+			if (sc->rx_ring_inuse > 1) {
+				switch (sc->hw.fc.current_mode) {
+				case ixgbe_fc_rx_pause:
+				case ixgbe_fc_tx_pause:
+				case ixgbe_fc_full:
+					ix_disable_rx_drop(sc);
+					break;
+
+				case ixgbe_fc_none:
+					ix_enable_rx_drop(sc);
+					break;
+
+				default:
+					break;
+				}
+			}
+
+			/* Update DMA coalescing config */
+			ix_config_dmac(sc);
+
+			sc->link_active = TRUE;
 
 			ifp->if_link_state = LINK_STATE_UP;
 			if_link_state_change(ifp);
@@ -1434,6 +1762,9 @@ ix_stop(struct ix_softc *sc)
 		ifsq_clr_oactive(txr->tx_ifsq);
 		ifsq_watchdog_stop(&txr->tx_watchdog);
 		txr->tx_flags &= ~IX_TXFLAG_ENABLED;
+
+		txr->tx_running = 0;
+		callout_stop(&txr->tx_gc_timer);
 	}
 
 	ixgbe_reset_hw(hw);
@@ -1456,55 +1787,6 @@ ix_stop(struct ix_softc *sc)
 
 	for (i = 0; i < sc->rx_ring_cnt; ++i)
 		ix_free_rx_ring(&sc->rx_rings[i]);
-}
-
-static void
-ix_setup_optics(struct ix_softc *sc)
-{
-	struct ixgbe_hw *hw = &sc->hw;
-	int layer;
-
-	layer = ixgbe_get_supported_physical_layer(hw);
-
-	if (layer & IXGBE_PHYSICAL_LAYER_10GBASE_T) {
-		sc->optics = IFM_10G_T;
-		return;
-	}
-
-	if (layer & IXGBE_PHYSICAL_LAYER_1000BASE_T) {
-		sc->optics = IFM_1000_T;
-		return;
-	}
-
-	if (layer & IXGBE_PHYSICAL_LAYER_1000BASE_SX) {
-		sc->optics = IFM_1000_SX;
-		return;
-	}
-
-	if (layer & (IXGBE_PHYSICAL_LAYER_10GBASE_LR |
-	    IXGBE_PHYSICAL_LAYER_10GBASE_LRM)) {
-		sc->optics = IFM_10G_LR;
-		return;
-	}
-
-	if (layer & IXGBE_PHYSICAL_LAYER_10GBASE_SR) {
-		sc->optics = IFM_10G_SR;
-		return;
-	}
-
-	if (layer & IXGBE_PHYSICAL_LAYER_SFP_PLUS_CU) {
-		sc->optics = IFM_10G_TWINAX;
-		return;
-	}
-
-	if (layer & (IXGBE_PHYSICAL_LAYER_10GBASE_KX4 |
-	    IXGBE_PHYSICAL_LAYER_10GBASE_CX4)) {
-		sc->optics = IFM_10G_CX4;
-		return;
-	}
-
-	/* If we get here just set the default */
-	sc->optics = IFM_ETHER | IFM_AUTO;
 }
 
 static void
@@ -1534,12 +1816,15 @@ ix_setup_ifp(struct ix_softc *sc)
 	/* Increase TSO burst length */
 	ifp->if_tsolen = (8 * ETHERMTU);
 
+	ifp->if_nmbclusters = sc->rx_ring_cnt * sc->rx_rings[0].rx_ndesc;
+	ifp->if_nmbjclusters = ifp->if_nmbclusters;
+
 	ifq_set_maxlen(&ifp->if_snd, sc->tx_rings[0].tx_ndesc - 2);
 	ifq_set_ready(&ifp->if_snd);
 	ifq_set_subq_cnt(&ifp->if_snd, sc->tx_ring_cnt);
 
-	ifp->if_mapsubq = ifq_mapsubq_mask;
-	ifq_set_subq_mask(&ifp->if_snd, 0);
+	ifp->if_mapsubq = ifq_mapsubq_modulo;
+	ifq_set_subq_divisor(&ifp->if_snd, 1);
 
 	ether_ifattach(ifp, hw->mac.addr, NULL);
 
@@ -1568,32 +1853,35 @@ ix_setup_ifp(struct ix_softc *sc)
 		ifsq_watchdog_init(&txr->tx_watchdog, ifsq, ix_watchdog);
 	}
 
-	/*
-	 * Specify the media types supported by this adapter and register
-	 * callbacks to update media and link information
-	 */
-	ifmedia_add(&sc->media, IFM_ETHER | sc->optics, 0, NULL);
-	ifmedia_set(&sc->media, IFM_ETHER | sc->optics);
-	if (hw->device_id == IXGBE_DEV_ID_82598AT) {
-		ifmedia_add(&sc->media,
-		    IFM_ETHER | IFM_1000_T | IFM_FDX, 0, NULL);
-		ifmedia_add(&sc->media, IFM_ETHER | IFM_1000_T, 0, NULL);
-	}
-	ifmedia_add(&sc->media, IFM_ETHER | IFM_AUTO, 0, NULL);
-	ifmedia_set(&sc->media, IFM_ETHER | IFM_AUTO);
+	/* Specify the media types supported by this adapter */
+	sc->phy_layer = ixgbe_get_supported_physical_layer(hw);
+	ix_init_media(sc);
 }
 
 static boolean_t
-ix_is_sfp(const struct ixgbe_hw *hw)
+ix_is_sfp(struct ixgbe_hw *hw)
 {
-	switch (hw->phy.type) {
-	case ixgbe_phy_sfp_avago:
-	case ixgbe_phy_sfp_ftl:
-	case ixgbe_phy_sfp_intel:
-	case ixgbe_phy_sfp_unknown:
-	case ixgbe_phy_sfp_passive_tyco:
-	case ixgbe_phy_sfp_passive_unknown:
-		return TRUE;
+	switch (hw->mac.type) {
+	case ixgbe_mac_82598EB:
+		if (hw->phy.type == ixgbe_phy_nl)
+			return TRUE;
+		return FALSE;
+
+	case ixgbe_mac_82599EB:
+		switch (hw->mac.ops.get_media_type(hw)) {
+		case ixgbe_media_type_fiber:
+		case ixgbe_media_type_fiber_qsfp:
+			return TRUE;
+		default:
+			return FALSE;
+		}
+
+	case ixgbe_mac_X550EM_x:
+	case ixgbe_mac_X550EM_a:
+		if (hw->mac.ops.get_media_type(hw) == ixgbe_media_type_fiber)
+			return TRUE;
+		return FALSE;
+
 	default:
 		return FALSE;
 	}
@@ -1606,14 +1894,10 @@ ix_config_link(struct ix_softc *sc)
 	boolean_t sfp;
 
 	sfp = ix_is_sfp(hw);
-	if (sfp) { 
-		if (hw->phy.multispeed_fiber) {
-			hw->mac.ops.setup_sfp(hw);
+	if (sfp) {
+		if (hw->phy.multispeed_fiber)
 			ixgbe_enable_tx_laser(hw);
-			ix_handle_msf(sc);
-		} else {
-			ix_handle_mod(sc);
-		}
+		ix_handle_mod(sc);
 	} else {
 		uint32_t autoneg, err = 0;
 
@@ -1624,7 +1908,10 @@ ix_config_link(struct ix_softc *sc)
 				return;
 		}
 
-		autoneg = hw->phy.autoneg_advertised;
+		if (sc->advspeed != IXGBE_LINK_SPEED_UNKNOWN)
+			autoneg = sc->advspeed;
+		else
+			autoneg = hw->phy.autoneg_advertised;
 		if (!autoneg && hw->mac.ops.get_link_capabilities != NULL) {
 			bool negotiate;
 
@@ -1663,16 +1950,18 @@ ix_alloc_rings(struct ix_softc *sc)
 	/*
 	 * Allocate TX descriptor rings and buffers
 	 */
-	sc->tx_rings = kmalloc_cachealign(
-	    sizeof(struct ix_tx_ring) * sc->tx_ring_cnt,
-	    M_DEVBUF, M_WAITOK | M_ZERO);
+	sc->tx_rings = kmalloc(sizeof(struct ix_tx_ring) * sc->tx_ring_cnt,
+			       M_DEVBUF,
+			       M_WAITOK | M_ZERO | M_CACHEALIGN);
 	for (i = 0; i < sc->tx_ring_cnt; ++i) {
 		struct ix_tx_ring *txr = &sc->tx_rings[i];
 
 		txr->tx_sc = sc;
 		txr->tx_idx = i;
 		txr->tx_intr_vec = -1;
+		txr->tx_intr_cpuid = -1;
 		lwkt_serialize_init(&txr->tx_serialize);
+		callout_init_mp(&txr->tx_gc_timer);
 
 		error = ix_create_tx_ring(txr);
 		if (error)
@@ -1682,9 +1971,9 @@ ix_alloc_rings(struct ix_softc *sc)
 	/*
 	 * Allocate RX descriptor rings and buffers
 	 */ 
-	sc->rx_rings = kmalloc_cachealign(
-	    sizeof(struct ix_rx_ring) * sc->rx_ring_cnt,
-	    M_DEVBUF, M_WAITOK | M_ZERO);
+	sc->rx_rings = kmalloc(sizeof(struct ix_rx_ring) * sc->rx_ring_cnt,
+			       M_DEVBUF,
+			       M_WAITOK | M_ZERO | M_CACHEALIGN);
 	for (i = 0; i < sc->rx_ring_cnt; ++i) {
 		struct ix_rx_ring *rxr = &sc->rx_rings[i];
 
@@ -1748,7 +2037,8 @@ ix_create_tx_ring(struct ix_tx_ring *txr)
 	}
 
 	tsize = __VM_CACHELINE_ALIGN(sizeof(struct ix_tx_buf) * txr->tx_ndesc);
-	txr->tx_buf = kmalloc_cachealign(tsize, M_DEVBUF, M_WAITOK | M_ZERO);
+	txr->tx_buf = kmalloc(tsize, M_DEVBUF,
+			      M_WAITOK | M_ZERO | M_CACHEALIGN);
 
 	/*
 	 * Create DMA tag for TX buffers
@@ -1846,6 +2136,8 @@ ix_init_tx_ring(struct ix_tx_ring *txr)
 	txr->tx_next_avail = 0;
 	txr->tx_next_clean = 0;
 	txr->tx_nsegs = 0;
+	txr->tx_nmbuf = 0;
+	txr->tx_running = 0;
 
 	/* Set number of descriptors available */
 	txr->tx_avail = txr->tx_ndesc;
@@ -1883,8 +2175,6 @@ ix_init_tx_unit(struct ix_softc *sc)
 		case ixgbe_mac_82598EB:
 			txctrl = IXGBE_READ_REG(hw, IXGBE_DCA_TXCTRL(i));
 			break;
-		case ixgbe_mac_82599EB:
-		case ixgbe_mac_X540:
 		default:
 			txctrl = IXGBE_READ_REG(hw, IXGBE_DCA_TXCTRL_82599(i));
 			break;
@@ -1894,8 +2184,6 @@ ix_init_tx_unit(struct ix_softc *sc)
 		case ixgbe_mac_82598EB:
 			IXGBE_WRITE_REG(hw, IXGBE_DCA_TXCTRL(i), txctrl);
 			break;
-		case ixgbe_mac_82599EB:
-		case ixgbe_mac_X540:
 		default:
 			IXGBE_WRITE_REG(hw, IXGBE_DCA_TXCTRL_82599(i), txctrl);
 			break;
@@ -2068,7 +2356,6 @@ ix_tso_ctx_setup(struct ix_tx_ring *txr, const struct mbuf *mp,
 static void
 ix_txeof(struct ix_tx_ring *txr, int hdr)
 {
-	struct ifnet *ifp = &txr->tx_sc->arpcom.ac_if;
 	int first, avail;
 
 	if (txr->tx_avail == txr->tx_ndesc)
@@ -2082,13 +2369,11 @@ ix_txeof(struct ix_tx_ring *txr, int hdr)
 	while (first != hdr) {
 		struct ix_tx_buf *txbuf = &txr->tx_buf[first];
 
+		KKASSERT(avail < txr->tx_ndesc);
 		++avail;
-		if (txbuf->m_head) {
-			bus_dmamap_unload(txr->tx_tag, txbuf->map);
-			m_freem(txbuf->m_head);
-			txbuf->m_head = NULL;
-			IFNET_STAT_INC(ifp, opackets, 1);
-		}
+
+		if (txbuf->m_head != NULL)
+			ix_free_txbuf(txr, txbuf);
 		if (++first == txr->tx_ndesc)
 			first = 0;
 	}
@@ -2099,6 +2384,44 @@ ix_txeof(struct ix_tx_ring *txr, int hdr)
 		ifsq_clr_oactive(txr->tx_ifsq);
 		txr->tx_watchdog.wd_timer = 0;
 	}
+	txr->tx_running = IX_TX_RUNNING;
+}
+
+static void
+ix_txgc(struct ix_tx_ring *txr)
+{
+	int first, hdr;
+#ifdef INVARIANTS
+	int avail;
+#endif
+
+	if (txr->tx_avail == txr->tx_ndesc)
+		return;
+
+	hdr = IXGBE_READ_REG(&txr->tx_sc->hw, IXGBE_TDH(txr->tx_idx));
+	first = txr->tx_next_clean;
+	if (first == hdr)
+		goto done;
+	txr->tx_gc++;
+
+#ifdef INVARIANTS
+	avail = txr->tx_avail;
+#endif
+	while (first != hdr) {
+		struct ix_tx_buf *txbuf = &txr->tx_buf[first];
+
+#ifdef INVARIANTS
+		KKASSERT(avail < txr->tx_ndesc);
+		++avail;
+#endif
+		if (txbuf->m_head != NULL)
+			ix_free_txbuf(txr, txbuf);
+		if (++first == txr->tx_ndesc)
+			first = 0;
+	}
+done:
+	if (txr->tx_nmbuf)
+		txr->tx_running = IX_TX_RUNNING;
 }
 
 static int
@@ -2136,7 +2459,8 @@ ix_create_rx_ring(struct ix_rx_ring *rxr)
 	}
 
 	rsize = __VM_CACHELINE_ALIGN(sizeof(struct ix_rx_buf) * rxr->rx_ndesc);
-	rxr->rx_buf = kmalloc_cachealign(rsize, M_DEVBUF, M_WAITOK | M_ZERO);
+	rxr->rx_buf = kmalloc(rsize, M_DEVBUF,
+			      M_WAITOK | M_ZERO | M_CACHEALIGN);
 
 	/*
 	 * Create DMA tag for RX buffers
@@ -2344,24 +2668,25 @@ ix_init_rx_ring(struct ix_rx_ring *rxr)
 #define BSIZEPKT_ROUNDUP ((1<<IXGBE_SRRCTL_BSIZEPKT_SHIFT)-1)
 	
 static void
-ix_init_rx_unit(struct ix_softc *sc)
+ix_init_rx_unit(struct ix_softc *sc, boolean_t polling)
 {
 	struct ixgbe_hw	*hw = &sc->hw;
 	struct ifnet *ifp = &sc->arpcom.ac_if;
-	uint32_t bufsz, rxctrl, fctrl, rxcsum, hlreg;
+	uint32_t bufsz, fctrl, rxcsum, hlreg;
 	int i;
 
 	/*
 	 * Make sure receives are disabled while setting up the descriptor ring
 	 */
-	rxctrl = IXGBE_READ_REG(hw, IXGBE_RXCTRL);
-	IXGBE_WRITE_REG(hw, IXGBE_RXCTRL, rxctrl & ~IXGBE_RXCTRL_RXEN);
+	ixgbe_disable_rx(hw);
 
 	/* Enable broadcasts */
 	fctrl = IXGBE_READ_REG(hw, IXGBE_FCTRL);
 	fctrl |= IXGBE_FCTRL_BAM;
-	fctrl |= IXGBE_FCTRL_DPF;
-	fctrl |= IXGBE_FCTRL_PMCF;
+	if (hw->mac.type == ixgbe_mac_82598EB) {
+		fctrl |= IXGBE_FCTRL_DPF;
+		fctrl |= IXGBE_FCTRL_PMCF;
+	}
 	IXGBE_WRITE_REG(hw, IXGBE_FCTRL, fctrl);
 
 	/* Set for Jumbo Frames? */
@@ -2398,27 +2723,21 @@ ix_init_rx_unit(struct ix_softc *sc)
 		srrctl |= IXGBE_SRRCTL_DESCTYPE_ADV_ONEBUF;
 		if (sc->rx_ring_inuse > 1) {
 			/* See the commend near ix_enable_rx_drop() */
-			switch (sc->fc) {
-			case ixgbe_fc_rx_pause:
-			case ixgbe_fc_tx_pause:
-			case ixgbe_fc_full:
+			if (sc->ifm_media &
+			    (IFM_ETH_RXPAUSE | IFM_ETH_TXPAUSE)) {
 				srrctl &= ~IXGBE_SRRCTL_DROP_EN;
 				if (i == 0 && bootverbose) {
-					if_printf(ifp, "flow control %d, "
-					    "disable RX drop\n", sc->fc);
+					if_printf(ifp, "flow control %s, "
+					    "disable RX drop\n",
+					    ix_ifmedia2str(sc->ifm_media));
 				}
-				break;
-
-			case ixgbe_fc_none:
+			} else {
 				srrctl |= IXGBE_SRRCTL_DROP_EN;
 				if (i == 0 && bootverbose) {
-					if_printf(ifp, "flow control %d, "
-					    "enable RX drop\n", sc->fc);
+					if_printf(ifp, "flow control %s, "
+					    "enable RX drop\n",
+					    ix_ifmedia2str(sc->ifm_media));
 				}
-				break;
-
-			default:
-				break;
 			}
 		}
 		IXGBE_WRITE_REG(hw, IXGBE_SRRCTL(i), srrctl);
@@ -2436,9 +2755,10 @@ ix_init_rx_unit(struct ix_softc *sc)
 	/*
 	 * Setup RSS
 	 */
-	if (IX_ENABLE_HWRSS(sc)) {
+	if (sc->rx_ring_inuse > 1) {
 		uint8_t key[IX_NRSSRK * IX_RSSRK_SIZE];
-		int j, r;
+		const struct if_ringmap *rm;
+		int j, r, nreta, table_nent;
 
 		/*
 		 * NOTE:
@@ -2462,22 +2782,50 @@ ix_init_rx_unit(struct ix_softc *sc)
 		}
 
 		/*
-		 * Configure RSS redirect table in following fashion:
-		 * (hash & ring_cnt_mask) == rdr_table[(hash & rdr_table_mask)]
+		 * Configure RSS redirect table.
 		 */
+
+		/* Table size will differ based on MAC */
+		switch (hw->mac.type) {
+		case ixgbe_mac_X550:
+		case ixgbe_mac_X550EM_x:
+		case ixgbe_mac_X550EM_a:
+			nreta = IX_NRETA_X550;
+			break;
+		default:
+			nreta = IX_NRETA;
+			break;
+		}
+
+		table_nent = nreta * IX_RETA_SIZE;
+		KASSERT(table_nent <= IX_RDRTABLE_SIZE,
+		    ("invalid RETA count %d", nreta));
+		if (polling)
+			rm = sc->rx_rmap;
+		else
+			rm = sc->rx_rmap_intr;
+		if_ringmap_rdrtable(rm, sc->rdr_table, table_nent);
+
 		r = 0;
-		for (j = 0; j < IX_NRETA; ++j) {
+		for (j = 0; j < nreta; ++j) {
 			uint32_t reta = 0;
 
 			for (i = 0; i < IX_RETA_SIZE; ++i) {
 				uint32_t q;
 
-				q = r % sc->rx_ring_inuse;
+				q = sc->rdr_table[r];
+				KASSERT(q < sc->rx_ring_inuse,
+				    ("invalid RX ring index %d", q));
 				reta |= q << (8 * i);
 				++r;
 			}
 			IX_RSS_DPRINTF(sc, 1, "reta 0x%08x\n", reta);
-			IXGBE_WRITE_REG(hw, IXGBE_RETA(j), reta);
+			if (j < IX_NRETA) {
+				IXGBE_WRITE_REG(hw, IXGBE_RETA(j), reta);
+			} else {
+				IXGBE_WRITE_REG(hw, IXGBE_ERETA(j - IX_NRETA),
+				    reta);
+			}
 		}
 
 		/*
@@ -2566,8 +2914,7 @@ ix_rssinfo(struct mbuf *m, struct pktinfo *pi,
 		return NULL;
 	}
 
-	m->m_flags |= M_HASH;
-	m->m_pkthdr.hash = toeplitz_hash(hash);
+	m_sethash(m, toeplitz_hash(hash));
 	return pi;
 }
 
@@ -2760,6 +3107,9 @@ ix_set_vlan(struct ix_softc *sc)
 	struct ixgbe_hw *hw = &sc->hw;
 	uint32_t ctrl;
 
+	if ((sc->arpcom.ac_if.if_capenable & IFCAP_VLAN_HWTAGGING) == 0)
+		return;
+
 	if (hw->mac.type == ixgbe_mac_82598EB) {
 		ctrl = IXGBE_READ_REG(hw, IXGBE_VLNCTRL);
 		ctrl |= IXGBE_VLNCTRL_VME;
@@ -2791,14 +3141,12 @@ ix_enable_intr(struct ix_softc *sc)
 
 	sc->intr_mask = (IXGBE_EIMS_ENABLE_MASK & ~IXGBE_EIMS_RTX_QUEUE);
 
-	/* Enable Fan Failure detection */
-	if (hw->device_id == IXGBE_DEV_ID_82598AT)
-		sc->intr_mask |= IXGBE_EIMS_GPI_SDP1;
-
-	switch (sc->hw.mac.type) {
+	switch (hw->mac.type) {
 	case ixgbe_mac_82599EB:
 		sc->intr_mask |= IXGBE_EIMS_ECC;
+		/* Temperature sensor on some adapters */
 		sc->intr_mask |= IXGBE_EIMS_GPI_SDP0;
+		/* SFP+ (RX_LOS_N & MOD_ABS_N) */
 		sc->intr_mask |= IXGBE_EIMS_GPI_SDP1;
 		sc->intr_mask |= IXGBE_EIMS_GPI_SDP2;
 		break;
@@ -2809,10 +3157,34 @@ ix_enable_intr(struct ix_softc *sc)
 		fwsm = IXGBE_READ_REG(hw, IXGBE_FWSM);
 		if (fwsm & IXGBE_FWSM_TS_ENABLED)
 			sc->intr_mask |= IXGBE_EIMS_TS;
-		/* FALL THROUGH */
+		break;
+
+	case ixgbe_mac_X550:
+		sc->intr_mask |= IXGBE_EIMS_ECC;
+		/* MAC thermal sensor is automatically enabled */
+		sc->intr_mask |= IXGBE_EIMS_TS;
+		break;
+
+	case ixgbe_mac_X550EM_a:
+	case ixgbe_mac_X550EM_x:
+		sc->intr_mask |= IXGBE_EIMS_ECC;
+		/* Some devices use SDP0 for important information */
+		if (hw->device_id == IXGBE_DEV_ID_X550EM_X_SFP ||
+		    hw->device_id == IXGBE_DEV_ID_X550EM_A_SFP ||
+		    hw->device_id == IXGBE_DEV_ID_X550EM_A_SFP_N ||
+		    hw->device_id == IXGBE_DEV_ID_X550EM_X_10G_T)
+			sc->intr_mask |= IXGBE_EIMS_GPI_SDP0_BY_MAC(hw);
+		if (hw->phy.type == ixgbe_phy_x550em_ext_t)
+			sc->intr_mask |= IXGBE_EICR_GPI_SDP0_X540;
+		break;
+
 	default:
 		break;
 	}
+
+	/* Enable Fan Failure detection */
+	if (sc->caps & IX_CAP_DETECT_FANFAIL)
+		sc->intr_mask |= IXGBE_EIMS_GPI_SDP1;
 
 	/* With MSI-X we use auto clear for RX and TX rings */
 	if (sc->intr_type == PCI_INTR_TYPE_MSIX) {
@@ -2878,88 +3250,68 @@ ix_disable_intr(struct ix_softc *sc)
 		lwkt_serialize_handler_disable(sc->intr_data[i].intr_serialize);
 }
 
-uint16_t
-ixgbe_read_pci_cfg(struct ixgbe_hw *hw, uint32_t reg)
-{
-	return pci_read_config(((struct ixgbe_osdep *)hw->back)->dev,
-	    reg, 2);
-}
-
-void
-ixgbe_write_pci_cfg(struct ixgbe_hw *hw, uint32_t reg, uint16_t value)
-{
-	pci_write_config(((struct ixgbe_osdep *)hw->back)->dev,
-	    reg, value, 2);
-}
-
 static void
 ix_slot_info(struct ix_softc *sc)
 {
-	struct ixgbe_hw *hw = &sc->hw;
 	device_t dev = sc->dev;
-	struct ixgbe_mac_info *mac = &hw->mac;
-	uint16_t link;
+	struct ixgbe_hw *hw = &sc->hw;
 	uint32_t offset;
+	uint16_t link;
+	boolean_t bus_info_valid = TRUE;
 
-	/* For most devices simply call the shared code routine */
-	if (hw->device_id != IXGBE_DEV_ID_82599_SFP_SF_QP) {
-		ixgbe_get_bus_info(hw);
+	/* Some devices are behind an internal bridge */
+	switch (hw->device_id) {
+	case IXGBE_DEV_ID_82599_SFP_SF_QP:
+	case IXGBE_DEV_ID_82599_QSFP_SF_QP:
+		goto get_parent_info;
+	default:
+		break;
+	}
+
+	ixgbe_get_bus_info(hw);
+
+	/*
+	 * Some devices don't use PCI-E, but there is no need
+	 * to display "Unknown" for bus speed and width.
+	 */
+	switch (hw->mac.type) {
+	case ixgbe_mac_X550EM_x:
+	case ixgbe_mac_X550EM_a:
+		return;
+	default:
 		goto display;
 	}
 
+get_parent_info:
 	/*
-	 * For the Quad port adapter we need to parse back
-	 * up the PCI tree to find the speed of the expansion
-	 * slot into which this adapter is plugged. A bit more work.
+	 * For the Quad port adapter we need to parse back up
+	 * the PCI tree to find the speed of the expansion slot
+	 * into which this adapter is plugged.  A bit more work.
 	 */
 	dev = device_get_parent(device_get_parent(dev));
 #ifdef IXGBE_DEBUG
-	device_printf(dev, "parent pcib = %x,%x,%x\n",
-	    pci_get_bus(dev), pci_get_slot(dev), pci_get_function(dev));
+	device_printf(dev, "parent pcib = %x,%x,%x\n", pci_get_bus(dev),
+	    pci_get_slot(dev), pci_get_function(dev));
 #endif
 	dev = device_get_parent(device_get_parent(dev));
 #ifdef IXGBE_DEBUG
-	device_printf(dev, "slot pcib = %x,%x,%x\n",
-	    pci_get_bus(dev), pci_get_slot(dev), pci_get_function(dev));
+	device_printf(dev, "slot pcib = %x,%x,%x\n", pci_get_bus(dev),
+	    pci_get_slot(dev), pci_get_function(dev));
 #endif
 	/* Now get the PCI Express Capabilities offset */
 	offset = pci_get_pciecap_ptr(dev);
+	if (offset == 0) {
+		/*
+		 * Hmm...can't get PCI-Express capabilities.
+		 * Falling back to default method.
+		 */
+		bus_info_valid = FALSE;
+		ixgbe_get_bus_info(hw);
+		goto display;
+	}
 	/* ...and read the Link Status Register */
 	link = pci_read_config(dev, offset + PCIER_LINKSTAT, 2);
-	switch (link & IXGBE_PCI_LINK_WIDTH) {
-	case IXGBE_PCI_LINK_WIDTH_1:
-		hw->bus.width = ixgbe_bus_width_pcie_x1;
-		break;
-	case IXGBE_PCI_LINK_WIDTH_2:
-		hw->bus.width = ixgbe_bus_width_pcie_x2;
-		break;
-	case IXGBE_PCI_LINK_WIDTH_4:
-		hw->bus.width = ixgbe_bus_width_pcie_x4;
-		break;
-	case IXGBE_PCI_LINK_WIDTH_8:
-		hw->bus.width = ixgbe_bus_width_pcie_x8;
-		break;
-	default:
-		hw->bus.width = ixgbe_bus_width_unknown;
-		break;
-	}
-
-	switch (link & IXGBE_PCI_LINK_SPEED) {
-	case IXGBE_PCI_LINK_SPEED_2500:
-		hw->bus.speed = ixgbe_bus_speed_2500;
-		break;
-	case IXGBE_PCI_LINK_SPEED_5000:
-		hw->bus.speed = ixgbe_bus_speed_5000;
-		break;
-	case IXGBE_PCI_LINK_SPEED_8000:
-		hw->bus.speed = ixgbe_bus_speed_8000;
-		break;
-	default:
-		hw->bus.speed = ixgbe_bus_speed_unknown;
-		break;
-	}
-
-	mac->ops.set_lan_id(hw);
+	ixgbe_set_pci_config_data_generic(hw, link);
 
 display:
 	device_printf(dev, "PCI Express Bus: Speed %s %s\n",
@@ -2970,16 +3322,29 @@ display:
 	    hw->bus.width == ixgbe_bus_width_pcie_x4 ? "Width x4" :
 	    hw->bus.width == ixgbe_bus_width_pcie_x1 ? "Width x1" : "Unknown");
 
-	if (hw->device_id != IXGBE_DEV_ID_82599_SFP_SF_QP &&
-	    hw->bus.width <= ixgbe_bus_width_pcie_x4 &&
-	    hw->bus.speed == ixgbe_bus_speed_2500) {
-		device_printf(dev, "For optimal performance a x8 "
-		    "PCIE, or x4 PCIE Gen2 slot is required.\n");
-	} else if (hw->device_id == IXGBE_DEV_ID_82599_SFP_SF_QP &&
-	    hw->bus.width <= ixgbe_bus_width_pcie_x8 &&
-	    hw->bus.speed < ixgbe_bus_speed_8000) {
-		device_printf(dev, "For optimal performance a x8 "
-		    "PCIE Gen3 slot is required.\n");
+	if (bus_info_valid) {
+		if (hw->device_id != IXGBE_DEV_ID_82599_SFP_SF_QP &&
+		    hw->bus.width <= ixgbe_bus_width_pcie_x4 &&
+		    hw->bus.speed == ixgbe_bus_speed_2500) {
+			device_printf(dev, "PCI-Express bandwidth available "
+			    "for this card is not sufficient for optimal "
+			    "performance.\n");
+			device_printf(dev, "For optimal performance a "
+			    "x8 PCIE, or x4 PCIE Gen2 slot is required.\n");
+		}
+		if (hw->device_id == IXGBE_DEV_ID_82599_SFP_SF_QP &&
+		    hw->bus.width <= ixgbe_bus_width_pcie_x8 &&
+		    hw->bus.speed < ixgbe_bus_speed_8000) {
+			device_printf(dev, "PCI-Express bandwidth available "
+			    "for this card is not sufficient for optimal "
+			    "performance.\n");
+			device_printf(dev, "For optimal performance a "
+			    "x8 PCIE Gen3 slot is required.\n");
+		}
+	} else {
+		device_printf(dev, "Unable to determine slot speed/width.  "
+		    "The speed/width reported are that of the internal "
+		    "switch.\n");
 	}
 }
 
@@ -3015,6 +3380,9 @@ ix_set_ivar(struct ix_softc *sc, uint8_t entry, uint8_t vector,
 
 	case ixgbe_mac_82599EB:
 	case ixgbe_mac_X540:
+	case ixgbe_mac_X550:
+	case ixgbe_mac_X550EM_a:
+	case ixgbe_mac_X550EM_x:
 		if (type == -1) { /* MISC IVAR */
 			index = (entry & 1) * 8;
 			ivar = IXGBE_READ_REG(hw, IXGBE_IVAR_MISC);
@@ -3028,7 +3396,7 @@ ix_set_ivar(struct ix_softc *sc, uint8_t entry, uint8_t vector,
 			ivar |= (vector << index);
 			IXGBE_WRITE_REG(hw, IXGBE_IVAR(entry >> 1), ivar);
 		}
-
+		/* FALL THROUGH */
 	default:
 		break;
 	}
@@ -3048,20 +3416,16 @@ ix_sfp_probe(struct ix_softc *sc)
 			return FALSE;
 
 		ret = hw->phy.ops.reset(hw);
+		sc->sfp_probe = FALSE;
 		if (ret == IXGBE_ERR_SFP_NOT_SUPPORTED) {
 			if_printf(&sc->arpcom.ac_if,
 			     "Unsupported SFP+ module detected!  "
 			     "Reload driver with supported module.\n");
-			sc->sfp_probe = FALSE;
 			return FALSE;
 		}
 		if_printf(&sc->arpcom.ac_if, "SFP+ module detected!\n");
 
 		/* We now have supported optics */
-		sc->sfp_probe = FALSE;
-		/* Set the optics type so system reports correctly */
-		ix_setup_optics(sc);
-
 		return TRUE;
 	}
 	return FALSE;
@@ -3083,13 +3447,40 @@ ix_handle_mod(struct ix_softc *sc)
 	struct ixgbe_hw *hw = &sc->hw;
 	uint32_t err;
 
+	if (sc->hw.need_crosstalk_fix) {
+		uint32_t cage_full = 0;
+
+		switch (hw->mac.type) {
+		case ixgbe_mac_82599EB:
+			cage_full = IXGBE_READ_REG(hw, IXGBE_ESDP) &
+			    IXGBE_ESDP_SDP2;
+			break;
+
+		case ixgbe_mac_X550EM_x:
+		case ixgbe_mac_X550EM_a:
+			cage_full = IXGBE_READ_REG(hw, IXGBE_ESDP) &
+			    IXGBE_ESDP_SDP0;
+			break;
+
+		default:
+			break;
+		}
+
+		if (!cage_full)
+			return;
+	}
+
 	err = hw->phy.ops.identify_sfp(hw);
 	if (err == IXGBE_ERR_SFP_NOT_SUPPORTED) {
 		if_printf(&sc->arpcom.ac_if,
 		    "Unsupported SFP+ module type was detected.\n");
 		return;
 	}
-	err = hw->mac.ops.setup_sfp(hw);
+
+	if (hw->mac.type == ixgbe_mac_82598EB)
+		err = hw->phy.ops.reset(hw);
+	else
+		err = hw->mac.ops.setup_sfp(hw);
 	if (err == IXGBE_ERR_SFP_NOT_SUPPORTED) {
 		if_printf(&sc->arpcom.ac_if,
 		    "Setup failure - unsupported SFP+ module type.\n");
@@ -3107,7 +3498,13 @@ ix_handle_msf(struct ix_softc *sc)
 	struct ixgbe_hw *hw = &sc->hw;
 	uint32_t autoneg;
 
-	autoneg = hw->phy.autoneg_advertised;
+	sc->phy_layer = ixgbe_get_supported_physical_layer(hw);
+	ix_init_media(sc);
+
+	if (sc->advspeed != IXGBE_LINK_SPEED_UNKNOWN)
+		autoneg = sc->advspeed;
+	else
+		autoneg = hw->phy.autoneg_advertised;
 	if (!autoneg && hw->mac.ops.get_link_capabilities != NULL) {
 		bool negotiate;
 
@@ -3118,81 +3515,67 @@ ix_handle_msf(struct ix_softc *sc)
 }
 
 static void
+ix_handle_phy(struct ix_softc *sc)
+{
+	struct ixgbe_hw *hw = &sc->hw;
+	int error;
+
+	error = hw->phy.ops.handle_lasi(hw);
+	if (error == IXGBE_ERR_OVERTEMP) {
+		if_printf(&sc->arpcom.ac_if,
+		    "CRITICAL: EXTERNAL PHY OVER TEMP!!  "
+		    "PHY will downshift to lower power state!\n");
+	} else if (error) {
+		if_printf(&sc->arpcom.ac_if,
+		    "Error handling LASI interrupt: %d\n", error);
+	}
+}
+
+static void
 ix_update_stats(struct ix_softc *sc)
 {
 	struct ifnet *ifp = &sc->arpcom.ac_if;
 	struct ixgbe_hw *hw = &sc->hw;
+	struct ixgbe_hw_stats *stats = &sc->stats;
 	uint32_t missed_rx = 0, bprc, lxon, lxoff, total;
 	uint64_t total_missed_rx = 0;
 	int i;
 
-	sc->stats.crcerrs += IXGBE_READ_REG(hw, IXGBE_CRCERRS);
-	sc->stats.illerrc += IXGBE_READ_REG(hw, IXGBE_ILLERRC);
-	sc->stats.errbc += IXGBE_READ_REG(hw, IXGBE_ERRBC);
-	sc->stats.mspdc += IXGBE_READ_REG(hw, IXGBE_MSPDC);
+	stats->crcerrs += IXGBE_READ_REG(hw, IXGBE_CRCERRS);
+	stats->illerrc += IXGBE_READ_REG(hw, IXGBE_ILLERRC);
+	stats->errbc += IXGBE_READ_REG(hw, IXGBE_ERRBC);
+	stats->mspdc += IXGBE_READ_REG(hw, IXGBE_MSPDC);
+	stats->mpc[0] += IXGBE_READ_REG(hw, IXGBE_MPC(0));
 
-	/*
-	 * Note: These are for the 8 possible traffic classes, which
-	 * in current implementation is unused, therefore only 0 should
-	 * read real data.
-	 */
-	for (i = 0; i < 8; i++) {
-		uint32_t mp;
-
-		mp = IXGBE_READ_REG(hw, IXGBE_MPC(i));
-		/* missed_rx tallies misses for the gprc workaround */
-		missed_rx += mp;
-		/* global total per queue */
-		sc->stats.mpc[i] += mp;
-
-		/* Running comprehensive total for stats display */
-		total_missed_rx += sc->stats.mpc[i];
-
-		if (hw->mac.type == ixgbe_mac_82598EB) {
-			sc->stats.rnbc[i] += IXGBE_READ_REG(hw, IXGBE_RNBC(i));
-			sc->stats.qbtc[i] += IXGBE_READ_REG(hw, IXGBE_QBTC(i));
-			sc->stats.qbrc[i] += IXGBE_READ_REG(hw, IXGBE_QBRC(i));
-			sc->stats.pxonrxc[i] +=
-			    IXGBE_READ_REG(hw, IXGBE_PXONRXC(i));
-		} else {
-			sc->stats.pxonrxc[i] +=
-			    IXGBE_READ_REG(hw, IXGBE_PXONRXCNT(i));
-		}
-		sc->stats.pxontxc[i] += IXGBE_READ_REG(hw, IXGBE_PXONTXC(i));
-		sc->stats.pxofftxc[i] += IXGBE_READ_REG(hw, IXGBE_PXOFFTXC(i));
-		sc->stats.pxoffrxc[i] += IXGBE_READ_REG(hw, IXGBE_PXOFFRXC(i));
-		sc->stats.pxon2offc[i] +=
-		    IXGBE_READ_REG(hw, IXGBE_PXON2OFFCNT(i));
-	}
 	for (i = 0; i < 16; i++) {
-		sc->stats.qprc[i] += IXGBE_READ_REG(hw, IXGBE_QPRC(i));
-		sc->stats.qptc[i] += IXGBE_READ_REG(hw, IXGBE_QPTC(i));
-		sc->stats.qprdc[i] += IXGBE_READ_REG(hw, IXGBE_QPRDC(i));
+		stats->qprc[i] += IXGBE_READ_REG(hw, IXGBE_QPRC(i));
+		stats->qptc[i] += IXGBE_READ_REG(hw, IXGBE_QPTC(i));
+		stats->qprdc[i] += IXGBE_READ_REG(hw, IXGBE_QPRDC(i));
 	}
-	sc->stats.mlfc += IXGBE_READ_REG(hw, IXGBE_MLFC);
-	sc->stats.mrfc += IXGBE_READ_REG(hw, IXGBE_MRFC);
-	sc->stats.rlec += IXGBE_READ_REG(hw, IXGBE_RLEC);
+	stats->mlfc += IXGBE_READ_REG(hw, IXGBE_MLFC);
+	stats->mrfc += IXGBE_READ_REG(hw, IXGBE_MRFC);
+	stats->rlec += IXGBE_READ_REG(hw, IXGBE_RLEC);
 
 	/* Hardware workaround, gprc counts missed packets */
-	sc->stats.gprc += IXGBE_READ_REG(hw, IXGBE_GPRC);
-	sc->stats.gprc -= missed_rx;
+	stats->gprc += IXGBE_READ_REG(hw, IXGBE_GPRC);
+	stats->gprc -= missed_rx;
 
 	if (hw->mac.type != ixgbe_mac_82598EB) {
-		sc->stats.gorc += IXGBE_READ_REG(hw, IXGBE_GORCL) +
+		stats->gorc += IXGBE_READ_REG(hw, IXGBE_GORCL) +
 		    ((uint64_t)IXGBE_READ_REG(hw, IXGBE_GORCH) << 32);
-		sc->stats.gotc += IXGBE_READ_REG(hw, IXGBE_GOTCL) +
+		stats->gotc += IXGBE_READ_REG(hw, IXGBE_GOTCL) +
 		    ((uint64_t)IXGBE_READ_REG(hw, IXGBE_GOTCH) << 32);
-		sc->stats.tor += IXGBE_READ_REG(hw, IXGBE_TORL) +
+		stats->tor += IXGBE_READ_REG(hw, IXGBE_TORL) +
 		    ((uint64_t)IXGBE_READ_REG(hw, IXGBE_TORH) << 32);
-		sc->stats.lxonrxc += IXGBE_READ_REG(hw, IXGBE_LXONRXCNT);
-		sc->stats.lxoffrxc += IXGBE_READ_REG(hw, IXGBE_LXOFFRXCNT);
+		stats->lxonrxc += IXGBE_READ_REG(hw, IXGBE_LXONRXCNT);
+		stats->lxoffrxc += IXGBE_READ_REG(hw, IXGBE_LXOFFRXCNT);
 	} else {
-		sc->stats.lxonrxc += IXGBE_READ_REG(hw, IXGBE_LXONRXC);
-		sc->stats.lxoffrxc += IXGBE_READ_REG(hw, IXGBE_LXOFFRXC);
+		stats->lxonrxc += IXGBE_READ_REG(hw, IXGBE_LXONRXC);
+		stats->lxoffrxc += IXGBE_READ_REG(hw, IXGBE_LXOFFRXC);
 		/* 82598 only has a counter in the high register */
-		sc->stats.gorc += IXGBE_READ_REG(hw, IXGBE_GORCH);
-		sc->stats.gotc += IXGBE_READ_REG(hw, IXGBE_GOTCH);
-		sc->stats.tor += IXGBE_READ_REG(hw, IXGBE_TORH);
+		stats->gorc += IXGBE_READ_REG(hw, IXGBE_GORCH);
+		stats->gotc += IXGBE_READ_REG(hw, IXGBE_GOTCH);
+		stats->tor += IXGBE_READ_REG(hw, IXGBE_TORH);
 	}
 
 	/*
@@ -3200,57 +3583,57 @@ ix_update_stats(struct ix_softc *sc)
 	 * broadcasts, so for now we subtract those.
 	 */
 	bprc = IXGBE_READ_REG(hw, IXGBE_BPRC);
-	sc->stats.bprc += bprc;
-	sc->stats.mprc += IXGBE_READ_REG(hw, IXGBE_MPRC);
+	stats->bprc += bprc;
+	stats->mprc += IXGBE_READ_REG(hw, IXGBE_MPRC);
 	if (hw->mac.type == ixgbe_mac_82598EB)
-		sc->stats.mprc -= bprc;
+		stats->mprc -= bprc;
 
-	sc->stats.prc64 += IXGBE_READ_REG(hw, IXGBE_PRC64);
-	sc->stats.prc127 += IXGBE_READ_REG(hw, IXGBE_PRC127);
-	sc->stats.prc255 += IXGBE_READ_REG(hw, IXGBE_PRC255);
-	sc->stats.prc511 += IXGBE_READ_REG(hw, IXGBE_PRC511);
-	sc->stats.prc1023 += IXGBE_READ_REG(hw, IXGBE_PRC1023);
-	sc->stats.prc1522 += IXGBE_READ_REG(hw, IXGBE_PRC1522);
+	stats->prc64 += IXGBE_READ_REG(hw, IXGBE_PRC64);
+	stats->prc127 += IXGBE_READ_REG(hw, IXGBE_PRC127);
+	stats->prc255 += IXGBE_READ_REG(hw, IXGBE_PRC255);
+	stats->prc511 += IXGBE_READ_REG(hw, IXGBE_PRC511);
+	stats->prc1023 += IXGBE_READ_REG(hw, IXGBE_PRC1023);
+	stats->prc1522 += IXGBE_READ_REG(hw, IXGBE_PRC1522);
 
 	lxon = IXGBE_READ_REG(hw, IXGBE_LXONTXC);
-	sc->stats.lxontxc += lxon;
+	stats->lxontxc += lxon;
 	lxoff = IXGBE_READ_REG(hw, IXGBE_LXOFFTXC);
-	sc->stats.lxofftxc += lxoff;
+	stats->lxofftxc += lxoff;
 	total = lxon + lxoff;
 
-	sc->stats.gptc += IXGBE_READ_REG(hw, IXGBE_GPTC);
-	sc->stats.mptc += IXGBE_READ_REG(hw, IXGBE_MPTC);
-	sc->stats.ptc64 += IXGBE_READ_REG(hw, IXGBE_PTC64);
-	sc->stats.gptc -= total;
-	sc->stats.mptc -= total;
-	sc->stats.ptc64 -= total;
-	sc->stats.gotc -= total * ETHER_MIN_LEN;
+	stats->gptc += IXGBE_READ_REG(hw, IXGBE_GPTC);
+	stats->mptc += IXGBE_READ_REG(hw, IXGBE_MPTC);
+	stats->ptc64 += IXGBE_READ_REG(hw, IXGBE_PTC64);
+	stats->gptc -= total;
+	stats->mptc -= total;
+	stats->ptc64 -= total;
+	stats->gotc -= total * ETHER_MIN_LEN;
 
-	sc->stats.ruc += IXGBE_READ_REG(hw, IXGBE_RUC);
-	sc->stats.rfc += IXGBE_READ_REG(hw, IXGBE_RFC);
-	sc->stats.roc += IXGBE_READ_REG(hw, IXGBE_ROC);
-	sc->stats.rjc += IXGBE_READ_REG(hw, IXGBE_RJC);
-	sc->stats.mngprc += IXGBE_READ_REG(hw, IXGBE_MNGPRC);
-	sc->stats.mngpdc += IXGBE_READ_REG(hw, IXGBE_MNGPDC);
-	sc->stats.mngptc += IXGBE_READ_REG(hw, IXGBE_MNGPTC);
-	sc->stats.tpr += IXGBE_READ_REG(hw, IXGBE_TPR);
-	sc->stats.tpt += IXGBE_READ_REG(hw, IXGBE_TPT);
-	sc->stats.ptc127 += IXGBE_READ_REG(hw, IXGBE_PTC127);
-	sc->stats.ptc255 += IXGBE_READ_REG(hw, IXGBE_PTC255);
-	sc->stats.ptc511 += IXGBE_READ_REG(hw, IXGBE_PTC511);
-	sc->stats.ptc1023 += IXGBE_READ_REG(hw, IXGBE_PTC1023);
-	sc->stats.ptc1522 += IXGBE_READ_REG(hw, IXGBE_PTC1522);
-	sc->stats.bptc += IXGBE_READ_REG(hw, IXGBE_BPTC);
-	sc->stats.xec += IXGBE_READ_REG(hw, IXGBE_XEC);
-	sc->stats.fccrc += IXGBE_READ_REG(hw, IXGBE_FCCRC);
-	sc->stats.fclast += IXGBE_READ_REG(hw, IXGBE_FCLAST);
+	stats->ruc += IXGBE_READ_REG(hw, IXGBE_RUC);
+	stats->rfc += IXGBE_READ_REG(hw, IXGBE_RFC);
+	stats->roc += IXGBE_READ_REG(hw, IXGBE_ROC);
+	stats->rjc += IXGBE_READ_REG(hw, IXGBE_RJC);
+	stats->mngprc += IXGBE_READ_REG(hw, IXGBE_MNGPRC);
+	stats->mngpdc += IXGBE_READ_REG(hw, IXGBE_MNGPDC);
+	stats->mngptc += IXGBE_READ_REG(hw, IXGBE_MNGPTC);
+	stats->tpr += IXGBE_READ_REG(hw, IXGBE_TPR);
+	stats->tpt += IXGBE_READ_REG(hw, IXGBE_TPT);
+	stats->ptc127 += IXGBE_READ_REG(hw, IXGBE_PTC127);
+	stats->ptc255 += IXGBE_READ_REG(hw, IXGBE_PTC255);
+	stats->ptc511 += IXGBE_READ_REG(hw, IXGBE_PTC511);
+	stats->ptc1023 += IXGBE_READ_REG(hw, IXGBE_PTC1023);
+	stats->ptc1522 += IXGBE_READ_REG(hw, IXGBE_PTC1522);
+	stats->bptc += IXGBE_READ_REG(hw, IXGBE_BPTC);
+	stats->xec += IXGBE_READ_REG(hw, IXGBE_XEC);
+	stats->fccrc += IXGBE_READ_REG(hw, IXGBE_FCCRC);
+	stats->fclast += IXGBE_READ_REG(hw, IXGBE_FCLAST);
 	/* Only read FCOE on 82599 */
 	if (hw->mac.type != ixgbe_mac_82598EB) {
-		sc->stats.fcoerpdc += IXGBE_READ_REG(hw, IXGBE_FCOERPDC);
-		sc->stats.fcoeprc += IXGBE_READ_REG(hw, IXGBE_FCOEPRC);
-		sc->stats.fcoeptc += IXGBE_READ_REG(hw, IXGBE_FCOEPTC);
-		sc->stats.fcoedwrc += IXGBE_READ_REG(hw, IXGBE_FCOEDWRC);
-		sc->stats.fcoedwtc += IXGBE_READ_REG(hw, IXGBE_FCOEDWTC);
+		stats->fcoerpdc += IXGBE_READ_REG(hw, IXGBE_FCOERPDC);
+		stats->fcoeprc += IXGBE_READ_REG(hw, IXGBE_FCOEPRC);
+		stats->fcoeptc += IXGBE_READ_REG(hw, IXGBE_FCOEPTC);
+		stats->fcoedwrc += IXGBE_READ_REG(hw, IXGBE_FCOEDWRC);
+		stats->fcoedwtc += IXGBE_READ_REG(hw, IXGBE_FCOEDWTC);
 	}
 
 	/* Rx Errors */
@@ -3438,7 +3821,8 @@ ix_enable_rx_drop(struct ix_softc *sc)
 
 	if (bootverbose) {
 		if_printf(&sc->arpcom.ac_if,
-		    "flow control %d, enable RX drop\n", sc->fc);
+		    "flow control %s, enable RX drop\n",
+		    ix_fc2str(sc->hw.fc.current_mode));
 	}
 
 	for (i = 0; i < sc->rx_ring_inuse; ++i) {
@@ -3457,7 +3841,8 @@ ix_disable_rx_drop(struct ix_softc *sc)
 
 	if (bootverbose) {
 		if_printf(&sc->arpcom.ac_if,
-		    "flow control %d, disable RX drop\n", sc->fc);
+		    "flow control %s, disable RX drop\n",
+		    ix_fc2str(sc->hw.fc.current_mode));
 	}
 
 	for (i = 0; i < sc->rx_ring_inuse; ++i) {
@@ -3467,140 +3852,6 @@ ix_disable_rx_drop(struct ix_softc *sc)
 		IXGBE_WRITE_REG(hw, IXGBE_SRRCTL(i), srrctl);
 	}
 }
-
-static int
-ix_sysctl_flowctrl(SYSCTL_HANDLER_ARGS)
-{
-	struct ix_softc *sc = (struct ix_softc *)arg1;
-	struct ifnet *ifp = &sc->arpcom.ac_if;
-	int error, fc;
-
-	fc = sc->fc;
-	error = sysctl_handle_int(oidp, &fc, 0, req);
-	if (error || req->newptr == NULL)
-		return error;
-
-	switch (fc) {
-	case ixgbe_fc_rx_pause:
-	case ixgbe_fc_tx_pause:
-	case ixgbe_fc_full:
-	case ixgbe_fc_none:
-		break;
-	default:
-		return EINVAL;
-	}
-
-	ifnet_serialize_all(ifp);
-
-	/* Don't bother if it's not changed */
-	if (sc->fc == fc)
-		goto done;
-	sc->fc = fc;
-
-	/* Don't do anything, if the interface is not up yet */
-	if ((ifp->if_flags & IFF_RUNNING) == 0)
-		goto done;
-
-	if (sc->rx_ring_inuse > 1) {
-		switch (sc->fc) {
-		case ixgbe_fc_rx_pause:
-		case ixgbe_fc_tx_pause:
-		case ixgbe_fc_full:
-			ix_disable_rx_drop(sc);
-			break;
-
-		case ixgbe_fc_none:
-			ix_enable_rx_drop(sc);
-			break;
-
-		default:
-			panic("leading fc check mismatch");
-		}
-	}
-
-	sc->hw.fc.requested_mode = sc->fc;
-	/* Don't autoneg if forcing a value */
-	sc->hw.fc.disable_fc_autoneg = TRUE;
-	ixgbe_fc_enable(&sc->hw);
-
-done:
-	ifnet_deserialize_all(ifp);
-	return error;
-}
-
-#ifdef foo
-/* XXX not working properly w/ 82599 connected w/ DAC */
-/* XXX only work after the interface is up */
-static int
-ix_sysctl_advspeed(SYSCTL_HANDLER_ARGS)
-{
-	struct ix_softc *sc = (struct ix_softc *)arg1;
-	struct ifnet *ifp = &sc->arpcom.ac_if;
-	struct ixgbe_hw *hw = &sc->hw;
-	ixgbe_link_speed speed;
-	int error, advspeed;
-
-	advspeed = sc->advspeed;
-	error = sysctl_handle_int(oidp, &advspeed, 0, req);
-	if (error || req->newptr == NULL)
-		return error;
-
-	if (!(hw->phy.media_type == ixgbe_media_type_copper ||
-	    hw->phy.multispeed_fiber))
-		return EOPNOTSUPP;
-	if (hw->mac.ops.setup_link == NULL)
-		return EOPNOTSUPP;
-
-	switch (advspeed) {
-	case 0:	/* auto */
-		speed = IXGBE_LINK_SPEED_UNKNOWN;
-		break;
-
-	case 1:	/* 1Gb */
-		speed = IXGBE_LINK_SPEED_1GB_FULL;
-		break;
-
-	case 2:	/* 100Mb */
-		speed = IXGBE_LINK_SPEED_100_FULL;
-		break;
-
-	case 3:	/* 1Gb/10Gb */
-		speed = IXGBE_LINK_SPEED_1GB_FULL |
-		    IXGBE_LINK_SPEED_10GB_FULL;
-		break;
-
-	default:
-		return EINVAL;
-	}
-
-	ifnet_serialize_all(ifp);
-
-	if (sc->advspeed == advspeed) /* no change */
-		goto done;
-
-	if ((speed & IXGBE_LINK_SPEED_100_FULL) &&
-	    hw->mac.type != ixgbe_mac_X540) {
-		error = EOPNOTSUPP;
-		goto done;
-	}
-
-	sc->advspeed = advspeed;
-
-	if ((ifp->if_flags & IFF_RUNNING) == 0)
-		goto done;
-
-	if (speed == IXGBE_LINK_SPEED_UNKNOWN) {
-		ix_config_link(sc);
-	} else {
-		hw->mac.autotry_restart = TRUE;
-		hw->mac.ops.setup_link(hw, speed, sc->link_up);
-	}
-
-done:
-	ifnet_deserialize_all(ifp);
-	return error;
-}
-#endif
 
 static void
 ix_setup_serialize(struct ix_softc *sc)
@@ -3639,16 +3890,42 @@ static int
 ix_alloc_intr(struct ix_softc *sc)
 {
 	struct ix_intr_data *intr;
+	struct ix_tx_ring *txr;
 	u_int intr_flags;
+	int i;
 
 	ix_alloc_msix(sc);
 	if (sc->intr_type == PCI_INTR_TYPE_MSIX) {
 		ix_set_ring_inuse(sc, FALSE);
-		return 0;
+		goto done;
 	}
 
-	if (sc->intr_data != NULL)
+	/*
+	 * Reset some settings changed by ix_alloc_msix().
+	 */
+	if (sc->rx_rmap_intr != NULL) {
+		if_ringmap_free(sc->rx_rmap_intr);
+		sc->rx_rmap_intr = NULL;
+	}
+	if (sc->tx_rmap_intr != NULL) {
+		if_ringmap_free(sc->tx_rmap_intr);
+		sc->tx_rmap_intr = NULL;
+	}
+	if (sc->intr_data != NULL) {
 		kfree(sc->intr_data, M_DEVBUF);
+		sc->intr_data = NULL;
+	}
+	for (i = 0; i < sc->tx_ring_cnt; ++i) {
+		txr = &sc->tx_rings[i];
+		txr->tx_intr_vec = -1;
+		txr->tx_intr_cpuid = -1;
+	}
+	for (i = 0; i < sc->rx_ring_cnt; ++i) {
+		struct ix_rx_ring *rxr = &sc->rx_rings[i];
+
+		rxr->rx_intr_vec = -1;
+		rxr->rx_txr = NULL;
+	}
 
 	sc->intr_cnt = 1;
 	sc->intr_data = kmalloc(sizeof(struct ix_intr_data), M_DEVBUF,
@@ -3658,8 +3935,28 @@ ix_alloc_intr(struct ix_softc *sc)
 	/*
 	 * Allocate MSI/legacy interrupt resource
 	 */
-	sc->intr_type = pci_alloc_1intr(sc->dev, ix_msi_enable,
-	    &intr->intr_rid, &intr_flags);
+	if (sc->caps & IX_CAP_LEGACY_INTR) {
+		sc->intr_type = pci_alloc_1intr(sc->dev, ix_msi_enable,
+		    &intr->intr_rid, &intr_flags);
+	} else {
+		int cpu;
+
+		/*
+		 * Only MSI is supported.
+		 */
+		cpu = device_getenv_int(sc->dev, "msi.cpu", -1);
+		if (cpu >= ncpus)
+			cpu = ncpus - 1;
+
+		if (pci_alloc_msi(sc->dev, &intr->intr_rid, 1, cpu) == 0) {
+			sc->intr_type = PCI_INTR_TYPE_MSI;
+			intr_flags = RF_ACTIVE;
+		} else {
+			sc->intr_type = PCI_INTR_TYPE_LEGACY;
+			device_printf(sc->dev, "Unable to allocate MSI\n");
+			return ENXIO;
+		}
+	}
 
 	intr->intr_res = bus_alloc_resource_any(sc->dev, SYS_RES_IRQ,
 	    &intr->intr_rid, intr_flags);
@@ -3671,22 +3968,39 @@ ix_alloc_intr(struct ix_softc *sc)
 
 	intr->intr_serialize = &sc->main_serialize;
 	intr->intr_cpuid = rman_get_cpuid(intr->intr_res);
-	intr->intr_func = ix_intr;
+	if (sc->hw.mac.type == ixgbe_mac_82598EB)
+		intr->intr_func = ix_intr_82598;
+	else
+		intr->intr_func = ix_intr;
 	intr->intr_funcarg = sc;
 	intr->intr_rate = IX_INTR_RATE;
 	intr->intr_use = IX_INTR_USE_RXTX;
 
-	sc->tx_rings[0].tx_intr_cpuid = intr->intr_cpuid;
 	sc->tx_rings[0].tx_intr_vec = IX_TX_INTR_VEC;
+	sc->tx_rings[0].tx_intr_cpuid = intr->intr_cpuid;
 
 	sc->rx_rings[0].rx_intr_vec = IX_RX0_INTR_VEC;
 
 	ix_set_ring_inuse(sc, FALSE);
 
 	KKASSERT(sc->rx_ring_inuse <= IX_MIN_RXRING_RSS);
-	if (sc->rx_ring_inuse == IX_MIN_RXRING_RSS)
+	if (sc->rx_ring_inuse == IX_MIN_RXRING_RSS) {
 		sc->rx_rings[1].rx_intr_vec = IX_RX1_INTR_VEC;
 
+		/*
+		 * Allocate RX ring map for RSS setup.
+		 */
+		sc->rx_rmap_intr = if_ringmap_alloc(sc->dev,
+		    IX_MIN_RXRING_RSS, IX_MIN_RXRING_RSS);
+		KASSERT(if_ringmap_count(sc->rx_rmap_intr) ==
+		    sc->rx_ring_inuse, ("RX ring inuse mismatch"));
+	}
+done:
+	for (i = 0; i < sc->tx_ring_cnt; ++i) {
+		txr = &sc->tx_rings[i];
+		if (txr->tx_intr_cpuid < 0)
+			txr->tx_intr_cpuid = 0;
+	}
 	return 0;
 }
 
@@ -3814,6 +4128,18 @@ ix_tryserialize(struct ifnet *ifp, enum ifnet_serialize slz)
 	return ifnet_serialize_array_try(sc->serializes, sc->nserialize, slz);
 }
 
+static void
+ix_serialize_skipmain(struct ix_softc *sc)
+{
+	lwkt_serialize_array_enter(sc->serializes, sc->nserialize, 1);
+}
+
+static void
+ix_deserialize_skipmain(struct ix_softc *sc)
+{
+	lwkt_serialize_array_exit(sc->serializes, sc->nserialize, 1);
+}
+
 #ifdef INVARIANTS
 
 static void
@@ -3856,12 +4182,54 @@ ix_free_rings(struct ix_softc *sc)
 }
 
 static void
+ix_watchdog_reset(struct ix_softc *sc)
+{
+	int i;
+
+	ASSERT_IFNET_SERIALIZED_ALL(&sc->arpcom.ac_if);
+	ix_init(sc);
+	for (i = 0; i < sc->tx_ring_inuse; ++i)
+		ifsq_devstart_sched(sc->tx_rings[i].tx_ifsq);
+}
+
+static void
+ix_sync_netisr(struct ix_softc *sc, int flags)
+{
+	struct ifnet *ifp = &sc->arpcom.ac_if;
+
+	ifnet_serialize_all(ifp);
+	if (ifp->if_flags & IFF_RUNNING) {
+		ifp->if_flags &= ~(IFF_RUNNING | flags);
+	} else {
+		ifnet_deserialize_all(ifp);
+		return;
+	}
+	ifnet_deserialize_all(ifp);
+
+	/* Make sure that polling stopped. */
+	netmsg_service_sync();
+}
+
+static void
+ix_watchdog_task(void *xsc, int pending __unused)
+{
+	struct ix_softc *sc = xsc;
+	struct ifnet *ifp = &sc->arpcom.ac_if;
+
+	ix_sync_netisr(sc, 0);
+
+	ifnet_serialize_all(ifp);
+	if ((ifp->if_flags & (IFF_UP | IFF_RUNNING)) == IFF_UP)
+		ix_watchdog_reset(sc);
+	ifnet_deserialize_all(ifp);
+}
+
+static void
 ix_watchdog(struct ifaltq_subque *ifsq)
 {
 	struct ix_tx_ring *txr = ifsq_get_priv(ifsq);
 	struct ifnet *ifp = ifsq_get_ifp(ifsq);
 	struct ix_softc *sc = ifp->if_softc;
-	int i;
 
 	KKASSERT(txr->tx_ifsq == ifsq);
 	ASSERT_IFNET_SERIALIZED_ALL(ifp);
@@ -3881,9 +4249,11 @@ ix_watchdog(struct ifaltq_subque *ifsq)
 	if_printf(ifp, "TX(%d) desc avail = %d, next TX to Clean = %d\n",
 	    txr->tx_idx, txr->tx_avail, txr->tx_next_clean);
 
-	ix_init(sc);
-	for (i = 0; i < sc->tx_ring_inuse; ++i)
-		ifsq_devstart_sched(sc->tx_rings[i].tx_ifsq);
+	if ((ifp->if_flags & (IFF_IDIRECT | IFF_NPOLLING | IFF_RUNNING)) ==
+	    (IFF_IDIRECT | IFF_NPOLLING | IFF_RUNNING))
+		taskqueue_enqueue(taskqueue_thread[0], &sc->wdog_task);
+	else
+		ix_watchdog_reset(sc);
 }
 
 static void
@@ -3894,11 +4264,8 @@ ix_free_tx_ring(struct ix_tx_ring *txr)
 	for (i = 0; i < txr->tx_ndesc; ++i) {
 		struct ix_tx_buf *txbuf = &txr->tx_buf[i];
 
-		if (txbuf->m_head != NULL) {
-			bus_dmamap_unload(txr->tx_tag, txbuf->map);
-			m_freem(txbuf->m_head);
-			txbuf->m_head = NULL;
-		}
+		if (txbuf->m_head != NULL)
+			ix_free_txbuf(txr, txbuf);
 	}
 }
 
@@ -3934,9 +4301,9 @@ ix_newbuf(struct ix_rx_ring *rxr, int i, boolean_t wait)
 	struct ix_rx_buf *rxbuf;
 	int flags, error, nseg;
 
-	flags = MB_DONTWAIT;
+	flags = M_NOWAIT;
 	if (__predict_false(wait))
-		flags = MB_WAIT;
+		flags = M_WAITOK;
 
 	m = m_getjcl(flags, MT_DATA, M_PKTHDR, rxr->rx_mbuf_sz);
 	if (m == NULL) {
@@ -3977,58 +4344,63 @@ ix_newbuf(struct ix_rx_ring *rxr, int i, boolean_t wait)
 static void
 ix_add_sysctl(struct ix_softc *sc)
 {
-#ifdef IX_RSS_DEBUG
+	struct sysctl_ctx_list *ctx = device_get_sysctl_ctx(sc->dev);
+	struct sysctl_oid *tree = device_get_sysctl_tree(sc->dev);
 	char node[32];
 	int i;
-#endif
 
-	sysctl_ctx_init(&sc->sysctl_ctx);
-	sc->sysctl_tree = SYSCTL_ADD_NODE(&sc->sysctl_ctx,
-	    SYSCTL_STATIC_CHILDREN(_hw), OID_AUTO,
-	    device_get_nameunit(sc->dev), CTLFLAG_RD, 0, "");
-	if (sc->sysctl_tree == NULL) {
-		device_printf(sc->dev, "can't add sysctl node\n");
-		return;
-	}
-
-	SYSCTL_ADD_INT(&sc->sysctl_ctx, SYSCTL_CHILDREN(sc->sysctl_tree),
+	SYSCTL_ADD_INT(ctx, SYSCTL_CHILDREN(tree),
 	    OID_AUTO, "rxr", CTLFLAG_RD, &sc->rx_ring_cnt, 0, "# of RX rings");
-	SYSCTL_ADD_INT(&sc->sysctl_ctx, SYSCTL_CHILDREN(sc->sysctl_tree),
+	SYSCTL_ADD_INT(ctx, SYSCTL_CHILDREN(tree),
 	    OID_AUTO, "rxr_inuse", CTLFLAG_RD, &sc->rx_ring_inuse, 0,
 	    "# of RX rings used");
-	SYSCTL_ADD_INT(&sc->sysctl_ctx, SYSCTL_CHILDREN(sc->sysctl_tree),
+	SYSCTL_ADD_INT(ctx, SYSCTL_CHILDREN(tree),
 	    OID_AUTO, "txr", CTLFLAG_RD, &sc->tx_ring_cnt, 0, "# of TX rings");
-	SYSCTL_ADD_INT(&sc->sysctl_ctx, SYSCTL_CHILDREN(sc->sysctl_tree),
+	SYSCTL_ADD_INT(ctx, SYSCTL_CHILDREN(tree),
 	    OID_AUTO, "txr_inuse", CTLFLAG_RD, &sc->tx_ring_inuse, 0,
 	    "# of TX rings used");
-	SYSCTL_ADD_PROC(&sc->sysctl_ctx, SYSCTL_CHILDREN(sc->sysctl_tree),
+	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree),
 	    OID_AUTO, "rxd", CTLTYPE_INT | CTLFLAG_RD,
 	    sc, 0, ix_sysctl_rxd, "I",
 	    "# of RX descs");
-	SYSCTL_ADD_PROC(&sc->sysctl_ctx, SYSCTL_CHILDREN(sc->sysctl_tree),
+	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree),
 	    OID_AUTO, "txd", CTLTYPE_INT | CTLFLAG_RD,
 	    sc, 0, ix_sysctl_txd, "I",
 	    "# of TX descs");
-	SYSCTL_ADD_PROC(&sc->sysctl_ctx, SYSCTL_CHILDREN(sc->sysctl_tree),
+	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree),
 	    OID_AUTO, "tx_wreg_nsegs", CTLTYPE_INT | CTLFLAG_RW,
 	    sc, 0, ix_sysctl_tx_wreg_nsegs, "I",
 	    "# of segments sent before write to hardware register");
-	SYSCTL_ADD_PROC(&sc->sysctl_ctx, SYSCTL_CHILDREN(sc->sysctl_tree),
+	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree),
 	    OID_AUTO, "rx_wreg_nsegs", CTLTYPE_INT | CTLFLAG_RW,
 	    sc, 0, ix_sysctl_rx_wreg_nsegs, "I",
 	    "# of received segments sent before write to hardware register");
-	SYSCTL_ADD_PROC(&sc->sysctl_ctx, SYSCTL_CHILDREN(sc->sysctl_tree),
+	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree),
 	    OID_AUTO, "tx_intr_nsegs", CTLTYPE_INT | CTLFLAG_RW,
 	    sc, 0, ix_sysctl_tx_intr_nsegs, "I",
 	    "# of segments per TX interrupt");
-
+	SYSCTL_ADD_INT(ctx, SYSCTL_CHILDREN(tree),
+	    OID_AUTO, "direct_input", CTLFLAG_RW, &sc->direct_input, 0,
+	    "Enable direct input");
+	if (sc->intr_type == PCI_INTR_TYPE_MSIX) {
+		SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree),
+		    OID_AUTO, "tx_msix_cpumap", CTLTYPE_OPAQUE | CTLFLAG_RD,
+		    sc->tx_rmap_intr, 0, if_ringmap_cpumap_sysctl, "I",
+		    "TX MSI-X CPU map");
+		SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree),
+		    OID_AUTO, "rx_msix_cpumap", CTLTYPE_OPAQUE | CTLFLAG_RD,
+		    sc->rx_rmap_intr, 0, if_ringmap_cpumap_sysctl, "I",
+		    "RX MSI-X CPU map");
+	}
 #ifdef IFPOLL_ENABLE
-	SYSCTL_ADD_PROC(&sc->sysctl_ctx, SYSCTL_CHILDREN(sc->sysctl_tree),
-	    OID_AUTO, "npoll_rxoff", CTLTYPE_INT|CTLFLAG_RW,
-	    sc, 0, ix_sysctl_npoll_rxoff, "I", "NPOLLING RX cpu offset");
-	SYSCTL_ADD_PROC(&sc->sysctl_ctx, SYSCTL_CHILDREN(sc->sysctl_tree),
-	    OID_AUTO, "npoll_txoff", CTLTYPE_INT|CTLFLAG_RW,
-	    sc, 0, ix_sysctl_npoll_txoff, "I", "NPOLLING TX cpu offset");
+	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree),
+	    OID_AUTO, "tx_poll_cpumap", CTLTYPE_OPAQUE | CTLFLAG_RD,
+	    sc->tx_rmap, 0, if_ringmap_cpumap_sysctl, "I",
+	    "TX polling CPU map");
+	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree),
+	    OID_AUTO, "rx_poll_cpumap", CTLTYPE_OPAQUE | CTLFLAG_RD,
+	    sc->rx_rmap, 0, if_ringmap_cpumap_sysctl, "I",
+	    "RX polling CPU map");
 #endif
 
 #define IX_ADD_INTR_RATE_SYSCTL(sc, use, name) \
@@ -4045,39 +4417,43 @@ do { \
 #undef IX_ADD_INTR_RATE_SYSCTL
 
 #ifdef IX_RSS_DEBUG
-	SYSCTL_ADD_INT(&sc->sysctl_ctx, SYSCTL_CHILDREN(sc->sysctl_tree),
+	SYSCTL_ADD_INT(ctx, SYSCTL_CHILDREN(tree),
 	    OID_AUTO, "rss_debug", CTLFLAG_RW, &sc->rss_debug, 0,
 	    "RSS debug level");
 	for (i = 0; i < sc->rx_ring_cnt; ++i) {
 		ksnprintf(node, sizeof(node), "rx%d_pkt", i);
-		SYSCTL_ADD_ULONG(&sc->sysctl_ctx,
-		    SYSCTL_CHILDREN(sc->sysctl_tree), OID_AUTO, node,
+		SYSCTL_ADD_ULONG(ctx,
+		    SYSCTL_CHILDREN(tree), OID_AUTO, node,
 		    CTLFLAG_RW, &sc->rx_rings[i].rx_pkts, "RXed packets");
 	}
 #endif
+	for (i = 0; i < sc->tx_ring_cnt; ++i) {
+		struct ix_tx_ring *txr = &sc->tx_rings[i];
 
-	SYSCTL_ADD_PROC(&sc->sysctl_ctx, SYSCTL_CHILDREN(sc->sysctl_tree),
-	    OID_AUTO, "flowctrl", CTLTYPE_INT | CTLFLAG_RW,
-	    sc, 0, ix_sysctl_flowctrl, "I",
-	    "flow control, 0 - off, 1 - rx pause, 2 - tx pause, 3 - full");
+		ksnprintf(node, sizeof(node), "tx%d_nmbuf", i);
+		SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO, node,
+		    CTLTYPE_INT | CTLFLAG_RD, txr, 0, ix_sysctl_tx_nmbuf, "I",
+		    "# of pending TX mbufs");
 
-#ifdef foo
-	/*
-	 * Allow a kind of speed control by forcing the autoneg
-	 * advertised speed list to only a certain value, this
-	 * supports 1G on 82599 devices, and 100Mb on X540.
-	 */
-	SYSCTL_ADD_PROC(&sc->sysctl_ctx, SYSCTL_CHILDREN(sc->sysctl_tree),
-	    OID_AUTO, "advspeed", CTLTYPE_INT | CTLFLAG_RW,
-	    sc, 0, ix_sysctl_advspeed, "I",
-	    "advertised link speed, "
-	    "0 - auto, 1 - 1Gb, 2 - 100Mb, 3 - 1Gb/10Gb");
-#endif
+		ksnprintf(node, sizeof(node), "tx%d_gc", i);
+		SYSCTL_ADD_ULONG(ctx, SYSCTL_CHILDREN(tree), OID_AUTO, node,
+		    CTLFLAG_RW, &txr->tx_gc, "# of TX desc GC");
+	}
 
 #if 0
 	ix_add_hw_stats(sc);
 #endif
 
+}
+
+static int
+ix_sysctl_tx_nmbuf(SYSCTL_HANDLER_ARGS)
+{
+	struct ix_tx_ring *txr = (void *)arg1;
+	int nmbuf;
+
+	nmbuf = txr->tx_nmbuf;
+	return (sysctl_handle_int(oidp, &nmbuf, 0, req));
 }
 
 static int
@@ -4272,8 +4648,8 @@ ix_add_intr_rate_sysctl(struct ix_softc *sc, int use,
 
 	for (i = 0; i < sc->intr_cnt; ++i) {
 		if (sc->intr_data[i].intr_use == use) {
-			SYSCTL_ADD_PROC(&sc->sysctl_ctx,
-			    SYSCTL_CHILDREN(sc->sysctl_tree),
+			SYSCTL_ADD_PROC(device_get_sysctl_ctx(sc->dev),
+			    SYSCTL_CHILDREN(device_get_sysctl_tree(sc->dev)),
 			    OID_AUTO, name, CTLTYPE_INT | CTLFLAG_RW,
 			    sc, 0, handler, "I", desc);
 			break;
@@ -4281,23 +4657,23 @@ ix_add_intr_rate_sysctl(struct ix_softc *sc, int use,
 	}
 }
 
-static void
-ix_set_timer_cpuid(struct ix_softc *sc, boolean_t polling)
+static int
+ix_get_timer_cpuid(const struct ix_softc *sc, boolean_t polling)
 {
 	if (polling || sc->intr_type == PCI_INTR_TYPE_MSIX)
-		sc->timer_cpuid = 0; /* XXX fixed */
+		return 0; /* XXX fixed */
 	else
-		sc->timer_cpuid = rman_get_cpuid(sc->intr_data[0].intr_res);
+		return rman_get_cpuid(sc->intr_data[0].intr_res);
 }
 
 static void
 ix_alloc_msix(struct ix_softc *sc)
 {
-	int msix_enable, msix_cnt, msix_cnt2, alloc_cnt;
+	int msix_enable, msix_cnt, msix_ring, alloc_cnt;
 	struct ix_intr_data *intr;
 	int i, x, error;
-	int offset, offset_def, agg_rxtx, ring_max;
-	boolean_t aggregate, setup = FALSE;
+	int ring_cnt, ring_cntmax;
+	boolean_t setup = FALSE;
 
 	msix_enable = ix_msix_enable;
 	/*
@@ -4315,97 +4691,59 @@ ix_alloc_msix(struct ix_softc *sc)
 	msix_cnt = device_getenv_int(sc->dev, "msix.count", msix_cnt);
 #endif
 	if (msix_cnt <= 1) {
-		/* One MSI-X model does not make sense */
+		/* One MSI-X model does not make sense. */
 		return;
-	}
-
-	i = 0;
-	while ((1 << (i + 1)) <= msix_cnt)
-		++i;
-	msix_cnt2 = 1 << i;
-
-	if (bootverbose) {
-		device_printf(sc->dev, "MSI-X count %d/%d\n",
-		    msix_cnt2, msix_cnt);
-	}
-
-	KKASSERT(msix_cnt >= msix_cnt2);
-	if (msix_cnt == msix_cnt2) {
-		/* We need at least one MSI-X for link status */
-		msix_cnt2 >>= 1;
-		if (msix_cnt2 <= 1) {
-			/* One MSI-X for RX/TX does not make sense */
-			device_printf(sc->dev, "not enough MSI-X for TX/RX, "
-			    "MSI-X count %d/%d\n", msix_cnt2, msix_cnt);
-			return;
-		}
-		KKASSERT(msix_cnt > msix_cnt2);
-
-		if (bootverbose) {
-			device_printf(sc->dev, "MSI-X count eq fixup %d/%d\n",
-			    msix_cnt2, msix_cnt);
-		}
 	}
 
 	/*
 	 * Make sure that we don't break interrupt related registers
 	 * (EIMS, etc) limitation.
-	 *
-	 * NOTE: msix_cnt > msix_cnt2, when we reach here
 	 */
 	if (sc->hw.mac.type == ixgbe_mac_82598EB) {
-		if (msix_cnt2 > IX_MAX_MSIX_82598)
-			msix_cnt2 = IX_MAX_MSIX_82598;
+		if (msix_cnt > IX_MAX_MSIX_82598)
+			msix_cnt = IX_MAX_MSIX_82598;
 	} else {
-		if (msix_cnt2 > IX_MAX_MSIX)
-			msix_cnt2 = IX_MAX_MSIX;
+		if (msix_cnt > IX_MAX_MSIX)
+			msix_cnt = IX_MAX_MSIX;
 	}
-	msix_cnt = msix_cnt2 + 1;	/* +1 for status */
+	if (bootverbose)
+		device_printf(sc->dev, "MSI-X count %d\n", msix_cnt);
+	msix_ring = msix_cnt - 1; /* -1 for status */
 
-	if (bootverbose) {
-		device_printf(sc->dev, "MSI-X count max fixup %d/%d\n",
-		    msix_cnt2, msix_cnt);
-	}
+	/*
+	 * Configure # of RX/TX rings usable by MSI-X.
+	 */
+	ix_get_rxring_cnt(sc, &ring_cnt, &ring_cntmax);
+	if (ring_cntmax > msix_ring)
+		ring_cntmax = msix_ring;
+	sc->rx_rmap_intr = if_ringmap_alloc(sc->dev, ring_cnt, ring_cntmax);
 
-	sc->rx_ring_msix = sc->rx_ring_cnt;
-	if (sc->rx_ring_msix > msix_cnt2)
-		sc->rx_ring_msix = msix_cnt2;
+	ix_get_txring_cnt(sc, &ring_cnt, &ring_cntmax);
+	if (ring_cntmax > msix_ring)
+		ring_cntmax = msix_ring;
+	sc->tx_rmap_intr = if_ringmap_alloc(sc->dev, ring_cnt, ring_cntmax);
 
-	sc->tx_ring_msix = sc->tx_ring_cnt;
-	if (sc->tx_ring_msix > msix_cnt2)
-		sc->tx_ring_msix = msix_cnt2;
+	if_ringmap_match(sc->dev, sc->rx_rmap_intr, sc->tx_rmap_intr);
+	sc->rx_ring_msix = if_ringmap_count(sc->rx_rmap_intr);
+	KASSERT(sc->rx_ring_msix <= sc->rx_ring_cnt,
+	    ("total RX ring count %d, MSI-X RX ring count %d",
+	     sc->rx_ring_cnt, sc->rx_ring_msix));
+	sc->tx_ring_msix = if_ringmap_count(sc->tx_rmap_intr);
+	KASSERT(sc->tx_ring_msix <= sc->tx_ring_cnt,
+	    ("total TX ring count %d, MSI-X TX ring count %d",
+	     sc->tx_ring_cnt, sc->tx_ring_msix));
 
-	ring_max = sc->rx_ring_msix;
-	if (ring_max < sc->tx_ring_msix)
-		ring_max = sc->tx_ring_msix;
+	/*
+	 * Aggregate TX/RX MSI-X
+	 */
+	ring_cntmax = sc->rx_ring_msix;
+	if (ring_cntmax < sc->tx_ring_msix)
+		ring_cntmax = sc->tx_ring_msix;
+	KASSERT(ring_cntmax <= msix_ring,
+	    ("invalid ring count max %d, MSI-X count for rings %d",
+	     ring_cntmax, msix_ring));
 
-	/* Allow user to force independent RX/TX MSI-X handling */
-	agg_rxtx = device_getenv_int(sc->dev, "msix.agg_rxtx",
-	    ix_msix_agg_rxtx);
-
-	if (!agg_rxtx && msix_cnt >= sc->tx_ring_msix + sc->rx_ring_msix + 1) {
-		/*
-		 * Independent TX/RX MSI-X
-		 */
-		aggregate = FALSE;
-		if (bootverbose)
-			device_printf(sc->dev, "independent TX/RX MSI-X\n");
-		alloc_cnt = sc->tx_ring_msix + sc->rx_ring_msix;
-	} else {
-		/*
-		 * Aggregate TX/RX MSI-X
-		 */
-		aggregate = TRUE;
-		if (bootverbose)
-			device_printf(sc->dev, "aggregate TX/RX MSI-X\n");
-		alloc_cnt = msix_cnt2;
-		if (alloc_cnt > ring_max)
-			alloc_cnt = ring_max;
-		KKASSERT(alloc_cnt >= sc->rx_ring_msix &&
-		    alloc_cnt >= sc->tx_ring_msix);
-	}
-	++alloc_cnt;	/* For status */
-
+	alloc_cnt = ring_cntmax + 1; /* +1 for status */
 	if (bootverbose) {
 		device_printf(sc->dev, "MSI-X alloc %d, "
 		    "RX ring %d, TX ring %d\n", alloc_cnt,
@@ -4435,104 +4773,83 @@ ix_alloc_msix(struct ix_softc *sc)
 	}
 
 	x = 0;
-	if (!aggregate) {
-		/*
-		 * RX rings
-		 */
-		if (sc->rx_ring_msix == ncpus2) {
-			offset = 0;
-		} else {
-			offset_def = (sc->rx_ring_msix *
-			    device_get_unit(sc->dev)) % ncpus2;
+	for (i = 0; i < sc->rx_ring_msix; ++i) {
+		struct ix_rx_ring *rxr = &sc->rx_rings[i];
+		struct ix_tx_ring *txr = NULL;
+		int cpuid, j;
 
-			offset = device_getenv_int(sc->dev,
-			    "msix.rxoff", offset_def);
-			if (offset >= ncpus2 ||
-			    offset % sc->rx_ring_msix != 0) {
-				device_printf(sc->dev,
-				    "invalid msix.rxoff %d, use %d\n",
-				    offset, offset_def);
-				offset = offset_def;
-			}
-		}
-		ix_conf_rx_msix(sc, 0, &x, offset);
+		KKASSERT(x < sc->intr_cnt);
+		rxr->rx_intr_vec = x;
+		ix_setup_msix_eims(sc, x,
+		    &rxr->rx_eims, &rxr->rx_eims_val);
+
+		cpuid = if_ringmap_cpumap(sc->rx_rmap_intr, i);
 
 		/*
-		 * TX rings
+		 * Try finding TX ring to piggyback.
 		 */
-		if (sc->tx_ring_msix == ncpus2) {
-			offset = 0;
-		} else {
-			offset_def = (sc->tx_ring_msix *
-			    device_get_unit(sc->dev)) % ncpus2;
-
-			offset = device_getenv_int(sc->dev,
-			    "msix.txoff", offset_def);
-			if (offset >= ncpus2 ||
-			    offset % sc->tx_ring_msix != 0) {
-				device_printf(sc->dev,
-				    "invalid msix.txoff %d, use %d\n",
-				    offset, offset_def);
-				offset = offset_def;
+		for (j = 0; j < sc->tx_ring_msix; ++j) {
+			if (cpuid ==
+			    if_ringmap_cpumap(sc->tx_rmap_intr, j)) {
+				txr = &sc->tx_rings[j];
+				KKASSERT(txr->tx_intr_cpuid < 0);
+				break;
 			}
 		}
-		ix_conf_tx_msix(sc, 0, &x, offset);
-	} else {
-		int ring_agg;
+		rxr->rx_txr = txr;
 
-		ring_agg = sc->rx_ring_msix;
-		if (ring_agg > sc->tx_ring_msix)
-			ring_agg = sc->tx_ring_msix;
-
-		if (ring_max == ncpus2) {
-			offset = 0;
-		} else {
-			offset_def = (ring_max * device_get_unit(sc->dev)) %
-			    ncpus2;
-
-			offset = device_getenv_int(sc->dev, "msix.off",
-			    offset_def);
-			if (offset >= ncpus2 || offset % ring_max != 0) {
-				device_printf(sc->dev,
-				    "invalid msix.off %d, use %d\n",
-				    offset, offset_def);
-				offset = offset_def;
-			}
-		}
-
-		for (i = 0; i < ring_agg; ++i) {
-			struct ix_tx_ring *txr = &sc->tx_rings[i];
-			struct ix_rx_ring *rxr = &sc->rx_rings[i];
-
-			KKASSERT(x < sc->intr_cnt);
-			rxr->rx_intr_vec = x;
-			ix_setup_msix_eims(sc, x,
-			    &rxr->rx_eims, &rxr->rx_eims_val);
-			rxr->rx_txr = txr;
-			/* NOTE: Leave TX ring's intr_vec negative */
-
-			intr = &sc->intr_data[x++];
-
-			intr->intr_serialize = &rxr->rx_serialize;
-			intr->intr_func = ix_msix_rxtx;
-			intr->intr_funcarg = rxr;
+		intr = &sc->intr_data[x++];
+		intr->intr_serialize = &rxr->rx_serialize;
+		if (txr != NULL) {
+			ksnprintf(intr->intr_desc0,
+			    sizeof(intr->intr_desc0), "%s rx%dtx%d",
+			    device_get_nameunit(sc->dev), i, txr->tx_idx);
 			intr->intr_use = IX_INTR_USE_RXTX;
+			intr->intr_func = ix_msix_rxtx;
+		} else {
+			ksnprintf(intr->intr_desc0,
+			    sizeof(intr->intr_desc0), "%s rx%d",
+			    device_get_nameunit(sc->dev), i);
+			intr->intr_rate = IX_MSIX_RX_RATE;
+			intr->intr_use = IX_INTR_USE_RX;
+			intr->intr_func = ix_msix_rx;
+		}
+		intr->intr_funcarg = rxr;
+		intr->intr_cpuid = cpuid;
+		KKASSERT(intr->intr_cpuid < netisr_ncpus);
+		intr->intr_desc = intr->intr_desc0;
 
-			intr->intr_cpuid = i + offset;
-			KKASSERT(intr->intr_cpuid < ncpus2);
+		if (txr != NULL) {
 			txr->tx_intr_cpuid = intr->intr_cpuid;
+			/* NOTE: Leave TX ring's intr_vec negative. */
+		}
+	}
 
-			ksnprintf(intr->intr_desc0, sizeof(intr->intr_desc0),
-			    "%s rxtx%d", device_get_nameunit(sc->dev), i);
-			intr->intr_desc = intr->intr_desc0;
+	for (i = 0; i < sc->tx_ring_msix; ++i) {
+		struct ix_tx_ring *txr = &sc->tx_rings[i];
+
+		if (txr->tx_intr_cpuid >= 0) {
+			/* Piggybacked by RX ring. */
+			continue;
 		}
 
-		if (ring_agg != ring_max) {
-			if (ring_max == sc->tx_ring_msix)
-				ix_conf_tx_msix(sc, i, &x, offset);
-			else
-				ix_conf_rx_msix(sc, i, &x, offset);
-		}
+		KKASSERT(x < sc->intr_cnt);
+		txr->tx_intr_vec = x;
+		ix_setup_msix_eims(sc, x, &txr->tx_eims, &txr->tx_eims_val);
+
+		intr = &sc->intr_data[x++];
+		intr->intr_serialize = &txr->tx_serialize;
+		intr->intr_rate = IX_MSIX_TX_RATE;
+		intr->intr_use = IX_INTR_USE_TX;
+		intr->intr_func = ix_msix_tx;
+		intr->intr_funcarg = txr;
+		intr->intr_cpuid = if_ringmap_cpumap(sc->tx_rmap_intr, i);
+		KKASSERT(intr->intr_cpuid < netisr_ncpus);
+		ksnprintf(intr->intr_desc0, sizeof(intr->intr_desc0), "%s tx%d",
+		    device_get_nameunit(sc->dev), i);
+		intr->intr_desc = intr->intr_desc0;
+
+		txr->tx_intr_cpuid = intr->intr_cpuid;
 	}
 
 	/*
@@ -4617,69 +4934,6 @@ ix_free_msix(struct ix_softc *sc, boolean_t setup)
 }
 
 static void
-ix_conf_rx_msix(struct ix_softc *sc, int i, int *x0, int offset)
-{
-	int x = *x0;
-
-	for (; i < sc->rx_ring_msix; ++i) {
-		struct ix_rx_ring *rxr = &sc->rx_rings[i];
-		struct ix_intr_data *intr;
-
-		KKASSERT(x < sc->intr_cnt);
-		rxr->rx_intr_vec = x;
-		ix_setup_msix_eims(sc, x, &rxr->rx_eims, &rxr->rx_eims_val);
-
-		intr = &sc->intr_data[x++];
-
-		intr->intr_serialize = &rxr->rx_serialize;
-		intr->intr_func = ix_msix_rx;
-		intr->intr_funcarg = rxr;
-		intr->intr_rate = IX_MSIX_RX_RATE;
-		intr->intr_use = IX_INTR_USE_RX;
-
-		intr->intr_cpuid = i + offset;
-		KKASSERT(intr->intr_cpuid < ncpus2);
-
-		ksnprintf(intr->intr_desc0, sizeof(intr->intr_desc0), "%s rx%d",
-		    device_get_nameunit(sc->dev), i);
-		intr->intr_desc = intr->intr_desc0;
-	}
-	*x0 = x;
-}
-
-static void
-ix_conf_tx_msix(struct ix_softc *sc, int i, int *x0, int offset)
-{
-	int x = *x0;
-
-	for (; i < sc->tx_ring_msix; ++i) {
-		struct ix_tx_ring *txr = &sc->tx_rings[i];
-		struct ix_intr_data *intr;
-
-		KKASSERT(x < sc->intr_cnt);
-		txr->tx_intr_vec = x;
-		ix_setup_msix_eims(sc, x, &txr->tx_eims, &txr->tx_eims_val);
-
-		intr = &sc->intr_data[x++];
-
-		intr->intr_serialize = &txr->tx_serialize;
-		intr->intr_func = ix_msix_tx;
-		intr->intr_funcarg = txr;
-		intr->intr_rate = IX_MSIX_TX_RATE;
-		intr->intr_use = IX_INTR_USE_TX;
-
-		intr->intr_cpuid = i + offset;
-		KKASSERT(intr->intr_cpuid < ncpus2);
-		txr->tx_intr_cpuid = intr->intr_cpuid;
-
-		ksnprintf(intr->intr_desc0, sizeof(intr->intr_desc0), "%s tx%d",
-		    device_get_nameunit(sc->dev), i);
-		intr->intr_desc = intr->intr_desc0;
-	}
-	*x0 = x;
-}
-
-static void
 ix_msix_rx(void *xrxr)
 {
 	struct ix_rx_ring *rxr = xrxr;
@@ -4697,9 +4951,7 @@ ix_msix_tx(void *xtxr)
 
 	ASSERT_SERIALIZED(&txr->tx_serialize);
 
-	ix_txeof(txr, *(txr->tx_hdr));
-	if (!ifsq_is_empty(txr->tx_ifsq))
-		ifsq_devstart(txr->tx_ifsq);
+	ix_tx_intr(txr, *(txr->tx_hdr));
 	IXGBE_WRITE_REG(&txr->tx_sc->hw, txr->tx_eims, txr->tx_eims_val);
 }
 
@@ -4724,9 +4976,7 @@ ix_msix_rxtx(void *xrxr)
 	hdr = *(txr->tx_hdr);
 	if (hdr != txr->tx_next_clean) {
 		lwkt_serialize_enter(&txr->tx_serialize);
-		ix_txeof(txr, hdr);
-		if (!ifsq_is_empty(txr->tx_ifsq))
-			ifsq_devstart(txr->tx_ifsq);
+		ix_tx_intr(txr, hdr);
 		lwkt_serialize_exit(&txr->tx_serialize);
 	}
 
@@ -4744,23 +4994,70 @@ ix_intr_status(struct ix_softc *sc, uint32_t eicr)
 
 	if (hw->mac.type != ixgbe_mac_82598EB) {
 		if (eicr & IXGBE_EICR_ECC)
-			if_printf(&sc->arpcom.ac_if, "ECC ERROR!!  Reboot!!\n");
-		else if (eicr & IXGBE_EICR_GPI_SDP1)
-			ix_handle_msf(sc);
-		else if (eicr & IXGBE_EICR_GPI_SDP2)
+			if_printf(&sc->arpcom.ac_if, "ECC ERROR!!  REBOOT!!\n");
+
+		/* Check for over temp condition */
+		if (sc->caps & IX_CAP_TEMP_SENSOR) {
+			int32_t retval;
+
+			switch (sc->hw.mac.type) {
+			case ixgbe_mac_X550EM_a:
+				if ((eicr & IXGBE_EICR_GPI_SDP0_X550EM_a) == 0)
+					break;
+				retval = hw->phy.ops.check_overtemp(hw);
+				if (retval != IXGBE_ERR_OVERTEMP)
+					break;
+
+				/* Disable more temp sensor interrupts. */
+				IXGBE_WRITE_REG(hw, IXGBE_EIMC,
+				    IXGBE_EICR_GPI_SDP0_X550EM_a);
+				if_printf(&sc->arpcom.ac_if, "CRITICAL: "
+				    "OVER TEMP!!  PHY IS SHUT DOWN!!  "
+				    "SHUTDOWN!!\n");
+				break;
+
+			default:
+				if ((eicr & IXGBE_EICR_TS) == 0)
+					break;
+				retval = hw->phy.ops.check_overtemp(hw);
+				if (retval != IXGBE_ERR_OVERTEMP)
+					break;
+
+				/* Disable more temp sensor interrupts. */
+				IXGBE_WRITE_REG(hw, IXGBE_EIMC, IXGBE_EICR_TS);
+				if_printf(&sc->arpcom.ac_if, "CRITICAL: "
+				    "OVER TEMP!!  PHY IS SHUT DOWN!!  "
+				    "SHUTDOWN!!\n");
+				break;
+			}
+		}
+	}
+
+	if (ix_is_sfp(hw)) {
+		uint32_t eicr_mask;
+
+		/* Pluggable optics-related interrupt */
+		if (hw->mac.type >= ixgbe_mac_X540)
+			eicr_mask = IXGBE_EICR_GPI_SDP0_X540;
+		else
+			eicr_mask = IXGBE_EICR_GPI_SDP2_BY_MAC(hw);
+
+		if (eicr & eicr_mask)
 			ix_handle_mod(sc);
-	} 
+
+		if (hw->mac.type == ixgbe_mac_82599EB &&
+		    (eicr & IXGBE_EICR_GPI_SDP1_BY_MAC(hw)))
+			ix_handle_msf(sc);
+	}
 
 	/* Check for fan failure */
-	if (hw->device_id == IXGBE_DEV_ID_82598AT &&
-	    (eicr & IXGBE_EICR_GPI_SDP1))
-		if_printf(&sc->arpcom.ac_if, "FAN FAILURE!!  Replace!!\n");
+	if (sc->caps & IX_CAP_DETECT_FANFAIL)
+		ix_detect_fanfail(sc, eicr, TRUE);
 
-	/* Check for over temp condition */
-	if (hw->mac.type == ixgbe_mac_X540 && (eicr & IXGBE_EICR_TS)) {
-		if_printf(&sc->arpcom.ac_if, "OVER TEMP!!  "
-		    "PHY IS SHUT DOWN!!  Reboot\n");
-	}
+	/* External PHY interrupt */
+	if (hw->phy.type == ixgbe_phy_x550em_ext_t &&
+	    (eicr & IXGBE_EICR_GPI_SDP0_X540))
+		ix_handle_phy(sc);
 }
 
 static void
@@ -4823,9 +5120,8 @@ ix_npoll_tx(struct ifnet *ifp, void *arg, int cycle __unused)
 
 	ASSERT_SERIALIZED(&txr->tx_serialize);
 
-	ix_txeof(txr, *(txr->tx_hdr));
-	if (!ifsq_is_empty(txr->tx_ifsq))
-		ifsq_devstart(txr->tx_ifsq);
+	ix_tx_intr(txr, *(txr->tx_hdr));
+	ix_try_txgc(txr, 1);
 }
 
 static void
@@ -4834,7 +5130,15 @@ ix_npoll_rx(struct ifnet *ifp __unused, void *arg, int cycle)
 	struct ix_rx_ring *rxr = arg;
 
 	ASSERT_SERIALIZED(&rxr->rx_serialize);
+	ix_rxeof(rxr, cycle);
+}
 
+static void
+ix_npoll_rx_direct(struct ifnet *ifp __unused, void *arg, int cycle)
+{
+	struct ix_rx_ring *rxr = arg;
+
+	ASSERT_NOT_SERIALIZED(&rxr->rx_serialize);
 	ix_rxeof(rxr, cycle);
 }
 
@@ -4842,122 +5146,499 @@ static void
 ix_npoll(struct ifnet *ifp, struct ifpoll_info *info)
 {
 	struct ix_softc *sc = ifp->if_softc;
-	int i, txr_cnt, rxr_cnt;
+	int i, txr_cnt, rxr_cnt, idirect;
 
 	ASSERT_IFNET_SERIALIZED_ALL(ifp);
 
+	idirect = sc->direct_input;
+	cpu_ccfence();
+
 	if (info) {
-		int off;
+		int cpu;
 
 		info->ifpi_status.status_func = ix_npoll_status;
 		info->ifpi_status.serializer = &sc->main_serialize;
 
 		txr_cnt = ix_get_txring_inuse(sc, TRUE);
-		off = sc->tx_npoll_off;
 		for (i = 0; i < txr_cnt; ++i) {
 			struct ix_tx_ring *txr = &sc->tx_rings[i];
-			int idx = i + off;
 
-			KKASSERT(idx < ncpus2);
-			info->ifpi_tx[idx].poll_func = ix_npoll_tx;
-			info->ifpi_tx[idx].arg = txr;
-			info->ifpi_tx[idx].serializer = &txr->tx_serialize;
-			ifsq_set_cpuid(txr->tx_ifsq, idx);
+			cpu = if_ringmap_cpumap(sc->tx_rmap, i);
+			KKASSERT(cpu < netisr_ncpus);
+			info->ifpi_tx[cpu].poll_func = ix_npoll_tx;
+			info->ifpi_tx[cpu].arg = txr;
+			info->ifpi_tx[cpu].serializer = &txr->tx_serialize;
+			ifsq_set_cpuid(txr->tx_ifsq, cpu);
 		}
 
 		rxr_cnt = ix_get_rxring_inuse(sc, TRUE);
-		off = sc->rx_npoll_off;
 		for (i = 0; i < rxr_cnt; ++i) {
 			struct ix_rx_ring *rxr = &sc->rx_rings[i];
-			int idx = i + off;
 
-			KKASSERT(idx < ncpus2);
-			info->ifpi_rx[idx].poll_func = ix_npoll_rx;
-			info->ifpi_rx[idx].arg = rxr;
-			info->ifpi_rx[idx].serializer = &rxr->rx_serialize;
-		}
-
-		if (ifp->if_flags & IFF_RUNNING) {
-			if (rxr_cnt == sc->rx_ring_inuse &&
-			    txr_cnt == sc->tx_ring_inuse) {
-				ix_set_timer_cpuid(sc, TRUE);
-				ix_disable_intr(sc);
+			cpu = if_ringmap_cpumap(sc->rx_rmap, i);
+			KKASSERT(cpu < netisr_ncpus);
+			info->ifpi_rx[cpu].arg = rxr;
+			if (idirect) {
+				info->ifpi_rx[cpu].poll_func =
+				    ix_npoll_rx_direct;
+				info->ifpi_rx[cpu].serializer = NULL;
 			} else {
-				ix_init(sc);
+				info->ifpi_rx[cpu].poll_func = ix_npoll_rx;
+				info->ifpi_rx[cpu].serializer =
+				    &rxr->rx_serialize;
 			}
 		}
+		if (idirect)
+			ifp->if_flags |= IFF_IDIRECT;
 	} else {
+		ifp->if_flags &= ~IFF_IDIRECT;
 		for (i = 0; i < sc->tx_ring_cnt; ++i) {
 			struct ix_tx_ring *txr = &sc->tx_rings[i];
 
 			ifsq_set_cpuid(txr->tx_ifsq, txr->tx_intr_cpuid);
 		}
-
-		if (ifp->if_flags & IFF_RUNNING) {
-			txr_cnt = ix_get_txring_inuse(sc, FALSE);
-			rxr_cnt = ix_get_rxring_inuse(sc, FALSE);
-
-			if (rxr_cnt == sc->rx_ring_inuse &&
-			    txr_cnt == sc->tx_ring_inuse) {
-				ix_set_timer_cpuid(sc, FALSE);
-				ix_enable_intr(sc);
-			} else {
-				ix_init(sc);
-			}
-		}
 	}
-}
-
-static int
-ix_sysctl_npoll_rxoff(SYSCTL_HANDLER_ARGS)
-{
-	struct ix_softc *sc = (void *)arg1;
-	struct ifnet *ifp = &sc->arpcom.ac_if;
-	int error, off;
-
-	off = sc->rx_npoll_off;
-	error = sysctl_handle_int(oidp, &off, 0, req);
-	if (error || req->newptr == NULL)
-		return error;
-	if (off < 0)
-		return EINVAL;
-
-	ifnet_serialize_all(ifp);
-	if (off >= ncpus2 || off % sc->rx_ring_cnt != 0) {
-		error = EINVAL;
-	} else {
-		error = 0;
-		sc->rx_npoll_off = off;
-	}
-	ifnet_deserialize_all(ifp);
-
-	return error;
-}
-
-static int
-ix_sysctl_npoll_txoff(SYSCTL_HANDLER_ARGS)
-{
-	struct ix_softc *sc = (void *)arg1;
-	struct ifnet *ifp = &sc->arpcom.ac_if;
-	int error, off;
-
-	off = sc->tx_npoll_off;
-	error = sysctl_handle_int(oidp, &off, 0, req);
-	if (error || req->newptr == NULL)
-		return error;
-	if (off < 0)
-		return EINVAL;
-
-	ifnet_serialize_all(ifp);
-	if (off >= ncpus2 || off % sc->tx_ring_cnt != 0) {
-		error = EINVAL;
-	} else {
-		error = 0;
-		sc->tx_npoll_off = off;
-	}
-	ifnet_deserialize_all(ifp);
-
-	return error;
+	if (ifp->if_flags & IFF_RUNNING)
+		ix_init(sc);
 }
 
 #endif /* IFPOLL_ENABLE */
+
+static enum ixgbe_fc_mode
+ix_ifmedia2fc(int ifm)
+{
+	int fc_opt = ifm & (IFM_ETH_RXPAUSE | IFM_ETH_TXPAUSE);
+
+	switch (fc_opt) {
+	case (IFM_ETH_RXPAUSE | IFM_ETH_TXPAUSE):
+		return ixgbe_fc_full;
+
+	case IFM_ETH_RXPAUSE:
+		return ixgbe_fc_rx_pause;
+
+	case IFM_ETH_TXPAUSE:
+		return ixgbe_fc_tx_pause;
+
+	default:
+		return ixgbe_fc_none;
+	}
+}
+
+static const char *
+ix_ifmedia2str(int ifm)
+{
+	int fc_opt = ifm & (IFM_ETH_RXPAUSE | IFM_ETH_TXPAUSE);
+
+	switch (fc_opt) {
+	case (IFM_ETH_RXPAUSE | IFM_ETH_TXPAUSE):
+		return IFM_ETH_FC_FULL;
+
+	case IFM_ETH_RXPAUSE:
+		return IFM_ETH_FC_RXPAUSE;
+
+	case IFM_ETH_TXPAUSE:
+		return IFM_ETH_FC_TXPAUSE;
+
+	default:
+		return IFM_ETH_FC_NONE;
+	}
+}
+
+static const char *
+ix_fc2str(enum ixgbe_fc_mode fc)
+{
+	switch (fc) {
+	case ixgbe_fc_full:
+		return IFM_ETH_FC_FULL;
+
+	case ixgbe_fc_rx_pause:
+		return IFM_ETH_FC_RXPAUSE;
+
+	case ixgbe_fc_tx_pause:
+		return IFM_ETH_FC_TXPAUSE;
+
+	default:
+		return IFM_ETH_FC_NONE;
+	}
+}
+
+static int
+ix_powerdown(struct ix_softc *sc)
+{
+	struct ixgbe_hw *hw = &sc->hw;
+	int error = 0;
+
+	/* Limit power management flow to X550EM baseT */
+	if (hw->device_id == IXGBE_DEV_ID_X550EM_X_10G_T &&
+	    hw->phy.ops.enter_lplu) {
+		/* Turn off support for APM wakeup. (Using ACPI instead) */
+		IXGBE_WRITE_REG(hw, IXGBE_GRC,
+		    IXGBE_READ_REG(hw, IXGBE_GRC) & ~(uint32_t)2);
+
+		/*
+		 * Clear Wake Up Status register to prevent any previous wakeup
+		 * events from waking us up immediately after we suspend.
+		 */
+		IXGBE_WRITE_REG(hw, IXGBE_WUS, 0xffffffff);
+
+		/*
+		 * Program the Wakeup Filter Control register with user filter
+		 * settings
+		 */
+		IXGBE_WRITE_REG(hw, IXGBE_WUFC, sc->wufc);
+
+		/* Enable wakeups and power management in Wakeup Control */
+		IXGBE_WRITE_REG(hw, IXGBE_WUC,
+		    IXGBE_WUC_WKEN | IXGBE_WUC_PME_EN);
+
+		/* X550EM baseT adapters need a special LPLU flow */
+		hw->phy.reset_disable = true;
+		ix_stop(sc);
+		error = hw->phy.ops.enter_lplu(hw);
+		if (error) {
+			if_printf(&sc->arpcom.ac_if,
+			    "Error entering LPLU: %d\n", error);
+		}
+		hw->phy.reset_disable = false;
+	} else {
+		/* Just stop for other adapters */
+		ix_stop(sc);
+	}
+	return error;
+}
+
+static void
+ix_config_flowctrl(struct ix_softc *sc)
+{
+	struct ixgbe_hw *hw = &sc->hw;
+	uint32_t rxpb, frame, size, tmp;
+
+	frame = sc->max_frame_size;
+
+	/* Calculate High Water */
+	switch (hw->mac.type) {
+	case ixgbe_mac_X540:
+	case ixgbe_mac_X550:
+	case ixgbe_mac_X550EM_a:
+	case ixgbe_mac_X550EM_x:
+		tmp = IXGBE_DV_X540(frame, frame);
+		break;
+	default:
+		tmp = IXGBE_DV(frame, frame);
+		break;
+	}
+	size = IXGBE_BT2KB(tmp);
+	rxpb = IXGBE_READ_REG(hw, IXGBE_RXPBSIZE(0)) >> 10;
+	hw->fc.high_water[0] = rxpb - size;
+
+	/* Now calculate Low Water */
+	switch (hw->mac.type) {
+	case ixgbe_mac_X540:
+	case ixgbe_mac_X550:
+	case ixgbe_mac_X550EM_a:
+	case ixgbe_mac_X550EM_x:
+		tmp = IXGBE_LOW_DV_X540(frame);
+		break;
+	default:
+		tmp = IXGBE_LOW_DV(frame);
+		break;
+	}
+	hw->fc.low_water[0] = IXGBE_BT2KB(tmp);
+
+	hw->fc.requested_mode = ix_ifmedia2fc(sc->ifm_media);
+	if (sc->ifm_media & IFM_ETH_FORCEPAUSE)
+		hw->fc.disable_fc_autoneg = TRUE;
+	else
+		hw->fc.disable_fc_autoneg = FALSE;
+	hw->fc.pause_time = IX_FC_PAUSE;
+	hw->fc.send_xon = TRUE;
+}
+
+static void
+ix_config_dmac(struct ix_softc *sc)
+{
+	struct ixgbe_hw *hw = &sc->hw;
+	struct ixgbe_dmac_config *dcfg = &hw->mac.dmac_config;
+
+	if (hw->mac.type < ixgbe_mac_X550 || !hw->mac.ops.dmac_config)
+		return;
+
+	if ((dcfg->watchdog_timer ^ sc->dmac) ||
+	    (dcfg->link_speed ^ sc->link_speed)) {
+		dcfg->watchdog_timer = sc->dmac;
+		dcfg->fcoe_en = false;
+		dcfg->link_speed = sc->link_speed;
+		dcfg->num_tcs = 1;
+
+		if (bootverbose) {
+			if_printf(&sc->arpcom.ac_if, "dmac settings: "
+			    "watchdog %d, link speed %d\n",
+			    dcfg->watchdog_timer, dcfg->link_speed);
+		}
+
+		hw->mac.ops.dmac_config(hw);
+	}
+}
+
+static void
+ix_init_media(struct ix_softc *sc)
+{
+	struct ixgbe_hw *hw = &sc->hw;
+	uint32_t layer;
+
+	ifmedia_removeall(&sc->media);
+
+	layer = sc->phy_layer;
+
+	/*
+	 * Media types with matching DragonFlyBSD media defines
+	 */
+	if (layer & IXGBE_PHYSICAL_LAYER_10GBASE_T) {
+		ifmedia_add_nodup(&sc->media, IFM_ETHER | IFM_10G_T | IFM_FDX,
+		    0, NULL);
+	}
+	if (layer & IXGBE_PHYSICAL_LAYER_1000BASE_T) {
+		ifmedia_add_nodup(&sc->media, IFM_ETHER | IFM_1000_T | IFM_FDX,
+		    0, NULL);
+	}
+	if (layer & IXGBE_PHYSICAL_LAYER_100BASE_TX) {
+		ifmedia_add_nodup(&sc->media, IFM_ETHER | IFM_100_TX | IFM_FDX,
+		    0, NULL);
+		/* No half-duplex support */
+	}
+	if (layer & IXGBE_PHYSICAL_LAYER_10BASE_T) {
+		ifmedia_add_nodup(&sc->media, IFM_ETHER | IFM_10_T | IFM_FDX,
+		    0, NULL);
+		/* No half-duplex support */
+	}
+
+	if ((layer & IXGBE_PHYSICAL_LAYER_SFP_PLUS_CU) ||
+	    (layer & IXGBE_PHYSICAL_LAYER_SFP_ACTIVE_DA)) {
+		ifmedia_add_nodup(&sc->media,
+		    IFM_ETHER | IFM_10G_TWINAX | IFM_FDX, 0, NULL);
+	}
+
+	if (layer & IXGBE_PHYSICAL_LAYER_10GBASE_LR) {
+		ifmedia_add_nodup(&sc->media, IFM_ETHER | IFM_10G_LR | IFM_FDX,
+		    0, NULL);
+		if (hw->phy.multispeed_fiber) {
+			ifmedia_add_nodup(&sc->media,
+			    IFM_ETHER | IFM_1000_LX | IFM_FDX, 0, NULL);
+		}
+	}
+	if (layer & IXGBE_PHYSICAL_LAYER_10GBASE_LRM) {
+		ifmedia_add_nodup(&sc->media, IFM_ETHER | IFM_10G_LRM | IFM_FDX,
+		    0, NULL);
+		if (hw->phy.multispeed_fiber) {
+			ifmedia_add_nodup(&sc->media,
+			    IFM_ETHER | IFM_1000_LX | IFM_FDX, 0, NULL);
+		}
+	}
+
+	if (layer & IXGBE_PHYSICAL_LAYER_10GBASE_SR) {
+		ifmedia_add_nodup(&sc->media, IFM_ETHER | IFM_10G_SR | IFM_FDX,
+		    0, NULL);
+		if (hw->phy.multispeed_fiber) {
+			ifmedia_add_nodup(&sc->media,
+			    IFM_ETHER | IFM_1000_SX | IFM_FDX, 0, NULL);
+		}
+	} else if (layer & IXGBE_PHYSICAL_LAYER_1000BASE_SX) {
+		ifmedia_add_nodup(&sc->media, IFM_ETHER | IFM_1000_SX | IFM_FDX,
+		    0, NULL);
+	}
+
+	if (layer & IXGBE_PHYSICAL_LAYER_10GBASE_CX4) {
+		ifmedia_add_nodup(&sc->media, IFM_ETHER | IFM_10G_CX4 | IFM_FDX,
+		    0, NULL);
+	}
+
+	/*
+	 * XXX Other (no matching DragonFlyBSD media type):
+	 * To workaround this, we'll assign these completely
+	 * inappropriate media types.
+	 */
+	if (layer & IXGBE_PHYSICAL_LAYER_10GBASE_KR) {
+		if_printf(&sc->arpcom.ac_if, "Media supported: 10GbaseKR\n");
+		if_printf(&sc->arpcom.ac_if, "10GbaseKR mapped to 10GbaseSR\n");
+		ifmedia_add_nodup(&sc->media, IFM_ETHER | IFM_10G_SR | IFM_FDX,
+		    0, NULL);
+	}
+	if (layer & IXGBE_PHYSICAL_LAYER_10GBASE_KX4) {
+		if_printf(&sc->arpcom.ac_if, "Media supported: 10GbaseKX4\n");
+		if_printf(&sc->arpcom.ac_if,
+		    "10GbaseKX4 mapped to 10GbaseCX4\n");
+		ifmedia_add_nodup(&sc->media, IFM_ETHER | IFM_10G_CX4 | IFM_FDX,
+		    0, NULL);
+	}
+	if (layer & IXGBE_PHYSICAL_LAYER_1000BASE_KX) {
+		if_printf(&sc->arpcom.ac_if, "Media supported: 1000baseKX\n");
+		if_printf(&sc->arpcom.ac_if,
+		    "1000baseKX mapped to 1000baseCX\n");
+		ifmedia_add_nodup(&sc->media, IFM_ETHER | IFM_1000_CX | IFM_FDX,
+		    0, NULL);
+	}
+	if (layer & IXGBE_PHYSICAL_LAYER_2500BASE_KX) {
+		if_printf(&sc->arpcom.ac_if, "Media supported: 2500baseKX\n");
+		if_printf(&sc->arpcom.ac_if,
+		    "2500baseKX mapped to 2500baseSX\n");
+		ifmedia_add_nodup(&sc->media, IFM_ETHER | IFM_2500_SX | IFM_FDX,
+		    0, NULL);
+	}
+	if (layer & IXGBE_PHYSICAL_LAYER_1000BASE_BX) {
+		if_printf(&sc->arpcom.ac_if,
+		    "Media supported: 1000baseBX, ignored\n");
+	}
+
+	/* XXX we probably don't need this */
+	if (hw->device_id == IXGBE_DEV_ID_82598AT) {
+		ifmedia_add_nodup(&sc->media,
+		    IFM_ETHER | IFM_1000_T | IFM_FDX, 0, NULL);
+	}
+
+	ifmedia_add_nodup(&sc->media, IFM_ETHER | IFM_AUTO, 0, NULL);
+
+	if (ifmedia_tryset(&sc->media, sc->ifm_media)) {
+		int flowctrl = (sc->ifm_media & IFM_ETH_FCMASK);
+
+		sc->advspeed = IXGBE_LINK_SPEED_UNKNOWN;
+		sc->ifm_media = IX_IFM_DEFAULT | flowctrl;
+		ifmedia_set(&sc->media, sc->ifm_media);
+	}
+}
+
+static void
+ix_setup_caps(struct ix_softc *sc)
+{
+
+	sc->caps |= IX_CAP_LEGACY_INTR;
+
+	switch (sc->hw.mac.type) {
+	case ixgbe_mac_82598EB:
+		if (sc->hw.device_id == IXGBE_DEV_ID_82598AT)
+			sc->caps |= IX_CAP_DETECT_FANFAIL;
+		break;
+
+	case ixgbe_mac_X550:
+		sc->caps |= IX_CAP_TEMP_SENSOR | IX_CAP_FW_RECOVERY;
+		break;
+
+	case ixgbe_mac_X550EM_x:
+		if (sc->hw.device_id == IXGBE_DEV_ID_X550EM_X_KR)
+			sc->caps |= IX_CAP_EEE;
+		sc->caps |= IX_CAP_FW_RECOVERY;
+		break;
+
+	case ixgbe_mac_X550EM_a:
+		sc->caps &= ~IX_CAP_LEGACY_INTR;
+		if (sc->hw.device_id == IXGBE_DEV_ID_X550EM_A_1G_T ||
+		    sc->hw.device_id == IXGBE_DEV_ID_X550EM_A_1G_T_L)
+			sc->caps |= IX_CAP_TEMP_SENSOR | IX_CAP_EEE;
+		sc->caps |= IX_CAP_FW_RECOVERY;
+		break;
+
+	case ixgbe_mac_82599EB:
+		if (sc->hw.device_id == IXGBE_DEV_ID_82599_QSFP_SF_QP)
+			sc->caps &= ~IX_CAP_LEGACY_INTR;
+		break;
+
+	default:
+		break;
+	}
+}
+
+static void
+ix_detect_fanfail(struct ix_softc *sc, uint32_t reg, boolean_t intr)
+{
+	uint32_t mask;
+
+	mask = intr ? IXGBE_EICR_GPI_SDP1_BY_MAC(&sc->hw) : IXGBE_ESDP_SDP1;
+	if (reg & mask) {
+		if_printf(&sc->arpcom.ac_if,
+		    "CRITICAL: FAN FAILURE!!  REPLACE IMMEDIATELY!!\n");
+	}
+}
+
+static void
+ix_config_gpie(struct ix_softc *sc)
+{
+	struct ixgbe_hw *hw = &sc->hw;
+	uint32_t gpie;
+
+	gpie = IXGBE_READ_REG(hw, IXGBE_GPIE);
+
+	if (sc->intr_type == PCI_INTR_TYPE_MSIX) {
+		/* Enable Enhanced MSI-X mode */
+		gpie |= IXGBE_GPIE_MSIX_MODE |
+		    IXGBE_GPIE_EIAME |
+		    IXGBE_GPIE_PBA_SUPPORT |
+		    IXGBE_GPIE_OCD;
+	}
+
+	/* Fan Failure Interrupt */
+	if (sc->caps & IX_CAP_DETECT_FANFAIL)
+		gpie |= IXGBE_SDP1_GPIEN;
+
+	/* Thermal Sensor Interrupt */
+	if (sc->caps & IX_CAP_TEMP_SENSOR)
+		gpie |= IXGBE_SDP0_GPIEN_X540;
+
+	/* Link detection */
+	switch (hw->mac.type) {
+	case ixgbe_mac_82599EB:
+		gpie |= IXGBE_SDP1_GPIEN | IXGBE_SDP2_GPIEN;
+		break;
+
+	case ixgbe_mac_X550EM_x:
+	case ixgbe_mac_X550EM_a:
+		gpie |= IXGBE_SDP0_GPIEN_X540;
+		break;
+
+	default:
+		break;
+	}
+
+	IXGBE_WRITE_REG(hw, IXGBE_GPIE, gpie);
+}
+
+static void
+ix_fw_timer(void *xsc)
+{
+	struct ix_softc *sc = xsc;
+	struct ifnet *ifp = &sc->arpcom.ac_if;
+
+	lwkt_serialize_enter(&sc->main_serialize);
+
+	if (ixgbe_fw_recovery_mode(&sc->hw)) {
+		if ((sc->flags & IX_FLAG_FW_RECOVERY) == 0) {
+			sc->flags |= IX_FLAG_FW_RECOVERY;
+			if (ifp->if_flags & IFF_RUNNING) {
+				if_printf(ifp,
+				    "fw recovery mode entered, stop\n");
+				ix_serialize_skipmain(sc);
+				ix_stop(sc);
+				ix_deserialize_skipmain(sc);
+			} else {
+				if_printf(ifp, "fw recovery mode entered\n");
+			}
+		}
+	} else {
+		if (sc->flags & IX_FLAG_FW_RECOVERY) {
+			sc->flags &= ~IX_FLAG_FW_RECOVERY;
+			if (ifp->if_flags & IFF_UP) {
+				if_printf(ifp,
+				    "fw recovery mode exited, reinit\n");
+				ix_serialize_skipmain(sc);
+				ix_init(sc);
+				ix_deserialize_skipmain(sc);
+			} else {
+				if_printf(ifp, "fw recovery mode exited\n");
+			}
+		}
+	}
+
+	callout_reset_bycpu(&sc->fw_timer, hz, ix_fw_timer, sc,
+	    ix_get_timer_cpuid(sc,
+		(ifp->if_flags & IFF_NPOLLING) ? TRUE : FALSE));
+
+	lwkt_serialize_exit(&sc->main_serialize);
+}

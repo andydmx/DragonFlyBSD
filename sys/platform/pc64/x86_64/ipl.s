@@ -48,11 +48,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -210,17 +206,21 @@ doreti_next:
 	.globl	doreti_iret
 	.globl	doreti_syscall_ret
 doreti_syscall_ret:
-	POP_FRAME		/* registers and %gs (+cli) */
+	POP_FRAME()		/* registers and %gs (+cli) */
 	/* WARNING: special global doreti_iret is  also used by exception.S */
 doreti_iret:
 	iretq
 
 	/*
 	 * doreti_iret_fault.  Alternative return code for the case where
-	 * we get a fault in the doreti_exit code above.  trap()
-	 * (sys/platform/pc64/x86_64/trap.c) catches this specific * case,
-	 * sends the process a signal and continues in the corresponding
-	 * place in the code below.
+	 * we get a fault from iretq above.
+	 *
+	 * iretq -> IDT(prot) -> trap -> iretq -> doreti_iret_fault.
+	 *
+	 * The iretq above was trying to return to usermode and issued
+	 * a KMMUEXIT, so it might be on the trampoline stack.  We must
+	 * issue a KMMUENTER to ensure that we are on the correct stack
+	 * and have the correct mmu context.
 	 *
 	 * Interrupts are likely disabled due to the above interlock
 	 * between cli/iretq.  We must enable them before calling any
@@ -229,7 +229,9 @@ doreti_iret:
 	ALIGN_TEXT
 	.globl	doreti_iret_fault
 doreti_iret_fault:
-	PUSH_FRAME_NOSWAP
+	KMMUENTER_TFRIP
+	subq	$TF_RIP,%rsp
+	PUSH_FRAME_REGS
 	sti
 	movq	$T_PROTFLT,TF_TRAPNO(%rsp)
 	movq	$0,TF_ERR(%rsp)	/* XXX should be the error code */
@@ -312,7 +314,9 @@ doreti_ipiq:
 	movl	%eax,%r12d		/* save cpl (can't use stack) */
 	incl	PCPU(intr_nesting_level)
 	andl	$~RQF_IPIQ,PCPU(reqflags)
+	subq	%rax,%rax
 	sti
+	xchgl	%eax,PCPU(npoll)	/* (atomic op) allow another Xipi */
 	subq	$8,%rsp			/* trapframe->intrframe */
 	movq	%rsp,%rdi		/* pass frame by ref (C arg) */
 	call	lwkt_process_ipiq_frame
@@ -328,7 +332,7 @@ doreti_timer:
 	sti
 	subq	$8,%rsp			/* trapframe->intrframe */
 	movq	%rsp,%rdi		/* pass frame by ref (C arg) */
-	call	lapic_timer_process_frame
+	call	pcpu_timer_process_frame
 	addq	$8,%rsp			/* intrframe->trapframe */
 	decl	PCPU(intr_nesting_level)
 	movl	%r12d,%eax		/* restore cpl for loop */
@@ -442,6 +446,8 @@ splz_ipiq:
 	andl	$~RQF_IPIQ,PCPU(reqflags)
 	sti
 	pushq	%rax
+	subq	%rax,%rax
+	xchgl	%eax,PCPU(npoll)	/* (atomic op) allow another Xipi */
 	call	lwkt_process_ipiq
 	popq	%rax
 	jmp	splz_next
@@ -450,7 +456,7 @@ splz_timer:
 	andl	$~RQF_TIMER,PCPU(reqflags)
 	sti
 	pushq	%rax
-	call	lapic_timer_process
+	call	pcpu_timer_process
 	popq	%rax
 	jmp	splz_next
 

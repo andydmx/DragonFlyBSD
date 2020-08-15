@@ -33,19 +33,12 @@
  */
 
 #include "hammer.h"
-#include <sys/param.h>
-#include <sys/mount.h>
-#include <sys/types.h>
-#include <sys/stat.h>
-#include <unistd.h>
-#include <string.h>
-#include <time.h>
 
 static void config_get(const char *dirpath, struct hammer_ioc_config *config);
 static void config_set(const char *dirpath, struct hammer_ioc_config *config);
 static void config_remove_path(void);
 
-char *ConfigPath;
+static char *ConfigPath;
 
 /*
  * hammer config [<fs> [configfile]]
@@ -157,11 +150,15 @@ hammer_cmd_viconfig(char **av, int ac)
 	atexit(config_remove_path);
 
 	fd = open(path, O_RDWR|O_CREAT|O_TRUNC, 0600);
-	if (fd < 0)
+	if (fd < 0) {
 		err(2, "hammer viconfig: creating temporary file %s", path);
+		/* not reached */
+	}
 	write(fd, config.config.text, strlen(config.config.text));
-	if (fstat(fd, &st) < 0)
+	if (fstat(fd, &st) < 0) {
 		err(2, "hammer viconfig");
+		/* not reached */
+	}
 	times[0].tv_sec = st.st_mtime - 1;
 	times[0].tv_usec = 0;
 	times[1] = times[0];
@@ -169,28 +166,35 @@ hammer_cmd_viconfig(char **av, int ac)
 	utimes(path, times);
 
 	if ((tmp = getenv("EDITOR")) != NULL ||
-	    (tmp = getenv("VISUAL")) != NULL)
+	    (tmp = getenv("VISUAL")) != NULL) {
 		editor = strdup(tmp);
-	else
+	} else {
 		editor = strdup("vi");
+	}
 
 	asprintf(&runcmd, "%s %s", editor, path);
 	system(runcmd);
 
-	if (stat(path, &st) < 0)
+	if (stat(path, &st) < 0) {
 		err(2, "hammer viconfig: unable to stat file after vi");
+		/* not reached */
+	}
 	if (times[0].tv_sec == st.st_mtime) {
 		printf("hammer viconfig: no changes were made\n");
 		remove(path);
 		return;
 	}
 	fd = open(path, O_RDONLY);
-	if (fd < 0)
+	if (fd < 0) {
 		err(2, "hammer viconfig: unable to read %s", path);
+		/* not reached */
+	}
 	remove(path);
 	n = read(fd, config.config.text, sizeof(config.config.text) - 1);
-	if (n < 0)
+	if (n < 0) {
 		err(2, "hammer viconfig: unable to read %s", path);
+		/* not reached */
+	}
 	if (n == sizeof(config.config.text) - 1) {
 		err(2, "hammer config: config file too big, limit %zu bytes",
 		    sizeof(config.config.text) - 1);
@@ -202,40 +206,56 @@ hammer_cmd_viconfig(char **av, int ac)
 	free(runcmd);
 }
 
-static void
+static
+void
 config_get(const char *dirpath, struct hammer_ioc_config *config)
 {
 	struct hammer_ioc_version version;
 	int fd;
 
 	bzero(&version, sizeof(version));
-	if ((fd = open(dirpath, O_RDONLY)) < 0)
+	if ((fd = open(dirpath, O_RDONLY)) < 0) {
 		err(2, "hammer config: unable to open directory %s", dirpath);
-	if (ioctl(fd, HAMMERIOC_GET_VERSION, &version) < 0)
+		/* not reached */
+	}
+	if (ioctl(fd, HAMMERIOC_GET_VERSION, &version) < 0) {
 		errx(2, "hammer config: not a HAMMER filesystem!");
-
-	if (ioctl(fd, HAMMERIOC_GET_CONFIG, config) < 0)
+		/* not reached */
+	}
+	HammerVersion = version.cur_version;
+	if (ioctl(fd, HAMMERIOC_GET_CONFIG, config) < 0) {
 		errx(2, "hammer config: config_get");
+		/* not reached */
+	}
 	close(fd);
 }
 
-static void
+static
+void
 config_set(const char *dirpath, struct hammer_ioc_config *config)
 {
 	struct hammer_ioc_version version;
 	int fd;
 
 	bzero(&version, sizeof(version));
-	if ((fd = open(dirpath, O_RDONLY)) < 0)
+	if ((fd = open(dirpath, O_RDONLY)) < 0) {
 		errx(2, "hammer config: unable to open directory %s", dirpath);
-	if (ioctl(fd, HAMMERIOC_GET_VERSION, &version) < 0)
+		/* not reached */
+	}
+	if (ioctl(fd, HAMMERIOC_GET_VERSION, &version) < 0) {
 		errx(2, "hammer config: not a HAMMER filesystem!");
-	if (ioctl(fd, HAMMERIOC_SET_CONFIG, config) < 0)
+		/* not reached */
+	}
+	HammerVersion = version.cur_version;
+	if (ioctl(fd, HAMMERIOC_SET_CONFIG, config) < 0) {
 		err(2, "hammer config");
+		/* not reached */
+	}
 	close(fd);
 }
 
-static void
+static
+void
 config_remove_path(void)
 {
 	remove(ConfigPath);

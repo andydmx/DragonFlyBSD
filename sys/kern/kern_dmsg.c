@@ -32,7 +32,7 @@
  * SUCH DAMAGE.
  */
 /*
- * TODO: txcmd CREATE state is deferred by txmsgq, need to calculate
+ * TODO: txcmd CREATE state is deferred by tx msgq, need to calculate
  *	 a streaming response.  See subr_diskiocom()'s diskiodone().
  */
 #include <sys/param.h>
@@ -46,6 +46,7 @@
 #include <sys/mount.h>
 #include <sys/socket.h>
 #include <sys/vnode.h>
+#include <sys/sysctl.h>
 #include <sys/file.h>
 #include <sys/proc.h>
 #include <sys/priv.h>
@@ -57,13 +58,42 @@
 
 RB_GENERATE(kdmsg_state_tree, kdmsg_state, rbnode, kdmsg_state_cmp);
 
+SYSCTL_NODE(, OID_AUTO, kdmsg, CTLFLAG_RW, 0, "kdmsg");
+static int kdmsg_debug = 1;
+SYSCTL_INT(_kdmsg, OID_AUTO, debug, CTLFLAG_RW, &kdmsg_debug, 0,
+	   "Set debug level for kernel dmsg layer");
+
+#define kd_printf(level, ctl, ...)      	\
+        if (kdmsg_debug >= (level)) kprintf("kdmsg: " ctl, __VA_ARGS__)
+
+#define kdio_printf(iocom, level, ctl, ...)      \
+        if (kdmsg_debug >= (level)) kprintf("kdmsg: " ctl, __VA_ARGS__)
+
 static int kdmsg_msg_receive_handling(kdmsg_msg_t *msg);
 static int kdmsg_state_msgrx(kdmsg_msg_t *msg);
 static int kdmsg_state_msgtx(kdmsg_msg_t *msg);
+static void kdmsg_msg_write_locked(kdmsg_iocom_t *iocom, kdmsg_msg_t *msg);
 static void kdmsg_state_cleanuprx(kdmsg_msg_t *msg);
 static void kdmsg_state_cleanuptx(kdmsg_msg_t *msg);
+static void kdmsg_subq_delete(kdmsg_state_t *state);
+static void kdmsg_simulate_failure(kdmsg_state_t *state, int meto, int error);
 static void kdmsg_state_abort(kdmsg_state_t *state);
+static void kdmsg_state_dying(kdmsg_state_t *state);
 static void kdmsg_state_free(kdmsg_state_t *state);
+static void kdmsg_drain_msg(kdmsg_msg_t *msg);
+
+#ifdef KDMSG_DEBUG
+#define KDMSG_DEBUG_ARGS	, const char *file, int line
+#define kdmsg_state_hold(state)	_kdmsg_state_hold(state, __FILE__, __LINE__)
+#define kdmsg_state_drop(state)	_kdmsg_state_drop(state, __FILE__, __LINE__)
+#else
+#define KDMSG_DEBUG 0
+#define KDMSG_DEBUG_ARGS
+#define kdmsg_state_hold(state)	_kdmsg_state_hold(state)
+#define kdmsg_state_drop(state)	_kdmsg_state_drop(state)
+#endif
+static void _kdmsg_state_hold(kdmsg_state_t *state KDMSG_DEBUG_ARGS);
+static void _kdmsg_state_drop(kdmsg_state_t *state KDMSG_DEBUG_ARGS);
 
 static void kdmsg_iocom_thread_rd(void *arg);
 static void kdmsg_iocom_thread_wr(void *arg);
@@ -107,7 +137,7 @@ kdmsg_iocom_reconnect(kdmsg_iocom_t *iocom, struct file *fp,
 	 * Destroy the current connection
 	 */
 	lockmgr(&iocom->msglk, LK_EXCLUSIVE);
-	atomic_set_int(&iocom->msg_ctl, KDMSG_CLUSTERCTL_KILL);
+	atomic_set_int(&iocom->msg_ctl, KDMSG_CLUSTERCTL_KILLRX);
 	while (iocom->msgrd_td || iocom->msgwr_td) {
 		wakeup(&iocom->msg_ctl);
 		lksleep(iocom, &iocom->msglk, 0, "clstrkl", hz);
@@ -157,6 +187,7 @@ kdmsg_iocom_autoinitiate(kdmsg_iocom_t *iocom,
 	iocom->auto_lnk_conn.head = msg->any.head;
 	msg->any.lnk_conn = iocom->auto_lnk_conn;
 	iocom->conn_state = msg->state;
+	kdmsg_state_hold(msg->state);	/* iocom->conn_state */
 	kdmsg_msg_write(msg);
 }
 
@@ -194,6 +225,11 @@ kdmsg_lnk_conn_reply(kdmsg_state_t *state, kdmsg_msg_t *msg)
 
 	if ((state->txcmd & DMSGF_DELETE) == 0 &&
 	    (msg->any.head.cmd & DMSGF_DELETE)) {
+		/*
+		 * iocom->conn_state has a state ref, drop it when clearing.
+		 */
+		if (iocom->conn_state)
+			kdmsg_state_drop(iocom->conn_state);
 		iocom->conn_state = NULL;
 		kdmsg_msg_reply(msg, 0);
 	}
@@ -228,16 +264,33 @@ void
 kdmsg_iocom_uninit(kdmsg_iocom_t *iocom)
 {
 	kdmsg_state_t *state;
+	kdmsg_msg_t *msg;
+	int retries;
 
 	/*
-	 * Ask the cluster controller to go away
+	 * Ask the cluster controller to go away by setting
+	 * KILLRX.  Send a PING to get a response to unstick reading
+	 * from the pipe.
+	 *
+	 * After 10 seconds shitcan the pipe and do an unclean shutdown.
 	 */
 	lockmgr(&iocom->msglk, LK_EXCLUSIVE);
-	atomic_set_int(&iocom->msg_ctl, KDMSG_CLUSTERCTL_KILL);
 
+	atomic_set_int(&iocom->msg_ctl, KDMSG_CLUSTERCTL_KILLRX);
+	msg = kdmsg_msg_alloc(&iocom->state0, DMSG_LNK_PING, NULL, NULL);
+	kdmsg_msg_write_locked(iocom, msg);
+
+	retries = 10;
 	while (iocom->msgrd_td || iocom->msgwr_td) {
 		wakeup(&iocom->msg_ctl);
 		lksleep(iocom, &iocom->msglk, 0, "clstrkl", hz);
+		if (--retries == 0 && iocom->msg_fp) {
+			kdio_printf(iocom, 0, "%s\n",
+				    "iocom_uninit: "
+				    "shitcanning unresponsive pipe");
+			fp_shutdown(iocom->msg_fp, SHUT_RDWR);
+			/* retries allowed to go negative, keep looping */
+		}
 	}
 
 	/*
@@ -245,12 +298,12 @@ kdmsg_iocom_uninit(kdmsg_iocom_t *iocom)
 	 */
 	if ((state = iocom->freerd_state) != NULL) {
 		iocom->freerd_state = NULL;
-		kdmsg_state_free(state);
+		kdmsg_state_drop(state);
 	}
 
 	if ((state = iocom->freewr_state) != NULL) {
 		iocom->freewr_state = NULL;
-		kdmsg_state_free(state);
+		kdmsg_state_drop(state);
 	}
 
 	/*
@@ -279,7 +332,7 @@ kdmsg_iocom_thread_rd(void *arg)
 	size_t abytes;
 	int error = 0;
 
-	while ((iocom->msg_ctl & KDMSG_CLUSTERCTL_KILL) == 0) {
+	while ((iocom->msg_ctl & KDMSG_CLUSTERCTL_KILLRX) == 0) {
 		/*
 		 * Retrieve the message from the pipe or socket.
 		 */
@@ -288,13 +341,13 @@ kdmsg_iocom_thread_rd(void *arg)
 		if (error)
 			break;
 		if (hdr.magic != DMSG_HDR_MAGIC) {
-			kprintf("kdmsg: bad magic: %04x\n", hdr.magic);
+			kdio_printf(iocom, 1, "bad magic: %04x\n", hdr.magic);
 			error = EINVAL;
 			break;
 		}
 		hbytes = (hdr.cmd & DMSGF_SIZE) * DMSG_ALIGN;
-		if (hbytes < sizeof(hdr) || hbytes > DMSG_AUX_MAX) {
-			kprintf("kdmsg: bad header size %zd\n", hbytes);
+		if (hbytes < sizeof(hdr) || hbytes > DMSG_HDR_MAX) {
+			kdio_printf(iocom, 1, "bad header size %zd\n", hbytes);
 			error = EINVAL;
 			break;
 		}
@@ -310,15 +363,17 @@ kdmsg_iocom_thread_rd(void *arg)
 					hbytes - sizeof(hdr),
 					NULL, 1, UIO_SYSSPACE);
 			if (error) {
-				kprintf("kdmsg: short msg received\n");
+				kdio_printf(iocom, 1, "%s\n",
+					    "short msg received");
 				error = EINVAL;
 				break;
 			}
 		}
 		msg->aux_size = hdr.aux_bytes;
 		if (msg->aux_size > DMSG_AUX_MAX) {
-			kprintf("kdmsg: illegal msg payload size %zd\n",
-				msg->aux_size);
+			kdio_printf(iocom, 1,
+				    "illegal msg payload size %zd\n",
+				    msg->aux_size);
 			error = EINVAL;
 			break;
 		}
@@ -329,7 +384,8 @@ kdmsg_iocom_thread_rd(void *arg)
 			error = fp_read(iocom->msg_fp, msg->aux_data,
 					abytes, NULL, 1, UIO_SYSSPACE);
 			if (error) {
-				kprintf("kdmsg: short msg payload received\n");
+				kdio_printf(iocom, 1, "%s\n",
+					    "short msg payload received");
 				break;
 			}
 		}
@@ -338,46 +394,30 @@ kdmsg_iocom_thread_rd(void *arg)
 		msg = NULL;
 	}
 
-	if (error)
-		kprintf("kdmsg: read failed error %d\n", error);
+#if 0
+	kdio_printf(iocom, 1, "read thread terminating error=%d\n", error);
+#endif
 
 	lockmgr(&iocom->msglk, LK_EXCLUSIVE);
 	if (msg)
 		kdmsg_msg_free(msg);
 
 	/*
-	 * Shutdown the socket before waiting for the transmit side.
-	 *
-	 * If we are dying due to e.g. a socket disconnect verses being
-	 * killed explicity we have to set KILL in order to kick the tx
-	 * side when it might not have any other work to do.  KILL might
-	 * already be set if we are in an unmount or reconnect.
+	 * Shutdown the socket and set KILLRX for consistency in case the
+	 * shutdown was not commanded.  Signal the transmit side to shutdown
+	 * by setting KILLTX and waking it up.
 	 */
 	fp_shutdown(iocom->msg_fp, SHUT_RDWR);
-
-	atomic_set_int(&iocom->msg_ctl, KDMSG_CLUSTERCTL_KILL);
-	wakeup(&iocom->msg_ctl);
-
-	/*
-	 * Wait for the transmit side to drain remaining messages
-	 * before cleaning up the rx state.  The transmit side will
-	 * set KILLTX and wait for the rx side to completely finish
-	 * (set msgrd_td to NULL) before cleaning up any remaining
-	 * tx states.
-	 */
-	lockmgr(&iocom->msglk, LK_RELEASE);
-	atomic_set_int(&iocom->msg_ctl, KDMSG_CLUSTERCTL_KILLRX);
-	wakeup(&iocom->msg_ctl);
-	while ((iocom->msg_ctl & KDMSG_CLUSTERCTL_KILLTX) == 0) {
-		wakeup(&iocom->msg_ctl);
-		tsleep(iocom, 0, "clstrkw", hz);
-	}
-
+	atomic_set_int(&iocom->msg_ctl, KDMSG_CLUSTERCTL_KILLRX |
+					KDMSG_CLUSTERCTL_KILLTX);
 	iocom->msgrd_td = NULL;
+	lockmgr(&iocom->msglk, LK_RELEASE);
+	wakeup(&iocom->msg_ctl);
 
 	/*
-	 * iocom can be ripped out from under us at this point but
-	 * wakeup() is safe.
+	 * iocom can be ripped out at any time once the lock is
+	 * released with msgrd_td set to NULL.  The wakeup()s are safe but
+	 * that is all.
 	 */
 	wakeup(iocom);
 	lwkt_exit();
@@ -389,11 +429,11 @@ kdmsg_iocom_thread_wr(void *arg)
 {
 	kdmsg_iocom_t *iocom = arg;
 	kdmsg_msg_t *msg;
-	kdmsg_state_t *state;
 	ssize_t res;
 	size_t abytes;
 	int error = 0;
-	int retries = 20;
+	int save_ticks;
+	int didwarn;
 
 	/*
 	 * Transmit loop
@@ -401,7 +441,7 @@ kdmsg_iocom_thread_wr(void *arg)
 	msg = NULL;
 	lockmgr(&iocom->msglk, LK_EXCLUSIVE);
 
-	while ((iocom->msg_ctl & KDMSG_CLUSTERCTL_KILL) == 0 && error == 0) {
+	while ((iocom->msg_ctl & KDMSG_CLUSTERCTL_KILLTX) == 0 && error == 0) {
 		/*
 		 * Sleep if no messages pending.  Interlock with flag while
 		 * holding msglk.
@@ -420,18 +460,15 @@ kdmsg_iocom_thread_wr(void *arg)
 			 * persist and half-closed state handling.
 			 */
 			TAILQ_REMOVE(&iocom->msgq, msg, qentry);
-			lockmgr(&iocom->msglk, LK_RELEASE);
 
 			error = kdmsg_state_msgtx(msg);
 			if (error == EALREADY) {
 				error = 0;
 				kdmsg_msg_free(msg);
-				lockmgr(&iocom->msglk, LK_EXCLUSIVE);
 				continue;
 			}
 			if (error) {
 				kdmsg_msg_free(msg);
-				lockmgr(&iocom->msglk, LK_EXCLUSIVE);
 				break;
 			}
 
@@ -441,13 +478,14 @@ kdmsg_iocom_thread_wr(void *arg)
 			 * We have to clean up the message as if the transmit
 			 * succeeded even if it failed.
 			 */
+			lockmgr(&iocom->msglk, LK_RELEASE);
 			error = fp_write(iocom->msg_fp, &msg->any,
 					 msg->hdr_size, &res, UIO_SYSSPACE);
 			if (error || res != msg->hdr_size) {
 				if (error == 0)
 					error = EINVAL;
-				kdmsg_state_cleanuptx(msg);
 				lockmgr(&iocom->msglk, LK_EXCLUSIVE);
+				kdmsg_state_cleanuptx(msg);
 				break;
 			}
 			if (msg->aux_size) {
@@ -458,91 +496,94 @@ kdmsg_iocom_thread_wr(void *arg)
 				if (error || res != abytes) {
 					if (error == 0)
 						error = EINVAL;
-					kdmsg_state_cleanuptx(msg);
 					lockmgr(&iocom->msglk, LK_EXCLUSIVE);
+					kdmsg_state_cleanuptx(msg);
 					break;
 				}
 			}
-			kdmsg_state_cleanuptx(msg);
 			lockmgr(&iocom->msglk, LK_EXCLUSIVE);
+			kdmsg_state_cleanuptx(msg);
 		}
 	}
 
-	/*
-	 * Cleanup messages pending transmission and release msgq lock.
-	 */
-	if (error)
-		kprintf("kdmsg: write failed error %d\n", error);
-	kprintf("thread_wr: Terminating iocom\n");
+#if 0
+	kdio_printf(iocom, 1, "write thread terminating error=%d\n", error);
+#endif
 
 	/*
-	 * Shutdown the socket.  This will cause the rx thread to get an
-	 * EOF and ensure that both threads get to a termination state.
+	 * Shutdown the socket and set KILLTX for consistency in case the
+	 * shutdown was not commanded.  Signal the receive side to shutdown
+	 * by setting KILLRX and waking it up.
 	 */
 	fp_shutdown(iocom->msg_fp, SHUT_RDWR);
+	atomic_set_int(&iocom->msg_ctl, KDMSG_CLUSTERCTL_KILLRX |
+					KDMSG_CLUSTERCTL_KILLTX);
+	wakeup(&iocom->msg_ctl);
 
 	/*
-	 * Set KILLTX (which the rx side waits for), then wait for the RX
-	 * side to completely finish before we clean out any remaining
-	 * command states.
+	 * The transmit thread is responsible for final cleanups, wait
+	 * for the receive side to terminate to prevent new received
+	 * states from interfering with our cleanup.
+	 *
+	 * Do not set msgwr_td to NULL until we actually exit.
 	 */
-	lockmgr(&iocom->msglk, LK_RELEASE);
-	atomic_set_int(&iocom->msg_ctl, KDMSG_CLUSTERCTL_KILLTX);
-	wakeup(&iocom->msg_ctl);
 	while (iocom->msgrd_td) {
 		wakeup(&iocom->msg_ctl);
-		tsleep(iocom, 0, "clstrkw", hz);
+		lksleep(iocom, &iocom->msglk, 0, "clstrkt", hz);
 	}
-	lockmgr(&iocom->msglk, LK_EXCLUSIVE);
 
 	/*
-	 * Simulate received MSGF_DELETE's for any remaining states.
-	 * (For remote masters).
+	 * We can no longer receive new messages.  We must drain the transmit
+	 * message queue and simulate received messages to close anay remaining
+	 * states.
 	 *
-	 * Drain the message queue to handle any device initiated writes
-	 * due to state callbacks.
+	 * Loop until all the states are gone and there are no messages
+	 * pending transmit.
 	 */
-cleanuprd:
-	RB_FOREACH(state, kdmsg_state_tree, &iocom->staterd_tree)
-		atomic_set_int(&state->flags, KDMSG_STATE_DYING);
-	RB_FOREACH(state, kdmsg_state_tree, &iocom->statewr_tree)
-		atomic_set_int(&state->flags, KDMSG_STATE_DYING);
-	kdmsg_drain_msgq(iocom);
-	RB_FOREACH(state, kdmsg_state_tree, &iocom->staterd_tree) {
-		if ((state->rxcmd & DMSGF_DELETE) == 0) {
-			lockmgr(&iocom->msglk, LK_RELEASE);
-			kdmsg_state_abort(state);
-			lockmgr(&iocom->msglk, LK_EXCLUSIVE);
-			goto cleanuprd;
-		}
-	}
-
-	/*
-	 * Simulate received MSGF_DELETE's for any remaining states.
-	 * (For local masters).
-	 */
-	kdmsg_drain_msgq(iocom);
-	RB_FOREACH(state, kdmsg_state_tree, &iocom->statewr_tree) {
-		if ((state->rxcmd & DMSGF_DELETE) == 0) {
-			lockmgr(&iocom->msglk, LK_RELEASE);
-			kdmsg_state_abort(state);
-			lockmgr(&iocom->msglk, LK_EXCLUSIVE);
-			goto cleanuprd;
-		}
-	}
-
-	/*
-	 * Retry until all work is done
-	 */
-	if (--retries == 0)
-		panic("kdmsg: comm thread shutdown couldn't drain");
-	if (TAILQ_FIRST(&iocom->msgq) ||
-	    RB_ROOT(&iocom->staterd_tree) ||
-	    RB_ROOT(&iocom->statewr_tree)) {
-		goto cleanuprd;
-	}
+	save_ticks = ticks;
+	didwarn = 0;
 	iocom->flags |= KDMSG_IOCOMF_EXITNOACC;
 
+	while (TAILQ_FIRST(&iocom->msgq) ||
+	       RB_ROOT(&iocom->staterd_tree) ||
+	       RB_ROOT(&iocom->statewr_tree) ||
+	       iocom->conn_state) {
+		/*
+		 * Simulate failure for all sub-states of state0.
+		 */
+		kdmsg_drain_msgq(iocom);
+		kdmsg_simulate_failure(&iocom->state0, 0, DMSG_ERR_LOSTLINK);
+
+		lksleep(iocom, &iocom->msglk, 0, "clstrtk", hz / 2);
+
+		if ((int)(ticks - save_ticks) > hz*2 && didwarn == 0) {
+			didwarn = 1;
+			kdio_printf(iocom, 0,
+				    "Warning, write thread on %p "
+				    "still terminating\n",
+				    iocom);
+		}
+		if ((int)(ticks - save_ticks) > hz*15 && didwarn == 1) {
+			didwarn = 2;
+			kdio_printf(iocom, 0,
+				    "Warning, write thread on %p "
+				    "still terminating\n",
+				    iocom);
+		}
+		if ((int)(ticks - save_ticks) > hz*60) {
+			kdio_printf(iocom, 0,
+				    "Can't terminate: msgq %p "
+				    "rd_tree %p wr_tree %p\n",
+				    TAILQ_FIRST(&iocom->msgq),
+				    RB_ROOT(&iocom->staterd_tree),
+				    RB_ROOT(&iocom->statewr_tree));
+			lksleep(iocom, &iocom->msglk, 0, "clstrtk", hz * 10);
+		}
+	}
+
+	/*
+	 * Exit handling is done by the write thread.
+	 */
 	lockmgr(&iocom->msglk, LK_RELEASE);
 
 	/*
@@ -573,7 +614,7 @@ cleanuprd:
  * This cleans out the pending transmit message queue, adjusting any
  * persistent states properly in the process.
  *
- * Caller must hold pmp->iocom.msglk
+ * Called with iocom locked.
  */
 void
 kdmsg_drain_msgq(kdmsg_iocom_t *iocom)
@@ -582,24 +623,38 @@ kdmsg_drain_msgq(kdmsg_iocom_t *iocom)
 
 	/*
 	 * Clean out our pending transmit queue, executing the
-	 * appropriate state adjustments.  If this tries to open
-	 * any new outgoing transactions we have to loop up and
-	 * clean them out.
+	 * appropriate state adjustments as if the messages were
+	 * sent.
 	 */
 	while ((msg = TAILQ_FIRST(&iocom->msgq)) != NULL) {
 		TAILQ_REMOVE(&iocom->msgq, msg, qentry);
-		lockmgr(&iocom->msglk, LK_RELEASE);
-		if (kdmsg_state_msgtx(msg))
-			kdmsg_msg_free(msg);
-		else
-			kdmsg_state_cleanuptx(msg);
-		lockmgr(&iocom->msglk, LK_EXCLUSIVE);
+		kdmsg_drain_msg(msg);
+	}
+}
+
+/*
+ * Drain one message by simulating transmission and also simulating a
+ * receive failure.
+ */
+static void
+kdmsg_drain_msg(kdmsg_msg_t *msg)
+{
+	if (kdmsg_state_msgtx(msg)) {
+		kdmsg_msg_free(msg);
+	} else {
+		if (msg->state) {
+			kdmsg_simulate_failure(msg->state,
+					       0, DMSG_ERR_LOSTLINK);
+		}
+		kdmsg_state_cleanuptx(msg);
 	}
 }
 
 /*
  * Do all processing required to handle a freshly received message
  * after its low level header has been validated.
+ *
+ * iocom is not locked.
  */
 static
 int
@@ -615,10 +670,21 @@ kdmsg_msg_receive_handling(kdmsg_msg_t *msg)
 	 * a discard without execution.
 	 */
 	error = kdmsg_state_msgrx(msg);
+	if (msg->state->flags & KDMSG_STATE_ABORTING) {
+		kdio_printf(iocom, 5,
+			    "kdmsg_state_abort(b): state %p rxcmd=%08x "
+			    "txcmd=%08x msgrx error %d\n",
+			    msg->state, msg->state->rxcmd,
+			    msg->state->txcmd, error);
+	}
 	if (error) {
 		/*
 		 * Raw protocol or connection error
 		 */
+		if (msg->state->flags & KDMSG_STATE_ABORTING)
+			kdio_printf(iocom, 5,
+				    "X1 state %p error %d\n",
+				    msg->state, error);
 		kdmsg_msg_free(msg);
 		if (error == EALREADY)
 			error = 0;
@@ -627,12 +693,22 @@ kdmsg_msg_receive_handling(kdmsg_msg_t *msg)
 		 * Message related to state which already has a
 		 * handling function installed for it.
 		 */
+		if (msg->state->flags & KDMSG_STATE_ABORTING)
+			kdio_printf(iocom, 5,
+				    "X2 state %p func %p\n",
+				    msg->state, msg->state->func);
 		error = msg->state->func(msg->state, msg);
 		kdmsg_state_cleanuprx(msg);
 	} else if (iocom->flags & KDMSG_IOCOMF_AUTOANY) {
+		if (msg->state->flags & KDMSG_STATE_ABORTING)
+			kdio_printf(iocom, 5,
+				    "X3 state %p\n", msg->state);
 		error = kdmsg_autorxmsg(msg);
 		kdmsg_state_cleanuprx(msg);
 	} else {
+		if (msg->state->flags & KDMSG_STATE_ABORTING)
+			kdio_printf(iocom, 5,
+				    "X4 state %p\n", msg->state);
 		error = iocom->rcvmsg(msg);
 		kdmsg_state_cleanuprx(msg);
 	}
@@ -640,35 +716,21 @@ kdmsg_msg_receive_handling(kdmsg_msg_t *msg)
 }
 
 /*
- * Process state tracking for a message after reception, prior to
- * execution.
+ * Process state tracking for a message after reception and dequeueing,
+ * prior to execution of the state callback.  The state is updated and
+ * will be removed from the RBTREE if completely closed, but the state->parent
+ * and subq linkage is not cleaned up until after the callback (see
+ * cleanuprx()).
  *
- * Called with msglk held and the msg dequeued.
+ * msglk is not held.
  *
- * All messages are called with dummy state and return actual state.
- * (One-off messages often just return the same dummy state).
+ * NOTE: A message transaction can consist of several messages in either
+ *	 direction.
  *
- * May request that caller discard the message by setting *discardp to 1.
- * The returned state is not used in this case and is allowed to be NULL.
- *
- * --
- *
- * These routines handle persistent and command/reply message state via the
- * CREATE and DELETE flags.  The first message in a command or reply sequence
- * sets CREATE, the last message in a command or reply sequence sets DELETE.
- *
- * There can be any number of intermediate messages belonging to the same
- * sequence sent inbetween the CREATE message and the DELETE message,
- * which set neither flag.  This represents a streaming command or reply.
- *
- * Any command message received with CREATE set expects a reply sequence to
- * be returned.  Reply sequences work the same as command sequences except the
- * REPLY bit is also sent.  Both the command side and reply side can
- * degenerate into a single message with both CREATE and DELETE set.  Note
- * that one side can be streaming and the other side not, or neither, or both.
- *
- * The msgid is unique for the initiator.  That is, two sides sending a new
- * message can use the same msgid without colliding.
+ * NOTE: The msgid is unique to the initiator, not necessarily unique for
+ *	 us or for any relay or for the return direction for that matter.
+ *	 That is, two sides sending a new message can use the same msgid
+ *	 without colliding.
  *
  * --
  *
@@ -683,7 +745,7 @@ kdmsg_msg_receive_handling(kdmsg_msg_t *msg)
  * also race, and in this situation the other side might have already
  * initiated a new unrelated command with the same message id.  Since
  * the abort has not set the CREATE flag the situation can be detected
- * and the message will also be discarded.
+  * and the message will also be discarded.
  *
  * Non-blocking requests can be initiated with ABORT+CREATE[+DELETE].
  * The ABORT request is essentially integrated into the command instead
@@ -716,6 +778,8 @@ kdmsg_state_msgrx(kdmsg_msg_t *msg)
 	kdmsg_state_t sdummy;
 	int error;
 
+	bzero(&sdummy, sizeof(sdummy));	/* avoid gcc warnings */
+
 	/*
 	 * Make sure a state structure is ready to go in case we need a new
 	 * one.  This is the only routine which uses freerd_state so no
@@ -725,9 +789,11 @@ kdmsg_state_msgrx(kdmsg_msg_t *msg)
 		state = kmalloc(sizeof(*state), iocom->mmsg, M_WAITOK | M_ZERO);
 		state->flags = KDMSG_STATE_DYNAMIC;
 		state->iocom = iocom;
+		state->refs = 1;
 		TAILQ_INIT(&state->subq);
 		iocom->freerd_state = state;
 	}
+	state = NULL;	/* safety */
 
 	/*
 	 * Lock RB tree and locate existing persistent state, if any.
@@ -737,18 +803,36 @@ kdmsg_state_msgrx(kdmsg_msg_t *msg)
 	 */
 	lockmgr(&iocom->msglk, LK_EXCLUSIVE);
 
-	sdummy.msgid = msg->any.head.msgid;
-	sdummy.iocom = iocom;
-	if (msg->any.head.cmd & DMSGF_REVTRANS) {
-		state = RB_FIND(kdmsg_state_tree, &iocom->statewr_tree,
-				&sdummy);
+again:
+	if (msg->state == &iocom->state0) {
+		sdummy.msgid = msg->any.head.msgid;
+		sdummy.iocom = iocom;
+		if (msg->any.head.cmd & DMSGF_REVTRANS) {
+			state = RB_FIND(kdmsg_state_tree, &iocom->statewr_tree,
+					&sdummy);
+		} else {
+			state = RB_FIND(kdmsg_state_tree, &iocom->staterd_tree,
+					&sdummy);
+		}
+
+		/*
+		 * Set message state unconditionally.  If this is a CREATE
+		 * message this state will become the parent state and new
+		 * state will be allocated for the message state.
+		 */
+		if (state == NULL)
+			state = &iocom->state0;
+		if (state->flags & KDMSG_STATE_INTERLOCK) {
+			state->flags |= KDMSG_STATE_SIGNAL;
+			lksleep(state, &iocom->msglk, 0, "dmrace", hz);
+			goto again;
+		}
+		kdmsg_state_hold(state);
+		kdmsg_state_drop(msg->state);	/* iocom->state0 */
+		msg->state = state;
 	} else {
-		state = RB_FIND(kdmsg_state_tree, &iocom->staterd_tree,
-				&sdummy);
+		state = msg->state;
 	}
-	if (state == NULL)
-		state = &iocom->state0;
-	msg->state = state;
 
 	/*
 	 * Short-cut one-off or mid-stream messages.
@@ -770,7 +854,8 @@ kdmsg_state_msgrx(kdmsg_msg_t *msg)
 		 * New persistant command received.
 		 */
 		if (state != &iocom->state0) {
-			kprintf("kdmsg_state_msgrx: duplicate transaction\n");
+			kdio_printf(iocom, 1, "%s\n",
+				    "duplicate transaction");
 			error = EINVAL;
 			break;
 		}
@@ -793,8 +878,9 @@ kdmsg_state_msgrx(kdmsg_msg_t *msg)
 						 &sdummy);
 			}
 			if (pstate == NULL) {
-				kprintf("kdmsg_state_msgrx: "
-					"missing parent in stacked trans\n");
+				kdio_printf(iocom, 1, "%s\n",
+					    "missing parent in "
+					    "stacked trans");
 				error = EINVAL;
 				break;
 			}
@@ -803,20 +889,30 @@ kdmsg_state_msgrx(kdmsg_msg_t *msg)
 		}
 
 		/*
-		 * Allocate new state
+		 * Allocate new state.
+		 *
+		 * msg->state becomes the owner of the ref we inherit from
+		 * freerd_stae.
 		 */
+		kdmsg_state_drop(state);
 		state = iocom->freerd_state;
 		iocom->freerd_state = NULL;
 
-		msg->state = state;
+		msg->state = state;		/* inherits freerd ref */
 		state->parent = pstate;
 		KKASSERT(state->iocom == iocom);
-		state->flags |= KDMSG_STATE_INSERTED |
+		state->flags |= KDMSG_STATE_RBINSERTED |
+				KDMSG_STATE_SUBINSERTED |
 			        KDMSG_STATE_OPPOSITE;
+		if (TAILQ_EMPTY(&pstate->subq))
+			kdmsg_state_hold(pstate);/* states on pstate->subq */
+		kdmsg_state_hold(state);	/* state on pstate->subq */
+		kdmsg_state_hold(state);	/* state on rbtree */
 		state->icmd = msg->any.head.cmd & DMSGF_BASECMDMASK;
 		state->rxcmd = msg->any.head.cmd & ~DMSGF_DELETE;
 		state->txcmd = DMSGF_REPLY;
 		state->msgid = msg->any.head.msgid;
+		state->flags &= ~KDMSG_STATE_NEW;
 		RB_INSERT(kdmsg_state_tree, &iocom->staterd_tree, state);
 		TAILQ_INSERT_TAIL(&pstate->subq, state, entry);
 		error = 0;
@@ -828,10 +924,13 @@ kdmsg_state_msgrx(kdmsg_msg_t *msg)
 		 */
 		if (state == &iocom->state0) {
 			if (msg->any.head.cmd & DMSGF_ABORT) {
+				kdio_printf(iocom, 1, "%s\n",
+					    "msgrx: "
+					    "state already A");
 				error = EALREADY;
 			} else {
-				kprintf("kdmsg_state_msgrx: "
-					"no state for DELETE\n");
+				kdio_printf(iocom, 1, "%s\n",
+					    "msgrx: no state for DELETE");
 				error = EINVAL;
 			}
 			break;
@@ -843,10 +942,12 @@ kdmsg_state_msgrx(kdmsg_msg_t *msg)
 		 */
 		if ((state->rxcmd & DMSGF_CREATE) == 0) {
 			if (msg->any.head.cmd & DMSGF_ABORT) {
+				kdio_printf(iocom, 1, "%s\n",
+					    "msgrx: state already B");
 				error = EALREADY;
 			} else {
-				kprintf("kdmsg_state_msgrx: "
-					"state reused for DELETE\n");
+				kdio_printf(iocom, 1, "%s\n",
+					    "msgrx: state reused for DELETE");
 				error = EINVAL;
 			}
 			break;
@@ -874,10 +975,11 @@ kdmsg_state_msgrx(kdmsg_msg_t *msg)
 		 * persistent state message should already exist.
 		 */
 		if (state == &iocom->state0) {
-			kprintf("kdmsg_state_msgrx: no state match for "
-				"REPLY cmd=%08x msgid=%016jx\n",
-				msg->any.head.cmd,
-				(intmax_t)msg->any.head.msgid);
+			kdio_printf(iocom, 1,
+				    "msgrx: no state match for "
+				    "REPLY cmd=%08x msgid=%016jx\n",
+				    msg->any.head.cmd,
+				    (intmax_t)msg->any.head.msgid);
 			error = EINVAL;
 			break;
 		}
@@ -893,8 +995,9 @@ kdmsg_state_msgrx(kdmsg_msg_t *msg)
 			if (msg->any.head.cmd & DMSGF_ABORT) {
 				error = EALREADY;
 			} else {
-				kprintf("kdmsg_state_msgrx: no state match "
-					"for REPLY|DELETE\n");
+				kdio_printf(iocom, 1, "%s\n",
+					    "msgrx: no state match "
+					    "for REPLY|DELETE");
 				error = EINVAL;
 			}
 			break;
@@ -909,8 +1012,9 @@ kdmsg_state_msgrx(kdmsg_msg_t *msg)
 			if (msg->any.head.cmd & DMSGF_ABORT) {
 				error = EALREADY;
 			} else {
-				kprintf("kdmsg_state_msgrx: state reused "
-					"for REPLY|DELETE\n");
+				kdio_printf(iocom, 1, "%s\n",
+					    "msgrx: state reused "
+					    "for REPLY|DELETE");
 				error = EINVAL;
 			}
 			break;
@@ -943,8 +1047,6 @@ kdmsg_state_msgrx(kdmsg_msg_t *msg)
 	 * always have a DMSGF_CREATE and/or DMSGF_DELETE flag.
 	 */
 done:
-	lockmgr(&iocom->msglk, LK_RELEASE);
-
 	if (msg->any.head.cmd & (DMSGF_CREATE | DMSGF_DELETE)) {
 		if (state != &iocom->state0) {
 			msg->tcmd = (msg->state->icmd & DMSGF_BASECMDMASK) |
@@ -957,6 +1059,41 @@ done:
 	} else {
 		msg->tcmd = msg->any.head.cmd & DMSGF_CMDSWMASK;
 	}
+
+	/*
+	 * Adjust the state for DELETE handling now, before making the
+	 * callback so we are atomic with other state updates.
+	 *
+	 * Subq/parent linkages are cleaned up after the callback.
+	 * If an error occurred the message is ignored and state is not
+	 * updated.
+	 */
+	if ((state = msg->state) == NULL || error != 0) {
+		kdio_printf(iocom, 1,
+			    "msgrx: state=%p error %d\n",
+			    state, error);
+	} else if (msg->any.head.cmd & DMSGF_DELETE) {
+		KKASSERT((state->rxcmd & DMSGF_DELETE) == 0);
+		state->rxcmd |= DMSGF_DELETE;
+		if (state->txcmd & DMSGF_DELETE) {
+			KKASSERT(state->flags & KDMSG_STATE_RBINSERTED);
+			if (state->rxcmd & DMSGF_REPLY) {
+				KKASSERT(msg->any.head.cmd &
+					 DMSGF_REPLY);
+				RB_REMOVE(kdmsg_state_tree,
+					  &iocom->statewr_tree, state);
+			} else {
+				KKASSERT((msg->any.head.cmd &
+					  DMSGF_REPLY) == 0);
+				RB_REMOVE(kdmsg_state_tree,
+					  &iocom->staterd_tree, state);
+			}
+			state->flags &= ~KDMSG_STATE_RBINSERTED;
+			kdmsg_state_drop(state);	/* state on rbtree */
+		}
+	}
+	lockmgr(&iocom->msglk, LK_RELEASE);
+
 	return (error);
 }
 
@@ -969,6 +1106,7 @@ static int
 kdmsg_autorxmsg(kdmsg_msg_t *msg)
 {
 	kdmsg_iocom_t *iocom = msg->state->iocom;
+	kdmsg_msg_t *rep;
 	int error = 0;
 	uint32_t cmd;
 
@@ -989,6 +1127,17 @@ kdmsg_autorxmsg(kdmsg_msg_t *msg)
 	}
 
 	switch(cmd) {
+	case DMSG_LNK_PING:
+		/*
+		 * Received ping, send reply
+		 */
+		rep = kdmsg_msg_alloc(msg->state, DMSG_LNK_PING | DMSGF_REPLY,
+				      NULL, NULL);
+		kdmsg_msg_write(rep);
+		break;
+	case DMSG_LNK_PING | DMSGF_REPLY:
+		/* ignore replies */
+		break;
 	case DMSG_LNK_CONN | DMSGF_CREATE:
 	case DMSG_LNK_CONN | DMSGF_CREATE | DMSGF_DELETE:
 		/*
@@ -1077,54 +1226,81 @@ kdmsg_autorxmsg(kdmsg_msg_t *msg)
 /*
  * Post-receive-handling message and state cleanup.  This routine is called
  * after the state function handling/callback to properly dispose of the
- * message and update or dispose of the state.
+ * message and unlink the state's parent/subq linkage if the state is
+ * completely closed.
+ *
+ * msglk is not held.
  */
 static
 void
 kdmsg_state_cleanuprx(kdmsg_msg_t *msg)
 {
-	kdmsg_iocom_t *iocom = msg->state->iocom;
-	kdmsg_state_t *state;
+	kdmsg_state_t *state = msg->state;
+	kdmsg_iocom_t *iocom = state->iocom;
+
+	lockmgr(&iocom->msglk, LK_EXCLUSIVE);
+	if (state != &iocom->state0) {
+		/*
+		 * When terminating a transaction (in either direction), all
+		 * sub-states are aborted.
+		 */
+		if ((msg->any.head.cmd & DMSGF_DELETE) &&
+		    TAILQ_FIRST(&msg->state->subq)) {
+			kdio_printf(iocom, 2,
+				    "simulate failure for substates of "
+				    "state %p cmd %08x/%08x\n",
+				    msg->state,
+				    msg->state->rxcmd,
+				    msg->state->txcmd);
+			kdmsg_simulate_failure(msg->state,
+					       0, DMSG_ERR_LOSTLINK);
+		}
+
+		/*
+		 * Once the state is fully closed we can (try to) remove it
+		 * from the subq topology.
+		 */
+		if ((state->flags & KDMSG_STATE_SUBINSERTED) &&
+		    (state->rxcmd & DMSGF_DELETE) &&
+		    (state->txcmd & DMSGF_DELETE)) {
+			/* 
+			 * Remove parent linkage if state is completely closed.
+			 */
+			kdmsg_subq_delete(state);
+		}
+	}
+	kdmsg_msg_free(msg);
+
+	lockmgr(&iocom->msglk, LK_RELEASE);
+}
+
+/*
+ * Remove state from its parent's subq.  This can wind up recursively
+ * dropping the parent upward.
+ *
+ * NOTE: Once we drop the parent, our pstate pointer may become invalid.
+ */
+static
+void
+kdmsg_subq_delete(kdmsg_state_t *state)
+{
 	kdmsg_state_t *pstate;
 
-	if ((state = msg->state) == NULL) {
-		kdmsg_msg_free(msg);
-	} else if (msg->any.head.cmd & DMSGF_DELETE) {
-		lockmgr(&iocom->msglk, LK_EXCLUSIVE);
-		KKASSERT((state->rxcmd & DMSGF_DELETE) == 0);
-		state->rxcmd |= DMSGF_DELETE;
-		if (state->txcmd & DMSGF_DELETE) {
-			KKASSERT(state->flags & KDMSG_STATE_INSERTED);
-			if (state->rxcmd & DMSGF_REPLY) {
-				KKASSERT(msg->any.head.cmd &
-					 DMSGF_REPLY);
-				RB_REMOVE(kdmsg_state_tree,
-					  &iocom->statewr_tree, state);
-			} else {
-				KKASSERT((msg->any.head.cmd &
-					  DMSGF_REPLY) == 0);
-				RB_REMOVE(kdmsg_state_tree,
-					  &iocom->staterd_tree, state);
-			}
-			pstate = state->parent;
-			TAILQ_REMOVE(&pstate->subq, state, entry);
-			if (pstate != &pstate->iocom->state0 &&
-			    TAILQ_EMPTY(&pstate->subq) &&
-			    (pstate->flags & KDMSG_STATE_INSERTED) == 0) {
-				kdmsg_state_free(pstate);
-			}
-			state->flags &= ~KDMSG_STATE_INSERTED;
-			state->parent = NULL;
-			kdmsg_msg_free(msg);
-			if (TAILQ_EMPTY(&state->subq))
-				kdmsg_state_free(state);
-			lockmgr(&iocom->msglk, LK_RELEASE);
-		} else {
-			kdmsg_msg_free(msg);
-			lockmgr(&iocom->msglk, LK_RELEASE);
+	if (state->flags & KDMSG_STATE_SUBINSERTED) {
+		pstate = state->parent;
+		KKASSERT(pstate);
+		if (pstate->scan == state)
+			pstate->scan = NULL;
+		TAILQ_REMOVE(&pstate->subq, state, entry);
+		state->flags &= ~KDMSG_STATE_SUBINSERTED;
+		state->parent = NULL;
+		if (TAILQ_EMPTY(&pstate->subq)) {
+			kdmsg_state_drop(pstate);/* pstate->subq */
 		}
+		pstate = NULL;			 /* safety */
+		kdmsg_state_drop(state);  	 /* pstate->subq */
 	} else {
-		kdmsg_msg_free(msg);
+		KKASSERT(state->parent == NULL);
 	}
 }
 
@@ -1137,7 +1313,43 @@ kdmsg_state_cleanuprx(kdmsg_msg_t *msg)
  *
  * This is used when the other end of the link is dead so the device driver
  * gets a completed transaction for all pending states.
+ *
+ * Called with iocom locked.
  */
+static
+void
+kdmsg_simulate_failure(kdmsg_state_t *state, int meto, int error)
+{
+	kdmsg_state_t *substate;
+
+	kdmsg_state_hold(state);		/* aborting */
+
+	/*
+	 * Abort parent state first. Parent will not actually disappear
+	 * until children are gone.  Device drivers must handle the situation.
+	 * The advantage of this is that device drivers can flag the situation
+	 * as an interlock against new operations on dying states.  And since
+	 * device operations are often asynchronous anyway, this sequence of
+	 * events works out better.
+	 */
+	if (meto)
+		kdmsg_state_abort(state);
+
+	/*
+	 * Recurse through any children.
+	 */
+again:
+	TAILQ_FOREACH(substate, &state->subq, entry) {
+		if (substate->flags & KDMSG_STATE_ABORTING)
+			continue;
+		state->scan = substate;
+		kdmsg_simulate_failure(substate, 1, error);
+		if (state->scan != substate)
+			goto again;
+	}
+	kdmsg_state_drop(state);		/* aborting */
+}
+
 static
 void
 kdmsg_state_abort(kdmsg_state_t *state)
@@ -1145,29 +1357,76 @@ kdmsg_state_abort(kdmsg_state_t *state)
 	kdmsg_msg_t *msg;
 
 	/*
-	 * Prevent recursive aborts which could otherwise occur if the
-	 * simulated message reception runs state->func which then turns
-	 * around and tries to reply to a broken circuit when then calls
-	 * the state abort code again.
+	 * Set ABORTING and DYING, return if already set.  If the state was
+	 * just allocated we defer the abort operation until the related
+	 * message is processed.
 	 */
+	KKASSERT((state->flags & KDMSG_STATE_ABORTING) == 0);
 	if (state->flags & KDMSG_STATE_ABORTING)
 		return;
 	state->flags |= KDMSG_STATE_ABORTING;
+	kdmsg_state_dying(state);
+	if (state->flags & KDMSG_STATE_NEW) {
+		kdio_printf(iocom, 5,
+			    "kdmsg_state_abort(0): state %p rxcmd %08x "
+			    "txcmd %08x flags %08x - in NEW state\n",
+			    state, state->rxcmd,
+			    state->txcmd, state->flags);
+		return;
+	}
 
 	/*
+	 * NOTE: The DELETE flag might already be set due to an early
+	 *	 termination.
+	 *
 	 * NOTE: Args to kdmsg_msg_alloc() to avoid dynamic state allocation.
 	 *
 	 * NOTE: We are simulating a received message using our state
 	 *	 (vs a message generated by the other side using its state),
 	 *	 so we must invert DMSGF_REVTRANS and DMSGF_REVCIRC.
 	 */
-	msg = kdmsg_msg_alloc(state, DMSG_LNK_ERROR, NULL, NULL);
-	if ((state->rxcmd & DMSGF_CREATE) == 0)
-		msg->any.head.cmd |= DMSGF_CREATE;
-	msg->any.head.cmd |= DMSGF_DELETE | (state->rxcmd & DMSGF_REPLY);
-	msg->any.head.cmd ^= (DMSGF_REVTRANS | DMSGF_REVCIRC);
-	msg->any.head.error = DMSG_ERR_LOSTLINK;
-	kdmsg_msg_receive_handling(msg);
+	kdio_printf(iocom, 5, 
+		    "kdmsg_state_abort(1): state %p rxcmd %08x txcmd %08x\n",
+		    state, state->rxcmd, state->txcmd);
+	if ((state->rxcmd & DMSGF_DELETE) == 0) {
+		msg = kdmsg_msg_alloc(state, DMSG_LNK_ERROR, NULL, NULL);
+		if ((state->rxcmd & DMSGF_CREATE) == 0)
+			msg->any.head.cmd |= DMSGF_CREATE;
+		msg->any.head.cmd |= DMSGF_DELETE |
+				     (state->rxcmd & DMSGF_REPLY);
+		msg->any.head.cmd ^= (DMSGF_REVTRANS | DMSGF_REVCIRC);
+		msg->any.head.error = DMSG_ERR_LOSTLINK;
+		kdio_printf(iocom, 5,
+			    "kdmsg_state_abort(a): state %p msgcmd %08x\n",
+			    state, msg->any.head.cmd);
+		/* circuit not initialized */
+		lockmgr(&state->iocom->msglk, LK_RELEASE);
+		kdmsg_msg_receive_handling(msg);
+		lockmgr(&state->iocom->msglk, LK_EXCLUSIVE);
+		msg = NULL;
+	}
+	kdio_printf(iocom, 5,
+		    "kdmsg_state_abort(2): state %p rxcmd %08x txcmd %08x\n",
+		    state, state->rxcmd, state->txcmd);
+}
+
+/*
+ * Recursively sets KDMSG_STATE_DYING on state and all sub-states, preventing
+ * the transmission of any new messages on these states.  This is done
+ * atomically when parent state is terminating, whereas setting ABORTING is
+ * not atomic and can leak races.
+ */
+static
+void
+kdmsg_state_dying(kdmsg_state_t *state)
+{
+	kdmsg_state_t *scan;
+
+	if ((state->flags & KDMSG_STATE_DYING) == 0) {
+		state->flags |= KDMSG_STATE_DYING;
+		TAILQ_FOREACH(scan, &state->subq, entry)
+			kdmsg_state_dying(scan);
+	}
 }
 
 /*
@@ -1201,6 +1460,8 @@ kdmsg_state_msgtx(kdmsg_msg_t *msg)
 		state = kmalloc(sizeof(*state), iocom->mmsg, M_WAITOK | M_ZERO);
 		state->flags = KDMSG_STATE_DYNAMIC;
 		state->iocom = iocom;
+		state->refs = 1;
+		TAILQ_INIT(&state->subq);
 		iocom->freewr_state = state;
 	}
 
@@ -1208,7 +1469,6 @@ kdmsg_state_msgtx(kdmsg_msg_t *msg)
 	 * Lock RB tree.  If persistent state is present it will have already
 	 * been assigned to msg.
 	 */
-	lockmgr(&iocom->msglk, LK_EXCLUSIVE);
 	state = msg->state;
 
 	/*
@@ -1216,7 +1476,6 @@ kdmsg_state_msgtx(kdmsg_msg_t *msg)
 	 */
 	if ((msg->any.head.cmd & (DMSGF_CREATE | DMSGF_DELETE |
 				  DMSGF_ABORT)) == 0) {
-		lockmgr(&iocom->msglk, LK_RELEASE);
 		return(0);
 	}
 
@@ -1243,6 +1502,7 @@ kdmsg_state_msgtx(kdmsg_msg_t *msg)
 		state->icmd = msg->any.head.cmd & DMSGF_BASECMDMASK;
 		state->txcmd = msg->any.head.cmd & ~DMSGF_DELETE;
 		state->rxcmd = DMSGF_REPLY;
+		state->flags &= ~KDMSG_STATE_NEW;
 		error = 0;
 		break;
 	case DMSGF_DELETE:
@@ -1254,7 +1514,8 @@ kdmsg_state_msgtx(kdmsg_msg_t *msg)
 			if (msg->any.head.cmd & DMSGF_ABORT) {
 				error = EALREADY;
 			} else {
-				kprintf("kdmsg_state_msgtx: no state match "
+				kdio_printf(iocom, 1,
+					"msgtx: no state match "
 					"for DELETE cmd=%08x msgid=%016jx\n",
 					msg->any.head.cmd,
 					(intmax_t)msg->any.head.msgid);
@@ -1272,8 +1533,9 @@ kdmsg_state_msgtx(kdmsg_msg_t *msg)
 			if (msg->any.head.cmd & DMSGF_ABORT) {
 				error = EALREADY;
 			} else {
-				kprintf("kdmsg_state_msgtx: state reused "
-					"for DELETE\n");
+				kdio_printf(iocom, 1, "%s\n",
+					    "msgtx: state reused "
+					    "for DELETE");
 				error = EINVAL;
 			}
 			break;
@@ -1300,8 +1562,9 @@ kdmsg_state_msgtx(kdmsg_msg_t *msg)
 		 * persistent state message should already exist.
 		 */
 		if (state == &state->iocom->state0) {
-			kprintf("kdmsg_state_msgtx: no state match "
-				"for REPLY | CREATE\n");
+			kdio_printf(iocom, 1, "%s\n",
+				    "msgtx: no state match "
+				    "for REPLY | CREATE");
 			error = EINVAL;
 			break;
 		}
@@ -1323,8 +1586,9 @@ kdmsg_state_msgtx(kdmsg_msg_t *msg)
 			if (msg->any.head.cmd & DMSGF_ABORT) {
 				error = EALREADY;
 			} else {
-				kprintf("kdmsg_state_msgtx: no state match "
-					"for REPLY | DELETE\n");
+				kdio_printf(iocom, 1, "%s\n",
+					    "msgtx: no state match "
+					    "for REPLY | DELETE");
 				error = EINVAL;
 			}
 			break;
@@ -1338,8 +1602,9 @@ kdmsg_state_msgtx(kdmsg_msg_t *msg)
 			if (msg->any.head.cmd & DMSGF_ABORT) {
 				error = EALREADY;
 			} else {
-				kprintf("kdmsg_state_msgtx: state reused "
-					"for REPLY | DELETE\n");
+				kdio_printf(iocom, 1, "%s\n",
+					    "msgtx: state reused "
+					    "for REPLY | DELETE");
 				error = EINVAL;
 			}
 			break;
@@ -1362,26 +1627,51 @@ kdmsg_state_msgtx(kdmsg_msg_t *msg)
 		error = 0;
 		break;
 	}
-	lockmgr(&iocom->msglk, LK_RELEASE);
+
+	/*
+	 * Set interlock (XXX hack) in case the send side blocks and a
+	 * response is returned before kdmsg_state_cleanuptx() can be
+	 * run.
+	 */
+	if (state && error == 0)
+		state->flags |= KDMSG_STATE_INTERLOCK;
+
 	return (error);
 }
 
+/*
+ * Called with iocom locked.
+ */
 static
 void
 kdmsg_state_cleanuptx(kdmsg_msg_t *msg)
 {
 	kdmsg_iocom_t *iocom = msg->state->iocom;
 	kdmsg_state_t *state;
-	kdmsg_state_t *pstate;
 
 	if ((state = msg->state) == NULL) {
 		kdmsg_msg_free(msg);
-	} else if (msg->any.head.cmd & DMSGF_DELETE) {
-		lockmgr(&iocom->msglk, LK_EXCLUSIVE);
+		return;
+	}
+
+	/*
+	 * Clear interlock (XXX hack) in case the send side blocks and a
+	 * response is returned in the other thread before
+	 * kdmsg_state_cleanuptx() can be run.  We maintain our hold on
+	 * iocom->msglk so we can do this before completing our task.
+	 */
+	if (state->flags & KDMSG_STATE_SIGNAL) {
+		kdio_printf(iocom, 1, "state %p interlock!\n", state);
+		wakeup(state);
+	}
+	state->flags &= ~(KDMSG_STATE_INTERLOCK | KDMSG_STATE_SIGNAL);
+	kdmsg_state_hold(state);
+
+	if (msg->any.head.cmd & DMSGF_DELETE) {
 		KKASSERT((state->txcmd & DMSGF_DELETE) == 0);
 		state->txcmd |= DMSGF_DELETE;
 		if (state->rxcmd & DMSGF_DELETE) {
-			KKASSERT(state->flags & KDMSG_STATE_INSERTED);
+			KKASSERT(state->flags & KDMSG_STATE_RBINSERTED);
 			if (state->txcmd & DMSGF_REPLY) {
 				KKASSERT(msg->any.head.cmd &
 					 DMSGF_REPLY);
@@ -1393,26 +1683,70 @@ kdmsg_state_cleanuptx(kdmsg_msg_t *msg)
 				RB_REMOVE(kdmsg_state_tree,
 					  &iocom->statewr_tree, state);
 			}
-			pstate = state->parent;
-			TAILQ_REMOVE(&pstate->subq, state, entry);
-			if (pstate != &pstate->iocom->state0 &&
-			    TAILQ_EMPTY(&pstate->subq) &&
-			    (pstate->flags & KDMSG_STATE_INSERTED) == 0) {
-				kdmsg_state_free(pstate);
-			}
-			state->flags &= ~KDMSG_STATE_INSERTED;
-			state->parent = NULL;
-			kdmsg_msg_free(msg);
+			state->flags &= ~KDMSG_STATE_RBINSERTED;
+
+			/*
+			 * The subq recursion is used for parent linking and
+			 * scanning the topology for aborts, we can only
+			 * remove leafs.  The circuit is effectively dead now,
+			 * but topology won't be torn down until all of its
+			 * children have finished/aborted.
+			 *
+			 * This is particularly important for end-point
+			 * devices which might need to access private data
+			 * in parent states.  Out of order disconnects can
+			 * occur if an end-point device is processing a
+			 * message transaction asynchronously because abort
+			 * requests are basically synchronous and it probably
+			 * isn't convenient (or possible) for the end-point
+			 * to abort an asynchronous operation.
+			 */
 			if (TAILQ_EMPTY(&state->subq))
-				kdmsg_state_free(state);
-			lockmgr(&iocom->msglk, LK_RELEASE);
+				kdmsg_subq_delete(state);
+			kdmsg_msg_free(msg);
+			kdmsg_state_drop(state);   /* state on rbtree */
 		} else {
 			kdmsg_msg_free(msg);
-			lockmgr(&iocom->msglk, LK_RELEASE);
 		}
 	} else {
 		kdmsg_msg_free(msg);
 	}
+
+	/*
+	 * Deferred abort after transmission.
+	 */
+	if ((state->flags & (KDMSG_STATE_ABORTING | KDMSG_STATE_DYING)) &&
+	    (state->rxcmd & DMSGF_DELETE) == 0) {
+		kdio_printf(iocom, 5,
+			    "kdmsg_state_cleanuptx: state=%p "
+			    "executing deferred abort\n",
+			    state);
+		state->flags &= ~KDMSG_STATE_ABORTING;
+		kdmsg_state_abort(state);
+	}
+	kdmsg_state_drop(state);
+}
+
+static
+void
+_kdmsg_state_hold(kdmsg_state_t *state KDMSG_DEBUG_ARGS)
+{
+	atomic_add_int(&state->refs, 1);
+#if KDMSG_DEBUG
+	kd_printf(4, "state %p +%d\t%s:%d\n", state, state->refs, file, line);
+#endif
+}
+
+static
+void
+_kdmsg_state_drop(kdmsg_state_t *state KDMSG_DEBUG_ARGS)
+{
+	KKASSERT(state->refs > 0);
+#if KDMSG_DEBUG
+	kd_printf(4, "state %p -%d\t%s:%d\n", state, state->refs, file, line);
+#endif
+	if (atomic_fetchadd_int(&state->refs, -1) == 1)
+		kdmsg_state_free(state);
 }
 
 static
@@ -1421,8 +1755,12 @@ kdmsg_state_free(kdmsg_state_t *state)
 {
 	kdmsg_iocom_t *iocom = state->iocom;
 
-	KKASSERT((state->flags & KDMSG_STATE_INSERTED) == 0);
-	kfree(state, iocom->mmsg);
+	KKASSERT((state->flags & KDMSG_STATE_RBINSERTED) == 0);
+	KKASSERT((state->flags & KDMSG_STATE_SUBINSERTED) == 0);
+	KKASSERT(TAILQ_EMPTY(&state->subq));
+
+	if (state != &state->iocom->state0)
+		kfree(state, iocom->mmsg);
 }
 
 kdmsg_msg_t *
@@ -1444,13 +1782,23 @@ kdmsg_msg_alloc(kdmsg_state_t *state, uint32_t cmd,
 		/*
 		 * New transaction, requires tracking state and a unique
 		 * msgid to be allocated.
+		 *
+		 * It is possible to race a circuit failure, inherit the
+		 * parent's STATE_DYING flag to trigger an abort sequence
+		 * in the transmit path.  By not inheriting ABORTING the
+		 * abort sequence can recurse.
+		 *
+		 * NOTE: The transactions has not yet been initiated so we
+		 *	 cannot set DMSGF_CREATE/DELETE bits in txcmd or rxcmd.
+		 *	 We have to properly setup DMSGF_REPLY, however.
 		 */
 		pstate = state;
 		state = kmalloc(sizeof(*state), iocom->mmsg, M_WAITOK | M_ZERO);
 		TAILQ_INIT(&state->subq);
 		state->iocom = iocom;
 		state->parent = pstate;
-		state->flags = KDMSG_STATE_DYNAMIC;
+		state->flags = KDMSG_STATE_DYNAMIC |
+			       KDMSG_STATE_NEW;
 		state->func = func;
 		state->any.any = data;
 		state->msgid = (uint64_t)(uintptr_t)state;
@@ -1459,11 +1807,20 @@ kdmsg_msg_alloc(kdmsg_state_t *state, uint32_t cmd,
 		lockmgr(&iocom->msglk, LK_EXCLUSIVE);
 		if (RB_INSERT(kdmsg_state_tree, &iocom->statewr_tree, state))
 			panic("duplicate msgid allocated");
+		if (TAILQ_EMPTY(&pstate->subq))
+			kdmsg_state_hold(pstate);/* pstate->subq */
 		TAILQ_INSERT_TAIL(&pstate->subq, state, entry);
-		state->flags |= KDMSG_STATE_INSERTED;
+		state->flags |= KDMSG_STATE_RBINSERTED |
+				KDMSG_STATE_SUBINSERTED;
+		state->flags |= pstate->flags & KDMSG_STATE_DYING;
+		kdmsg_state_hold(state);	/* pstate->subq */
+		kdmsg_state_hold(state);	/* state on rbtree */
+		kdmsg_state_hold(state);	/* msg->state */
 		lockmgr(&iocom->msglk, LK_RELEASE);
 	} else {
 		pstate = state->parent;
+		KKASSERT(pstate != NULL);
+		kdmsg_state_hold(state);	/* msg->state */
 	}
 
 	if (state->flags & KDMSG_STATE_OPPOSITE)
@@ -1484,17 +1841,46 @@ void
 kdmsg_msg_free(kdmsg_msg_t *msg)
 {
 	kdmsg_iocom_t *iocom = msg->state->iocom;
+	kdmsg_state_t *state;
 
 	if ((msg->flags & KDMSG_FLAG_AUXALLOC) &&
 	    msg->aux_data && msg->aux_size) {
 		kfree(msg->aux_data, iocom->mmsg);
+		msg->aux_data = NULL;
 		msg->flags &= ~KDMSG_FLAG_AUXALLOC;
 	}
-	msg->state = NULL;
+	if ((state = msg->state) != NULL) {
+		msg->state = NULL;
+		kdmsg_state_drop(state);	/* msg->state */
+	}
 	msg->aux_data = NULL;
 	msg->aux_size = 0;
 
 	kfree(msg, iocom->mmsg);
+}
+
+void
+kdmsg_detach_aux_data(kdmsg_msg_t *msg, kdmsg_data_t *data)
+{
+	if (msg->flags & KDMSG_FLAG_AUXALLOC) {
+		data->aux_data = msg->aux_data;
+		data->aux_size = msg->aux_size;
+		data->iocom = msg->state->iocom;
+		msg->flags &= ~KDMSG_FLAG_AUXALLOC;
+	} else {
+		data->aux_data = NULL;
+		data->aux_size = 0;
+		data->iocom = msg->state->iocom;
+	}
+}
+
+void
+kdmsg_free_aux_data(kdmsg_data_t *data)
+{
+	if (data->aux_data) {
+		kfree(data->aux_data, data->iocom->mmsg);
+		data->aux_data = NULL;
+	}
 }
 
 /*
@@ -1535,6 +1921,15 @@ void
 kdmsg_msg_write(kdmsg_msg_t *msg)
 {
 	kdmsg_iocom_t *iocom = msg->state->iocom;
+
+	lockmgr(&iocom->msglk, LK_EXCLUSIVE);
+	kdmsg_msg_write_locked(iocom, msg);
+	lockmgr(&iocom->msglk, LK_RELEASE);
+}
+
+static void
+kdmsg_msg_write_locked(kdmsg_iocom_t *iocom, kdmsg_msg_t *msg)
+{
 	kdmsg_state_t *state;
 
 	if (msg->state) {
@@ -1547,7 +1942,6 @@ kdmsg_msg_write(kdmsg_msg_t *msg)
 		 */
 		state = msg->state;
 		msg->any.head.msgid = state->msgid;
-		lockmgr(&iocom->msglk, LK_EXCLUSIVE);
 	} else {
 		/*
 		 * One-off message (always uses msgid 0 to distinguish
@@ -1556,22 +1950,47 @@ kdmsg_msg_write(kdmsg_msg_t *msg)
 		 */
 		state = NULL;
 		msg->any.head.msgid = 0;
-		lockmgr(&iocom->msglk, LK_EXCLUSIVE);
 	}
 
 	/*
-	 * This flag is not set until after the tx thread has drained
-	 * the txmsgq and simulated responses.  After that point the
-	 * txthread is dead and can no longer simulate responses.
+	 * For stateful messages, if the circuit is dead or dying we have
+	 * to abort the potentially newly-created state and discard the
+	 * message.
 	 *
-	 * Device drivers should never try to send a message once this
-	 * flag is set.  They should have detected (through the state
-	 * closures) that the link is in trouble.
+	 * - We must discard the message because the other end will not
+	 *   be expecting any more messages over the dead or dying circuit
+	 *   and might not be able to receive them.
+	 *
+	 * - We abort the state by simulating a failure to generate a fake
+	 *   incoming DELETE.  This will trigger the state callback and allow
+	 *   the device to clean things up and reply, closing the outgoing
+	 *   direction and allowing the state to be freed.
+	 *
+	 * This situation occurs quite often, particularly as SPANs stabilize.
+	 * End-points must do the right thing.
 	 */
-	if (iocom->flags & KDMSG_IOCOMF_EXITNOACC) {
-		lockmgr(&iocom->msglk, LK_RELEASE);
-		panic("kdmsg_msg_write: Attempt to write message to "
-		      "terminated iocom\n");
+	if (state) {
+		KKASSERT((state->txcmd & DMSGF_DELETE) == 0);
+		if (state->flags & KDMSG_STATE_DYING) {
+#if 0
+		if ((state->flags & KDMSG_STATE_DYING) ||
+		    (state->parent->txcmd & DMSGF_DELETE) ||
+		    (state->parent->flags & KDMSG_STATE_DYING)) {
+#endif
+			kdio_printf(iocom, 4,
+				    "kdmsg_msg_write: Write to dying circuit "
+				    "state=%p "
+				    "ptxcmd=%08x prxcmd=%08x flags=%08x\n",
+				    state,
+				    state->parent->rxcmd,
+				    state->parent->txcmd,
+				    state->parent->flags);
+			kdmsg_state_hold(state);
+			kdmsg_state_msgtx(msg);
+			kdmsg_state_cleanuptx(msg);
+			kdmsg_state_drop(state);
+			return;
+		}
 	}
 
 	/*
@@ -1592,15 +2011,20 @@ kdmsg_msg_write(kdmsg_msg_t *msg)
 	msg->any.head.hdr_crc = 0;
 	msg->any.head.hdr_crc = iscsi_crc32(msg->any.buf, msg->hdr_size);
 
-	TAILQ_INSERT_TAIL(&iocom->msgq, msg, qentry);
+	/*
+	 * If termination races new message senders we must drain the
+	 * message immediately instead of queue it.
+	 */
+	if (iocom->flags & KDMSG_IOCOMF_EXITNOACC)
+		kdmsg_drain_msg(msg);
+	else
+		TAILQ_INSERT_TAIL(&iocom->msgq, msg, qentry);
 
 	if (iocom->msg_ctl & KDMSG_CLUSTERCTL_SLEEPING) {
 		atomic_clear_int(&iocom->msg_ctl,
 				 KDMSG_CLUSTERCTL_SLEEPING);
 		wakeup(&iocom->msg_ctl);
 	}
-
-	lockmgr(&iocom->msglk, LK_RELEASE);
 }
 
 /*

@@ -48,6 +48,7 @@
 #include <sys/endian.h>
 #include <sys/interrupt.h>
 #include <sys/kernel.h>
+#include <sys/malloc.h>
 #include <sys/mbuf.h>
 #include <sys/module.h>
 
@@ -799,7 +800,7 @@ bt3c_receive(bt3c_softc_p sc)
 			sc->state = NG_BT3C_W4_PKT_IND;
 			sc->want = 1;
 
-			MGETHDR(sc->m, MB_DONTWAIT, MT_DATA);
+			MGETHDR(sc->m, M_NOWAIT, MT_DATA);
 			if (sc->m == NULL) {
 				NG_BT3C_ERR(sc->dev, "Could not get mbuf\n");
 				NG_BT3C_STAT_IERROR(sc->stat);
@@ -807,7 +808,7 @@ bt3c_receive(bt3c_softc_p sc)
 				break; /* XXX lost of sync */
 			}
 
-			MCLGET(sc->m, MB_DONTWAIT);
+			MCLGET(sc->m, M_NOWAIT);
 			if (!(sc->m->m_flags & M_EXT)) {
 				NG_FREE_M(sc->m);
 

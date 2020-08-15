@@ -26,13 +26,13 @@
 .\"
 .\" $FreeBSD: src/share/man/man9/lock.9,v 1.11 2003/09/08 19:57:21 ru Exp $
 .\"
-.Dd January 19, 2014
+.Dd July 21, 2018
 .Dt LOCK 9
 .Os
 .Sh NAME
 .Nm lockinit ,
-.Nm lockcount ,
 .Nm lockmgr ,
+.Nm lockmgr_try ,
 .Nm lockstatus ,
 .Nm lockmgr_printinfo ,
 .Nm lockowned
@@ -45,11 +45,9 @@
 .Ft void
 .Fn lockuninit "struct lock *lkp"
 .Ft int
-.Fn lockcount "struct lock *lkp"
-.Ft int
-.Fn lockcountnb "struct lock *lkp"
-.Ft int
 .Fn lockmgr "struct lock *lkp" "u_int flags"
+.Ft boolean_t
+.Fn lockmgr_try "struct lock *lkp" "u_int flags"
 .Ft int
 .Fn lockstatus "struct lock *lkp" "struct thread *td"
 .Ft void
@@ -94,19 +92,6 @@ function destroys a lock that was previously initialized using
 .Fn lockinit .
 .Pp
 The
-.Fn lockcount
-function returns a count of the number of exclusive locks and shared locks
-held against the lock
-.Fa lkp .
-.Pp
-The
-.Fn lockcountnb
-function is a non-blocking counter-part of
-.Fn lockcount .
-which, can be safely used in assertion statements e.g. a
-.Xr KASSERT 9 .
-.Pp
-The
 .Fn lockmgr
 function handles general locking functionality within the kernel, including
 support for shared and exclusive locks, and recursion.
@@ -138,14 +123,24 @@ Upgrade a shared lock to an exclusive lock.
 Fails with
 .Er EBUSY
 if there is someone ahead of you in line waiting for an upgrade.
-If this call fails, the shared lock is lost.
-Attempts to upgrade an exclusive lock will cause a
-.Xr panic 9 .
+If this call fails for any reason, the shared lock is lost.
+Attempts to upgrade an exclusive lock not already
+owned by the caller will cause a
+.Xr panic 9 ,
+but otherwise will always succeed.
+NOTE! When this operation succeeds, it guarantees that no other
+exclusive lock was able to acquire the lock ahead of you, but
+as indicated above, if it fails your current shared lock is lost.
 .It Dv LK_UPGRADE
 Upgrade a shared lock to an exclusive lock.
-If this call fails, the shared lock is lost.
-Attempts to upgrade an exclusive lock will cause a
-.Xr panic 9 .
+If this call fails for any reason, the shared lock is lost.
+Attempts to upgrade an exclusive lock not already
+owned by the caller will cause a
+.Xr panic 9 ,
+but otherwise will always succeed.
+WARNING!  This operation can block with the current lock temporarily
+released, and other exclusive or shared lock holders can inject before
+the lock is acquired on your behalf.
 .It Dv LK_RELEASE
 Release the lock.
 Releasing a lock that is not held can cause a
@@ -160,6 +155,16 @@ Allow recursion on an exclusive lock.
 For every lock there must be a release.
 .El
 .El
+.Pp
+The
+.Fn lockmgr_try
+function is similar to
+.Fn lockmgr
+but it will not sleep and returns
+.Dv TRUE
+if the lock was successfully obtained and
+.Dv FALSE
+if it was not.
 .Pp
 The
 .Fn lockstatus
@@ -185,10 +190,6 @@ The
 .Fn lockowned
 function is used to determine whether the calling thread owns a lock.
 .Sh RETURN VALUES
-The
-.Fn lockcount
-function returns an integer greater than or equal to zero.
-.Pp
 The
 .Fn lockmgr
 function returns 0 on success and non-zero on failure.

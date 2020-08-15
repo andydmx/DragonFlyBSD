@@ -13,7 +13,7 @@
 #define	SYS_open	5
 #define	SYS_close	6
 #define	SYS_wait4	7
-				/* 8 is old creat */
+#define	SYS___nosys	8
 #define	SYS_link	9
 #define	SYS_unlink	10
 				/* 11 is obsolete execv */
@@ -24,7 +24,7 @@
 #define	SYS_chown	16
 #define	SYS_break	17
 #define	SYS_getfsstat	18
-				/* 19 is old lseek */
+				/* 19 is obsolete old lseek */
 #define	SYS_getpid	20
 #define	SYS_mount	21
 #define	SYS_unmount	22
@@ -43,9 +43,9 @@
 #define	SYS_fchflags	35
 #define	SYS_sync	36
 #define	SYS_kill	37
-				/* 38 is old stat */
+				/* 38 is obsolete old stat */
 #define	SYS_getppid	39
-				/* 40 is old lstat */
+				/* 40 is obsolete old lstat */
 #define	SYS_dup	41
 #define	SYS_pipe	42
 #define	SYS_getegid	43
@@ -67,17 +67,17 @@
 #define	SYS_execve	59
 #define	SYS_umask	60
 #define	SYS_chroot	61
-				/* 62 is old fstat */
-				/* 63 is old getkerninfo */
-				/* 64 is old getpagesize */
+				/* 62 is obsolete old fstat */
+				/* 63 is obsolete getkerninfo */
+				/* 64 is obsolete getpagesize */
 #define	SYS_msync	65
 #define	SYS_vfork	66
 				/* 67 is obsolete vread */
 				/* 68 is obsolete vwrite */
 #define	SYS_sbrk	69
 #define	SYS_sstk	70
-				/* 71 is old mmap */
-				/* 72 is old vadvise */
+				/* 71 is obsolete old mmap */
+				/* 72 is obsolete vadvise */
 #define	SYS_munmap	73
 #define	SYS_mprotect	74
 #define	SYS_madvise	75
@@ -89,11 +89,11 @@
 #define	SYS_getpgrp	81
 #define	SYS_setpgid	82
 #define	SYS_setitimer	83
-				/* 84 is old wait */
+				/* 84 is obsolete wait */
 #define	SYS_swapon	85
 #define	SYS_getitimer	86
-				/* 87 is old gethostname */
-				/* 88 is old sethostname */
+				/* 87 is obsolete gethostname */
+				/* 88 is obsolete sethostname */
 #define	SYS_getdtablesize	89
 #define	SYS_dup2	90
 #define	SYS_fcntl	92
@@ -102,22 +102,22 @@
 #define	SYS_setpriority	96
 #define	SYS_socket	97
 #define	SYS_connect	98
-				/* 99 is old accept */
+				/* 99 is obsolete old accept */
 #define	SYS_getpriority	100
-				/* 101 is old send */
-				/* 102 is old recv */
+				/* 101 is obsolete send */
+				/* 102 is obsolete recv */
 				/* 103 is obsolete freebsd3_sigreturn */
 #define	SYS_bind	104
 #define	SYS_setsockopt	105
 #define	SYS_listen	106
 				/* 107 is obsolete vtimes */
-				/* 108 is old sigvec */
-				/* 109 is old sigblock */
-				/* 110 is old sigsetmask */
+				/* 108 is obsolete 4.3 sigvec */
+				/* 109 is obsolete 4.3 sigblock */
+				/* 110 is obsolete 4.3 sigsetmask */
 				/* 111 is obsolete freebsd3_sigsuspend */
-				/* 112 is old sigstack */
-				/* 113 is old recvmsg */
-				/* 114 is old sendmsg */
+				/* 112 is obsolete sigstack */
+				/* 113 is obsolete old recvmsg */
+				/* 114 is obsolete old sendmsg */
 				/* 115 is obsolete vtrace */
 #define	SYS_gettimeofday	116
 #define	SYS_getrusage	117
@@ -127,12 +127,12 @@
 #define	SYS_settimeofday	122
 #define	SYS_fchown	123
 #define	SYS_fchmod	124
-				/* 125 is old recvfrom */
+				/* 125 is obsolete old recvfrom */
 #define	SYS_setreuid	126
 #define	SYS_setregid	127
 #define	SYS_rename	128
-				/* 129 is old truncate */
-				/* 130 is old ftruncate */
+				/* 129 is obsolete old truncate */
+				/* 130 is obsolete old ftruncate */
 #define	SYS_flock	131
 #define	SYS_mkfifo	132
 #define	SYS_sendto	133
@@ -143,24 +143,24 @@
 #define	SYS_utimes	138
 				/* 139 is obsolete 4.2 sigreturn */
 #define	SYS_adjtime	140
-				/* 141 is old getpeername */
-				/* 142 is old gethostid */
-				/* 143 is old sethostid */
-				/* 144 is old getrlimit */
-				/* 145 is old setrlimit */
-				/* 146 is old killpg */
+				/* 141 is obsolete old getpeername */
+				/* 142 is obsolete 4.3 gethostid */
+				/* 143 is obsolete 4.3 sethostid */
+				/* 144 is obsolete old getrlimit */
+				/* 145 is obsolete old setrlimit */
+				/* 146 is obsolete 4.3 killpg */
 #define	SYS_setsid	147
 #define	SYS_quotactl	148
-				/* 149 is old quota */
-				/* 150 is old getsockname */
+				/* 149 is obsolete quota */
+				/* 150 is obsolete old getsockname */
 #define	SYS_nfssvc	155
-				/* 156 is old getdirentries */
+				/* 156 is obsolete old getdirentries */
 #define	SYS_statfs	157
 #define	SYS_fstatfs	158
 #define	SYS_getfh	161
-#define	SYS_getdomainname	162
-#define	SYS_setdomainname	163
-#define	SYS_uname	164
+				/* 162 is obsolete getdomainname */
+				/* 163 is obsolete setdomainname */
+				/* 164 is obsolete uname */
 #define	SYS_sysarch	165
 #define	SYS_rtprio	166
 				/* 169 is obsolete semsys */
@@ -172,14 +172,10 @@
 #define	SYS_setgid	181
 #define	SYS_setegid	182
 #define	SYS_seteuid	183
-				/* 188 is old stat */
-				/* 189 is old fstat */
-				/* 190 is old lstat */
 #define	SYS_pathconf	191
 #define	SYS_fpathconf	192
 #define	SYS_getrlimit	194
 #define	SYS_setrlimit	195
-				/* 196 is old getdirentries */
 #define	SYS_mmap	197
 #define	SYS___syscall	198
 #define	SYS_lseek	199
@@ -212,19 +208,17 @@
 #define	SYS_openbsd_poll	252
 #define	SYS_issetugid	253
 #define	SYS_lchown	254
-				/* 272 is old getdents */
 #define	SYS_lchmod	274
 #define	SYS_netbsd_lchown	275
 #define	SYS_lutimes	276
 #define	SYS_netbsd_msync	277
-				/* 278 is obsolete { */
-				/* 279 is obsolete { */
-				/* 280 is obsolete { */
+				/* 278 is obsolete nstat */
+				/* 279 is obsolete nfstat */
+				/* 280 is obsolete nlstat */
 #define	SYS_extpreadv	289
 #define	SYS_extpwritev	290
 #define	SYS_fhstatfs	297
 #define	SYS_fhopen	298
-				/* 299 is old fhstat */
 #define	SYS_modnext	300
 #define	SYS_modstat	301
 #define	SYS_modfnext	302
@@ -286,7 +280,7 @@
 #define	SYS_getresgid	361
 #define	SYS_kqueue	362
 #define	SYS_kevent	363
-#define	SYS_sctp_peeloff	364
+#define	SYS_kenv	390
 #define	SYS_lchflags	391
 #define	SYS_uuidgen	392
 #define	SYS_sendfile	393
@@ -377,4 +371,19 @@
 #define	SYS_vmm_guest_ctl	534
 #define	SYS_vmm_guest_sync_addr	535
 #define	SYS_procctl	536
-#define	SYS_MAXSYSCALL	537
+#define	SYS_chflagsat	537
+#define	SYS_pipe2	538
+#define	SYS_utimensat	539
+#define	SYS_futimens	540
+#define	SYS_accept4	541
+#define	SYS_lwp_setname	542
+#define	SYS_ppoll	543
+#define	SYS_lwp_setaffinity	544
+#define	SYS_lwp_getaffinity	545
+#define	SYS_lwp_create2	546
+#define	SYS_getcpuclockid	547
+#define	SYS_wait6	548
+#define	SYS_lwp_getname	549
+#define	SYS_getrandom	550
+#define	SYS___realpath	551
+#define	SYS_MAXSYSCALL	552

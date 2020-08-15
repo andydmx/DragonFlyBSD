@@ -1,8 +1,9 @@
 /*
+ * Copyright (c) 2008-2014, Simon Schubert <2@0x2c.org>.
  * Copyright (c) 2008 The DragonFly Project.  All rights reserved.
  *
  * This code is derived from software contributed to The DragonFly Project
- * by Simon 'corecode' Schubert <corecode@fs.ei.tum.de>.
+ * by Simon Schubert <2@0x2c.org>.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -36,6 +37,7 @@
 
 #include <sys/file.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 
 #include <ctype.h>
 #include <dirent.h>
@@ -44,6 +46,8 @@
 #include <fcntl.h>
 #include <inttypes.h>
 #include <unistd.h>
+#include <strings.h>
+#include <string.h>
 #include <syslog.h>
 
 #include "dma.h"
@@ -289,7 +293,7 @@ load_queue(struct queue *queue)
 
 	spooldir = opendir(config.spooldir);
 	if (spooldir == NULL)
-		err(1, "reading queue");
+		err(EX_NOINPUT, "reading queue");
 
 	while ((de = readdir(spooldir)) != NULL) {
 		queuefn = NULL;
@@ -415,7 +419,7 @@ flushqueue_since(unsigned int period)
 		return (0);
 
 	/* Did the flush file get touched within the last period seconds? */
-	if (st.st_mtim.tv_sec + (int)period >= now.tv_sec)
+	if (st.st_mtim.tv_sec + period >= now.tv_sec)
 		return (1);
 	else
 		return (0);

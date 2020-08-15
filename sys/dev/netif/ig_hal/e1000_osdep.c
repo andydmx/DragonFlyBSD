@@ -1,6 +1,6 @@
 /******************************************************************************
 
-  Copyright (c) 2001-2008, Intel Corporation 
+  Copyright (c) 2001-2014, Intel Corporation 
   All rights reserved.
   
   Redistribution and use in source and binary forms, with or without 
@@ -31,7 +31,22 @@
 
 ******************************************************************************/
 
+#include <sys/param.h>
+#include <sys/kernel.h>
+#include <sys/sysctl.h>
+#include <net/if.h>
+#include <net/if_media.h>
+
 #include "e1000_api.h"
+#include "e1000_dragonfly.h"
+
+SYSCTL_NODE(_hw, OID_AUTO, ig_hal, CTLFLAG_RW, 0, "Intel 1Ge HAL");
+
+int	e1000_debug;
+
+TUNABLE_INT("hw.ig_hal.debug", &e1000_debug);
+SYSCTL_INT(_hw_ig_hal, OID_AUTO, debug, CTLFLAG_RW, &e1000_debug, 0,
+    "Enable Intel 1Ge HAL debug");
 
 /*
  * NOTE: the following routines using the e1000 
@@ -94,6 +109,81 @@ e1000_write_pcie_cap_reg(struct e1000_hw *hw, uint32_t reg, uint16_t *value)
 
 	pci_write_config(dev, pcie_ptr + reg, *value, 2);
 	return E1000_SUCCESS;
+}
+
+void
+e1000_fc2str(enum e1000_fc_mode fc, char *str, int len)
+{
+	const char *fc_str = IFM_ETH_FC_NONE;
+
+	switch (fc) {
+	case e1000_fc_full:
+		fc_str = IFM_ETH_FC_FULL;
+		break;
+
+	case e1000_fc_rx_pause:
+		fc_str = IFM_ETH_FC_RXPAUSE;
+		break;
+
+	case e1000_fc_tx_pause:
+		fc_str = IFM_ETH_FC_TXPAUSE;
+		break;
+
+	default:
+		break;
+	}
+	strlcpy(str, fc_str, len);
+}
+
+enum e1000_fc_mode
+e1000_ifmedia2fc(int ifm)
+{
+	int fc_opt = ifm & (IFM_ETH_RXPAUSE | IFM_ETH_TXPAUSE);
+
+	switch (fc_opt) {
+	case (IFM_ETH_RXPAUSE | IFM_ETH_TXPAUSE):
+		return e1000_fc_full;
+
+	case IFM_ETH_RXPAUSE:
+		return e1000_fc_rx_pause;
+
+	case IFM_ETH_TXPAUSE:
+		return e1000_fc_tx_pause;
+
+	default:
+		return e1000_fc_none;
+	}
+}
+
+int
+e1000_fc2ifmedia(enum e1000_fc_mode fc)
+{
+	switch (fc) {
+	case e1000_fc_full:
+		return (IFM_ETH_RXPAUSE | IFM_ETH_TXPAUSE);
+
+	case e1000_fc_rx_pause:
+		return IFM_ETH_RXPAUSE;
+
+	case e1000_fc_tx_pause:
+		return IFM_ETH_TXPAUSE;
+
+	default:
+		return 0;
+	}
+}
+
+void
+e1000_force_flowctrl(struct e1000_hw *hw, int ifm)
+{
+	enum e1000_fc_mode fc;
+
+	fc = e1000_ifmedia2fc(ifm);
+	if (hw->fc.current_mode != fc) {
+		hw->fc.requested_mode = fc;
+		hw->fc.current_mode = fc;
+		e1000_force_mac_fc(hw);
+	}
 }
 
 /* Module glue */

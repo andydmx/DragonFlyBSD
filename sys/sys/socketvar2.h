@@ -10,11 +10,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -37,14 +33,15 @@
 #ifndef _SYS_SOCKETVAR2_H_
 #define _SYS_SOCKETVAR2_H_
 
+#ifndef _KERNEL
+#error "This file should not be included by userland programs."
+#endif
+
 #ifndef _SYS_SOCKETVAR_H_
 #include <sys/socketvar.h>
 #endif
 #ifndef _SYS_SYSTM_H_
 #include <sys/systm.h>
-#endif
-#ifndef _SYS_MALLOC_H_
-#include <sys/malloc.h>
 #endif
 #include <machine/atomic.h>
 
@@ -57,6 +54,7 @@
  *
  * Returns 0 on success, non-zero if the lock could not be acquired.
  */
+#ifdef MALLOC_DEFINE
 static __inline int
 ssb_lock(struct signalsockbuf *ssb, int wf)
 {
@@ -76,6 +74,7 @@ ssb_lock(struct signalsockbuf *ssb, int wf)
 		}
 	}
 }
+#endif
 
 /*
  * Release a previously acquired lock on a signalsockbuf.
@@ -116,6 +115,13 @@ soclrstate(struct socket *so, short state)
 static __inline void
 soreference(struct socket *so)
 {
+	/*
+	 * 0 -> 1 transition will happen on an aborted
+	 * socket, which is left on the so_comp queue,
+	 * e.g. accept(2) the aborted socket, or when
+	 * the listen(2) socket owning the so_comp queue
+	 * is closed.
+	 */
 	atomic_add_int(&so->so_refs, 1);
 }
 

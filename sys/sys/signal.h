@@ -15,11 +15,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -42,14 +38,30 @@
 #ifndef	_SYS_SIGNAL_H_
 #define	_SYS_SIGNAL_H_
 
-#include <machine/stdint.h>	/* for __ types */
 #include <sys/cdefs.h>
-#include <sys/_posix.h>
+#include <sys/_pthreadtypes.h>
+#include <sys/_siginfo.h>
+#include <sys/_sigset.h>
+#include <machine/stdint.h>
+
+#ifndef _PID_T_DECLARED
+typedef	__pid_t		pid_t;
+#define	_PID_T_DECLARED
+#endif
+
+#ifndef _SIZE_T_DECLARED
+typedef	__size_t	size_t;
+#define	_SIZE_T_DECLARED
+#endif
+
+#ifndef _UID_T_DECLARED
+typedef	__uint32_t	uid_t;
+#define	_UID_T_DECLARED
+#endif
 
 /*
  * sigset_t macros.
  */
-#define	_SIG_WORDS	4
 #define	_SIG_MAXSIG	128
 #define	_SIG_IDX(sig)	((sig) - 1)
 #define	_SIG_WORD(sig)	(_SIG_IDX(sig) >> 5)
@@ -59,120 +71,71 @@
 /*
  * System defined signals.
  */
+#if __POSIX_VISIBLE
 #define	SIGHUP		1	/* hangup */
+#endif
 #define	SIGINT		2	/* interrupt */
+#if __POSIX_VISIBLE
 #define	SIGQUIT		3	/* quit */
+#endif
 #define	SIGILL		4	/* illegal instr. (not reset when caught) */
-#ifndef _POSIX_SOURCE
+#if __XSI_VISIBLE
 #define	SIGTRAP		5	/* trace trap (not reset when caught) */
 #endif
 #define	SIGABRT		6	/* abort() */
-#ifndef _POSIX_SOURCE
+#if __BSD_VISIBLE
 #define	SIGIOT		SIGABRT	/* compatibility */
 #define	SIGEMT		7	/* EMT instruction */
 #endif
 #define	SIGFPE		8	/* floating point exception */
+#if __POSIX_VISIBLE
 #define	SIGKILL		9	/* kill (cannot be caught or ignored) */
-#ifndef _POSIX_SOURCE
+#endif
+#if __POSIX_VISIBLE >= 200112 || __XSI_VISIBLE
 #define	SIGBUS		10	/* bus error */
 #endif
 #define	SIGSEGV		11	/* segmentation violation */
-#ifndef _POSIX_SOURCE
+#if __POSIX_VISIBLE >= 200112 || __XSI_VISIBLE
 #define	SIGSYS		12	/* non-existent system call invoked */
 #endif
+#if __POSIX_VISIBLE
 #define	SIGPIPE		13	/* write on a pipe with no one to read it */
 #define	SIGALRM		14	/* alarm clock */
+#endif
 #define	SIGTERM		15	/* software termination signal from kill */
-#ifndef _POSIX_SOURCE
+#if __POSIX_VISIBLE >= 200112 || __XSI_VISIBLE
 #define	SIGURG		16	/* urgent condition on IO channel */
 #endif
+#if __POSIX_VISIBLE
 #define	SIGSTOP		17	/* sendable stop signal not from tty */
 #define	SIGTSTP		18	/* stop signal from tty */
 #define	SIGCONT		19	/* continue a stopped process */
 #define	SIGCHLD		20	/* to parent on child stop or exit */
 #define	SIGTTIN		21	/* to readers pgrp upon background tty read */
 #define	SIGTTOU		22	/* like TTIN if (tp->t_local&LTOSTOP) */
-#ifndef _POSIX_SOURCE
+#endif
+#if __BSD_VISIBLE
 #define	SIGIO		23	/* input/output possible signal */
+#endif
+#if __XSI_VISIBLE
 #define	SIGXCPU		24	/* exceeded CPU time limit */
 #define	SIGXFSZ		25	/* exceeded file size limit */
 #define	SIGVTALRM	26	/* virtual time alarm */
 #define	SIGPROF		27	/* profiling time alarm */
+#endif
+#if __BSD_VISIBLE
 #define	SIGWINCH	28	/* window size changes */
 #define	SIGINFO		29	/* information request */
 #endif
+#if __POSIX_VISIBLE
 #define	SIGUSR1		30	/* user defined signal 1 */
 #define	SIGUSR2		31	/* user defined signal 2 */
-#if __BSD_VISIBLE
-#define SIGTHR          32      /* Thread interrupt (FreeBSD-5 reserved) */
-#define SIGCKPT         33      /* checkpoint and continue */
-#define SIGCKPTEXIT     34      /* checkpoint and exit */
 #endif
-
-/*
- * si_code stuff
- */
-/* SIGILL */
-#define	ILL_ILLOPC	1	/* Illegal opcode			*/
-#define	ILL_ILLOPN	2	/* Illegal operand			*/
-#define	ILL_ILLADR	3	/* Illegal addressing mode		*/
-#define	ILL_ILLTRP	4	/* Illegal trap				*/
-#define	ILL_PRVOPC	5	/* Privileged opcode			*/
-#define	ILL_PRVREG	6	/* Privileged register			*/
-#define	ILL_COPROC	7	/* Coprocessor error			*/
-#define	ILL_BADSTK	8	/* Internal stack error			*/
-
-/* SIGFPE */
-#define	FPE_INTOVF	1	/* Integer overflow			*/
-#define	FPE_INTDIV	2	/* Integer divide by zero		*/
-#define	FPE_FLTDIV	3	/* Floating point divide by zero	*/
-#define	FPE_FLTOVF	4	/* Floating point overflow		*/
-#define	FPE_FLTUND	5	/* Floating point underflow		*/
-#define	FPE_FLTRES	6	/* Floating point inexact result	*/
-#define	FPE_FLTINV	7	/* Invalid Floating point operation	*/
-#define	FPE_FLTSUB	8	/* Subscript out of range		*/
-
-/* SIGSEGV */
-#define	SEGV_MAPERR	1	/* Address not mapped to object		*/
-#define	SEGV_ACCERR	2	/* Invalid permissions for mapped object*/
-
-/* SIGBUS */
-#define	BUS_ADRALN	1	/* Invalid address alignment		*/
-#define	BUS_ADRERR	2	/* Non-existent physical address	*/
-#define	BUS_OBJERR	3	/* Object specific hardware error	*/
-
-/* SIGTRAP */
-#define	TRAP_BRKPT	1	/* Process breakpoint			*/
-#define	TRAP_TRACE	2	/* Process trace trap			*/
-
-/* SIGCHLD */
-#define	CLD_EXITED	1	/* Child has exited			*/
-#define	CLD_KILLED	2	/* Child has terminated abnormally but	*/
-				/* did not create a core file		*/
-#define	CLD_DUMPED	3	/* Child has terminated abnormally and	*/
-				/* created a core file			*/
-#define	CLD_TRAPPED	4	/* Traced child has trapped		*/
-#define	CLD_STOPPED	5	/* Child has stopped			*/
-#define	CLD_CONTINUED	6	/* Stopped child has continued		*/
-
-/* SIGPOLL */
-#define	POLL_IN		1	/* Data input available			*/
-#define	POLL_OUT	2	/* Output buffers available		*/
-#define	POLL_MSG	3	/* Input message available		*/
-#define	POLL_ERR	4	/* I/O Error				*/
-#define	POLL_PRI	5	/* High priority input available	*/
-#define	POLL_HUP	6	/* Device disconnected			*/
-
-
-/** si_code */
-#define	SI_USER		0	/* Sent by kill(2)			*/
-#define	SI_QUEUE	-1	/* Sent by the sigqueue(2)		*/
-#define	SI_TIMER	-2	/* Generated by expiration of a timer	*/
-				/* set by timer_settime(2)		*/
-#define	SI_ASYNCIO	-3	/* Generated by completion of an	*/
-				/* asynchronous I/O signal		*/
-#define	SI_MESGQ	-4	/* Generated by arrival of a message on	*/
-				/* an empty message queue		*/
+#if __BSD_VISIBLE
+#define	SIGTHR		32	/* Thread interrupt (FreeBSD-5 reserved) */
+#define	SIGCKPT		33	/* checkpoint and continue */
+#define	SIGCKPTEXIT	34	/* checkpoint and exit */
+#endif
 
 /*-
  * Type of a signal handling function.
@@ -193,65 +156,41 @@
  * SIG_EINTR causes system calls to interrupt but generates no signal
  * delivery.  The caller is responsible for polling the event.
  */
-typedef void __sighandler_t (int);
+typedef	void __sighandler_t (int);
 
 #define	SIG_DFL		((__sighandler_t *)0)
 #define	SIG_IGN		((__sighandler_t *)1)
 #define	SIG_ERR		((__sighandler_t *)-1)
 
-#if defined(_P1003_1B_VISIBLE) || defined(_KERNEL)
-union sigval {
-	/* Members as suggested by SuSv2 and IEEE Std 1003.1 */
-	int     sival_int;
-	void	*sival_ptr;
-	/* Leave old members for backward compatibility */
-	int     sigval_int;
-	void    *sigval_ptr;
-
-};
-
+#if __POSIX_VISIBLE >= 199309
 struct sigevent {
 	int	sigev_notify;		/* Notification type */
 	union {
 		int	__sigev_signo;	/* Signal number */
 		int	__sigev_notify_kqueue;
-		void	*__sigev_notify_attributes;
+		pthread_attr_t *__sigev_notify_attributes;
 	} __sigev_u;
 	union sigval sigev_value;	/* Signal value */
 	void (*sigev_notify_function)(union sigval);
 };
-#define sigev_signo		__sigev_u.__sigev_signo
-#define sigev_notify_attributes	__sigev_u.__sigev_notify_attributes
-#define sigev_notify_kqueue	__sigev_u.__sigev_notify_kqueue
+#define	sigev_signo		__sigev_u.__sigev_signo
+#define	sigev_notify_attributes	__sigev_u.__sigev_notify_attributes
+#if __BSD_VISIBLE
+#define	sigev_notify_kqueue	__sigev_u.__sigev_notify_kqueue
+#endif
 
 #define	SIGEV_NONE	0		/* No async notification */
 #define	SIGEV_SIGNAL	1		/* Generate a queued signal */
-#define SIGEV_THREAD	2		/* Call back in a pthread */
-#define SIGEV_KEVENT	3		/* Generate a kevent */
+#define	SIGEV_THREAD	2		/* Call back in a pthread */
+#if __BSD_VISIBLE
+#define	SIGEV_KEVENT	3		/* Generate a kevent */
+#endif
+#endif /* __POSIX_VISIBLE >= 199309 */
 
-typedef struct __siginfo {
-	int	si_signo;		/* signal number */
-	int	si_errno;		/* errno association */
-	/*
-	 * Cause of signal, one of the SI_ macros or signal-specific
-	 * values, i.e. one of the FPE_... values for SIGFPE. This
-	 * value is equivalent to the second argument to an old-style
-	 * FreeBSD signal handler.
-	 */
-	int	si_code;		/* signal code */
-	int	si_pid;			/* sending process */
-	unsigned int si_uid;		/* sender's ruid */
-	int	si_status;		/* exit value */
-	void	*si_addr;		/* faulting instruction */
-	union sigval si_value;		/* signal value */
-	long	si_band;		/* band event for SIGPOLL */
-	int	__spare__[7];		/* gimme some slack */
-} siginfo_t;
-#endif /* _P1003_1B_VISIBLE */
-
-typedef struct __sigset {
-	unsigned int	__bits[_SIG_WORDS];
-} sigset_t;
+#ifndef _SIGSET_T_DECLARED
+typedef	struct __sigset	sigset_t;
+#define	_SIGSET_T_DECLARED
+#endif
 
 /*
  * XXX - there are some nasty dependencies on include file order. Now that
@@ -259,8 +198,7 @@ typedef struct __sigset {
  */     
 #include <machine/signal.h>     /* sig_atomic_t; trap codes; sigcontext */
 
-#if !defined(_ANSI_SOURCE)
-
+#if __POSIX_VISIBLE
 struct __siginfo;
 
 /*
@@ -278,34 +216,46 @@ struct	sigaction {
 /* if SA_SIGINFO is set, sa_sigaction is to be used instead of sa_handler. */
 #define	sa_handler	__sigaction_u.__sa_handler
 
-#define SA_NOCLDSTOP	0x0008	/* do not generate SIGCHLD on child stop */
+#define	SA_NOCLDSTOP	0x0008	/* do not generate SIGCHLD on child stop */
+#endif /* __POSIX_VISIBLE */
 
-#if !defined(_POSIX_SOURCE)
-
+#if __XSI_VISIBLE
 #define	sa_sigaction	__sigaction_u.__sa_sigaction
+#endif
 
-#define SA_ONSTACK	0x0001	/* take signal on signal stack */
-#define SA_RESTART	0x0002	/* restart system call on signal return */
+#if __XSI_VISIBLE
+#define	SA_ONSTACK	0x0001	/* take signal on signal stack */
+#define	SA_RESTART	0x0002	/* restart system call on signal return */
 #define	SA_RESETHAND	0x0004	/* reset to SIG_DFL when taking signal */
 #define	SA_NODEFER	0x0010	/* don't mask the signal we're delivering */
 #define	SA_NOCLDWAIT	0x0020	/* don't keep zombies around */
 #define	SA_SIGINFO	0x0040	/* signal handler with SA_SIGINFO args */
+#endif
 
-#define NSIG		64	/* size of sigptbl */
+#if __BSD_VISIBLE
+#define	NSIG		64	/* size of sigptbl */
 
 /* Additional FreeBSD values. */
-#define SI_UNDEFINED	0
+#define	SI_UNDEFINED	0
 
-typedef void __siginfohandler_t (int, struct __siginfo *, void *);
+typedef	void __siginfohandler_t (int, siginfo_t *, void *);
 
+#endif
+
+/* XXX this should really be under __BSD_VISIBLE */
 typedef	__sighandler_t	*sig_t;	/* type of pointer to a signal function */
 
+/* #if __XSI_VISIBLE */
 /*
  * Structure used in sigaltstack call.
  */
-typedef struct sigaltstack {
-	char	*ss_sp;			/* signal stack base */
-	__size_t ss_size;		/* signal stack length */
+#if __BSD_VISIBLE
+typedef	struct sigaltstack {
+#else
+typedef	struct {
+#endif
+	void	*ss_sp;			/* signal stack base */
+	size_t	ss_size;		/* signal stack length */
 	int	ss_flags;		/* SS_DISABLE and/or SS_ONSTACK */
 } stack_t;
 
@@ -313,10 +263,12 @@ typedef struct sigaltstack {
 #define	SS_DISABLE	0x0004	/* disable taking signals on alternate stack */
 #define	MINSIGSTKSZ	8192			/* minimum allowable stack */
 #define	SIGSTKSZ	(MINSIGSTKSZ + 32768)	/* recommended stack size */
+/* #endif */
 
 /* Have enough typedefs for this now.  XXX */
 #include <sys/ucontext.h>
 
+#if __BSD_VISIBLE
 /*
  * 4.3 compatibility:
  * Signal vector "template" used in sigvec call.
@@ -327,47 +279,46 @@ struct	sigvec {
 	int	sv_flags;		/* see signal options below */
 };
 
-#define SV_ONSTACK	SA_ONSTACK
-#define SV_INTERRUPT	SA_RESTART	/* same bit, opposite sense */
-#define SV_RESETHAND	SA_RESETHAND
-#define SV_NODEFER	SA_NODEFER
-#define SV_NOCLDSTOP	SA_NOCLDSTOP
-#define SV_SIGINFO	SA_SIGINFO
-#define sv_onstack sv_flags	/* isn't compatibility wonderful! */
+#define	SV_ONSTACK	SA_ONSTACK
+#define	SV_INTERRUPT	SA_RESTART	/* same bit, opposite sense */
+#define	SV_RESETHAND	SA_RESETHAND
+#define	SV_NODEFER	SA_NODEFER
+#define	SV_NOCLDSTOP	SA_NOCLDSTOP
+#define	SV_SIGINFO	SA_SIGINFO
+#define	sv_onstack sv_flags	/* isn't compatibility wonderful! */
+#endif
 
-/*
- * Structure used in sigstack call.
- */
-struct	sigstack {
-	char	*ss_sp;			/* signal stack pointer */
-	int	ss_onstack;		/* current status */
-};
-
+#if __BSD_VISIBLE || (__POSIX_VISIBLE && __POSIX_VISIBLE < 200809)
 /*
  * Macro for converting signal number to a mask suitable for
  * sigblock().
  */
-#define sigmask(m)	(1 << ((m)-1))
+#define	sigmask(m)	(1 << ((m)-1))
+#endif
 
+#if __BSD_VISIBLE
 #define	BADSIG		SIG_ERR
+#endif
 
-#endif /* !_POSIX_SOURCE */
-
+#if __POSIX_VISIBLE
 /*
  * Flags for sigprocmask:
  */
 #define	SIG_BLOCK	1	/* block specified signal set */
 #define	SIG_UNBLOCK	2	/* unblock specified signal set */
 #define	SIG_SETMASK	3	/* set specified signal set */
-
-#endif /* !_ANSI_SOURCE */
+#endif
 
 /*
  * For historical reasons; programs expect signal's return value to be
  * defined by <sys/signal.h>.
  */
 __BEGIN_DECLS
-__sighandler_t *signal (int, __sighandler_t *);
+__sighandler_t *signal(int, __sighandler_t *);
+#if __BSD_VISIBLE
+int sigblockall(void);
+int sigunblockall(void);
+#endif
 __END_DECLS
 
 #endif	/* !_SYS_SIGNAL_H_ */

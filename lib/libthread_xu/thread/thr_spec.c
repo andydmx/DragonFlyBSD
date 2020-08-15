@@ -10,10 +10,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by John Birrell.
- * 4. Neither the name of the author nor the names of any co-contributors
+ * 3. Neither the name of the author nor the names of any co-contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -29,12 +26,10 @@
  * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
  *
- * $DragonFly: src/lib/libthread_xu/thread/thr_spec.c,v 1.5 2006/04/06 13:03:09 davidxu Exp $
  */
 
 #include "namespace.h"
 #include <machine/tls.h>
-
 #include <signal.h>
 #include <stdlib.h>
 #include <string.h>
@@ -46,12 +41,18 @@
 
 struct pthread_key _thread_keytable[PTHREAD_KEYS_MAX];
 umtx_t	_keytable_lock;
+static size_t _pthread_specific_bytes;
 
 int
 _pthread_key_create(pthread_key_t *key, void (*destructor) (void *))
 {
-	struct pthread *curthread = tls_get_curthread();
+	struct pthread *curthread;
 	int i;
+
+	/* User program might be preparing to call pthread_create() */
+	_thr_check_init();
+
+	curthread = tls_get_curthread();
 
 	/* Lock the key table: */
 	THR_LOCK_ACQUIRE(curthread, &_keytable_lock);
@@ -96,7 +97,7 @@ _pthread_key_delete(pthread_key_t key)
 	return (ret);
 }
 
-void 
+void
 _thread_cleanupspecific(void)
 {
 	struct pthread	*curthread = tls_get_curthread();
@@ -120,18 +121,17 @@ _thread_cleanupspecific(void)
 			    (curthread->specific[key].data != NULL)) {
 				if (curthread->specific[key].seqno ==
 				    _thread_keytable[key].seqno) {
-					data = 
-					    curthread->specific[key].data;
+					data = curthread->specific[key].data;
 					destructor = _thread_keytable[key].destructor;
 				}
 				curthread->specific[key].data = NULL;
 				curthread->specific_data_count--;
 			} else if (curthread->specific[key].data != NULL) {
-				/* 
+				/*
 				 * This can happen if the key is deleted via
 				 * pthread_key_delete without first setting the value
-	 			 * to NULL in all threads. POSIX says that the
-	 			 * destructor is not invoked in this case.
+				 * to NULL in all threads. POSIX says that the
+				 * destructor is not invoked in this case.
 				 */
 				curthread->specific[key].data = NULL;
 				curthread->specific_data_count--;
@@ -153,29 +153,41 @@ _thread_cleanupspecific(void)
 		}
 	}
 	THR_LOCK_RELEASE(curthread, &_keytable_lock);
-	free(curthread->specific);
+
+	munmap(curthread->specific, _pthread_specific_bytes);
 	curthread->specific = NULL;
-	if (curthread->specific_data_count > 0)
+
+	if (curthread->specific_data_count > 0) {
 		stderr_debug("Thread %p has exited with leftover "
-		    "thread-specific data after %d destructor iterations\n",
-		    curthread, PTHREAD_DESTRUCTOR_ITERATIONS);
+			     "thread-specific data after %d destructor "
+			     "iterations\n",
+			     curthread, PTHREAD_DESTRUCTOR_ITERATIONS);
+	}
 }
 
 static inline struct pthread_specific_elem *
 pthread_key_allocate_data(void)
 {
 	struct pthread_specific_elem *new_data;
+	size_t bytes;
+	size_t pgmask;
 
-	new_data = (struct pthread_specific_elem *)
-	    malloc(sizeof(struct pthread_specific_elem) * PTHREAD_KEYS_MAX);
-	if (new_data != NULL) {
-		memset((void *) new_data, 0,
-		    sizeof(struct pthread_specific_elem) * PTHREAD_KEYS_MAX);
+	bytes = _pthread_specific_bytes;
+	if (bytes == 0) {
+		pgmask = getpagesize() - 1;
+		bytes = sizeof(struct pthread_specific_elem) * PTHREAD_KEYS_MAX;
+		bytes = (bytes + pgmask) & ~pgmask;
+		_pthread_specific_bytes = bytes;
 	}
+	new_data = mmap(NULL, bytes, PROT_READ | PROT_WRITE,
+			MAP_ANON | MAP_PRIVATE, -1, 0);
+	if (new_data == MAP_FAILED)
+		new_data = NULL;
+
 	return (new_data);
 }
 
-int 
+int
 _pthread_setspecific(pthread_key_t key, const void *value)
 {
 	struct pthread	*pthread;
@@ -184,8 +196,8 @@ _pthread_setspecific(pthread_key_t key, const void *value)
 	/* Point to the running thread: */
 	pthread = tls_get_curthread();
 
-	if ((pthread->specific) ||
-	    (pthread->specific = pthread_key_allocate_data())) {
+	if (pthread->specific ||
+	    (pthread->specific = pthread_key_allocate_data()) != NULL) {
 		if ((unsigned int)key < PTHREAD_KEYS_MAX) {
 			if (_thread_keytable[key].allocated) {
 				if (pthread->specific[key].data == NULL) {
@@ -197,12 +209,15 @@ _pthread_setspecific(pthread_key_t key, const void *value)
 				pthread->specific[key].seqno =
 				    _thread_keytable[key].seqno;
 				ret = 0;
-			} else
+			} else {
 				ret = EINVAL;
-		} else
+			}
+		} else {
 			ret = EINVAL;
-	} else
+		}
+	} else {
 		ret = ENOMEM;
+	}
 	return (ret);
 }
 
@@ -225,7 +240,7 @@ _pthread_getspecific(pthread_key_t key)
 		} else {
 			/*
 			 * This key has not been used before, so return NULL
-			 * instead: 
+			 * instead.
 			 */
 			data = NULL;
 		}
@@ -239,4 +254,3 @@ __strong_reference(_pthread_key_create, pthread_key_create);
 __strong_reference(_pthread_key_delete, pthread_key_delete);
 __strong_reference(_pthread_getspecific, pthread_getspecific);
 __strong_reference(_pthread_setspecific, pthread_setspecific);
-

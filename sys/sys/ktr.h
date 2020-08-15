@@ -180,11 +180,14 @@ SYSCTL_DECL(_debug_ktr);
  */
 #define KTR_LOG(name, ...)						\
 	do {								\
-		__ktr_info_ ## name ## _fmtcheck (__ktr_ ## name ## _fmt, ##__VA_ARGS__);	\
-		if (ktr_ ## name ## _enable &&				\
-		    (ktr_ ## name ## _mask & *ktr_info_ ## name .kf_master_enable)) { \
+		__ktr_info_ ## name ## _fmtcheck (__ktr_ ## name ## _fmt, \
+						  ##__VA_ARGS__);	\
+		if (__predict_false(ktr_ ## name ## _enable &&		\
+		    (ktr_ ## name ## _mask &				\
+		     *ktr_info_ ## name .kf_master_enable))) {		\
 			struct ktr_entry *entry;			\
-			entry = ktr_begin_write_entry(&ktr_info_ ## name, __FILE__, __LINE__); \
+			entry = ktr_begin_write_entry(			\
+				&ktr_info_ ## name, __FILE__, __LINE__); \
 			if (!entry)					\
 				break;					\
 			*(struct ktr_info_  ## name ## _args *)&entry->ktr_data[0] = \
@@ -199,11 +202,13 @@ SYSCTL_DECL(_debug_ktr);
 #define KTR_COND_LOG(name, cond, ...)					\
 	do {								\
 		__ktr_info_ ## name ## _fmtcheck (__ktr_ ## name ## _fmt, ##__VA_ARGS__);	\
-		if ((cond) &&						\
+		if (__predict_false((cond) &&				\
 		    ktr_ ## name ## _enable &&				\
-		    (ktr_ ## name ## _mask & *ktr_info_ ## name .kf_master_enable)) { \
+		    (ktr_ ## name ## _mask &				\
+		     *ktr_info_ ## name .kf_master_enable))) {		\
 			struct ktr_entry *entry;			\
-			entry = ktr_begin_write_entry(&ktr_info_ ## name, __FILE__, __LINE__); \
+			entry = ktr_begin_write_entry(			\
+				&ktr_info_ ## name, __FILE__, __LINE__); \
 			if (!entry)					\
 				break;					\
 			*(struct ktr_info_  ## name ## _args *)&entry->ktr_data[0] = \
@@ -217,19 +222,11 @@ SYSCTL_DECL(_debug_ktr);
 
 #else
 
-#define KTR_INFO_MASTER(master)						\
-	    static const int ktr_ ## master ## _enable = 0
-
-#define KTR_INFO_MASTER_EXTERN(master)					\
-	    static const int ktr_ ## master ## _enable
-
-#define KTR_INFO(compile, master, name, maskbit, format, ...)		\
-	    static const int ktr_ ## master ## _ ## name ## _mask =	\
-		    (1 << maskbit)
-
-#define KTR_LOG(info, args...)
-
-#define KTR_COND_LOG(info, args...)
+#define KTR_INFO_MASTER(master)
+#define KTR_INFO_MASTER_EXTERN(master)
+#define KTR_INFO(compile, master, name, maskbit, format, ...)
+#define KTR_LOG(info, args...)		do { } while (0)
+#define KTR_COND_LOG(info, args...)	do { } while (0)
 
 #endif
 

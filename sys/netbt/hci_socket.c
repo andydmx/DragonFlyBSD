@@ -40,6 +40,7 @@
 #include <sys/param.h>
 #include <sys/domain.h>
 #include <sys/kernel.h>
+#include <sys/malloc.h>
 #include <sys/mbuf.h>
 #include <sys/proc.h>
 #include <sys/priv.h>
@@ -513,7 +514,7 @@ hci_send(struct hci_pcb *pcb, struct mbuf *m, bdaddr_t *addr)
 	}
 
 	/* makes a copy for precious to keep */
-	m0 = m_copym(m, 0, M_COPYALL, MB_DONTWAIT);
+	m0 = m_copym(m, 0, M_COPYALL, M_NOWAIT);
 	if (m0 == NULL) {
 		err = ENOMEM;
 		goto bad;
@@ -560,9 +561,9 @@ static void
 hci_sdetach(netmsg_t msg)
 {
 	struct socket *so = msg->detach.base.nm_so;
-	struct hci_pcb *pcb = (struct hci_pcb *)so->so_pcb;	
+	struct hci_pcb *pcb = (struct hci_pcb *)so->so_pcb;
 	int error;
-	
+
 	if (pcb == NULL) {
 		error = EINVAL;
 	} else {
@@ -583,7 +584,7 @@ static void
 hci_sdisconnect(netmsg_t msg)
 {
 	struct socket *so = msg->disconnect.base.nm_so;
-	struct hci_pcb *pcb = (struct hci_pcb *)so->so_pcb;	
+	struct hci_pcb *pcb = (struct hci_pcb *)so->so_pcb;
 	int error;
 
 	if (pcb) {
@@ -751,7 +752,7 @@ hci_ssockaddr(netmsg_t msg)
 	struct sockaddr **nam = msg->sockaddr.nm_nam;
 	struct hci_pcb *pcb = (struct hci_pcb *)so->so_pcb;
 	struct sockaddr_bt *sa;
-	
+
 	KKASSERT(nam != NULL);
 	sa = (struct sockaddr_bt *)nam;
 
@@ -872,7 +873,7 @@ hci_ctloutput(netmsg_t msg)
 		case SO_HCI_EVT_FILTER:	/* set event filter */
 			error = soopt_to_kbuf(sopt, &pcb->hp_efilter,
 			    sizeof(struct hci_filter),
-			    sizeof(struct hci_filter)); 
+			    sizeof(struct hci_filter));
 			break;
 
 		case SO_HCI_PKT_FILTER:	/* set packet filter */
@@ -999,7 +1000,7 @@ hci_mtap(struct mbuf *m, struct hci_unit *unit)
 		/*
 		 * copy to socket
 		 */
-		m0 = m_copym(m, 0, M_COPYALL, MB_DONTWAIT);
+		m0 = m_copym(m, 0, M_COPYALL, M_NOWAIT);
 		if (m0 && sbappendaddr(&pcb->hp_socket->so_rcv.sb,
 				(struct sockaddr *)&sa, m0, ctlmsg)) {
 			sorwakeup(pcb->hp_socket);

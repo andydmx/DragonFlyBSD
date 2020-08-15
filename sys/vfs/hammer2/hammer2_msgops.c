@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2012-2014 The DragonFly Project.  All rights reserved.
+ * Copyright (c) 2012-2018 The DragonFly Project.  All rights reserved.
  *
  * This code is derived from software contributed to The DragonFly Project
  * by Matthew Dillon <dillon@dragonflybsd.org>
@@ -37,7 +37,6 @@
 #include <sys/fcntl.h>
 #include <sys/buf.h>
 #include <sys/proc.h>
-#include <sys/namei.h>
 #include <sys/mount.h>
 #include <sys/vnode.h>
 #include <sys/mountctl.h>

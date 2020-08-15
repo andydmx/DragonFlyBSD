@@ -35,7 +35,6 @@
  * SUCH DAMAGE.
  *
  *      @(#)extern.h	8.1 (Berkeley) 6/6/93
- * $DragonFly: src/usr.bin/pr/extern.h,v 1.3 2003/11/03 19:31:31 eirikn Exp $
  */
 
 extern int eoptind;
@@ -49,13 +48,13 @@ int	 inln(FILE *, char *, int, int *, int, int *);
 int	 inskip(FILE *, int, int);
 void	 mfail(void);
 int	 mulfile(int, char **);
-FILE	*nxtfile(int, char **, char **, char *, int);
+FILE	*nxtfile(int, char **, const char **, char *, int);
 int	 onecol(int, char **);
 int	 otln(char *, int, int *, int *, int);
 void	 pfail(void);
-int	 prhead(char *, char *, int);
+int	 prhead(char *, const char *, int);
 int	 prtail(int, int);
-int	 setup(int, char **);
-void	 terminate(int);
+int	 setup(int, char *[]);
+void	 terminate(int) __dead2;
 void	 usage(void);
 int	 vertcol(int, char **);

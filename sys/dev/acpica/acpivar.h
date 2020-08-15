@@ -34,8 +34,6 @@
 #ifdef _KERNEL
 
 
-#include "acpi_if.h"
-#include "bus_if.h"
 #include <sys/eventhandler.h>
 #include <sys/sysctl.h>
 #include <sys/lock.h>
@@ -49,6 +47,8 @@
 #include <contrib/dev/acpica/source/include/acobject.h>
 #include <contrib/dev/acpica/source/include/acstruct.h>
 #include <contrib/dev/acpica/source/include/acutils.h>
+
+#include "acpi_if.h"
 
 struct apm_clone_data;
 struct acpi_softc {
@@ -95,6 +95,7 @@ struct acpi_device {
     uintptr_t			ad_magic;
     void			*ad_private;
     int				ad_flags;
+    int				ad_recheck;	/* Should re-check presence. */
 
     /* Resources */
     struct resource_list	ad_rl;
@@ -154,20 +155,22 @@ struct acpi_prw_data {
  *     GPE -> EC runs _Qxx -> _Qxx reads EC space -> GPE
  */
 extern struct lock acpi_lock;
+extern struct lwkt_token acpi_token;
 /* acpi_thermal does lock recurs on purpose */
 /* I bet I should use some other locks here */
-#define ACPI_LOCK(sys)                  lockmgr(&sys##_lock, LK_EXCLUSIVE|LK_RETRY|LK_CANRECURSE);
-#define ACPI_UNLOCK(sys)                lockmgr(&sys##_lock, LK_RELEASE);
-#define ACPI_LOCK_ASSERT(sys)           KKASSERT(lockstatus(&sys##_lock, curthread) == LK_EXCLUSIVE);
+#define ACPI_LOCK(sys)                  lockmgr(&sys##_lock, LK_EXCLUSIVE|LK_RETRY|LK_CANRECURSE)
+#define ACPI_UNLOCK(sys)                lockmgr(&sys##_lock, LK_RELEASE)
+#define ACPI_LOCK_ASSERT(sys)           KKASSERT(lockstatus(&sys##_lock, curthread) == LK_EXCLUSIVE)
 #define ACPI_ASSERTLOCK ACPI_LOCK_ASSERT
-#define ACPI_LOCK_DECL(sys, name)       static struct lock sys##_lock;
-#define ACPI_LOCK_INIT(sys, name)       lockinit(&sys##_lock, name, 0, 0);
+#define ACPI_LOCK_DECL(sys, name)       static struct lock sys##_lock
+#define ACPI_LOCK_INIT(sys, name)       lockinit(&sys##_lock, name, 0, 0)
 
-#define ACPI_SERIAL_INIT(sys)           lockinit(&sys##_serial, #sys, 0, 0);
-#define ACPI_SERIAL_BEGIN(sys)          lockmgr(&sys##_serial, LK_EXCLUSIVE|LK_RETRY);
-#define ACPI_SERIAL_END(sys)            lockmgr(&sys##_serial, LK_RELEASE);
-#define ACPI_SERIAL_ASSERT(sys)         KKASSERT(lockstatus(&sys##_serial, curthread) == LK_EXCLUSIVE);
-#define ACPI_SERIAL_DECL(sys, name)     static struct lock sys##_serial;
+#define ACPI_SERIAL_INIT(sys)           lockinit(&sys##_serial, #sys, 0, 0)
+#define ACPI_SERIAL_BEGIN(sys)          lockmgr(&sys##_serial, LK_EXCLUSIVE|LK_RETRY)
+#define ACPI_SERIAL_END(sys)            lockmgr(&sys##_serial, LK_RELEASE)
+#define ACPI_SERIAL_ASSERT(sys)         KKASSERT(lockstatus(&sys##_serial, curthread) == LK_EXCLUSIVE)
+#define ACPI_SERIAL_DECL(sys, name)     static struct lock sys##_serial
+
 /*
  * ACPICA does not define layers for non-ACPICA drivers.
  * We define some here within the range provided.
@@ -192,10 +195,19 @@ extern struct lock acpi_lock;
 #define	ACPI_INTR_SAPIC		2
 
 /*
- * Various features and capabilities for the acpi_get_features() method.
- * In particular, these are used for the ACPI 3.0 _PDC and _OSC methods.
- * See the Intel document titled "Intel Processor Vendor-Specific ACPI",
- * number 302223-005.
+ * Various features and capabilities for the acpi_eval_osc() method.
+ */
+#define	ACPI_OSC_QUERY_SUPPORT	(1 << 0) /* Query Support Flag */
+
+#define	ACPI_OSC_ERRMASK	0x0000001e
+#define	ACPI_OSCERR_FAILURE	(1 << 1) /* _OSC failure */
+#define	ACPI_OSCERR_BADUUID	(1 << 2) /* Unrecognized UUID */
+#define	ACPI_OSCERR_BADREV	(1 << 3) /* Unrecognized revision ID */
+#define	ACPI_OSCERR_CAPSMASKED	(1 << 4) /* Capabilities have been cleared */
+
+/*
+ * Intel CPU _OSC capabilities, see "Intel Processor Vendor-Specific ACPI",
+ * number 302223-007.
  */
 #define ACPI_PDC_PX_MSR		(1 << 0) /* Intel SpeedStep PERF_CTL MSRs */
 #define ACPI_PDC_MP_C1_IO_HALT	(1 << 1) /* Intel C1 "IO then halt" sequence */
@@ -208,13 +220,6 @@ extern struct lock acpi_lock;
 #define ACPI_PDC_MP_C1_NATIVE	(1 << 8) /* MP C1 support other than halt */
 #define ACPI_PDC_MP_C2C3_NATIVE	(1 << 9) /* MP C2 and C3 support */
 #define ACPI_PDC_PX_HWCOORD	(1 << 11)/* Hardware coordination of Px */
-
-#define ACPI_OSC_QUERY_SUPPORT	(1 << 0) /* Query Support Flag */
-
-#define ACPI_OSCERR_OSCFAIL	(1 << 1) /* _OSC failure */
-#define ACPI_OSCERR_UUID	(1 << 2) /* Unrecognized UUID */
-#define ACPI_OSCERR_REVISION	(1 << 3) /* Unrecognized revision ID */
-#define ACPI_OSCERR_CAPSMASKED	(1 << 4) /* Capabilities have been cleared */
 
 /*
  * Quirk flags.
@@ -243,6 +248,7 @@ extern int	acpi_quirks;
 #define ACPI_IVAR_MAGIC		0x101
 #define ACPI_IVAR_PRIVATE	0x102
 #define ACPI_IVAR_FLAGS		0x103
+#define ACPI_IVAR_RECHECK	0x104
 
 /*
  * Accessor functions for our ivars.  Default value for BUS_READ_IVAR is
@@ -269,6 +275,7 @@ __ACPI_BUS_ACCESSOR(acpi, handle, ACPI, HANDLE, ACPI_HANDLE)
 __ACPI_BUS_ACCESSOR(acpi, magic, ACPI, MAGIC, uintptr_t)
 __ACPI_BUS_ACCESSOR(acpi, private, ACPI, PRIVATE, void *)
 __ACPI_BUS_ACCESSOR(acpi, flags, ACPI, FLAGS, int)
+__ACPI_BUS_ACCESSOR(acpi, recheck, ACPI, RECHECK, int)
 
 void acpi_fake_objhandler(ACPI_HANDLE h, void *data);
 static __inline device_t
@@ -301,12 +308,6 @@ acpi_TimerDelta(uint32_t end, uint32_t start)
 		end |= 0x01000000;
 	return (end - start);
 }
-
-#if 0				/* XXX */
-#ifdef ACPI_DEBUGGER
-void		acpi_EnterDebugger(void);
-#endif
-#endif
 
 #ifdef ACPI_DEBUG
 #include <sys/cons.h>
@@ -483,6 +484,7 @@ ACPI_HANDLE	acpi_GetReference(ACPI_HANDLE scope, ACPI_OBJECT *obj);
 int		acpi_task_thread_init(void);
 void		acpi_task_thread_schedule(void);
 extern BOOLEAN acpi_MatchHid(ACPI_HANDLE h, const char *hid);
+extern BOOLEAN acpi_MatchUid(ACPI_HANDLE h, const char *uid);
 /*
  * Base level for BUS_ADD_CHILD.  Special devices are added at orders less
  * than this, and normal devices at or above this level.  This keeps the

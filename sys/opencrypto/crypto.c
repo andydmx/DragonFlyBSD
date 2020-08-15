@@ -69,7 +69,6 @@
 #include <sys/objcache.h>
 
 #include <sys/thread2.h>
-#include <sys/mplock2.h>
 
 #include <ddb/ddb.h>
 
@@ -771,7 +770,7 @@ crypto_unblock(u_int32_t driverid, int what)
 		for (n = 0; n < ncpus; ++n) {
 			tdinfo = &tdinfo_array[n];
 			CRYPTO_Q_LOCK(tdinfo);
-			if (tdinfo[n].crp_sleep)
+			if (tdinfo->crp_sleep)
 				wakeup_one(&tdinfo->crp_q);
 			CRYPTO_Q_UNLOCK(tdinfo);
 		}
@@ -1028,7 +1027,7 @@ crypto_tstat(struct cryptotstat *ts, struct timespec *tv)
 		t.tv_sec--;
 		t.tv_nsec += 1000000000;
 	}
-	timespecadd(&ts->acc, &t);
+	timespecadd(&ts->acc, &t, &ts->acc);
 	if (timespeccmp(&t, &ts->min, <))
 		ts->min = t;
 	if (timespeccmp(&t, &ts->max, >))
@@ -1458,7 +1457,6 @@ crypto_ret_proc(void *dummy __unused)
 	struct cryptop *crpt;
 	struct cryptkop *krpt;
 
-	get_mplock();
 	CRYPTO_RETQ_LOCK();
 	for (;;) {
 		/* Harvest return q's for completed ops */
@@ -1499,8 +1497,8 @@ crypto_ret_proc(void *dummy __unused)
 			 * Nothing more to be processed.  Sleep until we're
 			 * woken because there are more returns to process.
 			 */
-			lksleep (&crp_ret_q, &crypto_ret_q_lock,
-				 0, "crypto_ret_wait", 0);
+			lksleep(&crp_ret_q, &crypto_ret_q_lock,
+				0, "crypto_ret_wait", 0);
 			if (cryptoretthread == NULL)
 				break;
 			cryptostats.cs_rets++;

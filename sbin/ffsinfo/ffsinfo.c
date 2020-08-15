@@ -438,7 +438,7 @@ dump_whole_inode(ino_t inode, int fsi, int level)
 	/*
 	 * Ok, now prepare for dumping all direct and indirect pointers.
 	 */
-	rb=howmany(ino->di_size, sblock.fs_bsize)-NDADDR;
+	rb=howmany(ino->di_size, sblock.fs_bsize)-UFS_NDADDR;
 	if(rb>0) {
 		/*
 		 * Dump single indirect block.
@@ -578,7 +578,7 @@ ginode(ino_t inumber, int fsi)
 		iblk = ino_to_fsba(&sblock, inumber);
 		rdfs(fsbtodb(&sblock, iblk), (size_t)sblock.fs_bsize,
 		    &ablk, fsi);
-		startinum = (inumber / INOPB(&sblock)) * INOPB(&sblock);
+		startinum = rounddown(inumber, INOPB(&sblock));
 	}
 
 	DBG_LEAVE;

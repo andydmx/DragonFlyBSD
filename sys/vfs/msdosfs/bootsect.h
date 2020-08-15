@@ -1,7 +1,7 @@
-/* $FreeBSD: src/sys/msdosfs/bootsect.h,v 1.7 1999/08/28 00:48:06 peter Exp $ */
+/* $FreeBSD$ */
 /*	$NetBSD: bootsect.h,v 1.9 1997/11/17 15:36:17 ws Exp $	*/
 
-/*
+/*-
  * Written by Paul Popelka (paulp@uts.amdahl.com)
  *
  * You can do anything you want with this software, just don't say you wrote
@@ -16,9 +16,8 @@
  *
  * October 1992
  */
-
-#ifndef _VFS_MSDOSFS_BOOTSECT_H_
-#define	_VFS_MSDOSFS_BOOTSECT_H_
+#ifndef _FS_MSDOSFS_BOOTSECT_H_
+#define	_FS_MSDOSFS_BOOTSECT_H_
 
 /*
  * Format of a boot sector.  This is the first sector on a DOS floppy disk
@@ -26,13 +25,13 @@
  * first sector of a partitioned hard disk.
  */
 struct bootsector33 {
-	u_int8_t	bsJump[3];		/* jump inst E9xxxx or EBxx90 */
+	uint8_t		bsJump[3];		/* jump inst E9xxxx or EBxx90 */
 	int8_t		bsOemName[8];		/* OEM name and version */
 	int8_t		bsBPB[19];		/* BIOS parameter block */
 	int8_t		bsDriveNumber;		/* drive number (0x80) */
 	int8_t		bsBootCode[479];	/* pad so struct is 512b */
-	u_int8_t	bsBootSectSig0;
-	u_int8_t	bsBootSectSig1;
+	uint8_t		bsBootSectSig0;
+	uint8_t		bsBootSectSig1;
 #define	BOOTSIG0	0x55
 #define	BOOTSIG1	0xaa
 };
@@ -49,48 +48,28 @@ struct extboot {
 };
 
 struct bootsector50 {
-	u_int8_t	bsJump[3];		/* jump inst E9xxxx or EBxx90 */
+	uint8_t		bsJump[3];		/* jump inst E9xxxx or EBxx90 */
 	int8_t		bsOemName[8];		/* OEM name and version */
 	int8_t		bsBPB[25];		/* BIOS parameter block */
 	int8_t		bsExt[26];		/* Bootsector Extension */
 	int8_t		bsBootCode[448];	/* pad so structure is 512b */
-	u_int8_t	bsBootSectSig0;
-	u_int8_t	bsBootSectSig1;
+	uint8_t		bsBootSectSig0;
+	uint8_t		bsBootSectSig1;
 #define	BOOTSIG0	0x55
 #define	BOOTSIG1	0xaa
 };
 
 struct bootsector710 {
-	u_int8_t	bsJump[3];		/* jump inst E9xxxx or EBxx90 */
+	uint8_t		bsJump[3];		/* jump inst E9xxxx or EBxx90 */
 	int8_t		bsOEMName[8];		/* OEM name and version */
-	int8_t		bsPBP[53];		/* BIOS parameter block */
+	int8_t		bsBPB[53];		/* BIOS parameter block */
 	int8_t		bsExt[26];		/* Bootsector Extension */
-	int8_t		bsBootCode[418];	/* pad so structure is 512b */
-	u_int8_t	bsBootSectSig2;		/* 2 & 3 are only defined for FAT32? */
-	u_int8_t	bsBootSectSig3;
-	u_int8_t	bsBootSectSig0;
-	u_int8_t	bsBootSectSig1;
+	int8_t		bsBootCode[420];	/* pad so structure is 512b */
+	uint8_t		bsBootSectSig0;
+	uint8_t		bsBootSectSig1;
 #define	BOOTSIG0	0x55
 #define	BOOTSIG1	0xaa
-#define	BOOTSIG2	0
-#define	BOOTSIG3	0
 };
-#ifdef	atari
-/*
- * The boot sector on a gemdos fs is a little bit different from the msdos fs
- * format. Currently there is no need to declare a separate structure, the
- * bootsector33 struct will do.
- */
-#if 0
-struct bootsec_atari {
-	u_int8_t	bsBranch[2];		/* branch inst if auto-boot	*/
-	int8_t		bsFiller[6];		/* anything or nothing		*/
-	int8_t		bsSerial[3];		/* serial no. for mediachange	*/
-	int8_t		bsBPB[19];		/* BIOS parameter block		*/
-	int8_t		bsBootCode[482];	/* pad so struct is 512b	*/
-};
-#endif
-#endif /* atari */
 
 union bootsector {
 	struct bootsector33 bs33;
@@ -116,4 +95,4 @@ union bootsector {
 #define	bsHugeSectors	bsBPB.bpbHugeSectors
 #endif
 
-#endif /* !_VFS_MSDOSFS_BOOTSECT_H_ */
+#endif /* !_FS_MSDOSFS_BOOTSECT_H_ */

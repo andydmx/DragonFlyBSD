@@ -22,9 +22,10 @@
  * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
  * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
  * THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- *
- * $FreeBSD: head/sys/net80211/ieee80211_crypto.c 195812 2009-07-21 19:36:32Z sam $
  */
+
+#include <sys/cdefs.h>
+__FBSDID("$FreeBSD$");
 
 /*
  * IEEE 802.11 generic crypto support.
@@ -39,9 +40,9 @@
 #include <sys/socket.h>
 
 #include <net/if.h>
+#include <net/if_var.h>
 #include <net/if_media.h>
 #include <net/ethernet.h>		/* XXX ETHER_HDR_LEN */
-#include <net/route.h>
 
 #include <netproto/802_11/ieee80211_var.h>
 
@@ -89,8 +90,7 @@ null_key_delete(struct ieee80211vap *vap, const struct ieee80211_key *k)
 	return 1;
 }
 static 	int
-null_key_set(struct ieee80211vap *vap, const struct ieee80211_key *k,
-	const uint8_t mac[IEEE80211_ADDR_LEN])
+null_key_set(struct ieee80211vap *vap, const struct ieee80211_key *k)
 {
 	return 1;
 }
@@ -132,7 +132,7 @@ dev_key_delete(struct ieee80211vap *vap,
 static __inline int
 dev_key_set(struct ieee80211vap *vap, const struct ieee80211_key *key)
 {
-	return vap->iv_key_set(vap, key, key->wk_macaddr);
+	return vap->iv_key_set(vap, key);
 }
 
 /*
@@ -323,10 +323,6 @@ ieee80211_crypto_newkey(struct ieee80211vap *vap,
 		    __func__, cip->ic_name);
 		flags |= IEEE80211_KEY_SWCRYPT;
 	}
-	if (ieee80211_force_swcrypto) {
-		flags |= IEEE80211_KEY_SWCRYPT;
-		flags |= IEEE80211_KEY_SWMIC;
-	}
 	/*
 	 * Hardware TKIP with software MIC is an important
 	 * combination; we handle it by flagging each key,
@@ -492,16 +488,13 @@ int
 ieee80211_crypto_setkey(struct ieee80211vap *vap, struct ieee80211_key *key)
 {
 	const struct ieee80211_cipher *cip = key->wk_cipher;
-#ifdef IEEE80211_DEBUG
-	char ethstr[ETHER_ADDRSTRLEN + 1];
-#endif
 
 	KASSERT(cip != NULL, ("No cipher!"));
 
 	IEEE80211_DPRINTF(vap, IEEE80211_MSG_CRYPTO,
 	    "%s: %s keyix %u flags 0x%x mac %s rsc %ju tsc %ju len %u\n",
 	    __func__, cip->ic_name, key->wk_keyix,
-	    key->wk_flags, kether_ntoa(key->wk_macaddr, ethstr),
+	    key->wk_flags, ether_sprintf(key->wk_macaddr),
 	    key->wk_keyrsc[IEEE80211_NONQOS_TID], key->wk_keytsc,
 	    key->wk_keylen);
 
@@ -528,17 +521,21 @@ ieee80211_crypto_setkey(struct ieee80211vap *vap, struct ieee80211_key *key)
 	return dev_key_set(vap, key);
 }
 
-/*
- * Add privacy headers appropriate for the specified key.
- */
+uint8_t
+ieee80211_crypto_get_keyid(struct ieee80211vap *vap, struct ieee80211_key *k)
+{
+	if (k >= &vap->iv_nw_keys[0] &&
+	    k <  &vap->iv_nw_keys[IEEE80211_WEP_NKID])
+		return (k - vap->iv_nw_keys);
+	else
+		return (0);
+}
+
 struct ieee80211_key *
-ieee80211_crypto_encap(struct ieee80211_node *ni, struct mbuf *m)
+ieee80211_crypto_get_txkey(struct ieee80211_node *ni, struct mbuf *m)
 {
 	struct ieee80211vap *vap = ni->ni_vap;
-	struct ieee80211_key *k;
 	struct ieee80211_frame *wh;
-	const struct ieee80211_cipher *cip;
-	uint8_t keyid;
 
 	/*
 	 * Multicast traffic always uses the multicast key.
@@ -557,14 +554,27 @@ ieee80211_crypto_encap(struct ieee80211_node *ni, struct mbuf *m)
 			vap->iv_stats.is_tx_nodefkey++;
 			return NULL;
 		}
-		keyid = vap->iv_def_txkey;
-		k = &vap->iv_nw_keys[vap->iv_def_txkey];
-	} else {
-		keyid = 0;
-		k = &ni->ni_ucastkey;
+		return &vap->iv_nw_keys[vap->iv_def_txkey];
 	}
-	cip = k->wk_cipher;
-	return (cip->ic_encap(k, m, keyid<<6) ? k : NULL);
+
+	return &ni->ni_ucastkey;
+}
+
+/*
+ * Add privacy headers appropriate for the specified key.
+ */
+struct ieee80211_key *
+ieee80211_crypto_encap(struct ieee80211_node *ni, struct mbuf *m)
+{
+	struct ieee80211_key *k;
+	const struct ieee80211_cipher *cip;
+
+	if ((k = ieee80211_crypto_get_txkey(ni, m)) != NULL) {
+		cip = k->wk_cipher;
+		return (cip->ic_encap(k, m) ? k : NULL);
+	}
+
+	return NULL;
 }
 
 /*

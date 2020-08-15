@@ -1,13 +1,13 @@
 /*
  * Copyright (c) 2008 The DragonFly Project.  All rights reserved.
- * 
+ *
  * This code is derived from software contributed to The DragonFly Project
  * by Matthew Dillon <dillon@backplane.com>
- * 
+ *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
  * are met:
- * 
+ *
  * 1. Redistributions of source code must retain the above copyright
  *    notice, this list of conditions and the following disclaimer.
  * 2. Redistributions in binary form must reproduce the above copyright
@@ -17,7 +17,7 @@
  * 3. Neither the name of The DragonFly Project nor the names of its
  *    contributors may be used to endorse or promote products derived
  *    from this software without specific, prior written permission.
- * 
+ *
  * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
  * ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
  * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
@@ -30,7 +30,7 @@
  * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT
  * OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
- * 
+ *
  * $DragonFly: src/sys/vfs/hammer/hammer_ioctl.h,v 1.23 2008/11/13 02:18:43 dillon Exp $
  */
 /*
@@ -40,8 +40,9 @@
 #ifndef VFS_HAMMER_IOCTL_H_
 #define VFS_HAMMER_IOCTL_H_
 
-#include <sys/types.h>
+#include <sys/param.h>
 #include <sys/ioccom.h>
+
 #include "hammer_disk.h"
 
 /*
@@ -52,7 +53,7 @@
 struct hammer_ioc_head {
 	int32_t		flags;
 	int32_t		error;
-	int32_t		reserved02[4];
+	int32_t		reserved01[4];
 };
 
 #define HAMMER_IOC_HEAD_ERROR	0x00008000
@@ -112,7 +113,7 @@ struct hammer_ioc_prune {
 struct hammer_ioc_rebalance {
 	struct hammer_ioc_head head;
 	int		saturation;	/* saturation pt elements/node */
-	int		reserved02;
+	int		reserved01;
 
 	struct hammer_base_elm key_beg;	/* start forward scan */
 	struct hammer_base_elm key_end; /* stop forward scan (inclusive) */
@@ -122,7 +123,8 @@ struct hammer_ioc_rebalance {
 	int64_t		stat_deletions; /* number of nodes deleted */
 	int64_t		stat_collisions;/* number of collision retries */
 	int64_t		stat_nrebal;	/* number of btree-nodes rebalanced */
-	int64_t		stat_unused04;
+	int32_t		allpfs;		/* rebalance all PFS if set */
+	int32_t		reserved02;
 };
 
 /*
@@ -151,11 +153,11 @@ struct hammer_ioc_rebalance {
 
 #define HAMMER_MAX_HISTORY_ELMS	64
 
-typedef struct hammer_ioc_hist_entry {
+struct hammer_ioc_hist_entry {
 	hammer_tid_t	tid;
-	u_int32_t	time32;
-	u_int32_t	unused;
-} *hammer_ioc_hist_entry_t;
+	uint32_t	time32;
+	uint32_t	reserved01;
+};
 
 struct hammer_ioc_history {
 	struct hammer_ioc_head head;
@@ -182,24 +184,25 @@ struct hammer_ioc_history {
 struct hammer_ioc_reblock {
 	struct hammer_ioc_head head;
 	int32_t		free_level;		/* 0 for maximum compaction */
-	u_int32_t	reserved01;
+	uint32_t	reserved01;
 
 	struct hammer_base_elm key_beg;		/* start forward scan */
 	struct hammer_base_elm key_end;		/* stop forward scan */
 	struct hammer_base_elm key_cur;		/* scan interruption point */
 
 	int64_t		btree_count;		/* B-Tree nodes checked */
-	int64_t		record_count;		/* Records checked */
+	int64_t		reserved02;
 	int64_t		data_count;		/* Data segments checked */
 	int64_t		data_byte_count;	/* Data bytes checked */
 
 	int64_t		btree_moves;		/* B-Tree nodes moved */
-	int64_t		record_moves;		/* Records moved */
+	int64_t		reserved03;
 	int64_t		data_moves;		/* Data segments moved */
 	int64_t		data_byte_moves;	/* Data bytes moved */
 
-	int32_t		unused02;
-	int32_t		unused03;
+	int16_t		allpfs;			/* Reblock all PFS if set */
+	int16_t		vol_no;			/* Volume to reblock if set */
+	int32_t		reserved04;
 };
 
 /*
@@ -224,14 +227,14 @@ struct hammer_ioc_synctid {
 struct hammer_ioc_info {
 	struct hammer_ioc_head		head;
 
-	char		vol_name[64];
-	uuid_t		vol_fsid;
-	uuid_t		vol_fstype;
+	char		vol_label[64];
+	hammer_uuid_t	vol_fsid;
+	hammer_uuid_t	vol_fstype;
 
 	int		version;
 	int		nvolumes;
+	int		rootvol;
 	int		reserved01;
-	int		reserved02;
 
 	int64_t		bigblocks;
 	int64_t		freebigblocks;
@@ -242,46 +245,28 @@ struct hammer_ioc_info {
 };
 
 /*
- * HAMMERIOC_PFS_ITERATE
- */
-struct hammer_ioc_pfs_iterate {
-	struct hammer_ioc_head  head;
-	uint32_t pos;
-	struct hammer_pseudofs_data *ondisk;
-};
-
-/*
  * HAMMERIOC_GET_PSEUDOFS
  * HAMMERIOC_SET_PSEUDOFS
+ * HAMMERIOC_SCAN_PSEUDOFS
  */
 struct hammer_ioc_pseudofs_rw {
 	struct hammer_ioc_head	head;
 	int			pfs_id;
-	u_int32_t		bytes;
-	u_int32_t		version;
-	u_int32_t		flags;
-	struct hammer_pseudofs_data *ondisk;
+	uint32_t		bytes;
+	uint32_t		version;
+	uint32_t		reserved01;
+	hammer_pseudofs_data_t	ondisk;
 };
 
 #define HAMMER_IOC_PSEUDOFS_VERSION	1
-
-#define HAMMER_IOC_PFS_SYNC_BEG		0x0001
-#define HAMMER_IOC_PFS_SYNC_END		0x0002
-#define HAMMER_IOC_PFS_SHARED_UUID	0x0004
-#define HAMMER_IOC_PFS_MIRROR_UUID	0x0008
-#define HAMMER_IOC_PFS_MASTER_ID	0x0010
-#define HAMMER_IOC_PFS_MIRROR_FLAGS	0x0020
-#define HAMMER_IOC_PFS_LABEL		0x0040
-
-#define HAMMER_MAX_PFS			65536
 
 /*
  * HAMMERIOC_MIRROR_READ/WRITE
  */
 struct hammer_ioc_mirror_rw {
 	struct hammer_ioc_head	head;
-	struct hammer_base_elm 	key_beg;	/* start forward scan */
-	struct hammer_base_elm 	key_end;	/* stop forward scan */
+	struct hammer_base_elm	key_beg;	/* start forward scan */
+	struct hammer_base_elm	key_end;	/* stop forward scan */
 	struct hammer_base_elm	key_cur;	/* interruption point */
 	hammer_tid_t		tid_beg;	/* filter modification range */
 	hammer_tid_t		tid_end;	/* filter modification range */
@@ -290,7 +275,7 @@ struct hammer_ioc_mirror_rw {
 	int			size;		/* max size */
 	int			pfs_id;		/* PFS id being read/written */
 	int			reserved01;
-	uuid_t			shared_uuid;	/* validator for safety */
+	hammer_uuid_t		shared_uuid;	/* validator for safety */
 };
 
 #define HAMMER_IOC_MIRROR_NODATA	0x0001	/* do not include bulk data */
@@ -300,14 +285,12 @@ struct hammer_ioc_mirror_rw {
  * data[] array.
  */
 struct hammer_ioc_mrecord_head {
-	u_int32_t		signature;	/* signature for byte order */
-	u_int32_t		rec_crc;
-	u_int32_t		rec_size;
-	u_int32_t		type;
+	uint32_t		signature;	/* signature for byte order */
+	hammer_crc_t		rec_crc;
+	uint32_t		rec_size;
+	uint32_t		type;
 	/* extended */
 };
-
-typedef struct hammer_ioc_mrecord_head *hammer_ioc_mrecord_head_t;
 
 struct hammer_ioc_mrecord_rec {
 	struct hammer_ioc_mrecord_head	head;
@@ -317,8 +300,8 @@ struct hammer_ioc_mrecord_rec {
 
 struct hammer_ioc_mrecord_skip {
 	struct hammer_ioc_mrecord_head	head;
-	struct hammer_base_elm	 	skip_beg;
-	struct hammer_base_elm 		skip_end;
+	struct hammer_base_elm		skip_beg;
+	struct hammer_base_elm		skip_end;
 };
 
 struct hammer_ioc_mrecord_update {
@@ -332,34 +315,39 @@ struct hammer_ioc_mrecord_sync {
 
 struct hammer_ioc_mrecord_pfs {
 	struct hammer_ioc_mrecord_head	head;
-	u_int32_t			version;
-	u_int32_t			reserved01;
+	uint32_t			version;
+	uint32_t			reserved01;
 	struct hammer_pseudofs_data	pfsd;
 };
 
 struct hammer_ioc_version {
 	struct hammer_ioc_head head;
-	u_int32_t		cur_version;
-	u_int32_t		min_version;
-	u_int32_t		wip_version;
-	u_int32_t		max_version;
+	uint32_t		cur_version;
+	uint32_t		min_version;
+	uint32_t		wip_version;
+	uint32_t		max_version;
 	char			description[64];
 };
 
 struct hammer_ioc_volume {
 	struct hammer_ioc_head head;
 	char			device_name[MAXPATHLEN];
+	int32_t			vol_no;
+	uint8_t			flag;
+	uint8_t			reserved[3];
 	int64_t			vol_size;
 	int64_t			boot_area_size;
-	int64_t			mem_area_size;
+	int64_t			memory_log_size;
 };
+
+#define HAMMER_IOC_VOLUME_REBLOCK	1
 
 struct hammer_ioc_volume_list {
 	struct hammer_ioc_volume *vols;
 	int nvols;
 };
 
-union hammer_ioc_mrecord_any {
+typedef union hammer_ioc_mrecord_any {
 	struct hammer_ioc_mrecord_head	head;
 	struct hammer_ioc_mrecord_rec	rec;
 	struct hammer_ioc_mrecord_skip	skip;
@@ -367,9 +355,7 @@ union hammer_ioc_mrecord_any {
 	struct hammer_ioc_mrecord_update sync;
 	struct hammer_ioc_mrecord_pfs	pfs;
 	struct hammer_ioc_version	version;
-};
-
-typedef union hammer_ioc_mrecord_any *hammer_ioc_mrecord_any_t;
+} *hammer_ioc_mrecord_any_t;
 
 /*
  * MREC types.  Flags are in the upper 16 bits but some are also included
@@ -427,9 +413,9 @@ typedef union hammer_ioc_mrecord_any *hammer_ioc_mrecord_any_t;
 
 struct hammer_ioc_snapshot {
 	struct hammer_ioc_head	head;
-	int			unused01;
-	u_int32_t		index;
-	u_int32_t		count;
+	int			reserved01;
+	uint32_t		index;
+	uint32_t		count;
 	struct hammer_snapshot_data snaps[HAMMER_SNAPS_PER_IOCTL];
 };
 
@@ -445,9 +431,9 @@ struct hammer_ioc_snapshot {
  */
 struct hammer_ioc_config {
 	struct hammer_ioc_head	head;
-	u_int32_t		reserved01;
-	u_int32_t		reserved02;
-	u_int64_t		reserved03[4];
+	uint32_t		reserved01;
+	uint32_t		reserved02;
+	uint64_t		reserved03[4];
 	struct hammer_config_data config;
 };
 
@@ -461,7 +447,7 @@ struct hammer_ioc_dedup {
 };
 
 #define HAMMER_IOC_DEDUP_CMP_FAILURE	0x0001 /* verification failed */
-#define HAMMER_IOC_DEDUP_UNDERFLOW	0x0002 /* bigblock underflow */
+#define HAMMER_IOC_DEDUP_UNDERFLOW	0x0002 /* big-block underflow */
 #define HAMMER_IOC_DEDUP_INVALID_ZONE	0x0004 /* we can't dedup all zones */
 
 /*
@@ -494,17 +480,17 @@ struct hammer_ioc_data {
 #define HAMMERIOC_SET_VERSION	_IOWR('h',14,struct hammer_ioc_version)
 #define HAMMERIOC_REBALANCE	_IOWR('h',15,struct hammer_ioc_rebalance)
 #define HAMMERIOC_GET_INFO	_IOR('h',16,struct hammer_ioc_info)
-#define HAMMERIOC_ADD_VOLUME 	_IOWR('h',17,struct hammer_ioc_volume)
+#define HAMMERIOC_ADD_VOLUME	_IOWR('h',17,struct hammer_ioc_volume)
 #define HAMMERIOC_ADD_SNAPSHOT	_IOWR('h',18,struct hammer_ioc_snapshot)
 #define HAMMERIOC_DEL_SNAPSHOT	_IOWR('h',19,struct hammer_ioc_snapshot)
 #define HAMMERIOC_GET_SNAPSHOT	_IOWR('h',20,struct hammer_ioc_snapshot)
 #define HAMMERIOC_GET_CONFIG	_IOWR('h',21,struct hammer_ioc_config)
 #define HAMMERIOC_SET_CONFIG	_IOWR('h',22,struct hammer_ioc_config)
-#define HAMMERIOC_DEL_VOLUME 	_IOWR('h',24,struct hammer_ioc_volume)
+#define HAMMERIOC_DEL_VOLUME	_IOWR('h',24,struct hammer_ioc_volume)
 #define HAMMERIOC_DEDUP		_IOWR('h',25,struct hammer_ioc_dedup)
 #define HAMMERIOC_GET_DATA	_IOWR('h',26,struct hammer_ioc_data)
 #define HAMMERIOC_LIST_VOLUMES	_IOWR('h',27,struct hammer_ioc_volume_list)
-#define HAMMERIOC_PFS_ITERATE	_IOWR('h',28,struct hammer_ioc_pfs_iterate)
+#define HAMMERIOC_SCAN_PSEUDOFS	_IOWR('h',28,struct hammer_ioc_pseudofs_rw)
 
-#endif
+#endif /* !VFS_HAMMER_IOCTL_H_ */
 

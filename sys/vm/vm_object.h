@@ -1,9 +1,13 @@
 /*
+ * Copyright (c) 2019 The DragonFly Project.  All rights reserved.
  * Copyright (c) 1991, 1993
  *	The Regents of the University of California.  All rights reserved.
  *
  * This code is derived from software contributed to Berkeley by
  * The Mach Operating System project at Carnegie-Mellon University.
+ *
+ * This code is derived from software contributed to The DragonFly Project
+ * by Matthew Dillon <dillon@backplane.com>
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -13,7 +17,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -85,7 +89,7 @@
 #ifndef _MACHINE_PMAP_H_
 #include <machine/pmap.h>
 #endif
-#ifndef _MACHINE_ATOMIC_H_
+#ifndef _CPU_ATOMIC_H_
 #include <machine/atomic.h>
 #endif
 #ifndef _VM_VM_H_
@@ -96,10 +100,6 @@
 #endif
 
 #ifdef _KERNEL
-
-#ifndef _SYS_THREAD2_H_
-#include <sys/thread2.h>
-#endif
 
 #ifndef _SYS_REFCOUNT_H_
 #include <sys/refcount.h>
@@ -113,6 +113,7 @@ int rb_swblock_compare(struct swblock *, struct swblock *);
 
 RB_PROTOTYPE2(swblock_rb_tree, swblock, swb_entry, rb_swblock_compare,
 	      vm_pindex_t);
+RB_HEAD(swblock_rb_tree, swblock);
 
 enum obj_type { 
 	OBJT_DEFAULT,
@@ -129,38 +130,27 @@ typedef u_char objtype_t;
 /*
  * A VM object which represents an arbitrarily sized data store.
  *
- * NOTE:
- *	shadow_head is only used by OBJT_DEFAULT or OBJT_SWAP objects.
- *	OBJT_VNODE objects explicitly do not keep track of who is shadowing
- *	them.
- *
- * LOCKING:
- *	vmobj_tokens[n] for object_list, hashed by address.
- *
- *	vm_object_hold/drop() for most vm_object related operations.
- *	OBJ_CHAINLOCK to avoid chain/shadow object collisions.
+ * vm_objects are soft-locked with their token, meaning that any
+ * blocking can allow other threads to squeeze in some work.
  */
 struct vm_object {
-	TAILQ_ENTRY(vm_object) object_list; /* locked by vmobj_tokens[n] */
-	LIST_HEAD(, vm_object) shadow_head; /* objects we are a shadow for */
-	LIST_ENTRY(vm_object) shadow_list;  /* chain of shadow objects */
-	RB_HEAD(vm_page_rb_tree, vm_page) rb_memq;	/* resident pages */
-	int generation;			/* generation ID */
-	vm_pindex_t size;		/* Object size */
-	int ref_count;
-	int shadow_count;		/* count of objs we are a shadow for */
-	vm_memattr_t memattr;		/* default memory attribute for pages */
-	objtype_t type;			/* type of pager */
-	u_short flags;			/* see below */
-	u_short pg_color;		/* color of first page in obj */
-	u_int paging_in_progress;	/* Paging (in or out) so don't collapse or destroy */
-	int resident_page_count;	/* number of resident pages */
-        u_int agg_pv_list_count;        /* aggregate pv list count */
-	struct vm_object *backing_object; /* object that I'm a shadow of */
-	vm_ooffset_t backing_object_offset;/* Offset in backing object */
-	TAILQ_ENTRY(vm_object) pager_object_list; /* list of all objects of this pager type */
-	void *handle;			/* control handle: vp, etc */
-	int hold_count;			/* count prevents destruction */
+	struct lwkt_token token;	/* everything else */
+	struct lock	backing_lk;	/* lock for backing_list only */
+	TAILQ_ENTRY(vm_object) object_entry;
+	TAILQ_HEAD(, vm_map_backing) backing_list;
+	struct vm_page_rb_tree rb_memq;	/* resident pages */
+	int		generation;	/* generation ID */
+	vm_pindex_t	size;		/* Object size */
+	int		ref_count;
+	vm_memattr_t	memattr;	/* default memory attribute for pages */
+	objtype_t	type;		/* type of pager */
+	u_short		flags;		/* see below */
+	u_short		pg_color;	/* color of first page in obj */
+	u_int		paging_in_progress;	/* Activity in progress */
+	long		resident_page_count;	/* number of resident pages */
+	TAILQ_ENTRY(vm_object) pager_object_entry; /* optional use by pager */
+	void		*handle;	/* control handle: vp, etc */
+	int		hold_count;	/* count prevents destruction */
 	
 #if defined(DEBUG_LOCKS)
 	/* 
@@ -168,11 +158,10 @@ struct vm_object {
 	 */
 
 #define VMOBJ_DEBUG_ARRAY_SIZE		(32)
-	u_int debug_hold_bitmap;
-	thread_t debug_hold_thrs[VMOBJ_DEBUG_ARRAY_SIZE];
-	char *debug_hold_file[VMOBJ_DEBUG_ARRAY_SIZE];
-	int debug_hold_line[VMOBJ_DEBUG_ARRAY_SIZE];
-	u_int debug_hold_ovfl;
+	char		debug_hold_thrs[VMOBJ_DEBUG_ARRAY_SIZE][64];
+	const char	*debug_hold_file[VMOBJ_DEBUG_ARRAY_SIZE];
+	int		debug_hold_line[VMOBJ_DEBUG_ARRAY_SIZE];
+	int		debug_index;
 #endif
 
 	union {
@@ -193,48 +182,61 @@ struct vm_object {
 	 * store.  For vnodes the swap backing store acts as a fast
 	 * data cache but the vnode contains the official data.
 	 */
-	RB_HEAD(swblock_rb_tree, swblock) swblock_root;
-	int	swblock_count;
-	struct	lwkt_token	token;
-	struct md_object	md;	/* machine specific (typ pmap) */
-	uint32_t		chainlk;/* chaining lock */
+	struct swblock_rb_tree swblock_root;
+	long		swblock_count;
+	struct md_object md;		/* machine specific (typ pmap) */
 };
 
 /*
  * Flags
  *
- * NOTE: OBJ_ONEMAPPING only applies to DEFAULT and SWAP objects.  It
- *	 may be gratuitously re-cleared in other cases but will already be
- *	 clear in those cases.  It might not be set on other object types
- *	 (particularly OBJT_VNODE).
+ * OBJ_ONEMAPPING - Only applies to DEFAULT and SWAP objects.  It may be
+ *		    gratuitously re-cleared in other cases but will already
+ *		    be clear in those cases.  It might not be set on other
+ *		    object types (particularly OBJT_VNODE).
+ *
+ *		    This flag indicates that any given page index within the
+ *		    object is only mapped to at most one vm_map_entry.
+ *
+ *		    WARNING!  An obj->refs of 1 does NOT allow you to
+ *		    re-set this bit because the object might be part of
+ *		    a shared chain of vm_map_backing structures.
+ *
+ * OBJ_NOPAGEIN   - vn and tmpfs set this flag, indicating to swapoff
+ *		    that the objects aren't intended to have any vm_page's,
+ *		    only swap blocks.  vn and tmpfs don't know how to deal
+ *		    with any actual pages.
  */
-#define OBJ_UNUSED0001	0x0001		/* backing_object/shadow changing */
-#define OBJ_ONSHADOW	0x0002		/* backing_object on shadow list */
+#define OBJ_UNUSED0001	0x0001
+#define OBJ_UNUSED0002	0x0002
 #define OBJ_ACTIVE	0x0004		/* active objects */
 #define OBJ_DEAD	0x0008		/* dead objects (during rundown) */
 #define	OBJ_NOSPLIT	0x0010		/* dont split this object */
-#define OBJ_UNUSED0040	0x0040
+#define OBJ_NOPAGEIN	0x0040		/* special OBJT_SWAP */
 #define	OBJ_WRITEABLE	0x0080		/* object has been made writable */
 #define OBJ_MIGHTBEDIRTY 0x0100		/* object might be dirty */
 #define OBJ_CLEANING	0x0200
 #define OBJ_DEADWNT	0x1000		/* waiting because object is dead */
-#define	OBJ_ONEMAPPING	0x2000		/* flag single vm_map_entry mapping */
+#define	OBJ_ONEMAPPING	0x2000
 #define OBJ_NOMSYNC	0x4000		/* disable msync() system call */
-
-#define CHAINLK_EXCL	0x80000000
-#define CHAINLK_WAIT	0x40000000
-#define CHAINLK_EXCLREQ	0x20000000
-#define CHAINLK_MASK	0x1FFFFFFF
 
 #define IDX_TO_OFF(idx) (((vm_ooffset_t)(idx)) << PAGE_SHIFT)
 #define OFF_TO_IDX(off) ((vm_pindex_t)(((vm_ooffset_t)(off)) >> PAGE_SHIFT))
 
+#define VMOBJ_HSIZE	256
+#define VMOBJ_HMASK	(VMOBJ_HSIZE - 1)
+
 #ifdef	_KERNEL
 
-#define OBJPC_SYNC	0x1			/* sync I/O */
-#define OBJPC_INVAL	0x2			/* invalidate */
-#define OBJPC_NOSYNC	0x4			/* skip if PG_NOSYNC */
+#define OBJPC_SYNC		0x0001	/* sync I/O */
+#define OBJPC_INVAL		0x0002	/* invalidate */
+#define OBJPC_NOSYNC		0x0004	/* skip if PG_NOSYNC */
+#define OBJPC_IGNORE_CLEANCHK	0x0008
+#define OBJPC_CLUSTER_OK	0x0010	/* used only by vnode pager */
+#define OBJPC_TRY_TO_CACHE	0x0020	/* typically used only in pageout path */
+#define OBJPC_ALLOW_ACTIVE	0x0040	/* dito */
 
+#if 0
 /*
  * Used to chain vm_object deallocations
  */
@@ -242,16 +244,16 @@ struct vm_object_dealloc_list {
 	struct vm_object_dealloc_list *next;
 	vm_object_t	object;
 };
+#endif
 
 TAILQ_HEAD(object_q, vm_object);
 
-#define VMOBJ_HSIZE	64
-#define VMOBJ_HMASK	(VMOBJ_HSIZE - 1)
-#define VMOBJ_HASH(obj)	(((intptr_t)(obj) >> 8) & VMOBJ_HMASK)
+struct vm_object_hash {
+	struct object_q		list;
+	struct lwkt_token	token;
+} __cachealign;
 
-extern struct object_q vm_object_lists[VMOBJ_HSIZE];
-extern struct lwkt_token vmobj_tokens[VMOBJ_HSIZE];
-
+extern struct vm_object_hash vm_object_hash[VMOBJ_HSIZE];
 
  /* lock for object list and count */
 
@@ -309,28 +311,17 @@ vm_object_token(vm_object_t obj)
 
 vm_object_t vm_object_allocate (objtype_t, vm_pindex_t);
 vm_object_t vm_object_allocate_hold (objtype_t, vm_pindex_t);
-void _vm_object_allocate (objtype_t, vm_pindex_t, vm_object_t);
+void _vm_object_allocate (objtype_t, vm_pindex_t, vm_object_t, const char *);
 boolean_t vm_object_coalesce (vm_object_t, vm_pindex_t, vm_size_t, vm_size_t);
-void vm_object_collapse (vm_object_t, struct vm_object_dealloc_list **);
-void vm_object_deallocate (vm_object_t);
-void vm_object_deallocate_locked (vm_object_t);
-void vm_object_deallocate_list(struct vm_object_dealloc_list **);
+vm_object_t vm_object_collapse (vm_object_t, vm_object_t);
 void vm_object_terminate (vm_object_t);
 void vm_object_set_writeable_dirty (vm_object_t);
-void vm_object_init (void);
+void vm_object_init(vm_object_t, vm_pindex_t);
+void vm_object_init1 (void);
 void vm_object_page_clean (vm_object_t, vm_pindex_t, vm_pindex_t, int);
 void vm_object_page_remove (vm_object_t, vm_pindex_t, vm_pindex_t, boolean_t);
 void vm_object_pmap_copy (vm_object_t, vm_pindex_t, vm_pindex_t);
-void vm_object_pmap_copy_1 (vm_object_t, vm_pindex_t, vm_pindex_t);
-void vm_object_pmap_remove (vm_object_t, vm_pindex_t, vm_pindex_t);
-void vm_object_reference_quick (vm_object_t);
-void vm_object_reference_locked (vm_object_t);
-void vm_object_chain_wait (vm_object_t object, int shared);
-void vm_object_chain_acquire(vm_object_t object, int shared);
-void vm_object_chain_release(vm_object_t object);
-void vm_object_chain_release_all(vm_object_t object, vm_object_t stopobj);
-void vm_object_shadow (vm_object_t *, vm_ooffset_t *, vm_size_t, int);
-void vm_object_madvise (vm_object_t, vm_pindex_t, int, int);
+void vm_object_madvise (vm_object_t, vm_pindex_t, vm_pindex_t, int);
 void vm_object_init2 (void);
 vm_page_t vm_fault_object_page(vm_object_t, vm_ooffset_t,
 				vm_prot_t, int, int *, int *);
@@ -339,25 +330,58 @@ void vm_object_lock(vm_object_t);
 void vm_object_lock_shared(vm_object_t);
 void vm_object_unlock(vm_object_t);
 
-#ifndef DEBUG_LOCKS
-void vm_object_hold(vm_object_t);
-int vm_object_hold_try(vm_object_t);
-void vm_object_hold_shared(vm_object_t);
-#else
-#define vm_object_hold(obj)		\
-	debugvm_object_hold(obj, __FILE__, __LINE__)
-void debugvm_object_hold(vm_object_t, char *, int);
-#define vm_object_hold_try(obj)		\
-	debugvm_object_hold_try(obj, __FILE__, __LINE__)
-int debugvm_object_hold_try(vm_object_t, char *, int);
-#define vm_object_hold_shared(obj)	\
-	debugvm_object_hold_shared(obj, __FILE__, __LINE__)
-void debugvm_object_hold_shared(vm_object_t, char *, int);
+#if defined(DEBUG_LOCKS)
+
+#define VMOBJDEBUG(x)	debug ## x
+#define VMOBJDBARGS	, char *file, int line
+#define VMOBJDBFWD	, file, line
+
+#define vm_object_hold(obj)			\
+		debugvm_object_hold(obj, __FILE__, __LINE__)
+#define vm_object_hold_try(obj)			\
+		debugvm_object_hold_try(obj, __FILE__, __LINE__)
+#define vm_object_hold_shared(obj)		\
+		debugvm_object_hold_shared(obj, __FILE__, __LINE__)
+#define vm_object_drop(obj)			\
+		debugvm_object_drop(obj, __FILE__, __LINE__)
+#define vm_object_reference_quick(obj)		\
+		debugvm_object_reference_quick(obj, __FILE__, __LINE__)
+#define vm_object_reference_locked(obj)		\
+		debugvm_object_reference_locked(obj, __FILE__, __LINE__)
+#if 0
+#define vm_object_reference_locked_chain_held(obj)		\
+		debugvm_object_reference_locked_chain_held(	\
+					obj, __FILE__, __LINE__)
 #endif
+#define vm_object_deallocate(obj)		\
+		debugvm_object_deallocate(obj, __FILE__, __LINE__)
+#define vm_object_deallocate_locked(obj)	\
+		debugvm_object_deallocate_locked(obj, __FILE__, __LINE__)
+
+#else
+
+#define VMOBJDEBUG(x)	x
+#define VMOBJDBARGS
+#define VMOBJDBFWD
+
+#endif
+
+void VMOBJDEBUG(vm_object_hold)(vm_object_t object VMOBJDBARGS);
+int VMOBJDEBUG(vm_object_hold_try)(vm_object_t object VMOBJDBARGS);
+void VMOBJDEBUG(vm_object_hold_shared)(vm_object_t object VMOBJDBARGS);
+void VMOBJDEBUG(vm_object_drop)(vm_object_t object VMOBJDBARGS);
+void VMOBJDEBUG(vm_object_reference_quick)(vm_object_t object VMOBJDBARGS);
+void VMOBJDEBUG(vm_object_reference_locked)(vm_object_t object VMOBJDBARGS);
+#if 0
+void VMOBJDEBUG(vm_object_reference_locked_chain_held)(
+			vm_object_t object VMOBJDBARGS);
+#endif
+void VMOBJDEBUG(vm_object_deallocate)(vm_object_t object VMOBJDBARGS);
+void VMOBJDEBUG(vm_object_deallocate_locked)(vm_object_t object VMOBJDBARGS);
+
 void vm_object_upgrade(vm_object_t);
 void vm_object_downgrade(vm_object_t);
-
-void vm_object_drop(vm_object_t);
+int vm_quickcolor(void);
 
 #endif				/* _KERNEL */
 

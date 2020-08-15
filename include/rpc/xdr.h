@@ -29,7 +29,6 @@
  *	from: @(#)xdr.h	2.2 88/07/29 4.0 RPCSRC
  * $NetBSD: xdr.h,v 1.19 2000/07/17 05:00:45 matt Exp $
  * $FreeBSD: src/include/rpc/xdr.h,v 1.23 2003/03/07 13:19:40 nectar Exp $
- * $DragonFly: src/include/rpc/xdr.h,v 1.3 2003/11/14 01:01:50 dillon Exp $
  */
 
 /*
@@ -219,15 +218,11 @@ xdr_putint32(XDR *xdrs, int32_t *ip)
 		(*(xdrs)->x_ops->x_control)(xdrs, req, op)
 #define xdr_control(xdrs, req, op) XDR_CONTROL(xdrs, req, op)
 
-/*
- * Solaris strips the '_t' from these types -- not sure why.
- * But, let's be compatible.
- */
-#define xdr_rpcvers(xdrs, versp) xdr_u_int32(xdrs, versp)
-#define xdr_rpcprog(xdrs, progp) xdr_u_int32(xdrs, progp)
-#define xdr_rpcproc(xdrs, procp) xdr_u_int32(xdrs, procp)
-#define xdr_rpcprot(xdrs, protp) xdr_u_int32(xdrs, protp)
-#define xdr_rpcport(xdrs, portp) xdr_u_int32(xdrs, portp)
+#define xdr_rpcvers(xdrs, versp) xdr_u_int32_t(xdrs, versp)
+#define xdr_rpcprog(xdrs, progp) xdr_u_int32_t(xdrs, progp)
+#define xdr_rpcproc(xdrs, procp) xdr_u_int32_t(xdrs, procp)
+#define xdr_rpcprot(xdrs, protp) xdr_u_int32_t(xdrs, protp)
+#define xdr_rpcport(xdrs, portp) xdr_u_int32_t(xdrs, portp)
 
 /*
  * Support struct for discriminated unions.
@@ -260,13 +255,13 @@ struct xdr_discrim {
  * N.B. and frozen for all time: each data type here uses 4 bytes
  * of external representation.
  */
-#define IXDR_GET_INT32(buf)		((int32_t)__ntohl((u_int32_t)*(buf)++))
-#define IXDR_PUT_INT32(buf, v)		(*(buf)++ =(int32_t)__htonl((u_int32_t)v))
-#define IXDR_GET_U_INT32(buf)		((u_int32_t)IXDR_GET_INT32(buf))
+#define IXDR_GET_INT32(buf)		((int32_t)__ntohl((uint32_t)*(buf)++))
+#define IXDR_PUT_INT32(buf, v)		(*(buf)++ =(int32_t)__htonl((uint32_t)v))
+#define IXDR_GET_U_INT32(buf)		((uint32_t)IXDR_GET_INT32(buf))
 #define IXDR_PUT_U_INT32(buf, v)	IXDR_PUT_INT32((buf), ((int32_t)(v)))
 
-#define IXDR_GET_LONG(buf)		((long)__ntohl((u_int32_t)*(buf)++))
-#define IXDR_PUT_LONG(buf, v)		(*(buf)++ =(int32_t)__htonl((u_int32_t)v))
+#define IXDR_GET_LONG(buf)		((long)__ntohl((uint32_t)*(buf)++))
+#define IXDR_PUT_LONG(buf, v)		(*(buf)++ =(int32_t)__htonl((uint32_t)v))
 
 #define IXDR_GET_BOOL(buf)		((bool_t)IXDR_GET_LONG(buf))
 #define IXDR_GET_ENUM(buf, t)		((t)IXDR_GET_LONG(buf))
@@ -292,13 +287,14 @@ extern bool_t	xdr_u_long(XDR *, u_long *);
 extern bool_t	xdr_short(XDR *, short *);
 extern bool_t	xdr_u_short(XDR *, u_short *);
 extern bool_t	xdr_int16_t(XDR *, int16_t *);
-extern bool_t	xdr_u_int16_t(XDR *, u_int16_t *);
+extern bool_t	xdr_u_int16_t(XDR *, uint16_t *);
+extern bool_t	xdr_uint16_t(XDR *, uint16_t *);
 extern bool_t	xdr_int32_t(XDR *, int32_t *);
-extern bool_t	xdr_u_int32_t(XDR *, u_int32_t *);
-extern bool_t	xdr_uint32_t(XDR *, u_int32_t *);
+extern bool_t	xdr_u_int32_t(XDR *, uint32_t *);
+extern bool_t	xdr_uint32_t(XDR *, uint32_t *);
 extern bool_t	xdr_int64_t(XDR *, int64_t *);
-extern bool_t	xdr_u_int64_t(XDR *, u_int64_t *);
-extern bool_t	xdr_uint64_t(XDR *, u_int64_t *);
+extern bool_t	xdr_u_int64_t(XDR *, uint64_t *);
+extern bool_t	xdr_uint64_t(XDR *, uint64_t *);
 extern bool_t	xdr_bool(XDR *, bool_t *);
 extern bool_t	xdr_enum(XDR *, enum_t *);
 extern bool_t	xdr_array(XDR *, char **, u_int *, u_int, u_int, xdrproc_t);
@@ -320,6 +316,7 @@ extern bool_t	xdr_hyper(XDR *, quad_t *);
 extern bool_t	xdr_u_hyper(XDR *, u_quad_t *);
 extern bool_t	xdr_longlong_t(XDR *, quad_t *);
 extern bool_t	xdr_u_longlong_t(XDR *, u_quad_t *);
+extern unsigned long	xdr_sizeof(xdrproc_t, void *);
 __END_DECLS
 
 /*

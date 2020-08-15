@@ -103,7 +103,6 @@
 #include <sys/sysctl.h>
 #include <sys/bus.h>
 #include <sys/rman.h>
-#include <sys/thread2.h>
 
 #include <net/if.h>
 #include <net/ifq_var.h>
@@ -314,7 +313,7 @@ static driver_t dc_driver = {
 
 static devclass_t dc_devclass;
 
-#ifdef __i386__
+#ifdef __x86_64__
 static int dc_quick=1;
 SYSCTL_INT(_hw, OID_AUTO, dc_quick, CTLFLAG_RW,
 	&dc_quick,0,"do not mdevget in dc driver");
@@ -1042,7 +1041,7 @@ dc_crc_mask(struct dc_softc *sc)
  * frames. We also sneak the broadcast address into the hash filter since
  * we need that too.
  */
-void
+static void
 dc_setfilt_21143(struct dc_softc *sc)
 {
 	struct dc_desc		*sframe;
@@ -1114,7 +1113,7 @@ dc_setfilt_21143(struct dc_softc *sc)
 	return;
 }
 
-void
+static void
 dc_setfilt_admtek(struct dc_softc *sc)
 {
 	struct ifnet		*ifp;
@@ -1181,7 +1180,7 @@ dc_setfilt_admtek(struct dc_softc *sc)
 	return;
 }
 
-void
+static void
 dc_setfilt_asix(struct dc_softc *sc)
 {
 	struct ifnet		*ifp;
@@ -1254,7 +1253,7 @@ dc_setfilt_asix(struct dc_softc *sc)
 	return;
 }
 
-void
+static void
 dc_setfilt_xircom(struct dc_softc *sc)
 {
 	struct dc_desc		*sframe;
@@ -2318,7 +2317,7 @@ dc_newbuf(struct dc_softc *sc, int i, struct mbuf *m)
 	c = &sc->dc_ldata->dc_rx_list[i];
 
 	if (m == NULL) {
-		m_new = m_getcl(MB_DONTWAIT, MT_DATA, M_PKTHDR);
+		m_new = m_getcl(M_NOWAIT, MT_DATA, M_PKTHDR);
 		if (m_new == NULL)
 			return (ENOBUFS);
 		m_new->m_len = m_new->m_pkthdr.len = MCLBYTES;
@@ -2567,12 +2566,13 @@ dc_rxeof(struct dc_softc *sc)
 		/* No errors; receive the packet. */	
 		total_len -= ETHER_CRC_LEN;
 
-#ifdef __i386__
+#ifdef __x86_64__
 		/*
 		 * On the x86 we do not have alignment problems, so try to
 		 * allocate a new buffer for the receive ring, and pass up
 		 * the one where the packet is already, saving the expensive
 		 * copy done in m_devget().
+		 *
 		 * If we are on an architecture with alignment problems, or
 		 * if the allocation fails, then use m_devget and leave the
 		 * existing buffer in the receive ring.
@@ -2587,7 +2587,7 @@ dc_rxeof(struct dc_softc *sc)
 			struct mbuf *m0;
 
 			m0 = m_devget(mtod(m, char *) - ETHER_ALIGN,
-			    total_len + ETHER_ALIGN, 0, ifp, NULL);
+				      total_len + ETHER_ALIGN, 0, ifp);
 			dc_newbuf(sc, i, m);
 			DC_INC(i, DC_RX_LIST_CNT);
 			if (m0 == NULL) {
@@ -3128,7 +3128,7 @@ dc_start(struct ifnet *ifp, struct ifaltq_subque *ifsq)
 			}
 
 			/* only coalesce if have >1 mbufs */
-			m_defragged = m_defrag(m_head, MB_DONTWAIT);
+			m_defragged = m_defrag(m_head, M_NOWAIT);
 			if (m_defragged == NULL) {
 				ifq_set_oactive(&ifp->if_snd);
 				ifq_prepend(&ifp->if_snd, m_head);

@@ -55,7 +55,6 @@ static char    *pw_shellpolicy(struct userconf * cnf, struct cargs * args, char 
 static char    *pw_password(struct userconf * cnf, struct cargs * args, char const * user);
 static char    *shell_path(char const * path, char *shells[], char *sh);
 static void     rmat(uid_t uid);
-static void     rmopie(char const * name);
 
 /*-
  * -C config      configuration file
@@ -377,12 +376,6 @@ pw_user(struct userconf * cnf, int mode, struct cargs * args)
 				errx(EX_DATAERR, "cannot remove user 'root'");
 
 			if (!PWALTDIR()) {
-				/*
-				 * Remove opie record from /etc/opiekeys
-		        	 */
-
-				rmopie(pwd->pw_name);
-
 				/*
 				 * Remove crontabs
 				 */
@@ -1240,31 +1233,3 @@ rmat(uid_t uid)
 		closedir(d);
 	}
 }
-
-static void
-rmopie(char const * name)
-{
-	static const char etcopie[] = "/etc/opiekeys";
-	FILE   *fp = fopen(etcopie, "r+");
-
-	if (fp != NULL) {
-		char	tmp[1024];
-		off_t	atofs = 0;
-		int	length = strlen(name);
-
-		while (fgets(tmp, sizeof tmp, fp) != NULL) {
-			if (strncmp(name, tmp, length) == 0 && tmp[length]==' ') {
-				if (fseek(fp, atofs, SEEK_SET) == 0) {
-					fwrite("#", 1, 1, fp);	/* Comment username out */
-				}
-				break;
-			}
-			atofs = ftell(fp);
-		}
-		/*
-		 * If we got an error of any sort, don't update!
-		 */
-		fclose(fp);
-	}
-}
-

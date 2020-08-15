@@ -14,8 +14,8 @@
 # If the host system does not have the desired compiler for HOST_CCVER
 # we back off to something it probably does have.
 
-_DEFAULT_CCVER=		gcc47
-_DEFAULT_BINUTILSVER=	binutils224
+_DEFAULT_CCVER=		gcc80
+_DEFAULT_BINUTILSVER=	binutils227
 
 CCVER ?= ${_DEFAULT_CCVER}
 _CCVER := ${CCVER}
@@ -25,10 +25,13 @@ HOST_CCVER?= ${_CCVER}
 HOST_CCVER?= ${_DEFAULT_CCVER}
 .endif
 
+.if !defined(HOST_BINUTILSVER)
 .if exists(/usr/libexec/${_DEFAULT_BINUTILSVER}/elf/as)
 HOST_BINUTILSVER?=	${_DEFAULT_BINUTILSVER}
 .else
-HOST_BINUTILSVER!=	basename `find -s /usr/libexec/binutils* -depth 0 | tail -1`
+_NEXTAS!=		find -s /usr/libexec/binutils* -name as -print0 -quit
+HOST_BINUTILSVER?=	${_NEXTAS:H:H:T}
+.endif
 .endif
 
 .if defined(FORCE_CPUTYPE)
@@ -41,8 +44,8 @@ CPUTYPE= ${FORCE_CPUTYPE}
 .  endif
 .elif ${CCVER} == gcc47
 .  include <bsd.cpu.gcc47.mk>
-.elif ${CCVER} == gcc44
-.  include <bsd.cpu.gcc44.mk>
+.elif ${CCVER} == gcc80
+.  include <bsd.cpu.gcc80.mk>
 .else
 .  include <bsd.cpu.custom.mk>
 .endif

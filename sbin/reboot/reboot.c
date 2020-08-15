@@ -45,19 +45,20 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <utmpx.h>
 
-void usage(void);
-u_int get_pageins(void);
+static void usage(void) __dead2;
+static u_int get_pageins(void);
 
-int dohalt;
+static int dohalt;
 
 int
 main(int argc, char *argv[])
 {
 	struct passwd *pw;
-	int ch, howto, i, fd, kflag, lflag, nflag, qflag, sverrno;
+	int ch, howto, i, lflag, nflag, qflag, sverrno;
 	u_int pageins;
-	char *kernel = NULL, *p;
+	char *p;
 	const char *user;
 
 	if (strstr((p = strrchr(*argv, '/')) ? p + 1 : *argv, "halt")) {
@@ -65,15 +66,11 @@ main(int argc, char *argv[])
 		howto = RB_HALT;
 	} else
 		howto = 0;
-	kflag = lflag = nflag = qflag = 0;
-	while ((ch = getopt(argc, argv, "dk:lnpq")) != -1)
+	lflag = nflag = qflag = 0;
+	while ((ch = getopt(argc, argv, "dlnpq")) != -1)
 		switch(ch) {
 		case 'd':
 			howto |= RB_DUMP;
-			break;
-		case 'k':
-			kflag = 1;
-			kernel = optarg;
 			break;
 		case 'l':
 			lflag = 1;
@@ -94,6 +91,8 @@ main(int argc, char *argv[])
 		}
 	argc -= optind;
 	argv += optind;
+	if (argc != 0)
+		usage();
 
 	if ((howto & (RB_DUMP | RB_HALT)) == (RB_DUMP | RB_HALT))
 		errx(1, "cannot dump (-d) when halting; must reboot instead");
@@ -105,17 +104,6 @@ main(int argc, char *argv[])
 	if (qflag) {
 		reboot(howto);
 		err(1, NULL);
-	}
-
-	if (kflag) {
-		fd = open("/boot/nextboot.conf",
-			  O_WRONLY | O_CREAT | O_TRUNC, 0444);
-		if (fd != -1) {
-			write(fd, "kernel=\"", 8L);
-			write(fd, kernel, strlen(kernel));
-			write(fd, "\"\n", 2);
-			close(fd);
-		}
 	}
 
 	/* Log the reboot. */
@@ -131,7 +119,7 @@ main(int argc, char *argv[])
 			syslog(LOG_CRIT, "rebooted by %s", user);
 		}
 	}
-	logwtmp("~", "shutdown", "");
+	logwtmpx("~", "shutdown", "", 0, INIT_PROCESS);
 
 	/*
 	 * Do a sync early on, so disks start transfers while we're off
@@ -149,6 +137,16 @@ main(int argc, char *argv[])
 	signal(SIGHUP, SIG_IGN);
 	/* parent shell might also send a SIGTERM?  Best to ignore as well */
 	signal(SIGTERM, SIG_IGN);
+	/* Group leaders may try killing us with other signals, ignore */
+	signal(SIGINT,  SIG_IGN);
+	signal(SIGQUIT, SIG_IGN);
+	signal(SIGTSTP, SIG_IGN);
+
+	/*
+	 * If we're running in a pipeline, we don't want to die
+	 * after killing whatever we're writing to.
+	 */
+	signal(SIGPIPE, SIG_IGN);
 
 	/* Send a SIGTERM first, a chance to save the buffers. */
 	if (kill(-1, SIGTERM) == -1)
@@ -195,15 +193,14 @@ restart:
 	/* NOTREACHED */
 }
 
-void
+static void
 usage(void)
 {
-	fprintf(stderr, "usage: %s [-dnpq] [-k kernel]\n",
-	    dohalt ? "halt" : "reboot");
+	fprintf(stderr, "usage: %s [-dnpq]\n", dohalt ? "halt" : "reboot");
 	exit(1);
 }
 
-u_int
+static u_int
 get_pageins(void)
 {
 	u_int pageins;

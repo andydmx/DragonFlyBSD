@@ -24,12 +24,13 @@
  * THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  * $FreeBSD: src/sbin/gpt/show.c,v 1.14 2006/06/22 22:22:32 marcel Exp $
- * $DragonFly: src/sbin/gpt/show.c,v 1.3 2007/06/17 08:34:59 dillon Exp $
  */
 
 #include <sys/types.h>
+#include <sys/diskmbr.h>
 
 #include <err.h>
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -39,15 +40,15 @@
 #include "map.h"
 #include "gpt.h"
 
-static int show_label = 0;
-static int show_uuid = 0;
+static bool show_guid = false;
+static bool show_label = false;
+static bool show_uuid = false;
 
 static void
 usage_show(void)
 {
-
 	fprintf(stderr,
-	    "usage: %s [-lu] device ...\n", getprogname());
+	    "usage: %s [-glu] device ...\n", getprogname());
 	exit(1);
 }
 
@@ -76,12 +77,13 @@ unfriendly:
 static void
 show(int fd __unused)
 {
-	uuid_t type;
+	uuid_t type, guid;
 	off_t start;
 	map_t *m, *p;
 	struct mbr *mbr;
 	struct gpt_ent *ent;
 	unsigned int i;
+	char *s;
 
 	printf("  %*s", lbawidth, "start");
 	printf("  %*s", lbawidth, "size");
@@ -100,6 +102,9 @@ show(int fd __unused)
 		putchar(' ');
 		putchar(' ');
 		switch (m->map_type) {
+		case MAP_TYPE_UNUSED:
+			printf("Unused");
+			break;
 		case MAP_TYPE_MBR:
 			if (m->map_start != 0)
 				printf("Extended ");
@@ -130,7 +135,14 @@ show(int fd __unused)
 				if (m->map_start == p->map_start + start)
 					break;
 			}
-			printf("%d", mbr->mbr_part[i].part_typ);
+			if (i == 4) {
+				/* wasn't there */
+				printf("[partition not found?]");
+			} else {
+				printf("%d%s", mbr->mbr_part[i].part_typ,
+				    mbr->mbr_part[i].part_flag == 0x80 ?
+				    " (active)" : "");
+			}
 			break;
 		case MAP_TYPE_GPT_PART:
 			printf("GPT part ");
@@ -138,6 +150,13 @@ show(int fd __unused)
 			if (show_label) {
 				printf("- \"%s\"",
 				    utf16_to_utf8(ent->ent_name));
+			} else if (show_guid) {
+				s = NULL;
+				le_uuid_dec(&ent->ent_uuid, &guid);
+				uuid_to_string(&guid, &s, NULL);
+				printf("- %s", s);
+				free(s);
+				s = NULL;
 			} else {
 				le_uuid_dec(&ent->ent_type, &type);
 				printf("- %s", friendly(&type));
@@ -145,6 +164,13 @@ show(int fd __unused)
 			break;
 		case MAP_TYPE_PMBR:
 			printf("PMBR");
+			mbr = m->map_data;
+			if (mbr->mbr_part[0].part_typ == DOSPTYP_PMBR &&
+			    mbr->mbr_part[0].part_flag == 0x80)
+				printf(" (active)");
+			break;
+		default:
+			printf("Unknown %#x", m->map_type);
 			break;
 		}
 		putchar('\n');
@@ -157,13 +183,16 @@ cmd_show(int argc, char *argv[])
 {
 	int ch, fd;
 
-	while ((ch = getopt(argc, argv, "lu")) != -1) {
+	while ((ch = getopt(argc, argv, "glu")) != -1) {
 		switch(ch) {
+		case 'g':
+			show_guid = true;
+			break;
 		case 'l':
-			show_label = 1;
+			show_label = true;
 			break;
 		case 'u':
-			show_uuid = 1;
+			show_uuid = true;
 			break;
 		default:
 			usage_show();

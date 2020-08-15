@@ -1,55 +1,90 @@
 /*
- * This file is in the public domain.
- * $FreeBSD: src/sys/sys/inttypes.h,v 1.2 1999/08/28 00:51:47 peter Exp $
+ * Copyright (c) 2019 The DragonFly Project.  All rights reserved.
  *
- * Note: since portions of these header files can be included with various
- * other combinations of defines, we cannot surround the whole header file
- * with an #ifndef sequence.  Elements are individually protected.
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+ * ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+ * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
+ * FOR A PARTICULAR PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE
+ * COPYRIGHT HOLDERS OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+ * INCIDENTAL, SPECIAL, EXEMPLARY OR CONSEQUENTIAL DAMAGES (INCLUDING,
+ * BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED
+ * AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+ * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT
+ * OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+ * SUCH DAMAGE.
  */
-
-#include <sys/cdefs.h>
-#include <machine/stdint.h>
 
 #ifndef _SYS_STDINT_H_
-#define _SYS_STDINT_H_
+#define	_SYS_STDINT_H_
+
+#ifndef _SYS_CDEFS_H_
+#include <sys/cdefs.h>
+#endif
+#include <machine/stdint.h>
 
 /*
- * wchar_t and rune_t have to be of the same type. rune_t is meant
- * for internal use only.
+ * Proxy header for kernel compilation.  Do not include outside kernel
+ * headers. Userland should use <stdint.h> instead.
  *
- * wchar_t, wint_t and rune_t are signed, to allow EOF (-1) to naturally
- * assigned.
- *
- * ANSI specifies ``int'' as argument for the is*() and to*() routines.
- * Keeping wchar_t and rune_t as ``int'' instead of the more natural
- * ``long'' helps ANSI conformance. ISO 10646 will most likely end up
- * as 31 bit standard and all supported architectures have
- * sizeof(int) >= 4.
+ * This header is not a convenient placeholder for non integer types.
  */
-#ifndef __cplusplus
-typedef	int		__wchar_t;
-#endif
-#ifndef ___WINT_T_DECLARED
-typedef	int		__wint_t;
-#define	___WINT_T_DECLARED
-#endif
-#ifndef ___RUNE_T_DECLARED
-typedef	int		__rune_t;
-#define ___RUNE_T_DECLARED
-#endif
-typedef	void		*__wctrans_t;
-typedef	void		*__wctype_t;
 
-/*
- * mbstate_t is an opaque object to keep conversion state, during multibyte
- * stream conversions.  The content must not be referenced by user programs.
- */
-typedef union {
-	__uint8_t __mbstate8[128];
-	__int64_t __mbstateL;	/* for alignment */
-} __mbstate_t;
+#ifdef _KERNEL
+#include <machine/int_limits.h>
 
-typedef __int64_t	__off_t;
-typedef __int32_t	__pid_t;
+typedef	__boolean_t	boolean_t;		/* kernel only */
 
-#endif	/* SYS_STDINT_H */
+#if !defined(__bool_true_false_are_defined) && !defined(__cplusplus)
+#define	__bool_true_false_are_defined	1
+#define	false	0
+#define	true	1
+#if __STDC_VERSION__ < 199901L && !__GNUC_PREREQ__(3, 0)
+typedef	int	_Bool;
+#endif
+typedef	_Bool	bool;
+#endif /* !__bool_true_false_are_defined && !__cplusplus */
+
+#define	offsetof(type, field)	__offsetof(type, field)
+
+#ifndef _PTRDIFF_T_DECLARED
+typedef	__ptrdiff_t	ptrdiff_t;	/* ptr1 - ptr2 for kernel */
+#define	_PTRDIFF_T_DECLARED
+#endif
+
+typedef	__int8_t	int8_t;
+typedef	__int16_t	int16_t;
+typedef	__int32_t	int32_t;
+typedef	__int64_t	int64_t;
+
+typedef	__uint8_t	uint8_t;
+typedef	__uint16_t	uint16_t;
+typedef	__uint32_t	uint32_t;
+typedef	__uint64_t	uint64_t;
+
+#ifndef _INTPTR_T_DECLARED
+typedef	__intptr_t	intptr_t;	/* VKERNEL uses <unistd.h> */
+#define	_INTPTR_T_DECLARED
+#endif
+typedef	__uintptr_t	uintptr_t;
+
+typedef	__intmax_t	intmax_t;
+typedef	__uintmax_t	uintmax_t;
+#endif /* _KERNEL */
+
+#ifndef _KERNEL
+#ifndef _STDINT_H_
+#include <stdint.h>			/* in case we still need it */
+#endif
+#endif /* !_KERNEL */
+
+#endif /* !_SYS_STDINT_H_ */

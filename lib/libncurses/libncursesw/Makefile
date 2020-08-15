@@ -1,5 +1,19 @@
-ENABLE_WIDEC=
+# Build wide version of ncurses
+LIB=	private_ncursesw
+PRIVATELIB=
 
-.PATH: ${.CURDIR}/../libncurses
+SHLIBDIR?=	/lib
 
-.include "${.CURDIR}/../libncurses/Makefile"
+ZNCURSES=	yes
+ZTRACE=		yes
+CFLAGS+=	-DTRACE
+CFLAGS+=	-DDRAGONFLY_NATIVE
+
+INCS=		${HEADERS} ${SRCHDRS}
+INCSDIR=	${INCLUDEDIR}/priv/ncurses
+INCSLINKS=	curses.h ${INCLUDEDIR}/priv/ncurses/ncurses.h
+
+ENABLE_WIDEC=	yes
+
+.include "${.CURDIR}/../Makefile.sources"
+.include <bsd.lib.mk>

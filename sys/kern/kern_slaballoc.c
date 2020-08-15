@@ -1,17 +1,16 @@
 /*
- * (MPSAFE)
- *
  * KERN_SLABALLOC.C	- Kernel SLAB memory allocator
- * 
- * Copyright (c) 2003,2004,2010 The DragonFly Project.  All rights reserved.
- * 
+ *
+ * Copyright (c) 2003,2004,2010-2019 The DragonFly Project.
+ * All rights reserved.
+ *
  * This code is derived from software contributed to The DragonFly Project
  * by Matthew Dillon <dillon@backplane.com>
- * 
+ *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
  * are met:
- * 
+ *
  * 1. Redistributions of source code must retain the above copyright
  *    notice, this list of conditions and the following disclaimer.
  * 2. Redistributions in binary form must reproduce the above copyright
@@ -21,7 +20,7 @@
  * 3. Neither the name of The DragonFly Project nor the names of its
  *    contributors may be used to endorse or promote products derived
  *    from this software without specific, prior written permission.
- * 
+ *
  * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
  * ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
  * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
@@ -77,6 +76,7 @@
  *	(if PAGE_SIZE is 4K the maximum zone allocation is 16383)
  *
  *	Allocations >= ZoneLimit go directly to kmem.
+ *	(n * PAGE_SIZE, n > 2) allocations go directly to kmem.
  *
  * Alignment properties:
  * - All power-of-2 sized allocations are power-of-2 aligned.
@@ -107,6 +107,7 @@
 #include <sys/globaldata.h>
 #include <sys/sysctl.h>
 #include <sys/ktr.h>
+#include <sys/malloc.h>
 
 #include <vm/vm.h>
 #include <vm/vm_param.h>
@@ -122,6 +123,16 @@
 
 #include <sys/thread2.h>
 #include <vm/vm_page2.h>
+
+#if (__VM_CACHELINE_SIZE == 32)
+#define CAN_CACHEALIGN(sz)	((sz) >= 256)
+#elif (__VM_CACHELINE_SIZE == 64)
+#define CAN_CACHEALIGN(sz)	((sz) >= 512)
+#elif (__VM_CACHELINE_SIZE == 128)
+#define CAN_CACHEALIGN(sz)	((sz) >= 1024)
+#else
+#error "unsupported cacheline size"
+#endif
 
 #define btokup(z)	(&pmap_kvtom((vm_offset_t)(z))->ku_pagecnt)
 
@@ -152,14 +163,11 @@ KTR_INFO(KTR_MEMORY, memory, free_end, 10, "free end");
 /*
  * Fixed globals (not per-cpu)
  */
-static int ZoneSize;
-static int ZoneLimit;
-static int ZonePageCount;
-static uintptr_t ZoneMask;
-static int ZoneBigAlloc;		/* in KB */
-static int ZoneGenAlloc;		/* in KB */
-struct malloc_type *kmemstatistics;	/* exported to vmstat */
-static int32_t weirdary[16];
+__read_frequently static int ZoneSize;
+__read_frequently static int ZoneLimit;
+__read_frequently static int ZonePageCount;
+__read_frequently static uintptr_t ZoneMask;
+__read_frequently struct malloc_type *kmemstatistics;	/* exported to vmstat */
 
 static void *kmem_slab_alloc(vm_size_t bytes, vm_offset_t align, int flags);
 static void kmem_slab_free(void *ptr, vm_size_t bytes);
@@ -173,18 +181,19 @@ static void chunk_mark_free(SLZone *z, void *chunk);
 #endif
 
 /*
- * Misc constants.  Note that allocations that are exact multiples of 
+ * Misc constants.  Note that allocations that are exact multiples of
  * PAGE_SIZE, or exceed the zone limit, fall through to the kmem module.
  */
 #define ZONE_RELS_THRESH	32		/* threshold number of zones */
 
+#ifdef INVARIANTS
 /*
  * The WEIRD_ADDR is used as known text to copy into free objects to
  * try to create deterministic failure cases if the data is accessed after
  * free.
- */    
+ */
 #define WEIRD_ADDR      0xdeadc0de
-#define MAX_COPY        sizeof(weirdary)
+#endif
 #define ZERO_LENGTH_PTR	((void *)-8)
 
 /*
@@ -194,7 +203,8 @@ static void chunk_mark_free(SLZone *z, void *chunk);
 MALLOC_DEFINE(M_CACHE, "cache", "Various Dynamically allocated caches");
 MALLOC_DEFINE(M_DEVBUF, "devbuf", "device driver memory");
 MALLOC_DEFINE(M_TEMP, "temp", "misc temporary data buffers");
- 
+MALLOC_DEFINE(M_DRM, "m_drm", "DRM memory allocations");
+
 MALLOC_DEFINE(M_IP6OPT, "ip6opt", "IPv6 options");
 MALLOC_DEFINE(M_IP6NDP, "ip6ndp", "IPv6 Neighbor Discovery");
 
@@ -203,32 +213,37 @@ MALLOC_DEFINE(M_IP6NDP, "ip6ndp", "IPv6 Neighbor Discovery");
  * on available physical memory.  We choose a zone side which is approximately
  * 1/1024th of our memory, so if we have 128MB of ram we have a zone size of
  * 128K.  The zone size is limited to the bounds set in slaballoc.h
- * (typically 32K min, 128K max). 
+ * (typically 32K min, 128K max).
  */
 static void kmeminit(void *dummy);
+static void kmemfinishinit(void *dummy);
 
 char *ZeroPage;
 
-SYSINIT(kmem, SI_BOOT1_ALLOCATOR, SI_ORDER_FIRST, kmeminit, NULL)
+SYSINIT(kmem1, SI_BOOT1_ALLOCATOR, SI_ORDER_FIRST, kmeminit, NULL);
+SYSINIT(kmem2, SI_BOOT2_POST_SMP, SI_ORDER_FIRST, kmemfinishinit, NULL);
 
 #ifdef INVARIANTS
 /*
  * If enabled any memory allocated without M_ZERO is initialized to -1.
  */
-static int  use_malloc_pattern;
+__read_frequently static int  use_malloc_pattern;
 SYSCTL_INT(_debug, OID_AUTO, use_malloc_pattern, CTLFLAG_RW,
     &use_malloc_pattern, 0,
     "Initialize memory to -1 if M_ZERO not specified");
+
+__read_frequently static int32_t weirdary[16];
+__read_frequently static int  use_weird_array;
+SYSCTL_INT(_debug, OID_AUTO, use_weird_array, CTLFLAG_RW,
+    &use_weird_array, 0,
+    "Initialize memory to weird values on kfree()");
 #endif
 
-static int ZoneRelsThresh = ZONE_RELS_THRESH;
-SYSCTL_INT(_kern, OID_AUTO, zone_big_alloc, CTLFLAG_RD, &ZoneBigAlloc, 0, "");
-SYSCTL_INT(_kern, OID_AUTO, zone_gen_alloc, CTLFLAG_RD, &ZoneGenAlloc, 0, "");
+__read_frequently static int ZoneRelsThresh = ZONE_RELS_THRESH;
 SYSCTL_INT(_kern, OID_AUTO, zone_cache, CTLFLAG_RW, &ZoneRelsThresh, 0, "");
-static long SlabsAllocated;
-static long SlabsFreed;
-SYSCTL_LONG(_kern, OID_AUTO, slabs_allocated, CTLFLAG_RD, &SlabsAllocated, 0, "");
-SYSCTL_LONG(_kern, OID_AUTO, slabs_freed, CTLFLAG_RD, &SlabsFreed, 0, "");
+
+static struct spinlock kmemstat_spin =
+			SPINLOCK_INITIALIZER(&kmemstat_spin, "malinit");
 
 /*
  * Returns the kernel memory size limit for the purposes of initializing
@@ -253,7 +268,9 @@ kmeminit(void *dummy)
 {
     size_t limsize;
     int usesize;
+#ifdef INVARIANTS
     int i;
+#endif
 
     limsize = kmem_lim_size();
     usesize = (int)(limsize * 1024);	/* convert to KB */
@@ -271,6 +288,12 @@ kmeminit(void *dummy)
 		    ZoneRelsThresh *= 2;
 	    if (limsize >= 15 * 1024)
 		    ZoneRelsThresh *= 2;
+	    if (limsize >= 31 * 1024)
+		    ZoneRelsThresh *= 2;
+	    if (limsize >= 63 * 1024)
+		    ZoneRelsThresh *= 2;
+	    if (limsize >= 127 * 1024)
+		    ZoneRelsThresh *= 2;
     }
 
     /*
@@ -286,13 +309,44 @@ kmeminit(void *dummy)
     ZoneMask = ~(uintptr_t)(ZoneSize - 1);
     ZonePageCount = ZoneSize / PAGE_SIZE;
 
+#ifdef INVARIANTS
     for (i = 0; i < NELEM(weirdary); ++i)
 	weirdary[i] = WEIRD_ADDR;
+#endif
 
     ZeroPage = kmem_slab_alloc(PAGE_SIZE, PAGE_SIZE, M_WAITOK|M_ZERO);
 
     if (bootverbose)
 	kprintf("Slab ZoneSize set to %dKB\n", ZoneSize / 1024);
+}
+
+/*
+ * Once we know how many cpus are configured reduce ZoneRelsThresh
+ * based on multiples of 32 cpu threads.
+ */
+static void
+kmemfinishinit(void *dummy)
+{
+	if (ncpus > 32)
+		ZoneRelsThresh = ZoneRelsThresh * 32 / ncpus;
+}
+
+/*
+ * (low level) Initialize slab-related elements in the globaldata structure.
+ *
+ * Occurs after kmeminit().
+ */
+void
+slab_gdinit(globaldata_t gd)
+{
+	SLGlobalData *slgd;
+	int i;
+
+	slgd = &gd->gd_slab;
+	for (i = 0; i < NZONES; ++i)
+		TAILQ_INIT(&slgd->ZoneAry[i]);
+	TAILQ_INIT(&slgd->FreeZones);
+	TAILQ_INIT(&slgd->FreeOvZones);
 }
 
 /*
@@ -302,11 +356,12 @@ void
 malloc_init(void *data)
 {
     struct malloc_type *type = data;
+    struct kmalloc_use *use;
     size_t limsize;
 
     if (type->ks_magic != M_MAGIC)
 	panic("malloc type lacks magic");
-					   
+
     if (type->ks_limit != 0)
 	return;
 
@@ -316,8 +371,16 @@ malloc_init(void *data)
     limsize = kmem_lim_size() * (1024 * 1024);
     type->ks_limit = limsize / 10;
 
+    if (ncpus == 1)
+	use = &type->ks_use0;
+    else
+	use = kmalloc(ncpus * sizeof(*use), M_TEMP, M_WAITOK | M_ZERO);
+
+    spin_lock(&kmemstat_spin);
     type->ks_next = kmemstatistics;
+    type->ks_use = use;
     kmemstatistics = type;
+    spin_unlock(&kmemstat_spin);
 }
 
 void
@@ -345,16 +408,17 @@ malloc_uninit(void *data)
 #ifdef INVARIANTS
     /*
      * memuse is only correct in aggregation.  Due to memory being allocated
-     * on one cpu and freed on another individual array entries may be 
+     * on one cpu and freed on another individual array entries may be
      * negative or positive (canceling each other out).
      */
     for (i = ttl = 0; i < ncpus; ++i)
-	ttl += type->ks_memuse[i];
+	ttl += type->ks_use[i].memuse;
     if (ttl) {
 	kprintf("malloc_uninit: %ld bytes of '%s' still allocated on cpu %d\n",
 	    ttl, type->ks_shortdesc, i);
     }
 #endif
+    spin_lock(&kmemstat_spin);
     if (type == kmemstatistics) {
 	kmemstatistics = type->ks_next;
     } else {
@@ -367,6 +431,39 @@ malloc_uninit(void *data)
     }
     type->ks_next = NULL;
     type->ks_limit = 0;
+    spin_unlock(&kmemstat_spin);
+
+    if (type->ks_use != &type->ks_use0) {
+	kfree(type->ks_use, M_TEMP);
+	type->ks_use = NULL;
+    }
+}
+
+/*
+ * Reinitialize all installed malloc regions after ncpus has been
+ * determined.  type->ks_use0 is initially set to &type->ks_use0,
+ * this function will dynamically allocate it as appropriate for ncpus.
+ */
+void
+malloc_reinit_ncpus(void)
+{
+    struct malloc_type *t;
+    struct kmalloc_use *use;
+
+    /*
+     * If only one cpu we can leave ks_use set to ks_use0
+     */
+    if (ncpus <= 1)
+	return;
+
+    /*
+     * Expand ks_use for all kmalloc blocks
+     */
+    for (t = kmemstatistics; t; t = t->ks_next) {
+	KKASSERT(t->ks_use == &t->ks_use0);
+	t->ks_use = kmalloc(sizeof(*use) * ncpus, M_TEMP, M_WAITOK|M_ZERO);
+	t->ks_use[0] = t->ks_use0;
+    }
 }
 
 /*
@@ -376,12 +473,17 @@ malloc_uninit(void *data)
 void
 kmalloc_raise_limit(struct malloc_type *type, size_t bytes)
 {
-    if (type->ks_limit == 0)
-	malloc_init(type);
+    KKASSERT(type->ks_limit != 0);
     if (bytes == 0)
 	bytes = KvaSize;
     if (type->ks_limit < bytes)
 	type->ks_limit = bytes;
+}
+
+void
+kmalloc_set_unlimited(struct malloc_type *type)
+{
+    type->ks_limit = kmem_lim_size() * (1024 * 1024);
 }
 
 /*
@@ -424,6 +526,7 @@ static __inline int
 zoneindex(unsigned long *bytes, unsigned long *align)
 {
     unsigned int n = (unsigned int)*bytes;	/* unsigned for shift opt */
+
     if (n < 128) {
 	*bytes = n = (n + 7) & ~7;
 	*align = 8;
@@ -444,7 +547,7 @@ zoneindex(unsigned long *bytes, unsigned long *align)
 	    *bytes = n = (n + 63) & ~63;
 	    *align = 64;
 	    return(n / 64 + 23);
-	} 
+	}
 	if (n < 2048) {
 	    *bytes = n = (n + 127) & ~127;
 	    *align = 128;
@@ -477,8 +580,7 @@ zoneindex(unsigned long *bytes, unsigned long *align)
     return(0);
 }
 
-static __inline
-void
+static __inline void
 clean_zone_rchunks(SLZone *z)
 {
     SLChunk *bchunk;
@@ -500,35 +602,37 @@ clean_zone_rchunks(SLZone *z)
 }
 
 /*
- * If the zone becomes totally free, and there are other zones we
- * can allocate from, move this zone to the FreeZones list.  Since
- * this code can be called from an IPI callback, do *NOT* try to mess
- * with kernel_map here.  Hysteresis will be performed at malloc() time.
+ * If the zone becomes totally free and is not the only zone listed for a
+ * chunk size we move it to the FreeZones list.  We always leave at least
+ * one zone per chunk size listed, even if it is freeable.
+ *
+ * Do not move the zone if there is an IPI in_flight (z_RCount != 0),
+ * otherwise MP races can result in our free_remote code accessing a
+ * destroyed zone.  The remote end interlocks z_RCount with z_RChunks
+ * so one has to test both z_NFree and z_RCount.
+ *
+ * Since this code can be called from an IPI callback, do *NOT* try to mess
+ * with kernel_map here.  Hysteresis will be performed at kmalloc() time.
  */
-static __inline
-SLZone *
+static __inline SLZone *
 check_zone_free(SLGlobalData *slgd, SLZone *z)
 {
-    if (z->z_NFree == z->z_NMax &&
-	(z->z_Next || LIST_FIRST(&slgd->ZoneAry[z->z_ZoneIndex]) != z) &&
-	z->z_RCount == 0
-    ) {
-	SLZone *znext;
+    SLZone *znext;
+
+    znext = TAILQ_NEXT(z, z_Entry);
+    if (z->z_NFree == z->z_NMax && z->z_RCount == 0 &&
+	(TAILQ_FIRST(&slgd->ZoneAry[z->z_ZoneIndex]) != z || znext)) {
 	int *kup;
 
-	znext = LIST_NEXT(z, z_Entry);
-	LIST_REMOVE(z, z_Entry);
+	TAILQ_REMOVE(&slgd->ZoneAry[z->z_ZoneIndex], z, z_Entry);
 
 	z->z_Magic = -1;
-	LIST_INSERT_HEAD(&slgd->FreeZones, z, z_Entry);
+	TAILQ_INSERT_HEAD(&slgd->FreeZones, z, z_Entry);
 	++slgd->NFreeZones;
 	kup = btokup(z);
 	*kup = 0;
-	z = znext;
-    } else {
-	z = LIST_NEXT(z, z_Entry);
     }
-    return z;
+    return znext;
 }
 
 #ifdef SLAB_DEBUG
@@ -587,6 +691,9 @@ powerof2_size(unsigned long size)
  * MPSAFE
  */
 
+/* don't let kmalloc macro mess up function declaration */
+#undef kmalloc
+
 #ifdef SLAB_DEBUG
 void *
 kmalloc_debug(unsigned long size, struct malloc_type *type, int flags,
@@ -613,13 +720,22 @@ kmalloc(unsigned long size, struct malloc_type *type, int flags)
     /*
      * XXX silly to have this in the critical path.
      */
-    if (type->ks_limit == 0) {
-	crit_enter();
-	malloc_init(type);
-	crit_exit();
-    }
-    ++type->ks_calls;
+    KKASSERT(type->ks_limit != 0);
+    ++type->ks_use[gd->gd_cpuid].calls;
 
+    /*
+     * Flagged for cache-alignment
+     */
+    if (flags & M_CACHEALIGN) {
+	if (size < __VM_CACHELINE_SIZE)
+		size = __VM_CACHELINE_SIZE;
+	else if (!CAN_CACHEALIGN(size))
+		flags |= M_POWEROF2;
+    }
+
+    /*
+     * Flagged to force nearest power-of-2 (higher or same)
+     */
     if (flags & M_POWEROF2)
 	size = powerof2_size(size);
 
@@ -630,14 +746,14 @@ kmalloc(unsigned long size, struct malloc_type *type, int flags)
      *
      * ks_loosememuse is an up-only limit that is NOT MP-synchronized, used
      * to determine if a more complete limit check should be done.  The
-     * actual memory use is tracked via ks_memuse[cpu].
+     * actual memory use is tracked via ks_use[cpu].memuse.
      */
     while (type->ks_loosememuse >= type->ks_limit) {
 	int i;
 	long ttl;
 
 	for (i = ttl = 0; i < ncpus; ++i)
-	    ttl += type->ks_memuse[i];
+	    ttl += type->ks_use[i].memuse;
 	type->ks_loosememuse = ttl;	/* not MP synchronized */
 	if ((ssize_t)ttl < 0)		/* deal with occassional race */
 		ttl = 0;
@@ -676,13 +792,13 @@ kmalloc(unsigned long size, struct malloc_type *type, int flags)
 	if (slgd->NFreeZones > ZoneRelsThresh) {	/* crit sect race */
 	    int *kup;
 
-	    z = LIST_FIRST(&slgd->FreeZones);
-	    LIST_REMOVE(z, z_Entry);
+	    z = TAILQ_LAST(&slgd->FreeZones, SLZoneList);
+	    KKASSERT(z != NULL);
+	    TAILQ_REMOVE(&slgd->FreeZones, z, z_Entry);
 	    --slgd->NFreeZones;
 	    kup = btokup(z);
 	    *kup = 0;
 	    kmem_slab_free(z, ZoneSize);	/* may block */
-	    atomic_add_int(&ZoneGenAlloc, -ZoneSize / 1024);
 	}
 	crit_exit();
     }
@@ -690,16 +806,15 @@ kmalloc(unsigned long size, struct malloc_type *type, int flags)
     /*
      * XXX handle oversized frees that were queued from kfree().
      */
-    while (LIST_FIRST(&slgd->FreeOvZones) && (flags & M_RNOWAIT) == 0) {
+    while (TAILQ_FIRST(&slgd->FreeOvZones) && (flags & M_RNOWAIT) == 0) {
 	crit_enter();
-	if ((z = LIST_FIRST(&slgd->FreeOvZones)) != NULL) {
+	if ((z = TAILQ_LAST(&slgd->FreeOvZones, SLZoneList)) != NULL) {
 	    vm_size_t tsize;
 
 	    KKASSERT(z->z_Magic == ZALLOC_OVSZ_MAGIC);
-	    LIST_REMOVE(z, z_Entry);
+	    TAILQ_REMOVE(&slgd->FreeOvZones, z, z_Entry);
 	    tsize = z->z_ChunkSize;
 	    kmem_slab_free(z, tsize);	/* may block */
-	    atomic_add_int(&ZoneBigAlloc, -(int)tsize / 1024);
 	}
 	crit_exit();
     }
@@ -721,7 +836,6 @@ kmalloc(unsigned long size, struct malloc_type *type, int flags)
 	    logmemory(malloc_end, NULL, type, size, flags);
 	    return(NULL);
 	}
-	atomic_add_int(&ZoneBigAlloc, (int)size / 1024);
 	flags &= ~M_ZERO;	/* result already zero'd if M_ZERO was set */
 	flags |= M_PASSIVE_ZERO;
 	kup = btokup(chunk);
@@ -742,7 +856,7 @@ kmalloc(unsigned long size, struct malloc_type *type, int flags)
     KKASSERT(zi < NZONES);
     crit_enter();
 
-    if ((z = LIST_FIRST(&slgd->ZoneAry[zi])) != NULL) {
+    if ((z = TAILQ_LAST(&slgd->ZoneAry[zi], SLZoneList)) != NULL) {
 	/*
 	 * Locate a chunk - we have to have at least one.  If this is the
 	 * last chunk go ahead and do the work to retrieve chunks freed
@@ -772,7 +886,7 @@ kmalloc(unsigned long size, struct malloc_type *type, int flags)
 	     * Clear RSignal
 	     */
 	    if (z->z_NFree == 0) {
-		LIST_REMOVE(z, z_Entry);
+		TAILQ_REMOVE(&slgd->ZoneAry[zi], z, z_Entry);
 	    } else {
 		z->z_RSignal = 0;
 	    }
@@ -835,8 +949,8 @@ kmalloc(unsigned long size, struct malloc_type *type, int flags)
 	int off;
 	int *kup;
 
-	if ((z = LIST_FIRST(&slgd->FreeZones)) != NULL) {
-	    LIST_REMOVE(z, z_Entry);
+	if ((z = TAILQ_FIRST(&slgd->FreeZones)) != NULL) {
+	    TAILQ_REMOVE(&slgd->FreeZones, z, z_Entry);
 	    --slgd->NFreeZones;
 	    bzero(z, sizeof(SLZone));
 	    z->z_Flags |= SLZF_UNOTZEROD;
@@ -844,7 +958,6 @@ kmalloc(unsigned long size, struct malloc_type *type, int flags)
 	    z = kmem_slab_alloc(ZoneSize, ZoneSize, flags|M_ZERO);
 	    if (z == NULL)
 		goto fail;
-	    atomic_add_int(&ZoneGenAlloc, ZoneSize / 1024);
 	}
 
 	/*
@@ -867,7 +980,7 @@ kmalloc(unsigned long size, struct malloc_type *type, int flags)
 	 */
 	if (powerof2(size))
 	    align = size;
-	off = (off + align - 1) & ~(align - 1);
+	off = roundup2(off, align);
 
 	z->z_Magic = ZALLOC_SLAB_MAGIC;
 	z->z_ZoneIndex = zi;
@@ -884,7 +997,7 @@ kmalloc(unsigned long size, struct malloc_type *type, int flags)
 	bzero(z->z_Sources, sizeof(z->z_Sources));
 #endif
 	chunk = (SLChunk *)(z->z_BasePtr + z->z_UIndex * size);
-	LIST_INSERT_HEAD(&slgd->ZoneAry[zi], z, z_Entry);
+	TAILQ_INSERT_HEAD(&slgd->ZoneAry[zi], z, z_Entry);
 	if ((z->z_Flags & SLZF_UNOTZEROD) == 0) {
 	    flags &= ~M_ZERO;	/* already zero'd */
 	    flags |= M_PASSIVE_ZERO;
@@ -906,9 +1019,14 @@ kmalloc(unsigned long size, struct malloc_type *type, int flags)
     }
 
 done:
-    ++type->ks_inuse[gd->gd_cpuid];
-    type->ks_memuse[gd->gd_cpuid] += size;
-    type->ks_loosememuse += size;	/* not MP synchronized */
+    ++type->ks_use[gd->gd_cpuid].inuse;
+    type->ks_use[gd->gd_cpuid].memuse += size;
+    type->ks_use[gd->gd_cpuid].loosememuse += size;
+    if (type->ks_use[gd->gd_cpuid].loosememuse >= ZoneSize) {
+	/* not MP synchronized */
+	type->ks_loosememuse += type->ks_use[gd->gd_cpuid].loosememuse;
+	type->ks_use[gd->gd_cpuid].loosememuse = 0;
+    }
     crit_exit();
 
     if (flags & M_ZERO)
@@ -1017,12 +1135,7 @@ krealloc(void *ptr, unsigned long size, struct malloc_type *type, int flags)
 long
 kmalloc_limit(struct malloc_type *type)
 {
-    if (type->ks_limit == 0) {
-	crit_enter();
-	if (type->ks_limit == 0)
-	    malloc_init(type);
-	crit_exit();
-    }
+    KKASSERT(type->ks_limit != 0);
     return(type->ks_limit);
 }
 
@@ -1051,13 +1164,33 @@ kstrdup(const char *str, struct malloc_type *type)
     return(nstr);
 }
 
+#ifdef SLAB_DEBUG
+char *
+kstrndup_debug(const char *str, size_t maxlen, struct malloc_type *type,
+	      const char *file, int line)
+#else
+char *
+kstrndup(const char *str, size_t maxlen, struct malloc_type *type)
+#endif
+{
+    int zlen;	/* length inclusive of terminating NUL */
+    char *nstr;
+
+    if (str == NULL)
+	return(NULL);
+    zlen = strnlen(str, maxlen) + 1;
+    nstr = kmalloc_debug(zlen, type, M_WAITOK, file, line);
+    bcopy(str, nstr, zlen);
+    nstr[zlen - 1] = '\0';
+    return(nstr);
+}
+
 /*
  * Notify our cpu that a remote cpu has freed some chunks in a zone that
  * we own.  RCount will be bumped so the memory should be good, but validate
  * that it really is.
  */
-static
-void
+static void
 kfree_remote(void *ptr)
 {
     SLGlobalData *slgd;
@@ -1093,41 +1226,21 @@ kfree_remote(void *ptr)
      */
     clean_zone_rchunks(z);
     if (z->z_NFree && nfree == 0) {
-	LIST_INSERT_HEAD(&slgd->ZoneAry[z->z_ZoneIndex], z, z_Entry);
+	TAILQ_INSERT_HEAD(&slgd->ZoneAry[z->z_ZoneIndex], z, z_Entry);
     }
 
-    /*
-     * If the zone becomes totally free, and there are other zones we
-     * can allocate from, move this zone to the FreeZones list.  Since
-     * this code can be called from an IPI callback, do *NOT* try to mess
-     * with kernel_map here.  Hysteresis will be performed at malloc() time.
-     *
-     * Do not move the zone if there is an IPI inflight, otherwise MP
-     * races can result in our free_remote code accessing a destroyed
-     * zone.
-     */
-    if (z->z_NFree == z->z_NMax &&
-	(z->z_Next || LIST_FIRST(&slgd->ZoneAry[z->z_ZoneIndex]) != z) &&
-	z->z_RCount == 0
-    ) {
-	int *kup;
-
-	LIST_REMOVE(z, z_Entry);
-	z->z_Magic = -1;
-	LIST_INSERT_HEAD(&slgd->FreeZones, z, z_Entry);
-	++slgd->NFreeZones;
-	kup = btokup(z);
-	*kup = 0;
-    }
+    check_zone_free(slgd, z);
     logmemory(free_rem_end, z, NULL, 0L, 0);
 }
 
 /*
  * free (SLAB ALLOCATOR)
  *
- * Free a memory block previously allocated by malloc.  Note that we do not
- * attempt to update ks_loosememuse as MP races could prevent us from
- * checking memory limits in malloc.
+ * Free a memory block previously allocated by malloc.
+ *
+ * Note: We do not attempt to update ks_loosememuse as MP races could
+ * prevent us from checking memory limits in malloc.   YYY we may
+ * consider updating ks_cpu.loosememuse.
  *
  * MPSAFE
  */
@@ -1176,8 +1289,10 @@ kfree(void *ptr, struct malloc_type *type)
 	size = *kup << PAGE_SHIFT;
 	*kup = 0;
 #ifdef INVARIANTS
-	KKASSERT(sizeof(weirdary) <= size);
-	bcopy(weirdary, ptr, sizeof(weirdary));
+	if (use_weird_array) {
+		KKASSERT(sizeof(weirdary) <= size);
+		bcopy(weirdary, ptr, sizeof(weirdary));
+	}
 #endif
 	/*
 	 * NOTE: For oversized allocations we do not record the
@@ -1190,23 +1305,21 @@ kfree(void *ptr, struct malloc_type *type)
 	 * primarily until we can fix softupdate's assumptions about free().
 	 */
 	crit_enter();
-	--type->ks_inuse[gd->gd_cpuid];
-	type->ks_memuse[gd->gd_cpuid] -= size;
+	--type->ks_use[gd->gd_cpuid].inuse;
+	type->ks_use[gd->gd_cpuid].memuse -= size;
 	if (mycpu->gd_intr_nesting_level ||
-	    (gd->gd_curthread->td_flags & TDF_INTTHREAD))
-	{
+	    (gd->gd_curthread->td_flags & TDF_INTTHREAD)) {
 	    logmemory(free_ovsz_delayed, ptr, type, size, 0);
 	    z = (SLZone *)ptr;
 	    z->z_Magic = ZALLOC_OVSZ_MAGIC;
 	    z->z_ChunkSize = size;
 
-	    LIST_INSERT_HEAD(&slgd->FreeOvZones, z, z_Entry);
+	    TAILQ_INSERT_HEAD(&slgd->FreeOvZones, z, z_Entry);
 	    crit_exit();
 	} else {
 	    crit_exit();
 	    logmemory(free_ovsz, ptr, type, size, 0);
 	    kmem_slab_free(ptr, size);	/* may block */
-	    atomic_add_int(&ZoneBigAlloc, -(int)size / 1024);
 	}
 	logmemory_quick(free_end);
 	return;
@@ -1214,7 +1327,7 @@ kfree(void *ptr, struct malloc_type *type)
 
     /*
      * Zone case.  Figure out the zone based on the fact that it is
-     * ZoneSize aligned. 
+     * ZoneSize aligned.
      */
     z = (SLZone *)((uintptr_t)ptr & ZoneMask);
     kup = btokup(z);
@@ -1235,13 +1348,13 @@ kfree(void *ptr, struct malloc_type *type)
     if (z->z_CpuGd != gd) {
 	/*
 	 * Making these adjustments now allow us to avoid passing (type)
-	 * to the remote cpu.  Note that ks_inuse/ks_memuse is being
+	 * to the remote cpu.  Note that inuse/memuse is being
 	 * adjusted on OUR cpu, not the zone cpu, but it should all still
 	 * sum up properly and cancel out.
 	 */
 	crit_enter();
-	--type->ks_inuse[gd->gd_cpuid];
-	type->ks_memuse[gd->gd_cpuid] -= z->z_ChunkSize;
+	--type->ks_use[gd->gd_cpuid].inuse;
+	type->ks_use[gd->gd_cpuid].memuse -= z->z_ChunkSize;
 	crit_exit();
 
 	/*
@@ -1281,8 +1394,8 @@ kfree(void *ptr, struct malloc_type *type)
 	 * We can use a passive IPI to reduce overhead even further.
 	 */
 	if (bchunk == NULL && rsignal) {
-		logmemory(free_request, ptr, type,
-			  (unsigned long)z->z_ChunkSize, 0);
+	    logmemory(free_request, ptr, type,
+		      (unsigned long)z->z_ChunkSize, 0);
 	    lwkt_send_ipiq_passive(z->z_CpuGd, kfree_remote, z);
 	    /* z can get ripped out from under us from this point on */
 	} else if (rsignal) {
@@ -1308,10 +1421,12 @@ kfree(void *ptr, struct malloc_type *type)
      * and so forth.  XXX needs more work, see the old malloc code.
      */
 #ifdef INVARIANTS
-    if (z->z_ChunkSize < sizeof(weirdary))
-	bcopy(weirdary, chunk, z->z_ChunkSize);
-    else
-	bcopy(weirdary, chunk, sizeof(weirdary));
+    if (use_weird_array) {
+	    if (z->z_ChunkSize < sizeof(weirdary))
+		bcopy(weirdary, chunk, z->z_ChunkSize);
+	    else
+		bcopy(weirdary, chunk, sizeof(weirdary));
+    }
 #endif
 
     /*
@@ -1326,7 +1441,7 @@ kfree(void *ptr, struct malloc_type *type)
     chunk->c_Next = z->z_LChunks;
     z->z_LChunks = chunk;
     if (chunk->c_Next == NULL)
-	    z->z_LChunksp = &chunk->c_Next;
+	z->z_LChunksp = &chunk->c_Next;
 
 #ifdef INVARIANTS
     if (chunk->c_Next && (vm_offset_t)chunk->c_Next < KvaStart)
@@ -1335,14 +1450,17 @@ kfree(void *ptr, struct malloc_type *type)
 
     /*
      * Bump the number of free chunks.  If it becomes non-zero the zone
-     * must be added back onto the appropriate list.
+     * must be added back onto the appropriate list.  A fully allocated
+     * zone that sees its first free is considered 'mature' and is placed
+     * at the head, giving the system time to potentially free the remaining
+     * entries even while other allocations are going on and making the zone
+     * freeable.
      */
-    if (z->z_NFree++ == 0) {
-	LIST_INSERT_HEAD(&slgd->ZoneAry[z->z_ZoneIndex], z, z_Entry);
-    }
+    if (z->z_NFree++ == 0)
+	    TAILQ_INSERT_HEAD(&slgd->ZoneAry[z->z_ZoneIndex], z, z_Entry);
 
-    --type->ks_inuse[z->z_Cpu];
-    type->ks_memuse[z->z_Cpu] -= z->z_ChunkSize;
+    --type->ks_use[gd->gd_cpuid].inuse;
+    type->ks_use[gd->gd_cpuid].memuse -= z->z_ChunkSize;
 
     check_zone_free(slgd, z);
     logmemory_quick(free_end);
@@ -1350,8 +1468,10 @@ kfree(void *ptr, struct malloc_type *type)
 }
 
 /*
- * Cleanup slabs which are hanging around due to RChunks.  Called once every
- * 10 seconds on all cpus.
+ * Cleanup slabs which are hanging around due to RChunks or which are wholely
+ * free and can be moved to the free list if not moved by other means.
+ *
+ * Called once every 10 seconds on all cpus.
  */
 void
 slab_cleanup(void)
@@ -1362,12 +1482,11 @@ slab_cleanup(void)
 
     crit_enter();
     for (i = 0; i < NZONES; ++i) {
-	if ((z = LIST_FIRST(&slgd->ZoneAry[i])) == NULL)
+	if ((z = TAILQ_FIRST(&slgd->ZoneAry[i])) == NULL)
 		continue;
-	z = LIST_NEXT(z, z_Entry);
 
 	/*
-	 * Scan zones starting with the second zone in each list.
+	 * Scan zones.
 	 */
 	while (z) {
 	    /*
@@ -1388,12 +1507,11 @@ slab_cleanup(void)
 /*
  * Helper routines for sanity checks
  */
-static
-void
+static void
 chunk_mark_allocated(SLZone *z, void *chunk)
 {
     int bitdex = ((char *)chunk - (char *)z->z_BasePtr) / z->z_ChunkSize;
-    __uint32_t *bitptr;
+    uint32_t *bitptr;
 
     KKASSERT((((intptr_t)chunk ^ (intptr_t)z) & ZoneMask) == 0);
     KASSERT(bitdex >= 0 && bitdex < z->z_NMax,
@@ -1405,12 +1523,11 @@ chunk_mark_allocated(SLZone *z, void *chunk)
     *bitptr |= 1 << bitdex;
 }
 
-static
-void
+static void
 chunk_mark_free(SLZone *z, void *chunk)
 {
     int bitdex = ((char *)chunk - (char *)z->z_BasePtr) / z->z_ChunkSize;
-    __uint32_t *bitptr;
+    uint32_t *bitptr;
 
     KKASSERT((((intptr_t)chunk ^ (intptr_t)z) & ZoneMask) == 0);
     KASSERT(bitdex >= 0 && bitdex < z->z_NMax,
@@ -1474,10 +1591,11 @@ kmem_slab_alloc(vm_size_t size, vm_offset_t align, int flags)
     vm_object_reference_locked(&kernel_object);
     vm_map_insert(&kernel_map, &count,
 		  &kernel_object, NULL,
-		  addr, addr, addr + size,
+		  addr, NULL,
+		  addr, addr + size,
 		  VM_MAPTYPE_NORMAL,
-		  VM_PROT_ALL, VM_PROT_ALL,
-		  0);
+		  VM_SUBSYS_KMALLOC,
+		  VM_PROT_ALL, VM_PROT_ALL, 0);
     vm_object_drop(&kernel_object);
     vm_map_set_wired_quick(&kernel_map, addr, size, &count);
     vm_map_unlock(&kernel_map);
@@ -1497,8 +1615,8 @@ kmem_slab_alloc(vm_size_t size, vm_offset_t align, int flags)
     }
 
     /*
-     * Allocate the pages.  Do not mess with the PG_ZERO flag or map
-     * them yet.  VM_ALLOC_NORMAL can only be set if we are not preempting.
+     * Allocate the pages.  Do not map them yet.  VM_ALLOC_NORMAL can only
+     * be set if we are not preempting.
      *
      * VM_ALLOC_SYSTEM is automatically set if we are preempting and
      * M_WAITOK was specified as an alternative (i.e. M_USE_RESERVE is
@@ -1572,7 +1690,7 @@ kmem_slab_alloc(vm_size_t size, vm_offset_t align, int flags)
     crit_exit();
 
     /*
-     * Enter the pages into the pmap and deal with PG_ZERO and M_ZERO.
+     * Enter the pages into the pmap and deal with M_ZERO.
      */
     m = mbase;
     i = 0;
@@ -1583,11 +1701,10 @@ kmem_slab_alloc(vm_size_t size, vm_offset_t align, int flags)
 	 */
 	m->valid = VM_PAGE_BITS_ALL;
 	vm_page_wire(m);
-	pmap_enter(&kernel_pmap, addr + i, m, VM_PROT_ALL | VM_PROT_NOSYNC,
-		   1, NULL);
-	if ((m->flags & PG_ZERO) == 0 && (flags & M_ZERO))
-	    bzero((char *)addr + i, PAGE_SIZE);
-	vm_page_flag_clear(m, PG_ZERO);
+	pmap_enter(&kernel_pmap, addr + i, m,
+		   VM_PROT_ALL | VM_PROT_NOSYNC, 1, NULL);
+	if (flags & M_ZERO)
+		pagezero((char *)addr + i);
 	KKASSERT(m->flags & (PG_WRITEABLE | PG_MAPPED));
 	vm_page_flag_set(m, PG_REFERENCED);
 	vm_page_wakeup(m);
@@ -1599,7 +1716,6 @@ kmem_slab_alloc(vm_size_t size, vm_offset_t align, int flags)
     }
     smp_invltlb();
     vm_map_entry_release(count);
-    atomic_add_long(&SlabsAllocated, 1);
     return((void *)addr);
 }
 
@@ -1611,36 +1727,5 @@ kmem_slab_free(void *ptr, vm_size_t size)
 {
     crit_enter();
     vm_map_remove(&kernel_map, (vm_offset_t)ptr, (vm_offset_t)ptr + size);
-    atomic_add_long(&SlabsFreed, 1);
     crit_exit();
-}
-
-void *
-kmalloc_cachealign(unsigned long size_alloc, struct malloc_type *type,
-    int flags)
-{
-#if (__VM_CACHELINE_SIZE == 32)
-#define CAN_CACHEALIGN(sz)	((sz) >= 256)
-#elif (__VM_CACHELINE_SIZE == 64)
-#define CAN_CACHEALIGN(sz)	((sz) >= 512)
-#elif (__VM_CACHELINE_SIZE == 128)
-#define CAN_CACHEALIGN(sz)	((sz) >= 1024)
-#else
-#error "unsupported cacheline size"
-#endif
-
-	void *ret;
-
-	if (size_alloc < __VM_CACHELINE_SIZE)
-		size_alloc = __VM_CACHELINE_SIZE;
-	else if (!CAN_CACHEALIGN(size_alloc))
-		flags |= M_POWEROF2;
-
-	ret = kmalloc(size_alloc, type, flags);
-	KASSERT(((uintptr_t)ret & (__VM_CACHELINE_SIZE - 1)) == 0,
-	    ("%p(%lu) not cacheline %d aligned",
-	     ret, size_alloc, __VM_CACHELINE_SIZE));
-	return ret;
-
-#undef CAN_CACHEALIGN
 }

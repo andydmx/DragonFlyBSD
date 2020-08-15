@@ -30,38 +30,31 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
-#include <sys/types.h>
 #include <sys/param.h>
-
 #include <sys/malloc.h>
 #include <sys/module.h>
 #include <sys/linker.h>
+#include <cpu/atomic.h>
 #include <dev/disk/dm/dm.h>
-
-#include "netbsd-dm.h"
+#include <dev/disk/dm/netbsd-dm.h>
 
 static dm_target_t *dm_target_lookup_name(const char *);
 
-TAILQ_HEAD(dm_target_head, dm_target);
+static TAILQ_HEAD(, dm_target) dm_target_list;
 
-static struct dm_target_head dm_target_list =
-TAILQ_HEAD_INITIALIZER(dm_target_list);
+static struct lock dm_target_mutex;
 
-struct lock dm_target_mutex;
-
-/*
- * Called indirectly from dm_table_load_ioctl to mark target as used.
- */
 void
-dm_target_busy(dm_target_t * target)
+dm_target_busy(dm_target_t *target)
 {
 	atomic_add_int(&target->ref_cnt, 1);
 }
+
 /*
  * Release reference counter on target.
  */
 void
-dm_target_unbusy(dm_target_t * target)
+dm_target_unbusy(dm_target_t *target)
 {
 	KKASSERT(target->ref_cnt > 0);
 	atomic_subtract_int(&target->ref_cnt, 1);
@@ -121,8 +114,9 @@ dm_target_lookup(const char *dm_target_name)
 
 	return dmt;
 }
+
 /*
- * Search for name in TAIL and return apropriate pointer.
+ * Search for name in TAILQ and return apropriate pointer.
  */
 static dm_target_t *
 dm_target_lookup_name(const char *dm_target_name)
@@ -136,15 +130,21 @@ dm_target_lookup_name(const char *dm_target_name)
 
 	return NULL;
 }
+
 /*
- * Insert new target struct into the TAIL.
- * dm_target
- *   contains name, version, function pointer to specifif target functions.
+ * Insert new target struct into the TAILQ.
+ * dm_target contains name, version, function pointer to specific target
+ * functions.
  */
 int
-dm_target_insert(dm_target_t * dm_target)
+dm_target_insert(dm_target_t *dm_target)
 {
 	dm_target_t *dmt;
+
+	if (dm_target->strategy == NULL) {
+		kprintf("dm: %s missing strategy\n", dm_target->name);
+		return EINVAL;
+	}
 
 	lockmgr(&dm_target_mutex, LK_EXCLUSIVE);
 
@@ -161,12 +161,11 @@ dm_target_insert(dm_target_t * dm_target)
 	return 0;
 }
 
-
 /*
- * Remove target from TAIL, target is selected with it's name.
+ * Remove target from TAILQ, target is selected with it's name.
  */
 int
-dm_target_rem(char *dm_target_name)
+dm_target_remove(char *dm_target_name)
 {
 	dm_target_t *dmt;
 
@@ -183,12 +182,11 @@ dm_target_rem(char *dm_target_name)
 		lockmgr(&dm_target_mutex, LK_RELEASE);
 		return EBUSY;
 	}
-	TAILQ_REMOVE(&dm_target_list,
-	    dmt, dm_target_next);
+	TAILQ_REMOVE(&dm_target_list, dmt, dm_target_next);
 
 	lockmgr(&dm_target_mutex, LK_RELEASE);
 
-	(void) kfree(dmt, M_DM);
+	dm_target_free(dmt);
 
 	return 0;
 }
@@ -199,8 +197,28 @@ dm_target_rem(char *dm_target_name)
 dm_target_t *
 dm_target_alloc(const char *name)
 {
-	return kmalloc(sizeof(dm_target_t), M_DM, M_WAITOK | M_ZERO);
+	dm_target_t *dmt;
+
+	dmt = kmalloc(sizeof(*dmt), M_DM, M_WAITOK | M_ZERO);
+	if (dmt == NULL)
+		return NULL;
+
+	if (name)
+		strlcpy(dmt->name, name, sizeof(dmt->name));
+
+	return dmt;
 }
+
+int
+dm_target_free(dm_target_t *dmt)
+{
+	KKASSERT(dmt != NULL);
+
+	kfree(dmt, M_DM);
+
+	return 0;
+}
+
 /*
  * Return prop_array of dm_target dictionaries.
  */
@@ -239,10 +257,13 @@ dm_target_prop_list(void)
 	return target_array;
 }
 
-/* Initialize dm_target subsystem. */
+/*
+ * Initialize dm_target subsystem.
+ */
 int
 dm_target_init(void)
 {
+	TAILQ_INIT(&dm_target_list);	/* initialize global target list */
 	lockinit(&dm_target_mutex, "dmtrgt", 0, LK_CANRECURSE);
 
 	return 0;
@@ -250,7 +271,7 @@ dm_target_init(void)
 
 /*
  * Destroy all targets and remove them from queue.
- * This routine is called from dm_detach, before module
+ * This routine is called from dmdestroy, before module
  * is unloaded.
  */
 int
@@ -259,15 +280,13 @@ dm_target_uninit(void)
 	dm_target_t *dm_target;
 
 	lockmgr(&dm_target_mutex, LK_EXCLUSIVE);
-	while (TAILQ_FIRST(&dm_target_list) != NULL) {
 
-		dm_target = TAILQ_FIRST(&dm_target_list);
-
-		TAILQ_REMOVE(&dm_target_list, TAILQ_FIRST(&dm_target_list),
-		    dm_target_next);
-
-		(void) kfree(dm_target, M_DM);
+	while ((dm_target = TAILQ_FIRST(&dm_target_list)) != NULL) {
+		TAILQ_REMOVE(&dm_target_list, dm_target, dm_target_next);
+		dm_target_free(dm_target);
 	}
+	KKASSERT(TAILQ_EMPTY(&dm_target_list));
+
 	lockmgr(&dm_target_mutex, LK_RELEASE);
 
 	lockuninit(&dm_target_mutex);

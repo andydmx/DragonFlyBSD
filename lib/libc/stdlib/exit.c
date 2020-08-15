@@ -28,7 +28,6 @@
  *
  * @(#)exit.c	8.1 (Berkeley) 6/4/93
  * $FreeBSD: src/lib/libc/stdlib/exit.c,v 1.9 2007/01/09 00:28:09 imp Exp $
- * $DragonFly: src/lib/libc/stdlib/exit.c,v 1.8 2005/11/20 12:37:48 swildner Exp $
  */
 
 #include "namespace.h"
@@ -51,6 +50,12 @@ void (*__cleanup)(void);
 int	__isthreaded	= 0;
 
 /*
+ * Allows code to test if the whole process is exiting, to avoid
+ * unnecessary overhead such as freeing zones in nmalloc.
+ */
+int	__isexiting	= 0;
+
+/*
  * Exit, flushing stdio buffers if necessary.
  */
 void
@@ -59,8 +64,11 @@ exit(int status)
 	/* Ensure that the auto-initialization routine is linked in: */
 	extern int _thread_autoinit_dummy_decl;
 
+	__isexiting = 1;
 	_thread_autoinit_dummy_decl = 1;
 
+	/* Call TLS destructors, if any. */
+	_thread_finalize();
 	__cxa_finalize(NULL);
 	if (__cleanup)
 		(*__cleanup)();

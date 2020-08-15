@@ -25,6 +25,7 @@
  * THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+#include <sys/lwp.h>
 #include <stdarg.h>
 #include <unistd.h>
 #include <stdio.h>
@@ -37,12 +38,12 @@
 //#define SYSV_DEBUG
 #ifdef SYSV_DEBUG
 void
-sysv_print(const char *fmt, ...) {
+sysv_print(const char *fmt, ...)
+{
 	va_list ap;
 	char format[50];
 
-	sprintf(format, "[%d %d] %s",
-			getpid(), lwp_gettid(), fmt);
+	sprintf(format, "[%d %d] %s", getpid(), lwp_gettid(), fmt);
 	va_start(ap, fmt);
 	vprintf(format, ap);
 	va_end(ap);
@@ -50,11 +51,14 @@ sysv_print(const char *fmt, ...) {
 }
 #else
 void
-sysv_print(__unused const char *fmt, ...) {}
+sysv_print(__unused const char *fmt, ...)
+{
+}
 #endif
 
 void
-sysv_print_err(const char *fmt, ...) {
+sysv_print_err(const char *fmt, ...)
+{
 	va_list ap;
 	char format[50];
 

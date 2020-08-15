@@ -8,19 +8,18 @@
 # ----------------------------------------------------------------------------
 #
 # $FreeBSD: src/tools/tools/kernxref/kernxref.sh,v 1.13 1999/08/28 00:54:30 peter Exp $
-# $DragonFly: src/tools/tools/kernxref/kernxref.sh,v 1.3 2004/03/20 16:27:41 drhodus Exp $
 #
-# This shellscript will make a cross reference of the symbols of the LINT 
+# This shellscript will make a cross reference of the symbols of the LINT64 
 # kernel.
 
 COMPILEDIR=/sys/compile
-KERNELNAME=LINT
+KERNELNAME=LINT64
 
 cd ${COMPILEDIR}/${KERNELNAME}
 
 nm -gon `echo *.o /boot/kernel/*.ok	\
 	| tr ' ' '\012'					\
-	| egrep -v '(aicasm|genassym)'`			\
+	| egrep -v '(genassym)'`			\
 	| tr : ' ' | awk '
 NF > 1	{
 	if (length($2) == 8) {

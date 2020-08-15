@@ -46,13 +46,12 @@
 #include <vm/vm_map.h>
 #include <vm/vm_extern.h>
 #include <sys/mman.h>
-#include <sys/sysproto.h>
+#include <sys/sysmsg.h>
 #include <sys/resource.h>
 #include <sys/resourcevar.h>
 #include <sys/malloc.h>
 #include <sys/stat.h>
 #include <sys/uio.h>
-#include <sys/namei.h>
 #include <sys/vnode.h>
 #include <machine/inttypes.h>
 #include <machine/limits.h>
@@ -495,14 +494,13 @@ ckpt_fhtovp(fhandle_t *fh, struct vnode **vpp)
 		return ESTALE;
 	}
 	error = VFS_FHTOVP(mp, NULL, &fh->fh_fid, vpp);
+	mount_drop(mp);
 	if (error) {
 		PRINTF(("failed with: %d\n", error));
 		TRACE_ERR;
-	        TRACE_EXIT;
-		return error;
 	}
 	TRACE_EXIT;
-	return 0;
+	return error;
 }
 
 static int
@@ -557,9 +555,9 @@ elf_gettextvp(struct proc *p, struct file *fp)
 
 	vmspace_exec(p, NULL);
 	p->p_vmspace->vm_daddr = vminfo.cvm_daddr;
-	p->p_vmspace->vm_dsize = vminfo.cvm_dsize;
+	p->p_vmspace->vm_dsize = ctob(vminfo.cvm_dsize);	/* in bytes */
 	p->p_vmspace->vm_taddr = vminfo.cvm_taddr;
-	p->p_vmspace->vm_tsize = vminfo.cvm_tsize;
+	p->p_vmspace->vm_tsize = ctob(vminfo.cvm_tsize);	/* in bytes */
 	if ((error = read_check(fp, &vpcount, sizeof(int))) != 0)
 		goto done;
 	vnh = kmalloc(sizeof(struct vn_hdr) * vpcount, M_TEMP, M_WAITOK);
@@ -695,11 +693,15 @@ ckpt_freeze_proc(struct lwp *lp, struct file *fp)
         PRINTF(("calling generic_elf_coredump\n"));
 	limit = p->p_rlimit[RLIMIT_CORE].rlim_cur;
 	if (limit) {
-		proc_stop(p);
-		while (p->p_nstopped < p->p_nthreads - 1)
-			tsleep(&p->p_nstopped, 0, "freeze", 1);
-		error = generic_elf_coredump(lp, SIGCKPT, fp, limit);
-		proc_unstop(p);
+		if (p->p_stat != SCORE) {
+			proc_stop(p, SCORE);
+			while (p->p_nstopped < p->p_nthreads - 1)
+				tsleep(&p->p_nstopped, 0, "freeze", 1);
+			error = generic_elf_coredump(lp, SIGCKPT, fp, limit);
+			proc_unstop(p, SCORE);
+		} else {
+			error = ERANGE;
+		}
 	} else {
 		error = ERANGE;
 	}
@@ -711,12 +713,12 @@ ckpt_freeze_proc(struct lwp *lp, struct file *fp)
  * MPALMOSTSAFE
  */
 int 
-sys_sys_checkpoint(struct sys_checkpoint_args *uap)
+sys_sys_checkpoint(struct sysmsg *sysmsg,
+		   const struct sys_checkpoint_args *uap)
 {
         int error = 0;
 	struct thread *td = curthread;
 	struct proc *p = td->td_proc;
-	struct filedesc *fdp = p->p_fd;
 	struct file *fp;
 
 	/*
@@ -739,25 +741,25 @@ sys_sys_checkpoint(struct sys_checkpoint_args *uap)
 		fp = NULL;
 		if (uap->fd == -1 && uap->pid == (pid_t)-1)
 			error = checkpoint_signal_handler(td->td_lwp);
-		else if ((fp = holdfp(fdp, uap->fd, FWRITE)) == NULL)
+		else if ((fp = holdfp(td, uap->fd, FWRITE)) == NULL)
 			error = EBADF;
 		else
 			error = ckpt_freeze_proc(td->td_lwp, fp);
 		if (fp)
-			fdrop(fp);
+			dropfp(td, uap->fd, fp);
 		break;
 	case CKPT_THAW:
 		if (uap->pid != -1) {
 			error = EINVAL;
 			break;
 		}
-		if ((fp = holdfp(fdp, uap->fd, FREAD)) == NULL) {
+		if ((fp = holdfp(td, uap->fd, FREAD)) == NULL) {
 			error = EBADF;
 			break;
 		}
-		uap->sysmsg_result = uap->retval;
+		sysmsg->sysmsg_result = uap->retval;
 	        error = ckpt_thaw_proc(td->td_lwp, fp);
-		fdrop(fp);
+		dropfp(td, uap->fd, fp);
 		break;
 	default:
 	        error = EOPNOTSUPP;

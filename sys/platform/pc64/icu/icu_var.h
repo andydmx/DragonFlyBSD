@@ -10,11 +10,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -34,8 +30,12 @@
 #ifndef _ARCH_ICU_ICU_VAR_H_
 #define	_ARCH_ICU_ICU_VAR_H_
 
-#ifndef _SYS_TYPES_H_
-#include <sys/types.h>
+#include <machine/stdint.h>
+
+/* Same as in bus/isa/isavar.h */
+#ifndef _INTRMASK_T_DECLARED
+#define _INTRMASK_T_DECLARED
+typedef __uint32_t	intrmask_t; /* Interrupt mask (spl, xxx_imask, etc) */
 #endif
 
 void		icu_definit(void);

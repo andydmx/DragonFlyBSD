@@ -49,6 +49,12 @@
 struct storage;
 
 /*
+ * Function argument flags
+ */
+#define I_BOOTED_LIVECD		0x1
+#define I_UPGRADE_TOOGLE	0x2
+
+/*
  * Installer function arguments.
  */
 struct i_fn_args {
@@ -65,15 +71,15 @@ struct i_fn_args {
 	FILE *log;			/* file to log to */
 	struct aura_dict *temp_files;	/* names of files to delete on exit */
 	struct config_vars *cmd_names;	/* names (and paths) of commands to use */
-	int booted_from_livecd;		/* system is running from livecd */
-	int upgrade_menu_toggle;	/* toggle the experimental upgrade option */
+	int flags;			/* Option flags */
 };
 
 /*** PROTOTYPES ***/
 
 /* Installer Context */
 
-struct i_fn_args *i_fn_args_new(const char *, const char *, int, const char *);
+struct i_fn_args *i_fn_args_new(const char *, const char *, const char *,
+				int, const char *);
 void		 i_fn_args_free(struct i_fn_args *);
 
 void		 i_log(struct i_fn_args *, const char *, ...)

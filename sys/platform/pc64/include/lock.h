@@ -63,11 +63,19 @@
 	popq	%rcx ;		/* flags */			\
 	cli ;							\
 	orq	$PSL_C,%rcx ;	/* make sure non-zero */	\
-7: ;								\
-	movq	$0,%rax ;	/* expected contents of lock */	\
+906: ;								\
+	movq	mem, %rax ;					\
+907: ;								\
+	cmpq	$0,%rax ;					\
+	jnz	908f ;						\
 	lock cmpxchgq %rcx,mem ; /* Z=1 (jz) on success */	\
+	jz	909f ; 						\
 	pause ;							\
-	jnz	7b ; 						\
+	jmp	907b ;						\
+908: ;								\
+	pause ;							\
+	jmp	906b ;						\
+909: ;								\
 
 #define SPIN_LOCK_PUSH_REGS					\
 	subq	$16,%rsp ;					\
@@ -110,10 +118,6 @@ struct spinlock_deprecated {
 	volatile long	opaque;
 };
 
-typedef struct spinlock_deprecated *spinlock_t;
-
-void	mpintr_lock(void);	/* disables int / spinlock combo */
-void	mpintr_unlock(void);
 void	com_lock(void);		/* disables int / spinlock combo */
 void	com_unlock(void);
 void	imen_lock(void);	/* disables int / spinlock combo */
@@ -121,15 +125,15 @@ void	imen_unlock(void);
 void	clock_lock(void);	/* disables int / spinlock combo */
 void	clock_unlock(void);
 
-void	spin_lock_deprecated(spinlock_t lock);
-void	spin_unlock_deprecated(spinlock_t lock);
+void	spin_lock_deprecated(struct spinlock_deprecated *lock);
+void	spin_unlock_deprecated(struct spinlock_deprecated *lock);
 
 /*
  * Inline version of spinlock routines -- overrides assembly.  Only unlock
  * and init here please.
  */
 static __inline void
-spin_lock_init(spinlock_t lock)
+spin_init_deprecated(struct spinlock_deprecated *lock)
 {
 	lock->opaque = 0;
 }

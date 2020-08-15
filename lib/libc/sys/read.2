@@ -27,16 +27,17 @@
 .\"
 .\"     @(#)read.2	8.4 (Berkeley) 2/26/94
 .\" $FreeBSD: src/lib/libc/sys/read.2,v 1.9.2.6 2001/12/14 18:34:01 ru Exp $
-.\" $DragonFly: src/lib/libc/sys/read.2,v 1.5 2006/04/27 16:01:33 swildner Exp $
 .\"
-.Dd April 27, 2006
+.Dd June 8, 2020
 .Dt READ 2
 .Os
 .Sh NAME
 .Nm read ,
 .Nm readv ,
 .Nm pread ,
-.Nm preadv
+.Nm preadv ,
+.Nm extpread ,
+.Nm extpreadv
 .Nd read input
 .Sh LIBRARY
 .Lb libc
@@ -52,6 +53,10 @@
 .Fn pread "int d" "void *buf" "size_t nbytes" "off_t offset"
 .Ft ssize_t
 .Fn preadv "int d" "const struct iovec *iov" "int iovcnt" "off_t offset"
+.Ft ssize_t
+.Fn extpread "int d" "void *buf" "size_t nbytes" "int flags" "off_t offset"
+.Ft ssize_t
+.Fn extpreadv "int d" "const struct iovec *iov" "int iovcnt" "int flags" "off_t offset"
 .Sh DESCRIPTION
 .Fn Read
 attempts to read
@@ -68,9 +73,11 @@ buffers specified by the members of the
 .Fa iov
 array: iov[0], iov[1], ..., iov[iovcnt\|\-\|1].
 The
-.Fn pread
+.Fn pread ,
+.Fn preadv ,
+.Fn extpread ,
 and
-.Fn preadv
+.Fn extpreadv
 calls perform the same function, but read from the specified position in
 the file without modifying the file pointer.
 .Pp
@@ -98,6 +105,27 @@ and
 .Fn preadv
 will always fill an area completely before proceeding
 to the next.
+.Pp
+The
+.Fn extpread
+and
+.Fn extpreadv
+allow a
+.Ar flags
+argument
+to also be passed in, controlling blocking/non-blocking and other features
+on a call-by-call basis, ignoring the related default for the descriptor.
+Allowed flags are:
+.Bl -tag -width ".Dv O_FNONBLOCKING"
+.It Dv O_FBLOCKING
+Force the system call to operate in a blocking fashion.
+.It Dv O_FNONBLOCKING
+Force the system call to operate in a non-blocking fashion.
+.It Dv O_FAPPEND
+Force append mode for the operation.
+.It Dv O_FOFFSET
+Force offset mode for the operation.
+.El
 .Pp
 On objects capable of seeking, the
 .Fn read
@@ -133,11 +161,13 @@ Otherwise, a -1 is returned and the global variable
 .Va errno
 is set to indicate the error.
 .Sh ERRORS
-.Fn Read ,
+.Fn read ,
 .Fn readv ,
 .Fn pread ,
+.Fn preadv ,
+.Fn extpread
 and
-.Fn preadv
+.Fn extpreadv
 will succeed unless:
 .Bl -tag -width Er
 .It Bq Er EBADF
@@ -155,15 +185,29 @@ any data arrived by the delivery of a signal.
 The pointer associated with
 .Fa d
 was negative.
+.It Bq Er EISDIR
+The file descriptor
+.Fa d
+refers to a directory and the implementation does not allow the directory
+to be read using
+.Fn read
+or
+.Fn pread .
+The
+.Fn readdir
+function should be used instead.
 .It Bq Er EAGAIN
 The file was marked for non-blocking I/O,
 and no data were ready to be read.
+.It Bq Er ENOBUFS
+A message was not delivered because it would have overflowed the buffer.
 .El
 .Pp
 In addition,
-.Fn readv
-and
+.Fn readv ,
 .Fn preadv
+and
+.Fn extpreadv
 may return one of the following errors:
 .Bl -tag -width Er
 .It Bq Er EINVAL
@@ -188,9 +232,11 @@ points outside the process's allocated address space.
 .El
 .Pp
 The
-.Fn pread
+.Fn pread ,
+.Fn preadv ,
+.Fn extpread
 and
-.Fn preadv
+.Fn extpreadv
 calls may also return the following errors:
 .Bl -tag -width Er
 .It Bq Er EINVAL
@@ -205,7 +251,8 @@ The file descriptor is associated with a pipe, socket, or FIFO.
 .Xr pipe 2 ,
 .Xr select 2 ,
 .Xr socket 2 ,
-.Xr socketpair 2
+.Xr socketpair 2 ,
+.Xr readdir 3
 .Sh STANDARDS
 The
 .Fn read
@@ -217,6 +264,14 @@ and
 .Fn pread
 functions are expected to conform to
 .St -xpg4.2 .
+.Pp
+The
+.Fn extpread
+and
+.Fn extpreadv
+functions are
+.Dx
+specific extensions.
 .Sh HISTORY
 The
 .Fn preadv

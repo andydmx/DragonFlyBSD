@@ -49,6 +49,17 @@
 #include "ata-disk.h"
 #include "ata_if.h"
 
+/* local implementation, to trigger a warning */
+static inline void
+biofinish(struct bio *bp, struct bio *x __unused, int error)
+{
+	struct buf *bbp = bp->bio_buf;
+
+	bbp->b_flags |= B_ERROR;
+	bbp->b_error = error;
+	biodone(bp);
+}
+
 /* device structure */
 static	d_open_t	ad_open;
 static	d_close_t	ad_close;
@@ -67,10 +78,11 @@ static struct dev_ops ad_ops = {
 };
 
 /* prototypes */
-static void ad_init(device_t);
-static void ad_done(struct ata_request *);
+static void ad_init(device_t dev);
+static void ad_get_geometry(device_t dev);
+static void ad_done(struct ata_request *request);
 static void ad_describe(device_t dev);
-static int ad_version(u_int16_t);
+static int ad_version(u_int16_t version);
 
 /* local vars */
 static MALLOC_DEFINE(M_AD, "ad_driver", "ATA disk driver");
@@ -97,8 +109,6 @@ ad_attach(device_t dev)
     struct disk_info info;
     struct ad_softc *adp;
     cdev_t cdev;
-    u_int32_t lbasize;
-    u_int64_t lbasize48;
 
     /* check that we have a virgin disk to attach */
     if (device_get_ivars(dev))
@@ -107,37 +117,8 @@ ad_attach(device_t dev)
     adp = kmalloc(sizeof(struct ad_softc), M_AD, M_INTWAIT | M_ZERO);
     device_set_ivars(dev, adp);
 
-    if ((atadev->param.atavalid & ATA_FLAG_54_58) &&
-	atadev->param.current_heads && atadev->param.current_sectors) {
-	adp->heads = atadev->param.current_heads;
-	adp->sectors = atadev->param.current_sectors;
-	adp->total_secs = (u_int32_t)atadev->param.current_size_1 |
-			  ((u_int32_t)atadev->param.current_size_2 << 16);
-    }
-    else {
-	adp->heads = atadev->param.heads;
-	adp->sectors = atadev->param.sectors;
-	adp->total_secs = atadev->param.cylinders * adp->heads * adp->sectors;  
-    }
-    lbasize = (u_int32_t)atadev->param.lba_size_1 |
-	      ((u_int32_t)atadev->param.lba_size_2 << 16);
-
-    /* does this device need oldstyle CHS addressing */
-    if (!ad_version(atadev->param.version_major) || !lbasize)
-	atadev->flags |= ATA_D_USE_CHS;
-
-    /* use the 28bit LBA size if valid or bigger than the CHS mapping */
-    if (atadev->param.cylinders == 16383 || adp->total_secs < lbasize)
-	adp->total_secs = lbasize;
-
-    /* use the 48bit LBA size if valid */
-    lbasize48 = ((u_int64_t)atadev->param.lba_size48_1) |
-		((u_int64_t)atadev->param.lba_size48_2 << 16) |
-		((u_int64_t)atadev->param.lba_size48_3 << 32) |
-		((u_int64_t)atadev->param.lba_size48_4 << 48);
-    if ((atadev->param.support.command2 & ATA_SUPPORT_ADDRESS48) &&
-	lbasize48 > ATA_MAX_28BIT_LBA)
-	adp->total_secs = lbasize48;
+    /* get device geometry into internal structs */
+    ad_get_geometry(dev);
 
     /* init device parameters */
     ad_init(dev);
@@ -175,6 +156,11 @@ ad_attach(device_t dev)
 
     disk_setdiskinfo(&adp->disk, &info);
 
+#if defined(__DragonFly__)
+    callout_init_mp(&atadev->spindown_timer);
+#else
+    callout_init(&atadev->spindown_timer, 1);
+#endif
     return 0;
 }
 
@@ -182,6 +168,7 @@ static int
 ad_detach(device_t dev)
 {
     struct ad_softc *adp = device_get_ivars(dev);
+    struct ata_device *atadev = device_get_softc(dev);
     device_t *children;
     int nchildren, i;
 
@@ -189,12 +176,9 @@ ad_detach(device_t dev)
     if (!adp)
 	return ENXIO;
 
-#if 0 /* XXX TGEN Probably useless, we fail the queue below. */
-    /* check that the disk is closed */
-    if (adp->ad_flags & AD_DISK_OPEN)
-        return EBUSY;
-#endif /* 0 */
-    
+    /* destroy the power timeout */
+    callout_drain(&atadev->spindown_timer);
+
     /* detach & delete all children */
     if (!device_get_children(dev, &children, &nchildren)) {
 	for (i = 0; i < nchildren; i++)
@@ -242,6 +226,37 @@ ad_reinit(device_t dev)
     return 0;
 }
 
+static void
+ad_power_callback(struct ata_request *request)
+{
+    device_printf(request->dev, "drive spun down.\n");
+    ata_free_request(request);
+}
+
+static void
+ad_spindown(void *priv)
+{
+    device_t dev = priv;
+    struct ata_device *atadev = device_get_softc(dev);
+    struct ata_request *request;
+
+    if (!atadev->spindown)
+	return;
+    device_printf(dev, "Idle, spin down\n");
+    atadev->spindown_state = 1;
+    if (!(request = ata_alloc_request())) {
+	device_printf(dev, "FAILURE - out of memory in ad_spindown\n");
+	return;
+    }
+    request->dev = dev;
+    request->flags = ATA_R_CONTROL;
+    request->timeout = ATA_DEFAULT_TIMEOUT;
+    request->retries = 1;
+    request->callback = ad_power_callback;
+    request->u.ata.command = ATA_STANDBY_IMMEDIATE;
+    ata_queue_request(request);
+}
+
 static int
 ad_open(struct dev_open_args *ap)
 {
@@ -253,27 +268,13 @@ ad_open(struct dev_open_args *ap)
     if(!device_is_attached(dev))
 	return EBUSY;
 
-#if 0 /* XXX TGEN Probably useless, queue will be failed on detach. */
-    adp->ad_flags &= AD_DISK_OPEN;
-#endif /* 0 */
     return 0;
 }
 
 static int
 ad_close(struct dev_close_args *ap)
 {
-#if 0 /* XXX TGEN Probably useless, queue will be failed on detach. */
-    device_t dev = ap->a_head.a_dev->si_drv1;
-    struct ad_softc *adp = device_get_ivars(dev);
-    adp->ad_flags |= AD_DISK_OPEN;
-#endif /* 0 */
     return 0;
-}
-
-static int
-ad_ioctl(struct dev_ioctl_args *ap)
-{
-    return ata_device_ioctl(ap->a_head.a_dev->si_drv1, ap->a_cmd, ap->a_data);
 }
 
 static int
@@ -286,11 +287,13 @@ ad_strategy(struct dev_strategy_args *ap)
     struct ata_request *request;
     struct ad_softc *adp = device_get_ivars(dev);
 
+    if (atadev->spindown)
+	callout_reset(&atadev->spindown_timer, hz * atadev->spindown,
+		      ad_spindown, dev);
+
     if (!(request = ata_alloc_request())) {
 	device_printf(dev, "FAILURE - out of memory in strategy\n");
-	bbp->b_flags |= B_ERROR;
-	bbp->b_error = ENOMEM;
-	biodone(bp);
+	biofinish(bp, NULL, ENOMEM);
 	return(0);
     }
 
@@ -298,7 +301,13 @@ ad_strategy(struct dev_strategy_args *ap)
     request->dev = dev;
     request->bio = bp;
     request->callback = ad_done;
-    request->timeout = ATA_DEFAULT_TIMEOUT;
+    if (atadev->spindown_state) {
+	device_printf(dev, "request while spun down, starting.\n");
+	atadev->spindown_state = 0;
+	request->timeout = MAX(ATA_DEFAULT_TIMEOUT, 31);
+    } else {
+	request->timeout = ATA_DEFAULT_TIMEOUT;
+    }
     request->retries = 2;
     request->data = bbp->b_data;
     request->bytecount = bbp->b_bcount;
@@ -339,14 +348,12 @@ ad_strategy(struct dev_strategy_args *ap)
 	request->flags = ATA_R_CONTROL;
 	request->u.ata.command = ATA_FLUSHCACHE;
 	/* ATA FLUSHCACHE requests may take up to 30 sec to timeout */
-	request->timeout = 30;
+	request->timeout = 30;		/* ATA_DEFAULT_TIMEOUT */
 	break;
     default:
 	device_printf(dev, "FAILURE - unknown BUF operation\n");
 	ata_free_request(request);
-	bbp->b_flags |= B_ERROR;
-	bbp->b_error = EIO;
-	biodone(bp);
+	biofinish(bp, NULL, EIO);
 	return(0);
     }
     request->flags |= ATA_R_ORDERED;
@@ -369,6 +376,12 @@ ad_done(struct ata_request *request)
     devstat_end_transaction_buf(&adp->stats, bbp);
     biodone(bp);
     ata_free_request(request);
+}
+
+static int
+ad_ioctl(struct dev_ioctl_args *ap)
+{
+    return ata_device_ioctl(ap->a_head.a_dev->si_drv1, ap->a_cmd, ap->a_data);
 }
 
 static int
@@ -445,7 +458,48 @@ ad_init(device_t dev)
 	atadev->max_iosize = DEV_BSIZE;
 }
 
-void
+static void
+ad_get_geometry(device_t dev)
+{
+    struct ata_device *atadev = device_get_softc(dev);
+    struct ad_softc *adp = device_get_ivars(dev);
+    u_int64_t lbasize48;
+    u_int32_t lbasize;
+
+    if ((atadev->param.atavalid & ATA_FLAG_54_58) &&
+	atadev->param.current_heads && atadev->param.current_sectors) {
+	adp->heads = atadev->param.current_heads;
+	adp->sectors = atadev->param.current_sectors;
+	adp->total_secs = (u_int32_t)atadev->param.current_size_1 |
+			  ((u_int32_t)atadev->param.current_size_2 << 16);
+    }
+    else {
+	adp->heads = atadev->param.heads;
+	adp->sectors = atadev->param.sectors;
+	adp->total_secs = atadev->param.cylinders * adp->heads * adp->sectors;
+    }
+    lbasize = (u_int32_t)atadev->param.lba_size_1 |
+	      ((u_int32_t)atadev->param.lba_size_2 << 16);
+
+    /* does this device need oldstyle CHS addressing */
+    if (!ad_version(atadev->param.version_major) || !lbasize)
+	atadev->flags |= ATA_D_USE_CHS;
+
+    /* use the 28bit LBA size if valid or bigger than the CHS mapping */
+    if (atadev->param.cylinders == 16383 || adp->total_secs < lbasize)
+	adp->total_secs = lbasize;
+
+    /* use the 48bit LBA size if valid */
+    lbasize48 = ((u_int64_t)atadev->param.lba_size48_1) |
+		((u_int64_t)atadev->param.lba_size48_2 << 16) |
+		((u_int64_t)atadev->param.lba_size48_3 << 32) |
+		((u_int64_t)atadev->param.lba_size48_4 << 48);
+    if ((atadev->param.support.command2 & ATA_SUPPORT_ADDRESS48) &&
+	lbasize48 > ATA_MAX_28BIT_LBA)
+	adp->total_secs = lbasize48;
+}
+
+static void
 ad_describe(device_t dev)
 {
     struct ata_channel *ch = device_get_softc(device_get_parent(dev));
@@ -474,18 +528,16 @@ ad_describe(device_t dev)
 	strncpy(product, atadev->param.model, 40);
     }
 
-    device_printf(dev, "%lluMB <%s%s %.8s> at ata%d-%s %s%s\n",
-		  (unsigned long long)(adp->total_secs / (1048576 / DEV_BSIZE)),
+    device_printf(dev, "%juMB <%s%s %.8s> at ata%d-%s %s%s\n",
+		  adp->total_secs / (1048576 / DEV_BSIZE),
 		  vendor, product, atadev->param.revision,
-		  device_get_unit(ch->dev),
-		  (atadev->unit == ATA_MASTER) ? "master" : "slave",
+		  device_get_unit(ch->dev), ata_unit2str(atadev),
 		  (adp->flags & AD_F_TAG_ENABLED) ? "tagged " : "",
 		  ata_mode2str(atadev->mode));
     if (bootverbose) {
-	device_printf(dev, "%llu sectors [%lluC/%dH/%dS] "
-		      "%d sectors/interrupt %d depth queue\n",
-		      (unsigned long long)adp->total_secs,(unsigned long long)(
-		      adp->total_secs / (adp->heads * adp->sectors)),
+	device_printf(dev, "%ju sectors [%juC/%dH/%dS] "
+		      "%d sectors/interrupt %d depth queue\n", adp->total_secs,
+		      adp->total_secs / (adp->heads * adp->sectors),
 		      adp->heads, adp->sectors, atadev->max_iosize / DEV_BSIZE,
 		      adp->num_tags + 1);
     }

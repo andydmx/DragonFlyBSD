@@ -11,7 +11,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -68,6 +68,10 @@
 #define	CR4_XMM		0x00000400	/* Enable SIMD/MMX2 to use except 16 */
 #define	CR4_VMXE	0x00002000	/* Enables VMX - Intel specific */
 #define	CR4_XSAVE	0x00040000	/* Enable XSave (for AVX Instructions)*/
+#define	CR4_SMEP	0x00100000	/* Supervisor-Mode Execution Prevent */
+#define	CR4_SMAP	0x00200000	/* Supervisor-Mode Access Prevent */
+#define	CR4_PKE		0x00400000	/* Protection Keys Enable */
+
 
 /*
  * Bits in x86_64 special registers.  EFER is 64 bits wide.
@@ -134,6 +138,7 @@
 #define	CPUID2_SSE42	0x00100000
 #define	CPUID2_X2APIC	0x00200000
 #define	CPUID2_POPCNT	0x00800000
+#define	CPUID2_TSCDLT	0x01000000	/* LAPIC TSC-Deadline Mode support */
 #define	CPUID2_AESNI	0x02000000	/* AES Instruction Set */
 #define	CPUID2_XSAVE    0x04000000	/* XSave supported by CPU */
 #define	CPUID2_OSXSAVE  0x08000000      /* XSave and AVX supported by OS */
@@ -245,6 +250,7 @@
 /*
  * Structured Extended Features
  */
+/* EBX */
 #define	CPUID_STDEXT_FSGSBASE	0x00000001
 #define	CPUID_STDEXT_TSC_ADJUST	0x00000002
 #define	CPUID_STDEXT_BMI1	0x00000008
@@ -259,6 +265,9 @@
 #define	CPUID_STDEXT_ADX	0x00080000
 #define	CPUID_STDEXT_SMAP	0x00100000
 
+/* ECX */
+#define	CPUID_STDEXT2_RDPID	0x00400000
+
 /*
  * Thermal and PM Features
  */
@@ -268,6 +277,7 @@
 #define CPUID_THERMAL_PLN	0x00000010
 #define CPUID_THERMAL_ECMD	0x00000020
 #define CPUID_THERMAL_PTM	0x00000040
+#define CPUID_THERMAL_HWP	0x00000080	/* Hardware P-states */
 
 #define CPUID_THERMAL2_SETBH	0x00000008
 
@@ -307,6 +317,8 @@
 #define	MSR_APICBASE		0x01b
 #define	MSR_EBL_CR_POWERON	0x02a
 #define	MSR_TEST_CTL		0x033
+#define MSR_SPEC_CTRL		0x048	/* IBRS Spectre mitigation */
+#define MSR_PRED_CMD		0x049	/* IBPB Spectre mitigation */
 #define	MSR_BIOS_UPDT_TRIG	0x079
 #define	MSR_BBL_CR_D0		0x088
 #define	MSR_BBL_CR_D1		0x089
@@ -316,6 +328,7 @@
 #define	MSR_PERFCTR1		0x0c2
 #define	MSR_IA32_EXT_CONFIG	0x0ee	/* Undocumented. Core Solo/Duo only */
 #define	MSR_MTRRcap		0x0fe
+#define MSR_IA32_ARCH_CAPABILITIES 0x10a
 #define	MSR_BBL_CR_ADDR		0x116
 #define	MSR_BBL_CR_DECC		0x118
 #define	MSR_BBL_CR_CTL		0x119
@@ -334,7 +347,9 @@
 #define	MSR_THERM_INTERRUPT	0x19b
 #define	MSR_THERM_STATUS	0x19c
 #define	MSR_IA32_MISC_ENABLE	0x1a0
-#define	MSR_IA32_TEMPERATURE_TARGET	0x1a2
+#define	MSR_IA32_TEMPERATURE_TARGET 0x1a2
+#define	MSR_PKG_THERM_STATUS	0x1b1
+#define	MSR_PKG_THERM_INTR	0x1b2
 #define	MSR_DEBUGCTLMSR		0x1d9
 #define	MSR_LASTBRANCHFROMIP	0x1db
 #define	MSR_LASTBRANCHTOIP	0x1dc
@@ -367,14 +382,86 @@
 #define	MSR_MC4_STATUS		0x411
 #define	MSR_MC4_ADDR		0x412
 #define	MSR_MC4_MISC		0x413
+#define	MSR_RAPL_POWER_UNIT	0x606
+#define	MSR_PKG_ENERGY_STATUS	0x611
+#define	MSR_DRAM_ENERGY_STATUS	0x619
+#define	MSR_PP0_ENERGY_STATUS	0x639
+#define	MSR_PP1_ENERGY_STATUS	0x641
+#define	MSR_PLATFORM_ENERGY_COUNTER 0x64d /* Skylake and later */
 
 /*
  * Constants related to MSR's.
  */
 #define	APICBASE_RESERVED	0x000006ff
 #define	APICBASE_BSP		0x00000100
+#define	APICBASE_X2APIC		0x00000400
 #define	APICBASE_ENABLED	0x00000800
 #define	APICBASE_ADDRESS	0xfffff000
+
+/*
+ * IBRS and IBPB Spectre mitigation
+ *
+ * Intel: Either CPUID_80000008_I1_IBPB_SUPPORT or CPUID_7_0_I3_SPEC_CTRL
+ *	  indicates IBPB support.  However, note that MSR_PRED_CMD is
+ *	  a command register that may only be written, not read.
+ *
+ * IBPB: (barrier)
+ *	  $1 is written to MSR_PRED_CMD unconditionally, writing 0
+ *	  has no effect.
+ *
+ * IBRS and STIBP
+ *	  Serves as barrier and mode, set on entry to kernel and clear
+ *	  on exit.  Be sure to clear before going idle (else hyperthread
+ *	  performance will drop).
+ */
+
+#define CPUID_7_0_I3_SPEC_CTRL		0x04000000	/* in EDX (index 3) */
+#define CPUID_7_0_I3_STIBP		0x08000000	/* in EDX (index 3) */
+
+#define SPEC_CTRL_IBRS			0x00000001
+#define SPEC_CTRL_STIBP			0x00000002
+#define SPEC_CTRL_DUMMY1		0x00010000	/* ficticious */
+#define SPEC_CTRL_DUMMY2		0x00020000	/* ficticious */
+#define SPEC_CTRL_DUMMY3		0x00040000	/* ficticious */
+#define SPEC_CTRL_DUMMY4		0x00080000	/* ficticious */
+#define SPEC_CTRL_DUMMY5		0x00100000	/* ficticious */
+#define SPEC_CTRL_DUMMY6		0x00200000	/* ficticious */
+
+/*
+ * In EBX (index 1)
+ */
+#define CPUID_INTEL_80000008_I1_IBPB_SUPPORT	0x00001000
+
+#define CPUID_AMD_80000008_I1_IBPB_SUPPORT	0x00001000
+#define CPUID_AMD_80000008_I1_IBRS_SUPPORT	0x00004000
+#define CPUID_AMD_80000008_I1_STIBP_SUPPORT	0x00008000
+
+#define CPUID_AMD_80000008_I1_IBRS_AUTO		0x00010000
+#define CPUID_AMD_80000008_I1_STIBP_AUTO	0x00020000
+#define CPUID_AMD_80000008_I1_IBRS_REQUESTED	0x00040000
+
+/*
+ * MDS mitigation in microcode (Intel only) in EDX (index 3)
+ */
+#define CPUID_SEF_AVX512_4VNNIW		0x00000004
+#define CPUID_SEF_AVX512_4FMAPS		0x00000008
+#define CPUID_SEF_MD_CLEAR		0x00000400
+#define CPUID_SEF_TSX_FORCE_ABORT	0x00002000
+
+#define CPUID_SEF_ARCH_CAP		0x20000000
+
+/*
+ * MSR_IA32_ARCH_CAPABILITIES
+ */
+#define IA32_ARCH_CAP_RDCL_NO	0x00000001
+#define IA32_ARCH_CAP_IBRS_ALL	0x00000002
+#define IA32_ARCH_CAP_RSBA	0x00000004
+#define IA32_ARCH_CAP_SKIP_L1DFL_VMENTRY	0x00000008
+#define IA32_ARCH_SSB_NO	0x00000010
+#define IA32_ARCH_MDS_NO	0x00000020
+#define IA32_ARCH_CAP_IF_PSCHANGE_MC_NO		0x00000040
+#define IA32_ARCH_CAP_TSX_CTRL	0x00000080
+#define IA32_ARCH_CAP_TAA_NO	0x00000100
 
 /*
  * PAT modes.
@@ -555,6 +642,7 @@
 #define	MSR_FSBASE	0xc0000100	/* base address of the %fs "segment" */
 #define	MSR_GSBASE	0xc0000101	/* base address of the %gs "segment" */
 #define	MSR_KGSBASE	0xc0000102	/* base address of the kernel %gs */
+#define	MSR_TSCAUX	0xc0000103	/* TSC_AUX register (for rdtscp) */
 #define	MSR_PERFEVSEL0	0xc0010000
 #define	MSR_PERFEVSEL1	0xc0010001
 #define	MSR_PERFEVSEL2	0xc0010002
@@ -604,5 +692,18 @@
 #define	VIA_CPUID_DO_PHE	0x000800
 #define	VIA_CPUID_HAS_PMM	0x001000
 #define	VIA_CPUID_DO_PMM	0x002000
+
+/* Hardware P-states interface */
+#define MSR_PPERF		0x0000064e
+#define MSR_PERF_LIMIT_REASONS	0x0000064f
+#define MSR_PM_ENABLE		0x00000770
+#define MSR_HWP_CAPABILITIES	0x00000771
+#define MSR_HWP_REQUEST_PKG	0x00000772
+#define MSR_HWP_INTERRUPT	0x00000773
+#define MSR_HWP_REQUEST		0x00000774
+#define MSR_HWP_STATUS		0x00000777
+
+/* Local APIC TSC Deadline Mode Target count */
+#define MSR_TSC_DEADLINE	0x000006e0
 
 #endif /* !_CPU_SPECIALREG_H_ */

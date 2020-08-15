@@ -25,7 +25,7 @@
 .\"
 .\" $FreeBSD: src/sys/boot/common/loader.8,v 1.57 2003/06/29 20:57:55 brueffer Exp $
 .\"
-.Dd November 12, 2014
+.Dd May 20, 2019
 .Dt LOADER 8
 .Os
 .Sh NAME
@@ -487,9 +487,6 @@ Selects gdb-remote mode for the kernel debugger by default.
 .It Va boot_single
 Prevents the kernel from initiating a multi-user startup; instead single-user
 mode will be entered when the kernel has finished device probing.
-.It Va boot_userconfig
-Requests that the kernel's interactive device configuration program
-be run when the kernel is booted.
 .It Va boot_verbose
 Setting this variable causes extra debugging information to be printed
 by the kernel during and after the boot phase.
@@ -554,6 +551,15 @@ See also
 command.
 .It Va LINES
 Define the number of lines on the screen, to be used by the pager.
+.It Va local_modules
+Setting this variable to
+.Dq Li YES
+causes
+.Pa /boot/modules.local
+to be included after
+.Va modules_path
+directories list and passed to kernel for
+.Xr kldload 8 .
 .It Va module_path
 Sets the list of directories which will be searched for modules named in a
 .Nm load
@@ -778,7 +784,18 @@ such as:
 Root file system and extra options for
 .Nm initrd .
 See
-.Xr mkinitrd 8 .
+.Xr initrd 7 .
+.It Va nfsroot.iosize
+Override the default NFS netbooted root mount io block size.
+The default is 8192 which works with most servers.
+suggested values are 8192, 16384, or 32768.
+.It Va nfsroot.rahead
+Override the default read-ahead used by netbooted root mounts.
+The default is 4 which is reasonable.  Suggested values are 1 through 8.
+.It Va machdep.hack_efifb_probe_early
+Setting this to 1 works around an issue that occurs on some recent
+systems where there is no system console when booting via UEFI.
+See bug report #3167.
 .El
 .Sh FILES
 .Bl -tag -width /boot/defaults/dloader.menu -compact
@@ -819,15 +836,6 @@ Boot in single user mode:
 .Dl loadall
 .Dl boot -s
 .Pp
-Load kernel's user configuration file.
-Notice that a kernel must be loaded before any other
-.Ic load
-command is attempted.
-.Bd -literal -offset indent
-load kernel
-load -t userconfig_script kernel.conf
-.Ed
-.Pp
 Load the kernel, a splash screen, and then autoboot in five seconds.
 .Bd -literal -offset indent
 load kernel
@@ -855,7 +863,6 @@ boot kernel
 .Xr loader.conf 5 ,
 .Xr tuning 7 ,
 .Xr boot 8 ,
-.Xr btxld 8 ,
 .Xr cryptsetup 8 ,
 .Xr lvm 8 ,
 .Xr pxeboot 8 ,

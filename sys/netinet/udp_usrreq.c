@@ -63,7 +63,6 @@
  * $FreeBSD: src/sys/netinet/udp_usrreq.c,v 1.64.2.18 2003/01/24 05:11:34 sam Exp $
  */
 
-#include "opt_ipsec.h"
 #include "opt_inet6.h"
 
 #include <sys/param.h>
@@ -81,8 +80,8 @@
 #include <sys/syslog.h>
 #include <sys/in_cksum.h>
 #include <sys/ktr.h>
+#include <sys/jail.h>
 
-#include <sys/thread2.h>
 #include <sys/socketvar2.h>
 #include <sys/serialize.h>
 
@@ -109,14 +108,6 @@
 #include <netinet/icmp_var.h>
 #include <netinet/udp.h>
 #include <netinet/udp_var.h>
-
-#ifdef FAST_IPSEC
-#include <netproto/ipsec/ipsec.h>
-#endif
-
-#ifdef IPSEC
-#include <netinet6/ipsec.h>
-#endif
 
 #define MSGF_UDP_SEND		MSGF_PROTO1
 
@@ -182,36 +173,25 @@ struct	inpcbinfo udbinfo[MAXCPU];
 #ifndef UDBHASHSIZE
 #define UDBHASHSIZE 16
 #endif
+CTASSERT(powerof2(UDBHASHSIZE));
 
 struct	udpstat udpstat_percpu[MAXCPU] __cachealign;
 
-#ifdef INET6
-struct udp_in6 {
-	struct sockaddr_in6	uin6_sin;
-	u_char			uin6_init_done : 1;
-};
-struct udp_ip6 {
-	struct ip6_hdr		uip6_ip6;
-	u_char			uip6_init_done : 1;
-};
-#else
-struct udp_in6;
-struct udp_ip6;
-#endif /* INET6 */
-
-static void udp_append (struct inpcb *last, struct ip *ip,
-    struct mbuf *n, int off, struct sockaddr_in *udp_in,
-    struct udp_in6 *, struct udp_ip6 *);
-#ifdef INET6
-static void ip_2_ip6_hdr (struct ip6_hdr *ip6, struct ip *ip);
-#endif
+static void udp_append(struct inpcb *last, struct ip *ip,
+    struct mbuf *n, int off, struct sockaddr_in *udp_in);
 
 static int udp_connect_oncpu(struct inpcb *inp, struct sockaddr_in *sin,
-    struct sockaddr_in *if_sin);
+    struct sockaddr_in *if_sin, uint16_t hash);
 
 static boolean_t udp_inswildcardhash(struct inpcb *inp,
     struct netmsg_base *msg, int error);
 static void udp_remwildcardhash(struct inpcb *inp);
+
+static __inline int
+udp_lportcpu(short lport)
+{
+	return (ntohs(lport) % netisr_ncpus);
+}
 
 void
 udp_init(void)
@@ -219,10 +199,10 @@ udp_init(void)
 	struct inpcbportinfo *portinfo;
 	int cpu;
 
-	portinfo = kmalloc_cachealign(sizeof(*portinfo) * ncpus2, M_PCB,
-	    M_WAITOK);
+	portinfo = kmalloc(sizeof(*portinfo) * netisr_ncpus, M_PCB,
+			   M_WAITOK | M_CACHEALIGN);
 
-	for (cpu = 0; cpu < ncpus2; cpu++) {
+	for (cpu = 0; cpu < netisr_ncpus; cpu++) {
 		struct inpcbinfo *uicb = &udbinfo[cpu];
 
 		/*
@@ -233,9 +213,8 @@ udp_init(void)
 		in_pcbinfo_init(uicb, cpu, TRUE);
 		uicb->hashbase = hashinit(UDBHASHSIZE, M_PCB, &uicb->hashmask);
 
-		in_pcbportinfo_init(&portinfo[cpu], UDBHASHSIZE, TRUE, cpu);
-		uicb->portinfo = portinfo;
-		uicb->portinfo_mask = ncpus2_mask;
+		in_pcbportinfo_init(&portinfo[cpu], UDBHASHSIZE, cpu);
+		in_pcbportinfo_set(uicb, portinfo, netisr_ncpus);
 
 		uicb->wildcardhashbase = hashinit(UDBHASHSIZE, M_PCB,
 		    &uicb->wildcardhashmask);
@@ -248,7 +227,7 @@ udp_init(void)
 	/*
 	 * Initialize UDP statistics counters for each CPU.
 	 */
-	for (cpu = 0; cpu < ncpus; ++cpu)
+	for (cpu = 0; cpu < netisr_ncpus; ++cpu)
 		bzero(&udpstat_percpu[cpu], sizeof(struct udpstat));
 }
 
@@ -257,7 +236,7 @@ sysctl_udpstat(SYSCTL_HANDLER_ARGS)
 {
 	int cpu, error = 0;
 
-	for (cpu = 0; cpu < ncpus; ++cpu) {
+	for (cpu = 0; cpu < netisr_ncpus; ++cpu) {
 		if ((error = SYSCTL_OUT(req, &udpstat_percpu[cpu],
 					sizeof(struct udpstat))))
 			break;
@@ -276,9 +255,14 @@ udp_ctloutput(netmsg_t msg)
 {
 	struct socket *so = msg->base.nm_so;
 	struct sockopt *sopt = msg->ctloutput.nm_sopt;
-	struct	inpcb *inp = so->so_pcb;
+	struct inpcb *inp = so->so_pcb;
 
-	if (sopt->sopt_level == IPPROTO_IP) {
+	if (inp == NULL) {
+		lwkt_replymsg(&msg->lmsg, EINVAL);
+		return;
+	}
+
+	if (sopt->sopt_level == IPPROTO_IP && sopt->sopt_dir == SOPT_SET) {
 		switch (sopt->sopt_name) {
 		case IP_MULTICAST_IF:
 		case IP_MULTICAST_VIF:
@@ -286,14 +270,18 @@ udp_ctloutput(netmsg_t msg)
 		case IP_MULTICAST_LOOP:
 		case IP_ADD_MEMBERSHIP:
 		case IP_DROP_MEMBERSHIP:
-			if (&curthread->td_msgport != netisr_cpuport(0)) {
-				/*
-				 * This pr_ctloutput msg will be forwarded
-				 * to netisr0 to run; we can't do direct
-				 * detaching anymore.
-				 */
-				inp->inp_flags &= ~INP_DIRECT_DETACH;
-			}
+			/*
+			 * This pr_ctloutput msg will be forwarded
+			 * to netisr0 to run; we can't do direct
+			 * detaching anymore.
+			 *
+			 * NOTE:
+			 * Don't optimize for the sockets whose
+			 * current so_port is netisr0's msgport.
+			 * These sockets could be connect(2)'ed
+			 * later and the so_port will be changed.
+			 */
+			inp->inp_flags &= ~INP_DIRECT_DETACH;
 			break;
 		}
 	}
@@ -320,8 +308,7 @@ check_multicast_membership(const struct ip *ip, const struct inpcb *inp,
 		return (0);
 	}
 
-	KASSERT(&curthread->td_msgport == netisr_cpuport(0),
-	    ("multicast input not in netisr0"));
+	ASSERT_NETISR0;
 
 	mopt = inp->inp_moptions;
 	if (mopt == NULL)
@@ -344,10 +331,6 @@ struct udp_mcast_arg {
 	struct mbuf	*m;
 	int		iphlen;
 	struct sockaddr_in *udp_in;
-#ifdef INET6
-	struct udp_in6	*udp_in6;
-	struct udp_ip6	*udp_ip6;
-#endif
 };
 
 static int
@@ -364,29 +347,10 @@ udp_mcast_input(struct udp_mcast_arg *arg)
 	if (last != NULL) {
 		struct mbuf *n;
 
-#ifdef IPSEC
-		/* check AH/ESP integrity. */
-		if (ipsec4_in_reject_so(m, last->inp_socket))
-			ipsecstat.in_polvio++;
-			/* do not inject data to pcb */
-		else
-#endif /*IPSEC*/
-#ifdef FAST_IPSEC
-		/* check AH/ESP integrity. */
-		if (ipsec4_in_reject(m, last))
-			;
-		else
-#endif /*FAST_IPSEC*/
-		if ((n = m_copypacket(m, MB_DONTWAIT)) != NULL)
+		if ((n = m_copypacket(m, M_NOWAIT)) != NULL)
 			udp_append(last, ip, n,
 			    arg->iphlen + sizeof(struct udphdr),
-			    arg->udp_in,
-#ifdef INET6
-			    arg->udp_in6, arg->udp_ip6
-#else
-			    NULL, NULL
-#endif
-			    );
+			    arg->udp_in);
 	}
 	arg->last = last = inp;
 
@@ -408,13 +372,6 @@ int
 udp_input(struct mbuf **mp, int *offp, int proto)
 {
 	struct sockaddr_in udp_in = { sizeof udp_in, AF_INET };
-#ifdef INET6
-	struct udp_in6 udp_in6 = {
-		{ sizeof udp_in6.uin6_sin, AF_INET6 }, 0
-	};
-	struct udp_ip6 udp_ip6;
-#endif
-
 	int iphlen;
 	struct ip *ip;
 	struct udphdr *uh;
@@ -423,7 +380,6 @@ udp_input(struct mbuf **mp, int *offp, int proto)
 	struct mbuf *opts = NULL;
 	int len, off;
 	struct ip save_ip;
-	struct sockaddr *append_sa;
 	struct inpcbinfo *pcbinfo = &udbinfo[mycpuid];
 
 	off = *offp;
@@ -542,11 +498,6 @@ udp_input(struct mbuf **mp, int *offp, int proto)
 		 * (Algorithm copied from raw_intr().)
 		 */
 		last = NULL;
-#ifdef INET6
-		udp_in6.uin6_init_done = udp_ip6.uip6_init_done = 0;
-		arg.udp_in6 = &udp_in6;
-		arg.udp_ip6 = &udp_ip6;
-#endif
 		arg.iphlen = iphlen;
 
 		connhead = &pcbinfo->hashbase[
@@ -554,7 +505,7 @@ udp_input(struct mbuf **mp, int *offp, int proto)
 		    ip->ip_dst.s_addr, uh->uh_dport, pcbinfo->hashmask)];
 		LIST_FOREACH(inp, connhead, inp_hash) {
 #ifdef INET6
-			if (!(inp->inp_vflag & INP_IPV4))
+			if (!INP_ISIPV4(inp))
 				continue;
 #endif
 			if (!in_hosteq(inp->inp_faddr, ip->ip_src) ||
@@ -580,7 +531,7 @@ udp_input(struct mbuf **mp, int *offp, int proto)
 		ichead = &pcbinfo->wildcardhashbase[
 		    INP_PCBWILDCARDHASH(uh->uh_dport,
 		    pcbinfo->wildcardhashmask)];
-		ic_marker = in_pcbcontainer_marker(mycpuid);
+		ic_marker = in_pcbcontainer_marker();
 
 		GET_PCBINFO_TOKEN(pcbinfo);
 		LIST_INSERT_HEAD(ichead, ic_marker, ic_list);
@@ -592,7 +543,7 @@ udp_input(struct mbuf **mp, int *offp, int proto)
 			if (inp->inp_flags & INP_PLACEMARKER)
 				continue;
 #ifdef INET6
-			if (!(inp->inp_vflag & INP_IPV4))
+			if (!INP_ISIPV4(inp))
 				continue;
 #endif
 			if (inp->inp_lport != uh->uh_dport)
@@ -626,26 +577,8 @@ done:
 			udp_stat.udps_noportbcast++;
 			goto bad;
 		}
-#ifdef IPSEC
-		/* check AH/ESP integrity. */
-		if (ipsec4_in_reject_so(m, last->inp_socket)) {
-			ipsecstat.in_polvio++;
-			goto bad;
-		}
-#endif /*IPSEC*/
-#ifdef FAST_IPSEC
-		/* check AH/ESP integrity. */
-		if (ipsec4_in_reject(m, last))
-			goto bad;
-#endif /*FAST_IPSEC*/
 		udp_append(last, ip, m, iphlen + sizeof(struct udphdr),
-		    &udp_in,
-#ifdef INET6
-		    &udp_in6, &udp_ip6
-#else
-		    NULL, NULL
-#endif
-		    );
+		    &udp_in);
 		return(IPPROTO_DONE);
 	}
 	/*
@@ -656,13 +589,12 @@ done:
 	    udp_reuseport_ext ? m : NULL);
 	if (inp == NULL) {
 		if (log_in_vain) {
-			char buf[sizeof "aaa.bbb.ccc.ddd"];
+			char src[INET_ADDRSTRLEN], dst[INET_ADDRSTRLEN];
 
-			strcpy(buf, inet_ntoa(ip->ip_dst));
 			log(LOG_INFO,
 			    "Connection attempt to UDP %s:%d from %s:%d\n",
-			    buf, ntohs(uh->uh_dport), inet_ntoa(ip->ip_src),
-			    ntohs(uh->uh_sport));
+			    kinet_ntoa(ip->ip_dst, dst), ntohs(uh->uh_dport),
+			    kinet_ntoa(ip->ip_src, src), ntohs(uh->uh_sport));
 		}
 		udp_stat.udps_noport++;
 		if (m->m_flags & (M_BCAST | M_MCAST)) {
@@ -680,16 +612,7 @@ done:
 		icmp_error(m, ICMP_UNREACH, ICMP_UNREACH_PORT, 0, 0);
 		return(IPPROTO_DONE);
 	}
-#ifdef IPSEC
-	if (ipsec4_in_reject_so(m, inp->inp_socket)) {
-		ipsecstat.in_polvio++;
-		goto bad;
-	}
-#endif /*IPSEC*/
-#ifdef FAST_IPSEC
-	if (ipsec4_in_reject(m, inp))
-		goto bad;
-#endif /*FAST_IPSEC*/
+	KASSERT(INP_ISIPV4(inp), ("not inet inpcb"));
 	/*
 	 * Check the minimum TTL for socket.
 	 */
@@ -703,33 +626,16 @@ done:
 	udp_in.sin_port = uh->uh_sport;
 	udp_in.sin_addr = ip->ip_src;
 	if ((inp->inp_flags & INP_CONTROLOPTS) ||
-	    (inp->inp_socket->so_options & SO_TIMESTAMP)) {
-#ifdef INET6
-		if (inp->inp_vflag & INP_IPV6) {
-			int savedflags;
-
-			ip_2_ip6_hdr(&udp_ip6.uip6_ip6, ip);
-			savedflags = inp->inp_flags;
-			inp->inp_flags &= ~INP_UNMAPPABLEOPTS;
-			ip6_savecontrol(inp, &opts, &udp_ip6.uip6_ip6, m);
-			inp->inp_flags = savedflags;
-		} else
-#endif
+	    (inp->inp_socket->so_options & SO_TIMESTAMP))
 		ip_savecontrol(inp, &opts, ip, m);
-	}
 	m_adj(m, iphlen + sizeof(struct udphdr));
-#ifdef INET6
-	if (inp->inp_vflag & INP_IPV6) {
-		in6_sin_2_v4mapsin6(&udp_in, &udp_in6.uin6_sin);
-		append_sa = (struct sockaddr *)&udp_in6;
-	} else
-#endif
-		append_sa = (struct sockaddr *)&udp_in;
 
 	lwkt_gettoken(&inp->inp_socket->so_rcv.ssb_token);
-	if (ssb_appendaddr(&inp->inp_socket->so_rcv, append_sa, m, opts) == 0) {
+	if (ssb_appendaddr(&inp->inp_socket->so_rcv,
+	    (struct sockaddr *)&udp_in, m, opts) == 0) {
 		lwkt_reltoken(&inp->inp_socket->so_rcv.ssb_token);
 		udp_stat.udps_fullsock++;
+		soroverflow(inp->inp_socket);
 		goto bad;
 	}
 	lwkt_reltoken(&inp->inp_socket->so_rcv.ssb_token);
@@ -742,68 +648,27 @@ bad:
 	return(IPPROTO_DONE);
 }
 
-#ifdef INET6
-static void
-ip_2_ip6_hdr(struct ip6_hdr *ip6, struct ip *ip)
-{
-	bzero(ip6, sizeof *ip6);
-
-	ip6->ip6_vfc = IPV6_VERSION;
-	ip6->ip6_plen = ip->ip_len;
-	ip6->ip6_nxt = ip->ip_p;
-	ip6->ip6_hlim = ip->ip_ttl;
-	ip6->ip6_src.s6_addr32[2] = ip6->ip6_dst.s6_addr32[2] =
-		IPV6_ADDR_INT32_SMP;
-	ip6->ip6_src.s6_addr32[3] = ip->ip_src.s_addr;
-	ip6->ip6_dst.s6_addr32[3] = ip->ip_dst.s_addr;
-}
-#endif
-
 /*
  * subroutine of udp_input(), mainly for source code readability.
  * caller must properly init udp_ip6 and udp_in6 beforehand.
  */
 static void
 udp_append(struct inpcb *last, struct ip *ip, struct mbuf *n, int off,
-    struct sockaddr_in *udp_in,
-    struct udp_in6 *udp_in6, struct udp_ip6 *udp_ip6)
+    struct sockaddr_in *udp_in)
 {
-	struct sockaddr *append_sa;
 	struct mbuf *opts = NULL;
 	int ret;
 
-	if (last->inp_flags & INP_CONTROLOPTS ||
-	    last->inp_socket->so_options & SO_TIMESTAMP) {
-#ifdef INET6
-		if (last->inp_vflag & INP_IPV6) {
-			int savedflags;
+	KASSERT(INP_ISIPV4(last), ("not inet inpcb"));
 
-			if (udp_ip6->uip6_init_done == 0) {
-				ip_2_ip6_hdr(&udp_ip6->uip6_ip6, ip);
-				udp_ip6->uip6_init_done = 1;
-			}
-			savedflags = last->inp_flags;
-			last->inp_flags &= ~INP_UNMAPPABLEOPTS;
-			ip6_savecontrol(last, &opts, &udp_ip6->uip6_ip6, n);
-			last->inp_flags = savedflags;
-		} else
-#endif
+	if (last->inp_flags & INP_CONTROLOPTS ||
+	    last->inp_socket->so_options & SO_TIMESTAMP)
 		ip_savecontrol(last, &opts, ip, n);
-	}
-#ifdef INET6
-	if (last->inp_vflag & INP_IPV6) {
-		if (udp_in6->uin6_init_done == 0) {
-			in6_sin_2_v4mapsin6(udp_in, &udp_in6->uin6_sin);
-			udp_in6->uin6_init_done = 1;
-		}
-		append_sa = (struct sockaddr *)&udp_in6->uin6_sin;
-	} else
-#endif
-		append_sa = (struct sockaddr *)udp_in;
 	m_adj(n, off);
 
 	lwkt_gettoken(&last->inp_socket->so_rcv.ssb_token);
-	ret = ssb_appendaddr(&last->inp_socket->so_rcv, append_sa, n, opts);
+	ret = ssb_appendaddr(&last->inp_socket->so_rcv,
+	    (struct sockaddr *)udp_in, n, opts);
 	lwkt_reltoken(&last->inp_socket->so_rcv.ssb_token);
 	if (ret == 0) {
 		m_freem(n);
@@ -829,7 +694,7 @@ udp_notify(struct inpcb *inp, int error)
 
 struct netmsg_udp_notify {
 	struct netmsg_base base;
-	void		(*nm_notify)(struct inpcb *, int);
+	inp_notify_t	nm_notify;
 	struct in_addr	nm_faddr;
 	int		nm_arg;
 };
@@ -840,29 +705,28 @@ udp_notifyall_oncpu(netmsg_t msg)
 	struct netmsg_udp_notify *nm = (struct netmsg_udp_notify *)msg;
 	int nextcpu, cpu = mycpuid;
 
+	ASSERT_NETISR_NCPUS(cpu);
+
 	in_pcbnotifyall(&udbinfo[cpu], nm->nm_faddr, nm->nm_arg, nm->nm_notify);
 
 	nextcpu = cpu + 1;
-	if (nextcpu < ncpus2)
+	if (nextcpu < netisr_ncpus)
 		lwkt_forwardmsg(netisr_cpuport(nextcpu), &nm->base.lmsg);
 	else
 		lwkt_replymsg(&nm->base.lmsg, 0);
 }
 
-void
-udp_ctlinput(netmsg_t msg)
+inp_notify_t
+udp_get_inpnotify(int cmd, const struct sockaddr *sa,
+    struct ip **ip0, int *cpuid)
 {
-	struct sockaddr *sa = msg->ctlinput.nm_arg;
-	struct ip *ip = msg->ctlinput.nm_extra;
-	int cmd = msg->ctlinput.nm_cmd;
-	struct udphdr *uh;
-	void (*notify)(struct inpcb *, int) = udp_notify;
 	struct in_addr faddr;
-	struct inpcb *inp;
+	struct ip *ip = *ip0;
+	inp_notify_t notify = udp_notify;
 
-	faddr = ((struct sockaddr_in *)sa)->sin_addr;
+	faddr = ((const struct sockaddr_in *)sa)->sin_addr;
 	if (sa->sa_family != AF_INET || faddr.s_addr == INADDR_ANY)
-		goto done;
+		return NULL;
 
 	if (PRC_IS_REDIRECT(cmd)) {
 		ip = NULL;
@@ -870,19 +734,65 @@ udp_ctlinput(netmsg_t msg)
 	} else if (cmd == PRC_HOSTDEAD) {
 		ip = NULL;
 	} else if ((unsigned)cmd >= PRC_NCMDS || inetctlerrmap[cmd] == 0) {
-		goto done;
+		return NULL;
 	}
 
+	if (cpuid != NULL) {
+		if (ip == NULL) {
+			/* Go through all effective netisr CPUs. */
+			*cpuid = netisr_ncpus;
+		} else {
+			const struct udphdr *uh;
+
+			uh = (const struct udphdr *)
+			    ((caddr_t)ip + (ip->ip_hl << 2));
+			*cpuid = udp_addrcpu(faddr.s_addr, uh->uh_dport,
+			    ip->ip_src.s_addr, uh->uh_sport);
+		}
+	}
+
+	*ip0 = ip;
+	return notify;
+}
+
+void
+udp_ctlinput(netmsg_t msg)
+{
+	struct sockaddr *sa = msg->ctlinput.nm_arg;
+	struct ip *ip = msg->ctlinput.nm_extra;
+	int cmd = msg->ctlinput.nm_cmd, cpuid;
+	inp_notify_t notify;
+	struct in_addr faddr;
+
+	ASSERT_NETISR_NCPUS(mycpuid);
+
+	notify = udp_get_inpnotify(cmd, sa, &ip, &cpuid);
+	if (notify == NULL)
+		goto done;
+
+	faddr = ((struct sockaddr_in *)sa)->sin_addr;
 	if (ip) {
-		uh = (struct udphdr *)((caddr_t)ip + (ip->ip_hl << 2));
+		const struct udphdr *uh;
+		struct inpcb *inp;
+
+		if (cpuid != mycpuid)
+			goto done;
+
+		uh = (const struct udphdr *)((caddr_t)ip + (ip->ip_hl << 2));
 		inp = in_pcblookup_hash(&udbinfo[mycpuid], faddr, uh->uh_dport,
 					ip->ip_src, uh->uh_sport, 0, NULL);
 		if (inp != NULL && inp->inp_socket != NULL)
 			notify(inp, inetctlerrmap[cmd]);
+	} else if (msg->ctlinput.nm_direct) {
+		if (cpuid != netisr_ncpus && cpuid != mycpuid)
+			goto done;
+
+		in_pcbnotifyall(&udbinfo[mycpuid], faddr, inetctlerrmap[cmd],
+		    notify);
 	} else {
 		struct netmsg_udp_notify *nm;
 
-		KKASSERT(&curthread->td_msgport == netisr_cpuport(0));
+		ASSERT_NETISR0;
 		nm = kmalloc(sizeof(*nm), M_LWKTMSG, M_INTWAIT);
 		netmsg_init(&nm->base, NULL, &netisr_afree_rport,
 			    0, udp_notifyall_oncpu);
@@ -896,7 +806,7 @@ done:
 }
 
 SYSCTL_PROC(_net_inet_udp, UDPCTL_PCBLIST, pcblist, CTLFLAG_RD, udbinfo, 0,
-	    in_pcblist_global_ncpus2, "S,xinpcb", "List of active UDP sockets");
+	    in_pcblist_ncpus, "S,xinpcb", "List of active UDP sockets");
 
 static int
 udp_getcred(SYSCTL_HANDLER_ARGS)
@@ -979,6 +889,7 @@ udp_send(netmsg_t msg)
 	int pru_flags = msg->send.nm_flags;
 	struct inpcb *inp = so->so_pcb;
 	struct thread *td = msg->send.nm_td;
+	uint16_t hash;
 	int flags;
 
 	struct udpiphdr *ui;
@@ -1030,10 +941,6 @@ udp_send(netmsg_t msg)
 			goto release;
 		}
 		sin = (struct sockaddr_in *)dstaddr;
-		if (!prison_remote_ip(td, (struct sockaddr *)&sin)) {
-			error = EAFNOSUPPORT; /* IPv6 only jail */
-			goto release;
-		}
 	} else {
 		if (inp->inp_faddr.s_addr == INADDR_ANY) {
 			/* no destination specified and not already connected */
@@ -1047,7 +954,7 @@ udp_send(netmsg_t msg)
 	 * Calculate data length and get a mbuf
 	 * for UDP and IP headers.
 	 */
-	M_PREPEND(m, sizeof(struct udpiphdr), MB_DONTWAIT);
+	M_PREPEND(m, sizeof(struct udpiphdr), M_NOWAIT);
 	if (m == NULL) {
 		error = ENOBUFS;
 		goto release;
@@ -1144,11 +1051,16 @@ udp_send(netmsg_t msg)
 		 * For connected socket, this datagram has already
 		 * been in the correct netisr; no need to rehash.
 		 */
+		KASSERT(inp->inp_flags & INP_HASH, ("inpcb has no hash"));
+		m_sethash(m, inp->inp_hashval);
 		goto sendit;
 	}
 
-	cpu = udp_addrcpu(ui->ui_dst.s_addr, ui->ui_dport,
+	hash = udp_addrhash(ui->ui_dst.s_addr, ui->ui_dport,
 	    ui->ui_src.s_addr, ui->ui_sport);
+	m_sethash(m, hash);
+
+	cpu = netisr_hashcpu(hash);
 	if (cpu != mycpuid) {
 		struct mbuf *m_opt = NULL;
 		struct netmsg_pru_send *smsg;
@@ -1167,7 +1079,7 @@ udp_send(netmsg_t msg)
 			 * XXX optimize this?
 			 */
 			m_opt = m_copym(inp->inp_options, 0, M_COPYALL,
-			    MB_WAIT);
+			    M_WAITOK);
 		}
 		if ((pru_flags & PRUS_NOREPLY) == 0) {
 			/*
@@ -1253,6 +1165,12 @@ udp_abort(netmsg_t msg __unused)
 	panic("udp_abort is called");
 }
 
+static int
+udp_preattach(struct socket *so, int proto __unused, struct pru_attach_info *ai)
+{
+	return soreserve(so, udp_sendspace, udp_recvspace, ai->sb_rlimit);
+}
+
 static void
 udp_attach(netmsg_t msg)
 {
@@ -1261,22 +1179,22 @@ udp_attach(netmsg_t msg)
 	struct inpcb *inp;
 	int error;
 
-	inp = so->so_pcb;
-	if (inp != NULL) {
-		error = EINVAL;
-		goto out;
+	KASSERT(so->so_pcb == NULL, ("udp socket attached"));
+
+	if (ai != NULL) {
+		error = udp_preattach(so, 0 /* don't care */, ai);
+		if (error)
+			goto out;
+	} else {
+		/* Post attach; do nothing */
 	}
-	error = soreserve(so, udp_sendspace, udp_recvspace, ai->sb_rlimit);
-	if (error)
-		goto out;
 
 	error = in_pcballoc(so, &udbinfo[mycpuid]);
 	if (error)
 		goto out;
 
-	inp = (struct inpcb *)so->so_pcb;
+	inp = so->so_pcb;
 	inp->inp_flags |= INP_DIRECT_DETACH;
-	inp->inp_vflag |= INP_IPV4;
 	inp->inp_ip_ttl = ip_defttl;
 	error = 0;
 out:
@@ -1319,7 +1237,7 @@ udp_inswildcardhash_oncpu(struct inpcb *inp, struct netmsg_base *msg)
 	    ("not on owner cpu"));
 
 	in_pcbinswildcardhash(inp);
-	for (cpu = 0; cpu < ncpus2; ++cpu) {
+	for (cpu = 0; cpu < netisr_ncpus; ++cpu) {
 		if (cpu == mycpuid) {
 			/*
 			 * This inpcb has been inserted by the above
@@ -1330,12 +1248,14 @@ udp_inswildcardhash_oncpu(struct inpcb *inp, struct netmsg_base *msg)
 		in_pcbinswildcardhash_oncpu(inp, &udbinfo[cpu]);
 	}
 
-	if (inp->inp_socket->so_options & SO_REUSEPORT) {
+	/* NOTE: inp_lgrpindex is _not_ assigned in jail. */
+	if ((inp->inp_socket->so_options & SO_REUSEPORT) &&
+	    inp->inp_lgrpindex >= 0) {
 		/*
 		 * For SO_REUSEPORT socket, redistribute it based on its
 		 * local group index.
 		 */
-		cpu = inp->inp_lgrpindex & ncpus2_mask;
+		cpu = inp->inp_lgrpindex % netisr_ncpus;
 		if (cpu != mycpuid) {
 			struct lwkt_port *port = netisr_cpuport(cpu);
 			lwkt_msg_t lmsg = &msg->lmsg;
@@ -1368,8 +1288,7 @@ udp_inswildcardhash_dispatch(netmsg_t msg)
 	boolean_t forwarded;
 
 	KASSERT(inp->inp_lport != 0, ("local port not set yet"));
-	KASSERT((ntohs(inp->inp_lport) & ncpus2_mask) == mycpuid,
-	    ("not target cpu"));
+	KASSERT(udp_lportcpu(inp->inp_lport) == mycpuid, ("not target cpu"));
 
 	in_pcblink(inp, &udbinfo[mycpuid]);
 
@@ -1399,7 +1318,7 @@ udp_inswildcardhash(struct inpcb *inp, struct netmsg_base *msg, int error)
 	in_pcbresetroute(inp);
 
 	KASSERT(inp->inp_lport != 0, ("local port not set yet"));
-	cpu = ntohs(inp->inp_lport) & ncpus2_mask;
+	cpu = udp_lportcpu(inp->inp_lport);
 
 	lmsg->ms_error = error;
 	if (cpu != mycpuid) {
@@ -1433,10 +1352,65 @@ udp_bind(netmsg_t msg)
 	if (inp) {
 		struct sockaddr *nam = msg->bind.nm_nam;
 		struct thread *td = msg->bind.nm_td;
+		struct sockaddr_in *sin;
+		lwkt_port_t port;
+		int cpu;
+
+		/*
+		 * Check "already bound" here (in_pcbbind() does the same
+		 * check though), so we don't forward a connected/bound
+		 * socket randomly which would panic in the following
+		 * in_pcbunlink().
+		 */
+		if (inp->inp_lport != 0 ||
+		    inp->inp_laddr.s_addr != INADDR_ANY) {
+			error = EINVAL;	/* already bound */
+			goto done;
+		}
+
+		if (nam->sa_len != sizeof(*sin)) {
+			error = EINVAL;
+			goto done;
+		}
+		sin = (struct sockaddr_in *)nam;
+
+		cpu = udp_lportcpu(sin->sin_port);
+		port = netisr_cpuport(cpu);
+
+		/*
+		 * See the related comment in tcp_usrreq.c tcp_usr_bind().
+		 * The exception is that we use local port based netisr
+		 * to serialize in_pcbbind().
+		 */
+		if (&curthread->td_msgport != port) {
+			lwkt_msg_t lmsg = &msg->bind.base.lmsg;
+
+			KASSERT((msg->bind.nm_flags & PRUB_RELINK) == 0,
+			    ("already asked to relink"));
+
+			in_pcbunlink(so->so_pcb, &udbinfo[mycpuid]);
+			msg->bind.nm_flags |= PRUB_RELINK;
+
+			/*
+			 * See the related comment in tcp_usrreq.c
+			 * tcp_connect().
+			 */
+			lwkt_setmsg_receipt(lmsg, udp_sosetport);
+			lwkt_forwardmsg(port, lmsg);
+			/* msg invalid now */
+			return;
+		}
+		KASSERT(so->so_port == port, ("so_port is not netisr%d", cpu));
+
+		if (msg->bind.nm_flags & PRUB_RELINK) {
+			msg->bind.nm_flags &= ~PRUB_RELINK;
+			in_pcblink(so->so_pcb, &udbinfo[mycpuid]);
+		}
+		KASSERT(inp->inp_pcbinfo == &udbinfo[cpu],
+		    ("pcbinfo is not udbinfo%d", cpu));
 
 		error = in_pcbbind(inp, nam, td);
 		if (error == 0) {
-			struct sockaddr_in *sin = (struct sockaddr_in *)nam;
 			boolean_t forwarded;
 
 			if (sin->sin_addr.s_addr != INADDR_ANY)
@@ -1455,7 +1429,16 @@ udp_bind(netmsg_t msg)
 	} else {
 		error = EINVAL;
 	}
+done:
 	lwkt_replymsg(&msg->bind.base.lmsg, error);
+}
+
+static int
+udp_preconnect(struct socket *so, const struct sockaddr *nam __unused,
+    struct thread *td __unused)
+{
+	sosetstate(so, SS_ISCONNECTED);		/* XXX */
+	return 0;
 }
 
 static void
@@ -1468,6 +1451,7 @@ udp_connect(netmsg_t msg)
 	struct sockaddr_in *sin = (struct sockaddr_in *)nam;
 	struct sockaddr_in *if_sin;
 	struct lwkt_port *port;
+	uint16_t hash;
 	int error;
 
 	KKASSERT(msg->connect.nm_m == NULL);
@@ -1505,14 +1489,11 @@ udp_connect(netmsg_t msg)
 	error = in_pcbladdr(inp, nam, &if_sin, td);
 	if (error)
 		goto out;
-	if (!prison_remote_ip(td, nam)) {
-		error = EAFNOSUPPORT; /* IPv6 only jail */
-		goto out;
-	}
 
-	port = udp_addrport(sin->sin_addr.s_addr, sin->sin_port,
+	hash = udp_addrhash(sin->sin_addr.s_addr, sin->sin_port,
 	    inp->inp_laddr.s_addr != INADDR_ANY ?
 	    inp->inp_laddr.s_addr : if_sin->sin_addr.s_addr, inp->inp_lport);
+	port = netisr_hashport(hash);
 	if (port != &curthread->td_msgport) {
 		lwkt_msg_t lmsg = &msg->connect.base.lmsg;
 		int nm_flags = PRUC_RECONNECT;
@@ -1532,6 +1513,25 @@ udp_connect(netmsg_t msg)
 			udp_remwildcardhash(inp);
 		}
 
+		if (so->so_orig_port == NULL) {
+			/*
+			 * First time change protocol processing port.
+			 * Save the current port for synchronization upon
+			 * udp_detach.
+			 */
+			so->so_orig_port = &curthread->td_msgport;
+		} else {
+			/*
+			 * We have changed protocol processing port more
+			 * than once.  We could not do direct detach
+			 * anymore, because we lose the track of the
+			 * original protocol processing ports to perform
+			 * synchronization upon udp_detach.  This should
+			 * be rare though.
+			 */
+			inp->inp_flags &= ~INP_DIRECT_DETACH;
+		}
+
 		/*
 		 * We are moving the protocol processing port the socket
 		 * is on, we have to unlink here and re-link on the
@@ -1546,8 +1546,31 @@ udp_connect(netmsg_t msg)
 		/* msg invalid now */
 		return;
 	}
-	error = udp_connect_oncpu(inp, sin, if_sin);
+	error = udp_connect_oncpu(inp, sin, if_sin, hash);
 out:
+	if (msg->connect.nm_flags & PRUC_HELDTD)
+		lwkt_rele(td);
+	if (error && (msg->connect.nm_flags & PRUC_ASYNC)) {
+		if (inp->inp_lport == 0) {
+			/*
+			 * As long as we have the local port, it is fine
+			 * for connect to fail, e.g. disconnect.
+			 */
+			so->so_error = error;
+		}
+		soclrstate(so, SS_ISCONNECTED);
+		/*
+		 * Wake up callers blocked on this socket to make sure
+		 * that they can see this error.
+		 *
+		 * NOTE:
+		 * sodisconnected() can't be used here, which bricks
+		 * sending and receiving.
+		 */
+		wakeup(&so->so_timeo);
+		sowwakeup(so);
+		sorwakeup(so);
+	}
 	if (error && inp != NULL && inp->inp_lport != 0 &&
 	    (inp->inp_flags & INP_WILDCARD) == 0) {
 		boolean_t forwarded;
@@ -1574,7 +1597,7 @@ udp_remwildcardhash(struct inpcb *inp)
 	KASSERT(inp->inp_pcbinfo == &udbinfo[mycpuid],
 	    ("not on owner cpu"));
 
-	for (cpu = 0; cpu < ncpus2; ++cpu) {
+	for (cpu = 0; cpu < netisr_ncpus; ++cpu) {
 		if (cpu == mycpuid) {
 			/*
 			 * This inpcb will be removed by the later
@@ -1589,7 +1612,7 @@ udp_remwildcardhash(struct inpcb *inp)
 
 static int
 udp_connect_oncpu(struct inpcb *inp, struct sockaddr_in *sin,
-    struct sockaddr_in *if_sin)
+    struct sockaddr_in *if_sin, uint16_t hash)
 {
 	struct socket *so = inp->inp_socket;
 	struct inpcb *oinp;
@@ -1616,6 +1639,9 @@ udp_connect_oncpu(struct inpcb *inp, struct sockaddr_in *sin,
 	inp->inp_faddr = sin->sin_addr;
 	inp->inp_fport = sin->sin_port;
 	in_pcbinsconnhash(inp);
+
+	inp->inp_flags |= INP_HASH;
+	inp->inp_hashval = hash;
 
 	soisconnected(so);
 
@@ -1666,7 +1692,7 @@ udp_detach_oncpu_dispatch(netmsg_t msg)
 	}
 
 	nextcpu = cpuid + 1;
-	if (nextcpu < ncpus2) {
+	if (nextcpu < netisr_ncpus) {
 		lwkt_forwardmsg(netisr_cpuport(nextcpu), &clomsg->lmsg);
 	} else {
 		/*
@@ -1677,6 +1703,21 @@ udp_detach_oncpu_dispatch(netmsg_t msg)
 		    udp_detach_final_dispatch);
 		lwkt_sendmsg(so->so_port, &clomsg->lmsg);
 	}
+}
+
+static void
+udp_detach_syncorig_dispatch(netmsg_t msg)
+{
+	struct netmsg_base *clomsg = &msg->base;
+	struct socket *so = clomsg->nm_so;
+
+	/*
+	 * Original protocol processing port is synchronized;
+	 * destroy this inpcb in its owner netisr.
+	 */
+	netmsg_init(clomsg, so, &netisr_apanic_rport, 0,
+	    udp_detach_final_dispatch);
+	lwkt_sendmsg(so->so_port, &clomsg->lmsg);
 }
 
 static void
@@ -1698,7 +1739,7 @@ udp_detach(netmsg_t msg)
 	 */
 	lwkt_replymsg(&msg->detach.base.lmsg, EJUSTRETURN);
 
-	if (ncpus2 == 1) {
+	if (netisr_ncpus == 1) {
 		/* Only one CPU, detach the inpcb directly. */
 		udp_detach2(so);
 		return;
@@ -1710,6 +1751,13 @@ udp_detach(netmsg_t msg)
 	 */
 	in_pcbofflist(inp);
 
+	/*
+	 * Remove this inpcb from the local port hash directly
+	 * here, so that its bound local port could be recycled
+	 * timely.
+	 */
+	in_pcbremporthash(inp);
+
 	if (inp->inp_flags & INP_DIRECT_DETACH) {
 		/*
 		 * Direct detaching is allowed
@@ -1717,7 +1765,22 @@ udp_detach(netmsg_t msg)
 		KASSERT((inp->inp_flags & INP_WILDCARD) == 0,
 		    ("in the wildcardhash"));
 		KASSERT(inp->inp_moptions == NULL, ("has mcast options"));
-		udp_detach2(so);
+		if (so->so_orig_port == NULL) {
+			udp_detach2(so);
+		} else {
+			/*
+			 * Protocol processing port changed once, so
+			 * we need to make sure that there are nothing
+			 * left on the original protocol processing
+			 * port before we destroy this socket and inpcb.
+			 * This is more lightweight than going through
+			 * all UDP processing netisrs.
+			 */
+			clomsg = &so->so_clomsg;
+			netmsg_init(clomsg, so, &netisr_apanic_rport,
+			    MSGF_IGNSOPORT, udp_detach_syncorig_dispatch);
+			lwkt_sendmsg(so->so_orig_port, &clomsg->lmsg);
+		}
 		return;
 	}
 
@@ -1752,6 +1815,7 @@ udp_disconnect(netmsg_t msg)
 	soclrstate(so, SS_ISCONNECTED);		/* XXX */
 
 	in_pcbdisconnect(inp);
+	inp->inp_flags &= ~INP_HASH;
 
 	/*
 	 * Follow traditional BSD behavior and retain the local port
@@ -1818,5 +1882,7 @@ struct pr_usrreqs udp_usrreqs = {
 	.pru_shutdown = udp_shutdown,
 	.pru_sockaddr = in_setsockaddr_dispatch,
 	.pru_sosend = sosendudp,
-	.pru_soreceive = soreceive
+	.pru_soreceive = soreceive,
+	.pru_preconnect = udp_preconnect,
+	.pru_preattach = udp_preattach
 };

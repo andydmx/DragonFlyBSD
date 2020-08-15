@@ -60,25 +60,37 @@
 #ifndef _WCHAR_H_
 #define _WCHAR_H_
 
-#include <stdio.h> /* for FILE* */
+#include <sys/cdefs.h>
 #include <sys/_null.h>
-#include <sys/types.h>
-#include <machine/limits.h>
-#include <ctype.h>
+#include <machine/stdarg.h>	/* for __va_list */
+#include <machine/stdint.h>
+#include <machine/wchar_limits.h>
+#include <machine/wchar.h>
+#include <ctype.h>		/* for __wcwidth() */
+
+#if __POSIX_VISIBLE >= 200809 || __XSI_VISIBLE
+#ifndef _VA_LIST_DECLARED
+#define	_VA_LIST_DECLARED
+#ifdef va_start
+/* prevent gcc from fixing this header */
+#endif
+typedef	__va_list	va_list;
+#endif
+#endif
 
 #ifndef __cplusplus
 #ifndef _WCHAR_T_DECLARED
 #define	_WCHAR_T_DECLARED
-typedef	__wchar_t	wchar_t;
+typedef	___wchar_t	wchar_t;
 #endif
 #endif
 
 #ifndef WCHAR_MIN
-#define	WCHAR_MIN	INT_MIN
+#define	WCHAR_MIN	__WCHAR_MIN
 #endif
 
 #ifndef WCHAR_MAX
-#define	WCHAR_MAX	INT_MAX
+#define	WCHAR_MAX	__WCHAR_MAX
 #endif
 
 #ifndef _WINT_T_DECLARED
@@ -98,6 +110,18 @@ typedef __size_t	size_t;
 
 #ifndef WEOF
 #define	WEOF 	((wint_t)(-1))
+#endif
+
+#if __BSD_VISIBLE
+#define WCSBIN_EOF		0x01	/* indicate input buffer EOF */
+#define WCSBIN_SURRO		0x02	/* allow surrogates */
+#define WCSBIN_LONGCODES	0x04	/* allow up to 31-bit WCs */
+#define WCSBIN_STRICT		0x08	/* no escaping, else escapes happen */
+#endif
+
+#ifndef _STDFILE_DECLARED
+#define	_STDFILE_DECLARED
+typedef struct __FILE FILE;
 #endif
 
 struct tm;
@@ -120,6 +144,10 @@ size_t	mbrtowc(wchar_t * __restrict, const char * __restrict, size_t,
 int	mbsinit(const mbstate_t *);
 size_t	mbsrtowcs(wchar_t * __restrict, const char ** __restrict, size_t,
 	    mbstate_t * __restrict);
+#if __BSD_VISIBLE
+size_t	mbintowcr(wchar_t * __restrict dst, const char * __restrict src,
+	    size_t dlen, size_t *slen, int flags);
+#endif
 wint_t	putwc(wchar_t, FILE *);
 wint_t	putwchar(wchar_t);
 int	swprintf(wchar_t * __restrict, size_t n, const wchar_t * __restrict,
@@ -132,6 +160,10 @@ int	vswprintf(wchar_t * __restrict, size_t n, const wchar_t * __restrict,
 	    __va_list);
 int	vwprintf(const wchar_t * __restrict, __va_list);
 size_t	wcrtomb(char * __restrict, wchar_t, mbstate_t * __restrict);
+#if __BSD_VISIBLE
+size_t	wcrtombin(char * __restrict dst, const wchar_t * __restrict src,
+	    size_t dlen, size_t *slen, int flags);
+#endif
 wchar_t	*wcscat(wchar_t * __restrict, const wchar_t * __restrict);
 wchar_t	*wcschr(const wchar_t *, wchar_t) __pure;
 int	wcscmp(const wchar_t *, const wchar_t *) __pure;
@@ -167,6 +199,13 @@ wchar_t	*wmemmove(wchar_t *, const wchar_t *, size_t);
 wchar_t	*wmemset(wchar_t *, wchar_t, size_t);
 int	wprintf(const wchar_t * __restrict, ...);
 int	wscanf(const wchar_t * __restrict, ...);
+
+#if __BSD_VISIBLE
+size_t	utf8towcr(wchar_t * __restrict dst, const char * __restrict src,
+	    size_t dlen, size_t *slen, int flags);
+size_t	wcrtoutf8(char * __restrict dst, const wchar_t * __restrict src,
+	    size_t dlen, size_t *slen, int flags);
+#endif
 
 #ifndef _STDSTREAM_DECLARED
 extern FILE *__stdinp;
@@ -205,13 +244,13 @@ int	wcwidth(wchar_t);
 #define	wcwidth(_c)	__wcwidth(_c)
 #endif
 
-#if __POSIX_VISIBLE >= 200809 || __BSD_VISIBLE
+#if __POSIX_VISIBLE >= 200809
 size_t	mbsnrtowcs(wchar_t * __restrict, const char ** __restrict, size_t,
 	    size_t, mbstate_t * __restrict);
 FILE	*open_wmemstream(wchar_t **, size_t *);
 wchar_t	*wcpcpy(wchar_t * __restrict, const wchar_t * __restrict);
 wchar_t	*wcpncpy(wchar_t * __restrict, const wchar_t * __restrict, size_t);
-wchar_t	*wcsdup(const wchar_t *);
+wchar_t	*wcsdup(const wchar_t *) __malloclike;
 int	wcscasecmp(const wchar_t *, const wchar_t *);
 int	wcsncasecmp(const wchar_t *, const wchar_t *, size_t n);
 size_t	wcsnlen(const wchar_t *, size_t) __pure;

@@ -26,7 +26,6 @@
  * SUCH DAMAGE.
  *
  * $FreeBSD: src/usr.sbin/ppp/fsm.c,v 1.52.2.8 2002/09/01 02:12:27 brian Exp $
- * $DragonFly: src/usr.sbin/ppp/fsm.c,v 1.2 2003/06/17 04:30:00 dillon Exp $
  */
 
 #include <sys/param.h>
@@ -106,7 +105,7 @@ static const struct fsmcodedesc {
 static const char *
 Code2Nam(u_int code)
 {
-  if (code == 0 || code > sizeof FsmCodes / sizeof FsmCodes[0])
+  if (code == 0 || code > NELEM(FsmCodes))
     return "Unknown";
   return FsmCodes[code-1].name;
 }
@@ -119,7 +118,7 @@ State2Nam(u_int state)
     "Req-Sent", "Ack-Rcvd", "Ack-Sent", "Opened",
   };
 
-  if (state >= sizeof StateNames / sizeof StateNames[0])
+  if (state >= NELEM(StateNames))
     return "unknown";
   return StateNames[state];
 }
@@ -514,7 +513,7 @@ FsmRecvConfigReq(struct fsm *fp, struct fsmheader *lhp, struct mbuf *bp)
       m_freem(bp);
       return;
     }
-    /* Drop through */
+    /* FALLTHROUGH */
   case ST_STARTING:
     log_Printf(fp->LogLevel, "%s: Oops, RCR in %s.\n",
               fp->link->name, State2Nam(fp->state));
@@ -527,12 +526,13 @@ FsmRecvConfigReq(struct fsm *fp, struct fsmheader *lhp, struct mbuf *bp)
   case ST_CLOSING:
     log_Printf(fp->LogLevel, "%s: Error: Got ConfigReq while state = %s\n",
               fp->link->name, State2Nam(fp->state));
+    /* FALLTHROUGH */
   case ST_STOPPING:
     m_freem(bp);
     return;
   case ST_STOPPED:
     FsmInitRestartCounter(fp, FSM_REQ_TIMER);
-    /* Drop through */
+    /* FALLTHROUGH */
   case ST_OPENED:
     FsmSendConfigReq(fp);
     break;
@@ -1063,7 +1063,7 @@ fsm_Input(struct fsm *fp, struct mbuf *bp)
   }
 
   if (lh.code < fp->min_code || lh.code > fp->max_code ||
-      lh.code > sizeof FsmCodes / sizeof *FsmCodes) {
+      lh.code > NELEM(FsmCodes)) {
     /*
      * Use a private id.  This is really a response-type packet, but we
      * MUST send a unique id for each REQ....

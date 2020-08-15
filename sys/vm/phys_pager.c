@@ -39,8 +39,19 @@
 #include <vm/vm_pager.h>
 #include <vm/vm_zone.h>
 
-#include <sys/thread2.h>
 #include <vm/vm_page2.h>
+
+static	pgo_dealloc_t		phys_pager_dealloc;
+static	pgo_getpage_t		phys_pager_getpage;
+static	pgo_putpages_t		phys_pager_putpages;
+static	pgo_haspage_t		phys_pager_haspage;
+
+struct pagerops physpagerops = {
+	.pgo_dealloc =		phys_pager_dealloc,
+	.pgo_getpage =		phys_pager_getpage,
+	.pgo_putpages =		phys_pager_putpages,
+	.pgo_haspage =		phys_pager_haspage
+};
 
 /*
  * No requirements.
@@ -82,11 +93,9 @@ phys_pager_getpage(vm_object_t object, vm_page_t *mpp, int seqaccess)
 {
 	vm_page_t m = *mpp;
 
-	if ((m->flags & PG_ZERO) == 0)
-		vm_page_zero_fill(m);
-	vm_page_flag_set(m, PG_ZERO);
+	vm_page_zero_fill(m);
 	/* Switch off pv_entries */
-	vm_page_unmanage(m);
+	vm_page_flag_set(m, PG_UNQUEUED);
 	m->valid = VM_PAGE_BITS_ALL;
 	m->dirty = VM_PAGE_BITS_ALL;
 
@@ -98,7 +107,7 @@ phys_pager_getpage(vm_object_t object, vm_page_t *mpp, int seqaccess)
  */
 static void
 phys_pager_putpages(vm_object_t object, vm_page_t *m, int count,
-		    int sync, int *rtvals)
+		    int flags, int *rtvals)
 {
 
 	panic("phys_pager_putpage called");
@@ -123,10 +132,3 @@ phys_pager_haspage(vm_object_t object, vm_pindex_t pindex)
 {
 	return (TRUE);
 }
-
-struct pagerops physpagerops = {
-	phys_pager_dealloc,
-	phys_pager_getpage,
-	phys_pager_putpages,
-	phys_pager_haspage
-};

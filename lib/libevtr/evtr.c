@@ -1,10 +1,10 @@
 /*
  * Copyright (c) 2009, 2010 Aggelos Economopoulos.  All rights reserved.
- * 
+ *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
  * are met:
- * 
+ *
  * 1. Redistributions of source code must retain the above copyright
  *    notice, this list of conditions and the following disclaimer.
  * 2. Redistributions in binary form must reproduce the above copyright
@@ -14,7 +14,7 @@
  * 3. Neither the name of The DragonFly Project nor the names of its
  *    contributors may be used to endorse or promote products derived
  *    from this software without specific, prior written permission.
- * 
+ *
  * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
  * ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
  * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
@@ -35,9 +35,11 @@
 #include <errno.h>
 #include <limits.h>
 #include <stdarg.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/param.h>
 #include <sys/queue.h>
 #include <sys/stat.h>
 #include <sys/tree.h>
@@ -1029,7 +1031,7 @@ evtr_dump_fmt(evtr_t evtr, uint64_t ts, const evtr_event_t ev)
 
 /*
  * Replace string pointers or string ids in fmtdata
- */ 
+ */
 static
 int
 mangle_string_ptrs(const char *fmt, uint8_t *fmtdata,
@@ -1434,7 +1436,7 @@ evtr_close(evtr_t evtr)
 
 	if (evtr->flags & EVTRF_WR) {
 		hashtab_destroy(&evtr->fmts->tab);
-		for (i = 0; i < EVTR_NS_MAX; ++i)
+		for (i = 0; i < EVTR_NS_MAX - 1; ++i)
 			hashtab_destroy(&evtr->strings[i]->tab);
 	} else {
 		id_tree_free(&evtr->fmtmap.root);
@@ -1451,7 +1453,7 @@ evtr_read(evtr_t evtr, void *buf, size_t size)
 {
 	assert(size > 0);
 	assert_foff_in_sync(evtr);
-	printd(IO, "evtr_read at %#jx, %zd bytes\n", evtr->bytes, size);
+	printd(IO, "evtr_read at %#jx, %zu bytes\n", evtr->bytes, size);
 	if (fread(buf, size, 1, evtr->f) != 1) {
 		if (feof(evtr->f)) {
 			evtr->errmsg = "incomplete record";
@@ -1683,7 +1685,7 @@ int
 evtr_skip_to_record(evtr_t evtr)
 {
 	int skip;
-	
+
 	skip = REC_ALIGN - (evtr->bytes % REC_ALIGN);
 	if (skip > 0) {
 		if (fseek(evtr->f, skip, SEEK_CUR)) {
@@ -1872,7 +1874,7 @@ evtr_last_event(evtr_t evtr, evtr_event_t ev)
 		 * location that we are sure contains a header so we can
 		 * pick up the stream.
 		 */
-		last_boundary = (st.st_size / REC_BOUNDARY) * REC_BOUNDARY;
+		last_boundary = rounddown(st.st_size, REC_BOUNDARY);
 		/* XXX: ->bytes should be in query */
 		assert(evtr->bytes == 0);
 		evtr_skip(evtr, last_boundary);
@@ -1954,7 +1956,7 @@ void
 evtr_query_destroy(struct evtr_query *q)
 {
 	evtr_deregister_filters(q, q->filt, q->nfilt);
-		
+
 	free(q->buf);
 	free(q);
 }

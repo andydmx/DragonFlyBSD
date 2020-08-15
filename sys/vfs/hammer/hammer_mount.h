@@ -1,13 +1,13 @@
 /*
  * Copyright (c) 2007 The DragonFly Project.  All rights reserved.
- * 
+ *
  * This code is derived from software contributed to The DragonFly Project
  * by Matthew Dillon <dillon@backplane.com>
- * 
+ *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
  * are met:
- * 
+ *
  * 1. Redistributions of source code must retain the above copyright
  *    notice, this list of conditions and the following disclaimer.
  * 2. Redistributions in binary form must reproduce the above copyright
@@ -17,7 +17,7 @@
  * 3. Neither the name of The DragonFly Project nor the names of its
  *    contributors may be used to endorse or promote products derived
  *    from this software without specific, prior written permission.
- * 
+ *
  * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
  * ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
  * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
@@ -30,9 +30,12 @@
  * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT
  * OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
- * 
+ *
  * $DragonFly: src/sys/vfs/hammer/hammer_mount.h,v 1.11 2008/09/17 21:44:20 dillon Exp $
  */
+
+#ifndef VFS_HAMMER_MOUNT_H_
+#define VFS_HAMMER_MOUNT_H_
 
 #ifndef _SYS_TYPES_H_
 #include <sys/types.h>
@@ -46,19 +49,20 @@
  * system call.
  */
 struct hammer_mount_info {
-	const char	**volumes;	/* array of pointers to device names */
+	char		**volumes;	/* array of pointers to device names */
 	int		nvolumes;	/* number of devices */
 	int		hflags;		/* extended hammer mount flags */
 	int		master_id;	/* -1=no-mirror mode, or 0-15 */
-	u_int64_t	asof;		/* asof - HAMMER_MAX_TID is current */
+	uint64_t	asof;		/* asof - HAMMER_MAX_TID is current */
 	char		reserved1[136];	/* was struct export_args */
-	u_int64_t	reserved2[15];
+	uint64_t	reserved2[15];
 };
 
 #define HMNT_NOHISTORY	0x00000001
 #define HMNT_MASTERID	0x00000002	/* master_id field set */
-#define HMNT_EXPORTREQ	0x00000004
+#define HMNT_NOMIRROR	0x00000004	/* master_id field set to -1 */
 #define HMNT_UNDO_DIRTY	0x00000008
 
-#define HMNT_USERFLAGS	(HMNT_NOHISTORY | HMNT_MASTERID)
+#define HMNT_USERFLAGS	(HMNT_NOHISTORY | HMNT_MASTERID | HMNT_NOMIRROR)
 
+#endif /* !VFS_HAMMER_MOUNT_H_ */

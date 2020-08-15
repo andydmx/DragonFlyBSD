@@ -359,7 +359,7 @@ procfs_ioctl(struct vop_ioctl_args *ap)
 	    tsleep_interlock(&procp->p_stype, PCATCH);
 	    spin_unlock(&procp->p_spin);
 	    if (procp->p_stops == 0) {
-		error = EINVAL;
+		error = 0;
 		goto done;
 	    }
 	    if (procp->p_flags & P_POSTEXIT) {
@@ -410,7 +410,7 @@ procfs_ioctl(struct vop_ioctl_args *ap)
 	error = 0;
 done:
 	pfs_pdone(procp);
-	return 0;
+	return error;
 }
 
 /*
@@ -561,7 +561,7 @@ procfs_getattr(struct vop_getattr_args *ap)
 	 * p_stat structure is not addressible if u. gets
 	 * swapped out for that process.
 	 */
-	nanotime(&vap->va_ctime);
+	vfs_timestamp(&vap->va_ctime);
 	vap->va_atime = vap->va_mtime = vap->va_ctime;
 
 	/*
@@ -818,6 +818,8 @@ procfs_lookup(struct vop_old_lookup_args *ap)
 			break;
 		/* XXX lwp */
 		lp = FIRST_LWP_IN_PROC(p);
+		if (lp == NULL)
+			break;
 
 		if (!PRISON_CHECK(ap->a_cnp->cn_cred, p->p_ucred))
 			break;
@@ -940,6 +942,10 @@ procfs_readdir_proc(struct vop_readdir_args *ap)
 	}
 	/* XXX lwp, not MPSAFE */
 	lp = FIRST_LWP_IN_PROC(p);
+	if (lp == NULL) {
+		error = EINVAL;
+		goto done;
+	}
 
 	error = 0;
 	i = (int)uio->uio_offset;
@@ -1000,7 +1006,7 @@ procfs_readdir_root(struct vop_readdir_args *ap)
 			break;
 	}
 	if (res >= 0)
-		allproc_scan(procfs_readdir_root_callback, &info);
+		allproc_scan(procfs_readdir_root_callback, &info, 0);
 	uio->uio_offset = (off_t)info.i;
 
 	return (info.error);

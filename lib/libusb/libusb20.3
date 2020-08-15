@@ -24,9 +24,9 @@
 .\" OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
 .\" SUCH DAMAGE.
 .\"
-.\" $FreeBSD: head/lib/libusb/libusb20.3 250582 2013-05-12 22:22:12Z joel $
+.\" $FreeBSD: head/lib/libusb/libusb20.3 276294 2014-12-27 08:31:52Z joel $
 .\"
-.Dd May 3, 2013
+.Dd January 16, 2015
 .Dt LIBUSB20 3
 .Os
 .Sh NAME
@@ -38,7 +38,7 @@
 .Sh LIBRARY
 .
 .
-USB access library (libusb -lusb)
+.Lb libusb
 .
 .
 .
@@ -48,9 +48,10 @@ USB access library (libusb -lusb)
 .Fn libusb20_tr_close "struct libusb20_transfer *xfer"
 .Ft int
 .Fn libusb20_tr_open "struct libusb20_transfer *xfer" "uint32_t max_buf_size" "uint32_t max_frame_count" "uint8_t ep_no"
+.Ft int
 .Fn libusb20_tr_open_stream "struct libusb20_transfer *xfer" "uint32_t max_buf_size" "uint32_t max_frame_count" "uint8_t ep_no" "uint16_t stream_id"
 .Ft struct libusb20_transfer*
-.Fn libusb20_tr_get_pointer "struct libusb20_device *pdev"  "uint16_t tr_index"
+.Fn libusb20_tr_get_pointer "struct libusb20_device *pdev" "uint16_t tr_index"
 .Ft uint16_t
 .Fn libusb20_tr_get_time_complete "struct libusb20_transfer *xfer"
 .Ft uint32_t
@@ -200,13 +201,18 @@ USB access library (libusb -lusb)
 .Ft struct libusb20_backend *
 .Fn libusb20_be_alloc_linux "void"
 .Ft struct libusb20_device *
-.Fn libusb20_be_device_foreach  "struct libusb20_backend *pbe" "struct libusb20_device *pdev"
+.Fn libusb20_be_device_foreach "struct libusb20_backend *pbe" "struct libusb20_device *pdev"
 .Ft void
 .Fn libusb20_be_dequeue_device "struct libusb20_backend *pbe" "struct libusb20_device *pdev"
 .Ft void
 .Fn libusb20_be_enqueue_device "struct libusb20_backend *pbe" "struct libusb20_device *pdev"
 .Ft void
 .Fn libusb20_be_free "struct libusb20_backend *pbe"
+.Ft "const char *"
+.Fn libusb20_strerror "int code"
+.Ft "const char *"
+.Fn libusb20_error_name "int code"
+.In libusb20_desc.h
 .Ft uint8_t
 .Fn libusb20_me_get_1 "const struct libusb20_me_struct *me" "uint16_t off"
 .Ft uint16_t
@@ -217,10 +223,6 @@ USB access library (libusb -lusb)
 .Fn libusb20_me_decode "const void *pdata" "uint16_t len" "void *pdecoded"
 .Ft "const uint8_t *"
 .Fn libusb20_desc_foreach "const struct libusb20_me_struct *me" "const uint8_t *pdesc"
-.Ft "const char *"
-.Fn libusb20_strerror "int code"
-.Ft "const char *"
-.Fn libusb20_error_name "int code"
 .
 .
 .Sh DESCRIPTION
@@ -312,14 +314,16 @@ This function returns NULL in case of failure.
 .
 .Fn libusb20_tr_get_time_complete
 will return the completion time of an USB transfer in
-millisecond units. This function is most useful for isochronous USB
+millisecond units.
+This function is most useful for isochronous USB
 transfers when doing echo cancelling.
 .
 .Pp
 .
 .Fn libusb20_tr_get_actual_frames
 will return the actual number of USB frames after an USB
-transfer completed. A value of zero means that no data was transferred.
+transfer completed.
+A value of zero means that no data was transferred.
 .
 .Pp
 .
@@ -681,7 +685,8 @@ Before this call will succeed the USB device must be opened.
 .Fa setup
 is a pointer to a decoded and host endian SETUP packet.
 .Fa data
-is a pointer to a data transfer buffer associated with the control transaction. This argument can be NULL.
+is a pointer to a data transfer buffer associated with the control transaction.
+This argument can be NULL.
 .Fa pactlen
 is a pointer to a variable that will hold the actual transfer length after the control transaction is complete.
 .Fa timeout
@@ -783,9 +788,11 @@ The USB device need not be opened when calling this function.
 .
 .Fn libusb20_dev_alloc_config
 will read out and decode the USB config descriptor for
-the given USB device and config index. This function returns a pointer
+the given USB device and config index.
+This function returns a pointer
 to the decoded configuration which must eventually be passed to
-free(). NULL is returned in case of failure.
+.Fn free .
+NULL is returned in case of failure.
 .
 .Pp
 .
@@ -957,8 +964,8 @@ returned.
 .Fn libusb20_be_alloc_freebsd
 .Fn libusb20_be_alloc_linux
 These functions are used to allocate a specific USB backend or the
-operating system default USB backend. Allocating a backend is a way to
-scan for currently present USB devices.
+operating system default USB backend.
+Allocating a backend is a way to scan for currently present USB devices.
 .
 .Pp
 .

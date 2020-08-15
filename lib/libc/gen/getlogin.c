@@ -10,11 +10,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -38,7 +34,6 @@
 #include <sys/param.h>
 #include <errno.h>
 #include <pwd.h>
-#include <utmp.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
@@ -51,7 +46,7 @@
 #define	THREAD_LOCK()	if (__isthreaded) _pthread_mutex_lock(&logname_mutex)
 #define	THREAD_UNLOCK()	if (__isthreaded) _pthread_mutex_unlock(&logname_mutex)
 
-extern int		_getlogin(char *, int);
+extern int		_getlogin(char *, size_t);
  
 int			_logname_valid;		/* known to setlogin() */
 static pthread_mutex_t	logname_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -85,10 +80,10 @@ getlogin(void)
 }
 
 int
-getlogin_r(char *logname, int namelen)
+getlogin_r(char *logname, size_t namelen)
 {
 	char	*result;
-	int	len;
+	size_t	len;
 	int	status;
 	
 	THREAD_LOCK();

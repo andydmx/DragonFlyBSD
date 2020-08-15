@@ -15,11 +15,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -67,12 +63,12 @@ extern uid_t	uid, euid;
 static int compar(const void *_p1, const void *_p2);
 
 /*
- * Getline reads a line from the control file cfp, removes tabs, converts
+ * get_line reads a line from the control file cfp, removes tabs, converts
  *  new-line to null and leaves it in line.
  * Returns 0 at EOF or the number of characters read.
  */
 int
-getline(FILE *cfp)
+get_line(FILE *cfp)
 {
 	int linel = 0;
 	char *lp = line;
@@ -116,7 +112,7 @@ getq(const struct printer *pp, struct jobqueue *(*namelist[]))
 		seteuid(uid);
 		return (-1);
 	}
-	if (fstat(dirp->dd_fd, &stbuf) < 0)
+	if (fstat(dirfd(dirp), &stbuf) < 0)
 		goto errdone;
 	seteuid(uid);
 

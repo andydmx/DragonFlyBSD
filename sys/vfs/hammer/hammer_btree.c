@@ -1,13 +1,13 @@
 /*
  * Copyright (c) 2007-2008 The DragonFly Project.  All rights reserved.
- * 
+ *
  * This code is derived from software contributed to The DragonFly Project
  * by Matthew Dillon <dillon@backplane.com>
- * 
+ *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
  * are met:
- * 
+ *
  * 1. Redistributions of source code must retain the above copyright
  *    notice, this list of conditions and the following disclaimer.
  * 2. Redistributions in binary form must reproduce the above copyright
@@ -17,7 +17,7 @@
  * 3. Neither the name of The DragonFly Project nor the names of its
  *    contributors may be used to endorse or promote products derived
  *    from this software without specific, prior written permission.
- * 
+ *
  * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
  * ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
  * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
@@ -41,7 +41,7 @@
  * of the tree), but adds two additional boundary elements which describe
  * the left-most and right-most element a node is able to represent.  In
  * otherwords, we have boundary elements at the two ends of a B-Tree node
- * instead of sub-tree pointers.
+ * with no valid sub-tree pointer for the right-most element.
  *
  * A B-Tree internal node looks like this:
  *
@@ -54,6 +54,8 @@
  *
  * The radix for an internal node is 1 less then a leaf but we get a
  * number of significant benefits for our troubles.
+ * The left-hand boundary (B in the left) is integrated into the first
+ * element so it doesn't require 2 elements to accomodate boundaries.
  *
  * The big benefit to using a B-Tree containing boundary information
  * is that it is possible to cache pointers into the middle of the tree
@@ -77,25 +79,27 @@
  * up the boundaries).
  */
 #include "hammer.h"
-#include <sys/buf.h>
-#include <sys/buf2.h>
 
 static int btree_search(hammer_cursor_t cursor, int flags);
 static int btree_split_internal(hammer_cursor_t cursor);
 static int btree_split_leaf(hammer_cursor_t cursor);
-static int btree_remove(hammer_cursor_t cursor);
-static int btree_node_is_full(hammer_node_ondisk_t node);
-static int hammer_btree_mirror_propagate(hammer_cursor_t cursor,	
+static int btree_remove(hammer_cursor_t cursor, int *ndelete);
+static __inline int btree_node_is_full(hammer_node_ondisk_t node);
+static int hammer_btree_mirror_propagate(hammer_cursor_t cursor,
 			hammer_tid_t mirror_tid);
 static void hammer_make_separator(hammer_base_elm_t key1,
 			hammer_base_elm_t key2, hammer_base_elm_t dest);
 static void hammer_cursor_mirror_filter(hammer_cursor_t cursor);
+static __inline void hammer_debug_btree_elm(hammer_cursor_t cursor,
+		hammer_btree_elm_t elm, const char *s, int res);
+static __inline void hammer_debug_btree_parent(hammer_cursor_t cursor,
+		const char *s);
 
 /*
  * Iterate records after a search.  The cursor is iterated forwards past
  * the current record until a record matching the key-range requirements
  * is found.  ENOENT is returned if the iteration goes past the ending
- * key. 
+ * key.
  *
  * The iteration is inclusive of key_beg and can be inclusive or exclusive
  * of key_end depending on whether HAMMER_CURSOR_END_INCLUSIVE is set.
@@ -133,7 +137,7 @@ hammer_btree_iterate(hammer_cursor_t cursor)
 	node = cursor->node->ondisk;
 	if (node == NULL)
 		return(ENOENT);
-	if (cursor->index < node->count && 
+	if (cursor->index < node->count &&
 	    (cursor->flags & HAMMER_CURSOR_ATEDISK)) {
 		++cursor->index;
 	}
@@ -169,14 +173,15 @@ hammer_btree_iterate(hammer_cursor_t cursor)
 
 		if (cursor->index == node->count) {
 			if (hammer_debug_btree) {
-				kprintf("BRACKETU %016llx[%d] -> %016llx[%d] (td=%p)\n",
-					(long long)cursor->node->node_offset,
+				hkprintf("BRACKETU %016jx[%d] -> %016jx[%d] td=%p\n",
+					(intmax_t)cursor->node->node_offset,
 					cursor->index,
-					(long long)(cursor->parent ? cursor->parent->node_offset : -1),
+					(intmax_t)(cursor->parent ? cursor->parent->node_offset : -1),
 					cursor->parent_index,
 					curthread);
 			}
-			KKASSERT(cursor->parent == NULL || cursor->parent->ondisk->elms[cursor->parent_index].internal.subtree_offset == cursor->node->node_offset);
+			KKASSERT(cursor->parent == NULL ||
+				 cursor->parent->ondisk->elms[cursor->parent_index].internal.subtree_offset == cursor->node->node_offset);
 			error = hammer_cursor_up(cursor);
 			if (error)
 				break;
@@ -211,25 +216,8 @@ hammer_btree_iterate(hammer_cursor_t cursor)
 			r = hammer_btree_cmp(&cursor->key_end, &elm[0].base);
 			s = hammer_btree_cmp(&cursor->key_beg, &elm[1].base);
 			if (hammer_debug_btree) {
-				kprintf("BRACKETL %016llx[%d] %016llx %02x %016llx lo=%02x %d (td=%p)\n",
-					(long long)cursor->node->node_offset,
-					cursor->index,
-					(long long)elm[0].internal.base.obj_id,
-					elm[0].internal.base.rec_type,
-					(long long)elm[0].internal.base.key,
-					elm[0].internal.base.localization,
-					r,
-					curthread
-				);
-				kprintf("BRACKETR %016llx[%d] %016llx %02x %016llx lo=%02x %d\n",
-					(long long)cursor->node->node_offset,
-					cursor->index + 1,
-					(long long)elm[1].internal.base.obj_id,
-					elm[1].internal.base.rec_type,
-					(long long)elm[1].internal.base.key,
-					elm[1].internal.base.localization,
-					s
-				);
+				hammer_debug_btree_elm(cursor, elm, "BRACKETL", r);
+				hammer_debug_btree_elm(cursor, elm + 1, "BRACKETR", s);
 			}
 
 			if (r < 0) {
@@ -273,8 +261,7 @@ hammer_btree_iterate(hammer_cursor_t cursor)
 				 */
 				KKASSERT(cursor->flags &
 					 HAMMER_CURSOR_ITERATE_CHECK);
-				kprintf("hammer_btree_iterate: "
-					"DEBUG: Caught parent seek "
+				hdkprintf("DEBUG: Caught parent seek "
 					"in internal iteration\n");
 			}
 
@@ -289,17 +276,7 @@ hammer_btree_iterate(hammer_cursor_t cursor)
 			elm = &node->elms[cursor->index];
 			r = hammer_btree_cmp(&cursor->key_end, &elm->base);
 			if (hammer_debug_btree) {
-				kprintf("ELEMENT  %016llx:%d %c %016llx %02x %016llx lo=%02x %d\n",
-					(long long)cursor->node->node_offset,
-					cursor->index,
-					(elm[0].leaf.base.btype ?
-					 elm[0].leaf.base.btype : '?'),
-					(long long)elm[0].leaf.base.obj_id,
-					elm[0].leaf.base.rec_type,
-					(long long)elm[0].leaf.base.key,
-					elm[0].leaf.base.localization,
-					r
-				);
+				hammer_debug_btree_elm(cursor, elm, "ELEMENT", r);
 			}
 			if (r < 0) {
 				error = ENOENT;
@@ -326,8 +303,7 @@ hammer_btree_iterate(hammer_cursor_t cursor)
 				s = hammer_btree_cmp(&cursor->key_beg,
 						     &elm->base);
 				if (s > 0) {
-					kprintf("hammer_btree_iterate: "
-						"DEBUG: Caught parent seek "
+					hdkprintf("DEBUG: Caught parent seek "
 						"in leaf iteration\n");
 					++cursor->index;
 					continue;
@@ -354,23 +330,13 @@ hammer_btree_iterate(hammer_cursor_t cursor)
 			if (error)
 				break;
 		}
-		/*
-		 * node pointer invalid after loop
-		 */
 
 		/*
 		 * Return entry
 		 */
 		if (hammer_debug_btree) {
-			int i = cursor->index;
-			hammer_btree_elm_t elm = &cursor->node->ondisk->elms[i];
-			kprintf("ITERATE  %p:%d %016llx %02x %016llx lo=%02x\n",
-				cursor->node, i,
-				(long long)elm->internal.base.obj_id,
-				elm->internal.base.rec_type,
-				(long long)elm->internal.base.key,
-				elm->internal.base.localization
-			);
+			elm = &cursor->node->ondisk->elms[cursor->index];
+			hammer_debug_btree_elm(cursor, elm, "ITERATE", 0xffff);
 		}
 		return(0);
 	}
@@ -447,7 +413,7 @@ hammer_btree_iterate_reverse(hammer_cursor_t cursor)
 	node = cursor->node->ondisk;
 	if (node == NULL)
 		return(ENOENT);
-	if (cursor->index != -1 && 
+	if (cursor->index != -1 &&
 	    (cursor->flags & HAMMER_CURSOR_ATEDISK)) {
 		--cursor->index;
 	}
@@ -491,32 +457,17 @@ hammer_btree_iterate_reverse(hammer_cursor_t cursor)
 		 * Check internal or leaf element.  Determine if the record
 		 * at the cursor has gone beyond the end of our range.
 		 *
-		 * We recurse down through internal nodes. 
+		 * We recurse down through internal nodes.
 		 */
 		KKASSERT(cursor->index != node->count);
 		if (node->type == HAMMER_BTREE_TYPE_INTERNAL) {
 			elm = &node->elms[cursor->index];
+
 			r = hammer_btree_cmp(&cursor->key_end, &elm[0].base);
 			s = hammer_btree_cmp(&cursor->key_beg, &elm[1].base);
 			if (hammer_debug_btree) {
-				kprintf("BRACKETL %016llx[%d] %016llx %02x %016llx lo=%02x %d\n",
-					(long long)cursor->node->node_offset,
-					cursor->index,
-					(long long)elm[0].internal.base.obj_id,
-					elm[0].internal.base.rec_type,
-					(long long)elm[0].internal.base.key,
-					elm[0].internal.base.localization,
-					r
-				);
-				kprintf("BRACKETR %016llx[%d] %016llx %02x %016llx lo=%02x %d\n",
-					(long long)cursor->node->node_offset,
-					cursor->index + 1,
-					(long long)elm[1].internal.base.obj_id,
-					elm[1].internal.base.rec_type,
-					(long long)elm[1].internal.base.key,
-					elm[1].internal.base.localization,
-					s
-				);
+				hammer_debug_btree_elm(cursor, elm, "BRACKETL", r);
+				hammer_debug_btree_elm(cursor, elm + 1, "BRACKETR", s);
 			}
 
 			if (s >= 0) {
@@ -549,17 +500,7 @@ hammer_btree_iterate_reverse(hammer_cursor_t cursor)
 			elm = &node->elms[cursor->index];
 			s = hammer_btree_cmp(&cursor->key_beg, &elm->base);
 			if (hammer_debug_btree) {
-				kprintf("ELEMENT  %016llx:%d %c %016llx %02x %016llx lo=%02x %d\n",
-					(long long)cursor->node->node_offset,
-					cursor->index,
-					(elm[0].leaf.base.btype ?
-					 elm[0].leaf.base.btype : '?'),
-					(long long)elm[0].leaf.base.obj_id,
-					elm[0].leaf.base.rec_type,
-					(long long)elm[0].leaf.base.key,
-					elm[0].leaf.base.localization,
-					s
-				);
+				hammer_debug_btree_elm(cursor, elm, "ELEMENTR", s);
 			}
 			if (s > 0) {
 				error = ENOENT;
@@ -591,23 +532,13 @@ hammer_btree_iterate_reverse(hammer_cursor_t cursor)
 			if (error)
 				break;
 		}
-		/*
-		 * node pointer invalid after loop
-		 */
 
 		/*
 		 * Return entry
 		 */
 		if (hammer_debug_btree) {
-			int i = cursor->index;
-			hammer_btree_elm_t elm = &cursor->node->ondisk->elms[i];
-			kprintf("ITERATE  %p:%d %016llx %02x %016llx lo=%02x\n",
-				cursor->node, i,
-				(long long)elm->internal.base.obj_id,
-				elm->internal.base.rec_type,
-				(long long)elm->internal.base.key,
-				elm->internal.base.localization
-			);
+			elm = &cursor->node->ondisk->elms[cursor->index];
+			hammer_debug_btree_elm(cursor, elm, "ITERATER", 0xffff);
 		}
 		return(0);
 	}
@@ -619,7 +550,7 @@ hammer_btree_iterate_reverse(hammer_cursor_t cursor)
  * could not be found, EDEADLK if inserting and a retry is needed, and a
  * fatal error otherwise.  When retrying, the caller must terminate the
  * cursor and reinitialize it.  EDEADLK cannot be returned if not inserting.
- * 
+ *
  * The cursor is suitably positioned for a deletion on success, and suitably
  * positioned for an insertion on ENOENT if HAMMER_CURSOR_INSERT was
  * specified.
@@ -674,8 +605,8 @@ hammer_btree_lookup(hammer_cursor_t cursor)
 				break;
 			}
 			if (hammer_debug_btree) {
-				kprintf("CREATE_CHECK %016llx\n",
-					(long long)cursor->create_check);
+				hkprintf("CREATE_CHECK %016jx\n",
+					(intmax_t)cursor->create_check);
 			}
 			cursor->key_beg.create_tid = cursor->create_check;
 			/* loop */
@@ -743,7 +674,6 @@ hammer_btree_last(hammer_cursor_t cursor)
 /*
  * Extract the record and/or data associated with the cursor's current
  * position.  Any prior record or data stored in the cursor is replaced.
- * The cursor must be positioned at a leaf node.
  *
  * NOTE: All extractions occur at the leaf of the B-Tree.
  */
@@ -756,6 +686,15 @@ hammer_btree_extract(hammer_cursor_t cursor, int flags)
 	hammer_mount_t hmp;
 	int32_t data_len;
 	int error;
+
+	/*
+	 * Certain types of corruption can result in a NULL node pointer.
+	 */
+	if (cursor->node == NULL) {
+		hkprintf("NULL cursor->node, filesystem might "
+			"have gotten corrupted\n");
+		return (EINVAL);
+	}
 
 	/*
 	 * The case where the data reference resolves to the same buffer
@@ -778,10 +717,14 @@ hammer_btree_extract(hammer_cursor_t cursor, int flags)
 	KKASSERT(node->type == HAMMER_BTREE_TYPE_LEAF);
 	cursor->leaf = &elm->leaf;
 
+	/*
+	 * Returns here unless HAMMER_CURSOR_GET_DATA is set.
+	 */
 	if ((flags & HAMMER_CURSOR_GET_DATA) == 0)
 		return(0);
+
 	if (elm->leaf.base.btype != HAMMER_BTREE_TYPE_RECORD)
-		return(0);
+		return(EINVAL);
 	data_off = elm->leaf.data_offset;
 	data_len = elm->leaf.data_len;
 	if (data_off == 0)
@@ -819,9 +762,9 @@ hammer_btree_extract(hammer_cursor_t cursor, int flags)
 	 * Deal with CRC errors on the extracted data.
 	 */
 	if (error == 0 &&
-	    hammer_crc_test_leaf(cursor->data, &elm->leaf) == 0) {
-		kprintf("CRC DATA @ %016llx/%d FAILED\n",
-			(long long)elm->leaf.data_offset, elm->leaf.data_len);
+	    hammer_crc_test_leaf(hmp->version, cursor->data, &elm->leaf) == 0) {
+		hdkprintf("CRC DATA @ %016jx/%d FAILED\n",
+			(intmax_t)elm->leaf.data_offset, elm->leaf.data_len);
 		if (hammer_debug_critical)
 			Debugger("CRC FAILED: DATA");
 		if (cursor->trans->flags & HAMMER_TRANSF_CRCDOM)
@@ -840,12 +783,10 @@ hammer_btree_extract(hammer_cursor_t cursor, int flags)
  *
  * The caller must call hammer_btree_lookup() with the HAMMER_CURSOR_INSERT
  * flag set and that call must return ENOENT before this function can be
- * called.
+ * called. ENOSPC is returned if there is no room to insert a new record.
  *
  * The caller may depend on the cursor's exclusive lock after return to
  * interlock frontend visibility (see HAMMER_RECF_CONVERT_DELETE).
- *
- * ENOSPC is returned if there is no room to insert a new record.
  */
 int
 hammer_btree_insert(hammer_cursor_t cursor, hammer_btree_leaf_elm_t elm,
@@ -867,8 +808,7 @@ hammer_btree_insert(hammer_cursor_t cursor, hammer_btree_leaf_elm_t elm,
 	 * possible.  The root inode can never be deleted so the leaf should
 	 * never be empty.
 	 *
-	 * Remember that the right-hand boundary is not included in the
-	 * count.
+	 * Remember that leaf nodes do not have boundaries.
 	 */
 	hammer_modify_node_all(cursor->trans, cursor->node);
 	node = cursor->node->ondisk;
@@ -928,9 +868,12 @@ hammer_btree_insert(hammer_cursor_t cursor, hammer_btree_leaf_elm_t elm,
  *
  * This function can return EDEADLK, requiring the caller to retry the
  * operation after clearing the deadlock.
+ *
+ * This function will store the number of deleted btree nodes in *ndelete
+ * if ndelete is not NULL.
  */
 int
-hammer_btree_delete(hammer_cursor_t cursor)
+hammer_btree_delete(hammer_cursor_t cursor, int *ndelete)
 {
 	hammer_node_ondisk_t ondisk;
 	hammer_node_t node;
@@ -939,12 +882,14 @@ hammer_btree_delete(hammer_cursor_t cursor)
 	int i;
 
 	KKASSERT (cursor->trans->sync_lock_refs > 0);
+	if (ndelete)
+		*ndelete = 0;
 	if ((error = hammer_cursor_upgrade(cursor)) != 0)
 		return(error);
 	++hammer_stats_btree_deletes;
 
 	/*
-	 * Delete the element from the leaf node. 
+	 * Delete the element from the leaf node.
 	 *
 	 * Remember that leaf nodes do not have boundaries.
 	 */
@@ -981,11 +926,11 @@ hammer_btree_delete(hammer_cursor_t cursor)
 	 * current node.
 	 *
 	 * Ignore deadlock errors, that simply means that btree_remove
-	 * was unable to recurse and had to leave us with an empty leaf. 
+	 * was unable to recurse and had to leave us with an empty leaf.
 	 */
 	KKASSERT(cursor->index <= ondisk->count);
 	if (ondisk->count == 0) {
-		error = btree_remove(cursor);
+		error = btree_remove(cursor, ndelete);
 		if (error == EDEADLK)
 			error = 0;
 	} else {
@@ -997,18 +942,17 @@ hammer_btree_delete(hammer_cursor_t cursor)
 }
 
 /*
- * PRIMAY B-TREE SEARCH SUPPORT PROCEDURE
+ * PRIMARY B-TREE SEARCH SUPPORT PROCEDURE
  *
  * Search the filesystem B-Tree for cursor->key_beg, return the matching node.
  *
  * The search can begin ANYWHERE in the B-Tree.  As a first step the search
  * iterates up the tree as necessary to properly position itself prior to
  * actually doing the sarch.
- * 
+ *
  * INSERTIONS: The search will split full nodes and leaves on its way down
  * and guarentee that the leaf it ends up on is not full.  If we run out
- * of space the search continues to the leaf (to position the cursor for
- * the spike), but ENOSPC is returned.
+ * of space the search continues to the leaf, but ENOSPC is returned.
  *
  * The search is only guarenteed to end up on a leaf if an error code of 0
  * is returned, or if inserting and an error code of ENOENT is returned.
@@ -1022,8 +966,6 @@ hammer_btree_delete(hammer_cursor_t cursor)
  *   right boundary is non-inclusive.  The create_tid is a generic part
  *   of the key for internal nodes.
  *
- * - Leaf nodes contain terminal elements only now.
- *
  * - Filesystem lookups typically set HAMMER_CURSOR_ASOF, indicating a
  *   historical search.  ASOF and INSERT are mutually exclusive.  When
  *   doing an as-of lookup btree_search() checks for a right-edge boundary
@@ -1033,7 +975,7 @@ hammer_btree_delete(hammer_cursor_t cursor)
  *   The iteration backwards because as-of searches can wind up going
  *   down the wrong branch of the B-Tree.
  */
-static 
+static
 int
 btree_search(hammer_cursor_t cursor, int flags)
 {
@@ -1049,29 +991,11 @@ btree_search(hammer_cursor_t cursor, int flags)
 	++hammer_stats_btree_searches;
 
 	if (hammer_debug_btree) {
-		kprintf("SEARCH   %016llx[%d] %016llx %02x key=%016llx cre=%016llx lo=%02x (td = %p)\n",
-			(long long)cursor->node->node_offset,
-			cursor->index,
-			(long long)cursor->key_beg.obj_id,
-			cursor->key_beg.rec_type,
-			(long long)cursor->key_beg.key,
-			(long long)cursor->key_beg.create_tid,
-			cursor->key_beg.localization, 
-			curthread
-		);
+		hammer_debug_btree_elm(cursor,
+				(hammer_btree_elm_t)&cursor->key_beg,
+				"SEARCH", 0xffff);
 		if (cursor->parent)
-		    kprintf("SEARCHP %016llx[%d] (%016llx/%016llx %016llx/%016llx) (%p/%p %p/%p)\n",
-			(long long)cursor->parent->node_offset,
-			cursor->parent_index,
-			(long long)cursor->left_bound->obj_id,
-			(long long)cursor->parent->ondisk->elms[cursor->parent_index].internal.base.obj_id,
-			(long long)cursor->right_bound->obj_id,
-			(long long)cursor->parent->ondisk->elms[cursor->parent_index+1].internal.base.obj_id,
-			cursor->left_bound,
-			&cursor->parent->ondisk->elms[cursor->parent_index],
-			cursor->right_bound,
-			&cursor->parent->ondisk->elms[cursor->parent_index+1]
-		    );
+			hammer_debug_btree_parent(cursor, "SEARCHP");
 	}
 
 	/*
@@ -1117,14 +1041,9 @@ btree_search(hammer_cursor_t cursor, int flags)
 	 * (If inserting we aren't doing an as-of search so we don't have
 	 *  to worry about create_check).
 	 */
-	while ((flags & HAMMER_CURSOR_INSERT) && enospc == 0) {
-		if (cursor->node->ondisk->type == HAMMER_BTREE_TYPE_INTERNAL) {
-			if (btree_node_is_full(cursor->node->ondisk) == 0)
-				break;
-		} else {
-			if (btree_node_is_full(cursor->node->ondisk) ==0)
-				break;
-		}
+	while (flags & HAMMER_CURSOR_INSERT) {
+		if (btree_node_is_full(cursor->node->ondisk) == 0)
+			break;
 		if (cursor->node->ondisk->parent == 0 ||
 		    cursor->parent->ondisk->count != HAMMER_BTREE_INT_ELMS) {
 			break;
@@ -1158,8 +1077,8 @@ btree_search(hammer_cursor_t cursor, int flags)
 		 */
 		++hammer_stats_btree_iterations;
 		if (hammer_debug_btree) {
-			kprintf("SEARCH-I %016llx count=%d\n",
-				(long long)cursor->node->node_offset,
+			hkprintf("SEARCH-I %016jx count=%d\n",
+				(intmax_t)cursor->node->node_offset,
 				node->count);
 		}
 
@@ -1173,7 +1092,7 @@ btree_search(hammer_cursor_t cursor, int flags)
 			elm = &node->elms[i];
 			r = hammer_btree_cmp(&cursor->key_beg, &elm->base);
 			if (hammer_debug_btree > 2) {
-				kprintf(" IELM %p %d r=%d\n",
+				hkprintf(" IELM %p [%d] r=%d\n",
 					&node->elms[i], i, r);
 			}
 			if (r < 0)
@@ -1186,16 +1105,21 @@ btree_search(hammer_cursor_t cursor, int flags)
 			++i;
 		}
 		if (hammer_debug_btree) {
-			kprintf("SEARCH-I preI=%d/%d r=%d\n",
+			hkprintf("SEARCH-I preI=%d/%d r=%d\n",
 				i, node->count, r);
 		}
 
 		/*
-		 * These cases occur when the parent's idea of the boundary
+		 * The first two cases (i == 0 or i == node->count + 1)
+		 * occur when the parent's idea of the boundary
 		 * is wider then the child's idea of the boundary, and
 		 * require special handling.  If not inserting we can
 		 * terminate the search early for these cases but the
 		 * child's boundaries cannot be unconditionally modified.
+		 *
+		 * The last case (neither of the above) fits in child's
+		 * idea of the boundary, so we can simply push down the
+		 * cursor.
 		 */
 		if (i == 0) {
 			/*
@@ -1203,7 +1127,7 @@ btree_search(hammer_cursor_t cursor, int flags)
 			 * left_boundary but to the RIGHT of the parent's left
 			 * boundary.
 			 */
-			u_int8_t save;
+			uint8_t save;
 
 			elm = &node->elms[0];
 
@@ -1285,16 +1209,7 @@ btree_search(hammer_cursor_t cursor, int flags)
 		elm = &node->elms[i];
 
 		if (hammer_debug_btree) {
-			kprintf("RESULT-I %016llx[%d] %016llx %02x "
-				"key=%016llx cre=%016llx lo=%02x\n",
-				(long long)cursor->node->node_offset,
-				i,
-				(long long)elm->internal.base.obj_id,
-				elm->internal.base.rec_type,
-				(long long)elm->internal.base.key,
-				(long long)elm->internal.base.create_tid,
-				elm->internal.base.localization
-			);
+			hammer_debug_btree_elm(cursor, elm, "RESULT-I", 0xffff);
 		}
 
 		/*
@@ -1314,9 +1229,8 @@ btree_search(hammer_cursor_t cursor, int flags)
 		 * prepend and append an empty leaf node in order to make
 		 * the boundary correction.
 		 *
-		 * If we run out of space we set enospc and continue on
-		 * to a leaf to provide the spike code with a good point
-		 * of entry.
+		 * If we run out of space we set enospc but continue on
+		 * to a leaf.
 		 */
 		if ((flags & HAMMER_CURSOR_INSERT) && enospc == 0) {
 			if (btree_node_is_full(node)) {
@@ -1363,8 +1277,8 @@ btree_search(hammer_cursor_t cursor, int flags)
 	KKASSERT (node->type == HAMMER_BTREE_TYPE_LEAF);
 	KKASSERT(node->count <= HAMMER_BTREE_LEAF_ELMS);
 	if (hammer_debug_btree) {
-		kprintf("SEARCH-L %016llx count=%d\n",
-			(long long)cursor->node->node_offset,
+		hkprintf("SEARCH-L %016jx count=%d\n",
+			(intmax_t)cursor->node->node_offset,
 			node->count);
 	}
 
@@ -1380,7 +1294,7 @@ btree_search(hammer_cursor_t cursor, int flags)
 		r = hammer_btree_cmp(&cursor->key_beg, &elm->leaf.base);
 
 		if (hammer_debug_btree > 1)
-			kprintf("  ELM %p %d r=%d\n", &node->elms[i], i, r);
+			hkprintf(" LELM %p [%d] r=%d\n", &node->elms[i], i, r);
 
 		/*
 		 * We are at a record element.  Stop if we've flipped past
@@ -1417,8 +1331,8 @@ btree_search(hammer_cursor_t cursor, int flags)
 		cursor->index = i;
 		error = 0;
 		if (hammer_debug_btree) {
-			kprintf("RESULT-L %016llx[%d] (SUCCESS)\n",
-				(long long)cursor->node->node_offset, i);
+			hkprintf("RESULT-L %016jx[%d] (SUCCESS)\n",
+				(intmax_t)cursor->node->node_offset, i);
 		}
 		goto done;
 	}
@@ -1428,8 +1342,8 @@ btree_search(hammer_cursor_t cursor, int flags)
 	 */
 failed:
 	if (hammer_debug_btree) {
-		kprintf("RESULT-L %016llx[%d] (FAILED)\n",
-			(long long)cursor->node->node_offset, i);
+		hkprintf("RESULT-L %016jx[%d] (FAILED)\n",
+			(intmax_t)cursor->node->node_offset, i);
 	}
 
 	/*
@@ -1460,7 +1374,7 @@ failed:
 	/*
 	 * We reached a leaf but did not find the key we were looking for.
 	 * If this is an insert we will be properly positioned for an insert
-	 * (ENOENT) or spike (ENOSPC) operation.
+	 * (ENOENT) or unable to insert (ENOSPC).
 	 */
 	error = enospc ? ENOSPC : ENOENT;
 done:
@@ -1545,7 +1459,7 @@ btree_split_internal(hammer_cursor_t cursor)
 		goto done;
 	++hammer_stats_btree_splits;
 
-	/* 
+	/*
 	 * Calculate the split point.  If the insertion point is at the
 	 * end of the leaf we adjust the split point significantly to the
 	 * right to try to optimize node fill and flag it.  If we hit
@@ -1591,9 +1505,9 @@ btree_split_internal(hammer_cursor_t cursor)
 		ondisk->elms[0].base = hmp->root_btree_beg;
 		ondisk->elms[0].base.btype = node->ondisk->type;
 		ondisk->elms[0].internal.subtree_offset = node->node_offset;
+		ondisk->elms[0].internal.mirror_tid = ondisk->mirror_tid;
 		ondisk->elms[1].base = hmp->root_btree_end;
 		hammer_modify_node_done(parent);
-		/* ondisk->elms[1].base.btype - not used */
 		made_root = 1;
 		parent_index = 0;	/* index of current node in parent */
 	} else {
@@ -1609,10 +1523,10 @@ btree_split_internal(hammer_cursor_t cursor)
 	 *   0 1 2 3 4 5 6	<-- subtree indices
 	 *
 	 *       x x P x x
-	 *        s S S s  
+	 *        s S S s
 	 *         /   \
 	 *  B O O O B    B N N B	<--- inner boundary points are 'P'
-	 *   0 1 2 3      4 5 6  
+	 *   0 1 2 3      4 5 6
 	 */
 	new_node = hammer_alloc_btree(cursor->trans, 0, &error);
 	if (new_node == NULL) {
@@ -1636,7 +1550,7 @@ btree_split_internal(hammer_cursor_t cursor)
 	ondisk = node->ondisk;
 	elm = &ondisk->elms[split];
 	bcopy(elm, &new_node->ondisk->elms[0],
-	      (ondisk->count - split + 1) * esize);
+	      (ondisk->count - split + 1) * esize);  /* +1 for boundary */
 	new_node->ondisk->count = ondisk->count - split;
 	new_node->ondisk->parent = parent->node_offset;
 	new_node->ondisk->type = HAMMER_BTREE_TYPE_INTERNAL;
@@ -1649,6 +1563,7 @@ btree_split_internal(hammer_cursor_t cursor)
 	 * its subtree_offset was moved to the new node.  If we had created
 	 * a new root its parent pointer may have changed.
 	 */
+	elm->base.btype = HAMMER_BTREE_TYPE_NONE;
 	elm->internal.subtree_offset = 0;
 	ondisk->count = split;
 
@@ -1657,7 +1572,7 @@ btree_split_internal(hammer_cursor_t cursor)
 	 * reference to the original node, and reference the new node.
 	 * The separator is P.
 	 *
-	 * Remember that base.count does not include the right-hand boundary.
+	 * Remember that ondisk->count does not include the right-hand boundary.
 	 */
 	hammer_modify_node_all(cursor->trans, parent);
 	ondisk = parent->ondisk;
@@ -1665,6 +1580,10 @@ btree_split_internal(hammer_cursor_t cursor)
 	parent_elm = &ondisk->elms[parent_index+1];
 	bcopy(parent_elm, parent_elm + 1,
 	      (ondisk->count - parent_index) * esize);
+
+	/*
+	 * Why not use hammer_make_separator() here ?
+	 */
 	parent_elm->internal.base = elm->base;	/* separator P */
 	parent_elm->internal.base.btype = new_node->ondisk->type;
 	parent_elm->internal.subtree_offset = new_node->node_offset;
@@ -1680,9 +1599,9 @@ btree_split_internal(hammer_cursor_t cursor)
 	 */
 	for (i = 0; i < new_node->ondisk->count; ++i) {
 		elm = &new_node->ondisk->elms[i];
-		error = btree_set_parent(cursor->trans, new_node, elm);
+		error = btree_set_parent_of_child(cursor->trans, new_node, elm);
 		if (error) {
-			panic("btree_split_internal: btree-fixup problem");
+			hpanic("btree-fixup problem");
 		}
 	}
 	hammer_modify_node_done(new_node);
@@ -1754,8 +1673,6 @@ done:
 
 /*
  * Same as the above, but splits a full leaf node.
- *
- * This function
  */
 static
 int
@@ -1784,15 +1701,12 @@ btree_split_leaf(hammer_cursor_t cursor)
 	KKASSERT(hammer_btree_cmp(cursor->right_bound,
 		 &cursor->node->ondisk->elms[cursor->node->ondisk->count-1].leaf.base) > 0);
 
-	/* 
+	/*
 	 * Calculate the split point.  If the insertion point is at the
 	 * end of the leaf we adjust the split point significantly to the
 	 * right to try to optimize node fill and flag it.  If we hit
 	 * that same leaf again our heuristic failed and we don't try
 	 * to optimize node fill (it could lead to a degenerate case).
-	 *
-	 * Spikes are made up of two leaf elements which cannot be
-	 * safely split.
 	 */
 	leaf = cursor->node;
 	ondisk = leaf->ondisk;
@@ -1844,8 +1758,8 @@ btree_split_leaf(hammer_cursor_t cursor)
 		ondisk->elms[0].base = hmp->root_btree_beg;
 		ondisk->elms[0].base.btype = leaf->ondisk->type;
 		ondisk->elms[0].internal.subtree_offset = leaf->node_offset;
+		ondisk->elms[0].internal.mirror_tid = ondisk->mirror_tid;
 		ondisk->elms[1].base = hmp->root_btree_end;
-		/* ondisk->elms[1].base.btype = not used */
 		hammer_modify_node_done(parent);
 		made_root = 1;
 		parent_index = 0;	/* insertion point in parent */
@@ -1863,7 +1777,7 @@ btree_split_leaf(hammer_cursor_t cursor)
 	 *  L L L L L L L L
 	 *
 	 *       x x P x x
-	 *        s S S s  
+	 *        s S S s
 	 *         /   \
 	 *  L L L L     L L L L
 	 */
@@ -1879,7 +1793,7 @@ btree_split_leaf(hammer_cursor_t cursor)
 	hammer_lock_ex(&new_leaf->lock);
 
 	/*
-	 * Create the new node and copy the leaf elements from the split 
+	 * Create the new node and copy the leaf elements from the split
 	 * point on to the new node.
 	 */
 	hammer_modify_node_all(cursor->trans, leaf);
@@ -1908,7 +1822,7 @@ btree_split_leaf(hammer_cursor_t cursor)
 	 * reference to the original node, and reference the new node.
 	 * The separator is P.
 	 *
-	 * Remember that base.count does not include the right-hand boundary.
+	 * Remember that ondisk->count does not include the right-hand boundary.
 	 * We are copying parent_index+1 to parent_index+2, not +0 to +1.
 	 */
 	hammer_modify_node_all(cursor->trans, parent);
@@ -1919,6 +1833,12 @@ btree_split_leaf(hammer_cursor_t cursor)
 	bcopy(parent_elm, parent_elm + 1,
 	      (ondisk->count - parent_index) * esize);
 
+	/*
+	 * elm[-1] is the right-most elm in the original node.
+	 * elm[0] equals the left-most elm at index=0 in the new node.
+	 * parent_elm[-1] and parent_elm point to original and new node.
+	 * Update the parent_elm base to meet >elm[-1] and <=elm[0].
+	 */
 	hammer_make_separator(&elm[-1].base, &elm[0].base, &parent_elm->base);
 	parent_elm->internal.base.btype = new_leaf->ondisk->type;
 	parent_elm->internal.subtree_offset = new_leaf->node_offset;
@@ -2022,7 +1942,7 @@ TAILQ_HEAD(hammer_rhb_list, hammer_rhb);
 int
 hammer_btree_correct_rhb(hammer_cursor_t cursor, hammer_tid_t tid)
 {
-	struct hammer_mount *hmp;
+	hammer_mount_t hmp;
 	struct hammer_rhb_list rhb_list;
 	hammer_base_elm_t elm;
 	hammer_node_t orig_node;
@@ -2102,7 +2022,7 @@ hammer_btree_correct_rhb(hammer_cursor_t cursor, hammer_tid_t tid)
 			error = hammer_btree_correct_lhb(cursor, tid);
 			break;
 		default:
-			panic("hammer_btree_correct_rhb(): Bad node type");
+			hpanic("Bad node type");
 			error = EINVAL;
 			break;
 		}
@@ -2136,7 +2056,7 @@ hammer_btree_correct_lhb(hammer_cursor_t cursor, hammer_tid_t tid)
 	hammer_base_elm_t elm;
 	hammer_base_elm_t cmp;
 	struct hammer_rhb *rhb;
-	struct hammer_mount *hmp;
+	hammer_mount_t hmp;
 	int error;
 
 	TAILQ_INIT(&rhb_list);
@@ -2168,7 +2088,7 @@ hammer_btree_correct_lhb(hammer_cursor_t cursor, hammer_tid_t tid)
 			elm = &cursor->node->ondisk->elms[cursor->index].base;
 			if (elm->btype == HAMMER_BTREE_TYPE_RECORD)
 				break;
-			panic("Illegal leaf record type %02x", elm->btype);
+			hpanic("Illegal leaf record type %02x", elm->btype);
 		}
 		error = hammer_cursor_down(cursor);
 		if (error)
@@ -2207,7 +2127,7 @@ hammer_btree_correct_lhb(hammer_cursor_t cursor, hammer_tid_t tid)
 			elm->create_tid = tid;
 			hammer_modify_node_done(cursor->node);
 		} else {
-			panic("hammer_btree_correct_lhb(): Bad element type");
+			hpanic("Bad element type");
 		}
 	}
 
@@ -2242,7 +2162,7 @@ hammer_btree_correct_lhb(hammer_cursor_t cursor, hammer_tid_t tid)
  * for further iteration but not for an immediate insertion or deletion.
  */
 static int
-btree_remove(hammer_cursor_t cursor)
+btree_remove(hammer_cursor_t cursor, int *ndelete)
 {
 	hammer_node_ondisk_t ondisk;
 	hammer_btree_elm_t elm;
@@ -2273,7 +2193,7 @@ btree_remove(hammer_cursor_t cursor)
 
 	/*
 	 * Attempt to remove the parent's reference to the child.  If the
-	 * parent would become empty we have to recurse.  If we fail we 
+	 * parent would become empty we have to recurse.  If we fail we
 	 * leave the parent pointing to an empty leaf node.
 	 *
 	 * We have to recurse successfully before we can delete the internal
@@ -2311,12 +2231,11 @@ btree_remove(hammer_cursor_t cursor)
 
 		if (error == 0) {
 			hammer_cursor_deleted_element(cursor->node, 0);
-			error = btree_remove(cursor);
+			error = btree_remove(cursor, ndelete);
 			if (error == 0) {
 				KKASSERT(node != cursor->node);
 				hammer_cursor_removed_node(
-					node, cursor->node,
-					cursor->index);
+					node, cursor->node, cursor->index);
 				hammer_modify_node_all(cursor->trans, node);
 				ondisk = node->ondisk;
 				ondisk->type = HAMMER_BTREE_TYPE_DELETED;
@@ -2324,13 +2243,17 @@ btree_remove(hammer_cursor_t cursor)
 				hammer_modify_node_done(node);
 				hammer_flush_node(node, 0);
 				hammer_delete_node(cursor->trans, node);
+				if (ndelete)
+					(*ndelete)++;
 			} else {
 				/*
 				 * Defer parent removal because we could not
 				 * get the lock, just let the leaf remain
 				 * empty.
 				 */
-				/**/
+				/*
+				 * hammer show doesn't consider this as an error.
+				 */
 			}
 			hammer_unlock(&node->lock);
 			hammer_rel_node(node);
@@ -2340,7 +2263,9 @@ btree_remove(hammer_cursor_t cursor)
 			 * get the lock, just let the leaf remain
 			 * empty.
 			 */
-			/**/
+			/*
+			 * hammer show doesn't consider this as an error.
+			 */
 		}
 	} else {
 		KKASSERT(parent->ondisk->count > 1);
@@ -2400,17 +2325,14 @@ btree_remove(hammer_cursor_t cursor)
 		 */
 		cursor->flags |= HAMMER_CURSOR_ITERATE_CHECK;
 		error = hammer_cursor_up(cursor);
+		if (ndelete)
+			(*ndelete)++;
 	}
 	return (error);
 }
 
 /*
- * Propagate cursor->trans->tid up the B-Tree starting at the current
- * cursor position using pseudofs info gleaned from the passed inode.
- *
- * The passed inode has no relationship to the cursor position other
- * then being in the same pseudofs as the insertion or deletion we
- * are propagating the mirror_tid for.
+ * Propagate mirror_tid up the B-Tree starting at the current cursor.
  *
  * WARNING!  Because we push and pop the passed cursor, it may be
  *	     modified by other B-Tree operations while it is unlocked
@@ -2419,7 +2341,6 @@ btree_remove(hammer_cursor_t cursor)
  */
 void
 hammer_btree_do_propagation(hammer_cursor_t cursor,
-			    hammer_pseudofs_inmem_t pfsm,
 			    hammer_btree_leaf_elm_t leaf)
 {
 	hammer_cursor_t ncursor;
@@ -2509,10 +2430,9 @@ hammer_btree_mirror_propagate(hammer_cursor_t cursor, hammer_tid_t mirror_tid)
 		elm->mirror_tid = mirror_tid;
 		hammer_modify_node_done(node);
 		if (hammer_debug_general & 0x0002) {
-			kprintf("mirror_propagate: propagate "
-				"%016llx @%016llx:%d\n",
-				(long long)mirror_tid,
-				(long long)node->node_offset,
+			hdkprintf("propagate %016jx @%016jx:%d\n",
+				(intmax_t)mirror_tid,
+				(intmax_t)node->node_offset,
 				cursor->index);
 		}
 
@@ -2526,10 +2446,9 @@ hammer_btree_mirror_propagate(hammer_cursor_t cursor, hammer_tid_t mirror_tid)
 		node->ondisk->mirror_tid = mirror_tid;
 		hammer_modify_node_done(node);
 		if (hammer_debug_general & 0x0002) {
-			kprintf("mirror_propagate: propagate "
-				"%016llx @%016llx\n",
-				(long long)mirror_tid,
-				(long long)node->node_offset);
+			hdkprintf("propagate %016jx @%016jx\n",
+				(intmax_t)mirror_tid,
+				(intmax_t)node->node_offset);
 		}
 	}
 	if (error == ENOENT)
@@ -2537,6 +2456,11 @@ hammer_btree_mirror_propagate(hammer_cursor_t cursor, hammer_tid_t mirror_tid)
 	return(error);
 }
 
+/*
+ * Return a pointer to node's parent.  If there is no error,
+ * *parent_index is set to an index of parent's elm that points
+ * to this node.
+ */
 hammer_node_t
 hammer_btree_get_parent(hammer_transaction_t trans, hammer_node_t node,
 			int *parent_indexp, int *errorp, int try_exclusive)
@@ -2586,7 +2510,7 @@ hammer_btree_get_parent(hammer_transaction_t trans, hammer_node_t node,
 	}
 	if (i == parent->ondisk->count) {
 		hammer_unlock(&parent->lock);
-		panic("Bad B-Tree link: parent %p node %p", parent, node);
+		hpanic("Bad B-Tree link: parent %p node %p", parent, node);
 	}
 	*parent_indexp = i;
 	KKASSERT(*errorp == 0);
@@ -2602,7 +2526,7 @@ hammer_btree_get_parent(hammer_transaction_t trans, hammer_node_t node,
  * XXX deadlock potential here with our exclusive locks
  */
 int
-btree_set_parent(hammer_transaction_t trans, hammer_node_t node,
+btree_set_parent_of_child(hammer_transaction_t trans, hammer_node_t node,
 		 hammer_btree_elm_t elm)
 {
 	hammer_node_t child;
@@ -2610,9 +2534,7 @@ btree_set_parent(hammer_transaction_t trans, hammer_node_t node,
 
 	error = 0;
 
-	switch(elm->base.btype) {
-	case HAMMER_BTREE_TYPE_INTERNAL:
-	case HAMMER_BTREE_TYPE_LEAF:
+	if (hammer_is_internal_node_elm(elm)) {
 		child = hammer_get_node(trans, elm->internal.subtree_offset,
 					0, &error);
 		if (error == 0) {
@@ -2621,9 +2543,6 @@ btree_set_parent(hammer_transaction_t trans, hammer_node_t node,
 			hammer_modify_node_done(child);
 			hammer_rel_node(child);
 		}
-		break;
-	default:
-		break;
 	}
 	return(error);
 }
@@ -2715,7 +2634,7 @@ hammer_btree_lock_children(hammer_cursor_t cursor, int depth,
 	hammer_node_ondisk_t ondisk;
 	hammer_btree_elm_t elm;
 	hammer_node_t child;
-	struct hammer_mount *hmp;
+	hammer_mount_t hmp;
 	int error;
 	int i;
 
@@ -2723,6 +2642,9 @@ hammer_btree_lock_children(hammer_cursor_t cursor, int depth,
 	ondisk = node->ondisk;
 	error = 0;
 	hmp = cursor->trans->hmp;
+
+	if (ondisk->type != HAMMER_BTREE_TYPE_INTERNAL)
+		return(0);  /* This could return non-zero */
 
 	/*
 	 * We really do not want to block on I/O with exclusive locks held,
@@ -2732,10 +2654,6 @@ hammer_btree_lock_children(hammer_cursor_t cursor, int depth,
 	for (i = 0; i < ondisk->count; ++i) {
 		++hammer_stats_btree_elements;
 		elm = &ondisk->elms[i];
-		if (elm->base.btype != HAMMER_BTREE_TYPE_LEAF &&
-		    elm->base.btype != HAMMER_BTREE_TYPE_INTERNAL) {
-			continue;
-		}
 		child = hammer_get_node(cursor->trans,
 					elm->internal.subtree_offset,
 					0, &error);
@@ -2750,18 +2668,10 @@ hammer_btree_lock_children(hammer_cursor_t cursor, int depth,
 		++hammer_stats_btree_elements;
 		elm = &ondisk->elms[i];
 
-		switch(elm->base.btype) {
-		case HAMMER_BTREE_TYPE_INTERNAL:
-		case HAMMER_BTREE_TYPE_LEAF:
-			KKASSERT(elm->internal.subtree_offset != 0);
-			child = hammer_get_node(cursor->trans,
-						elm->internal.subtree_offset,
-						0, &error);
-			break;
-		default:
-			child = NULL;
-			break;
-		}
+		KKASSERT(elm->internal.subtree_offset != 0);
+		child = hammer_get_node(cursor->trans,
+					elm->internal.subtree_offset,
+					0, &error);
 		if (child) {
 			if (hammer_lock_ex_try(&child->lock) != 0) {
 				if (cursor->deadlk_node == NULL) {
@@ -2775,8 +2685,7 @@ hammer_btree_lock_children(hammer_cursor_t cursor, int depth,
 					item = TAILQ_FIRST(&lcache->list);
 					KKASSERT(item != NULL);
 					item->flags |= HAMMER_NODE_LOCK_LCACHE;
-					TAILQ_REMOVE(&lcache->list,
-						     item, entry);
+					TAILQ_REMOVE(&lcache->list, item, entry);
 				} else {
 					item = kmalloc(sizeof(*item),
 						       hmp->m_misc,
@@ -3028,87 +2937,112 @@ hammer_make_separator(hammer_base_elm_t key1, hammer_base_elm_t key2,
 /*
  * Return whether a generic internal or leaf node is full
  */
-static int
+static __inline
+int
 btree_node_is_full(hammer_node_ondisk_t node)
 {
-	switch(node->type) {
-	case HAMMER_BTREE_TYPE_INTERNAL:
-		if (node->count == HAMMER_BTREE_INT_ELMS)
-			return(1);
-		break;
-	case HAMMER_BTREE_TYPE_LEAF:
-		if (node->count == HAMMER_BTREE_LEAF_ELMS)
-			return(1);
-		break;
-	default:
-		panic("illegal btree subtype");
-	}
-	return(0);
-}
+	int n;
 
-#if 0
-static int
-btree_max_elements(u_int8_t type)
-{
-	if (type == HAMMER_BTREE_TYPE_LEAF)
-		return(HAMMER_BTREE_LEAF_ELMS);
-	if (type == HAMMER_BTREE_TYPE_INTERNAL)
-		return(HAMMER_BTREE_INT_ELMS);
-	panic("btree_max_elements: bad type %d", type);
+	n = hammer_node_max_elements(node->type);
+	if (n == -1)
+		hpanic("bad type %d", node->type);
+
+	return(n == node->count);
 }
-#endif
 
 void
 hammer_print_btree_node(hammer_node_ondisk_t ondisk)
 {
-	hammer_btree_elm_t elm;
-	int i;
+	int i, n;
 
-	kprintf("node %p count=%d parent=%016llx type=%c\n",
+	kprintf("node %p count=%d parent=%016jx type=%c\n",
 		ondisk, ondisk->count,
-		(long long)ondisk->parent, ondisk->type);
+		(intmax_t)ondisk->parent, ondisk->type);
+
+	switch (ondisk->type) {
+	case HAMMER_BTREE_TYPE_INTERNAL:
+		n = ondisk->count + 1;  /* count is NOT boundary inclusive */
+		break;
+	case HAMMER_BTREE_TYPE_LEAF:
+		n = ondisk->count;  /* there is no boundary */
+		break;
+	default:
+		return;  /* nothing to do */
+	}
 
 	/*
-	 * Dump both boundary elements if an internal node
+	 * Dump elements including boundary.
 	 */
-	if (ondisk->type == HAMMER_BTREE_TYPE_INTERNAL) {
-		for (i = 0; i <= ondisk->count; ++i) {
-			elm = &ondisk->elms[i];
-			hammer_print_btree_elm(elm, ondisk->type, i);
-		}
-	} else {
-		for (i = 0; i < ondisk->count; ++i) {
-			elm = &ondisk->elms[i];
-			hammer_print_btree_elm(elm, ondisk->type, i);
-		}
+	for (i = 0; i < n; ++i) {
+		kprintf("  %2d", i);
+		hammer_print_btree_elm(&ondisk->elms[i]);
 	}
 }
 
 void
-hammer_print_btree_elm(hammer_btree_elm_t elm, u_int8_t type, int i)
+hammer_print_btree_elm(hammer_btree_elm_t elm)
 {
-	kprintf("  %2d", i);
-	kprintf("\tobj_id       = %016llx\n", (long long)elm->base.obj_id);
-	kprintf("\tkey          = %016llx\n", (long long)elm->base.key);
-	kprintf("\tcreate_tid   = %016llx\n", (long long)elm->base.create_tid);
-	kprintf("\tdelete_tid   = %016llx\n", (long long)elm->base.delete_tid);
+	kprintf("\tobj_id       = %016jx\n", (intmax_t)elm->base.obj_id);
+	kprintf("\tkey          = %016jx\n", (intmax_t)elm->base.key);
+	kprintf("\tcreate_tid   = %016jx\n", (intmax_t)elm->base.create_tid);
+	kprintf("\tdelete_tid   = %016jx\n", (intmax_t)elm->base.delete_tid);
 	kprintf("\trec_type     = %04x\n", elm->base.rec_type);
 	kprintf("\tobj_type     = %02x\n", elm->base.obj_type);
-	kprintf("\tbtype 	= %02x (%c)\n",
-		elm->base.btype,
-		(elm->base.btype ? elm->base.btype : '?'));
-	kprintf("\tlocalization	= %02x\n", elm->base.localization);
+	kprintf("\tbtype        = %02x (%c)\n", elm->base.btype,
+						hammer_elm_btype(elm));
+	kprintf("\tlocalization = %08x\n", elm->base.localization);
 
-	switch(type) {
-	case HAMMER_BTREE_TYPE_INTERNAL:
-		kprintf("\tsubtree_off  = %016llx\n",
-			(long long)elm->internal.subtree_offset);
-		break;
-	case HAMMER_BTREE_TYPE_RECORD:
-		kprintf("\tdata_offset  = %016llx\n",
-			(long long)elm->leaf.data_offset);
+	if (hammer_is_internal_node_elm(elm)) {
+		kprintf("\tsubtree_off  = %016jx\n",
+			(intmax_t)elm->internal.subtree_offset);
+	} else if (hammer_is_leaf_node_elm(elm)) {
+		kprintf("\tdata_offset  = %016jx\n",
+			(intmax_t)elm->leaf.data_offset);
 		kprintf("\tdata_len     = %08x\n", elm->leaf.data_len);
 		kprintf("\tdata_crc     = %08x\n", elm->leaf.data_crc);
-		break;
 	}
+}
+
+static __inline
+void
+hammer_debug_btree_elm(hammer_cursor_t cursor, hammer_btree_elm_t elm,
+		const char *s, int res)
+{
+	hkprintf("%-8s %016jx[%02d] %c "
+		"lo=%08x obj=%016jx rec=%02x key=%016jx tid=%016jx td=%p "
+		"r=%d\n",
+		s,
+		(intmax_t)cursor->node->node_offset,
+		cursor->index,
+		hammer_elm_btype(elm),
+		elm->base.localization,
+		(intmax_t)elm->base.obj_id,
+		elm->base.rec_type,
+		(intmax_t)elm->base.key,
+		(intmax_t)elm->base.create_tid,
+		curthread,
+		res);
+}
+
+static __inline
+void
+hammer_debug_btree_parent(hammer_cursor_t cursor, const char *s)
+{
+	hammer_btree_elm_t elm =
+	    &cursor->parent->ondisk->elms[cursor->parent_index];
+
+	hkprintf("%-8s %016jx[%d] %c "
+		"(%016jx/%016jx %016jx/%016jx) (%p/%p %p/%p)\n",
+		s,
+		(intmax_t)cursor->parent->node_offset,
+		cursor->parent_index,
+		hammer_elm_btype(elm),
+		(intmax_t)cursor->left_bound->obj_id,
+		(intmax_t)elm->internal.base.obj_id,
+		(intmax_t)cursor->right_bound->obj_id,
+		(intmax_t)(elm + 1)->internal.base.obj_id,
+		cursor->left_bound,
+		elm,
+		cursor->right_bound,
+		elm + 1);
 }

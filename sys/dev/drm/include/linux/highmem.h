@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2014 François Tigeot
+ * Copyright (c) 2014-2020 François Tigeot <ftigeot@wolfpond.org>
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -29,19 +29,42 @@
 
 #include <machine/vmparam.h>
 
-static inline void *kmap(struct vm_page *pg)
+#include <linux/kernel.h>
+#include <linux/bug.h>
+#include <linux/mm.h>
+#include <linux/uaccess.h>
+#include <linux/hardirq.h>
+
+#include <asm/cacheflush.h>
+
+static inline struct page *
+kmap_to_page(void *addr)
 {
-	return (void *)PHYS_TO_DMAP(VM_PAGE_TO_PHYS(pg));
+	if (addr == NULL)
+		return NULL;
+
+	return (struct page *)PHYS_TO_VM_PAGE(vtophys(addr));
 }
 
-static inline void kunmap(struct vm_page *pg)
+static inline void *kmap(struct page *pg)
+{
+	return (void *)PHYS_TO_DMAP(VM_PAGE_TO_PHYS( (struct vm_page *)pg ));
+}
+
+static inline void kunmap(struct page *pg)
 {
 	/* Nothing to do on systems with a direct memory map */
 }
 
-static inline void *kmap_atomic(struct vm_page *pg)
+static inline void *kmap_atomic(struct page *pg)
 {
-	return (void *)PHYS_TO_DMAP(VM_PAGE_TO_PHYS(pg));
+	return (void *)PHYS_TO_DMAP(VM_PAGE_TO_PHYS( (struct vm_page *)pg ));
+}
+
+static inline void *
+kmap_atomic_prot(struct page *pg, pgprot_t prot)
+{
+	return kmap_atomic(pg);
 }
 
 static inline void kunmap_atomic(void *vaddr)

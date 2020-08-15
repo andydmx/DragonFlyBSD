@@ -47,217 +47,177 @@
 #include <stdlib.h>
 #include <time.h>
 
+#include <stdio.h>
+#include <sys/file.h>
+
+#include <machine/sysarch.h>
+#include <machine/tls.h>
+
 #include "debug.h"
 #include "rtld.h"
 #include "rtld_machdep.h"
 
+extern pid_t __sys_getpid(void);
+
 #define WAFLAG		0x1	/* A writer holds the lock */
-#define RC_INCR		0x2	/* Adjusts count of readers desiring lock */
+#define SLFLAG		0x2	/* Sleep pending on lock */
+#define RC_INCR		0x4	/* Adjusts count of readers desiring lock */
 
-typedef struct Struct_Lock {
+struct Struct_Lock {
 	volatile u_int lock;
-	void *base;
-} Lock;
+	int count;		/* recursion (exclusive) */
+	void *owner;		/* owner (exclusive) - tls_get_tcb() */
+	sigset_t savesigmask;	/* first exclusive owner sets mask */
+} __cachealign;
 
-static sigset_t fullsigmask, oldsigmask;
-static int thread_flag;
+#define cpu_ccfence()	__asm __volatile("" : : : "memory")
 
-static void *
-def_lock_create(void)
+static sigset_t fullsigmask;
+
+struct Struct_Lock phdr_lock;
+struct Struct_Lock bind_lock;
+struct Struct_Lock libc_lock;
+
+rtld_lock_t	rtld_phdr_lock = &phdr_lock;
+rtld_lock_t	rtld_bind_lock = &bind_lock;
+rtld_lock_t	rtld_libc_lock = &libc_lock;
+
+static int _rtld_isthreaded;
+
+void _rtld_setthreaded(int threaded);
+
+void
+_rtld_setthreaded(int threaded)
 {
-    void *base;
-    char *p;
-    uintptr_t r;
-    Lock *l;
-
-    /*
-     * Arrange for the lock to occupy its own cache line.  First, we
-     * optimistically allocate just a cache line, hoping that malloc
-     * will give us a well-aligned block of memory.  If that doesn't
-     * work, we allocate a larger block and take a well-aligned cache
-     * line from it.
-     */
-    base = xmalloc(CACHE_LINE_SIZE);
-    p = (char *)base;
-    if ((uintptr_t)p % CACHE_LINE_SIZE != 0) {
-	free(base);
-	base = xmalloc(2 * CACHE_LINE_SIZE);
-	p = (char *)base;
-	if ((r = (uintptr_t)p % CACHE_LINE_SIZE) != 0)
-	    p += CACHE_LINE_SIZE - r;
-    }
-    l = (Lock *)p;
-    l->base = base;
-    l->lock = 0;
-    return l;
+	_rtld_isthreaded = threaded;
 }
 
-static void
-def_lock_destroy(void *lock)
+static __inline
+void *
+myid(void)
 {
-    Lock *l = (Lock *)lock;
-
-    free(l->base);
+	if (_rtld_isthreaded) {
+		return(tls_get_tcb());
+	}
+	return (void *)(intptr_t)1;
 }
 
-static void
-def_rlock_acquire(void *lock)
+void
+rlock_acquire(rtld_lock_t lock, RtldLockState *state)
 {
-    Lock *l = (Lock *)lock;
+	void *tid = myid();
+	int v;
 
-    atomic_add_acq_int(&l->lock, RC_INCR);
-    while (l->lock & WAFLAG)
-	    ;	/* Spin */
+	v = lock->lock;
+	cpu_ccfence();
+	for (;;) {
+		if ((v & WAFLAG) == 0) {
+			if (atomic_fcmpset_int(&lock->lock, &v, v + RC_INCR)) {
+				state->lockstate = RTLD_LOCK_RLOCKED;
+				break;
+			}
+		} else {
+			if (lock->owner == tid) {
+				++lock->count;
+				state->lockstate = RTLD_LOCK_WLOCKED;
+				break;
+			}
+			if (atomic_fcmpset_int(&lock->lock, &v, v | SLFLAG)) {
+				umtx_sleep(&lock->lock, v, 0);
+			}
+		}
+		cpu_ccfence();
+	}
 }
 
-static void
-def_wlock_acquire(void *lock)
+void
+wlock_acquire(rtld_lock_t lock, RtldLockState *state)
 {
-    Lock *l = (Lock *)lock;
-    sigset_t tmp_oldsigmask;
+	void *tid = myid();
+	sigset_t tmp_oldsigmask;
+	int v;
 
-    for ( ; ; ) {
+	if (lock->owner == tid) {
+		++lock->count;
+		state->lockstate = RTLD_LOCK_WLOCKED;
+		return;
+	}
+
 	sigprocmask(SIG_BLOCK, &fullsigmask, &tmp_oldsigmask);
-	if (atomic_cmpset_acq_int(&l->lock, 0, WAFLAG))
-	    break;
-	sigprocmask(SIG_SETMASK, &tmp_oldsigmask, NULL);
-    }
-    oldsigmask = tmp_oldsigmask;
-}
-
-static void
-def_lock_release(void *lock)
-{
-    Lock *l = (Lock *)lock;
-
-    if ((l->lock & WAFLAG) == 0)
-	atomic_add_rel_int(&l->lock, -RC_INCR);
-    else {
-	atomic_add_rel_int(&l->lock, -WAFLAG);
-	sigprocmask(SIG_SETMASK, &oldsigmask, NULL);
-    }
-}
-
-static int
-def_thread_set_flag(int mask)
-{
-	int old_val = thread_flag;
-	thread_flag |= mask;
-	return (old_val);
-}
-
-static int
-def_thread_clr_flag(int mask)
-{
-	int old_val = thread_flag;
-	thread_flag &= ~mask;
-	return (old_val);
-}
-
-/*
- * Public interface exposed to the rest of the dynamic linker.
- */
-static struct RtldLockInfo lockinfo;
-static struct RtldLockInfo deflockinfo;
-
-static __inline int
-thread_mask_set(int mask)
-{
-	return lockinfo.thread_set_flag(mask);
-}
-
-static __inline void
-thread_mask_clear(int mask)
-{
-	lockinfo.thread_clr_flag(mask);
-}
-
-#define	RTLD_LOCK_CNT	3
-struct rtld_lock {
-	void	*handle;
-	int	 mask;
-} rtld_locks[RTLD_LOCK_CNT];
-
-rtld_lock_t	rtld_bind_lock = &rtld_locks[0];
-rtld_lock_t	rtld_libc_lock = &rtld_locks[1];
-rtld_lock_t	rtld_phdr_lock = &rtld_locks[2];
-
-void
-rlock_acquire(rtld_lock_t lock, RtldLockState *lockstate)
-{
-
-	if (lockstate == NULL)
-		return;
-
-	if (thread_mask_set(lock->mask) & lock->mask) {
-		dbg("rlock_acquire: recursed");
-		lockstate->lockstate = RTLD_LOCK_UNLOCKED;
-		return;
+	v = lock->lock;
+	for (;;) {
+		if ((v & ~SLFLAG) == 0) {
+			if (atomic_fcmpset_int(&lock->lock, &v, WAFLAG))
+				break;
+		} else {
+			if (atomic_fcmpset_int(&lock->lock, &v, v | SLFLAG)) {
+				umtx_sleep(&lock->lock, v, 0);
+			}
+		}
+		cpu_ccfence();
 	}
-	lockinfo.rlock_acquire(lock->handle);
-	lockstate->lockstate = RTLD_LOCK_RLOCKED;
+	lock->owner = tid;
+	lock->count = 1;
+	lock->savesigmask = tmp_oldsigmask;
+	state->lockstate = RTLD_LOCK_WLOCKED;
 }
 
 void
-wlock_acquire(rtld_lock_t lock, RtldLockState *lockstate)
+lock_release(rtld_lock_t lock, RtldLockState *state)
 {
+	sigset_t tmp_oldsigmask;
+	int v;
 
-	if (lockstate == NULL)
+	if (state->lockstate == RTLD_LOCK_UNLOCKED)
 		return;
-
-	if (thread_mask_set(lock->mask) & lock->mask) {
-		dbg("wlock_acquire: recursed");
-		lockstate->lockstate = RTLD_LOCK_UNLOCKED;
-		return;
+	if ((lock->lock & WAFLAG) == 0) {
+		v = atomic_fetchadd_int(&lock->lock, -RC_INCR) - RC_INCR;
+		if (v == SLFLAG) {
+			atomic_clear_int(&lock->lock, SLFLAG);
+			umtx_wakeup(&lock->lock, 0);
+		}
+	} else if (--lock->count == 0) {
+		tmp_oldsigmask = lock->savesigmask;
+		lock->owner = NULL;
+		v = atomic_fetchadd_int(&lock->lock, -WAFLAG) - WAFLAG;
+		if (v == SLFLAG) {
+			atomic_clear_int(&lock->lock, SLFLAG);
+			umtx_wakeup(&lock->lock, 0);
+		}
+		sigprocmask(SIG_SETMASK, &tmp_oldsigmask, NULL);
 	}
-	lockinfo.wlock_acquire(lock->handle);
-	lockstate->lockstate = RTLD_LOCK_WLOCKED;
+	state->lockstate = RTLD_LOCK_UNLOCKED;
+}
+
+static
+void
+lock_reset(rtld_lock_t lock)
+{
+	memset(lock, 0, sizeof(*lock));
 }
 
 void
-lock_release(rtld_lock_t lock, RtldLockState *lockstate)
+lock_upgrade(rtld_lock_t lock, RtldLockState *state)
 {
-
-	if (lockstate == NULL)
+	if (state == NULL)
 		return;
-
-	switch (lockstate->lockstate) {
-	case RTLD_LOCK_UNLOCKED:
-		break;
-	case RTLD_LOCK_RLOCKED:
-	case RTLD_LOCK_WLOCKED:
-		thread_mask_clear(lock->mask);
-		lockinfo.lock_release(lock->handle);
-		break;
-	default:
-		assert(0);
+	if (state->lockstate == RTLD_LOCK_RLOCKED) {
+		lock_release(lock, state);
+		wlock_acquire(lock, state);
 	}
 }
 
 void
-lock_upgrade(rtld_lock_t lock, RtldLockState *lockstate)
+lock_restart_for_upgrade(RtldLockState *state)
 {
-
-	if (lockstate == NULL)
+	if (state == NULL)
 		return;
-
-	lock_release(lock, lockstate);
-	wlock_acquire(lock, lockstate);
-}
-
-void
-lock_restart_for_upgrade(RtldLockState *lockstate)
-{
-
-	if (lockstate == NULL)
-		return;
-
-	switch (lockstate->lockstate) {
+	switch (state->lockstate) {
 	case RTLD_LOCK_UNLOCKED:
 	case RTLD_LOCK_WLOCKED:
 		break;
 	case RTLD_LOCK_RLOCKED:
-		siglongjmp(lockstate->env, 1);
+		siglongjmp(state->env, 1);
 		break;
 	default:
 		assert(0);
@@ -267,95 +227,60 @@ lock_restart_for_upgrade(RtldLockState *lockstate)
 void
 lockdflt_init(void)
 {
-    int i;
+	/*
+	 * Construct a mask to block all signals except traps which might
+	 * conceivably be generated within the dynamic linker itself.
+	 */
+	sigfillset(&fullsigmask);
+	sigdelset(&fullsigmask, SIGILL);
+	sigdelset(&fullsigmask, SIGTRAP);
+	sigdelset(&fullsigmask, SIGABRT);
+	sigdelset(&fullsigmask, SIGEMT);
+	sigdelset(&fullsigmask, SIGFPE);
+	sigdelset(&fullsigmask, SIGBUS);
+	sigdelset(&fullsigmask, SIGSEGV);
+	sigdelset(&fullsigmask, SIGSYS);
 
-    deflockinfo.rtli_version  = RTLI_VERSION;
-    deflockinfo.lock_create   = def_lock_create;
-    deflockinfo.lock_destroy  = def_lock_destroy;
-    deflockinfo.rlock_acquire = def_rlock_acquire;
-    deflockinfo.wlock_acquire = def_wlock_acquire;
-    deflockinfo.lock_release  = def_lock_release;
-    deflockinfo.thread_set_flag = def_thread_set_flag;
-    deflockinfo.thread_clr_flag = def_thread_clr_flag;
-    deflockinfo.at_fork = NULL;
-
-    for (i = 0; i < RTLD_LOCK_CNT; i++) {
-	    rtld_locks[i].mask   = (1 << i);
-	    rtld_locks[i].handle = NULL;
-    }
-
-    memcpy(&lockinfo, &deflockinfo, sizeof(lockinfo));
-    _rtld_thread_init(NULL);
-    /*
-     * Construct a mask to block all signals except traps which might
-     * conceivably be generated within the dynamic linker itself.
-     */
-    sigfillset(&fullsigmask);
-    sigdelset(&fullsigmask, SIGILL);
-    sigdelset(&fullsigmask, SIGTRAP);
-    sigdelset(&fullsigmask, SIGABRT);
-    sigdelset(&fullsigmask, SIGEMT);
-    sigdelset(&fullsigmask, SIGFPE);
-    sigdelset(&fullsigmask, SIGBUS);
-    sigdelset(&fullsigmask, SIGSEGV);
-    sigdelset(&fullsigmask, SIGSYS);
+	_rtld_thread_init(NULL);
 }
 
 /*
- * Callback function to allow threads implementation to
- * register their own locking primitives if the default
- * one is not suitable.
- * The current context should be the only context
- * executing at the invocation time.
+ * (also called by pthreads)
  */
 void
-_rtld_thread_init(struct RtldLockInfo *pli)
+_rtld_thread_init(void *dummy __unused)
 {
-	int flags, i;
-	void *locks[RTLD_LOCK_CNT];
+	lock_reset(rtld_phdr_lock);
+	lock_reset(rtld_bind_lock);
+	lock_reset(rtld_libc_lock);
+}
 
-	/* disable all locking while this function is running */
-	flags =	thread_mask_set(~0);
+static RtldLockState fork_states[3];
 
-	if (pli == NULL)
-		pli = &deflockinfo;
+void
+_rtld_thread_prefork(void)
+{
+	wlock_acquire(rtld_phdr_lock, &fork_states[0]);
+	wlock_acquire(rtld_bind_lock, &fork_states[1]);
+	wlock_acquire(rtld_libc_lock, &fork_states[2]);
+}
 
+void
+_rtld_thread_postfork(void)
+{
+	lock_release(rtld_libc_lock, &fork_states[2]);
+	lock_release(rtld_bind_lock, &fork_states[1]);
+	lock_release(rtld_phdr_lock, &fork_states[0]);
+}
 
-	for (i = 0; i < RTLD_LOCK_CNT; i++)
-		if ((locks[i] = pli->lock_create()) == NULL)
-			break;
+void
+_rtld_thread_childfork(void)
+{
+	sigset_t tmp_oldsigmask;
 
-	if (i < RTLD_LOCK_CNT) {
-		while (--i >= 0)
-			pli->lock_destroy(locks[i]);
-		abort();
-	}
-
-	for (i = 0; i < RTLD_LOCK_CNT; i++) {
-		if (rtld_locks[i].handle == NULL)
-			continue;
-		if (flags & rtld_locks[i].mask)
-			lockinfo.lock_release(rtld_locks[i].handle);
-		lockinfo.lock_destroy(rtld_locks[i].handle);
-	}
-
-	for (i = 0; i < RTLD_LOCK_CNT; i++) {
-		rtld_locks[i].handle = locks[i];
-		if (flags & rtld_locks[i].mask)
-			pli->wlock_acquire(rtld_locks[i].handle);
-	}
-
-	lockinfo.lock_create = pli->lock_create;
-	lockinfo.lock_destroy = pli->lock_destroy;
-	lockinfo.rlock_acquire = pli->rlock_acquire;
-	lockinfo.wlock_acquire = pli->wlock_acquire;
-	lockinfo.lock_release  = pli->lock_release;
-	lockinfo.thread_set_flag = pli->thread_set_flag;
-	lockinfo.thread_clr_flag = pli->thread_clr_flag;
-	lockinfo.at_fork = pli->at_fork;
-
-	/* restore thread locking state, this time with new locks */
-	thread_mask_clear(~0);
-	thread_mask_set(flags);
-	dbg("_rtld_thread_init: done");
+	lock_reset(rtld_phdr_lock);
+	lock_reset(rtld_bind_lock);
+	tmp_oldsigmask = rtld_libc_lock->savesigmask;
+	lock_reset(rtld_libc_lock);
+	sigprocmask(SIG_SETMASK, &tmp_oldsigmask, NULL);
 }

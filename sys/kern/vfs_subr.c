@@ -39,13 +39,15 @@
  * External virtual filesystem routines
  */
 #include "opt_ddb.h"
+#include "opt_inet.h"
+#include "opt_inet6.h"
 
 #include <sys/param.h>
 #include <sys/systm.h>
+#include <sys/uio.h>
 #include <sys/buf.h>
 #include <sys/conf.h>
 #include <sys/dirent.h>
-#include <sys/domain.h>
 #include <sys/eventhandler.h>
 #include <sys/fcntl.h>
 #include <sys/file.h>
@@ -79,24 +81,24 @@
 #include <vm/vm_zone.h>
 
 #include <sys/buf2.h>
-#include <sys/thread2.h>
-#include <sys/sysref2.h>
-#include <sys/mplock2.h>
+#include <vm/vm_page2.h>
 
-static MALLOC_DEFINE(M_NETADDR, "Export Host", "Export host address structure");
+#include <netinet/in.h>
 
-int numvnodes;
+static MALLOC_DEFINE(M_NETCRED, "Export Host", "Export host address structure");
+
+__read_mostly int numvnodes;
 SYSCTL_INT(_debug, OID_AUTO, numvnodes, CTLFLAG_RD, &numvnodes, 0,
     "Number of vnodes allocated");
-int verbose_reclaims;
+__read_mostly int verbose_reclaims;
 SYSCTL_INT(_debug, OID_AUTO, verbose_reclaims, CTLFLAG_RD, &verbose_reclaims, 0,
     "Output filename of reclaimed vnode(s)");
 
-enum vtype iftovt_tab[16] = {
+__read_mostly enum vtype iftovt_tab[16] = {
 	VNON, VFIFO, VCHR, VNON, VDIR, VNON, VBLK, VNON,
 	VREG, VNON, VLNK, VNON, VSOCK, VNON, VNON, VBAD,
 };
-int vttoif_tab[9] = {
+__read_mostly int vttoif_tab[9] = {
 	0, S_IFREG, S_IFDIR, S_IFBLK, S_IFCHR, S_IFLNK,
 	S_IFSOCK, S_IFIFO, S_IFMT,
 };
@@ -105,7 +107,7 @@ static int reassignbufcalls;
 SYSCTL_INT(_vfs, OID_AUTO, reassignbufcalls, CTLFLAG_RW, &reassignbufcalls,
     0, "Number of times buffers have been reassigned to the proper list");
 
-static int check_buf_overlap = 2;	/* invasive check */
+__read_mostly static int check_buf_overlap = 2;	/* invasive check */
 SYSCTL_INT(_vfs, OID_AUTO, check_buf_overlap, CTLFLAG_RW, &check_buf_overlap,
     0, "Enable overlapping buffer checks");
 
@@ -113,14 +115,20 @@ int	nfs_mount_type = -1;
 static struct lwkt_token spechash_token;
 struct nfs_public nfs_pub;	/* publicly exported FS */
 
-int desiredvnodes;
+__read_mostly int maxvnodes;
 SYSCTL_INT(_kern, KERN_MAXVNODES, maxvnodes, CTLFLAG_RW, 
-		&desiredvnodes, 0, "Maximum number of vnodes");
+	   &maxvnodes, 0, "Maximum number of vnodes");
 
+static struct radix_node_head *vfs_create_addrlist_af(int af,
+		    struct netexport *nep);
 static void	vfs_free_addrlist (struct netexport *nep);
 static int	vfs_free_netcred (struct radix_node *rn, void *w);
+static void	vfs_free_addrlist_af (struct radix_node_head **prnh);
 static int	vfs_hang_addrlist (struct mount *mp, struct netexport *nep,
-				       const struct export_args *argp);
+	            const struct export_args *argp);
+static void vclean_vxlocked(struct vnode *vp, int flags);
+
+__read_mostly int prtactive = 0; /* 1 => print out reclaim of active vnodes */
 
 /*
  * Red black tree functions
@@ -144,29 +152,44 @@ rb_buf_compare(struct buf *b1, struct buf *b2)
  *
  * Called from vfsinit()
  */
+#define MAXVNBREAKMEM	(1L * 1024 * 1024 * 1024)
+#define MINVNODES	2000
+#define MAXVNODES	4000000
+
 void
 vfs_subr_init(void)
 {
-	int factor1;
-	int factor2;
+	int factor1;	/* Limit based on ram (x 2 above 1GB) */
+	int factor2;	/* Limit based on available KVM */
+	size_t freemem;
 
 	/*
-	 * Desiredvnodes is kern.maxvnodes.  We want to scale it 
-	 * according to available system memory but we may also have
-	 * to limit it based on available KVM, which is capped on 32 bit
-	 * systems, to ~80K vnodes or so.
+	 * Size maxvnodes to available memory.  Size significantly
+	 * smaller on low-memory systems (calculations for the first
+	 * 1GB of ram), and pump it up a bit when free memory is
+	 * above 1GB.
 	 *
-	 * WARNING!  For machines with 64-256M of ram we have to be sure
-	 *	     that the default limit scales down well due to HAMMER
-	 *	     taking up significantly more memory per-vnode vs UFS.
-	 *	     We want around ~5800 on a 128M machine.
+	 * The general minimum is maxproc * 8 (we want someone pushing
+	 * up maxproc a lot to also get more vnodes).  Usually maxproc
+	 * does not affect this calculation.
+	 *
+	 * There isn't much of a point allowing maxvnodes to exceed a
+	 * few million as our modern filesystems cache pages in the
+	 * underlying block device and not so much hanging off of VM
+	 * objects.
 	 */
-	factor1 = 20 * (sizeof(struct vm_object) + sizeof(struct vnode));
-	factor2 = 25 * (sizeof(struct vm_object) + sizeof(struct vnode));
-	desiredvnodes =
-		imin((int64_t)vmstats.v_page_count * PAGE_SIZE / factor1,
-		     KvaSize / factor2);
-	desiredvnodes = imax(desiredvnodes, maxproc * 8);
+	factor1 = 50 * (sizeof(struct vm_object) + sizeof(struct vnode));
+	factor2 = 30 * (sizeof(struct vm_object) + sizeof(struct vnode));
+
+	freemem = (int64_t)vmstats.v_page_count * PAGE_SIZE;
+
+	maxvnodes = freemem / factor1;
+	if (freemem > MAXVNBREAKMEM)
+		maxvnodes += (freemem - MAXVNBREAKMEM) / factor1;
+	maxvnodes = imax(maxvnodes, maxproc * 8);
+	maxvnodes = imin(maxvnodes, KvaSize / factor2);
+	maxvnodes = imin(maxvnodes, MAXVNODES);
+	maxvnodes = imax(maxvnodes, MINVNODES);
 
 	lwkt_token_init(&spechash_token, "spechash");
 }
@@ -178,10 +201,14 @@ vfs_subr_init(void)
  *   1 = seconds and nanoseconds, accurate within 1/HZ.
  *   2 = seconds and nanoseconds, truncated to microseconds.
  * >=3 = seconds and nanoseconds, maximum precision.
+ *
+ * Note that utimes() precision is microseconds because it takes a timeval
+ * structure, so its probably best to default to USEC and not NSEC.
  */
-enum { TSP_SEC, TSP_HZ, TSP_USEC, TSP_NSEC };
+enum { TSP_SEC, TSP_HZ, TSP_USEC, TSP_NSEC,
+       TSP_USEC_PRECISE, TSP_NSEC_PRECISE };
 
-static int timestamp_precision = TSP_SEC;
+__read_mostly static int timestamp_precision = TSP_USEC;
 SYSCTL_INT(_vfs, OID_AUTO, timestamp_precision, CTLFLAG_RW,
 		&timestamp_precision, 0, "Precision of file timestamps");
 
@@ -193,22 +220,28 @@ SYSCTL_INT(_vfs, OID_AUTO, timestamp_precision, CTLFLAG_RW,
 void
 vfs_timestamp(struct timespec *tsp)
 {
-	struct timeval tv;
-
 	switch (timestamp_precision) {
-	case TSP_SEC:
-		tsp->tv_sec = time_second;
+	case TSP_SEC:		/* seconds precision */
+		getnanotime(tsp);
 		tsp->tv_nsec = 0;
 		break;
-	case TSP_HZ:
+	default:
+	case TSP_HZ:		/* ticks precision (limit to microseconds) */
+		getnanotime(tsp);
+		tsp->tv_nsec -= tsp->tv_nsec % 1000;
+		break;
+	case TSP_USEC:		/* microseconds (ticks precision) */
+		getnanotime(tsp);
+		tsp->tv_nsec -= tsp->tv_nsec % 1000;
+		break;
+	case TSP_NSEC:		/* nanoseconds (ticks precision) */
 		getnanotime(tsp);
 		break;
-	case TSP_USEC:
-		microtime(&tv);
-		TIMEVAL_TO_TIMESPEC(&tv, tsp);
+	case TSP_USEC_PRECISE:	/* microseconds (high preceision) */
+		nanotime(tsp);
+		tsp->tv_nsec -= tsp->tv_nsec % 1000;
 		break;
-	case TSP_NSEC:
-	default:
+	case TSP_NSEC_PRECISE:	/* nanoseconds (high precision) */
 		nanotime(tsp);
 		break;
 	}
@@ -603,6 +636,8 @@ vtruncbuf_bp_metasync(struct buf *bp, void *data)
  *
  * When fsyncing data synchronously do a data pass, then a metadata pass,
  * then do additional data+metadata passes to try to get all the data out.
+ *
+ * Caller must ref the vnode but does not have to lock it.
  */
 static int vfsync_wait_output(struct vnode *vp, 
 			    int (*waitoutput)(struct vnode *, struct thread *));
@@ -614,6 +649,7 @@ static int vfsync_bp(struct buf *bp, void *data);
 
 struct vfsync_info {
 	struct vnode *vp;
+	int fastpass;
 	int synchronous;
 	int syncdeps;
 	int lazycount;
@@ -680,8 +716,10 @@ vfsync(struct vnode *vp, int waitfor, int passes,
 		 * all the dependancies flushed.
 		 */
 		info.cmpfunc = vfsync_data_only_cmp;
+		info.fastpass = 1;
 		RB_SCAN(buf_rb_tree, &vp->v_rbdirty_tree, vfsync_data_only_cmp,
 			vfsync_bp, &info);
+		info.fastpass = 0;
 		error = vfsync_wait_output(vp, waitoutput);
 		if (error == 0) {
 			info.skippedbufs = 0;
@@ -691,12 +729,15 @@ vfsync(struct vnode *vp, int waitfor, int passes,
 			error = vfsync_wait_output(vp, waitoutput);
 			if (info.skippedbufs) {
 				kprintf("Warning: vfsync skipped %d dirty "
-					"bufs in pass2!\n", info.skippedbufs);
+					"buf%s in pass2!\n",
+					info.skippedbufs,
+					((info.skippedbufs > 1) ? "s" : ""));
 			}
 		}
 		while (error == 0 && passes > 0 &&
 		       !RB_EMPTY(&vp->v_rbdirty_tree)
 		) {
+			info.skippedbufs = 0;
 			if (--passes == 0) {
 				info.synchronous = 1;
 				info.syncdeps = 1;
@@ -709,10 +750,25 @@ vfsync(struct vnode *vp, int waitfor, int passes,
 			info.syncdeps = 1;
 			if (error == 0)
 				error = vfsync_wait_output(vp, waitoutput);
+			if (info.skippedbufs && passes == 0) {
+				kprintf("Warning: vfsync skipped %d dirty "
+					"buf%s in final pass!\n",
+					info.skippedbufs,
+					((info.skippedbufs > 1) ? "s" : ""));
+			}
 		}
+#if 0
+		/*
+		 * This case can occur normally because vnode lock might
+		 * not be held.
+		 */
+		if (!RB_EMPTY(&vp->v_rbdirty_tree))
+			kprintf("dirty bufs left after final pass\n");
+#endif
 		break;
 	}
 	lwkt_reltoken(&vp->v_token);
+
 	return(error);
 }
 
@@ -767,12 +823,43 @@ vfsync_bp(struct buf *bp, void *data)
 	struct vnode *vp = info->vp;
 	int error;
 
-	/*
-	 * Ignore buffers that we cannot immediately lock.
-	 */
-	if (BUF_LOCK(bp, LK_EXCLUSIVE | LK_NOWAIT)) {
-		++info->skippedbufs;
-		return(0);
+	if (info->fastpass) {
+		/*
+		 * Ignore buffers that we cannot immediately lock.
+		 */
+		if (BUF_LOCK(bp, LK_EXCLUSIVE | LK_NOWAIT)) {
+			/*
+			 * Removed BUF_TIMELOCK(..., 1), even a 1-tick
+			 * delay can mess up performance
+			 *
+			 * Another reason is that during a dirty-buffer
+			 * scan a clustered write can start I/O on buffers
+			 * ahead of the scan, causing the scan to not
+			 * get a lock here.  Usually this means the write
+			 * is already in progress so, in fact, we *want*
+			 * to skip the buffer.
+			 */
+			++info->skippedbufs;
+			return(0);
+		}
+	} else if (info->synchronous == 0) {
+		/*
+		 * Normal pass, give the buffer a little time to become
+		 * available to us.
+		 */
+		if (BUF_TIMELOCK(bp, LK_EXCLUSIVE, "bflst2", hz / 10)) {
+			++info->skippedbufs;
+			return(0);
+		}
+	} else {
+		/*
+		 * Synchronous pass, give the buffer a lot of time before
+		 * giving up.
+		 */
+		if (BUF_TIMELOCK(bp, LK_EXCLUSIVE, "bflst3", hz * 10)) {
+			++info->skippedbufs;
+			return(0);
+		}
 	}
 
 	/*
@@ -817,21 +904,32 @@ vfsync_bp(struct buf *bp, void *data)
 
 	if (info->synchronous) {
 		/*
-		 * Synchronous flushing.  An error may be returned.
+		 * Synchronous flush.  An error may be returned and will
+		 * stop the scan.
 		 */
 		bremfree(bp);
 		error = bwrite(bp);
-	} else { 
+	} else {
 		/*
-		 * Asynchronous flushing.  A negative return value simply
-		 * stops the scan and is not considered an error.  We use
-		 * this to support limited MNT_LAZY flushes.
+		 * Asynchronous flush.  We use the error return to support
+		 * MNT_LAZY flushes.
+		 *
+		 * In low-memory situations we revert to synchronous
+		 * operation.  This should theoretically prevent the I/O
+		 * path from exhausting memory in a non-recoverable way.
 		 */
 		vp->v_lazyw = bp->b_loffset;
 		bremfree(bp);
-		info->lazycount += cluster_awrite(bp);
-		waitrunningbufspace();
-		vm_wait_nominal();
+		if (vm_page_count_min(0)) {
+			/* low memory */
+			info->lazycount += bp->b_bufsize;
+			bwrite(bp);
+		} else {
+			/* normal */
+			info->lazycount += cluster_awrite(bp);
+			waitrunningbufspace();
+			/*vm_wait_nominal();*/
+		}
 		if (info->lazylimit && info->lazycount >= info->lazylimit)
 			error = 1;
 		else
@@ -939,7 +1037,7 @@ brelvp(struct buf *bp)
 	 */
 	if ((vp->v_flag & (VONWORKLST | VISDIRTY | VOBJDIRTY)) == VONWORKLST &&
 	    RB_EMPTY(&vp->v_rbdirty_tree)) {
-		vn_syncer_remove(vp);
+		vn_syncer_remove(vp, 0);
 	}
 	bp->b_vp = NULL;
 
@@ -1029,7 +1127,7 @@ reassignbuf(struct buf *bp)
 		if ((vp->v_flag & (VONWORKLST | VISDIRTY | VOBJDIRTY)) ==
 		     VONWORKLST &&
 		    RB_EMPTY(&vp->v_rbdirty_tree)) {
-			vn_syncer_remove(vp);
+			vn_syncer_remove(vp, 0);
 		}
 	}
 }
@@ -1125,6 +1223,8 @@ addaliasu(struct vnode *nvp, int x, int y)
  *
  * May only be called if the vnode is in a known state (i.e. being prevented
  * from being deallocated by some other condition such as a vfs inode hold).
+ *
+ * This call might not succeed.
  */
 void
 vclean_unlocked(struct vnode *vp)
@@ -1143,7 +1243,7 @@ vclean_unlocked(struct vnode *vp)
  * there are active references, the vnode is being ripped out and we have
  * to call VOP_CLOSE() as appropriate before we can reclaim it.
  */
-void
+static void
 vclean_vxlocked(struct vnode *vp, int flags)
 {
 	int active;
@@ -1191,7 +1291,6 @@ vclean_vxlocked(struct vnode *vp, int flags)
 	 * object, if it has one. 
 	 */
 	vinvalbuf(vp, V_SAVE, 0, 0);
-	KKASSERT(lockcountnb(&vp->v_lock) == 1);
 
 	/*
 	 * If purging an active vnode (typically during a forced unmount
@@ -1231,7 +1330,6 @@ vclean_vxlocked(struct vnode *vp, int flags)
 			VOP_INACTIVE(vp);
 		vinvalbuf(vp, V_SAVE, 0, 0);
 	}
-	KKASSERT(lockcountnb(&vp->v_lock) == 1);
 
 	/*
 	 * If the vnode has an object, destroy it.
@@ -1256,6 +1354,9 @@ vclean_vxlocked(struct vnode *vp, int flags)
 		}
 	}
 	KKASSERT((vp->v_flag & VOBJBUF) == 0);
+
+	if (vp->v_flag & VOBJDIRTY)
+		vclrobjdirty(vp);
 
 	/*
 	 * Reclaim the vnode if not already dead.
@@ -1416,7 +1517,7 @@ vgone_vxlocked(struct vnode *vp)
 	 * assert that the VX lock is held.  This is an absolute requirement
 	 * now for vgone_vxlocked() to be called.
 	 */
-	KKASSERT(lockcountnb(&vp->v_lock) == 1);
+	KKASSERT(lockinuse(&vp->v_lock));
 
 	/*
 	 * Clean out the filesystem specific data and set the VRECLAIMED
@@ -1426,7 +1527,19 @@ vgone_vxlocked(struct vnode *vp)
 	 * list as syncer/dirty flags cleared during the cleaning.
 	 */
 	vclean_vxlocked(vp, DOCLOSE);
-	KKASSERT((vp->v_flag & VONWORKLST) == 0);
+
+	/*
+	 * Normally panic if the vnode is still dirty, unless we are doing
+	 * a forced unmount (tmpfs typically).
+	 */
+	if (vp->v_flag & VONWORKLST) {
+		if (vp->v_mount->mnt_kern_flag & MNTK_UNMOUNTF) {
+			/* force removal */
+			vn_syncer_remove(vp, 1);
+		} else {
+			panic("vp %p still dirty in vgone after flush", vp);
+		}
+	}
 
 	/*
 	 * Delete from old mount point vnode list, if on one.
@@ -1453,34 +1566,10 @@ vgone_vxlocked(struct vnode *vp)
 }
 
 /*
- * Lookup a vnode by device number.
- *
- * Returns non-zero and *vpp set to a vref'd vnode on success.
- * Returns zero on failure.
- */
-int
-vfinddev(cdev_t dev, enum vtype type, struct vnode **vpp)
-{
-	struct vnode *vp;
-
-	lwkt_gettoken(&spechash_token);
-	SLIST_FOREACH(vp, &dev->si_hlist, v_cdevnext) {
-		if (type == vp->v_type) {
-			*vpp = vp;
-			vref(vp);
-			lwkt_reltoken(&spechash_token);
-			return (1);
-		}
-	}
-	lwkt_reltoken(&spechash_token);
-	return (0);
-}
-
-/*
  * Calculate the total number of references to a special device.  This
  * routine may only be called for VBLK and VCHR vnodes since v_rdev is
- * an overloaded field.  Since udev2dev can now return NULL, we have
- * to check for a NULL v_rdev.
+ * an overloaded field.  Since dev_from_devid() can now return NULL, we
+ * have to check for a NULL v_rdev.
  */
 int
 count_dev(cdev_t dev)
@@ -1761,10 +1850,7 @@ vfs_mountedon(struct vnode *vp)
 {
 	cdev_t dev;
 
-	if ((dev = vp->v_rdev) == NULL) {
-/*		if (vp->v_type != VBLK)
-			dev = get_dev(vp->v_uminor, vp->v_umajor); */
-	}
+	dev = vp->v_rdev;
 	if (dev != NULL && dev->si_mountpoint)
 		return (EBUSY);
 	return (0);
@@ -1773,18 +1859,24 @@ vfs_mountedon(struct vnode *vp)
 /*
  * Unmount all filesystems. The list is traversed in reverse order
  * of mounting to avoid dependencies.
+ *
+ * We want the umountall to be able to break out of its loop if a
+ * failure occurs, after scanning all possible mounts, so the callback
+ * returns 0 on error.
+ *
+ * NOTE: Do not call mountlist_remove(mp) on error any more, this will
+ *	 confuse mountlist_scan()'s unbusy check.
  */
-
 static int vfs_umountall_callback(struct mount *mp, void *data);
 
 void
-vfs_unmountall(void)
+vfs_unmountall(int halting)
 {
 	int count;
 
 	do {
-		count = mountlist_scan(vfs_umountall_callback, 
-					NULL, MNTSCAN_REVERSE|MNTSCAN_NOBUSY);
+		count = mountlist_scan(vfs_umountall_callback, &halting,
+				       MNTSCAN_REVERSE|MNTSCAN_NOBUSY);
 	} while (count);
 }
 
@@ -1793,18 +1885,24 @@ int
 vfs_umountall_callback(struct mount *mp, void *data)
 {
 	int error;
+	int halting = *(int *)data;
 
-	error = dounmount(mp, MNT_FORCE);
+	/*
+	 * NOTE: When halting, dounmount will disconnect but leave
+	 *	 certain mount points intact.  e.g. devfs.
+	 */
+	error = dounmount(mp, MNT_FORCE, halting);
 	if (error) {
-		mountlist_remove(mp);
 		kprintf("unmount of filesystem mounted from %s failed (", 
 			mp->mnt_stat.f_mntfromname);
 		if (error == EBUSY)
 			kprintf("BUSY)\n");
 		else
 			kprintf("%d)\n", error);
+		return 0;
+	} else {
+		return 1;
 	}
-	return(1);
 }
 
 /*
@@ -1820,23 +1918,27 @@ vfs_flagstostr(int flags, const struct mountctl_opt *optp,
 	       char *buf, size_t len, int *errorp)
 {
 	static const struct mountctl_opt optnames[] = {
-		{ MNT_ASYNC,            "asynchronous" },
-		{ MNT_EXPORTED,         "NFS exported" },
-		{ MNT_LOCAL,            "local" },
-		{ MNT_NOATIME,          "noatime" },
-		{ MNT_NODEV,            "nodev" },
-		{ MNT_NOEXEC,           "noexec" },
-		{ MNT_NOSUID,           "nosuid" },
-		{ MNT_NOSYMFOLLOW,      "nosymfollow" },
-		{ MNT_QUOTA,            "with-quotas" },
 		{ MNT_RDONLY,           "read-only" },
 		{ MNT_SYNCHRONOUS,      "synchronous" },
-		{ MNT_UNION,            "union" },
-		{ MNT_NOCLUSTERR,       "noclusterr" },
-		{ MNT_NOCLUSTERW,       "noclusterw" },
+		{ MNT_NOEXEC,           "noexec" },
+		{ MNT_NOSUID,           "nosuid" },
+		{ MNT_NODEV,            "nodev" },
+		{ MNT_AUTOMOUNTED,      "automounted" },
+		{ MNT_ASYNC,            "asynchronous" },
 		{ MNT_SUIDDIR,          "suiddir" },
 		{ MNT_SOFTDEP,          "soft-updates" },
-		{ MNT_IGNORE,           "ignore" },
+		{ MNT_NOSYMFOLLOW,      "nosymfollow" },
+		{ MNT_TRIM,             "trim" },
+		{ MNT_NOATIME,          "noatime" },
+		{ MNT_NOCLUSTERR,       "noclusterr" },
+		{ MNT_NOCLUSTERW,       "noclusterw" },
+		{ MNT_EXRDONLY,         "NFS read-only" },
+		{ MNT_EXPORTED,         "NFS exported" },
+		/* Remaining NFS flags could come here */
+		{ MNT_LOCAL,            "local" },
+		{ MNT_QUOTA,            "with-quotas" },
+		/* { MNT_ROOTFS,           "rootfs" }, */
+		/* { MNT_IGNORE,           "ignore" }, */
 		{ 0,			NULL}
 	};
 	int bwritten;
@@ -1909,7 +2011,6 @@ vfs_hang_addrlist(struct mount *mp, struct netexport *nep,
 	int i;
 	struct radix_node *rn;
 	struct sockaddr *saddr, *smask = NULL;
-	struct domain *dom;
 	int error;
 
 	if (argp->ex_addrlen == 0) {
@@ -1929,7 +2030,7 @@ vfs_hang_addrlist(struct mount *mp, struct netexport *nep,
 		return (EINVAL);
 
 	i = sizeof(struct netcred) + argp->ex_addrlen + argp->ex_masklen;
-	np = (struct netcred *) kmalloc(i, M_NETADDR, M_WAITOK | M_ZERO);
+	np = (struct netcred *)kmalloc(i, M_NETCRED, M_WAITOK | M_ZERO);
 	saddr = (struct sockaddr *) (np + 1);
 	if ((error = copyin(argp->ex_addr, (caddr_t) saddr, argp->ex_addrlen)))
 		goto out;
@@ -1943,26 +2044,21 @@ vfs_hang_addrlist(struct mount *mp, struct netexport *nep,
 		if (smask->sa_len > argp->ex_masklen)
 			smask->sa_len = argp->ex_masklen;
 	}
-	i = saddr->sa_family;
-	if ((rnh = nep->ne_rtable[i]) == NULL) {
-		/*
-		 * Seems silly to initialize every AF when most are not used,
-		 * do so on demand here
-		 */
-		SLIST_FOREACH(dom, &domains, dom_next)
-			if (dom->dom_family == i && dom->dom_rtattach) {
-				dom->dom_rtattach((void **) &nep->ne_rtable[i],
-				    dom->dom_rtoffset);
-				break;
-			}
-		if ((rnh = nep->ne_rtable[i]) == NULL) {
+	NE_LOCK(nep);
+	if (nep->ne_maskhead == NULL) {
+		if (!rn_inithead((void **)&nep->ne_maskhead, NULL, 0)) {
 			error = ENOBUFS;
 			goto out;
 		}
 	}
-	rn = (*rnh->rnh_addaddr) ((char *) saddr, (char *) smask, rnh,
-	    np->netc_rnodes);
-	if (rn == NULL || np != (struct netcred *) rn) {	/* already exists */
+	if ((rnh = vfs_create_addrlist_af(saddr->sa_family, nep)) == NULL) {
+		error = ENOBUFS;
+		goto out;
+	}
+	rn = (*rnh->rnh_addaddr)((char *)saddr, (char *)smask, rnh,
+				 np->netc_rnodes);
+	NE_UNLOCK(nep);
+	if (rn == NULL || np != (struct netcred *)rn) {	/* already exists */
 		error = EPERM;
 		goto out;
 	}
@@ -1970,20 +2066,104 @@ vfs_hang_addrlist(struct mount *mp, struct netexport *nep,
 	np->netc_anon = argp->ex_anon;
 	np->netc_anon.cr_ref = 1;
 	return (0);
+
 out:
-	kfree(np, M_NETADDR);
+	kfree(np, M_NETCRED);
 	return (error);
 }
 
-/* ARGSUSED */
+/*
+ * Free netcred structures installed in the netexport
+ */
 static int
 vfs_free_netcred(struct radix_node *rn, void *w)
 {
-	struct radix_node_head *rnh = (struct radix_node_head *) w;
+	struct radix_node_head *rnh = (struct radix_node_head *)w;
 
 	(*rnh->rnh_deladdr) (rn->rn_key, rn->rn_mask, rnh);
-	kfree((caddr_t) rn, M_NETADDR);
+	kfree(rn, M_NETCRED);
+
 	return (0);
+}
+
+/*
+ * callback to free an element of the mask table installed in the
+ * netexport.  These may be created indirectly and are not netcred
+ * structures.
+ */
+static int
+vfs_free_netcred_mask(struct radix_node *rn, void *w)
+{
+	struct radix_node_head *rnh = (struct radix_node_head *)w;
+
+	(*rnh->rnh_deladdr) (rn->rn_key, rn->rn_mask, rnh);
+	kfree(rn, M_RTABLE);
+
+	return (0);
+}
+
+static struct radix_node_head *
+vfs_create_addrlist_af(int af, struct netexport *nep)
+{
+	struct radix_node_head *rnh = NULL;
+#if defined(INET) || defined(INET6)
+	struct radix_node_head *maskhead = nep->ne_maskhead;
+	int off;
+#endif
+
+	NE_ASSERT_LOCKED(nep);
+#if defined(INET) || defined(INET6)
+	KKASSERT(maskhead != NULL);
+#endif
+	switch (af) {
+#ifdef INET
+	case AF_INET:
+		if ((rnh = nep->ne_inethead) == NULL) {
+			off = offsetof(struct sockaddr_in, sin_addr) << 3;
+			if (!rn_inithead((void **)&rnh, maskhead, off))
+				return (NULL);
+			nep->ne_inethead = rnh;
+		}
+		break;
+#endif
+#ifdef INET6
+	case AF_INET6:
+		if ((rnh = nep->ne_inet6head) == NULL) {
+			off = offsetof(struct sockaddr_in6, sin6_addr) << 3;
+			if (!rn_inithead((void **)&rnh, maskhead, off))
+				return (NULL);
+			nep->ne_inet6head = rnh;
+		}
+		break;
+#endif
+	}
+	return (rnh);
+}
+
+/*
+ * helper function for freeing netcred elements
+ */
+static void
+vfs_free_addrlist_af(struct radix_node_head **prnh)
+{
+	struct radix_node_head *rnh = *prnh;
+
+	(*rnh->rnh_walktree) (rnh, vfs_free_netcred, rnh);
+	kfree(rnh, M_RTABLE);
+	*prnh = NULL;
+}
+
+/*
+ * helper function for freeing mask elements
+ */
+static void
+vfs_free_addrlist_masks(struct radix_node_head **prnh)
+{
+	struct radix_node_head *rnh = *prnh;
+
+	(*rnh->rnh_walktree) (rnh, vfs_free_netcred_mask, rnh);
+	kfree(rnh, M_RTABLE);
+	*prnh = NULL;
 }
 
 /*
@@ -1992,16 +2172,14 @@ vfs_free_netcred(struct radix_node *rn, void *w)
 static void
 vfs_free_addrlist(struct netexport *nep)
 {
-	int i;
-	struct radix_node_head *rnh;
-
-	for (i = 0; i <= AF_MAX; i++)
-		if ((rnh = nep->ne_rtable[i])) {
-			(*rnh->rnh_walktree) (rnh, vfs_free_netcred,
-			    (caddr_t) rnh);
-			kfree((caddr_t) rnh, M_RTABLE);
-			nep->ne_rtable[i] = 0;
-		}
+	NE_LOCK(nep);
+	if (nep->ne_inethead != NULL)
+		vfs_free_addrlist_af(&nep->ne_inethead);
+	if (nep->ne_inet6head != NULL)
+		vfs_free_addrlist_af(&nep->ne_inet6head);
+	if (nep->ne_maskhead)
+		vfs_free_addrlist_masks(&nep->ne_maskhead);
+	NE_UNLOCK(nep);
 }
 
 int
@@ -2127,9 +2305,23 @@ vfs_export_lookup(struct mount *mp, struct netexport *nep,
 		/*
 		 * Lookup in the export list first.
 		 */
+		NE_LOCK(nep);
 		if (nam != NULL) {
 			saddr = nam;
-			rnh = nep->ne_rtable[saddr->sa_family];
+			switch (saddr->sa_family) {
+#ifdef INET
+			case AF_INET:
+				rnh = nep->ne_inethead;
+				break;
+#endif
+#ifdef INET6
+			case AF_INET6:
+				rnh = nep->ne_inet6head;
+				break;
+#endif
+			default:
+				rnh = NULL;
+			}
 			if (rnh != NULL) {
 				np = (struct netcred *)
 					(*rnh->rnh_matchaddr)((char *)saddr,
@@ -2138,6 +2330,7 @@ vfs_export_lookup(struct mount *mp, struct netexport *nep,
 					np = NULL;
 			}
 		}
+		NE_UNLOCK(nep);
 		/*
 		 * If no address match, use the default if it exists.
 		 */
@@ -2198,6 +2391,9 @@ vfs_msync(struct mount *mp, int flags)
  * scan1 is a fast pre-check.  There could be hundreds of thousands of
  * vnodes, we cannot afford to do anything heavy weight until we have a
  * fairly good indication that there is work to do.
+ *
+ * The new namecache holds the vnode for each v_namecache association
+ * so allow these refs.
  */
 static
 int
@@ -2206,8 +2402,8 @@ vfs_msync_scan1(struct mount *mp, struct vnode *vp, void *data)
 	int flags = (int)(intptr_t)data;
 
 	if ((vp->v_flag & VRECLAIMED) == 0) {
-		if (vp->v_auxrefs == 0 && VREFCNT(vp) <= 0 &&
-		    vp->v_object) {
+		if (vp->v_auxrefs == vp->v_namecache_count &&
+		    VREFCNT(vp) <= 0 && vp->v_object) {
 			return(0);	/* call scan2 */
 		}
 		if ((mp->mnt_flag & MNT_RDONLY) == 0 &&
@@ -2232,14 +2428,52 @@ vfs_msync_scan2(struct mount *mp, struct vnode *vp, void *data)
 {
 	vm_object_t obj;
 	int flags = (int)(intptr_t)data;
+	int opcflags;
 
 	if (vp->v_flag & VRECLAIMED)
 		return(0);
 
 	if ((mp->mnt_flag & MNT_RDONLY) == 0 && (vp->v_flag & VOBJDIRTY)) {
 		if ((obj = vp->v_object) != NULL) {
-			vm_object_page_clean(obj, 0, 0, 
-			 flags == MNT_WAIT ? OBJPC_SYNC : OBJPC_NOSYNC);
+			if (flags == MNT_WAIT) {
+				/*
+				 * VFS_MSYNC is called with MNT_WAIT when
+				 * unmounting.
+				 */
+				opcflags = OBJPC_SYNC;
+			} else if (vp->v_writecount || obj->ref_count) {
+				/*
+				 * VFS_MSYNC is otherwise called via the
+				 * periodic filesystem sync or the 'sync'
+				 * command.  Honor MADV_NOSYNC / MAP_NOSYNC
+				 * if the file is open for writing or memory
+				 * mapped.  Pages flagged PG_NOSYNC will not
+				 * be automatically flushed at this time.
+				 *
+				 * The obj->ref_count test is not perfect
+				 * since temporary refs may be present, but
+				 * the periodic filesystem sync will ultimately
+				 * catch it if the file is not open and not
+				 * mapped.
+				 */
+				opcflags = OBJPC_NOSYNC;
+			} else {
+				/*
+				 * If the file is no longer open for writing
+				 * and also no longer mapped, do not honor
+				 * MAP_NOSYNC.  That is, fully synchronize
+				 * the file.
+				 *
+				 * This still occurs on the periodic fs sync,
+				 * so frontend programs which turn the file
+				 * over quickly enough can still avoid the
+				 * sync, but ultimately we do want to flush
+				 * even MADV_NOSYNC pages once it is no longer
+				 * mapped or open for writing.
+				 */
+				opcflags = 0;
+			}
+			vm_object_page_clean(obj, 0, 0, opcflags);
 		}
 	}
 	return(0);
@@ -2355,4 +2589,63 @@ vn_mark_atime(struct vnode *vp, struct thread *td)
 	if ((vp->v_mount->mnt_flag & (MNT_NOATIME | MNT_RDONLY)) == 0) {
 		VOP_MARKATIME(vp, cred);
 	}
+}
+
+/*
+ * Calculate the number of entries in an inode-related chained hash table.
+ * With today's memory sizes, maxvnodes can wind up being a very large
+ * number.  There is no reason to waste memory, so tolerate some stacking.
+ */
+int
+vfs_inodehashsize(void)
+{
+	int hsize;
+
+	hsize = 32;
+	while (hsize < maxvnodes)
+		hsize <<= 1;
+	while (hsize > maxvnodes * 2)
+		hsize >>= 1;		/* nominal 2x stacking */
+
+	if (maxvnodes > 1024 * 1024)
+		hsize >>= 1;		/* nominal 8x stacking */
+
+	if (maxvnodes > 128 * 1024)
+		hsize >>= 1;		/* nominal 4x stacking */
+
+	if (hsize < 16)
+		hsize = 16;
+
+	return hsize;
+}
+
+union _qcvt {
+	quad_t qcvt;
+	int32_t val[2];
+};
+
+#define SETHIGH(q, h) { \
+	union _qcvt tmp; \
+	tmp.qcvt = (q); \
+	tmp.val[_QUAD_HIGHWORD] = (h); \
+	(q) = tmp.qcvt; \
+}
+#define SETLOW(q, l) { \
+	union _qcvt tmp; \
+	tmp.qcvt = (q); \
+	tmp.val[_QUAD_LOWWORD] = (l); \
+	(q) = tmp.qcvt; \
+}
+
+u_quad_t
+init_va_filerev(void)
+{
+	struct timeval tv;
+	u_quad_t ret = 0;
+
+	getmicrouptime(&tv);
+	SETHIGH(ret, tv.tv_sec);
+	SETLOW(ret, tv.tv_usec * 4294);
+
+	return ret;
 }

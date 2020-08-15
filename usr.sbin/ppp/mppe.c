@@ -134,6 +134,7 @@ MPPEReduceSessionKey(struct mppe_state *mp)
   case 40:
     mp->sesskey[2] = 0x9e;
     mp->sesskey[1] = 0x26;
+    /* FALLTHROUGH */
   case 56:
     mp->sesskey[0] = 0xd1;
   case 128:
@@ -470,7 +471,7 @@ MPPERequired(struct fsm *fp)
 }
 
 static u_int32_t
-MPPE_ConfigVal(struct bundle *bundle, const struct ccp_config *cfg)
+MPPE_ConfigVal(struct bundle *bundle __unused, const struct ccp_config *cfg)
 {
   u_int32_t val;
 
@@ -676,7 +677,7 @@ MPPE_InitState(struct fsm_opt *o)
 }
 
 static void *
-MPPEInitInput(struct bundle *bundle, struct fsm_opt *o)
+MPPEInitInput(struct bundle *bundle __unused, struct fsm_opt *o)
 {
   struct mppe_state *mip;
 
@@ -732,7 +733,7 @@ MPPEInitInput(struct bundle *bundle, struct fsm_opt *o)
 }
 
 static void *
-MPPEInitOutput(struct bundle *bundle, struct fsm_opt *o)
+MPPEInitOutput(struct bundle *bundle __unused, struct fsm_opt *o)
 {
   struct mppe_state *mop;
 

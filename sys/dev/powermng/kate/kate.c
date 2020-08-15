@@ -21,6 +21,8 @@
 #include <sys/bus.h>
 #include <sys/sensors.h>
 
+#include <machine/specialreg.h>
+
 #include <bus/pci/pcivar.h>
 #include "pcidevs.h"
 
@@ -63,7 +65,7 @@ static const struct {
 
 
 struct kate_softc {
-	struct device		*sc_dev;
+	device_t		sc_dev;
 
 	struct ksensor		sc_sensors[4];
 	struct ksensordev	sc_sensordev;
@@ -71,12 +73,14 @@ struct kate_softc {
 	char			sc_rev;
 	int8_t			sc_ii;
 	int8_t			sc_in;
+	int32_t			sc_flags;
+#define	KATE_FLAG_ALT_OFFSET	0x04	/* CurTmp starts at -28C. */
 };
 
-static void	kate_identify(driver_t *, struct device *);
-static int	kate_probe(struct device *);
-static int	kate_attach(struct device *);
-static int	kate_detach(struct device *);
+static void	kate_identify(driver_t *, device_t);
+static int	kate_probe(device_t);
+static int	kate_attach(device_t);
+static int	kate_detach(device_t);
 static void	kate_refresh(void *);
 
 static device_method_t kate_methods[] = {
@@ -99,7 +103,7 @@ DRIVER_MODULE(kate, hostb, kate_driver, kate_devclass, NULL, NULL);
 
 
 static void
-kate_identify(driver_t *driver, struct device *parent)
+kate_identify(driver_t *driver, device_t parent)
 {
 	if (kate_probe(parent) == ENXIO)
 		return;
@@ -109,7 +113,7 @@ kate_identify(driver_t *driver, struct device *parent)
 }
 
 static int
-kate_probe(struct device *dev)
+kate_probe(device_t dev)
 {
 #ifndef KATE_STRICT
 	struct kate_softc	ks;
@@ -155,11 +159,12 @@ kate_probe(struct device *dev)
 }
 
 static int
-kate_attach(struct device *dev)
+kate_attach(device_t dev)
 {
 	struct kate_softc	*sc;
 	uint32_t		c, d;
-	int			i, j, cmpcap;
+	int			i, j, cmpcap, model;
+	u_int			regs[4], brand_id;
 
 	sc = device_get_softc(dev);
 	sc->sc_dev = dev;
@@ -180,6 +185,31 @@ kate_attach(struct device *dev)
 		device_printf(dev, "cpuid 0x%x\n", c);
 	}
 
+	model = CPUID_TO_MODEL(c);
+	if (model >= 0x60 && model != 0xc1) {
+		do_cpuid(0x80000001, regs);
+		brand_id = (regs[1] >> 9) & 0x1f;
+
+		switch (model) {
+		case 0x68: /* Socket S1g1 */
+		case 0x6c:
+		case 0x7c:
+			break;
+		case 0x6b: /* Socket AM2 and ASB1 (2 cores) */
+			if (brand_id != 0x0b && brand_id != 0x0c)
+				sc->sc_flags |= KATE_FLAG_ALT_OFFSET;
+			break;
+		case 0x6f: /* Socket AM2 and ASB1 (1 core) */
+		case 0x7f:
+			if (brand_id != 0x07 && brand_id != 0x09 &&
+			    brand_id != 0x0c)
+				sc->sc_flags |= KATE_FLAG_ALT_OFFSET;
+			break;
+		default:
+			sc->sc_flags |= KATE_FLAG_ALT_OFFSET;
+		}
+	}
+
 	d = pci_read_config(dev, K_NORTHBRIDGE_CAP_R, 4);
 	cmpcap = (d >> 12) & 0x3;
 
@@ -191,7 +221,7 @@ kate_attach(struct device *dev)
 		if ((sc->sc_sensors[0].flags & SENSOR_FINVALID) &&
 		    (sc->sc_sensors[1].flags & SENSOR_FINVALID))
 			sc->sc_ii = 2;
-		if ((sc->sc_sensors[4].flags & SENSOR_FINVALID))
+		if ((sc->sc_sensors[3].flags & SENSOR_FINVALID))
 			sc->sc_in = 3;
 	}
 #else
@@ -207,17 +237,14 @@ kate_attach(struct device *dev)
 		sensor_attach(&sc->sc_sensordev, &sc->sc_sensors[i]);
 	}
 
-	if (sensor_task_register(sc, kate_refresh, 5)) {
-		device_printf(dev, "unable to register update task\n");
-		return ENXIO;
-	}
+	sensor_task_register(sc, kate_refresh, 5);
 
 	sensordev_install(&sc->sc_sensordev);
 	return 0;
 }
 
 static int
-kate_detach(struct device *dev)
+kate_detach(device_t dev)
 {
 	struct kate_softc	*sc = device_get_softc(dev);
 
@@ -226,12 +253,13 @@ kate_detach(struct device *dev)
 	return 0;
 }
 
-void
+static void
 kate_refresh(void *arg)
 {
 	struct kate_softc	*sc = arg;
 	struct ksensor		*s = sc->sc_sensors;
 	uint32_t		t, m;
+	int64_t			temp;
 	int			i, v;
 
 	t = pci_read_config(sc->sc_dev, K_THERMTRIP_STAT_R, 4);
@@ -268,6 +296,10 @@ kate_refresh(void *arg)
 			s[i].flags &= ~SENSOR_FINVALID;
 		else
 			s[i].flags |= SENSOR_FINVALID;
-		s[i].value = (v * 250000 - 49000000) + 273150000;
+		temp = v * 250000;
+		temp -= (sc->sc_flags & KATE_FLAG_ALT_OFFSET) != 0 ?
+		    28000000 : 49000000;
+		temp += 273150000;
+		s[i].value = temp;
 	}
 }

@@ -15,11 +15,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -51,8 +47,10 @@
 #include <vm/vm_object.h>
 #endif
 
+struct vm_map_backing;
+
 void vnode_pager_freepage (vm_page_t);
-struct vnode *vnode_pager_lock (vm_object_t);
+struct vnode *vnode_pager_lock (struct vm_map_backing *);
 
 /*
  * XXX Generic routines; currently called by badly written FS code; these

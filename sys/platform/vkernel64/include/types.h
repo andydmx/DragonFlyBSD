@@ -37,6 +37,4 @@
 
 #include <cpu/types.h>
 
-typedef __uint32_t	intrmask_t;
-
 #endif /* !_MACHINE_TYPES_H_ */

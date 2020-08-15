@@ -4,9 +4,11 @@
 PROG=	mountd
 CFLAGS+=-DNFS -DMFS -DCD9660 -DMSDOSFS
 MAN=	exports.5 netgroup.5 mountd.8
-WARNS?=	2
+WARNS?=	3
 
 DPADD=	${LIBUTIL}
 LDADD=	-lutil
+
+NO_WCAST_FUNCTION_TYPE=
 
 .include <bsd.prog.mk>

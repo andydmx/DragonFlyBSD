@@ -1,4 +1,4 @@
-/* $OpenBSD: auth2-kbdint.c,v 1.5 2006/08/03 03:34:41 deraadt Exp $ */
+/* $OpenBSD: auth2-kbdint.c,v 1.11 2019/11/13 04:47:52 deraadt Exp $ */
 /*
  * Copyright (c) 2000 Markus Friedl.  All rights reserved.
  *
@@ -27,37 +27,40 @@
 
 #include <sys/types.h>
 
+#include <stdlib.h>
+#include <stdio.h>
 #include <stdarg.h>
 
 #include "xmalloc.h"
 #include "packet.h"
-#include "key.h"
 #include "hostfile.h"
 #include "auth.h"
 #include "log.h"
-#include "buffer.h"
+#include "misc.h"
 #include "servconf.h"
+#include "ssherr.h"
 
 /* import */
 extern ServerOptions options;
 
 static int
-userauth_kbdint(Authctxt *authctxt)
+userauth_kbdint(struct ssh *ssh)
 {
-	int authenticated = 0;
+	int r, authenticated = 0;
 	char *lang, *devs;
 
-	lang = packet_get_string(NULL);
-	devs = packet_get_string(NULL);
-	packet_check_eom();
+	if ((r = sshpkt_get_cstring(ssh, &lang, NULL)) != 0 ||
+	    (r = sshpkt_get_cstring(ssh, &devs, NULL)) != 0 ||
+	    (r = sshpkt_get_end(ssh)) != 0)
+		fatal("%s: %s", __func__, ssh_err(r));
 
 	debug("keyboard-interactive devs %s", devs);
 
 	if (options.challenge_response_authentication)
-		authenticated = auth2_challenge(authctxt, devs);
+		authenticated = auth2_challenge(ssh, devs);
 
-	xfree(devs);
-	xfree(lang);
+	free(devs);
+	free(lang);
 	return authenticated;
 }
 

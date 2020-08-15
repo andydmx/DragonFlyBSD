@@ -49,6 +49,7 @@ typedef struct {
 	u_int32_t	n_descsz;	/* Length of descriptor. */
 	u_int32_t	n_type;		/* Type of this note. */
 } Elf_Note;
+typedef Elf_Note Elf_Nhdr;
 
 /* Indexes into the e_ident array.  Keep synced with
    http://www.sco.com/developers/gabi/latest/ch4.eheader.html */
@@ -533,7 +534,7 @@ typedef struct {
    DT_VALRNGHI) and virtual address range (DT_ADDRRNGLO to DT_ADDRRNGHI),
    are used on Solaris.  We support them everywhere.  Note these values
    lie outside of the (new) range for OS specific values.  This is a
-   deliberate special case and we maintain it for backwards compatability.
+   deliberate special case and we maintain it for backwards compatibility.
  */
 #define DT_VALRNGLO		0x6ffffd00
 #define DT_GNU_PRELINKED	0x6ffffdf5

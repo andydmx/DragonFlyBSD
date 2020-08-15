@@ -32,9 +32,10 @@
  * SUCH DAMAGE.
  */
 
-
+#include <sys/cpumask.h>
 #include <sys/interrupt.h>
 #include <sys/kernel.h>
+#include <sys/malloc.h>
 #include <sys/memrange.h>
 #include <sys/tls.h>
 #include <sys/types.h>
@@ -46,6 +47,7 @@
 #include <vm/vm_page.h>
 
 #include <sys/mplock2.h>
+#include <sys/thread2.h>
 
 #include <machine/cpu.h>
 #include <machine/cpufunc.h>
@@ -71,7 +73,6 @@ cpumask_t	smp_active_mask = CPUMASK_INITIALIZER_ONLYONE;
 static int	boot_address;
 /* which cpus have been started */
 static cpumask_t smp_startup_mask = CPUMASK_INITIALIZER_ONLYONE;
-int		mp_naps;                /* # of Applications processors */
 static int  mp_finish;
 
 /* Local data for detecting CPU TOPOLOGY */
@@ -130,7 +131,7 @@ ap_finish(void)
 			(long)CPUMASK_LOWMASK(smp_active_mask));
 }
 
-SYSINIT(finishsmp, SI_BOOT2_FINISH_SMP, SI_ORDER_FIRST, ap_finish, NULL)
+SYSINIT(finishsmp, SI_BOOT2_FINISH_SMP, SI_ORDER_FIRST, ap_finish, NULL);
 
 void *
 start_ap(void *arg __unused)
@@ -145,6 +146,8 @@ start_ap(void *arg __unused)
 /* storage for AP thread IDs */
 pthread_t ap_tids[MAXCPU];
 
+int naps;
+
 void
 mp_start(void)
 {
@@ -152,16 +155,11 @@ mp_start(void)
 	int shift;
 
 	ncpus = optcpus;
+	naps = ncpus - 1;
 
-	mp_naps = ncpus - 1;
-
-	/* ncpus2 -- ncpus rounded down to the nearest power of 2 */
 	for (shift = 0; (1 << shift) <= ncpus; ++shift)
 		;
 	--shift;
-	ncpus2_shift = shift;
-	ncpus2 = 1 << shift;
-	ncpus2_mask = ncpus2 - 1;
 
         /* ncpus_fit -- ncpus rounded up to the nearest power of 2 */
         if ((1 << shift) < ncpus)
@@ -169,12 +167,18 @@ mp_start(void)
         ncpus_fit = 1 << shift;
         ncpus_fit_mask = ncpus_fit - 1;
 
+	malloc_reinit_ncpus();
+
 	/*
 	 * cpu0 initialization
 	 */
 	ipiq_size = sizeof(struct lwkt_ipiq) * ncpus;
-	mycpu->gd_ipiq = (void *)kmem_alloc(&kernel_map, ipiq_size);
+	mycpu->gd_ipiq = (void *)kmem_alloc(&kernel_map, ipiq_size,
+					    VM_SUBSYS_IPIQ);
 	bzero(mycpu->gd_ipiq, ipiq_size);
+
+	/* initialize arc4random. */
+	arc4_init_pcpu(0);
 
 	/*
 	 * cpu 1-(n-1)
@@ -191,7 +195,7 @@ mp_announce(void)
 	kprintf("DragonFly/MP: Multiprocessor\n");
 	kprintf(" cpu0 (BSP)\n");
 
-	for (x = 1; x <= mp_naps; ++x)
+	for (x = 1; x <= naps; ++x)
 		kprintf(" cpu%d (AP)\n", x);
 }
 
@@ -333,6 +337,14 @@ ap_init(void)
 	mdcpu->gd_fpending = 0;
 	mdcpu->gd_ipending = 0;
 	initclocks_pcpu();	/* clock interrupts (via IPIs) */
+
+	/*
+	 * Since we may have cleaned up the interrupt triggers, manually
+	 * process any pending IPIs before exiting our critical section.
+	 * Once the critical section has exited, normal interrupt processing
+	 * may occur.
+	 */
+	atomic_swap_int(&mycpu->gd_npoll, 0);
 	lwkt_process_ipiq();
 
         /*
@@ -396,8 +408,7 @@ start_all_aps(u_int boot_addr)
 	pthread_attr_init(&attr);
 
 	vm_object_hold(&kernel_object);
-	for (x = 1; x <= mp_naps; x++)
-	{
+	for (x = 1; x <= naps; ++x) {
 		/* Allocate space for the CPU's private space. */
 		for (i = 0; i < sizeof(struct mdglobaldata); i += PAGE_SIZE) {
 			va =(vm_offset_t)&CPU_prvspace[x].mdglobaldata + i;
@@ -430,9 +441,13 @@ start_all_aps(u_int boot_addr)
                 gd->gd_PADDR1 = (vpte_t *)ps->PPAGE1;
 #endif
 
-		ipiq_size = sizeof(struct lwkt_ipiq) * (mp_naps + 1);
-                gd->mi.gd_ipiq = (void *)kmem_alloc(&kernel_map, ipiq_size);
+		ipiq_size = sizeof(struct lwkt_ipiq) * (naps + 1);
+                gd->mi.gd_ipiq = (void *)kmem_alloc(&kernel_map, ipiq_size,
+						    VM_SUBSYS_IPIQ);
                 bzero(gd->mi.gd_ipiq, ipiq_size);
+
+		/* initialize arc4random. */
+		arc4_init_pcpu(x);
 
                 /*
                  * Setup the AP boot stack
@@ -452,8 +467,8 @@ start_all_aps(u_int boot_addr)
 
 		if (vmm_enabled) {
 			stack = mmap(NULL, KERNEL_STACK_SIZE,
-			    PROT_READ|PROT_WRITE|PROT_EXEC,
-			    MAP_ANON, -1, 0);
+				     PROT_READ|PROT_WRITE|PROT_EXEC,
+				     MAP_ANON, -1, 0);
 			if (stack == MAP_FAILED) {
 				panic("Unable to allocate stack for thread %d\n", x);
 			}
@@ -477,7 +492,6 @@ start_all_aps(u_int boot_addr)
 /*
  * CPU TOPOLOGY DETECTION FUNCTIONS.
  */
-
 void
 detect_cpu_topology(void)
 {
@@ -493,16 +507,21 @@ get_chip_ID(int cpuid)
 }
 
 int
+get_chip_ID_from_APICID(int apicid)
+{
+        return apicid >> (logical_CPU_bits + core_bits);
+}
+
+int
 get_core_number_within_chip(int cpuid)
 {
-	return (get_apicid_from_cpuid(cpuid) >> logical_CPU_bits) &
-	    ( (1 << core_bits) -1);
+	return ((get_apicid_from_cpuid(cpuid) >> logical_CPU_bits) &
+		((1 << core_bits) - 1));
 }
 
 int
 get_logical_CPU_number_within_core(int cpuid)
 {
-	return get_apicid_from_cpuid(cpuid) &
-	    ( (1 << logical_CPU_bits) -1);
+	return (get_apicid_from_cpuid(cpuid) &
+		((1 << logical_CPU_bits) - 1));
 }
-

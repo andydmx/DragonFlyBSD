@@ -292,16 +292,8 @@ aac_attach(struct aac_softc *sc)
 	/*
 	 * Add sysctls.
 	 */
-	sysctl_ctx_init(&sc->aac_sysctl_ctx);
-	sc->aac_sysctl_tree = SYSCTL_ADD_NODE(&sc->aac_sysctl_ctx,
-	    SYSCTL_STATIC_CHILDREN(_hw), OID_AUTO,
-	    device_get_nameunit(sc->aac_dev), CTLFLAG_RD, 0, "");
-	if (sc->aac_sysctl_tree == NULL) {
-		device_printf(sc->aac_dev, "can't add sysctl node\n");
-		return (EINVAL);
-	}
-	SYSCTL_ADD_INT(&sc->aac_sysctl_ctx,
-	    SYSCTL_CHILDREN(sc->aac_sysctl_tree),
+	SYSCTL_ADD_INT(device_get_sysctl_ctx(sc->aac_dev),
+	    SYSCTL_CHILDREN(device_get_sysctl_tree(sc->aac_dev)),
 	    OID_AUTO, "firmware_build", CTLFLAG_RD,
 	    &sc->aac_revision.buildNumber, 0,
 	    "firmware build number");
@@ -658,8 +650,6 @@ aac_free(struct aac_softc *sc)
 		bus_release_resource(sc->aac_dev, SYS_RES_MEMORY,
 		    rman_get_rid(sc->aac_regs_res1), sc->aac_regs_res1);
 	dev_ops_remove_minor(&aac_ops, device_get_unit(sc->aac_dev));
-
-	sysctl_ctx_free(&sc->aac_sysctl_ctx);
 }
 
 /*
@@ -676,7 +666,7 @@ aac_detach(device_t dev)
 	sc = device_get_softc(dev);
 	fwprintf(sc, HBA_FLAGS_DBG_FUNCTION_ENTRY_B, "");
 
-	callout_stop_sync(&sc->aac_daemontime);
+	callout_terminate(&sc->aac_daemontime);
 
 	lockmgr(&sc->aac_io_lock, LK_EXCLUSIVE);
 	while (sc->aifflags & AAC_AIFFLAGS_RUNNING) {
@@ -2028,6 +2018,8 @@ aac_sync_command(struct aac_softc *sc, u_int32_t command,
 	time_t then;
 	u_int32_t status;
 
+	if (sp != NULL)
+		*sp = 0;	/* avoid gcc warnings */
 	fwprintf(sc, HBA_FLAGS_DBG_FUNCTION_ENTRY_B, "");
 
 	/* populate the mailbox */
@@ -2727,8 +2719,7 @@ aac_describe_controller(struct aac_softc *sc)
 		    info->KernelRevision.buildNumber,
 		    (u_int32_t)(info->SerialNumber & 0xffffff));
 
-		device_printf(sc->aac_dev, "Supported Options=%b\n",
-			      sc->supported_options,
+		device_printf(sc->aac_dev, "Supported Options=%pb%i\n",
 			      "\20"
 			      "\1SNAPSHOT"
 			      "\2CLUSTERS"
@@ -2748,7 +2739,8 @@ aac_describe_controller(struct aac_softc *sc)
 			      "\21ADPTINFO"
 			      "\22NEWCOMM"
 			      "\23ARRAY64BIT"
-			      "\24HEATSENSOR");
+			      "\24HEATSENSOR"
+			      , sc->supported_options);
 	}
 
 	if (sc->supported_options & AAC_SUPPORTED_SUPPLEMENT_ADAPTER_INFO) {

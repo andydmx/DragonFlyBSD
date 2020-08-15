@@ -15,11 +15,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -42,6 +38,10 @@
 #ifndef _CPU_SEGMENTS_H_
 #define	_CPU_SEGMENTS_H_
 
+#ifndef LOCORE
+#include <sys/tls.h>
+#endif
+
 /*
  * x86_64 Segmentation Data Structures and definitions
  */
@@ -63,7 +63,7 @@
 #ifndef LOCORE
 
 /*
- * User segment descriptors (%cs, %ds etc for compatability apps. 64 bit wide)
+ * User segment descriptors (%cs, %ds etc for compatibility apps. 64 bit wide)
  * For long-mode apps, %cs only has the conforming bit in sd_type, the sd_dpl,
  * sd_p, sd_l and sd_def32 which must be zero).  %ds only has sd_p.
  */
@@ -147,38 +147,14 @@ struct	gate_descriptor {
 
 #ifndef LOCORE
 
-#ifndef _SYS_TLS_H_
-#include <sys/tls.h>
-#endif
-
 struct savetls {
 	struct tls_info info[2];
 };
 
-/* is memory segment descriptor pointer ? */
-#define ISMEMSDP(s)	((s->d_type) >= SDT_MEMRO && (s->d_type) <= SDT_MEMERAC)
-
-/* is 286 gate descriptor pointer ? */
-#define IS286GDP(s)	(((s->d_type) >= SDT_SYS286CGT \
-				 && (s->d_type) < SDT_SYS286TGT))
-
-/* is 386 gate descriptor pointer ? */
-#define IS386GDP(s)	(((s->d_type) >= SDT_SYS386CGT \
-				&& (s->d_type) < SDT_SYS386TGT))
-
-/* is gate descriptor pointer ? */
-#define ISGDP(s)	(IS286GDP(s) || IS386GDP(s))
-
-/* is segment descriptor pointer ? */
-#define ISSDP(s)	(ISMEMSDP(s) || !ISGDP(s))
-
-/* is system segment descriptor pointer ? */
-#define ISSYSSDP(s)	(!ISMEMSDP(s) && !ISGDP(s))
-
 /*
  * Software definitions are in this convenient format,
  * which are translated into inconvenient segment descriptors
- * when needed to be used by the 386 hardware
+ * when needed to be used by the x86 hardware.
  */
 
 struct	soft_segment_descriptor {
@@ -258,11 +234,11 @@ struct region_descriptor {
 #ifndef LOCORE
 
 #ifdef _KERNEL
-extern struct user_segment_descriptor gdt[];
 extern struct soft_segment_descriptor gdt_segs[];
 extern struct gate_descriptor idt_arr[MAXCPU][NIDT];
 extern struct region_descriptor r_idt_arr[];
-extern struct mtx dt_lock;
+extern struct region_descriptor r_gdt;
+extern struct user_segment_descriptor gdt[NGDT * MAXCPU];
 
 void	lgdt(struct region_descriptor *rdp);
 void	sdtossd(struct user_segment_descriptor *sdp,

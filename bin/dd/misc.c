@@ -1,4 +1,6 @@
 /*-
+ * SPDX-License-Identifier: BSD-3-Clause
+ *
  * Copyright (c) 1991, 1993, 1994
  *	The Regents of the University of California.  All rights reserved.
  *
@@ -31,72 +33,113 @@
  * SUCH DAMAGE.
  *
  * @(#)misc.c	8.3 (Berkeley) 4/2/94
- * $FreeBSD: src/bin/dd/misc.c,v 1.18.2.1 2001/08/01 01:40:03 obrien Exp $
- * $DragonFly: src/bin/dd/misc.c,v 1.6 2008/01/28 16:08:02 matthias Exp $
+ * $FreeBSD: head/bin/dd/misc.c 338646 2018-09-13 14:54:46Z kevans $
  */
 
 #include <sys/types.h>
-#include <sys/time.h>
 
+#include <err.h>
 #include <errno.h>
+#include <libutil.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "dd.h"
 #include "extern.h"
 
+double
+secs_elapsed(void)
+{
+	struct timespec end, ts_res;
+	double secs, res;
+
+	if (clock_gettime(CLOCK_MONOTONIC, &end))
+		err(1, "clock_gettime");
+	if (clock_getres(CLOCK_MONOTONIC, &ts_res))
+		err(1, "clock_getres");
+	secs = (end.tv_sec - st.start.tv_sec) +
+	       (end.tv_nsec - st.start.tv_nsec) * 1e-9;
+	res = ts_res.tv_sec + ts_res.tv_nsec * 1e-9;
+	if (secs < res)
+		secs = res;
+
+	return (secs);
+}
+
 void
 summary(void)
 {
-	struct timeval tv;
 	double secs;
-	char buf[100];
 
-	gettimeofday(&tv, NULL);
-	secs = tv.tv_sec + tv.tv_usec * 1e-6 - st.start;
-	if (secs < 1e-6)
-		secs = 1e-6;
-	/* Use snprintf(3) so that we don't reenter stdio(3). */
-	snprintf(buf, sizeof(buf),
-	    "%ju+%ju records in\n%ju+%ju records out\n",
-	    (uintmax_t)st.in_full, (uintmax_t)st.in_part,
-	    (uintmax_t)st.out_full, (uintmax_t)st.out_part);
-	write(STDERR_FILENO, buf, strlen(buf));
+	if (ddflags & C_NOINFO)
+		return;
+
+	if (ddflags & C_PROGRESS)
+		fprintf(stderr, "\n");
+
+	secs = secs_elapsed();
+
+	fprintf(stderr, "%ju+%ju records in\n%ju+%ju records out\n",
+	    st.in_full, st.in_part, st.out_full, st.out_part);
 	if (st.swab) {
-		snprintf(buf, sizeof(buf), "%ju odd length swab %s\n",
-		     (uintmax_t)st.swab,
-		     ((st.swab == 1) ? "block" : "blocks"));
-		write(STDERR_FILENO, buf, strlen(buf));
+		fprintf(stderr, "%ju odd length swab %s\n",
+		     st.swab, (st.swab == 1) ? "block" : "blocks");
 	}
 	if (st.trunc) {
-		snprintf(buf, sizeof(buf), "%ju truncated %s\n",
-		     (uintmax_t)st.trunc,
-		     ((st.trunc == 1) ? "block" : "blocks"));
-		write(STDERR_FILENO, buf, strlen(buf));
+		fprintf(stderr, "%ju truncated %s\n",
+		     st.trunc, (st.trunc == 1) ? "block" : "blocks");
 	}
-	snprintf(buf, sizeof(buf),
-	    "%ju bytes transferred in %.6f secs (%.0f bytes/sec)\n",
-	    (uintmax_t)st.bytes, secs, st.bytes / secs);
-	write(STDERR_FILENO, buf, strlen(buf));
+	if (!(ddflags & C_NOXFER)) {
+		fprintf(stderr,
+		    "%ju bytes transferred in %.6f secs (%.0f bytes/sec)\n",
+		    st.bytes, secs, st.bytes / secs);
+	}
+	need_summary = 0;
 }
 
-/* ARGSUSED */
 void
-summaryx(int notused __unused)
+progress(void)
 {
-	int save_errno = errno;
+	static int outlen;
+	char si[4 + 1 + 2 + 1];		/* 123 <space> <suffix> NUL */
+	char iec[4 + 1 + 3 + 1];	/* 123 <space> <suffix> NUL */
+	char persec[4 + 1 + 2 + 1];	/* 123 <space> <suffix> NUL */
+	char *buf;
+	double secs;
 
-	summary();
-	errno = save_errno;
+	secs = secs_elapsed();
+	humanize_number(si, sizeof(si), (int64_t)st.bytes, "B", HN_AUTOSCALE,
+	    HN_DECIMAL | HN_DIVISOR_1000);
+	humanize_number(iec, sizeof(iec), (int64_t)st.bytes, "B", HN_AUTOSCALE,
+	    HN_DECIMAL | HN_IEC_PREFIXES);
+	humanize_number(persec, sizeof(persec), (int64_t)(st.bytes / secs), "B",
+	    HN_AUTOSCALE, HN_DECIMAL | HN_DIVISOR_1000);
+	asprintf(&buf, "  %'ju bytes (%s, %s) transferred %.3fs, %s/s",
+	    (uintmax_t)st.bytes, si, iec, secs, persec);
+	outlen = fprintf(stderr, "%-*s\r", outlen, buf) - 1;
+	fflush(stderr);
+	free(buf);
+	need_progress = 0;
 }
 
-/* ARGSUSED */
+void
+siginfo_handler(int signo __unused)
+{
+	need_summary = 1;
+}
+
+void
+sigalarm_handler(int signo __unused)
+{
+	need_progress = 1;
+}
+
 void
 terminate(int sig)
 {
-
 	summary();
 	_exit(sig == 0 ? 0 : 1);
 }

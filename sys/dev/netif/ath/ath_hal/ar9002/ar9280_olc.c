@@ -84,8 +84,8 @@ ar9280olcGetTxGainIndex(struct ath_hal *ah,
 		*pwr = (rawDatasetOpLoop[idxL].pwrPdg[0][0] +
 				rawDatasetOpLoop[idxR].pwrPdg[0][0])/2;
 	}
-	while (pcdac > AH9280(ah)->originalGain[i] &&
-			i < (AR9280_TX_GAIN_TABLE_SIZE - 1))
+	while (i < (AR9280_TX_GAIN_TABLE_SIZE - 1) &&
+			pcdac > AH9280(ah)->originalGain[i])
 		i++;
 
 	*pcdacIdx = i;
@@ -328,7 +328,7 @@ ar9280SetPowerCalTable(struct ath_hal *ah, struct ar5416eeprom *pEepData,
 		 * uses this to calculate the PDADC delta during
 		 * calibration ; 0 here effectively stops the
 		 * temperature compensation calibration from
-		 * occuring.
+		 * occurring.
 		 */
 		AH5416(ah)->initPDADC = 0;
 	}
@@ -342,7 +342,7 @@ ar9280SetPowerCalTable(struct ath_hal *ah, struct ar5416eeprom *pEepData,
 	for (i = 0; i < AR5416_MAX_CHAINS; i++) {
 		regChainOffset = ar5416GetRegChainOffset(ah, i);
 		if (pEepData->baseEepHeader.txMask & (1 << i)) {
-			uint16_t diff = 0;
+			uint16_t diff = 0;	/* quiet gcc error w/ass */
 
 			if (IEEE80211_IS_CHAN_2GHZ(chan)) {
 				pRawDataset = pEepData->calPierData2G[i];

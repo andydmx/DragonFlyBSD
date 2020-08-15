@@ -32,25 +32,23 @@
 
 #include "opt_inet.h"
 #include "opt_inet6.h"
-#include "opt_tcpdebug.h"
 
 #ifndef INET
 #error The option TCPDEBUG requires option INET.
 #endif
 
-#ifdef TCPDEBUG
 /* load symbolic names */
 #define PRUREQUESTS
 #define TCPSTATES
 #define	TCPTIMERS
 #define	TANAMES
-#endif
 
 #include <sys/param.h>
 #include <sys/systm.h>
 #include <sys/protosw.h>
 #include <sys/socket.h>
 
+#include <net/netisr.h>
 #include <net/netmsg.h>
 
 #include <netinet/in.h>
@@ -67,10 +65,7 @@
 #include <netinet/tcpip.h>
 #include <netinet/tcp_debug.h>
 
-#ifdef TCPDEBUG
 static int	tcpconsdebug = 0;
-#endif
-
 static struct tcp_debug tcp_debug[TCP_NDEBUG];
 static int	tcp_debx;
 
@@ -149,7 +144,6 @@ tcp_trace(short act, short ostate, struct tcpcb *tp, void *ipgen,
 		bzero(&td->td_ti6.th, sizeof td->td_ti6.th);
 	}
 	td->td_req = req;
-#ifdef TCPDEBUG
 	if (tcpconsdebug == 0)
 		return;
 	if (tp)
@@ -215,5 +209,4 @@ tcp_trace(short act, short ostate, struct tcpcb *tp, void *ipgen,
 	    (u_long)tp->snd_una, (u_long)tp->snd_nxt, (u_long)tp->snd_max);
 	kprintf("\tsnd_(wl1,wl2,wnd) (%lx,%lx,%lx)\n",
 	    (u_long)tp->snd_wl1, (u_long)tp->snd_wl2, tp->snd_wnd);
-#endif /* TCPDEBUG */
 }

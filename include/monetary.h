@@ -30,7 +30,7 @@
 #define	_MONETARY_H_
 
 #include <sys/cdefs.h>
-#include <sys/types.h>
+#include <machine/stdint.h>
 
 #ifndef _SIZE_T_DECLARED
 typedef	__size_t	size_t;
@@ -43,7 +43,10 @@ typedef	__ssize_t	ssize_t;
 #endif
 
 __BEGIN_DECLS
-ssize_t	strfmon(char * __restrict, size_t, const char * __restrict, ...);
+#if __POSIX_VISIBLE >= 200809 || __XSI_VISIBLE
+ssize_t	strfmon(char * __restrict, size_t, const char * __restrict, ...)
+	    __strfmonlike(3, 4);
+#endif
 
 #if __POSIX_VISIBLE >= 200809 || defined(_XLOCALE_H_)
 #include <xlocale/_monetary.h>

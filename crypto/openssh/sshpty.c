@@ -1,4 +1,4 @@
-/* $OpenBSD: sshpty.c,v 1.28 2007/09/11 23:49:09 stevesk Exp $ */
+/* $OpenBSD: sshpty.c,v 1.34 2019/07/04 16:20:10 deraadt Exp $ */
 /*
  * Author: Tatu Ylonen <ylo@cs.hut.fi>
  * Copyright (c) 1995 Tatu Ylonen <ylo@cs.hut.fi>, Espoo, Finland
@@ -68,7 +68,7 @@ pty_allocate(int *ptyfd, int *ttyfd, char *namebuf, size_t namebuflen)
 	int i;
 
 	i = openpty(ptyfd, ttyfd, NULL, NULL, NULL);
-	if (i < 0) {
+	if (i == -1) {
 		error("openpty: %.100s", strerror(errno));
 		return 0;
 	}
@@ -85,12 +85,12 @@ pty_allocate(int *ptyfd, int *ttyfd, char *namebuf, size_t namebuflen)
 void
 pty_release(const char *tty)
 {
-#ifndef __APPLE_PRIVPTY__
-	if (chown(tty, (uid_t) 0, (gid_t) 0) < 0)
+#if !defined(__APPLE_PRIVPTY__) && !defined(HAVE_OPENPTY)
+	if (chown(tty, (uid_t) 0, (gid_t) 0) == -1)
 		error("chown %.100s 0 0 failed: %.100s", tty, strerror(errno));
-	if (chmod(tty, (mode_t) 0666) < 0)
+	if (chmod(tty, (mode_t) 0666) == -1)
 		error("chmod %.100s 0666 failed: %.100s", tty, strerror(errno));
-#endif /* __APPLE_PRIVPTY__ */
+#endif /* !__APPLE_PRIVPTY__ && !HAVE_OPENPTY */
 }
 
 /* Makes the tty the process's controlling tty and sets it to sane modes. */
@@ -99,33 +99,6 @@ void
 pty_make_controlling_tty(int *ttyfd, const char *tty)
 {
 	int fd;
-#ifdef USE_VHANGUP
-	void *old;
-#endif /* USE_VHANGUP */
-
-#ifdef _UNICOS
-	if (setsid() < 0)
-		error("setsid: %.100s", strerror(errno));
-
-	fd = open(tty, O_RDWR|O_NOCTTY);
-	if (fd != -1) {
-		signal(SIGHUP, SIG_IGN);
-		ioctl(fd, TCVHUP, (char *)NULL);
-		signal(SIGHUP, SIG_DFL);
-		setpgid(0, 0);
-		close(fd);
-	} else {
-		error("Failed to disconnect from controlling tty.");
-	}
-
-	debug("Setting controlling tty using TCSETCTTY.");
-	ioctl(*ttyfd, TCSETCTTY, NULL);
-	fd = open("/dev/tty", O_RDWR);
-	if (fd < 0)
-		error("%.100s: %.100s", tty, strerror(errno));
-	close(*ttyfd);
-	*ttyfd = fd;
-#else /* _UNICOS */
 
 	/* First disconnect from the old controlling tty. */
 #ifdef TIOCNOTTY
@@ -135,7 +108,7 @@ pty_make_controlling_tty(int *ttyfd, const char *tty)
 		close(fd);
 	}
 #endif /* TIOCNOTTY */
-	if (setsid() < 0)
+	if (setsid() == -1)
 		error("setsid: %.100s", strerror(errno));
 
 	/*
@@ -157,30 +130,19 @@ pty_make_controlling_tty(int *ttyfd, const char *tty)
 	if (setpgrp(0,0) < 0)
 		error("SETPGRP %s",strerror(errno));
 #endif /* NEED_SETPGRP */
-#ifdef USE_VHANGUP
-	old = signal(SIGHUP, SIG_IGN);
-	vhangup();
-	signal(SIGHUP, old);
-#endif /* USE_VHANGUP */
 	fd = open(tty, O_RDWR);
-	if (fd < 0) {
+	if (fd == -1)
 		error("%.100s: %.100s", tty, strerror(errno));
-	} else {
-#ifdef USE_VHANGUP
-		close(*ttyfd);
-		*ttyfd = fd;
-#else /* USE_VHANGUP */
+	else
 		close(fd);
-#endif /* USE_VHANGUP */
-	}
+
 	/* Verify that we now have a controlling tty. */
 	fd = open(_PATH_TTY, O_WRONLY);
-	if (fd < 0)
+	if (fd == -1)
 		error("open /dev/tty failed - could not set controlling tty: %.100s",
 		    strerror(errno));
 	else
 		close(fd);
-#endif /* _UNICOS */
 }
 
 /* Changes the window size associated with the pty. */
@@ -209,20 +171,17 @@ pty_setowner(struct passwd *pw, const char *tty)
 
 	/* Determine the group to make the owner of the tty. */
 	grp = getgrnam("tty");
-	if (grp) {
-		gid = grp->gr_gid;
-		mode = S_IRUSR | S_IWUSR | S_IWGRP;
-	} else {
-		gid = pw->pw_gid;
-		mode = S_IRUSR | S_IWUSR | S_IWGRP | S_IWOTH;
-	}
+	if (grp == NULL)
+		debug("%s: no tty group", __func__);
+	gid = (grp != NULL) ? grp->gr_gid : pw->pw_gid;
+	mode = (grp != NULL) ? 0620 : 0600;
 
 	/*
 	 * Change owner and mode of the tty as required.
 	 * Warn but continue if filesystem is read-only and the uids match/
 	 * tty is owned by root.
 	 */
-	if (stat(tty, &st))
+	if (stat(tty, &st) == -1)
 		fatal("stat(%.100s) failed: %.100s", tty,
 		    strerror(errno));
 
@@ -231,7 +190,7 @@ pty_setowner(struct passwd *pw, const char *tty)
 #endif
 
 	if (st.st_uid != pw->pw_uid || st.st_gid != gid) {
-		if (chown(tty, pw->pw_uid, gid) < 0) {
+		if (chown(tty, pw->pw_uid, gid) == -1) {
 			if (errno == EROFS &&
 			    (st.st_uid == pw->pw_uid || st.st_uid == 0))
 				debug("chown(%.100s, %u, %u) failed: %.100s",
@@ -245,7 +204,7 @@ pty_setowner(struct passwd *pw, const char *tty)
 	}
 
 	if ((st.st_mode & (S_IRWXU|S_IRWXG|S_IRWXO)) != mode) {
-		if (chmod(tty, mode) < 0) {
+		if (chmod(tty, mode) == -1) {
 			if (errno == EROFS &&
 			    (st.st_mode & (S_IRGRP | S_IROTH)) == 0)
 				debug("chmod(%.100s, 0%o) failed: %.100s",
@@ -255,4 +214,18 @@ pty_setowner(struct passwd *pw, const char *tty)
 				    tty, (u_int)mode, strerror(errno));
 		}
 	}
+}
+
+/* Disconnect from the controlling tty. */
+void
+disconnect_controlling_tty(void)
+{
+#ifdef TIOCNOTTY
+	int fd;
+
+	if ((fd = open(_PATH_TTY, O_RDWR | O_NOCTTY)) >= 0) {
+		(void) ioctl(fd, TIOCNOTTY, NULL);
+		close(fd);
+	}
+#endif /* TIOCNOTTY */
 }

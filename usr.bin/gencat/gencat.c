@@ -31,7 +31,7 @@
  * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
  * POSSIBILITY OF SUCH DAMAGE.
  *
- * $FreeBSD: head/usr.bin/gencat/gencat.c 241737 2012-10-19 14:49:42Z ed $
+ * $FreeBSD: head/usr.bin/gencat/gencat.c 299356 2016-05-10 11:12:31Z bapt $
  */
 
 /***********************************************************
@@ -104,7 +104,7 @@ static long lineno = 0;
 
 static	char   *cskip(char *);
 static	void	error(const char *);
-static	char   *getline(int);
+static	char   *get_line(int);
 static	char   *getmsg(int, char *, char);
 static	void	warning(const char *, const char *);
 static	char   *wskip(char *);
@@ -112,16 +112,15 @@ static	char   *xstrdup(const char *);
 static	void   *xmalloc(size_t);
 static	void   *xrealloc(void *, size_t);
 
-void	MCParse(int);
-void	MCReadCat(int);
-void	MCWriteCat(int);
-void	MCDelMsg(int);
-void	MCAddMsg(int, const char *);
-void	MCAddSet(int);
-void	MCDelSet(int);
-void	usage(void);
+static void	MCParse(int);
+static void	MCWriteCat(int);
+static void	MCDelMsg(int);
+static void	MCAddMsg(int, const char *);
+static void	MCAddSet(int);
+static void	MCDelSet(int);
+static void	usage(void) __dead2;
 
-void
+static void
 usage(void)
 {
 	fprintf(stderr, "usage: %s catfile msgfile ...\n", getprogname());
@@ -230,7 +229,7 @@ xstrdup(const char *str)
 }
 
 static char *
-getline(int fd)
+get_line(int fd)
 {
 	static long curlen = BUFSIZ;
 	static char buf[BUFSIZ], *bptr = buf, *bend = buf;
@@ -333,7 +332,7 @@ getmsg(int fd, char *cptr, char quote)
 				++cptr;
 				switch (*cptr) {
 				case '\0':
-					cptr = getline(fd);
+					cptr = get_line(fd);
 					if (!cptr)
 						error("premature end of file");
 					msglen += strlen(cptr);
@@ -384,7 +383,7 @@ getmsg(int fd, char *cptr, char quote)
 	return (msg);
 }
 
-void
+static void
 MCParse(int fd)
 {
 	char   *cptr, *str;
@@ -393,7 +392,7 @@ MCParse(int fd)
 
 	/* XXX: init sethead? */
 
-	while ((cptr = getline(fd))) {
+	while ((cptr = get_line(fd))) {
 		if (*cptr == '$') {
 			++cptr;
 			if (strncmp(cptr, "set", 3) == 0) {
@@ -470,7 +469,7 @@ MCParse(int fd)
  * avoids additional housekeeping variables and/or a lot of seeks
  * that would otherwise be required.
  */
-void
+static void
 MCWriteCat(int fd)
 {
 	int     nsets;		/* number of sets */
@@ -575,7 +574,7 @@ MCWriteCat(int fd)
 	write(fd, msgcat, msgcat_size);
 }
 
-void
+static void
 MCAddSet(int setId)
 {
 	struct _setT *p, *q;
@@ -612,7 +611,7 @@ MCAddSet(int setId)
 	curSet = p;
 }
 
-void
+static void
 MCAddMsg(int msgId, const char *str)
 {
 	struct _msgT *p, *q;
@@ -650,7 +649,7 @@ MCAddMsg(int msgId, const char *str)
 	p->str = xstrdup(str);
 }
 
-void
+static void
 MCDelSet(int setId)
 {
 	struct _setT *set;
@@ -673,7 +672,7 @@ MCDelSet(int setId)
 	warning(NULL, "specified set doesn't exist");
 }
 
-void
+static void
 MCDelMsg(int msgId)
 {
 	struct _msgT *msg;

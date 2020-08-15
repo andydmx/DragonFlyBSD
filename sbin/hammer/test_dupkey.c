@@ -2,30 +2,28 @@
  * This is a really simple stupid standalone program which will find two
  * filenames with the same CRC, used to test the directory iterator.
  *
- * cc -I /usr/src/sys test_dupkey.c /usr/src/sys/libkern/crc32.c -o test_dupkey
+ * cc -I /usr/src/sys test_dupkey.c /usr/src/sys/libkern/crc32.c \
+ * /usr/src/sys/libkern/icrc32.c -o test_dupkey
  *
  * $DragonFly: src/sbin/hammer/test_dupkey.c,v 1.1 2008/06/26 04:07:57 dillon Exp $
  */
 
-#include <stdio.h>
-#include <stdlib.h>
-#include <unistd.h>
 #include "hammer_util.h"
 
-static u_int32_t namekey(const char *name);
+static uint32_t namekey(const char *name);
 static void randomname(char *name);
 
-u_int32_t bitmap[0x80000000U / 32];
+uint32_t bitmap[0x80000000U / 32];
 
 int
 main(int ac, char **av)
 {
 	char name[32];
-	u_int32_t key;
-	u_int32_t *ptr;
-	u_int32_t mask;
-	u_int32_t count;
-	u_int32_t saved;
+	uint32_t key;
+	uint32_t *ptr;
+	uint32_t mask;
+	uint32_t count;
+	uint32_t saved;
 
 	srandom(0);	/* reproducable random sequence number */
 	count = 0;
@@ -34,9 +32,8 @@ main(int ac, char **av)
 		key = namekey(name);
 		ptr = &bitmap[key / 32];
 		mask = 1 << (key & 31);
-		if (*ptr & mask) {
+		if (*ptr & mask)
 			break;
-		}
 		*ptr |= mask;
 		++count;
 	}
@@ -54,13 +51,15 @@ main(int ac, char **av)
 		++count;
 	}
 	printf(" '%s'\n", name);
+
+	return(0);
 }
 
 static
-u_int32_t
+uint32_t
 namekey(const char *name)
 {
-	u_int32_t key;
+	uint32_t key;
 
 	key = crc32(name, strlen(name)) & 0x7FFFFFFF;
 	if (key == 0)

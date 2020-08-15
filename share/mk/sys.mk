@@ -1,7 +1,7 @@
 #	from: @(#)sys.mk	8.2 (Berkeley) 3/21/94
 # $FreeBSD: src/share/mk/sys.mk,v 1.45.2.6 2002/12/23 16:33:37 ru Exp $
 
-unix		?=	We run FreeBSD, not UNIX.
+unix		?=	We run DragonFly, not UNIX.
 
 # Set any local definitions first.  Place this early, it needs
 # MACHINE_CPUARCH to be defined
@@ -43,23 +43,28 @@ AWK		?=	awk
 
 .if defined(%POSIX)
 CC		?=	c89
+CFLAGS		?=	-pipe -O${WORLD_CCOPTLEVEL}
 .else
 CC		?=	cc
+CFLAGS		?=	-pipe -O${WORLD_CCOPTLEVEL} ${WORLD_CFLAGS}
 .endif
 CC_LINK		?=	${CC}
+
 # The system cc frontend is not subject to the path, e.g. when buildworld
 # is doing cross compiles it may still need the native compiler for things.
 #
 NXENV		?=	CCVER=${HOST_CCVER} BINUTILSVER=${HOST_BINUTILSVER} OBJFORMAT_PATH=/ PATH=/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/usr/pkg/bin
 NXCC		?=	${NXENV} ${CC}
 NXCC_LINK	?=	${NXENV} ${CC_LINK}
-CFLAGS		?=	-O -pipe
 
 CXX		?=	c++
 CXX_LINK	?=	${CXX}
 NXCXX		?=	${NXENV} ${CXX}
 NXCXX_LINK	?=	${NXENV} ${CXX_LINK}
-CXXFLAGS	?=	${CXXINCLUDES} ${CFLAGS:N-std=*:N-Wnested-externs:N-W*-prototypes:N-Wno-pointer-sign:N-Wold-style-definition}
+CXXFLAGS	?=	${CXXINCLUDES} ${CFLAGS:N-std=*:N-Wnested-externs:N-W*-prototypes:N-Wno-pointer-sign:N-Wold-style-definition:N-Wsystem-headers}
+.if !defined(SYSBUILD) && defined(.MAKE.BUILT.BY) && ${.MAKE.BUILT.BY:Mgcc47}
+CXXFLAGS	+=	-D_GLIBCXX_USE_CXX11_ABI=0
+.endif
 
 CPP		?=	cpp
 
@@ -93,8 +98,8 @@ LFLAGS		?=
 LD		?=	ld
 NXLD		?=	${NXENV} ${LD}
 LDFLAGS		?=
-NXCFLAGS	?=	${CFLAGS:N-mtune*:N-mcpu*:N-march*}
-NXCXXFLAGS	?=	${CFLAGS:N-mtune*:N-mcpu*:N-march*}
+NXCFLAGS	?=	${CROSS_CFLAGS} ${CFLAGS:N-mtune*:N-mcpu*:N-march*:N-flto}
+NXCXXFLAGS	?=	${CROSS_CFLAGS} ${CFLAGS:N-mtune*:N-mcpu*:N-march*:N-flto:N-std=*}
 NXLDLIBS	?=	${LDLIBS}
 NXLDFLAGS	?=	-static ${LDFLAGS}
 
@@ -123,9 +128,9 @@ YFLAGS		?=	-d
 
 # The 'make' program is expected to define the following.
 #
-# MACHINE_PLATFORM	platform architecture (vkernel, pc32)
-# MACHINE		machine architecture (i386, etc..)
-# MACHINE_ARCH		cpu architecture (i386, x86_64, etc)
+# MACHINE_PLATFORM	platform architecture (pc64, vkernel64, etc.)
+# MACHINE		machine architecture (x86_64, etc.)
+# MACHINE_ARCH		cpu architecture (x86_64, etc.)
 #
 .if !defined(MACHINE)
 .error "MACHINE was not defined by make"
@@ -141,9 +146,6 @@ YFLAGS		?=	-d
 #
 .if !defined(MACHINE_PLATFORM)
 MACHINE_PLATFORM!=sysctl -n hw.platform
-.endif
-.if ${MACHINE} == "pc32"
-MACHINE=i386
 .endif
 
 .if defined(%POSIX)
@@ -255,7 +257,10 @@ MACHINE=i386
 # .no == native object file, for helper code when cross building.
 #
 .c.no:
-	${NXCC} ${_${.IMPSRC:T}_FLAGS} ${NXCFLAGS} -c ${.IMPSRC} -o ${.TARGET}
+	${NXCC} ${_${.IMPSRC:T}_FLAGS} ${NXCFLAGS:N-flto} -c ${.IMPSRC} -o ${.TARGET}
+
+.cc.no .C.no .cpp.no .cxx.no:
+	${NXCXX} ${_${.IMPSRC:T}_FLAGS} ${NXCXXFLAGS:N-flto} -c ${.IMPSRC} -o ${.TARGET}
 
 .y.no:
 	${YACC} ${YFLAGS} ${.IMPSRC}
@@ -300,13 +305,35 @@ MACHINE=i386
 
 .endif
 
+# Include base system defaults.
 .if exists(/etc/defaults/make.conf)
 .include </etc/defaults/make.conf>
 .endif
 
+# XXX we should some how include src tree etc/defaults/make.conf too. Changes
+# to default/make.conf only applies after installworld so might produce world
+# that no longer can bootstrap itself.
+
+# Private helper for handling alternative compilers and Makefile.inc1 tester.
+WORLD_ALTCOMPILER?= gcc47
+
+# Include global user settings.
 __MAKE_CONF?=/etc/make.conf
 .if exists(${__MAKE_CONF})
 .include "${__MAKE_CONF}"
+.endif
+
+# Helper for bootstrapping in makefiles.
+.if !defined(WORLD_VERSION)
+.if defined(.MAKE.DF.VERSION)
+WORLD_VERSION=	${.MAKE.DF.VERSION}
+.else
+.if exists(/usr/include/sys/param.h)
+WORLD_VERSION!=	${AWK} '/^\#define[[:blank:]]__DragonFly_version/ {print $$3}' < /usr/include/sys/param.h
+.endif
+.endif
+# Export it to ensure it will stay constant from initial make invoke.
+.MAKEFLAGS: WORLD_VERSION=${WORLD_VERSION}
 .endif
 
 .include <bsd.cpu.mk>
@@ -320,7 +347,7 @@ __MAKE_CONF?=/etc/make.conf
 # XXX hint for bsd.port.mk
 OBJFORMAT?=	elf
 
-# Tell bmake to expand -V VAR be default
+# Tell bmake to expand -V VAR by default
 .MAKE.EXPAND_VARIABLES= yes
 
 .if !defined(.PARSEDIR)

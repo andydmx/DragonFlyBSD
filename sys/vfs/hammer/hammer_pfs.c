@@ -1,13 +1,13 @@
 /*
  * Copyright (c) 2008 The DragonFly Project.  All rights reserved.
- * 
+ *
  * This code is derived from software contributed to The DragonFly Project
  * by Matthew Dillon <dillon@backplane.com>
- * 
+ *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
  * are met:
- * 
+ *
  * 1. Redistributions of source code must retain the above copyright
  *    notice, this list of conditions and the following disclaimer.
  * 2. Redistributions in binary form must reproduce the above copyright
@@ -17,7 +17,7 @@
  * 3. Neither the name of The DragonFly Project nor the names of its
  *    contributors may be used to endorse or promote products derived
  *    from this software without specific, prior written permission.
- * 
+ *
  * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
  * ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
  * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
@@ -49,18 +49,19 @@ static int hammer_pfs_delete_at_cursor(hammer_cursor_t cursor,
  * Get mirroring/pseudo-fs information
  *
  * NOTE: The ip used for ioctl is not necessarily related to the PFS
+ * since this ioctl only requires PFS id (or upper 16 bits of ip localization).
  */
 int
 hammer_ioc_get_pseudofs(hammer_transaction_t trans, hammer_inode_t ip,
 			struct hammer_ioc_pseudofs_rw *pfs)
 {
 	hammer_pseudofs_inmem_t pfsm;
-	u_int32_t localization;
+	uint32_t localization;
 	int error;
 
 	if ((error = hammer_pfs_autodetect(pfs, ip)) != 0)
 		return(error);
-	localization = (u_int32_t)pfs->pfs_id << 16;
+	localization = pfs_to_lo(pfs->pfs_id);
 	pfs->bytes = sizeof(struct hammer_pseudofs_data);
 	pfs->version = HAMMER_IOC_PSEUDOFS_VERSION;
 
@@ -79,14 +80,13 @@ hammer_ioc_get_pseudofs(hammer_transaction_t trans, hammer_inode_t ip,
 	 * flush_tid2 is the TID most recently flushed, but the UNDO hasn't
 	 * caught up to it yet so a crash will roll us back to flush_tid1.
 	 */
-	if ((pfsm->pfsd.mirror_flags & HAMMER_PFSD_SLAVE) == 0)
+	if (hammer_is_pfs_master(&pfsm->pfsd))
 		pfsm->pfsd.sync_end_tid = trans->hmp->flush_tid1;
 
 	/*
 	 * Copy out to userland.
 	 */
-	error = 0;
-	if (pfs->ondisk && error == 0)
+	if (pfs->ondisk)
 		error = copyout(&pfsm->pfsd, pfs->ondisk, sizeof(pfsm->pfsd));
 	hammer_rel_pseudofs(trans->hmp, pfsm);
 	return(error);
@@ -94,23 +94,20 @@ hammer_ioc_get_pseudofs(hammer_transaction_t trans, hammer_inode_t ip,
 
 /*
  * Set mirroring/pseudo-fs information
- *
- * NOTE: The ip used for ioctl is not necessarily related to the PFS
  */
 int
 hammer_ioc_set_pseudofs(hammer_transaction_t trans, hammer_inode_t ip,
 			struct ucred *cred, struct hammer_ioc_pseudofs_rw *pfs)
 {
 	hammer_pseudofs_inmem_t pfsm;
-	u_int32_t localization;
+	uint32_t localization;
 	int error;
 
 	if ((error = hammer_pfs_autodetect(pfs, ip)) != 0)
 		return(error);
-	localization = (u_int32_t)pfs->pfs_id << 16;
+	localization = pfs_to_lo(pfs->pfs_id);
 	if (pfs->version != HAMMER_IOC_PSEUDOFS_VERSION)
 		error = EINVAL;
-	localization = (u_int32_t)pfs->pfs_id << 16;
 
 	if (error == 0 && pfs->ondisk) {
 		/*
@@ -127,9 +124,8 @@ hammer_ioc_set_pseudofs(hammer_transaction_t trans, hammer_inode_t ip,
 		 * We do not create root inodes for slaves, the root inode
 		 * must be mirrored from the master.
 		 */
-		if (error == 0 &&
-		    (pfsm->pfsd.mirror_flags & HAMMER_PFSD_SLAVE) == 0) {
-			error = hammer_mkroot_pseudofs(trans, cred, pfsm);
+		if (error == 0 && hammer_is_pfs_master(&pfsm->pfsd)) {
+			error = hammer_mkroot_pseudofs(trans, cred, pfsm, ip);
 		}
 		if (error == 0)
 			error = hammer_save_pseudofs(trans, pfsm);
@@ -151,18 +147,19 @@ hammer_ioc_set_pseudofs(hammer_transaction_t trans, hammer_inode_t ip,
  * rollback.
  *
  * NOTE: The ip used for ioctl is not necessarily related to the PFS
+ * since this ioctl only requires PFS id (or upper 16 bits of ip localization).
  */
 int
 hammer_ioc_upgrade_pseudofs(hammer_transaction_t trans, hammer_inode_t ip,
 			struct hammer_ioc_pseudofs_rw *pfs)
 {
 	hammer_pseudofs_inmem_t pfsm;
-	u_int32_t localization;
+	uint32_t localization;
 	int error;
 
 	if ((error = hammer_pfs_autodetect(pfs, ip)) != 0)
 		return(error);
-	localization = (u_int32_t)pfs->pfs_id << 16;
+	localization = pfs_to_lo(pfs->pfs_id);
 	if ((error = hammer_unload_pseudofs(trans, localization)) != 0)
 		return(error);
 
@@ -171,7 +168,7 @@ hammer_ioc_upgrade_pseudofs(hammer_transaction_t trans, hammer_inode_t ip,
 	 */
 	pfsm = hammer_load_pseudofs(trans, localization, &error);
 	if (error == 0) {
-		if ((pfsm->pfsd.mirror_flags & HAMMER_PFSD_SLAVE) != 0) {
+		if (hammer_is_pfs_slave(&pfsm->pfsd)) {
 			error = hammer_pfs_rollback(trans, pfsm,
 					    pfsm->pfsd.sync_end_tid + 1);
 			if (error == 0) {
@@ -199,6 +196,7 @@ hammer_ioc_upgrade_pseudofs(hammer_transaction_t trans, hammer_inode_t ip,
  * then upgrades again.
  *
  * NOTE: The ip used for ioctl is not necessarily related to the PFS
+ * since this ioctl only requires PFS id (or upper 16 bits of ip localization).
  */
 int
 hammer_ioc_downgrade_pseudofs(hammer_transaction_t trans, hammer_inode_t ip,
@@ -206,18 +204,18 @@ hammer_ioc_downgrade_pseudofs(hammer_transaction_t trans, hammer_inode_t ip,
 {
 	hammer_mount_t hmp = trans->hmp;
 	hammer_pseudofs_inmem_t pfsm;
-	u_int32_t localization;
+	uint32_t localization;
 	int error;
 
 	if ((error = hammer_pfs_autodetect(pfs, ip)) != 0)
 		return(error);
-	localization = (u_int32_t)pfs->pfs_id << 16;
+	localization = pfs_to_lo(pfs->pfs_id);
 	if ((error = hammer_unload_pseudofs(trans, localization)) != 0)
 		return(error);
 
 	pfsm = hammer_load_pseudofs(trans, localization, &error);
 	if (error == 0) {
-		if ((pfsm->pfsd.mirror_flags & HAMMER_PFSD_SLAVE) == 0) {
+		if (hammer_is_pfs_master(&pfsm->pfsd)) {
 			pfsm->pfsd.mirror_flags |= HAMMER_PFSD_SLAVE;
 			if (pfsm->pfsd.sync_end_tid < hmp->flush_tid1)
 				pfsm->pfsd.sync_end_tid = hmp->flush_tid1;
@@ -236,18 +234,19 @@ hammer_ioc_downgrade_pseudofs(hammer_transaction_t trans, hammer_inode_t ip,
  * filesystem.
  *
  * NOTE: The ip used for ioctl is not necessarily related to the PFS
+ * since this ioctl only requires PFS id (or upper 16 bits of ip localization).
  */
 int
 hammer_ioc_destroy_pseudofs(hammer_transaction_t trans, hammer_inode_t ip,
 			struct hammer_ioc_pseudofs_rw *pfs)
 {
 	hammer_pseudofs_inmem_t pfsm;
-	u_int32_t localization;
+	uint32_t localization;
 	int error;
 
 	if ((error = hammer_pfs_autodetect(pfs, ip)) != 0)
 		return(error);
-	localization = (u_int32_t)pfs->pfs_id << 16;
+	localization = pfs_to_lo(pfs->pfs_id);
 
 	if ((error = hammer_unload_pseudofs(trans, localization)) != 0)
 		return(error);
@@ -277,21 +276,21 @@ hammer_ioc_wait_pseudofs(hammer_transaction_t trans, hammer_inode_t ip,
 {
 	hammer_pseudofs_inmem_t pfsm;
 	struct hammer_pseudofs_data pfsd;
-	u_int32_t localization;
+	uint32_t localization;
 	hammer_tid_t tid;
 	void *waitp;
 	int error;
 
 	if ((error = hammer_pfs_autodetect(pfs, ip)) != 0)
 		return(error);
-	localization = (u_int32_t)pfs->pfs_id << 16;
+	localization = pfs_to_lo(pfs->pfs_id);
 
 	if ((error = copyin(pfs->ondisk, &pfsd, sizeof(pfsd))) != 0)
 		return(error);
 
 	pfsm = hammer_load_pseudofs(trans, localization, &error);
 	if (error == 0) {
-		if (pfsm->pfsd.mirror_flags & HAMMER_PFSD_SLAVE) {
+		if (hammer_is_pfs_slave(&pfsm->pfsd)) {
 			tid = pfsm->pfsd.sync_end_tid;
 			waitp = &pfsm->pfsd.sync_end_tid;
 		} else {
@@ -309,6 +308,69 @@ hammer_ioc_wait_pseudofs(hammer_transaction_t trans, hammer_inode_t ip,
 	return(error);
 }
 
+/*
+ * Iterate PFS ondisk data.
+ * This function essentially does the same as hammer_load_pseudofs()
+ * except that this function only retrieves PFS data without touching
+ * hammer_pfs_rb_tree at all.
+ *
+ * NOTE: The ip used for ioctl is not necessarily related to the PFS
+ * since this ioctl only requires PFS id (or upper 16 bits of ip localization).
+ *
+ * NOTE: The API was changed in DragonFly 4.7, due to design issues
+ * this ioctl and libhammer (which is the only caller of this ioctl
+ * within DragonFly source, but no longer maintained by anyone) had.
+ */
+int
+hammer_ioc_scan_pseudofs(hammer_transaction_t trans, hammer_inode_t ip,
+			struct hammer_ioc_pseudofs_rw *pfs)
+{
+	struct hammer_cursor cursor;
+	hammer_inode_t dip;
+	uint32_t localization;
+	int error;
+
+	if ((error = hammer_pfs_autodetect(pfs, ip)) != 0)
+		return(error);
+	localization = pfs_to_lo(pfs->pfs_id);
+	pfs->bytes = sizeof(struct hammer_pseudofs_data);
+	pfs->version = HAMMER_IOC_PSEUDOFS_VERSION;
+
+	dip = hammer_get_inode(trans, NULL, HAMMER_OBJID_ROOT, HAMMER_MAX_TID,
+		HAMMER_DEF_LOCALIZATION, 0, &error);
+
+	error = hammer_init_cursor(trans, &cursor,
+		(dip ? &dip->cache[1] : NULL), dip);
+	if (error)
+		goto fail;
+
+	cursor.key_beg.localization = HAMMER_DEF_LOCALIZATION |
+				      HAMMER_LOCALIZE_MISC;
+	cursor.key_beg.obj_id = HAMMER_OBJID_ROOT;
+	cursor.key_beg.create_tid = 0;
+	cursor.key_beg.delete_tid = 0;
+	cursor.key_beg.rec_type = HAMMER_RECTYPE_PFS;
+	cursor.key_beg.obj_type = 0;
+	cursor.key_beg.key = localization;
+	cursor.asof = HAMMER_MAX_TID;
+	cursor.flags |= HAMMER_CURSOR_ASOF;
+
+	error = hammer_ip_lookup(&cursor);
+	if (error == 0) {
+		error = hammer_ip_resolve_data(&cursor);
+		if (error == 0) {
+			if (pfs->ondisk)
+				copyout(cursor.data, pfs->ondisk, cursor.leaf->data_len);
+			localization = cursor.leaf->base.key;
+			pfs->pfs_id = lo_to_pfs(localization);
+		}
+	}
+	hammer_done_cursor(&cursor);
+fail:
+	if (dip)
+		hammer_rel_inode(dip, 0);
+	return(error);
+}
 
 /*
  * Auto-detect the pseudofs and do basic bounds checking.
@@ -320,7 +382,7 @@ hammer_pfs_autodetect(struct hammer_ioc_pseudofs_rw *pfs, hammer_inode_t ip)
 	int error = 0;
 
 	if (pfs->pfs_id == -1)
-		pfs->pfs_id = (int)(ip->obj_localization >> 16);
+		pfs->pfs_id = lo_to_pfs(ip->obj_localization);
 	if (pfs->pfs_id < 0 || pfs->pfs_id >= HAMMER_MAX_PFS)
 		error = EINVAL;
 	if (pfs->bytes < sizeof(struct hammer_pseudofs_data))
@@ -335,7 +397,7 @@ hammer_pfs_autodetect(struct hammer_ioc_pseudofs_rw *pfs, hammer_inode_t ip)
  *
  * This is typically used to remove any partial syncs when upgrading a
  * slave to a master.  It can theoretically also be used to rollback
- * any PFS, including PFS#0, BUT ONLY TO POINTS THAT HAVE NOT YET BEEN
+ * any PFS, including root PFS, BUT ONLY TO POINTS THAT HAVE NOT YET BEEN
  * PRUNED, and to points that are older only if they are on a retained
  * (pruning softlink) boundary.
  *
@@ -356,7 +418,7 @@ hammer_pfs_rollback(hammer_transaction_t trans,
 
 	bzero(&cmirror, sizeof(cmirror));
 	bzero(&key_cur, sizeof(key_cur));
-	key_cur.localization = HAMMER_MIN_LOCALIZATION + pfsm->localization;
+	key_cur.localization = HAMMER_MIN_LOCALIZATION | pfsm->localization;
 	key_cur.obj_id = HAMMER_MIN_OBJID;
 	key_cur.key = HAMMER_MIN_KEY;
 	key_cur.create_tid = 1;
@@ -371,7 +433,7 @@ retry:
 		goto failed;
 	}
 	cursor.key_beg = key_cur;
-	cursor.key_end.localization = HAMMER_MAX_LOCALIZATION +
+	cursor.key_end.localization = HAMMER_MAX_LOCALIZATION |
 				      pfsm->localization;
 	cursor.key_end.obj_id = HAMMER_MAX_OBJID;
 	cursor.key_end.key = HAMMER_MAX_KEY;

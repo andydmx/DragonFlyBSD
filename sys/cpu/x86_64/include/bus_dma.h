@@ -57,33 +57,13 @@ typedef uint64_t bus_space_handle_t;
 /*
  * Map a region of device bus space into CPU virtual address space.
  */
-
-static __inline int bus_space_map(bus_space_tag_t t, bus_addr_t addr,
-				  bus_size_t size, int flags,
-				  bus_space_handle_t *bshp);
-
-static __inline int
-bus_space_map(bus_space_tag_t t __unused, bus_addr_t addr,
-	      bus_size_t size __unused, int flags __unused,
-	      bus_space_handle_t *bshp)
-{
-
-	*bshp = addr;
-	return (0);
-}
+int bus_space_map(bus_space_tag_t, bus_addr_t, bus_size_t, int,
+		  bus_space_handle_t *);
 
 /*
  * Unmap a region of device bus space.
  */
-
-static __inline void bus_space_unmap(bus_space_tag_t t, bus_space_handle_t bsh,
-				     bus_size_t size);
-
-static __inline void
-bus_space_unmap(bus_space_tag_t t __unused, bus_space_handle_t bsh __unused,
-		bus_size_t size __unused)
-{
-}
+void bus_space_unmap(bus_space_tag_t, bus_space_handle_t, bus_size_t);
 
 /*
  * Get a new handle for a subregion of an already-mapped area of bus space.
@@ -181,8 +161,15 @@ bus_space_read_4(bus_space_tag_t tag, bus_space_handle_t handle,
 	return (*(volatile u_int32_t *)(handle + offset));
 }
 
-#if 0	/* Cause a link error for bus_space_read_8 */
-#define	bus_space_read_8(t, h, o)	!!! bus_space_read_8 unimplemented !!!
+#ifdef _KERNEL
+static __inline u_int64_t
+bus_space_read_8(bus_space_tag_t tag, bus_space_handle_t handle,
+		 bus_size_t offset)
+{
+	if (tag == X86_64_BUS_SPACE_IO)
+		panic("bus_space_read_8: illegal on I/O space");
+	return (*(volatile u_int64_t *)(handle + offset));
+}
 #endif
 
 /*
@@ -424,8 +411,15 @@ bus_space_write_4(bus_space_tag_t tag, bus_space_handle_t bsh,
 		*(volatile u_int32_t *)(bsh + offset) = value;
 }
 
-#if 0	/* Cause a link error for bus_space_write_8 */
-#define	bus_space_write_8	!!! bus_space_write_8 not implemented !!!
+#ifdef _KERNEL
+static __inline void
+bus_space_write_8(bus_space_tag_t tag, bus_space_handle_t bsh,
+		       bus_size_t offset, u_int64_t value)
+{
+	if (tag == X86_64_BUS_SPACE_IO)
+		panic("bus_space_write_8: illegal on I/O space");
+	*(volatile u_int64_t *)(bsh + offset) = value;
+}
 #endif
 
 /*

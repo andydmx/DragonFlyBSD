@@ -29,7 +29,6 @@
  */
 
 #include "opt_acpi.h"
-#include "opt_compat_oldpci.h"
 
 #include <sys/param.h>
 #include <sys/systm.h>
@@ -215,6 +214,7 @@ struct pci_quirk {
 	int	type;
 #define	PCI_QUIRK_MAP_REG	1 /* PCI map register in weird place */
 #define	PCI_QUIRK_DISABLE_MSI	2 /* MSI/MSI-X doesn't work */
+#define	PCI_QUIRK_MSI_INTX_BUG	6 /* PCIM_CMD_INTxDIS disables MSI */
 	int	arg1;
 	int	arg2;
 };
@@ -251,6 +251,17 @@ struct pci_quirk pci_quirks[] = {
 	 */
 	{ 0x74501022, PCI_QUIRK_DISABLE_MSI,	0,	0 },
 
+	/*
+	 * Atheros AR8161/AR8162/E2200/E2400/E2500 Ethernet controllers have
+	 * a bug that MSI interrupt does not assert if PCIM_CMD_INTxDIS bit
+	 * of the command register is set.
+	 */
+	{ 0x10901969, PCI_QUIRK_MSI_INTX_BUG,	0,	0 },
+	{ 0x10911969, PCI_QUIRK_MSI_INTX_BUG,	0,	0 },
+	{ 0xE0911969, PCI_QUIRK_MSI_INTX_BUG,	0,	0 },
+	{ 0xE0A11969, PCI_QUIRK_MSI_INTX_BUG,	0,	0 },
+	{ 0xE0B11969, PCI_QUIRK_MSI_INTX_BUG,	0,	0 },
+
 	{ 0 }
 };
 
@@ -274,18 +285,18 @@ static int pci_enable_io_modes = 1;
 TUNABLE_INT("hw.pci.enable_io_modes", &pci_enable_io_modes);
 SYSCTL_INT(_hw_pci, OID_AUTO, enable_io_modes, CTLFLAG_RW,
     &pci_enable_io_modes, 1,
-    "Enable I/O and memory bits in the config register.  Some BIOSes do not\n\
-enable these bits correctly.  We'd like to do this all the time, but there\n\
-are some peripherals that this causes problems with.");
+    "Enable I/O and memory bits in the config register.  Some BIOSes do not"
+    " enable these bits correctly.  We'd like to do this all the time, but"
+    " there are some peripherals that this causes problems with.");
 
 static int pci_do_power_nodriver = 0;
 TUNABLE_INT("hw.pci.do_power_nodriver", &pci_do_power_nodriver);
 SYSCTL_INT(_hw_pci, OID_AUTO, do_power_nodriver, CTLFLAG_RW,
     &pci_do_power_nodriver, 0,
-  "Place a function into D3 state when no driver attaches to it.  0 means\n\
-disable.  1 means conservatively place devices into D3 state.  2 means\n\
-aggressively place devices into D3 state.  3 means put absolutely everything\n\
-in D3 state.");
+    "Place a function into D3 state when no driver attaches to it.  0 means"
+    " disable.  1 means conservatively place devices into D3 state.  2 means"
+    " aggressively place devices into D3 state.  3 means put absolutely"
+    " everything in D3 state.");
 
 static int pci_do_power_resume = 1;
 TUNABLE_INT("hw.pci.do_power_resume", &pci_do_power_resume);
@@ -308,16 +319,29 @@ TUNABLE_INT("hw.pci.honor_msi_blacklist", &pci_honor_msi_blacklist);
 SYSCTL_INT(_hw_pci, OID_AUTO, honor_msi_blacklist, CTLFLAG_RD,
     &pci_honor_msi_blacklist, 1, "Honor chipset blacklist for MSI");
 
-#if defined(__i386__) || defined(__x86_64__)
+#if defined(__x86_64__)
 static int pci_usb_takeover = 1;
 TUNABLE_INT("hw.pci.usb_early_takeover", &pci_usb_takeover);
 SYSCTL_INT(_hw_pci, OID_AUTO, usb_early_takeover, CTLFLAG_RD,
-    &pci_usb_takeover, 1, "Enable early takeover of USB controllers.\n\
-Disable this if you depend on BIOS emulation of USB devices, that is\n\
-you use USB devices (like keyboard or mouse) but do not load USB drivers");
+    &pci_usb_takeover, 1,
+    "Enable early takeover of USB controllers. Disable this if you depend on"
+    " BIOS emulation of USB devices, that is you use USB devices (like"
+    " keyboard or mouse) but do not load USB drivers");
 #endif
 
 static int pci_msi_cpuid;
+
+static int
+pci_has_quirk(uint32_t devid, int quirk)
+{
+	const struct pci_quirk *q;
+
+	for (q = &pci_quirks[0]; q->devid; q++) {
+		if (q->devid == devid && q->type == quirk)
+			return (1);
+	}
+	return (0);
+}
 
 /* Find a device_t by bus/slot/function in domain 0 */
 
@@ -376,6 +400,28 @@ pci_find_class(uint8_t class, uint8_t subclass)
 		}
 	}
 
+	return (NULL);
+}
+
+device_t
+pci_iterate_class(struct pci_devinfo **dinfop, uint8_t class, uint8_t subclass)
+{
+	struct pci_devinfo *dinfo;
+
+	if (*dinfop)
+		dinfo = STAILQ_NEXT(*dinfop, pci_links);
+	else
+		dinfo = STAILQ_FIRST(&pci_devq);
+
+	while (dinfo) {
+		if (dinfo->cfg.baseclass == class &&
+		    dinfo->cfg.subclass == subclass) {
+			*dinfop = dinfo;
+			return (dinfo->cfg.dev);
+		}
+		dinfo = STAILQ_NEXT(dinfo, pci_links);
+	}
+	*dinfop = NULL;
 	return (NULL);
 }
 
@@ -474,17 +520,11 @@ pci_hdrtypedata(device_t pcib, int b, int s, int f, pcicfgregs *cfg)
 		break;
 	case 1:
 		cfg->nummaps	    = PCI_MAXMAPS_1;
-#ifdef COMPAT_OLDPCI
-		cfg->secondarybus   = REG(PCIR_SECBUS_1, 1);
-#endif
 		break;
 	case 2:
 		cfg->subvendor      = REG(PCIR_SUBVEND_2, 2);
 		cfg->subdevice      = REG(PCIR_SUBDEV_2, 2);
 		cfg->nummaps	    = PCI_MAXMAPS_2;
-#ifdef COMPAT_OLDPCI
-		cfg->secondarybus   = REG(PCIR_SECBUS_2, 1);
-#endif
 		break;
 	}
 #undef REG
@@ -632,7 +672,7 @@ pci_read_cap_pmgt(device_t pcib, int ptr, int nextptr, pcicfgregs *cfg)
 static void
 pci_read_cap_ht(device_t pcib, int ptr, int nextptr, pcicfgregs *cfg)
 {
-#if defined(__i386__) || defined(__x86_64__)
+#if defined(__x86_64__)
 
 #define REG(n, w)	\
 	PCIB_READ_CONFIG(pcib, cfg->bus, cfg->slot, cfg->func, n, w)
@@ -671,7 +711,7 @@ pci_read_cap_ht(device_t pcib, int ptr, int nextptr, pcicfgregs *cfg)
 
 #undef REG
 
-#endif	/* __i386__ || __x86_64__ */
+#endif	/* __x86_64__ */
 }
 
 static void
@@ -855,7 +895,7 @@ pci_read_capabilities(device_t pcib, pcicfgregs *cfg)
 		}
 	}
 
-#if defined(__i386__) || defined(__x86_64__)
+#if defined(__x86_64__)
 	/*
 	 * Enable the MSI mapping window for all HyperTransport
 	 * slaves.  PCI-PCI bridges have their windows enabled via
@@ -1665,6 +1705,7 @@ pci_teardown_msix(device_t dev)
 	KASSERT(msix->msix_alloc == 0 && TAILQ_EMPTY(&msix->msix_vectors),
 	    ("MSI-X vector is still allocated"));
 
+	pci_disable_msix(dev);
 	pci_mask_msix_allvectors(dev);
 
 	msix->msix_table_res = NULL;
@@ -1759,7 +1800,7 @@ pci_ht_map_msi(device_t dev, uint64_t addr)
 /*
  * Support for MSI message signalled interrupts.
  */
-void
+static void
 pci_enable_msi(device_t dev, uint64_t address, uint16_t data)
 {
 	struct pci_devinfo *dinfo = device_get_ivars(dev);
@@ -1786,7 +1827,7 @@ pci_enable_msi(device_t dev, uint64_t address, uint16_t data)
 	pci_ht_map_msi(dev, address);
 }
 
-void
+static void
 pci_disable_msi(device_t dev)
 {
 	struct pci_devinfo *dinfo = device_get_ivars(dev);
@@ -1865,6 +1906,14 @@ pci_msi_blacklisted(void)
 	device_t dev;
 
 	if (!pci_honor_msi_blacklist)
+		return (0);
+
+	/*
+	 * Always assume that MSI-X works in virtual machines. This is
+	 * for example needed for most (or all) qemu based setups, since
+	 * the emulated chipsets tend to be very old.
+	 */
+	if (vmm_guest != VMM_GUEST_NONE)
 		return (0);
 
 	/* Blacklist all non-PCI-express and non-PCI-X chipsets. */
@@ -2451,7 +2500,7 @@ pci_print_verbose_expr(const pcicfgregs *cfg)
 
 	if (pcie_slotimpl(cfg)) {
 		kprintf(", slotcap=0x%08x", expr->expr_slotcap);
-		if (expr->expr_slotcap & PCIEM_SLTCAP_HP_CAP)
+		if (expr->expr_slotcap & PCIEM_SLOTCAP_HP_CAP)
 			kprintf("[HOTPLUG]");
 	}
 	kprintf("\n");
@@ -2554,7 +2603,7 @@ pci_add_map(device_t pcib, device_t bus, device_t dev,
 	 * such entries for the moment.  These will be allocated later if
 	 * the driver specifically requests them.  However, some
 	 * removable busses look better when all resources are allocated,
-	 * so allow '0' to be overriden.
+	 * so allow '0' to be overridden.
 	 *
 	 * Similarly treat maps whose values is the same as the test value
 	 * read back.  These maps have had all f's written to them by the
@@ -2951,7 +3000,7 @@ xhci_early_takeover(device_t self)
 			bus_write_1(res, eecp + XHCI_XECP_BIOS_SEM, 0x00);
 		} else {
 			if (bootverbose) 
-				kprintf("xhci early:"
+				kprintf("xhci early: "
 				    "handover successful\n");
 		}
 	
@@ -3313,8 +3362,16 @@ pci_setup_intr(device_t dev, device_t child, struct resource *irq, int flags,
 			pci_unmask_msix_vector(child, vector);
 		}
 
-		/* Make sure that INTx is disabled if we are using MSI/MSIX */
-		pci_set_command_bit(dev, child, PCIM_CMD_INTxDIS);
+		/*
+		 * Make sure that INTx is disabled if we are using MSI/MSI-X,
+		 * unless the device is affected by PCI_QUIRK_MSI_INTX_BUG,
+		 * in which case we "enable" INTx so MSI/MSI-X actually works.
+		 */
+		if (!pci_has_quirk(pci_get_devid(child),
+		    PCI_QUIRK_MSI_INTX_BUG))
+			pci_set_command_bit(dev, child, PCIM_CMD_INTxDIS);
+		else
+			pci_clear_command_bit(dev, child, PCIM_CMD_INTxDIS);
 	bad:
 		if (error) {
 			(void)bus_generic_teardown_intr(dev, child, irq,
@@ -4289,55 +4346,6 @@ pci_cfg_save(device_t dev, struct pci_devinfo *dinfo, int setstate)
 	if (pci_get_powerstate(dev) != PCI_POWERSTATE_D3)
 		pci_set_powerstate(dev, PCI_POWERSTATE_D3);
 }
-
-#ifdef COMPAT_OLDPCI
-
-/*
- * Locate the parent of a PCI device by scanning the PCI devlist
- * and return the entry for the parent.
- * For devices on PCI Bus 0 (the host bus), this is the PCI Host.
- * For devices on secondary PCI busses, this is that bus' PCI-PCI Bridge.
- */
-pcicfgregs *
-pci_devlist_get_parent(pcicfgregs *cfg)
-{
-	struct devlist *devlist_head;
-	struct pci_devinfo *dinfo;
-	pcicfgregs *bridge_cfg;
-	int i;
-
-	dinfo = STAILQ_FIRST(devlist_head = &pci_devq);
-
-	/* If the device is on PCI bus 0, look for the host */
-	if (cfg->bus == 0) {
-		for (i = 0; (dinfo != NULL) && (i < pci_numdevs);
-		dinfo = STAILQ_NEXT(dinfo, pci_links), i++) {
-			bridge_cfg = &dinfo->cfg;
-			if (bridge_cfg->baseclass == PCIC_BRIDGE
-				&& bridge_cfg->subclass == PCIS_BRIDGE_HOST
-		    		&& bridge_cfg->bus == cfg->bus) {
-				return bridge_cfg;
-			}
-		}
-	}
-
-	/* If the device is not on PCI bus 0, look for the PCI-PCI bridge */
-	if (cfg->bus > 0) {
-		for (i = 0; (dinfo != NULL) && (i < pci_numdevs);
-		dinfo = STAILQ_NEXT(dinfo, pci_links), i++) {
-			bridge_cfg = &dinfo->cfg;
-			if (bridge_cfg->baseclass == PCIC_BRIDGE
-				&& bridge_cfg->subclass == PCIS_BRIDGE_PCI
-				&& bridge_cfg->secondarybus == cfg->bus) {
-				return bridge_cfg;
-			}
-		}
-	}
-
-	return NULL; 
-}
-
-#endif	/* COMPAT_OLDPCI */
 
 int
 pci_alloc_1intr(device_t dev, int msi_enable, int *rid0, u_int *flags0)

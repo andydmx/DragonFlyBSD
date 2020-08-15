@@ -40,6 +40,7 @@
 
 #include <sys/param.h>
 #include <sys/systm.h>
+#include <sys/uio.h>
 #include <sys/conf.h>
 #include <sys/device.h>
 #include <sys/malloc.h>
@@ -57,8 +58,6 @@
 #include <sys/socket.h>
 #include <sys/vnode.h>
 
-#include <sys/thread2.h>
-
 #include <net/if.h>
 #include <net/bpf.h>
 #include <net/bpfdesc.h>
@@ -70,6 +69,8 @@
 #include <sys/kernel.h>
 #include <sys/sysctl.h>
 
+#include <netproto/802_11/ieee80211_dragonfly.h>
+
 #include <sys/devfs.h>
 
 struct netmsg_bpf_output {
@@ -77,10 +78,11 @@ struct netmsg_bpf_output {
 	struct mbuf	*nm_mbuf;
 	struct ifnet	*nm_ifp;
 	struct sockaddr	*nm_dst;
+	boolean_t 	nm_feedback;
 };
 
 MALLOC_DEFINE(M_BPF, "BPF", "BPF data");
-DEVFS_DECLARE_CLONE_BITMAP(bpf);
+DEVFS_DEFINE_CLONE_BITMAP(bpf);
 
 #if NBPF <= 1
 #define BPF_PREALLOCATED_UNITS	4
@@ -112,14 +114,15 @@ static void	bpf_attachd(struct bpf_d *d, struct bpf_if *bp);
 static void	bpf_detachd(struct bpf_d *d);
 static void	bpf_resetd(struct bpf_d *);
 static void	bpf_freed(struct bpf_d *);
-static void	bpf_mcopy(const void *, void *, size_t);
+static void	bpf_mcopy(volatile const void *, volatile void *, size_t);
 static int	bpf_movein(struct uio *, int, struct mbuf **,
 			   struct sockaddr *, int *, struct bpf_insn *);
 static int	bpf_setif(struct bpf_d *, struct ifreq *);
 static void	bpf_timed_out(void *);
 static void	bpf_wakeup(struct bpf_d *);
 static void	catchpacket(struct bpf_d *, u_char *, u_int, u_int,
-			    void (*)(const void *, void *, size_t),
+			    void (*)(volatile const void *,
+				     volatile void *, size_t),
 			    const struct timeval *);
 static int	bpf_setf(struct bpf_d *, struct bpf_program *, u_long cmd);
 static int	bpf_getdltlist(struct bpf_d *, struct bpf_dltlist *);
@@ -152,6 +155,7 @@ static int
 bpf_movein(struct uio *uio, int linktype, struct mbuf **mp,
 	   struct sockaddr *sockp, int *datlen, struct bpf_insn *wfilter)
 {
+	const struct ieee80211_bpf_params *p;
 	struct mbuf *m;
 	int error;
 	int len;
@@ -203,6 +207,17 @@ bpf_movein(struct uio *uio, int linktype, struct mbuf **mp,
 		hlen = 4;	/* This should match PPP_HDRLEN */
 		break;
 
+	case DLT_IEEE802_11:		/* IEEE 802.11 wireless */
+		sockp->sa_family = AF_IEEE80211;
+		hlen = 0;
+		break;
+
+	case DLT_IEEE802_11_RADIO:	/* IEEE 802.11 wireless w/ phy params */
+		sockp->sa_family = AF_IEEE80211;
+		sockp->sa_len = 12;	/* XXX != 0 */
+		hlen = sizeof(struct ieee80211_bpf_params);
+		break;
+
 	default:
 		return(EIO);
 	}
@@ -212,7 +227,7 @@ bpf_movein(struct uio *uio, int linktype, struct mbuf **mp,
 	if ((unsigned)len > MCLBYTES)
 		return(EIO);
 
-	m = m_getl(len, MB_WAIT, MT_DATA, M_PKTHDR, NULL);
+	m = m_getl(len, M_WAITOK, MT_DATA, M_PKTHDR, NULL);
 	if (m == NULL)
 		return(ENOBUFS);
 	m->m_pkthdr.len = m->m_len = len;
@@ -238,6 +253,23 @@ bpf_movein(struct uio *uio, int linktype, struct mbuf **mp,
 	 * Make room for link header, and copy it to sockaddr.
 	 */
 	if (hlen != 0) {
+		if (sockp->sa_family == AF_IEEE80211) {
+			/*
+			 * Collect true length from the parameter header
+			 * NB: sockp is known to be zero'd so if we do a
+			 *     short copy unspecified parameters will be
+			 *     zero.
+			 * NB: packet may not be aligned after stripping
+			 *     bpf params
+			 * XXX check ibp_vers
+			 */
+			p = mtod(m, const struct ieee80211_bpf_params *);
+			hlen = p->ibp_len;
+			if (hlen > sizeof(sockp->sa_data)) {
+				error = EINVAL;
+				goto bad;
+			}
+		}
 		bcopy(m->m_data, sockp->sa_data, hlen);
 		m->m_pkthdr.len -= hlen;
 		m->m_len -= hlen;
@@ -350,6 +382,7 @@ bpfopen(struct dev_open_args *ap)
 	d->bd_bufsize = bpf_bufsize;
 	d->bd_sig = SIGIO;
 	d->bd_seesent = 1;
+	d->bd_feedback = 0;
 	callout_init(&d->bd_callout);
 	lwkt_reltoken(&bpf_token);
 
@@ -377,6 +410,7 @@ bpfclose(struct dev_close_args *ap)
 {
 	cdev_t dev = ap->a_head.a_dev;
 	struct bpf_d *d = dev->si_drv1;
+	int unit;
 
 	lwkt_gettoken(&bpf_token);
 	funsetown(&d->bd_sigio);
@@ -387,9 +421,11 @@ bpfclose(struct dev_close_args *ap)
 		bpf_detachd(d);
 	bpf_freed(d);
 	dev->si_drv1 = NULL;
-	if (dev->si_uminor >= BPF_PREALLOCATED_UNITS) {
-		devfs_clone_bitmap_put(&DEVFS_CLONE_BITMAP(bpf), dev->si_uminor);
+
+	unit = dev->si_uminor;
+	if (unit >= BPF_PREALLOCATED_UNITS) {
 		destroy_dev(dev);
+		devfs_clone_bitmap_put(&DEVFS_CLONE_BITMAP(bpf), unit);
 	}
 	kfree(d, M_BPF);
 	lwkt_reltoken(&bpf_token);
@@ -549,13 +585,29 @@ bpf_output_dispatch(netmsg_t msg)
 {
 	struct netmsg_bpf_output *bmsg = (struct netmsg_bpf_output *)msg;
 	struct ifnet *ifp = bmsg->nm_ifp;
+	struct mbuf *mc = NULL;
 	int error;
+
+	if (bmsg->nm_feedback) {
+		mc = m_dup(bmsg->nm_mbuf, M_NOWAIT);
+		if (mc != NULL)
+			mc->m_pkthdr.rcvif = ifp;
+	}
 
 	/*
 	 * The driver frees the mbuf.
 	 */
 	error = ifp->if_output(ifp, bmsg->nm_mbuf, bmsg->nm_dst, NULL);
 	lwkt_replymsg(&msg->lmsg, error);
+
+	if (mc != NULL) {
+		if (error == 0) {
+			mc->m_flags &= ~M_HASH;
+			(*ifp->if_input)(ifp, mc, NULL, -1);
+		} else {
+			m_freem(mc);
+		}
+	}
 }
 
 static int
@@ -605,7 +657,13 @@ bpfwrite(struct dev_write_args *ap)
 	bmsg.nm_ifp = ifp;
 	bmsg.nm_dst = &dst;
 
+	if (d->bd_feedback)
+		bmsg.nm_feedback = TRUE;
+	else
+		bmsg.nm_feedback = FALSE;
+
 	ret = lwkt_domsg(netisr_cpuport(0), &bmsg.base.lmsg, 0);
+
 	lwkt_reltoken(&bpf_token);
 
 	return ret;
@@ -647,6 +705,8 @@ bpf_resetd(struct bpf_d *d)
  *  BIOCVERSION		Get filter language version.
  *  BIOCGHDRCMPLT	Get "header already complete" flag
  *  BIOCSHDRCMPLT	Set "header already complete" flag
+ *  BIOCSFEEDBACK	Set packet feedback mode.
+ *  BIOCGFEEDBACK	Get packet feedback mode.
  *  BIOCGSEESENT	Get "see packets sent" flag
  *  BIOCSSEESENT	Set "see packets sent" flag
  *  BIOCLOCK		Set "locked" flag
@@ -669,7 +729,7 @@ bpfioctl(struct dev_ioctl_args *ap)
 		case BIOCGBLEN:
 		case BIOCFLUSH:
 		case BIOCGDLT:
-		case BIOCGDLTLIST: 
+		case BIOCGDLTLIST:
 		case BIOCGETIF:
 		case BIOCGRTIMEOUT:
 		case BIOCGSTATS:
@@ -752,7 +812,7 @@ bpfioctl(struct dev_ioctl_args *ap)
 	 */
 	case BIOCSETF:
 	case BIOCSETWF:
-		error = bpf_setf(d, (struct bpf_program *)ap->a_data, 
+		error = bpf_setf(d, (struct bpf_program *)ap->a_data,
 			ap->a_cmd);
 		break;
 
@@ -923,6 +983,20 @@ bpfioctl(struct dev_ioctl_args *ap)
 		d->bd_async = *(int *)ap->a_data;
 		break;
 
+	/*
+	 * Set "feed packets from bpf back to input" mode
+	 */
+	case BIOCSFEEDBACK:
+		d->bd_feedback = *(int *)ap->a_data;
+		break;
+
+	/*
+	 * Get "feed packets from bpf back to input" mode
+	 */
+	case BIOCGFEEDBACK:
+		*(u_int *)ap->a_data = d->bd_feedback;
+		break;
+
 	case FIOSETOWN:
 		error = fsetown(*(int *)ap->a_data, &d->bd_sigio);
 		break;
@@ -1028,9 +1102,13 @@ bpf_setif(struct bpf_d *d, struct ifreq *ifr)
 	int error;
 	struct ifnet *theywant;
 
+	ifnet_lock();
+
 	theywant = ifunit(ifr->ifr_name);
-	if (theywant == NULL)
+	if (theywant == NULL) {
+		ifnet_unlock();
 		return(ENXIO);
+	}
 
 	/*
 	 * Look through attached interfaces for the named one.
@@ -1051,8 +1129,10 @@ bpf_setif(struct bpf_d *d, struct ifreq *ifr)
 		 */
 		if (d->bd_sbuf == NULL) {
 			error = bpf_allocbufs(d);
-			if (error != 0)
+			if (error != 0) {
+				ifnet_unlock();
 				return(error);
+			}
 		}
 		if (bp != d->bd_bif) {
 			if (d->bd_bif != NULL) {
@@ -1065,8 +1145,12 @@ bpf_setif(struct bpf_d *d, struct ifreq *ifr)
 			bpf_attachd(d, bp);
 		}
 		bpf_resetd(d);
+
+		ifnet_unlock();
 		return(0);
 	}
+
+	ifnet_unlock();
 
 	/* Not found. */
 	return(ENXIO);
@@ -1178,7 +1262,7 @@ bpf_tap(struct bpf_if *bp, u_char *pkt, u_int pktlen)
 				microtime(&tv);
 				gottime = 1;
 			}
-			catchpacket(d, pkt, pktlen, slen, ovbcopy, &tv);
+			catchpacket(d, pkt, pktlen, slen, _bcopy, &tv);
 		}
 	}
 	lwkt_reltoken(&bpf_token);
@@ -1189,11 +1273,11 @@ bpf_tap(struct bpf_if *bp, u_char *pkt, u_int pktlen)
  * from m_copydata in sys/uipc_mbuf.c.
  */
 static void
-bpf_mcopy(const void *src_arg, void *dst_arg, size_t len)
+bpf_mcopy(volatile const void *src_arg, volatile void *dst_arg, size_t len)
 {
-	const struct mbuf *m;
+	volatile const struct mbuf *m;
 	u_int count;
-	u_char *dst;
+	volatile u_char *dst;
 
 	m = src_arg;
 	dst = dst_arg;
@@ -1320,7 +1404,7 @@ bpf_ptap(struct bpf_if *bp, struct mbuf *m, const void *data, u_int dlen)
  */
 static void
 catchpacket(struct bpf_d *d, u_char *pkt, u_int pktlen, u_int snaplen,
-	    void (*cpfn)(const void *, void *, size_t),
+	    void (*cpfn)(volatile const void *, volatile void *, size_t),
 	    const struct timeval *tv)
 {
 	struct bpf_hdr *hp;
@@ -1608,7 +1692,7 @@ bpf_drvuninit(void *unused)
 	devfs_clone_bitmap_uninit(&DEVFS_CLONE_BITMAP(bpf));
 }
 
-SYSINIT(bpfdev,SI_SUB_DRIVERS,SI_ORDER_MIDDLE+CDEV_MAJOR,bpf_drvinit,NULL)
+SYSINIT(bpfdev, SI_SUB_DRIVERS, SI_ORDER_MIDDLE+CDEV_MAJOR, bpf_drvinit, NULL);
 SYSUNINIT(bpfdev, SI_SUB_DRIVERS,SI_ORDER_MIDDLE+CDEV_MAJOR,bpf_drvuninit, NULL);
 
 #else /* !BPF */

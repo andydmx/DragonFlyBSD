@@ -39,8 +39,17 @@
 #include <sys/bus.h>
 #include <sys/malloc.h>
 #include <sys/proc.h>
+#if defined(__DragonFly__)
+/* empty */
+#else
+#include <sys/pcpu.h>
+#endif
 #include <sys/lock.h>
-#include <sys/mutex.h>
+#if defined(__DragonFly__)
+/* empty */
+#else
+#include <sys/alq.h>
+#endif
 #include <sys/endian.h>
 #include <sys/time.h>
 

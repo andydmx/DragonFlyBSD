@@ -16,11 +16,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -56,7 +52,7 @@
 
 #include "quota.h"
 #include "inode.h"
-#include "ext2mount.h"
+#include "ext2_mount.h"
 
 #include "ext2_fs.h"
 #include "ext2_fs_sb.h"
@@ -146,7 +142,7 @@ kprintf("ext2_truncate called %d to %d\n", VTOI(ovp)->i_number, length);
 	oip = VTOI(ovp);
 	if (ovp->v_type == VLNK &&
 	    oip->i_size < ovp->v_mount->mnt_maxsymlinklen) {
-#if DIAGNOSTIC
+#ifdef DIAGNOSTIC
 		if (length != 0)
 			panic("ext2_truncate: partial truncate of symlink");
 #endif
@@ -159,7 +155,7 @@ kprintf("ext2_truncate called %d to %d\n", VTOI(ovp)->i_number, length);
 		oip->i_flag |= IN_CHANGE | IN_UPDATE;
 		return (EXT2_UPDATE(ovp, 0));
 	}
-#if QUOTA
+#ifdef QUOTA
 	if ((error = ext2_getinoquota(oip)) != 0)
 		return (error);
 #endif
@@ -330,7 +326,7 @@ kprintf("ext2_truncate called %d to %d\n", VTOI(ovp)->i_number, length);
 		}
 	}
 done:
-#if DIAGNOSTIC
+#ifdef DIAGNOSTIC
 	for (level = SINGLE; level <= TRIPLE; level++)
 		if (newblks[NDADDR + level] != oip->i_ib[level])
 			panic("itrunc1");
@@ -350,7 +346,7 @@ done:
 		oip->i_blocks = 0;
 	oip->i_flag |= IN_CHANGE;
 	vnode_pager_setsize(ovp, length);
-#if QUOTA
+#ifdef QUOTA
 	ext2_chkdq(oip, -blocksreleased, NOCRED, 0);
 #endif
 	return (allerror);

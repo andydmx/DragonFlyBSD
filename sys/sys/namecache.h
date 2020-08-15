@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2003,2004 The DragonFly Project.  All rights reserved.
+ * Copyright (c) 2003,2004-2019 The DragonFly Project.  All rights reserved.
  * 
  * This code is derived from software contributed to The DragonFly Project
  * by Matthew Dillon <dillon@backplane.com>
@@ -42,11 +42,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -61,8 +57,6 @@
  * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
  * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
- *
- * $DragonFly: src/sys/sys/namecache.h,v 1.31 2008/05/09 17:52:18 dillon Exp $
  */
 
 #ifndef _SYS_NAMECACHE_H_
@@ -71,14 +65,14 @@
 #ifndef _SYS_TYPES_H_
 #include <sys/types.h>
 #endif
+#ifndef _SYS_LOCK_H_
+#include <sys/lock.h>
+#endif
 #ifndef _SYS_QUEUE_H_
 #include <sys/queue.h>
 #endif
 #ifndef _SYS_SPINLOCK_H_
 #include <sys/spinlock.h>
-#endif
-#ifndef _SYS_THREAD_H_
-#include <sys/thread.h>
 #endif
 
 struct vnode;
@@ -117,23 +111,28 @@ TAILQ_HEAD(namecache_list, namecache);
  * operations vector is typically obtained via nc_mount->mnt_vn_use_ops.
  */
 struct namecache {
-    LIST_ENTRY(namecache) nc_hash;	/* hash chain (nc_parent,name) */
+    TAILQ_ENTRY(namecache) nc_hash;	/* hash chain (nc_parent,name) */
     TAILQ_ENTRY(namecache) nc_entry;	/* scan via nc_parent->nc_list */
     TAILQ_ENTRY(namecache) nc_vnode;	/* scan via vnode->v_namecache */
     struct namecache_list  nc_list;	/* list of children */
     struct nchash_head	*nc_head;
     struct namecache	*nc_parent;	/* namecache entry for parent */
     struct vnode	*nc_vp;		/* vnode representing name or NULL */
-    int			nc_refs;	/* ref count prevents deletion */
     u_short		nc_flag;
     u_char		nc_nlen;	/* The length of the name, 255 max */
     u_char		nc_unused;
     char		*nc_name;	/* Separately allocated seg name */
     int			nc_error;
     int			nc_timeout;	/* compared against ticks, or 0 */
-    u_int		nc_lockstatus;	/* namespace locking */
-    struct thread	*nc_locktd;	/* namespace locking */
-    long		nc_namecache_gen; /* cmp against mnt_namecache_gen */
+    int			nc_negcpu;	/* which ncneg list are we on? */
+    struct {
+	    u_int	nc_namecache_gen; /* mount generation (autoclear) */
+	    u_int	nc_generation;	/* rename/unlink generation */
+	    int		nc_refs;	/* ref count prevents deletion */
+    } __cachealign;
+    struct {
+	    struct lock nc_lock;
+    } __cachealign;
 };
 
 /*
@@ -146,9 +145,9 @@ struct nchandle {
 };
 
 /*
- * Flags in namecache.nc_flag (u_char)
+ * Flags in namecache.nc_flag (u_short)
  */
-#define NCF_UNUSED01	0x0001
+#define NCF_NOTX	0x0001	/* 'x' bit not set in user, group, or world */
 #define NCF_WHITEOUT	0x0002	/* negative entry corresponds to whiteout */
 #define NCF_UNRESOLVED	0x0004	/* invalid or unresolved entry */
 #define NCF_ISMOUNTPT	0x0008	/* someone may have mounted on us here */
@@ -160,11 +159,8 @@ struct nchandle {
 #define NCF_ISDIR	0x0200	/* represents a directory */
 #define NCF_DESTROYED	0x0400	/* name association is considered destroyed */
 #define NCF_DEFEREDZAP	0x0800	/* zap defered due to lock unavailability */
-
-#define NC_EXLOCK_REQ	0x80000000	/* nc_lockstatus state flag */
-#define NC_SHLOCK_REQ	0x40000000	/* nc_lockstatus state flag */
-#define NC_SHLOCK_FLAG	0x20000000	/* nc_lockstatus state flag */
-#define NC_SHLOCK_VHOLD	0x10000000	/* nc_lockstatus state flag */
+#define NCF_WXOK	0x1000	/* world-searchable (nlookup shortcut) */
+#define NCF_DUMMY	0x2000	/* dummy ncp, iterations ignore it */
 
 /*
  * cache_inval[_vp]() flags
@@ -179,6 +175,7 @@ struct componentname;
 struct nlcomponent;
 struct mount;
 
+void	cache_clearmntcache(struct mount *mp);
 void	cache_lock(struct nchandle *nch);
 void	cache_lock_maybe_shared(struct nchandle *nch, int excl);
 void	cache_relock(struct nchandle *nch1, struct ucred *cred1,
@@ -190,8 +187,11 @@ void	cache_setvp(struct nchandle *nch, struct vnode *vp);
 void	cache_settimeout(struct nchandle *nch, int nticks);
 void	cache_setunresolved(struct nchandle *nch);
 void	cache_clrmountpt(struct nchandle *nch);
-struct nchandle cache_nlookup(struct nchandle *nch, struct nlcomponent *nlc);
+struct nchandle cache_nlookup(struct nchandle *nch,
+			struct nlcomponent *nlc);
 struct nchandle cache_nlookup_nonblock(struct nchandle *nch,
+			struct nlcomponent *nlc);
+struct nchandle cache_nlookup_nonlocked(struct nchandle *nch,
 			struct nlcomponent *nlc);
 int	cache_nlookup_maybe_shared(struct nchandle *nch,
 			struct nlcomponent *nlc, int excl,
@@ -204,6 +204,7 @@ void	cache_unmounting(struct mount *mp);
 int	cache_inval(struct nchandle *nch, int flags);
 int	cache_inval_vp(struct vnode *vp, int flags);
 int	cache_inval_vp_nonblock(struct vnode *vp);
+void	cache_inval_wxok(struct vnode *vp);
 void	vfs_cache_setroot(struct vnode *vp, struct nchandle *nch);
 
 int	cache_resolve(struct nchandle *nch, struct ucred *cred);
@@ -211,7 +212,8 @@ void	cache_purge(struct vnode *vp);
 void	cache_purgevfs (struct mount *mp);
 void	cache_hysteresis(int critpath);
 void	cache_get(struct nchandle *nch, struct nchandle *target);
-int	cache_get_nonblock(struct nchandle *nch, struct nchandle *target);
+int	cache_get_nonblock(struct nchandle *nch, int elmno,
+			struct nchandle *target);
 void	cache_get_maybe_shared(struct nchandle *nch,
 			struct nchandle *target, int excl);
 struct nchandle *cache_hold(struct nchandle *nch);
@@ -219,6 +221,7 @@ void	cache_copy(struct nchandle *nch, struct nchandle *target);
 void	cache_changemount(struct nchandle *nch, struct mount *mp);
 void	cache_put(struct nchandle *nch);
 void	cache_drop(struct nchandle *nch);
+void	cache_drop_and_cache(struct nchandle *nch, int elmno);
 void	cache_zero(struct nchandle *nch);
 void	cache_rename(struct nchandle *fnch, struct nchandle *tnch);
 void	cache_unlink(struct nchandle *nch);
@@ -228,6 +231,8 @@ int	cache_vref(struct nchandle *, struct ucred *, struct vnode **);
 int	cache_fromdvp(struct vnode *, struct ucred *, int, struct nchandle *);
 int	cache_fullpath(struct proc *, struct nchandle *, struct nchandle *,
 			char **, char **, int);
+void	vfscache_rollup_cpu(struct globaldata *gd);
+struct vnode *cache_dvpref(struct namecache *ncp);
 
 #endif
 

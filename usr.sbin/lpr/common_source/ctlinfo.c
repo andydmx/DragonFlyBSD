@@ -31,7 +31,6 @@
  * ------+---------+---------+---------+---------+---------+---------+---------*
  *
  * $FreeBSD: src/usr.sbin/lpr/common_source/ctlinfo.c,v 1.1.2.6 2002/07/14 23:47:09 gad Exp $
- * $DragonFly: src/usr.sbin/lpr/common_source/ctlinfo.c,v 1.3 2004/11/26 14:47:04 joerg Exp $
  */
 
 /*
@@ -50,7 +49,7 @@
 /* #define DEBUGREADCF_FNAME "LpdDebugReadCF" */
 /* #define LEAVE_TMPCF_FILES 1 */
 
-#include <sys/types.h>
+#include <sys/param.h>
 #include <sys/stat.h>
 #include <ctype.h>
 #include <errno.h>
@@ -66,14 +65,12 @@
 
 struct cjprivate {
 	struct cjobinfo pub;
-	char	*cji_buff;		/* buffer for getline */
+	char	*cji_buff;		/* buffer for get_line */
 	char	*cji_eobuff;		/* last byte IN the buffer */
 	FILE	*cji_fstream;
 	int	 cji_buffsize;		/* # bytes in the buffer */
 	int	 cji_dumpit;
 };
-
-#define roundup(x, y)   ((((x)+((y)-1))/(y))*(y))
 
 /*
  * This has to be large enough to fit the maximum length of a single line

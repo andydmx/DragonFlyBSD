@@ -16,11 +16,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -160,7 +156,7 @@ ext2_debug("ext2_balloc called (%d, %d, %d)\n",
 	pref = 0;
 	if ((error = ext2_getlbns(vp, bn, indirs, &num)) != 0)
 		return(error);
-#if DIAGNOSTIC
+#ifdef DIAGNOSTIC
 	if (num < 1)
 		panic ("ext2_balloc: ext2_bmaparray returned indirect block");
 #endif

@@ -53,6 +53,7 @@
 #include <bus/u4b/usb_busdma.h>
 #include <bus/u4b/usb_dynamic.h>
 #include <bus/u4b/usb_device.h>
+#include <bus/u4b/usb_dev.h>
 #include <bus/u4b/usb_hub.h>
 
 #include <bus/u4b/usb_controller.h>
@@ -213,6 +214,11 @@ usb_detach(device_t dev)
 	usb_proc_mwait(USB_BUS_EXPLORE_PROC(bus),
 	    &bus->detach_msg[0], &bus->detach_msg[1]);
 
+#if USB_HAVE_UGEN
+	/* Wait for cleanup to complete */
+	usb_proc_mwait(USB_BUS_EXPLORE_PROC(bus),
+	    &bus->cleanup_msg[0], &bus->cleanup_msg[1]);
+#endif
 	USB_BUS_UNLOCK(bus);
 
 #if USB_HAVE_PER_BUS_PROCESS
@@ -391,6 +397,15 @@ usb_bus_explore(struct usb_proc_msg *pm)
 		(udev->hub->explore) (udev);
 		USB_BUS_LOCK(bus);
 	}
+
+	/*
+	 * Interrupt config hook wakes up after the second bus exploration
+	 * completes.
+	 */
+	if (bus->do_hook > 0 && --bus->do_hook == 0) {
+		config_intrhook_disestablish(&bus->hook);
+		bus->hook.ich_func = NULL;
+	}
 #if USB_HAVE_ROOT_MOUNT_HOLD
 	usb_root_mount_rel(bus);
 #endif
@@ -411,6 +426,13 @@ usb_bus_detach(struct usb_proc_msg *pm)
 	bus = ((struct usb_bus_msg *)pm)->bus;
 	udev = bus->devices[USB_ROOT_HUB_ADDR];
 	dev = bus->bdev;
+
+	/* intr_config_hook */
+	if (bus->do_hook > 0) {
+		bus->do_hook = -1;
+		config_intrhook_disestablish(&bus->hook);
+	}
+
 	/* clear the softc */
 	device_set_softc(dev, NULL);
 	USB_BUS_UNLOCK(bus);
@@ -616,6 +638,32 @@ usb_bus_shutdown(struct usb_proc_msg *pm)
 	USB_BUS_LOCK(bus);
 }
 
+/*------------------------------------------------------------------------*
+ *	usb_bus_cleanup
+ *
+ * This function is used to cleanup leftover USB character devices.
+ *------------------------------------------------------------------------*/
+#if USB_HAVE_UGEN
+static void
+usb_bus_cleanup(struct usb_proc_msg *pm)
+{
+	struct usb_bus *bus;
+	struct usb_fs_privdata *pd;
+
+	bus = ((struct usb_bus_msg *)pm)->bus;
+
+	while ((pd = LIST_FIRST(&bus->pd_cleanup_list)) != NULL) {
+
+		LIST_REMOVE(pd, pd_next);
+		USB_BUS_UNLOCK(bus);
+
+		usb_destroy_dev_sync(pd);
+
+		USB_BUS_LOCK(bus);
+	}
+}
+#endif
+
 static void
 usb_power_wdog(void *arg)
 {
@@ -746,6 +794,14 @@ usb_bus_attach(struct usb_proc_msg *pm)
 	usb_power_wdog(bus);
 }
 
+/*
+ * Hook signal (ignored)
+ */
+static void
+usb_intr_config_hook(void *arg)
+{
+}
+
 /*------------------------------------------------------------------------*
  *	usb_attach_sub
  *
@@ -795,6 +851,27 @@ usb_attach_sub(device_t dev, struct usb_bus *bus)
 	bus->shutdown_msg[0].bus = bus;
 	bus->shutdown_msg[1].hdr.pm_callback = &usb_bus_shutdown;
 	bus->shutdown_msg[1].bus = bus;
+
+#if USB_HAVE_UGEN
+	LIST_INIT(&bus->pd_cleanup_list);
+	bus->cleanup_msg[0].hdr.pm_callback = &usb_bus_cleanup;
+	bus->cleanup_msg[0].bus = bus;
+	bus->cleanup_msg[1].hdr.pm_callback = &usb_bus_cleanup;
+	bus->cleanup_msg[1].bus = bus;
+#endif
+
+	/*
+	 * DragonFly - intr config hook, two explore passes.
+	 */
+	bzero(&bus->hook, sizeof(bus->hook));
+	bus->hook.ich_func = usb_intr_config_hook;
+	bus->hook.ich_arg = bus;
+	bus->hook.ich_desc = "usb";
+
+	if (config_intrhook_establish(&bus->hook) == 0)
+		bus->do_hook = 2;
+	else
+		bus->do_hook = 0;
 
 #if USB_HAVE_PER_BUS_PROCESS
 	/* Create USB explore and callback processes */
@@ -895,7 +972,7 @@ usb_bus_mem_alloc_all(struct usb_bus *bus, bus_dma_tag_t dmat,
 
 #if USB_HAVE_BUSDMA
 	usb_dma_tag_setup(bus->dma_parent_tag, bus->dma_tags,
-	    dmat, &bus->bus_lock, NULL, 32, USB_BUS_DMA_TAG_MAX);
+	    dmat, &bus->bus_lock, NULL, bus->dma_bits, USB_BUS_DMA_TAG_MAX);
 #endif
 	if ((bus->devices_max > USB_MAX_DEVICES) ||
 	    (bus->devices_max < USB_MIN_DEVICES) ||

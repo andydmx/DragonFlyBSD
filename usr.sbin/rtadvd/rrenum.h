@@ -1,9 +1,10 @@
+/*	$FreeBSD: stable/10/usr.sbin/rtadvd/rrenum.h 222732 2011-06-06 03:06:43Z hrs $	*/
 /*	$KAME: rrenum.h,v 1.3 2001/01/21 15:37:14 itojun Exp $	*/
 
 /*
  * Copyright (C) 1998 WIDE Project.
  * All rights reserved.
- * 
+ *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
  * are met:
@@ -15,7 +16,7 @@
  * 3. Neither the name of the project nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
- * 
+ *
  * THIS SOFTWARE IS PROVIDED BY THE PROJECT AND CONTRIBUTORS ``AS IS'' AND
  * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
  * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
@@ -27,9 +28,6 @@
  * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
  * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
- *
- * $FreeBSD: src/usr.sbin/rtadvd/rrenum.h,v 1.1.2.2 2001/07/03 11:02:14 ume Exp $
- * $DragonFly: src/usr.sbin/rtadvd/rrenum.h,v 1.3 2003/11/03 19:31:42 eirikn Exp $
  */
 
 void rr_input(int, struct icmp6_router_renum *, struct in6_pktinfo *,

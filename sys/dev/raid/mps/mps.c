@@ -1020,7 +1020,7 @@ mps_setup_sysctl(struct mps_softc *sc)
 	    OID_AUTO, "max_chains", CTLFLAG_RD,
 	    &sc->max_chains, 0,"maximum chain frames that will be allocated");
 
-#if __FreeBSD_version >= 900030
+#if 0 /* __FreeBSD_version >= 900030 */
 	SYSCTL_ADD_UQUAD(sysctl_ctx, SYSCTL_CHILDREN(sysctl_tree),
 	    OID_AUTO, "chain_alloc_fail", CTLFLAG_RD,
 	    &sc->chain_alloc_fail, "chain allocation failures");
@@ -1061,10 +1061,11 @@ mps_attach(struct mps_softc *sc)
 
 	mps_printf(sc, "Firmware: %s, Driver: %s\n", sc->fw_version,
 	    MPS_DRIVER_VERSION);
-	mps_printf(sc, "IOCCapabilities: %b\n", sc->facts->IOCCapabilities,
+	mps_printf(sc, "IOCCapabilities: %pb%i\n",
 	    "\20" "\3ScsiTaskFull" "\4DiagTrace" "\5SnapBuf" "\6ExtBuf"
 	    "\7EEDP" "\10BiDirTarg" "\11Multicast" "\14TransRetry" "\15IR"
-	    "\16EventReplay" "\17RaidAccel" "\20MSIXIndex" "\21HostDisc");
+	    "\16EventReplay" "\17RaidAccel" "\20MSIXIndex" "\21HostDisc",
+	    sc->facts->IOCCapabilities);
 
 	/*
 	 * If the chip doesn't support event replay then a hard reset will be
@@ -1324,7 +1325,7 @@ mps_free(struct mps_softc *sc)
 	mps_lock(sc);
 	sc->mps_flags |= MPS_FLAGS_SHUTDOWN;
 	mps_unlock(sc);
-	callout_stop_sync(&sc->periodic);
+	callout_terminate(&sc->periodic);
 
 	if (((error = mps_detach_log(sc)) != 0) ||
 	    ((error = mps_detach_sas(sc)) != 0))

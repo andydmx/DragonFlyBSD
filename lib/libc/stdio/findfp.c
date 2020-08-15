@@ -83,7 +83,7 @@ static spinlock_t thread_lock = _SPINLOCK_INITIALIZER;
 #define THREAD_LOCK()	if (__isthreaded) _SPINLOCK(&thread_lock)
 #define THREAD_UNLOCK()	if (__isthreaded) _SPINUNLOCK(&thread_lock)
 
-#if NOT_YET
+#if 0 /* not yet */
 #define	SET_GLUE_PTR(ptr, val)	atomic_set_rel_ptr(&(ptr), (uintptr_t)(val))
 #else
 #define	SET_GLUE_PTR(ptr, val)	ptr = val
@@ -154,35 +154,6 @@ found:
 /*	fp->_lock = NULL; */	/* once set always set (reused) */
 	memset(WCIO_GET(fp), 0, sizeof(struct wchar_io_data));
 	return (fp);
-}
-
-/*
- * XXX.  Force immediate allocation of internal memory.  Not used by stdio,
- * but documented historically for certain applications.  Bad applications.
- */
-__warn_references(f_prealloc, 
-	"warning: this program uses f_prealloc(), which is not recommended.");
-
-void
-f_prealloc(void)
-{
-	struct glue *g;
-	int n;
-
-	n = getdtablesize() - FOPEN_MAX + 20;		/* 20 for slop. */
-	/*
-	 * It should be safe to walk the list without locking it;
-	 * new nodes are only added to the end and none are ever
-	 * removed.
-	 */
-	for (g = &__sglue; (n -= g->niobs) > 0 && g->next; g = g->next)
-		/* void */;
-	if ((n > 0) && ((g = moreglue(n)) != NULL)) {
-		THREAD_LOCK();
-		SET_GLUE_PTR(lastglue->next, g);
-		lastglue = g;
-		THREAD_UNLOCK();
-	}
 }
 
 /*

@@ -28,7 +28,6 @@
  *
  * @(#)kvm_getloadavg.c	8.1 (Berkeley) 6/4/93
  * $FreeBSD: src/lib/libkvm/kvm_getloadavg.c,v 1.3 1999/12/27 07:14:57 peter Exp $
- * $DragonFly: src/lib/libkvm/kvm_getloadavg.c,v 1.4 2004/04/11 21:28:03 cpressey Exp $
  */
 
 #include <sys/param.h>
@@ -41,16 +40,16 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <nlist.h>
-#include <kvm.h>
 
+#include "kvm.h"
 #include "kvm_private.h"
 
 static struct nlist nl[] = {
-	{ "_averunnable" },
+	{ .n_name = "_averunnable" },
 #define	X_AVERUNNABLE	0
-	{ "_fscale" },
+	{ .n_name = "_fscale" },
 #define	X_FSCALE	1
-	{ "" },
+	{ .n_name = "" },
 };
 
 /*
@@ -90,7 +89,7 @@ kvm_getloadavg(kvm_t *kd, double loadavg[], int nelem)
 	if (!KREAD(kd, nl[X_FSCALE].n_value, &fscale))
 		loadinfo.fscale = fscale;
 
-	nelem = MIN(nelem, sizeof(loadinfo.ldavg) / sizeof(fixpt_t));
+	nelem = MIN((size_t)nelem, sizeof(loadinfo.ldavg) / sizeof(fixpt_t));
 	for (i = 0; i < nelem; i++)
 		loadavg[i] = (double) loadinfo.ldavg[i] / loadinfo.fscale;
 	return (nelem);

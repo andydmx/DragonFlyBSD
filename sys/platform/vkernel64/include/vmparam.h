@@ -46,18 +46,22 @@
 /*
  * Virtual memory related constants, all in bytes
  */
-#define	MAXTSIZ		(128UL*1024*1024)	/* max text size */
+#define	MAXTSIZ		(32UL*1024*1024*1024)	/* max text size */
+
 #ifndef DFLDSIZ
 #define	DFLDSIZ		(128UL*1024*1024)	/* initial data size limit */
 #endif
 #ifndef MAXDSIZ
-#define	MAXDSIZ		(32768UL*1024*1024)	/* max data size */
+#define	MAXDSIZ		(32UL*1024*1024*1024)	/* max data size */
 #endif
 #ifndef	DFLSSIZ
 #define	DFLSSIZ		(8UL*1024*1024)		/* initial stack size limit */
 #endif
 #ifndef	MAXSSIZ
 #define	MAXSSIZ		(512UL*1024*1024)	/* max stack size */
+#endif
+#ifndef	MAXTHRSSIZ
+#define	MAXTHRSSIZ	(128UL*1024*1024*1024) /* thread stack area */
 #endif
 #ifndef SGROWSIZ
 #define	SGROWSIZ	(128UL*1024)		/* amount to grow stack */
@@ -79,8 +83,15 @@
 
 #define VKERNEL_USEABLE_PHYS_RAM_BASE (128ULL << 30) /* from 32GB */
 
+/*
+ * Do not allow the top 2MB of the user stack to be mapped to work around
+ * an AMD bug wherein the cpu can lockup or destabilize if the instruction
+ * prefetcher crosses over into non-canonical address space.  Only the top
+ * 4KB needs to be disallowed, but taking out the whole 2MB allows potential
+ * 2MB PTE optimizations to be retained.
+ */
 #define VM_MIN_USER_ADDRESS	((vm_offset_t)0)
-#define VM_MAX_USER_ADDRESS	UVADDR(NUPML4E, 0, 0, 0)
+#define VM_MAX_USER_ADDRESS	UVADDR(NUPML4E - 1, NPDPEPG - 1, NPDEPG - 1, 0)
 
 #define DMAP_SIZE		(512UL * 1024 * 1024 * 1024)
 

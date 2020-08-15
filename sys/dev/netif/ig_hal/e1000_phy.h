@@ -1,6 +1,6 @@
 /******************************************************************************
 
-  Copyright (c) 2001-2012, Intel Corporation 
+  Copyright (c) 2001-2016, Intel Corporation
   All rights reserved.
   
   Redistribution and use in source and binary forms, with or without 
@@ -30,7 +30,7 @@
   POSSIBILITY OF SUCH DAMAGE.
 
 ******************************************************************************/
-/*$FreeBSD:$*/
+/*$FreeBSD$*/
 
 #ifndef _E1000_PHY_H_
 #define _E1000_PHY_H_
@@ -117,7 +117,8 @@ s32  e1000_get_cable_length_82577(struct e1000_hw *hw);
 s32  e1000_write_phy_reg_gs40g(struct e1000_hw *hw, u32 offset, u16 data);
 s32  e1000_read_phy_reg_gs40g(struct e1000_hw *hw, u32 offset, u16 *data);
 s32 e1000_read_phy_reg_mphy(struct e1000_hw *hw, u32 address, u32 *data);
-s32 e1000_write_phy_reg_mphy(struct e1000_hw *hw, u32 address, u32 data);
+s32 e1000_write_phy_reg_mphy(struct e1000_hw *hw, u32 address, u32 data,
+			     bool line_override);
 bool e1000_is_mphy_ready(struct e1000_hw *hw);
 
 #define E1000_MAX_PHY_ADDR		8
@@ -166,7 +167,6 @@ bool e1000_is_mphy_ready(struct e1000_hw *hw);
 #define GS40G_MAC_LB			0x4140
 #define GS40G_MAC_SPEED_1G		0X0006
 #define GS40G_COPPER_SPEC		0x0010
-#define GS40G_CS_POWER_DOWN		0x0002
 
 #define HV_INTC_FC_PAGE_START		768
 #define I82578_ADDR_REG			29
@@ -202,6 +202,13 @@ bool e1000_is_mphy_ready(struct e1000_hw *hw);
 #define E1000_82580_PM_SPD		0x0001 /* Smart Power Down */
 #define E1000_82580_PM_D0_LPLU		0x0002 /* For D0a states */
 #define E1000_82580_PM_D3_LPLU		0x0004 /* For all other states */
+#define E1000_82580_PM_GO_LINKD		0x0020 /* Go Link Disconnect */
+
+#define E1000_MPHY_DIS_ACCESS		0x80000000 /* disable_access bit */
+#define E1000_MPHY_ENA_ACCESS		0x40000000 /* enable_access bit */
+#define E1000_MPHY_BUSY			0x00010000 /* busy bit */
+#define E1000_MPHY_ADDRESS_FNC_OVERRIDE	0x20000000 /* fnc_override bit */
+#define E1000_MPHY_ADDRESS_MASK		0x0000FFFF /* address mask */
 
 /* BM PHY Copper Specific Control 1 */
 #define BM_CS_CTRL1			16
@@ -218,14 +225,8 @@ bool e1000_is_mphy_ready(struct e1000_hw *hw);
 #define HV_M_STATUS_AUTONEG_COMPLETE	0x1000
 #define HV_M_STATUS_SPEED_MASK		0x0300
 #define HV_M_STATUS_SPEED_1000		0x0200
+#define HV_M_STATUS_SPEED_100		0x0100
 #define HV_M_STATUS_LINK_UP		0x0040
-
-#define E1000_82580_PM_GO_LINKD		0x0020 /* Go Link Disconnect */
-
-#define E1000_MPHY_DIS_ACCESS	0x80000000 /* disable_access bit */
-#define E1000_MPHY_ENA_ACCESS	0x40000000 /* enable_access bit */
-#define E1000_MPHY_BUSY		0x00010000 /* busy bit */
-#define E1000_MPHY_ADDRESS_MASK	0x0000FFFF /* address bit mask */
 
 #define IGP01E1000_PHY_PCS_INIT_REG	0x00B4
 #define IGP01E1000_PHY_POLARITY_MASK	0x0078

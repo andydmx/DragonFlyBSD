@@ -28,13 +28,12 @@
 .\"
 .\" $FreeBSD$
 .\"
-.Dd May 6, 2012
+.Dd June 20, 2014
 .Dt RTLD 1
 .Os
 .Sh NAME
-.Nm ld-elf.so.2 ,
-.Nm ld-elf.so.1 ,
 .Nm rtld ,
+.Nm ld-elf.so.2 ,
 .Nm _rtld_functrace
 .Nd run-time link-editor
 .Sh SYNOPSIS
@@ -119,7 +118,7 @@ The
 .Pa /lib
 and
 .Pa /usr/lib
-directory unless the referencing object was linked using the
+directories, unless the referencing object was linked using the
 .Dq Fl z Ar nodefaultlib
 option
 .El
@@ -128,7 +127,8 @@ The
 .Nm
 utility
 recognizes a number of environment variables that can be used to modify
-its behaviour as follows:
+its behaviour.
+for example:
 .Bl -tag -width ".Ev LD_LIBMAP_DISABLE"
 .It Ev LD_DUMP_REL_POST
 If set,
@@ -176,6 +176,12 @@ the directories specified by
 .Ev LD_LIBRARY_PATH
 will be searched first
 followed by the set of built-in standard directories.
+This variable is unset for set-user-ID and set-group-ID programs.
+.Ev LD_LIBRARY_PATH_FDS
+A colon separated list of file descriptor numbers for library directories.
+This is intended for future use within capsicum
+sandboxes, when global namespaces such as the filesystem are unavailable.
+It is consulted just after LD_LIBRARY_PATH.
 This variable is unset for set-user-ID and set-group-ID programs.
 .It Ev LD_BIND_NOW
 When set to a nonempty string, causes
@@ -280,8 +286,9 @@ at the same time.
 .Sh DIFFERENCES BETWEEN .1 and .2
 ABI changes have been made to support TLS allocation and initialization
 and to give threading libraries a chance to complete initialization of the
-TCB prior to the calling of the _init() functions for the dynamically loaded
-libraries.
+TCB prior to the calling of the
+.Fn _init
+functions for the dynamically loaded libraries.
 .Sh FILES
 .Bl -tag -width ".Pa /var/run/ld-elf.so.hints" -compact
 .It Pa /var/run/ld-elf.so.hints
@@ -295,6 +302,7 @@ To set up an
 for printing out the functions as they are called, this code can be used:
 .Bd -literal -offset indent
 #include <string.h>
+#include <unistd.h>
 
 static int nl = 10;
 

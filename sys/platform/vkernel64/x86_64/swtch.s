@@ -46,11 +46,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -84,7 +80,7 @@
 
 #include "assym.s"
 
-#define MPLOCKED        lock ;
+#define	MPLOCKED	lock ;
 
 	.data
 
@@ -172,24 +168,24 @@ ENTRY(cpu_heavy_switch)
 	/*
 	 * Save debug regs if necessary
 	 */
-	movq    PCB_FLAGS(%rdx),%rax
-	andq    $PCB_DBREGS,%rax
-	jz      1f                              /* no, skip over */
-	movq    %dr7,%rax                       /* yes, do the save */
-	movq    %rax,PCB_DR7(%rdx)
+	movq	PCB_FLAGS(%rdx),%rax
+	andq	$PCB_DBREGS,%rax
+	jz	1f				/* no, skip over */
+	movq	%dr7,%rax			/* yes, do the save */
+	movq	%rax,PCB_DR7(%rdx)
 	/* JG correct value? */
-	andq    $0x0000fc00, %rax               /* disable all watchpoints */
-	movq    %rax,%dr7
-	movq    %dr6,%rax
-	movq    %rax,PCB_DR6(%rdx)
-	movq    %dr3,%rax
-	movq    %rax,PCB_DR3(%rdx)
-	movq    %dr2,%rax
-	movq    %rax,PCB_DR2(%rdx)
-	movq    %dr1,%rax
-	movq    %rax,PCB_DR1(%rdx)
-	movq    %dr0,%rax
-	movq    %rax,PCB_DR0(%rdx)
+	andq	$0x0000fc00, %rax		/* disable all watchpoints */
+	movq	%rax,%dr7
+	movq	%dr6,%rax
+	movq	%rax,PCB_DR6(%rdx)
+	movq	%dr3,%rax
+	movq	%rax,PCB_DR3(%rdx)
+	movq	%dr2,%rax
+	movq	%rax,PCB_DR2(%rdx)
+	movq	%dr1,%rax
+	movq	%rax,PCB_DR1(%rdx)
+	movq	%dr0,%rax
+	movq	%rax,PCB_DR0(%rdx)
 1:
 
 #if 1
@@ -224,6 +220,7 @@ ENTRY(cpu_heavy_switch)
 	movq	TD_SP(%rax),%rsp
 	CHECKNZ((%rsp), %r9)
 	ret
+END(cpu_heavy_switch)
 
 /*
  *  cpu_exit_switch(struct thread *next)
@@ -281,9 +278,10 @@ ENTRY(cpu_exit_switch)
 	movq	TD_SP(%rax),%rsp
 	CHECKNZ((%rsp), %r9)
 	ret
+END(cpu_exit_switch)
 
 /*
- * cpu_heavy_restore()	(current thread in %rax on entry)
+ * cpu_heavy_restore()	(current thread in %rax on entry, %rbx is old thread)
  *
  *	Restore the thread after an LWKT switch.  This entry is normally
  *	called via the LWKT switch restore function, which was pulled
@@ -322,24 +320,24 @@ ENTRY(cpu_heavy_restore)
 	movq	TD_LWP(%rax),%rcx
 	movq	LWP_VMSPACE(%rcx), %rcx		/* RCX = vmspace */
 
-	movq	PCPU(other_cpus)+0, %rsi
+	movq	PCPU(cpumask)+0, %rsi
 	MPLOCKED orq	%rsi, VM_PMAP+PM_ACTIVE+0(%rcx)
-	movq	PCPU(other_cpus)+8, %rsi
+	movq	PCPU(cpumask)+8, %rsi
 	MPLOCKED orq	%rsi, VM_PMAP+PM_ACTIVE+8(%rcx)
-	movq	PCPU(other_cpus)+16, %rsi
+	movq	PCPU(cpumask)+16, %rsi
 	MPLOCKED orq	%rsi, VM_PMAP+PM_ACTIVE+16(%rcx)
-	movq	PCPU(other_cpus)+24, %rsi
+	movq	PCPU(cpumask)+24, %rsi
 	MPLOCKED orq	%rsi, VM_PMAP+PM_ACTIVE+24(%rcx)
 
-	movl    VM_PMAP+PM_ACTIVE_LOCK(%rcx),%esi
+	movl	VM_PMAP+PM_ACTIVE_LOCK(%rcx),%esi
 	testl	$CPULOCK_EXCL,%esi
 	jz	1f
 
-	movq    %rax,%r12		/* save newthread ptr */
-	movq    %rcx,%rdi               /* (found to be set) */
-	call    pmap_interlock_wait     /* pmap_interlock_wait(%rdi:vm) */
-	movq    %r12,%rax
-	movq    TD_PCB(%rax),%rdx       /* RDX = PCB */
+	movq	%rax,%r12		/* save newthread ptr */
+	movq	%rcx,%rdi		/* (found to be set) */
+	call	pmap_interlock_wait	/* pmap_interlock_wait(%rdi:vm) */
+	movq	%r12,%rax
+	movq	TD_PCB(%rax),%rdx	/* RDX = PCB */
 1:
 	/*
 	 * Restore the MMU address space.  If it is the same as the last
@@ -373,7 +371,7 @@ ENTRY(cpu_heavy_restore)
 	movq	PCB_EXT(%rdx),%rdi	/* check for a PCB extension */
 	movq	$1,%rcx			/* maybe mark use of a private tss */
 	testq	%rdi,%rdi
-#if JG
+#if 0 /* JG */
 	jnz	2f
 #endif
 
@@ -387,7 +385,7 @@ ENTRY(cpu_heavy_restore)
 	movq	%rcx, PCPU(common_tss) + TSS_RSP0
 	movq	%rcx, PCPU(rsp0)
 
-#if JG
+#if 0 /* JG */
 	cmpl	$0,PCPU(private_tss)	/* don't have to reload if      */
 	je	3f			/* already using the common TSS */
 
@@ -490,34 +488,35 @@ ENTRY(cpu_heavy_restore)
 	/*
 	 * Restore the DEBUG register state if necessary.
 	 */
-	movq    PCB_FLAGS(%rdx),%rax
-	andq    $PCB_DBREGS,%rax
-	jz      1f                              /* no, skip over */
-	movq    PCB_DR6(%rdx),%rax              /* yes, do the restore */
-	movq    %rax,%dr6
-	movq    PCB_DR3(%rdx),%rax
-	movq    %rax,%dr3
-	movq    PCB_DR2(%rdx),%rax
-	movq    %rax,%dr2
-	movq    PCB_DR1(%rdx),%rax
-	movq    %rax,%dr1
-	movq    PCB_DR0(%rdx),%rax
-	movq    %rax,%dr0
-	movq	%dr7,%rax                /* load dr7 so as not to disturb */
+	movq	PCB_FLAGS(%rdx),%rax
+	andq	$PCB_DBREGS,%rax
+	jz	1f				/* no, skip over */
+	movq	PCB_DR6(%rdx),%rax		/* yes, do the restore */
+	movq	%rax,%dr6
+	movq	PCB_DR3(%rdx),%rax
+	movq	%rax,%dr3
+	movq	PCB_DR2(%rdx),%rax
+	movq	%rax,%dr2
+	movq	PCB_DR1(%rdx),%rax
+	movq	%rax,%dr1
+	movq	PCB_DR0(%rdx),%rax
+	movq	%rax,%dr0
+	movq	%dr7,%rax		/* load dr7 so as not to disturb */
 	/* JG correct value? */
-	andq    $0x0000fc00,%rax         /*   reserved bits               */
+	andq	$0x0000fc00,%rax	/*   reserved bits               */
 	/* JG we've got more registers on x86_64 */
 	movq    PCB_DR7(%rdx),%rcx
 	/* JG correct value? */
 	andq	$~0x0000fc00,%rcx
-	orq     %rcx,%rax
-	movq    %rax,%dr7
+	orq	%rcx,%rax
+	movq	%rax,%dr7
 1:
 	movq	%rbx,%rax
 	movq	PCB_RBX(%rdx),%rbx
 
 	CHECKNZ((%rsp), %r9)
 	ret
+END(cpu_heavy_restore)
 
 /*
  * savectx(struct pcb *pcb)
@@ -568,7 +567,7 @@ ENTRY(savectx)
 	popq	%rcx
 
 	movq	$PCB_SAVEFPU_SIZE,%rdx
-	leaq    PCB_SAVEFPU(%rcx),%rcx
+	leaq	PCB_SAVEFPU(%rcx),%rcx
 	movq	%rcx,%rsi
 	movq	%rax,%rdi
 	call	bcopy
@@ -577,9 +576,11 @@ ENTRY(savectx)
 1:
 	CHECKNZ((%rsp), %r9)
 	ret
+END(savectx)
 
 /*
  * cpu_idle_restore()	(current thread in %rax on entry) (one-time execution)
+ *			(old thread is %rbx on entry)
  *
  *	Don't bother setting up any regs other than %rbp so backtraces
  *	don't die.  This restore function is used to bootstrap into the
@@ -602,8 +603,8 @@ ENTRY(cpu_idle_restore)
 	movl	$0,%ebp
 	/* JG push RBP? */
 	pushq	$0
-	cmpl    $0,PCPU(cpuid)
-	je      1f
+	cmpl	$0,PCPU(cpuid)
+	je	1f
 	andl	$~TDF_RUNNING,TD_FLAGS(%rbx)
 	orl	$TDF_RUNNING,TD_FLAGS(%rax)	/* manual, no switch_return */
 	call	ap_init
@@ -621,9 +622,11 @@ ENTRY(cpu_idle_restore)
 	call	lwkt_switch_return
 	popq	%rax
 	jmp	cpu_idle
+END(cpu_idle_restore)
 
 /*
  * cpu_kthread_restore() (current thread is %rax on entry) (one-time execution)
+ *			 (old thread is %rbx on entry)
  *
  *	Don't bother setting up any regs other then %rbp so backtraces
  *	don't die.  This restore function is used to bootstrap into an
@@ -646,7 +649,7 @@ ENTRY(cpu_kthread_restore)
 	 * rax and rbx come from the switchout code.  Call
 	 * lwkt_switch_return(otd).
 	 *
-	 * NOTE: unlike i386, %rsi and %rdi are not call-saved regs.
+	 * NOTE: unlike i386, the %rsi and %rdi are not call-saved regs.
 	 */
 	pushq	%rax
 	movq	%rbx,%rdi
@@ -658,6 +661,7 @@ ENTRY(cpu_kthread_restore)
 	/* note: top of stack return address inherited by function */
 	CHECKNZ(%rax, %r9)
 	jmp	*%rax
+END(cpu_kthread_restore)
 
 /*
  * cpu_lwkt_switch(struct thread *)
@@ -713,6 +717,7 @@ ENTRY(cpu_lwkt_switch)
 	 */
 	CHECKNZ((%rsp), %r9)
 	ret
+END(cpu_lwkt_switch)
 
 /*
  * cpu_lwkt_restore()	(current thread in %rax on entry)
@@ -740,6 +745,7 @@ ENTRY(cpu_lwkt_restore)
 	popq	%rbx
 	popq	%rbp
 	ret
+END(cpu_lwkt_restore)
 
 /*
  * bootstrap_idle()
@@ -751,3 +757,4 @@ ENTRY(bootstrap_idle)
 	movq	%rax,%rbx
 	movq	TD_SP(%rax),%rsp
 	ret
+END(bootstrap_idle)

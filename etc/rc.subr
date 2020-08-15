@@ -1,5 +1,5 @@
 # $NetBSD: rc.subr,v 1.49 2002/05/21 12:31:01 lukem Exp $
-# $FreeBSD: src/etc/rc.subr,v 1.13 2003/06/09 17:31:06 mtm Exp $
+# $FreeBSD: head/etc/rc.subr 275359 2014-12-01 12:17:42Z des $
 #
 # Copyright (c) 1997-2002 The NetBSD Foundation, Inc.
 # All rights reserved.
@@ -39,18 +39,26 @@
 #	functions used by various rc scripts
 #
 
+: ${RC_PID:=$$}; export RC_PID
+
 #
 #	Operating System dependent/independent variables
 #
 
-if [ "X$_file" = "X" ]; then
-    _file=$0
+if [ -z "$_file" ]; then
+	_file="$0"
+fi
+provide_list=`rcorder -p $_file`
+
+if [ -n "${_rc_subr_loaded}" ]; then
+	return
 fi
 
-provide_list=`rcorder -p $_file`
+_rc_subr_loaded="YES"
 
 SYSCTL="/sbin/sysctl"
 SYSCTL_N="${SYSCTL} -n"
+SYSCTL_W="${SYSCTL}"
 CMD_OSTYPE="${SYSCTL_N} kern.ostype"
 OSTYPE=`${CMD_OSTYPE}`
 
@@ -60,13 +68,25 @@ RC_DISABLED=2
 RC_IRRELEVANT=3
 RC_CONFIGURED=4
 RC_STOPPED=5
-SYSCTL_W="${SYSCTL}"
 
 #
 #	functions
 #	---------
 
+# list_vars pattern
+#	List vars matching pattern.
 #
+list_vars()
+{
+	set | { while read LINE; do
+		var="${LINE%%=*}"
+		case "$var" in
+		"$LINE"|*[!a-zA-Z0-9_]*) continue ;;
+		$1) echo $var
+		esac
+	done; }
+}
+
 # set_rcvar base_var
 #	Set the variable name enabling a specific service.
 #	FreeBSD uses ${service}_enable, while NetBSD uses
@@ -244,6 +264,7 @@ checkyesno()
 	esac
 }
 
+#
 # reverse_list list
 #	print the list in reverse order
 #
@@ -254,6 +275,32 @@ reverse_list()
 		_revlist="$_revfile $_revlist"
 	done
 	echo $_revlist
+}
+
+#
+# stop_boot always
+#	If booting directly to multiuser or $always is true,
+#	send SIGTERM to the parent (/etc/rc) to abort the boot.
+#	Otherwise just exit.
+#
+stop_boot()
+{
+	local always
+
+	case $1 in
+		#	"yes", "true", "on", or "1"
+        [Yy][Ee][Ss]|[Tt][Rr][Uu][Ee]|[Oo][Nn]|1)
+		always=true
+		;;
+	*)
+		always=false
+		;;
+	esac
+	if [ "$autoboot" = yes -o "$always" = true ]; then
+		echo "ERROR: ABORTING BOOT (sending SIGTERM to parent)!"
+		kill -TERM ${RC_PID}
+	fi
+	exit 1
 }
 
 #
@@ -527,6 +574,8 @@ check_startmsgs()
 #				NOTE:	$flags from the parent environment
 #					can be used to override this.
 #
+#	${name}_env	n	Environment variables to run ${command} with.
+#
 #	${name}_nice	n	Nice level to run ${command} at.
 #
 #	${name}_user	n	User to run ${command} as, using su(1) if not
@@ -539,6 +588,8 @@ check_startmsgs()
 #	${name}_groups	n	Comma separated list of supplementary groups
 #				to run the chrooted ${command} with.
 #				Requires /usr to be mounted.
+#
+#	${name}_prepend	n	Command added before ${command}.
 #
 #	${rc_arg}_cmd	n	If set, use this as the method when invoked;
 #				Otherwise, use default command (see below)
@@ -567,7 +618,7 @@ check_startmsgs()
 #				The check and possible loads are actually
 #				done after start_precmd so that the modules
 #				aren't loaded in vain, should the precmd
-#				return a non-zero status to indicate a error.
+#				return a non-zero status to indicate an error.
 #				If a word in the list looks like "foo:bar",
 #				"foo" is the KLD file name and "bar" is the
 #				module name.  If a word looks like "foo~bar",
@@ -723,7 +774,8 @@ run_rc_command()
 	fi
 	eval _chdir=\$${name}_chdir	_chroot=\$${name}_chroot \
 	    _nice=\$${name}_nice	_user=\$${name}_user \
-	    _group=\$${name}_group	_groups=\$${name}_groups
+	    _group=\$${name}_group	_groups=\$${name}_groups \
+	    _env=\$${name}_env 		_prepend=\$${name}_prepend
 
 	if [ -n "$_user" ]; then	# unset $_user if running as that user
 		if [ "$_user" = "$(id -un)" ]; then
@@ -875,15 +927,20 @@ run_rc_command()
 			if [ -n "$_chroot" ]; then
 				_doit="\
 ${_nice:+nice -n $_nice }\
+${_env:+env $_env }\
 chroot ${_user:+-u $_user }${_group:+-g $_group }${_groups:+-G $_groups }\
 $_chroot $command $rc_flags $command_args"
 			else
 				_doit="\
 ${_chdir:+cd $_chdir; }\
 ${_nice:+nice -n $_nice }\
+${_env:+env $_env }\
 $command $rc_flags $command_args"
 				if [ -n "$_user" ]; then
 				    _doit="su -m $_user -c 'sh -c \"$_doit\"'"
+				fi
+				if [ -n "$_prepend" ]; then
+					_doit="$_prepend $_doit"
 				fi
 			fi
 
@@ -1040,6 +1097,83 @@ $command $rc_flags $command_args"
 }
 
 #
+# Helper functions for run_rc_command: common code.
+# They use such global variables besides the exported rc_* ones:
+#
+#	name	       R/W
+#	------------------
+#	_precmd		R
+#	_postcmd	R
+#	_return		W
+#
+_run_rc_precmd()
+{
+	check_required_before "$rc_arg" || return 1
+
+	if [ -n "$_precmd" ]; then
+		debug "run_rc_command: ${rc_arg}_precmd: $_precmd $rc_extra_args"
+		eval "$_precmd $rc_extra_args"
+		_return=$?
+
+		# If precmd failed and force isn't set, request exit.
+		if [ $_return -ne 0 ] && [ -z "$rc_force" ]; then
+			return 1
+		fi
+	fi
+
+	check_required_after "$rc_arg" || return 1
+
+	return 0
+}
+
+_run_rc_postcmd()
+{
+	if [ -n "$_postcmd" ]; then
+		debug "run_rc_command: ${rc_arg}_postcmd: $_postcmd $rc_extra_args"
+		eval "$_postcmd $rc_extra_args"
+		_return=$?
+	fi
+	return 0
+}
+
+_run_rc_doit()
+{
+	debug "run_rc_command: doit: $*"
+	eval "$@"
+	_return=$?
+
+	# If command failed and force isn't set, request exit.
+	if [ $_return -ne 0 ] && [ -z "$rc_force" ]; then
+		return 1
+	fi
+
+	return 0
+}
+
+_run_rc_notrunning()
+{
+	local _pidmsg
+
+	if [ -n "$pidfile" ]; then
+		_pidmsg=" (check $pidfile)."
+	else
+		_pidmsg=
+	fi
+	echo 1>&2 "${name} not running?${_pidmsg}"
+}
+
+_run_rc_killcmd()
+{
+	local _cmd
+
+	_cmd="kill -$1 $rc_pid"
+	if [ -n "$_user" ]; then
+		_cmd="su -m ${_user} -c 'sh -c \"${_cmd}\"'"
+	fi
+	echo "$_cmd"
+}
+
+#
 # run_rc_script file arg
 #	Start the script `file' with `arg', and correctly handle the
 #	return value from the script.  If `file' ends with `.sh', it's
@@ -1182,12 +1316,10 @@ load_rc_config()
 
 	# XXX - Deprecated variable name support
 	#
-        	[ -n "$portmap_enable" ] && rpcbind_enable="$portmap_enable"
-        	[ -n "$portmap_program" ] && rpcbind_program="$portmap_program"
-        	[ -n "$portmap_flags" ] && rpcbind_flags="$portmap_flags"
-        	[ -n "$single_mountd_enable" ] && mountd_enable="$single_mountd_enable"
-		[ -n "$dhcp_program" ] && dhclient_program="$dhcp_program"
-		[ -n "$dhcp_flags" ] && dhclient_flags="$dhcp_flags"
+	[ -n "$portmap_enable" ] && rpcbind_enable="$portmap_enable"
+	[ -n "$portmap_program" ] && rpcbind_program="$portmap_program"
+	[ -n "$portmap_flags" ] && rpcbind_flags="$portmap_flags"
+	[ -n "$single_mountd_enable" ] && mountd_enable="$single_mountd_enable"
 
 }
 
@@ -1397,4 +1529,22 @@ devfs_domount()
 	fi
 
 return 0
+}
+
+# Find scripts in local_startup directories.
+find_local_scripts() {
+	local_rc=''
+	for dir in ${local_startup}; do
+		if [ -d "${dir}" ]; then
+			for file in `grep -l '^# PROVIDE:' ${dir}/* 2>/dev/null`; do
+				case "$file" in
+				*.sample) ;;
+				*)	if [ -x "$file" ]; then
+						local_rc="${local_rc} ${file}"
+					fi
+					;;
+				esac
+			done
+		fi
+	done
 }

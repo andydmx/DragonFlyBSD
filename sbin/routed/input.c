@@ -10,11 +10,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgment:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -30,17 +26,11 @@
  * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
  *
+ * @(#)input.c	8.1 (Berkeley) 6/5/93
  * $FreeBSD: src/sbin/routed/input.c,v 1.7.2.1 2001/08/01 09:01:45 obrien Exp $
  */
 
 #include "defs.h"
-
-#if !defined(sgi) && !defined(__NetBSD__)
-static char sccsid[] __attribute__((unused)) = "@(#)input.c	8.1 (Berkeley) 6/5/93";
-#elif defined(__NetBSD__)
-#include <sys/cdefs.h>
-__RCSID("$NetBSD$");
-#endif
 
 static void input(struct sockaddr_in *, struct interface *, struct interface *,
 		  struct rip *, int);
@@ -992,10 +982,10 @@ ck_passwd(struct interface *aifp,
 					       naddr_ntoa(from));
 			}
 
-			MD5Init(&md5_ctx);
-			MD5Update(&md5_ctx, (u_char *)rip, len);
-			MD5Update(&md5_ctx, ap->key, RIP_AUTH_MD5_LEN);
-			MD5Final(hash, &md5_ctx);
+			MD5_Init(&md5_ctx);
+			MD5_Update(&md5_ctx, (u_char *)rip, len);
+			MD5_Update(&md5_ctx, ap->key, RIP_AUTH_MD5_LEN);
+			MD5_Final(hash, &md5_ctx);
 			if (!memcmp(hash, na2->au.au_pw, sizeof(hash)))
 				return 1;
 		}

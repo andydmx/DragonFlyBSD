@@ -26,10 +26,12 @@
  **************************************************************************/
 /*
  * Authors: Thomas Hellstrom <thellstrom-at-vmware-dot-com>
- * $FreeBSD: head/sys/dev/drm2/drm_global.c 248060 2013-03-08 18:11:02Z dumbbell $
  */
 
 #include <drm/drmP.h>
+#include <linux/mutex.h>
+#include <linux/slab.h>
+#include <linux/module.h>
 #include <drm/drm_global.h>
 
 struct drm_global_item {
@@ -57,51 +59,80 @@ void drm_global_release(void)
 	int i;
 	for (i = 0; i < DRM_GLOBAL_NUM; ++i) {
 		struct drm_global_item *item = &glob[i];
-		KKASSERT(item->object == NULL);
-		KKASSERT(item->refcount == 0);
-		lockuninit(&item->mutex);
+		BUG_ON(item->object != NULL);
+		BUG_ON(item->refcount != 0);
 	}
 }
 
+/**
+ * drm_global_item_ref - Initialize and acquire reference to memory
+ * object
+ * @ref: Object for initialization
+ *
+ * This initializes a memory object, allocating memory and calling the
+ * .init() hook. Further calls will increase the reference count for
+ * that item.
+ *
+ * Returns:
+ * Zero on success, non-zero otherwise.
+ */
 int drm_global_item_ref(struct drm_global_reference *ref)
 {
-	int ret;
+	int ret = 0;
 	struct drm_global_item *item = &glob[ref->global_type];
-	void *object;
 
-	lockmgr(&item->mutex, LK_EXCLUSIVE);
+	mutex_lock(&item->mutex);
 	if (item->refcount == 0) {
-		item->object = kmalloc(ref->size, M_DRM,
-		    M_WAITOK | M_ZERO);
-
-		ref->object = item->object;
+		ref->object = kzalloc(ref->size, GFP_KERNEL);
+		if (unlikely(ref->object == NULL)) {
+			ret = -ENOMEM;
+			goto error_unlock;
+		}
 		ret = ref->init(ref);
 		if (unlikely(ret != 0))
-			goto out_err;
+			goto error_free;
 
+		item->object = ref->object;
+	} else {
+		ref->object = item->object;
 	}
+
 	++item->refcount;
-	ref->object = item->object;
-	object = item->object;
-	lockmgr(&item->mutex, LK_RELEASE);
+	mutex_unlock(&item->mutex);
 	return 0;
-out_err:
-	lockmgr(&item->mutex, LK_RELEASE);
-	item->object = NULL;
+
+error_free:
+	kfree(ref->object);
+	ref->object = NULL;
+error_unlock:
+	mutex_unlock(&item->mutex);
 	return ret;
 }
+EXPORT_SYMBOL(drm_global_item_ref);
+
+/**
+ * drm_global_item_unref - Drop reference to memory
+ * object
+ * @ref: Object being removed
+ *
+ * Drop a reference to the memory object and eventually call the
+ * release() hook.  The allocated object should be dropped in the
+ * release() hook or before calling this function
+ *
+ */
 
 void drm_global_item_unref(struct drm_global_reference *ref)
 {
 	struct drm_global_item *item = &glob[ref->global_type];
 
-	lockmgr(&item->mutex, LK_EXCLUSIVE);
-	KKASSERT(item->refcount != 0);
-	KKASSERT(ref->object == item->object);
+	mutex_lock(&item->mutex);
+	BUG_ON(item->refcount == 0);
+	BUG_ON(ref->object != item->object);
 	if (--item->refcount == 0) {
 		ref->release(ref);
-		drm_free(item->object, M_DRM);
 		item->object = NULL;
 	}
-	lockmgr(&item->mutex, LK_RELEASE);
+	mutex_unlock(&item->mutex);
 }
+EXPORT_SYMBOL(drm_global_item_unref);
+

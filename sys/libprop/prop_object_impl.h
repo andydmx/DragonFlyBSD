@@ -32,9 +32,7 @@
 #ifndef _PROPLIB_PROP_OBJECT_IMPL_H_
 #define	_PROPLIB_PROP_OBJECT_IMPL_H_
 
-#if defined(_KERNEL) || defined(_STANDALONE)
-#include <sys/libkern.h>
-#else
+#if !defined(_KERNEL) && !defined(_STANDALONE)
 #include <inttypes.h>
 #endif
 
@@ -275,12 +273,12 @@ struct prop_pool_init {
 #define _PROP_POOL_INIT(pp, size, wchan)				\
 MALLOC_DEFINE(M_##pp, wchan, wchan);					\
 struct objcache *pp;							\
-static void									\
+static void								\
 pp##_init(void)								\
 {									\
 	pp = objcache_create_simple(M_##pp, size);			\
 }									\
-SYSINIT(pp##_init, SI_SUB_PRE_DRIVERS, SI_ORDER_ANY, pp##_init, NULL)
+SYSINIT(pp##_init, SI_SUB_PROP, SI_ORDER_ANY, pp##_init, NULL)
 
 #define	_PROP_MALLOC_DEFINE(t, s, l)					\
 		MALLOC_DEFINE(t, s, l);
@@ -295,7 +293,7 @@ SYSINIT(pp##_init, SI_SUB_PRE_DRIVERS, SI_ORDER_ANY, pp##_init, NULL)
 #define	_PROP_MUTEX_UNLOCK(x)		lockmgr(&(x), LK_RELEASE)
 
 #define	_PROP_RWLOCK_DECL(x)		struct mtx x;
-#define	_PROP_RWLOCK_INIT(x)		mtx_init(&(x))
+#define	_PROP_RWLOCK_INIT(x)		mtx_init(&(x), "prop")
 #define	_PROP_RWLOCK_RDLOCK(x)		mtx_lock(&(x))
 #define	_PROP_RWLOCK_WRLOCK(x)		mtx_lock(&(x))
 #define	_PROP_RWLOCK_UNLOCK(x)		mtx_unlock(&(x))

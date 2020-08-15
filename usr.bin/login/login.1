@@ -27,9 +27,8 @@
 .\"
 .\"	@(#)login.1	8.2 (Berkeley) 5/5/94
 .\" $FreeBSD: src/usr.bin/login/login.1,v 1.33 2007/11/30 11:02:36 philip Exp $
-.\" $DragonFly: src/usr.bin/login/login.1,v 1.2 2003/06/17 04:29:28 dillon Exp $
 .\"
-.Dd September 13, 2006
+.Dd December 31, 2017
 .Dt LOGIN 1
 .Os
 .Sh NAME
@@ -50,7 +49,7 @@ of the user fails,
 .Nm
 prompts for a user name.
 Authentication of users is configurable via
-.Xr pam 8 .
+.Xr pam 3 .
 Password authentication is the default.
 .Pp
 The following options are available:
@@ -97,7 +96,7 @@ If the file
 .Pa .hushlogin
 exists in the user's home directory, all of these messages are suppressed.
 This is to simplify logins for non-human users, such as
-.Xr uucp 1 .
+.Xr uucp 1 Pq Pa net/freebsd-uucp .
 .Pp
 The
 .Nm
@@ -134,7 +133,7 @@ makes login quieter
 .It Pa /etc/auth.conf
 configure authentication services
 .It Pa /etc/pam.d/login
-.Xr pam 8
+.Xr pam 3
 configuration file
 .El
 .Sh SEE ALSO
@@ -143,7 +142,7 @@ configuration file
 .Xr csh 1 ,
 .Xr newgrp 1 ,
 .Xr passwd 1 ,
-.Xr rlogin 1 ,
+.Xr rlogin 1 Pq Pa net/bsdrcmds ,
 .Xr getpass 3 ,
 .Xr fbtab 5 ,
 .Xr login.access 5 ,

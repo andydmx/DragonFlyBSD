@@ -18,11 +18,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -44,7 +40,6 @@
  * Author: Jeff Forys, University of Utah CSS
  *
  * $FreeBSD: src/libexec/rbootd/defs.h,v 1.2.6.1 2001/02/18 02:54:11 kris Exp $
- * $DragonFly: src/libexec/rbootd/defs.h,v 1.3 2003/11/14 03:54:30 dillon Exp $
  */
 
 #include "rmp.h"
@@ -164,7 +159,7 @@ void	 DebugOn (int);
 void	 DispPkt (RMPCONN *, int);
 void	 DoTimeout (void);
 void	 DspFlnm (u_int, char *);
-void	 Exit (int);
+void	 Exit (int) __dead2;
 CLIENT	*FindClient (RMPCONN *);
 RMPCONN	*FindConn (RMPCONN *);
 void	 FreeClients (void);

@@ -611,9 +611,12 @@ ng_source_store_output_ifp(sc_p sc, char *ifname)
 	struct ifnet *ifp;
 	int s;
 
+	ifnet_lock();
+
 	ifp = ifunit(ifname);
 
 	if (ifp == NULL) {
+		ifnet_unlock();
 		kprintf("%s: can't find interface %d\n", __func__, if_index);
 		return (EINVAL);
 	}
@@ -633,6 +636,7 @@ ng_source_store_output_ifp(sc_p sc, char *ifname)
 	}
 	splx(s);
 #endif
+	ifnet_unlock();
 	return (0);
 }
 
@@ -878,9 +882,9 @@ ng_source_dup_mod(sc_p sc, struct mbuf *m0, struct mbuf **m_ptr)
 
 	/* Duplicate the packet. */
 	if (modify)
-		m = m_dup(m0, MB_DONTWAIT);
+		m = m_dup(m0, M_NOWAIT);
 	else
-		m = m_copypacket(m0, MB_DONTWAIT);
+		m = m_copypacket(m0, M_NOWAIT);
 	if (m == NULL) {
 		error = ENOBUFS;
 		goto done;

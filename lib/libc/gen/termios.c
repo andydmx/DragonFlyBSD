@@ -1,4 +1,6 @@
 /*-
+ * SPDX-License-Identifier: BSD-3-Clause
+ *
  * Copyright (c) 1989, 1993
  *	The Regents of the University of California.  All rights reserved.
  *
@@ -10,11 +12,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -30,10 +28,8 @@
  * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
  *
- * $FreeBSD: src/lib/libc/gen/termios.c,v 1.9.2.1 2000/03/18 23:13:25 jasone Exp $
- * $DragonFly: src/lib/libc/gen/termios.c,v 1.5 2005/11/19 22:32:53 swildner Exp $
- *
  * @(#)termios.c	8.2 (Berkeley) 2/21/94
+ * $FreeBSD: head/lib/libc/gen/termios.c 326025 2017-11-20 19:49:47Z pfg $
  */
 
 #include "namespace.h"
@@ -43,9 +39,14 @@
 #include <sys/time.h>
 
 #include <errno.h>
+#include <string.h>
+#define	TTYDEFCHARS
 #include <termios.h>
+#undef TTYDEFCHARS
 #include <unistd.h>
 #include "un-namespace.h"
+
+int __tcdrain(int);
 
 int
 tcgetattr(int fd, struct termios *t)
@@ -108,6 +109,18 @@ tcgetsid(int fd)
 	return ((pid_t)s);
 }
 
+int
+tcsetsid(int fd, pid_t pid)
+{
+
+	if (pid != getsid(0)) {
+		errno = EINVAL;
+		return (-1);
+	}
+
+	return (_ioctl(fd, TIOCSCTTY, NULL));
+}
+
 speed_t
 cfgetospeed(const struct termios *t)
 {
@@ -162,6 +175,22 @@ cfmakeraw(struct termios *t)
 	t->c_cflag |= CS8|CREAD;
 	t->c_cc[VMIN] = 1;
 	t->c_cc[VTIME] = 0;
+}
+
+/*
+ * Obtain a termios structure which is similar to the one provided by
+ * the kernel.
+ */
+void
+cfmakesane(struct termios *t)
+{
+	t->c_cflag = TTYDEF_CFLAG;
+	t->c_iflag = TTYDEF_IFLAG;
+	t->c_lflag = TTYDEF_LFLAG;
+	t->c_oflag = TTYDEF_OFLAG;
+	t->c_ispeed = TTYDEF_SPEED;
+	t->c_ospeed = TTYDEF_SPEED;
+	memcpy(&t->c_cc, ttydefchars, sizeof ttydefchars);
 }
 
 int

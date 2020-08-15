@@ -23,7 +23,7 @@
  * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
  *
- * $FreeBSD: src/sys/dev/hptrr/osm.h,v 1.4 2008/03/08 18:06:48 scottl Exp $
+ * $FreeBSD: head/sys/dev/hptrr/osm.h 176939 2008-03-08 18:06:48Z scottl $
  */
 #include <dev/raid/hptrr/hptrr_config.h>
 /*
@@ -42,7 +42,7 @@
 extern int os_max_cache_size;
 
 
-#define DMAPOOL_PAGE_SIZE 0x1000 /* PAGE_SIZE (i386/x86_64) */
+#define DMAPOOL_PAGE_SIZE 0x1000 /* PAGE_SIZE (x86_64) */
 #define os_max_cache_pages (os_max_cache_size/DMAPOOL_PAGE_SIZE)
 
 /* data types */
@@ -196,8 +196,8 @@ void __os_dbgbreak(const char *file, int line);
 void os_check_stack(const char *location, int size);
 #define HPT_CHECK_STACK(size) os_check_stack(__func__, (size))
 #else
-#define KdPrint(x)
-#define HPT_ASSERT(x)
+#define KdPrint(x)	do { } while (0)
+#define HPT_ASSERT(x)	do { } while (0)
 #define HPT_CHECK_STACK(size)
 #endif
 

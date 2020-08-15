@@ -9,8 +9,388 @@
 # mailing list with the details.
 
 +-----------------------------------------------------------------------+
++         UPGRADING DRAGONFLY FROM 5.6 TO LATER VERSIONS                +
++-----------------------------------------------------------------------+
+
+LIBRADIUS AND LIBTACPLUS REMOVED
+--------------------------------
+
+Both libraries have been moved from base to DPorts net/ category.
+
+PAM_SSH MODULE REMOVED
+----------------------
+
+The pam_ssh(8) have been removed from base to DPorts security/pam_ssh.
+
+UTMP LEGACY API REMOVED
+-----------------------
+
+The legacy "utmp" API (getutent() and friends, utmp.h, etc.) has been
+removed, and we are now using the POSIX "utmpx" API (getutxent(),
+utmpx.h, etc.) only. The most visible change for users is that the
+/var/log/wtmp file will no longer be written to, just /var/log/wtmpx.
+The wtmpcvt(1) utility is provided to convert old wtmp format files to
+wtmpx.
+
+To not break old applications, the utmp symbols are still provided by
+libc as dummy functions that do nothing and always succeed.
+
+TIMED AND TIMEDC REMOVED
+------------------------
+
+timed(8) and timedc(8) have been removed because they are beyond
+obsolete for setting the time.
+
+LIBOPIE, LIBMD REMOVED
+----------------------
+
+Removal of OPIE requires /etc/pam.d/ configs to be updated.
+
++-----------------------------------------------------------------------+
++         UPGRADING DRAGONFLY FROM 5.4 TO LATER VERSIONS                +
++-----------------------------------------------------------------------+
+
+GCC50 REMOVED
+-------------
+
+The GCC50 compiler has been retired.  It has been replaced by a GCC80.
+The default alternative compiler has stayed the same - GCC47.
+
+
+PUFFS, PUTTER AND LIBREFUSE REMOVED
+-----------------------------------
+
+The puffs(4)/putter(4) subsystem has been removed, along with librefuse,
+libpuffs, and the mount_psshfs(8) utility. All of these have never been
+working correctly.
+
+FFS_ROOT OPTION REMOVED
+-----------------------
+
+The FFS_ROOT kernel configuration option has been finally removed, after
+having been a no-op since 4.9. That means users using a custom kernel
+configuration file that still contains it need to remove the option from
+that file.
+
++-----------------------------------------------------------------------+
++         UPGRADING DRAGONFLY FROM 5.2 TO LATER VERSIONS                +
++-----------------------------------------------------------------------+
+
+DIGI, RP AND SI DRIVERS REMOVED
+-------------------------------
+
+The digi(4), rp(4) and si(4) serial drivers have been removed. None of
+them were in our default kernel configuration file. The sicontrol(8)
+utility was removed, too.
+
+MKINITRD COMMAND REMOVED
+------------------------
+
+The mkinitrd(8) command is removed and its functionality is replaced by
+the new "initrd" make target.  After rebooting into the new world and
+verifying everything works, execute "make initrd" to upgrade the rescue
+tools and initrd image.
+
+IPSEC, IPSEC_ESP AND IPSEC_DEBUG REMOVED FROM VKERNEL64 CONFIG
+--------------------------------------------------------------
+
+IPsec has been removed from the system. Of our standard kernel
+configurations, only the virtual kernel one had it. People running
+vkernels with configuration files derived from our VKERNEL64 will
+have to remove these options manually.
+
++-----------------------------------------------------------------------+
++         UPGRADING DRAGONFLY FROM 5.0 TO LATER VERSIONS                +
++-----------------------------------------------------------------------+
+
+VIRTIO_PCI REMOVED FROM KERNEL CONFIG
+-------------------------------------
+
+The "device virtio_pci" line in X86_64_GENERIC has been removed. People
+with configuration files derived from it have to remove it manually.
+
+VARIOUS 'R' COMMANDS AND DAEMONS REMOVED
+----------------------------------------
+
+rcp(1), rlogin(1), rlogind(8), rsh(1) and rshd(8) have been removed.
+For those that still need them, there is the net/bsdrcmds port.
+
+VARIOUS FORMER OPTIONS REMOVED
+------------------------------
+
+Various former kernel configuration options which had been no-ops for
+some time were completely removed: SYSVMSG, SYSVSEM, SYSVSHM, P1003_1B,
+_KPOSIX_VERSION and DSCHED_FQ. Users that have any of these still in
+their kernel configuration files have to remove them.
+
+BOOTSTRAPPING LIMITED FROM PRE 4.4
+----------------------------------
+
+Upgrading to 5.1 and later versions now require at least 4.4 in
+preparations for upcoming base compilers updates.
+
+IF_PPP, PPPD, IF_FAITH, AND FAITHD REMOVED
+------------------------------------------
+
+if_ppp has been replaced by "user ppp", i.e. ppp(8) and tun(4). It had
+already been removed from our default kernel configuration before 5.0,
+so only people with custom configurations based on earlier X86_64_GENERIC
+will have to remove it manually.
+
+The faith(4) interface has been completely removed after it had also
+been removed from our default kernel configuration. 
+
++-----------------------------------------------------------------------+
++         UPGRADING DRAGONFLY FROM 4.8 TO LATER VERSIONS                +
++-----------------------------------------------------------------------+
+
+FFS_ROOT OPTION DISABLED
+------------------------
+
+The FFS_ROOT option has been made a no-op and will be completely removed
+at some point in the future. Users with a custom kernel configuration
+can remove this option from it now.
+
++-----------------------------------------------------------------------+
++         UPGRADING DRAGONFLY FROM 4.6 TO LATER VERSIONS                +
++-----------------------------------------------------------------------+
+
+DSA OPENSSH KEYS DEPRECATED
+---------------------------
+
+Note that DSA OpenSSH keys were deprecated in the 4.6 to 4.8 release. 
+If you are upgrading from a release older than 4.8 and use DSA OpenSSH 
+keys, please update your private/public key pair or risk locking 
+yourself out.
+
+AHC, AHD, AIC, NCV, NSP AND STG DRIVERS REMOVED
+-----------------------------------------------
+
+They were all in our X86_64_GENERIC kernel configuration file, along with
+the AHC_REG_PRETTY_PRINT and AHD_REG_PRETTY_PRINT options, so any custom
+configuration files derived from it need adjustment.
+
+PORTAL FILE SYSTEM REMOVED
+--------------------------
+
+It has been broken for a long time now.
+
+BINUTILS 2.27 REPLACES 2.24, PRIMARY
+------------------------------------
+
+The oldest of the two versions of Binutils, version 2.24, was removed
+and replaced with Binutils 2.27.  It becomes the primary version version
+of binutils and version 2.25 becomes the alternate.
+
+The accepted values of BINUTILSVER are now "binutils227" (default) and
+"binutils225".  The building of Binutils 2.25 can be prevented by setting
+NO_ALTBINUTILS=yes in make.conf.
+
+COMPAT_43 KERNEL OPTION REMOVED
+-------------------------------
+
+It was commented out in our default configs for several years now, but
+might still be present in custom configs created before Nov. 2011.
+
+OPENSSL REMOVED
+---------------
+
+OpenSSL has been removed from base and replaced with a private version of
+LibreSSL.  The previously installed OpenSSL libraries, headers, and man
+pages will remain on the system unless the "make upgrade" command is
+specifically instructed to remove them.  To do this, define
+REMOVE_OPENSSL_FILES for the upgrade command, e.g.
+"make upgrade REMOVE_OPENSSL_FILES=yes"
+
+28-Oct-2016: openssl has been replaced by ressl.  It is recommended that any
+stale OpenSSL files be removed to avoid configuration scripts from using
+the stale and potentially vulnerable version, but all binaries that are
+dynamically linked to the OpenSSL libraries should be rebuilt first to
+avoid breakage.
+
+OPENSSH HPN REMOVED
+-------------------
+
+It has become too cumbersome to maintain HPN patches in OpenSSH in base.
+To use OpenSSH in base remove HPN config, if you have added it.
+Check files below for HPN config, see a few lines below.
+  /etc/ssh/ssh_config, /etc/ssh/sshd_config, ~/.ssh/config
+sshd(8) will fail to start if HPN config is used.
+
+NOTE: HPN config in sshd_config will prohibit remote access to host using ssh.
+
+HPN config:
+HPNDisabled
+HPNBufferSize
+TcpRcvBuf
+TcpRcvBufPoll
+NoneEnabled
+NoneSwitch
+cipher MTR-AES-CTR
+cipher NONE
+
+OpenSSH HPN is a patch set to OpenSSH providing higher performance under some
+circumstances, especially for networking.
+If HPN functionality is needed, install security/openssh from dports.
+
+CS, EX AND VX DRIVERS REMOVED
+-----------------------------
+
+The cs(4), ex(4) and vx(4) drivers have been removed. They were very
+old and its doubtful they ever worked properly in x86_64 but they were
+in X86_64_GENERIC, so custom configurations derived from it have to be
+adjusted.
+
++-----------------------------------------------------------------------+
++         UPGRADING DRAGONFLY FROM 4.4 TO LATER VERSIONS                +
++-----------------------------------------------------------------------+
+
+AMD REMOVED
+-----------
+
+The am-utils automounter suite has been removed. It stopped working
+at some point and was never fixed. autofs(5) and the associated
+userland has been brought in from FreeBSD and replaces it.
+
+AN DRIVER REMOVED
+-----------------
+
+The an(4) driver has been removed. It was in the X86_64_GENERIC kernel
+config file, so any configurations derived from it have to be adjusted.
+
+/DEV/DRI GROUP CHANGED
+----------------------
+
+The default group assigned to /dev/dri entries has been changed
+from 'wheel' to 'video' with the id of '44'. If you want to have
+access to the dri devices please add yourself to the video group
+with:
+
+# pw groupmod video -m $USER
+
++-----------------------------------------------------------------------+
++         UPGRADING DRAGONFLY FROM 4.2 TO LATER VERSIONS                +
++-----------------------------------------------------------------------+
+
+DSCHED REMOVED
+--------------
+
+dsched(4) has been removed and one of its kernel options, DSCHED_FQ, was
+in our default kernel config file. So the DSCHED_FQ option has been turned
+into a no-op for now and can be removed from custom configurations.
+
+EST DRIVER REMOVED, COMPILE_ET AND LIBCOM_ERR TOO
+-------------------------------------------------
+
+The est(4) driver has been removed. All CPUs it supported (except one)
+were 32 bits only. Those who are still using the Core 2 Duo T7500 should
+report back if there are any issues with this CPU and our regular ACPI
+P-state support.
+
+Also, compile_et(1) and com_err(3) have been removed as well. They
+should have been removed along with kerberos support, back in 2009.
+
+SEVERAL LOCALES RENAMED
+-----------------------
+
+Several locales were using obsolete and misleading names, and thus have
+been adjusted to current standards. Any users of the following locales
+need to select alternates:
+
+DFLY 4.2 locale            DFLY 4.4 alterative locale
+---------------            ------------------------------------
+mn_MN.UTF-8                mn_Cyrl_MN.UTF-8
+no_NO.UTF-8                nb_NO.UTF-8      or nn_NO.UTF-8
+no_NO.ISO8859-1            nb_NO.ISO8869-1  or nn_NO.ISO8859-1
+no_NO.ISO8859-15           nb_NO.ISO8859-15 or nn_NO.ISO8859-15
+sr_YU.UTF-8                sr_Cyrl_RS.UTF-8 or sr_Latn_RS.UTF-8
+sr_YU.ISO8859-5            sr_Cyrl_RS.ISO8859-5
+sr_YU.ISO8859-2            sr_Latn_RS.ISO8859-2
+zh_CN.GBK                  zh_Hans_CN.GBK
+zh_CN.UTF-8                zh_Hans_CN.UTF-8
+zh_CN.eucCN                zh_Hans_CN.eucCN
+zh_CN.GB2312               zh_Hans_CH.GB2312
+zh_CN.GB18030              zh_Hans_CH.GB18030
+zh_HK.Big5HKSCS            zh_Hant_HK.Big5HKSCS
+zh_HK.UTF_8                zh_Hant_HK.UTF-8
+zh_TW.Big5                 zh_Hant_TW.Big5
+zh_TW.UTF-8                zh_Hant_TW.UTF-8
+
++-----------------------------------------------------------------------+
 +         UPGRADING DRAGONFLY FROM 4.0 TO LATER VERSIONS                +
 +-----------------------------------------------------------------------+
+
+BINUTILS 2.25 REPLACES 2.22, PRIMARY
+------------------------------------
+
+The oldest of the two versions of Binutils, version 2.22, was removed
+and replaced with Binutils 2.25.  It becomes the primary version version
+of binutils and version 2.24 becomes the alternate.  There are 8 current
+CVE written against 2.24, so for security reasons version 2.25 should
+always be used.
+
+The accepted values of BINUTILSVER are now "binutils225" (default) and
+"binutils224".  The building of Binutils 2.24 can be prevented by setting
+NO_ALTBINUTILS=yes in make.conf.
+
+LOADER OPTIONS CHANGED
+----------------------
+
+Right after the development branch started, the Fred art accompanying the
+loader menu was improved.  The line between Fred and the menu was removed
+by default (but can optionally be returned) and the placement shifted as
+a result.  The drawing was improved, and the colored version was improved,
+changing the eyes and wing color from white to red.  A new color version
+of Fred was added, one with a blue scheme.
+
+The loader menu defaults have changed since release 4.0:  The vertical
+line was removed, the loader is displayed in color by default*, and the
+blue scheme is used.
+
+The loader.conf changes are:
+loader_color:   option has been removed
+loader_plain:   option has been added, it changed menu to monochrome
+fred_is_red:    changes color scheme from blue to red
+fred_is_blue:   option existed only on 4.1, it has been removed
+fred_separated: Adds line between Fred and menu (as seen previously)
+
+* If loader.conf defines "console" as "comconsole" or "console" is defined
+  in the environment as "comconsole" then color will not be displayed,
+  even if loader_plain value is "NO".
+
+SENDMAIL REMOVED FROM BASE
+--------------------------
+
+The only Mail Transfer Agent provided now is DragonFly Mail Agent (dma).
+If the system being upgraded is still configured to use the sendmail
+binaries from base, the "make upgrade" command will fail.
+
+The administrator must change /etc/mail/mailer.conf to switch the
+mailwrapper to dma or a DPorts-based MTA prior to running the upgrade
+command that permanently removes sendmail executables and could
+potentially break a running mail server.
+
+Refer: http://www.dragonflybsd.com/docs/docs/newhandbook/mta/ for
+detailed instructions on how to configure the MTA selection.
+
+_KPOSIX_VERSION and P1003_1B OPTIONS REMOVED
+--------------------------------------------
+
+The _KPOSIX_VERSION and P1003_1B kernel options have been changed to
+no-ops. They can be removed from custom kernel configurations.
+
+SOUND SYSTEM UPDATED FROM FreeBSD 11-CURRENT
+--------------------------------------------
+
+Many more sound devices may be detected.
+
+If the default device choosen isn't to your liking, setting the sysctl
+hw.snd.default_unit to a different number will change it.
+
+SCTP SUPPORT DROPPED
+--------------------
+
+Support for the SCTP protocol has been removed.
 
 OLD USB DRIVERS REMOVED
 -----------------------
@@ -30,6 +410,27 @@ unknown:
   * uscanner	(no longer needed in usb4bsd)
 
 They should be removed or commented out in such custom kernel configs.
+
+GCC 5
+-----
+
+The GCC 4.4 compiler has been retired.  It has been replaced by a GCC 5.1.
+The following make.conf variables no longer work: NO_GCC44, NO_OBJC, and
+NO_CXX.  The latter was never documented and the latest versions of GCC are
+partially written in C++ so a C++ compiler is no longer optional.  In
+practical terms it has not been optional for many years as other base
+components are also written in C++.  The resource savings by avoiding
+building Objective-C compiler is so small, the complexity added by NO_OBJC
+internally was deemed a bad tradeoff so that is the reason for its removal.
+Also note that no "info" pages are installed with GCC 5.  After this entry
+was originally written, all info pages were removed from DragonFly.
+
+GCC 5.1 has been designated as the primary compiler.  As such, there is a
+new make.conf variable, NO_ALTCOMPILER.  It will block the rebuilding of
+the designated secondary compiler, GCC 4.7.  However, while DPorts
+primarily uses GCC 5 to build ports now, it still uses GCC 4.7 as well, so
+if building ports from source is desired, don't block building of the
+secondary compiler.
 
 +-----------------------------------------------------------------------+
 +         UPGRADING DRAGONFLY FROM 3.8 TO LATER VERSIONS                +

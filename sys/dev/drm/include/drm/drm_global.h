@@ -27,7 +27,6 @@
 /*
  * Authors: Thomas Hellstrom <thellstrom-at-vmware-dot-com>
  */
-/* $FreeBSD: head/sys/dev/drm2/drm_global.h 247834 2013-03-05 09:27:21Z kib $ */
 
 #ifndef _DRM_GLOBAL_H_
 #define _DRM_GLOBAL_H_
@@ -46,9 +45,9 @@ struct drm_global_reference {
 	void (*release) (struct drm_global_reference *);
 };
 
-extern void drm_global_init(void);
-extern void drm_global_release(void);
-extern int drm_global_item_ref(struct drm_global_reference *ref);
-extern void drm_global_item_unref(struct drm_global_reference *ref);
+void drm_global_init(void);
+void drm_global_release(void);
+int drm_global_item_ref(struct drm_global_reference *ref);
+void drm_global_item_unref(struct drm_global_reference *ref);
 
 #endif

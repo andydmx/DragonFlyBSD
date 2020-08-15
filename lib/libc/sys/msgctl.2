@@ -31,7 +31,7 @@
 .\"
 .\" $FreeBSD: src/lib/libc/gen/msgctl.3,v 1.8.2.7 2003/03/13 18:05:37 trhodes Exp $
 .\"
-.Dd January 4, 2014
+.Dd September 13, 2019
 .Dt MSGCTL 2
 .Os
 .Sh NAME
@@ -83,17 +83,17 @@ struct msqid_ds {
 The
 .Vt ipc_perm
 structure used inside the
-.Vt shmid_ds
+.Vt msqid_ds
 structure is defined in
 .In sys/ipc.h
 and looks like this:
 .Bd -literal
 struct ipc_perm {
-	ushort	cuid;	/* creator user id */
-	ushort	cgid;	/* creator group id */
-	ushort	uid;	/* user id */
-	ushort	gid;	/* group id */
-	ushort	mode;	/* r/w permission */
+	uid_t	cuid;	/* creator user id */
+	gid_t	cgid;	/* creator group id */
+	uid_t	uid;	/* user id */
+	gid_t	gid;	/* group id */
+	mode_t	mode;	/* r/w permission */
 	ushort	seq;	/* sequence # (to generate unique msg/sem/shm id) */
 	key_t	key;	/* user specified msg/sem/shm key */
 };
@@ -104,7 +104,7 @@ The operation to be performed by
 is specified in
 .Fa cmd
 and is one of:
-.Bl -tag -width IPC_RMIDX
+.Bl -tag -width ".Dv IPC_RMIDX"
 .It Dv IPC_STAT
 Gather information about the message queue and place it in the
 structure pointed to by
@@ -187,7 +187,11 @@ system call will fail if:
 The
 .Fa cmd
 argument
-is equal to IPC_SET or IPC_RMID and the caller is not the super-user, nor does
+is equal to
+.Dv IPC_SET
+or
+.Dv IPC_RMID
+and the caller is not the super-user, nor does
 the effective uid match either the
 .Va msg_perm.uid
 or
@@ -196,10 +200,12 @@ fields of the data structure associated with the message queue.
 .Pp
 An attempt is made to increase the value of
 .Va msg_qbytes
-through IPC_SET
+through
+.Dv IPC_SET
 but the caller is not the super-user.
 .It Bq Er EACCES
-The command is IPC_STAT
+The command is
+.Dv IPC_STAT
 and the caller has no read permission for this message queue.
 .It Bq Er EINVAL
 The

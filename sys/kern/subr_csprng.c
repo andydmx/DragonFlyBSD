@@ -45,41 +45,14 @@
  * reinitialize the pools with a hash of the previous chunk
  * of entropy.
  */
-#define MIN_POOL_SIZE	64 + SHA256_DIGEST_LENGTH
+#define MIN_POOL_SIZE	(64 + SHA256_DIGEST_LENGTH)
 
 /* Minimum reseed interval */
 #define MIN_RESEED_INTERVAL	hz/10
 
-/* Lock macros */
-#define POOL_LOCK_INIT(pool) \
-    spin_init(&(pool)->lock, "csprng_poollock")
-
-#define POOL_LOCK(pool)      \
-    spin_lock(&pool->lock)
-
-#define POOL_TRYLOCK(pool)   \
-    spin_trylock(&pool->lock)
-
-#define POOL_UNLOCK(pool)    \
-    spin_unlock(&pool->lock)
-
-
-#define STATE_LOCK_INIT(state)  \
-    spin_init(&state->lock, "csprng_statelock")
-
-#define STATE_LOCK(state)	\
-    spin_lock(&state->lock)
-
-#define STATE_UNLOCK(state)	\
-    spin_unlock(&state->lock)
-
-#define STATE_SLEEP(state, wmesg, timo)	\
-    ssleep(state, &state->lock, 0, wmesg, timo)
-
-#define STATE_WAKEUP(state)	\
-    wakeup(state)
-
+#if 0
 static void csprng_reseed_callout(void *arg);
+#endif
 static int csprng_reseed(struct csprng_state *state);
 
 static struct timeval csprng_reseed_interval = { 0, 100000 };
@@ -113,18 +86,16 @@ csprng_init(struct csprng_state *state)
 	state->failed_reseeds = 0;
 	state->callout_based_reseed = 0;
 
-	STATE_LOCK_INIT(state);
-
 	for (i = 0; i < 32; i++) {
 		r = csprng_pool_init(&state->pool[i], NULL, 0);
 		if (r != 0)
 			break;
-		POOL_LOCK_INIT(&state->pool[i]);
 	}
 
 	return r;
 }
 
+#if 0
 int
 csprng_init_reseed(struct csprng_state *state)
 {
@@ -132,10 +103,11 @@ csprng_init_reseed(struct csprng_state *state)
 
 	callout_init_mp(&state->reseed_callout);
 	callout_reset(&state->reseed_callout, MIN_RESEED_INTERVAL,
-	    csprng_reseed_callout, state);
+		      csprng_reseed_callout, state);
 
 	return 0;
 }
+#endif
 
 /*
  * XXX:
@@ -146,12 +118,14 @@ csprng_init_reseed(struct csprng_state *state)
 
 static
 int
-encrypt_bytes(struct csprng_state *state, uint8_t *out, uint8_t *in, size_t bytes)
+encrypt_bytes(struct csprng_state *state, uint8_t *out, uint8_t *in,
+	      size_t bytes)
 {
 	/* Update nonce whenever the counter is about to overflow */
 	if (chacha_check_counter(&state->cipher_ctx)) {
 		++state->nonce;
-		chacha_ivsetup(&state->cipher_ctx, (const uint8_t *)&state->nonce);
+		chacha_ivsetup(&state->cipher_ctx,
+			       (const uint8_t *)&state->nonce);
 	}
 
 	chacha_encrypt_bytes(&state->cipher_ctx, in, out, (uint32_t)bytes);
@@ -160,13 +134,16 @@ encrypt_bytes(struct csprng_state *state, uint8_t *out, uint8_t *in, size_t byte
 }
 
 /*
+ *
+ * Called with state->spin held.
+ *
  * XXX: flags is currently unused, but could be used to know whether
  *      it's a /dev/random or /dev/urandom read, and make sure that
  *      enough entropy has been collected recently, etc.
  */
 int
 csprng_get_random(struct csprng_state *state, uint8_t *out, int bytes,
-    int flags __unused)
+		  int flags __unused, int unlimited)
 {
 	int cnt;
 	int total_bytes = 0;
@@ -178,8 +155,6 @@ csprng_get_random(struct csprng_state *state, uint8_t *out, int bytes,
 	 *      as input).
 	 */
 	bzero(out, bytes);
-
-	STATE_LOCK(state);
 
 again:
 	if (!state->callout_based_reseed &&
@@ -193,8 +168,8 @@ again:
 	 * Sleep until entropy is added to the pools (or a callout-based
 	 * reseed, if enabled, occurs).
 	 */
-	if (state->reseed_cnt == 0) {
-		STATE_SLEEP(state, "csprngrsd", 0);
+	if (unlimited == 0 && state->reseed_cnt == 0) {
+		ssleep(state, &state->spin, 0, "csprngrsd", 0);
 		goto again;
 	}
 
@@ -205,7 +180,8 @@ again:
 		encrypt_bytes(state, out, out, cnt);
 
 		/* Update key and rekey cipher */
-		encrypt_bytes(state, state->key, state->key, sizeof(state->key));
+		encrypt_bytes(state, state->key, state->key,
+			      sizeof(state->key));
 		chacha_keysetup(&state->cipher_ctx, state->key,
 		    8*sizeof(state->key));
 
@@ -214,11 +190,12 @@ again:
 		total_bytes += cnt;
 	}
 
-	STATE_UNLOCK(state);
-
 	return total_bytes;
 }
 
+/*
+ * Called with state->spin held.
+ */
 static
 int
 csprng_reseed(struct csprng_state *state)
@@ -252,7 +229,6 @@ csprng_reseed(struct csprng_state *state)
 			break;
 
 		pool = &state->pool[i];
-		POOL_LOCK(pool);
 
 		/*
 		 * Finalize hash of the entropy in this pool.
@@ -265,8 +241,6 @@ csprng_reseed(struct csprng_state *state)
 		 * but is in line with other Fortuna implementations.
 		 */
 		csprng_pool_init(pool, digest, sizeof(digest));
-
-		POOL_UNLOCK(pool);
 
 		/*
 		 * Update hash that will result in new key with this
@@ -284,12 +258,14 @@ csprng_reseed(struct csprng_state *state)
 	/* Increment the nonce if the counter overflows */
 	if (chacha_incr_counter(&state->cipher_ctx)) {
 		++state->nonce;
-		chacha_ivsetup(&state->cipher_ctx, (const uint8_t *)&state->nonce);
+		chacha_ivsetup(&state->cipher_ctx,
+			       (const uint8_t *)&state->nonce);
 	}
 
 	return 0;
 }
 
+#if 0
 static
 void
 csprng_reseed_callout(void *arg)
@@ -297,20 +273,22 @@ csprng_reseed_callout(void *arg)
 	struct csprng_state *state = (struct csprng_state *)arg;
 	int reseed_interval = MIN_RESEED_INTERVAL;
 
-	STATE_LOCK(state);
-
+	spin_lock(&state->spin);
 	csprng_reseed(arg);
-
-	STATE_WAKEUP(state);
-	STATE_UNLOCK(state);
+	spin_unlock(&state->spin);
+	wakeup(state);
 
 	callout_reset(&state->reseed_callout, reseed_interval,
-	    csprng_reseed_callout, state);
+		      csprng_reseed_callout, state);
 }
+#endif
 
+/*
+ * Called with state->spin held
+ */
 int
 csprng_add_entropy(struct csprng_state *state, int src_id,
-    const uint8_t *entropy, size_t bytes, int flags)
+		   const uint8_t *entropy, size_t bytes, int flags)
 {
 	struct csprng_pool *pool;
 	int pool_id;
@@ -323,31 +301,13 @@ csprng_add_entropy(struct csprng_state *state, int src_id,
 	pool_id = state->src_pool_idx[src_id]++ & 0x1f;
 	pool = &state->pool[pool_id];
 
-	if (flags & CSPRNG_TRYLOCK) {
-		/*
-		 * If we are asked to just try the lock instead
-		 * of spinning until we get it, return if we
-		 * can't get a hold of the lock right now.
-		 */
-		if (!POOL_TRYLOCK(pool))
-			return -1;
-	} else {
-		POOL_LOCK(pool);
-	}
-
-	SHA256_Update(&pool->hash_ctx, (const uint8_t *)&src_id, sizeof(src_id));
-	SHA256_Update(&pool->hash_ctx, (const uint8_t *)&bytes, sizeof(bytes));
+	SHA256_Update(&pool->hash_ctx, (const uint8_t *)&src_id,
+		      sizeof(src_id));
+	SHA256_Update(&pool->hash_ctx, (const uint8_t *)&bytes,
+		      sizeof(bytes));
 	SHA256_Update(&pool->hash_ctx, entropy, bytes);
 
 	pool->bytes += bytes;
-
-	POOL_UNLOCK(pool);
-
-	/*
-	 * If a wakeup is missed, it doesn't matter too much - it'll get woken
-	 * up by the next add_entropy() call.
-	 */
-	STATE_WAKEUP(state);
 
 	return 0;
 }

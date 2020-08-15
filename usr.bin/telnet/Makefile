@@ -2,12 +2,13 @@
 
 PROG=		telnet
 
-SRCS=		commands.c main.c network.c ring.c sys_bsd.c \
+SRCS=		authenc.c commands.c main.c network.c ring.c sys_bsd.c \
 		telnet.c terminal.c utilities.c
 
-CFLAGS+=	-DKLUDGELINEMODE -DUSE_TERMIO -DENV_HACK -DOPIE \
+CFLAGS+=	-DKLUDGELINEMODE -DUSE_TERMIO -DENV_HACK \
 		-I${.CURDIR}/../../lib -I${.CURDIR}/../../lib/libtelnet
 WARNS?=		2
+NO_STRICT_ALIASING=
 
 LIBTELNET=	${.OBJDIR}/../../lib/libtelnet/libtelnet.a
 
@@ -15,18 +16,20 @@ LIBTELNET=	${.OBJDIR}/../../lib/libtelnet/libtelnet.a
 CFLAGS+=	-DINET6
 .endif
 
-DPADD=		${LIBTERMCAP} ${LIBTELNET}
-LDADD=		-ltermcap ${LIBTELNET}
+DPADD=		${LIBNCURSES} ${LIBTELNET}
+LDADD=		-lprivate_ncurses ${LIBTELNET}
+CFLAGS+=	-I${_SHLIBDIRPREFIX}/usr/include/priv/ncurses
+LDFLAGS+=	${PRIVATELIB_LDFLAGS}
 
-CFLAGS+=	-DIPSEC
-DPADD+=		${LIBIPSEC}
-LDADD+=		-lipsec
-
-.if !defined(NO_OPENSSL)
-SRCS+=		authenc.c
 CFLAGS+=	-DENCRYPTION -DAUTHENTICATION
-DPADD+=		${LIBCRYPTO} ${LIBCRYPT} ${LIBPAM}
-LDADD+=		-lcrypto -lcrypt ${MINUSLPAM}
+CFLAGS+=	-I${.CURDIR}/../../crypto/libressl/include
+DPADD+=		${LIBCRYPTO} ${LIBCRYPT}
+LDADD+=		-lprivate_crypto -lcrypt
+
+.if !defined(RESCUE)
+# libtelnet requires PAM by default
+DPADD+=		${LIBPAM}
+LDADD+=		${MINUSLPAM}
 .endif
 
 .include <bsd.prog.mk>

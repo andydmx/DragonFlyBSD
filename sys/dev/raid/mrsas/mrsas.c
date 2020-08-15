@@ -380,13 +380,11 @@ mrsas_setup_sysctl(struct mrsas_softc *sc)
 	device_get_unit(sc->mrsas_dev));
     ksnprintf(tmpstr2, sizeof(tmpstr2), "mrsas%d", device_get_unit(sc->mrsas_dev));
 
-#if 0
     sysctl_ctx = device_get_sysctl_ctx(sc->mrsas_dev);
     if (sysctl_ctx != NULL)
         sysctl_tree = device_get_sysctl_tree(sc->mrsas_dev);
 
     if (sysctl_tree == NULL) {
-#endif
         sysctl_ctx_init(&sc->sysctl_ctx);
         sc->sysctl_tree = SYSCTL_ADD_NODE(&sc->sysctl_ctx,
             SYSCTL_STATIC_CHILDREN(_hw), OID_AUTO, tmpstr2,
@@ -395,9 +393,7 @@ mrsas_setup_sysctl(struct mrsas_softc *sc)
              return;
         sysctl_ctx = &sc->sysctl_ctx;
         sysctl_tree = sc->sysctl_tree;
-#if 0
     }
-#endif
     SYSCTL_ADD_UINT(sysctl_ctx, SYSCTL_CHILDREN(sysctl_tree),
         OID_AUTO, "disable_ocr", CTLFLAG_RW, &sc->disableOnlineCtrlReset, 0,
         "Disable the use of OCR");
@@ -1817,7 +1813,7 @@ int mrsas_init_adapter(struct mrsas_softc *sc)
     max_cmd = sc->max_fw_cmds;
 
     /* Determine allocation size of command frames */
-    sc->reply_q_depth = ((max_cmd *2 +1 +15)/16*16);
+    sc->reply_q_depth = rounddown(max_cmd * 2 + 1 + 15, 16);
     sc->request_alloc_sz = sizeof(MRSAS_REQUEST_DESCRIPTOR_UNION) * max_cmd;
     sc->reply_alloc_sz = sizeof(MPI2_REPLY_DESCRIPTORS_UNION) * (sc->reply_q_depth);
     sc->io_frames_alloc_sz = MRSAS_MPI2_RAID_DEFAULT_IO_FRAME_SIZE + (MRSAS_MPI2_RAID_DEFAULT_IO_FRAME_SIZE * (max_cmd + 1));
@@ -3566,7 +3562,7 @@ void mrsas_aen_handler(struct mrsas_softc *sc)
 	int error;
 
 	if (!sc) {
-		device_printf(sc->mrsas_dev, "invalid instance!\n");
+		kprintf("invalid instance!\n");
 		return;
 	}
 

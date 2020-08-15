@@ -37,10 +37,18 @@
 #define	_RUNETYPE_H_
 
 #include <sys/cdefs.h>
-#include <sys/types.h>
+#include <machine/stdint.h>
 
 #define	_CACHED_RUNES	(1 <<8 )	/* Must be a power of 2 */
 #define	_CRMASK		(~(_CACHED_RUNES - 1))
+
+/* See comments in <ctype.h> about __ct_rune_t. */
+#ifndef ___CT_RUNE_T_DECLARED
+typedef	int		__ct_rune_t;	/* Arg type for ctype funcs */
+#define	___CT_RUNE_T_DECLARED
+#endif
+
+typedef __ct_rune_t	__rune_t;	/* Internal runetype.h type */
 
 /*
  * The lower 8 bits of runetype[] contain the digit value of the rune.
@@ -93,9 +101,9 @@ extern __thread const _RuneLocale *_ThreadRuneLocale;
 static __inline const _RuneLocale *__getCurrentRuneLocale(void)
 {
 
-	if (_ThreadRuneLocale) 
+	if (_ThreadRuneLocale)
 		return _ThreadRuneLocale;
-	if (_CurrentRuneLocale) 
+	if (_CurrentRuneLocale)
 		return _CurrentRuneLocale;
 	return &_DefaultRuneLocale;
 }

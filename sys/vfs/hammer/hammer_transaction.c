@@ -1,13 +1,13 @@
 /*
  * Copyright (c) 2007-2008 The DragonFly Project.  All rights reserved.
- * 
+ *
  * This code is derived from software contributed to The DragonFly Project
  * by Matthew Dillon <dillon@backplane.com>
- * 
+ *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
  * are met:
- * 
+ *
  * 1. Redistributions of source code must retain the above copyright
  *    notice, this list of conditions and the following disclaimer.
  * 2. Redistributions in binary form must reproduce the above copyright
@@ -17,7 +17,7 @@
  * 3. Neither the name of The DragonFly Project nor the names of its
  *    contributors may be used to endorse or promote products derived
  *    from this software without specific, prior written permission.
- * 
+ *
  * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
  * ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
  * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
@@ -34,7 +34,7 @@
 
 #include "hammer.h"
 
-static u_int32_t ocp_allocbit(hammer_objid_cache_t ocp, u_int32_t n);
+static uint32_t ocp_allocbit(hammer_objid_cache_t ocp, uint32_t n);
 
 
 /*
@@ -43,10 +43,9 @@ static u_int32_t ocp_allocbit(hammer_objid_cache_t ocp, u_int32_t n);
  * May be called without fs_token
  */
 void
-hammer_start_transaction(struct hammer_transaction *trans,
-			 struct hammer_mount *hmp)
+hammer_start_transaction(hammer_transaction_t trans, hammer_mount_t hmp)
 {
-	struct timeval tv;
+	struct timespec ts;
 	int error;
 
 	trans->type = HAMMER_TRANS_STD;
@@ -57,9 +56,10 @@ hammer_start_transaction(struct hammer_transaction *trans,
 	trans->sync_lock_refs = 0;
 	trans->flags = 0;
 
-	getmicrotime(&tv);
-	trans->time = (unsigned long)tv.tv_sec * 1000000ULL + tv.tv_usec;
-	trans->time32 = (u_int32_t)tv.tv_sec;
+	vfs_timestamp(&ts);
+	trans->time = (unsigned long)ts.tv_sec * 1000000ULL +
+		      ts.tv_nsec / 1000;
+	trans->time32 = (uint32_t)ts.tv_sec;
 }
 
 /*
@@ -68,10 +68,9 @@ hammer_start_transaction(struct hammer_transaction *trans,
  * May be called without fs_token
  */
 void
-hammer_simple_transaction(struct hammer_transaction *trans,
-			  struct hammer_mount *hmp)
+hammer_simple_transaction(hammer_transaction_t trans, hammer_mount_t hmp)
 {
-	struct timeval tv;
+	struct timespec ts;
 	int error;
 
 	trans->type = HAMMER_TRANS_RO;
@@ -82,9 +81,10 @@ hammer_simple_transaction(struct hammer_transaction *trans,
 	trans->sync_lock_refs = 0;
 	trans->flags = 0;
 
-	getmicrotime(&tv);
-	trans->time = (unsigned long)tv.tv_sec * 1000000ULL + tv.tv_usec;
-	trans->time32 = (u_int32_t)tv.tv_sec;
+	vfs_timestamp(&ts);
+	trans->time = (unsigned long)ts.tv_sec * 1000000ULL +
+		      ts.tv_nsec / 1000;
+	trans->time32 = (uint32_t)ts.tv_sec;
 }
 
 /*
@@ -96,10 +96,9 @@ hammer_simple_transaction(struct hammer_transaction *trans,
  * (which the flusher is responsible for).
  */
 void
-hammer_start_transaction_fls(struct hammer_transaction *trans,
-			     struct hammer_mount *hmp)
+hammer_start_transaction_fls(hammer_transaction_t trans, hammer_mount_t hmp)
 {
-	struct timeval tv;
+	struct timespec ts;
 	int error;
 
 	bzero(trans, sizeof(*trans));
@@ -112,16 +111,17 @@ hammer_start_transaction_fls(struct hammer_transaction *trans,
 	trans->sync_lock_refs = 1;
 	trans->flags = 0;
 
-	getmicrotime(&tv);
-	trans->time = (unsigned long)tv.tv_sec * 1000000ULL + tv.tv_usec;
-	trans->time32 = (u_int32_t)tv.tv_sec;
+	vfs_timestamp(&ts);
+	trans->time = (unsigned long)ts.tv_sec * 1000000ULL +
+		      ts.tv_nsec / 1000;
+	trans->time32 = (uint32_t)ts.tv_sec;
 }
 
 /*
  * May be called without fs_token
  */
 void
-hammer_done_transaction(struct hammer_transaction *trans)
+hammer_done_transaction(hammer_transaction_t trans)
 {
 	int expected_lock_refs __debugvar;
 
@@ -141,7 +141,7 @@ hammer_done_transaction(struct hammer_transaction *trans)
 
 /*
  * Allocate (count) TIDs.  If running in multi-master mode the returned
- * base will be aligned to a 16-count plus the master id (0-15).  
+ * base will be aligned to a 16-count plus the master id (0-15).
  * Multi-master mode allows non-conflicting to run and new objects to be
  * created on multiple masters in parallel.  The transaction id identifies
  * the original master.  The object_id is also subject to this rule in
@@ -155,6 +155,8 @@ hammer_done_transaction(struct hammer_transaction *trans)
  * NOTE: When called by pseudo-backends such as ioctls the allocated
  *	 TID will be larger then the current flush TID, if a flush is running,
  *	 so any mirroring will pick the records up on a later flush.
+ *
+ * NOTE: HAMMER1 does not support multi-master clustering as of 2015.
  */
 hammer_tid_t
 hammer_alloc_tid(hammer_mount_t hmp, int count)
@@ -171,9 +173,9 @@ hammer_alloc_tid(hammer_mount_t hmp, int count)
 		tid |= hmp->master_id;
 	}
 	if (tid >= 0xFFFFFFFFFF000000ULL)
-		panic("hammer_start_transaction: Ran out of TIDs!");
+		hpanic("Ran out of TIDs!");
 	if (hammer_debug_tid)
-		kprintf("alloc_tid %016llx\n", (long long)tid);
+		hdkprintf("%016jx\n", (intmax_t)tid);
 	return(tid);
 }
 
@@ -188,7 +190,7 @@ hammer_alloc_objid(hammer_mount_t hmp, hammer_inode_t dip, int64_t namekey)
 {
 	hammer_objid_cache_t ocp;
 	hammer_tid_t tid;
-	u_int32_t n;
+	uint32_t n;
 
 	while ((ocp = dip->objid_cache) == NULL) {
 		if (hmp->objid_cache_count < OBJID_CACHE_SIZE) {
@@ -263,10 +265,10 @@ hammer_alloc_objid(hammer_mount_t hmp, hammer_inode_t dip, int64_t namekey)
  * This routine is only ever called if a bit is available somewhere
  * in the bitmap.
  */
-static u_int32_t
-ocp_allocbit(hammer_objid_cache_t ocp, u_int32_t n)
+static uint32_t
+ocp_allocbit(hammer_objid_cache_t ocp, uint32_t n)
 {
-	u_int32_t n0;
+	uint32_t n0;
 
 	n0 = (n >> 5) & 31;
 	n &= 31;

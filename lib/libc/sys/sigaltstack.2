@@ -28,7 +28,7 @@
 .\"     @(#)sigaltstack.2	8.2 (Berkeley) 5/1/95
 .\" $FreeBSD: src/lib/libc/sys/sigaltstack.2,v 1.11.2.7 2002/09/15 00:32:41 archie Exp $
 .\"
-.Dd June 1, 2013
+.Dd June 12, 2019
 .Dt SIGALTSTACK 2
 .Os
 .Sh NAME
@@ -40,13 +40,13 @@
 .In signal.h
 .Bd -literal
 typedef struct sigaltstack {
-        char    *ss_sp;
+        void    *ss_sp;
         size_t  ss_size;
         int     ss_flags;
 } stack_t;
 .Ed
 .Ft int
-.Fn sigaltstack "const stack_t *ss" "stack_t *oss"
+.Fn sigaltstack "const stack_t * restrict ss" "stack_t * restrict oss"
 .Sh DESCRIPTION
 .Fn Sigaltstack
 allows users to define an alternate stack on which signals
@@ -81,7 +81,7 @@ Trying to disable an active stack will cause
 to return -1 with
 .Va errno
 set to
-.Er EINVAL .
+.Er EPERM .
 A disabled stack will cause all signals to be
 taken on the regular user stack.
 If the stack is later re-enabled then all signals that were specified
@@ -111,6 +111,7 @@ sigstk.ss_flags = 0;
 if (sigaltstack(&sigstk,0) < 0)
 	perror("sigaltstack");
 .Ed
+.Pp
 An alternative approach is provided for programs with signal handlers
 that require a specific amount of stack space other than the default size.
 The value
@@ -151,10 +152,10 @@ member pointed to by
 .Fa ss
 contains flags other than
 .Dv SS_DISABLE .
-.It Bq Er EINVAL
-An attempt was made to disable an active stack.
 .It Bq Er ENOMEM
 Size of alternate stack area is less than or equal to
+.It Bq Er EPERM
+An attempt was made to modify an active stack.
 .Dv MINSIGSTKSZ .
 .El
 .Sh SEE ALSO
@@ -164,6 +165,6 @@ Size of alternate stack area is less than or equal to
 The predecessor to
 .Fn sigaltstack ,
 the
-.Fn sigstack
+.Nm sigstack
 system call, appeared in
 .Bx 4.2 .

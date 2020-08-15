@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2011, Bryan Venteicher <bryanv@daemoninthecloset.org>
+ * Copyright (c) 2011, Bryan Venteicher <bryanv@FreeBSD.org>
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -26,6 +26,8 @@
 
 /* Driver for VirtIO network devices. */
 
+#include "opt_ifpoll.h"
+
 #include <sys/cdefs.h>
 
 #include <sys/param.h>
@@ -44,6 +46,8 @@
 #include <sys/bus.h>
 #include <sys/rman.h>
 
+#include <machine/limits.h>
+
 #include <net/ethernet.h>
 #include <net/if.h>
 #include <net/if_arp.h>
@@ -52,6 +56,7 @@
 #include <net/if_media.h>
 #include <net/vlan/if_vlan_var.h>
 #include <net/vlan/if_vlan_ether.h>
+#include <net/if_poll.h>
 #include <net/ifq_var.h>
 
 #include <net/bpf.h>
@@ -62,214 +67,13 @@
 #include <netinet/ip6.h>
 #include <netinet/udp.h>
 #include <netinet/tcp.h>
-#include <netinet/sctp.h>
 
 #include <dev/virtual/virtio/virtio/virtio.h>
 #include <dev/virtual/virtio/virtio/virtqueue.h>
-
-#include "virtio_net.h"
-#include "virtio_if.h"
-
-struct vtnet_statistics {
-	unsigned long		mbuf_alloc_failed;
-
-	unsigned long		rx_frame_too_large;
-	unsigned long		rx_enq_replacement_failed;
-	unsigned long		rx_mergeable_failed;
-	unsigned long		rx_csum_bad_ethtype;
-	unsigned long		rx_csum_bad_start;
-	unsigned long		rx_csum_bad_ipproto;
-	unsigned long		rx_csum_bad_offset;
-	unsigned long		rx_csum_failed;
-	unsigned long		rx_csum_offloaded;
-	unsigned long		rx_task_rescheduled;
-
-	unsigned long		tx_csum_offloaded;
-	unsigned long		tx_tso_offloaded;
-	unsigned long		tx_csum_bad_ethtype;
-	unsigned long		tx_tso_bad_ethtype;
-	unsigned long		tx_task_rescheduled;
-};
-
-struct vtnet_softc {
-	device_t		vtnet_dev;
-	struct ifnet		*vtnet_ifp;
-	struct lwkt_serialize	vtnet_slz;
-
-	uint32_t		vtnet_flags;
-#define VTNET_FLAG_LINK		0x0001
-#define VTNET_FLAG_SUSPENDED	0x0002
-#define VTNET_FLAG_CTRL_VQ	0x0004
-#define VTNET_FLAG_CTRL_RX	0x0008
-#define VTNET_FLAG_VLAN_FILTER	0x0010
-#define VTNET_FLAG_TSO_ECN	0x0020
-#define VTNET_FLAG_MRG_RXBUFS	0x0040
-#define VTNET_FLAG_LRO_NOMRG	0x0080
-
-	struct virtqueue	*vtnet_rx_vq;
-	struct virtqueue	*vtnet_tx_vq;
-	struct virtqueue	*vtnet_ctrl_vq;
-
-	struct vtnet_tx_header	*vtnet_txhdrarea;
-	uint32_t		vtnet_txhdridx;
-	struct vtnet_mac_filter *vtnet_macfilter;
-
-	int			vtnet_hdr_size;
-	int			vtnet_tx_size;
-	int			vtnet_rx_size;
-	int			vtnet_rx_process_limit;
-	int			vtnet_rx_mbuf_size;
-	int			vtnet_rx_mbuf_count;
-	int			vtnet_if_flags;
-	int			vtnet_watchdog_timer;
-	uint64_t		vtnet_features;
-
-	struct task		vtnet_cfgchg_task;
-
-	struct vtnet_statistics	vtnet_stats;
-
-	struct sysctl_ctx_list  vtnet_sysctl_ctx;
-	struct sysctl_oid       *vtnet_sysctl_tree;
-
-	struct callout		vtnet_tick_ch;
-
-	eventhandler_tag	vtnet_vlan_attach;
-	eventhandler_tag	vtnet_vlan_detach;
-
-	struct ifmedia		vtnet_media;
-	/*
-	 * Fake media type; the host does not provide us with
-	 * any real media information.
-	 */
-#define VTNET_MEDIATYPE		(IFM_ETHER | IFM_1000_T | IFM_FDX)
-	char			vtnet_hwaddr[ETHER_ADDR_LEN];
-
-	/*
-	 * During reset, the host's VLAN filtering table is lost. The
-	 * array below is used to restore all the VLANs configured on
-	 * this interface after a reset.
-	 */
-#define VTNET_VLAN_SHADOW_SIZE	(4096 / 32)
-	int			vtnet_nvlans;
-	uint32_t		vtnet_vlan_shadow[VTNET_VLAN_SHADOW_SIZE];
-
-	char			vtnet_mtx_name[16];
-};
-
-/*
- * When mergeable buffers are not negotiated, the vtnet_rx_header structure
- * below is placed at the beginning of the mbuf data. Use 4 bytes of pad to
- * both keep the VirtIO header and the data non-contiguous and to keep the
- * frame's payload 4 byte aligned.
- *
- * When mergeable buffers are negotiated, the host puts the VirtIO header in
- * the beginning of the first mbuf's data.
- */
-#define VTNET_RX_HEADER_PAD	4
-struct vtnet_rx_header {
-	struct virtio_net_hdr	vrh_hdr;
-	char			vrh_pad[VTNET_RX_HEADER_PAD];
-} __packed;
-
-/*
- * For each outgoing frame, the vtnet_tx_header below is allocated from
- * the vtnet_tx_header_zone.
- */
-struct vtnet_tx_header {
-	union {
-		struct virtio_net_hdr		hdr;
-		struct virtio_net_hdr_mrg_rxbuf	mhdr;
-	} vth_uhdr;
-
-	struct mbuf		*vth_mbuf;
-};
+#include <dev/virtual/virtio/net/virtio_net.h>
+#include <dev/virtual/virtio/net/if_vtnetvar.h>
 
 MALLOC_DEFINE(M_VTNET, "VTNET_TX", "Outgoing VTNET TX frame header");
-
-/*
- * The VirtIO specification does not place a limit on the number of MAC
- * addresses the guest driver may request to be filtered. In practice,
- * the host is constrained by available resources. To simplify this driver,
- * impose a reasonably high limit of MAC addresses we will filter before
- * falling back to promiscuous or all-multicast modes.
- */
-#define VTNET_MAX_MAC_ENTRIES	128
-
-struct vtnet_mac_table {
-	uint32_t		nentries;
-	uint8_t			macs[VTNET_MAX_MAC_ENTRIES][ETHER_ADDR_LEN];
-} __packed;
-
-struct vtnet_mac_filter {
-	struct vtnet_mac_table	vmf_unicast;
-	uint32_t		vmf_pad; /* Make tables non-contiguous. */
-	struct vtnet_mac_table	vmf_multicast;
-};
-
-#define VTNET_WATCHDOG_TIMEOUT	5
-#define VTNET_CSUM_OFFLOAD	(CSUM_TCP | CSUM_UDP)// | CSUM_SCTP)
-
-/* Features desired/implemented by this driver. */
-#define VTNET_FEATURES 		\
-    (VIRTIO_NET_F_MAC		| \
-     VIRTIO_NET_F_STATUS	| \
-     VIRTIO_NET_F_CTRL_VQ	| \
-     VIRTIO_NET_F_CTRL_RX	| \
-     VIRTIO_NET_F_CTRL_VLAN	| \
-     VIRTIO_NET_F_CSUM		| \
-     VIRTIO_NET_F_HOST_TSO4	| \
-     VIRTIO_NET_F_HOST_TSO6	| \
-     VIRTIO_NET_F_HOST_ECN	| \
-     VIRTIO_NET_F_GUEST_CSUM	| \
-     VIRTIO_NET_F_GUEST_TSO4	| \
-     VIRTIO_NET_F_GUEST_TSO6	| \
-     VIRTIO_NET_F_GUEST_ECN	| \
-     VIRTIO_NET_F_MRG_RXBUF)
-
-/*
- * The VIRTIO_NET_F_GUEST_TSO[46] features permit the host to send us
- * frames larger than 1514 bytes. We do not yet support software LRO
- * via tcp_lro_rx().
- */
-#define VTNET_LRO_FEATURES (VIRTIO_NET_F_GUEST_TSO4 | \
-			    VIRTIO_NET_F_GUEST_TSO6 | VIRTIO_NET_F_GUEST_ECN)
-
-#define VTNET_MAX_MTU		65536
-#define VTNET_MAX_RX_SIZE	65550
-
-/*
- * Used to preallocate the Vq indirect descriptors. The first segment
- * is reserved for the header.
- */
-#define VTNET_MIN_RX_SEGS	2
-#define VTNET_MAX_RX_SEGS	34
-#define VTNET_MAX_TX_SEGS	34
-
-#define IFCAP_TSO4              0x00100 /* can do TCP Segmentation Offload */
-#define IFCAP_TSO6              0x00200 /* can do TCP6 Segmentation Offload */
-#define IFCAP_LRO               0x00400 /* can do Large Receive Offload */
-#define IFCAP_VLAN_HWFILTER     0x10000 /* interface hw can filter vlan tag */
-#define IFCAP_VLAN_HWTSO        0x40000 /* can do IFCAP_TSO on VLANs */
-
-
-/*
- * Assert we can receive and transmit the maximum with regular
- * size clusters.
- */
-CTASSERT(((VTNET_MAX_RX_SEGS - 1) * MCLBYTES) >= VTNET_MAX_RX_SIZE);
-CTASSERT(((VTNET_MAX_TX_SEGS - 1) * MCLBYTES) >= VTNET_MAX_MTU);
-
-/*
- * Determine how many mbufs are in each receive buffer. For LRO without
- * mergeable descriptors, we must allocate an mbuf chain large enough to
- * hold both the vtnet_rx_header and the maximum receivable data.
- */
-#define VTNET_NEEDED_RX_MBUFS(_sc)					\
-	((_sc)->vtnet_flags & VTNET_FLAG_LRO_NOMRG) == 0 ? 1 :		\
-	howmany(sizeof(struct vtnet_rx_header) + VTNET_MAX_RX_SIZE,	\
-	(_sc)->vtnet_rx_mbuf_size)
-
-static int	vtnet_modevent(module_t, int, void *);
 
 static int	vtnet_probe(device_t);
 static int	vtnet_attach(device_t);
@@ -277,18 +81,30 @@ static int	vtnet_detach(device_t);
 static int	vtnet_suspend(device_t);
 static int	vtnet_resume(device_t);
 static int	vtnet_shutdown(device_t);
-static int	vtnet_config_change(device_t);
 
 static void	vtnet_negotiate_features(struct vtnet_softc *);
+#ifdef IFPOLL_ENABLE
+static void	vtnet_npoll(struct ifnet *, struct ifpoll_info *);
+static void	vtnet_npoll_status(struct ifnet *);
+static void	vtnet_npoll_rx(struct ifnet *, void *, int);
+static void	vtnet_npoll_tx(struct ifnet *, void *, int);
+#endif
+static void	vtnet_serialize(struct ifnet *, enum ifnet_serialize);
+static void	vtnet_deserialize(struct ifnet *, enum ifnet_serialize);
+static int	vtnet_tryserialize(struct ifnet *, enum ifnet_serialize);
+#ifdef INVARIANTS
+static void	vtnet_serialize_assert(struct ifnet *, enum ifnet_serialize,
+		    boolean_t);
+#endif  /* INVARIANTS */
+static int	vtnet_alloc_intrs(struct vtnet_softc *);
 static int	vtnet_alloc_virtqueues(struct vtnet_softc *);
+static int	vtnet_bind_intrs(struct vtnet_softc *);
 static void	vtnet_get_hwaddr(struct vtnet_softc *);
 static void	vtnet_set_hwaddr(struct vtnet_softc *);
 static int	vtnet_is_link_up(struct vtnet_softc *);
 static void	vtnet_update_link_status(struct vtnet_softc *);
-#if 0
-static void	vtnet_watchdog(struct vtnet_softc *);
-#endif
-static void	vtnet_config_change_task(void *, int);
+static void	vtnet_watchdog(struct ifaltq_subque *);
+static int	vtnet_setup_interface(struct vtnet_softc *);
 static int	vtnet_change_mtu(struct vtnet_softc *, int);
 static int	vtnet_ioctl(struct ifnet *, u_long, caddr_t, struct ucred *);
 
@@ -310,38 +126,40 @@ static int	vtnet_rx_csum(struct vtnet_softc *, struct mbuf *,
 		    struct virtio_net_hdr *);
 static int	vtnet_rxeof_merged(struct vtnet_softc *, struct mbuf *, int);
 static int	vtnet_rxeof(struct vtnet_softc *, int, int *);
-static void	vtnet_rx_intr_task(void *);
-static int	vtnet_rx_vq_intr(void *);
+static void	vtnet_rx_msix_intr(void *);
+static void	vtnet_rx_vq_intr(void *);
 
+static void	vtnet_enqueue_txhdr(struct vtnet_softc *,
+		    struct vtnet_tx_header *);
 static void	vtnet_txeof(struct vtnet_softc *);
 static struct mbuf * vtnet_tx_offload(struct vtnet_softc *, struct mbuf *,
 		    struct virtio_net_hdr *);
 static int	vtnet_enqueue_txbuf(struct vtnet_softc *, struct mbuf **,
 		    struct vtnet_tx_header *);
 static int	vtnet_encap(struct vtnet_softc *, struct mbuf **);
-static void	vtnet_start_locked(struct ifnet *, struct ifaltq_subque *);
 static void	vtnet_start(struct ifnet *, struct ifaltq_subque *);
-static void	vtnet_tick(void *);
-static void	vtnet_tx_intr_task(void *);
-static int	vtnet_tx_vq_intr(void *);
+
+static void	vtnet_config_intr(void *);
+static void	vtnet_tx_msix_intr(void *);
+static void	vtnet_tx_vq_intr(void *);
 
 static void	vtnet_stop(struct vtnet_softc *);
-static int	vtnet_reinit(struct vtnet_softc *);
-static void	vtnet_init_locked(struct vtnet_softc *);
+static int	vtnet_virtio_reinit(struct vtnet_softc *);
 static void	vtnet_init(void *);
 
 static void	vtnet_exec_ctrl_cmd(struct vtnet_softc *, void *,
 		    struct sglist *, int, int);
 
-static void	vtnet_rx_filter(struct vtnet_softc *sc);
+static int	vtnet_ctrl_mac_cmd(struct vtnet_softc *, uint8_t *);
 static int	vtnet_ctrl_rx_cmd(struct vtnet_softc *, int, int);
 static int	vtnet_set_promisc(struct vtnet_softc *, int);
 static int	vtnet_set_allmulti(struct vtnet_softc *, int);
+static void	vtnet_rx_filter(struct vtnet_softc *sc);
 static void	vtnet_rx_filter_mac(struct vtnet_softc *);
 
 static int	vtnet_exec_vlan_filter(struct vtnet_softc *, int, uint16_t);
 static void	vtnet_rx_filter_vlan(struct vtnet_softc *);
-static void	vtnet_set_vlan_filter(struct vtnet_softc *, int, uint16_t);
+static void	vtnet_update_vlan_filter(struct vtnet_softc *, int, uint16_t);
 static void	vtnet_register_vlan(void *, struct ifnet *, uint16_t);
 static void	vtnet_unregister_vlan(void *, struct ifnet *, uint16_t);
 
@@ -360,22 +178,22 @@ static int vtnet_csum_disable = 0;
 TUNABLE_INT("hw.vtnet.csum_disable", &vtnet_csum_disable);
 static int vtnet_tso_disable = 1;
 TUNABLE_INT("hw.vtnet.tso_disable", &vtnet_tso_disable);
-static int vtnet_lro_disable = 1;
+static int vtnet_lro_disable = 0;
 TUNABLE_INT("hw.vtnet.lro_disable", &vtnet_lro_disable);
 
 /*
  * Reducing the number of transmit completed interrupts can
  * improve performance. To do so, the define below keeps the
  * Tx vq interrupt disabled and adds calls to vtnet_txeof()
- * in the start and watchdog paths. The price to pay for this
- * is the m_free'ing of transmitted mbufs may be delayed until
- * the watchdog fires.
+ * in the start path. The price to pay for this is the m_free'ing
+ * of transmitted mbufs may be delayed.
  */
 #define VTNET_TX_INTR_MODERATION
 
 static struct virtio_feature_desc vtnet_feature_desc[] = {
 	{ VIRTIO_NET_F_CSUM,		"TxChecksum"	},
 	{ VIRTIO_NET_F_GUEST_CSUM,	"RxChecksum"	},
+	{ VIRTIO_NET_F_CTRL_GUEST_OFFLOADS, "DynOffload"	},
 	{ VIRTIO_NET_F_MAC,		"MacAddress"	},
 	{ VIRTIO_NET_F_GSO,		"TxAllGSO"	},
 	{ VIRTIO_NET_F_GUEST_TSO4,	"RxTSOv4"	},
@@ -392,7 +210,9 @@ static struct virtio_feature_desc vtnet_feature_desc[] = {
 	{ VIRTIO_NET_F_CTRL_RX,		"RxMode"	},
 	{ VIRTIO_NET_F_CTRL_VLAN,	"VLanFilter"	},
 	{ VIRTIO_NET_F_CTRL_RX_EXTRA,	"RxModeExtra"	},
-	{ VIRTIO_NET_F_MQ,		"RFS"		},
+	{ VIRTIO_NET_F_GUEST_ANNOUNCE,	"GuestAnnounce"	},
+	{ VIRTIO_NET_F_MQ,		"Multiqueue"	},
+	{ VIRTIO_NET_F_CTRL_MAC_ADDR,	"SetMacAddress"	},
 	{ 0, NULL }
 };
 
@@ -405,10 +225,7 @@ static device_method_t vtnet_methods[] = {
 	DEVMETHOD(device_resume,	vtnet_resume),
 	DEVMETHOD(device_shutdown,	vtnet_shutdown),
 
-	/* VirtIO methods. */
-	DEVMETHOD(virtio_config_change, vtnet_config_change),
-
-	{ 0, 0 }
+	DEVMETHOD_END
 };
 
 static driver_t vtnet_driver = {
@@ -419,32 +236,9 @@ static driver_t vtnet_driver = {
 
 static devclass_t vtnet_devclass;
 
-DRIVER_MODULE(vtnet, virtio_pci, vtnet_driver, vtnet_devclass,
-	      vtnet_modevent, 0);
+DRIVER_MODULE(vtnet, virtio_pci, vtnet_driver, vtnet_devclass, NULL, NULL);
 MODULE_VERSION(vtnet, 1);
 MODULE_DEPEND(vtnet, virtio, 1, 1, 1);
-
-static int
-vtnet_modevent(module_t mod, int type, void *unused)
-{
-	int error;
-
-	error = 0;
-
-	switch (type) {
-	case MOD_LOAD:
-		break;
-	case MOD_UNLOAD:
-		break;
-	case MOD_SHUTDOWN:
-		break;
-	default:
-		error = EOPNOTSUPP;
-		break;
-	}
-
-	return (error);
-}
 
 static int
 vtnet_probe(device_t dev)
@@ -461,14 +255,17 @@ static int
 vtnet_attach(device_t dev)
 {
 	struct vtnet_softc *sc;
-	struct ifnet *ifp;
-	int tx_size, error;
+	int i, error;
 
 	sc = device_get_softc(dev);
 	sc->vtnet_dev = dev;
 
 	lwkt_serialize_init(&sc->vtnet_slz);
-	callout_init(&sc->vtnet_tick_ch);
+	lwkt_serialize_init(&sc->vtnet_rx_slz);
+	lwkt_serialize_init(&sc->vtnet_tx_slz);
+	sc->serializes[0] = &sc->vtnet_slz;
+	sc->serializes[1] = &sc->vtnet_rx_slz;
+	sc->serializes[2] = &sc->vtnet_tx_slz;
 
 	ifmedia_init(&sc->vtnet_media, IFM_IMASK, vtnet_ifmedia_upd,
 		     vtnet_ifmedia_sts);
@@ -476,9 +273,19 @@ vtnet_attach(device_t dev)
 	ifmedia_set(&sc->vtnet_media, VTNET_MEDIATYPE);
 
 	vtnet_add_statistics(sc);
+	SLIST_INIT(&sc->vtnet_txhdr_free);
 
+	/* Register our feature descriptions. */
 	virtio_set_feature_desc(dev, vtnet_feature_desc);
 	vtnet_negotiate_features(sc);
+
+	if (virtio_with_feature(dev, VIRTIO_RING_F_INDIRECT_DESC))
+		sc->vtnet_flags |= VTNET_FLAG_INDIRECT;
+
+	if (virtio_with_feature(dev, VIRTIO_NET_F_MAC)) {
+		/* This feature should always be negotiated. */
+		sc->vtnet_flags |= VTNET_FLAG_MAC;
+	}
 
 	if (virtio_with_feature(dev, VIRTIO_NET_F_MRG_RXBUF)) {
 		sc->vtnet_flags |= VTNET_FLAG_MRG_RXBUFS;
@@ -497,9 +304,16 @@ vtnet_attach(device_t dev)
 			sc->vtnet_flags |= VTNET_FLAG_CTRL_RX;
 		if (virtio_with_feature(dev, VIRTIO_NET_F_CTRL_VLAN))
 			sc->vtnet_flags |= VTNET_FLAG_VLAN_FILTER;
+		if (virtio_with_feature(dev, VIRTIO_NET_F_CTRL_MAC_ADDR) &&
+		    virtio_with_feature(dev, VIRTIO_NET_F_CTRL_RX))
+			sc->vtnet_flags |= VTNET_FLAG_CTRL_MAC;
 	}
 
-	vtnet_get_hwaddr(sc);
+	error = vtnet_alloc_intrs(sc);
+	if (error) {
+		device_printf(dev, "cannot allocate interrupts\n");
+		goto fail;
+	}
 
 	error = vtnet_alloc_virtqueues(sc);
 	if (error) {
@@ -507,11 +321,423 @@ vtnet_attach(device_t dev)
 		goto fail;
 	}
 
+	error = vtnet_bind_intrs(sc);
+	if (error) {
+		device_printf(dev, "cannot bind virtqueues to interrupts\n");
+		goto fail;
+	}
+
+	/* Read (or generate) the MAC address for the adapter. */
+	vtnet_get_hwaddr(sc);
+
+	error = vtnet_setup_interface(sc);
+	if (error) {
+		device_printf(dev, "cannot setup interface\n");
+		goto fail;
+	}
+
+	for (i = 0; i < sc->vtnet_nintr; i++) {
+		error = virtio_setup_intr(dev, i, sc->vtnet_intr_slz[i]);
+		if (error) {
+			device_printf(dev, "cannot setup virtqueue "
+			    "interrupts\n");
+			ether_ifdetach(sc->vtnet_ifp);
+			goto fail;
+		}
+	}
+
+	if ((sc->vtnet_flags & VTNET_FLAG_MAC) == 0) {
+		ifnet_serialize_all(sc->vtnet_ifp);
+		vtnet_set_hwaddr(sc);
+		ifnet_deserialize_all(sc->vtnet_ifp);
+	}
+
+	/*
+	 * Device defaults to promiscuous mode for backwards
+	 * compatibility. Turn it off if possible.
+	 */
+	if (sc->vtnet_flags & VTNET_FLAG_CTRL_RX) {
+		ifnet_serialize_all(sc->vtnet_ifp);
+		if (vtnet_set_promisc(sc, 0) != 0) {
+			sc->vtnet_ifp->if_flags |= IFF_PROMISC;
+			device_printf(dev,
+			    "cannot disable promiscuous mode\n");
+		}
+		ifnet_deserialize_all(sc->vtnet_ifp);
+	} else
+		sc->vtnet_ifp->if_flags |= IFF_PROMISC;
+
+fail:
+	if (error)
+		vtnet_detach(dev);
+
+	return (error);
+}
+
+static int
+vtnet_detach(device_t dev)
+{
+	struct vtnet_softc *sc;
+	struct ifnet *ifp;
+	int i;
+
+	sc = device_get_softc(dev);
+	ifp = sc->vtnet_ifp;
+
+	for (i = 0; i < sc->vtnet_nintr; i++)
+		virtio_teardown_intr(dev, i);
+
+	if (device_is_attached(dev)) {
+		ifnet_serialize_all(ifp);
+		vtnet_stop(sc);
+		lwkt_serialize_handler_disable(&sc->vtnet_slz);
+		lwkt_serialize_handler_disable(&sc->vtnet_rx_slz);
+		lwkt_serialize_handler_disable(&sc->vtnet_tx_slz);
+		ifnet_deserialize_all(ifp);
+
+		ether_ifdetach(ifp);
+	}
+
+	if (sc->vtnet_vlan_attach != NULL) {
+		EVENTHANDLER_DEREGISTER(vlan_config, sc->vtnet_vlan_attach);
+		sc->vtnet_vlan_attach = NULL;
+	}
+	if (sc->vtnet_vlan_detach != NULL) {
+		EVENTHANDLER_DEREGISTER(vlan_unconfig, sc->vtnet_vlan_detach);
+		sc->vtnet_vlan_detach = NULL;
+	}
+
+	if (ifp) {
+		if_free(ifp);
+		sc->vtnet_ifp = NULL;
+	}
+
+	if (sc->vtnet_rx_vq != NULL)
+		vtnet_free_rx_mbufs(sc);
+	if (sc->vtnet_tx_vq != NULL)
+		vtnet_free_tx_mbufs(sc);
+	if (sc->vtnet_ctrl_vq != NULL)
+		vtnet_free_ctrl_vq(sc);
+
+	if (sc->vtnet_txhdrarea != NULL) {
+		contigfree(sc->vtnet_txhdrarea,
+		    sc->vtnet_txhdrcount * sizeof(struct vtnet_tx_header),
+		    M_VTNET);
+		sc->vtnet_txhdrarea = NULL;
+	}
+	SLIST_INIT(&sc->vtnet_txhdr_free);
+	if (sc->vtnet_macfilter != NULL) {
+		contigfree(sc->vtnet_macfilter,
+		    sizeof(struct vtnet_mac_filter), M_DEVBUF);
+		sc->vtnet_macfilter = NULL;
+	}
+
+	ifmedia_removeall(&sc->vtnet_media);
+
+	return (0);
+}
+
+static int
+vtnet_suspend(device_t dev)
+{
+	struct vtnet_softc *sc;
+
+	sc = device_get_softc(dev);
+
+	ifnet_serialize_all(sc->vtnet_ifp);
+	vtnet_stop(sc);
+	sc->vtnet_flags |= VTNET_FLAG_SUSPENDED;
+	ifnet_deserialize_all(sc->vtnet_ifp);
+
+	return (0);
+}
+
+static int
+vtnet_resume(device_t dev)
+{
+	struct vtnet_softc *sc;
+	struct ifnet *ifp;
+
+	sc = device_get_softc(dev);
+	ifp = sc->vtnet_ifp;
+
+	ifnet_serialize_all(ifp);
+	if (ifp->if_flags & IFF_UP)
+		vtnet_init(sc);
+	sc->vtnet_flags &= ~VTNET_FLAG_SUSPENDED;
+	ifnet_deserialize_all(ifp);
+
+	return (0);
+}
+
+static int
+vtnet_shutdown(device_t dev)
+{
+
+	/*
+	 * Suspend already does all of what we need to
+	 * do here; we just never expect to be resumed.
+	 */
+	return (vtnet_suspend(dev));
+}
+
+static void
+vtnet_negotiate_features(struct vtnet_softc *sc)
+{
+	device_t dev;
+	uint64_t mask, features;
+
+	dev = sc->vtnet_dev;
+	mask = 0;
+
+	if (vtnet_csum_disable)
+		mask |= VIRTIO_NET_F_CSUM | VIRTIO_NET_F_GUEST_CSUM;
+
+	/*
+	 * XXX DragonFly doesn't support receive checksum offload for ipv6 yet,
+	 *     hence always disable the virtio feature for now.
+	 * XXX We need to support the DynOffload feature, in order to
+	 *     dynamically enable/disable this feature.
+	 */
+	mask |= VIRTIO_NET_F_GUEST_CSUM;
+
+	/*
+	 * TSO is only available when the tx checksum offload feature is also
+	 * negotiated.
+	 */
+	if (vtnet_csum_disable || vtnet_tso_disable)
+		mask |= VIRTIO_NET_F_HOST_TSO4 | VIRTIO_NET_F_HOST_TSO6 |
+		    VIRTIO_NET_F_HOST_ECN;
+
+	if (vtnet_lro_disable)
+		mask |= VTNET_LRO_FEATURES;
+
+	features = VTNET_FEATURES & ~mask;
+	features |= VIRTIO_F_NOTIFY_ON_EMPTY;
+	features |= VIRTIO_F_ANY_LAYOUT;
+	sc->vtnet_features = virtio_negotiate_features(dev, features);
+
+	if (virtio_with_feature(dev, VTNET_LRO_FEATURES) &&
+	    virtio_with_feature(dev, VIRTIO_NET_F_MRG_RXBUF) == 0) {
+		/*
+		 * LRO without mergeable buffers requires special care. This
+		 * is not ideal because every receive buffer must be large
+		 * enough to hold the maximum TCP packet, the Ethernet header,
+		 * and the header. This requires up to 34 descriptors with
+		 * MCLBYTES clusters. If we do not have indirect descriptors,
+		 * LRO is disabled since the virtqueue will not contain very
+		 * many receive buffers.
+		 */
+		if (!virtio_with_feature(dev, VIRTIO_RING_F_INDIRECT_DESC)) {
+			device_printf(dev,
+			    "LRO disabled due to both mergeable buffers and "
+			    "indirect descriptors not negotiated\n");
+
+			features &= ~VTNET_LRO_FEATURES;
+			sc->vtnet_features =
+			    virtio_negotiate_features(dev, features);
+		} else
+			sc->vtnet_flags |= VTNET_FLAG_LRO_NOMRG;
+	}
+}
+
+static void
+vtnet_serialize(struct ifnet *ifp, enum ifnet_serialize slz)
+{
+	struct vtnet_softc *sc = ifp->if_softc;
+
+	ifnet_serialize_array_enter(sc->serializes, 3, slz);
+}
+
+static void
+vtnet_deserialize(struct ifnet *ifp, enum ifnet_serialize slz)
+{
+	struct vtnet_softc *sc = ifp->if_softc;
+
+	ifnet_serialize_array_exit(sc->serializes, 3, slz);
+}
+
+static int
+vtnet_tryserialize(struct ifnet *ifp, enum ifnet_serialize slz)
+{
+	struct vtnet_softc *sc = ifp->if_softc;
+
+	return ifnet_serialize_array_try(sc->serializes, 3, slz);
+}
+
+#ifdef INVARIANTS
+
+static void
+vtnet_serialize_assert(struct ifnet *ifp, enum ifnet_serialize slz,
+    boolean_t serialized)
+{
+	struct vtnet_softc *sc = ifp->if_softc;
+
+	ifnet_serialize_array_assert(sc->serializes, 3, slz, serialized);
+}
+
+#endif  /* INVARIANTS */
+
+static int
+vtnet_alloc_intrs(struct vtnet_softc *sc)
+{
+	int cnt, error;
+	int intrcount = virtio_intr_count(sc->vtnet_dev);
+	int i;
+	int use_config;
+
+	if (virtio_with_feature(sc->vtnet_dev, VIRTIO_NET_F_STATUS)) {
+		use_config = 1;
+		/* We can use a maximum of 3 interrupt vectors. */
+		intrcount = imin(intrcount, 3);
+	} else {
+		/* We can use a maximum of 2 interrupt vectors. */
+		intrcount = imin(intrcount, 2);
+	}
+
+	if (intrcount < 1)
+		return (ENXIO);
+
+	for (i = 0; i < intrcount; i++)
+		sc->vtnet_cpus[i] = -1;
+
+	cnt = intrcount;
+	error = virtio_intr_alloc(sc->vtnet_dev, &cnt, use_config,
+	    sc->vtnet_cpus);
+	if (error != 0) {
+		virtio_intr_release(sc->vtnet_dev);
+		return (error);
+	}
+	sc->vtnet_nintr = cnt;
+
+	return (0);
+}
+
+static int
+vtnet_alloc_virtqueues(struct vtnet_softc *sc)
+{
+	device_t dev;
+	struct vq_alloc_info vq_info[3];
+	int nvqs;
+
+	dev = sc->vtnet_dev;
+	nvqs = 2;
+
+	/*
+	 * Indirect descriptors are not needed for the Rx
+	 * virtqueue when mergeable buffers are negotiated.
+	 * The header is placed inline with the data, not
+	 * in a separate descriptor, and mbuf clusters are
+	 * always physically contiguous.
+	 */
+	if ((sc->vtnet_flags & VTNET_FLAG_MRG_RXBUFS) == 0) {
+		sc->vtnet_rx_nsegs = (sc->vtnet_flags & VTNET_FLAG_LRO_NOMRG) ?
+		    VTNET_MAX_RX_SEGS : VTNET_MIN_RX_SEGS;
+	} else
+		sc->vtnet_rx_nsegs = VTNET_MRG_RX_SEGS;
+
+	if (virtio_with_feature(dev, VIRTIO_NET_F_HOST_TSO4) ||
+	    virtio_with_feature(dev, VIRTIO_NET_F_HOST_TSO6))
+		sc->vtnet_tx_nsegs = VTNET_MAX_TX_SEGS;
+	else
+		sc->vtnet_tx_nsegs = VTNET_MIN_TX_SEGS;
+
+	VQ_ALLOC_INFO_INIT(&vq_info[0], sc->vtnet_rx_nsegs, &sc->vtnet_rx_vq,
+	    "%s receive", device_get_nameunit(dev));
+
+	VQ_ALLOC_INFO_INIT(&vq_info[1], sc->vtnet_tx_nsegs, &sc->vtnet_tx_vq,
+	    "%s transmit", device_get_nameunit(dev));
+
+	if (sc->vtnet_flags & VTNET_FLAG_CTRL_VQ) {
+		nvqs++;
+
+		VQ_ALLOC_INFO_INIT(&vq_info[2], 0, &sc->vtnet_ctrl_vq,
+		    "%s control", device_get_nameunit(dev));
+	}
+
+	return (virtio_alloc_virtqueues(dev, nvqs, vq_info));
+}
+
+static int
+vtnet_bind_intrs(struct vtnet_softc *sc)
+{
+	int error = 0;
+	int i;
+
+	for (i = 0; i < 3; i++)
+		sc->vtnet_intr_slz[i] = &sc->vtnet_slz;
+
+	/* Possible "Virtqueue <-> IRQ" configurations */
+	switch (sc->vtnet_nintr) {
+	case 1:
+		sc->vtnet_irqmap[0] = (struct irqmap){0, vtnet_rx_vq_intr};
+		sc->vtnet_irqmap[1] = (struct irqmap){0, vtnet_tx_vq_intr};
+		break;
+	case 2:
+		if (virtio_with_feature(sc->vtnet_dev, VIRTIO_NET_F_STATUS)) {
+			sc->vtnet_irqmap[0] =
+			    (struct irqmap){1, vtnet_rx_vq_intr};
+			sc->vtnet_irqmap[1] =
+			    (struct irqmap){1, vtnet_tx_vq_intr};
+		} else {
+			sc->vtnet_irqmap[0] =
+			    (struct irqmap){0, vtnet_rx_msix_intr};
+			sc->vtnet_irqmap[1] =
+			    (struct irqmap){1, vtnet_tx_msix_intr};
+			sc->vtnet_intr_slz[0] = &sc->vtnet_rx_slz;
+			sc->vtnet_intr_slz[1] = &sc->vtnet_tx_slz;
+		}
+		break;
+	case 3:
+		sc->vtnet_irqmap[0] = (struct irqmap){1, vtnet_rx_msix_intr};
+		sc->vtnet_irqmap[1] = (struct irqmap){2, vtnet_tx_msix_intr};
+		sc->vtnet_intr_slz[1] = &sc->vtnet_rx_slz;
+		sc->vtnet_intr_slz[2] = &sc->vtnet_tx_slz;
+		break;
+	default:
+		device_printf(sc->vtnet_dev,
+		    "Invalid interrupt vector count: %d\n", sc->vtnet_nintr);
+		error = EINVAL;
+		goto fail;
+	}
+
+	for (i = 0; i < 2; i++) {
+		error = virtio_bind_intr(sc->vtnet_dev,
+		    sc->vtnet_irqmap[i].irq, i, sc->vtnet_irqmap[i].handler,
+		    sc);
+		if (error) {
+			device_printf(sc->vtnet_dev,
+			    "cannot bind virtqueue IRQs\n");
+			goto fail;
+		}
+	}
+	if (virtio_with_feature(sc->vtnet_dev, VIRTIO_NET_F_STATUS)) {
+		error = virtio_bind_intr(sc->vtnet_dev, 0, -1,
+		    vtnet_config_intr, sc);
+		if (error) {
+			device_printf(sc->vtnet_dev,
+			    "cannot bind config_change IRQ\n");
+			goto fail;
+		}
+	}
+
+fail:
+	return (error);
+}
+
+static int
+vtnet_setup_interface(struct vtnet_softc *sc)
+{
+	device_t dev;
+	struct ifnet *ifp;
+	int i;
+
+	dev = sc->vtnet_dev;
+
 	ifp = sc->vtnet_ifp = if_alloc(IFT_ETHER);
 	if (ifp == NULL) {
 		device_printf(dev, "cannot allocate ifnet structure\n");
-		error = ENOSPC;
-		goto fail;
+		return (ENOSPC);
 	}
 
 	ifp->if_softc = sc;
@@ -519,38 +745,50 @@ vtnet_attach(device_t dev)
 	ifp->if_flags = IFF_BROADCAST | IFF_SIMPLEX | IFF_MULTICAST;
 	ifp->if_init = vtnet_init;
 	ifp->if_start = vtnet_start;
+#ifdef IFPOLL_ENABLE
+	ifp->if_npoll = vtnet_npoll;
+#endif
+	ifp->if_serialize = vtnet_serialize;
+	ifp->if_deserialize = vtnet_deserialize;
+	ifp->if_tryserialize = vtnet_tryserialize;
+#ifdef INVARIANTS
+	ifp->if_serialize_assert = vtnet_serialize_assert;
+#endif
 	ifp->if_ioctl = vtnet_ioctl;
 
-	sc->vtnet_rx_size = virtqueue_size(sc->vtnet_rx_vq);
-	sc->vtnet_rx_process_limit = sc->vtnet_rx_size;
-
-	tx_size = virtqueue_size(sc->vtnet_tx_vq);
-	sc->vtnet_tx_size = tx_size;
-	sc->vtnet_txhdridx = 0;
+	sc->vtnet_rx_process_limit = virtqueue_size(sc->vtnet_rx_vq);
+	sc->vtnet_tx_size = virtqueue_size(sc->vtnet_tx_vq);
+	if (sc->vtnet_flags & VTNET_FLAG_INDIRECT)
+		sc->vtnet_txhdrcount = sc->vtnet_tx_size;
+	else
+		sc->vtnet_txhdrcount = (sc->vtnet_tx_size / 2) + 1;
 	sc->vtnet_txhdrarea = contigmalloc(
-	    ((sc->vtnet_tx_size / 2) + 1) * sizeof(struct vtnet_tx_header),
+	    sc->vtnet_txhdrcount * sizeof(struct vtnet_tx_header),
 	    M_VTNET, M_WAITOK, 0, BUS_SPACE_MAXADDR, 4, 0);
 	if (sc->vtnet_txhdrarea == NULL) {
 		device_printf(dev, "cannot contigmalloc the tx headers\n");
-		goto fail;
+		return (ENOMEM);
 	}
+	for (i = 0; i < sc->vtnet_txhdrcount; i++)
+		vtnet_enqueue_txhdr(sc, &sc->vtnet_txhdrarea[i]);
 	sc->vtnet_macfilter = contigmalloc(
 	    sizeof(struct vtnet_mac_filter),
 	    M_DEVBUF, M_WAITOK, 0, BUS_SPACE_MAXADDR, 4, 0);
 	if (sc->vtnet_macfilter == NULL) {
 		device_printf(dev,
 		    "cannot contigmalloc the mac filter table\n");
-		goto fail;
+		return (ENOMEM);
 	}
-	ifq_set_maxlen(&ifp->if_snd, tx_size - 1);
+	ifq_set_maxlen(&ifp->if_snd, sc->vtnet_tx_size - 1);
 	ifq_set_ready(&ifp->if_snd);
 
 	ether_ifattach(ifp, sc->vtnet_hwaddr, NULL);
 
-	if (virtio_with_feature(dev, VIRTIO_NET_F_STATUS)){
-		//ifp->if_capabilities |= IFCAP_LINKSTATE;
-		 kprintf("add dynamic link state\n");
-	}
+	/* The Tx IRQ is currently always the last allocated interrupt. */
+	ifq_set_cpuid(&ifp->if_snd, sc->vtnet_cpus[sc->vtnet_nintr - 1]);
+	ifsq_watchdog_init(&sc->vtnet_tx_watchdog,
+	    ifq_get_subq_default(&ifp->if_snd), vtnet_watchdog);
+	ifq_set_hw_serialize(&ifp->if_snd, &sc->vtnet_tx_slz);
 
 	/* Tell the upper layer(s) we support long frames. */
 	ifp->if_data.ifi_hdrlen = sizeof(struct ether_vlan_header);
@@ -570,15 +808,16 @@ vtnet_attach(device_t dev)
 			sc->vtnet_flags |= VTNET_FLAG_TSO_ECN;
 	}
 
-	if (virtio_with_feature(dev, VIRTIO_NET_F_GUEST_CSUM)) {
+	if (virtio_with_feature(dev, VIRTIO_NET_F_GUEST_CSUM))
 		ifp->if_capabilities |= IFCAP_RXCSUM;
 
-		if (virtio_with_feature(dev, VIRTIO_NET_F_GUEST_TSO4) ||
-		    virtio_with_feature(dev, VIRTIO_NET_F_GUEST_TSO6))
-			ifp->if_capabilities |= IFCAP_LRO;
-	}
+#if 0	/* IFCAP_LRO doesn't exist in DragonFly. */
+	if (virtio_with_feature(dev, VIRTIO_NET_F_GUEST_TSO4) ||
+	    virtio_with_feature(dev, VIRTIO_NET_F_GUEST_TSO6))
+		ifp->if_capabilities |= IFCAP_LRO;
+#endif
 
-	if (ifp->if_capabilities & IFCAP_HWCSUM) {
+	if ((ifp->if_capabilities & IFCAP_HWCSUM) == IFCAP_HWCSUM) {
 		/*
 		 * VirtIO does not support VLAN tagging, but we can fake
 		 * it by inserting and removing the 802.1Q header during
@@ -604,240 +843,7 @@ vtnet_attach(device_t dev)
 		    vtnet_unregister_vlan, sc, EVENTHANDLER_PRI_FIRST);
 	}
 
-	TASK_INIT(&sc->vtnet_cfgchg_task, 0, vtnet_config_change_task, sc);
-
-	error = virtio_setup_intr(dev, &sc->vtnet_slz);
-	if (error) {
-		device_printf(dev, "cannot setup virtqueue interrupts\n");
-		ether_ifdetach(ifp);
-		goto fail;
-	}
-
-	/*
-	 * Device defaults to promiscuous mode for backwards
-	 * compatibility. Turn it off if possible.
-	 */
-	if (sc->vtnet_flags & VTNET_FLAG_CTRL_RX) {
-		lwkt_serialize_enter(&sc->vtnet_slz);
-		if (vtnet_set_promisc(sc, 0) != 0) {
-			ifp->if_flags |= IFF_PROMISC;
-			device_printf(dev,
-			    "cannot disable promiscuous mode\n");
-		}
-		lwkt_serialize_exit(&sc->vtnet_slz);
-	} else
-		ifp->if_flags |= IFF_PROMISC;
-
-fail:
-	if (error)
-		vtnet_detach(dev);
-
-	return (error);
-}
-
-static int
-vtnet_detach(device_t dev)
-{
-	struct vtnet_softc *sc;
-	struct ifnet *ifp;
-
-	sc = device_get_softc(dev);
-	ifp = sc->vtnet_ifp;
-
-	if (device_is_attached(dev)) {
-		lwkt_serialize_enter(&sc->vtnet_slz);
-		vtnet_stop(sc);
-		lwkt_serialize_exit(&sc->vtnet_slz);
-
-		callout_stop(&sc->vtnet_tick_ch);
-		taskqueue_drain(taskqueue_swi, &sc->vtnet_cfgchg_task);
-
-		ether_ifdetach(ifp);
-	}
-
-	if (sc->vtnet_vlan_attach != NULL) {
-		EVENTHANDLER_DEREGISTER(vlan_config, sc->vtnet_vlan_attach);
-		sc->vtnet_vlan_attach = NULL;
-	}
-	if (sc->vtnet_vlan_detach != NULL) {
-		EVENTHANDLER_DEREGISTER(vlan_unconfg, sc->vtnet_vlan_detach);
-		sc->vtnet_vlan_detach = NULL;
-	}
-
-	if (ifp) {
-		if_free(ifp);
-		sc->vtnet_ifp = NULL;
-	}
-
-	if (sc->vtnet_rx_vq != NULL)
-		vtnet_free_rx_mbufs(sc);
-	if (sc->vtnet_tx_vq != NULL)
-		vtnet_free_tx_mbufs(sc);
-	if (sc->vtnet_ctrl_vq != NULL)
-		vtnet_free_ctrl_vq(sc);
-
-	if (sc->vtnet_txhdrarea != NULL) {
-		contigfree(sc->vtnet_txhdrarea,
-		    ((sc->vtnet_tx_size / 2) + 1) *
-		    sizeof(struct vtnet_tx_header), M_VTNET);
-		sc->vtnet_txhdrarea = NULL;
-	}
-	if (sc->vtnet_macfilter != NULL) {
-		contigfree(sc->vtnet_macfilter,
-		    sizeof(struct vtnet_mac_filter), M_DEVBUF);
-		sc->vtnet_macfilter = NULL;
-	}
-
-	ifmedia_removeall(&sc->vtnet_media);
-
 	return (0);
-}
-
-static int
-vtnet_suspend(device_t dev)
-{
-	struct vtnet_softc *sc;
-
-	sc = device_get_softc(dev);
-
-	lwkt_serialize_enter(&sc->vtnet_slz);
-	vtnet_stop(sc);
-	sc->vtnet_flags |= VTNET_FLAG_SUSPENDED;
-	lwkt_serialize_exit(&sc->vtnet_slz);
-
-	return (0);
-}
-
-static int
-vtnet_resume(device_t dev)
-{
-	struct vtnet_softc *sc;
-	struct ifnet *ifp;
-
-	sc = device_get_softc(dev);
-	ifp = sc->vtnet_ifp;
-
-	lwkt_serialize_enter(&sc->vtnet_slz);
-	if (ifp->if_flags & IFF_UP)
-		vtnet_init_locked(sc);
-	sc->vtnet_flags &= ~VTNET_FLAG_SUSPENDED;
-	lwkt_serialize_exit(&sc->vtnet_slz);
-
-	return (0);
-}
-
-static int
-vtnet_shutdown(device_t dev)
-{
-
-	/*
-	 * Suspend already does all of what we need to
-	 * do here; we just never expect to be resumed.
-	 */
-	return (vtnet_suspend(dev));
-}
-
-static int
-vtnet_config_change(device_t dev)
-{
-	struct vtnet_softc *sc;
-
-	sc = device_get_softc(dev);
-
-	taskqueue_enqueue(taskqueue_thread[mycpuid], &sc->vtnet_cfgchg_task);
-
-	return (1);
-}
-
-static void
-vtnet_negotiate_features(struct vtnet_softc *sc)
-{
-	device_t dev;
-	uint64_t mask, features;
-
-	dev = sc->vtnet_dev;
-	mask = 0;
-
-	if (vtnet_csum_disable)
-		mask |= VIRTIO_NET_F_CSUM | VIRTIO_NET_F_GUEST_CSUM;
-
-	/*
-	 * TSO and LRO are only available when their corresponding
-	 * checksum offload feature is also negotiated.
-	 */
-
-	if (vtnet_csum_disable || vtnet_tso_disable)
-		mask |= VIRTIO_NET_F_HOST_TSO4 | VIRTIO_NET_F_HOST_TSO6 |
-		    VIRTIO_NET_F_HOST_ECN;
-
-	if (vtnet_csum_disable || vtnet_lro_disable)
-		mask |= VTNET_LRO_FEATURES;
-
-	features = VTNET_FEATURES & ~mask;
-	features |= VIRTIO_F_NOTIFY_ON_EMPTY;
-	sc->vtnet_features = virtio_negotiate_features(dev, features);
-}
-
-static int
-vtnet_alloc_virtqueues(struct vtnet_softc *sc)
-{
-	device_t dev;
-	struct vq_alloc_info vq_info[3];
-	int nvqs, rxsegs;
-
-	dev = sc->vtnet_dev;
-	nvqs = 2;
-
-	/*
-	 * Indirect descriptors are not needed for the Rx
-	 * virtqueue when mergeable buffers are negotiated.
-	 * The header is placed inline with the data, not
-	 * in a separate descriptor, and mbuf clusters are
-	 * always physically contiguous.
-	 */
-	if ((sc->vtnet_flags & VTNET_FLAG_MRG_RXBUFS) == 0) {
-		rxsegs = sc->vtnet_flags & VTNET_FLAG_LRO_NOMRG ?
-		    VTNET_MAX_RX_SEGS : VTNET_MIN_RX_SEGS;
-	} else
-		rxsegs = 0;
-
-	VQ_ALLOC_INFO_INIT(&vq_info[0], rxsegs,
-	    vtnet_rx_vq_intr, sc, &sc->vtnet_rx_vq,
-	    "%s receive", device_get_nameunit(dev));
-
-	VQ_ALLOC_INFO_INIT(&vq_info[1], VTNET_MAX_TX_SEGS,
-	    vtnet_tx_vq_intr, sc, &sc->vtnet_tx_vq,
-	    "%s transmit", device_get_nameunit(dev));
-
-	if (sc->vtnet_flags & VTNET_FLAG_CTRL_VQ) {
-		nvqs++;
-
-		VQ_ALLOC_INFO_INIT(&vq_info[2], 0, NULL, NULL,
-		    &sc->vtnet_ctrl_vq, "%s control",
-		    device_get_nameunit(dev));
-	}
-
-	return (virtio_alloc_virtqueues(dev, 0, nvqs, vq_info));
-}
-
-static void
-vtnet_get_hwaddr(struct vtnet_softc *sc)
-{
-	device_t dev;
-
-	dev = sc->vtnet_dev;
-
-	if (virtio_with_feature(dev, VIRTIO_NET_F_MAC)) {
-		virtio_read_device_config(dev,
-		    offsetof(struct virtio_net_config, mac),
-		    sc->vtnet_hwaddr, ETHER_ADDR_LEN);
-	} else {
-		/* Generate random locally administered unicast address. */
-		sc->vtnet_hwaddr[0] = 0xB2;
-		karc4rand(&sc->vtnet_hwaddr[1], ETHER_ADDR_LEN - 1);
-
-		vtnet_set_hwaddr(sc);
-	}
 }
 
 static void
@@ -847,7 +853,38 @@ vtnet_set_hwaddr(struct vtnet_softc *sc)
 
 	dev = sc->vtnet_dev;
 
-	virtio_write_device_config(dev,
+	if ((sc->vtnet_flags & VTNET_FLAG_CTRL_MAC) &&
+	    (sc->vtnet_flags & VTNET_FLAG_CTRL_RX)) {
+		if (vtnet_ctrl_mac_cmd(sc, sc->vtnet_hwaddr) != 0)
+			device_printf(dev, "unable to set MAC address\n");
+	} else if (sc->vtnet_flags & VTNET_FLAG_MAC) {
+		virtio_write_device_config(dev,
+		    offsetof(struct virtio_net_config, mac),
+		    sc->vtnet_hwaddr, ETHER_ADDR_LEN);
+	}
+}
+
+static void
+vtnet_get_hwaddr(struct vtnet_softc *sc)
+{
+	device_t dev;
+
+	dev = sc->vtnet_dev;
+
+	if ((sc->vtnet_flags & VTNET_FLAG_MAC) == 0) {
+		/*
+		 * Generate a random locally administered unicast address.
+		 *
+		 * It would be nice to generate the same MAC address across
+		 * reboots, but it seems all the hosts currently available
+		 * support the MAC feature, so this isn't too important.
+		 */
+		sc->vtnet_hwaddr[0] = 0xB2;
+		karc4rand(&sc->vtnet_hwaddr[1], ETHER_ADDR_LEN - 1);
+		return;
+	}
+
+	virtio_read_device_config(dev,
 	    offsetof(struct virtio_net_config, mac),
 	    sc->vtnet_hwaddr, ETHER_ADDR_LEN);
 }
@@ -864,8 +901,12 @@ vtnet_is_link_up(struct vtnet_softc *sc)
 
 	ASSERT_SERIALIZED(&sc->vtnet_slz);
 
-	status = virtio_read_dev_config_2(dev,
-			offsetof(struct virtio_net_config, status));
+	if (virtio_with_feature(dev, VIRTIO_NET_F_STATUS)) {
+		status = virtio_read_dev_config_2(dev,
+				offsetof(struct virtio_net_config, status));
+	} else {
+		status = VIRTIO_NET_S_LINK_UP;
+	}
 
 	return ((status & VIRTIO_NET_S_LINK_UP) != 0);
 }
@@ -891,7 +932,7 @@ vtnet_update_link_status(struct vtnet_softc *sc)
 		ifp->if_link_state = LINK_STATE_UP;
 		if_link_state_change(ifp);
 		if (!ifsq_is_empty(ifsq))
-			vtnet_start_locked(ifp, ifsq);
+			ifsq_devstart_sched(ifsq);
 	} else if (!link && (sc->vtnet_flags & VTNET_FLAG_LINK)) {
 		sc->vtnet_flags &= ~VTNET_FLAG_LINK;
 		if (bootverbose)
@@ -902,41 +943,30 @@ vtnet_update_link_status(struct vtnet_softc *sc)
 	}
 }
 
-#if 0
 static void
-vtnet_watchdog(struct vtnet_softc *sc)
+vtnet_watchdog(struct ifaltq_subque *ifsq)
 {
 	struct ifnet *ifp;
+	struct vtnet_softc *sc;
 
-	ifp = sc->vtnet_ifp;
+	ifp = ifsq_get_ifp(ifsq);
+	sc = ifp->if_softc;
+	ASSERT_IFNET_SERIALIZED_ALL(ifp);
 
-#ifdef VTNET_TX_INTR_MODERATION
-	vtnet_txeof(sc);
-#endif
-
-	if (sc->vtnet_watchdog_timer == 0 || --sc->vtnet_watchdog_timer)
+	if (virtqueue_empty(sc->vtnet_tx_vq)) {
+		if_printf(ifp, "Spurious TX watchdog timeout -- ignoring\n");
+		sc->vtnet_tx_watchdog.wd_timer = 0;
 		return;
+	}
 
-	if_printf(ifp, "watchdog timeout -- resetting\n");
+	if_printf(ifp, "TX watchdog timeout -- resetting\n");
 #ifdef VTNET_DEBUG
 	virtqueue_dump(sc->vtnet_tx_vq);
 #endif
 	ifp->if_oerrors++;
 	ifp->if_flags &= ~IFF_RUNNING;
-	vtnet_init_locked(sc);
-}
-#endif
-
-static void
-vtnet_config_change_task(void *arg, int pending)
-{
-	struct vtnet_softc *sc;
-
-	sc = arg;
-
-	lwkt_serialize_enter(&sc->vtnet_slz);
-	vtnet_update_link_status(sc);
-	lwkt_serialize_exit(&sc->vtnet_slz);
+	vtnet_init(sc);
+	ifsq_devstart_sched(ifsq);
 }
 
 static int
@@ -955,15 +985,11 @@ vtnet_ioctl(struct ifnet *ifp, u_long cmd, caddr_t data,struct ucred *cr)
 	case SIOCSIFMTU:
 		if (ifr->ifr_mtu < ETHERMIN || ifr->ifr_mtu > VTNET_MAX_MTU)
 			error = EINVAL;
-		else if (ifp->if_mtu != ifr->ifr_mtu) {
-			lwkt_serialize_enter(&sc->vtnet_slz);
+		else if (ifp->if_mtu != ifr->ifr_mtu)
 			error = vtnet_change_mtu(sc, ifr->ifr_mtu);
-			lwkt_serialize_exit(&sc->vtnet_slz);
-		}
 		break;
 
 	case SIOCSIFFLAGS:
-		lwkt_serialize_enter(&sc->vtnet_slz);
 		if ((ifp->if_flags & IFF_UP) == 0) {
 			if (ifp->if_flags & IFF_RUNNING)
 				vtnet_stop(sc);
@@ -975,21 +1001,19 @@ vtnet_ioctl(struct ifnet *ifp, u_long cmd, caddr_t data,struct ucred *cr)
 				else
 					error = ENOTSUP;
 			}
-		} else
-			vtnet_init_locked(sc);
+		} else {
+			vtnet_init(sc);
+		}
 
 		if (error == 0)
 			sc->vtnet_if_flags = ifp->if_flags;
-		lwkt_serialize_exit(&sc->vtnet_slz);
 		break;
 
 	case SIOCADDMULTI:
 	case SIOCDELMULTI:
-		lwkt_serialize_enter(&sc->vtnet_slz);
 		if ((sc->vtnet_flags & VTNET_FLAG_CTRL_RX) &&
 		    (ifp->if_flags & IFF_RUNNING))
 			vtnet_rx_filter_mac(sc);
-		lwkt_serialize_exit(&sc->vtnet_slz);
 		break;
 
 	case SIOCSIFMEDIA:
@@ -1000,7 +1024,6 @@ vtnet_ioctl(struct ifnet *ifp, u_long cmd, caddr_t data,struct ucred *cr)
 	case SIOCSIFCAP:
 		mask = ifr->ifr_reqcap ^ ifp->if_capenable;
 
-		lwkt_serialize_enter(&sc->vtnet_slz);
 
 		if (mask & IFCAP_TXCSUM) {
 			ifp->if_capenable ^= IFCAP_TXCSUM;
@@ -1023,10 +1046,12 @@ vtnet_ioctl(struct ifnet *ifp, u_long cmd, caddr_t data,struct ucred *cr)
 			reinit = 1;
 		}
 
+#if 0	/* IFCAP_LRO doesn't exist in DragonFly. */
 		if (mask & IFCAP_LRO) {
 			ifp->if_capenable ^= IFCAP_LRO;
 			reinit = 1;
 		}
+#endif
 
 		if (mask & IFCAP_VLAN_HWFILTER) {
 			ifp->if_capenable ^= IFCAP_VLAN_HWFILTER;
@@ -1041,11 +1066,10 @@ vtnet_ioctl(struct ifnet *ifp, u_long cmd, caddr_t data,struct ucred *cr)
 
 		if (reinit && (ifp->if_flags & IFF_RUNNING)) {
 			ifp->if_flags &= ~IFF_RUNNING;
-			vtnet_init_locked(sc);
+			vtnet_init(sc);
 		}
 		//VLAN_CAPABILITIES(ifp);
 
-		lwkt_serialize_exit(&sc->vtnet_slz);
 		break;
 
 	default:
@@ -1094,7 +1118,7 @@ vtnet_change_mtu(struct vtnet_softc *sc, int new_mtu)
 
 	if (ifp->if_flags & IFF_RUNNING) {
 		ifp->if_flags &= ~IFF_RUNNING;
-		vtnet_init_locked(sc);
+		vtnet_init(sc);
 	}
 
 	return (0);
@@ -1117,7 +1141,7 @@ vtnet_init_rx_vq(struct vtnet_softc *sc)
 	}
 
 	if (nbufs > 0) {
-		virtqueue_notify(vq, &sc->vtnet_slz);
+		virtqueue_notify(vq, NULL);
 
 		/*
 		 * EMSGSIZE signifies the virtqueue did not have enough
@@ -1161,6 +1185,7 @@ vtnet_free_tx_mbufs(struct vtnet_softc *sc)
 
 	while ((txhdr = virtqueue_drain(vq, &last)) != NULL) {
 		m_freem(txhdr->vth_mbuf);
+		vtnet_enqueue_txhdr(sc, txhdr);
 	}
 
 	KASSERT(virtqueue_empty(vq), ("mbufs remaining in Tx Vq"));
@@ -1187,7 +1212,7 @@ vtnet_alloc_rxbuf(struct vtnet_softc *sc, int nbufs, struct mbuf **m_tailp)
 
 	/*use getcl instead of getjcl. see  if_mxge.c comment line 2398*/
 	//m_head = m_getjcl(M_DONTWAIT, MT_DATA, M_PKTHDR, clsize);
-	m_head = m_getcl(MB_DONTWAIT, MT_DATA, M_PKTHDR );
+	m_head = m_getcl(M_NOWAIT, MT_DATA, M_PKTHDR );
 	if (m_head == NULL)
 		goto fail;
 
@@ -1200,7 +1225,7 @@ vtnet_alloc_rxbuf(struct vtnet_softc *sc, int nbufs, struct mbuf **m_tailp)
 
 		for (i = 0; i < nbufs - 1; i++) {
 			//m = m_getjcl(M_DONTWAIT, MT_DATA, 0, clsize);
-			m = m_getcl(MB_DONTWAIT, MT_DATA, 0);
+			m = m_getcl(M_NOWAIT, MT_DATA, 0);
 			if (m == NULL)
 				goto fail;
 
@@ -1368,11 +1393,11 @@ vtnet_enqueue_rxbuf(struct vtnet_softc *sc, struct mbuf *m)
 	uint8_t *mdata;
 	int offset, error;
 
-	ASSERT_SERIALIZED(&sc->vtnet_slz);
+	ASSERT_SERIALIZED(&sc->vtnet_rx_slz);
 	if ((sc->vtnet_flags & VTNET_FLAG_LRO_NOMRG) == 0)
 		KASSERT(m->m_next == NULL, ("chained Rx mbuf"));
 
-	sglist_init(&sg, VTNET_MAX_RX_SEGS, segs);
+	sglist_init(&sg, sc->vtnet_rx_nsegs, segs);
 
 	mdata = mtod(m, uint8_t *);
 	offset = 0;
@@ -1398,6 +1423,115 @@ vtnet_enqueue_rxbuf(struct vtnet_softc *sc, struct mbuf *m)
 
 	return (virtqueue_enqueue(sc->vtnet_rx_vq, m, &sg, 0, sg.sg_nseg));
 }
+
+#ifdef IFPOLL_ENABLE
+
+static void
+vtnet_npoll_status(struct ifnet *ifp)
+{
+	struct vtnet_softc *sc = ifp->if_softc;
+
+	ASSERT_SERIALIZED(&sc->vtnet_slz);
+
+	vtnet_update_link_status(sc);
+}
+
+static void
+vtnet_npoll_rx(struct ifnet *ifp, void *arg __unused, int cycle)
+{
+	struct vtnet_softc *sc = ifp->if_softc;
+
+	vtnet_rxeof(sc, cycle, NULL);
+}
+
+static void
+vtnet_npoll_tx(struct ifnet *ifp, void *arg __unused, int cycle __unused)
+{
+	struct vtnet_softc *sc = ifp->if_softc;
+
+	ASSERT_SERIALIZED(&sc->vtnet_tx_slz);
+
+	vtnet_txeof(sc);
+	if (!ifq_is_empty(&ifp->if_snd))
+		if_devstart(ifp);
+}
+
+static void
+vtnet_npoll(struct ifnet *ifp, struct ifpoll_info *info)
+{
+	struct vtnet_softc *sc = ifp->if_softc;
+	int i;
+
+	ASSERT_IFNET_SERIALIZED_ALL(ifp);
+
+	if (info) {
+		int cpu;
+
+		info->ifpi_status.status_func = vtnet_npoll_status;
+		info->ifpi_status.serializer = &sc->vtnet_slz;
+
+		/* Use the same cpu for rx and tx. */
+		cpu = device_get_unit(device_get_parent(sc->vtnet_dev));
+		/* Shuffle a bit. */
+		cpu = (cpu * 61) % netisr_ncpus;
+		KKASSERT(cpu < netisr_ncpus);
+		info->ifpi_tx[cpu].poll_func = vtnet_npoll_tx;
+		info->ifpi_tx[cpu].arg = NULL;
+		info->ifpi_tx[cpu].serializer = &sc->vtnet_tx_slz;
+		ifq_set_cpuid(&ifp->if_snd, cpu);
+
+		info->ifpi_rx[cpu].poll_func = vtnet_npoll_rx;
+		info->ifpi_rx[cpu].arg = NULL;
+		info->ifpi_rx[cpu].serializer = &sc->vtnet_rx_slz;
+
+		for (i = 0; i < 3; i++)
+			lwkt_serialize_handler_disable(sc->serializes[i]);
+		vtnet_disable_rx_intr(sc);
+		vtnet_disable_tx_intr(sc);
+		for (i = 0; i < sc->vtnet_nintr; i++)
+			virtio_teardown_intr(sc->vtnet_dev, i);
+		if (virtio_with_feature(sc->vtnet_dev, VIRTIO_NET_F_STATUS))
+			virtio_unbind_intr(sc->vtnet_dev, -1);
+		for (i = 0; i < 2; i++)
+			virtio_unbind_intr(sc->vtnet_dev, i);
+	} else {
+		int error;
+
+		ifq_set_cpuid(&ifp->if_snd,
+		    sc->vtnet_cpus[sc->vtnet_nintr - 1]);
+		for (i = 0; i < 3; i++)
+			lwkt_serialize_handler_enable(sc->serializes[i]);
+		for (i = 0; i < 2; i++) {
+			error = virtio_bind_intr(sc->vtnet_dev,
+			    sc->vtnet_irqmap[i].irq, i,
+			    sc->vtnet_irqmap[i].handler, sc);
+			if (error) {
+				device_printf(sc->vtnet_dev,
+				    "cannot re-bind virtqueue IRQs\n");
+			}
+		}
+		if (virtio_with_feature(sc->vtnet_dev, VIRTIO_NET_F_STATUS)) {
+			error = virtio_bind_intr(sc->vtnet_dev, 0, -1,
+			    vtnet_config_intr, sc);
+			if (error) {
+				device_printf(sc->vtnet_dev,
+				    "cannot re-bind config_change IRQ\n");
+			}
+		}
+		for (i = 0; i < sc->vtnet_nintr; i++) {
+			error = virtio_setup_intr(sc->vtnet_dev, i,
+			    sc->vtnet_intr_slz[i]);
+			if (error) {
+				device_printf(sc->vtnet_dev,
+				    "cannot setup virtqueue interrupts\n");
+			}
+		}
+		vtnet_enable_rx_intr(sc);
+		vtnet_enable_tx_intr(sc);
+	}
+}
+
+#endif	/* IFPOLL_ENABLE */
 
 static void
 vtnet_vlan_tag_remove(struct mbuf *m)
@@ -1465,10 +1599,6 @@ vtnet_rx_csum(struct vtnet_softc *sc, struct mbuf *m,
 	case offsetof(struct tcphdr, th_sum):
 		m->m_pkthdr.csum_flags |= CSUM_DATA_VALID | CSUM_PSEUDO_HDR;
 		m->m_pkthdr.csum_data = 0xFFFF;
-		break;
-
-	case offsetof(struct sctphdr, checksum):
-		//m->m_pkthdr.csum_flags |= CSUM_SCTP_VALID;
 		break;
 
 	default:
@@ -1546,8 +1676,6 @@ vtnet_rxeof(struct vtnet_softc *sc, int count, int *rx_npktsp)
 	deq = 0;
 	rx_npkts = 0;
 
-	ASSERT_SERIALIZED(&sc->vtnet_slz);
-
 	while (--count >= 0) {
 		m = virtqueue_dequeue(vq, &len);
 		if (m == NULL)
@@ -1623,10 +1751,8 @@ vtnet_rxeof(struct vtnet_softc *sc, int count, int *rx_npktsp)
 				sc->vtnet_stats.rx_csum_failed++;
 		}
 
-		lwkt_serialize_exit(&sc->vtnet_slz);
 		rx_npkts++;
-		ifp->if_input(ifp, m, NULL, -1);
-		lwkt_serialize_enter(&sc->vtnet_slz);
+		ifp->if_input(ifp, m, NULL, mycpuid);
 
 		/*
 		 * The interface may have been stopped while we were
@@ -1636,7 +1762,8 @@ vtnet_rxeof(struct vtnet_softc *sc, int count, int *rx_npktsp)
 			break;
 	}
 
-	virtqueue_notify(vq, &sc->vtnet_slz);
+	if (deq > 0)
+		virtqueue_notify(vq, NULL);
 
 	if (rx_npktsp != NULL)
 		*rx_npktsp = rx_npkts;
@@ -1645,21 +1772,22 @@ vtnet_rxeof(struct vtnet_softc *sc, int count, int *rx_npktsp)
 }
 
 static void
-vtnet_rx_intr_task(void *arg)
+vtnet_rx_msix_intr(void *xsc)
 {
 	struct vtnet_softc *sc;
 	struct ifnet *ifp;
 	int more;
 
-	sc = arg;
+	sc = xsc;
 	ifp = sc->vtnet_ifp;
 
-next:
-//	lwkt_serialize_enter(&sc->vtnet_slz);
+	if (!virtqueue_pending(sc->vtnet_rx_vq))
+		return;
 
+	vtnet_disable_rx_intr(sc);
+next:
 	if ((ifp->if_flags & IFF_RUNNING) == 0) {
 		vtnet_enable_rx_intr(sc);
-//		lwkt_serialize_exit(&sc->vtnet_slz);
 		return;
 	}
 
@@ -1669,25 +1797,27 @@ next:
 		more = 1;
 	}
 
-//	lwkt_serialize_exit(&sc->vtnet_slz);
-
 	if (more) {
 		sc->vtnet_stats.rx_task_rescheduled++;
 		goto next;
 	}
 }
 
-static int
+static void
 vtnet_rx_vq_intr(void *xsc)
 {
-	struct vtnet_softc *sc;
+	struct vtnet_softc *sc = xsc;
 
-	sc = xsc;
+	lwkt_serialize_enter(&sc->vtnet_rx_slz);
+	vtnet_rx_msix_intr(xsc);
+	lwkt_serialize_exit(&sc->vtnet_rx_slz);
+}
 
-	vtnet_disable_rx_intr(sc);
-	vtnet_rx_intr_task(sc);
-
-	return (1);
+static void
+vtnet_enqueue_txhdr(struct vtnet_softc *sc, struct vtnet_tx_header *txhdr)
+{
+	bzero(txhdr, sizeof(*txhdr));
+	SLIST_INSERT_HEAD(&sc->vtnet_txhdr_free, txhdr, link);
 }
 
 static void
@@ -1702,18 +1832,19 @@ vtnet_txeof(struct vtnet_softc *sc)
 	ifp = sc->vtnet_ifp;
 	deq = 0;
 
-	ASSERT_SERIALIZED(&sc->vtnet_slz);
-
 	while ((txhdr = virtqueue_dequeue(vq, NULL)) != NULL) {
 		deq++;
 		ifp->if_opackets++;
 		m_freem(txhdr->vth_mbuf);
+		vtnet_enqueue_txhdr(sc, txhdr);
 	}
 
 	if (deq > 0) {
 		ifq_clr_oactive(&ifp->if_snd);
 		if (virtqueue_empty(vq))
-			sc->vtnet_watchdog_timer = 0;
+			sc->vtnet_tx_watchdog.wd_timer = 0;
+		else
+			sc->vtnet_tx_watchdog.wd_timer = VTNET_WATCHDOG_TIMEOUT;
 	}
 }
 
@@ -1841,38 +1972,37 @@ vtnet_enqueue_txbuf(struct vtnet_softc *sc, struct mbuf **m_head,
 	struct sglist_seg segs[VTNET_MAX_TX_SEGS];
 	struct virtqueue *vq;
 	struct mbuf *m;
-	int collapsed, error;
+	int error;
 
 	vq = sc->vtnet_tx_vq;
 	m = *m_head;
-	collapsed = 0;
 
-	sglist_init(&sg, VTNET_MAX_TX_SEGS, segs);
+	sglist_init(&sg, sc->vtnet_tx_nsegs, segs);
 	error = sglist_append(&sg, &txhdr->vth_uhdr, sc->vtnet_hdr_size);
 	KASSERT(error == 0 && sg.sg_nseg == 1,
-	    ("cannot add header to sglist"));
+	    ("%s: error %d adding header to sglist", __func__, error));
 
-again:
 	error = sglist_append_mbuf(&sg, m);
 	if (error) {
-		if (collapsed)
-			goto fail;
-
-		//m = m_collapse(m, MB_DONTWAIT, VTNET_MAX_TX_SEGS - 1);
-		m = m_defrag(m, MB_DONTWAIT);
+		m = m_defrag(m, M_NOWAIT);
 		if (m == NULL)
 			goto fail;
 
 		*m_head = m;
-		collapsed = 1;
-		goto again;
+		sc->vtnet_stats.tx_defragged++;
+
+		error = sglist_append_mbuf(&sg, m);
+		if (error)
+			goto fail;
 	}
 
 	txhdr->vth_mbuf = m;
+	error = virtqueue_enqueue(vq, txhdr, &sg, sg.sg_nseg, 0);
 
-	return (virtqueue_enqueue(vq, txhdr, &sg, sg.sg_nseg, 0));
+	return (error);
 
 fail:
+	sc->vtnet_stats.tx_defrag_failed++;
 	m_freem(*m_head);
 	*m_head = NULL;
 
@@ -1886,13 +2016,13 @@ vtnet_vlan_tag_insert(struct mbuf *m)
 	struct ether_vlan_header *evl;
 
 	if (M_WRITABLE(m) == 0) {
-		n = m_dup(m, MB_DONTWAIT);
+		n = m_dup(m, M_NOWAIT);
 		m_freem(m);
 		if ((m = n) == NULL)
 			return (NULL);
 	}
 
-	M_PREPEND(m, ETHER_VLAN_ENCAP_LEN, MB_DONTWAIT);
+	M_PREPEND(m, ETHER_VLAN_ENCAP_LEN, M_NOWAIT);
 	if (m == NULL)
 		return (NULL);
 	if (m->m_len < sizeof(struct ether_vlan_header)) {
@@ -1920,8 +2050,10 @@ vtnet_encap(struct vtnet_softc *sc, struct mbuf **m_head)
 	struct mbuf *m;
 	int error;
 
-	txhdr = &sc->vtnet_txhdrarea[sc->vtnet_txhdridx];
-	memset(txhdr, 0, sizeof(struct vtnet_tx_header));
+	txhdr = SLIST_FIRST(&sc->vtnet_txhdr_free);
+	if (txhdr == NULL)
+		return (ENOBUFS);
+	SLIST_REMOVE_HEAD(&sc->vtnet_txhdr_free, link);
 
 	/*
 	 * Always use the non-mergeable header to simplify things. When
@@ -1949,28 +2081,14 @@ vtnet_encap(struct vtnet_softc *sc, struct mbuf **m_head)
 	}
 
 	error = vtnet_enqueue_txbuf(sc, m_head, txhdr);
-	if (error == 0)
-		sc->vtnet_txhdridx =
-		    (sc->vtnet_txhdridx + 1) % ((sc->vtnet_tx_size / 2) + 1);
 fail:
+	if (error != 0)
+		vtnet_enqueue_txhdr(sc, txhdr);
 	return (error);
 }
 
 static void
 vtnet_start(struct ifnet *ifp, struct ifaltq_subque *ifsq)
-{
-	struct vtnet_softc *sc;
-
-	sc = ifp->if_softc;
-
-	ASSERT_ALTQ_SQ_DEFAULT(ifp, ifsq);
-	lwkt_serialize_enter(&sc->vtnet_slz);
-	vtnet_start_locked(ifp, ifsq);
-	lwkt_serialize_exit(&sc->vtnet_slz);
-}
-
-static void
-vtnet_start_locked(struct ifnet *ifp, struct ifaltq_subque *ifsq)
 {
 	struct vtnet_softc *sc;
 	struct virtqueue *vq;
@@ -1981,7 +2099,8 @@ vtnet_start_locked(struct ifnet *ifp, struct ifaltq_subque *ifsq)
 	vq = sc->vtnet_tx_vq;
 	enq = 0;
 
-	ASSERT_SERIALIZED(&sc->vtnet_slz);
+	ASSERT_ALTQ_SQ_DEFAULT(ifp, ifsq);
+	ASSERT_SERIALIZED(&sc->vtnet_tx_slz);
 
 	if ((ifp->if_flags & (IFF_RUNNING)) !=
 	    IFF_RUNNING || ((sc->vtnet_flags & VTNET_FLAG_LINK) == 0))
@@ -1994,19 +2113,19 @@ vtnet_start_locked(struct ifnet *ifp, struct ifaltq_subque *ifsq)
 
 	while (!ifsq_is_empty(ifsq)) {
 		if (virtqueue_full(vq)) {
-			ifq_set_oactive(&ifp->if_snd);
+			ifsq_set_oactive(ifsq);
 			break;
 		}
 
-		m0 = ifq_dequeue(&ifp->if_snd);
+		m0 = ifsq_dequeue(ifsq);
 		if (m0 == NULL)
 			break;
 
 		if (vtnet_encap(sc, &m0) != 0) {
 			if (m0 == NULL)
 				break;
-			ifq_prepend(&ifp->if_snd, m0);
-			ifq_set_oactive(&ifp->if_snd);
+			ifsq_prepend(ifsq, m0);
+			ifsq_set_oactive(ifsq);
 			break;
 		}
 
@@ -2015,76 +2134,62 @@ vtnet_start_locked(struct ifnet *ifp, struct ifaltq_subque *ifsq)
 	}
 
 	if (enq > 0) {
-		virtqueue_notify(vq, &sc->vtnet_slz);
-		sc->vtnet_watchdog_timer = VTNET_WATCHDOG_TIMEOUT;
+		virtqueue_notify(vq, NULL);
+		sc->vtnet_tx_watchdog.wd_timer = VTNET_WATCHDOG_TIMEOUT;
 	}
 }
 
 static void
-vtnet_tick(void *xsc)
-{
-	struct vtnet_softc *sc;
-
-	sc = xsc;
-
-#if 0
-	ASSERT_SERIALIZED(&sc->vtnet_slz);
-#ifdef VTNET_DEBUG
-	virtqueue_dump(sc->vtnet_rx_vq);
-	virtqueue_dump(sc->vtnet_tx_vq);
-#endif
-
-	vtnet_watchdog(sc);
-	callout_reset(&sc->vtnet_tick_ch, hz, vtnet_tick, sc);
-#endif
-}
-
-static void
-vtnet_tx_intr_task(void *arg)
+vtnet_tx_msix_intr(void *xsc)
 {
 	struct vtnet_softc *sc;
 	struct ifnet *ifp;
 	struct ifaltq_subque *ifsq;
 
-	sc = arg;
+	sc = xsc;
 	ifp = sc->vtnet_ifp;
 	ifsq = ifq_get_subq_default(&ifp->if_snd);
 
-next:
-//	lwkt_serialize_enter(&sc->vtnet_slz);
+	if (!virtqueue_pending(sc->vtnet_tx_vq))
+		return;
 
+	vtnet_disable_tx_intr(sc);
+next:
 	if ((ifp->if_flags & IFF_RUNNING) == 0) {
 		vtnet_enable_tx_intr(sc);
-//		lwkt_serialize_exit(&sc->vtnet_slz);
 		return;
 	}
 
 	vtnet_txeof(sc);
 
 	if (!ifsq_is_empty(ifsq))
-		vtnet_start_locked(ifp, ifsq);
+		ifsq_devstart(ifsq);
 
 	if (vtnet_enable_tx_intr(sc) != 0) {
 		vtnet_disable_tx_intr(sc);
 		sc->vtnet_stats.tx_task_rescheduled++;
-//		lwkt_serialize_exit(&sc->vtnet_slz);
 		goto next;
 	}
-
-//	lwkt_serialize_exit(&sc->vtnet_slz);
 }
 
-static int
+static void
 vtnet_tx_vq_intr(void *xsc)
+{
+	struct vtnet_softc *sc = xsc;
+
+	lwkt_serialize_enter(&sc->vtnet_tx_slz);
+	vtnet_tx_msix_intr(xsc);
+	lwkt_serialize_exit(&sc->vtnet_tx_slz);
+}
+
+static void
+vtnet_config_intr(void *arg)
 {
 	struct vtnet_softc *sc;
 
-	sc = xsc;
+	sc = arg;
 
-	vtnet_disable_tx_intr(sc);
-	vtnet_tx_intr_task(sc);
-
-	return (1);
+	vtnet_update_link_status(sc);
 }
 
 static void
@@ -2096,11 +2201,10 @@ vtnet_stop(struct vtnet_softc *sc)
 	dev = sc->vtnet_dev;
 	ifp = sc->vtnet_ifp;
 
-	ASSERT_SERIALIZED(&sc->vtnet_slz);
+	ASSERT_IFNET_SERIALIZED_ALL(ifp);
 
-	sc->vtnet_watchdog_timer = 0;
-	callout_stop(&sc->vtnet_tick_ch);
 	ifq_clr_oactive(&ifp->if_snd);
+	ifsq_watchdog_stop(&sc->vtnet_tx_watchdog);
 	ifp->if_flags &= ~(IFF_RUNNING);
 
 	vtnet_disable_rx_intr(sc);
@@ -2121,11 +2225,14 @@ vtnet_stop(struct vtnet_softc *sc)
 }
 
 static int
-vtnet_reinit(struct vtnet_softc *sc)
+vtnet_virtio_reinit(struct vtnet_softc *sc)
 {
+	device_t dev;
 	struct ifnet *ifp;
 	uint64_t features;
+	int error;
 
+	dev = sc->vtnet_dev;
 	ifp = sc->vtnet_ifp;
 	features = sc->vtnet_features;
 
@@ -2140,30 +2247,38 @@ vtnet_reinit(struct vtnet_softc *sc)
 			features &= ~VIRTIO_NET_F_GUEST_CSUM;
 	}
 
+#if 0	/* IFCAP_LRO doesn't exist in DragonFly. */
 	if (ifp->if_capabilities & IFCAP_LRO) {
 		if ((ifp->if_capenable & IFCAP_LRO) == 0)
 			features &= ~VTNET_LRO_FEATURES;
 	}
+#endif
 
 	if (ifp->if_capabilities & IFCAP_VLAN_HWFILTER) {
 		if ((ifp->if_capenable & IFCAP_VLAN_HWFILTER) == 0)
 			features &= ~VIRTIO_NET_F_CTRL_VLAN;
 	}
 
-	return (virtio_reinit(sc->vtnet_dev, features));
+	error = virtio_reinit(dev, features);
+	if (error)
+		device_printf(dev, "virtio reinit error %d\n", error);
+
+	return (error);
 }
 
 static void
-vtnet_init_locked(struct vtnet_softc *sc)
+vtnet_init(void *xsc)
 {
+	struct vtnet_softc *sc;
 	device_t dev;
 	struct ifnet *ifp;
 	int error;
 
+	sc = xsc;
 	dev = sc->vtnet_dev;
 	ifp = sc->vtnet_ifp;
 
-	ASSERT_SERIALIZED(&sc->vtnet_slz);
+	ASSERT_IFNET_SERIALIZED_ALL(ifp);
 
 	if (ifp->if_flags & IFF_RUNNING)
 		return;
@@ -2172,7 +2287,7 @@ vtnet_init_locked(struct vtnet_softc *sc)
 	vtnet_stop(sc);
 
 	/* Reinitialize the host device. */
-	error = vtnet_reinit(sc);
+	error = vtnet_virtio_reinit(sc);
 	if (error) {
 		device_printf(dev,
 		    "reinitialization failed, stopping device...\n");
@@ -2212,6 +2327,9 @@ vtnet_init_locked(struct vtnet_softc *sc)
 			vtnet_rx_filter_vlan(sc);
 	}
 
+#ifdef IFPOLL_ENABLE
+	if (!(ifp->if_flags & IFF_NPOLLING))
+#endif
 	{
 		vtnet_enable_rx_intr(sc);
 		vtnet_enable_tx_intr(sc);
@@ -2219,23 +2337,11 @@ vtnet_init_locked(struct vtnet_softc *sc)
 
 	ifp->if_flags |= IFF_RUNNING;
 	ifq_clr_oactive(&ifp->if_snd);
+	ifsq_watchdog_start(&sc->vtnet_tx_watchdog);
 
 	virtio_reinit_complete(dev);
 
 	vtnet_update_link_status(sc);
-	callout_reset(&sc->vtnet_tick_ch, hz, vtnet_tick, sc);
-}
-
-static void
-vtnet_init(void *xsc)
-{
-	struct vtnet_softc *sc;
-
-	sc = xsc;
-
-	lwkt_serialize_enter(&sc->vtnet_slz);
-	vtnet_init_locked(sc);
-	lwkt_serialize_exit(&sc->vtnet_slz);
 }
 
 static void
@@ -2247,7 +2353,7 @@ vtnet_exec_ctrl_cmd(struct vtnet_softc *sc, void *cookie,
 
 	vq = sc->vtnet_ctrl_vq;
 
-	ASSERT_SERIALIZED(&sc->vtnet_slz);
+	ASSERT_IFNET_SERIALIZED_ALL(sc->vtnet_ifp);
 	KASSERT(sc->vtnet_flags & VTNET_FLAG_CTRL_VQ,
 	    ("no control virtqueue"));
 	KASSERT(virtqueue_empty(vq),
@@ -2256,7 +2362,12 @@ vtnet_exec_ctrl_cmd(struct vtnet_softc *sc, void *cookie,
 	if (virtqueue_enqueue(vq, cookie, sg, readable, writable) != 0)
 		return;
 
-	virtqueue_notify(vq, &sc->vtnet_slz);
+	/*
+	 * XXX We can safely drop the serializer between here, and the end of
+	 *     the function, when we can correctly sleep for this command to
+	 *     be finished.
+	 */
+	virtqueue_notify(vq, NULL);
 
 	/*
 	 * Poll until the command is complete. Previously, we would
@@ -2273,6 +2384,41 @@ vtnet_exec_ctrl_cmd(struct vtnet_softc *sc, void *cookie,
 	KASSERT(c == cookie, ("unexpected control command response"));
 }
 
+static int
+vtnet_ctrl_mac_cmd(struct vtnet_softc *sc, uint8_t *hwaddr)
+{
+	struct {
+		struct virtio_net_ctrl_hdr hdr __aligned(2);
+		uint8_t pad1;
+		char aligned_hwaddr[ETHER_ADDR_LEN] __aligned(8);
+		uint8_t pad2;
+		uint8_t ack;
+	} s;
+	struct sglist_seg segs[3];
+	struct sglist sg;
+	int error;
+
+	s.hdr.class = VIRTIO_NET_CTRL_MAC;
+	s.hdr.cmd = VIRTIO_NET_CTRL_MAC_ADDR_SET;
+	s.ack = VIRTIO_NET_ERR;
+
+	/* Copy the mac address into physically contiguous memory */
+	memcpy(s.aligned_hwaddr, hwaddr, ETHER_ADDR_LEN);
+
+	sglist_init(&sg, 3, segs);
+	error = 0;
+	error |= sglist_append(&sg, &s.hdr,
+	    sizeof(struct virtio_net_ctrl_hdr));
+	error |= sglist_append(&sg, s.aligned_hwaddr, ETHER_ADDR_LEN);
+	error |= sglist_append(&sg, &s.ack, sizeof(uint8_t));
+	KASSERT(error == 0 && sg.sg_nseg == 3,
+	    ("%s: error %d adding set MAC msg to sglist", __func__, error));
+
+	vtnet_exec_ctrl_cmd(sc, &s.ack, &sg, sg.sg_nseg - 1, 1);
+
+	return (s.ack == VIRTIO_NET_OK ? 0 : EIO);
+}
+
 static void
 vtnet_rx_filter(struct vtnet_softc *sc)
 {
@@ -2282,48 +2428,52 @@ vtnet_rx_filter(struct vtnet_softc *sc)
 	dev = sc->vtnet_dev;
 	ifp = sc->vtnet_ifp;
 
-	ASSERT_SERIALIZED(&sc->vtnet_slz);
+	ASSERT_IFNET_SERIALIZED_ALL(ifp);
 	KASSERT(sc->vtnet_flags & VTNET_FLAG_CTRL_RX,
 	    ("CTRL_RX feature not negotiated"));
 
 	if (vtnet_set_promisc(sc, ifp->if_flags & IFF_PROMISC) != 0)
 		device_printf(dev, "cannot %s promiscuous mode\n",
-		    ifp->if_flags & IFF_PROMISC ? "enable" : "disable");
+		    (ifp->if_flags & IFF_PROMISC) ? "enable" : "disable");
 
 	if (vtnet_set_allmulti(sc, ifp->if_flags & IFF_ALLMULTI) != 0)
 		device_printf(dev, "cannot %s all-multicast mode\n",
-		    ifp->if_flags & IFF_ALLMULTI ? "enable" : "disable");
+		    (ifp->if_flags & IFF_ALLMULTI) ? "enable" : "disable");
 }
 
 static int
 vtnet_ctrl_rx_cmd(struct vtnet_softc *sc, int cmd, int on)
 {
-	struct virtio_net_ctrl_hdr hdr __aligned(2);
 	struct sglist_seg segs[3];
 	struct sglist sg;
-	uint8_t onoff, ack;
+	struct {
+		struct virtio_net_ctrl_hdr hdr __aligned(2);
+		uint8_t pad1;
+		uint8_t onoff;
+		uint8_t pad2;
+		uint8_t ack;
+	} s;
 	int error;
 
-	if ((sc->vtnet_flags & VTNET_FLAG_CTRL_RX) == 0)
-		return (ENOTSUP);
+	KASSERT(sc->vtnet_flags & VTNET_FLAG_CTRL_RX,
+	    ("%s: CTRL_RX feature not negotiated", __func__));
 
-	error = 0;
-
-	hdr.class = VIRTIO_NET_CTRL_RX;
-	hdr.cmd = cmd;
-	onoff = !!on;
-	ack = VIRTIO_NET_ERR;
+	s.hdr.class = VIRTIO_NET_CTRL_RX;
+	s.hdr.cmd = cmd;
+	s.onoff = !!on;
+	s.ack = VIRTIO_NET_ERR;
 
 	sglist_init(&sg, 3, segs);
-	error |= sglist_append(&sg, &hdr, sizeof(struct virtio_net_ctrl_hdr));
-	error |= sglist_append(&sg, &onoff, sizeof(uint8_t));
-	error |= sglist_append(&sg, &ack, sizeof(uint8_t));
+	error = 0;
+	error |= sglist_append(&sg, &s.hdr, sizeof(struct virtio_net_ctrl_hdr));
+	error |= sglist_append(&sg, &s.onoff, sizeof(uint8_t));
+	error |= sglist_append(&sg, &s.ack, sizeof(uint8_t));
 	KASSERT(error == 0 && sg.sg_nseg == 3,
-	    ("error adding Rx filter message to sglist"));
+	    ("%s: error %d adding Rx message to sglist", __func__, error));
 
-	vtnet_exec_ctrl_cmd(sc, &ack, &sg, sg.sg_nseg - 1, 1);
+	vtnet_exec_ctrl_cmd(sc, &s.ack, &sg, sg.sg_nseg - 1, 1);
 
-	return (ack == VIRTIO_NET_OK ? 0 : EIO);
+	return (s.ack == VIRTIO_NET_OK ? 0 : EIO);
 }
 
 static int
@@ -2349,7 +2499,7 @@ vtnet_rx_filter_mac(struct vtnet_softc *sc)
 	struct sglist sg;
 	struct ifnet *ifp;
 	struct ifaddr *ifa;
-        struct ifaddr_container *ifac;
+	struct ifaddr_container *ifac;
 	struct ifmultiaddr *ifma;
 	int ucnt, mcnt, promisc, allmulti, error;
 	uint8_t ack;
@@ -2359,11 +2509,10 @@ vtnet_rx_filter_mac(struct vtnet_softc *sc)
 	mcnt = 0;
 	promisc = 0;
 	allmulti = 0;
-	error = 0;
 
-	ASSERT_SERIALIZED(&sc->vtnet_slz);
+	ASSERT_IFNET_SERIALIZED_ALL(ifp);
 	KASSERT(sc->vtnet_flags & VTNET_FLAG_CTRL_RX,
-	    ("CTRL_RX feature not negotiated"));
+	    ("%s: CTRL_RX feature not negotiated", __func__));
 
 	/* Use the MAC filtering table allocated in vtnet_attach. */
 	filter = sc->vtnet_macfilter;
@@ -2375,8 +2524,13 @@ vtnet_rx_filter_mac(struct vtnet_softc *sc)
 		ifa = ifac->ifa;
 		if (ifa->ifa_addr->sa_family != AF_LINK)
 			continue;
-		else if (ucnt == VTNET_MAX_MAC_ENTRIES)
+		else if (memcmp(LLADDR((struct sockaddr_dl *)ifa->ifa_addr),
+		    sc->vtnet_hwaddr, ETHER_ADDR_LEN) == 0)
+			continue;
+		else if (ucnt == VTNET_MAX_MAC_ENTRIES) {
+			promisc = 1;
 			break;
+		}
 
 		bcopy(LLADDR((struct sockaddr_dl *)ifa->ifa_addr),
 		    &filter->vmf_unicast.macs[ucnt], ETHER_ADDR_LEN);
@@ -2384,10 +2538,8 @@ vtnet_rx_filter_mac(struct vtnet_softc *sc)
 	}
 	//if_addr_runlock(ifp);
 
-	if (ucnt >= VTNET_MAX_MAC_ENTRIES) {
-		promisc = 1;
+	if (promisc != 0) {
 		filter->vmf_unicast.nentries = 0;
-
 		if_printf(ifp, "more than %d MAC addresses assigned, "
 		    "falling back to promiscuous mode\n",
 		    VTNET_MAX_MAC_ENTRIES);
@@ -2399,8 +2551,10 @@ vtnet_rx_filter_mac(struct vtnet_softc *sc)
 	TAILQ_FOREACH(ifma, &ifp->if_multiaddrs, ifma_link) {
 		if (ifma->ifma_addr->sa_family != AF_LINK)
 			continue;
-		else if (mcnt == VTNET_MAX_MAC_ENTRIES)
+		else if (mcnt == VTNET_MAX_MAC_ENTRIES) {
+			allmulti = 1;
 			break;
+		}
 
 		bcopy(LLADDR((struct sockaddr_dl *)ifma->ifma_addr),
 		    &filter->vmf_multicast.macs[mcnt], ETHER_ADDR_LEN);
@@ -2408,17 +2562,15 @@ vtnet_rx_filter_mac(struct vtnet_softc *sc)
 	}
 	//if_maddr_runlock(ifp);
 
-	if (mcnt >= VTNET_MAX_MAC_ENTRIES) {
-		allmulti = 1;
+	if (allmulti != 0) {
 		filter->vmf_multicast.nentries = 0;
-
 		if_printf(ifp, "more than %d multicast MAC addresses "
 		    "assigned, falling back to all-multicast mode\n",
 		    VTNET_MAX_MAC_ENTRIES);
 	} else
 		filter->vmf_multicast.nentries = mcnt;
 
-	if (promisc && allmulti)
+	if (promisc != 0 && allmulti != 0)
 		goto out;
 
 	hdr.class = VIRTIO_NET_CTRL_MAC;
@@ -2426,14 +2578,15 @@ vtnet_rx_filter_mac(struct vtnet_softc *sc)
 	ack = VIRTIO_NET_ERR;
 
 	sglist_init(&sg, 4, segs);
+	error = 0;
 	error |= sglist_append(&sg, &hdr, sizeof(struct virtio_net_ctrl_hdr));
 	error |= sglist_append(&sg, &filter->vmf_unicast,
-	    sizeof(struct vtnet_mac_table));
+	    sizeof(uint32_t) + filter->vmf_unicast.nentries * ETHER_ADDR_LEN);
 	error |= sglist_append(&sg, &filter->vmf_multicast,
-	    sizeof(struct vtnet_mac_table));
+	    sizeof(uint32_t) + filter->vmf_multicast.nentries * ETHER_ADDR_LEN);
 	error |= sglist_append(&sg, &ack, sizeof(uint8_t));
 	KASSERT(error == 0 && sg.sg_nseg == 4,
-	    ("error adding MAC filtering message to sglist"));
+	    ("%s: error %d adding MAC filter msg to sglist", __func__, error));
 
 	vtnet_exec_ctrl_cmd(sc, &ack, &sg, sg.sg_nseg - 1, 1);
 
@@ -2441,91 +2594,89 @@ vtnet_rx_filter_mac(struct vtnet_softc *sc)
 		if_printf(ifp, "error setting host MAC filter table\n");
 
 out:
-	if (promisc)
-		if (vtnet_set_promisc(sc, 1) != 0)
-			if_printf(ifp, "cannot enable promiscuous mode\n");
-	if (allmulti)
-		if (vtnet_set_allmulti(sc, 1) != 0)
-			if_printf(ifp, "cannot enable all-multicast mode\n");
+	if (promisc != 0 && vtnet_set_promisc(sc, 1) != 0)
+		if_printf(ifp, "cannot enable promiscuous mode\n");
+	if (allmulti != 0 && vtnet_set_allmulti(sc, 1) != 0)
+		if_printf(ifp, "cannot enable all-multicast mode\n");
 }
 
 static int
 vtnet_exec_vlan_filter(struct vtnet_softc *sc, int add, uint16_t tag)
 {
-	struct virtio_net_ctrl_hdr hdr __aligned(2);
 	struct sglist_seg segs[3];
 	struct sglist sg;
-	uint8_t ack;
+	struct {
+		struct virtio_net_ctrl_hdr hdr __aligned(2);
+		uint8_t pad1;
+		uint16_t tag;
+		uint8_t pad2;
+		uint8_t ack;
+	} s;
 	int error;
 
-	hdr.class = VIRTIO_NET_CTRL_VLAN;
-	hdr.cmd = add ? VIRTIO_NET_CTRL_VLAN_ADD : VIRTIO_NET_CTRL_VLAN_DEL;
-	ack = VIRTIO_NET_ERR;
-	error = 0;
+	s.hdr.class = VIRTIO_NET_CTRL_VLAN;
+	s.hdr.cmd = add ? VIRTIO_NET_CTRL_VLAN_ADD : VIRTIO_NET_CTRL_VLAN_DEL;
+	s.tag = tag;
+	s.ack = VIRTIO_NET_ERR;
 
 	sglist_init(&sg, 3, segs);
-	error |= sglist_append(&sg, &hdr, sizeof(struct virtio_net_ctrl_hdr));
-	error |= sglist_append(&sg, &tag, sizeof(uint16_t));
-	error |= sglist_append(&sg, &ack, sizeof(uint8_t));
+	error = 0;
+	error |= sglist_append(&sg, &s.hdr, sizeof(struct virtio_net_ctrl_hdr));
+	error |= sglist_append(&sg, &s.tag, sizeof(uint16_t));
+	error |= sglist_append(&sg, &s.ack, sizeof(uint8_t));
 	KASSERT(error == 0 && sg.sg_nseg == 3,
-	    ("error adding VLAN control message to sglist"));
+	    ("%s: error %d adding VLAN message to sglist", __func__, error));
 
-	vtnet_exec_ctrl_cmd(sc, &ack, &sg, sg.sg_nseg - 1, 1);
+	vtnet_exec_ctrl_cmd(sc, &s.ack, &sg, sg.sg_nseg - 1, 1);
 
-	return (ack == VIRTIO_NET_OK ? 0 : EIO);
+	return (s.ack == VIRTIO_NET_OK ? 0 : EIO);
 }
 
 static void
 vtnet_rx_filter_vlan(struct vtnet_softc *sc)
 {
-	device_t dev;
-	uint32_t w, mask;
+	uint32_t w;
 	uint16_t tag;
-	int i, nvlans, error;
+	int i, bit, nvlans;
 
-	ASSERT_SERIALIZED(&sc->vtnet_slz);
+	ASSERT_IFNET_SERIALIZED_ALL(sc->vtnet_ifp);
 	KASSERT(sc->vtnet_flags & VTNET_FLAG_VLAN_FILTER,
-	    ("VLAN_FILTER feature not negotiated"));
+	    ("%s: VLAN_FILTER feature not negotiated", __func__));
 
-	dev = sc->vtnet_dev;
 	nvlans = sc->vtnet_nvlans;
-	error = 0;
 
-	/* Enable filtering for each configured VLAN. */
+	/* Enable the filter for each configured VLAN. */
 	for (i = 0; i < VTNET_VLAN_SHADOW_SIZE && nvlans > 0; i++) {
 		w = sc->vtnet_vlan_shadow[i];
-		for (mask = 1, tag = i * 32; w != 0; mask <<= 1, tag++) {
-			if ((w & mask) != 0) {
-				w &= ~mask;
-				nvlans--;
-				if (vtnet_exec_vlan_filter(sc, 1, tag) != 0)
-					error++;
+		while ((bit = ffs(w) - 1) != -1) {
+			w &= ~(1 << bit);
+			tag = sizeof(w) * CHAR_BIT * i + bit;
+			nvlans--;
+
+			if (vtnet_exec_vlan_filter(sc, 1, tag) != 0) {
+				device_printf(sc->vtnet_dev,
+				    "cannot enable VLAN %d filter\n", tag);
 			}
 		}
 	}
 
 	KASSERT(nvlans == 0, ("VLAN count incorrect"));
-	if (error)
-		device_printf(dev, "cannot restore VLAN filter table\n");
 }
 
 static void
-vtnet_set_vlan_filter(struct vtnet_softc *sc, int add, uint16_t tag)
+vtnet_update_vlan_filter(struct vtnet_softc *sc, int add, uint16_t tag)
 {
 	struct ifnet *ifp;
 	int idx, bit;
-
-	KASSERT(sc->vtnet_flags & VTNET_FLAG_VLAN_FILTER,
-	    ("VLAN_FILTER feature not negotiated"));
-
-	if ((tag == 0) || (tag > 4095))
-		return;
 
 	ifp = sc->vtnet_ifp;
 	idx = (tag >> 5) & 0x7F;
 	bit = tag & 0x1F;
 
-	lwkt_serialize_enter(&sc->vtnet_slz);
+	if (tag == 0 || tag > 4095)
+		return;
+
+	ifnet_serialize_all(ifp);
 
 	/* Update shadow VLAN table. */
 	if (add) {
@@ -2536,16 +2687,14 @@ vtnet_set_vlan_filter(struct vtnet_softc *sc, int add, uint16_t tag)
 		sc->vtnet_vlan_shadow[idx] &= ~(1 << bit);
 	}
 
-	if (ifp->if_capenable & IFCAP_VLAN_HWFILTER) {
-		if (vtnet_exec_vlan_filter(sc, add, tag) != 0) {
-			device_printf(sc->vtnet_dev,
-			    "cannot %s VLAN %d %s the host filter table\n",
-			    add ? "add" : "remove", tag,
-			    add ? "to" : "from");
-		}
+	if (ifp->if_capenable & IFCAP_VLAN_HWFILTER &&
+	    vtnet_exec_vlan_filter(sc, add, tag) != 0) {
+		device_printf(sc->vtnet_dev,
+		    "cannot %s VLAN %d %s the host filter table\n",
+		    add ? "add" : "remove", tag, add ? "to" : "from");
 	}
 
-	lwkt_serialize_exit(&sc->vtnet_slz);
+	ifnet_deserialize_all(ifp);
 }
 
 static void
@@ -2555,7 +2704,7 @@ vtnet_register_vlan(void *arg, struct ifnet *ifp, uint16_t tag)
 	if (ifp->if_softc != arg)
 		return;
 
-	vtnet_set_vlan_filter(arg, 1, tag);
+	vtnet_update_vlan_filter(arg, 1, tag);
 }
 
 static void
@@ -2565,7 +2714,7 @@ vtnet_unregister_vlan(void *arg, struct ifnet *ifp, uint16_t tag)
 	if (ifp->if_softc != arg)
 		return;
 
-	vtnet_set_vlan_filter(arg, 0, tag);
+	vtnet_update_vlan_filter(arg, 0, tag);
 }
 
 static int
@@ -2593,13 +2742,11 @@ vtnet_ifmedia_sts(struct ifnet *ifp, struct ifmediareq *ifmr)
 	ifmr->ifm_status = IFM_AVALID;
 	ifmr->ifm_active = IFM_ETHER;
 
-	lwkt_serialize_enter(&sc->vtnet_slz);
 	if (vtnet_is_link_up(sc) != 0) {
 		ifmr->ifm_status |= IFM_ACTIVE;
 		ifmr->ifm_active |= VTNET_MEDIATYPE;
 	} else
 		ifmr->ifm_active |= IFM_NONE;
-	lwkt_serialize_exit(&sc->vtnet_slz);
 }
 
 static void
@@ -2607,78 +2754,70 @@ vtnet_add_statistics(struct vtnet_softc *sc)
 {
 	device_t dev;
 	struct vtnet_statistics *stats;
-        //struct sysctl_ctx_list *ctx;
-	//struct sysctl_oid *tree;
-	//struct sysctl_oid_list *child;
-	int error = 0;
+	struct sysctl_ctx_list *ctx;
+	struct sysctl_oid *tree;
+	struct sysctl_oid_list *child;
 
 	dev = sc->vtnet_dev;
 	stats = &sc->vtnet_stats;
-	sysctl_ctx_init(&sc->vtnet_sysctl_ctx);
-	sc->vtnet_sysctl_tree = SYSCTL_ADD_NODE(&sc->vtnet_sysctl_ctx,
-						SYSCTL_STATIC_CHILDREN(_hw),
-						OID_AUTO,
-						device_get_nameunit(dev),
-						CTLFLAG_RD, 0, "");
+	ctx = device_get_sysctl_ctx(dev);
+	tree = device_get_sysctl_tree(dev);
+	child = SYSCTL_CHILDREN(tree);
 
-	if (sc->vtnet_sysctl_tree == NULL) {
-		device_printf(dev, "can't add sysctl node\n");
-		error = ENXIO;
-	}
+	SYSCTL_ADD_UQUAD(ctx, child, OID_AUTO, "mbuf_alloc_failed",
+	    CTLFLAG_RD, &stats->mbuf_alloc_failed, 0,
+	    "Mbuf cluster allocation failures");
 
-
-	SYSCTL_ADD_ULONG(&sc->vtnet_sysctl_ctx,
-			 SYSCTL_CHILDREN(sc->vtnet_sysctl_tree), OID_AUTO,
-			 "mbuf_alloc_failed", CTLFLAG_RD, &stats->mbuf_alloc_failed,
-			 "Mbuf cluster allocation failures");
-	SYSCTL_ADD_ULONG(&sc->vtnet_sysctl_ctx,
-			 SYSCTL_CHILDREN(sc->vtnet_sysctl_tree), OID_AUTO,
-			 "rx_frame_too_large", CTLFLAG_RD, &stats->rx_frame_too_large,
-			 "Received frame larger than the mbuf chain");
-	SYSCTL_ADD_ULONG(&sc->vtnet_sysctl_ctx,SYSCTL_CHILDREN(sc->vtnet_sysctl_tree), OID_AUTO, "rx_enq_replacement_failed",
-	    CTLFLAG_RD, &stats->rx_enq_replacement_failed,
+	SYSCTL_ADD_UQUAD(ctx, child, OID_AUTO, "rx_frame_too_large",
+	    CTLFLAG_RD, &stats->rx_frame_too_large, 0,
+	    "Received frame larger than the mbuf chain");
+	SYSCTL_ADD_UQUAD(ctx, child, OID_AUTO, "rx_enq_replacement_failed",
+	    CTLFLAG_RD, &stats->rx_enq_replacement_failed, 0,
 	    "Enqueuing the replacement receive mbuf failed");
-	SYSCTL_ADD_ULONG(&sc->vtnet_sysctl_ctx, SYSCTL_CHILDREN(sc->vtnet_sysctl_tree), OID_AUTO, "rx_mergeable_failed",
-	    CTLFLAG_RD, &stats->rx_mergeable_failed,
+	SYSCTL_ADD_UQUAD(ctx, child, OID_AUTO, "rx_mergeable_failed",
+	    CTLFLAG_RD, &stats->rx_mergeable_failed, 0,
 	    "Mergeable buffers receive failures");
-	SYSCTL_ADD_ULONG(&sc->vtnet_sysctl_ctx, SYSCTL_CHILDREN(sc->vtnet_sysctl_tree), OID_AUTO, "rx_csum_bad_ethtype",
-	    CTLFLAG_RD, &stats->rx_csum_bad_ethtype,
+	SYSCTL_ADD_UQUAD(ctx, child, OID_AUTO, "rx_csum_bad_ethtype",
+	    CTLFLAG_RD, &stats->rx_csum_bad_ethtype, 0,
 	    "Received checksum offloaded buffer with unsupported "
 	    "Ethernet type");
-	SYSCTL_ADD_ULONG(&sc->vtnet_sysctl_ctx, SYSCTL_CHILDREN(sc->vtnet_sysctl_tree), OID_AUTO, "rx_csum_bad_start",
-	    CTLFLAG_RD, &stats->rx_csum_bad_start,
-	    "Received checksum offloaded buffer with incorrect start offset");
-	SYSCTL_ADD_ULONG(&sc->vtnet_sysctl_ctx, SYSCTL_CHILDREN(sc->vtnet_sysctl_tree), OID_AUTO, "rx_csum_bad_ipproto",
-	    CTLFLAG_RD, &stats->rx_csum_bad_ipproto,
+	SYSCTL_ADD_UQUAD(ctx, child, OID_AUTO, "rx_csum_bad_ipproto",
+	    CTLFLAG_RD, &stats->rx_csum_bad_ipproto, 0,
 	    "Received checksum offloaded buffer with incorrect IP protocol");
-	SYSCTL_ADD_ULONG(&sc->vtnet_sysctl_ctx, SYSCTL_CHILDREN(sc->vtnet_sysctl_tree), OID_AUTO, "rx_csum_bad_offset",
-	    CTLFLAG_RD, &stats->rx_csum_bad_offset,
+	SYSCTL_ADD_UQUAD(ctx, child, OID_AUTO, "rx_csum_bad_offset",
+	    CTLFLAG_RD, &stats->rx_csum_bad_offset, 0,
 	    "Received checksum offloaded buffer with incorrect offset");
-	SYSCTL_ADD_ULONG(&sc->vtnet_sysctl_ctx, SYSCTL_CHILDREN(sc->vtnet_sysctl_tree), OID_AUTO, "rx_csum_failed",
-	    CTLFLAG_RD, &stats->rx_csum_failed,
+	SYSCTL_ADD_UQUAD(ctx, child, OID_AUTO, "rx_csum_failed",
+	    CTLFLAG_RD, &stats->rx_csum_failed, 0,
 	    "Received buffer checksum offload failed");
-	SYSCTL_ADD_ULONG(&sc->vtnet_sysctl_ctx, SYSCTL_CHILDREN(sc->vtnet_sysctl_tree), OID_AUTO, "rx_csum_offloaded",
-	    CTLFLAG_RD, &stats->rx_csum_offloaded,
+	SYSCTL_ADD_UQUAD(ctx, child, OID_AUTO, "rx_csum_offloaded",
+	    CTLFLAG_RD, &stats->rx_csum_offloaded, 0,
 	    "Received buffer checksum offload succeeded");
-	SYSCTL_ADD_ULONG(&sc->vtnet_sysctl_ctx, SYSCTL_CHILDREN(sc->vtnet_sysctl_tree), OID_AUTO, "rx_task_rescheduled",
-	    CTLFLAG_RD, &stats->rx_task_rescheduled,
+	SYSCTL_ADD_UQUAD(ctx, child, OID_AUTO, "rx_task_rescheduled",
+	    CTLFLAG_RD, &stats->rx_task_rescheduled, 0,
 	    "Times the receive interrupt task rescheduled itself");
 
-	SYSCTL_ADD_ULONG(&sc->vtnet_sysctl_ctx, SYSCTL_CHILDREN(sc->vtnet_sysctl_tree), OID_AUTO, "tx_csum_offloaded",
-	    CTLFLAG_RD, &stats->tx_csum_offloaded,
-	    "Offloaded checksum of transmitted buffer");
-	SYSCTL_ADD_ULONG(&sc->vtnet_sysctl_ctx, SYSCTL_CHILDREN(sc->vtnet_sysctl_tree), OID_AUTO, "tx_tso_offloaded",
-	    CTLFLAG_RD, &stats->tx_tso_offloaded,
-	    "Segmentation offload of transmitted buffer");
-	SYSCTL_ADD_ULONG(&sc->vtnet_sysctl_ctx, SYSCTL_CHILDREN(sc->vtnet_sysctl_tree), OID_AUTO, "tx_csum_bad_ethtype",
-	    CTLFLAG_RD, &stats->tx_csum_bad_ethtype,
+	SYSCTL_ADD_UQUAD(ctx, child, OID_AUTO, "tx_csum_bad_ethtype",
+	    CTLFLAG_RD, &stats->tx_csum_bad_ethtype, 0,
 	    "Aborted transmit of checksum offloaded buffer with unknown "
 	    "Ethernet type");
-	SYSCTL_ADD_ULONG(&sc->vtnet_sysctl_ctx, SYSCTL_CHILDREN(sc->vtnet_sysctl_tree), OID_AUTO, "tx_tso_bad_ethtype",
-	    CTLFLAG_RD, &stats->tx_tso_bad_ethtype,
+	SYSCTL_ADD_UQUAD(ctx, child, OID_AUTO, "tx_tso_bad_ethtype",
+	    CTLFLAG_RD, &stats->tx_tso_bad_ethtype, 0,
 	    "Aborted transmit of TSO buffer with unknown Ethernet type");
-	SYSCTL_ADD_ULONG(&sc->vtnet_sysctl_ctx, SYSCTL_CHILDREN(sc->vtnet_sysctl_tree), OID_AUTO, "tx_task_rescheduled",
-	    CTLFLAG_RD, &stats->tx_task_rescheduled,
+	SYSCTL_ADD_UQUAD(ctx, child, OID_AUTO, "tx_defragged",
+	    CTLFLAG_RD, &stats->tx_defragged, 0,
+	    "Transmit mbufs defragged");
+	SYSCTL_ADD_UQUAD(ctx, child, OID_AUTO, "tx_defrag_failed",
+	    CTLFLAG_RD, &stats->tx_defrag_failed, 0,
+	    "Aborted transmit of buffer because defrag failed");
+	SYSCTL_ADD_UQUAD(ctx, child, OID_AUTO, "tx_csum_offloaded",
+	    CTLFLAG_RD, &stats->tx_csum_offloaded, 0,
+	    "Offloaded checksum of transmitted buffer");
+	SYSCTL_ADD_UQUAD(ctx, child, OID_AUTO, "tx_tso_offloaded",
+	    CTLFLAG_RD, &stats->tx_tso_offloaded, 0,
+	    "Segmentation offload of transmitted buffer");
+	SYSCTL_ADD_UQUAD(ctx, child, OID_AUTO, "tx_task_rescheduled",
+	    CTLFLAG_RD, &stats->tx_task_rescheduled, 0,
 	    "Times the transmit interrupt task rescheduled itself");
 }
 

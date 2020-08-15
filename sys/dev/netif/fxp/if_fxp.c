@@ -42,7 +42,6 @@
 #include <sys/interrupt.h>
 #include <sys/socket.h>
 #include <sys/sysctl.h>
-#include <sys/thread2.h>
 
 #include <net/if.h>
 #include <net/ifq_var.h>
@@ -286,15 +285,11 @@ SYSCTL_INT(_hw, OID_AUTO, fxp_rnr, CTLFLAG_RW, &fxp_rnr, 0, "fxp rnr events");
 static void
 fxp_lwcopy(volatile u_int32_t *src, volatile u_int32_t *dst)
 {
-#ifdef __i386__
-	*dst = *src;
-#else
 	volatile u_int16_t *a = (volatile u_int16_t *)src;
 	volatile u_int16_t *b = (volatile u_int16_t *)dst;
 
 	b[0] = a[0];
 	b[1] = a[1];
-#endif
 }
 
 /*
@@ -394,12 +389,13 @@ fxp_attach(device_t dev)
 	int error = 0;
 	struct fxp_softc *sc = device_get_softc(dev);
 	struct ifnet *ifp;
+	struct sysctl_ctx_list *ctx;
+	struct sysctl_oid *tree;
 	u_int32_t val;
 	u_int16_t data;
 	int i, rid, m1, m2, prefer_iomap;
 
 	callout_init(&sc->fxp_stat_timer);
-	sysctl_ctx_init(&sc->sysctl_ctx);
 
 	/*
 	 * Enable bus mastering. Enable memory space too, in case
@@ -504,16 +500,13 @@ fxp_attach(device_t dev)
 	/*
 	 * Create the sysctl tree
 	 */
-	sc->sysctl_tree = SYSCTL_ADD_NODE(&sc->sysctl_ctx,
-	    SYSCTL_STATIC_CHILDREN(_hw), OID_AUTO,
-	    device_get_nameunit(dev), CTLFLAG_RD, 0, "");
-	if (sc->sysctl_tree == NULL)
-		goto fail;
-	SYSCTL_ADD_PROC(&sc->sysctl_ctx, SYSCTL_CHILDREN(sc->sysctl_tree),
+	ctx = device_get_sysctl_ctx(dev);
+	tree = device_get_sysctl_tree(dev);
+	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree),
 	    OID_AUTO, "int_delay", CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_PRISON,
 	    &sc->tunable_int_delay, 0, &sysctl_hw_fxp_int_delay, "I",
 	    "FXP driver receive interrupt microcode bundling delay");
-	SYSCTL_ADD_PROC(&sc->sysctl_ctx, SYSCTL_CHILDREN(sc->sysctl_tree),
+	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree),
 	    OID_AUTO, "bundle_max", CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_PRISON,
 	    &sc->tunable_bundle_max, 0, &sysctl_hw_fxp_bundle_max, "I",
 	    "FXP driver receive interrupt microcode bundle size limit");
@@ -662,9 +655,8 @@ fxp_attach(device_t dev)
 	ether_ifattach(ifp, sc->arpcom.ac_enaddr, NULL);
 
 #ifdef IFPOLL_ENABLE
-	ifpoll_compat_setup(&sc->fxp_npoll,
-	    &sc->sysctl_ctx, sc->sysctl_tree, device_get_unit(dev),
-	    ifp->if_serializer);
+	ifpoll_compat_setup(&sc->fxp_npoll, ctx, (struct sysctl_oid *)tree,
+	    device_get_unit(dev), ifp->if_serializer);
 #endif
 
 	/*
@@ -727,8 +719,6 @@ fxp_release(device_t dev)
 		bus_release_resource(dev, SYS_RES_IRQ, 0, sc->irq);
 	if (sc->mem)
 		bus_release_resource(dev, sc->rtp, sc->rgd, sc->mem);
-
-        sysctl_ctx_free(&sc->sysctl_ctx);
 }
 
 /*
@@ -1111,7 +1101,7 @@ tbdinit:
 				continue;
 			}
 
-			mn = m_dup(mb_head, MB_DONTWAIT);
+			mn = m_dup(mb_head, M_NOWAIT);
 			if (mn == NULL) {
 				m_freem(mb_head);
 				IFNET_STAT_INC(ifp, oerrors, 1);
@@ -1962,7 +1952,7 @@ fxp_add_rfabuf(struct fxp_softc *sc, struct mbuf *oldm)
 	struct mbuf *m;
 	struct fxp_rfa *rfa, *p_rfa;
 
-	m = m_getcl(MB_DONTWAIT, MT_DATA, M_PKTHDR);
+	m = m_getcl(M_NOWAIT, MT_DATA, M_PKTHDR);
 	if (m == NULL) { /* try to recycle the old mbuf instead */
 		if (oldm == NULL)
 			return 1;

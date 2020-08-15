@@ -1,4 +1,4 @@
-# $FreeBSD: src/lib/libfetch/Makefile,v 1.51 2007/12/19 05:10:07 ru Exp $
+# $FreeBSD: head/lib/libfetch/Makefile 298107 2016-04-16 07:45:30Z gjb $
 
 LIB=		fetch
 CFLAGS+=	-I.
@@ -8,15 +8,13 @@ SRCS=		fetch.c common.c ftp.c http.c file.c \
 INCS=		fetch.h
 MAN=		fetch.3
 CLEANFILES=	ftperr.h httperr.h
+NO_STRICT_ALIASING=
 
-.if !defined(NO_CRYPT) && !defined(NO_OPENSSL)
 CFLAGS+=	-DWITH_SSL
 DPADD=		${LIBSSL} ${LIBCRYPTO}
-LDADD=		-lssl -lcrypto
-.else
-DPADD=		${LIBMD}
-LDADD=		-lmd
-.endif
+LDADD=		-lprivate_ssl -lprivate_crypto
+CFLAGS+=	${PRIVATELIB_CFLAGS}
+LDFLAGS+=	${PRIVATELIB_LDFLAGS}
 
 SHLIB_MAJOR=    4
 
@@ -60,6 +58,7 @@ MLINKS+= fetch.3 fetchPutFTP.3
 MLINKS+= fetch.3 fetchPutFile.3
 MLINKS+= fetch.3 fetchPutHTTP.3
 MLINKS+= fetch.3 fetchPutURL.3
+MLINKS+= fetch.3 fetchReqHTTP.3
 MLINKS+= fetch.3 fetchStat.3
 MLINKS+= fetch.3 fetchStatFTP.3
 MLINKS+= fetch.3 fetchStatFile.3

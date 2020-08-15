@@ -98,24 +98,58 @@ static driver_t atkbdc_driver = {
 
 static struct isa_pnp_id atkbdc_ids[] = {
 	{ 0x0303d041, "Keyboard controller (i8042)" },	/* PNP0303 */
+	{ 0x0703d041, "Keyboard controller (i8042)" },	/* PNP0307 */
+	{ 0x0b03d041, "Keyboard controller (i8042)" },	/* PNP030B */
+	/* Japanese */
+	{ 0x2003d041, "Keyboard controller (i8042)" },	/* PNP0320 */
+	{ 0x2103d041, "Keyboard controller (i8042)" },	/* PNP0321 */
+	{ 0x2203d041, "Keyboard controller (i8042)" },	/* PNP0322 */
+	{ 0x2303d041, "Keyboard controller (i8042)" },	/* PNP0323 */
+	{ 0x2403d041, "Keyboard controller (i8042)" },	/* PNP0324 */
+	{ 0x2503d041, "Keyboard controller (i8042)" },	/* PNP0325 */
+	{ 0x2603d041, "Keyboard controller (i8042)" },	/* PNP0326 */
+	{ 0x2703d041, "Keyboard controller (i8042)" },	/* PNP0327 */
+	/* Korean */
+	{ 0x4003d041, "Keyboard controller (i8042)" },	/* PNP0340 */
+	{ 0x4103d041, "Keyboard controller (i8042)" },	/* PNP0341 */
+	{ 0x4203d041, "Keyboard controller (i8042)" },	/* PNP0342 */
+	{ 0x4303d041, "Keyboard controller (i8042)" },	/* PNP0343 */
+	{ 0x4403d041, "Keyboard controller (i8042)" },	/* PNP0344 */
 	{ 0 }
 };
+
+extern int acpi_fadt_8042_nolegacy;
 
 static int
 atkbdc_probe(device_t dev)
 {
+	device_t parent = device_get_parent(dev);
 	struct resource	*port0;
 	struct resource	*port1;
 	int		error;
 	int		rid;
-#if defined(__i386__) || defined(__x86_64__)
+#if defined(__x86_64__)
 	bus_space_tag_t	tag;
 	bus_space_handle_t ioh1;
 	volatile int	i;
 #endif
 
+	if (strcmp(device_get_name(parent), "acpi") != 0 &&
+	    acpi_fadt_8042_nolegacy != 0) {
+		device_t acpidev = devclass_find_unit("acpi", 0);
+
+		/*
+		 * If acpi didn't attach, we should go ahead with the legacy
+		 * i8042 probing.
+		 */
+		if (acpidev != NULL && device_is_attached(acpidev)) {
+			/* We should find i8042 via the ACPI namespace. */
+			return ENXIO;
+		}
+	}
+
 	/* check PnP IDs */
-	if (ISA_PNP_PROBE(device_get_parent(dev), dev, atkbdc_ids) == ENXIO)
+	if (ISA_PNP_PROBE(parent, dev, atkbdc_ids) == ENXIO)
 		return ENXIO;
 
 	device_set_desc(dev, "Keyboard controller (i8042)");
@@ -138,7 +172,7 @@ atkbdc_probe(device_t dev)
 		return ENXIO;
 	}
 
-#if defined(__i386__) || defined(__x86_64__)
+#if defined(__x86_64__)
 	/*
 	 * Check if we really have AT keyboard controller. Poll status
 	 * register until we get "all clear" indication. If no such
@@ -205,7 +239,7 @@ atkbdc_attach(device_t dev)
 	int		rid;
 	int		i;
 
-	lwkt_gettoken(&tty_token);
+	lwkt_gettoken(&kbd_token);
 	unit = device_get_unit(dev);
 	sc = *(atkbdc_softc_t **)device_get_softc(dev);
 	if (sc == NULL) {
@@ -218,7 +252,7 @@ atkbdc_attach(device_t dev)
 		 */
 		sc = atkbdc_get_softc(unit);
 		if (sc == NULL) {
-			lwkt_reltoken(&tty_token);
+			lwkt_reltoken(&kbd_token);
 			return ENOMEM;
 		}
 	}
@@ -227,7 +261,7 @@ atkbdc_attach(device_t dev)
 	sc->port0 = bus_alloc_resource(dev, SYS_RES_IOPORT, &rid, 0, ~0, 1,
 				       RF_ACTIVE);
 	if (sc->port0 == NULL) {
-		lwkt_reltoken(&tty_token);
+		lwkt_reltoken(&kbd_token);
 		return ENXIO;
 	}
 	rid = 1;
@@ -235,7 +269,7 @@ atkbdc_attach(device_t dev)
 				       RF_ACTIVE);
 	if (sc->port1 == NULL) {
 		bus_release_resource(dev, SYS_RES_IOPORT, 0, sc->port0);
-		lwkt_reltoken(&tty_token);
+		lwkt_reltoken(&kbd_token);
 		return ENXIO;
 	}
 
@@ -243,7 +277,7 @@ atkbdc_attach(device_t dev)
 	if (error) {
 		bus_release_resource(dev, SYS_RES_IOPORT, 0, sc->port0);
 		bus_release_resource(dev, SYS_RES_IOPORT, 1, sc->port1);
-		lwkt_reltoken(&tty_token);
+		lwkt_reltoken(&kbd_token);
 		return error;
 	}
 	*(atkbdc_softc_t **)device_get_softc(dev) = sc;
@@ -270,7 +304,7 @@ atkbdc_attach(device_t dev)
 
 	bus_generic_attach(dev);
 
-	lwkt_reltoken(&tty_token);
+	lwkt_reltoken(&kbd_token);
 	return 0;
 }
 
@@ -297,7 +331,7 @@ atkbdc_read_ivar(device_t bus, device_t dev, int index, u_long *val)
 {
 	atkbdc_device_t *ivar;
 
-	lwkt_gettoken(&tty_token);
+	lwkt_gettoken(&kbd_token);
 	ivar = (atkbdc_device_t *)device_get_ivars(dev);
 	switch (index) {
 	case KBDC_IVAR_IRQ:
@@ -319,11 +353,11 @@ atkbdc_read_ivar(device_t bus, device_t dev, int index, u_long *val)
 		*val = (u_long)ivar->compatid;
 		break;
 	default:
-		lwkt_reltoken(&tty_token);
+		lwkt_reltoken(&kbd_token);
 		return ENOENT;
 	}
 
-	lwkt_reltoken(&tty_token);
+	lwkt_reltoken(&kbd_token);
 	return 0;
 }
 
@@ -332,7 +366,7 @@ atkbdc_write_ivar(device_t bus, device_t dev, int index, u_long val)
 {
 	atkbdc_device_t *ivar;
 
-	lwkt_gettoken(&tty_token);
+	lwkt_gettoken(&kbd_token);
 	ivar = (atkbdc_device_t *)device_get_ivars(dev);
 	switch (index) {
 	case KBDC_IVAR_IRQ:
@@ -354,11 +388,11 @@ atkbdc_write_ivar(device_t bus, device_t dev, int index, u_long val)
 		ivar->compatid = (u_int32_t)val;
 		break;
 	default:
-		lwkt_reltoken(&tty_token);
+		lwkt_reltoken(&kbd_token);
 		return ENOENT;
 	}
 
-	lwkt_reltoken(&tty_token);
+	lwkt_reltoken(&kbd_token);
 	return 0;
 }
 

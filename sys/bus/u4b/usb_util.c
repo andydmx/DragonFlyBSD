@@ -33,7 +33,6 @@
 #include <sys/bus.h>
 #include <sys/module.h>
 #include <sys/lock.h>
-#include <sys/mutex.h>
 #include <sys/condvar.h>
 #include <sys/sysctl.h>
 #include <sys/unistd.h>
@@ -246,42 +245,4 @@ usb_make_str_desc(void *ptr, uint16_t max_len, const char *s)
 		USETW2(p->bString[max_len], 0, s[max_len]);
 	}
 	return (totlen);
-}
-
-void 
-usb_callout_timeout_wrapper(void *arg)
-{
-	struct usb_callout *uco = (struct usb_callout *)arg;
-
-	KKASSERT(uco != NULL);
-
-	/*
-	 * Simulate FreeBSD's callout behaviour which allows
-	 * a lock to be acquired before the function is called
-	 */
-
-	lockmgr(uco->uco_lock, LK_EXCLUSIVE);
-	uco->uco_func(uco->uco_arg);
-	lockmgr(uco->uco_lock, LK_RELEASE);
-	/* XXX Have to introduce flags and release lock? */
-}
-
-void 
-usb_callout_init_mtx_dfly(struct usb_callout *uco, struct lock *lock,
-    int flags)
-{
-	callout_init(&uco->co);
-	uco->uco_lock = lock;
-	uco->uco_flags = flags;    
-}
-
-void
-usb_callout_reset_dfly(struct usb_callout *uco, int ticks, timeout_t *func,
-    void *arg)
-{
-	KKASSERT(uco != NULL);
-	uco->uco_func = func;
-	uco->uco_arg = arg;
-
-	callout_reset(&uco->co, ticks, &usb_callout_timeout_wrapper, uco);
 }

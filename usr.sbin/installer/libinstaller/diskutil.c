@@ -1,5 +1,5 @@
 /*
- * Copyright (c)2004 The DragonFly Project.  All rights reserved.
+ * Copyright (c)2004,2015 The DragonFly Project.  All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -194,6 +194,13 @@ disk_get_desc(const struct disk *d)
 	return(d->desc);
 }
 
+unsigned long
+disk_get_capacity(const struct disk *d)
+{
+	return(d->capacity);
+}
+
+
 void
 disk_set_desc(struct disk *d, const char *desc)
 {
@@ -215,7 +222,7 @@ disk_set_desc(struct disk *d, const char *desc)
 	if (*c == '\0')
 		d->capacity = 0;
 	else
-		d->capacity = atoi(c + 1);
+		d->capacity = strtoul(c + 1, NULL, 0);
 }
 
 /*
@@ -501,16 +508,16 @@ slices_free(struct slice *head)
 }
 
 struct subpartition *
-subpartition_new_hammer(struct slice *s, const char *mountpoint, long capacity,
-    int encrypted)
+subpartition_new_hammer(struct slice *s, const char *mountpoint,
+			long capacity, int encrypted)
 {
 	struct subpartition *sp;
+	struct subpartition *last = s->subpartition_tail;
 
 	AURA_MALLOC(sp, subpartition);
 
 	sp->parent = s;
 
-	struct subpartition *last = s->subpartition_tail;
 	if (last == NULL) {
 		sp->letter = 'a';
 	} else if (last->letter == 'b') {
@@ -518,6 +525,8 @@ subpartition_new_hammer(struct slice *s, const char *mountpoint, long capacity,
 	} else {
 		sp->letter = (char)(last->letter + 1);
 	}
+	if (sp->letter == 'b' && strcmp(mountpoint, "swap") != 0)
+		sp->letter = 'd';
 
 	sp->mountpoint = aura_strdup(mountpoint);
 	sp->capacity = capacity;
@@ -538,12 +547,79 @@ subpartition_new_hammer(struct slice *s, const char *mountpoint, long capacity,
 		sp->bsize = 16384;
 
 	sp->is_swap = 0;
+#if 0
 	sp->pfs = 0;
+#endif
 	if (strcasecmp(mountpoint, "swap") == 0)
 		sp->is_swap = 1;
+#if 0
 	if (strcmp(mountpoint, "/") != 0 && strcmp(mountpoint, "/boot") != 0 &&
 	    strcmp(mountpoint, "swap") != 0)
 		sp->pfs = 1;
+#endif
+
+	sp->next = NULL;
+	if (s->subpartition_head == NULL)
+		s->subpartition_head = sp;
+	else
+		s->subpartition_tail->next = sp;
+
+	sp->prev = s->subpartition_tail;
+	s->subpartition_tail = sp;
+
+	return(sp);
+}
+
+struct subpartition *
+subpartition_new_hammer2(struct slice *s, const char *mountpoint,
+			 long capacity, int encrypted)
+{
+	struct subpartition *sp;
+	struct subpartition *last = s->subpartition_tail;
+
+	AURA_MALLOC(sp, subpartition);
+
+	sp->parent = s;
+
+	if (last == NULL) {
+		sp->letter = 'a';
+	} else if (last->letter == 'b') {
+		sp->letter = 'd';
+	} else {
+		sp->letter = (char)(last->letter + 1);
+	}
+	if (sp->letter == 'b' && strcmp(mountpoint, "swap") != 0)
+		sp->letter = 'd';
+
+	sp->mountpoint = aura_strdup(mountpoint);
+	sp->capacity = capacity;
+	sp->encrypted = encrypted;
+	sp->type = FS_HAMMER2;
+
+	/*
+	 * We need this here, because a UFS /boot needs valid values
+	 */
+	if (sp->capacity < 1024)
+		sp->fsize = 1024;
+	else
+		sp->fsize = 2048;
+
+	if (sp->capacity < 1024)
+		sp->bsize = 8192;
+	else
+		sp->bsize = 16384;
+
+	sp->is_swap = 0;
+#if 0
+	sp->pfs = 0;
+#endif
+	if (strcasecmp(mountpoint, "swap") == 0)
+		sp->is_swap = 1;
+#if 0
+	if (strcmp(mountpoint, "/") != 0 && strcmp(mountpoint, "/boot") != 0 &&
+	    strcmp(mountpoint, "swap") != 0)
+		sp->pfs = 1;
+#endif
 
 	sp->next = NULL;
 	if (s->subpartition_head == NULL)
@@ -567,10 +643,26 @@ struct subpartition *
 subpartition_new_ufs(struct slice *s, const char *mountpoint, long capacity,
     int encrypted, int softupdates, long fsize, long bsize, int tmpfsbacked)
 {
-	struct subpartition *sp, *sptmp;
-	int letter='d';
+	struct subpartition *sp;
+	struct subpartition *last = s->subpartition_tail;
 
 	AURA_MALLOC(sp, subpartition);
+
+	if (tmpfsbacked) {
+		sp->letter = '@';
+	} else {
+		while (last && last->letter == '@')
+			last = last->prev;
+		if (last == NULL) {
+			sp->letter = 'a';
+		} else if (last->letter == 'b') {
+			sp->letter = 'd';
+		} else {
+			sp->letter = (char)(last->letter + 1);
+		}
+		if (sp->letter == 'b' && strcmp(mountpoint, "swap") != 0)
+			sp->letter = 'd';
+	}
 
 	sp->parent = s;
 
@@ -612,29 +704,19 @@ subpartition_new_ufs(struct slice *s, const char *mountpoint, long capacity,
 	if (strcasecmp(mountpoint, "swap") == 0)
 		sp->is_swap = 1;
 
-	if (s->subpartition_head == NULL) {
+	/*
+	 * install
+	 */
+	sp->next = NULL;
+	if (s->subpartition_head == NULL)
 		s->subpartition_head = sp;
-		s->subpartition_tail = sp;
-	} else {
-		for (sptmp = s->subpartition_head; sptmp != NULL;
-		     sptmp = sptmp->next) {
-			if (strcmp(sptmp->mountpoint, sp->mountpoint) > 0)
-				break;
-		}
-		if (sptmp != NULL) {
-			if (s->subpartition_head == sptmp)
-				s->subpartition_head = sp;
-			else
-				sptmp->prev->next = sp;
-			sp->next = sptmp;
-			sp->prev = sptmp->prev;
-			sptmp->prev = sp;
-		} else {
-			sp->prev = s->subpartition_tail;
-			s->subpartition_tail->next = sp;
-			s->subpartition_tail = sp;
-		}
-	}
+	else
+		s->subpartition_tail->next = sp;
+
+	sp->prev = s->subpartition_tail;
+	s->subpartition_tail = sp;
+
+#if 0
 
 	for (sptmp = s->subpartition_head; sptmp != NULL;
 	     sptmp = sptmp->next) {
@@ -648,6 +730,7 @@ subpartition_new_ufs(struct slice *s, const char *mountpoint, long capacity,
 		else
 			sptmp->letter = letter++;
 	}
+#endif
 
 	return(sp);
 }
@@ -756,6 +839,40 @@ subpartition_get_device_name(const struct subpartition *sp)
 		snprintf(tmp_dev_name, 256, "%ss%d%c",
 		    sp->parent->parent->device, sp->parent->number, sp->letter);
 	return(tmp_dev_name);
+}
+
+/*
+ * /dev/mapper/
+ *
+ * (result is persistant until next call)
+ */
+const char *
+subpartition_get_mapper_name(const struct subpartition *sp, int withdev)
+{
+	const char *src;
+	static char *save;
+
+	src = strrchr(sp->mountpoint, '/');
+	if (src == NULL || src[1] == 0)
+		src = "root";
+	else
+		++src;
+
+	if (save)
+		free(save);
+	switch(withdev) {
+	case -1:
+		asprintf(&save, "%s", src);
+		break;
+	case 0:
+		asprintf(&save, "mapper/%s", src);
+		break;
+	case 1:
+	default:
+		asprintf(&save, "/dev/mapper/%s", src);
+		break;
+	}
+	return save;
 }
 
 const char *

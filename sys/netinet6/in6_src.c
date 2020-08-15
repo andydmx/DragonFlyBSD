@@ -238,8 +238,8 @@ in6_selectsrc(struct sockaddr_in6 *dstsock, struct ip6_pktopts *opts,
 	if (!jailed && IN6_IS_ADDR_MULTICAST(dst)) {
 		struct ifnet *ifp = mopts ? mopts->im6o_multicast_ifp : NULL;
 
-		if (ifp == NULL && IN6_IS_ADDR_MC_NODELOCAL(dst)) {
-			ifp = &loif[0];
+		if (ifp == NULL && IN6_IS_ADDR_MC_INTFACELOCAL(dst)) {
+			ifp = loif;
 		}
 
 		if (ifp) {
@@ -341,25 +341,6 @@ in6_selectsrc(struct sockaddr_in6 *dstsock, struct ip6_pktopts *opts,
 					ia6 = NULL;
 			}
 		}
-#if 0
-		/*
-		 * xxx The followings are necessary? (kazu)
-		 * I don't think so.
-		 * It's for SO_DONTROUTE option in IPv4.(jinmei)
-		 */
-		if (ia6 == 0) {
-			struct sockaddr_in6 sin6 = {sizeof(sin6), AF_INET6, 0};
-
-			sin6->sin6_addr = *dst;
-
-			ia6 = ifatoia6(ifa_ifwithdstaddr(sin6tosa(&sin6)));
-			if (ia6 == 0)
-				ia6 = ifatoia6(ifa_ifwithnet(sin6tosa(&sin6)));
-			if (ia6 == 0)
-				return (0);
-			return (&satosin6(&ia6->ia_addr)->sin6_addr);
-		}
-#endif /* 0 */
 		if (ia6 == NULL) {
 			*errorp = EHOSTUNREACH;	/* no route */
 			return (0);
@@ -381,12 +362,43 @@ in6_selectsrc(struct sockaddr_in6 *dstsock, struct ip6_pktopts *opts,
 int
 in6_selecthlim(struct in6pcb *in6p, struct ifnet *ifp)
 {
-	if (in6p && in6p->in6p_hops >= 0)
+	int hlim;
+
+	if (in6p && in6p->in6p_hops >= 0) {
 		return (in6p->in6p_hops);
-	else if (ifp)
-		return (ND_IFINFO(ifp)->chlim);
-	else
-		return (ip6_defhlim);
+	} else if (ifp) {
+		hlim = ND_IFINFO(ifp)->chlim;
+		if (hlim < ip6_minhlim)
+			hlim = ip6_minhlim;
+	} else {
+		hlim = ip6_defhlim;
+	}
+	return (hlim);
+}
+
+static boolean_t
+in6_pcbporthash_update(struct inpcbportinfo *portinfo,
+    struct inpcb *inp, u_short lport, struct ucred *cred, int wild)
+{
+	struct inpcbporthead *porthash;
+
+	/*
+	 * This has to be atomic.  If the porthash is shared across multiple
+	 * protocol threads, e.g. tcp and udp, then the token must be held.
+	 */
+	porthash = in_pcbporthash_head(portinfo, lport);
+	GET_PORTHASH_TOKEN(porthash);
+
+	if (in6_pcblookup_local(porthash, &inp->in6p_laddr, lport,
+	    wild, cred) != NULL) {
+		REL_PORTHASH_TOKEN(porthash);
+		return FALSE;
+	}
+	inp->inp_lport = lport;
+	in_pcbinsporthash(porthash, inp);
+
+	REL_PORTHASH_TOKEN(porthash);
+	return TRUE;
 }
 
 /*
@@ -397,12 +409,13 @@ int
 in6_pcbsetlport(struct in6_addr *laddr, struct inpcb *inp, struct thread *td)
 {
 	struct socket *so = inp->inp_socket;
-	u_int16_t lport = 0, first, last, *lastport, step;
+	uint16_t lport, first, last, step, first0, last0;
 	int count, error = 0, wild = 0;
 	struct inpcbinfo *pcbinfo = inp->inp_pcbinfo;
 	struct inpcbportinfo *portinfo;
 	struct ucred *cred = NULL;
 	int portinfo_first, portinfo_idx;
+	uint32_t cut;
 
 	/* XXX: this is redundant when called from in6_pcbbind */
 	if ((so->so_options & (SO_REUSEADDR|SO_REUSEPORT)) == 0)
@@ -412,93 +425,71 @@ in6_pcbsetlport(struct in6_addr *laddr, struct inpcb *inp, struct thread *td)
 
 	inp->inp_flags |= INP_ANONPORT;
 
-	step = pcbinfo->portinfo_mask + 1;
-	portinfo_first = mycpuid & pcbinfo->portinfo_mask;
+	step = pcbinfo->portinfo_cnt;
+	portinfo_first = mycpuid % pcbinfo->portinfo_cnt;
 	portinfo_idx = portinfo_first;
-loop:
-	portinfo = &pcbinfo->portinfo[portinfo_idx];
 
 	if (inp->inp_flags & INP_HIGHPORT) {
-		first = ipport_hifirstauto;	/* sysctl */
-		last  = ipport_hilastauto;
-		lastport = &portinfo->lasthi;
+		first0 = ipport_hifirstauto;	/* sysctl */
+		last0  = ipport_hilastauto;
 	} else if (inp->inp_flags & INP_LOWPORT) {
 		if ((error = priv_check(td, PRIV_ROOT)) != 0)
 			return error;
-		first = ipport_lowfirstauto;	/* 1023 */
-		last  = ipport_lowlastauto;	/* 600 */
-		lastport = &portinfo->lastlow;
+		first0 = ipport_lowfirstauto;	/* 1023 */
+		last0  = ipport_lowlastauto;	/* 600 */
 	} else {
-		first = ipport_firstauto;	/* sysctl */
-		last  = ipport_lastauto;
-		lastport = &portinfo->lastport;
+		first0 = ipport_firstauto;	/* sysctl */
+		last0  = ipport_lastauto;
 	}
+	if (first0 > last0) {
+		lport = last0;
+		last0 = first0;
+		first0 = lport;
+	}
+	KKASSERT(last0 >= first0);
 
-	/*
-	 * This has to be atomic.  If the porthash is shared across multiple
-	 * protocol threads (aka tcp) then the token must be held.
-	 */
-	GET_PORT_TOKEN(portinfo);
+	cut = karc4random();
+loop:
+	portinfo = &pcbinfo->portinfo[portinfo_idx];
+	first = first0;
+	last = last0;
 
 	/*
 	 * Simple check to ensure all ports are not used up causing
 	 * a deadlock here.
-	 *
-	 * We split the two cases (up and down) so that the direction
-	 * is not being tested on each round of the loop.
 	 */
-	if (first > last) {
-		/*
-		 * counting down
-		 */
-		in_pcbportrange(&first, &last, portinfo->offset, step);
-		count = (first - last) / step;
+	in_pcbportrange(&last, &first, portinfo->offset, step);
+	lport = last - first;
+	count = lport / step;
 
-		do {
-			if (count-- < 0) {	/* completely used? */
-				error = EAGAIN;
-				goto done;
-			}
-			*lastport -= step;
-			if (*lastport > first || *lastport < last)
-				*lastport = first;
-			KKASSERT((*lastport & pcbinfo->portinfo_mask) ==
-			    portinfo->offset);
-			lport = htons(*lastport);
-		} while (in6_pcblookup_local(portinfo, &inp->in6p_laddr,
-			 lport, wild, cred));
-	} else {
-		/*
-		 * counting up
-		 */
-		in_pcbportrange(&last, &first, portinfo->offset, step);
-		count = (last - first) / step;
+	lport = rounddown(cut % lport, step) + first;
+	KKASSERT(lport % step == portinfo->offset);
 
-		do {
-			if (count-- < 0) {	/* completely used? */
-				error = EAGAIN;
-				goto done;
-			}
-			*lastport += step;
-			if (*lastport < first || *lastport > last)
-				*lastport = first;
-			KKASSERT((*lastport & pcbinfo->portinfo_mask) ==
-			    portinfo->offset);
-			lport = htons(*lastport);
-		} while (in6_pcblookup_local(portinfo, &inp->in6p_laddr,
-			 lport, wild, cred));
+	for (;;) {
+		if (count-- < 0) {	/* completely used? */
+			error = EAGAIN;
+			break;
+		}
+
+		if (__predict_false(lport < first || lport > last)) {
+			lport = first;
+			KKASSERT(lport % step == portinfo->offset);
+		}
+
+		if (in6_pcbporthash_update(portinfo, inp, htons(lport),
+		    cred, wild)) {
+			error = 0;
+			break;
+		}
+
+		lport += step;
+		KKASSERT(lport % step == portinfo->offset);
 	}
-
-	inp->inp_lport = lport;
-	in_pcbinsporthash(portinfo, inp);
-	error = 0;
-done:
-	REL_PORT_TOKEN(portinfo);
 
 	if (error) {
 		/* Try next portinfo */
 		portinfo_idx++;
-		portinfo_idx &= pcbinfo->portinfo_mask;
+		portinfo_idx %= pcbinfo->portinfo_cnt;
 		if (portinfo_idx != portinfo_first)
 			goto loop;
 
@@ -509,14 +500,14 @@ done:
 }
 
 /*
- * generate kernel-internal form (scopeid embedded into s6_addr16[1]).
+ * Generate kernel-internal form (scopeid embedded into s6_addr16[1]).
  * If the address scope of is link-local, embed the interface index in the
  * address.  The routine determines our precedence
  * between advanced API scope/interface specification and basic API
  * specification.
  *
- * this function should be nuked in the future, when we get rid of
- * embedded scopeid thing.
+ * This function should be nuked in the future, when we get rid of embedded
+ * scopeid thing.
  *
  * XXX actually, it is over-specification to return ifp against sin6_scope_id.
  * there can be multiple interfaces that belong to a particular scope zone
@@ -575,7 +566,7 @@ in6_embedscope(struct in6_addr *in6,
 			if (scopeid < 0 || if_index < scopeid)
 				return ENXIO;  /* XXX EINVAL? */
 			ifp = ifindex2ifnet[scopeid];
-			/*XXX assignment to 16bit from 32bit variable */
+			/* XXX assignment to 16bit from 32bit variable */
 			in6->s6_addr16[1] = htons(scopeid & 0xffff);
 		}
 
@@ -601,7 +592,7 @@ int
 in6_recoverscope(struct sockaddr_in6 *sin6, const struct in6_addr *in6,
 		 struct ifnet *ifp)
 {
-	u_int32_t scopeid;
+	u_int32_t zoneid;
 
 	sin6->sin6_addr = *in6;
 
@@ -611,19 +602,19 @@ in6_recoverscope(struct sockaddr_in6 *sin6, const struct in6_addr *in6,
 	 */
 
 	sin6->sin6_scope_id = 0;
-	if (IN6_IS_SCOPE_LINKLOCAL(in6)) {
+	if (IN6_IS_SCOPE_LINKLOCAL(in6) || IN6_IS_ADDR_MC_INTFACELOCAL(in6)) {
 		/*
 		 * KAME assumption: link id == interface id
 		 */
-		scopeid = ntohs(sin6->sin6_addr.s6_addr16[1]);
-		if (scopeid) {
+		zoneid = ntohs(sin6->sin6_addr.s6_addr16[1]);
+		if (zoneid) {
 			/* sanity check */
-			if (scopeid < 0 || if_index < scopeid)
+			if (zoneid < 0 || if_index < zoneid)
 				return ENXIO;
-			if (ifp && ifp->if_index != scopeid)
+			if (ifp && ifp->if_index != zoneid)
 				return ENXIO;
 			sin6->sin6_addr.s6_addr16[1] = 0;
-			sin6->sin6_scope_id = scopeid;
+			sin6->sin6_scope_id = zoneid;
 		}
 	}
 
@@ -631,13 +622,12 @@ in6_recoverscope(struct sockaddr_in6 *sin6, const struct in6_addr *in6,
 }
 
 /*
- * just clear the embedded scope identifer.
- * XXX: currently used for bsdi4 only as a supplement function.
+ * just clear the embedded scope identifier.
  */
 void
 in6_clearscope(struct in6_addr *addr)
 {
-	if (IN6_IS_SCOPE_LINKLOCAL(addr))
+	if (IN6_IS_SCOPE_LINKLOCAL(addr) || IN6_IS_ADDR_MC_INTFACELOCAL(addr))
 		addr->s6_addr16[1] = 0;
 }
 

@@ -3,6 +3,13 @@
 # This file contains common settings used for building DragonFly
 # sources.
 
+# Support handling -W flags for both host cc and target cc.
+.if defined(__USE_HOST_CCVER)
+_WCCVER=	${HOST_CCVER}
+.else
+_WCCVER=	${CCVER}
+.endif
+
 CSTD?=	gnu99
 
 .if ${CSTD} == "k&r"
@@ -17,6 +24,9 @@ CFLAGS		+= -std=iso9899:1999
 CFLAGS		+= -std=${CSTD}
 .endif
 
+# Explicitly clear _cnowarnflags (should not be used in Makefiles).
+_cnowarnflags=
+
 # Enable various levels of compiler warning checks.  These may be
 # overridden (e.g. if using a non-gcc compiler) by defining NO_WARNS.
 
@@ -24,15 +34,15 @@ CFLAGS		+= -std=${CSTD}
 . if defined(WARNS)
 .  if ${WARNS} >= 1
 CWARNFLAGS	+=	-Wmissing-include-dirs -Wsystem-headers
-.   if !defined(NO_WERROR) && (${CCVER} == "gcc44" || ${CCVER} == "gcc47")
+.   if !defined(NO_WERROR) && (${_WCCVER} == "gcc47" || ${_WCCVER} == "gcc80")
 CWARNFLAGS	+=	-Werror
 .   endif
 .  endif
 .  if ${WARNS} >= 2
-CWARNFLAGS	+=	-Wall -Wformat-security -Winit-self -Wno-pointer-sign
+CWARNFLAGS	+=	-Wall -Wformat-security -Winit-self
 .  endif
 .  if ${WARNS} >= 3
-CWARNFLAGS	+=	-Wextra -Wno-unused-parameter -Wstrict-prototypes\
+CWARNFLAGS	+=	-Wextra -Wstrict-prototypes\
 			-Wmissing-prototypes -Wpointer-arith\
 			-Wold-style-definition
 .  endif
@@ -44,23 +54,61 @@ CWARNFLAGS	+=	-Wreturn-type -Wcast-qual -Wwrite-strings -Wswitch\
 CWARNFLAGS	+=	-Wchar-subscripts -Winline -Wnested-externs\
 			-Wredundant-decls
 .  endif
+.  if ${WARNS} >= 2 && ${WARNS} <= 6
+# Delete -Wno-pointer-sign from -Wall by default (C only).
+_cnowarnflags	+=	-Wno-pointer-sign
+.  endif
 .  if ${WARNS} >= 2 && ${WARNS} <= 4
 # XXX Delete -Wmaybe-uninitialized by default for now -- the compiler doesn't
 # XXX always get it right.
-.   if ${CCVER} == "gcc47"
-CWARNFLAGS	+=	-Wno-maybe-uninitialized
+.   if ${_WCCVER:Mgcc*}
+_cnowarnflags	+=	-Wno-maybe-uninitialized
 .   else
-CWARNFLAGS	+=	-Wno-uninitialized
+_cnowarnflags	+=	-Wno-uninitialized
 .   endif
+.  endif
+.  if ${WARNS} == 3
+# Delete -Wno-unused-parameter from -Wextra by default only if WARNS < 4.
+_cnowarnflags	+=	-Wno-unused-parameter
+.  endif
+# Delete -Wformat-* family that give little benefits, same for stringop.
+.  if ${WARNS} >= 2 && ${WARNS} <= 6 && ${_WCCVER:Mgcc8*}
+_cnowarnflags	+=	-Wno-format-overflow -Wno-format-truncation
+_cnowarnflags	+=	-Wno-stringop-truncation
+.  endif
+.  if ${WARNS} >= 1 && ${WARNS} <= 6 && ${_WCCVER:Mgcc8*}
+_cnowarnflags	+=	-Wno-stringop-overflow
 .  endif
 # Activate gcc47's -Wunused-but-set-variable (which is in -Wall) and
 # -Wunused-but-set-parameter (which is in -Wextra) only at WARNS >= 4
 # (which is the level when also -Wunused-parameter comes into play).
-.  if ${WARNS} >= 2 && ${WARNS} <= 3 && ${CCVER} == "gcc47"
-CWARNFLAGS	+=	-Wno-unused-but-set-variable
+.  if ${WARNS} >= 2 && ${WARNS} <= 3 && ${_WCCVER:Mgcc*}
+_cnowarnflags	+=	-Wno-unused-but-set-variable
 .  endif
-.  if ${WARNS} == 3 && ${CCVER} == "gcc47"
-CWARNFLAGS	+=	-Wno-unused-but-set-parameter
+.  if ${WARNS} == 3 && ${_WCCVER:Mgcc*}
+_cnowarnflags	+=	-Wno-unused-but-set-parameter
+.  endif
+.  if ${WARNS} == 3 && (${_WCCVER:Mgcc49} || ${_WCCVER:Mgcc[5-]*})
+_cnowarnflags	+=	-Wno-unused-value
+.  endif
+.  if ${WARNS} == 3 && ${_WCCVER:Mgcc8*}
+_cnowarnflags	+=	-Wno-implicit-fallthrough
+.  endif
+.  if ${WARNS} >= 2 && ${_WCCVER:Mgcc4[789]}
+_cnowarnflags	+=	-Wno-error=maybe-uninitialized\
+			-Wno-error=uninitialized\
+			-Wno-error=shadow
+.  endif
+# Disable -Werror selectively for -Os and -Og compilations.  Both -Winline and
+# -Wmaybe-uninitialized are noisy and should be caught by standard -O and -O2.
+# These are still useful diagnostics while investigating compilation issues.
+.  if defined(WORLD_CCOPTLEVEL) && (${WORLD_CCOPTLEVEL:Mg} || ${WORLD_CCOPTLEVEL:Ms})
+.   if ${WARNS} >= 6
+CWARNFLAGS	+=	-Wno-error=inline
+.   endif
+.   if ${WARNS} >= 5 && ${_WCCVER:Mgcc*}
+CWARNFLAGS	+=	-Wno-error=maybe-uninitialized
+.   endif
 .  endif
 . endif
 
@@ -69,12 +117,37 @@ WFORMAT		=	1
 . endif
 . if defined(WFORMAT)
 .  if ${WFORMAT} > 0
-CWARNFLAGS	+=	-Wformat=2 -Wno-format-extra-args
-.   if !defined(NO_WERROR) && (${CCVER} == "gcc47" || ${CCVER} == "gcc44")
+CWARNFLAGS	+=	-Wformat=2
+.   if !defined(NO_WERROR) && (${_WCCVER} == "gcc47" || ${_WCCVER} == "gcc80")
 CWARNFLAGS	+=	-Werror
 .   endif
 .  endif
 . endif
+.endif
+
+# Build world with -fno-common. This will be default with GCC 10.
+#
+.if ${_WCCVER:Ngcc1[0-9][0-9]}
+CFLAGS		+=	-fno-common
+.endif
+
+.if defined(NO_WCAST_FUNCTION_TYPE) && ${WARNS} >= 3 && ${_WCCVER:Mgcc8*}
+_cnowarnflags	+=      -Wno-cast-function-type
+.endif
+.if defined(NO_WARRAY_BOUNDS)
+_cnowarnflags	+=      -Wno-array-bounds
+.endif
+.if defined(NO_STRICT_OVERFLOW)
+CFLAGS		+=	-fno-strict-overflow
+.endif
+.if defined(NO_STRICT_ALIASING)
+CFLAGS		+=      -fno-strict-aliasing
+.endif
+
+
+# Add -Wno-foo flags last
+.if !defined(WARNS_AUDIT)
+CWARNFLAGS	+=	${_cnowarnflags}
 .endif
 
 # Allow user-specified additional warning flags
@@ -91,5 +164,6 @@ PHONY_NOTMAIN = afterdepend afterinstall all beforedepend beforeinstall \
 	realinstall regress subdir-all subdir-depend subdir-install \
 	tags whereobj
 
-.PHONY: ${PHONY_NOTMAIN}
+# if given PROG matches anything in the PHONY list, exclude it.
+.PHONY: ${PHONY_NOTMAIN:N${PROG:U}}
 .NOTMAIN: ${PHONY_NOTMAIN}

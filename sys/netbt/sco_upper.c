@@ -34,6 +34,7 @@
 
 #include <sys/param.h>
 #include <sys/kernel.h>
+#include <sys/malloc.h>
 #include <sys/mbuf.h>
 #include <sys/proc.h>
 #include <sys/systm.h>
@@ -296,7 +297,7 @@ sco_send(struct sco_pcb *pcb, struct mbuf *m)
 		return EMSGSIZE;
 	}
 
-	M_PREPEND(m, sizeof(hci_scodata_hdr_t), MB_DONTWAIT);
+	M_PREPEND(m, sizeof(hci_scodata_hdr_t), M_NOWAIT);
 	if (m == NULL)
 		return ENOMEM;
 

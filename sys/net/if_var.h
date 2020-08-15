@@ -10,11 +10,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -87,19 +83,12 @@
 /*
  * Forward structure declarations for function prototypes [sic].
  */
-struct	mbuf;
-struct	proc;
-struct	rtentry;
-struct	rt_addrinfo;
+struct	rtentry;		/* ifa_rtrequest */
 struct	socket;
-struct	ether_header;
 struct	ucred;
 struct	lwkt_serialize;
 struct	ifaddr_container;
 struct	ifaddr;
-struct	lwkt_port;
-struct	lwkt_msg;
-union	netmsg;
 struct	pktinfo;
 struct	ifpoll_info;
 struct	ifdata_pcpu;
@@ -111,16 +100,19 @@ struct	ifdata_pcpu;
 #ifdef _KERNEL
 #include <sys/eventhandler.h>
 #include <sys/mbuf.h>
-#include <sys/systm.h>		/* XXX */
 #include <sys/thread2.h>
 #endif /* _KERNEL */
 
 #define IF_DUNIT_NONE   -1
 
-TAILQ_HEAD(ifnethead, ifnet);	/* we use TAILQs so that the order of */
-TAILQ_HEAD(ifaddrhead, ifaddr_container); /* instantiation is preserved in the list */
-TAILQ_HEAD(ifprefixhead, ifprefix);
+/*
+ * we use TAILQs so that the order of instantiation is preserved in
+ * the list.
+ */
+TAILQ_HEAD(ifnethead, ifnet);
+TAILQ_HEAD(ifaddrhead, ifaddr_container);
 TAILQ_HEAD(ifmultihead, ifmultiaddr);
+TAILQ_HEAD(ifgrouphead, ifg_group);
 
 /*
  * Structure defining a mbuf queue.
@@ -192,11 +184,11 @@ enum ifnet_serialize {
  * Caller of if_output MUST NOT serialize ifnet or if_snd by calling
  * the related serialize functions.
  *
- * For better tranmission performance, driver should setup if_snd subqueue
- * owner cpuid properly using ifsq_set_cpuid() (or ifq_set_cpuid(), if not
- * multiple transmit queue capable).  Normally, the if_snd subqueue owner
- * cpu is the one that processing the transmission interrupt.  And in driver,
- * direct call of if_start should be avoided, use ifsq_devstart() or
+ * For better transmission performance, driver should setup if_snd subqueue
+ * owner's cpuid properly using ifsq_set_cpuid() (or ifq_set_cpuid(), if not
+ * multiple transmit queue capable).  Normally, the if_snd subqueue owner's
+ * cpu is the one that processing the transmission interruption.  And in
+ * driver, direct call of if_start should be avoided, use ifsq_devstart() or
  * ifsq_devstart_sched() instead (or if_devstart()/if_devstart_sched(), if
  * not multiple transmit queue capable).
  *
@@ -247,8 +239,8 @@ enum ifnet_serialize {
  * properly (assume QCOUNT is power of 2):
  *
  *	ifq_set_subq_cnt(&ifp->if_snd, QCOUNT);
- *      ifp->if_mapsubq = ifq_mapsubq_mask;
- *	ifq_set_subq_mask(&ifp->if_snd, QCOUNT - 1);
+ *	ifp->if_mapsubq = ifq_mapsubq_modulo;
+ *	ifq_set_subq_divisor(&ifp->if_snd, QCOUNT);
  *
  * After the type specific attach, driver should setup the subqueues owner
  * cpu, serializer and watchdog properly:
@@ -325,7 +317,8 @@ struct ifnet {
 	void	*if_softc;		/* pointer to driver state */
 	void	*if_l2com;		/* pointer to protocol bits */
 	TAILQ_ENTRY(ifnet) if_link;	/* all struct ifnets are chained */
-	char	if_xname[IFNAMSIZ];	/* external name (name + unit) */
+	char	if_xname[IFNAMSIZ];	/* external name (name + unit);
+					 * can be renamed (SIOCSIFNAME) */
 	const char *if_dname;		/* driver name */
 	int	if_dunit;		/* unit or IF_DUNIT_NONE */
 	void	*if_vlantrunks;		/* vlan trunks */
@@ -343,7 +336,12 @@ struct ifnet {
 	struct	if_data if_data;	/* NOTE: stats are in if_data_pcpu */
 	struct	ifmultihead if_multiaddrs; /* multicast addresses configured */
 	int	if_amcount;		/* number of all-multicast requests */
-/* procedure handles */
+	TAILQ_HEAD(, ifg_list) if_groups; /* linked list of groups per if;
+					   * protected by 'ifgroup_lock' */
+
+	/*
+	 * procedure handlers
+	 */
 	int	(*if_output)		/* output routine (enqueue) */
 		(struct ifnet *, struct mbuf *, struct sockaddr *,
 		     struct rtentry *);
@@ -361,7 +359,6 @@ struct ifnet {
 	int	(*if_resolvemulti)	/* validate/resolve multicast */
 		(struct ifnet *, struct sockaddr **, struct sockaddr *);
 	void	*if_unused5;
-	TAILQ_HEAD(, ifg_list) if_groups; /* linked list of groups per if */
 	int	(*if_mapsubq)		/* cpuid to if_snd subqueue map */
 		(struct ifaltq *, int);
 	int	if_unused2;
@@ -392,7 +389,6 @@ struct ifnet {
 #endif
 	int	if_tsolen;		/* max TSO length */
 	struct	ifaltq if_snd;		/* output subqueues */
-	struct	ifprefixhead if_prefixhead; /* list of prefixes per if */
 	const uint8_t	*if_broadcastaddr;
 	void	*if_bridge;		/* bridge glue */
 	void	*if_lagg;		/* lagg glue */
@@ -407,11 +403,18 @@ struct ifnet {
 	 */
 	struct lwkt_serialize if_default_serializer;
 
-	struct mtx	if_ioctl_mtx;	/* high-level ioctl mutex */
 	int	if_unused4;
 	struct ifdata_pcpu *if_data_pcpu; /* per-cpu stats */
 	void	*if_pf_kif;		/* pf interface */
-	void	*if_unused7;
+
+	/*
+	 * Mbuf clusters/jclusters limits should be increased
+	 * by if_nmbclusters/if_nmbjclusters.  Mainly for mbuf
+	 * clusters/jclusters that could sit on the device
+	 * queues, e.g. reception queues, for quite some time.
+	 */
+	int	if_nmbclusters;
+	int	if_nmbjclusters;
 };
 typedef void if_init_f_t (void *);
 
@@ -435,6 +438,7 @@ typedef void if_init_f_t (void *);
 #define	if_omcasts	if_data.ifi_omcasts
 #define	if_iqdrops	if_data.ifi_iqdrops
 #define	if_noproto	if_data.ifi_noproto
+#define	if_oqdrops	if_data.ifi_oqdrops
 #define	if_lastchange	if_data.ifi_lastchange
 #define if_recvquota	if_data.ifi_recvquota
 #define	if_xmitquota	if_data.ifi_xmitquota
@@ -458,6 +462,7 @@ struct ifdata_pcpu {
 	u_long	ifd_omcasts;		/* packets sent via multicast */
 	u_long	ifd_iqdrops;		/* dropped on input, this interface */
 	u_long	ifd_noproto;		/* destined for unsupported protocol */
+	u_long	ifd_oqdrops;		/* dropped on output, this interface */
 } __cachealign;
 
 #endif	/* _KERNEL || _KERNEL_STRUCTURES */
@@ -511,10 +516,6 @@ struct ifdata_pcpu {
 } while (0)
 
 #ifdef _KERNEL
-
-/* interface link layer address change event */
-typedef void (*iflladdr_event_handler_t)(void *, struct ifnet *);
-EVENTHANDLER_DECLARE(iflladdr_event, iflladdr_event_handler_t);
 
 #ifdef INVARIANTS
 #define ASSERT_IFNET_SERIALIZED_ALL(ifp) \
@@ -640,20 +641,6 @@ struct ifaddr {
 #define	ifa_list	ifa_link
 
 /*
- * The prefix structure contains information about one prefix
- * of an interface.  They are maintained by the different address families,
- * are allocated and attached when an prefix or an address is set,
- * and are linked together so all prefixes for an interface can be located.
- */
-struct ifprefix {
-	struct	sockaddr *ifpr_prefix;	/* prefix of interface */
-	struct	ifnet *ifpr_ifp;	/* back-pointer to interface */
-	TAILQ_ENTRY(ifprefix) ifpr_list; /* queue macro glue */
-	u_char	ifpr_plen;		/* prefix length in bits */
-	u_char	ifpr_type;		/* protocol dependent prefix type */
-};
-
-/*
  * Multicast address structure.  This is analogous to the ifaddr
  * structure except that it keeps track of multicast addresses.
  * Also, the reference count here is a count of requests for this
@@ -669,6 +656,14 @@ struct ifmultiaddr {
 };
 
 #ifdef _KERNEL
+
+struct ifaddr_marker {
+	struct ifaddr		ifa;
+	struct ifaddr_container	ifac;
+	struct sockaddr		addr;
+	struct sockaddr		netmask;
+	struct sockaddr		dstaddr;
+};
 
 /*
  * ifaddr statistics update macro
@@ -702,9 +697,6 @@ do { \
 		(v) += (ifp)->if_data_pcpu[_cpu].ifd_##name; \
 } while (0)
 
-#ifndef _SYS_SERIALIZE2_H_
-#include <sys/serialize2.h>
-#endif
 
 enum ifaddr_event {
 	IFADDR_EVENT_ADD,
@@ -716,23 +708,41 @@ enum ifaddr_event {
 typedef void (*ifaddr_event_handler_t)(void *, struct ifnet *,
 	enum ifaddr_event, struct ifaddr *);
 EVENTHANDLER_DECLARE(ifaddr_event, ifaddr_event_handler_t);
+/* interface link layer address change event */
+typedef void (*iflladdr_event_handler_t)(void *, struct ifnet *);
+EVENTHANDLER_DECLARE(iflladdr_event, iflladdr_event_handler_t);
 /* new interface attach event */
 typedef void (*ifnet_attach_event_handler_t)(void *, struct ifnet *);
 EVENTHANDLER_DECLARE(ifnet_attach_event, ifnet_attach_event_handler_t);
 /* interface detach event */
 typedef void (*ifnet_detach_event_handler_t)(void *, struct ifnet *);
 EVENTHANDLER_DECLARE(ifnet_detach_event, ifnet_detach_event_handler_t);
+/* Interface link state change event */
+typedef void (*ifnet_link_event_handler_t)(void *, struct ifnet *, int);
+EVENTHANDLER_DECLARE(ifnet_link_event, ifnet_link_event_handler_t);
+/* Interface up/down event */
+#define IFNET_EVENT_UP		0
+#define IFNET_EVENT_DOWN	1
+typedef void (*ifnet_event_fn)(void *, struct ifnet *ifp, int event);
+EVENTHANDLER_DECLARE(ifnet_event, ifnet_event_fn);
+
+/* Array of all ifnets in the system */
+struct ifnet_array {
+	int		ifnet_count;	/* # of elem. in ifnet_arr */
+	int		ifnet_pad;	/* explicit */
+	struct ifnet	*ifnet_arr[];
+};
 
 /*
  * interface groups
  */
 struct ifg_group {
-	char				 ifg_group[IFNAMSIZ];
-	u_int				 ifg_refcnt;
-	void				*ifg_pf_kif;
-	int				 ifg_carp_demoted;
-	TAILQ_HEAD(, ifg_member)	 ifg_members;
-	TAILQ_ENTRY(ifg_group)		 ifg_next;
+	char			 ifg_group[IFNAMSIZ];
+	u_int			 ifg_refcnt;
+	void			*ifg_pf_kif;
+	int			 ifg_carp_demoted;
+	TAILQ_HEAD(, ifg_member) ifg_members;
+	TAILQ_ENTRY(ifg_group)	 ifg_next;
 };
 
 struct ifg_member {
@@ -782,11 +792,13 @@ IFAREF(struct ifaddr *_ifa)
 	_IFAREF(_ifa, mycpuid);
 }
 
-#include <sys/malloc.h>
+#include <sys/serialize2.h>
 
+#ifdef MALLOC_DECLARE
 MALLOC_DECLARE(M_IFADDR);
 MALLOC_DECLARE(M_IFMADDR);
 MALLOC_DECLARE(M_IFNET);
+#endif
 
 void	ifac_free(struct ifaddr_container *, int);
 
@@ -806,30 +818,6 @@ static __inline void
 IFAFREE(struct ifaddr *_ifa)
 {
 	_IFAFREE(_ifa, mycpuid);
-}
-
-struct lwkt_port *ifnet_portfn(int);
-int	ifnet_domsg(struct lwkt_msg *, int);
-void	ifnet_sendmsg(struct lwkt_msg *, int);
-void	ifnet_forwardmsg(struct lwkt_msg *, int);
-struct ifnet *ifnet_byindex(unsigned short);
-
-static __inline int
-ifa_domsg(struct lwkt_msg *_lmsg, int _cpu)
-{
-	return ifnet_domsg(_lmsg, _cpu);
-}
-
-static __inline void
-ifa_sendmsg(struct lwkt_msg *_lmsg, int _cpu)
-{
-	ifnet_sendmsg(_lmsg, _cpu);
-}
-
-static __inline void
-ifa_forwardmsg(struct lwkt_msg *_lmsg, int _nextcpu)
-{
-	ifnet_forwardmsg(_lmsg, _nextcpu);
 }
 
 static __inline void
@@ -879,11 +867,45 @@ ifnet_serialize_array_assert(lwkt_serialize_t *_arr, int _arrcnt,
 #define REINPUT_KEEPRCVIF	0x0001	/* ether_reinput_oncpu() */
 #define REINPUT_RUNBPF 		0x0002	/* ether_reinput_oncpu() */
 
-extern	struct ifnethead ifnet;
-extern struct	ifnet	**ifindex2ifnet;
-extern	int ifqmaxlen;
-extern	struct ifnet loif[];
-extern	int if_index;
+/*
+ * MPSAFE NOTE for ifnet queue (ifnet), ifnet array, ifunit() and
+ * ifindex2ifnet.
+ *
+ * - ifnet queue must only be accessed by non-netisr threads and
+ *   ifnet lock must be held (by ifnet_lock()).
+ * - If accessing ifnet queue is needed in netisrs, ifnet array
+ *   (obtained through ifnet_array_get()) must be used instead.
+ *   There is no need to (must not, actually) hold ifnet lock for
+ *   ifnet array accessing.
+ * - ifindex2ifnet could be accessed by both non-netisr threads and
+ *   netisrs.  Accessing ifindex2ifnet in non-netisr threads must be
+ *   protected by ifnet lock (by ifnet_lock()).  Accessing
+ *   ifindex2ifnet in netisrs is lockless MPSAFE and ifnet lock must
+ *   not be held.  However, ifindex2ifnet should be saved in a stack
+ *   variable to get a consistent view of ifindex2ifnet, if
+ *   ifindex2ifnet is accessed multiple times from a function in
+ *   netisrs.
+ * - ifunit() must only be called in non-netisr threads and ifnet
+ *   lock must be held before calling this function and for the
+ *   accessing of the ifp returned by this function.
+ * - If ifunit() is needed in netisr, ifunit_netisr() must be used
+ *   instead.  There is no need to (must not, actually) hold ifnet
+ *   lock for ifunit_netisr() and the returned ifp.
+ */
+extern struct ifnethead	ifnet;
+#define ifnetlist	ifnet	/* easily distinguished ifnet alias */
+
+extern struct ifnet	**ifindex2ifnet;
+extern int		if_index;
+
+struct ifnet		*ifunit(const char *);
+struct ifnet		*ifunit_netisr(const char *);
+const struct ifnet_array *ifnet_array_get(void);
+int			ifnet_array_isempty(void);
+
+extern int ifqmaxlen;
+extern struct ifnet *loif;  /* first loopback interface */
+extern struct ifgrouphead ifg_head;
 
 struct ip;
 struct tcphdr;
@@ -922,21 +944,16 @@ int	if_getanyethermac(uint16_t *, int);
 int	if_printf(struct ifnet *, const char *, ...) __printflike(2, 3);
 struct ifnet *if_alloc(uint8_t);
 void	if_free(struct ifnet *);
-void	if_route(struct ifnet *, int flag, int fam);
 int	if_setlladdr(struct ifnet *, const u_char *, int);
-void	if_unroute(struct ifnet *, int flag, int fam);
+struct ifnet *if_bylla(const void *, unsigned char);
 void	if_up(struct ifnet *);
 /*void	ifinit(void);*/ /* declared in systm.h for main() */
 int	ifioctl(struct socket *, u_long, caddr_t, struct ucred *);
 int	ifpromisc(struct ifnet *, int);
-struct	ifnet *ifunit(const char *);
-struct	ifnet *if_withname(struct sockaddr *);
 
-struct	ifg_group *if_creategroup(const char *);
-int     if_addgroup(struct ifnet *, const char *);
-int     if_delgroup(struct ifnet *, const char *);
-int     if_getgroup(caddr_t, struct ifnet *);
-int     if_getgroupmembers(caddr_t);
+int	ifgroup_lockmgr(u_int flags);
+int	if_addgroup(struct ifnet *, const char *);
+int	if_delgroup(struct ifnet *, const char *);
 
 struct	ifaddr *ifa_ifwithaddr(struct sockaddr *);
 struct	ifaddr *ifa_ifwithdstaddr(struct sockaddr *);
@@ -946,21 +963,22 @@ struct	ifaddr *ifaof_ifpforaddr(struct sockaddr *, struct ifnet *);
 
 typedef void *if_com_alloc_t(u_char type, struct ifnet *ifp);
 typedef void if_com_free_t(void *com, u_char type);
-void    if_register_com_alloc(u_char, if_com_alloc_t *a, if_com_free_t *);
-void    if_deregister_com_alloc(u_char);
+void	if_register_com_alloc(u_char, if_com_alloc_t *a, if_com_free_t *);
+void	if_deregister_com_alloc(u_char);
 
-void	*ifa_create(int, int);
+void	*ifa_create(int);
 void	ifa_destroy(struct ifaddr *);
 void	ifa_iflink(struct ifaddr *, struct ifnet *, int);
 void	ifa_ifunlink(struct ifaddr *, struct ifnet *);
-
-struct ifaddr *ifaddr_byindex(unsigned short);
+void	ifa_marker_init(struct ifaddr_marker *, struct ifnet *);
 
 struct	ifmultiaddr *ifmaof_ifpforaddr(struct sockaddr *, struct ifnet *);
 int	if_simloop(struct ifnet *ifp, struct mbuf *m, int af, int hlen);
 void	if_devstart(struct ifnet *ifp); /* COMPAT */
 void	if_devstart_sched(struct ifnet *ifp); /* COMPAT */
-int	if_ring_count2(int cnt, int cnt_max);
+
+void	ifnet_lock(void);
+void	ifnet_unlock(void);
 
 #define IF_LLSOCKADDR(ifp)						\
     ((struct sockaddr_dl *)(ifp)->if_lladdr->ifa_addr)

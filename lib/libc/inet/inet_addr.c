@@ -10,11 +10,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- * 	This product includes software developed by the University of
- * 	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  * 
@@ -66,12 +62,10 @@
  * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
  * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT
  * OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+ *
+ * @(#)inet_addr.c	8.1 (Berkeley) 6/17/93
+ * $Id: inet_addr.c,v 1.5 2005/04/27 04:56:19 sra Exp $
  */
-
-#if defined(LIBC_SCCS) && !defined(lint)
-static const char sccsid[] = "@(#)inet_addr.c	8.1 (Berkeley) 6/17/93";
-static const char rcsid[] = "$Id: inet_addr.c,v 1.5 2005/04/27 04:56:19 sra Exp $";
-#endif /* LIBC_SCCS and not lint */
 
 #include "port_before.h"
 
@@ -205,7 +199,6 @@ inet_aton(const char *cp, struct in_addr *addr) {
 	return (1);
 }
 
-#ifdef _LIBC
 /*
  * Weak aliases for applications that use certain private entry points,
  * and fail to include <arpa/inet.h>.
@@ -214,5 +207,3 @@ inet_aton(const char *cp, struct in_addr *addr) {
 __weak_reference(__inet_addr, inet_addr);
 #undef inet_aton
 __weak_reference(__inet_aton, inet_aton);
-#endif
-/*! \file */

@@ -74,14 +74,15 @@ int	sumrusage;		/* -S */
 int	termwidth;		/* width of screen (0 == infinity) */
 int	totwidth;		/* calculated width of requested variables */
 int	numcpus;		/* hw.ncpu */
+int	showtid;		/* -H */
 
 static int needuser, needcomm, needenv;
 #if defined(LAZY_PS)
 static int forceuread=0;
-#define PS_ARGS	"aCcefgHhjLlM:mN:O:o:p:rRSTt:U:uvwx"
+#define PS_ARGS	"AaCcefgHhjLlM:mN:O:o:p:rRSTt:U:uvwx"
 #else
 static int forceuread=1;
-#define PS_ARGS	"aCcegHhjLlM:mN:O:o:p:rRSTt:U:uvwx"
+#define PS_ARGS	"AaCcegHhjLlM:mN:O:o:p:rRSTt:U:uvwx"
 #endif
 
 enum sort { DEFAULT, SORTMEM, SORTCPU } sortby = DEFAULT;
@@ -121,7 +122,7 @@ main(int argc, char **argv)
 	pid_t pid;
 	uid_t *uids;
 	int all, ch, flag, i, fmt, ofmt, lineno, nentries, nocludge, dropgid;
-	int prtheader, wflag, what, xflg, uid, nuids, showtid;
+	int prtheader, wflag, what, xflg, uid, nuids;
 	int chainflg;
 	char errbuf[_POSIX2_LINE_MAX];
 	const char *cp, *nlistf, *memf;
@@ -169,6 +170,9 @@ main(int argc, char **argv)
 
 	while ((ch = getopt(argc, argv, PS_ARGS)) != -1) {
 		switch((char)ch) {
+		case 'A':
+			all = xflg = 1;
+			break;
 		case 'a':
 			all = 1;
 			break;

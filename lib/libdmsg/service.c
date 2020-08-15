@@ -71,9 +71,9 @@ dmsg_master_service(void *data)
 	dmsg_iocom_core(&iocom);
 	dmsg_iocom_done(&iocom);
 
-	fprintf(stderr,
-		"iocom on fd %d terminated error rx=%d, tx=%d\n",
-		info->fd, iocom.ioq_rx.error, iocom.ioq_tx.error);
+	dmio_printf(iocom, 1,
+		    "iocom on fd %d terminated error rx=%d, tx=%d\n",
+		    info->fd, iocom.ioq_rx.error, iocom.ioq_tx.error);
 	close(info->fd);
 	info->fd = -1;	/* safety */
 	if (info->exit_callback)
@@ -111,8 +111,8 @@ master_auth_signal(dmsg_iocom_t *iocom)
 			     DMSG_LNK_CONN | DMSGF_CREATE,
 			     master_auth_conn_rx, NULL);
 	msg->any.lnk_conn.peer_mask = (uint64_t)-1;
-	msg->any.lnk_conn.peer_type = DMSG_PEER_CLUSTER;
-	msg->any.lnk_conn.pfs_mask = (uint64_t)-1;
+	msg->any.lnk_conn.peer_type = DMSG_PEER_ROUTER;
+	msg->any.lnk_conn.peer_mask = (uint64_t)-1;
 
 	dmsg_msg_write(msg);
 

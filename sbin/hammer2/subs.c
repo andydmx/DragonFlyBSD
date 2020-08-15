@@ -33,7 +33,23 @@
  * SUCH DAMAGE.
  */
 
-#include "hammer2.h"
+#include <sys/types.h>
+#include <sys/time.h>
+#include <sys/ioctl.h>
+#include <sys/mount.h>
+#include <sys/statvfs.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <errno.h>
+#include <uuid.h>
+
+#include <vfs/hammer2/hammer2_disk.h>
+#include <vfs/hammer2/hammer2_ioctl.h>
+
+#include "hammer2_subs.h"
 
 /*
  * Obtain a file descriptor that the caller can execute ioctl()'s on.
@@ -60,83 +76,6 @@ hammer2_ioctl_handle(const char *sel_path)
 		return(-1);
 	}
 	return (fd);
-}
-
-/*
- * Execute the specified function as a detached independent process/daemon,
- * unless we are in debug mode.  If we are in debug mode the function is
- * executed as a pthread in the current process.
- */
-void
-hammer2_demon(void *(*func)(void *), void *arg)
-{
-	pthread_t thread = NULL;
-	pid_t pid;
-	int ttyfd;
-
-	/*
-	 * Do not disconnect in debug mode
-	 */
-	if (DebugOpt) {
-                pthread_create(&thread, NULL, func, arg);
-		NormalExit = 0;
-		return;
-	}
-
-	/*
-	 * Otherwise disconnect us.  Double-fork to get rid of the ppid
-	 * association and disconnect the TTY.
-	 */
-	if ((pid = fork()) < 0) {
-		fprintf(stderr, "hammer2: fork(): %s\n", strerror(errno));
-		exit(1);
-	}
-	if (pid > 0) {
-		while (waitpid(pid, NULL, 0) != pid)
-			;
-		return;		/* parent returns */
-	}
-
-	/*
-	 * Get rid of the TTY/session before double-forking to finish off
-	 * the ppid.
-	 */
-	ttyfd = open("/dev/null", O_RDWR);
-	if (ttyfd >= 0) {
-		if (ttyfd != 0)
-			dup2(ttyfd, 0);
-		if (ttyfd != 1)
-			dup2(ttyfd, 1);
-		if (ttyfd != 2)
-			dup2(ttyfd, 2);
-		if (ttyfd > 2)
-			close(ttyfd);
-	}
-
-	ttyfd = open("/dev/tty", O_RDWR);
-	if (ttyfd >= 0) {
-		ioctl(ttyfd, TIOCNOTTY, 0);
-		close(ttyfd);
-	}
-	setsid();
-
-	/*
-	 * Second fork to disconnect ppid (the original parent waits for
-	 * us to exit).
-	 */
-	if ((pid = fork()) < 0) {
-		_exit(2);
-	}
-	if (pid > 0)
-		_exit(0);
-
-	/*
-	 * The double child
-	 */
-	setsid();
-	pthread_create(&thread, NULL, func, arg);
-	pthread_exit(NULL);
-	_exit(2);	/* NOT REACHED */
 }
 
 const char *
@@ -186,8 +125,6 @@ hammer2_iptype_to_str(uint8_t type)
 		return("BDEV");
 	case HAMMER2_OBJTYPE_SOFTLINK:
 		return("SOFTLINK");
-	case HAMMER2_OBJTYPE_HARDLINK:
-		return("HARDLINK");
 	case HAMMER2_OBJTYPE_SOCKET:
 		return("SOCKET");
 	case HAMMER2_OBJTYPE_WHITEOUT:
@@ -201,12 +138,14 @@ const char *
 hammer2_pfstype_to_str(uint8_t type)
 {
 	switch(type) {
-	case DMSG_PFSTYPE_NONE:
+	case HAMMER2_PFSTYPE_NONE:
 		return("NONE");
+	case HAMMER2_PFSTYPE_SUPROOT:
+		return("SUPROOT");
+	case HAMMER2_PFSTYPE_DUMMY:
+		return("DUMMY");
 	case HAMMER2_PFSTYPE_CACHE:
 		return("CACHE");
-	case HAMMER2_PFSTYPE_COPY:
-		return("COPY");
 	case HAMMER2_PFSTYPE_SLAVE:
 		return("SLAVE");
 	case HAMMER2_PFSTYPE_SOFT_SLAVE:
@@ -221,12 +160,39 @@ hammer2_pfstype_to_str(uint8_t type)
 }
 
 const char *
+hammer2_breftype_to_str(uint8_t type)
+{
+	switch (type) {
+	case HAMMER2_BREF_TYPE_EMPTY:
+		return("empty");
+	case HAMMER2_BREF_TYPE_INODE:
+		return("inode");
+	case HAMMER2_BREF_TYPE_INDIRECT:
+		return("indirect");
+	case HAMMER2_BREF_TYPE_DATA:
+		return("data");
+	case HAMMER2_BREF_TYPE_DIRENT:
+		return("dirent");
+	case HAMMER2_BREF_TYPE_FREEMAP_NODE:
+		return("freemap_node");
+	case HAMMER2_BREF_TYPE_FREEMAP_LEAF:
+		return("freemap_leaf");
+	case HAMMER2_BREF_TYPE_FREEMAP:
+		return("freemap");
+	case HAMMER2_BREF_TYPE_VOLUME:
+		return("volume");
+	default:
+		return("unknown");
+	}
+}
+
+const char *
 sizetostr(hammer2_off_t size)
 {
 	static char buf[32];
 
 	if (size < 1024 / 2) {
-		snprintf(buf, sizeof(buf), "%6.2f", (double)size);
+		snprintf(buf, sizeof(buf), "%6.2fB", (double)size);
 	} else if (size < 1024 * 1024 / 2) {
 		snprintf(buf, sizeof(buf), "%6.2fKB",
 			(double)size / 1024);
@@ -267,29 +233,17 @@ counttostr(hammer2_off_t size)
 	return(buf);
 }
 
-#if 0
 /*
- * Allocation wrappers give us shims for possible future use
+ * Borrow HAMMER1's directory hash algorithm #1 with a few modifications.
+ * The filename is split into fields which are hashed separately and then
+ * added together.
+ *
+ * Differences include: bit 63 must be set to 1 for HAMMER2 (HAMMER1 sets
+ * it to 0), this is because bit63=0 is used for hidden hardlinked inodes.
+ * (This means we do not need to do a 0-check/or-with-0x100000000 either).
+ *
+ * Also, the iscsi crc code is used instead of the old crc32 code.
  */
-void *
-hammer2_alloc(size_t bytes)
-{
-	void *ptr;
-
-	ptr = malloc(bytes);
-	assert(ptr);
-	bzero(ptr, bytes);
-	return (ptr);
-}
-
-void
-hammer2_free(void *ptr)
-{
-	free(ptr);
-}
-
-#endif
-
 hammer2_key_t
 dirhash(const unsigned char *name, size_t len)
 {
@@ -352,4 +306,48 @@ dirhash(const unsigned char *name, size_t len)
 	key |= 0x8000U;
 
 	return (key);
+}
+
+char **
+get_hammer2_mounts(int *acp)
+{
+	struct statfs *fs;
+	char **av;
+	int n;
+	int w;
+	int i;
+
+	/*
+	 * Get a stable list of mount points
+	 */
+again:
+	n = getfsstat(NULL, 0, MNT_NOWAIT);
+	av = calloc(n, sizeof(char *));
+	fs = calloc(n, sizeof(struct statfs *));
+	if (getfsstat(fs, sizeof(*fs) * n, MNT_NOWAIT) != n) {
+		free(av);
+		free(fs);
+		goto again;
+	}
+
+	/*
+	 * Pull out hammer2 filesystems only
+	 */
+	for (i = w = 0; i < n; ++i) {
+		if (strcmp(fs[i].f_fstypename, "hammer2") != 0)
+			continue;
+		av[w++] = strdup(fs[i].f_mntonname);
+	}
+	*acp = w;
+	free(fs);
+
+	return av;
+}
+
+void
+put_hammer2_mounts(int ac, char **av)
+{
+	while (--ac >= 0)
+		free(av[ac]);
+	free(av);
 }

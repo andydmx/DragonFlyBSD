@@ -58,6 +58,7 @@
 #define MALLOC_DEFINE(a, b, c)
 #define lwkt_gettoken(x)
 #define lwkt_reltoken(x)
+#undef kmalloc
 #define kmalloc(bytes, zone, flags)	calloc(bytes, 1)
 #define lwkt_token_init(a, b)
 #define lwkt_token_uninit(a)
@@ -72,7 +73,7 @@ main(int ac, char **av)
 {
 	char buf[256];
 	struct idr idr;
-	intptr_t generation = 0x10000000;
+	intptr_t generation = 0x0;
 	int error;
 	int id;
 
@@ -318,8 +319,6 @@ idr_get_new_above(struct idr *idp, void *ptr, int sid, int *id)
 {
 	int resid;
 
-	KKASSERT(ptr != NULL);
-
 	/*
 	 * NOTE! Because the idp is initialized with a non-zero count,
 	 *	 sid might be < idp->idr_count but idr_maxwant might not
@@ -350,6 +349,61 @@ idr_get_new_above(struct idr *idp, void *ptr, int sid, int *id)
 
 	lwkt_reltoken(&idp->idr_token);
 	return (0);
+}
+
+/*
+ * start: minimum id, inclusive
+ * end:   maximum id, exclusive or INT_MAX if end is negative
+ */
+int
+idr_alloc(struct idr *idp, void *ptr, int start, int end, unsigned gfp_mask)
+{
+	int lim = end > 0 ? end - 1 : INT_MAX;
+	int want = start;
+	int result, id;
+
+	if (start < 0)
+		return -EINVAL;
+
+	if (lim < start)
+		return -ENOSPC;
+
+	lwkt_gettoken(&idp->idr_token);
+
+grow_again:
+	if (want >= idp->idr_count)
+		idr_grow(idp, want);
+
+	/*
+	 * Check if a spot is available, break and return 0 if true,
+	 * unless the available spot is beyond our limit.  It is
+	 * possible to exceed the limit due to the way array growth
+	 * works.
+	 */
+	id = idr_find_free(idp, start, lim);
+	if (id == -1) {
+		want = idp->idr_count;
+		goto grow_again;
+	}
+
+	if (id >= lim) {
+		result = -ENOSPC;
+		goto done;
+	}
+
+	if (id >= idp->idr_count)
+		panic("idr_alloc(): illegal resid %d", id);
+	if (id > idp->idr_lastindex)
+		idp->idr_lastindex = id;
+	if (start <= idp->idr_freeindex)
+		idp->idr_freeindex = id;
+	result = id;
+	idr_reserve(idp, id, 1);
+	idp->idr_nodes[id].data = ptr;
+
+done:
+	lwkt_reltoken(&idp->idr_token);
+	return result;
 }
 
 int
@@ -406,7 +460,7 @@ idr_grow(struct idr *idp, int want)
 	idp->idr_nexpands++;
 }
 
-void
+void *
 idr_remove(struct idr *idp, int id)
 {
 	void *ptr;
@@ -414,16 +468,19 @@ idr_remove(struct idr *idp, int id)
 	lwkt_gettoken(&idp->idr_token);
 	if (id < 0 || id >= idp->idr_count) {
 		lwkt_reltoken(&idp->idr_token);
-		return;
+		return NULL;
 	}
-	if ((ptr = idp->idr_nodes[id].data) == NULL) {
-		lwkt_reltoken(&idp->idr_token);
-		return;
-	}
+        if (idp->idr_nodes[id].allocated == 0) {
+                lwkt_reltoken(&idp->idr_token);
+                return NULL;
+        }
+	ptr = idp->idr_nodes[id].data;
 	idp->idr_nodes[id].data = NULL;
 	idr_reserve(idp, id, -1);
 	idrfixup(idp, id);
 	lwkt_reltoken(&idp->idr_token);
+
+	return ptr;
 }
 
 /*
@@ -496,7 +553,7 @@ idr_replace(struct idr *idp, void *ptr, int id)
 
 	lwkt_gettoken(&idp->idr_token);
 	idrnp = idr_get_node(idp, id);
-	if (idrnp == NULL || ptr == NULL) {
+	if (idrnp == NULL) {
 		ret = NULL;
 	} else {
 		ret = idrnp->data;

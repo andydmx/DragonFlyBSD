@@ -56,6 +56,7 @@
 #include <sys/malloc.h>
 #include <sys/mount.h>
 #include <sys/proc.h>
+#include <sys/spinlock2.h>
 #include <sys/syslog.h>
 #include <sys/vnode.h>
 #include <sys/conf.h>
@@ -70,7 +71,6 @@
 #include "ufs_extern.h"
 
 #include <sys/buf2.h>
-#include <sys/thread2.h>
 #include <sys/lock.h>
 
 /*
@@ -248,7 +248,7 @@ free_lock(struct lock *lkp)
 static int
 lock_held(struct lock *lkp) 
 {
-	return lockcountnb(lkp);
+	return lockinuse(lkp);
 }
 #endif
 
@@ -360,7 +360,7 @@ static	void workitem_free(struct worklist *, int);
 static void
 worklist_insert(struct workhead *head, struct worklist *item)
 {
-	KKASSERT(lock_held(&lk) > 0);
+	KKASSERT(lock_held(&lk));
 
 	if (item->wk_state & ONWORKLIST) {
 		panic("worklist_insert: already on list");
@@ -602,7 +602,7 @@ process_worklist_item(struct mount *matchmnt, int flags)
 	struct vnode *vp;
 	int matchcnt = 0;
 
-	KKASSERT(lock_held(&lk) > 0);
+	KKASSERT(lock_held(&lk));
 
 	matchfs = NULL;
 	if (matchmnt != NULL)
@@ -839,7 +839,7 @@ pagedep_lookup(struct inode *ip, ufs_lbn_t lbn, int flags,
 	struct mount *mp;
 	int i;
 
-	KKASSERT(lock_held(&lk) > 0);
+	KKASSERT(lock_held(&lk));
 	
 	mp = ITOV(ip)->v_mount;
 	pagedephd = PAGEDEP_HASH(mp, ip->i_number, lbn);
@@ -916,7 +916,7 @@ inodedep_lookup(struct fs *fs, ino_t inum, int flags,
 	struct inodedep *inodedep;
 	struct inodedep_hashhead *inodedephd;
 
-	KKASSERT(lock_held(&lk) > 0);
+	KKASSERT(lock_held(&lk));
 
 	inodedephd = INODEDEP_HASH(fs, inum);
 top:
@@ -1042,15 +1042,22 @@ top:
 void 
 softdep_initialize(void)
 {
+	size_t idsize = sizeof(struct inodedep);
+	int hsize = vfs_inodehashsize();
+
 	LIST_INIT(&mkdirlisthd);
 	LIST_INIT(&softdep_workitem_pending);
-	max_softdeps = min(desiredvnodes * 8,
-		M_INODEDEP->ks_limit / (2 * sizeof(struct inodedep)));
-	pagedep_hashtbl = hashinit(desiredvnodes / 5, M_PAGEDEP,
-	    &pagedep_hash);
+	max_softdeps = min(maxvnodes * 8, M_INODEDEP->ks_limit / (2 * idsize));
+
+	/*
+	 * Cap it at 100,000, having more just gets kinda silly.
+	 */
+	max_softdeps = min(max_softdeps, 100000);
+
+	pagedep_hashtbl = hashinit(hsize / 4, M_PAGEDEP, &pagedep_hash);
 	lockinit(&lk, "ffs_softdep", 0, LK_CANRECURSE);
 	sema_init(&pagedep_in_progress, "pagedep", 0);
-	inodedep_hashtbl = hashinit(desiredvnodes, M_INODEDEP, &inodedep_hash);
+	inodedep_hashtbl = hashinit(hsize, M_INODEDEP, &inodedep_hash);
 	sema_init(&inodedep_in_progress, "inodedep", 0);
 	newblk_hashtbl = hashinit(64, M_NEWBLK, &newblk_hash);
 	sema_init(&newblk_in_progress, "newblk", 0);
@@ -1206,7 +1213,7 @@ bmsafemap_lookup(struct buf *bp)
 	struct bmsafemap *bmsafemap;
 	struct worklist *wk;
 
-	KKASSERT(lock_held(&lk) > 0);
+	KKASSERT(lock_held(&lk));
 
 	LIST_FOREACH(wk, &bp->b_dep, wk_list) {
 		if (wk->wk_type == D_BMSAFEMAP)
@@ -1311,7 +1318,7 @@ softdep_setup_allocdirect(struct inode *ip, ufs_lbn_t lbn, ufs_daddr_t newblkno,
 	kfree(newblk, M_NEWBLK);
 
 	WORKLIST_INSERT_BP(bp, &adp->ad_list);
-	if (lbn >= NDADDR) {
+	if (lbn >= UFS_NDADDR) {
 		/* allocating an indirect block */
 		if (oldblkno != 0) {
 			panic("softdep_setup_allocdirect: non-zero indir");
@@ -1381,14 +1388,14 @@ allocdirect_merge(struct allocdirectlst *adphead,
 {
 	struct freefrag *freefrag;
 
-	KKASSERT(lock_held(&lk) > 0);
+	KKASSERT(lock_held(&lk));
 
 	if (newadp->ad_oldblkno != oldadp->ad_newblkno ||
 	    newadp->ad_oldsize != oldadp->ad_newsize ||
-	    newadp->ad_lbn >= NDADDR) {
+	    newadp->ad_lbn >= UFS_NDADDR) {
 		panic("allocdirect_check: old %d != new %d || lbn %ld >= %d",
 		    newadp->ad_oldblkno, oldadp->ad_newblkno, newadp->ad_lbn,
-		    NDADDR);
+		    UFS_NDADDR);
 	}
 	newadp->ad_oldblkno = oldadp->ad_oldblkno;
 	newadp->ad_oldsize = oldadp->ad_oldsize;
@@ -1752,11 +1759,11 @@ softdep_setup_freeblocks(struct inode *ip, off_t length)
 	freeblks->fb_oldsize = ip->i_size;
 	freeblks->fb_newsize = length;
 	freeblks->fb_chkcnt = ip->i_blocks;
-	for (i = 0; i < NDADDR; i++) {
+	for (i = 0; i < UFS_NDADDR; i++) {
 		freeblks->fb_dblks[i] = ip->i_db[i];
 		ip->i_db[i] = 0;
 	}
-	for (i = 0; i < NIADDR; i++) {
+	for (i = 0; i < UFS_NIADDR; i++) {
 		freeblks->fb_iblks[i] = ip->i_ib[i];
 		ip->i_ib[i] = 0;
 	}
@@ -1988,7 +1995,7 @@ static void
 free_allocdirect(struct allocdirectlst *adphead,
 		 struct allocdirect *adp, int delay)
 {
-	KKASSERT(lock_held(&lk) > 0);
+	KKASSERT(lock_held(&lk));
 
 	if ((adp->ad_state & DEPCOMPLETE) == 0)
 		LIST_REMOVE(adp, ad_deps);
@@ -2135,7 +2142,7 @@ handle_workitem_freeblocks(struct freeblks *freeblks)
 	int i, level, bsize;
 	long nblocks, blocksreleased = 0;
 	int error, allerror = 0;
-	ufs_lbn_t baselbns[NIADDR], tmpval;
+	ufs_lbn_t baselbns[UFS_NIADDR], tmpval;
 
 	tip.i_number = freeblks->fb_previousinum;
 	tip.i_devvp = freeblks->fb_devvp;
@@ -2145,8 +2152,8 @@ handle_workitem_freeblocks(struct freeblks *freeblks)
 	tip.i_uid = freeblks->fb_uid;
 	fs = freeblks->fb_fs;
 	tmpval = 1;
-	baselbns[0] = NDADDR;
-	for (i = 1; i < NIADDR; i++) {
+	baselbns[0] = UFS_NDADDR;
+	for (i = 1; i < UFS_NIADDR; i++) {
 		tmpval *= NINDIR(fs);
 		baselbns[i] = baselbns[i - 1] + tmpval;
 	}
@@ -2155,7 +2162,7 @@ handle_workitem_freeblocks(struct freeblks *freeblks)
 	/*
 	 * Indirect blocks first.
 	 */
-	for (level = (NIADDR - 1); level >= 0; level--) {
+	for (level = (UFS_NIADDR - 1); level >= 0; level--) {
 		if ((bn = freeblks->fb_iblks[level]) == 0)
 			continue;
 		if ((error = indir_trunc(&tip, fsbtodoff(fs, bn), level,
@@ -2167,7 +2174,7 @@ handle_workitem_freeblocks(struct freeblks *freeblks)
 	/*
 	 * All direct blocks or frags.
 	 */
-	for (i = (NDADDR - 1); i >= 0; i--) {
+	for (i = (UFS_NDADDR - 1); i >= 0; i--) {
 		if ((bn = freeblks->fb_dblks[i]) == 0)
 			continue;
 		bsize = blksize(fs, &tip, i);
@@ -2272,7 +2279,7 @@ free_allocindir(struct allocindir *aip, struct inodedep *inodedep)
 {
 	struct freefrag *freefrag;
 
-	KKASSERT(lock_held(&lk) > 0);
+	KKASSERT(lock_held(&lk));
 
 	if ((aip->ai_state & DEPCOMPLETE) == 0)
 		LIST_REMOVE(aip, ai_deps);
@@ -2334,7 +2341,7 @@ softdep_setup_directory_add(struct buf *bp, struct inode *dp, off_t diroffset,
 	/*
 	 * Whiteouts have no dependencies.
 	 */
-	if (newinum == WINO) {
+	if (newinum == UFS_WINO) {
 		if (newdirbp != NULL)
 			bdwrite(newdirbp);
 		return;
@@ -2476,7 +2483,7 @@ free_diradd(struct diradd *dap)
 	struct inodedep *inodedep;
 	struct mkdir *mkdir, *nextmd;
 
-	KKASSERT(lock_held(&lk) > 0);
+	KKASSERT(lock_held(&lk));
 
 	WORKLIST_REMOVE(&dap->da_list);
 	LIST_REMOVE(dap, da_pdlist);
@@ -2711,7 +2718,7 @@ softdep_setup_directory_change(struct buf *bp, struct inode *dp,
 	/*
 	 * Whiteouts do not need diradd dependencies.
 	 */
-	if (newinum != WINO) {
+	if (newinum != UFS_WINO) {
 		dap = kmalloc(sizeof(struct diradd), M_DIRADD,
 			      M_SOFTDEP_FLAGS | M_ZERO);
 		dap->da_list.wk_type = D_DIRADD;
@@ -2744,7 +2751,7 @@ softdep_setup_directory_change(struct buf *bp, struct inode *dp,
 	 * Whiteouts have no additional dependencies,
 	 * so just put the dirrem on the correct list.
 	 */
-	if (newinum == WINO) {
+	if (newinum == UFS_WINO) {
 		if ((dirrem->dm_state & COMPLETE) == 0) {
 			LIST_INSERT_HEAD(&pagedep->pd_dirremhd, dirrem,
 			    dm_next);
@@ -3194,17 +3201,19 @@ initiate_write_inodeblock(struct inodedep *inodedep, struct buf *bp)
 			panic("softdep_write_inodeblock: lbn order");
 		}
 		prevlbn = adp->ad_lbn;
-		if (adp->ad_lbn < NDADDR &&
+		if (adp->ad_lbn < UFS_NDADDR &&
 		    dp->di_db[adp->ad_lbn] != adp->ad_newblkno) {
 			panic("%s: direct pointer #%ld mismatch %d != %d",
 			    "softdep_write_inodeblock", adp->ad_lbn,
 			    dp->di_db[adp->ad_lbn], adp->ad_newblkno);
 		}
-		if (adp->ad_lbn >= NDADDR &&
-		    dp->di_ib[adp->ad_lbn - NDADDR] != adp->ad_newblkno) {
+		if (adp->ad_lbn >= UFS_NDADDR &&
+		    dp->di_ib[adp->ad_lbn - UFS_NDADDR] != adp->ad_newblkno) {
 			panic("%s: indirect pointer #%ld mismatch %d != %d",
-			    "softdep_write_inodeblock", adp->ad_lbn - NDADDR,
-			    dp->di_ib[adp->ad_lbn - NDADDR], adp->ad_newblkno);
+			    "softdep_write_inodeblock",
+			    adp->ad_lbn - UFS_NDADDR,
+			    dp->di_ib[adp->ad_lbn - UFS_NDADDR],
+			    adp->ad_newblkno);
 		}
 		deplist |= 1 << adp->ad_lbn;
 		if ((adp->ad_state & ATTACHED) == 0) {
@@ -3223,14 +3232,14 @@ initiate_write_inodeblock(struct inodedep *inodedep, struct buf *bp)
 	 */
 	for (lastadp = NULL, adp = TAILQ_FIRST(&inodedep->id_inoupdt); adp;
 	     lastadp = adp, adp = TAILQ_NEXT(adp, ad_next)) {
-		if (adp->ad_lbn >= NDADDR)
+		if (adp->ad_lbn >= UFS_NDADDR)
 			break;
 		dp->di_db[adp->ad_lbn] = adp->ad_oldblkno;
 		/* keep going until hitting a rollback to a frag */
 		if (adp->ad_oldsize == 0 || adp->ad_oldsize == fs->fs_bsize)
 			continue;
 		dp->di_size = fs->fs_bsize * adp->ad_lbn + adp->ad_oldsize;
-		for (i = adp->ad_lbn + 1; i < NDADDR; i++) {
+		for (i = adp->ad_lbn + 1; i < UFS_NDADDR; i++) {
 #ifdef DIAGNOSTIC
 			if (dp->di_db[i] != 0 && (deplist & (1 << i)) == 0) {
 				panic("softdep_write_inodeblock: lost dep1");
@@ -3238,10 +3247,10 @@ initiate_write_inodeblock(struct inodedep *inodedep, struct buf *bp)
 #endif /* DIAGNOSTIC */
 			dp->di_db[i] = 0;
 		}
-		for (i = 0; i < NIADDR; i++) {
+		for (i = 0; i < UFS_NIADDR; i++) {
 #ifdef DIAGNOSTIC
 			if (dp->di_ib[i] != 0 &&
-			    (deplist & ((1 << NDADDR) << i)) == 0) {
+			    (deplist & ((1 << UFS_NDADDR) << i)) == 0) {
 				panic("softdep_write_inodeblock: lost dep2");
 			}
 #endif /* DIAGNOSTIC */
@@ -3275,7 +3284,7 @@ initiate_write_inodeblock(struct inodedep *inodedep, struct buf *bp)
 	 * postpone fsck, we are stuck with this argument.
 	 */
 	for (; adp; adp = TAILQ_NEXT(adp, ad_next))
-		dp->di_ib[adp->ad_lbn - NDADDR] = 0;
+		dp->di_ib[adp->ad_lbn - UFS_NDADDR] = 0;
 	FREE_LOCK(&lk);
 }
 
@@ -3559,7 +3568,7 @@ handle_written_inodeblock(struct inodedep *inodedep, struct buf *bp)
 		if (adp->ad_state & ATTACHED) 
 			panic("handle_written_inodeblock: new entry");
 		
-		if (adp->ad_lbn < NDADDR) {
+		if (adp->ad_lbn < UFS_NDADDR) {
 			if (dp->di_db[adp->ad_lbn] != adp->ad_oldblkno) {
 				panic("%s: %s #%ld mismatch %d != %d",
 				    "handle_written_inodeblock",
@@ -3568,13 +3577,14 @@ handle_written_inodeblock(struct inodedep *inodedep, struct buf *bp)
 			}
 			dp->di_db[adp->ad_lbn] = adp->ad_newblkno;
 		} else {
-			if (dp->di_ib[adp->ad_lbn - NDADDR] != 0) {
+			if (dp->di_ib[adp->ad_lbn - UFS_NDADDR] != 0) {
 				panic("%s: %s #%ld allocated as %d",
 				    "handle_written_inodeblock",
-				    "indirect pointer", adp->ad_lbn - NDADDR,
-				    dp->di_ib[adp->ad_lbn - NDADDR]);
+				    "indirect pointer",
+				    adp->ad_lbn - UFS_NDADDR,
+				    dp->di_ib[adp->ad_lbn - UFS_NDADDR]);
 			}
-			dp->di_ib[adp->ad_lbn - NDADDR] = adp->ad_newblkno;
+			dp->di_ib[adp->ad_lbn - UFS_NDADDR] = adp->ad_newblkno;
 		}
 		adp->ad_state &= ~UNDONE;
 		adp->ad_state |= ATTACHED;
@@ -4706,7 +4716,7 @@ request_cleanup(int resource)
 {
 	struct thread *td = curthread;		/* XXX */
 
-	KKASSERT(lock_held(&lk) > 0);
+	KKASSERT(lock_held(&lk));
 
 	/*
 	 * We never hold up the filesystem syncer process.
@@ -4842,6 +4852,7 @@ clear_inodedeps(struct thread *td)
 	 * We will then gather up all the inodes in its block 
 	 * that have dependencies and flush them out.
 	 */
+	inodedep = NULL;	/* avoid gcc warnings */
 	for (cnt = 0; cnt < inodedep_hash; cnt++) {
 		inodedephd = &inodedep_hashtbl[next++];
 		if (next >= inodedep_hash)
@@ -4864,7 +4875,7 @@ clear_inodedeps(struct thread *td)
 	/*
 	 * Find the last inode in the block with dependencies.
 	 */
-	firstino = inodedep->id_ino & ~(INOPB(fs) - 1);
+	firstino = rounddown2(inodedep->id_ino, INOPB(fs));
 	for (lastino = firstino + INOPB(fs) - 1; lastino > firstino; lastino--)
 		if (inodedep_lookup(fs, lastino, 0, &inodedep) != 0)
 			break;
@@ -5007,7 +5018,7 @@ getdirtybuf(struct buf **bpp, int waitfor)
 	/*
 	 * Try to obtain the buffer lock without deadlocking on &lk.
 	 */
-	KKASSERT(lock_held(&lk) > 0);
+	KKASSERT(lock_held(&lk));
 	error = BUF_LOCK(bp, LK_EXCLUSIVE | LK_NOWAIT);
 	if (error == 0) {
 		/*
@@ -5021,8 +5032,13 @@ getdirtybuf(struct buf **bpp, int waitfor)
 
 		/*
 		 * Finish nominal buffer locking sequence return success.
+		 *
+		 * Since we are not using a normal getblk(), and UFS
+		 * isn't KVABIO aware, we must make sure that the bp
+		 * is synchronized before returning it.
 		 */
 		bremfree(bp);
+		bkvasync_all(bp);
 		return (1);
 	}
 

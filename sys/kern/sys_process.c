@@ -29,12 +29,12 @@
  * SUCH DAMAGE.
  *
  * $FreeBSD: src/sys/kern/sys_process.c,v 1.51.2.6 2003/01/08 03:06:45 kan Exp $
- * $DragonFly: src/sys/kern/sys_process.c,v 1.30 2007/02/19 01:14:23 corecode Exp $
  */
 
 #include <sys/param.h>
 #include <sys/systm.h>
-#include <sys/sysproto.h>
+#include <sys/sysmsg.h>
+#include <sys/uio.h>
 #include <sys/proc.h>
 #include <sys/priv.h>
 #include <sys/vnode.h>
@@ -47,7 +47,6 @@
 #include <vm/vm_map.h>
 #include <vm/vm_page.h>
 
-#include <sys/user.h>
 #include <vfs/procfs/procfs.h>
 
 #include <sys/thread2.h>
@@ -56,17 +55,20 @@
 /* use the equivalent procfs code */
 #if 0
 static int
-pread (struct proc *procp, unsigned int addr, unsigned int *retval) {
+pread (struct proc *procp, unsigned int addr, unsigned int *retval)
+{
 	int		rv;
 	vm_map_t	map, tmap;
 	vm_object_t	object;
+	vm_map_backing_t ba;
 	vm_offset_t	kva = 0;
 	int		page_offset;	/* offset into page */
 	vm_offset_t	pageno;		/* page number */
 	vm_map_entry_t	out_entry;
 	vm_prot_t	out_prot;
-	boolean_t	wired;
+	int		wflags;
 	vm_pindex_t	pindex;
+	vm_pindex_t	pcount;
 
 	/* Map page into kernel space */
 
@@ -77,7 +79,12 @@ pread (struct proc *procp, unsigned int addr, unsigned int *retval) {
 
 	tmap = map;
 	rv = vm_map_lookup(&tmap, pageno, VM_PROT_READ, &out_entry,
-			   &object, &pindex, &out_prot, &wired);
+			   &ba, &pindex, &pcount, &out_prot, &wflags);
+	if (ba)
+		object = ba->object;
+	else
+		object = NULL;
+
 
 	if (rv != KERN_SUCCESS)
 		return EINVAL;
@@ -87,8 +94,8 @@ pread (struct proc *procp, unsigned int addr, unsigned int *retval) {
 	/* Find space in kernel_map for the page we're interested in */
 	rv = vm_map_find (&kernel_map, object, NULL,
 			  IDX_TO_OFF(pindex), &kva, PAGE_SIZE,
-			  PAGE_SIZE,
-			  0, VM_MAPTYPE_NORMAL,
+			  PAGE_SIZE, FALSE,
+			  VM_MAPTYPE_NORMAL, VM_SUBSYS_PROC,
 			  VM_PROT_ALL, VM_PROT_ALL, 0);
 
 	if (!rv) {
@@ -107,17 +114,20 @@ pread (struct proc *procp, unsigned int addr, unsigned int *retval) {
 }
 
 static int
-pwrite (struct proc *procp, unsigned int addr, unsigned int datum) {
+pwrite (struct proc *procp, unsigned int addr, unsigned int datum)
+{
 	int		rv;
 	vm_map_t	map, tmap;
 	vm_object_t	object;
+	vm_map_backing_t ba;
 	vm_offset_t	kva = 0;
 	int		page_offset;	/* offset into page */
 	vm_offset_t	pageno;		/* page number */
 	vm_map_entry_t	out_entry;
 	vm_prot_t	out_prot;
-	boolean_t	wired;
+	int		wflags;
 	vm_pindex_t	pindex;
+	vm_pindex_t	pcount;
 	boolean_t	fix_prot = 0;
 
 	/* Map page into kernel space */
@@ -146,7 +156,7 @@ pwrite (struct proc *procp, unsigned int addr, unsigned int datum) {
 	}
 
 	/*
-	 * Now we need to get the page.  out_entry, out_prot, wired, and
+	 * Now we need to get the page.  out_entry, out_prot, wflags, and
 	 * single_use aren't used.  One would think the vm code would be
 	 * a *bit* nicer...  We use tmap because vm_map_lookup() can
 	 * change the map argument.
@@ -154,7 +164,12 @@ pwrite (struct proc *procp, unsigned int addr, unsigned int datum) {
 
 	tmap = map;
 	rv = vm_map_lookup(&tmap, pageno, VM_PROT_WRITE, &out_entry,
-			   &object, &pindex, &out_prot, &wired);
+			   &ba, &pindex, &pcount, &out_prot, &wflags);
+	if (ba)
+		object = ba->object;
+	else
+		object = NULL;
+
 	if (rv != KERN_SUCCESS)
 		return EINVAL;
 
@@ -173,8 +188,8 @@ pwrite (struct proc *procp, unsigned int addr, unsigned int datum) {
 	/* Find space in kernel_map for the page we're interested in */
 	rv = vm_map_find (&kernel_map, object, NULL,
 			  IDX_TO_OFF(pindex), &kva, PAGE_SIZE,
-			  PAGE_SIZE,
-			  0, VM_MAPTYPE_NORMAL,
+			  PAGE_SIZE, FALSE,
+			  VM_MAPTYPE_NORMAL, VM_SUBSYS_PROC,
 			  VM_PROT_ALL, VM_PROT_ALL, 0);
 	if (!rv) {
 		vm_object_reference XXX (object);
@@ -199,7 +214,7 @@ pwrite (struct proc *procp, unsigned int addr, unsigned int datum) {
  * MPALMOSTSAFE
  */
 int
-sys_ptrace(struct ptrace_args *uap)
+sys_ptrace(struct sysmsg *sysmsg, const struct ptrace_args *uap)
 {
 	struct proc *p = curproc;
 
@@ -245,7 +260,7 @@ sys_ptrace(struct ptrace_args *uap)
 		return (error);
 
 	error = kern_ptrace(p, uap->req, uap->pid, addr, uap->data,
-			&uap->sysmsg_result);
+			&sysmsg->sysmsg_result);
 	if (error)
 		return (error);
 
@@ -418,6 +433,12 @@ kern_ptrace(struct proc *curp, int req, pid_t pid, void *addr,
 
 	/* XXX lwp */
 	lp = FIRST_LWP_IN_PROC(p);
+	if (lp == NULL) {
+		lwkt_reltoken(&p->p_token);
+		PRELE(p);
+		return EINVAL;
+	}
+
 #ifdef FIX_SSTEP
 	/*
 	 * Single step fixup ala procfs
@@ -470,8 +491,7 @@ kern_ptrace(struct proc *curp, int req, pid_t pid, void *addr,
 		}
 
 		if (addr != (void *)1) {
-			if ((error = ptrace_set_pc (lp,
-			    (u_long)(uintfptr_t)addr))) {
+			if ((error = ptrace_set_pc (lp, (u_long)addr))) {
 				LWPRELE(lp);
 				lwkt_reltoken(&p->p_token);
 				PRELE(p);
@@ -506,7 +526,7 @@ kern_ptrace(struct proc *curp, int req, pid_t pid, void *addr,
 		crit_enter();
 		if (p->p_stat == SSTOP) {
 			p->p_xstat = data;
-			proc_unstop(p);
+			proc_unstop(p, SSTOP);
 		} else if (data) {
 			ksignal(p, data);
 		}

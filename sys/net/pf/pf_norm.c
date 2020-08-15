@@ -35,11 +35,13 @@
 #include <sys/mbuf.h>
 #include <sys/filio.h>
 #include <sys/fcntl.h>
+#include <sys/malloc.h>
 #include <sys/socket.h>
 #include <sys/kernel.h>
 #include <sys/time.h>
 
 #include <net/if.h>
+#include <net/if_var.h>
 #include <net/if_types.h>
 #include <net/bpf.h>
 #include <net/route.h>
@@ -67,13 +69,13 @@
 #define BUFFER_FRAGMENTS(fr)	(!((fr)->fr_flags & PFFRAG_NOBUFFER))
 
 
-TAILQ_HEAD(pf_fragqueue, pf_fragment)	pf_fragqueue[MAXCPU];
-TAILQ_HEAD(pf_cachequeue, pf_fragment)	pf_cachequeue[MAXCPU];
+TAILQ_HEAD(pf_fragqueue, pf_fragment)	*pf_fragqueue;
+TAILQ_HEAD(pf_cachequeue, pf_fragment)	*pf_cachequeue;
 
 static __inline int	 pf_frag_compare(struct pf_fragment *,
 			    struct pf_fragment *);
-RB_HEAD(pf_frag_tree, pf_fragment)	pf_frag_tree[MAXCPU],
-					pf_cache_tree[MAXCPU];
+RB_HEAD(pf_frag_tree, pf_fragment)	*pf_frag_tree,
+					*pf_cache_tree;
 RB_PROTOTYPE(pf_frag_tree, pf_fragment, fr_entry, pf_frag_compare);
 RB_GENERATE(pf_frag_tree, pf_fragment, fr_entry, pf_frag_compare);
 
@@ -120,12 +122,33 @@ pf_normalize_init(void)
 	pool_sethardlimit(&pf_cent_pl, PFFRAG_FRCENT_HIWAT, NULL, 0);
 	*/
 
-	for (n = 0; n < MAXCPU; ++n) {
+	/*
+	 * pcpu queues and trees
+	 */
+	pf_fragqueue = kmalloc(sizeof(*pf_fragqueue) * ncpus,
+				M_PF, M_WAITOK | M_ZERO);
+	pf_cachequeue = kmalloc(sizeof(*pf_cachequeue) * ncpus,
+				M_PF, M_WAITOK | M_ZERO);
+	pf_frag_tree = kmalloc(sizeof(*pf_frag_tree) * ncpus,
+				M_PF, M_WAITOK | M_ZERO);
+	pf_cache_tree = kmalloc(sizeof(*pf_cache_tree) * ncpus,
+				M_PF, M_WAITOK | M_ZERO);
+
+	for (n = 0; n < ncpus; ++n) {
 		TAILQ_INIT(&pf_fragqueue[n]);
 		TAILQ_INIT(&pf_cachequeue[n]);
 		RB_INIT(&pf_frag_tree[n]);
 		RB_INIT(&pf_cache_tree[n]);
 	}
+}
+
+void
+pf_normalize_unload(void)
+{
+	kfree(pf_fragqueue, M_PF);
+	kfree(pf_cachequeue, M_PF);
+	kfree(pf_frag_tree, M_PF);
+	kfree(pf_cache_tree, M_PF);
 }
 
 static __inline int
@@ -616,14 +639,14 @@ pf_fragcache(struct mbuf **m0, struct ip *h, struct pf_fragment **frag, int mff,
 				 * than this mbuf magic.  For my next trick,
 				 * I'll pull a rabbit out of my laptop.
 				 */
-				*m0 = m_dup(m, MB_DONTWAIT);
+				*m0 = m_dup(m, M_NOWAIT);
 				/* From KAME Project : We have missed this! */
 				m_adj(*m0, (h->ip_hl << 2) -
 				    (*m0)->m_pkthdr.len);
 				if (*m0 == NULL)
 					goto no_mem;
-				KASSERT(((*m0)->m_next == NULL), 
-				    ("(*m0)->m_next != NULL: %s", 
+				KASSERT(((*m0)->m_next == NULL),
+				    ("(*m0)->m_next != NULL: %s",
 				    __func__));
 				m_adj(m, precut + (h->ip_hl << 2));
 				m_cat(*m0, m);
@@ -881,6 +904,9 @@ pf_normalize_ip(struct mbuf **m0, int dir, struct pfi_kif *kif, u_short *reason,
 	/* We will need other tests here */
 	if (!fragoff && !mff)
 		goto no_fragment;
+
+	/* A fragment; rehash required. */
+	m->m_flags &= ~M_HASH;
 
 	/* We're dealing with a fragment now. Don't allow fragments
 	 * with IP_DF to enter the cache. If the flag was cleared by
@@ -1365,7 +1391,7 @@ pf_normalize_tcp_init(struct mbuf *m, int off, struct pf_pdesc *pd,
 	u_int8_t hdr[60];
 	u_int8_t *opt;
 
-	KASSERT((src->scrub == NULL), 
+	KASSERT((src->scrub == NULL),
 	    ("pf_normalize_tcp_init: src->scrub != NULL"));
 
 	src->scrub = kmalloc(sizeof(struct pf_state_scrub), M_PFSTATESCRUBPL,
@@ -1464,8 +1490,11 @@ pf_normalize_tcp_stateful(struct mbuf *m, int off, struct pf_pdesc *pd,
 	int copyback = 0;
 	int got_ts = 0;
 
-	KASSERT((src->scrub || dst->scrub), 
+	KASSERT((src->scrub || dst->scrub),
 	    ("pf_normalize_tcp_statefull: src->scrub && dst->scrub!"));
+
+	tsval = 0;	/* avoid gcc complaint */
+	tsecr = 0;	/* avoid gcc complaint */
 
 	/*
 	 * Enforce the minimum TTL seen for this connection.  Negate a common
@@ -1616,7 +1645,7 @@ pf_normalize_tcp_stateful(struct mbuf *m, int off, struct pf_pdesc *pd,
 		 * measurement of RTT (round trip time) and PAWS
 		 * (protection against wrapped sequence numbers).  PAWS
 		 * gives us a set of rules for rejecting packets on
-		 * long fat pipes (packets that were somehow delayed 
+		 * long fat pipes (packets that were somehow delayed
 		 * in transit longer than the time it took to send the
 		 * full TCP sequence space of 4Gb).  We can use these
 		 * rules and infer a few others that will let us treat

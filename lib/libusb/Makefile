@@ -1,5 +1,5 @@
 #
-# $FreeBSD: head/lib/libusb/Makefile 260315 2014-01-05 10:41:43Z hselasky $
+# $FreeBSD: head/lib/libusb/Makefile 275024 2014-11-25 11:07:26Z bapt $
 #
 # Makefile for the FreeBSD specific LibUSB 2.0
 #
@@ -15,12 +15,11 @@ INCS+=		libusb20_desc.h
 MAN=		libusb.3 libusb20.3
 MKLINT=		no
 NOGCCERROR=
-PTHREAD_LIBS?=	-lpthread
 
-WARNS?=		2
+WARNS?=		3
 
 DPADD=		${LIBPTHREAD}
-LDADD=		${PTHREAD_LIBS}
+LDADD=		-lpthread
 
 MLINKS+=	libusb.3 usb.3
 
@@ -32,19 +31,15 @@ SRCS+=		libusb01.c
 INCS+=		libusb.h
 SRCS+=		libusb10.c
 SRCS+=		libusb10_desc.c
+SRCS+=		libusb10_hotplug.c
 SRCS+=		libusb10_io.c
 
 .if defined(COMPAT_32BIT)
 CFLAGS+=	-DCOMPAT_32BIT
 .endif
 
-beforeinstall:
-	${INSTALL} -C -o ${LIBOWN} -g ${LIBGRP} -m ${LIBMODE} \
-		${.CURDIR}/libusb-0.1.pc ${DESTDIR}${LIBDATADIR}/pkgconfig
-	${INSTALL} -C -o ${LIBOWN} -g ${LIBGRP} -m ${LIBMODE} \
-		${.CURDIR}/libusb-1.0.pc ${DESTDIR}${LIBDATADIR}/pkgconfig
-	${INSTALL} -C -o ${LIBOWN} -g ${LIBGRP} -m ${LIBMODE} \
-		${.CURDIR}/libusb-2.0.pc ${DESTDIR}${LIBDATADIR}/pkgconfig
+FILES=		libusb-0.1.pc libusb-1.0.pc libusb-2.0.pc
+FILESDIR=	${LIBDATADIR}/pkgconfig
 
 #
 # Cross platform support
@@ -68,8 +63,6 @@ CFLAGS+=	-DLIBUSB_GLOBAL_INCLUDE_FILE=\"${LIBUSB_GLOBAL_INCLUDE_FILE}\"
 CFLAGS+=	-DUSB_GLOBAL_INCLUDE_FILE=\"${LIBUSB_GLOBAL_INCLUDE_FILE}\"
 CFLAGS+=	-I ../../sys
 .endif
-
-.include <bsd.lib.mk>
 
 # LibUSB v1.0
 MLINKS += libusb.3 libusb_init.3
@@ -138,6 +131,8 @@ MLINKS += libusb.3 libusb_handle_events_locked.3
 MLINKS += libusb.3 libusb_get_next_timeout.3
 MLINKS += libusb.3 libusb_set_pollfd_notifiers.3
 MLINKS += libusb.3 libusb_get_pollfds.3
+MLINKS += libusb.3 libusb_hotplug_register_callback.3
+MLINKS += libusb.3 libusb_hotplug_deregister_callback.3
 
 # LibUSB v0.1
 MLINKS += libusb.3 usb_open.3
@@ -258,3 +253,5 @@ MLINKS += libusb20.3 libusb20_me_decode.3
 MLINKS += libusb20.3 libusb20_desc_foreach.3
 MLINKS += libusb20.3 libusb20_strerror.3
 MLINKS += libusb20.3 libusb20_error_name.3
+
+.include <bsd.lib.mk>

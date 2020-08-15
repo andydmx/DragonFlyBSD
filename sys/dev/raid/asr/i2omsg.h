@@ -117,15 +117,7 @@
 
 
 
-#if ((defined(KERNEL) || defined(_KERNEL)) && defined(__FreeBSD__))
-# if (KERN_VERSION < 3)
-#  include "i386/pci/i2otypes.h"
-# else
-#  include "dev/asr/i2otypes.h"
-# endif
-#else
-# include "i2otypes.h"
-#endif
+#include "i2otypes.h"
 
 
 PRAGMA_ALIGN_PUSH
@@ -931,7 +923,8 @@ typedef struct _I2O_SG_ELEMENT {
        I2O_SGE_SHORT_TRANSACTION_ELEMENT   ShortTransaction;
 
        /* Simple Addressing Element */
-       I2O_SGE_SIMPLE_ELEMENT		   Simple[1];
+       /* (variable, as with others, use '2' to avoid gcc warning) */
+       I2O_SGE_SIMPLE_ELEMENT		   Simple[2];
 
        /* Simple Addressing with Context Element */
        I2O_SGE_SIMPLE_CONTEXT_ELEMENT	   SimpleContext[1];

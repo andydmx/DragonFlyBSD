@@ -38,7 +38,6 @@
 #include <libutil.h>
 #include <paths.h>
 #include <termcap.h>
-#include <utmp.h>
 
 #include <arpa/inet.h>
 
@@ -52,7 +51,6 @@ int	auth_level = 0;
 #include <libtelnet/misc.h>
 
 char	remote_hostname[MAXHOSTNAMELEN];
-size_t	utmp_len = sizeof(remote_hostname) - 1;
 int	registerd_host_only = 0;
 
 
@@ -64,19 +62,17 @@ char	ptyibuf[BUFSIZ], *ptyip = ptyibuf;
 char	ptyibuf2[BUFSIZ];
 
 int readstream(int, char *, int);
-void doit(struct sockaddr *);
+void doit(struct sockaddr *) __dead2;
 int terminaltypeok(char *);
 
 int	hostinfo = 1;			/* do we print login banner? */
 
-int debug = 0;
+static int debug = 0;
 int keepalive = 1;
 const char *altlogin;
 
-void doit(struct sockaddr *);
-int terminaltypeok(char *);
 void startslave(char *, int, char *);
-extern void usage(void);
+extern void usage(void) __dead2;
 static void _gettermname(void);
 
 /*
@@ -114,7 +110,8 @@ int family = AF_INET;
 char *hostname;
 char host_name[MAXHOSTNAMELEN];
 
-extern void telnet(int, int, char *);
+extern void telnet(int, int, char *) __dead2;
+extern char *terminaltype;
 
 int level;
 char user_name[256];
@@ -269,9 +266,7 @@ main(int argc, char *argv[])
 			break;
 
 		case 'u':
-			utmp_len = (size_t)atoi(optarg);
-			if (utmp_len >= sizeof(remote_hostname))
-				utmp_len = sizeof(remote_hostname) - 1;
+			fprintf(stderr, "telnetd: -u option unneeded\n");
 			break;
 
 		case 'U':
@@ -359,7 +354,7 @@ main(int argc, char *argv[])
 		/* NOT REACHED */
 	}
 
-	openlog("telnetd", LOG_PID | LOG_ODELAY, LOG_DAEMON);
+	openlog("telnetd", LOG_PID, LOG_DAEMON);
 	fromlen = sizeof (from);
 	if (getpeername(0, (struct sockaddr *)&from, &fromlen) < 0) {
 		warn("getpeername");
@@ -635,7 +630,6 @@ terminaltypeok(char *s)
 void
 doit(struct sockaddr *who)
 {
-	int err_; /* XXX */
 	int ptynum;
 
 	/*
@@ -644,13 +638,13 @@ doit(struct sockaddr *who)
 #ifndef	convex
 	pty = getpty(&ptynum);
 	if (pty < 0)
-		fatal(net, "All network ports in use");
+		fatalmsg(net, "All network ports in use");
 #else
 	for (;;) {
 		char *lp;
 
 		if ((lp = getpty()) == NULL)
-			fatal(net, "Out of ptys");
+			fatalmsg(net, "Out of ptys");
 
 		if ((pty = open(lp, 2)) >= 0) {
 			strlcpy(line,lp,sizeof(line));
@@ -663,16 +657,9 @@ doit(struct sockaddr *who)
 	/* get name of connected client */
 	if (realhostname_sa(remote_hostname, sizeof(remote_hostname) - 1,
 	    who, who->sa_len) == HOSTNAME_INVALIDADDR && registerd_host_only)
-		fatal(net, "Couldn't resolve your address into a host name.\r\n\
+		fatalmsg(net, "Couldn't resolve your address into a host name.\r\n\
 	Please contact your net administrator");
 	remote_hostname[sizeof(remote_hostname) - 1] = '\0';
-
-	trimdomain(remote_hostname, UT_HOSTSIZE);
-	if (!isdigit(remote_hostname[0]) && strlen(remote_hostname) > utmp_len)
-		err_ = getnameinfo(who, who->sa_len, remote_hostname,
-				  sizeof(remote_hostname), NULL, 0,
-				  NI_NUMERICHOST|NI_WITHSCOPEID);
-		/* XXX: do 'err_' check */
 
 	(void) gethostname(host_name, sizeof(host_name) - 1);
 	host_name[sizeof(host_name) - 1] = '\0';

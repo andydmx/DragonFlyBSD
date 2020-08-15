@@ -28,7 +28,7 @@
 .\"     @(#)netintro.4	8.2 (Berkeley) 11/30/93
 .\" $FreeBSD: src/share/man/man4/netintro.4,v 1.10.2.6 2002/08/30 14:23:38 sobomax Exp $
 .\"
-.Dd November 30, 1993
+.Dd March 3, 2020
 .Dt NETINTRO 4
 .Os
 .Sh NAME
@@ -90,10 +90,7 @@ hardware.  An interface may support one or more protocol
 families and/or address formats.
 The SYNOPSIS section of each network interface
 entry gives a sample specification
-of the related drivers for use in providing
-a system description to the
-.Xr config 8
-program.
+of the related drivers for use in the kernel configuration file.
 The DIAGNOSTICS section lists messages which may appear on the console
 and/or in the system error log,
 .Pa /var/log/messages
@@ -146,7 +143,6 @@ are known to the system
 #define    AF_INET      2    /* internetwork: UDP, TCP, etc. */
 #define    AF_CCITT     10   /* CCITT protocols, X.25 etc */
 #define    AF_HYLINK    15   /* NSC Hyperchannel */
-#define    AF_ISO       18   /* ISO protocols */
 .Ed
 .Sh ROUTING
 .Ux
@@ -288,6 +284,13 @@ multiple masks or destination addresses, and also adopts the
 convention that specification of the default address means
 to delete the first address for the interface belonging to
 the address family in which the original socket was opened.
+.It Dv SIOCGIFALIAS
+This request provides means to get additional addresses
+together with netmask and broadcast/destination from an
+interface.
+It also uses the
+.Vt ifaliasreq
+structure.
 .It Dv SIOCGIFCONF
 Get interface configuration list.  This request takes an
 .Vt ifconf
@@ -358,7 +361,6 @@ struct if_clonereq {
 .Xr ioctl 2 ,
 .Xr socket 2 ,
 .Xr intro 4 ,
-.Xr config 8 ,
 .Xr routed 8
 .Sh HISTORY
 The

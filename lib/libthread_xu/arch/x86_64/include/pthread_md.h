@@ -35,13 +35,14 @@
 
 #include <stddef.h>
 #include <sys/types.h>
-
 #include <machine/sysarch.h>
 #include <machine/tls.h>
 
 struct pthread;
 
-#define atomic_cmpset_acq_int  atomic_cmpset_int
+#define	CPU_SPINWAIT		__asm __volatile("pause");
+
+#define	atomic_cmpset_acq_int	atomic_cmpset_int
 
 /*
  * The constructors.

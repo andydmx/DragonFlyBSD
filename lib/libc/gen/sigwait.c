@@ -28,9 +28,9 @@
 #include <errno.h>
 #include "un-namespace.h"
 
-extern int __sys_sigwaitinfo(const sigset_t *, siginfo_t *);
+int _sigwait(const sigset_t *, int *);
 
-__weak_reference(_sigwait, sigwait);
+extern int __sys_sigwaitinfo(const sigset_t *, siginfo_t *);
 
 int
 _sigwait(const sigset_t *set, int *sig)
@@ -44,3 +44,5 @@ _sigwait(const sigset_t *set, int *sig)
 	}
 	return (errno);
 }
+
+__weak_reference(_sigwait, sigwait);

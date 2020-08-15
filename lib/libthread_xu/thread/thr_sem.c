@@ -30,23 +30,28 @@
 
 #include "namespace.h"
 #include <machine/tls.h>
-#include <sys/semaphore.h>
 #include <sys/mman.h>
 #include <sys/queue.h>
 #include <sys/stat.h>
 #include <sys/types.h>
-
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <pthread.h>
+#include <semaphore.h>
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#ifdef _PTHREADS_DEBUGGING
+#include <stdio.h>
+#endif
 #include "un-namespace.h"
+
 #include "thr_private.h"
+
+#define cpu_ccfence()        __asm __volatile("" : : : "memory")
 
 #define container_of(ptr, type, member)				\
 ({								\
@@ -58,11 +63,11 @@
  * Semaphore definitions.
  */
 struct sem {
-	u_int32_t		magic;
 	volatile umtx_t		count;
+	u_int32_t		magic;
 	int			semid;
 	int			unused; /* pad */
-};
+} __cachealign;
 
 #define	SEM_MAGIC	((u_int32_t) 0x09fa4012)
 
@@ -98,12 +103,34 @@ struct sem_info {
 	LIST_ENTRY(sem_info) next;
 };
 
-
-
-static pthread_once_t once = PTHREAD_ONCE_INIT;
 static pthread_mutex_t sem_lock;
 static LIST_HEAD(,sem_info) sem_list = LIST_HEAD_INITIALIZER(sem_list);
 
+#ifdef _PTHREADS_DEBUGGING
+
+static
+void
+sem_log(const char *ctl, ...)
+{
+        char buf[256];
+        va_list va;
+        size_t len;
+
+        va_start(va, ctl);
+        len = vsnprintf(buf, sizeof(buf), ctl, va);
+        va_end(va);
+        _thr_log(buf, len);
+}
+
+#else
+
+static __inline
+void
+sem_log(const char *ctl __unused, ...)
+{
+}
+
+#endif
 
 #define SEMID_LWP	0
 #define SEMID_FORK	1
@@ -127,8 +154,8 @@ sem_child_postfork(void)
 	_pthread_mutex_unlock(&sem_lock);
 }
 
-static void
-sem_module_init(void)
+void
+_thr_sem_init(void)
 {
 	pthread_mutexattr_t ma;
 
@@ -136,7 +163,7 @@ sem_module_init(void)
 	_pthread_mutexattr_settype(&ma,  PTHREAD_MUTEX_RECURSIVE);
 	_pthread_mutex_init(&sem_lock, &ma);
 	_pthread_mutexattr_destroy(&ma);
-	_pthread_atfork(sem_prefork, sem_postfork, sem_child_postfork);
+	_thr_atfork_kern(sem_prefork, sem_postfork, sem_child_postfork);
 }
 
 static inline int
@@ -177,7 +204,7 @@ sem_alloc(unsigned int value, int pshared)
 			sem_base = NULL;
 		semid = SEMID_FORK;
 	} else {
-		sem = malloc(sizeof(struct sem));
+		sem = __malloc(sizeof(struct sem));
 		semid = SEMID_LWP;
 	}
 	if (sem == NULL) {
@@ -187,6 +214,9 @@ sem_alloc(unsigned int value, int pshared)
 	sem->magic = SEM_MAGIC;
 	sem->count = (u_int32_t)value;
 	sem->semid = semid;
+
+	sem_log("sem_alloc %p (%d)\n", sem, value);
+
 	return (sem);
 }
 
@@ -216,7 +246,7 @@ _sem_destroy(sem_t *sem)
 
 	switch ((*sem)->semid) {
 		case SEMID_LWP:
-			free(*sem);
+			__free(*sem);
 			break;
 		case SEMID_FORK:
 			/* memory is left intact */
@@ -231,10 +261,12 @@ _sem_destroy(sem_t *sem)
 int
 _sem_getvalue(sem_t * __restrict sem, int * __restrict sval)
 {
-	if (sem_check_validity(sem) != 0)
+	if (sem_check_validity(sem) != 0) {
+		errno = EINVAL;
 		return (-1);
-
+	}
 	*sval = (*sem)->count;
+
 	return (0);
 }
 
@@ -243,14 +275,21 @@ _sem_trywait(sem_t *sem)
 {
 	int val;
 
-	if (sem_check_validity(sem) != 0)
+	if (sem_check_validity(sem) != 0) {
+		errno = EINVAL;
 		return (-1);
+	}
 
+	sem_log("sem_trywait %p %d\n", *sem, (*sem)->count);
 	while ((val = (*sem)->count) > 0) {
-		if (atomic_cmpset_int(&(*sem)->count, val, val - 1))
+		cpu_ccfence();
+		if (atomic_cmpset_int(&(*sem)->count, val, val - 1)) {
+			sem_log("sem_trywait %p %d (success)\n", *sem, val - 1);
 			return (0);
+		}
 	}
 	errno = EAGAIN;
+	sem_log("sem_trywait %p %d (failure)\n", *sem, val);
 	return (-1);
 }
 
@@ -260,21 +299,38 @@ _sem_wait(sem_t *sem)
 	struct pthread *curthread;
 	int val, oldcancel, retval;
 
-	if (sem_check_validity(sem) != 0)
+	if (sem_check_validity(sem) != 0) {
+		errno = EINVAL;
 		return (-1);
+	}
 
 	curthread = tls_get_curthread();
 	_pthread_testcancel();
+
+	sem_log("sem_wait %p %d (begin)\n", *sem, (*sem)->count);
+
 	do {
+		cpu_ccfence();
 		while ((val = (*sem)->count) > 0) {
-			if (atomic_cmpset_acq_int(&(*sem)->count, val, val - 1))
+			cpu_ccfence();
+			if (atomic_cmpset_acq_int(&(*sem)->count, val, val - 1)) {
+				sem_log("sem_wait %p %d (success)\n",
+					*sem, val - 1);
 				return (0);
+			}
 		}
 		oldcancel = _thr_cancel_enter(curthread);
-		retval = _thr_umtx_wait(&(*sem)->count, 0, NULL, 0);
+		sem_log("sem_wait %p %d (wait)\n", *sem, val);
+		retval = _thr_umtx_wait_intr(&(*sem)->count, 0);
+		sem_log("sem_wait %p %d (wait return %d)\n",
+			*sem, (*sem)->count, retval);
 		_thr_cancel_leave(curthread, oldcancel);
-	} while (retval == 0);
+		/* ignore retval */
+	} while (retval != EINTR);
+
+	sem_log("sem_wait %p %d (error %d)\n", *sem, retval);
 	errno = retval;
+
 	return (-1);
 }
 
@@ -289,30 +345,43 @@ _sem_timedwait(sem_t * __restrict sem, const struct timespec * __restrict abstim
 		return (-1);
 
 	curthread = tls_get_curthread();
+	_pthread_testcancel();
+	sem_log("sem_timedwait %p %d (begin)\n", *sem, (*sem)->count);
 
 	/*
 	 * The timeout argument is only supposed to
 	 * be checked if the thread would have blocked.
 	 */
-	_pthread_testcancel();
 	do {
 		while ((val = (*sem)->count) > 0) {
-			if (atomic_cmpset_acq_int(&(*sem)->count, val, val - 1))
+			cpu_ccfence();
+			if (atomic_cmpset_acq_int(&(*sem)->count, val, val - 1)) {
+				sem_log("sem_wait %p %d (success)\n",
+					*sem, val - 1);
 				return (0);
+			}
 		}
 		if (abstime == NULL ||
-				abstime->tv_nsec >= 1000000000 || abstime->tv_nsec < 0) {
+		    abstime->tv_nsec >= 1000000000 ||
+		    abstime->tv_nsec < 0) {
+			sem_log("sem_wait %p %d (bad abstime)\n", *sem, val);
 			errno = EINVAL;
 			return (-1);
 		}
 		clock_gettime(CLOCK_REALTIME, &ts);
-		TIMESPEC_SUB(&ts2, abstime, &ts);
+		timespecsub(abstime, &ts, &ts2);
 		oldcancel = _thr_cancel_enter(curthread);
+		sem_log("sem_wait %p %d (wait)\n", *sem, val);
 		retval = _thr_umtx_wait(&(*sem)->count, 0, &ts2,
-				CLOCK_REALTIME);
+					CLOCK_REALTIME);
+		sem_log("sem_wait %p %d (wait return %d)\n",
+			*sem, (*sem)->count, retval);
 		_thr_cancel_leave(curthread, oldcancel);
-	} while (retval == 0);
+	} while (retval != ETIMEDOUT && retval != EINTR);
+
+	sem_log("sem_wait %p %d (error %d)\n", *sem, retval);
 	errno = retval;
+
 	return (-1);
 }
 
@@ -328,10 +397,10 @@ _sem_post(sem_t *sem)
 	 * sem_post() is required to be safe to call from within
 	 * signal handlers, these code should work as that.
 	 */
-	do {
-		val = (*sem)->count;
-	} while (!atomic_cmpset_acq_int(&(*sem)->count, val, val + 1));
-	_thr_umtx_wake(&(*sem)->count, val + 1);
+	val = atomic_fetchadd_int(&(*sem)->count, 1) + 1;
+	sem_log("sem_post %p %d\n", *sem, val);
+	_thr_umtx_wake(&(*sem)->count, 0);
+
 	return (0);
 }
 
@@ -341,7 +410,7 @@ get_path(const char *name, char *path, size_t len, char const **prefix)
 	size_t path_len;
 
 	*prefix = NULL;
-	
+
 	if (name[0] == '/') {
 		*prefix = getenv("LIBTHREAD_SEM_PREFIX");
 
@@ -396,7 +465,7 @@ sem_add_mapping(ino_t inode, dev_t dev, sem_t sem, int fd)
 {
 	struct sem_info *ni;
 
-	ni = malloc(sizeof(struct sem_info));
+	ni = __malloc(sizeof(struct sem_info));
 	if (ni == NULL) {
 		errno = ENOSPC;
 		return (SEM_FAILED);
@@ -429,10 +498,10 @@ sem_close_mapping(sem_t *sem)
 	} else {
 		if (ni->inode != 0) {
 			LIST_REMOVE(ni, next);
-		}	
+		}
 		munmap(ni->sem, getpagesize());
 		__sys_close(ni->fd);
-		free(ni);
+		__free(ni);
 		return (0);
 	}
 }
@@ -443,7 +512,6 @@ _sem_open(const char *name, int oflag, ...)
 	char path[PATH_MAX];
 	char tmppath[PATH_MAX];
 	char const *prefix = NULL;
-	char *tmpname = NULL;
 	size_t path_len;
 	int error, fd, create;
 	sem_t *sem;
@@ -452,8 +520,7 @@ _sem_open(const char *name, int oflag, ...)
 	mode_t mode;
 	struct stat sbuf;
 	unsigned int value = 0;
-	unsigned int retry_count;
-	
+
 	create = 0;
 	error = 0;
 	fd = -1;
@@ -475,8 +542,6 @@ _sem_open(const char *name, int oflag, ...)
 		return (SEM_FAILED);
 	}
 
-	_pthread_once(&once, sem_module_init);
-
 	_pthread_mutex_lock(&sem_lock);
 
 	error = get_path(name, path, PATH_MAX, &prefix);
@@ -486,13 +551,10 @@ _sem_open(const char *name, int oflag, ...)
 	}
 
 retry:
-	tmpname = NULL;
-	retry_count = 10;
-
 	fd = __sys_open(path, O_RDWR | O_CLOEXEC);
 
 	if (fd > 0) {
-		
+
 		if ((oflag & O_EXCL) == O_EXCL) {
 			__sys_close(fd);
 			errno = EEXIST;
@@ -538,28 +600,28 @@ retry:
 
 		if (path_len > sizeof(tmppath)) {
 			errno = ENAMETOOLONG;
-			goto error;	
+			goto error;
 		}
 
-		while (retry_count-- > 0) {
-			tmpname = mktemp(tmppath);
 
-			if ( tmpname == NULL) {
-				errno = EINVAL;
-				goto error;
-			}
+		fd = mkstemp(tmppath);
 
-			fd = __sys_open(tmpname, O_RDWR | O_CLOEXEC | O_CREAT | O_EXCL, mode);
-
-			if (fd > 0 || errno != EEXIST) {
-				break;
-			}
-
+		if ( fd == -1 ) {
+			errno = EINVAL;
+			goto error;
 		}
 
-		if (retry_count == 0) {
+		error = fchmod(fd, mode);
+		if ( error == -1 ) {
 			__sys_close(fd);
-			errno = ENOSPC; /* XXX POSIX does not allow for EAGAIN */
+			errno = EINVAL;
+			goto error;
+		}
+
+		error = __sys_fcntl(fd, F_SETFD, FD_CLOEXEC);
+		if ( error == -1 ) {
+			__sys_close(fd);
+			errno = EINVAL;
 			goto error;
 		}
 
@@ -592,9 +654,9 @@ retry:
 			errno = ENOMEM;
 
 		if (create)
-			unlink(tmpname);
+			_unlink(tmppath);
 
-		__sys_close(fd);	
+		__sys_close(fd);
 		goto error;
 	}
 
@@ -604,10 +666,10 @@ retry:
 		semtmp->count = (u_int32_t)value;
 		semtmp->semid = SEMID_NAMED;
 
-		if (link(tmpname, path) != 0) {
+		if (link(tmppath, path) != 0) {
 			munmap(semtmp, getpagesize());
 			__sys_close(fd);
-			unlink(tmpname);
+			_unlink(tmppath);
 
 			if (errno == EEXIST && (oflag & O_EXCL) == 0) {
 				goto retry;
@@ -615,7 +677,7 @@ retry:
 
 			goto error;
 		}
-		unlink(tmpname);
+		_unlink(tmppath);
 
 		if (_fstat(fd, &sbuf) != 0) {
 			/* Bad things happened, like another thread closing our descriptor */
@@ -641,8 +703,6 @@ error:
 int
 _sem_close(sem_t *sem)
 {
-	_pthread_once(&once, sem_module_init);
-
 	_pthread_mutex_lock(&sem_lock);
 
 	if (sem_check_validity(sem)) {
@@ -674,7 +734,7 @@ _sem_unlink(const char *name)
 		return (-1);
 	}
 
-	error = unlink(path);
+	error = _unlink(path);
 
 	if(error) {
 		if (errno != ENAMETOOLONG && errno != ENOENT)
@@ -696,4 +756,3 @@ __strong_reference(_sem_post, sem_post);
 __strong_reference(_sem_open, sem_open);
 __strong_reference(_sem_close, sem_close);
 __strong_reference(_sem_unlink, sem_unlink);
-

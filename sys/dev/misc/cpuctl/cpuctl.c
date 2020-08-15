@@ -23,6 +23,7 @@
  * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
  *
+ * $FreeBSD: head/sys/dev/cpuctl/cpuctl.c 275960 2014-12-20 16:40:49Z kib $
  */
 
 
@@ -30,7 +31,6 @@
 #include <sys/systm.h>
 #include <sys/conf.h>
 #include <sys/fcntl.h>
-#include <sys/ioccom.h>
 #include <sys/malloc.h>
 #include <sys/module.h>
 #include <sys/priv.h>
@@ -49,20 +49,22 @@
 #include <machine/specialreg.h>
 
 static d_open_t cpuctl_open;
+static d_close_t cpuctl_close;
 static d_ioctl_t cpuctl_ioctl;
 
 #define	CPUCTL_VERSION 1
 
 #ifdef DEBUG
-# define DPRINTF(format,...)	 kprintf(format, __VA_ARGS__); 
+# define	DPRINTF(format,...) kprintf(format, __VA_ARGS__);
 #else
-# define DPRINTF(format,...)
+# define	DPRINTF(format,...)
 #endif
 
-#define	UCODE_SIZE_MAX	(16 * 1024)
+#define	UCODE_SIZE_MAX	(4 * 1024 * 1024)
 
 static int cpuctl_do_msr(int cpu, cpuctl_msr_args_t *data, u_long cmd);
-static int cpuctl_do_cpuid(int cpu, cpuctl_cpuid_args_t *data);
+static void cpuctl_do_cpuid(int cpu, cpuctl_cpuid_args_t *data);
+static void cpuctl_do_cpuid_count(int cpu, cpuctl_cpuid_count_args_t *data);
 static int cpuctl_do_update(int cpu, cpuctl_update_args_t *data);
 static int update_intel(int cpu, cpuctl_update_args_t *args);
 static int update_amd(int cpu, cpuctl_update_args_t *args);
@@ -70,11 +72,13 @@ static int update_via(int cpu, cpuctl_update_args_t *args);
 
 static cdev_t *cpuctl_devs;
 static MALLOC_DEFINE(M_CPUCTL, "cpuctl", "CPUCTL buffer");
+static struct lock cpuctl_lock = LOCK_INITIALIZER("cpuctl", 0, 0);
 
 static struct dev_ops cpuctl_cdevsw = {
+        .head = { .name = "cpuctl", .flags = D_MPSAFE },
         .d_open =       cpuctl_open,
+	.d_close =	cpuctl_close,
         .d_ioctl =      cpuctl_ioctl,
-        .head = { .name =       "cpuctl" },
 };
 
 int
@@ -91,9 +95,13 @@ cpuctl_ioctl(struct dev_ioctl_args *ap)
 		return (ENXIO);
 	}
 	/* Require write flag for "write" requests. */
-	if ((cmd == CPUCTL_WRMSR || cmd == CPUCTL_UPDATE) &&
+	if ((cmd == CPUCTL_WRMSR || cmd == CPUCTL_UPDATE ||
+	     cmd == CPUCTL_MSRSBIT || cmd == CPUCTL_MSRCBIT) &&
 	    ((flags & FWRITE) == 0))
 		return (EPERM);
+
+	lockmgr(&cpuctl_lock, LK_EXCLUSIVE);
+
 	switch (cmd) {
 	case CPUCTL_RDMSR:
 		ret = cpuctl_do_msr(cpu, (cpuctl_msr_args_t *)data, cmd);
@@ -107,7 +115,8 @@ cpuctl_ioctl(struct dev_ioctl_args *ap)
 		ret = cpuctl_do_msr(cpu, (cpuctl_msr_args_t *)data, cmd);
 		break;
 	case CPUCTL_CPUID:
-		ret = cpuctl_do_cpuid(cpu, (cpuctl_cpuid_args_t *)data);
+		cpuctl_do_cpuid(cpu, (cpuctl_cpuid_args_t *)data);
+		ret = 0;
 		break;
 	case CPUCTL_UPDATE:
 		ret = priv_check(curthread, PRIV_CPUCTL_UPDATE);
@@ -115,19 +124,25 @@ cpuctl_ioctl(struct dev_ioctl_args *ap)
 			goto fail;
 		ret = cpuctl_do_update(cpu, (cpuctl_update_args_t *)data);
 		break;
+	case CPUCTL_CPUID_COUNT:
+		cpuctl_do_cpuid_count(cpu, (cpuctl_cpuid_count_args_t *)data);
+		ret = 0;
+		break;
 	default:
 		ret = EINVAL;
 		break;
 	}
 fail:
+	lockmgr(&cpuctl_lock, LK_RELEASE);
+
 	return (ret);
 }
 
 /*
  * Actually perform cpuid operation.
  */
-static int
-cpuctl_do_cpuid(int cpu, cpuctl_cpuid_args_t *data)
+static void
+cpuctl_do_cpuid_count(int cpu, cpuctl_cpuid_count_args_t *data)
 {
 	int oldcpu;
 
@@ -136,13 +151,24 @@ cpuctl_do_cpuid(int cpu, cpuctl_cpuid_args_t *data)
 
 	/* Explicitly clear cpuid data to avoid returning stale info. */
 	bzero(data->data, sizeof(data->data));
-	DPRINTF("[cpuctl,%d]: retriving cpuid level %#0x for %d cpu\n",
-	    __LINE__, data->level, cpu);
+	DPRINTF("[cpuctl,%d]: retrieving cpuid lev %#0x type %#0x for %d cpu\n",
+	    __LINE__, data->level, data->level_type, cpu);
 	oldcpu = mycpuid;
 	lwkt_migratecpu(cpu);
-	cpuid_count(data->level, 0, data->data);
+	cpuid_count(data->level, data->level_type, data->data);
 	lwkt_migratecpu(oldcpu);
-	return (0);
+}
+
+static void
+cpuctl_do_cpuid(int cpu, cpuctl_cpuid_args_t *data)
+{
+	cpuctl_cpuid_count_args_t cdata;
+
+	cdata.level = data->level;
+	/* Override the level type. */
+	cdata.level_type = 0;
+	cpuctl_do_cpuid_count(cpu, &cdata);
+	bcopy(cdata.data, data->data, sizeof(data->data)); /* Ignore error */
 }
 
 /*
@@ -155,7 +181,7 @@ cpuctl_do_msr(int cpu, cpuctl_msr_args_t *data, u_long cmd)
 	int oldcpu;
 	int ret;
 
-	KASSERT(cpu >= 0 && cpu < ncpus ,
+	KASSERT(cpu >= 0 && cpu < ncpus,
 	    ("[cpuctl,%d]: bad cpu number %d", __LINE__, cpu));
 
 	/*
@@ -192,6 +218,8 @@ cpuctl_do_msr(int cpu, cpuctl_msr_args_t *data, u_long cmd)
 /*
  * Actually perform microcode update.
  */
+extern void mitigation_vm_setup(void *arg);
+
 static int
 cpuctl_do_update(int cpu, cpuctl_update_args_t *data)
 {
@@ -205,12 +233,7 @@ cpuctl_do_update(int cpu, cpuctl_update_args_t *data)
 	    ("[cpuctl,%d]: bad cpu number %d", __LINE__, cpu));
 	DPRINTF("[cpuctl,%d]: XXX %d", __LINE__, cpu);
 
-	ret = cpuctl_do_cpuid(cpu, &args);
-	if (ret != 0) {
-		DPRINTF("[cpuctl,%d]: cannot retrive cpuid info for cpu %d",
-		    __LINE__, cpu);
-		return (ENXIO);
-	}
+	cpuctl_do_cpuid(cpu, &args);
 	((uint32_t *)vendor)[0] = args.data[1];
 	((uint32_t *)vendor)[1] = args.data[3];
 	((uint32_t *)vendor)[2] = args.data[2];
@@ -223,6 +246,10 @@ cpuctl_do_update(int cpu, cpuctl_update_args_t *data)
 		ret = update_via(cpu, data);
 	else
 		ret = ENXIO;
+
+	if (ret == 0)
+		mitigation_vm_setup((void *)(intptr_t)1);
+
 	return (ret);
 }
 
@@ -417,14 +444,20 @@ cpuctl_open(struct dev_open_args *ap)
 	int cpu;
 
 	cpu = dev2unit(ap->a_head.a_dev);
-	if (cpu > ncpus) {
-		DPRINTF("[cpuctl,%d]: incorrect cpu number %d\n", __LINE__,
-		    cpu);
+	if (cpu < 0 || cpu >= ncpus) {
+		DPRINTF("[cpuctl,%d]: incorrect cpu number %d\n",
+			__LINE__, cpu);
 		return (ENXIO);
 	}
 	if (ap->a_oflags & FWRITE)
 		ret = securelevel > 0 ? EPERM : 0;
 	return (ret);
+}
+
+static int
+cpuctl_close(struct dev_close_args *ap)
+{
+	return 0;
 }
 
 static int
@@ -441,16 +474,11 @@ cpuctl_modevent(module_t mod __unused, int type, void *data __unused)
 		}
 		if (bootverbose)
 			kprintf("cpuctl: access to MSR registers/cpuid info.\n");
-		cpuctl_devs = (struct cdev **)kmalloc(sizeof(void *) * ncpus,
-		    M_CPUCTL, M_WAITOK | M_ZERO);
-		if (cpuctl_devs == NULL) {
-			DPRINTF("[cpuctl,%d]: cannot allocate memory\n",
-			    __LINE__);
-			return (ENOMEM);
-		}
+		cpuctl_devs = kmalloc(sizeof(*cpuctl_devs) * ncpus, M_CPUCTL,
+		    M_WAITOK | M_ZERO);
 		for (cpu = 0; cpu < ncpus; cpu++)
 			cpuctl_devs[cpu] = make_dev(&cpuctl_cdevsw, cpu,
-					UID_ROOT, GID_KMEM, 0640, "cpuctl%d", cpu);
+			    UID_ROOT, GID_KMEM, 0640, "cpuctl%d", cpu);
 		break;
 	case MOD_UNLOAD:
 		for (cpu = 0; cpu < ncpus; cpu++) {
@@ -463,7 +491,7 @@ cpuctl_modevent(module_t mod __unused, int type, void *data __unused)
 		break;
 	default:
 		return (EOPNOTSUPP);
-        }
+	}
 	return (0);
 }
 

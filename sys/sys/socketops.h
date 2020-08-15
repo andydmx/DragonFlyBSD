@@ -29,18 +29,14 @@
  * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT
  * OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
- *
- * $DragonFly: src/sys/sys/socketops.h,v 1.14 2008/10/27 02:56:30 sephe Exp $
  */
 
 #ifndef _SOCKETOPS_H_
 #define _SOCKETOPS_H_
 
 #ifndef _KERNEL
-
 #error "This file should not be included by userland programs."
-
-#else
+#endif
 
 #ifndef _SYS_PROTOSW_H_
 #include <sys/protosw.h>
@@ -74,12 +70,15 @@ so_pru_soreceive(struct socket *so, struct sockaddr **paddr, struct uio *uio,
 		controlp, flagsp));
 }
 
-void so_pru_abort (struct socket *so);
+struct lwkt_port;
+
 void so_pru_abort_async (struct socket *so);
 void so_pru_abort_direct (struct socket *so);
 int so_pru_accept (struct socket *so, struct sockaddr **nam);
 int so_pru_attach (struct socket *so, int proto, struct pru_attach_info *ai);
 int so_pru_attach_direct(struct socket *so, int proto,
+		struct pru_attach_info *ai);
+int so_pru_attach_fast(struct socket *so, int proto,
 		struct pru_attach_info *ai);
 int so_pru_bind (struct socket *so, struct sockaddr *nam, struct thread *td);
 int so_pru_connect (struct socket *so, struct sockaddr *nam, struct thread *td);
@@ -110,7 +109,11 @@ int so_pru_sense (struct socket *so, struct stat *sb);
 int so_pru_shutdown (struct socket *so);
 int so_pru_sockaddr (struct socket *so, struct sockaddr **nam);
 int so_pr_ctloutput(struct socket *so, struct sockopt *sopt);
+struct lwkt_port *so_pr_ctlport(struct protosw *pr, int cmd,
+		struct sockaddr *arg, void *extra, int *cpuid);
 void so_pr_ctlinput(struct protosw *pr, int cmd,
+		struct sockaddr *arg, void *extra);
+void so_pr_ctlinput_direct(struct protosw *pr, int cmd,
 		struct sockaddr *arg, void *extra);
 
 static __inline int
@@ -125,5 +128,4 @@ so_pru_senda(struct socket *so, int flags, struct mbuf *m,
 	}
 }
 
-#endif	/* _KERNEL */
 #endif	/* _SYS_SOCKETOPS_H_ */

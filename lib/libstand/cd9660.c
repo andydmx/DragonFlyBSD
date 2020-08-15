@@ -41,8 +41,8 @@
 #include <sys/param.h>
 #include <string.h>
 #include <sys/dirent.h>
-#include <isofs/cd9660/iso.h>
-#include <isofs/cd9660/cd9660_rrip.h>
+#include <vfs/isofs/cd9660/iso.h>
+#include <vfs/isofs/cd9660/cd9660_rrip.h>
 
 #include "stand.h"
 
@@ -115,19 +115,6 @@ struct ptable_ent {
 #define	PTSIZE(pp)	roundup(PTFIXSZ + isonum_711((pp)->namlen), 2)
 
 #define	cdb2devb(bno)	((bno) * (ISO_DEFAULT_BLOCK_SIZE / DEV_BSIZE))
-
-/* XXX these should be in the system headers */
-static __inline int
-isonum_722(u_char *p)
-{
-	return (*p << 8)|p[1];
-}
-
-static __inline int
-isonum_732(u_char *p)
-{
-	return (*p << 24)|(p[1] << 16)|(p[2] << 8)|p[3];
-}
 
 static ISO_SUSP_HEADER *
 susp_lookup_record(struct open_file *f, const char *identifier,

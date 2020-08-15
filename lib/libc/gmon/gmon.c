@@ -34,6 +34,7 @@
 #include <sys/param.h>
 #include <sys/time.h>
 #include <sys/gmon.h>
+#include <sys/mman.h>
 #include <sys/sysctl.h>
 
 #include <err.h>
@@ -46,12 +47,6 @@
 
 #include "libc_private.h"
 
-#if defined(__i386__) || defined(__sparc64__) || defined(__x86_64__) || defined(__powerpc__)
-extern char *minbrk __asm (".minbrk");
-#else
-extern char *minbrk __asm ("minbrk");
-#endif
-
 struct gmonparam _gmonparam = { .state = GMON_PROF_OFF };
 
 static int	s_scale;
@@ -60,6 +55,7 @@ static int	s_scale;
 
 #define ERR(s) _write(2, s, sizeof(s))
 
+void	_mcleanup(void);
 void	moncontrol(int);
 static int hertz(void);
 
@@ -87,8 +83,9 @@ monstartup(u_long lowpc, u_long highpc)
 		p->tolimit = MAXARCS;
 	p->tossize = p->tolimit * sizeof(struct tostruct);
 
-	cp = sbrk(p->kcountsize + p->fromssize + p->tossize);
-	if (cp == (char *)-1) {
+	cp = mmap(NULL, p->kcountsize + p->fromssize + p->tossize,
+		PROT_READ | PROT_WRITE, MAP_ANON, -1, 0);
+	 if (cp == MAP_FAILED) {
 		ERR("monstartup: out of memory\n");
 		return;
 	}
@@ -101,26 +98,12 @@ monstartup(u_long lowpc, u_long highpc)
 	cp += p->kcountsize;
 	p->froms = (u_short *)cp;
 
-	minbrk = sbrk(0);
 	p->tos[0].link = 0;
 
 	o = p->highpc - p->lowpc;
-	if (p->kcountsize < o) {
-#ifndef hp300
+	if (p->kcountsize < o)
 		s_scale = ((float)p->kcountsize / o ) * SCALE_1_TO_1;
-#else /* avoid floating point */
-		int quot = o / p->kcountsize;
-
-		if (quot >= 0x10000)
-			s_scale = 1;
-		else if (quot >= 0x100)
-			s_scale = 0x10000 / quot;
-		else if (o >= 0x800000)
-			s_scale = 0x1000000 / (o / (p->kcountsize >> 8));
-		else
-			s_scale = 0x1000000 / ((o << 8) / p->kcountsize);
-#endif
-	} else
+	else
 		s_scale = SCALE_1_TO_1;
 
 	moncontrol(1);
@@ -166,13 +149,13 @@ _mcleanup(void)
 
 	moncontrol(0);
 	snprintf(outname, sizeof(outname), "%s.gmon", _getprogname());
-	fd = _open(outname, O_CREAT|O_TRUNC|O_WRONLY, 0666);
+	fd = _open(outname, O_CREAT|O_TRUNC|O_WRONLY|O_CLOEXEC, 0666);
 	if (fd < 0) {
 		_warn("_mcleanup: %s", outname);
 		return;
 	}
 #ifdef DEBUG
-	log = _open("gmon.log", O_CREAT|O_TRUNC|O_WRONLY, 0664);
+	log = _open("gmon.log", O_CREAT|O_TRUNC|O_WRONLY|O_CLOEXEC, 0664);
 	if (log < 0) {
 		_warn("_mcleanup: gmon.log");
 		return;

@@ -15,11 +15,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -56,17 +52,24 @@
 #include <vm/vm_object.h>
 #endif
 
+#ifdef _KERNEL
 TAILQ_HEAD(pagerlst, vm_object);
 
 struct buf;
 struct bio;
 
+typedef void pgo_dealloc_t(vm_object_t);
+typedef int pgo_getpage_t(vm_object_t, vm_page_t *, int);
+typedef void pgo_putpages_t(vm_object_t, vm_page_t *, int, int, int *);
+typedef boolean_t pgo_haspage_t(vm_object_t, vm_pindex_t);
+
 struct pagerops {
-	void (*pgo_dealloc) (vm_object_t);
-	int (*pgo_getpage) (vm_object_t, vm_page_t *, int);
-	void (*pgo_putpages) (vm_object_t, vm_page_t *, int, int, int *);
-	boolean_t (*pgo_haspage) (vm_object_t, vm_pindex_t);
+	pgo_dealloc_t	*pgo_dealloc;
+	pgo_getpage_t	*pgo_getpage;
+	pgo_putpages_t	*pgo_putpages;
+	pgo_haspage_t	*pgo_haspage;
 };
+#endif	/* _KERNEL */
 
 /*
  * get/put return values
@@ -83,11 +86,6 @@ struct pagerops {
 #define	VM_PAGER_PEND	3
 #define	VM_PAGER_ERROR	4
 #define VM_PAGER_AGAIN	5
-
-#define	VM_PAGER_PUT_SYNC		0x0001
-#define	VM_PAGER_PUT_INVAL		0x0002
-#define	VM_PAGER_IGNORE_CLEANCHK	0x0004
-#define	VM_PAGER_CLUSTER_OK		0x0008
 
 #ifdef _KERNEL
 
@@ -164,8 +162,8 @@ vm_pager_put_pages(
 static __inline boolean_t
 vm_pager_has_page(vm_object_t object, vm_pindex_t offset)
 {
-        return ((*pagertab[object->type]->pgo_haspage)(object, offset));
-} 
+	return ((*pagertab[object->type]->pgo_haspage)(object, offset));
+}
 
 struct cdev_pager_ops {
 	int (*cdev_pg_fault)(vm_object_t vm_obj, vm_ooffset_t offset,
@@ -181,6 +179,6 @@ vm_object_t cdev_pager_allocate(void *handle, enum obj_type tp,
 vm_object_t cdev_pager_lookup(void *handle);
 void cdev_pager_free_page(vm_object_t object, vm_page_t m);
 
-#endif
+#endif	/* _KERNEL */
 
-#endif				/* _VM_VM_PAGER_H_ */
+#endif	/* _VM_VM_PAGER_H_ */

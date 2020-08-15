@@ -489,8 +489,7 @@ ar5111SetPowerTable(struct ath_hal *ah,
 		}
 
 	/* Find the first power level with a pcdac */
-	pwr = (uint16_t)(PWR_STEP *
-		((minScaledPwr - PWR_MIN + PWR_STEP / 2) / PWR_STEP) + PWR_MIN);
+	pwr = (uint16_t)(rounddown(minScaledPwr - PWR_MIN + PWR_STEP / 2, PWR_STEP) + PWR_MIN);
 
 	/* Write all the first pcdac entries based off the pcdacMin */
 	pcdacTableIndex = 0;
@@ -560,6 +559,8 @@ ar5212GetScaledPower(uint16_t channel, uint16_t pcdacValue,
 	ar5212GetLowerUpperPcdacs(pcdacValue,
 		rFreq, pSrcStruct, &lrPcdac, &urPcdac);
 
+	lPwr = 0;	/* avoid gcc warnings */
+	uPwr = 0;	/* avoid gcc warnings */
 	/* get the power index for the pcdac value */
 	ar5212FindValueInList(lFreq, llPcdac, pSrcStruct, &lPwr);
 	ar5212FindValueInList(lFreq, ulPcdac, pSrcStruct, &uPwr);

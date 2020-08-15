@@ -65,9 +65,6 @@ static u_long nfsrvhash;
 #define TRUE	1
 #define	FALSE	0
 
-#define	NETFAMILY(rp) \
-		(((rp)->rc_flag & RC_INETADDR) ? AF_INET : AF_ISO)
-
 struct lwkt_token srvcache_token = LWKT_TOKEN_INITIALIZER(srvcache_token);
 
 /*
@@ -149,6 +146,16 @@ nfsrv_initcache(void)
 }
 
 /*
+ * Destroy the server request cache list
+ */
+void
+nfsrv_destroycache(void)
+{
+	KKASSERT(TAILQ_EMPTY(&nfsrvlruhead));
+	hashdestroy(nfsrvhashtbl, M_NFSD, nfsrvhash);
+}
+
+/*
  * Look for the request in the cache
  * If found then
  *    return action and optionally reply
@@ -184,7 +191,7 @@ loop:
 	for (rp = NFSRCHASH(nd->nd_retxid)->lh_first; rp != NULL;
 	    rp = rp->rc_hash.le_next) {
 	    if (nd->nd_retxid == rp->rc_xid && nd->nd_procnum == rp->rc_proc &&
-		netaddr_match(NETFAMILY(rp), &rp->rc_haddr, nd->nd_nam)) {
+		netaddr_match(AF_INET, &rp->rc_haddr, nd->nd_nam)) {
 		        NFS_DPF(RC, ("H%03x", rp->rc_xid & 0xfff));
 			if ((rp->rc_flag & RC_LOCKED) != 0) {
 				rp->rc_flag |= RC_WANTED;
@@ -210,7 +217,7 @@ loop:
 			} else if (rp->rc_flag & RC_REPMBUF) {
 				nfsstats.srvcache_nonidemdonehits++;
 				*repp = m_copym(rp->rc_reply, 0, M_COPYALL,
-						MB_WAIT);
+						M_WAITOK);
 				ret = RC_REPLY;
 			} else {
 				nfsstats.srvcache_idemdonehits++;
@@ -264,7 +271,6 @@ loop:
 		rp->rc_flag |= RC_INETADDR;
 		rp->rc_inetaddr = saddr->sin_addr.s_addr;
 		break;
-	case AF_ISO:
 	default:
 		rp->rc_flag |= RC_NAM;
 		rp->rc_nam = dup_sockaddr(nd->nd_nam);
@@ -298,7 +304,7 @@ loop:
 	for (rp = NFSRCHASH(nd->nd_retxid)->lh_first; rp != NULL;
 	    rp = rp->rc_hash.le_next) {
 	    if (nd->nd_retxid == rp->rc_xid && nd->nd_procnum == rp->rc_proc &&
-		netaddr_match(NETFAMILY(rp), &rp->rc_haddr, nd->nd_nam)) {
+		netaddr_match(AF_INET, &rp->rc_haddr, nd->nd_nam)) {
 			NFS_DPF(RC, ("U%03x", rp->rc_xid & 0xfff));
 			if ((rp->rc_flag & RC_LOCKED) != 0) {
 				rp->rc_flag |= RC_WANTED;
@@ -337,7 +343,7 @@ loop:
 						rp->rc_flag &= ~RC_REPMBUF;
 					}
 					rp->rc_reply = m_copym(repmbuf, 0,
-							M_COPYALL, MB_WAIT);
+							M_COPYALL, M_WAITOK);
 					rp->rc_flag |= RC_REPMBUF;
 				}
 			}

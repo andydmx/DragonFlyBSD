@@ -29,7 +29,6 @@
  * @(#) Copyright (c) 1980, 1988, 1993 The Regents of the University of California.  All rights reserved.
  * @(#)leave.c	8.1 (Berkeley) 6/6/93
  * $FreeBSD: src/usr.bin/leave/leave.c,v 1.5.2.2 2001/07/30 09:43:30 dd Exp $
- * $DragonFly: src/usr.bin/leave/leave.c,v 1.7 2006/08/14 07:37:38 swildner Exp $
  */
 
 #include <err.h>
@@ -41,8 +40,8 @@
 #include <time.h>
 #include <unistd.h>
 
-void doalarm(u_int);
-static void usage(void);
+static void doalarm(u_int) __dead2;
+static void usage(void) __dead2;
 
 /*
  * leave [[+]hhmm]
@@ -90,11 +89,18 @@ main(int argc, char **argv)
 	minutes = hours % 100;
 	hours /= 100;
 
-	if (minutes < 0 || minutes > 59)
+	/*
+	 * NOTE: Allows minutes specifications > 59 for +now usages,
+	 *	 just like microwaves have for decades. -Matt
+	 */
+	if (minutes < 0)
 		usage();
-	if (plusnow)
+
+	if (plusnow) {
 		secs = hours * 60 * 60 + minutes * 60;
-	else {
+	} else {
+		if (minutes > 59)
+			usage();
 		(void)time(&now);
 		t = localtime(&now);
 
@@ -124,7 +130,7 @@ main(int argc, char **argv)
 	exit(0);
 }
 
-void
+static void
 doalarm(u_int secs)
 {
 	int bother;

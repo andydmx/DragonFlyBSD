@@ -13,19 +13,10 @@
 #include <sys/param.h>
 #include <sys/types.h>
 
+#include "crypt.h"
+#include "local.h"
 
-/* Structure to save state of computation between the single steps.  */
-struct sha512_ctx
-{
-  uint64_t H[8];
-
-  uint64_t total[2];
-  uint64_t buflen;
-  char buffer[256];	/* NB: always correctly aligned for uint64_t.  */
-};
-
-
-#if __BYTE_ORDER == __LITTLE_ENDIAN
+#if _BYTE_ORDER == _LITTLE_ENDIAN
 # define SWAP(n) \
   (((n) << 56)					\
    | (((n) & 0xff00) << 40)			\
@@ -93,8 +84,8 @@ static const uint64_t K[80] =
 
 /* Process LEN bytes of BUFFER, accumulating context into CTX.
    It is assumed that LEN % 128 == 0.  */
-static void
-sha512_process_block (const void *buffer, size_t len, struct sha512_ctx *ctx)
+void
+__crypt__sha512_process_block (const void *buffer, size_t len, struct sha512_ctx *ctx)
 {
   const uint64_t *words = buffer;
   size_t nwords = len / sizeof (uint64_t);
@@ -193,8 +184,8 @@ sha512_process_block (const void *buffer, size_t len, struct sha512_ctx *ctx)
 
 /* Initialize structure containing state of computation.
    (FIPS 180-2:5.3.3)  */
-static void
-sha512_init_ctx (struct sha512_ctx *ctx)
+void
+__crypt__sha512_init_ctx (struct sha512_ctx *ctx)
 {
   ctx->H[0] = UINT64_C (0x6a09e667f3bcc908);
   ctx->H[1] = UINT64_C (0xbb67ae8584caa73b);
@@ -215,8 +206,8 @@ sha512_init_ctx (struct sha512_ctx *ctx)
 
    IMPORTANT: On some systems it is required that RESBUF is correctly
    aligned for a 32 bits value.  */
-static void *
-sha512_finish_ctx (struct sha512_ctx *ctx, void *resbuf)
+void *
+__crypt__sha512_finish_ctx (struct sha512_ctx *ctx, void *resbuf)
 {
   /* Take yet unprocessed bytes into account.  */
   uint64_t bytes = ctx->buflen;
@@ -236,7 +227,7 @@ sha512_finish_ctx (struct sha512_ctx *ctx, void *resbuf)
 						  (ctx->total[0] >> 61));
 
   /* Process last bytes.  */
-  sha512_process_block (ctx->buffer, bytes + pad + 16, ctx);
+  __crypt__sha512_process_block (ctx->buffer, bytes + pad + 16, ctx);
 
   /* Put result from CTX in first 64 bytes following RESBUF.  */
   for (unsigned int i = 0; i < 8; ++i)
@@ -246,8 +237,8 @@ sha512_finish_ctx (struct sha512_ctx *ctx, void *resbuf)
 }
 
 
-static void
-sha512_process_bytes (const void *buffer, size_t len, struct sha512_ctx *ctx)
+void
+__crypt__sha512_process_bytes (const void *buffer, size_t len, struct sha512_ctx *ctx)
 {
   /* When we already have some bits in our internal buffer concatenate
      both inputs first.  */
@@ -261,7 +252,7 @@ sha512_process_bytes (const void *buffer, size_t len, struct sha512_ctx *ctx)
 
       if (ctx->buflen > 128)
 	{
-	  sha512_process_block (ctx->buffer, ctx->buflen & ~127, ctx);
+	  __crypt__sha512_process_block (ctx->buffer, ctx->buflen & ~127, ctx);
 
 	  ctx->buflen &= 127;
 	  /* The regions in the following copy operation cannot overlap.  */
@@ -276,26 +267,22 @@ sha512_process_bytes (const void *buffer, size_t len, struct sha512_ctx *ctx)
   /* Process available complete blocks.  */
   if (len >= 128)
     {
-#if !_STRING_ARCH_unaligned
-/* To check alignment gcc has an appropriate operator.  Other
-   compilers don't.  */
-# if __GNUC__ >= 2
-#  define UNALIGNED_P(p) (((uintptr_t) p) % __alignof__ (uint64_t) != 0)
-# else
-#  define UNALIGNED_P(p) (((uintptr_t) p) % sizeof (uint64_t) != 0)
-# endif
+#if __GNUC__ >= 2
+# define UNALIGNED_P(p) (((uintptr_t) p) % __alignof__ (uint64_t) != 0)
+#else
+# define UNALIGNED_P(p) (((uintptr_t) p) % sizeof (uint64_t) != 0)
+#endif
       if (UNALIGNED_P (buffer))
 	while (len > 128)
 	  {
-	    sha512_process_block (memcpy (ctx->buffer, buffer, 128), 128,
+	    __crypt__sha512_process_block (memcpy (ctx->buffer, buffer, 128), 128,
 				    ctx);
 	    buffer = (const char *) buffer + 128;
 	    len -= 128;
 	  }
       else
-#endif
 	{
-	  sha512_process_block (buffer, len & ~127, ctx);
+	  __crypt__sha512_process_block (buffer, len & ~127, ctx);
 	  buffer = (const char *) buffer + (len & ~127);
 	  len &= 127;
 	}
@@ -310,7 +297,7 @@ sha512_process_bytes (const void *buffer, size_t len, struct sha512_ctx *ctx)
       left_over += len;
       if (left_over >= 128)
 	{
-	  sha512_process_block (ctx->buffer, 128, ctx);
+	  __crypt__sha512_process_block (ctx->buffer, 128, ctx);
 	  left_over -= 128;
 	  memcpy (ctx->buffer, &ctx->buffer[128], left_over);
 	}
@@ -403,59 +390,59 @@ crypt_sha512_r (const char *key, const char *salt, char *buffer, int buflen)
     }
 
   /* Prepare for the real work.  */
-  sha512_init_ctx (&ctx);
+  __crypt__sha512_init_ctx (&ctx);
 
   /* Add the key string.  */
-  sha512_process_bytes (key, key_len, &ctx);
+  __crypt__sha512_process_bytes (key, key_len, &ctx);
 
   /* The last part is the salt string.  This must be at most 16
      characters and it ends at the first `$' character (for
      compatibility with existing implementations).  */
-  sha512_process_bytes (salt, salt_len, &ctx);
+  __crypt__sha512_process_bytes (salt, salt_len, &ctx);
 
 
   /* Compute alternate SHA512 sum with input KEY, SALT, and KEY.  The
      final result will be added to the first context.  */
-  sha512_init_ctx (&alt_ctx);
+  __crypt__sha512_init_ctx (&alt_ctx);
 
   /* Add key.  */
-  sha512_process_bytes (key, key_len, &alt_ctx);
+  __crypt__sha512_process_bytes (key, key_len, &alt_ctx);
 
   /* Add salt.  */
-  sha512_process_bytes (salt, salt_len, &alt_ctx);
+  __crypt__sha512_process_bytes (salt, salt_len, &alt_ctx);
 
   /* Add key again.  */
-  sha512_process_bytes (key, key_len, &alt_ctx);
+  __crypt__sha512_process_bytes (key, key_len, &alt_ctx);
 
   /* Now get result of this (64 bytes) and add it to the other
      context.  */
-  sha512_finish_ctx (&alt_ctx, alt_result);
+  __crypt__sha512_finish_ctx (&alt_ctx, alt_result);
 
   /* Add for any character in the key one byte of the alternate sum.  */
   for (cnt = key_len; cnt > 64; cnt -= 64)
-    sha512_process_bytes (alt_result, 64, &ctx);
-  sha512_process_bytes (alt_result, cnt, &ctx);
+    __crypt__sha512_process_bytes (alt_result, 64, &ctx);
+  __crypt__sha512_process_bytes (alt_result, cnt, &ctx);
 
   /* Take the binary representation of the length of the key and for every
      1 add the alternate sum, for every 0 the key.  */
   for (cnt = key_len; cnt > 0; cnt >>= 1)
     if ((cnt & 1) != 0)
-      sha512_process_bytes (alt_result, 64, &ctx);
+      __crypt__sha512_process_bytes (alt_result, 64, &ctx);
     else
-      sha512_process_bytes (key, key_len, &ctx);
+      __crypt__sha512_process_bytes (key, key_len, &ctx);
 
   /* Create intermediate result.  */
-  sha512_finish_ctx (&ctx, alt_result);
+  __crypt__sha512_finish_ctx (&ctx, alt_result);
 
   /* Start computation of P byte sequence.  */
-  sha512_init_ctx (&alt_ctx);
+  __crypt__sha512_init_ctx (&alt_ctx);
 
   /* For every character in the password add the entire password.  */
   for (cnt = 0; cnt < key_len; ++cnt)
-    sha512_process_bytes (key, key_len, &alt_ctx);
+    __crypt__sha512_process_bytes (key, key_len, &alt_ctx);
 
   /* Finish the digest.  */
-  sha512_finish_ctx (&alt_ctx, temp_result);
+  __crypt__sha512_finish_ctx (&alt_ctx, temp_result);
 
   /* Create byte sequence P.  */
   cp = p_bytes = alloca (key_len);
@@ -464,14 +451,14 @@ crypt_sha512_r (const char *key, const char *salt, char *buffer, int buflen)
   memcpy (cp, temp_result, cnt);
 
   /* Start computation of S byte sequence.  */
-  sha512_init_ctx (&alt_ctx);
+  __crypt__sha512_init_ctx (&alt_ctx);
 
   /* For every character in the password add the entire password.  */
   for (cnt = 0; cnt < 16 + alt_result[0]; ++cnt)
-    sha512_process_bytes (salt, salt_len, &alt_ctx);
+    __crypt__sha512_process_bytes (salt, salt_len, &alt_ctx);
 
   /* Finish the digest.  */
-  sha512_finish_ctx (&alt_ctx, temp_result);
+  __crypt__sha512_finish_ctx (&alt_ctx, temp_result);
 
   /* Create byte sequence S.  */
   cp = s_bytes = alloca (salt_len);
@@ -484,30 +471,30 @@ crypt_sha512_r (const char *key, const char *salt, char *buffer, int buflen)
   for (cnt = 0; cnt < rounds; ++cnt)
     {
       /* New context.  */
-      sha512_init_ctx (&ctx);
+      __crypt__sha512_init_ctx (&ctx);
 
       /* Add key or last result.  */
       if ((cnt & 1) != 0)
-	sha512_process_bytes (p_bytes, key_len, &ctx);
+	__crypt__sha512_process_bytes (p_bytes, key_len, &ctx);
       else
-	sha512_process_bytes (alt_result, 64, &ctx);
+	__crypt__sha512_process_bytes (alt_result, 64, &ctx);
 
       /* Add salt for numbers not divisible by 3.  */
       if (cnt % 3 != 0)
-	sha512_process_bytes (s_bytes, salt_len, &ctx);
+	__crypt__sha512_process_bytes (s_bytes, salt_len, &ctx);
 
       /* Add key for numbers not divisible by 7.  */
       if (cnt % 7 != 0)
-	sha512_process_bytes (p_bytes, key_len, &ctx);
+	__crypt__sha512_process_bytes (p_bytes, key_len, &ctx);
 
       /* Add key or last result.  */
       if ((cnt & 1) != 0)
-	sha512_process_bytes (alt_result, 64, &ctx);
+	__crypt__sha512_process_bytes (alt_result, 64, &ctx);
       else
-	sha512_process_bytes (p_bytes, key_len, &ctx);
+	__crypt__sha512_process_bytes (p_bytes, key_len, &ctx);
 
       /* Create intermediate result.  */
-      sha512_finish_ctx (&ctx, alt_result);
+      __crypt__sha512_finish_ctx (&ctx, alt_result);
     }
 
   /* Now we can construct the result string.  It consists of three
@@ -579,8 +566,8 @@ crypt_sha512_r (const char *key, const char *salt, char *buffer, int buflen)
      attaching to processes or reading core dumps cannot get any
      information.  We do it in this way to clear correct_words[]
      inside the SHA512 implementation as well.  */
-  sha512_init_ctx (&ctx);
-  sha512_finish_ctx (&ctx, alt_result);
+  __crypt__sha512_init_ctx (&ctx);
+  __crypt__sha512_finish_ctx (&ctx, alt_result);
   memset (temp_result, '\0', sizeof (temp_result));
   memset (p_bytes, '\0', key_len);
   memset (s_bytes, '\0', salt_len);
@@ -682,7 +669,7 @@ static const struct
       "\x23\x54\xe0\x93\xd7\x6f\x30\x48\xb4\x56\x76\x43\x46\x90\x0c\xb1"
       "\x30\xd2\xa4\xfd\x5d\xd1\x6a\xbb\x5e\x30\xbc\xb8\x50\xde\xe8\x43" }
   };
-#define ntests (sizeof (tests) / sizeof (tests[0]))
+#define ntests (NELEM(tests))
 
 
 static const struct
@@ -717,7 +704,7 @@ static const struct
     "$6$rounds=1000$roundstoolow$kUMsbe306n21p9R.FRkW3IGn.S9NPN0x50YhH1x"
     "hLsPuWGsUSklZt58jaTfF4ZEQpyUNGc0dqbpBYYBaHHrsX." },
 };
-#define ntests2 (sizeof (tests2) / sizeof (tests2[0]))
+#define ntests2 (NELEM(tests2))
 
 
 int
@@ -730,19 +717,19 @@ main (void)
 
   for (cnt = 0; cnt < (int) ntests; ++cnt)
     {
-      sha512_init_ctx (&ctx);
-      sha512_process_bytes (tests[cnt].input, strlen (tests[cnt].input), &ctx);
-      sha512_finish_ctx (&ctx, sum);
+      __crypt__sha512_init_ctx (&ctx);
+      __crypt__sha512_process_bytes (tests[cnt].input, strlen (tests[cnt].input), &ctx);
+      __crypt__sha512_finish_ctx (&ctx, sum);
       if (memcmp (tests[cnt].result, sum, 64) != 0)
 	{
 	  printf ("test %d run %d failed\n", cnt, 1);
 	  result = 1;
 	}
 
-      sha512_init_ctx (&ctx);
+      __crypt__sha512_init_ctx (&ctx);
       for (int i = 0; tests[cnt].input[i] != '\0'; ++i)
-	sha512_process_bytes (&tests[cnt].input[i], 1, &ctx);
-      sha512_finish_ctx (&ctx, sum);
+	__crypt__sha512_process_bytes (&tests[cnt].input[i], 1, &ctx);
+      __crypt__sha512_finish_ctx (&ctx, sum);
       if (memcmp (tests[cnt].result, sum, 64) != 0)
 	{
 	  printf ("test %d run %d failed\n", cnt, 2);
@@ -753,10 +740,10 @@ main (void)
   /* Test vector from FIPS 180-2: appendix C.3.  */
   char buf[1000];
   memset (buf, 'a', sizeof (buf));
-  sha512_init_ctx (&ctx);
+  __crypt__sha512_init_ctx (&ctx);
   for (int i = 0; i < 1000; ++i)
-    sha512_process_bytes (buf, sizeof (buf), &ctx);
-  sha512_finish_ctx (&ctx, sum);
+    __crypt__sha512_process_bytes (buf, sizeof (buf), &ctx);
+  __crypt__sha512_finish_ctx (&ctx, sum);
   static const char expected[64] =
     "\xe7\x18\x48\x3d\x0c\xe7\x69\x64\x4e\x2e\x42\xc7\xbc\x15\xb4\x63"
     "\x8e\x1f\x98\xb1\x3b\x20\x44\x28\x56\x32\xa8\x03\xaf\xa9\x73\xeb"

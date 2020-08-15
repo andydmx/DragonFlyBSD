@@ -10,11 +10,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -32,7 +28,6 @@
  *
  *	@(#)file.h	8.3 (Berkeley) 1/9/95
  * $FreeBSD: src/sys/sys/file.h,v 1.22.2.7 2002/11/21 23:39:24 sam Exp $
- * $DragonFly: src/sys/sys/file.h,v 1.25 2007/01/12 06:06:58 dillon Exp $
  */
 
 #ifndef _SYS_FILE_H_
@@ -62,8 +57,8 @@
 #ifndef _SYS_NAMECACHE_H_
 #include <sys/namecache.h>
 #endif
-#ifndef _SYS_UIO_H_
-#include <sys/uio.h>
+#ifndef _SYS__UIO_H_
+#include <sys/_uio.h>
 #endif
 
 struct stat;
@@ -123,6 +118,7 @@ struct file {
 	struct nchandle f_nchandle; /* namecache reference */
 	struct spinlock f_spin;	/* NOT USED */
 	struct klist 	f_klist;/* knotes attached to fp/kq */
+	void   *private_data;	/* Linux (drm) per-file data */
 };
 
 #define	DTYPE_VNODE	1	/* file */
@@ -131,8 +127,8 @@ struct file {
 #define	DTYPE_FIFO	4	/* fifo (named pipe) */
 #define	DTYPE_KQUEUE	5	/* event queue */
 #define DTYPE_CRYPTO	6	/* crypto */
-#define DTYPE_SYSLINK	7	/* syslink */
-#define DTYPE_MQUEUE	8	/* message queue */
+#define DTYPE_MQUEUE	7	/* message queue */
+#define DTYPE_DMABUF	8	/* DRM DMA buffer */
 
 LIST_HEAD(filelist, file);
 
@@ -144,22 +140,22 @@ LIST_HEAD(filelist, file);
 MALLOC_DECLARE(M_FILE);
 #endif
 
-extern void fhold(struct file *fp);
-extern int fdrop (struct file *fp);
-extern int checkfdclosed(struct filedesc *fdp, int fd, struct file *fp);
-extern int fp_open(const char *path, int flags, int mode, struct file **fpp);
-extern int fp_vpopen(struct vnode *vp, int flags, struct file **fpp);
-extern int fp_pread(struct file *fp, void *buf, size_t nbytes, off_t offset, ssize_t *res, enum uio_seg);
-extern int fp_pwrite(struct file *fp, void *buf, size_t nbytes, off_t offset, ssize_t *res, enum uio_seg);
-extern int fp_read(struct file *fp, void *buf, size_t nbytes, ssize_t *res, int all, enum uio_seg);
-extern int fp_write(struct file *fp, void *buf, size_t nbytes, ssize_t *res, enum uio_seg);
-extern int fp_stat(struct file *fp, struct stat *ub);
-extern int fp_mmap(void *addr, size_t size, int prot, int flags, struct file *fp, off_t pos, void **resp);
+void fhold(struct file *);
+int fdrop(struct file *);
+int checkfdclosed(thread_t, struct filedesc *, int, struct file *, int);
+int fp_open(const char *, int, int, struct file **);
+int fp_vpopen(struct vnode *, int, struct file **);
+int fp_pread(struct file *, void *, size_t, off_t, ssize_t *, enum uio_seg);
+int fp_pwrite(struct file *, void *, size_t, off_t, ssize_t *, enum uio_seg);
+int fp_read(struct file *, void *, size_t, ssize_t *, int, enum uio_seg);
+int fp_write(struct file *, void *, size_t, ssize_t *, enum uio_seg);
+int fp_stat(struct file *, struct stat *);
+int fp_mmap(void *, size_t, int, int, struct file *, off_t, void **);
 
-extern int nofo_shutdown(struct file *fp, int how);
+int nofo_shutdown(struct file *, int);
 
-extern int fp_close(struct file *fp);
-extern int fp_shutdown(struct file *fp, int how);
+int fp_close(struct file *);
+int fp_shutdown(struct file *, int);
 
 extern struct fileops vnode_fileops;
 extern struct fileops specvnode_fileops;

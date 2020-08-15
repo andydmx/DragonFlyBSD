@@ -90,8 +90,9 @@ struct client_config *config;
 
 int		findproto(char *, int);
 struct sockaddr	*get_ifa(char *, int);
-void		usage(void);
+void		usage(void) __dead2;
 int		check_option(struct client_lease *l, int option);
+int		check_classless_option(unsigned char *data, int len);
 int		ipv4addrs(char * buf);
 int		res_hnok(const char *dn);
 char		*option_as_string(unsigned int code, unsigned char *data, int len);
@@ -107,7 +108,7 @@ int
 findproto(char *cp, int n)
 {
 	struct sockaddr *sa;
-	int i;
+	unsigned int i;
 
 	if (n == 0)
 		return -1;
@@ -311,6 +312,22 @@ main(int argc, char *argv[])
 
 	argc -= optind;
 	argv += optind;
+
+	/*
+	 * dport wpa_supplicant uses 'start ifc' instead of 'ifc', allow
+	 * the 'start' keyword.
+	 */
+	if (argc > 1) {
+		if (strcmp(argv[0], "start") == 0) {
+			--argc;
+			++argv;
+			stayalive = 1;
+		} else if (strcmp(argv[0], "stop") == 0) {
+			dokillclient = 1;
+			--argc;
+			++argv;
+		}
+	}
 
 	if (argc != 1)
 		usage();
@@ -1746,14 +1763,12 @@ priv_script_go(void)
 	pid = fork();
 	if (pid < 0) {
 		error("fork: %m");
-		wstatus = 0;
 	} else if (pid) {
 		do {
 			wpid = wait(&wstatus);
 		} while (wpid != pid && wpid > 0);
 		if (wpid < 0) {
 			error("wait: %m");
-			wstatus = 0;
 		}
 	} else {
 		execve(scriptName, argv, envp);
@@ -1769,6 +1784,17 @@ void
 script_set_env(const char *prefix, const char *name, const char *value)
 {
 	int i, j, namelen;
+
+	/* No `` or $() command substitution allowed in environment values! */
+	for (j = 0; j < strlen(value); j++)
+		switch (value[j]) {
+		case '`':
+		case '$':
+			warning("illegal character (%c) in value '%s'",
+			    value[j], value);
+			/* Ignore this option */
+			return;
+		}
 
 	namelen = strlen(name);
 
@@ -1806,16 +1832,6 @@ script_set_env(const char *prefix, const char *name, const char *value)
 	    strlen(value) + 1);
 	if (client->scriptEnv[i] == NULL)
 		error("script_set_env: no memory for variable assignment");
-
-	/* No `` or $() command substitution allowed in environment values! */
-	for (j = 0; j < strlen(value); j++)
-		switch (value[j]) {
-		case '`':
-		case '$':
-			error("illegal character (%c) in value '%s'", value[j],
-			    value);
-			/* not reached */
-		}
 	snprintf(client->scriptEnv[i], strlen(prefix) + strlen(name) +
 	    1 + strlen(value) + 1, "%s%s=%s", prefix, name, value);
 }
@@ -2020,11 +2036,78 @@ check_option(struct client_lease *l, int option)
 	case DHO_TFTP_SERVER:
 	case DHO_END:
 		return (1);
+	case DHO_CLASSLESS_ROUTES:
+		return (check_classless_option(l->options[option].data,
+					       l->options[option].len));
 	default:
 		if (!unknown_ok)
 			warning("unknown dhcp option value 0x%x", option);
 		return (unknown_ok);
 	}
+}
+
+/* RFC 3442 The Classless Static Routes option checks */
+int
+check_classless_option(unsigned char *data, int len)
+{
+	int i = 0;
+	unsigned char width;
+	in_addr_t addr, mask;
+
+	if (len < 5) {
+		warning("Too small length: %d", len);
+		return (0);
+	}
+	while(i < len) {
+		width = data[i++];
+		if (width == 0) {
+			i += 4;
+			continue;
+		} else if (width < 9) {
+			addr =  (in_addr_t)(data[i]     << 24);
+			i += 1;
+		} else if (width < 17) {
+			addr =  (in_addr_t)(data[i]     << 24) +
+				(in_addr_t)(data[i + 1] << 16);
+			i += 2;
+		} else if (width < 25) {
+			addr =  (in_addr_t)(data[i]     << 24) +
+				(in_addr_t)(data[i + 1] << 16) +
+				(in_addr_t)(data[i + 2] << 8);
+			i += 3;
+		} else if (width < 33) {
+			addr =  (in_addr_t)(data[i]     << 24) +
+				(in_addr_t)(data[i + 1] << 16) +
+				(in_addr_t)(data[i + 2] << 8)  +
+				data[i + 3];
+			i += 4;
+		} else {
+			warning("Incorrect subnet width: %d", width);
+			return (0);
+		}
+		mask = (in_addr_t)(~0) << (32 - width);
+		addr = ntohl(addr);
+		mask = ntohl(mask);
+
+		/*
+		 * From RFC 3442:
+		 * ... After deriving a subnet number and subnet mask
+		 * from each destination descriptor, the DHCP client
+		 * MUST zero any bits in the subnet number where the
+		 * corresponding bit in the mask is zero...
+		 */
+		if ((addr & mask) != addr) {
+			addr &= mask;
+			data[i - 1] = (unsigned char)(
+				(addr >> rounddown(32 - width, 8)) & 0xFF);
+		}
+		i += 4;
+	}
+	if (i > len) {
+		warning("Incorrect data length: %d (must be %d)", len, i);
+		return (0);
+	}
+	return (1);
 }
 
 int

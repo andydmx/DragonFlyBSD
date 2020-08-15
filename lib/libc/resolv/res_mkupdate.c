@@ -13,6 +13,8 @@
  * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
  * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT
  * OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+ *
+ * $Id: res_mkupdate.c,v 1.8 2005/10/14 05:44:26 marka Exp $
  */
 
 /*! \file
@@ -20,10 +22,6 @@
  * Based on the Dynamic DNS reference implementation by Viraj Bais
  * &lt;viraj_bais@ccm.fm.intel.com>
  */
-
-#if !defined(lint) && !defined(SABER)
-static const char rcsid[] = "$Id: res_mkupdate.c,v 1.8 2005/10/14 05:44:26 marka Exp $";
-#endif /* not lint */
 
 #include "port_before.h"
 
@@ -120,7 +118,7 @@ res_nmkupdate(res_state statp, ns_updrec *rrecp_in, u_char *buf, int buflen) {
 	dpp = dnptrs;
 	*dpp++ = buf;
 	*dpp++ = NULL;
-	lastdnptr = dnptrs + sizeof dnptrs / sizeof dnptrs[0];
+	lastdnptr = dnptrs + NELEM(dnptrs);
 
 	if (rrecp_start == NULL)
 		return (-5);

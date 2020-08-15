@@ -133,7 +133,7 @@ struct pcicfg_pcix {
 
 /* config header information common to all header types */
 typedef struct pcicfg {
-    struct device *dev;		/* device which owns this */
+    device_t	dev;		/* device which owns this */
 
     uint32_t	bar[PCI_MAXMAPS_0]; /* BARs */
     uint32_t	bios;		/* BIOS mapping */
@@ -168,11 +168,7 @@ typedef struct pcicfg {
     uint8_t	slot;		/* config space slot address */
     uint8_t	func;		/* config space function number */
 
-#ifdef COMPAT_OLDPCI
-    uint8_t	secondarybus;	/* bus on secondary side of bridge, if any */
-#else
     uint8_t	dummy;
-#endif
 
     struct pcicfg_pp pp;	/* pci power management */
     struct pcicfg_vpd vpd;	/* pci vital product data */
@@ -184,11 +180,6 @@ typedef struct pcicfg {
 } pcicfgregs;
 
 /* additional type 1 device config header information (PCI to PCI bridge) */
-
-#define	PCI_PPBMEMBASE(h,l)  ((((pci_addr_t)(h) << 32) + ((l)<<16)) & ~0xfffff)
-#define	PCI_PPBMEMLIMIT(h,l) ((((pci_addr_t)(h) << 32) + ((l)<<16)) | 0xfffff)
-#define	PCI_PPBIOBASE(h,l)   ((((h)<<16) + ((l)<<8)) & ~0xfff)
-#define	PCI_PPBIOLIMIT(h,l)  ((((h)<<16) + ((l)<<8)) | 0xfff)
 
 typedef struct {
     pci_addr_t	pmembase;	/* base address of prefetchable memory */
@@ -237,7 +228,7 @@ struct pci_devinfo {
 
 /*
  * Define pci-specific resource flags for accessing memory via dense
- * or bwx memory spaces. These flags are ignored on i386.
+ * or bwx memory spaces.
  */
 #define	PCI_RF_DENSE	0x10000
 #define	PCI_RF_BWX	0x20000
@@ -337,8 +328,8 @@ PCIB_ACCESSOR(bus,		BUS,		uint32_t)
 
 /*
  * PCI interrupt validation.  Invalid interrupt values such as 0 or 128
- * on i386 or other platforms should be mapped out in the MD pcireadconf
- * code and not here, since the only MI invalid IRQ is 255.
+ * should be mapped out in the MD pcireadconf code and not here, since
+ * the only MI invalid IRQ is 255.
  */
 #define	PCI_INVALID_IRQ		255
 #define	PCI_INTERRUPT_VALID(x)	((x) != PCI_INVALID_IRQ)
@@ -499,6 +490,10 @@ device_t pci_find_bsf(uint8_t, uint8_t, uint8_t);
 device_t pci_find_dbsf(uint32_t, uint8_t, uint8_t, uint8_t);
 device_t pci_find_device(uint16_t, uint16_t);
 device_t pci_find_class(uint8_t class, uint8_t subclass);
+#if defined(_SYS_BUS_H_) && defined(_SYS_PCIIO_H_)
+device_t pci_iterate_class(struct pci_devinfo **dinfop,
+			uint8_t class, uint8_t subclass);
+#endif
 
 /* Can be used by drivers to manage the MSI-X table. */
 int	pci_pending_msix_vector(device_t dev, u_int index);
@@ -535,65 +530,6 @@ STAILQ_HEAD(devlist, pci_devinfo);
 
 extern struct devlist	pci_devq;
 extern uint32_t	pci_generation;
-
-/* for compatibility to FreeBSD-2.2 and 3.x versions of PCI code */
-
-#if defined(_KERNEL) && !defined(KLD_MODULE)
-#include "opt_compat_oldpci.h"
-#endif
-
-#ifdef COMPAT_OLDPCI
-/* all this is going some day */
-
-typedef pcicfgregs *pcici_t;
-typedef unsigned pcidi_t;
-typedef void pci_inthand_t(void *arg);
-
-#define pci_max_burst_len (3)
-
-/* just copied from old PCI code for now ... */
-
-struct pci_device {
-    char*    pd_name;
-    const char*  (*pd_probe ) (pcici_t tag, pcidi_t type);
-    void   (*pd_attach) (pcici_t tag, int     unit);
-    u_long  *pd_count;
-    int    (*pd_shutdown) (int, int);
-};
-
-#ifdef __i386__
-typedef u_short pci_port_t;
-#else
-typedef u_int pci_port_t;
-#endif
-
-u_long pci_conf_read (pcici_t tag, u_long reg);
-void pci_conf_write (pcici_t tag, u_long reg, u_long data);
-int pci_map_port (pcici_t tag, u_long reg, pci_port_t* pa);
-int pci_map_mem (pcici_t tag, u_long reg, vm_offset_t* va, vm_offset_t* pa);
-int pci_map_int (pcici_t tag, pci_inthand_t *handler, void *arg);
-int pci_map_int_right(pcici_t cfg, pci_inthand_t *handler, void *arg,
-		      u_int flags);
-int pci_unmap_int (pcici_t tag);
-
-void pci_cfgwrite (pcicfgregs *cfg, int reg, int data, int bytes);
-
-pcici_t pci_get_parent_from_tag(pcici_t tag);
-int     pci_get_bus_from_tag(pcici_t tag);
-
-pcicfgregs *pci_devlist_get_parent(pcicfgregs *cfg);
-
-struct module;
-int compat_pci_handler (struct module *, int, void *);
-#define COMPAT_PCI_DRIVER(name, pcidata)				\
-static moduledata_t name##_mod = {					\
-	#name,								\
-	compat_pci_handler,						\
-	&pcidata							\
-};									\
-DECLARE_MODULE(name, name##_mod, SI_SUB_DRIVERS, SI_ORDER_ANY)
-
-#endif /* COMPAT_OLDPCI */
 
 #define	VGA_PCI_BIOS_SHADOW_ADDR	0xC0000
 #define	VGA_PCI_BIOS_SHADOW_SIZE	131072

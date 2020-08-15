@@ -470,6 +470,7 @@ static DEFINE_CLASS_0(bge, bge_driver, bge_methods, sizeof(struct bge_softc));
 static devclass_t bge_devclass;
 
 DECLARE_DUMMY_MODULE(if_bge);
+MODULE_DEPEND(if_bge, miibus, 1, 1, 1);
 DRIVER_MODULE(if_bge, pci, bge_driver, bge_devclass, NULL, NULL);
 DRIVER_MODULE(miibus, bge, miibus_driver, miibus_devclass, NULL, NULL);
 
@@ -1020,7 +1021,7 @@ bge_newbuf_std(struct bge_softc *sc, int i, int init)
 	bus_dmamap_t map;
 	int error, nsegs;
 
-	m_new = m_getcl(init ? MB_WAIT : MB_DONTWAIT, MT_DATA, M_PKTHDR);
+	m_new = m_getcl(init ? M_WAITOK : M_NOWAIT, MT_DATA, M_PKTHDR);
 	if (m_new == NULL)
 		return ENOBUFS;
 	m_new->m_len = m_new->m_pkthdr.len = MCLBYTES;
@@ -1083,7 +1084,7 @@ bge_newbuf_jumbo(struct bge_softc *sc, int i, int init)
 	bus_addr_t paddr;
 
 	/* Allocate the mbuf. */
-	MGETHDR(m_new, init ? MB_WAIT : MB_DONTWAIT, MT_DATA);
+	MGETHDR(m_new, init ? M_WAITOK : M_NOWAIT, MT_DATA);
 	if (m_new == NULL)
 		return ENOBUFS;
 
@@ -2028,6 +2029,8 @@ bge_attach(device_t dev)
 {
 	struct ifnet *ifp;
 	struct bge_softc *sc;
+	struct sysctl_ctx_list *ctx;
+	struct sysctl_oid *tree;
 	uint32_t hwcfg = 0, misccfg;
 	int error = 0, rid, capmask;
 	uint8_t ether_addr[ETHER_ADDR_LEN];
@@ -2457,6 +2460,7 @@ bge_attach(device_t dev)
 	ifp->if_init = bge_init;
 	ifp->if_mtu = ETHERMTU;
 	ifp->if_capabilities = IFCAP_VLAN_HWTAGGING | IFCAP_VLAN_MTU;
+	ifp->if_nmbclusters = BGE_STD_RX_RING_CNT;
 	ifq_set_maxlen(&ifp->if_snd, BGE_TX_RING_CNT - 1);
 	ifq_set_ready(&ifp->if_snd);
 
@@ -2591,49 +2595,27 @@ again:
 			BGE_SETBIT(sc, BGE_MODE_CTL, BGE_MODECTL_STACKUP);
 	}
 
-	/*
-	 * Create sysctl nodes.
-	 */
-	sysctl_ctx_init(&sc->bge_sysctl_ctx);
-	sc->bge_sysctl_tree = SYSCTL_ADD_NODE(&sc->bge_sysctl_ctx,
-					      SYSCTL_STATIC_CHILDREN(_hw),
-					      OID_AUTO,
-					      device_get_nameunit(dev),
-					      CTLFLAG_RD, 0, "");
-	if (sc->bge_sysctl_tree == NULL) {
-		device_printf(dev, "can't add sysctl node\n");
-		error = ENXIO;
-		goto fail;
-	}
+	ctx = device_get_sysctl_ctx(sc->bge_dev);
+	tree = device_get_sysctl_tree(sc->bge_dev);
 
-	SYSCTL_ADD_PROC(&sc->bge_sysctl_ctx,
-			SYSCTL_CHILDREN(sc->bge_sysctl_tree),
-			OID_AUTO, "rx_coal_ticks",
+	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO, "rx_coal_ticks",
 			CTLTYPE_INT | CTLFLAG_RW,
 			sc, 0, bge_sysctl_rx_coal_ticks, "I",
 			"Receive coalescing ticks (usec).");
-	SYSCTL_ADD_PROC(&sc->bge_sysctl_ctx,
-			SYSCTL_CHILDREN(sc->bge_sysctl_tree),
-			OID_AUTO, "tx_coal_ticks",
+	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO, "tx_coal_ticks",
 			CTLTYPE_INT | CTLFLAG_RW,
 			sc, 0, bge_sysctl_tx_coal_ticks, "I",
 			"Transmit coalescing ticks (usec).");
-	SYSCTL_ADD_PROC(&sc->bge_sysctl_ctx,
-			SYSCTL_CHILDREN(sc->bge_sysctl_tree),
-			OID_AUTO, "rx_coal_bds",
+	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO, "rx_coal_bds",
 			CTLTYPE_INT | CTLFLAG_RW,
 			sc, 0, bge_sysctl_rx_coal_bds, "I",
 			"Receive max coalesced BD count.");
-	SYSCTL_ADD_PROC(&sc->bge_sysctl_ctx,
-			SYSCTL_CHILDREN(sc->bge_sysctl_tree),
-			OID_AUTO, "tx_coal_bds",
+	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO, "tx_coal_bds",
 			CTLTYPE_INT | CTLFLAG_RW,
 			sc, 0, bge_sysctl_tx_coal_bds, "I",
 			"Transmit max coalesced BD count.");
 
-	SYSCTL_ADD_INT(&sc->bge_sysctl_ctx,
-		       SYSCTL_CHILDREN(sc->bge_sysctl_tree),
-		       OID_AUTO, "tx_wreg", CTLFLAG_RW,
+	SYSCTL_ADD_INT(ctx, SYSCTL_CHILDREN(tree), OID_AUTO, "tx_wreg", CTLFLAG_RW,
 		       &sc->bge_tx_wreg, 0,
 		       "# of segments before writing to hardware register");
 
@@ -2654,34 +2636,29 @@ again:
 		 * consumes a lot of CPU cycles, so leave it off by
 		 * default.
 		 */
-		SYSCTL_ADD_INT(&sc->bge_sysctl_ctx,
-			       SYSCTL_CHILDREN(sc->bge_sysctl_tree),
-			       OID_AUTO, "force_defrag", CTLFLAG_RW,
+		SYSCTL_ADD_INT(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
+			       "force_defrag", CTLFLAG_RW,
 			       &sc->bge_force_defrag, 0,
 			       "Force defragment on TX path");
 	}
 	if (sc->bge_flags & BGE_FLAG_STATUS_TAG) {
 		if (!BGE_IS_5705_PLUS(sc)) {
-			SYSCTL_ADD_PROC(&sc->bge_sysctl_ctx,
-			    SYSCTL_CHILDREN(sc->bge_sysctl_tree), OID_AUTO,
+			SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
 			    "rx_coal_ticks_int", CTLTYPE_INT | CTLFLAG_RW,
 			    sc, 0, bge_sysctl_rx_coal_ticks_int, "I",
 			    "Receive coalescing ticks "
 			    "during interrupt (usec).");
-			SYSCTL_ADD_PROC(&sc->bge_sysctl_ctx,
-			    SYSCTL_CHILDREN(sc->bge_sysctl_tree), OID_AUTO,
+			SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
 			    "tx_coal_ticks_int", CTLTYPE_INT | CTLFLAG_RW,
 			    sc, 0, bge_sysctl_tx_coal_ticks_int, "I",
 			    "Transmit coalescing ticks "
 			    "during interrupt (usec).");
 		}
-		SYSCTL_ADD_PROC(&sc->bge_sysctl_ctx,
-		    SYSCTL_CHILDREN(sc->bge_sysctl_tree), OID_AUTO,
+		SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
 		    "rx_coal_bds_int", CTLTYPE_INT | CTLFLAG_RW,
 		    sc, 0, bge_sysctl_rx_coal_bds_int, "I",
 		    "Receive max coalesced BD count during interrupt.");
-		SYSCTL_ADD_PROC(&sc->bge_sysctl_ctx,
-		    SYSCTL_CHILDREN(sc->bge_sysctl_tree), OID_AUTO,
+		SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
 		    "tx_coal_bds_int", CTLTYPE_INT | CTLFLAG_RW,
 		    sc, 0, bge_sysctl_tx_coal_bds_int, "I",
 		    "Transmit max coalesced BD count during interrupt.");
@@ -2696,9 +2673,8 @@ again:
 
 #ifdef IFPOLL_ENABLE
 	/* Polling setup */
-	ifpoll_compat_setup(&sc->bge_npoll,
-	    &sc->bge_sysctl_ctx, sc->bge_sysctl_tree, device_get_unit(dev),
-	    ifp->if_serializer);
+	ifpoll_compat_setup(&sc->bge_npoll, ctx, tree,
+	    device_get_unit(dev), ifp->if_serializer);
 #endif
 
 	if (sc->bge_irq_type == PCI_INTR_TYPE_MSI) {
@@ -2765,9 +2741,6 @@ bge_detach(device_t dev)
 		bus_release_resource(dev, SYS_RES_MEMORY,
 		    PCIR_BAR(2), sc->bge_res2);
 	}
-
-	if (sc->bge_sysctl_tree != NULL)
-		sysctl_ctx_free(&sc->bge_sysctl_ctx);
 
 	bge_dma_free(sc);
 
@@ -3156,7 +3129,7 @@ refresh_rx:
 		}
 
 		IFNET_STAT_INC(ifp, ipackets, 1);
-#if !defined(__i386__) && !defined(__x86_64__)
+#if !defined(__x86_64__)
 		/*
 		 * The x86 allows unaligned accesses, but for other
 		 * platforms we must make sure the payload is aligned.
@@ -3601,7 +3574,7 @@ bge_encap(struct bge_softc *sc, struct mbuf **m_head0, uint32_t *txidx,
 		 * DMA read operation.  If it fails, keep moving on using
 		 * the original mbuf chain.
 		 */
-		m_new = m_defrag(m_head, MB_DONTWAIT);
+		m_new = m_defrag(m_head, M_NOWAIT);
 		if (m_new != NULL)
 			*m_head0 = m_head = m_new;
 	}
@@ -5044,7 +5017,7 @@ bge_get_eaddr(struct bge_softc *sc, uint8_t eaddr[])
 /*
  * NOTE: 'm' is not freed upon failure
  */
-struct mbuf *
+static struct mbuf *
 bge_defrag_shortdma(struct mbuf *m)
 {
 	struct mbuf *n;
@@ -5069,7 +5042,7 @@ bge_defrag_shortdma(struct mbuf *m)
 	}
 
 	if (found > 1)
-		n = m_defrag(m, MB_DONTWAIT);
+		n = m_defrag(m, M_NOWAIT);
 	else
 		n = m;
 	return n;

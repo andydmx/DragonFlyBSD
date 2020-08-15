@@ -32,11 +32,7 @@
 #include <btxv86.h>
 #include "libi386.h"
 
-#include "platform/acdragonfly.h"
-#include "acconfig.h"
-#define ACPI_SYSTEM_XFACE
-#include "actypes.h"
-#include "actbl.h"
+#include "acpi.h"
 
 /*
  * Detect ACPI and export information about the ACPI BIOS into the
@@ -60,6 +56,8 @@ biosacpi_detect(void)
 	return;
 
     /* export values from the RSDP */
+    sprintf(buf, "0x%08x", VTOP(rsdp));
+    setenv("hint.acpi.0.rsdp", buf, 1);
     revision = rsdp->Revision;
     if (revision == 0)
 	revision = 1;
@@ -81,7 +79,8 @@ biosacpi_detect(void)
 }
 
 /*
- * Find the RSDP in low memory.  See section 5.2.2 of the ACPI spec.
+ * Find the RSDP in low memory.  See "Finding the RSDP on IA-PC Systems" in
+ * the ACPI spec.
  */
 static ACPI_TABLE_RSDP *
 biosacpi_find_rsdp(void)
@@ -89,13 +88,15 @@ biosacpi_find_rsdp(void)
     ACPI_TABLE_RSDP	*rsdp;
     uint16_t		*addr;
 
-    /* EBDA is the 1 KB addressed by the 16 bit pointer at 0x40E. */
-    addr = (uint16_t *)PTOV(0x40E);
-    if ((rsdp = biosacpi_search_rsdp((char *)(*addr << 4), 0x400)) != NULL)
+    /* EBDA is the 1 KB addressed by the 16 bit pointer at 0x40e. */
+    addr = (uint16_t *)PTOV(ACPI_EBDA_PTR_LOCATION);
+    if ((rsdp = biosacpi_search_rsdp((char *)(*addr << 4),
+		    ACPI_EBDA_WINDOW_SIZE)) != NULL)
 	return (rsdp);
 
     /* Check the upper memory BIOS space, 0xe0000 - 0xfffff. */
-    if ((rsdp = biosacpi_search_rsdp((char *)0xe0000, 0x20000)) != NULL)
+    if ((rsdp = biosacpi_search_rsdp((char *)ACPI_HI_RSDP_WINDOW_BASE,
+		    ACPI_HI_RSDP_WINDOW_SIZE)) != NULL)
 	return (rsdp);
 
     return (NULL);

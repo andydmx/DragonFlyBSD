@@ -1,13 +1,13 @@
 /*
  * Copyright (c) 2008 The DragonFly Project.  All rights reserved.
- * 
+ *
  * This code is derived from software contributed to The DragonFly Project
  * by Matthew Dillon <dillon@backplane.com>
- * 
+ *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
  * are met:
- * 
+ *
  * 1. Redistributions of source code must retain the above copyright
  *    notice, this list of conditions and the following disclaimer.
  * 2. Redistributions in binary form must reproduce the above copyright
@@ -17,7 +17,7 @@
  * 3. Neither the name of The DragonFly Project nor the names of its
  *    contributors may be used to endorse or promote products derived
  *    from this software without specific, prior written permission.
- * 
+ *
  * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
  * ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
  * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
@@ -30,7 +30,7 @@
  * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT
  * OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
- * 
+ *
  * $DragonFly: src/usr.bin/undo/undo.c,v 1.6 2008/07/17 21:34:47 thomas Exp $
  */
 /*
@@ -41,7 +41,7 @@
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <sys/tree.h>
-#include <sys/param.h>
+#include <sys/ioctl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
@@ -49,6 +49,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <err.h>
 #include <vfs/hammer/hammer_disk.h>
 #include <vfs/hammer/hammer_ioctl.h>
 
@@ -71,33 +72,44 @@ enum undo_cmd { CMD_DUMP, CMD_ITERATEALL };
 
 #define UNDO_FLAG_MULT		0x0001
 #define UNDO_FLAG_INOCHG	0x0002
-#define UNDO_FLAG_SETTID1	0x0004
-#define UNDO_FLAG_SETTID2	0x0008
+#define UNDO_FLAG_TID_INDEX1	0x0004
+#define UNDO_FLAG_TID_INDEX2	0x0008
 
 static int undo_hist_entry_compare(struct undo_hist_entry *he1,
 		    struct undo_hist_entry *he2);
-static void doiterate(const char *filename, const char *outFileName,
-		   const char *outFilePostfix, int flags,
+static void doiterate(const char *filename, int flags,
 		   struct hammer_ioc_hist_entry ts1,
 		   struct hammer_ioc_hist_entry ts2,
 		   enum undo_cmd cmd, enum undo_type type);
-static void dogenerate(const char *filename, const char *outFileName,
-		   const char *outFilePostfix,
-		   int flags, int idx, enum undo_type type,
+static int doiterate_dump(const char *filename, int flags,
+		   struct undo_hist_entry_rb_tree *ptse_tree,
 		   struct hammer_ioc_hist_entry ts1,
-		   struct hammer_ioc_hist_entry ts2);
-static void collect_history(int fd, int *error,
+		   struct hammer_ioc_hist_entry ts2,
+		   enum undo_type type);
+static int doiterate_iterall(const char *filename, int flags,
+		   struct undo_hist_entry_rb_tree *ptse_tree,
+		   enum undo_type type);
+static void dogenerate(const char *filename, int flags,
+		   struct hammer_ioc_hist_entry ts1,
+		   struct hammer_ioc_hist_entry ts2,
+		   int idx, enum undo_type type);
+static void __collect_history(int fd, int *error,
 		   struct undo_hist_entry_rb_tree *tse_tree);
+static void collect_history(const char *filename, int *errorp,
+		   struct undo_hist_entry_rb_tree *dir_tree);
 static void collect_dir_history(const char *filename, int *error,
 		   struct undo_hist_entry_rb_tree *dir_tree);
 static void clean_tree(struct undo_hist_entry_rb_tree *tree);
 static hammer_tid_t parse_delta_time(const char *timeStr, int *flags,
 		   int ind_flag);
+static FILE *_fopen(const char *filename, const char *mode);
 static void runcmd(int fd, const char *cmd, ...);
-static char *timestamp(hammer_ioc_hist_entry_t hen);
+static char *timestamp(struct hammer_ioc_hist_entry *hen);
 static void usage(void);
 
 static int VerboseOpt;
+static const char *OutFileName = NULL;
+static const char *OutFilePostfix = NULL;
 
 RB_GENERATE2(undo_hist_entry_rb_tree, undo_hist_entry, rbnode,
 	undo_hist_entry_compare, hammer_tid_t, tse.tid);
@@ -106,8 +118,6 @@ RB_GENERATE2(undo_hist_entry_rb_tree, undo_hist_entry, rbnode,
 int
 main(int ac, char **av)
 {
-	const char *outFileName = NULL;
-	const char *outFilePostfix = NULL;
 	enum undo_cmd cmd;
 	enum undo_type type;
 	struct hammer_ioc_hist_entry ts1;
@@ -142,13 +152,13 @@ main(int ac, char **av)
 			cmd = CMD_ITERATEALL;
 			break;
 		case 'u':
-			outFilePostfix = ".undo";
+			OutFilePostfix = ".undo";
 			break;
 		case 'v':
 			++VerboseOpt;
 			break;
 		case 'o':
-			outFileName = optarg;
+			OutFileName = optarg;
 			break;
 		case 't':
 			/*
@@ -158,10 +168,10 @@ main(int ac, char **av)
 			++count_t;
 			if (count_t == 1) {
 				ts1.tid = parse_delta_time(optarg, &flags,
-				                           UNDO_FLAG_SETTID1);
+							UNDO_FLAG_TID_INDEX1);
 			} else if (count_t == 2) {
 				ts2.tid = parse_delta_time(optarg, &flags,
-				                           UNDO_FLAG_SETTID2);
+							UNDO_FLAG_TID_INDEX2);
 				if (type == TYPE_FILE)
 					type = TYPE_DIFF;
 			} else {
@@ -178,7 +188,7 @@ main(int ac, char **av)
 	/*
 	 * Option validation
 	 */
-	if (outFileName && outFilePostfix) {
+	if (OutFileName && OutFilePostfix) {
 		fprintf(stderr, "The -o option may not be combined with -u\n");
 		usage();
 	}
@@ -194,8 +204,8 @@ main(int ac, char **av)
 	/*
 	 * Validate the output template, if specified.
 	 */
-	if (outFileName && (flags & UNDO_FLAG_MULT)) {
-		const char *ptr = outFileName;
+	if (OutFileName && (flags & UNDO_FLAG_MULT)) {
+		const char *ptr = OutFileName;
 		int didStr = 0;
 
 		while ((ptr = strchr(ptr, '%')) != NULL) {
@@ -217,8 +227,7 @@ main(int ac, char **av)
 	}
 
 	while (ac) {
-		doiterate(*av, outFileName, outFilePostfix,
-			  flags, ts1, ts2, cmd, type);
+		doiterate(*av, flags, ts1, ts2, cmd, type);
 		++av;
 		--ac;
 	}
@@ -235,144 +244,159 @@ main(int ac, char **av)
  */
 static
 void
-doiterate(const char *filename, const char *outFileName,
-	  const char *outFilePostfix, int flags,
+doiterate(const char *filename, int flags,
 	  struct hammer_ioc_hist_entry ts1,
 	  struct hammer_ioc_hist_entry ts2,
 	  enum undo_cmd cmd, enum undo_type type)
 {
 	struct undo_hist_entry_rb_tree dir_tree;
 	struct undo_hist_entry_rb_tree tse_tree;
-	struct undo_hist_entry *tse1;
-	struct undo_hist_entry *tse2;
-	struct hammer_ioc_hist_entry tid_max;
+	struct undo_hist_entry *tse;
 	struct stat sb;
 	char *path = NULL;
-	int i;
-	int fd;
 	int error;
 
 	RB_INIT(&dir_tree);
 	RB_INIT(&tse_tree);
-
-	tid_max.tid = HAMMER_MAX_TID;
-	tid_max.time32 = 0;
 
 	/*
 	 * Use the directory history to locate all possible versions of
 	 * the file.
 	 */
 	collect_dir_history(filename, &error, &dir_tree);
-	RB_FOREACH(tse1, undo_hist_entry_rb_tree, &dir_tree) {
-		asprintf(&path, "%s@@0x%016jx", filename, (uintmax_t)tse1->tse.tid);
-		if (stat(path, &sb) == 0 && sb.st_mode & S_IFIFO) {
-			fprintf(stderr, "Warning: fake transaction id 0x%016jx\n", (uintmax_t)tse1->tse.tid);
+	RB_FOREACH(tse, undo_hist_entry_rb_tree, &dir_tree) {
+		asprintf(&path, "%s@@0x%016jx", filename, (uintmax_t)tse->tse.tid);
+		if (stat(path, &sb) == 0 && (sb.st_mode & S_IFIFO)) {
+			fprintf(stderr, "Warning: fake transaction id %s@@0x%016jx\n",
+				filename,
+				(uintmax_t)tse->tse.tid);
+			free(path);
 			continue;
 		}
-		if ((fd = open(path, O_RDONLY)) > 0) {
-			collect_history(fd, &error, &tse_tree);
-			close(fd);
-		}
+		collect_history(path, &error, &tse_tree);
 		free(path);
 	}
-	if ((fd = open(filename, O_RDONLY)) > 0) {
-		collect_history(fd, &error, &tse_tree);
-		close(fd);
-	}
-	if (cmd == CMD_DUMP) {
-		if ((ts1.tid == 0 ||
-		     flags & (UNDO_FLAG_SETTID1|UNDO_FLAG_SETTID2)) &&
-		    RB_EMPTY(&tse_tree)) {
-			if ((fd = open(filename, O_RDONLY)) > 0) {
-				collect_history(fd, &error, &tse_tree);
-				close(fd);
-			}
-		}
-		/*
-		 * Find entry if tid set to placeholder index
-		 */
-		if (flags & UNDO_FLAG_SETTID1){
-			tse1 = RB_MAX(undo_hist_entry_rb_tree, &tse_tree);
-			while (tse1 && ts1.tid--) {
-				tse1 = RB_PREV(undo_hist_entry_rb_tree,
-					       &tse_tree, tse1);
-			}
-			if (tse1)
-				ts1 = tse1->tse;
-			else
-				ts1.tid = 0;
-		}
-		if (flags & UNDO_FLAG_SETTID2){
-			tse2 = RB_MAX(undo_hist_entry_rb_tree, &tse_tree);
-			while (tse2 && ts2.tid--) {
-				tse2 = RB_PREV(undo_hist_entry_rb_tree,
-					       &tse_tree, tse2);
-			}
-			if (tse2)
-				ts2 = tse2->tse;
-			else
-				ts2.tid = 0;
-		}
+	collect_history(filename, &error, &tse_tree);
 
-		/*
-		 * Single entry, most recent prior to current
-		 */
-		if (ts1.tid == 0) {
-			tse2 = RB_MAX(undo_hist_entry_rb_tree, &tse_tree);
-			if (tse2) {
-				ts2 = tse2->tse;
-				tse1 = RB_PREV(undo_hist_entry_rb_tree,
-					       &tse_tree, tse2);
-				if (tse1)
-					ts1 = tse1->tse;
-			}
-		}
-		if (ts1.tid == 0) {
+	switch (cmd) {
+	case CMD_DUMP:
+		if (doiterate_dump(filename, flags, &tse_tree, ts1, ts2, type) == -1)
 			printf("%s: No UNDO history found\n", filename);
-		} else {
-			dogenerate(filename,
-				   outFileName, outFilePostfix,
-				   0, 0, type,
-				   ts1, ts2);
-		}
-	} else if (RB_ROOT(&tse_tree)) {
-		/*
-		 * Iterate entire history
-		 */
-		printf("%s: ITERATE ENTIRE HISTORY\n", filename);
-
-		tse1 = NULL;
-		i = 0;
-		RB_FOREACH(tse2, undo_hist_entry_rb_tree, &tse_tree) {
-			if (tse1) {
-				dogenerate(filename,
-					   outFileName, outFilePostfix,
-					   flags, i, type,
-					   tse1->tse, tse2->tse);
-			}
-			if (tse1 && tse2->inum != tse1->inum)
-				flags |= UNDO_FLAG_INOCHG;
-			else
-				flags &= ~UNDO_FLAG_INOCHG;
-			tse1 = tse2;
-			++i;
-		}
-		/*
-		 * There is no delta to print for the last pair,
-		 * because they are identical.
-		 */
-		if (type != TYPE_DIFF && type != TYPE_RDIFF) {
-			dogenerate(filename,
-				   outFileName, outFilePostfix,
-				   flags, i, type,
-				   tse1->tse, tid_max);
-		}
-	} else {
-		printf("%s: ITERATE ENTIRE HISTORY: %s\n",
-		       filename, strerror(error));
+		break;
+	case CMD_ITERATEALL:
+		if (doiterate_iterall(filename, flags, &tse_tree, type) == -1)
+			printf("%s: No UNDO history found\n", filename);
+		break;
+	default:
+		fprintf(stderr, "Invalid command %d\n", cmd);
+		break;
 	}
+
 	clean_tree(&dir_tree);
 	clean_tree(&tse_tree);
+}
+
+static
+int
+doiterate_dump(const char *filename, int flags,
+		struct undo_hist_entry_rb_tree *ptse_tree,
+		struct hammer_ioc_hist_entry ts1,
+		struct hammer_ioc_hist_entry ts2,
+		enum undo_type type)
+{
+	struct undo_hist_entry *tse1;
+	struct undo_hist_entry *tse2;
+
+	/*
+	 * Find entry if tid set to placeholder index
+	 */
+	if (flags & UNDO_FLAG_TID_INDEX1) {
+		tse1 = RB_MAX(undo_hist_entry_rb_tree, ptse_tree);
+		while (tse1 && ts1.tid--) {
+			tse1 = RB_PREV(undo_hist_entry_rb_tree,
+				       ptse_tree, tse1);
+		}
+		if (tse1)
+			ts1 = tse1->tse;
+		else
+			ts1.tid = 0;
+	}
+	if (flags & UNDO_FLAG_TID_INDEX2) {
+		tse2 = RB_MAX(undo_hist_entry_rb_tree, ptse_tree);
+		while (tse2 && ts2.tid--) {
+			tse2 = RB_PREV(undo_hist_entry_rb_tree,
+				       ptse_tree, tse2);
+		}
+		if (tse2)
+			ts2 = tse2->tse;
+		else
+			ts2.tid = 0;
+	}
+
+	/*
+	 * Single entry, most recent prior to current
+	 */
+	if (ts1.tid == 0) {
+		tse2 = RB_MAX(undo_hist_entry_rb_tree, ptse_tree);
+		if (tse2) {
+			ts2 = tse2->tse;
+			tse1 = RB_PREV(undo_hist_entry_rb_tree,
+				       ptse_tree, tse2);
+			if (tse1)
+				ts1 = tse1->tse;
+		}
+	}
+
+	if (ts1.tid) {
+		dogenerate(filename, 0, ts1, ts2, 0, type);
+		return(0);
+	}
+	return(-1);
+}
+
+static
+int
+doiterate_iterall(const char *filename, int flags,
+		struct undo_hist_entry_rb_tree *ptse_tree,
+		enum undo_type type)
+{
+	struct undo_hist_entry *tse1;
+	struct undo_hist_entry *tse2;
+	struct hammer_ioc_hist_entry tid_max;
+	int i;
+
+	if (RB_ROOT(ptse_tree) == NULL)
+		return(-1);
+
+	/*
+	 * Iterate entire history
+	 */
+	printf("%s: ITERATE ENTIRE HISTORY\n", filename);
+
+	tse1 = NULL;
+	i = 0;
+	RB_FOREACH(tse2, undo_hist_entry_rb_tree, ptse_tree) {
+		if (tse1) {
+			dogenerate(filename, flags, tse1->tse, tse2->tse, i, type);
+		}
+		if (tse1 && tse2->inum != tse1->inum)
+			flags |= UNDO_FLAG_INOCHG;
+		else
+			flags &= ~UNDO_FLAG_INOCHG;
+		tse1 = tse2;
+		++i;
+	}
+
+	/*
+	 * There is no delta to print for the last pair,
+	 * because they are identical.
+	 */
+	if (type != TYPE_DIFF && type != TYPE_RDIFF) {
+		tid_max.tid = HAMMER_MAX_TID;
+		tid_max.time32 = 0;
+		dogenerate(filename, flags, tse1->tse, tid_max, i, type);
+	}
+	return(0);
 }
 
 /*
@@ -381,26 +405,23 @@ doiterate(const char *filename, const char *outFileName,
  */
 static
 void
-dogenerate(const char *filename, const char *outFileName,
-	   const char *outFilePostfix,
-	   int flags, int idx, enum undo_type type,
+dogenerate(const char *filename, int flags,
 	   struct hammer_ioc_hist_entry ts1,
-	   struct hammer_ioc_hist_entry ts2)
+	   struct hammer_ioc_hist_entry ts2,
+	   int idx, enum undo_type type)
 {
 	struct stat st;
 	const char *elm;
 	char *ipath1 = NULL;
 	char *ipath2 = NULL;
 	FILE *fi;
-	FILE *fp; 
+	FILE *fp;
 	char *buf;
 	char *path;
 	time_t t;
 	struct tm *tp;
 	char datestr[64];
 	int n;
-
-	buf = malloc(8192);
 
 	/*
 	 * Open the input file.  If ts1 is 0 try to locate the most recent
@@ -423,7 +444,7 @@ dogenerate(const char *filename, const char *outFileName,
 		}
 		free(ipath1);
 		free(ipath2);
-		goto done;
+		return;
 	}
 
 	/*
@@ -437,34 +458,22 @@ dogenerate(const char *filename, const char *outFileName,
 	/*
 	 * Where do we stuff our output?
 	 */
-	if (outFileName) {
+	if (OutFileName) {
 		if (flags & UNDO_FLAG_MULT) {
-			asprintf(&path, outFileName, elm);
-			fp = fopen(path, "w");
-			if (fp == NULL) {
-				perror(path);
-				exit(1);
-			}
+			asprintf(&path, OutFileName, elm);
+			fp = _fopen(path, "w");
 			free(path);
 		} else {
-			fp = fopen(outFileName, "w");
-			if (fp == NULL) {
-				perror(outFileName);
-				exit(1);
-			}
+			fp = _fopen(OutFileName, "w");
 		}
-	} else if (outFilePostfix) {
+	} else if (OutFilePostfix) {
 		if (idx >= 0) {
 			asprintf(&path, "%s%s.%04d", filename,
-				 outFilePostfix, idx);
+				 OutFilePostfix, idx);
 		} else {
-			asprintf(&path, "%s%s", filename, outFilePostfix);
+			asprintf(&path, "%s%s", filename, OutFilePostfix);
 		}
-		fp = fopen(path, "w");
-		if (fp == NULL) {
-			perror(path);
-			exit(1);
-		}
+		fp = _fopen(path, "w");
 		free(path);
 	} else {
 		if ((flags & UNDO_FLAG_MULT) && type == TYPE_FILE) {
@@ -487,22 +496,28 @@ dogenerate(const char *filename, const char *outFileName,
 
 	switch(type) {
 	case TYPE_FILE:
+		buf = malloc(8192);
+		if (buf == NULL)
+			err(1, "malloc");
 		if ((fi = fopen(ipath1, "r")) != NULL) {
 			while ((n = fread(buf, 1, 8192, fi)) > 0)
 				fwrite(buf, 1, n, fp);
 			fclose(fi);
 		}
+		free(buf);
 		break;
 	case TYPE_DIFF:
 		printf("diff -N -r -u %s %s (to %s)\n",
 		       ipath1, ipath2, timestamp(&ts2));
 		fflush(stdout);
-		runcmd(fileno(fp), "/usr/bin/diff", "diff", "-N", "-r", "-u", ipath1, ipath2, NULL);
+		runcmd(fileno(fp), "/usr/bin/diff", "diff", "-N", "-r", "-u",
+			ipath1, ipath2, NULL);
 		break;
 	case TYPE_RDIFF:
 		printf("diff -N -r -u %s %s\n", ipath2, ipath1);
 		fflush(stdout);
-		runcmd(fileno(fp), "/usr/bin/diff", "diff", "-N", "-r", "-u", ipath2, ipath1, NULL);
+		runcmd(fileno(fp), "/usr/bin/diff", "diff", "-N", "-r", "-u",
+			ipath2, ipath1, NULL);
 		break;
 	case TYPE_HISTORY:
 		t = (time_t)ts1.time32;
@@ -519,8 +534,6 @@ dogenerate(const char *filename, const char *outFileName,
 
 	if (fp != stdout)
 		fclose(fp);
-done:
-	free(buf);
 }
 
 static
@@ -537,12 +550,11 @@ clean_tree(struct undo_hist_entry_rb_tree *tree)
 
 static
 void
-collect_history(int fd, int *errorp, struct undo_hist_entry_rb_tree *tse_tree)
+__collect_history(int fd, int *errorp, struct undo_hist_entry_rb_tree *tse_tree)
 {
 	struct hammer_ioc_history hist;
 	struct undo_hist_entry *tse;
 	struct stat st;
-	int istmp;
 	int i;
 
 	/*
@@ -557,14 +569,6 @@ collect_history(int fd, int *errorp, struct undo_hist_entry_rb_tree *tse_tree)
 
 	*errorp = 0;
 
-	if (tse_tree == NULL) {
-		tse_tree = malloc(sizeof(*tse_tree));
-		RB_INIT(tse_tree);
-		istmp = 1;
-	} else {
-		istmp = 0;
-	}
-
 	/*
 	 * Save the inode so inode changes can be reported.
 	 */
@@ -576,7 +580,7 @@ collect_history(int fd, int *errorp, struct undo_hist_entry_rb_tree *tse_tree)
 	 */
 	if (ioctl(fd, HAMMERIOC_GETHISTORY, &hist) < 0) {
 		*errorp = errno;
-		goto done;
+		return;
 	}
 	for (;;) {
 		for (i = 0; i < hist.count; ++i) {
@@ -593,22 +597,29 @@ collect_history(int fd, int *errorp, struct undo_hist_entry_rb_tree *tse_tree)
 			hist.key = hist.nxt_key;
 			hist.nxt_key = HAMMER_MAX_KEY;
 		}
-		if (hist.head.flags & HAMMER_IOC_HISTORY_NEXT_TID) 
+		if (hist.head.flags & HAMMER_IOC_HISTORY_NEXT_TID)
 			hist.beg_tid = hist.nxt_tid;
 		if (ioctl(fd, HAMMERIOC_GETHISTORY, &hist) < 0) {
 			*errorp = errno;
 			break;
 		}
 	}
+}
 
-	/*
-	 * Cleanup
-	 */
-done:
-	if (istmp) {
-		clean_tree(tse_tree);
-		free(tse_tree);
+static
+void
+collect_history(const char *filename, int *errorp,
+		struct undo_hist_entry_rb_tree *dir_tree)
+{
+	int fd;
+
+	fd = open(filename, O_RDONLY);
+	if (fd == -1) {
+		*errorp = errno;
+		return;
 	}
+	__collect_history(fd, errorp, dir_tree);
+	close(fd);
 }
 
 static
@@ -617,20 +628,16 @@ collect_dir_history(const char *filename, int *errorp,
 		    struct undo_hist_entry_rb_tree *dir_tree)
 {
 	char *dirname;
-	int fd;
-	int error;
 
-	*errorp = 0;
 	if (strrchr(filename, '/')) {
 		dirname = strdup(filename);
 		*strrchr(dirname, '/') = 0;
 	} else {
 		dirname = strdup(".");
 	}
-	if ((fd = open(dirname, O_RDONLY)) > 0) {
-		collect_history(fd, &error, dir_tree);
-		close(fd);
-	}
+
+	collect_history(dirname, errorp, dir_tree);
+	free(dirname);
 }
 
 static
@@ -645,6 +652,18 @@ parse_delta_time(const char *timeStr, int *flags, int ind_flag)
 	if (timeStr[0] >= '0' && timeStr[0] <= '9' && timeStr[1] != 'x')
 		*flags |= ind_flag;
 	return(tid);
+}
+
+static
+FILE*
+_fopen(const char *filename, const char *mode)
+{
+	FILE *fp;
+
+	fp = fopen(filename, mode);
+	if (fp == NULL)
+		err(1, "%s", filename);
+	return(fp);
 }
 
 static void
@@ -669,8 +688,7 @@ runcmd(int fd, const char *cmd, ...)
 	av[i] = NULL;
 
 	if ((pid = fork()) < 0) {
-		perror("fork");
-		exit(1);
+		err(1, "fork");
 	} else if (pid == 0) {
 		if (fd != 1) {
 			dup2(fd, 1);
@@ -689,7 +707,7 @@ runcmd(int fd, const char *cmd, ...)
  * Convert tid to timestamp.
  */
 static char *
-timestamp(hammer_ioc_hist_entry_t hen)
+timestamp(struct hammer_ioc_hist_entry *hen)
 {
 	static char timebuf[64];
 	time_t t = (time_t)hen->time32;

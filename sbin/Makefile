@@ -1,7 +1,5 @@
 #	@(#)Makefile	8.5 (Berkeley) 3/31/94
 # $FreeBSD: src/sbin/Makefile,v 1.77.2.9 2002/08/08 09:03:46 ru Exp $
-#
-# XXX MISSING:		icheck ncheck
 
 SUBDIR=	adjkerntz \
 	badsect \
@@ -14,9 +12,10 @@ SUBDIR=	adjkerntz \
 	devd \
 	devfsctl \
 	dhclient \
+	dhcpcd \
+	diskinfo \
 	disklabel32 \
 	disklabel64 \
-	diskinfo \
 	dmesg \
 	dump \
 	dumpfs \
@@ -24,17 +23,20 @@ SUBDIR=	adjkerntz \
 	ffsinfo \
 	fsck \
 	fsck_msdosfs \
+	fsck_hammer2 \
 	fsdb \
 	fsid \
 	fsirand \
 	getdevpath \
-	growfs \
 	gpt \
+	growfs \
 	hammer \
+	hammer2 \
 	ifconfig \
 	init \
 	ip6fw \
 	ipfw \
+	ipfw3 \
 	iscontrol \
 	jscan \
 	kldconfig \
@@ -43,55 +45,58 @@ SUBDIR=	adjkerntz \
 	kldunload \
 	ldconfig \
 	md5 \
-	mkinitrd \
-	mountctl \
 	mount \
-	mount_ufs \
+	mount_autofs \
 	mount_cd9660 \
 	mount_devfs \
 	mount_dirfs \
 	mount_ext2fs \
+	mount_fuse \
 	mount_hammer \
+	mount_hammer2 \
 	mount_hpfs \
 	mount_msdos \
 	mount_nfs \
 	mount_ntfs \
 	mount_null \
-	mount_portal \
 	mount_std \
 	mount_tmpfs \
 	mount_udf \
-	mount_union \
+	mount_ufs \
+	mountctl \
 	mountd \
 	natacontrol \
 	natd \
 	newbtconf \
 	newfs \
 	newfs_hammer \
+	newfs_hammer2 \
 	newfs_msdos \
 	nfsd \
 	nfsiod \
 	nologin \
 	nos-tun \
+	nvmectl \
 	ping \
 	ping6 \
 	quotacheck \
-	reboot \
 	rconfig \
 	rcorder \
+	rcrun \
+	reboot \
+	resolvconf \
 	restore \
 	route \
 	routed \
 	rtsol \
-	rcrun \
 	savecore \
 	shutdown \
 	slattach \
 	spppcontrol \
 	startslip \
+	svc \
 	swapon \
 	sysctl \
-	svc \
 	tcplay \
 	tunefs \
 	udevd \
@@ -100,13 +105,9 @@ SUBDIR=	adjkerntz \
 	vinum \
 	vquota
 
-.if ${MACHINE_ARCH} == i386 || ${MACHINE_ARCH} == x86_64
-.if ${MACHINE_ARCH} == i386
-SUBDIR+=kget
-.endif
+.if ${MACHINE_ARCH} == "x86_64"
 SUBDIR+=mount_smbfs \
-	fdisk \
-	nextboot
+	fdisk
 .endif
 
 .if exists(${.CURDIR}/${MACHINE})

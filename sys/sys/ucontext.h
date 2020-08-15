@@ -31,6 +31,9 @@
 #ifndef _SYS_UCONTEXT_H_
 #define	_SYS_UCONTEXT_H_
 
+#ifndef _SYS_CDEFS_H_
+#include <sys/cdefs.h>
+#endif
 #ifndef _SYS_SIGNAL_H_
 #include <sys/signal.h>
 #endif
@@ -50,18 +53,23 @@ typedef struct __ucontext {
 
 	struct __ucontext *uc_link;
 	stack_t		uc_stack;
-	int		__spare__[8];
+	void		(*uc_cofunc)(struct __ucontext *, void *);
+	void		*uc_arg;
+	int		__spare__[4];
 } ucontext_t;
 
 #ifndef _KERNEL
  
 __BEGIN_DECLS
   
-#if __BSD_VISIBLE || __POSIX_VISIBLE < 200809
-int	getcontext(ucontext_t *);
-int	setcontext(const ucontext_t *);
+#if __BSD_VISIBLE || (__POSIX_VISIBLE && __POSIX_VISIBLE < 200809)
+int	getcontext(ucontext_t *) __returns_twice;
+int	setcontext(const ucontext_t *) __dead2;
 void	makecontext(ucontext_t *, void (*)(void), int, ...);
 int	swapcontext(ucontext_t *, const ucontext_t *);
+void	setcontext_quick(ucontext_t *);
+void	makecontext_quick(ucontext_t *);
+void	swapcontext_quick(ucontext_t *, ucontext_t *);
 #endif
    
 __END_DECLS

@@ -10,10 +10,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by John Birrell.
- * 4. Neither the name of the author nor the names of any co-contributors
+ * 3. Neither the name of the author nor the names of any co-contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -29,17 +26,14 @@
  * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
  *
- * $DragonFly: src/lib/libthread_xu/thread/thr_spinlock.c,v 1.3 2006/04/06 13:03:09 davidxu Exp $
  */
 
-#include "namespace.h"
 #include <sys/types.h>
 #include <machine/atomic.h>
 #include <machine/tls.h>
 #include <pthread.h>
 #include <libc_private.h>
 #include "spinlock.h"
-#include "un-namespace.h"
 
 #include "thr_private.h"
 
@@ -61,10 +55,10 @@ static int			initialized;
 static void	init_spinlock(spinlock_t *lck);
 
 /*
- * These are for compatability only.  Spinlocks of this type
- * are deprecated.
+ * These functions implement temporary spinlocks as used by libc.
+ * these are not persistent spinlocks, so we use the API for
+ * temporary locks which block all signals for the duration.
  */
-
 void
 _spinunlock(spinlock_t *lck)
 {

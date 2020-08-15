@@ -126,7 +126,7 @@ struct aps_sensor_rec {
 #define APS_SENSOR_LIDOPEN	8
 
 struct aps_softc {
-	struct device		*sc_dev;
+	device_t		sc_dev;
 
 	struct resource		*sc_iores;
 	int			sc_iorid;
@@ -137,13 +137,13 @@ struct aps_softc {
 	struct aps_sensor_rec	aps_data;
 };
 
-static void	aps_identify(driver_t *, struct device *);
-static int	aps_probe(struct device *);
-static int	aps_attach(struct device *);
-static int	aps_detach(struct device *);
+static void	aps_identify(driver_t *, device_t);
+static int	aps_probe(device_t);
+static int	aps_attach(device_t);
+static int	aps_detach(device_t);
 
-static int	aps_resume(struct device *);
-static int	aps_suspend(struct device *);
+static int	aps_resume(device_t);
+static int	aps_suspend(device_t);
 
 static int	aps_init(struct resource *);
 static int	aps_read_data(struct aps_softc *);
@@ -246,9 +246,9 @@ aps_do_io(struct resource *iores, unsigned char *buf, int wmask, int rmask)
 /* for hints, see /sys/bus/isa/isahint.c */
 
 static void
-aps_identify(driver_t *driver, struct device *parent)
+aps_identify(driver_t *driver, device_t parent)
 {
-	struct device *child;
+	device_t child;
 
 	child = device_find_child(parent, driver->name, -1);
 	if (child != NULL) {
@@ -287,7 +287,7 @@ aps_identify(driver_t *driver, struct device *parent)
 }
 
 static int
-aps_probe(struct device *dev)
+aps_probe(device_t dev)
 {
 	struct resource *iores;
 	int iorid = 0;
@@ -339,7 +339,7 @@ aps_probe(struct device *dev)
 }
 
 static int
-aps_attach(struct device *dev)
+aps_attach(device_t dev)
 {
 	struct aps_softc *sc = device_get_softc(dev);
 
@@ -396,18 +396,14 @@ aps_attach(struct device *dev)
 
 	/* Refresh sensor data every 1 second */
 	/* XXX: a more frequent refresh might be appropriate */
-	if (sensor_task_register(sc, aps_refresh, 1)) {
-		device_printf(dev, "unable to register update task\n");
-		bus_release_resource(dev, SYS_RES_IOPORT, sc->sc_iorid, sc->sc_iores);
-		return ENXIO;
-	}
+	sensor_task_register(sc, aps_refresh, 1);
 
 	sensordev_install(&sc->sensordev);
 	return 0;
 }
 
 static int
-aps_detach(struct device *dev)
+aps_detach(device_t dev)
 {
 	struct aps_softc *sc = device_get_softc(dev);
 
@@ -539,7 +535,7 @@ aps_refresh(void *arg)
 }
 
 static int
-aps_resume(struct device *dev)
+aps_resume(device_t dev)
 {
 	struct aps_softc *sc = device_get_softc(dev);
 	unsigned char iobuf[16];
@@ -562,7 +558,7 @@ aps_resume(struct device *dev)
 }
 
 static int
-aps_suspend(struct device *dev)
+aps_suspend(device_t dev)
 {
 	struct aps_softc *sc = device_get_softc(dev);
 

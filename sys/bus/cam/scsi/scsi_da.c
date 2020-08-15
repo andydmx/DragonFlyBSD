@@ -46,11 +46,8 @@
 #include <sys/malloc.h>
 #include <sys/cons.h>
 #include <sys/proc.h>
-#include <sys/ioctl_compat.h>
 
 #include <sys/buf2.h>
-#include <sys/thread2.h>
-#include <sys/mplock2.h>
 
 #endif /* _KERNEL */
 
@@ -71,6 +68,7 @@
 #include "../cam_xpt_periph.h"
 #include "../cam_sim.h"
 
+#include "scsi_daio.h"
 #include "scsi_message.h"
 
 #ifndef _KERNEL 
@@ -90,14 +88,13 @@ typedef enum {
 	DA_FLAG_PACK_LOCKED	= 0x004,
 	DA_FLAG_PACK_REMOVABLE	= 0x008,
 	DA_FLAG_TAGGED_QUEUING	= 0x010,
-	DA_FLAG_NEED_OTAG	= 0x020,
-	DA_FLAG_WENT_IDLE	= 0x040,
 	DA_FLAG_RETRY_UA	= 0x080,
 	DA_FLAG_OPEN		= 0x100,
 	DA_FLAG_SCTX_INIT	= 0x200,
 	DA_FLAG_RD_LIMIT	= 0x400,
 	DA_FLAG_WR_LIMIT	= 0x800,
-	DA_FLAG_CAN_TRIM	= 0x1000
+	DA_FLAG_CAN_TRIM	= 0x1000,
+	DA_FLAG_CAP_MUTE	= 0x2000
 } da_flags;
 
 typedef enum {
@@ -108,6 +105,7 @@ typedef enum {
 } da_quirks;
 
 typedef enum {
+	DA_CCB_POLLED		= 0x00,
 	DA_CCB_PROBE		= 0x01,
 	DA_CCB_PROBE2		= 0x02,
 	DA_CCB_BUFFER_IO	= 0x03,
@@ -148,9 +146,11 @@ struct da_softc {
 	da_flags flags;	
 	da_quirks quirks;
 	int	 minimum_cmd_size;
-	int	 ordered_tag_count;
-	int	 outstanding_cmds_rd;
-	int	 outstanding_cmds_wr;
+	int	 outstanding_cmds_rd;	/* outstanding read requests */
+	int	 outstanding_cmds_wr;	/* outstanding write requests */
+	int	 tps_ticks;
+	long	 tps_rd;		/* read bandwidth exponential/tick */
+	long	 tps_wr;		/* write bandwidth exponential/tick */
 	int      trim_max_ranges;
 	int      trim_running;
 	int      trim_enabled;
@@ -160,7 +160,6 @@ struct da_softc {
 	struct task		sysctl_task;
 	struct sysctl_ctx_list	sysctl_ctx;
 	struct sysctl_oid	*sysctl_tree;
-	struct callout		sendordered_c;
 	struct trim_request     trim_req;
 };
 
@@ -351,12 +350,11 @@ static	void		dadone(struct cam_periph *periph,
 static  int		daerror(union ccb *ccb, u_int32_t cam_flags,
 				u_int32_t sense_flags);
 static void		daprevent(struct cam_periph *periph, int action);
-static int		dagetcapacity(struct cam_periph *periph);
+static int		dagetcapacity(struct cam_periph *periph, int ccbflags);
 static int		dacheckmedia(struct cam_periph *periph);
 static void		dasetgeom(struct cam_periph *periph, uint32_t block_len,
 				  uint64_t maxsector);
 static void		daflushbioq(struct bio_queue_head *bioq, int error);
-static timeout_t	dasendorderedtag;
 static void		dashutdown(void *arg, int howto);
 
 #ifndef DA_DEFAULT_TIMEOUT
@@ -367,14 +365,11 @@ static void		dashutdown(void *arg, int howto);
 #define	DA_DEFAULT_RETRY	4
 #endif
 
-#ifndef	DA_DEFAULT_SEND_ORDERED
-#define	DA_DEFAULT_SEND_ORDERED	1
-#endif
-
-static int da_retry_count = DA_DEFAULT_RETRY;
-static int da_default_timeout = DA_DEFAULT_TIMEOUT;
-static int da_send_ordered = DA_DEFAULT_SEND_ORDERED;
-static struct callout dasendorderedtag_ch;
+__read_mostly int da_retry_count = DA_DEFAULT_RETRY;
+__read_mostly int da_default_timeout = DA_DEFAULT_TIMEOUT;
+__read_mostly static int da_balance_enable = 1;
+__read_mostly static int da_balance_ratio = 100;	/* read-to-write */
+__read_mostly static int da_balance_debug = 0;
 
 SYSCTL_NODE(_kern_cam, OID_AUTO, da, CTLFLAG_RD, 0,
             "CAM Direct Access Disk driver");
@@ -384,25 +379,13 @@ TUNABLE_INT("kern.cam.da.retry_count", &da_retry_count);
 SYSCTL_INT(_kern_cam_da, OID_AUTO, default_timeout, CTLFLAG_RW,
            &da_default_timeout, 0, "Normal I/O timeout (in seconds)");
 TUNABLE_INT("kern.cam.da.default_timeout", &da_default_timeout);
-SYSCTL_INT(_kern_cam_da, OID_AUTO, da_send_ordered, CTLFLAG_RW,
-           &da_send_ordered, 0, "Send Ordered Tags");
-TUNABLE_INT("kern.cam.da.da_send_ordered", &da_send_ordered);
 
-/*
- * DA_ORDEREDTAG_INTERVAL determines how often, relative
- * to the default timeout, we check to see whether an ordered
- * tagged transaction is appropriate to prevent simple tag
- * starvation.  Since we'd like to ensure that there is at least
- * 1/2 of the timeout length left for a starved transaction to
- * complete after we've sent an ordered tag, we must poll at least
- * four times in every timeout period.  This takes care of the worst
- * case where a starved transaction starts during an interval that
- * meets the requirement "don't send an ordered tag" test so it takes
- * us two intervals to determine that a tag must be sent.
- */
-#ifndef DA_ORDEREDTAG_INTERVAL
-#define DA_ORDEREDTAG_INTERVAL 4
-#endif
+SYSCTL_INT(_kern_cam_da, OID_AUTO, balance_enable, CTLFLAG_RW,
+           &da_balance_enable, 0, "Enable tps balancing");
+SYSCTL_INT(_kern_cam_da, OID_AUTO, balance_ratio, CTLFLAG_RW,
+           &da_balance_ratio, 0, "Set read-to-write ratio 100=1:1");
+SYSCTL_INT(_kern_cam_da, OID_AUTO, balance_debug, CTLFLAG_RW,
+           &da_balance_debug, 0, "Enable tps balance debugging");
 
 static struct periph_driver dadriver =
 {
@@ -449,7 +432,7 @@ daioctl(struct dev_ioctl_args *ap)
 		return(ENXIO);
 	
 	switch (ap->a_cmd) {
-	case IOCTLTRIM:
+	case DAIOCTRIM:
 	{
 
 		bytes_left = del_num[1];
@@ -477,7 +460,7 @@ daioctl(struct dev_ioctl_args *ap)
 			 * 
 			 */
 			byte_count = MIN(bytes_left,0x7FFF8000);
-			bp = getnewbuf(0,0,0,1);
+			bp = getnewbuf(0, 0, 0, 1);
 		
 			bp->b_cmd = BUF_CMD_FREEBLKS;
 			bp->b_bio1.bio_offset = bytes_start;
@@ -489,6 +472,7 @@ daioctl(struct dev_ioctl_args *ap)
 		
 			if (biowait(&bp->b_bio1, "TRIM")) {
 				kprintf("Error:%d\n", bp->b_error);
+				brelse(bp);
 				return(bp->b_error ? bp->b_error : EIO);
 			}
 			brelse(bp);
@@ -548,7 +532,7 @@ daopen(struct dev_open_args *ap)
 	softc->flags |= DA_FLAG_OPEN;
 
 	if (error == 0) {
-		struct ccb_getdev cgd;
+		struct ccb_getdev *cgd;
 
 		/* Build disk information structure */
 		bzero(&info, sizeof(info));
@@ -558,9 +542,11 @@ daopen(struct dev_open_args *ap)
 		 * Grab the inquiry data to get the vendor and product names.
 		 * Put them in the typename and packname for the label.
 		 */
-		xpt_setup_ccb(&cgd.ccb_h, periph->path, /*priority*/ 1);
-		cgd.ccb_h.func_code = XPT_GDEV_TYPE;
-		xpt_action((union ccb *)&cgd);
+		cgd = &xpt_alloc_ccb()->cgd;
+		xpt_setup_ccb(&cgd->ccb_h, periph->path, /*priority*/ 1);
+		cgd->ccb_h.func_code = XPT_GDEV_TYPE;
+		xpt_action((union ccb *)cgd);
+		xpt_free_ccb(&cgd->ccb_h);
 
 		/*
 		 * Check to see whether or not the blocksize is set yet.
@@ -574,10 +560,12 @@ daopen(struct dev_open_args *ap)
 	}
 	
 	if (error == 0) {
+		softc->flags &= ~DA_FLAG_CAP_MUTE;
 		if ((softc->flags & DA_FLAG_PACK_REMOVABLE) != 0 &&
 		    (softc->quirks & DA_Q_NO_PREVENT) == 0)
 			daprevent(periph, PR_PREVENT);
 	} else {
+		softc->flags |= DA_FLAG_CAP_MUTE;
 		softc->flags &= ~DA_FLAG_OPEN;
 		cam_periph_release(periph);
 	}
@@ -612,6 +600,7 @@ daclose(struct dev_close_args *ap)
 		union	ccb *ccb;
 
 		ccb = cam_periph_getccb(periph, /*priority*/1);
+		ccb->ccb_h.ccb_state = DA_CCB_POLLED;
 
 		scsi_synchronize_cache(&ccb->csio,
 				       /*retries*/1,
@@ -765,7 +754,7 @@ dadump(struct dev_dump_args *ap)
 	struct	    da_softc *softc;
 	u_int	    unit;
 	u_int32_t   secsize;
-	struct	    ccb_scsiio csio;
+	struct	    ccb_scsiio *csio;
 
 	unit = dkunit(dev);
 	periph = cam_extend_get(daperiphs, unit);
@@ -781,15 +770,17 @@ dadump(struct dev_dump_args *ap)
 		return (ENXIO);
 	}
 
+	csio = &xpt_alloc_ccb()->csio;
+
 	/*
 	 * because length == 0 means we are supposed to flush cache, we only
 	 * try to write something if length > 0.
 	 */
 	if (ap->a_length > 0) {
-		xpt_setup_ccb(&csio.ccb_h, periph->path, /*priority*/1);
-		csio.ccb_h.flags |= CAM_POLLED;
-		csio.ccb_h.ccb_state = DA_CCB_DUMP;
-		scsi_read_write(&csio,
+		xpt_setup_ccb(&csio->ccb_h, periph->path, /*priority*/1);
+		csio->ccb_h.flags |= CAM_POLLED;
+		csio->ccb_h.ccb_state = DA_CCB_DUMP;
+		scsi_read_write(csio,
 				/*retries*/1,
 				dadone,
 				MSG_ORDERED_Q_TAG,
@@ -802,20 +793,21 @@ dadump(struct dev_dump_args *ap)
 				/*dxfer_len*/ap->a_length,
 				/*sense_len*/SSD_FULL_SIZE,
 				DA_DEFAULT_TIMEOUT * 1000);		
-		xpt_polled_action((union ccb *)&csio);
+		xpt_polled_action((union ccb *)csio);
 
-		if ((csio.ccb_h.status & CAM_STATUS_MASK) != CAM_REQ_CMP) {
+		if ((csio->ccb_h.status & CAM_STATUS_MASK) != CAM_REQ_CMP) {
 			kprintf("Aborting dump due to I/O error.\n");
-			if ((csio.ccb_h.status & CAM_STATUS_MASK) ==
+			if ((csio->ccb_h.status & CAM_STATUS_MASK) ==
 			     CAM_SCSI_STATUS_ERROR)
-				scsi_sense_print(&csio);
+				scsi_sense_print(csio);
 			else
 				kprintf("status == 0x%x, scsi status == 0x%x\n",
-				       csio.ccb_h.status, csio.scsi_status);
+				       csio->ccb_h.status, csio->scsi_status);
+			cam_periph_unlock(periph);
+			xpt_free_ccb(&csio->ccb_h);
 			return(EIO);
 		}
-		cam_periph_unlock(periph);
-		return 0;
+		goto done;
 	}
 
 	/*
@@ -823,9 +815,9 @@ dadump(struct dev_dump_args *ap)
 	 */
 	if ((softc->quirks & DA_Q_NO_SYNC_CACHE) == 0) {
 
-		xpt_setup_ccb(&csio.ccb_h, periph->path, /*priority*/1);
-		csio.ccb_h.ccb_state = DA_CCB_DUMP;
-		scsi_synchronize_cache(&csio,
+		xpt_setup_ccb(&csio->ccb_h, periph->path, /*priority*/1);
+		csio->ccb_h.ccb_state = DA_CCB_DUMP;
+		scsi_synchronize_cache(csio,
 				       /*retries*/1,
 				       /*cbfcnp*/dadone,
 				       MSG_SIMPLE_Q_TAG,
@@ -833,29 +825,32 @@ dadump(struct dev_dump_args *ap)
 				       /*lb_count*/0,
 				       SSD_FULL_SIZE,
 				       5 * 60 * 1000);
-		xpt_polled_action((union ccb *)&csio);
+		xpt_polled_action((union ccb *)csio);
 
-		if ((csio.ccb_h.status & CAM_STATUS_MASK) != CAM_REQ_CMP) {
-			if ((csio.ccb_h.status & CAM_STATUS_MASK) ==
+		if ((csio->ccb_h.status & CAM_STATUS_MASK) != CAM_REQ_CMP) {
+			if ((csio->ccb_h.status & CAM_STATUS_MASK) ==
 			     CAM_SCSI_STATUS_ERROR) {
 				int asc, ascq;
 				int sense_key, error_code;
 
-				scsi_extract_sense(&csio.sense_data,
+				scsi_extract_sense(&csio->sense_data,
 						   &error_code,
 						   &sense_key, 
 						   &asc, &ascq);
 				if (sense_key != SSD_KEY_ILLEGAL_REQUEST)
-					scsi_sense_print(&csio);
+					scsi_sense_print(csio);
 			} else {
 				xpt_print(periph->path, "Synchronize cache "
 				    "failed, status == 0x%x, scsi status == "
-				    "0x%x\n", csio.ccb_h.status,
-				    csio.scsi_status);
+				    "0x%x\n",
+				    csio->ccb_h.status, csio->scsi_status);
 			}
 		}
 	}
+done:
 	cam_periph_unlock(periph);
+	xpt_free_ccb(&csio->ccb_h);
+
 	return (0);
 }
 
@@ -873,8 +868,6 @@ dainit(void)
 		return;
 	}
 
-	callout_init(&dasendorderedtag_ch);
-
 	/*
 	 * Install a global async callback.  This callback will
 	 * receive async callbacks like "new device found".
@@ -884,11 +877,10 @@ dainit(void)
 	if (status != CAM_REQ_CMP) {
 		kprintf("da: Failed to attach master async callback "
 		       "due to status 0x%x!\n", status);
-	} else if (da_send_ordered) {
-
+	} else {
 		/* Register our shutdown event handler */
 		if ((EVENTHANDLER_REGISTER(shutdown_post_sync, dashutdown, 
-					   NULL, SHUTDOWN_PRI_DEFAULT)) == NULL)
+					   NULL, SHUTDOWN_PRI_SECOND)) == NULL)
 			kprintf("%s: shutdown event registration failed!\n",
 			    __func__);
 	}
@@ -959,7 +951,6 @@ dacleanup(struct cam_periph *periph)
 		cam_periph_lock(periph);
 	}
 
-	callout_stop(&softc->sendordered_c);
 	kfree(softc, M_DEVBUF);
 }
 
@@ -1039,10 +1030,8 @@ dasysctlinit(void *context, int pending)
 	struct da_softc *softc;
 	char tmpstr[80], tmpstr2[80];
 
-	get_mplock();
 	periph = (struct cam_periph *)context;
 	if (cam_periph_acquire(periph) != CAM_REQ_CMP) {
-		rel_mplock();
 		return;
 	}
 
@@ -1061,7 +1050,6 @@ dasysctlinit(void *context, int pending)
 	if (softc->sysctl_tree == NULL) {
 		kprintf("%s: unable to allocate sysctl tree\n", __func__);
 		cam_periph_release(periph);
-		rel_mplock();
 		return;
 	}
 
@@ -1087,7 +1075,6 @@ dasysctlinit(void *context, int pending)
 	}
 
 	cam_periph_release(periph);
-	rel_mplock();
 }
 
 static int
@@ -1126,7 +1113,7 @@ static cam_status
 daregister(struct cam_periph *periph, void *arg)
 {
 	struct da_softc *softc;
-	struct ccb_pathinq cpi;
+	struct ccb_pathinq *cpi;
 	struct ccb_getdev *cgd;
 	char tmpstr[80];
 	caddr_t match;
@@ -1196,11 +1183,11 @@ daregister(struct cam_periph *periph, void *arg)
 	TASK_INIT(&softc->sysctl_task, 0, dasysctlinit, periph);
 
 	/* Check if the SIM does not want 6 byte commands */
-	bzero(&cpi, sizeof(cpi));
-	xpt_setup_ccb(&cpi.ccb_h, periph->path, /*priority*/1);
-	cpi.ccb_h.func_code = XPT_PATH_INQ;
-	xpt_action((union ccb *)&cpi);
-	if (cpi.ccb_h.status == CAM_REQ_CMP && (cpi.hba_misc & PIM_NO_6_BYTE))
+	cpi = &xpt_alloc_ccb()->cpi;
+	xpt_setup_ccb(&cpi->ccb_h, periph->path, /*priority*/1);
+	cpi->ccb_h.func_code = XPT_PATH_INQ;
+	xpt_action((union ccb *)cpi);
+	if (cpi->ccb_h.status == CAM_REQ_CMP && (cpi->hba_misc & PIM_NO_6_BYTE))
 		softc->quirks |= DA_Q_NO_6_BYTE;
 
 	/*
@@ -1251,10 +1238,10 @@ daregister(struct cam_periph *periph, void *arg)
 	 */
 	CAM_SIM_UNLOCK(periph->sim);
 	disk_create(periph->unit_number, &softc->disk, &da_ops);
-	if (cpi.maxio == 0 || cpi.maxio > MAXPHYS)
+	if (cpi->maxio == 0 || cpi->maxio > MAXPHYS)
 		softc->disk.d_rawdev->si_iosize_max = MAXPHYS;
 	else
-		softc->disk.d_rawdev->si_iosize_max = cpi.maxio;
+		softc->disk.d_rawdev->si_iosize_max = cpi->maxio;
 	if (bootverbose) {
 		kprintf("%s%d: si_iosize_max:%d\n",
 		    periph->periph_name,
@@ -1279,19 +1266,9 @@ daregister(struct cam_periph *periph, void *arg)
 	 * to finish the probe.  The reference will be dropped in dadone at
 	 * the end of probe.
 	 */
+	xpt_free_ccb(&cpi->ccb_h);
 	cam_periph_hold(periph, 0);
 	xpt_schedule(periph, /*priority*/5);
-
-	/*
-	 * Schedule a periodic event to occasionally send an
-	 * ordered tag to a device.
-	 */
-	callout_init(&softc->sendordered_c);
-	callout_reset(&softc->sendordered_c,
-	    (DA_DEFAULT_TIMEOUT * hz) / DA_ORDEREDTAG_INTERVAL,
-	    dasendorderedtag, softc);
-
-	
 
 	return(CAM_REQ_CMP);
 }
@@ -1312,7 +1289,8 @@ dastart(struct cam_periph *periph, union ccb *start_ccb)
 		struct bio *bio_wr;
 		struct buf *bp;
 		u_int8_t tag_code;
-		int limit;
+		int rd_limit;
+		int wr_limit;
 
 		/*
 		 * See if there is a buf with work for us to do..
@@ -1355,11 +1333,6 @@ dastart(struct cam_periph *periph, union ccb *start_ccb)
 				bp = bio1->bio_buf;
 				count = bp->b_bcount / softc->params.secsize;
 				lba = bio1->bio_offset/softc->params.secsize;
-
-				kprintf("trim lba:%llu boff:%llu count:%d\n",
-				    (unsigned long long) lba,
-				    (unsigned long long) bio1->bio_offset,
-				    count);
 
 				bioq_remove(&softc->bio_queue_trim, bio1);
 				while (count > 0) {
@@ -1428,26 +1401,61 @@ dastart(struct cam_periph *periph, union ccb *start_ccb)
 		 * and prevent any writes from draining, even if the HD's
 		 * cache is not full.
 		 */
-		limit = periph->sim->max_tagged_dev_openings * 2 / 3 + 1;
-#if 0
+		rd_limit = periph->sim->max_tagged_dev_openings * 2 / 3 + 1;
+		wr_limit = rd_limit;
+
+		/*
+		 * When TPS balancing is enabled we force wr_limit to 0
+		 * as necessary to balance the read TPS against the write
+		 * TPS.  A lower or higher read:write ratio may be selected
+		 * via da_balance_ratio.
+		 *
+		 * wr_limit forcing stops queueing writes.  This is generally
+		 * necessary because devices buffer writes and may starve
+		 * reads even when plenty of read tags are available.
+		 *
+		 * When no reads are being done, normalize tps_rd to avoid
+		 * instantly crowbaring the write tps.
+		 */
+		if (da_balance_enable &&
+		    periph->sim->max_tagged_dev_openings >= 8 &&
+		    (bio_rd || softc->outstanding_cmds_rd) &&
+		    (bio_wr || softc->outstanding_cmds_wr) &&
+		    softc->tps_rd * 100 < softc->tps_wr * da_balance_ratio) {
+			wr_limit = 0;
+		} else if (bio_rd == NULL && softc->outstanding_cmds_rd == 0 &&
+			   softc->tps_rd < softc->tps_wr * 2) {
+			softc->tps_rd += 100;
+		}
+		if (softc->tps_ticks != ticks) {
+			softc->tps_ticks = ticks;
+			softc->tps_rd = (softc->tps_rd * (hz - 1)) / hz;
+			softc->tps_wr = (softc->tps_wr * (hz - 1)) / hz;
+		}
+
+#if 1
 		/* DEBUGGING */
-		static int savets;
-		static long savets2;
-		if (1 || time_uptime != savets2 || (ticks != savets && (softc->outstanding_cmds_rd || softc->outstanding_cmds_wr))) {
-			kprintf("%d %d (%d)\n",
-				softc->outstanding_cmds_rd,
-				softc->outstanding_cmds_wr,
-				limit);
-			savets = ticks;
-			savets2 = time_uptime;
+		static time_t savets;
+		if (da_balance_debug &&
+		    time_uptime != savets && (bio_rd || bio_wr ||
+					      softc->outstanding_cmds_rd ||
+					      softc->outstanding_cmds_wr)) {
+			kprintf("softc=%p %d/%d %d/%d tps %ld/%ld\n",
+				softc,
+				softc->outstanding_cmds_rd, rd_limit,
+				softc->outstanding_cmds_wr, wr_limit,
+				softc->tps_rd / 100, softc->tps_wr / 100);
+			savets = time_uptime;
 		}
 #endif
-		if (bio_rd && softc->outstanding_cmds_rd < limit) {
+		if (bio_rd && softc->outstanding_cmds_rd < rd_limit) {
 			bio = bio_rd;
 			bioq_remove(&softc->bio_queue_rd, bio);
-		} else if (bio_wr && softc->outstanding_cmds_wr < limit) {
+			softc->tps_rd += 100;
+		} else if (bio_wr && softc->outstanding_cmds_wr < wr_limit) {
 			bio = bio_wr;
 			bioq_remove(&softc->bio_queue_wr, bio);
+			softc->tps_wr += 100;
 		} else {
 			if (bio_rd)
 				softc->flags |= DA_FLAG_RD_LIMIT;
@@ -1464,14 +1472,7 @@ dastart(struct cam_periph *periph, union ccb *start_ccb)
 
 		devstat_start_transaction(&softc->device_stats);
 
-		if ((bp->b_flags & B_ORDERED) != 0 ||
-		    (softc->flags & DA_FLAG_NEED_OTAG) != 0) {
-			softc->flags &= ~DA_FLAG_NEED_OTAG;
-			softc->ordered_tag_count++;
-			tag_code = MSG_ORDERED_Q_TAG;
-		} else {
-			tag_code = MSG_SIMPLE_Q_TAG;
-		}
+		tag_code = MSG_SIMPLE_Q_TAG;
 
 		switch(bp->b_cmd) {
 		case BUF_CMD_READ:
@@ -1740,8 +1741,13 @@ dadone(struct cam_periph *periph, union ccb *done_ccb)
 		}
 
 		/*
-		 * Block out any asyncronous callbacks
-		 * while we touch the pending ccb list.
+		 * Schedule the peripheral to pipeline further reads and
+		 * writes.  A completed write wakes up more pending writes.
+		 * A completed read must wake up on either pending reads
+		 * or writes due to TPS balancing.
+		 *
+		 * Block out any asyncronous callbacks while we touch the
+		 * pending ccb list.
 		 */
 		LIST_REMOVE(&done_ccb->ccb_h, periph_links.le);
 		if (bp->b_cmd == BUF_CMD_WRITE || bp->b_cmd == BUF_CMD_FLUSH) {
@@ -1752,14 +1758,12 @@ dadone(struct cam_periph *periph, union ccb *done_ccb)
 			}
 		} else {
 			--softc->outstanding_cmds_rd;
-			if (softc->flags & DA_FLAG_RD_LIMIT) {
-				softc->flags &= ~DA_FLAG_RD_LIMIT;
+			if (softc->flags &
+			    (DA_FLAG_RD_LIMIT | DA_FLAG_WR_LIMIT)) {
+				softc->flags &=
+					~(DA_FLAG_RD_LIMIT | DA_FLAG_WR_LIMIT);
 				mustsched = 1;
 			}
-		}
-		if (softc->outstanding_cmds_rd +
-		    softc->outstanding_cmds_wr == 0) {
-			softc->flags |= DA_FLAG_WENT_IDLE;
 		}
 
 		devstat_end_transaction_buf(&softc->device_stats, bp);
@@ -1797,6 +1801,7 @@ dadone(struct cam_periph *periph, union ccb *done_ccb)
 		struct	   scsi_read_capacity_data *rdcap;
 		struct     scsi_read_capacity_data_16 *rcaplong;
 		char	   announce_buf[80];
+		int	   doinfo = 0;
 
 		rdcap = NULL;
 		rcaplong = NULL;
@@ -1848,7 +1853,6 @@ dadone(struct cam_periph *periph, union ccb *done_ccb)
 				dp->secsize, dp->heads, dp->secs_per_track,
 				dp->cylinders);
 			
-			CAM_SIM_UNLOCK(periph->sim);
 			info.d_media_blksize = softc->params.secsize;
 			info.d_media_blocks = softc->params.sectors;
 			info.d_media_size = 0;
@@ -1858,8 +1862,7 @@ dadone(struct cam_periph *periph, union ccb *done_ccb)
 			info.d_secpercyl = softc->params.heads *
 						softc->params.secs_per_track;
 			info.d_serialno = xpt_path_serialno(periph->path);
-			disk_setdiskinfo(&softc->disk, &info);
-			CAM_SIM_LOCK(periph->sim);
+			doinfo = 1;
 		} else {
 			int	error;
 
@@ -1883,7 +1886,7 @@ dadone(struct cam_periph *periph, union ccb *done_ccb)
 				int sense_key, error_code;
 				int have_sense;
 				cam_status status;
-				struct ccb_getdev cgd;
+				struct ccb_getdev *cgd;
 
 				/* Don't wedge this device's queue */
 				status = done_ccb->ccb_h.status;
@@ -1894,12 +1897,12 @@ dadone(struct cam_periph *periph, union ccb *done_ccb)
 							 /*timeout*/0,
 							 /*getcount_only*/0);
 
-
-				xpt_setup_ccb(&cgd.ccb_h, 
+				cgd = &xpt_alloc_ccb()->cgd;
+				xpt_setup_ccb(&cgd->ccb_h,
 					      done_ccb->ccb_h.path,
 					      /* priority */ 1);
-				cgd.ccb_h.func_code = XPT_GDEV_TYPE;
-				xpt_action((union ccb *)&cgd);
+				cgd->ccb_h.func_code = XPT_GDEV_TYPE;
+				xpt_action((union ccb *)cgd);
 
 				if (((csio->ccb_h.flags & CAM_SENSE_PHYS) != 0)
 				 || ((csio->ccb_h.flags & CAM_SENSE_PTR) != 0)
@@ -1926,7 +1929,7 @@ dadone(struct cam_periph *periph, union ccb *done_ccb)
 					const char *asc_desc;
 
 					scsi_sense_desc(sense_key, asc, ascq,
-							&cgd.inq_data,
+							&cgd->inq_data,
 							&sense_key_desc,
 							&asc_desc);
 					ksnprintf(announce_buf,
@@ -1936,7 +1939,7 @@ dadone(struct cam_periph *periph, union ccb *done_ccb)
 						sense_key_desc,
 						asc_desc);
 					info.d_media_blksize = 512;
-					disk_setdiskinfo(&softc->disk, &info);
+					doinfo = 1;
 				} else {
 					if (have_sense)
 						scsi_sense_print(
@@ -1955,26 +1958,21 @@ dadone(struct cam_periph *periph, union ccb *done_ccb)
 					 */
 					cam_periph_invalidate(periph);
 				} 
+				xpt_free_ccb(&cgd->ccb_h);
 			}
 		}
 		kfree(csio->data_ptr, M_SCSIDA);
-		if (announce_buf[0] != '\0') {
+		if (announce_buf[0] != '\0')
 			xpt_announce_periph(periph, announce_buf);
-			/*
-			 * Create our sysctl variables, now that we know
-			 * we have successfully attached.
-			 */
-			taskqueue_enqueue(taskqueue_thread[mycpuid],
-			    &softc->sysctl_task);
-		}
 
 		if (softc->trim_max_ranges) {
-			softc->disk.d_info.d_trimflag |= DA_FLAG_CAN_TRIM;
+			info.d_trimflag |= DA_FLAG_CAN_TRIM;
 			kprintf("%s%d: supports TRIM\n",
 		   	    periph->periph_name,
 		   	    periph->unit_number);
 		}
 		softc->state = DA_STATE_NORMAL;
+
 		/*
 		 * Since our peripheral may be invalidated by an error
 		 * above or an external event, we must release our CCB
@@ -1985,6 +1983,18 @@ dadone(struct cam_periph *periph, union ccb *done_ccb)
 		 */
 		xpt_release_ccb(done_ccb);
 		cam_periph_unhold(periph, 0);
+		if (doinfo) {
+			CAM_SIM_UNLOCK(periph->sim);
+			disk_setdiskinfo(&softc->disk, &info);
+			CAM_SIM_LOCK(periph->sim);
+
+			/*
+			 * Create our sysctl variables, now that we know
+			 * we have successfully attached.
+			 */
+			taskqueue_enqueue(taskqueue_thread[mycpuid],
+					  &softc->sysctl_task);
+		}
 		return;
 	}
 	case DA_CCB_WAITING:
@@ -1995,6 +2005,10 @@ dadone(struct cam_periph *periph, union ccb *done_ccb)
 	}
 	case DA_CCB_DUMP:
 		/* No-op.  We're polling */
+		return;
+	case DA_CCB_POLLED:
+		/* Caller releases ccb */
+		wakeup(&done_ccb->ccb_h.cbfcnp);
 		return;
 	default:
 		break;
@@ -2062,6 +2076,7 @@ daprevent(struct cam_periph *periph, int action)
 	}
 
 	ccb = cam_periph_getccb(periph, /*priority*/1);
+	ccb->ccb_h.ccb_state = DA_CCB_POLLED;
 
 	scsi_prevent(&ccb->csio,
 		     /*retries*/1,
@@ -2094,11 +2109,17 @@ dacheckmedia(struct cam_periph *periph)
 	struct da_softc *softc;
 	struct disk_info info;
 	int error;
+	int mute;
 
 	softc = (struct da_softc *)periph->softc;
 	dp = &softc->params;
 
-	error = dagetcapacity(periph);
+	if (softc->flags & DA_FLAG_CAP_MUTE)	/* additional ccb flags */
+		mute = CAM_QUIET;
+	else
+		mute = 0;
+
+	error = dagetcapacity(periph, mute);
 
 	/*
 	 * Only reprobe on initial open and if the media is removable.
@@ -2140,8 +2161,11 @@ dacheckmedia(struct cam_periph *periph)
 		}
 		CAM_SIM_LOCK(periph->sim);
 	} else {
-		kprintf("%s%d: open removable media: no media present\n",
-			periph->periph_name, periph->unit_number);
+		if (!mute || bootverbose) {
+			kprintf("%s%d: open removable media: "
+				"no media present\n",
+				periph->periph_name, periph->unit_number);
+		}
 		info.d_media_blksize = 512;
 		disk_setdiskinfo(&softc->disk, &info);
 	}
@@ -2149,7 +2173,7 @@ dacheckmedia(struct cam_periph *periph)
 }
 
 static int
-dagetcapacity(struct cam_periph *periph)
+dagetcapacity(struct cam_periph *periph, int ccbflags)
 {
 	struct da_softc *softc;
 	union ccb *ccb;
@@ -2169,6 +2193,8 @@ dagetcapacity(struct cam_periph *periph)
 							 M_SCSIDA, M_INTWAIT);
 		
 	ccb = cam_periph_getccb(periph, /*priority*/1);
+	ccb->ccb_h.ccb_state = DA_CCB_POLLED;
+
 	scsi_read_capacity(&ccb->csio,
 			   /*retries*/4,
 			   /*cbfncp*/dadone,
@@ -2177,6 +2203,7 @@ dagetcapacity(struct cam_periph *periph)
 			   SSD_FULL_SIZE,
 			   /*timeout*/60000);
 	ccb->ccb_h.ccb_bio = NULL;
+	ccb->ccb_h.flags |= ccbflags;
  
 	error = cam_periph_runccb(ccb, daerror,
 				  /*cam_flags*/CAM_RETRY_SELTO,
@@ -2245,7 +2272,7 @@ done:
 static void
 dasetgeom(struct cam_periph *periph, uint32_t block_len, uint64_t maxsector)
 {
-	struct ccb_calc_geometry ccg;
+	struct ccb_calc_geometry *ccg;
 	struct da_softc *softc;
 	struct disk_params *dp;
 
@@ -2262,15 +2289,16 @@ dasetgeom(struct cam_periph *periph, uint32_t block_len, uint64_t maxsector)
 	 * up with something that will make this a bootable
 	 * device.
 	 */
-	xpt_setup_ccb(&ccg.ccb_h, periph->path, /*priority*/1);
-	ccg.ccb_h.func_code = XPT_CALC_GEOMETRY;
-	ccg.block_size = dp->secsize;
-	ccg.volume_size = dp->sectors;
-	ccg.heads = 0;
-	ccg.secs_per_track = 0;
-	ccg.cylinders = 0;
-	xpt_action((union ccb*)&ccg);
-	if ((ccg.ccb_h.status & CAM_STATUS_MASK) != CAM_REQ_CMP) {
+	ccg = &xpt_alloc_ccb()->ccg;
+	xpt_setup_ccb(&ccg->ccb_h, periph->path, /*priority*/1);
+	ccg->ccb_h.func_code = XPT_CALC_GEOMETRY;
+	ccg->block_size = dp->secsize;
+	ccg->volume_size = dp->sectors;
+	ccg->heads = 0;
+	ccg->secs_per_track = 0;
+	ccg->cylinders = 0;
+	xpt_action((union ccb*)ccg);
+	if ((ccg->ccb_h.status & CAM_STATUS_MASK) != CAM_REQ_CMP) {
 		/*
 		 * We don't know what went wrong here- but just pick
 		 * a geometry so we don't have nasty things like divide
@@ -2283,31 +2311,11 @@ dasetgeom(struct cam_periph *periph, uint32_t block_len, uint64_t maxsector)
 			dp->cylinders = 1;
 		}
 	} else {
-		dp->heads = ccg.heads;
-		dp->secs_per_track = ccg.secs_per_track;
-		dp->cylinders = ccg.cylinders;
+		dp->heads = ccg->heads;
+		dp->secs_per_track = ccg->secs_per_track;
+		dp->cylinders = ccg->cylinders;
 	}
-}
-
-static void
-dasendorderedtag(void *arg)
-{
-	struct da_softc *softc = arg;
-
-	if (da_send_ordered) {
-		if ((softc->ordered_tag_count == 0)
-		 && ((softc->flags & DA_FLAG_WENT_IDLE) == 0)) {
-			softc->flags |= DA_FLAG_NEED_OTAG;
-		}
-		if (softc->outstanding_cmds_rd || softc->outstanding_cmds_wr)
-			softc->flags &= ~DA_FLAG_WENT_IDLE;
-
-		softc->ordered_tag_count = 0;
-	}
-	/* Queue us up again */
-	callout_reset(&softc->sendordered_c,
-	    (DA_DEFAULT_TIMEOUT * hz) / DA_ORDEREDTAG_INTERVAL,
-	    dasendorderedtag, softc);
+	xpt_free_ccb(&ccg->ccb_h);
 }
 
 /*
@@ -2321,7 +2329,7 @@ dashutdown(void * arg, int howto)
 	struct da_softc *softc;
 
 	TAILQ_FOREACH(periph, &dadriver.units, unit_links) {
-		union ccb ccb;
+		union ccb *ccb;
 
 		cam_periph_lock(periph);
 		softc = (struct da_softc *)periph->softc;
@@ -2336,10 +2344,11 @@ dashutdown(void * arg, int howto)
 			continue;
 		}
 
-		xpt_setup_ccb(&ccb.ccb_h, periph->path, /*priority*/1);
+		ccb = xpt_alloc_ccb();
+		xpt_setup_ccb(&ccb->ccb_h, periph->path, /*priority*/1);
 
-		ccb.ccb_h.ccb_state = DA_CCB_DUMP;
-		scsi_synchronize_cache(&ccb.csio,
+		ccb->ccb_h.ccb_state = DA_CCB_DUMP;
+		scsi_synchronize_cache(&ccb->csio,
 				       /*retries*/1,
 				       /*cbfcnp*/dadone,
 				       MSG_SIMPLE_Q_TAG,
@@ -2348,36 +2357,37 @@ dashutdown(void * arg, int howto)
 				       SSD_FULL_SIZE,
 				       60 * 60 * 1000);
 
-		xpt_polled_action(&ccb);
+		xpt_polled_action(ccb);
 
-		if ((ccb.ccb_h.status & CAM_STATUS_MASK) != CAM_REQ_CMP) {
-			if (((ccb.ccb_h.status & CAM_STATUS_MASK) ==
+		if ((ccb->ccb_h.status & CAM_STATUS_MASK) != CAM_REQ_CMP) {
+			if (((ccb->ccb_h.status & CAM_STATUS_MASK) ==
 			     CAM_SCSI_STATUS_ERROR)
-			 && (ccb.csio.scsi_status == SCSI_STATUS_CHECK_COND)){
+			 && (ccb->csio.scsi_status == SCSI_STATUS_CHECK_COND)){
 				int error_code, sense_key, asc, ascq;
 
-				scsi_extract_sense(&ccb.csio.sense_data,
+				scsi_extract_sense(&ccb->csio.sense_data,
 						   &error_code, &sense_key,
 						   &asc, &ascq);
 
 				if (sense_key != SSD_KEY_ILLEGAL_REQUEST)
-					scsi_sense_print(&ccb.csio);
+					scsi_sense_print(&ccb->csio);
 			} else {
 				xpt_print(periph->path, "Synchronize "
 				    "cache failed, status == 0x%x, scsi status "
-				    "== 0x%x\n", ccb.ccb_h.status,
-				    ccb.csio.scsi_status);
+				    "== 0x%x\n", ccb->ccb_h.status,
+				    ccb->csio.scsi_status);
 			}
 		}
 
-		if ((ccb.ccb_h.status & CAM_DEV_QFRZN) != 0)
-			cam_release_devq(ccb.ccb_h.path,
+		if ((ccb->ccb_h.status & CAM_DEV_QFRZN) != 0)
+			cam_release_devq(ccb->ccb_h.path,
 					 /*relsim_flags*/0,
 					 /*reduction*/0,
 					 /*timeout*/0,
 					 /*getcount_only*/0);
 
 		cam_periph_unlock(periph);
+		xpt_free_ccb(&ccb->ccb_h);
 	}
 }
 

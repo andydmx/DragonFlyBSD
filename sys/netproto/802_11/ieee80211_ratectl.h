@@ -22,7 +22,7 @@
  * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
  * THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
- * $FreeBSD: head/sys/net80211/ieee80211_ratectl.h 215289 2010-11-14 09:59:52Z bschmidt $
+ * $FreeBSD$
  */
 
 enum ieee80211_ratealgs {
@@ -34,8 +34,8 @@ enum ieee80211_ratealgs {
 	IEEE80211_RATECTL_MAX
 };
 
-#define	IEEE80211_RATECTL_TX_SUCCESS	0
-#define	IEEE80211_RATECTL_TX_FAILURE	1
+#define	IEEE80211_RATECTL_TX_SUCCESS	1
+#define	IEEE80211_RATECTL_TX_FAILURE	0
 
 struct ieee80211_ratectl {
 	const char *ir_name;
@@ -53,6 +53,7 @@ struct ieee80211_ratectl {
 	    			const struct ieee80211_node *,
 	    			void *, void *, void *);
 	void	(*ir_setinterval)(const struct ieee80211vap *, int);
+	void	(*ir_node_stats)(struct ieee80211_node *ni, struct sbuf *s);
 };
 
 void	ieee80211_ratectl_register(int, const struct ieee80211_ratectl *);
@@ -60,7 +61,9 @@ void	ieee80211_ratectl_unregister(int);
 void	ieee80211_ratectl_init(struct ieee80211vap *);
 void	ieee80211_ratectl_set(struct ieee80211vap *, int);
 
+#ifdef MALLOC_DECLARE
 MALLOC_DECLARE(M_80211_RATECTL);
+#endif
 
 static __inline void
 ieee80211_ratectl_deinit(struct ieee80211vap *vap)
@@ -114,4 +117,14 @@ ieee80211_ratectl_setinterval(const struct ieee80211vap *vap, int msecs)
 	if (vap->iv_rate->ir_setinterval == NULL)
 		return;
 	vap->iv_rate->ir_setinterval(vap, msecs);
+}
+
+static __inline void
+ieee80211_ratectl_node_stats(struct ieee80211_node *ni, struct sbuf *s)
+{
+	const struct ieee80211vap *vap = ni->ni_vap;
+
+	if (vap->iv_rate->ir_node_stats == NULL)
+		return;
+	vap->iv_rate->ir_node_stats(ni, s);
 }

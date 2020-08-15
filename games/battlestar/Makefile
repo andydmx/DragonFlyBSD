@@ -7,9 +7,8 @@ SRCS=	battlestar.c command1.c command2.c command3.c command4.c \
 	init.c cypher.c getcom.c parse.c room.c save.c fly.c misc.c \
 	globals.c dayfile.c nightfile.c dayobjs.c nightobjs.c words.c
 MAN=	battlestar.6
-DPADD=	${LIBCURSES} ${LIBTERMCAP}
-LDADD=	-lcurses -ltermcap
-HIDEGAME=hidegame
+VARGAMES=
+GAMESCURSES=
 
 beforeinstall:
 .if !exists(${DESTDIR}/var/games/battlestar.log)

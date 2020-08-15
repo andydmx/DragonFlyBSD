@@ -35,7 +35,7 @@
 
 #include <sys/param.h>
 #include <sys/systm.h>
-#include <sys/sysproto.h>
+#include <sys/sysmsg.h>
 #include <sys/kernel.h>
 #include <sys/sysctl.h>
 #include <sys/file.h>
@@ -120,7 +120,7 @@ SYSCTL_INT(_vfs_nfs, OID_AUTO, soreserve, CTLFLAG_RW, &nfs_soreserve, 0,
  * MPALMOSTSAFE
  */
 int
-sys_nfssvc(struct nfssvc_args *uap)
+sys_nfssvc(struct sysmsg *sysmsg, const struct nfssvc_args *uap)
 {
 #ifndef NFS_NOSERVER
 	struct nlookupdata nd;
@@ -190,7 +190,7 @@ sys_nfssvc(struct nfssvc_args *uap)
 		error = copyin(uap->argp, (caddr_t)&nfsdarg, sizeof(nfsdarg));
 		if (error)
 			goto done;
-		error = holdsock(td->td_proc->p_fd, nfsdarg.sock, &fp);
+		error = holdsock(td, nfsdarg.sock, &fp);
 		if (error)
 			goto done;
 		/*
@@ -225,7 +225,7 @@ sys_nfssvc(struct nfssvc_args *uap)
 			    nuidp != 0; nuidp = nuidp->nu_hash.le_next) {
 				if (nuidp->nu_cr.cr_uid == nsd->nsd_cr.cr_uid &&
 				    (!nfsd->nfsd_nd->nd_nam2 ||
-				     netaddr_match(NU_NETFAM(nuidp),
+				     netaddr_match(AF_INET,
 				     &nuidp->nu_haddr, nfsd->nfsd_nd->nd_nam2)))
 					break;
 			}
@@ -278,7 +278,6 @@ sys_nfssvc(struct nfssvc_args *uap)
 					nuidp->nu_inetaddr =
 					     saddr->sin_addr.s_addr;
 					break;
-				    case AF_ISO:
 				    default:
 					nuidp->nu_flag |= NU_NAM;
 					nuidp->nu_nam = 
@@ -409,7 +408,7 @@ nfssvc_addsock(struct file *fp, struct sockaddr *mynam, struct thread *td)
 	atomic_clear_int(&so->so_snd.ssb_flags, SSB_AUTOSIZE);
 
 	slp = kmalloc(sizeof (struct nfssvc_sock), M_NFSSVC, M_WAITOK | M_ZERO);
-	mtx_init(&slp->ns_solock);
+	mtx_init(&slp->ns_solock, "nfsvc");
 	STAILQ_INIT(&slp->ns_rec);
 	TAILQ_INIT(&slp->ns_uidlruhead);
 	lwkt_token_init(&slp->ns_token, "nfssrv_token");
@@ -421,7 +420,7 @@ nfssvc_addsock(struct file *fp, struct sockaddr *mynam, struct thread *td)
 
 	slp->ns_so = so;
 	slp->ns_nam = mynam;
-	fp->f_count++;
+	fhold(fp);
 	slp->ns_fp = fp;
 
 	so->so_upcallarg = (caddr_t)slp;
@@ -527,7 +526,7 @@ nfssvc_nfsd(struct nfsd_srvargs *nsd, caddr_t argp, struct thread *td)
 						}
 						nfsrv_rcv(slp->ns_so,
 							  (caddr_t)slp,
-							  MB_WAIT);
+							  M_WAITOK);
 						nfs_slpunlock(slp);
 						break;
 					}
@@ -564,7 +563,7 @@ nfssvc_nfsd(struct nfsd_srvargs *nsd, caddr_t argp, struct thread *td)
 				if (NFSRV_RECLIMIT(slp) == 0 &&
 				    (slp->ns_flag & SLP_NEEDQ)) {
 					nfsrv_rcv(slp->ns_so, (caddr_t)slp,
-						  MB_WAIT);
+						  M_WAITOK);
 				}
 				nfs_slpunlock(slp);
 			}
@@ -643,11 +642,13 @@ nfssvc_nfsd(struct nfsd_srvargs *nsd, caddr_t argp, struct thread *td)
 			port = ntohs(sin->sin_port);
 			if (port >= IPPORT_RESERVED && 
 			    nd->nd_procnum != NFSPROC_NULL) {
+			    char addr[INET_ADDRSTRLEN];
+
 			    nd->nd_procnum = NFSPROC_NOOP;
 			    nd->nd_repstat = (NFSERR_AUTHERR | AUTH_TOOWEAK);
 			    cacherep = RC_DOIT;
 			    kprintf("NFS request from unprivileged port (%s:%d)\n",
-				   inet_ntoa(sin->sin_addr), port);
+				    kinet_ntoa(sin->sin_addr, addr), port);
 			}
 		    }
 		}
@@ -712,7 +713,7 @@ nfssvc_nfsd(struct nfsd_srvargs *nsd, caddr_t argp, struct thread *td)
 			 * Record Mark.
 			 */
 			if (sotype == SOCK_STREAM) {
-				M_PREPEND(m, NFSX_UNSIGNED, MB_WAIT);
+				M_PREPEND(m, NFSX_UNSIGNED, M_WAITOK);
 				if (m == NULL) {
 					error = ENOBUFS;
 					slplocked = 0;
@@ -920,10 +921,10 @@ nfsrv_slpref(struct nfssvc_sock *slp)
 int
 nfs_slplock(struct nfssvc_sock *slp, int wait)
 {
-	mtx_t mtx = &slp->ns_solock;
+	mtx_t *mtx = &slp->ns_solock;
 
 	if (wait) {
-		mtx_lock_ex(mtx, "nfsslplck", 0, 0);
+		mtx_lock_ex(mtx, 0, 0);
 		return(1);
 	} else if (mtx_lock_ex_try(mtx) == 0) {
 		return(1);
@@ -938,7 +939,7 @@ nfs_slplock(struct nfssvc_sock *slp, int wait)
 void
 nfs_slpunlock(struct nfssvc_sock *slp)
 {
-	mtx_t mtx = &slp->ns_solock;
+	mtx_t *mtx = &slp->ns_solock;
 
 	mtx_unlock(mtx);
 }
@@ -1129,8 +1130,7 @@ nfs_getnickauth(struct nfsmount *nmp, struct ucred *cred, char **auth_str,
 	verfp = (u_int32_t *)verf_str;
 	*verfp++ = txdr_unsigned(RPCAKN_NICKNAME);
 	if (time_second != nuidp->nu_timestamp.tv_sec ||
-	    (time_second == nuidp->nu_timestamp.tv_sec &&
-	     time_second > nuidp->nu_timestamp.tv_usec))	/* XXX */
+	    time_second > nuidp->nu_timestamp.tv_usec)		/* XXX */
 		getmicrotime(&nuidp->nu_timestamp);
 	else
 		nuidp->nu_timestamp.tv_usec++;

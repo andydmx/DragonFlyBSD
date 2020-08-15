@@ -36,7 +36,18 @@
 
 #include "hammer.h"
 
-static void softprune_usage(int code);
+struct softprune {
+	struct softprune *next;
+	struct statfs fs;
+	char *filesystem;
+	struct hammer_ioc_prune prune;
+	int maxelms;
+	int prune_min;
+};
+
+static void hammer_softprune_scandir(struct softprune **basep,
+			struct hammer_ioc_prune *template,
+			const char *dirname);
 static int hammer_softprune_scanmeta(int fd, struct softprune *scan,
 			int delete_all);
 static void hammer_meta_flushdelete(int fd, struct hammer_ioc_snapshot *dsnap);
@@ -48,6 +59,7 @@ static struct softprune *hammer_softprune_addentry(struct softprune **basep,
 static void hammer_softprune_addelm(struct softprune *scan, hammer_tid_t tid,
 			time_t ct, time_t mt);
 static void hammer_softprune_finalize(struct softprune *scan);
+static void softprune_usage(int code);
 
 /*
  * prune <softlink-dir>
@@ -67,11 +79,7 @@ hammer_cmd_softprune(char **av, int ac, int everything_opt)
 	if (TimeoutOpt > 0)
 		alarm(TimeoutOpt);
 
-	bzero(&pfs, sizeof(pfs));
-	pfs.bytes = sizeof(*pfs.ondisk);
-	pfs.ondisk = malloc(pfs.bytes);
-	bzero(pfs.ondisk, pfs.bytes);
-	pfs.pfs_id = -1;
+	clrpfs(&pfs, NULL, -1);
 
 	/*
 	 * NOTE: To restrict to a single file XXX we have to set
@@ -91,8 +99,10 @@ hammer_cmd_softprune(char **av, int ac, int everything_opt)
 	/*
 	 * For now just allow one directory
 	 */
-	if (ac == 0 || ac > 1)
+	if (ac == 0 || ac > 1) {
 		softprune_usage(1);
+		/* not reached */
+	}
 
 	/*
 	 * Scan the softlink directory.
@@ -102,8 +112,10 @@ hammer_cmd_softprune(char **av, int ac, int everything_opt)
 		scan = hammer_softprune_addentry(&base, &template,
 						 *av, NULL, NULL,
 						 dummylink, dummylink);
-		if (scan == NULL)
+		if (scan == NULL) {
 			softprune_usage(1);
+			/* not reached */
+		}
 		scan->prune.nelms = 0;
 		scan->prune.head.flags |= HAMMER_IOC_PRUNE_ALL;
 	} else {
@@ -113,8 +125,10 @@ hammer_cmd_softprune(char **av, int ac, int everything_opt)
 			scan = hammer_softprune_addentry(&base, &template,
 							 *av, NULL, NULL,
 							 dummylink, dummylink);
-			if (scan == NULL)
+			if (scan == NULL) {
 				softprune_usage(1);
+				/* not reached */
+			}
 			scan->prune.nelms = 0;
 		}
 		++av;
@@ -125,9 +139,9 @@ hammer_cmd_softprune(char **av, int ac, int everything_opt)
 	 * XXX future (need to store separate cycles for each filesystem)
 	 */
 	if (base->next) {
-		fprintf(stderr, "Currently only one HAMMER filesystem may "
-				"be specified in the softlink scan\n");
-		exit(1);
+		errx(1, "Currently only one HAMMER filesystem may "
+			"be specified in the softlink scan");
+		/* not reached */
 	}
 
 	/*
@@ -238,6 +252,7 @@ hammer_cmd_softprune(char **av, int ac, int everything_opt)
  *	 snapshot mechanic we don't have to scan softlinks any more
  *	 and can just use the meta-data.  But for now we do both.
  */
+static
 void
 hammer_softprune_scandir(struct softprune **basep,
 			 struct hammer_ioc_prune *template,
@@ -254,8 +269,10 @@ hammer_softprune_scandir(struct softprune **basep,
 	path = NULL;
 	linkbuf = malloc(MAXPATHLEN);
 
-	if ((dir = opendir(dirname)) == NULL)
+	if ((dir = opendir(dirname)) == NULL) {
 		err(1, "Cannot open directory %s", dirname);
+		/* not reached */
+	}
 	while ((den = readdir(dir)) != NULL) {
 		if (strcmp(den->d_name, ".") == 0)
 			continue;
@@ -284,6 +301,24 @@ hammer_softprune_scandir(struct softprune **basep,
 }
 
 /*
+ * Scan a directory for softlinks representing snapshots.
+ * Return 1 if the directory contains snapshots, otherwise 0.
+ */
+int
+hammer_softprune_testdir(const char *dirname)
+{
+	struct softprune *base = NULL;
+	struct hammer_ioc_prune dummy_template;
+
+	bzero(&dummy_template, sizeof(dummy_template));
+	hammer_softprune_scandir(&base, &dummy_template, dirname);
+
+	if (base)
+		return(1);
+	return(0);
+}
+
+/*
  * Scan the metadata snapshots for the filesystem and either delete them
  * or add them to the pruning list.
  */
@@ -294,7 +329,7 @@ hammer_softprune_scanmeta(int fd, struct softprune *scan, int delete_all)
 	struct hammer_ioc_version	version;
 	struct hammer_ioc_snapshot	snapshot;
 	struct hammer_ioc_snapshot	dsnapshot;
-	struct hammer_snapshot_data	*snap;
+	hammer_snapshot_data_t		snap;
 	time_t ct;
 
 	/*
@@ -304,6 +339,7 @@ hammer_softprune_scanmeta(int fd, struct softprune *scan, int delete_all)
 	bzero(&version, sizeof(version));
 	if (ioctl(fd, HAMMERIOC_GET_VERSION, &version) < 0)
 		return(-1);
+	HammerVersion = version.cur_version;
 	if (version.cur_version < 3)
 		return(0);
 
@@ -347,7 +383,8 @@ hammer_softprune_scanmeta(int fd, struct softprune *scan, int delete_all)
  * Flush any entries built up in the deletion snapshot ioctl structure.
  * Used during a prune-everything.
  */
-static void
+static
+void
 hammer_meta_flushdelete(int fd, struct hammer_ioc_snapshot *dsnap)
 {
 	while (dsnap->index < dsnap->count) {
@@ -436,7 +473,8 @@ hammer_softprune_addentry(struct softprune **basep,
  *
  * Always leave one entry free for our terminator.
  */
-static void
+static
+void
 hammer_softprune_addelm(struct softprune *scan, hammer_tid_t tid,
 			time_t ct, time_t mt)
 {
@@ -470,7 +508,8 @@ hammer_softprune_addelm(struct softprune *scan, hammer_tid_t tid,
  *
  * The array must end up in descending order.
  */
-static int
+static
+int
 hammer_softprune_qsort_cmp(const void *arg1, const void *arg2)
 {
 	const struct hammer_ioc_prune_elm *elm1 = arg1;
@@ -483,7 +522,8 @@ hammer_softprune_qsort_cmp(const void *arg1, const void *arg2)
 	return(0);
 }
 
-static void
+static
+void
 hammer_softprune_finalize(struct softprune *scan)
 {
 	struct hammer_ioc_prune_elm *elm;
@@ -600,5 +640,4 @@ softprune_usage(int code)
 	fprintf(stderr, "hammer prune-everything <filesystem>\n");
 	exit(code);
 }
-
 

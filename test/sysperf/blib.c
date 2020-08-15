@@ -12,9 +12,9 @@
 #include <stdlib.h>
 #include <stdarg.h>
 
-static struct timeval tv1;
-static struct timeval tv2;
-static long long last_us;
+static __thread struct timeval tv1;
+static __thread struct timeval tv2;
+static __thread long long last_us;
 
 void
 start_timing(void)
@@ -38,9 +38,10 @@ stop_timing(long long count, const char *ctl, ...)
     vfprintf(stderr, ctl, va);
     va_end(va);
 
-    fprintf(stderr, " %6.3fs %lld loops = %6.3fuS/loop\n",
+    fprintf(stderr, " %6.3fs %lld loops, %8.0f loops/sec, %6.3fuS/loop\n",
 	(double)us / 1000000.0,
 	count,
+	(double)count * 1e6 / (double)us,
 	(double)us / (double)count
     );
 

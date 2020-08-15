@@ -65,7 +65,6 @@
 
 #include "opt_inet.h"
 #include "opt_inet6.h"
-#include "opt_ipsec.h"
 #include "opt_tcpdebug.h"
 #include "opt_tcp_input.h"
 
@@ -119,17 +118,6 @@ u_char tcp_saveipgen[40];    /* the size must be of max ip header, now IPv6 */
 struct tcphdr tcp_savetcp;
 #endif
 
-#ifdef FAST_IPSEC
-#include <netproto/ipsec/ipsec.h>
-#include <netproto/ipsec/ipsec6.h>
-#endif
-
-#ifdef IPSEC
-#include <netinet6/ipsec.h>
-#include <netinet6/ipsec6.h>
-#include <netproto/key/key.h>
-#endif
-
 /*
  * Limit burst of new packets during SACK based fast recovery
  * or extended limited transmit.
@@ -149,7 +137,7 @@ SYSCTL_INT(_net_inet_tcp, OID_AUTO, blackhole, CTLFLAG_RW,
 int tcp_delack_enabled = 1;
 SYSCTL_INT(_net_inet_tcp, OID_AUTO, delayed_ack, CTLFLAG_RW,
     &tcp_delack_enabled, 0,
-    "Delay ACK to try and piggyback it onto a data packet");
+    "Delay ACK to try to piggyback it onto a data packet");
 
 #ifdef TCP_DROP_SYNFIN
 static int drop_synfin = 0;
@@ -290,7 +278,7 @@ static boolean_t tcp_recv_dupack(struct tcpcb *, tcp_seq, u_int);
 #define ND6_HINT(tp) \
 do { \
 	if ((tp) && (tp)->t_inpcb && \
-	    ((tp)->t_inpcb->inp_vflag & INP_IPV6) && \
+	    INP_ISIPV6((tp)->t_inpcb) && \
 	    (tp)->t_inpcb->in6p_route.ro_rt) \
 		nd6_nud_hint((tp)->t_inpcb->in6p_route.ro_rt, NULL, 0); \
 } while (0)
@@ -871,10 +859,10 @@ findpcb:
 		} else {
 			cpu = mycpu->gd_cpuid;
 			inp = in_pcblookup_pkthash(&tcbinfo[cpu],
-			    ip->ip_src, th->th_sport,
-			    ip->ip_dst, th->th_dport,
-			    1, m->m_pkthdr.rcvif,
-			    tcp_reuseport_ext ? m : NULL);
+					    ip->ip_src, th->th_sport,
+					    ip->ip_dst, th->th_dport,
+					    1, m->m_pkthdr.rcvif,
+					    tcp_reuseport_ext ? m : NULL);
 		}
 	}
 
@@ -889,8 +877,7 @@ findpcb:
 #ifdef INET6
 			char dbuf[INET6_ADDRSTRLEN+2], sbuf[INET6_ADDRSTRLEN+2];
 #else
-			char dbuf[sizeof "aaa.bbb.ccc.ddd"];
-			char sbuf[sizeof "aaa.bbb.ccc.ddd"];
+			char dbuf[INET_ADDRSTRLEN], sbuf[INET_ADDRSTRLEN];
 #endif
 			if (isipv6) {
 				strcpy(dbuf, "[");
@@ -900,8 +887,8 @@ findpcb:
 				strcat(sbuf, ip6_sprintf(&ip6->ip6_src));
 				strcat(sbuf, "]");
 			} else {
-				strcpy(dbuf, inet_ntoa(ip->ip_dst));
-				strcpy(sbuf, inet_ntoa(ip->ip_src));
+				kinet_ntoa(ip->ip_dst, dbuf);
+				kinet_ntoa(ip->ip_src, sbuf);
 			}
 			switch (log_in_vain) {
 			case 1:
@@ -934,28 +921,6 @@ findpcb:
 		goto dropwithreset;
 	}
 
-#ifdef IPSEC
-	if (isipv6) {
-		if (ipsec6_in_reject_so(m, inp->inp_socket)) {
-			ipsec6stat.in_polvio++;
-			goto drop;
-		}
-	} else {
-		if (ipsec4_in_reject_so(m, inp->inp_socket)) {
-			ipsecstat.in_polvio++;
-			goto drop;
-		}
-	}
-#endif
-#ifdef FAST_IPSEC
-	if (isipv6) {
-		if (ipsec6_in_reject(m, inp))
-			goto drop;
-	} else {
-		if (ipsec4_in_reject(m, inp))
-			goto drop;
-	}
-#endif
 	/* Check the minimum TTL for socket. */
 #ifdef INET6
 	if ((isipv6 ? ip6->ip6_hlim : ip->ip_ttl) < inp->inp_ip_minttl)
@@ -963,10 +928,7 @@ findpcb:
 #endif
 
 	tp = intotcpcb(inp);
-	if (tp == NULL) {
-		rstreason = BANDLIM_RST_CLOSEDPORT;
-		goto dropwithreset;
-	}
+	KASSERT(tp != NULL, ("tcp_input: tp is NULL"));
 	if (tp->t_state <= TCPS_CLOSED)
 		goto drop;
 
@@ -1150,7 +1112,7 @@ findpcb:
 		}
 		/*
 		 * SYN appears to be valid; create compressed TCP state
-		 * for syncache, or perform t/tcp connection.
+		 * for syncache.
 		 */
 		if (so->so_qlen <= so->so_qlimit) {
 			tcp_dooptions(&to, optp, optlen, TRUE, th->th_ack);
@@ -1224,7 +1186,7 @@ after_listen:
 		}
 		if (!(to.to_flags & TOF_MSS))
 			to.to_mss = 0;
-		tcp_mss(tp, to.to_mss);
+		tcp_rmx_init(tp, to.to_mss);
 		/*
 		 * Only set the TF_SACK_PERMITTED per-connection flag
 		 * if we got a SACK_PERMITTED option from the other side
@@ -1502,7 +1464,7 @@ after_listen:
 					tp->t_flags |= TF_ONOUTPUTQ;
 					tp->tt_cpu = mycpu->gd_cpuid;
 					TAILQ_INSERT_TAIL(
-					    &tcpcbackq[tp->tt_cpu],
+					    &tcpcbackq[tp->tt_cpu].head,
 					    tp, t_outputq);
 				}
 			} else {
@@ -1537,8 +1499,8 @@ after_listen:
 		if ((thflags & TH_ACK) &&
 		    (SEQ_LEQ(th->th_ack, tp->snd_una) ||
 		     SEQ_GT(th->th_ack, tp->snd_max))) {
-				rstreason = BANDLIM_RST_OPENPORT;
-				goto dropwithreset;
+			rstreason = BANDLIM_RST_OPENPORT;
+			goto dropwithreset;
 		}
 		break;
 
@@ -1600,7 +1562,7 @@ after_listen:
 			 */
 			tp->t_starttime = ticks;
 			if (tp->t_flags & TF_NEEDFIN) {
-				tp->t_state = TCPS_FIN_WAIT_1;
+				TCP_STATE_CHANGE(tp, TCPS_FIN_WAIT_1);
 				tp->t_flags &= ~TF_NEEDFIN;
 				thflags &= ~TH_SYN;
 			} else {
@@ -1616,7 +1578,7 @@ after_listen:
 			 */
 			tp->t_flags |= TF_ACKNOW;
 			tcp_callout_stop(tp, tp->tt_rexmt);
-			tp->t_state = TCPS_SYN_RECEIVED;
+			TCP_STATE_CHANGE(tp, TCPS_SYN_RECEIVED);
 		}
 
 		/*
@@ -1654,7 +1616,10 @@ after_listen:
 	case TCPS_LAST_ACK:
 	case TCPS_CLOSING:
 	case TCPS_TIME_WAIT:
-		break;  /* continue normal processing */
+		/*
+		 * Continue normal processing
+		 */
+		break;
 	}
 
 	/*
@@ -1728,7 +1693,7 @@ after_listen:
 			case TCPS_CLOSE_WAIT:
 				so->so_error = ECONNRESET;
 			close:
-				tp->t_state = TCPS_CLOSED;
+				TCP_STATE_CHANGE(tp, TCPS_CLOSED);
 				tcpstat.tcps_drops++;
 				tp = tcp_close(tp);
 				break;
@@ -1743,6 +1708,18 @@ after_listen:
 			}
 		}
 		goto drop;
+	}
+
+	/*
+	 * Allow a new connection to replace an existing connection that is
+	 * in the TIME_WAIT state if the new connection's SYN seq is different
+	 * from tp->irs.
+	 */
+	if ((thflags & TH_SYN) &&
+	    tp->t_state == TCPS_TIME_WAIT &&
+	    th->th_seq != tp->irs) {
+		tp = tcp_close(tp);
+		goto findpcb;
 	}
 
 	/*
@@ -1897,18 +1874,7 @@ after_listen:
 		tcpstat.tcps_rcvpackafterwin++;
 		if (todrop >= tlen) {
 			tcpstat.tcps_rcvbyteafterwin += tlen;
-			/*
-			 * If a new connection request is received
-			 * while in TIME_WAIT, drop the old connection
-			 * and start over if the sequence numbers
-			 * are above the previous ones.
-			 */
-			if (thflags & TH_SYN &&
-			    tp->t_state == TCPS_TIME_WAIT &&
-			    SEQ_GT(th->th_seq, tp->rcv_nxt)) {
-				tp = tcp_close(tp);
-				goto findpcb;
-			}
+
 			/*
 			 * If window is closed can only take segments at
 			 * window edge, and have to drop data and PUSH from
@@ -2001,7 +1967,7 @@ after_listen:
 		 */
 		tp->t_starttime = ticks;
 		if (tp->t_flags & TF_NEEDFIN) {
-			tp->t_state = TCPS_FIN_WAIT_1;
+			TCP_STATE_CHANGE(tp, TCPS_FIN_WAIT_1);
 			tp->t_flags &= ~TF_NEEDFIN;
 		} else {
 			tcp_established(tp);
@@ -2308,7 +2274,7 @@ process_ACK:
 					tcp_callout_reset(tp, tp->tt_2msl,
 					    tp->t_maxidle, tcp_timer_2msl);
 				}
-				tp->t_state = TCPS_FIN_WAIT_2;
+				TCP_STATE_CHANGE(tp, TCPS_FIN_WAIT_2);
 			}
 			break;
 
@@ -2320,7 +2286,7 @@ process_ACK:
 		 */
 		case TCPS_CLOSING:
 			if (ourfinisacked) {
-				tp->t_state = TCPS_TIME_WAIT;
+				TCP_STATE_CHANGE(tp, TCPS_TIME_WAIT);
 				tcp_canceltimers(tp);
 				tcp_callout_reset(tp, tp->tt_2msl,
 					    2 * tcp_rmx_msl(tp),
@@ -2536,7 +2502,7 @@ dodata:							/* XXX */
 			tp->t_starttime = ticks;
 			/*FALLTHROUGH*/
 		case TCPS_ESTABLISHED:
-			tp->t_state = TCPS_CLOSE_WAIT;
+			TCP_STATE_CHANGE(tp, TCPS_CLOSE_WAIT);
 			break;
 
 		/*
@@ -2544,7 +2510,7 @@ dodata:							/* XXX */
 		 * enter the CLOSING state.
 		 */
 		case TCPS_FIN_WAIT_1:
-			tp->t_state = TCPS_CLOSING;
+			TCP_STATE_CHANGE(tp, TCPS_CLOSING);
 			break;
 
 		/*
@@ -2553,7 +2519,7 @@ dodata:							/* XXX */
 		 * standard timers.
 		 */
 		case TCPS_FIN_WAIT_2:
-			tp->t_state = TCPS_TIME_WAIT;
+			TCP_STATE_CHANGE(tp, TCPS_TIME_WAIT);
 			tcp_canceltimers(tp);
 			tcp_callout_reset(tp, tp->tt_2msl, 2 * tcp_rmx_msl(tp),
 				    tcp_timer_2msl);
@@ -2975,8 +2941,6 @@ tcp_xmit_timer(struct tcpcb *tp, int rtt, tcp_seq ack)
  * of the interface), as we can't discover anything about intervening
  * gateways or networks.  We also initialize the congestion/slow start
  * window to be a single segment if the destination isn't local.
- * While looking at the routing entry, we also initialize other path-dependent
- * parameters from pre-set or cached values in the routing entry.
  *
  * Also take into account the space needed for options that we
  * send regularly.  Make maxseg shorter by that amount to assure
@@ -2987,17 +2951,16 @@ tcp_xmit_timer(struct tcpcb *tp, int rtt, tcp_seq ack)
  * NOTE that this routine is only called when we process an incoming
  * segment, for outgoing segments only tcp_mssopt is called.
  */
-void
-tcp_mss(struct tcpcb *tp, int offer)
+static void
+tcp_rmx_mss(struct tcpcb *tp, struct rtentry *rt, int offer)
 {
-	struct rtentry *rt;
 	struct ifnet *ifp;
-	int rtt, mss;
+	int mss;
 	u_long bufsize;
 	struct inpcb *inp = tp->t_inpcb;
 	struct socket *so;
 #ifdef INET6
-	boolean_t isipv6 = ((inp->inp_vflag & INP_IPV6) ? TRUE : FALSE);
+	boolean_t isipv6 = INP_ISIPV6(inp);
 	size_t min_protoh = isipv6 ?
 			    sizeof(struct ip6_hdr) + sizeof(struct tcphdr) :
 			    sizeof(struct tcpiphdr);
@@ -3006,10 +2969,6 @@ tcp_mss(struct tcpcb *tp, int offer)
 	const size_t min_protoh = sizeof(struct tcpiphdr);
 #endif
 
-	if (isipv6)
-		rt = tcp_rtlookup6(&inp->inp_inc);
-	else
-		rt = tcp_rtlookup(&inp->inp_inc);
 	if (rt == NULL) {
 		tp->t_maxopd = tp->t_maxseg =
 		    (isipv6 ? tcp_v6mssdflt : tcp_mssdflt);
@@ -3026,12 +2985,10 @@ tcp_mss(struct tcpcb *tp, int offer)
 	 */
 	if (offer == 0) {
 		if (isipv6) {
-			if (in6_localaddr(&inp->in6p_faddr)) {
-				offer = ND_IFINFO(rt->rt_ifp)->linkmtu -
-					min_protoh;
-			} else {
+			if (in6_localaddr(&inp->in6p_faddr))
+				offer = IN6_LINKMTU(rt->rt_ifp) - min_protoh;
+			else
 				offer = tcp_v6mssdflt;
-			}
 		} else {
 			if (in_localaddr(inp->inp_faddr))
 				offer = ifp->if_mtu - min_protoh;
@@ -3055,47 +3012,19 @@ tcp_mss(struct tcpcb *tp, int offer)
 	rt->rt_rmx.rmx_mssopt = offer;
 
 	/*
-	 * While we're here, check if there's an initial rtt
-	 * or rttvar.  Convert from the route-table units
-	 * to scaled multiples of the slow timeout timer.
-	 */
-	if (tp->t_srtt == 0 && (rtt = rt->rt_rmx.rmx_rtt)) {
-		/*
-		 * XXX the lock bit for RTT indicates that the value
-		 * is also a minimum value; this is subject to time.
-		 */
-		if (rt->rt_rmx.rmx_locks & RTV_RTT)
-			tp->t_rttmin = rtt / (RTM_RTTUNIT / hz);
-		tp->t_srtt = rtt / (RTM_RTTUNIT / (hz * TCP_RTT_SCALE));
-		tp->t_rttbest = tp->t_srtt + TCP_RTT_SCALE;
-		tcpstat.tcps_usedrtt++;
-		if (rt->rt_rmx.rmx_rttvar) {
-			tp->t_rttvar = rt->rt_rmx.rmx_rttvar /
-			    (RTM_RTTUNIT / (hz * TCP_RTTVAR_SCALE));
-			tcpstat.tcps_usedrttvar++;
-		} else {
-			/* default variation is +- 1 rtt */
-			tp->t_rttvar =
-			    tp->t_srtt * TCP_RTTVAR_SCALE / TCP_RTT_SCALE;
-		}
-		TCPT_RANGESET(tp->t_rxtcur,
-			      ((tp->t_srtt >> 2) + tp->t_rttvar) >> 1,
-			      tp->t_rttmin, TCPTV_REXMTMAX);
-	}
-
-	/*
 	 * if there's an mtu associated with the route, use it
 	 * else, use the link mtu.  Take the smaller of mss or offer
 	 * as our final mss.
 	 */
 	if (rt->rt_rmx.rmx_mtu) {
-		mss = rt->rt_rmx.rmx_mtu - min_protoh;
+		mss = rt->rt_rmx.rmx_mtu;
 	} else {
 		if (isipv6)
-			mss = ND_IFINFO(rt->rt_ifp)->linkmtu - min_protoh;
+			mss = IN6_LINKMTU(rt->rt_ifp);
 		else
-			mss = ifp->if_mtu - min_protoh;
+			mss = ifp->if_mtu;
 	}
+	mss -= min_protoh;
 	mss = min(mss, offer);
 
 	/*
@@ -3116,7 +3045,7 @@ tcp_mss(struct tcpcb *tp, int offer)
 		mss &= ~(MCLBYTES-1);
 #else
 	if (mss > MCLBYTES)
-		mss = mss / MCLBYTES * MCLBYTES;
+		mss = rounddown(mss, MCLBYTES);
 #endif
 	/*
 	 * If there's a pipesize, change the socket buffer
@@ -3173,6 +3102,69 @@ tcp_mss(struct tcpcb *tp, int offer)
 	}
 }
 
+static void
+tcp_rmx_rtt(struct tcpcb *tp, struct rtentry *rt)
+{
+	int rtt;
+
+	if (rt == NULL)
+		return;
+
+	/*
+	 * Check if there's an initial rtt or rttvar.  Convert
+	 * from the route-table units to scaled multiples of
+	 * the slow timeout timer.
+	 */
+	if (tp->t_srtt == 0 && (rtt = rt->rt_rmx.rmx_rtt)) {
+		/*
+		 * XXX the lock bit for RTT indicates that the value
+		 * is also a minimum value; this is subject to time.
+		 */
+		if (rt->rt_rmx.rmx_locks & RTV_RTT)
+			tp->t_rttmin = rtt / (RTM_RTTUNIT / hz);
+		tp->t_srtt = rtt / (RTM_RTTUNIT / (hz * TCP_RTT_SCALE));
+		tp->t_rttbest = tp->t_srtt + TCP_RTT_SCALE;
+		tcpstat.tcps_usedrtt++;
+		if (rt->rt_rmx.rmx_rttvar) {
+			tp->t_rttvar = rt->rt_rmx.rmx_rttvar /
+			    (RTM_RTTUNIT / (hz * TCP_RTTVAR_SCALE));
+			tcpstat.tcps_usedrttvar++;
+		} else {
+			/* default variation is +- 1 rtt */
+			tp->t_rttvar =
+			    tp->t_srtt * TCP_RTTVAR_SCALE / TCP_RTT_SCALE;
+		}
+		TCPT_RANGESET(tp->t_rxtcur,
+			      ((tp->t_srtt >> 2) + tp->t_rttvar) >> 1,
+			      tp->t_rttmin, TCPTV_REXMTMAX);
+	}
+}
+
+void
+tcp_rmx_init(struct tcpcb *tp, int offer)
+{
+	struct inpcb *inp = tp->t_inpcb;
+#ifdef INET6
+	boolean_t isipv6 = INP_ISIPV6(inp);
+#else
+	const boolean_t isipv6 = FALSE;
+#endif
+	struct rtentry *rt;
+
+	if (isipv6)
+		rt = tcp_rtlookup6(&inp->inp_inc);
+	else
+		rt = tcp_rtlookup(&inp->inp_inc);
+
+	tcp_rmx_mss(tp, rt, offer);
+	tcp_rmx_rtt(tp, rt);
+
+	if (rt != NULL && !tcp_ncr_linklocal && (rt->rt_flags & RTF_LLINFO)) {
+		/* Don't enable NCR on link-local network. */
+		tp->t_flags &= ~TF_NCR;
+	}
+}
+
 /*
  * Determine the MSS option to send on an outgoing SYN.
  */
@@ -3181,8 +3173,7 @@ tcp_mssopt(struct tcpcb *tp)
 {
 	struct rtentry *rt;
 #ifdef INET6
-	boolean_t isipv6 =
-	    ((tp->t_inpcb->inp_vflag & INP_IPV6) ? TRUE : FALSE);
+	boolean_t isipv6 = INP_ISIPV6(tp->t_inpcb);
 	int min_protoh = isipv6 ?
 			     sizeof(struct ip6_hdr) + sizeof(struct tcphdr) :
 			     sizeof(struct tcpiphdr);
@@ -3198,7 +3189,12 @@ tcp_mssopt(struct tcpcb *tp)
 	if (rt == NULL)
 		return (isipv6 ? tcp_v6mssdflt : tcp_mssdflt);
 
+#ifdef INET6
+	return ((isipv6 ? IN6_LINKMTU(rt->rt_ifp) : rt->rt_ifp->if_mtu) -
+	    min_protoh);
+#else
 	return (rt->rt_ifp->if_mtu - min_protoh);
+#endif
 }
 
 /*
@@ -3421,7 +3417,7 @@ tcp_rmx_msl(const struct tcpcb *tp)
 	struct inpcb *inp = tp->t_inpcb;
 	int msl;
 #ifdef INET6
-	boolean_t isipv6 = ((inp->inp_vflag & INP_IPV6) ? TRUE : FALSE);
+	boolean_t isipv6 = INP_ISIPV6(inp);
 #else
 	const boolean_t isipv6 = FALSE;
 #endif
@@ -3443,7 +3439,7 @@ tcp_rmx_msl(const struct tcpcb *tp)
 static void
 tcp_established(struct tcpcb *tp)
 {
-	tp->t_state = TCPS_ESTABLISHED;
+	TCP_STATE_CHANGE(tp, TCPS_ESTABLISHED);
 	tcp_callout_reset(tp, tp->tt_keep, tp->t_keepidle, tcp_timer_keep);
 
 	if (tp->t_rxtsyn > 0) {

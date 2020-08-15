@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2004 The DragonFly Project.  All rights reserved.
+ * Copyright (c) 2004-2020 The DragonFly Project.  All rights reserved.
  * 
  * This code is derived from software contributed to The DragonFly Project
  * by Matthew Dillon <dillon@backplane.com>
@@ -53,6 +53,7 @@
 
 #include <sys/param.h>
 #include <sys/systm.h>
+#include <sys/uio.h>
 #include <sys/kernel.h>
 #include <sys/vnode.h>
 #include <sys/mount.h>
@@ -64,13 +65,37 @@
 #include <sys/stat.h>
 #include <sys/objcache.h>
 #include <sys/file.h>
+#include <sys/kcollect.h>
+#include <sys/sysctl.h>
 
 #ifdef KTRACE
 #include <sys/ktrace.h>
 #endif
 
+__read_mostly static int nlookup_debug;
+SYSCTL_INT(_debug, OID_AUTO, nlookup_debug, CTLFLAG_RW, &nlookup_debug, 0,
+	"Force retry test");
+
 static int naccess(struct nchandle *nch, int vmode, struct ucred *cred,
-		int *stickyp);
+			int *stickyp, int nchislocked);
+
+/*
+ * unmount operations flag NLC_IGNBADDIR in order to allow the
+ * umount to successfully issue a nlookup() on the path in order
+ * to extract the mount point.  Allow certain errors through.
+ */
+static __inline
+int
+keeperror(struct nlookupdata *nd, int error)
+{
+	if (error) {
+		if ((nd->nl_flags & NLC_IGNBADDIR) == 0 ||
+		   (error != EIO && error != EBADRPC && error != ESTALE)) {
+			return 1;
+		}
+	}
+	return 0;
+}
 
 /*
  * Initialize a nlookup() structure, early error return for copyin faults
@@ -113,19 +138,39 @@ nlookup_init(struct nlookupdata *nd,
 
     if (error == 0) {
 	if (p && p->p_fd) {
-	    cache_copy(&p->p_fd->fd_ncdir, &nd->nl_nch);
-	    cache_copy(&p->p_fd->fd_nrdir, &nd->nl_rootnch);
-	    if (p->p_fd->fd_njdir.ncp)
-		cache_copy(&p->p_fd->fd_njdir, &nd->nl_jailnch);
-	    nd->nl_cred = crhold(p->p_ucred);
+	    if (nd->nl_path[0] == '/') {
+		    if ((flags & NLC_NLNCH_NOINIT) == 0) {
+			    nd->nl_basench = &p->p_fd->fd_nrdir;
+			    cache_copy(nd->nl_basench, &nd->nl_nch);
+		    }
+		    cache_copy(&p->p_fd->fd_nrdir, &nd->nl_rootnch);
+		    if (p->p_fd->fd_njdir.ncp)
+			cache_copy(&p->p_fd->fd_njdir, &nd->nl_jailnch);
+		    nd->nl_cred = td->td_ucred;
+		    nd->nl_flags |= NLC_BORROWCRED;
+	    } else {
+		    if ((flags & NLC_NLNCH_NOINIT) == 0) {
+			    nd->nl_basench = &p->p_fd->fd_ncdir;
+			    cache_copy(nd->nl_basench, &nd->nl_nch);
+		    }
+		    cache_copy(&p->p_fd->fd_nrdir, &nd->nl_rootnch);
+		    if (p->p_fd->fd_njdir.ncp)
+			cache_copy(&p->p_fd->fd_njdir, &nd->nl_jailnch);
+		    nd->nl_cred = td->td_ucred;
+		    nd->nl_flags |= NLC_BORROWCRED;
+	    }
 	} else {
-	    cache_copy(&rootnch, &nd->nl_nch);
-	    cache_copy(&nd->nl_nch, &nd->nl_rootnch);
-	    cache_copy(&nd->nl_nch, &nd->nl_jailnch);
-	    nd->nl_cred = crhold(proc0.p_ucred);
+	    if ((flags & NLC_NLNCH_NOINIT) == 0) {
+		    nd->nl_basench = &rootnch;
+		    cache_copy(nd->nl_basench, &nd->nl_nch);
+	    }
+	    cache_copy(&rootnch, &nd->nl_rootnch);
+	    cache_copy(&rootnch, &nd->nl_jailnch);
+	    nd->nl_cred = proc0.p_ucred;
+	    nd->nl_flags |= NLC_BORROWCRED;
 	}
 	nd->nl_td = td;
-	nd->nl_flags |= flags;
+	nd->nl_flags |= flags & ~NLC_NLNCH_NOINIT;
     } else {
 	nlookup_done(nd);
     }
@@ -136,10 +181,10 @@ nlookup_init(struct nlookupdata *nd,
 /*
  * nlookup_init() for "at" family of syscalls.
  *
- * Works similarly to nlookup_init() but if path is relative and fd is not
- * AT_FDCWD, path is interpreted relative to the directory pointed to by fd.
- * In this case, the file entry pointed to by fd is ref'ed and returned in
- * *fpp. 
+ * Similar to nlookup_init() but if the path is relative and fd is not
+ * AT_FDCWD, the path will be interpreted relative to the directory pointed
+*  to by fd.  In this case, the file entry pointed to by fd is ref'ed and
+*  returned in *fpp.
  *
  * If the call succeeds, nlookup_done_at() must be called to clean-up the nd
  * and release the ref to the file entry.
@@ -149,19 +194,34 @@ nlookup_init_at(struct nlookupdata *nd, struct file **fpp, int fd,
 		const char *path, enum uio_seg seg, int flags)
 {
 	struct thread *td = curthread;
-	struct proc *p = td->td_proc;
 	struct file* fp;
 	struct vnode *vp;
 	int error;
 
 	*fpp = NULL;
 
-	if  ((error = nlookup_init(nd, path, seg, flags)) != 0) {
+	/*
+	 * Resolve the path, we might have to copy it in from userland,
+	 * but don't initialize nl_basench, or nl_nch.
+	 */
+	error = nlookup_init(nd, path, seg, flags | NLC_NLNCH_NOINIT);
+	if (__predict_false(error))
 		return (error);
-	}
 
-	if (nd->nl_path[0] != '/' && fd != AT_FDCWD) {
-		if ((error = holdvnode(p->p_fd, fd, &fp)) != 0)
+	/*
+	 * Setup nl_basench (a pointer only not refd), and copy+ref
+	 * to initialize nl_nch.  Only applicable to relative paths.
+	 * For absolute paths, or if (fd) is degenerate, just use the
+	 * normal path.
+	 */
+	if (nd->nl_path[0] == '/') {
+		struct proc *p = curproc;
+		nd->nl_basench = &p->p_fd->fd_nrdir;
+	} else if (fd == AT_FDCWD) {
+		struct proc *p = curproc;
+		nd->nl_basench = &p->p_fd->fd_ncdir;
+	} else {
+		if ((error = holdvnode(td, fd, &fp)) != 0)
 			goto done;
 		vp = (struct vnode*)fp->f_data;
 		if (vp->v_type != VDIR || fp->f_nchandle.ncp == NULL) {
@@ -170,17 +230,14 @@ nlookup_init_at(struct nlookupdata *nd, struct file **fpp, int fd,
 			error = ENOTDIR;
 			goto done;
 		}
-		cache_drop(&nd->nl_nch);
-		cache_copy(&fp->f_nchandle, &nd->nl_nch);
+		nd->nl_basench = &fp->f_nchandle;
 		*fpp = fp;
 	}
-
-
+	cache_copy(nd->nl_basench, &nd->nl_nch);
 done:
 	if (error)
 		nlookup_done(nd);
 	return (error);
-
 }
 
 /*
@@ -271,6 +328,7 @@ nlookup_init_root(struct nlookupdata *nd,
     return(error);
 }
 
+#if 0
 /*
  * Set a different credential; this credential will be used by future
  * operations performed on nd.nl_open_vp and nlookupdata structure.
@@ -282,10 +340,13 @@ nlookup_set_cred(struct nlookupdata *nd, struct ucred *cred)
 
 	if (nd->nl_cred != cred) {
 		cred = crhold(cred);
-		crfree(nd->nl_cred);
+		if ((nd->nl_flags & NLC_BORROWCRED) == 0)
+			crfree(nd->nl_cred);
+		nd->nl_flags &= ~NLC_BORROWCRED;
 		nd->nl_cred = cred;
 	}
 }
+#endif
 
 /*
  * Cleanup a nlookupdata structure after we are through with it.  This may
@@ -298,23 +359,24 @@ void
 nlookup_done(struct nlookupdata *nd)
 {
     if (nd->nl_nch.ncp) {
-	if (nd->nl_flags & NLC_NCPISLOCKED) {
-	    nd->nl_flags &= ~NLC_NCPISLOCKED;
+	if (nd->nl_flags & NLC_NCPISLOCKED)
 	    cache_unlock(&nd->nl_nch);
-	}
-	cache_drop(&nd->nl_nch);	/* NULL's out the nch */
+	cache_drop_and_cache(&nd->nl_nch, nd->nl_elmno);
     }
+    nd->nl_flags &= ~NLC_NCPISLOCKED;
     if (nd->nl_rootnch.ncp)
-	cache_drop(&nd->nl_rootnch);
+	cache_drop_and_cache(&nd->nl_rootnch, 0);
     if (nd->nl_jailnch.ncp)
-	cache_drop(&nd->nl_jailnch);
+	cache_drop_and_cache(&nd->nl_jailnch, 0);
     if ((nd->nl_flags & NLC_HASBUF) && nd->nl_path) {
 	objcache_put(namei_oc, nd->nl_path);
 	nd->nl_path = NULL;
     }
     if (nd->nl_cred) {
-	crfree(nd->nl_cred);
+	if ((nd->nl_flags & NLC_BORROWCRED) == 0)
+	    crfree(nd->nl_cred);
 	nd->nl_cred = NULL;
+	nd->nl_flags &= ~NLC_BORROWCRED;
     }
     if (nd->nl_open_vp) {
 	if (nd->nl_flags & NLC_LOCKVP) {
@@ -329,6 +391,7 @@ nlookup_done(struct nlookupdata *nd)
 	nd->nl_dvp = NULL;
     }
     nd->nl_flags = 0;	/* clear remaining flags (just clear everything) */
+    nd->nl_basench = NULL;
 }
 
 /*
@@ -397,16 +460,19 @@ islastelement(const char *ptr)
  * the last element of the namecache lookup will be locked
  * exclusively.
  *
+ * O_CREAT or O_TRUNC need the last element to be locked exlcusively.
+ * Intermediate elements are always locked shared.
+ *
  * NOTE: Even if we return on-zero, an unresolved namecache record
  *	 will always be locked exclusively.
  */
 static __inline
 int
-wantsexcllock(struct nlookupdata *nd, const char *ptr)
+wantsexcllock(struct nlookupdata *nd, int last_element)
 {
 	if ((nd->nl_flags & NLC_SHAREDLOCK) == 0)
-		return(islastelement(ptr));
-	return(0);
+		return(last_element);
+	return 0;
 }
 
 
@@ -449,16 +515,27 @@ nlookup(struct nlookupdata *nd)
     globaldata_t gd = mycpu;
     struct nlcomponent nlc;
     struct nchandle nch;
-    struct nchandle par;
     struct nchandle nctmp;
     struct mount *mp;
-    struct vnode *hvp;		/* hold to prevent recyclement */
     int wasdotordotdot;
+    char *path_reset;
     char *ptr;
+    char *nptr;
     int error;
     int len;
     int dflags;
     int hit = 1;
+    int saveflag = nd->nl_flags;
+    boolean_t doretry = FALSE;
+    boolean_t inretry = FALSE;
+
+    if (nlookup_debug > 0) {
+	--nlookup_debug;
+	doretry = 1;
+    }
+    path_reset = NULL;
+
+nlookup_start:
 
 #ifdef KTRACE
     if (KTRPOINT(nd->nl_td, KTR_NAMEI))
@@ -483,14 +560,10 @@ nlookup(struct nlookupdata *nd)
      * is ref'd and unlocked and represents our current position.
      */
     for (;;) {
-	/*
-	 * Make sure nl_nch is locked so we can access the vnode, resolution
-	 * state, etc.
-	 */
-	if ((nd->nl_flags & NLC_NCPISLOCKED) == 0) {
-		nd->nl_flags |= NLC_NCPISLOCKED;
-		cache_lock_maybe_shared(&nd->nl_nch, wantsexcllock(nd, ptr));
-	}
+	int last_element;
+
+	++nd->nl_elmno;
+	KKASSERT((nd->nl_flags & NLC_NCPISLOCKED) == 0);
 
 	/*
 	 * Check if the root directory should replace the current
@@ -502,11 +575,15 @@ nlookup(struct nlookupdata *nd)
 	    do {
 		++ptr;
 	    } while (*ptr == '/');
-	    cache_unlock(&nd->nl_nch);
-	    cache_get_maybe_shared(&nd->nl_rootnch, &nch,
-				   wantsexcllock(nd, ptr));
-	    cache_drop(&nd->nl_nch);
-	    nd->nl_nch = nch;		/* remains locked */
+
+	    /*
+	     * We might already be at the root as a pre-optimization
+	     */
+	    if (nd->nl_nch.mount != nd->nl_rootnch.mount ||
+		nd->nl_nch.ncp != nd->nl_rootnch.ncp) {
+		cache_drop_and_cache(&nd->nl_nch, 0);
+		cache_copy(&nd->nl_rootnch, &nd->nl_nch);
+	    }
 
 	    /*
 	     * Fast-track termination.  There is no parent directory of
@@ -520,31 +597,59 @@ nlookup(struct nlookupdata *nd)
 			error = (nd->nl_flags & NLC_CREATE) ? EEXIST : EACCES;
 		else
 			error = 0;
+		nd->nl_flags |= NLC_NCPISLOCKED;
+		cache_lock_maybe_shared(&nd->nl_nch,
+					wantsexcllock(nd, islastelement(ptr)));
 		break;
 	    }
 	    continue;
 	}
 
 	/*
-	 * Check directory search permissions (nd->nl_nch is locked & refd)
+	 * Pre-calculate next path component so we can check whether the
+	 * current component directory is the last directory in the path
+	 * or not.
 	 */
-	dflags = 0;
-	error = naccess(&nd->nl_nch, NLC_EXEC, nd->nl_cred, &dflags);
-	if (error)
-	    break;
+	for (nptr = ptr; *nptr && *nptr != '/'; ++nptr)
+		;
 
 	/*
-	 * Extract the path component.  Path components are limited to
-	 * 255 characters.
+	 * nd->nl_nch is referenced and not locked here.
+	 *
+	 * Check directory search permissions.  This will load dflags to
+	 * obtain directory-special permissions to be checked along with the
+	 * last component.
+	 *
+	 * We only need to pass-in &dflags for the second-to-last component.
+	 * Optimize by passing-in NULL for any prior components, which may
+	 * allow the code to bypass the naccess() call.
+	 *
+	 * naccess() is optimized to avoid having to lock the nch or get
+	 * the related vnode if cached perms are sufficient.
+	 */
+	dflags = 0;
+	if (*nptr == '/' || (saveflag & NLC_MODIFYING_MASK) == 0)
+	    error = naccess(&nd->nl_nch, NLC_EXEC, nd->nl_cred, NULL, 0);
+	else
+	    error = naccess(&nd->nl_nch, NLC_EXEC, nd->nl_cred, &dflags, 0);
+	if (error) {
+	    if (keeperror(nd, error))
+		    break;
+	    error = 0;
+	}
+
+	/*
+	 * Extract the next (or last) path component.  Path components are
+	 * limited to 255 characters.
 	 */
 	nlc.nlc_nameptr = ptr;
-	while (*ptr && *ptr != '/')
-	    ++ptr;
-	nlc.nlc_namelen = ptr - nlc.nlc_nameptr;
+	nlc.nlc_namelen = nptr - ptr;
+	ptr = nptr;
 	if (nlc.nlc_namelen >= 256) {
 	    error = ENAMETOOLONG;
 	    break;
 	}
+	last_element = islastelement(nptr);
 
 	/*
 	 * Lookup the path component in the cache, creating an unresolved
@@ -558,8 +663,8 @@ nlookup(struct nlookupdata *nd)
 	 * since our dflags will be for some sub-directory instead of the
 	 * parent dir.
 	 *
-	 * This subsection returns a locked, refd 'nch' unless it errors out,
-	 * and an unlocked but still ref'd nd->nl_nch.
+	 * This subsection returns a referenced and possibly locked 'nch'.
+	 * The locking status is based on the last_element flag.
 	 *
 	 * The namecache topology is not allowed to be disconnected, so 
 	 * encountering a NULL parent will generate EINVAL.  This typically
@@ -567,12 +672,15 @@ nlookup(struct nlookupdata *nd)
 	 *
 	 * WARNING! The unlocking of nd->nl_nch is sensitive code.
 	 */
-	KKASSERT(nd->nl_flags & NLC_NCPISLOCKED);
+	KKASSERT((nd->nl_flags & NLC_NCPISLOCKED) == 0);
 
 	if (nlc.nlc_namelen == 1 && nlc.nlc_nameptr[0] == '.') {
-	    cache_unlock(&nd->nl_nch);
-	    nd->nl_flags &= ~NLC_NCPISLOCKED;
-	    cache_get_maybe_shared(&nd->nl_nch, &nch, wantsexcllock(nd, ptr));
+	    if (last_element) {
+		cache_get_maybe_shared(&nd->nl_nch, &nch,
+				       wantsexcllock(nd, 1));
+	    } else {
+		cache_copy(&nd->nl_nch, &nch);
+	    }
 	    wasdotordotdot = 1;
 	} else if (nlc.nlc_namelen == 2 && 
 		   nlc.nlc_nameptr[0] == '.' && nlc.nlc_nameptr[1] == '.') {
@@ -582,10 +690,12 @@ nlookup(struct nlookupdata *nd)
 		/*
 		 * ".." at the root returns the root
 		 */
-		cache_unlock(&nd->nl_nch);
-		nd->nl_flags &= ~NLC_NCPISLOCKED;
-		cache_get_maybe_shared(&nd->nl_nch, &nch,
-				       wantsexcllock(nd, ptr));
+		if (last_element) {
+		    cache_get_maybe_shared(&nd->nl_nch, &nch,
+					   wantsexcllock(nd, 1));
+		} else {
+		    cache_copy(&nd->nl_nch, &nch);
+		}
 	    } else {
 		/*
 		 * Locate the parent ncp.  If we are at the root of a
@@ -595,101 +705,155 @@ nlookup(struct nlookupdata *nd)
 		 * Expect the parent to always be good since the
 		 * mountpoint doesn't go away.  XXX hack.  cache_get()
 		 * requires the ncp to already have a ref as a safety.
+		 *
+		 * However, a process which has been broken out of a chroot
+		 * will wind up with a NULL parent if it tries to '..' above
+		 * the real root, deal with the case.  Note that this does
+		 * not protect us from a jail breakout, it just stops a panic
+		 * if the jail-broken process tries to '..' past the real
+		 * root.
 		 */
 		nctmp = nd->nl_nch;
-		while (nctmp.ncp == nctmp.mount->mnt_ncmountpt.ncp)
+		while (nctmp.ncp == nctmp.mount->mnt_ncmountpt.ncp) {
 			nctmp = nctmp.mount->mnt_ncmounton;
-		nctmp.ncp = nctmp.ncp->nc_parent;
-		KKASSERT(nctmp.ncp != NULL);
-		cache_hold(&nctmp);
-		cache_unlock(&nd->nl_nch);
-		nd->nl_flags &= ~NLC_NCPISLOCKED;
-		cache_get_maybe_shared(&nctmp, &nch, wantsexcllock(nd, ptr));
-		cache_drop(&nctmp);		/* NOTE: zero's nctmp */
+			if (nctmp.ncp == NULL)
+				break;
+		}
+		if (nctmp.ncp == NULL) {
+			if (curthread->td_proc) {
+				kprintf("vfs_nlookup: '..' traverse broke "
+					"jail: pid %d (%s)\n",
+					curthread->td_proc->p_pid,
+					curthread->td_comm);
+			}
+			nctmp = nd->nl_rootnch;
+		} else {
+			nctmp.ncp = nctmp.ncp->nc_parent;
+		}
+		if (last_element) {
+		    cache_get_maybe_shared(&nctmp, &nch,
+					   wantsexcllock(nd, 1));
+		} else {
+		    cache_copy(&nctmp, &nch);
+		}
 	    }
 	    wasdotordotdot = 2;
 	} else {
 	    /*
-	     * Must unlock nl_nch when traversing down the path.  However,
-	     * the child ncp has not yet been found/created and the parent's
-	     * child list might be empty.  Thus releasing the lock can
-	     * allow a race whereby the parent ncp's vnode is recycled.
-	     * This case can occur especially when maxvnodes is set very low.
-	     *
-	     * We need the parent's ncp to remain resolved for all normal
-	     * filesystem activities, so we vhold() the vp during the lookup
-	     * to prevent recyclement due to vnlru / maxvnodes.
-	     *
-	     * If we race an unlink or rename the ncp might be marked
-	     * DESTROYED after resolution, requiring a retry.
+	     * Quickly lookup the component.  If we can't find it, then
+	     * slowly lookup and resolve the component.
 	     */
-	    if ((hvp = nd->nl_nch.ncp->nc_vp) != NULL)
-		vhold(hvp);
-	    cache_unlock(&nd->nl_nch);
-	    nd->nl_flags &= ~NLC_NCPISLOCKED;
-	    error = cache_nlookup_maybe_shared(&nd->nl_nch, &nlc,
-					       wantsexcllock(nd, ptr), &nch);
-	    if (error == EWOULDBLOCK) {
-		    nch = cache_nlookup(&nd->nl_nch, &nlc);
-		    if (nch.ncp->nc_flag & NCF_UNRESOLVED)
-			hit = 0;
-		    for (;;) {
-			error = cache_resolve(&nch, nd->nl_cred);
-			if (error != EAGAIN &&
-			    (nch.ncp->nc_flag & NCF_DESTROYED) == 0) {
-				break;
-			}
-			kprintf("[diagnostic] nlookup: relookup %*.*s\n",
-				nch.ncp->nc_nlen, nch.ncp->nc_nlen,
-				nch.ncp->nc_name);
-			cache_put(&nch);
-			nch = cache_nlookup(&nd->nl_nch, &nlc);
-		    }
+	    if (last_element) {
+		    error = cache_nlookup_maybe_shared(&nd->nl_nch, &nlc,
+						       wantsexcllock(nd, 1),
+						       &nch);
+	    } else {
+		    nch = cache_nlookup_nonlocked(&nd->nl_nch, &nlc);
+		    if (nch.ncp == NULL)
+			error = EWOULDBLOCK;
 	    }
-	    if (hvp)
-		vdrop(hvp);
+
+	    /*
+	     * At this point the only possible error is EWOULDBLOCK.
+	     *
+	     * If no error nch is set and referenced, and then also locked
+	     * according to last_element.  For EWOULDBLOCK nch is not set.
+	     * For any other error nch is set and referenced, but not locked.
+	     *
+	     * On EWOULDBLOCK the ncp may be unresolved (if not locked it can
+	     * become unresolved at any time, but we don't care at this time).
+	     */
+	    if (error == EWOULDBLOCK) {
+		nch = cache_nlookup(&nd->nl_nch, &nlc);
+		if (nch.ncp->nc_flag & NCF_UNRESOLVED)
+		    hit = 0;
+		for (;;) {
+		    error = cache_resolve(&nch, nd->nl_cred);
+		    if (error != EAGAIN &&
+			(nch.ncp->nc_flag & NCF_DESTROYED) == 0) {
+			    if (error == ESTALE) {
+				if (!inretry)
+				    error = ENOENT;
+				doretry = TRUE;
+			    }
+			    if (last_element == 0)
+				    cache_unlock(&nch);
+			    break;
+		    }
+		    kprintf("[diagnostic] nlookup: relookup %*.*s\n",
+			    nch.ncp->nc_nlen, nch.ncp->nc_nlen,
+			    nch.ncp->nc_name);
+		    cache_put(&nch);
+		    nch = cache_nlookup(&nd->nl_nch, &nlc);
+		}
+	    }
 	    wasdotordotdot = 0;
 	}
 
 	/*
-	 * If the last component was "." or ".." our dflags no longer
-	 * represents the parent directory and we have to explicitly
-	 * look it up.
+	 * If the component is "." or ".." our dflags no longer represents
+	 * the parent directory and we have to explicitly look it up.
 	 *
 	 * Expect the parent to be good since nch is locked.
+	 *
+	 * nch will continue to be valid even if an error occurs after this
+	 * point.
 	 */
 	if (wasdotordotdot && error == 0) {
+	    struct nchandle par;
+
 	    dflags = 0;
+	    if (last_element == 0)
+		cache_lock_maybe_shared(&nch, wantsexcllock(nd, 0));
+
 	    if ((par.ncp = nch.ncp->nc_parent) != NULL) {
 		par.mount = nch.mount;
 		cache_hold(&par);
-		cache_lock_maybe_shared(&par, wantsexcllock(nd, ptr));
-		error = naccess(&par, 0, nd->nl_cred, &dflags);
-		cache_put(&par);
+		error = naccess(&par, 0, nd->nl_cred, &dflags, 0);
+		cache_drop_and_cache(&par, nd->nl_elmno - 1);
+		if (error) {
+		    if (!keeperror(nd, error))
+			error = 0;
+		    if (error == EINVAL) {
+			kprintf("nlookup (%s): trailing . or .. retry on %s\n",
+				curthread->td_comm, nd->nl_path);
+			doretry = TRUE;
+		    }
+		}
 	    }
+
+	    if (last_element == 0)
+		cache_unlock(&nch);
 	}
 
 	/*
 	 * [end of subsection]
 	 *
-	 * nch is locked and referenced.
+	 * nch is referenced and locked according to (last_element).
 	 * nd->nl_nch is unlocked and referenced.
-	 *
-	 * nl_nch must be unlocked or we could chain lock to the root
-	 * if a resolve gets stuck (e.g. in NFS).
 	 */
 	KKASSERT((nd->nl_flags & NLC_NCPISLOCKED) == 0);
 
 	/*
 	 * Resolve the namespace if necessary.  The ncp returned by
-	 * cache_nlookup() is referenced and locked.
+	 * cache_nlookup() is referenced, and also locked according
+	 * to last_element.
 	 *
 	 * XXX neither '.' nor '..' should return EAGAIN since they were
 	 * previously resolved and thus cannot be newly created ncp's.
 	 */
 	if (nch.ncp->nc_flag & NCF_UNRESOLVED) {
+	    if (last_element == 0)
+		cache_lock(&nch);
 	    hit = 0;
 	    error = cache_resolve(&nch, nd->nl_cred);
+	    if (error == ESTALE) {
+		if (!inretry)
+		    error = ENOENT;
+		doretry = TRUE;
+	    }
+	    if (last_element == 0)
+		cache_unlock(&nch);
 	    KKASSERT(error != EAGAIN);
 	} else {
 	    error = nch.ncp->nc_error;
@@ -705,7 +869,7 @@ nlookup(struct nlookupdata *nd)
 	 * for a create/rename/delete.  The standard requires this and pax
 	 * pretty stupidly depends on it.
 	 */
-	if (islastelement(ptr)) {
+	if (last_element) {
 	    if (error == ENOENT &&
 		(nd->nl_flags & (NLC_CREATE | NLC_RENAME_DST))
 	    ) {
@@ -713,7 +877,7 @@ nlookup(struct nlookupdata *nd)
 			error = EROFS;
 		} else {
 			error = naccess(&nch, nd->nl_flags | dflags,
-					nd->nl_cred, NULL);
+					nd->nl_cred, NULL, last_element);
 		}
 	    }
 	    if (error == 0 && wasdotordotdot &&
@@ -735,7 +899,9 @@ nlookup(struct nlookupdata *nd)
 	 * Early completion on error.
 	 */
 	if (error) {
-	    cache_put(&nch);
+	    if (last_element)
+		    cache_unlock(&nch);
+	    cache_drop_and_cache(&nch, nd->nl_elmno);
 	    break;
 	}
 
@@ -749,9 +915,14 @@ nlookup(struct nlookupdata *nd)
 	) {
 	    if (nd->nl_loopcnt++ >= MAXSYMLINKS) {
 		error = ELOOP;
-		cache_put(&nch);
+		if (last_element)
+			cache_unlock(&nch);
+		cache_drop_and_cache(&nch, nd->nl_elmno);
 		break;
 	    }
+	    if (last_element == 0)
+		cache_lock_maybe_shared(&nch, 1);
+
 	    error = nreadsymlink(nd, &nch, &nlc);
 	    cache_put(&nch);
 	    if (error)
@@ -771,8 +942,13 @@ nlookup(struct nlookupdata *nd)
 		break;
 	    }
 	    bcopy(ptr, nlc.nlc_nameptr + nlc.nlc_namelen, len + 1);
-	    if (nd->nl_flags & NLC_HASBUF)
-		objcache_put(namei_oc, nd->nl_path);
+
+	    if (path_reset) {
+		if (nd->nl_flags & NLC_HASBUF)
+		    objcache_put(namei_oc, nd->nl_path);
+	    } else {
+		path_reset = nd->nl_path;
+	    }
 	    nd->nl_path = nlc.nlc_nameptr;
 	    nd->nl_flags |= NLC_HASBUF;
 	    ptr = nd->nl_path;
@@ -783,7 +959,7 @@ nlookup(struct nlookupdata *nd)
 	     */
 	    continue;
 	}
-
+	
 	/*
 	 * If the element is a directory and we are crossing a mount point,
 	 * Locate the mount.
@@ -801,7 +977,10 @@ nlookup(struct nlookupdata *nd)
 	     * mount point is already resolved.
 	     */
 again:
-	    cache_put(&nch);
+	    if (last_element)
+		    cache_unlock(&nch);
+	    cache_drop_and_cache(&nch, nd->nl_elmno);
+
 	    if (vfs_do_busy) {
 		while (vfs_busy(mp, 0)) {
 		    if (mp->mnt_kern_flag & MNTK_UNMOUNT) {
@@ -813,31 +992,56 @@ again:
 		    }
 		}
 	    }
-	    cache_get_maybe_shared(&mp->mnt_ncmountpt, &nch,
-				   wantsexcllock(nd, ptr));
+
+	    /*
+	     * We don't need to lock the nch unless the entry is unresolved
+	     * or this is the last element.
+	     */
+	    if (last_element)
+		cache_get_maybe_shared(&mp->mnt_ncmountpt, &nch,
+				       wantsexcllock(nd, 1));
+	    else
+		cache_copy(&mp->mnt_ncmountpt, &nch);
 
 	    if (nch.ncp->nc_flag & NCF_UNRESOLVED) {
-		if (vfs_do_busy == 0) {
-		    vfs_do_busy = 1;
-		    goto again;
+		if (last_element == 0)
+		    cache_lock(&nch);
+		if (nch.ncp->nc_flag & NCF_UNRESOLVED) {
+		    if (vfs_do_busy == 0) {
+			vfs_do_busy = 1;
+			if (last_element == 0)
+			    cache_unlock(&nch);
+			goto again;
+		    }
+		    error = VFS_ROOT(mp, &tdp);
+		    vfs_unbusy(mp);
+		    vfs_do_busy = 0;
+		    if (keeperror(nd, error)) {
+			cache_dropmount(mp);
+			if (last_element == 0)
+			    cache_unlock(&nch);
+			break;
+		    }
+		    if (error == 0) {
+			cache_setvp(&nch, tdp);
+			vput(tdp);
+		    }
 		}
-		error = VFS_ROOT(mp, &tdp);
-		vfs_unbusy(mp);
-		vfs_do_busy = 0;
-		if (error) {
-		    cache_dropmount(mp);
-		    break;
-		}
-		cache_setvp(&nch, tdp);
-		vput(tdp);
+		if (last_element == 0)
+		    cache_unlock(&nch);
 	    }
 	    if (vfs_do_busy)
 		vfs_unbusy(mp);
 	    cache_dropmount(mp);
 	}
 
-	if (error) {
-	    cache_put(&nch);
+	/*
+	 * Break out on error
+	 */
+	if (keeperror(nd, error)) {
+	    if (last_element)
+		    cache_unlock(&nch);
+	    cache_drop_and_cache(&nch, nd->nl_elmno);
 double_break:
 	    break;
 	}
@@ -863,8 +1067,10 @@ double_break:
 	 * element is a directory.
 	 */
 	if (*ptr && (nch.ncp->nc_flag & NCF_ISDIR)) {
-	    cache_drop(&nd->nl_nch);
-	    cache_unlock(&nch);
+	    cache_drop_and_cache(&nd->nl_nch, nd->nl_elmno);
+	    if (last_element)
+		    cache_unlock(&nch);
+	    /*nchislocked = 0; not needed */
 	    KKASSERT((nd->nl_flags & NLC_NCPISLOCKED) == 0);
 	    nd->nl_nch = nch;
 	    continue;
@@ -875,7 +1081,9 @@ double_break:
 	 * is not a directory
 	 */
 	if (*ptr) {
-	    cache_put(&nch);
+	    if (last_element)
+		    cache_unlock(&nch);
+	    cache_drop_and_cache(&nch, nd->nl_elmno);
 	    error = ENOTDIR;
 	    break;
 	}
@@ -891,10 +1099,12 @@ double_break:
 	 * if the file is marked append-only, and NLC_STICKY if the directory
 	 * containing the file is sticky.
 	 */
+	KKASSERT(last_element);
+
 	if (nch.ncp->nc_vp && (nd->nl_flags & NLC_ALLCHKS)) {
 	    error = naccess(&nch, nd->nl_flags | dflags,
-			    nd->nl_cred, NULL);
-	    if (error) {
+			    nd->nl_cred, NULL, 1);
+	    if (keeperror(nd, error)) {
 		cache_put(&nch);
 		break;
 	    }
@@ -903,24 +1113,50 @@ double_break:
 	/*
 	 * Termination: no more elements.
 	 *
-	 * If NLC_REFDVP is set acquire a referenced parent dvp.
+	 * If NLC_REFDVP is set acquire a referenced parent dvp.  Typically
+	 * used for mkdir/mknod/ncreate/nremove/unlink/rename.
+	 *
+	 * NOTE: nd->nl_nch does not necessarily represent the parent
+	 *	 directory, e.g. due to a mount point transition.
+	 *
+	 * nch is locked, standard lock order for the namecache is
+	 * child-to-parent so we can safely lock its parent.  We can
+	 * just use cache_dvpref().
+	 *
+	 * If nc_parent is NULL this is probably a mount point and there
+	 * is no legal parent directory.  However, we do not want to fail
+	 * the nlookup() because a higher level may wish to return a better
+	 * error code, such as mkdir("/mntpt") would want to return EEXIST
 	 */
 	if (nd->nl_flags & NLC_REFDVP) {
-		cache_lock(&nd->nl_nch);
-		error = cache_vref(&nd->nl_nch, nd->nl_cred, &nd->nl_dvp);
-		cache_unlock(&nd->nl_nch);
-		if (error) {
-			kprintf("NLC_REFDVP: Cannot ref dvp of %p\n", nch.ncp);
+		if (nch.ncp->nc_parent) {
+			nd->nl_dvp = cache_dvpref(nch.ncp);
+			if (nd->nl_dvp == NULL) {
+				error = EINVAL;
+				if (keeperror(nd, error)) {
+					kprintf("NLC_REFDVP: Cannot ref dvp "
+						"of %s\n",
+						nch.ncp->nc_name);
+					cache_put(&nch);
+					break;
+				}
+			}
+		} else {
+			error = 0;
 			cache_put(&nch);
 			break;
 		}
 	}
-	cache_drop(&nd->nl_nch);
+	cache_drop_and_cache(&nd->nl_nch, nd->nl_elmno);
 	nd->nl_nch = nch;
 	nd->nl_flags |= NLC_NCPISLOCKED;
 	error = 0;
 	break;
     }
+
+    /*
+     * We are done / or possibly retry
+     */
 
     if (hit)
 	++gd->gd_nchstats->ncs_longhits;
@@ -929,6 +1165,48 @@ double_break:
 
     if (nd->nl_flags & NLC_NCPISLOCKED)
 	KKASSERT(cache_lockstatus(&nd->nl_nch) > 0);
+
+    /*
+     * Reset nd->nl_path if necessary (due to softlinks).  We want to return
+     * nl_path to its original state before retrying or returning.
+     */
+    if (path_reset) {
+	if (nd->nl_flags & NLC_HASBUF) {
+	    objcache_put(namei_oc, nd->nl_path);
+	    nd->nl_flags &= ~NLC_HASBUF;
+	}
+	nd->nl_path = path_reset;
+	nd->nl_flags |= saveflag & NLC_HASBUF;
+	path_reset = NULL;
+    }
+
+    /*
+     * Retry the whole thing if doretry flag is set, but only once.
+     *
+     * autofs(5) may mount another filesystem under its root directory
+     * while resolving a path.
+     *
+     * NFS might return ESTALE
+     */
+    if (doretry && !inretry) {
+	kprintf("nlookup: errno %d retry %s\n", error, nd->nl_path);
+	inretry = TRUE;
+
+	/*
+	 * Clean up nd->nl_nch and reset to base directory
+	 */
+	if (nd->nl_flags & NLC_NCPISLOCKED) {
+		cache_unlock(&nd->nl_nch);
+		nd->nl_flags &= ~NLC_NCPISLOCKED;
+	}
+	cache_drop(&nd->nl_nch);
+	cache_copy(nd->nl_basench, &nd->nl_nch);
+
+	nd->nl_elmno = 0;
+	nd->nl_flags |= saveflag;
+
+	goto nlookup_start;
+    }
 
     /*
      * NOTE: If NLC_CREATE was set the ncp may represent a negative hit
@@ -1044,19 +1322,29 @@ fail:
  * The passed ncp must be referenced and locked.  If it is already resolved
  * it may be locked shared but otherwise should be locked exclusively.
  */
+
+#define S_WXOK_MASK	(S_IRUSR|S_IXUSR|S_IRGRP|S_IXGRP|S_IROTH|S_IXOTH)
+#define S_XOK_MASK	(S_IXUSR|S_IXGRP|S_IXOTH)
+
 static int
-naccess(struct nchandle *nch, int nflags, struct ucred *cred, int *nflagsp)
+naccess(struct nchandle *nch, int nflags, struct ucred *cred, int *nflagsp,
+	int nchislocked)
 {
     struct vnode *vp;
-    struct vattr va;
+    struct vattr_lite lva;
     struct namecache *ncp;
     int error;
     int cflags;
 
-    KKASSERT(cache_lockstatus(nch) > 0);
+    KKASSERT(nchislocked == 0 || cache_lockstatus(nch) > 0);
 
     ncp = nch->ncp;
+again:
     if (ncp->nc_flag & NCF_UNRESOLVED) {
+	if (nchislocked == 0) {
+		cache_lock(nch);
+		nchislocked = 2;
+	}
 	cache_resolve(nch, cred);
 	ncp = nch->ncp;
     }
@@ -1077,6 +1365,12 @@ naccess(struct nchandle *nch, int nflags, struct ucred *cred, int *nflagsp)
 	) {
 	    struct nchandle par;
 
+	    if (nchislocked == 0) {
+		cache_lock_maybe_shared(nch, 0);
+		nchislocked = 2;
+		if (ncp->nc_flag & NCF_UNRESOLVED)
+			goto again;
+	    }
 	    if ((par.ncp = ncp->nc_parent) == NULL) {
 		if (error != EAGAIN)
 			error = EINVAL;
@@ -1084,7 +1378,7 @@ naccess(struct nchandle *nch, int nflags, struct ucred *cred, int *nflagsp)
 		par.mount = nch->mount;
 		cache_hold(&par);
 		cache_lock_maybe_shared(&par, 0);
-		error = naccess(&par, NLC_WRITE, cred, NULL);
+		error = naccess(&par, NLC_WRITE, cred, NULL, 1);
 		cache_put(&par);
 	    }
 	}
@@ -1097,12 +1391,35 @@ naccess(struct nchandle *nch, int nflags, struct ucred *cred, int *nflagsp)
 	error = EEXIST;
 
     /*
+     * Try to short-cut the vnode operation for intermediate directory
+     * components.  This is a major SMP win because it avoids having
+     * to execute a lot of code for intermediate directory components,
+     * including shared refs and locks on intermediate directory vnodes.
+     *
+     * We can only do this if the caller does not need nflagsp.
+     */
+    if (error == 0 && nflagsp == NULL &&
+	nflags == NLC_EXEC && (ncp->nc_flag & NCF_WXOK)) {
+	if (nchislocked == 2)
+		cache_unlock(nch);
+	return 0;
+    }
+
+    /*
      * Get the vnode attributes so we can do the rest of our checks.
      *
-     * NOTE: We only call naccess_va() if the target exists.
+     * NOTE: We only call naccess_lva() if the target exists.
      */
     if (error == 0) {
+	if (nchislocked == 0) {
+	    cache_lock_maybe_shared(nch, 0);
+	    nchislocked = 2;
+	}
+#if 0
 	error = cache_vget(nch, cred, LK_SHARED, &vp);
+#else
+	error = cache_vref(nch, cred, &vp);
+#endif
 	if (error == ENOENT) {
 	    /*
 	     * Silently zero-out ENOENT if creating or renaming
@@ -1123,9 +1440,9 @@ naccess(struct nchandle *nch, int nflags, struct ucred *cred, int *nflagsp)
 	     *
 	     * XXX cache the va in the namecache or in the vnode
 	     */
-	    error = VOP_GETATTR(vp, &va);
+	    error = VOP_GETATTR_LITE(vp, &lva);
 	    if (error == 0 && (nflags & NLC_TRUNCATE)) {
-		switch(va.va_type) {
+		switch(lva.va_type) {
 		case VREG:
 		case VDATABASE:
 		case VCHR:
@@ -1143,7 +1460,7 @@ naccess(struct nchandle *nch, int nflags, struct ucred *cred, int *nflagsp)
 	    if (error == 0 && (nflags & NLC_WRITE) && vp->v_mount &&
 		(vp->v_mount->mnt_flag & MNT_RDONLY)
 	    ) {
-		switch(va.va_type) {
+		switch(lva.va_type) {
 		case VDIR:
 		case VLNK:
 		case VREG:
@@ -1154,7 +1471,11 @@ naccess(struct nchandle *nch, int nflags, struct ucred *cred, int *nflagsp)
 		    break;
 		}
 	    }
+#if 0
 	    vput(vp);
+#else
+	    vrele(vp);
+#endif
 
 	    /*
 	     * Check permissions based on file attributes.  The passed
@@ -1166,26 +1487,40 @@ naccess(struct nchandle *nch, int nflags, struct ucred *cred, int *nflagsp)
 		 * Adjust the returned (*nflagsp) if non-NULL.
 		 */
 		if (nflagsp) {
-		    if ((va.va_mode & VSVTX) && va.va_uid != cred->cr_uid)
+		    if ((lva.va_mode & VSVTX) && lva.va_uid != cred->cr_uid)
 			*nflagsp |= NLC_STICKY;
-		    if (va.va_flags & APPEND)
+		    if (lva.va_flags & APPEND)
 			*nflagsp |= NLC_APPENDONLY;
-		    if (va.va_flags & IMMUTABLE)
+		    if (lva.va_flags & IMMUTABLE)
 			*nflagsp |= NLC_IMMUTABLE;
 		}
 
 		/*
+		 * NCF_WXOK can be set for world-searchable directories.
+		 *
+		 * XXX When we implement capabilities this code would also
+		 * need a cap check, or only set the flag if there are no
+		 * capabilities.
+		 */
+		cflags = 0;
+		if (lva.va_type == VDIR &&
+		    (lva.va_mode & S_WXOK_MASK) == S_WXOK_MASK) {
+			cflags |= NCF_WXOK;
+		}
+		if ((lva.va_mode & S_XOK_MASK) == 0)
+			cflags |= NCF_NOTX;
+
+		/*
 		 * Track swapcache management flags in the namecache.
 		 *
-		 * Calculate the flags based on the current vattr info
+		 * Calculate the flags based on the current vattr_lite info
 		 * and recalculate the inherited flags from the parent
 		 * (the original cache linkage may have occurred without
 		 * getattrs and thus have stale flags).
 		 */
-		cflags = 0;
-		if (va.va_flags & SF_NOCACHE)
+		if (lva.va_flags & SF_NOCACHE)
 			cflags |= NCF_SF_NOCACHE;
-		if (va.va_flags & UF_CACHE)
+		if (lva.va_flags & UF_CACHE)
 			cflags |= NCF_UF_CACHE;
 		if (ncp->nc_parent) {
 			if (ncp->nc_parent->nc_flag &
@@ -1199,21 +1534,27 @@ naccess(struct nchandle *nch, int nflags, struct ucred *cred, int *nflagsp)
 		}
 
 		/*
-		 * XXX we're not supposed to update nc_flag when holding
-		 *     a shared lock.
+		 * We're not supposed to update nc_flag when holding a shared
+		 * lock, but we allow the case for certain flags.  Note that
+		 * holding an exclusive lock allows updating nc_flag without
+		 * atomics.  nc_flag is not allowe to be updated at all unless
+		 * a shared or exclusive lock is held.
 		 */
 		atomic_clear_short(&ncp->nc_flag,
 				   (NCF_SF_NOCACHE | NCF_UF_CACHE |
-				   NCF_SF_PNOCACHE | NCF_UF_PCACHE) & ~cflags);
+				   NCF_SF_PNOCACHE | NCF_UF_PCACHE |
+				   NCF_WXOK | NCF_NOTX) & ~cflags);
 		atomic_set_short(&ncp->nc_flag, cflags);
 
 		/*
 		 * Process general access.
 		 */
-		error = naccess_va(&va, nflags, cred);
+		error = naccess_lva(&lva, nflags, cred);
 	    }
 	}
     }
+    if (nchislocked == 2)
+	cache_unlock(nch);
     return(error);
 }
 
@@ -1221,7 +1562,7 @@ naccess(struct nchandle *nch, int nflags, struct ucred *cred, int *nflagsp)
  * Check the requested access against the given vattr using cred.
  */
 int
-naccess_va(struct vattr *va, int nflags, struct ucred *cred)
+naccess_lva(struct vattr_lite *lvap, int nflags, struct ucred *cred)
 {
     int i;
     int vmode;
@@ -1247,7 +1588,7 @@ naccess_va(struct vattr *va, int nflags, struct ucred *cred)
      *
      * Writes and truncations are only allowed on special devices.
      */
-    if ((va->va_flags & IMMUTABLE) || (nflags & NLC_IMMUTABLE)) {
+    if ((lvap->va_flags & IMMUTABLE) || (nflags & NLC_IMMUTABLE)) {
 	if ((nflags & NLC_IMMUTABLE) && (nflags & NLC_HLINK))
 	    return (EPERM);
 	if (nflags & (NLC_CREATE | NLC_DELETE |
@@ -1255,7 +1596,7 @@ naccess_va(struct vattr *va, int nflags, struct ucred *cred)
 	    return (EPERM);
 	}
 	if (nflags & (NLC_WRITE | NLC_TRUNCATE)) {
-	    switch(va->va_type) {
+	    switch(lvap->va_type) {
 	    case VDIR:
 		return (EISDIR);
 	    case VLNK:
@@ -1279,7 +1620,7 @@ naccess_va(struct vattr *va, int nflags, struct ucred *cred)
      * If the governing directory is marked APPEND-only it implies
      * NOUNLINK for all entries in the directory.
      */
-    if (((va->va_flags & NOUNLINK) || (nflags & NLC_APPENDONLY)) &&
+    if (((lvap->va_flags & NOUNLINK) || (nflags & NLC_APPENDONLY)) &&
 	(nflags & (NLC_DELETE | NLC_RENAME_SRC | NLC_RENAME_DST))
     ) {
 	return (EPERM);
@@ -1288,7 +1629,7 @@ naccess_va(struct vattr *va, int nflags, struct ucred *cred)
     /*
      * A file marked append-only may not be deleted but can be renamed.
      */
-    if ((va->va_flags & APPEND) &&
+    if ((lvap->va_flags & APPEND) &&
 	(nflags & (NLC_DELETE | NLC_RENAME_DST))
     ) {
 	return (EPERM);
@@ -1298,7 +1639,7 @@ naccess_va(struct vattr *va, int nflags, struct ucred *cred)
      * A file marked append-only which is opened for writing must also
      * be opened O_APPEND.
      */
-    if ((va->va_flags & APPEND) && (nflags & (NLC_OPEN | NLC_TRUNCATE))) {
+    if ((lvap->va_flags & APPEND) && (nflags & (NLC_OPEN | NLC_TRUNCATE))) {
 	if (nflags & NLC_TRUNCATE)
 	    return (EPERM);
 	if ((nflags & (NLC_OPEN | NLC_WRITE)) == (NLC_OPEN | NLC_WRITE)) {
@@ -1327,9 +1668,9 @@ naccess_va(struct vattr *va, int nflags, struct ucred *cred)
     if (nflags & NLC_EXEC)
 	vmode |= S_IXUSR;
 
-    if (cred->cr_uid == va->va_uid) {
+    if (cred->cr_uid == lvap->va_uid) {
 	if ((nflags & NLC_OWN) == 0) {
-	    if ((vmode & va->va_mode) != vmode)
+	    if ((vmode & lvap->va_mode) != vmode)
 		return(EACCES);
 	}
 	return(0);
@@ -1353,8 +1694,8 @@ naccess_va(struct vattr *va, int nflags, struct ucred *cred)
      */
     vmode >>= 3;
     for (i = 0; i < cred->cr_ngroups; ++i) {
-	if (va->va_gid == cred->cr_groups[i]) {
-	    if ((vmode & va->va_mode) != vmode)
+	if (lvap->va_gid == cred->cr_groups[i]) {
+	    if ((vmode & lvap->va_mode) != vmode)
 		return(EACCES);
 	    return(0);
 	}
@@ -1364,8 +1705,42 @@ naccess_va(struct vattr *va, int nflags, struct ucred *cred)
      * Check world perms
      */
     vmode >>= 3;
-    if ((vmode & va->va_mode) != vmode)
+    if ((vmode & lvap->va_mode) != vmode)
 	return(EACCES);
     return(0);
 }
 
+/*
+ * Long-term (10-second interval) statistics collection
+ */
+static
+uint64_t
+collect_nlookup_callback(int n)
+{
+	static uint64_t last_total;
+	uint64_t save;
+	uint64_t total;
+
+	total = 0;
+	for (n = 0; n < ncpus; ++n) {
+		globaldata_t gd = globaldata_find(n);
+		struct nchstats *sp;
+
+		if ((sp = gd->gd_nchstats) != NULL)
+			total += sp->ncs_longhits + sp->ncs_longmiss;
+	}
+	save = total;
+	total = total - last_total;
+	last_total = save;
+
+	return total;
+}
+
+static
+void
+nlookup_collect_init(void *dummy __unused)
+{
+	kcollect_register(KCOLLECT_NLOOKUP, "nlookup", collect_nlookup_callback,
+			  KCOLLECT_SCALE(KCOLLECT_NLOOKUP_FORMAT, 0));
+}
+SYSINIT(collect_nlookup, SI_SUB_PROP, SI_ORDER_ANY, nlookup_collect_init, 0);

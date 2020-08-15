@@ -10,11 +10,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -32,7 +28,6 @@
  *
  *	@(#)dirent.h	8.3 (Berkeley) 8/10/94
  * $FreeBSD: src/sys/sys/dirent.h,v 1.11 1999/12/29 04:24:39 peter Exp $
- * $DragonFly: src/sys/sys/dirent.h,v 1.7 2007/11/20 21:03:46 dillon Exp $
  */
 
 #ifndef	_SYS_DIRENT_H_
@@ -62,7 +57,7 @@
 #include <sys/types.h>
 
 struct dirent {
-#if defined(_KERNEL) || !defined(__BSD_VISIBLE)
+#if defined(_KERNEL) || !__BSD_VISIBLE
 	ino_t		d_ino;		/* file number of entry */
 #else
 	ino_t		d_fileno;	/* file number of entry */
@@ -81,7 +76,7 @@ struct dirent {
 #define _DIRENT_HAVE_D_NAMLEN
 #define _DIRENT_HAVE_D_TYPE
 
-#if !defined(_KERNEL) && defined(__BSD_VISIBLE)
+#if !defined(_KERNEL) && __BSD_VISIBLE
 #define	d_ino		d_fileno
 #endif
 

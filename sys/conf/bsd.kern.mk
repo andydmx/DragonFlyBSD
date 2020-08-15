@@ -8,9 +8,9 @@
 #
 
 CWARNFLAGS?=	-Wall -Wredundant-decls -Wnested-externs -Wstrict-prototypes \
-		-Wmissing-prototypes -Wpointer-arith -Winline -Wcast-qual \
-		-Wold-style-definition -Wno-inline \
-		-Wno-pointer-sign -Winit-self -std=c99
+		-Wmissing-prototypes -Wpointer-arith -Wcast-qual \
+		-Wold-style-definition -Wmissing-include-dirs \
+		-Wno-pointer-sign -Winit-self -Wundef -std=c99
 
 .if ${CCVER:Mgcc*}
 # All flags inside this block are gcc-specific except for --param
@@ -20,7 +20,7 @@ CFLAGS+=	-Wold-style-declaration \
 		-finline-limit=${INLINE_LIMIT} \
 		--param inline-unit-growth=100 \
 		--param large-function-growth=1000
-.if ${CCVER} == "gcc47"
+.if ${CCVER:Mgcc4[789]} || ${CCVER:Mgcc[5-]*}
 CWARNFLAGS+=	-Wno-unused-but-set-variable
 .endif
 .endif

@@ -8,8 +8,11 @@ SRCS=	main.c screen.c brac.c ch.c charset.c cmdbuf.c \
 	output.c pattern.c position.c prompt.c search.c signal.c \
 	tags.c ttyin.c version.c
 CFLAGS+=	-I${.CURDIR} -DSYSDIR=\"/etc\"
-DPADD=	${LIBTERMCAP}
-LDADD=	-ltermcap
+DPADD=	${LIBNCURSES}
+LDADD=	-lprivate_ncurses
+
+CFLAGS+=	-I${_SHLIBDIRPREFIX}/usr/include/priv/ncurses
+LDFLAGS+=	${PRIVATELIB_LDFLAGS}
 
 SCRIPTS= lesspipe.sh
 SCRIPTSNAME= lesspipe.sh

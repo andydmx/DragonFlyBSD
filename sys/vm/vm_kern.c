@@ -88,14 +88,76 @@ struct vm_map kernel_map;
 struct vm_map clean_map;
 struct vm_map buffer_map;
 
+static __inline
+int
+KMVMCPU(int kmflags)
+{
+	if ((kmflags & KM_CPU_SPEC) == 0)
+		return 0;
+	return VM_ALLOC_CPU(KM_GETCPU(kmflags));
+}
+
+/*
+ * Allocate pageable swap-backed anonymous memory
+ */
+void *
+kmem_alloc_swapbacked(kmem_anon_desc_t *kp, vm_size_t size, vm_subsys_t id)
+{
+	int error;
+	vm_pindex_t npages;
+
+	size = round_page(size);
+	npages = size / PAGE_SIZE;
+
+	if (kp->map == NULL)
+		kp->map = &kernel_map;
+	kp->data = vm_map_min(&kernel_map);
+	kp->size = size;
+	kp->object = vm_object_allocate(OBJT_DEFAULT, npages);
+
+	error = vm_map_find(kp->map, kp->object, NULL, 0,
+			    &kp->data, size,
+			    PAGE_SIZE, TRUE,
+			    VM_MAPTYPE_NORMAL, id,
+			    VM_PROT_ALL, VM_PROT_ALL, 0);
+	if (error) {
+		kprintf("kmem_alloc_swapbacked: %zd bytes failed %d\n",
+			size, error);
+		kp->data = (vm_offset_t)0;
+		kmem_free_swapbacked(kp);
+		return NULL;
+	}
+	return ((void *)(intptr_t)kp->data);
+}
+
+void
+kmem_free_swapbacked(kmem_anon_desc_t *kp)
+{
+	if (kp->data) {
+		/*
+		 * The object will be deallocated by kmem_free().
+		 */
+		kmem_free(kp->map, kp->data, kp->size);
+		kp->data = (vm_offset_t)0;
+	} else {
+		/*
+		 * Failure during allocation, object must be deallocated
+		 * manually.
+		 */
+		vm_object_deallocate(kp->object);
+	}
+	kp->object = NULL;
+}
+
 /*
  * Allocate pageable memory to the kernel's address map.  "map" must
- * be kernel_map or a submap of kernel_map.
+ * be kernel_map or a submap of kernel_map.  Caller must adjust map or
+ * enter VM pages itself.
  *
  * No requirements.
  */
 vm_offset_t
-kmem_alloc_pageable(vm_map_t map, vm_size_t size)
+kmem_alloc_pageable(vm_map_t map, vm_size_t size, vm_subsys_t id)
 {
 	vm_offset_t addr;
 	int result;
@@ -104,8 +166,8 @@ kmem_alloc_pageable(vm_map_t map, vm_size_t size)
 	addr = vm_map_min(map);
 	result = vm_map_find(map, NULL, NULL,
 			     (vm_offset_t) 0, &addr, size,
-			     PAGE_SIZE,
-			     TRUE, VM_MAPTYPE_NORMAL,
+			     PAGE_SIZE, TRUE,
+			     VM_MAPTYPE_NORMAL, id,
 			     VM_PROT_ALL, VM_PROT_ALL, 0);
 	if (result != KERN_SUCCESS)
 		return (0);
@@ -118,7 +180,8 @@ kmem_alloc_pageable(vm_map_t map, vm_size_t size)
  * No requirements.
  */
 vm_offset_t
-kmem_alloc_nofault(vm_map_t map, vm_size_t size, vm_size_t align)
+kmem_alloc_nofault(vm_map_t map, vm_size_t size, vm_subsys_t id,
+		   vm_size_t align)
 {
 	vm_offset_t addr;
 	int result;
@@ -127,8 +190,8 @@ kmem_alloc_nofault(vm_map_t map, vm_size_t size, vm_size_t align)
 	addr = vm_map_min(map);
 	result = vm_map_find(map, NULL, NULL,
 			     (vm_offset_t) 0, &addr, size,
-			     align,
-			     TRUE, VM_MAPTYPE_NORMAL,
+			     align, TRUE,
+			     VM_MAPTYPE_NORMAL, id,
 			     VM_PROT_ALL, VM_PROT_ALL, MAP_NOFAULT);
 	if (result != KERN_SUCCESS)
 		return (0);
@@ -141,7 +204,7 @@ kmem_alloc_nofault(vm_map_t map, vm_size_t size, vm_size_t align)
  * No requirements.
  */
 vm_offset_t
-kmem_alloc3(vm_map_t map, vm_size_t size, int kmflags)
+kmem_alloc3(vm_map_t map, vm_size_t size, vm_subsys_t id, int kmflags)
 {
 	vm_offset_t addr;
 	vm_offset_t gstart;
@@ -185,8 +248,9 @@ kmem_alloc3(vm_map_t map, vm_size_t size, int kmflags)
 	vm_object_reference_locked(&kernel_object);
 	vm_map_insert(map, &count,
 		      &kernel_object, NULL,
-		      addr, addr, addr + size,
-		      VM_MAPTYPE_NORMAL,
+		      addr, NULL,
+		      addr, addr + size,
+		      VM_MAPTYPE_NORMAL, id,
 		      VM_PROT_ALL, VM_PROT_ALL, cow);
 	vm_object_drop(&kernel_object);
 
@@ -219,7 +283,7 @@ kmem_alloc3(vm_map_t map, vm_size_t size, int kmflags)
 
 		mem = vm_page_grab(&kernel_object, OFF_TO_IDX(addr + i),
 				   VM_ALLOC_FORCE_ZERO | VM_ALLOC_NORMAL |
-				   VM_ALLOC_RETRY);
+				   VM_ALLOC_RETRY | KMVMCPU(kmflags));
 		vm_page_unqueue_nowakeup(mem);
 		vm_page_wakeup(mem);
 	}
@@ -275,8 +339,8 @@ kmem_suballoc(vm_map_t parent, vm_map_t result,
 	*min = (vm_offset_t) vm_map_min(parent);
 	ret = vm_map_find(parent, NULL, NULL,
 			  (vm_offset_t) 0, min, size,
-			  PAGE_SIZE,
-			  TRUE, VM_MAPTYPE_UNSPECIFIED,
+			  PAGE_SIZE, TRUE,
+			  VM_MAPTYPE_UNSPECIFIED, VM_SUBSYS_SYSMAP,
 			  VM_PROT_ALL, VM_PROT_ALL, 0);
 	if (ret != KERN_SUCCESS) {
 		kprintf("kmem_suballoc: bad status return of %d.\n", ret);
@@ -296,7 +360,7 @@ kmem_suballoc(vm_map_t parent, vm_map_t result,
  * No requirements.
  */
 vm_offset_t
-kmem_alloc_wait(vm_map_t map, vm_size_t size)
+kmem_alloc_wait(vm_map_t map, vm_size_t size, vm_subsys_t id)
 {
 	vm_offset_t addr;
 	int count;
@@ -326,10 +390,10 @@ kmem_alloc_wait(vm_map_t map, vm_size_t size)
 	}
 	vm_map_insert(map, &count,
 		      NULL, NULL,
-		      (vm_offset_t) 0, addr, addr + size,
-		      VM_MAPTYPE_NORMAL,
-		      VM_PROT_ALL, VM_PROT_ALL,
-		      0);
+		      (vm_offset_t)0, NULL,
+		      addr, addr + size,
+		      VM_MAPTYPE_NORMAL, id,
+		      VM_PROT_ALL, VM_PROT_ALL, 0);
 	vm_map_unlock(map);
 	vm_map_entry_release(count);
 
@@ -345,8 +409,9 @@ kmem_alloc_wait(vm_map_t map, vm_size_t size)
  *  given flags, then the pages are zeroed before they are mapped.
  */
 vm_offset_t
-kmem_alloc_attr(vm_map_t map, vm_size_t size, int flags, vm_paddr_t low,
-    vm_paddr_t high, vm_memattr_t memattr)
+kmem_alloc_attr(vm_map_t map, vm_size_t size, vm_subsys_t id,
+		int flags, vm_paddr_t low,
+		vm_paddr_t high, vm_memattr_t memattr)
 {
 	vm_offset_t addr, i, offset;
 	vm_page_t m;
@@ -366,21 +431,23 @@ kmem_alloc_attr(vm_map_t map, vm_size_t size, int flags, vm_paddr_t low,
 	vm_object_reference_locked(&kernel_object);
 	vm_map_insert(map, &count,
 		      &kernel_object, NULL,
-		      offset, addr, addr + size,
-		      VM_MAPTYPE_NORMAL,
+		      offset, NULL,
+		      addr, addr + size,
+		      VM_MAPTYPE_NORMAL, id,
 		      VM_PROT_ALL, VM_PROT_ALL, 0);
 	vm_map_unlock(map);
 	vm_map_entry_release(count);
 	vm_object_drop(&kernel_object);
 	for (i = 0; i < size; i += PAGE_SIZE) {
-		m = vm_page_alloc_contig(low, high, PAGE_SIZE, 0, PAGE_SIZE, memattr);
+		m = vm_page_alloc_contig(low, high, PAGE_SIZE, 0,
+					 PAGE_SIZE, memattr);
 		if (!m) {
 			return (0);
 		}
 		vm_object_hold(&kernel_object);
 		vm_page_insert(m, &kernel_object, OFF_TO_IDX(offset + i));
 		vm_object_drop(&kernel_object);
-		if ((flags & M_ZERO) && (m->flags & PG_ZERO) == 0)
+		if (flags & M_ZERO)
 			pmap_zero_page(VM_PAGE_TO_PHYS(m));
 		m->valid = VM_PAGE_BITS_ALL;
 	}
@@ -426,7 +493,8 @@ kmem_init(void)
 	vm_map_t m;
 	int count;
 
-	m = vm_map_create(&kernel_map, &kernel_pmap, KvaStart, KvaEnd);
+	m = &kernel_map;
+	vm_map_init(m, KvaStart, KvaEnd, &kernel_pmap);
 	vm_map_lock(m);
 	/* N.B.: cannot use kgdb to debug, starting with this assignment ... */
 	m->system_map = 1;
@@ -436,8 +504,9 @@ kmem_init(void)
 		if (addr < virtual2_start) {
 			vm_map_insert(m, &count,
 				      NULL, NULL,
-				      (vm_offset_t) 0, addr, virtual2_start,
-				      VM_MAPTYPE_NORMAL,
+				      (vm_offset_t) 0, NULL,
+				      addr, virtual2_start,
+				      VM_MAPTYPE_NORMAL, VM_SUBSYS_RESERVED,
 				      VM_PROT_ALL, VM_PROT_ALL, 0);
 		}
 		addr = virtual2_end;
@@ -445,16 +514,18 @@ kmem_init(void)
 	if (addr < virtual_start) {
 		vm_map_insert(m, &count,
 			      NULL, NULL,
-			      (vm_offset_t) 0, addr, virtual_start,
-			      VM_MAPTYPE_NORMAL,
+			      (vm_offset_t) 0, NULL,
+			      addr, virtual_start,
+			      VM_MAPTYPE_NORMAL, VM_SUBSYS_RESERVED,
 			      VM_PROT_ALL, VM_PROT_ALL, 0);
 	}
 	addr = virtual_end;
 	if (addr < KvaEnd) {
 		vm_map_insert(m, &count,
 			      NULL, NULL,
-			      (vm_offset_t) 0, addr, KvaEnd,
-			      VM_MAPTYPE_NORMAL,
+			      (vm_offset_t) 0, NULL,
+			      addr, KvaEnd,
+			      VM_MAPTYPE_NORMAL, VM_SUBSYS_RESERVED,
 			      VM_PROT_ALL, VM_PROT_ALL, 0);
 	}
 	/* ... and ending with the completion of the above `insert' */

@@ -35,7 +35,7 @@
 
 #include <sys/cdefs.h>
 #include <sys/_null.h>
-#include <sys/types.h>
+#include <machine/stdint.h>
 
 /*
  * Prototype functions which were historically defined in <string.h>, but
@@ -43,6 +43,11 @@
  */
 #if __BSD_VISIBLE
 #include <strings.h>
+
+#ifndef _MODE_T_DECLARED
+typedef	__uint16_t	mode_t;
+#define	_MODE_T_DECLARED
+#endif
 #endif
 
 #ifndef _SIZE_T_DECLARED
@@ -51,7 +56,7 @@ typedef	__size_t	size_t;
 #endif
 
 __BEGIN_DECLS
-#if __POSIX_VISIBLE >= 200112 || __XSI_VISIBLE >= 600
+#if __XSI_VISIBLE
 void	*memccpy(void * __restrict, const void * __restrict, int, size_t);
 #endif
 void	*memchr(const void *, int, size_t) __pure;
@@ -70,7 +75,7 @@ void	*mempcpy(void *, const void *, size_t);
 void	*memmove(void *, const void *, size_t);
 void	*memset(void *, int, size_t);
 #endif
-#if __POSIX_VISIBLE >= 200809 || __BSD_VISIBLE
+#if __POSIX_VISIBLE >= 200809
 char	*stpcpy(char * __restrict, const char * __restrict);
 char	*stpncpy(char * __restrict, const char * __restrict, size_t);
 #endif
@@ -90,8 +95,8 @@ int	 strcoll(const char *, const char *);
 char	*strcpy(char * __restrict, const char * __restrict);
 #endif
 size_t	 strcspn(const char *, const char *) __pure;
-#if __POSIX_VISIBLE >= 200112 || __XSI_VISIBLE
-char	*strdup(const char *);
+#if __POSIX_VISIBLE >= 200809 || __XSI_VISIBLE
+char	*strdup(const char *) __malloclike;
 #endif
 char	*strerror(int);
 #if __POSIX_VISIBLE >= 200112
@@ -112,9 +117,11 @@ char	*strncat(char * __restrict, const char * __restrict, size_t);
 int	 strncmp(const char *, const char *, size_t) __pure;
 char	*strncpy(char * __restrict, const char * __restrict, size_t);
 #endif
-#if __POSIX_VISIBLE >= 200809 || __BSD_VISIBLE
-char	*strndup(const char *, size_t);
+#if __POSIX_VISIBLE >= 200809
+char	*strndup(const char *, size_t) __malloclike;
+#if !defined(_KERNEL_VIRTUAL)
 size_t	 strnlen(const char *, size_t) __pure;
+#endif
 #endif
 #if __BSD_VISIBLE
 char	*strnstr(const char *, const char *, size_t) __pure;
@@ -128,7 +135,7 @@ char	*strrchr(const char *, int) __pure;
 char	*strsep(char **, const char *);
 #endif
 #endif
-#if __POSIX_VISIBLE >= 200809 || __BSD_VISIBLE
+#if __POSIX_VISIBLE >= 200809
 char	*strsignal(int);
 #endif
 size_t	 strspn(const char *, const char *) __pure;
@@ -136,28 +143,34 @@ size_t	 strspn(const char *, const char *) __pure;
 char	*strstr(const char *, const char *) __pure;
 #endif
 char	*strtok(char * __restrict, const char * __restrict);
-#if __POSIX_VISIBLE >= 199506 || __XSI_VISIBLE >= 500
-char	*strtok_r(char *, const char *, char **);
+#if __POSIX_VISIBLE >= 199506
+char	*strtok_r(char * __restrict, const char * __restrict,
+	     char ** __restrict);
 #endif
 size_t	 strxfrm(char * __restrict, const char * __restrict, size_t);
 #if __BSD_VISIBLE
-
-#ifndef _SWAB_DECLARED
-#define _SWAB_DECLARED
-
-#ifndef _SSIZE_T_DECLARED
-typedef	__ssize_t	ssize_t;
-#define	_SSIZE_T_DECLARED
-#endif /* _SSIZE_T_DECLARED */
-
-void	 swab(const void * __restrict, void * __restrict, ssize_t);
-#endif /* _SWAB_DECLARED */
-
+int	 timingsafe_bcmp(const void *, const void *, size_t) __pure;
+int	 timingsafe_memcmp(const void *, const void *, size_t) __pure;
 #endif /* __BSD_VISIBLE */
 
 #if __POSIX_VISIBLE >= 200809 || defined(_XLOCALE_H_)
 #include <xlocale/_string.h>
 #endif
+
+#if __EXT1_VISIBLE
+#ifndef _RSIZE_T_DECLARED
+typedef	size_t		rsize_t;
+#define	_RSIZE_T_DECLARED
+#endif
+
+#ifndef _ERRNO_T_DECLARED
+#define	_ERRNO_T_DECLARED
+typedef	int		errno_t;
+#endif
+
+/* ISO/IEC 9899:2011 K.3.7.4.1.1 */
+errno_t memset_s(void *, rsize_t, int, rsize_t);
+#endif /* __EXT1_VISIBLE */
 __END_DECLS
 
 #endif /* _STRING_H_ */

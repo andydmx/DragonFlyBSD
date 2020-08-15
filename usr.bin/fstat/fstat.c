@@ -53,10 +53,10 @@
 #include <vfs/ufs/inode.h>
 #include <sys/mount.h>
 #include <sys/namecache.h>
-#include <nfs/nfsproto.h>
-#include <nfs/rpcv2.h>
-#include <nfs/nfs.h>
-#include <nfs/nfsnode.h>
+#include <vfs/nfs/nfsproto.h>
+#include <vfs/nfs/rpcv2.h>
+#include <vfs/nfs/nfs.h>
+#include <vfs/nfs/nfsnode.h>
 #include <sys/devfs.h>
 
 #include <vm/vm.h>
@@ -112,6 +112,10 @@ int	wflg_mnt = 16;
 int	wflg_cmd = 10;
 int	pid_width = 5;
 int	ino_width = 6;
+
+const char *Uname;
+char	*Comm;
+int	Pid;
 
 struct fdnode *ofiles; 	/* buffer of pointers to file structures */
 int maxfiles;
@@ -267,10 +271,6 @@ main(int argc, char **argv)
 	exit(0);
 }
 
-const char *Uname;
-char	*Comm;
-int	Pid;
-
 #define PREFIX(i) \
 	printf("%-8.8s %-*s %*d", Uname, wflg_cmd, Comm, pid_width, Pid); \
 	switch(i) { \
@@ -393,8 +393,9 @@ dommap(struct proc *p)
 	struct vmspace vmspace;
 	vm_map_t map;
 	struct vm_map_entry entry;
-	vm_map_entry_t entryp;
+	vm_map_entry_t ken;
 	struct vm_object object;
+	struct vm_map_backing ba;
 	vm_object_t objp;
 	int prot, fflags;
 
@@ -405,34 +406,38 @@ dommap(struct proc *p)
 	}
 
 	map = &vmspace.vm_map;
-
-	for (entryp = map->header.next; entryp != &p->p_vmspace->vm_map.header;
-	    entryp = entry.next) {
-		if (!kread(entryp, &entry, sizeof(entry))) {
-			dprintf(stderr,
-			    "can't read vm_map_entry at %p for pid %d\n",
-			    (void *)entryp, Pid);
-			return;
-		}
-
+	for (ken = kvm_vm_map_entry_first(kd, map, &entry);
+	     ken; ken = kvm_vm_map_entry_next(kd, ken, &entry)) {
 		if (entry.maptype == VM_MAPTYPE_SUBMAP)
 			continue;
 
-		if ((objp = entry.object.vm_object) == NULL)
+		if (entry.ba.object == NULL)
 			continue;
-
-		for (; objp; objp = object.backing_object) {
-			if (!kread(objp, &object, sizeof(object))) {
+		ba = entry.ba;
+		for (;;) {
+			if ((objp = entry.ba.object) != NULL) {
+				if (!kread(objp, &object, sizeof(object))) {
+					dprintf(stderr,
+					    "can't read vm_object at %p "
+					    "for pid %d\n",
+					    (void *)objp, Pid);
+					return;
+				}
+			}
+			if (ba.backing_ba == NULL)
+				break;
+			if (!kread(ba.backing_ba, &ba, sizeof(ba))) {
 				dprintf(stderr,
-				    "can't read vm_object at %p for pid %d\n",
-				    (void *)objp, Pid);
+				    "can't read map_backing at %p "
+				    "for pid %d\n",
+				    (void *)ba.backing_ba, Pid);
 				return;
 			}
 		}
 
 		prot = entry.protection;
 		fflags = (prot & VM_PROT_READ ? FREAD : 0) |
-		    (prot & VM_PROT_WRITE ? FWRITE : 0);
+			 (prot & VM_PROT_WRITE ? FWRITE : 0);
 
 		switch (object.type) {
 		case OBJT_VNODE:
@@ -469,6 +474,10 @@ vtrans(struct vnode *vp, struct nchandle *ncr, int i, int flag, off_t off)
 		switch (vn.v_tag) {
 		case VT_HAMMER:
 			if (!hammer_filestat(&vn, &fst))
+				badtype = "error";
+			break;
+		case VT_HAMMER2:
+			if (!hammer2_filestat(&vn, &fst))
 				badtype = "error";
 			break;
 		case VT_TMPFS:
@@ -545,14 +554,18 @@ vtrans(struct vnode *vp, struct nchandle *ncr, int i, int flag, off_t off)
 		return;
 	}
 	if (nflg)
-		(void)printf(" %3u,%-9u   ", major(fst.fsid), minor(fst.fsid));
+		printf(" %3u,%-9u   ",
+		       major(fst.fsid), minor(fst.fsid));
 	else
-		(void)printf(" %-*s", wflg_mnt, getmnton(vn.v_mount, &vn.v_namecache, ncr));
+		printf(" %-*s",
+		       wflg_mnt, getmnton(vn.v_mount, &vn.v_namecache, ncr));
 	if (nflg)
-		(void)sprintf(mode, "%o", fst.mode);
+		sprintf(mode, "%o", fst.mode);
 	else
 		strmode(fst.mode, mode);
-	(void)printf(" %*ld %10s", ino_width, fst.fileid, mode);
+
+	printf(" %*ld %10s", ino_width, fst.fileid, mode);
+
 	switch (vn.v_type) {
 	case VBLK:
 	case VCHR:
@@ -590,11 +603,11 @@ ufs_filestat(struct vnode *vp, struct filestat *fsp)
 		return 0;
 	}
 	/*
-	 * The st_dev from stat(2) is a udev_t. These kernel structures
-	 * contain dev_t structures. We need to convert to udev to make
+	 * The st_dev from stat(2) is a dev_t. These kernel structures
+	 * contain cdev_t structures. We need to convert to udev to make
 	 * comparisons
 	 */
-	fsp->fsid = dev2udev(inode.i_dev);
+	fsp->fsid = fstat_dev2udev(inode.i_dev);
 	fsp->fileid = (long)inode.i_number;
 	fsp->mode = (mode_t)inode.i_mode;
 	fsp->size = inode.i_size;
@@ -633,7 +646,7 @@ devfs_filestat(struct vnode *vp, struct filestat *fsp)
 		    (void *)vp->v_data, Pid);
 		return 0;
 	}
-	fsp->fsid = fsp->rdev = dev2udev(vp->v_rdev);
+	fsp->fsid = fsp->rdev = fstat_dev2udev(vp->v_rdev);
 	fsp->fileid = devfs_node.d_dir.d_ino;
 	fsp->mode = (devfs_node.mode & ~S_IFMT) | S_IFCHR;
 	fsp->size = 0;
@@ -742,9 +755,25 @@ static void
 pipetrans(struct pipe *pi, int i, int flag)
 {
 	struct pipe pip;
+	struct pipebuf *b1;
+	struct pipebuf *b2;
 	char rw[3];
+	char side1;
+	char side2;
 
 	PREFIX(i);
+	if ((intptr_t)pi & 1) {
+		side1 = 'B';
+		side2 = 'A';
+		b1 = &pip.bufferB;
+		b2 = &pip.bufferA;
+	} else {
+		side1 = 'A';
+		side2 = 'B';
+		b1 = &pip.bufferA;
+		b2 = &pip.bufferB;
+	}
+	pi = (void *)((intptr_t)pi & ~(intptr_t)1);
 
 	/* fill in socket */
 	if (!kread(pi, &pip, sizeof(struct pipe))) {
@@ -752,8 +781,10 @@ pipetrans(struct pipe *pi, int i, int flag)
 		goto bad;
 	}
 
-	printf("* pipe %8lx <-> %8lx", (u_long)pi, (u_long)pip.pipe_peer);
-	printf(" %6d", (int)(pip.pipe_buffer.windex - pip.pipe_buffer.rindex));
+	printf("* pipe %8lx (%c<->%c)", (u_long)pi, side1, side2);
+	printf(" ravail %-zu wavail %-zu",
+	       b1->windex - b1->rindex,
+	       b2->windex - b2->rindex);
 	rw[0] = '\0';
 	if (flag & FREAD)
 		strcat(rw, "r");
@@ -891,11 +922,11 @@ bad:
 
 
 /*
- * Read the cdev structure in the kernel (as pointed to by a dev_t)
- * in order to work out the associated udev_t
+ * Read the cdev structure in the kernel (as pointed to by a cdev_t)
+ * in order to work out the associated dev_t
  */
-udev_t
-dev2udev(void *dev)
+dev_t
+fstat_dev2udev(cdev_t dev)
 {
 	struct cdev si;
 
@@ -906,12 +937,12 @@ dev2udev(void *dev)
 		}
 		return((si.si_umajor << 8) | si.si_uminor);
 	} else {
-		dprintf(stderr, "can't convert dev_t %p to a udev_t\n", dev);
+		dprintf(stderr, "can't convert cdev_t %p to a dev_t\n", dev);
 		return NOUDEV;
 	}
 }
 
-udev_t
+dev_t
 makeudev(int x, int y)
 {
         if ((x & 0xffffff00) || (y & 0x0000ff00))
@@ -989,4 +1020,3 @@ kread(const void *kaddr, void *uaddr, size_t nbytes)
     else
 	return(0);
 }
-

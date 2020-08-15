@@ -37,18 +37,17 @@
 #include <sys/socket.h>
 #include <sys/sockio.h>
 
-#include <stdlib.h>
-#include <unistd.h>
-
-#include <net/ethernet.h>
 #include <net/if.h>
 #include <net/if_var.h>
-#include <net/vlan/if_vlan_var.h>
 #include <net/route.h>
+#include <net/ethernet.h>
+#include <net/vlan/if_vlan_var.h>
 
 #include <ctype.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 #include <err.h>
 #include <errno.h>
 
@@ -95,7 +94,7 @@ static void
 setvlandev(const char *val, int d, int s, const struct afswtch	*afp)
 {
 
-	strncpy(__vreq.vlr_parent, val, sizeof(__vreq.vlr_parent));
+	strlcpy(__vreq.vlr_parent, val, sizeof(__vreq.vlr_parent));
 	__have_dev = 1;
 }
 
@@ -153,12 +152,10 @@ static struct afswtch af_vlan = {
 static __constructor(101) void
 vlan_ctor(void)
 {
-#define	N(a)	(sizeof(a) / sizeof(a[0]))
-	int i;
+	size_t i;
 
-	for (i = 0; i < N(vlan_cmds);  i++)
+	for (i = 0; i < nitems(vlan_cmds);  i++)
 		cmd_register(&vlan_cmds[i]);
 	af_register(&af_vlan);
 	callback_register(vlan_cb, NULL);
-#undef N
 }

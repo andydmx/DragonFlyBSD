@@ -48,7 +48,6 @@
 #include <sys/systm.h>
 #include <sys/module.h>
 #include <sys/bus.h>
-#include <sys/thread2.h>
 
 #include <net/bpf.h>
 #include <net/ethernet.h>
@@ -346,7 +345,7 @@ found:
 		STAILQ_INIT(&xferq->stdma);
 		xferq->stproc = NULL;
 		for (i = 0; i < xferq->bnchunk; i ++) {
-			m = m_getcl(MB_WAIT, MT_DATA, M_PKTHDR);
+			m = m_getcl(M_WAITOK, MT_DATA, M_PKTHDR);
 			xferq->bulkxfer[i].mbuf = m;
 			if (m != NULL) {
 				m->m_len = m->m_pkthdr.len = m->m_ext.ext_size;
@@ -504,7 +503,7 @@ fwe_as_output(struct fwe_softc *fwe, struct ifnet *ifp)
 		BPF_MTAP(ifp, m);
 
 		/* keep ip packet alignment for alpha */
-		M_PREPEND(m, ETHER_ALIGN, MB_DONTWAIT);
+		M_PREPEND(m, ETHER_ALIGN, M_NOWAIT);
 		fp = &xfer->send.hdr;
 		*(u_int32_t *)&xfer->send.hdr = *(int32_t *)&fwe->pkt_hdr;
 		fp->mode.stream.len = m->m_pkthdr.len;
@@ -550,7 +549,7 @@ fwe_as_input(struct fw_xferq *xferq)
 		m = sxfer->mbuf;
 
 		/* insert new rbuf */
-		sxfer->mbuf = m0 = m_getcl(MB_DONTWAIT, MT_DATA, M_PKTHDR);
+		sxfer->mbuf = m0 = m_getcl(M_NOWAIT, MT_DATA, M_PKTHDR);
 		if (m0 != NULL) {
 			m0->m_len = m0->m_pkthdr.len = m0->m_ext.ext_size;
 			STAILQ_INSERT_TAIL(&xferq->stfree, sxfer, link);

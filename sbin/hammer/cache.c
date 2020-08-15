@@ -34,47 +34,69 @@
  * $DragonFly: src/sbin/hammer/cache.c,v 1.5 2008/05/16 18:39:03 dillon Exp $
  */
 
-#include <sys/types.h>
-#include <assert.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <stdarg.h>
-#include <string.h>
-#include <unistd.h>
-#include <err.h>
-#include <fcntl.h>
 #include "hammer_util.h"
 
 static int CacheUse;
-static int CacheMax = 16 * 1024 * 1024;
-static int NCache;
+static int CacheMax = HAMMER_BUFSIZE * 1024;
 static TAILQ_HEAD(, cache_info) CacheList = TAILQ_HEAD_INITIALIZER(CacheList);
 
-void
-hammer_cache_set(int bytes)
+int
+hammer_parse_cache_size(const char *arg)
 {
-	CacheMax = bytes;
+	char *ptr;
+	int size = strtol(arg, &ptr, 0);
+
+	switch(*ptr) {
+	case 'm':
+	case 'M':
+		size *= 1024;
+		/* fall through */
+	case 'k':
+	case 'K':
+		size *= 1024;
+		++ptr;
+		break;
+	case '\0':
+	case ':':
+		/* bytes if no suffix */
+		break;
+	default:
+		return(-1);
+	}
+
+	if (*ptr == ':') {
+		UseReadAhead = strtol(ptr + 1, NULL, 0);
+		UseReadBehind = -UseReadAhead;
+	}
+	if (size < 1024 * 1024)
+		size = 1024 * 1024;
+	if (UseReadAhead < 0)
+		return(-1);
+	if (UseReadAhead * HAMMER_BUFSIZE / size / 16) {
+		UseReadAhead = size / 16 / HAMMER_BUFSIZE;
+		UseReadBehind = -UseReadAhead;
+	}
+
+	CacheMax = size;
+	return(0);
 }
 
 void
-hammer_cache_add(struct cache_info *cache, enum cache_type type)
+hammer_cache_add(cache_info_t cache)
 {
 	TAILQ_INSERT_HEAD(&CacheList, cache, entry);
-	cache->type = type;
 	CacheUse += HAMMER_BUFSIZE;
-	++NCache;
 }
 
 void
-hammer_cache_del(struct cache_info *cache)
+hammer_cache_del(cache_info_t cache)
 {
 	TAILQ_REMOVE(&CacheList, cache, entry);
 	CacheUse -= HAMMER_BUFSIZE;
-	--NCache;
 }
 
 void
-hammer_cache_used(struct cache_info *cache)
+hammer_cache_used(cache_info_t cache)
 {
 	TAILQ_REMOVE(&CacheList, cache, entry);
 	TAILQ_INSERT_TAIL(&CacheList, cache, entry);
@@ -83,43 +105,32 @@ hammer_cache_used(struct cache_info *cache)
 void
 hammer_cache_flush(void)
 {
-	struct cache_info *cache;
-	int target;
+	cache_info_t cache;
+	cache_info_t first = NULL;
 	int count = 0;
 
 	if (CacheUse >= CacheMax) {
-		target = CacheMax / 2;
 		while ((cache = TAILQ_FIRST(&CacheList)) != NULL) {
-			++count;
+			if (cache == first)
+				break; /* seen this ref'd before */
+
 			if (cache->refs) {
-				TAILQ_REMOVE(&CacheList, cache, entry);
-				TAILQ_INSERT_TAIL(&CacheList, cache, entry);
+				if (first == NULL)
+					first = cache;
+				hammer_cache_used(cache);
+				count++;
 				continue;
 			}
-			if (count >= NCache) {
-				CacheMax += 8 * 1024 * 1024;
-				target = CacheMax / 2;
+			if (count >= (CacheUse / HAMMER_BUFSIZE)) {
+				CacheMax += HAMMER_BUFSIZE * 512;
 				count = 0;
 			}
+
 			cache->refs = 1;
 			cache->delete = 1;
-			--count;
+			rel_buffer((buffer_info_t)cache);
 
-			switch(cache->type) {
-			case ISVOLUME:
-				rel_volume(cache->u.volume);
-				break;
-			case ISBUFFER:
-				rel_buffer(cache->u.buffer);
-				break;
-			default:
-				errx(1, "hammer_cache_flush: unknown type: %d",
-				     (int)cache->type);
-				/* not reached */
-				break;
-			}
-			/* structure was freed */
-			if (CacheUse < target)
+			if (CacheUse < CacheMax / 2)
 				break;
 		}
 	}

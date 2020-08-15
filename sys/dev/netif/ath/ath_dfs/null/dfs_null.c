@@ -29,6 +29,7 @@
  * $FreeBSD$
  */
 #include <sys/cdefs.h>
+__FBSDID("$FreeBSD$");
 
 /*
  * This implements an empty DFS module.
@@ -43,9 +44,16 @@
 #include <sys/kernel.h>
 #include <sys/lock.h>
 #include <sys/malloc.h>
-#include <sys/mutex.h>
 #include <sys/errno.h>
+
+#if defined(__DragonFly__)
+/* empty */
+#else
+#include <machine/bus.h>
+#include <machine/resource.h>
+#endif
 #include <sys/bus.h>
+
 #include <sys/socket.h>
  
 #include <net/if.h>
@@ -176,7 +184,7 @@ ath_dfs_process_phy_err(struct ath_softc *sc, struct mbuf *m,
 }
 
 /*
- * Process the radar events and determine whether a DFS event has occured.
+ * Process the radar events and determine whether a DFS event has occurred.
  *
  * This is designed to run outside of the RX processing path.
  * The RX path will call ath_dfs_tasklet_needed() to see whether
@@ -289,40 +297,43 @@ ath_dfs_get_thresholds(struct ath_softc *sc, HAL_PHYERR_PARAM *param)
 	return (1);
 }
 
+#if defined(__DragonFly__)
 /*
  * Module glue.
  */
 static int
 null_dfs_modevent(module_t mod, int type, void *unused)
 {
-        int error;
+	int error;
 
-        wlan_serialize_enter();
+	wlan_serialize_enter();
 
-        switch (type) {
-        case MOD_LOAD:
-                if (bootverbose) {
-                        kprintf("ath_dfs: WTF module\n");
-                }
-                error = 0;
-                break;
-        case MOD_UNLOAD:
-                error = 0;
-                break;
-        default:
-                error = EINVAL;
-                break;
-        }
-        wlan_serialize_exit();
+	switch (type) {
+	case MOD_LOAD:
+		if (bootverbose) {
+			kprintf("ath_dfs: WTF module\n");
+		}
+		error = 0;
+		break;
+	case MOD_UNLOAD:
+		error = 0;
+		break;
+	default:
+		error = EINVAL;
+		break;
+	}
+	wlan_serialize_exit();
 
-        return error;
+	return error;
 }
 
 static moduledata_t null_dfs_mod = {
-        "ath_dfs",
-        null_dfs_modevent,
-        0
+	"ath_dfs",
+	null_dfs_modevent,
+	0
 };
 
 DECLARE_MODULE(ath_dfs, null_dfs_mod, SI_SUB_DRIVERS, SI_ORDER_FIRST);
 MODULE_VERSION(ath_dfs, 1);
+
+#endif

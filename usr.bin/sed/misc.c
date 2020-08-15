@@ -1,4 +1,6 @@
 /*-
+ * SPDX-License-Identifier: BSD-3-Clause
+ *
  * Copyright (c) 1992 Diomidis Spinellis.
  * Copyright (c) 1992, 1993
  *	The Regents of the University of California.  All rights reserved.
@@ -31,8 +33,10 @@
  * SUCH DAMAGE.
  *
  * @(#)misc.c	8.1 (Berkeley) 6/6/93
- * $FreeBSD: src/usr.bin/sed/misc.c,v 1.10 2004/08/09 15:29:41 dds Exp $
+ * $FreeBSD: head/usr.bin/sed/misc.c 326025 2017-11-20 19:49:47Z pfg $
  */
+
+#include <sys/cdefs.h>
 
 #include <sys/types.h>
 

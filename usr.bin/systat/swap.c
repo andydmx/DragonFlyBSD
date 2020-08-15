@@ -28,7 +28,6 @@
  *
  * @(#)swap.c	8.3 (Berkeley) 4/29/95
  * $FreeBSD: src/usr.bin/systat/swap.c,v 1.12.2.2 2001/07/04 22:54:14 kris Exp $
- * $DragonFly: src/usr.bin/systat/swap.c,v 1.5 2008/11/10 04:59:45 swildner Exp $
  */
 
 /*
@@ -52,8 +51,6 @@
 #include "extern.h"
 
 void showspace(char *header, int hlen, long blocksize);
-
-kvm_t	*kd;
 
 static long blocksize;
 static int hlen;
@@ -147,11 +144,10 @@ showswap(void)
 			mvwprintw(
 			    wnd,
 			    i + 1,
-			    _col,
+			    0,
 			    "%-5s",
 			    "Total"
 			);
-			_col += 5;
 		}
 		if (kvmsw[i].ksw_total == 0) {
 			mvwprintw(

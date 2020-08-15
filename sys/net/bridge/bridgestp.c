@@ -41,6 +41,7 @@
 
 #include <sys/param.h>
 #include <sys/systm.h>
+#include <sys/malloc.h>	/* for M_NOWAIT */
 #include <sys/mbuf.h>
 #include <sys/socket.h>
 #include <sys/sockio.h>
@@ -253,7 +254,7 @@ bstp_send_config_bpdu(struct bridge_softc *sc, struct bridge_iflist *bif,
 	if ((ifp->if_flags & IFF_RUNNING) == 0)
 		return;
 
-	MGETHDR(m, MB_DONTWAIT, MT_DATA);
+	MGETHDR(m, M_NOWAIT, MT_DATA);
 	if (m == NULL)
 		return;
 
@@ -435,7 +436,7 @@ bstp_transmit_tcn(struct bridge_softc *sc)
 	if ((ifp->if_flags & IFF_RUNNING) == 0)
 		return;
 
-	MGETHDR(m, MB_DONTWAIT, MT_DATA);
+	MGETHDR(m, M_NOWAIT, MT_DATA);
 	if (m == NULL)
 		return;
 

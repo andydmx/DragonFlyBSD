@@ -762,7 +762,7 @@ sk_newbuf_jumbo(struct sk_if_softc *sc_if, int idx, int wait)
 
 	KKASSERT(idx < SK_RX_RING_CNT && idx >= 0);
 
-	MGETHDR(m_new, wait ? MB_WAIT : MB_DONTWAIT, MT_DATA);
+	MGETHDR(m_new, wait ? M_WAITOK : M_NOWAIT, MT_DATA);
 	if (m_new == NULL)
 		return ENOBUFS;
 
@@ -818,7 +818,7 @@ sk_newbuf_std(struct sk_if_softc *sc_if, int idx, int wait)
 
 	KKASSERT(idx < SK_RX_RING_CNT && idx >= 0);
 
-	m_new = m_getcl(wait ? MB_WAIT : MB_DONTWAIT, MT_DATA, M_PKTHDR);
+	m_new = m_getcl(wait ? M_WAITOK : M_NOWAIT, MT_DATA, M_PKTHDR);
 	if (m_new == NULL)
 		return ENOBUFS;
 
@@ -867,7 +867,7 @@ sk_newbuf_std(struct sk_if_softc *sc_if, int idx, int wait)
 /*
  * Allocate a jumbo buffer.
  */
-struct sk_jpool_entry *
+static struct sk_jpool_entry *
 sk_jalloc(struct sk_if_softc *sc_if)
 {
 	struct sk_chain_data *cd = &sc_if->sk_cdata;
@@ -890,7 +890,7 @@ sk_jalloc(struct sk_if_softc *sc_if)
 /*
  * Release a jumbo buffer.
  */
-void
+static void
 sk_jfree(void *arg)
 {
 	struct sk_jpool_entry *entry = arg;
@@ -1481,19 +1481,8 @@ skc_attach(device_t dev)
 	/*
 	 * Create sysctl nodes.
 	 */
-	sysctl_ctx_init(&sc->sk_sysctl_ctx);
-	sc->sk_sysctl_tree = SYSCTL_ADD_NODE(&sc->sk_sysctl_ctx,
-					     SYSCTL_STATIC_CHILDREN(_hw),
-					     OID_AUTO,
-					     device_get_nameunit(dev),
-					     CTLFLAG_RD, 0, "");
-	if (sc->sk_sysctl_tree == NULL) {
-		device_printf(dev, "can't add sysctl node\n");
-		error = ENXIO;
-		goto fail;
-	}
-	SYSCTL_ADD_PROC(&sc->sk_sysctl_ctx,
-			SYSCTL_CHILDREN(sc->sk_sysctl_tree),
+	SYSCTL_ADD_PROC(device_get_sysctl_ctx(dev),
+			SYSCTL_CHILDREN(device_get_sysctl_tree(dev)),
 			OID_AUTO, "imtime", CTLTYPE_INT | CTLFLAG_RW,
 			sc, 0, skc_sysctl_imtime, "I",
 			"Interrupt moderation time (usec).");
@@ -1606,9 +1595,6 @@ skc_detach(device_t dev)
 		bus_release_resource(dev, SYS_RES_MEMORY, sc->sk_res_rid,
 				     sc->sk_res);
 	}
-
-	if (sc->sk_sysctl_tree != NULL)
-		sysctl_ctx_free(&sc->sk_sysctl_ctx);
 
 	return 0;
 }

@@ -30,8 +30,6 @@
  * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT
  * OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
- *
- * $DragonFly: src/sbin/hammer/cmd_cleanup.c,v 1.6 2008/10/07 22:28:41 thomas Exp $
  */
 /*
  * Clean up specific HAMMER filesystems or all HAMMER filesystems.
@@ -62,9 +60,11 @@
 
 #include "hammer.h"
 
+#include <libutil.h>
+
 struct didpfs {
 	struct didpfs *next;
-	uuid_t		uuid;
+	hammer_uuid_t uuid;
 };
 
 static void do_cleanup(const char *path);
@@ -99,12 +99,6 @@ static int cleanup_dedup(const char *path, const char *snapshots_path,
 
 static void runcmd(int *resp, const char *ctl, ...) __printflike(2, 3);
 
-/*
- * WARNING: Do not make the SNAPSHOTS_BASE "/var/snapshots" because
- * it will interfere with the older HAMMER VERS < 3 snapshots directory
- * for the /var PFS.
- */
-#define SNAPSHOTS_BASE	"/var/hammer"	/* HAMMER VERS >= 3 */
 #define WS	" \t\r\n"
 
 struct didpfs *FirstPFS;
@@ -138,7 +132,6 @@ hammer_cmd_cleanup(char **av, int ac)
 				}
 			}
 		}
-
 	} else {
 		while (ac) {
 			do_cleanup(*av);
@@ -178,11 +171,8 @@ do_cleanup(const char *path)
 	int r;
 	int found_rebal = 0;
 
-	bzero(&pfs, sizeof(pfs));
 	bzero(&mrec_tmp, sizeof(mrec_tmp));
-	pfs.ondisk = &mrec_tmp.pfs.pfsd;
-	pfs.bytes = sizeof(mrec_tmp.pfs.pfsd);
-	pfs.pfs_id = -1;
+	clrpfs(&pfs, &mrec_tmp.pfs.pfsd, -1);
 
 	printf("cleanup %-20s -", path);
 	fd = open(path, O_RDONLY);
@@ -206,6 +196,7 @@ do_cleanup(const char *path)
 		close(fd);
 		return;
 	}
+	HammerVersion = version.cur_version;
 
 	bzero(&config, sizeof(config));
 	if (version.cur_version >= 3) {
@@ -220,8 +211,9 @@ do_cleanup(const char *path)
 	 * mounts might alias the same PFS.
 	 */
 	for (didpfs = FirstPFS; didpfs; didpfs = didpfs->next) {
-		if (bcmp(&didpfs->uuid, &mrec_tmp.pfs.pfsd.unique_uuid, sizeof(uuid_t)) == 0) {
-			printf(" PFS #%d already handled\n", pfs.pfs_id);
+		if (hammer_uuid_compare(&didpfs->uuid,
+			&mrec_tmp.pfs.pfsd.unique_uuid) == 0) {
+			printf(" PFS#%d already handled\n", pfs.pfs_id);
 			close(fd);
 			return;
 		}
@@ -244,7 +236,7 @@ do_cleanup(const char *path)
 		printf(" WARNING: pfs-slave's snapshots dir is not absolute\n");
 		close(fd);
 		return;
-	} else if (mrec_tmp.pfs.pfsd.mirror_flags & HAMMER_PFSD_SLAVE) {
+	} else if (hammer_is_pfs_slave(&mrec_tmp.pfs.pfsd)) {
 		if (version.cur_version < 3) {
 			printf(" WARNING: must configure snapshot dir for PFS slave\n");
 			printf("\tWe suggest <fs>/var/slaves/<name> where "
@@ -340,7 +332,10 @@ do_cleanup(const char *path)
 	if (new_config && snapshots_from_pfs == 0) {
 		char *npath;
 
-		assert(path[0] == '/');
+		if (path[0] != '/') {
+			printf(" path must start with '/'\n");
+			return;
+		}
 		if (strcmp(path, "/") == 0)
 			asprintf(&npath, "%s/root", SNAPSHOTS_BASE);
 		else
@@ -359,9 +354,9 @@ do_cleanup(const char *path)
 					runcmd(&r, "mkdir -p %s", npath);
 					runcmd(&r, "cpdup %s %s", snapshots_path, npath);
 					if (r != 0) {
-				    printf("Unable to move snapshots directory!\n");
-				    printf("Please fix this critical error.\n");
-				    printf("Aborting cleanup of %s\n", path);
+						printf("Unable to move snapshots directory!\n");
+						printf("Please fix this critical error.\n");
+						printf("Aborting cleanup of %s\n", path);
 						close(fd);
 						return;
 					}
@@ -380,14 +375,24 @@ do_cleanup(const char *path)
 	 */
 	if (flock(fd, LOCK_EX|LOCK_NB) == -1) {
 		if (errno == EWOULDBLOCK)
-			printf(" PFS #%d locked by other process\n", pfs.pfs_id);
+			printf(" PFS#%d locked by other process\n", pfs.pfs_id);
 		else
 			printf(" can not lock %s: %s\n", config_path, strerror(errno));
 		close(fd);
 		return;
 	}
 
-	printf(" handle PFS #%d using %s\n", pfs.pfs_id, snapshots_path);
+	printf(" handle PFS#%d using %s\n", pfs.pfs_id, snapshots_path);
+
+	struct pidfh	*pfh = NULL;
+	static char	pidfile[PIDFILE_BUFSIZE];
+
+	snprintf (pidfile, PIDFILE_BUFSIZE, "%s/hammer.cleanup.%d",
+		pidfile_loc, getpid());
+	pfh = pidfile_open(pidfile, 0644, NULL);
+	if (pfh == NULL)
+		warn ("Unable to open or create %s", pidfile);
+	pidfile_write(pfh);
 
 	/*
 	 * Process the config file
@@ -530,15 +535,20 @@ do_cleanup(const char *path)
 
 	/*
 	 * Cleanup, and delay a little
+	 *
+	 * NOTE: pidfile_remove() closes, removes, and frees the pfh.
+	 *	 pidfile_close() closes and frees.
 	 */
 	close(fd);
 	usleep(1000);
+	pidfile_remove(pfh);
 }
 
 /*
  * Initialize new config data (new or old style)
  */
-static void
+static
+void
 config_init(const char *path, struct hammer_ioc_config *config)
 {
 	const char *snapshots;
@@ -564,7 +574,8 @@ config_init(const char *path, struct hammer_ioc_config *config)
  * Migrate configuration data from the old snapshots/config
  * file to the new meta-data format.
  */
-static void
+static
+void
 migrate_config(FILE *fp, struct hammer_ioc_config *config)
 {
 	int n;
@@ -580,7 +591,8 @@ migrate_config(FILE *fp, struct hammer_ioc_config *config)
  * this way the pruning code won't lose track of them if you
  * happen to blow away the snapshots directory.
  */
-static void
+static
+void
 migrate_snapshots(int fd, const char *snapshots_path)
 {
 	struct hammer_ioc_snapshot snapshot;
@@ -596,9 +608,8 @@ migrate_snapshots(int fd, const char *snapshots_path)
 			if (den->d_name[0] == '.')
 				continue;
 			asprintf(&fpath, "%s/%s", snapshots_path, den->d_name);
-			if (lstat(fpath, &st) == 0 && S_ISLNK(st.st_mode)) {
+			if (lstat(fpath, &st) == 0 && S_ISLNK(st.st_mode))
 				migrate_one_snapshot(fd, fpath, &snapshot);
-			}
 			free(fpath);
 		}
 		closedir(dir);
@@ -611,12 +622,13 @@ migrate_snapshots(int fd, const char *snapshots_path)
  * Migrate a single snapshot.  If fpath is NULL the ioctl is flushed,
  * otherwise it is flushed when it fills up.
  */
-static void
+static
+void
 migrate_one_snapshot(int fd, const char *fpath,
 		     struct hammer_ioc_snapshot *snapshot)
 {
 	if (fpath) {
-		struct hammer_snapshot_data *snap;
+		hammer_snapshot_data_t snap;
 		struct tm tm;
 		time_t t;
 		int year;
@@ -664,7 +676,7 @@ migrate_one_snapshot(int fd, const char *fpath,
 			snap = &snapshot->snaps[snapshot->count];
 			bzero(snap, sizeof(*snap));
 			snap->tid = tid;
-			snap->ts = (u_int64_t)t * 1000000ULL;
+			snap->ts = (uint64_t)t * 1000000ULL;
 			snprintf(snap->label, sizeof(snap->label),
 				 "migrated");
 			++snapshot->count;
@@ -715,13 +727,15 @@ strtosecs(char *ptr)
 	case 's':
 		break;
 	default:
-		errx(1, "illegal suffix converting %s\n", ptr);
+		errx(1, "illegal suffix converting %s", ptr);
+		/* not reached */
 		break;
 	}
 	return(val);
 }
 
-static const char *
+static
+const char *
 dividing_slash(const char *path)
 {
 	int len = strlen(path);
@@ -742,7 +756,8 @@ dividing_slash(const char *path)
  *
  * If ForceOpt is set always return true.
  */
-static int
+static
+int
 check_period(const char *snapshots_path, const char *cmd, int arg1,
 	time_t *savep)
 {
@@ -813,7 +828,8 @@ check_period(const char *snapshots_path, const char *cmd, int arg1,
 /*
  * Store the start time of the last successful operation.
  */
-static void
+static
+void
 save_period(const char *snapshots_path, const char *cmd,
 			time_t savet)
 {
@@ -838,7 +854,8 @@ save_period(const char *snapshots_path, const char *cmd,
 /*
  * Simply count the number of softlinks in the snapshots dir
  */
-static int
+static
+int
 check_softlinks(int fd, int new_config, const char *snapshots_path)
 {
 	struct dirent *den;
@@ -885,7 +902,8 @@ check_softlinks(int fd, int new_config, const char *snapshots_path)
 /*
  * Clean up expired softlinks in the snapshots dir
  */
-static void
+static
+void
 cleanup_softlinks(int fd, int new_config,
 		  const char *snapshots_path, int arg2, char *arg3)
 {
@@ -904,8 +922,7 @@ cleanup_softlinks(int fd, int new_config,
 				continue;
 			asprintf(&fpath, "%s/%s", snapshots_path, den->d_name);
 			if (lstat(fpath, &st) == 0 && S_ISLNK(st.st_mode) &&
-			    (anylink || strncmp(den->d_name, "snap-", 5) == 0)
-			) {
+			    (anylink || strncmp(den->d_name, "snap-", 5) == 0)) {
 				if (check_expired(den->d_name, arg2)) {
 					if (VerboseOpt) {
 						printf("    expire %s\n",
@@ -926,12 +943,12 @@ cleanup_softlinks(int fd, int new_config,
 	if (new_config) {
 		struct hammer_ioc_snapshot snapshot;
 		struct hammer_ioc_snapshot dsnapshot;
-		struct hammer_snapshot_data *snap;
+		hammer_snapshot_data_t snap;
 		struct tm *tp;
 		time_t t;
 		time_t dt;
 		char snapts[32];
-		u_int32_t i;
+		uint32_t i;
 
 		bzero(&snapshot, sizeof(snapshot));
 		bzero(&dsnapshot, sizeof(dsnapshot));
@@ -968,7 +985,8 @@ cleanup_softlinks(int fd, int new_config,
 	}
 }
 
-static void
+static
+void
 delete_snapshots(int fd, struct hammer_ioc_snapshot *dsnapshot)
 {
 	for (;;) {
@@ -997,7 +1015,8 @@ delete_snapshots(int fd, struct hammer_ioc_snapshot *dsnapshot)
  * expiration in seconds (arg2) and return non-zero if the softlink
  * has expired.
  */
-static int
+static
+int
 check_expired(const char *fpath, int arg2)
 {
 	struct tm tm;
@@ -1038,7 +1057,8 @@ check_expired(const char *fpath, int arg2)
 /*
  * Issue a snapshot.
  */
-static int
+static
+int
 create_snapshot(const char *path, const char *snapshots_path)
 {
 	int r;
@@ -1047,16 +1067,12 @@ create_snapshot(const char *path, const char *snapshots_path)
 	return(r);
 }
 
-static int
+static
+int
 cleanup_prune(const char *path, const char *snapshots_path,
 		  int arg1 __unused, int arg2, int snapshots_disabled)
 {
 	const char *path_or_snapshots_path;
-	struct softprune *base = NULL;
-	struct hammer_ioc_prune dummy_template;
-
-	bzero(&dummy_template, sizeof(dummy_template));
-	hammer_softprune_scandir(&base, &dummy_template, snapshots_path);
 
 	/*
 	 * If the snapshots_path (e.g. /var/hammer/...) has no snapshots
@@ -1064,7 +1080,10 @@ cleanup_prune(const char *path, const char *snapshots_path,
 	 * containing the snapshots_path instead of the requested
 	 * filesystem.  De-confuse prune.  We need a better way.
 	 */
-	path_or_snapshots_path = base ? snapshots_path : path;
+	if (hammer_softprune_testdir(snapshots_path))
+		path_or_snapshots_path = snapshots_path;
+	else
+		path_or_snapshots_path = path;
 
 	/*
 	 * If snapshots have been disabled run prune-everything instead
@@ -1085,7 +1104,8 @@ cleanup_prune(const char *path, const char *snapshots_path,
 	return(0);
 }
 
-static int
+static
+int
 cleanup_rebalance(const char *path, const char *snapshots_path,
 		  int arg1 __unused, int arg2)
 {
@@ -1106,7 +1126,8 @@ cleanup_rebalance(const char *path, const char *snapshots_path,
 	return(0);
 }
 
-static int
+static
+int
 cleanup_reblock(const char *path, const char *snapshots_path,
 		  int arg1 __unused, int arg2)
 {
@@ -1162,7 +1183,8 @@ cleanup_reblock(const char *path, const char *snapshots_path,
 	return(0);
 }
 
-static int
+static
+int
 cleanup_recopy(const char *path, const char *snapshots_path,
 		  int arg1 __unused, int arg2)
 {
@@ -1199,7 +1221,8 @@ cleanup_recopy(const char *path, const char *snapshots_path,
 	return(0);
 }
 
-static int
+static
+int
 cleanup_dedup(const char *path, const char *snapshots_path __unused,
 		  int arg1 __unused, int arg2)
 {

@@ -29,10 +29,10 @@
  */
 
 #include <sys/param.h>
+#include <sys/errno.h>
 
 #ifdef _KERNEL
 #include <sys/ctype.h>
-#include <sys/errno.h>
 #include <sys/kernel.h>
 #include <sys/malloc.h>
 #include <sys/systm.h>
@@ -40,7 +40,6 @@
 #include <machine/stdarg.h>
 #else /* _KERNEL */
 #include <ctype.h>
-#include <errno.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -551,7 +550,7 @@ sbuf_vprintf(struct sbuf *s, const char *fmt, __va_list ap)
 	KASSERT(fmt != NULL,
 	    ("%s called with a NULL format string", __func__));
 
-	(void)kvcprintf(fmt, sbuf_putc_func, s, 10, ap);
+	(void)kvcprintf(fmt, sbuf_putc_func, s, ap);
 	if (s->s_error != 0)
 		return (-1);
 	return (0);

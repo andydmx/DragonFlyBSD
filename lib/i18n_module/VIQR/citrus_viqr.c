@@ -1,5 +1,5 @@
-/* $FreeBSD: head/lib/libiconv_modules/VIQR/citrus_viqr.c 252583 2013-07-03 18:27:45Z peter $ */
-/* $NetBSD: citrus_viqr.c,v 1.4 2008/06/14 16:01:08 tnozaki Exp $ */
+/* $FreeBSD: head/lib/libiconv_modules/VIQR/citrus_viqr.c 281550 2015-04-15 09:09:20Z tijl $ */
+/* $NetBSD: citrus_viqr.c,v 1.5 2011/11/19 18:20:13 tnozaki Exp $ */
 
 /*-
  * Copyright (c)2006 Citrus Project,
@@ -230,6 +230,7 @@ _citrus_VIQR_init_state(_VIQREncodingInfo * __restrict ei __unused,
 	psenc->chlen = 0;
 }
 
+#if 0
 static __inline void
 /*ARGSUSED*/
 _citrus_VIQR_pack_state(_VIQREncodingInfo * __restrict ei __unused,
@@ -247,14 +248,15 @@ _citrus_VIQR_unpack_state(_VIQREncodingInfo * __restrict ei __unused,
 
 	memcpy((void *)psenc, pspriv, sizeof(*psenc));
 }
+#endif
 
 static int
 _citrus_VIQR_mbrtowc_priv(_VIQREncodingInfo * __restrict ei,
-    wchar_t * __restrict pwc, const char ** __restrict s, size_t n,
+    wchar_t * __restrict pwc, char ** __restrict s, size_t n,
     _VIQRState * __restrict psenc, size_t * __restrict nresult)
 {
 	mnemonic_t *m, *m0;
-	const char *s0;
+	char *s0;
 	wchar_t wc;
 	ssize_t i;
 	int ch, escape;
@@ -455,7 +457,7 @@ _citrus_VIQR_encoding_module_init(_VIQREncodingInfo * __restrict ei,
 			return (errnum);
 		}
 	}
-	for (i = 0;; ++i) {
+	for (i = 0; i < mnemonic_ext_size; ++i) {
 		p = &mnemonic_ext[i];
 		n = strlen(p->name);
 		if (ei->mb_cur_max < n)

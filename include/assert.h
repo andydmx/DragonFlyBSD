@@ -1,4 +1,6 @@
 /*-
+ * SPDX-License-Identifier: BSD-3-Clause
+ *
  * Copyright (c) 1992, 1993
  *	The Regents of the University of California.  All rights reserved.
  * (c) UNIX System Laboratories, Inc.
@@ -15,11 +17,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -36,7 +34,7 @@
  * SUCH DAMAGE.
  *
  *	@(#)assert.h	8.2 (Berkeley) 1/21/94
- * $FreeBSD: src/include/assert.h,v 1.6 2007/12/01 19:28:13 phk Exp $
+ * $FreeBSD: head/include/assert.h 326024 2017-11-20 19:45:28Z pfg $
  */
 
 #include <sys/cdefs.h>
@@ -70,12 +68,21 @@
 #ifndef _ASSERT_H_
 #define _ASSERT_H_
 
+/*
+ * Static assertions.  In principle we could define static_assert for
+ * C++ older than C++11, but this breaks if _Static_assert is
+ * implemented as a macro.
+ *
+ * C++ template parameters may contain commas, even if not enclosed in
+ * parentheses, causing the _Static_assert macro to be invoked with more
+ * than two parameters.
+ */
 #if __ISO_C_VISIBLE >= 2011 && !defined(__cplusplus)
 #define	static_assert	_Static_assert
 #endif
 
 __BEGIN_DECLS
-void	__assert(const char *, const char *, int, const char *);
+void	__assert(const char *, const char *, int, const char *) __dead2;
 void	__diagassert(const char *, int, const char *, const char *);
 __END_DECLS
 

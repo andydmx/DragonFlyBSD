@@ -28,7 +28,7 @@
  */
 
 /*
- * 6.3 : Scheduling services
+ * Multithreading and Scheduling Services
  */
 
 #include "opt_acpi.h"
@@ -39,14 +39,11 @@
 #include <sys/kernel.h>
 #include <sys/kthread.h>
 #include <sys/malloc.h>
-#include <sys/proc.h>
 #include <sys/msgport.h>
 #include <sys/taskqueue.h>
 #include <machine/clock.h>
 
-#include <sys/thread2.h>
 #include <sys/msgport2.h>
-#include <sys/mplock2.h>
 
 #include "acpi.h"
 #include "accommon.h"
@@ -103,14 +100,14 @@ acpi_task_thread(void *arg)
     ACPI_OSD_EXEC_CALLBACK func;
     struct acpi_task *at;
 
-    get_mplock();
+    lwkt_gettoken(&acpi_token);
     for (;;) {
 	at = (void *)lwkt_waitport(&curthread->td_msgport, 0);
 	func = at->at_function;
 	func(at->at_context);
 	lwkt_replymsg(&at->at_msg, 0);
     }
-    rel_mplock();
+    lwkt_reltoken(&acpi_token);
 }
 
 /*
@@ -128,7 +125,7 @@ AcpiOsExecute(ACPI_EXECUTE_TYPE Type, ACPI_OSD_EXEC_CALLBACK Function,
     case OSL_GLOBAL_LOCK_HANDLER:
     case OSL_NOTIFY_HANDLER:
     case OSL_GPE_HANDLER:
-    case OSL_DEBUGGER_THREAD:
+    case OSL_DEBUGGER_EXEC_THREAD:
     case OSL_EC_POLL_HANDLER:
     case OSL_EC_BURST_HANDLER:
 	break;
@@ -209,15 +206,7 @@ AcpiOsStall(UINT32 Microseconds)
 ACPI_THREAD_ID
 AcpiOsGetThreadId(void)
 {
-    struct proc *p;
-
     /* XXX do not add ACPI_FUNCTION_TRACE here, results in recursive call. */
 
-    p = curproc;
-    if (p == NULL)
-	p = &proc0;
-    KASSERT(p != NULL, ("%s: curproc is NULL!", __func__));
-
-    /* Returning 0 is not allowed. */
-    return (p->p_pid + 1);
+    return ((uintptr_t)curthread);
 }

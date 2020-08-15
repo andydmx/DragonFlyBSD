@@ -55,6 +55,7 @@
 #include <sys/diskslice.h>
 #include <sys/conf.h>
 #include <sys/cons.h>
+#include <sys/kbio.h>
 #include <sys/device.h>
 #include <sys/disk.h>
 #include <sys/namecache.h>
@@ -95,7 +96,7 @@ int vfs_mountroot_devfs(void);
 static void	vfs_mountroot(void *junk);
 static int	vfs_mountroot_try(const char *mountfrom);
 static int	vfs_mountroot_ask(void);
-static int	getline(char *cp, int limit);
+static int	get_line(char *cp, int limit);
 
 /* legacy find-root code */
 char		*rootdevnames[2] = {NULL, NULL};
@@ -234,16 +235,19 @@ vfs_mountroot_devfs(void)
 	/*
 	 * Lookup the requested path and extract the nch and vnode.
 	 */
-	error = nlookup_init_raw(&nd,
-	     devfs_path, UIO_SYSSPACE, NLC_FOLLOW,
-	     cred, &rootnch);
+	error = nlookup_init_raw(&nd, devfs_path, UIO_SYSSPACE,
+				 NLC_FOLLOW, cred, &rootnch);
 
 	if (error == 0) {
-		devfs_debug(DEVFS_DEBUG_DEBUG, "vfs_mountroot_devfs: nlookup_init is ok...\n");
+		devfs_debug(DEVFS_DEBUG_DEBUG,
+			    "vfs_mountroot_devfs: nlookup_init is ok...\n");
 		if ((error = nlookup(&nd)) == 0) {
-			devfs_debug(DEVFS_DEBUG_DEBUG, "vfs_mountroot_devfs: nlookup is ok...\n");
+			devfs_debug(DEVFS_DEBUG_DEBUG,
+				    "vfs_mountroot_devfs: nlookup is ok...\n");
 			if (nd.nl_nch.ncp->nc_vp == NULL) {
-				devfs_debug(DEVFS_DEBUG_SHOW, "vfs_mountroot_devfs: nlookup: simply not found\n");
+				devfs_debug(DEVFS_DEBUG_SHOW,
+					    "vfs_mountroot_devfs: nlookup: "
+					    "simply not found\n");
 				error = ENOENT;
 			}
 		}
@@ -253,7 +257,9 @@ vfs_mountroot_devfs(void)
 	devfs_path = NULL;
 	if (error) {
 		nlookup_done(&nd);
-		devfs_debug(DEVFS_DEBUG_SHOW, "vfs_mountroot_devfs: nlookup failed, error: %d\n", error);
+		devfs_debug(DEVFS_DEBUG_SHOW,
+			    "vfs_mountroot_devfs: nlookup failed, error: %d\n",
+			    error);
 		return (error);
 	}
 
@@ -270,7 +276,8 @@ vfs_mountroot_devfs(void)
 	vp = nch.ncp->nc_vp;
 	if ((error = vget(vp, LK_EXCLUSIVE)) != 0) {
 		cache_put(&nch);
-		devfs_debug(DEVFS_DEBUG_SHOW, "vfs_mountroot_devfs: vget failed\n");
+		devfs_debug(DEVFS_DEBUG_SHOW,
+			    "vfs_mountroot_devfs: vget failed\n");
 		return (error);
 	}
 	cache_unlock(&nch);
@@ -278,13 +285,15 @@ vfs_mountroot_devfs(void)
 	if ((error = vinvalbuf(vp, V_SAVE, 0, 0)) != 0) {
 		cache_drop(&nch);
 		vput(vp);
-		devfs_debug(DEVFS_DEBUG_SHOW, "vfs_mountroot_devfs: vinvalbuf failed\n");
+		devfs_debug(DEVFS_DEBUG_SHOW,
+			    "vfs_mountroot_devfs: vinvalbuf failed\n");
 		return (error);
 	}
 	if (vp->v_type != VDIR) {
 		cache_drop(&nch);
 		vput(vp);
-		devfs_debug(DEVFS_DEBUG_SHOW, "vfs_mountroot_devfs: vp is not VDIR\n");
+		devfs_debug(DEVFS_DEBUG_SHOW,
+			    "vfs_mountroot_devfs: vp is not VDIR\n");
 		return (ENOTDIR);
 	}
 
@@ -294,22 +303,24 @@ vfs_mountroot_devfs(void)
 	 * Allocate and initialize the filesystem.
 	 */
 	mp = kmalloc(sizeof(struct mount), M_MOUNT, M_ZERO|M_WAITOK);
-	mount_init(mp);
+	mount_init(mp, vfsp->vfc_vfsops);
 	vfs_busy(mp, LK_NOWAIT);
-	mp->mnt_op = vfsp->vfc_vfsops;
 	mp->mnt_vfc = vfsp;
+	mp->mnt_pbuf_count = nswbuf_kva / NSWBUF_SPLIT;
 	vfsp->vfc_refcount++;
 	mp->mnt_stat.f_type = vfsp->vfc_typenum;
 	mp->mnt_flag |= vfsp->vfc_flags & MNT_VISFLAGMASK;
+	if (vfsp->vfc_flags & VFCF_MPSAFE)
+		mp->mnt_kern_flag |= MNTK_ALL_MPSAFE;
 	strncpy(mp->mnt_stat.f_fstypename, vfsp->vfc_name, MFSNAMELEN);
 	mp->mnt_stat.f_owner = cred->cr_uid;
+	mp->mnt_ncmounton = nch;
 	vn_unlock(vp);
 
 	/*
 	 * Mount the filesystem.
 	 */
 	error = VFS_MOUNT(mp, "/dev", NULL, cred);
-
 	vn_lock(vp, LK_EXCLUSIVE | LK_RETRY);
 
 	/*
@@ -331,21 +342,30 @@ vfs_mountroot_devfs(void)
 			cache_allocroot(&mp->mnt_ncmountpt, mp, NULL);
 			cache_unlock(&mp->mnt_ncmountpt);
 		}
-		mp->mnt_ncmounton = nch;		/* inherits ref */
+		vn_unlock(vp);
+		cache_lock(&nch);
 		nch.ncp->nc_flag |= NCF_ISMOUNTPT;
+		cache_unlock(&nch);
+		vn_lock(vp, LK_EXCLUSIVE | LK_RETRY);
 
-		/* XXX get the root of the fs and cache_setvp(mnt_ncmountpt...) */
+		/*
+		 * XXX get the root of the fs and
+		 * cache_setvp(mnt_ncmountpt...)
+		 */
 		mountlist_insert(mp, MNTINS_LAST);
 		vn_unlock(vp);
 		//checkdirs(&mp->mnt_ncmounton, &mp->mnt_ncmountpt);
 		error = vfs_allocate_syncvnode(mp);
 		if (error) {
-			devfs_debug(DEVFS_DEBUG_SHOW, "vfs_mountroot_devfs: vfs_allocate_syncvnode failed\n");
+			devfs_debug(DEVFS_DEBUG_SHOW,
+				    "vfs_mountroot_devfs: "
+				    "vfs_allocate_syncvnode failed\n");
 		}
 		vfs_unbusy(mp);
 		error = VFS_START(mp, 0);
 		vrele(vp);
 	} else {
+		bzero(&mp->mnt_ncmounton, sizeof(mp->mnt_ncmounton));
 		vn_syncer_thr_stop(mp);
 		vfs_rm_vnodeops(mp, NULL, &mp->mnt_vn_coherency_ops);
 		vfs_rm_vnodeops(mp, NULL, &mp->mnt_vn_journal_ops);
@@ -357,10 +377,12 @@ vfs_mountroot_devfs(void)
 		kfree(mp, M_MOUNT);
 		cache_drop(&nch);
 		vput(vp);
-		devfs_debug(DEVFS_DEBUG_SHOW, "vfs_mountroot_devfs: mount failed\n");
+		devfs_debug(DEVFS_DEBUG_SHOW,
+			    "vfs_mountroot_devfs: mount failed\n");
 	}
 
-	devfs_debug(DEVFS_DEBUG_DEBUG, "rootmount_devfs done with error: %d\n", error);
+	devfs_debug(DEVFS_DEBUG_DEBUG,
+		    "rootmount_devfs done with error: %d\n", error);
 	return (error);
 }
 
@@ -419,10 +441,12 @@ vfs_mountroot_try(const char *mountfrom)
 		}
 		mp->mnt_flag |= MNT_ROOTFS;
 
-		/* do our best to set rootdev */
-		if ((strcmp(vfsname, "hammer") != 0) && (devname[0] != 0) &&
-		    setrootbyname(devname))
+		/* do our best to set rootdev (really just for UFS) */
+		if (strcmp(vfsname, "hammer") != 0 &&
+		    strcmp(vfsname, "hammer2") != 0 &&
+		    (devname[0] != 0) && setrootbyname(devname)) {
 			kprintf("setrootbyname failed\n");
+		}
 
 		/* If the root device is a type "memory disk", mount RW */
 		if (rootdev != NULL && dev_is_good(rootdev) &&
@@ -517,7 +541,7 @@ vfs_mountroot_ask(void)
 	while (llimit--) {
 		kprintf("\nmountroot> ");
 
-		if (getline(name, 128) < 0)
+		if (get_line(name, 128) < 0)
 			break;
 		if (name[0] == 0) {
 			;
@@ -540,23 +564,29 @@ vfs_mountroot_ask(void)
 
 
 static int
-getline(char *cp, int limit)
+get_line(char *cp, int limit)
 {
 	char *lp;
+	int dummy;
 	int c;
 
 	lp = cp;
+	cnpoll(TRUE);
 	for (;;) {
-		c = cngetc();
+		c = cncheckc();
 
 		switch (c) {
+		case NOKEY:
+			tsleep(&dummy, 0, "cnpoll", hz / 25);
+			break;
 		case -1:
-			return(-1);
+			goto done;
 		case '\n':
 		case '\r':
 			kprintf("\n");
 			*lp++ = '\0';
-			return(0);
+			c = 0;
+			goto done;
 		case '\b':
 		case '\177':
 			if (lp > cp) {
@@ -572,8 +602,8 @@ getline(char *cp, int limit)
 			if (lp < cp)
 				lp = cp;
 			continue;
-		case '@':
 		case 'u' & 037:
+			/* NOTE: '@' no longer processed here, used for H2 */
 			lp = cp;
 			kprintf("%c", '\n');
 			continue;
@@ -587,6 +617,9 @@ getline(char *cp, int limit)
 			continue;
 		}
 	}
+done:
+	cnpoll(FALSE);
+	return c;
 }
 
 /*

@@ -136,7 +136,7 @@ acpi_config_intr(device_t dev, ACPI_RESOURCE *res)
 	panic("%s: bad resource type %u", __func__, res->Type);
     }
 
-#if defined(__x86_64__) || defined(__i386__)
+#if defined(__x86_64__)
     /*
      * XXX: Certain BIOSes have buggy AML that specify an IRQ that is
      * edge-sensitive and active-lo.  However, edge-sensitive IRQs
@@ -310,28 +310,28 @@ acpi_parse_resource(ACPI_RESOURCE *res, void *context)
     case ACPI_RESOURCE_TYPE_EXTENDED_ADDRESS64:
 	switch (res->Type) {
 	case ACPI_RESOURCE_TYPE_ADDRESS16:
-	    gran = res->Data.Address16.Granularity;
-	    min = res->Data.Address16.Minimum;
-	    max = res->Data.Address16.Maximum;
-	    length = res->Data.Address16.AddressLength;
+	    gran = res->Data.Address16.Address.Granularity;
+	    min = res->Data.Address16.Address.Minimum;
+	    max = res->Data.Address16.Address.Maximum;
+	    length = res->Data.Address16.Address.AddressLength;
 #ifdef ACPI_DEBUG
 	    name = "Address16";
 #endif
 	    break;
 	case ACPI_RESOURCE_TYPE_ADDRESS32:
-	    gran = res->Data.Address32.Granularity;
-	    min = res->Data.Address32.Minimum;
-	    max = res->Data.Address32.Maximum;
-	    length = res->Data.Address32.AddressLength;
+	    gran = res->Data.Address32.Address.Granularity;
+	    min = res->Data.Address32.Address.Minimum;
+	    max = res->Data.Address32.Address.Maximum;
+	    length = res->Data.Address32.Address.AddressLength;
 #ifdef ACPI_DEBUG
 	    name = "Address32";
 #endif
 	    break;
 	case ACPI_RESOURCE_TYPE_ADDRESS64:
-	    gran = res->Data.Address64.Granularity;
-	    min = res->Data.Address64.Minimum;
-	    max = res->Data.Address64.Maximum;
-	    length = res->Data.Address64.AddressLength;
+	    gran = res->Data.Address64.Address.Granularity;
+	    min = res->Data.Address64.Address.Minimum;
+	    max = res->Data.Address64.Address.Maximum;
+	    length = res->Data.Address64.Address.AddressLength;
 #ifdef ACPI_DEBUG
 	    name = "Address64";
 #endif
@@ -339,10 +339,10 @@ acpi_parse_resource(ACPI_RESOURCE *res, void *context)
 	default:
 	    KASSERT(res->Type == ACPI_RESOURCE_TYPE_EXTENDED_ADDRESS64,
 		("should never happen"));
-	    gran = res->Data.ExtAddress64.Granularity;
-	    min = res->Data.ExtAddress64.Minimum;
-	    max = res->Data.ExtAddress64.Maximum;
-	    length = res->Data.ExtAddress64.AddressLength;
+	    gran = res->Data.ExtAddress64.Address.Granularity;
+	    min = res->Data.ExtAddress64.Address.Minimum;
+	    max = res->Data.ExtAddress64.Address.Maximum;
+	    length = res->Data.ExtAddress64.Address.AddressLength;
 #ifdef ACPI_DEBUG
 	    name = "ExtAddress64";
 #endif
@@ -362,17 +362,6 @@ acpi_parse_resource(ACPI_RESOURCE *res, void *context)
 		"ignored %s for non-memory, non-I/O\n", name));
 	    break;
 	}
-
-#ifdef __i386__
-	if (min > ULONG_MAX || (res->Data.Address.MaxAddressFixed && max >
-	    ULONG_MAX)) {
-	    ACPI_DEBUG_PRINT((ACPI_DB_RESOURCES, "ignored %s above 4G\n",
-		name));
-	    break;
-	}
-	if (max > ULONG_MAX)
-		max = ULONG_MAX;
-#endif
 	if (res->Data.Address.MinAddressFixed == ACPI_ADDRESS_FIXED &&
 	    res->Data.Address.MaxAddressFixed == ACPI_ADDRESS_FIXED) {
 	    if (res->Data.Address.ResourceType == ACPI_MEMORY_RANGE) {
@@ -533,11 +522,21 @@ static void
 acpi_res_set_iorange(device_t dev, void *context, uint64_t low,
 		     uint64_t high, uint64_t length, uint64_t align)
 {
-    struct acpi_res_context	*cp = (struct acpi_res_context *)context;
+    struct acpi_res_context *cp = (struct acpi_res_context *)context;
+    uint64_t base;
 
     if (cp == NULL)
 	return;
-    device_printf(dev, "I/O range not supported\n");
+    if (align == 0)	/* broken acpi resources might pass align == 0 */
+	align = 1;
+
+    base = roundup(low, align);
+    if (base + length - 1 <= high) {
+	acpi_res_set_ioport(dev, context, base, length);
+	return;
+    }
+    device_printf(dev, "I/O range [0x%jx,0x%jx,0x%jx,0x%jx] not supported\n",
+	(uintmax_t)low, (uintmax_t)high, (uintmax_t)length, (uintmax_t)align);
 }
 
 static void
@@ -560,7 +559,9 @@ acpi_res_set_memoryrange(device_t dev, void *context, uint64_t low,
 
     if (cp == NULL)
 	return;
-    device_printf(dev, "memory range not supported\n");
+    device_printf(dev, "memory range [0x%jx,0x%jx,0x%jx,0x%jx] "
+        "not supported\n",
+	(uintmax_t)low, (uintmax_t)high, (uintmax_t)length, (uintmax_t)align);
 }
 
 static void
@@ -591,6 +592,11 @@ acpi_res_set_ext_irq(device_t dev, void *context, uint32_t *irq, int count,
 
     /* This implements no resource relocation. */
     if (count != 1)
+	return;
+
+    /* There is no such IRQ at all */
+    if (machintr_legacy_intr_find(*irq,
+	INTR_TRIGGER_CONFORM, INTR_POLARITY_CONFORM) < 0)
 	return;
 
     bus_set_resource(dev, SYS_RES_IRQ, cp->ar_nirq++, *irq, 1,
@@ -657,6 +663,7 @@ static driver_t acpi_sysres_driver = {
     "acpi_sysresource",
     acpi_sysres_methods,
     0,
+    .gpri = KOBJ_GPRI_ACPI+2
 };
 
 static devclass_t acpi_sysres_devclass;
@@ -674,7 +681,8 @@ acpi_sysres_probe(device_t dev)
 	return (ENXIO);
 
     device_set_desc(dev, "System Resource");
-    device_quiet(dev);
+    if (bootverbose == 0)
+	    device_quiet(dev);
     return (BUS_PROBE_DEFAULT);
 }
 

@@ -112,9 +112,9 @@ printcpuinfo(void)
 	u_int regs[4], i;
 	char *brand;
 
-	cpu_class = x86_64_cpus[cpu].cpu_class;
+	cpu_class = x86_64_cpus[cpu_type].cpu_class;
 	kprintf("CPU: ");
-	strncpy(cpu_model, x86_64_cpus[cpu].cpu_name, sizeof (cpu_model));
+	strncpy(cpu_model, x86_64_cpus[cpu_type].cpu_name, sizeof (cpu_model));
 
 	/* Check for extended CPUID information and a processor name. */
 	if (cpu_exthigh >= 0x80000004) {
@@ -200,7 +200,7 @@ printcpuinfo(void)
 			 * to check that all CPUs >= Pentium have a TSC and
 			 * MSRs.
 			 */
-			kprintf("\n  Features=0x%b", cpu_feature,
+			kprintf("\n  Features=0x%pb%i",
 			"\020"
 			"\001FPU"	/* Integral FPU */
 			"\002VME"	/* Extended VM86 mode support */
@@ -234,10 +234,10 @@ printcpuinfo(void)
 			"\036TM"	/* Thermal Monitor clock slowdown */
 			"\037IA64"	/* CPU can execute IA64 instructions */
 			"\040PBE"	/* Pending Break Enable */
-			);
+			, cpu_feature);
 
 			if (cpu_feature2 != 0) {
-				kprintf("\n  Features2=0x%b", cpu_feature2,
+				kprintf("\n  Features2=0x%pb%i",
 				"\020"
 				"\001SSE3"	/* SSE3 */
 				"\002PCLMULQDQ"	/* Carry-Less Mul Quadword */
@@ -250,7 +250,7 @@ printcpuinfo(void)
 				"\011TM2"	/* Thermal Monitor 2 */
 				"\012SSSE3"	/* SSSE3 */
 				"\013CNXT-ID"	/* L1 context ID available */
-				"\014<b11>"
+				"\014SDBG"	/* IA-32 silicon debug */
 				"\015FMA"	/* Fused Multiply Add */
 				"\016CX16"	/* CMPXCHG16B Instruction */
 				"\017xTPR"	/* Send Task Priority Messages */
@@ -271,6 +271,21 @@ printcpuinfo(void)
 				"\036F16C"	/* Half-precision conversions */
 				"\037RDRND"	/* RDRAND RNG function */
 				"\040VMM"	/*  Running on a hypervisor */
+				, cpu_feature2);
+			}
+
+			if (cpu_ia32_arch_caps != 0) {
+				kprintf("\n  IA32_ARCH_CAPS=0x%pb%i",
+				       "\020"
+				       "\001RDCL_NO"
+				       "\002IBRS_ALL"
+				       "\003RSBA"
+				       "\004SKIP_L1DFL_VME"
+				       "\005SSB_NO"
+				       "\006MDS_NO"
+				       "\010TSX_CTRL"
+				       "\011TAA_NO",
+				       (u_int)cpu_ia32_arch_caps
 				);
 			}
 
@@ -284,7 +299,7 @@ printcpuinfo(void)
 			 * ftp://download.intel.com/design/Pentium4/manuals/25366617.pdf
 			 */
 			if (amd_feature != 0) {
-				kprintf("\n  AMD Features=0x%b", amd_feature,
+				kprintf("\n  AMD Features=0x%pb%i",
 				"\020"		/* in hex */
 				"\001<s0>"	/* Same */
 				"\002<s1>"	/* Same */
@@ -318,11 +333,11 @@ printcpuinfo(void)
 				"\036LM"	/* 64 bit long mode */
 				"\0373DNow!+"	/* AMD 3DNow! Extensions */
 				"\0403DNow!"	/* AMD 3DNow! */
-				);
+				, amd_feature);
 			}
 
 			if (amd_feature2 != 0) {
-				kprintf("\n  AMD Features2=0x%b", amd_feature2,
+				kprintf("\n  AMD Features2=0x%pb%i",
 				"\020"
 				"\001LAHF"	/* LAHF/SAHF in long mode */
 				"\002CMP"	/* CMP legacy */
@@ -353,46 +368,118 @@ printcpuinfo(void)
 				"\033DBE"	/* Data Breakpoint Extension */
 				"\034PTSC"	/* Performance TSC */
 				"\035PCX_L2I"	/* L2I Performance Counter */
-				"\036<b29>"
-				"\037<b30>"
+		       	        "\036MWAITX"	/* MONITORX/MWAITX instructions */
+				"\037ADMSKX"
 				"\040<b31>"
-				);
+				, amd_feature2);
 			}
 
 			if (cpu_stdext_feature != 0) {
-				kprintf("\n  Structured Extended Features=0x%b",
-				    cpu_stdext_feature,
-				       "\020"
-				       /* RDFSBASE/RDGSBASE/WRFSBASE/WRGSBASE */
-				       "\001GSFSBASE"
-				       "\002TSCADJ"
-				       /* Bit Manipulation Instructions */
-				       "\004BMI1"
-				       /* Hardware Lock Elision */
-				       "\005HLE"
-				       /* Advanced Vector Instructions 2 */
-				       "\006AVX2"
-				       /* Supervisor Mode Execution Prot. */
-				       "\010SMEP"
-				       /* Bit Manipulation Instructions */
-				       "\011BMI2"
-				       "\012ENHMOVSB"
+				kprintf("\n  Structured Extended "
+					"Features=0x%pb%i",
+				        "\020"
+				        /*RDFSBASE/RDGSBASE/WRFSBASE/WRGSBASE*/
+				        "\001GSFSBASE"
+				        "\002TSCADJ"
+				        /* Bit Manipulation Instructions */
+				        "\004BMI1"
+				        /* Hardware Lock Elision */
+				        "\005HLE"
+				        /* Advanced Vector Instructions 2 */
+				        "\006AVX2"
+				        /* Supervisor Mode Execution Prot. */
+				        "\010SMEP"
+				        /* Bit Manipulation Instructions */
+				        "\011BMI2"
+				        "\012ENHMOVSB"
 				       /* Invalidate Processor Context ID */
-				       "\013INVPCID"
-				       /* Restricted Transactional Memory */
-				       "\014RTM"
-				       /* Enhanced NRBG */
-				       "\023RDSEED"
-				       /* ADCX + ADOX */
-				       "\024ADX"
-				       /* Supervisor Mode Access Prevention */
-				       "\025SMAP"
-				       );
+				        "\013INVPCID"
+				        /* Restricted Transactional Memory */
+				        "\014RTM"
+				        "\015PQM"
+				        "\016NFPUSG"
+				        /* Intel Memory Protection Extensions */
+				        "\017MPX"
+				        "\020PQE"
+				        /* AVX512 Foundation */
+				        "\021AVX512F"
+				        "\022AVX512DQ"
+				        /* Enhanced NRBG */
+				        "\023RDSEED"
+				        /* ADCX + ADOX */
+				        "\024ADX"
+				        /* Supervisor Mode Access Prevention */
+				        "\025SMAP"
+				        "\026AVX512IFMA"
+				        /* Formerly PCOMMIT */
+				        "\027<b22>"
+				        "\030CLFLUSHOPT"
+				        "\031CLWB"
+				        "\032PROCTRACE"
+				        "\033AVX512PF"
+				        "\034AVX512ER"
+				        "\035AVX512CD"
+				        "\036SHA"
+				        "\037AVX512BW"
+				        "\040AVX512VL",
+				        cpu_stdext_feature
+				);
+			}
+
+			if (cpu_stdext_feature2 != 0) {
+				kprintf("\n  Structured Extended "
+					"Features2=0x%pb%i",
+				        "\020"
+				        "\001PREFETCHWT1"
+				        "\002AVX512VBMI"
+				        "\003UMIP"
+				        "\004PKU"
+				        "\005OSPKE"
+				        "\006WAITPKG"
+				        "\007AVX512VBMI2"
+				        "\011GFNI"
+				        "\012VAES"
+				        "\013VPCLMULQDQ"
+				        "\014AVX512VNNI"
+				        "\015AVX512BITALG"
+				        "\016TME"
+				        "\017AVX512VPOPCNTDQ"
+				        "\021LA57"
+				        "\027RDPID"
+				        "\032CLDEMOTE"
+				        "\034MOVDIRI"
+				        "\035MOVDIR64B"
+				        "\036ENQCMD"
+				        "\037SGXLC",
+				        cpu_stdext_feature2
+			       );
+			}
+
+			if (cpu_stdext_feature3 != 0) {
+				kprintf("\n  Structured Extended "
+					"Features3=0x%pb%i",
+				        "\020"
+				        "\003AVX512_4VNNIW"
+				        "\004AVX512_4FMAPS"
+				        "\005FSRM"
+				        "\011AVX512VP2INTERSECT"
+				        "\012MCUOPT"
+				        "\013MD_CLEAR"
+				        "\016TSXFA"
+				        "\023PCONFIG"
+				        "\025IBT"
+				        "\033IBPB"
+				        "\034STIBP"
+				        "\035L1DFL"
+				        "\036ARCH_CAP"
+				        "\037CORE_CAP"
+				        "\040SSBD",
+				        cpu_stdext_feature3
+			       );
 			}
 
 			if (cpu_thermal_feature != 0) {
-				kprintf("\n  Thermal and PM Features=0x%b",
-				    cpu_thermal_feature,
+				kprintf("\n  Thermal and PM Features=0x%pb%i",
 				    "\020"
 				    /* Digital temperature sensor */
 				    "\001SENSOR"
@@ -406,18 +493,19 @@ printcpuinfo(void)
 				    "\006ECMD"
 				    /* Package thermal management */
 				    "\007PTM"
-				    );
+				    /* Hardware P-states */
+				    "\010HWP"
+				    , cpu_thermal_feature);
 			}
 
 			if (cpu_mwait_feature != 0) {
-				kprintf("\n  MONITOR/MWAIT Features=0x%b",
-				    cpu_mwait_feature,
+				kprintf("\n  MONITOR/MWAIT Features=0x%pb%i",
 				    "\020"
 				    /* Enumeration of Monitor-Mwait extension */
 				    "\001CST"
 				    /*  interrupts as break-event for MWAIT */
 				    "\002INTBRK"
-				    );
+				    , cpu_mwait_feature);
 			}
 
 			if (cpu_vendor_id == CPU_VENDOR_CENTAUR)
@@ -475,13 +563,19 @@ printcpuinfo(void)
 	if (*cpu_vendor || cpu_id)
 		kprintf("\n");
 
-	if (!bootverbose)
-		return;
+	if (cpu_stdext_feature & (CPUID_STDEXT_SMAP | CPUID_STDEXT_SMEP)) {
+		kprintf("CPU Special Features Installed:");
+		if (cpu_stdext_feature & CPUID_STDEXT_SMAP)
+			kprintf(" SMAP");
+		if (cpu_stdext_feature & CPUID_STDEXT_SMEP)
+			kprintf(" SMEP");
+		kprintf("\n");
+	}
 
-	if (cpu_vendor_id == CPU_VENDOR_AMD)
-		print_AMD_info();
-
-	kprintf("npx mask: 0x%8.8x\n", npx_mxcsr_mask);
+	if (bootverbose) {
+		if (cpu_vendor_id == CPU_VENDOR_AMD)
+			print_AMD_info();
+	}
 }
 
 void
@@ -507,7 +601,7 @@ panicifcpuunsupported(void)
 }
 
 
-#if JG
+#if 0 /* JG */
 /* Update TSC freq with the value indicated by the caller. */
 static void
 tsc_freq_changed(void *arg, const struct cf_level *level, int status)
@@ -549,8 +643,15 @@ identify_cpu(void)
 	if (cpu_high >= 5) {
 		do_cpuid(5, regs);
 		cpu_mwait_feature = regs[2];
-		if (cpu_mwait_feature & CPUID_MWAIT_EXT)
+		if (cpu_mwait_feature & CPUID_MWAIT_EXT) {
 			cpu_mwait_extemu = regs[3];
+			/* At least one C1 */
+			if (CPUID_MWAIT_CX_SUBCNT(cpu_mwait_extemu, 1) == 0) {
+				/* No C1 at all, no MWAIT EXT then */
+				cpu_mwait_feature &= ~CPUID_MWAIT_EXT;
+				cpu_mwait_extemu = 0;
+			}
+		}
 	}
 	if (cpu_high >= 6) {
 		do_cpuid(6, regs);
@@ -573,6 +674,11 @@ identify_cpu(void)
 			cpu_stdext_disable = 0;
 		TUNABLE_INT_FETCH("hw.cpu_stdext_disable", &cpu_stdext_disable);
 		cpu_stdext_feature &= ~cpu_stdext_disable;
+		cpu_stdext_feature2 = regs[2];
+		cpu_stdext_feature3 = regs[3];
+
+		if (cpu_stdext_feature3 & CPUID_SEF_ARCH_CAP)
+			cpu_ia32_arch_caps = rdmsr(MSR_IA32_ARCH_CAPABILITIES);
 	}
 
 	if (cpu_vendor_id == CPU_VENDOR_INTEL ||
@@ -592,7 +698,7 @@ identify_cpu(void)
 	}
 
 	/* XXX */
-	cpu = CPU_CLAWHAMMER;
+	cpu_type = CPU_CLAWHAMMER;
 
 	if (cpu_feature & CPUID_SSE2)
 		cpu_mi_feature |= CPU_MI_BZERONT;
@@ -734,12 +840,12 @@ print_via_padlock_info(void)
 	else
 		return;
 
-	kprintf("\n  VIA Padlock Features=0x%b", regs[3],
+	kprintf("\n  VIA Padlock Features=0x%pb%i",
 	"\020"
 	"\003RNG"		/* RNG */
 	"\007AES"		/* ACE */
 	"\011AES-CTR"		/* ACE2 */
 	"\013SHA1,SHA256"	/* PHE */
 	"\015RSA"		/* PMM */
-	);
+	, regs[3]);
 }

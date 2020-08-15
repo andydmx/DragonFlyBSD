@@ -28,7 +28,7 @@
 .\"     @(#)config.8	8.2 (Berkeley) 4/19/94
 .\" $FreeBSD: src/usr.sbin/config/config.8,v 1.21.2.7 2003/04/23 07:32:39 brueffer Exp $
 .\"
-.Dd March 28, 2010
+.Dd January 5, 2019
 .Dt CONFIG 8
 .Os
 .Sh NAME
@@ -36,7 +36,7 @@
 .Nd build system configuration files
 .Sh SYNOPSIS
 .Nm
-.Op Fl gpr
+.Op Fl gr
 .Op Fl d Ar destdir
 .Ar SYSTEM_NAME
 .Sh DESCRIPTION
@@ -69,16 +69,6 @@ does not append
 to the directory given.
 .It Fl g
 Configure a system for debugging.
-.It Fl p
-Configure a system for profiling; for example,
-.Xr kgmon 8
-and
-.Xr gprof 1 .
-If two or more
-.Fl p
-options are supplied,
-.Nm
-configures a system for high resolution profiling.
 .It Fl r
 Remove the old compile directory (see below).
 .It Ar SYSTEM_NAME
@@ -105,8 +95,8 @@ flag was specified, it will be removed first.
 The output of
 .Nm
 consists of a number of files; for the
-.Tn i386 ,
-they are:
+.Tn x86_64
+architecture, they are:
 .Pa ioconf.c ,
 a description
 of what I/O devices are attached to the system;
@@ -180,28 +170,20 @@ be left with debug info intact.
 .Pp
 Backup copies of the kernel and modules are automatically stripped of
 their debug information by
-.Xr objcopy 1 .
+.Xr objcopy 1 ,
+unless
+.Va NO_KERNEL_OLD_STRIP
+is set in
+.Xr make.conf 5 .
 .Sh FILES
 .Bl -tag -width ".It Pa /sys/platform/ Ns Va PLATFORM Ns Pa /conf/Makefile" -compact
 .It Pa /sys/conf/files
 list of common files system is built from
 .It Pa /sys/config/ Ns Ar SYSTEM_NAME
 default location for kernel configuration file
-.It Pa /sys/config/GENERIC
-default
-.Sy i386
-kernel configuration file
-.It Pa /sys/config/LINT
+.It Pa /sys/config/LINT64
 kernel configuration file for checking all the sources,
 includes description of kernel configuration options
-.It Pa /sys/config/SOEKRIS
-kernel configuration file for the
-.Tn Soekris Engineering net5501
-board
-.It Pa /sys/config/VKERNEL
-default 32 bit
-.Xr vkernel 7
-kernel configuration file
 .It Pa /sys/config/VKERNEL64
 default 64 bit
 .Xr vkernel 7
@@ -227,8 +209,7 @@ specific files
 .Xr make 1 ,
 .Xr kernconf 5 ,
 .Xr build 7 ,
-.Xr vkernel 7 ,
-.Xr kgmon 8
+.Xr vkernel 7
 .Pp
 The
 .Sx SYNOPSIS

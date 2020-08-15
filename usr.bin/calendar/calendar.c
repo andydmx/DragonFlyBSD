@@ -1,4 +1,6 @@
-/*
+/*-
+ * SPDX-License-Identifier: BSD-3-Clause
+ *
  * Copyright (c) 1989, 1993, 1994
  *	The Regents of the University of California.  All rights reserved.
  *
@@ -26,76 +28,108 @@
  * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
  *
- * @(#) Copyright (c) 1989, 1993 The Regents of the University of California.  All rights reserved.
  * @(#)calendar.c  8.3 (Berkeley) 3/25/94
- * $FreeBSD: src/usr.bin/calendar/calendar.c,v 1.11.2.5 2003/04/06 20:04:56 dwmalone Exp $
- * $DragonFly: src/usr.bin/calendar/calendar.c,v 1.5 2007/09/24 20:49:09 pavalos Exp $
+ * $FreeBSD: head/usr.bin/calendar/calendar.c 326025 2017-11-20 19:49:47Z pfg $
  */
+
+#include <sys/types.h>
 
 #include <err.h>
 #include <errno.h>
 #include <locale.h>
+#include <login_cap.h>
 #include <pwd.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <sysexits.h>
+#include <string.h>
 #include <time.h>
 #include <unistd.h>
 
-#include "pathnames.h"
 #include "calendar.h"
 
-struct passwd *pw;
-int doall = 0;
-int f_dayAfter = 0; /* days after current date */
-int f_dayBefore = 0; /* days before current date */
-int Friday = 5;	     /* day before weekend */
+struct passwd	*pw;
+bool		doall = false;
+bool		debug = false;
+static char	*DEBUG = NULL;
+static time_t	f_time = 0;
+double		UTCOffset;
+double		EastLongitude;
 
-static void	usage(void);
+static void	usage(void) __dead2;
+static double	get_utcoffset(void);
 
 int
-main(int argc, char **argv)
+main(int argc, char *argv[])
 {
+	int	f_dayAfter = 0;		/* days after current date */
+	int	f_dayBefore = 0;	/* days before current date */
+	int	Friday = 5;		/* day before weekend */
+
 	int ch;
-	time_t f_time = 0;
+	struct tm tp1, tp2;
 
 	setlocale(LC_ALL, "");
+	UTCOffset = get_utcoffset();
+	EastLongitude = UTCOffset * 15;
 
-	while ((ch = getopt(argc, argv, "-af:t:A:B:F:W:")) != -1) {
+	while ((ch = getopt(argc, argv, "-A:aB:D:dF:f:hl:t:U:W:?")) != -1) {
 		switch (ch) {
 		case '-':		/* backward compatible */
 		case 'a':
 			if (getuid()) {
 				errno = EPERM;
-				err(EXIT_FAILURE, NULL);
+				err(1, NULL);
 			}
-			doall = 1;
-			break;
-			
-		case 'f': /* other calendar file */
-		        calendarFile = optarg;
-			break;
-
-		case 't': /* other date, undocumented, for tests */
-			f_time = Mktime(optarg);
+			doall = true;
 			break;
 
 		case 'W': /* we don't need no steenking Fridays */
 			Friday = -1;
-
-			/* FALLTHROUGH */			
+			/* FALLTHROUGH */
 		case 'A': /* days after current date */
 			f_dayAfter = atoi(optarg);
+			if (f_dayAfter < 0)
+				errx(1, "number of days must be positive");
 			break;
 
 		case 'B': /* days before current date */
-			f_dayBefore = atoi(optarg); 
+			f_dayBefore = atoi(optarg);
+			if (f_dayBefore < 0)
+				errx(1, "number of days must be positive");
 			break;
 
-		case 'F':
+		case 'D': /* debug output of sun and moon info */
+			DEBUG = optarg;
+			break;
+
+		case 'd': /* debug output of current date */
+			debug = true;
+			break;
+
+		case 'F': /* Change the time: When does weekend start? */
 			Friday = atoi(optarg);
 			break;
 
+		case 'f': /* other calendar file */
+			calendarFile = optarg;
+			break;
+
+		case 'l': /* Change longitudal position */
+			EastLongitude = strtod(optarg, NULL);
+			UTCOffset = EastLongitude / 15;
+			break;
+
+		case 't': /* other date, for tests */
+			f_time = Mktime(optarg);
+			break;
+
+		case 'U': /* Change UTC offset */
+			UTCOffset = strtod(optarg, NULL);
+			EastLongitude = UTCOffset * 15;
+			break;
+
+		case 'h':
 		case '?':
 		default:
 			usage();
@@ -108,32 +142,85 @@ main(int argc, char **argv)
 		usage();
 
 	/* use current time */
-	if (f_time <= 0) 
-	    time(&f_time);
+	if (f_time <= 0)
+		time(&f_time);
 
-	settime(f_time);
-	
-	if (doall)
+	settimes(f_time, f_dayBefore, f_dayAfter, Friday, &tp1, &tp2);
+	generatedates(&tp1, &tp2);
+
+	/*
+	 * FROM now on, we are working in UTC.
+	 * This will only affect moon and sun related events anyway.
+	 */
+	if (setenv("TZ", "UTC", 1) != 0)
+		errx(1, "setenv: %s", strerror(errno));
+	tzset();
+
+	if (debug)
+		dumpdates();
+
+	if (DEBUG != NULL) {
+		dodebug(DEBUG);
+		exit(0);
+	}
+
+	if (doall) {
 		while ((pw = getpwent()) != NULL) {
-			setegid(pw->pw_gid);
-			initgroups(pw->pw_name, pw->pw_gid);
-			seteuid(pw->pw_uid);
-			if (!chdir(pw->pw_dir))
+			pid_t pid;
+
+			if (chdir(pw->pw_dir) == -1)
+				continue;
+
+			pid = fork();
+			if (pid < 0)
+				err(1, "fork");
+			if (pid == 0) {
+				login_cap_t *lc;
+
+				lc = login_getpwclass(pw);
+				if (setusercontext(lc, pw, pw->pw_uid,
+						   LOGIN_SETALL) != 0)
+					errx(1, "setusercontext");
+
 				cal();
-			seteuid(0);
+				exit(0);
+			}
 		}
-	else
+	} else {
 		cal();
-	exit(EX_OK);
+	}
+
+	return (0);
 }
 
 
-static void
+static void __dead2
 usage(void)
 {
-	fprintf(stderr, "%s\n%s\n",
-	    "usage: calendar [-a] [-A days] [-B days] [-F friday] "
-	    "[-f calendarfile]",
-	    "                [-t dd[.mm[.year]]] [-W days]");
-	exit(EX_USAGE);
+	fprintf(stderr, "%s\n%s\n%s\n",
+	    "usage: calendar [-A days] [-a] [-B days] [-D sun|moon] [-d]",
+	    "		     [-F friday] [-f calendarfile] [-l longitude]",
+	    "		     [-t dd[.mm[.year]]] [-U utcoffset] [-W days]"
+	    );
+	exit(1);
+}
+
+
+/*
+ * Calculate the timezone difference between here and UTC.
+ *
+ * Return the offset hour from UTC.
+ */
+static double
+get_utcoffset(void)
+{
+	time_t t;
+	struct tm tm;
+	long utcoffset;
+
+	time(&t);
+	localtime_r(&t, &tm);
+	utcoffset = tm.tm_gmtoff;
+
+	return (utcoffset / FSECSPERHOUR);
 }

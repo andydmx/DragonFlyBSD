@@ -1,4 +1,6 @@
-/*
+/*-
+ * SPDX-License-Identifier: BSD-2-Clause
+ *
  * Copyright (C) 1995 Wolfgang Solfrank
  * Copyright (c) 1995 Martin Husemann
  *
@@ -10,13 +12,6 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by Martin Husemann
- *	and Wolfgang Solfrank.
- * 4. Neither the name of the University nor the names of its contributors
- *    may be used to endorse or promote products derived from this software
- *    without specific prior written permission.
  *
  * THIS SOFTWARE IS PROVIDED BY THE AUTHORS ``AS IS'' AND ANY EXPRESS OR
  * IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
@@ -28,14 +23,10 @@
  * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
  * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
  * THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- *
- * $NetBSD: main.c,v 1.10 1997/10/01 02:18:14 enami Exp $
- * $FreeBSD: src/sbin/fsck_msdosfs/main.c,v 1.4.2.1 2001/08/01 05:47:56 obrien Exp $
  */
 
 #include <stdlib.h>
 #include <string.h>
-#include <ctype.h>
 #include <stdio.h>
 #include <unistd.h>
 #include <errno.h>
@@ -48,8 +39,9 @@ int alwaysno;		/* assume "no" for all questions */
 int alwaysyes;		/* assume "yes" for all questions */
 int preen;		/* set when preening */
 int rdonly;		/* device is opened read only (supersedes above) */
+int allow_mmap;		/* Allow the use of mmap(), if possible */
 
-static void usage(void);
+static void usage(void) __dead2;
 
 static void
 usage(void)
@@ -63,7 +55,8 @@ main(int argc, char **argv)
 	int ret = 0, erg;
 	int ch;
 
-	while ((ch = getopt(argc, argv, "fFnpy")) != -1) {
+	allow_mmap = 1;
+	while ((ch = getopt(argc, argv, "CfFnpyM")) != -1) {
 		switch (ch) {
 		case 'f':
 			/*
@@ -72,21 +65,30 @@ main(int argc, char **argv)
 			 */
 			break;
 		case 'F':
-			/* We can never run in background */
+			/*
+			 * We can never run in the background.  We must exit
+			 * silently with a nonzero exit code so that fsck(8)
+			 * can probe our support for -F.  The exit code
+			 * doesn't really matter, but we use an unusual one
+			 * in case someone tries -F directly.  The -F flag
+			 * is intentionally left out of the usage message.
+			 */
 			exit(5);
-			break;
 		case 'n':
 			alwaysno = 1;
-			alwaysyes = preen = 0;
+			alwaysyes = 0;
 			break;
 		case 'y':
 			alwaysyes = 1;
-			alwaysno = preen = 0;
+			alwaysno = 0;
 			break;
 
 		case 'p':
 			preen = 1;
-			alwaysyes = alwaysno = 0;
+			break;
+
+		case 'M':
+			allow_mmap = 0;
 			break;
 
 		default:
@@ -120,9 +122,10 @@ ask(int def, const char *fmt, ...)
 	char prompt[256];
 	int c;
 
+	if (alwaysyes || alwaysno || rdonly)
+		def = (alwaysyes && !rdonly && !alwaysno);
+
 	if (preen) {
-		if (rdonly)
-			def = 0;
 		if (def)
 			printf("FIXED\n");
 		return def;
@@ -130,9 +133,10 @@ ask(int def, const char *fmt, ...)
 
 	va_start(ap, fmt);
 	vsnprintf(prompt, sizeof(prompt), fmt, ap);
-	if (alwaysyes || rdonly) {
-		printf("%s? %s\n", prompt, rdonly ? "no" : "yes");
-		return !rdonly;
+	va_end(ap);
+	if (alwaysyes || alwaysno || rdonly) {
+		printf("%s? %s\n", prompt, def ? "yes" : "no");
+		return def;
 	}
 	do {
 		printf("%s? [yn] ", prompt);

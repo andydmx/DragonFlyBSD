@@ -12,11 +12,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -34,7 +30,6 @@
  *
  *	@(#)mbuf.h	8.5 (Berkeley) 2/19/95
  * $FreeBSD: src/sys/sys/mbuf.h,v 1.44.2.17 2003/04/15 06:15:02 silby Exp $
- * $DragonFly: src/sys/sys/mbuf.h,v 1.54 2008/10/19 08:39:55 sephe Exp $
  */
 
 #ifndef _SYS_MBUF_H_
@@ -84,7 +79,10 @@
  */
 struct m_hdr {
 	struct	mbuf *mh_next;		/* next buffer in chain */
-	struct	mbuf *mh_nextpkt;	/* next chain in queue/record */
+	union {
+		struct	mbuf *mh_nextpkt; /* next chain in queue/record */
+		STAILQ_ENTRY(mbuf) mh_stailqpkt;
+	};
 	caddr_t	mh_data;		/* location of data */
 	int	mh_len;			/* amount of data in this mbuf */
 	int	mh_flags;		/* flags; see below */
@@ -97,12 +95,16 @@ struct m_hdr {
 	union {
 		struct netmsg_packet mhm_pkt;	/* hardware->proto stack msg */
 		struct netmsg_pru_send mhm_snd;	/* usrspace->proto stack msg */
-		struct netmsg_inarp mhm_arp;	/* proto stack<->route msg */
+		struct netmsg_inarp mhm_arp;	/* proto stack arpinput msg */
+		struct netmsg_ctlinput mhm_ctl;	/* proto stack ctlinput msg */
+		struct netmsg_genpkt mhm_gen;	/* generic pkt send/recv msg */
 	} mh_msgu;
 };
 #define mh_netmsg	mh_msgu.mhm_pkt
 #define mh_sndmsg	mh_msgu.mhm_snd
 #define mh_arpmsg	mh_msgu.mhm_arp
+#define mh_ctlmsg	mh_msgu.mhm_ctl
+#define mh_genmsg	mh_msgu.mhm_gen
 
 /* pf stuff */
 struct pkthdr_pf {
@@ -219,6 +221,7 @@ struct mbuf {
 #define	m_type		m_hdr.mh_type
 #define	m_flags		m_hdr.mh_flags
 #define	m_nextpkt	m_hdr.mh_nextpkt
+#define	m_stailqpkt	m_hdr.mh_stailqpkt
 #define	m_pkthdr	M_dat.MH.MH_pkthdr
 #define	m_ext		M_dat.MH.MH_dat.MH_ext
 #define	m_pktdat	M_dat.MH.MH_dat.MH_databuf
@@ -253,7 +256,7 @@ struct mbuf {
 #define	M_CLCACHE	0x2000	/* mbuf allocated from the cluster cache */
 #define M_EXT_CLUSTER	0x4000	/* standard cluster else special */
 #define	M_PHCACHE	0x8000	/* mbuf allocated from the pkt header cache */
-#define M_NOTIFICATION	0x10000	/* notification event */
+#define M_UNUSED16	0x10000	/* was: notification event (SCTP) */
 #define M_VLANTAG	0x20000	/* ether_vlantag is valid */
 #define M_MPLSLABELED	0x40000	/* packet is mpls labeled */
 #define M_LENCHECKED	0x80000	/* packet proto lengths are checked */
@@ -303,13 +306,16 @@ struct mbuf {
 #define	PF_MBUF_STRUCTURE	0x00000002	/* m_pkthdr.pf valid */
 #define	PF_MBUF_ROUTED		0x00000004	/* pf_routed field is valid */
 #define	PF_MBUF_TAGGED		0x00000008
-#define	XX_MBUF_UNUSED10	0x00000010
+#define	IPFW_MBUF_CONTINUE	0x00000010
 #define	XX_MBUF_UNUSED20	0x00000020
 #define IPFORWARD_MBUF_TAGGED	0x00000040
 #define DUMMYNET_MBUF_TAGGED	0x00000080
 #define BRIDGE_MBUF_TAGGED	0x00000100
 #define FW_MBUF_REDISPATCH	0x00000200
+#define FW_MBUF_PRIVATE1	0x00000400
+#define FW_MBUF_PRIVATE2	0x00000800
 #define	IPFW_MBUF_GENERATED	FW_MBUF_GENERATED
+
 /*
  * mbuf types.
  */
@@ -347,17 +353,9 @@ struct mbstat {
 };
 
 /*
- * Flags specifying how an allocation should be made.
+ * objcache(9) ocflags sanitizing
  */
-
-#define	MB_DONTWAIT	0x4
-#define	MB_TRYWAIT	0x8
-#define	MB_WAIT		MB_TRYWAIT
-
-/*
- * Mbuf to Malloc Flag Conversion.
- */
-#define	MBTOM(how)	((how) & MB_TRYWAIT ? M_WAITOK : M_NOWAIT)
+#define	MB_OCFLAG(how)	((how) & M_WAITOK ? M_WAITOK : M_NOWAIT)
 
 /*
  * These are identifying numbers passed to the m_mballoc_wait function,
@@ -410,7 +408,7 @@ struct mbstat {
  * an object of the specified size at the end of the mbuf, longword aligned.
  */
 #define	M_ALIGN(m, len) do {						\
-	(m)->m_data += (MLEN - (len)) & ~(sizeof(long) - 1);		\
+	(m)->m_data += rounddown2(MLEN - (len), sizeof(long));		\
 } while (0)
 
 /*
@@ -418,7 +416,7 @@ struct mbstat {
  * or initialized by M_COPY_PKTHDR.
  */
 #define	MH_ALIGN(m, len) do {						\
-	(m)->m_data += (MHLEN - (len)) & ~(sizeof(long) - 1);		\
+	(m)->m_data += rounddown2(MHLEN - (len), sizeof(long));		\
 } while (0)
 
 /*
@@ -459,7 +457,7 @@ struct mbstat {
 /*
  * Arrange to prepend space of size plen to mbuf m.
  * If a new mbuf must be allocated, how specifies whether to wait.
- * If how is MB_DONTWAIT and allocation fails, the original mbuf chain
+ * If how is M_NOWAIT and allocation fails, the original mbuf chain
  * is freed and m is set to NULL.
  */
 #define	M_PREPEND(m, plen, how) do {					\
@@ -482,7 +480,7 @@ struct mbstat {
 #define	M_COPYALL	1000000000
 
 /* Compatibility with 4.3 */
-#define	m_copy(m, o, l)	m_copym((m), (o), (l), MB_DONTWAIT)
+#define	m_copy(m, o, l)	m_copym((m), (o), (l), M_NOWAIT)
 
 #ifdef _KERNEL
 extern	u_int		 m_clalloc_wid;	/* mbuf cluster wait count */
@@ -497,6 +495,9 @@ extern	int		 nmbufs;
 
 struct uio;
 
+void		 mcl_inclimit(int);
+void		 mjcl_inclimit(int);
+void		 mb_inclimit(int);
 void		 m_adj(struct mbuf *, int);
 void		 m_align(struct mbuf *, int);
 int		 m_apply(struct mbuf *, int, int,
@@ -510,8 +511,7 @@ struct	mbuf	*m_copym(const struct mbuf *, int, int, int);
 struct	mbuf	*m_copypacket(struct mbuf *, int);
 struct	mbuf	*m_defrag(struct mbuf *, int);
 struct	mbuf	*m_defrag_nofree(struct mbuf *, int);
-struct	mbuf	*m_devget(char *, int, int, struct ifnet *,
-		  void (*copy)(volatile const void *, volatile void *, size_t));
+struct	mbuf	*m_devget(char *, int, int, struct ifnet *);
 struct	mbuf	*m_dup(struct mbuf *, int);
 struct	mbuf	*m_dup_data(struct mbuf *, int);
 int		 m_dup_pkthdr(struct mbuf *, const struct mbuf *, int);
@@ -559,6 +559,13 @@ void		mbuftrackid(struct mbuf *, int);
 #define mbuftrackid(m, id)	/* empty */
 
 #endif
+
+static __inline void
+m_sethash(struct mbuf *m, uint16_t hash)
+{
+	m->m_flags |= M_HASH;
+	m->m_pkthdr.hash = hash;
+}
 
 /*
  * Allocate the right type of mbuf for the desired total length.
@@ -661,21 +668,8 @@ m_getb(int len, int how, int type, int flags)
 
 #define	PACKET_TAG_NONE				0  /* Nadda */
 
-/* Packet tag for use with PACKET_ABI_COMPAT */
-#define	PACKET_TAG_IPSEC_IN_DONE		1  /* IPsec applied, in */
-/* struct tdb_indent */
-#define	PACKET_TAG_IPSEC_OUT_DONE		2  /* IPsec applied, out */
-/* struct tdb_indent */
-#define	PACKET_TAG_IPSEC_IN_CRYPTO_DONE		3  /* NIC IPsec crypto done */
-/* struct tdb_indent, never added */
-#define	PACKET_TAG_IPSEC_OUT_CRYPTO_NEEDED	4  /* NIC IPsec crypto req'ed */
-/* struct tdb_indent, never added */
-#define	PACKET_TAG_IPSEC_PENDING_TDB		5  /* Reminder to do IPsec */
-/* struct tdb_indent, never added */
 #define	PACKET_TAG_ENCAP			6 /* Encap.  processing */
 /* struct ifnet *, the GIF interface */
-#define	PACKET_TAG_IPSEC_HISTORY		7 /* IPSEC history */
-/* struct ipsec_history */
 #define	PACKET_TAG_IPV6_INPUT			8 /* IPV6 input processing */
 /* struct ip6aux */
 #define	PACKET_TAG_IPFW_DIVERT			9 /* divert info */
@@ -687,8 +681,9 @@ m_getb(int len, int how, int type, int flags)
 #define PACKET_TAG_IPSRCRT			27 /* IP srcrt opts */
 /* struct ip_srcrt_opt */
 #define	PACKET_TAG_CARP                         28 /* CARP info */
-/* struct pf_mtag */
+/* struct ifnet */
 #define PACKET_TAG_PF				29 /* PF info */
+/* struct pf_mtag */
 
 #define PACKET_TAG_PF_DIVERT			0x0200 /* pf(4) diverted packet */
 	
@@ -717,15 +712,114 @@ m_tag_data(struct m_tag *tag)
 }
 
 static __inline struct m_tag *
-m_tag_get(int type, int length, int wait)
+m_tag_get(int type, int length, int mflags)
 {
-	return m_tag_alloc(MTAG_ABI_COMPAT, type, length, wait);
+	return m_tag_alloc(MTAG_ABI_COMPAT, type, length, mflags);
 }
 
 static __inline struct m_tag *
 m_tag_find(struct mbuf *m, int type, struct m_tag *start)
 {
 	return m_tag_locate(m, MTAG_ABI_COMPAT, type, start);
+}
+
+struct mbufq {
+	STAILQ_HEAD(, mbuf)	mq_head;
+	int			mq_len;
+	int			mq_maxlen;
+};
+
+static inline void
+mbufq_init(struct mbufq *mq, int maxlen)
+{
+
+	STAILQ_INIT(&mq->mq_head);
+	mq->mq_maxlen = maxlen;
+	mq->mq_len = 0;
+}
+
+static inline struct mbuf *
+mbufq_flush(struct mbufq *mq)
+{
+	struct mbuf *m;
+
+	m = STAILQ_FIRST(&mq->mq_head);
+	STAILQ_INIT(&mq->mq_head);
+	mq->mq_len = 0;
+	return (m);
+}
+
+static inline void
+mbufq_drain(struct mbufq *mq)
+{
+	struct mbuf *m, *n;
+
+	n = mbufq_flush(mq);
+	while ((m = n) != NULL) {
+		n = STAILQ_NEXT(m, m_stailqpkt);
+		m_freem(m);
+	}
+}
+
+static inline struct mbuf *
+mbufq_first(const struct mbufq *mq)
+{
+
+	return (STAILQ_FIRST(&mq->mq_head));
+}
+
+static inline struct mbuf *
+mbufq_last(const struct mbufq *mq)
+{
+
+	return (STAILQ_LAST(&mq->mq_head, mbuf, m_stailqpkt));
+}
+
+static inline int
+mbufq_full(const struct mbufq *mq)
+{
+
+	return (mq->mq_len >= mq->mq_maxlen);
+}
+
+static inline int
+mbufq_len(const struct mbufq *mq)
+{
+
+	return (mq->mq_len);
+}
+
+static inline int
+mbufq_enqueue(struct mbufq *mq, struct mbuf *m)
+{
+
+	if (mbufq_full(mq))
+		return (ENOBUFS);
+	STAILQ_INSERT_TAIL(&mq->mq_head, m, m_stailqpkt);
+	mq->mq_len++;
+	return (0);
+}
+
+static inline struct mbuf *
+mbufq_dequeue(struct mbufq *mq)
+{
+	struct mbuf *m;
+
+	m = STAILQ_FIRST(&mq->mq_head);
+	if (m) {
+		STAILQ_REMOVE_HEAD(&mq->mq_head, m_stailqpkt);
+		m->m_nextpkt = NULL;
+		mq->mq_len--;
+	}
+	return (m);
+}
+
+static inline void
+mbufq_prepend(struct mbufq *mq, struct mbuf *m)
+{
+
+	STAILQ_INSERT_HEAD(&mq->mq_head, m, m_stailqpkt);
+	mq->mq_len++;
 }
 
 #endif	/* _KERNEL */

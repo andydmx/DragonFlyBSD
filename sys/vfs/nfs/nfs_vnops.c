@@ -43,6 +43,7 @@
 #include <sys/param.h>
 #include <sys/kernel.h>
 #include <sys/systm.h>
+#include <sys/uio.h>
 #include <sys/resourcevar.h>
 #include <sys/proc.h>
 #include <sys/mount.h>
@@ -82,8 +83,6 @@
 #include <netinet/in.h>
 #include <netinet/in_var.h>
 
-#include <sys/thread2.h>
-
 /* Defs */
 #define	TRUE	1
 #define	FALSE	0
@@ -101,7 +100,6 @@ static	int	nfs_access (struct vop_access_args *);
 static	int	nfs_getattr (struct vop_getattr_args *);
 static	int	nfs_setattr (struct vop_setattr_args *);
 static	int	nfs_read (struct vop_read_args *);
-static	int	nfs_mmap (struct vop_mmap_args *);
 static	int	nfs_fsync (struct vop_fsync_args *);
 static	int	nfs_remove (struct vop_old_remove_args *);
 static	int	nfs_link (struct vop_old_link_args *);
@@ -119,6 +117,7 @@ static int	nfs_laccess (struct vop_access_args *);
 static int	nfs_readlink (struct vop_readlink_args *);
 static int	nfs_print (struct vop_print_args *);
 static int	nfs_advlock (struct vop_advlock_args *);
+static int	nfs_kqfilter (struct vop_kqfilter_args *ap);
 
 static	int	nfs_nresolve (struct vop_nresolve_args *);
 /*
@@ -140,7 +139,6 @@ struct vop_ops nfsv2_vnode_vops = {
 	.vop_old_lookup =	nfs_lookup,
 	.vop_old_mkdir =	nfs_mkdir,
 	.vop_old_mknod =	nfs_mknod,
-	.vop_mmap =		nfs_mmap,
 	.vop_open =		nfs_open,
 	.vop_print =		nfs_print,
 	.vop_read =		nfs_read,
@@ -154,7 +152,8 @@ struct vop_ops nfsv2_vnode_vops = {
 	.vop_strategy =		nfs_strategy,
 	.vop_old_symlink =	nfs_symlink,
 	.vop_write =		nfs_write,
-	.vop_nresolve =		nfs_nresolve
+	.vop_nresolve =		nfs_nresolve,
+	.vop_kqfilter =		nfs_kqfilter
 };
 
 /*
@@ -238,6 +237,14 @@ SYSCTL_INT(_vfs_nfs, OID_AUTO, access_cache_misses, CTLFLAG_RD,
 			 | NFSV3ACCESS_EXTEND | NFSV3ACCESS_EXECUTE	\
 			 | NFSV3ACCESS_DELETE | NFSV3ACCESS_LOOKUP)
 
+static __inline
+void
+nfs_knote(struct vnode *vp, int flags)
+{
+	if (flags)
+		KNOTE(&vp->v_pollinfo.vpi_kqinfo.ki_note, flags);
+}
+
 /*
  * Returns whether a name component is a degenerate '.' or '..'.
  */
@@ -300,6 +307,8 @@ static int
 nfs_access(struct vop_access_args *ap)
 {
 	struct ucred *cred;
+	struct ucred *ncred;
+	struct ucred *ocred;
 	struct vnode *vp = ap->a_vp;
 	thread_t td = curthread;
 	int error = 0;
@@ -332,13 +341,22 @@ nfs_access(struct vop_access_args *ap)
 	 * we need to check access against real ids if AT_EACCESS not set.
 	 * Handle this case by cloning the credentials and setting the
 	 * effective ids to the real ones.
+	 *
+	 * The crdup() here can cause a lot of ucred structures to build-up
+	 * (up to maxvnodes), so do our best to avoid it.
 	 */
 	if (ap->a_flags & AT_EACCESS) {
 		cred = crhold(ap->a_cred);
 	} else {
-		cred = crdup(ap->a_cred);
-		cred->cr_uid = cred->cr_ruid;
-		cred->cr_gid = cred->cr_rgid;
+		cred = ap->a_cred;
+		if (cred->cr_uid == cred->cr_ruid &&
+		    cred->cr_gid == cred->cr_rgid) {
+			cred = crhold(ap->a_cred);
+		} else {
+			cred = crdup(ap->a_cred);
+			cred->cr_uid = cred->cr_ruid;
+			cred->cr_gid = cred->cr_rgid;
+		}
 	}
 
 	/*
@@ -448,21 +466,26 @@ nfs_access(struct vop_access_args *ap)
 	 * for execute requests.
 	 */
 	if (error == 0) {
-		if ((ap->a_mode & (VREAD|VEXEC)) && cred != np->n_rucred) {
-			crhold(cred);
-			if (np->n_rucred)
-				crfree(np->n_rucred);
-			np->n_rucred = cred;
+		if ((ap->a_mode & (VREAD|VEXEC)) &&
+		    !nfs_crsame(cred, np->n_rucred)) {
+			ncred = nfs_crhold(cred);
+			ocred = np->n_rucred;
+			np->n_rucred = ncred;
+			if (ocred)
+				crfree(ocred);
 		}
-		if ((ap->a_mode & VWRITE) && cred != np->n_wucred) {
-			crhold(cred);
-			if (np->n_wucred)
-				crfree(np->n_wucred);
-			np->n_wucred = cred;
+		if ((ap->a_mode & VWRITE) &&
+		    !nfs_crsame(cred, np->n_wucred)) {
+			ncred = nfs_crhold(cred);
+			ocred = np->n_wucred;
+			np->n_wucred = ncred;
+			if (ocred)
+				crfree(ocred);
 		}
 	}
 	lwkt_reltoken(&nmp->nm_token);
 	crfree(cred);
+
 	return(error);
 }
 
@@ -484,6 +507,8 @@ nfs_open(struct vop_open_args *ap)
 	struct nfsnode *np = VTONFS(vp);
 	struct nfsmount *nmp = VFSTONFS(vp->v_mount);
 	struct vattr vattr;
+	struct ucred *ncred;
+	struct ucred *ocred;
 	int error;
 
 	lwkt_gettoken(&nmp->nm_token);
@@ -499,17 +524,19 @@ nfs_open(struct vop_open_args *ap)
 	/*
 	 * Save valid creds for reading and writing for later RPCs.
 	 */
-	if ((ap->a_mode & FREAD) && ap->a_cred != np->n_rucred) {
-		crhold(ap->a_cred);
-		if (np->n_rucred)
-			crfree(np->n_rucred);
-		np->n_rucred = ap->a_cred;
+	if ((ap->a_mode & FREAD) && !nfs_crsame(ap->a_cred, np->n_rucred)) {
+		ncred = nfs_crhold(ap->a_cred);
+		ocred = np->n_rucred;
+		np->n_rucred = ncred;
+		if (ocred)
+			crfree(ocred);
 	}
-	if ((ap->a_mode & FWRITE) && ap->a_cred != np->n_wucred) {
-		crhold(ap->a_cred);
-		if (np->n_wucred)
-			crfree(np->n_wucred);
-		np->n_wucred = ap->a_cred;
+	if ((ap->a_mode & FWRITE) && !nfs_crsame(ap->a_cred, np->n_wucred)) {
+		ncred = nfs_crhold(ap->a_cred);
+		ocred = np->n_wucred;
+		np->n_wucred = ncred;
+		if (ocred)
+			crfree(ocred);
 	}
 
 	/*
@@ -723,6 +750,7 @@ nfs_setattr(struct vop_setattr_args *ap)
 	struct nfsmount *nmp = VFSTONFS(vp->v_mount);
 	struct vattr *vap = ap->a_vap;
 	int error = 0;
+	int kflags = 0;
 	off_t tsize;
 	thread_t td = curthread;
 
@@ -746,6 +774,9 @@ nfs_setattr(struct vop_setattr_args *ap)
 
 	lwkt_gettoken(&nmp->nm_token);
 
+	/*
+	 * Handle size changes
+	 */
 	if (vap->va_size != VNOVAL) {
 		/*
 		 * truncation requested
@@ -797,32 +828,50 @@ again:
 			if (error == 0 && np->n_size != vap->va_size)
 				goto again;
 			np->n_vattr.va_size = vap->va_size;
+			kflags |= NOTE_WRITE;
+			if (tsize < vap->va_size)
+				kflags |= NOTE_EXTEND;
 			break;
 		}
-	} else if ((np->n_flag & NLMODIFIED) && vp->v_type == VREG) {
-		/*
-		 * What to do.  If we are modifying the mtime we lose
-		 * mtime detection of changes made by the server or other
-		 * clients.  But programs like rsync/rdist/cpdup are going
-		 * to call utimes a lot.  We don't want to piecemeal sync.
-		 *
-		 * For now sync if any prior remote changes were detected,
-		 * but allow us to lose track of remote changes made during
-		 * the utimes operation.
-		 */
-		if (np->n_flag & NRMODIFIED)
+	}
+
+	/*
+	 * If setting the mtime or if server/other-client modifications have
+	 * been detected, we must fully flush any pending writes.
+	 *
+	 * This will slow down cp/cpdup/rdist/rsync and other operations which
+	 * might call [l]utimes() to set the mtime after writing to a file,
+	 * but honestly there is no way to properly defer the write flush
+	 * and still get reasonably accurate/dependable synchronization of
+	 * [l]utimes().
+	 */
+	if ((np->n_flag & NLMODIFIED) && vp->v_type == VREG) {
+		if ((np->n_flag & NRMODIFIED) ||
+		    (vap->va_mtime.tv_sec != VNOVAL)) {
 			error = nfs_vinvalbuf(vp, V_SAVE, 1);
-		if (error == EINTR) {
-			lwkt_reltoken(&nmp->nm_token);
-			return (error);
-		}
-		if (error == 0) {
-			if (vap->va_mtime.tv_sec != VNOVAL) {
-				np->n_mtime = vap->va_mtime.tv_sec;
+			if (error == EINTR) {
+				lwkt_reltoken(&nmp->nm_token);
+				return (error);
 			}
 		}
 	}
+
+	/*
+	 * Get the blasted mtime to report properly.
+	 */
+	if (vap->va_mtime.tv_sec != VNOVAL) {
+		np->n_mtime = vap->va_mtime.tv_sec;
+		np->n_flag &= ~NUPD;
+		np->n_vattr.va_mtime = vap->va_mtime;
+	}
+
+	/*
+	 * Issue the setattr rpc, adjust our mtime and make sure NUPD
+	 * has been cleared so it does not get overridden.
+	 */
 	error = nfs_setattrrpc(vp, vap, ap->a_cred, td);
+	if (error == 0)
+		kflags |= NOTE_EXTEND;
 
 	/*
 	 * Sanity check if a truncation was issued.  This should only occur
@@ -842,6 +891,7 @@ again:
 		nfs_meta_setsize(vp, td, np->n_size, 0);
 	}
 	lwkt_reltoken(&nmp->nm_token);
+	nfs_knote(vp, kflags);
 
 	return (error);
 }
@@ -1631,6 +1681,8 @@ nfs_mknod(struct vop_old_mknod_args *ap)
 	lwkt_gettoken(&nmp->nm_token);
 	error = nfs_mknodrpc(ap->a_dvp, ap->a_vpp, ap->a_cnp, ap->a_vap);
 	lwkt_reltoken(&nmp->nm_token);
+	if (error == 0)
+		nfs_knote(ap->a_dvp, NOTE_WRITE);
 
 	return error;
 }
@@ -1762,10 +1814,11 @@ nfsmout:
 		 */
 		np = VTONFS(newvp);
 		if (np->n_rucred == NULL)
-			np->n_rucred = crhold(cnp->cn_cred);
+			np->n_rucred = nfs_crhold(cnp->cn_cred);
 		if (np->n_wucred == NULL)
-			np->n_wucred = crhold(cnp->cn_cred);
+			np->n_wucred = nfs_crhold(cnp->cn_cred);
 		*ap->a_vpp = newvp;
+		nfs_knote(dvp, NOTE_WRITE);
 	} else if (newvp) {
 		vput(newvp);
 	}
@@ -1811,14 +1864,25 @@ nfs_remove(struct vop_old_remove_args *ap)
 	} else if (VREFCNT(vp) == 1 || (np->n_sillyrename &&
 		   VOP_GETATTR(vp, &vattr) == 0 && vattr.va_nlink > 1)) {
 		/*
-		 * throw away biocache buffers, mainly to avoid
+		 * Force finalization so the VOP_INACTIVE() call is not delayed.
+		 * This prevents cred structures from building up in nfsnodes
+		 * for deleted files.
+		 */
+		atomic_set_int(&vp->v_refcnt, VREF_FINALIZE);
+		np->n_flag |= NREMOVED;
+
+		/*
+		 * Throw away biocache buffers, mainly to avoid
 		 * unnecessary delayed writes later.
 		 */
 		error = nfs_vinvalbuf(vp, 0, 1);
 		/* Do the rpc */
-		if (error != EINTR)
+		if (error != EINTR) {
 			error = nfs_removerpc(dvp, cnp->cn_nameptr,
-				cnp->cn_namelen, cnp->cn_cred, cnp->cn_td);
+					      cnp->cn_namelen,
+					      cnp->cn_cred, cnp->cn_td);
+		}
+
 		/*
 		 * Kludge City: If the first reply to the remove rpc is lost..
 		 *   the reply to the retransmitted request will be ENOENT
@@ -1832,6 +1896,10 @@ nfs_remove(struct vop_old_remove_args *ap)
 	}
 	np->n_attrstamp = 0;
 	lwkt_reltoken(&nmp->nm_token);
+	if (error == 0) {
+		nfs_knote(vp, NOTE_DELETE);
+		nfs_knote(dvp, NOTE_WRITE);
+	}
 
 	return (error);
 }
@@ -1902,6 +1970,17 @@ nfs_rename(struct vop_old_rename_args *ap)
 
 	lwkt_gettoken(&nmp->nm_token);
 
+	/*
+	 * Force finalization so the VOP_INACTIVE() call is not delayed.
+	 * This prevents cred structures from building up in nfsnodes
+	 * for deleted files.
+	 */
+	if (tvp) {
+		atomic_set_int(&tvp->v_refcnt, VREF_FINALIZE);
+		if (VTONFS(tvp))
+			VTONFS(tvp)->n_flag |= NREMOVED;
+	}
+
 	/* Check for cross-device rename */
 	if ((fvp->v_mount != tdvp->v_mount) ||
 	    (tvp && (fvp->v_mount != tvp->v_mount))) {
@@ -1937,10 +2016,11 @@ nfs_rename(struct vop_old_rename_args *ap)
 	 */
 	if (tvp && VREFCNT(tvp) > 1 && !VTONFS(tvp)->n_sillyrename &&
 		tvp->v_type != VDIR && !nfs_sillyrename(tdvp, tvp, tcnp)) {
+		nfs_knote(tvp, NOTE_DELETE);
 		vput(tvp);
 		tvp = NULL;
 	} else if (tvp) {
-		;
+		nfs_knote(tvp, NOTE_DELETE);
 	}
 
 	error = nfs_renamerpc(fdvp, fcnp->cn_nameptr, fcnp->cn_namelen,
@@ -1948,6 +2028,11 @@ nfs_rename(struct vop_old_rename_args *ap)
 		tcnp->cn_td);
 
 out:
+	if (error == 0) {
+		nfs_knote(fdvp, NOTE_WRITE);
+		nfs_knote(tdvp, NOTE_WRITE);
+		nfs_knote(fvp, NOTE_RENAME);
+	}
 	lwkt_reltoken(&nmp->nm_token);
 	if (tdvp == tvp)
 		vrele(tdvp);
@@ -2077,6 +2162,11 @@ nfsmout:
 	if (error == EEXIST)
 		error = 0;
 	lwkt_reltoken(&nmp->nm_token);
+	if (error == 0) {
+		nfs_knote(vp, NOTE_LINK);
+		nfs_knote(tdvp, NOTE_WRITE);
+	}
+
 	return (error);
 }
 
@@ -2180,6 +2270,8 @@ nfsmout:
 	VTONFS(dvp)->n_flag |= NLMODIFIED;
 	if (!wccflag)
 		VTONFS(dvp)->n_attrstamp = 0;
+	if (error == 0 && *ap->a_vpp)
+		nfs_knote(*ap->a_vpp, NOTE_WRITE);
 	lwkt_reltoken(&nmp->nm_token);
 
 	return (error);
@@ -2268,6 +2360,7 @@ nfsmout:
 		if (newvp)
 			vrele(newvp);
 	} else {
+		nfs_knote(dvp, NOTE_WRITE | NOTE_LINK);
 		*ap->a_vpp = newvp;
 	}
 	lwkt_reltoken(&nmp->nm_token);
@@ -2321,6 +2414,8 @@ nfsmout:
 	 */
 	if (error == ENOENT)
 		error = 0;
+	else
+		nfs_knote(dvp, NOTE_WRITE | NOTE_LINK);
 	lwkt_reltoken(&nmp->nm_token);
 
 	return (error);
@@ -2899,12 +2994,20 @@ nfs_sillyrename(struct vnode *dvp, struct vnode *vp, struct componentname *cnp)
 	int error;
 
 	/*
+	 * Force finalization so the VOP_INACTIVE() call is not delayed.
+	 * This prevents cred structures from building up in nfsnodes
+	 * for deleted files.
+	 */
+	atomic_set_int(&vp->v_refcnt, VREF_FINALIZE);
+	np = VTONFS(vp);
+	np->n_flag |= NREMOVED;
+
+	/*
 	 * We previously purged dvp instead of vp.  I don't know why, it
 	 * completely destroys performance.  We can't do it anyway with the
 	 * new VFS API since we would be breaking the namecache topology.
 	 */
 	cache_purge(vp);	/* XXX */
-	np = VTONFS(vp);
 #ifndef DIAGNOSTIC
 	if (vp->v_type == VDIR)
 		panic("nfs: sillyrename dir");
@@ -2938,6 +3041,7 @@ bad:
 	vrele(sp->s_dvp);
 	crfree(sp->s_cred);
 	kfree((caddr_t)sp, M_NFSREQ);
+
 	return (error);
 }
 
@@ -3109,7 +3213,7 @@ nfs_strategy(struct vop_strategy_args *ap)
 
 	KASSERT(bp->b_cmd != BUF_CMD_DONE,
 		("nfs_strategy: buffer %p unexpectedly marked done", bp));
-	KASSERT(BUF_REFCNT(bp) > 0,
+	KASSERT(BUF_LOCKINUSE(bp),
 		("nfs_strategy: buffer %p not locked", bp));
 
 	if (bio->bio_flags & BIO_SYNC)
@@ -3147,21 +3251,6 @@ nfs_strategy(struct vop_strategy_args *ap)
 	lwkt_reltoken(&nmp->nm_token);
 
 	return (error);
-}
-
-/*
- * Mmap a file
- *
- * NB Currently unsupported.
- *
- * nfs_mmap(struct vnode *a_vp, int a_fflags, struct ucred *a_cred)
- */
-/* ARGSUSED */
-static int
-nfs_mmap(struct vop_mmap_args *ap)
-{
-	/* no token lock required */
-	return (EINVAL);
 }
 
 /*
@@ -3640,3 +3729,106 @@ nfsfifo_close(struct vop_close_args *ap)
 	return (VOCALL(&fifo_vnode_vops, &ap->a_head));
 }
 
+/************************************************************************
+ *                          KQFILTER OPS                                *
+ ************************************************************************/
+
+static void filt_nfsdetach(struct knote *kn);
+static int filt_nfsread(struct knote *kn, long hint);
+static int filt_nfswrite(struct knote *kn, long hint);
+static int filt_nfsvnode(struct knote *kn, long hint);
+
+static struct filterops nfsread_filtops =
+	{ FILTEROP_ISFD | FILTEROP_MPSAFE,
+	  NULL, filt_nfsdetach, filt_nfsread };
+static struct filterops nfswrite_filtops =
+	{ FILTEROP_ISFD | FILTEROP_MPSAFE,
+	  NULL, filt_nfsdetach, filt_nfswrite };
+static struct filterops nfsvnode_filtops =
+	{ FILTEROP_ISFD | FILTEROP_MPSAFE,
+	  NULL, filt_nfsdetach, filt_nfsvnode };
+
+static int
+nfs_kqfilter (struct vop_kqfilter_args *ap)
+{
+	struct vnode *vp = ap->a_vp;
+	struct knote *kn = ap->a_kn;
+
+	switch (kn->kn_filter) {
+	case EVFILT_READ:
+		kn->kn_fop = &nfsread_filtops;
+		break;
+	case EVFILT_WRITE:
+		kn->kn_fop = &nfswrite_filtops;
+		break;
+	case EVFILT_VNODE:
+		kn->kn_fop = &nfsvnode_filtops;
+		break;
+	default:
+		return (EOPNOTSUPP);
+	}
+
+	kn->kn_hook = (caddr_t)vp;
+
+	knote_insert(&vp->v_pollinfo.vpi_kqinfo.ki_note, kn);
+
+	return(0);
+}
+
+static void
+filt_nfsdetach(struct knote *kn)
+{
+	struct vnode *vp = (void *)kn->kn_hook;
+
+	knote_remove(&vp->v_pollinfo.vpi_kqinfo.ki_note, kn);
+}
+
+static int
+filt_nfsread(struct knote *kn, long hint)
+{
+	struct vnode *vp = (void *)kn->kn_hook;
+	struct nfsnode *node = VTONFS(vp);
+	off_t off;
+
+	if (hint == NOTE_REVOKE) {
+		kn->kn_flags |= (EV_EOF | EV_NODATA | EV_ONESHOT);
+		return(1);
+	}
+
+	/*
+	 * Interlock against MP races when performing this function. XXX
+	 */
+	/* TMPFS_NODE_LOCK_SH(node); */
+	off = node->n_size - kn->kn_fp->f_offset;
+	kn->kn_data = (off < INTPTR_MAX) ? off : INTPTR_MAX;
+	if (kn->kn_sfflags & NOTE_OLDAPI) {
+		/* TMPFS_NODE_UNLOCK(node); */
+		return(1);
+	}
+	if (kn->kn_data == 0) {
+		kn->kn_data = (off < INTPTR_MAX) ? off : INTPTR_MAX;
+	}
+	/* TMPFS_NODE_UNLOCK(node); */
+	return (kn->kn_data != 0);
+}
+
+static int
+filt_nfswrite(struct knote *kn, long hint)
+{
+	if (hint == NOTE_REVOKE)
+		kn->kn_flags |= (EV_EOF | EV_NODATA | EV_ONESHOT);
+	kn->kn_data = 0;
+	return (1);
+}
+
+static int
+filt_nfsvnode(struct knote *kn, long hint)
+{
+	if (kn->kn_sfflags & hint)
+		kn->kn_fflags |= hint;
+	if (hint == NOTE_REVOKE) {
+		kn->kn_flags |= (EV_EOF | EV_NODATA);
+		return (1);
+	}
+	return (kn->kn_fflags != 0);
+}

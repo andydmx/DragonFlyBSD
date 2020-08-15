@@ -94,6 +94,7 @@
  * $FreeBSD: src/sys/vm/swap_pager.c,v 1.130.2.12 2002/08/31 21:15:55 dillon Exp $
  */
 
+#include "opt_swap.h"
 #include <sys/param.h>
 #include <sys/systm.h>
 #include <sys/conf.h>
@@ -106,9 +107,8 @@
 #include <sys/sysctl.h>
 #include <sys/blist.h>
 #include <sys/lock.h>
-#include <sys/thread2.h>
+#include <sys/kcollect.h>
 
-#include "opt_swap.h"
 #include <vm/vm.h>
 #include <vm/vm_object.h>
 #include <vm/vm_page.h>
@@ -132,6 +132,7 @@
 #define SWBIO_READ	0x01
 #define SWBIO_WRITE	0x02
 #define SWBIO_SYNC	0x04
+#define SWBIO_TTC	0x08	/* for OBJPC_TRY_TO_CACHE */
 
 struct swfreeinfo {
 	vm_object_t	object;
@@ -152,11 +153,13 @@ struct swswapoffinfo {
  */
 
 int swap_pager_full;		/* swap space exhaustion (task killing) */
-int vm_swap_cache_use;
-int vm_swap_anon_use;
+int swap_fail_ticks;		/* when we became exhausted */
+int swap_pager_almost_full;	/* swap space exhaustion (w/ hysteresis)*/
+swblk_t vm_swap_cache_use;
+swblk_t vm_swap_anon_use;
 static int vm_report_swap_allocs;
 
-static int swap_pager_almost_full; /* swap space exhaustion (w/ hysteresis)*/
+static struct krate kswaprate = { 1 };
 static int nsw_rcount;		/* free read buffers			*/
 static int nsw_wcount_sync;	/* limit write buffers / synchronous	*/
 static int nsw_wcount_async;	/* limit write buffers / asynchronous	*/
@@ -167,6 +170,7 @@ struct blist *swapblist;
 static int swap_async_max = 4;	/* maximum in-progress async I/O's	*/
 static int swap_burst_read = 0;	/* allow burst reading */
 static swblk_t swapiterator;	/* linearize allocations */
+int swap_user_async = 0;	/* user swap pager operation can be async */
 
 static struct spinlock swapbp_spin = SPINLOCK_INITIALIZER(&swapbp_spin, "swapbp_spin");
 
@@ -175,23 +179,38 @@ extern struct vnode *swapdev_vp;
 extern struct swdevt *swdevt;
 extern int nswdev;
 
-#define BLK2DEVIDX(blk) (nswdev > 1 ? blk / dmmax % nswdev : 0)
+#define BLK2DEVIDX(blk) (nswdev > 1 ? blk / SWB_DMMAX % nswdev : 0)
 
 SYSCTL_INT(_vm, OID_AUTO, swap_async_max,
         CTLFLAG_RW, &swap_async_max, 0, "Maximum running async swap ops");
 SYSCTL_INT(_vm, OID_AUTO, swap_burst_read,
         CTLFLAG_RW, &swap_burst_read, 0, "Allow burst reads for pageins");
+SYSCTL_INT(_vm, OID_AUTO, swap_user_async,
+        CTLFLAG_RW, &swap_user_async, 0, "Allow async uuser swap write I/O");
 
+#if SWBLK_BITS == 64
+SYSCTL_LONG(_vm, OID_AUTO, swap_cache_use,
+        CTLFLAG_RD, &vm_swap_cache_use, 0, "");
+SYSCTL_LONG(_vm, OID_AUTO, swap_anon_use,
+        CTLFLAG_RD, &vm_swap_anon_use, 0, "");
+SYSCTL_LONG(_vm, OID_AUTO, swap_free,
+        CTLFLAG_RD, &vm_swap_size, 0, "");
+SYSCTL_LONG(_vm, OID_AUTO, swap_size,
+        CTLFLAG_RD, &vm_swap_max, 0, "");
+#else
 SYSCTL_INT(_vm, OID_AUTO, swap_cache_use,
         CTLFLAG_RD, &vm_swap_cache_use, 0, "");
 SYSCTL_INT(_vm, OID_AUTO, swap_anon_use,
         CTLFLAG_RD, &vm_swap_anon_use, 0, "");
-SYSCTL_INT(_vm, OID_AUTO, swap_size,
+SYSCTL_INT(_vm, OID_AUTO, swap_free,
         CTLFLAG_RD, &vm_swap_size, 0, "");
+SYSCTL_INT(_vm, OID_AUTO, swap_size,
+        CTLFLAG_RD, &vm_swap_max, 0, "");
+#endif
 SYSCTL_INT(_vm, OID_AUTO, report_swap_allocs,
         CTLFLAG_RW, &vm_report_swap_allocs, 0, "");
 
-vm_zone_t		swap_zone;
+__read_mostly vm_zone_t	swap_zone;
 
 /*
  * Red-Black tree for swblock entries
@@ -253,15 +272,13 @@ struct pagerops swappagerops = {
 };
 
 /*
- * dmmax is in page-sized chunks with the new swap system.  It was
- * dev-bsized chunks in the old.  dmmax is always a power of 2.
+ * SWB_DMMAX is in page-sized chunks with the new swap system.  It was
+ * dev-bsized chunks in the old.  SWB_DMMAX is always a power of 2.
  *
  * swap_*() routines are externally accessible.  swp_*() routines are
  * internal.
  */
 
-int dmmax;
-static int dmmax_mask;
 int nswap_lowat = 128;		/* in pages, swap_pager_almost_full warn */
 int nswap_hiwat = 512;		/* in pages, swap_pager_almost_full warn */
 
@@ -305,12 +322,42 @@ swp_sizecheck(void)
 		if (swap_pager_almost_full == 0) {
 			kprintf("swap_pager: out of swap space\n");
 			swap_pager_almost_full = 1;
+			swap_fail_ticks = ticks;
 		}
 	} else {
 		swap_pager_full = 0;
 		if (vm_swap_size > nswap_hiwat)
 			swap_pager_almost_full = 0;
 	}
+}
+
+/*
+ * Long-term data collection on 10-second interval.  Return the value
+ * for KCOLLECT_SWAPPCT and set the values for SWAPANO and SWAPCCAC.
+ *
+ * Return total swap in the scale field.  This can change if swap is
+ * regularly added or removed and may cause some historical confusion
+ * in that case, but SWAPPCT will always be historically accurate.
+ */
+
+#define PTOB(value)	((uint64_t)(value) << PAGE_SHIFT)
+
+static uint64_t
+collect_swap_callback(int n)
+{
+	uint64_t total = vm_swap_max;
+	uint64_t anon = vm_swap_anon_use;
+	uint64_t cache = vm_swap_cache_use;
+
+	if (total == 0)		/* avoid divide by zero */
+		total = 1;
+	kcollect_setvalue(KCOLLECT_SWAPANO, PTOB(anon));
+	kcollect_setvalue(KCOLLECT_SWAPCAC, PTOB(cache));
+	kcollect_setscale(KCOLLECT_SWAPANO,
+			  KCOLLECT_SCALE(KCOLLECT_SWAPANO_FORMAT, PTOB(total)));
+	kcollect_setscale(KCOLLECT_SWAPCAC,
+			  KCOLLECT_SCALE(KCOLLECT_SWAPCAC_FORMAT, PTOB(total)));
+	return (((anon + cache) * 10000 + (total >> 1)) / total);
 }
 
 /*
@@ -325,13 +372,14 @@ swp_sizecheck(void)
 static void
 swap_pager_init(void *arg __unused)
 {
-	/*
-	 * Device Stripe, in PAGE_SIZE'd blocks
-	 */
-	dmmax = SWB_NPAGES * 2;
-	dmmax_mask = ~(dmmax - 1);
+	kcollect_register(KCOLLECT_SWAPPCT, "swapuse", collect_swap_callback,
+			  KCOLLECT_SCALE(KCOLLECT_SWAPPCT_FORMAT, 0));
+	kcollect_register(KCOLLECT_SWAPANO, "swapano", NULL,
+			  KCOLLECT_SCALE(KCOLLECT_SWAPANO_FORMAT, 0));
+	kcollect_register(KCOLLECT_SWAPCAC, "swapcac", NULL,
+			  KCOLLECT_SCALE(KCOLLECT_SWAPCAC_FORMAT, 0));
 }
-SYSINIT(vm_mem, SI_BOOT1_VM, SI_ORDER_THIRD, swap_pager_init, NULL)
+SYSINIT(vm_mem, SI_BOOT1_VM, SI_ORDER_THIRD, swap_pager_init, NULL);
 
 /*
  * SWAP_PAGER_SWAP_INIT() - swap pager initialization from pageout process
@@ -371,14 +419,14 @@ swap_pager_swap_init(void)
 
 	nsw_cluster_max = min((MAXPHYS/PAGE_SIZE), MAX_PAGEOUT_CLUSTER);
 
-	nsw_rcount = (nswbuf + 1) / 2;
-	nsw_wcount_sync = (nswbuf + 3) / 4;
+	nsw_rcount = (nswbuf_kva + 1) / 2;
+	nsw_wcount_sync = (nswbuf_kva + 3) / 4;
 	nsw_wcount_async = 4;
 	nsw_wcount_async_max = nsw_wcount_async;
 
 	/*
 	 * The zone is dynamically allocated so generally size it to
-	 * maxswzone (32MB to 512MB of KVM).  Set a minimum size based
+	 * maxswzone (32MB to 256GB of KVM).  Set a minimum size based
 	 * on physical memory of around 8x (each swblock can hold 16 pages).
 	 *
 	 * With the advent of SSDs (vs HDs) the practical (swap:memory) ratio
@@ -394,8 +442,7 @@ swap_pager_swap_init(void)
 			"SWAPMETA", 
 			sizeof(struct swblock), 
 			n,
-			ZONE_INTERRUPT, 
-			1);
+			ZONE_INTERRUPT);
 		if (swap_zone != NULL)
 			break;
 		/*
@@ -492,9 +539,20 @@ swp_pager_getswapspace(vm_object_t object, int npages)
 		blk = blist_allocat(swapblist, npages, 0);
 	if (blk == SWAPBLK_NONE) {
 		if (swap_pager_full != 2) {
-			kprintf("swap_pager_getswapspace: failed alloc=%d\n",
-				npages);
+			if (vm_swap_max == 0) {
+				krateprintf(&kswaprate,
+					"Warning: The system would like to "
+					"page to swap but no swap space "
+					"is configured!\n");
+			} else {
+				krateprintf(&kswaprate,
+					"swap_pager_getswapspace: "
+					"swap full allocating %d pages\n",
+					npages);
+			}
 			swap_pager_full = 2;
+			if (swap_pager_almost_full == 0)
+				swap_fail_ticks = ticks;
 			swap_pager_almost_full = 1;
 		}
 	} else {
@@ -517,9 +575,6 @@ swp_pager_getswapspace(vm_object_t object, int npages)
  *
  *	Note:  This routine may not block (it could in the old swap code),
  *	and through the use of the new blist routines it does not block.
- *
- *	We must be called at splvm() to avoid races with bitmap frees from
- *	vm_page_remove() aka swap_pager_page_removed().
  *
  * This routine may not block.
  */
@@ -564,6 +619,8 @@ swp_pager_freeswapspace(vm_object_t object, swblk_t blk, int npages)
 void
 swap_pager_freespace(vm_object_t object, vm_pindex_t start, vm_pindex_t size)
 {
+	if (object->swblock_count == 0)
+		return;
 	vm_object_hold(object);
 	swp_pager_meta_free(object, start, size);
 	vm_object_drop(object);
@@ -575,6 +632,8 @@ swap_pager_freespace(vm_object_t object, vm_pindex_t start, vm_pindex_t size)
 void
 swap_pager_freespace_all(vm_object_t object)
 {
+	if (object->swblock_count == 0)
+		return;
 	vm_object_hold(object);
 	swp_pager_meta_free_all(object);
 	vm_object_drop(object);
@@ -669,7 +728,7 @@ swap_pager_condfree_callback(struct swblock *swap, void *data)
  * into a VM object.  Checks whether swap has been assigned to
  * the page and sets PG_SWAPPED as necessary.
  *
- * No requirements.
+ * (m) must be busied by caller and remains busied on return.
  */
 void
 swap_pager_page_inserted(vm_page_t m)
@@ -848,6 +907,17 @@ swap_pager_haspage(vm_object_t object, vm_pindex_t pindex)
 }
 
 /*
+ * Object must be held exclusive or shared by the caller.
+ */
+boolean_t
+swap_pager_haspage_locked(vm_object_t object, vm_pindex_t pindex)
+{
+	if (swp_pager_meta_ctl(object, pindex, 0) == SWAPBLK_NONE)
+		return FALSE;
+	return TRUE;
+}
+
+/*
  * SWAP_PAGER_PAGE_UNSWAPPED() - remove swap backing store related to page
  *
  * This removes any associated swap backing store, whether valid or
@@ -859,11 +929,11 @@ swap_pager_haspage(vm_object_t object, vm_pindex_t pindex)
  * calls us in a special-case situation
  *
  * NOTE!!!  If the page is clean and the swap was valid, the caller
- * should make the page dirty before calling this routine.  This routine
- * does NOT change the m->dirty status of the page.  Also: MADV_FREE
- * depends on it.
+ *	    should make the page dirty before calling this routine.
+ *	    This routine does NOT change the m->dirty status of the page.
+ *	    Also: MADV_FREE depends on it.
  *
- * The page must be busied or soft-busied.
+ * The page must be busied.
  * The caller can hold the object to avoid blocking, else we might block.
  * No other requirements.
  */
@@ -884,7 +954,8 @@ swap_pager_unswapped(vm_page_t m)
  *
  * This implements a VM OBJECT strategy function using swap backing store.
  * This can operate on any VM OBJECT type, not necessarily just OBJT_SWAP
- * types.
+ * types.  Only BUF_CMD_{READ,WRITE,FREEBLKS} is supported, any other
+ * requests will return EINVAL.
  *
  * This is intended to be a cacheless interface (i.e. caching occurs at
  * higher levels), and is also used as a swap-based SSD cache for vnode
@@ -896,6 +967,9 @@ swap_pager_unswapped(vm_page_t m)
  * the caller requests.  This isn't perfect because we loose error
  * sequencing when we run multiple ops in parallel to satisfy a request.
  * But this is swap, so we let it all hang out.
+ *
+ * NOTE: This function supports the KVABIO API wherein bp->b_data might
+ *	 not be synchronized to the current cpu.
  *
  * No requirements.
  */
@@ -924,6 +998,21 @@ swap_pager_strategy(vm_object_t object, struct bio *bio)
 		track = &swapdev_vp->v_track_write;
 #endif
 
+	/*
+	 * Only supported commands
+	 */
+	if (bp->b_cmd != BUF_CMD_FREEBLKS &&
+	    bp->b_cmd != BUF_CMD_READ &&
+	    bp->b_cmd != BUF_CMD_WRITE) {
+		bp->b_error = EINVAL;
+		bp->b_flags |= B_ERROR | B_INVAL;
+		biodone(bio);
+		return;
+	}
+
+	/*
+	 * bcount must be an integral number of pages.
+	 */
 	if (bp->b_bcount & PAGE_MASK) {
 		bp->b_error = EINVAL;
 		bp->b_flags |= B_ERROR | B_INVAL;
@@ -943,6 +1032,10 @@ swap_pager_strategy(vm_object_t object, struct bio *bio)
 
 	start = (vm_pindex_t)(bio->bio_offset >> PAGE_SHIFT);
 	count = howmany(bp->b_bcount, PAGE_SIZE);
+
+	/*
+	 * WARNING!  Do not dereference *data without issuing a bkvasync()
+	 */
 	data = bp->b_data;
 
 	/*
@@ -990,7 +1083,7 @@ swap_pager_strategy(vm_object_t object, struct bio *bio)
 		 * new block and build it into the object.
 		 */
 		blk = swp_pager_meta_ctl(object, start, 0);
-		if ((blk == SWAPBLK_NONE) && bp->b_cmd != BUF_CMD_READ) {
+		if ((blk == SWAPBLK_NONE) && bp->b_cmd == BUF_CMD_WRITE) {
 			blk = swp_pager_getswapspace(object, 1);
 			if (blk == SWAPBLK_NONE) {
 				bp->b_error = ENOMEM;
@@ -1008,18 +1101,24 @@ swap_pager_strategy(vm_object_t object, struct bio *bio)
 		 *	- we cross a physical disk boundry in the
 		 *	  stripe.
 		 */
-		if (
-		    biox && (biox_blkno + btoc(bufx->b_bcount) != blk ||
-		     ((biox_blkno ^ blk) & dmmax_mask)
-		    )
-		) {
-			if (bp->b_cmd == BUF_CMD_READ) {
+		if (biox &&
+		    (biox_blkno + btoc(bufx->b_bcount) != blk ||
+		     ((biox_blkno ^ blk) & ~SWB_DMMASK))) {
+			switch(bp->b_cmd) {
+			case BUF_CMD_READ:
 				++mycpu->gd_cnt.v_swapin;
-				mycpu->gd_cnt.v_swappgsin += btoc(bufx->b_bcount);
-			} else {
+				mycpu->gd_cnt.v_swappgsin +=
+					btoc(bufx->b_bcount);
+				break;
+			case BUF_CMD_WRITE:
 				++mycpu->gd_cnt.v_swapout;
-				mycpu->gd_cnt.v_swappgsout += btoc(bufx->b_bcount);
+				mycpu->gd_cnt.v_swappgsout +=
+					btoc(bufx->b_bcount);
 				bufx->b_dirtyend = bufx->b_bcount;
+				break;
+			default:
+				/* NOT REACHED */
+				break;
 			}
 
 			/*
@@ -1038,10 +1137,9 @@ swap_pager_strategy(vm_object_t object, struct bio *bio)
 		 */
 		if (blk == SWAPBLK_NONE) {
 			/*
-			 * We can only get here if we are reading.  Since
-			 * we are at splvm() we can safely modify b_resid,
-			 * even if chain ops are in progress.
+			 * We can only get here if we are reading.
 			 */
+			bkvasync(bp);
 			bzero(data, PAGE_SIZE);
 			bp->b_resid -= PAGE_SIZE;
 		} else {
@@ -1049,9 +1147,9 @@ swap_pager_strategy(vm_object_t object, struct bio *bio)
 				/* XXX chain count > 4, wait to <= 4 */
 
 				bufx = getpbuf(NULL);
+				bufx->b_flags |= B_KVABIO;
 				biox = &bufx->b_bio1;
 				cluster_append(nbio, bufx);
-				bufx->b_flags |= (bp->b_flags & B_ORDERED);
 				bufx->b_cmd = bp->b_cmd;
 				biox->bio_done = swap_chain_iodone;
 				biox->bio_offset = (off_t)blk << PAGE_SHIFT;
@@ -1212,7 +1310,7 @@ swap_pager_getpage(vm_object_t object, vm_page_t *mpp, int seqaccess)
 	int j;
 	int raonly;
 	int error;
-	u_int32_t flags;
+	u_int32_t busy_count;
 	vm_page_t marray[XIO_INTERNAL_PAGES];
 
 	mreq = *mpp;
@@ -1287,7 +1385,7 @@ swap_pager_getpage(vm_object_t object, vm_page_t *mpp, int seqaccess)
 	blk = swp_pager_meta_ctl(mreq->object, mreq->pindex, 0);
 	marray[0] = mreq;
 
-	for (i = 1; swap_burst_read &&
+	for (i = 1; i <= swap_burst_read &&
 		    i < XIO_INTERNAL_PAGES &&
 		    mreq->pindex + i < object->size; ++i) {
 		swblk_t iblk;
@@ -1295,7 +1393,7 @@ swap_pager_getpage(vm_object_t object, vm_page_t *mpp, int seqaccess)
 		iblk = swp_pager_meta_ctl(object, mreq->pindex + i, 0);
 		if (iblk != blk + i)
 			break;
-		if ((blk ^ iblk) & dmmax_mask)
+		if ((blk ^ iblk) & ~SWB_DMMASK)
 			break;
 		m = vm_page_lookup_busy_try(object, mreq->pindex + i,
 					    TRUE, &error);
@@ -1341,17 +1439,20 @@ swap_pager_getpage(vm_object_t object, vm_page_t *mpp, int seqaccess)
 	}
 
 	/*
-	 * map our page(s) into kva for input
+	 * Map our page(s) into kva for input
+	 *
+	 * Use the KVABIO API to avoid synchronizing the pmap.
 	 */
 	bp = getpbuf_kva(&nsw_rcount);
 	bio = &bp->b_bio1;
 	kva = (vm_offset_t) bp->b_kvabase;
 	bcopy(marray, bp->b_xio.xio_pages, i * sizeof(vm_page_t));
-	pmap_qenter(kva, bp->b_xio.xio_pages, i);
+	pmap_qenter_noinval(kva, bp->b_xio.xio_pages, i);
 
 	bp->b_data = (caddr_t)kva;
 	bp->b_bcount = PAGE_SIZE * i;
 	bp->b_xio.xio_npages = i;
+	bp->b_flags |= B_KVABIO;
 	bio->bio_done = swp_pager_async_iodone;
 	bio->bio_offset = (off_t)blk << PAGE_SHIFT;
 	bio->bio_caller_info1.index = SWBIO_READ;
@@ -1366,8 +1467,10 @@ swap_pager_getpage(vm_object_t object, vm_page_t *mpp, int seqaccess)
 	else
 		bio->bio_driver_info = (void *)(intptr_t)0;
 
-	for (j = 0; j < i; ++j)
-		vm_page_flag_set(bp->b_xio.xio_pages[j], PG_SWAPINPROG);
+	for (j = 0; j < i; ++j) {
+		atomic_set_int(&bp->b_xio.xio_pages[j]->busy_count,
+			       PBUSY_SWAPINPROG);
+	}
 
 	mycpu->gd_cnt.v_swapin++;
 	mycpu->gd_cnt.v_swappgsin += bp->b_xio.xio_npages;
@@ -1392,7 +1495,7 @@ swap_pager_getpage(vm_object_t object, vm_page_t *mpp, int seqaccess)
 	vn_strategy(swapdev_vp, bio);
 
 	/*
-	 * Wait for the page we want to complete.  PG_SWAPINPROG is always
+	 * Wait for the page we want to complete.  PBUSY_SWAPINPROG is always
 	 * cleared on completion.  If an I/O error occurs, SWAPBLK_NONE
 	 * is set in the meta-data.
 	 *
@@ -1408,28 +1511,37 @@ swap_pager_getpage(vm_object_t object, vm_page_t *mpp, int seqaccess)
 	 * Read-ahead includes originally requested page case.
 	 */
 	for (;;) {
-		flags = mreq->flags;
+		busy_count = mreq->busy_count;
 		cpu_ccfence();
-		if ((flags & PG_SWAPINPROG) == 0)
+		if ((busy_count & PBUSY_SWAPINPROG) == 0)
 			break;
 		tsleep_interlock(mreq, 0);
-		if (!atomic_cmpset_int(&mreq->flags, flags,
-				       flags | PG_WANTED | PG_REFERENCED)) {
+		if (!atomic_cmpset_int(&mreq->busy_count, busy_count,
+				       busy_count |
+				        PBUSY_SWAPINPROG | PBUSY_WANTED)) {
 			continue;
 		}
+		atomic_set_int(&mreq->flags, PG_REFERENCED);
 		mycpu->gd_cnt.v_intrans++;
 		if (tsleep(mreq, PINTERLOCKED, "swread", hz*20)) {
 			kprintf(
 			    "swap_pager: indefinite wait buffer: "
-				" offset: %lld, size: %ld\n",
+			    " bp %p offset: %lld, size: %ld "
+			    " m=%p busy=%08x flags=%08x\n",
+			    bp,
 			    (long long)bio->bio_offset,
-			    (long)bp->b_bcount
-			);
+			    (long)bp->b_bcount,
+			    mreq, mreq->busy_count, mreq->flags);
 		}
 	}
 
 	/*
-	 * mreq is left bussied after completion, but all the other pages
+	 * Disallow speculative reads prior to the SWAPINPROG test.
+	 */
+	cpu_lfence();
+
+	/*
+	 * mreq is left busied after completion, but all the other pages
 	 * are freed.  If we had an unrecoverable read error the page will
 	 * not be valid.
 	 */
@@ -1473,7 +1585,7 @@ swap_pager_getpage(vm_object_t object, vm_page_t *mpp, int seqaccess)
  */
 void
 swap_pager_putpages(vm_object_t object, vm_page_t *m, int count,
-		    int sync, int *rtvals)
+		    int flags, int *rtvals)
 {
 	int i;
 	int n = 0;
@@ -1491,16 +1603,27 @@ swap_pager_putpages(vm_object_t object, vm_page_t *m, int count,
 	 * Step 1
 	 *
 	 * Turn object into OBJT_SWAP
-	 * check for bogus sysops
-	 * force sync if not pageout process
+	 * Check for bogus sysops
+	 *
+	 * Force sync if not pageout process, we don't want any single
+	 * non-pageout process to be able to hog the I/O subsystem!  This
+	 * can be overridden by setting.
 	 */
 	if (object->type == OBJT_DEFAULT) {
 		if (object->type == OBJT_DEFAULT)
 			swp_pager_meta_convert(object);
 	}
 
-	if (curthread != pagethread)
-		sync = TRUE;
+	/*
+	 * Normally we force synchronous swap I/O if this is not the
+	 * pageout daemon to prevent any single user process limited
+	 * via RLIMIT_RSS from hogging swap write bandwidth.
+	 */
+	if (curthread != pagethread &&
+	    curthread != emergpager &&
+	    swap_user_async == 0) {
+		flags |= OBJPC_SYNC;
+	}
 
 	/*
 	 * Step 2
@@ -1514,8 +1637,8 @@ swap_pager_putpages(vm_object_t object, vm_page_t *m, int count,
 		/*
 		 * limit range
 		 */
-		if ((n = swap_async_max) > nswbuf / 2)
-			n = nswbuf / 2;
+		if ((n = swap_async_max) > nswbuf_kva / 2)
+			n = nswbuf_kva / 2;
 		if (n < 1)
 			n = 1;
 		swap_async_max = n;
@@ -1584,11 +1707,10 @@ swap_pager_putpages(vm_object_t object, vm_page_t *m, int count,
 
 		/*
 		 * The I/O we are constructing cannot cross a physical
-		 * disk boundry in the swap stripe.  Note: we are still
-		 * at splvm().
+		 * disk boundry in the swap stripe.
 		 */
-		if ((blk ^ (blk + n)) & dmmax_mask) {
-			j = ((blk + dmmax) & dmmax_mask) - blk;
+		if ((blk ^ (blk + n)) & ~SWB_DMMASK) {
+			j = ((blk + SWB_DMMAX) & ~SWB_DMMASK) - blk;
 			swp_pager_freeswapspace(object, blk + j, n - j);
 			n = j;
 		}
@@ -1596,8 +1718,10 @@ swap_pager_putpages(vm_object_t object, vm_page_t *m, int count,
 		/*
 		 * All I/O parameters have been satisfied, build the I/O
 		 * request and assign the swap space.
+		 *
+		 * Use the KVABIO API to avoid synchronizing the pmap.
 		 */
-		if (sync == TRUE)
+		if ((flags & OBJPC_SYNC))
 			bp = getpbuf_kva(&nsw_wcount_sync);
 		else
 			bp = getpbuf_kva(&nsw_wcount_async);
@@ -1605,8 +1729,9 @@ swap_pager_putpages(vm_object_t object, vm_page_t *m, int count,
 
 		lwkt_reltoken(&vm_token);
 
-		pmap_qenter((vm_offset_t)bp->b_data, &m[i], n);
+		pmap_qenter_noinval((vm_offset_t)bp->b_data, &m[i], n);
 
+		bp->b_flags |= B_KVABIO;
 		bp->b_bcount = PAGE_SIZE * n;
 		bio->bio_offset = (off_t)blk << PAGE_SHIFT;
 
@@ -1619,7 +1744,7 @@ swap_pager_putpages(vm_object_t object, vm_page_t *m, int count,
 				vm_page_dirty(mreq);
 			rtvals[i+j] = VM_PAGER_OK;
 
-			vm_page_flag_set(mreq, PG_SWAPINPROG);
+			atomic_set_int(&mreq->busy_count, PBUSY_SWAPINPROG);
 			bp->b_xio.xio_pages[j] = mreq;
 		}
 		bp->b_xio.xio_npages = n;
@@ -1635,7 +1760,7 @@ swap_pager_putpages(vm_object_t object, vm_page_t *m, int count,
 		/*
 		 * asynchronous
 		 */
-		if (sync == FALSE) {
+		if ((flags & OBJPC_SYNC) == 0) {
 			bio->bio_done = swp_pager_async_iodone;
 			BUF_KERNPROC(bp);
 			vn_strategy(swapdev_vp, bio);
@@ -1654,6 +1779,8 @@ swap_pager_putpages(vm_object_t object, vm_page_t *m, int count,
 		 * double-free.
 		 */
 		bio->bio_caller_info1.index |= SWBIO_SYNC;
+		if (flags & OBJPC_TRY_TO_CACHE)
+			bio->bio_caller_info1.index |= SWBIO_TTC;
 		bio->bio_done = biodone_sync;
 		bio->bio_flags |= BIO_SYNC;
 		vn_strategy(swapdev_vp, bio);
@@ -1673,10 +1800,27 @@ swap_pager_putpages(vm_object_t object, vm_page_t *m, int count,
 
 /*
  * No requirements.
+ *
+ * Recalculate the low and high-water marks.
  */
 void
 swap_pager_newswap(void)
 {
+	/*
+	 * NOTE: vm_swap_max cannot exceed 1 billion blocks, which is the
+	 *	 limitation imposed by the blist code.  Remember that this
+	 *	 will be divided by NSWAP_MAX (4), so each swap device is
+	 *	 limited to around a terrabyte.
+	 */
+	if (vm_swap_max) {
+		nswap_lowat = (int64_t)vm_swap_max * 4 / 100;	/* 4% left */
+		nswap_hiwat = (int64_t)vm_swap_max * 6 / 100;	/* 6% left */
+		kprintf("swap low/high-water marks set to %d/%d\n",
+			nswap_lowat, nswap_hiwat);
+	} else {
+		nswap_lowat = 128;
+		nswap_hiwat = 512;
+	}
 	swp_sizecheck();
 }
 
@@ -1686,8 +1830,8 @@ swap_pager_newswap(void)
  *	Completion routine for asynchronous reads and writes from/to swap.
  *	Also called manually by synchronous code to finish up a bp.
  *
- *	For READ operations, the pages are PG_BUSY'd.  For WRITE operations, 
- *	the pages are vm_page_t->busy'd.  For READ operations, we PG_BUSY 
+ *	For READ operations, the pages are BUSY'd.  For WRITE operations,
+ *	the pages are vm_page_t->busy'd.  For READ operations, we BUSY
  *	unbusy all pages except the 'main' request page.  For WRITE 
  *	operations, we vm_page_t->busy'd unbusy all pages ( we can do this 
  *	because we marked them all VM_PAGER_PEND on return from putpages ).
@@ -1720,10 +1864,30 @@ swp_pager_async_iodone(struct bio *bio)
 	}
 
 	/*
-	 * set object, raise to splvm().
+	 * set object.
 	 */
 	if (bp->b_xio.xio_npages)
 		object = bp->b_xio.xio_pages[0]->object;
+
+#if 0
+	/* PMAP TESTING CODE (useful, keep it in but #if 0'd) */
+	if (bio->bio_caller_info1.index & SWBIO_WRITE) {
+		if (bio->bio_crc != iscsi_crc32(bp->b_data, bp->b_bcount)) {
+			kprintf("SWAPOUT: BADCRC %08x %08x\n",
+				bio->bio_crc,
+				iscsi_crc32(bp->b_data, bp->b_bcount));
+			for (i = 0; i < bp->b_xio.xio_npages; ++i) {
+				vm_page_t m = bp->b_xio.xio_pages[i];
+				if ((m->flags & PG_WRITEABLE) &&
+				    (pmap_mapped_sync(m) & PG_WRITEABLE)) {
+					kprintf("SWAPOUT: "
+						"%d/%d %p writable\n",
+						i, bp->b_xio.xio_npages, m);
+				}
+			}
+		}
+	}
+#endif
 
 	/*
 	 * remove the mapping for kernel virtual
@@ -1759,23 +1923,29 @@ swp_pager_async_iodone(struct bio *bio)
 				 * not match anything ).
 				 *
 				 * We have to wake specifically requested pages
-				 * up too because we cleared PG_SWAPINPROG and
+				 * up too because we cleared SWAPINPROG and
 				 * someone may be waiting for that.
 				 *
-				 * NOTE: for reads, m->dirty will probably
-				 * be overridden by the original caller of
-				 * getpages so don't play cute tricks here.
+				 * NOTE: For reads, m->dirty will probably
+				 *	 be overridden by the original caller
+				 *	 of getpages so don't play cute tricks
+				 *	 here.
 				 *
 				 * NOTE: We can't actually free the page from
-				 * here, because this is an interrupt.  It
-				 * is not legal to mess with object->memq
-				 * from an interrupt.  Deactivate the page
-				 * instead.
+				 *	 here, because this is an interrupt.
+				 *	 It is not legal to mess with
+				 *	 object->memq from an interrupt.
+				 *	 Deactivate the page instead.
+				 *
+				 * WARNING! The instant SWAPINPROG is
+				 *	    cleared another cpu may start
+				 *	    using the mreq page (it will
+				 *	    check m->valid immediately).
 				 */
 
 				m->valid = 0;
-				vm_page_flag_clear(m, PG_ZERO);
-				vm_page_flag_clear(m, PG_SWAPINPROG);
+				atomic_clear_int(&m->busy_count,
+						 PBUSY_SWAPINPROG);
 
 				/*
 				 * bio_driver_info holds the requested page
@@ -1807,15 +1977,18 @@ swp_pager_async_iodone(struct bio *bio)
 				 * do have backing store (the vnode).
 				 */
 				vm_page_busy_wait(m, FALSE, "swadpg");
+				vm_object_hold(m->object);
 				swp_pager_meta_ctl(m->object, m->pindex,
 						   SWM_FREE);
 				vm_page_flag_clear(m, PG_SWAPPED);
+				vm_object_drop(m->object);
 				if (m->object->type == OBJT_SWAP) {
 					vm_page_dirty(m);
 					vm_page_activate(m);
 				}
-				vm_page_flag_clear(m, PG_SWAPINPROG);
 				vm_page_io_finish(m);
+				atomic_clear_int(&m->busy_count,
+						 PBUSY_SWAPINPROG);
 				vm_page_wakeup(m);
 			}
 		} else if (bio->bio_caller_info1.index & SWBIO_READ) {
@@ -1828,8 +2001,6 @@ swp_pager_async_iodone(struct bio *bio)
 			 * that existed in the old swapper for a time before
 			 * it got ripped out due to precisely this problem.
 			 *
-			 * clear PG_ZERO in page.
-			 *
 			 * If not the requested page then deactivate it.
 			 *
 			 * Note that the requested page, reqpage, is left
@@ -1840,19 +2011,25 @@ swp_pager_async_iodone(struct bio *bio)
 			 */
 
 			/* 
-			 * NOTE: can't call pmap_clear_modify(m) from an
-			 * interrupt thread, the pmap code may have to map
-			 * non-kernel pmaps and currently asserts the case.
+			 * NOTE: Can't call pmap_clear_modify(m) from an
+			 *	 interrupt thread, the pmap code may have to
+			 *	 map non-kernel pmaps and currently asserts
+			 *	 the case.
+			 *
+			 * WARNING! The instant SWAPINPROG is
+			 *	    cleared another cpu may start
+			 *	    using the mreq page (it will
+			 *	    check m->valid immediately).
 			 */
 			/*pmap_clear_modify(m);*/
 			m->valid = VM_PAGE_BITS_ALL;
 			vm_page_undirty(m);
-			vm_page_flag_clear(m, PG_ZERO | PG_SWAPINPROG);
 			vm_page_flag_set(m, PG_SWAPPED);
+			atomic_clear_int(&m->busy_count, PBUSY_SWAPINPROG);
 
 			/*
 			 * We have to wake specifically requested pages
-			 * up too because we cleared PG_SWAPINPROG and
+			 * up too because we cleared SWAPINPROG and
 			 * could be waiting for it in getpages.  However,
 			 * be sure to not unbusy getpages specifically
 			 * requested page - getpages expects it to be 
@@ -1882,20 +2059,22 @@ swp_pager_async_iodone(struct bio *bio)
 			 *
 			 * When using the swap to cache clean vnode pages
 			 * we do not mess with the page dirty bits.
+			 *
+			 * NOTE! Nobody is waiting for the key mreq page
+			 *	 on write completion.
 			 */
 			vm_page_busy_wait(m, FALSE, "swadpg");
 			if (m->object->type == OBJT_SWAP)
 				vm_page_undirty(m);
-			vm_page_flag_clear(m, PG_SWAPINPROG);
 			vm_page_flag_set(m, PG_SWAPPED);
+			atomic_clear_int(&m->busy_count, PBUSY_SWAPINPROG);
 			if (vm_page_count_severe())
 				vm_page_deactivate(m);
-#if 0
-			if (!vm_page_count_severe() || !vm_page_try_to_cache(m))
-				vm_page_protect(m, VM_PROT_READ);
-#endif
 			vm_page_io_finish(m);
-			vm_page_wakeup(m);
+			if (bio->bio_caller_info1.index & SWBIO_TTC)
+				vm_page_try_to_cache(m);
+			else
+				vm_page_wakeup(m);
 		}
 	}
 
@@ -1981,6 +2160,7 @@ static int swp_pager_swapoff_callback(struct swblock *swap, void *data);
 int
 swap_pager_swapoff(int devidx)
 {
+	struct vm_object_hash *hash;
 	struct swswapoffinfo info;
 	struct vm_object marker;
 	vm_object_t object;
@@ -1990,10 +2170,12 @@ swap_pager_swapoff(int devidx)
 	marker.type = OBJT_MARKER;
 
 	for (n = 0; n < VMOBJ_HSIZE; ++n) {
-		lwkt_gettoken(&vmobj_tokens[n]);
-		TAILQ_INSERT_HEAD(&vm_object_lists[n], &marker, object_list);
+		hash = &vm_object_hash[n];
 
-		while ((object = TAILQ_NEXT(&marker, object_list)) != NULL) {
+		lwkt_gettoken(&hash->token);
+		TAILQ_INSERT_HEAD(&hash->list, &marker, object_entry);
+
+		while ((object = TAILQ_NEXT(&marker, object_entry)) != NULL) {
 			if (object->type == OBJT_MARKER)
 				goto skip;
 			if (object->type != OBJT_SWAP &&
@@ -2005,6 +2187,17 @@ swap_pager_swapoff(int devidx)
 				vm_object_drop(object);
 				goto skip;
 			}
+
+			/*
+			 * Object is special in that we can't just pagein
+			 * into vm_page's in it (tmpfs, vn).
+			 */
+			if ((object->flags & OBJ_NOPAGEIN) &&
+			    RB_ROOT(&object->swblock_root)) {
+				vm_object_drop(object);
+				goto skip;
+			}
+
 			info.object = object;
 			info.shared = 0;
 			info.devidx = devidx;
@@ -2013,15 +2206,15 @@ swap_pager_swapoff(int devidx)
 					    &info);
 			vm_object_drop(object);
 skip:
-			if (object == TAILQ_NEXT(&marker, object_list)) {
-				TAILQ_REMOVE(&vm_object_lists[n],
-					     &marker, object_list);
-				TAILQ_INSERT_AFTER(&vm_object_lists[n], object,
-						   &marker, object_list);
+			if (object == TAILQ_NEXT(&marker, object_entry)) {
+				TAILQ_REMOVE(&hash->list, &marker,
+					     object_entry);
+				TAILQ_INSERT_AFTER(&hash->list, object,
+						   &marker, object_entry);
 			}
 		}
-		TAILQ_REMOVE(&vm_object_lists[n], &marker, object_list);
-		lwkt_reltoken(&vmobj_tokens[n]);
+		TAILQ_REMOVE(&hash->list, &marker, object_entry);
+		lwkt_reltoken(&hash->token);
 	}
 
 	/*
@@ -2077,9 +2270,7 @@ swp_pager_swapoff_callback(struct swblock *swap, void *data)
  ************************************************************************
  *
  *	These routines manipulate the swap metadata stored in the 
- *	OBJT_SWAP object.  All swp_*() routines must be called at
- *	splvm() because swap can be freed up by the low level vm_page
- *	code which might be called from interrupts beyond what splbio() covers.
+ *	OBJT_SWAP object.
  *
  *	Swap metadata is implemented with a global hash and not directly
  *	linked into the object.  Instead the object simply contains

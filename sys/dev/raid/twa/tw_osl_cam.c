@@ -209,7 +209,7 @@ tw_osli_cam_detach(struct twa_softc *sc)
  * Return value:	0	-- success
  *			non-zero-- failure
  */
-TW_INT32
+static TW_INT32
 tw_osli_execute_scsi(struct tw_osli_req_context *req, union ccb *ccb)
 {
 	struct twa_softc		*sc = req->ctlr;
@@ -353,7 +353,7 @@ tw_osli_execute_scsi(struct tw_osli_req_context *req, union ccb *ccb)
  * Output:		None
  * Return value:	None
  */
-TW_VOID
+static TW_VOID
 twa_action(struct cam_sim *sim, union ccb *ccb)
 {
 	struct twa_softc	*sc = (struct twa_softc *)cam_sim_softc(sim);
@@ -502,7 +502,7 @@ twa_action(struct cam_sim *sim, union ccb *ccb)
  * Output:		None
  * Return value:	None
  */
-TW_VOID
+static TW_VOID
 twa_poll(struct cam_sim *sim)
 {
 	struct twa_softc *sc = (struct twa_softc *)(cam_sim_softc(sim));
@@ -538,7 +538,7 @@ tw_osli_request_bus_scan(struct twa_softc *sc)
 	lockmgr(sc->sim_lock, LK_EXCLUSIVE);
 	if (xpt_create_path(&ccb->ccb_h.path, xpt_periph, cam_sim_path(sc->sim),
 	    CAM_TARGET_WILDCARD, CAM_LUN_WILDCARD) != CAM_REQ_CMP) {
-		xpt_free_ccb(ccb);
+		xpt_free_ccb(&ccb->ccb_h);
 		lockmgr(sc->sim_lock, LK_RELEASE);
 		return(EIO);
 	}

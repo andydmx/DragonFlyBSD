@@ -14,6 +14,12 @@ LDADD=	-ll -lutil
 YFLAGS+=-v
 CFLAGS+=-I. -I${.CURDIR}
 
+# c++ headers are very noisy under -flto (-Wodr)
+.if (${CCVER:Mgcc5*} && ${CFLAGS:M-flto})
+CXXFLAGS+=-Wno-error=odr
+.endif
+
+
 CLEANFILES= y.output
 
 .include <bsd.prog.mk>

@@ -1,6 +1,6 @@
 /******************************************************************************
 
-  Copyright (c) 2001-2008, Intel Corporation 
+  Copyright (c) 2001-2015, Intel Corporation 
   All rights reserved.
   
   Redistribution and use in source and binary forms, with or without 
@@ -42,17 +42,23 @@
 #include <bus/pci/pcivar.h>
 #include <bus/pci/pcireg.h>
 
-#define usec_delay(x)		DELAY(x)
-#define msec_delay(x)		DELAY(1000*(x))
-/* TODO: Should we be paranoid about delaying in interrupt context? */
-#define msec_delay_irq(x)	DELAY(1000*(x))
+#define usec_delay(x) DELAY(x)
+#define usec_delay_irq(x) usec_delay(x)
+#define msec_delay(x) DELAY(1000*(x))
+#define msec_delay_irq(x) DELAY(1000*(x))
 
-#define DEBUGFUNC(F)		DEBUGOUT(F)
-#define DEBUGOUT(S)
-#define DEBUGOUT1(S,A)
-#define DEBUGOUT2(S,A,B)
-#define DEBUGOUT3(S,A,B,C)
-#define DEBUGOUT7(S,A,B,C,D,E,F,G)
+extern int e1000_debug;
+
+#define DEBUGOUT(S, args...)		\
+do {					\
+	if (e1000_debug)		\
+		kprintf(S, ##args);	\
+} while (0)
+#define DEBUGOUT1(S, args...)	DEBUGOUT(S, ##args)
+#define DEBUGOUT2(S, args...)	DEBUGOUT(S, ##args)
+#define DEBUGOUT3(S, args...)	DEBUGOUT(S, ##args)
+#define DEBUGOUT7(S, args...)	DEBUGOUT(S, ##args)
+#define DEBUGFUNC(F)		DEBUGOUT(F "\n")
 
 #define CMD_MEM_WRT_INVALIDATE	0x0010  /* BIT_4 */
 #define PCI_COMMAND_REGISTER	PCIR_COMMAND
@@ -69,7 +75,6 @@ typedef int64_t		s64;
 typedef int32_t		s32;
 typedef int16_t		s16;
 typedef int8_t		s8;
-typedef boolean_t	bool;
 
 #define __le16		u16
 #define __le32		u32
@@ -122,8 +127,8 @@ struct e1000_osdep {
         ((struct e1000_osdep *)(hw)->back)->mem_bus_space_handle, \
         E1000_REGISTER(hw, reg) + ((index)<< 2), value)
 
-#define E1000_READ_REG_ARRAY_DWORD	E1000_READ_REG_ARRAY
-#define E1000_WRITE_REG_ARRAY_DWORD	E1000_WRITE_REG_ARRAY
+#define E1000_READ_REG_ARRAY_DWORD E1000_READ_REG_ARRAY
+#define E1000_WRITE_REG_ARRAY_DWORD E1000_WRITE_REG_ARRAY
 
 #define E1000_READ_REG_ARRAY_BYTE(hw, reg, index) \
     bus_space_read_1(((struct e1000_osdep *)(hw)->back)->mem_bus_space_tag, \

@@ -1,4 +1,4 @@
-/*	$FreeBSD: head/sys/dev/ral/rt2560var.h 192468 2009-05-20 20:00:40Z sam $	*/
+/*	$FreeBSD$	*/
 
 /*-
  * Copyright (c) 2005, 2006
@@ -97,7 +97,6 @@ struct rt2560_rx_ring {
 
 struct rt2560_vap {
 	struct ieee80211vap	ral_vap;
-	struct ieee80211_beacon_offsets	ral_bo;
 
 	int			(*ral_newstate)(struct ieee80211vap *,
 				    enum ieee80211_state, int);
@@ -105,8 +104,13 @@ struct rt2560_vap {
 #define	RT2560_VAP(vap)		((struct rt2560_vap *)(vap))
 
 struct rt2560_softc {
-	struct arpcom		arpcom;
-	struct ifnet		*sc_ifp;
+	struct ieee80211com	sc_ic;
+#if defined(__DragonFly__)
+	struct lock		sc_mtx;
+#else
+	struct mtx		sc_mtx;
+#endif
+	struct mbufq		sc_snd;
 	device_t		sc_dev;
 	bus_space_tag_t		sc_st;
 	bus_space_handle_t	sc_sh;
@@ -146,16 +150,11 @@ struct rt2560_softc {
 	int			nb_ant;
 
 	struct rt2560_rx_radiotap_header sc_rxtap;
-	int			sc_rxtap_len;
-
 	struct rt2560_tx_radiotap_header sc_txtap;
-	int			sc_txtap_len;
-#define RT2560_F_INPUT_RUNNING	0x1
-#define RT2560_F_PRIO_OACTIVE	0x2
-#define RT2560_F_DATA_OACTIVE	0x4
-	int			sc_flags;
 
-	struct sysctl_ctx_list	sc_sysctl_ctx;
+#define RT2560_F_INPUT_RUNNING	0x1
+#define RT2560_F_RUNNING	0x2
+	int			sc_flags;
 };
 
 int	rt2560_attach(device_t, int);
@@ -163,3 +162,17 @@ int	rt2560_detach(void *);
 void	rt2560_stop(void *);
 void	rt2560_resume(void *);
 void	rt2560_intr(void *);
+
+#if defined(__DragonFly__)
+
+#define RAL_LOCK(sc)		lockmgr(&(sc)->sc_mtx, LK_EXCLUSIVE)
+#define RAL_LOCK_ASSERT(sc)	KKASSERT(lockstatus(&(sc)->sc_mtx, curthread) == LK_EXCLUSIVE)
+#define RAL_UNLOCK(sc)		lockmgr(&(sc)->sc_mtx, LK_RELEASE)
+
+#else
+
+#define RAL_LOCK(sc)		mtx_lock(&(sc)->sc_mtx)
+#define RAL_LOCK_ASSERT(sc)	mtx_assert(&(sc)->sc_mtx, MA_OWNED)
+#define RAL_UNLOCK(sc)		mtx_unlock(&(sc)->sc_mtx)
+
+#endif

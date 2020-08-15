@@ -1,5 +1,4 @@
 /*	$FreeBSD: src/sys/netinet6/ip6_forward.c,v 1.4.2.7 2003/01/24 05:11:35 sam Exp $	*/
-/*	$DragonFly: src/sys/netinet6/ip6_forward.c,v 1.13 2006/12/22 23:57:53 swildner Exp $	*/
 /*	$KAME: ip6_forward.c,v 1.69 2001/05/17 03:48:30 itojun Exp $	*/
 
 /*
@@ -34,7 +33,6 @@
 #include "opt_ip6fw.h"
 #include "opt_inet.h"
 #include "opt_inet6.h"
-#include "opt_ipsec.h"
 
 #include <sys/param.h>
 #include <sys/systm.h>
@@ -65,21 +63,6 @@
 
 #include <netinet/in_pcb.h>
 
-#ifdef IPSEC
-#include <netinet6/ipsec.h>
-#ifdef INET6
-#include <netinet6/ipsec6.h>
-#endif
-#include <netproto/key/key.h>
-#endif /* IPSEC */
-
-#ifdef FAST_IPSEC
-#include <netproto/ipsec/ipsec.h>
-#include <netproto/ipsec/ipsec6.h>
-#include <netproto/ipsec/key.h>
-#define	IPSEC
-#endif /* FAST_IPSEC */
-
 #include <net/ip6fw/ip6_fw.h>
 
 #include <net/net_osdep.h>
@@ -108,32 +91,13 @@ ip6_forward(struct mbuf *m, int srcrt)
 	int error, type = 0, code = 0;
 	struct mbuf *mcopy = NULL;
 	struct ifnet *origifp;	/* maybe unnecessary */
-#ifdef IPSEC
-	struct secpolicy *sp = NULL;
-#endif
-
-#ifdef IPSEC
-	/*
-	 * Check AH/ESP integrity.
-	 */
-	/*
-	 * Don't increment ip6s_cantforward because this is the check
-	 * before forwarding packet actually.
-	 */
-	if (ipsec6_in_reject(m, NULL)) {
-#if !defined(FAST_IPSEC)
-		ipsec6stat.in_polvio++;
-#endif
-		m_freem(m);
-		return;
-	}
-#endif /* IPSEC */
+	u_int32_t srczone, dstzone;
 
 	/*
 	 * Do not forward packets to multicast destination (should be handled
 	 * by ip6_mforward().
 	 * Do not forward packets with unspecified source.  It was discussed
-	 * in July 2000, on ipngwg mailing list.
+	 * in July 2000, on the ipngwg mailing list.
 	 */
 	if ((m->m_flags & (M_BCAST | M_MCAST)) != 0 ||
 	    IN6_IS_ADDR_MULTICAST(&ip6->ip6_dst) ||
@@ -167,147 +131,19 @@ ip6_forward(struct mbuf *m, int srcrt)
 	 * size of IPv6 + ICMPv6 headers) bytes of the packet in case
 	 * we need to generate an ICMP6 message to the src.
 	 * Thanks to M_EXT, in most cases copy will not occur.
-	 *
-	 * It is important to save it before IPsec processing as IPsec
-	 * processing may modify the mbuf.
 	 */
 	mcopy = m_copy(m, 0, imin(m->m_pkthdr.len, ICMPV6_PLD_MAXLEN));
 
-#ifdef IPSEC
-	/* get a security policy for this packet */
-	sp = ipsec6_getpolicybyaddr(m, IPSEC_DIR_OUTBOUND, IP_FORWARDING,
-	    &error);
-	if (sp == NULL) {
-		ipsec6stat.out_inval++;
-		ip6stat.ip6s_cantforward++;
-		if (mcopy) {
-#if 0
-			/* XXX: what icmp ? */
-#else
-			m_freem(mcopy);
-#endif
-		}
-		m_freem(m);
-		return;
-	}
-
-	error = 0;
-
-	/* check policy */
-	switch (sp->policy) {
-	case IPSEC_POLICY_DISCARD:
-		/*
-		 * This packet is just discarded.
-		 */
-		ipsec6stat.out_polvio++;
-		ip6stat.ip6s_cantforward++;
-		key_freesp(sp);
-		if (mcopy) {
-#if 0
-			/* XXX: what icmp ? */
-#else
-			m_freem(mcopy);
-#endif
-		}
-		m_freem(m);
-		return;
-
-	case IPSEC_POLICY_BYPASS:
-	case IPSEC_POLICY_NONE:
-		/* no need to do IPsec. */
-		key_freesp(sp);
-		goto skip_ipsec;
-
-	case IPSEC_POLICY_IPSEC:
-		if (sp->req == NULL) {
-			/* XXX should be panic ? */
-			kprintf("ip6_forward: No IPsec request specified.\n");
-			ip6stat.ip6s_cantforward++;
-			key_freesp(sp);
-			if (mcopy) {
-#if 0
-				/* XXX: what icmp ? */
-#else
-				m_freem(mcopy);
-#endif
-			}
-			m_freem(m);
-			return;
-		}
-		/* do IPsec */
-		break;
-
-	case IPSEC_POLICY_ENTRUST:
-	default:
-		/* should be panic ?? */
-		kprintf("ip6_forward: Invalid policy found. %d\n", sp->policy);
-		key_freesp(sp);
-		goto skip_ipsec;
-	}
-
-    {
-	struct ipsec_output_state state;
-
-	/*
-	 * All the extension headers will become inaccessible
-	 * (since they can be encrypted).
-	 * Don't panic, we need no more updates to extension headers
-	 * on inner IPv6 packet (since they are now encapsulated).
-	 *
-	 * IPv6 [ESP|AH] IPv6 [extension headers] payload
-	 */
-	bzero(&state, sizeof(state));
-	state.m = m;
-	state.ro = NULL;	/* update at ipsec6_output_tunnel() */
-	state.dst = NULL;	/* update at ipsec6_output_tunnel() */
-
-	error = ipsec6_output_tunnel(&state, sp, 0);
-
-	m = state.m;
-	key_freesp(sp);
-
-	if (error) {
-		/* mbuf is already reclaimed in ipsec6_output_tunnel. */
-		switch (error) {
-		case EHOSTUNREACH:
-		case ENETUNREACH:
-		case EMSGSIZE:
-		case ENOBUFS:
-		case ENOMEM:
-			break;
-		default:
-			kprintf("ip6_output (ipsec): error code %d\n", error);
-			/* fall through */
-		case ENOENT:
-			/* don't show these error codes to the user */
-			break;
-		}
-		ip6stat.ip6s_cantforward++;
-		if (mcopy) {
-#if 0
-			/* XXX: what icmp ? */
-#else
-			m_freem(mcopy);
-#endif
-		}
-		m_freem(m);
-		return;
-	}
-    }
-skip_ipsec:
-#endif /* IPSEC */
-
 	dst = (struct sockaddr_in6 *)&ip6_forward_rt.ro_dst;
 	if (!srcrt) {
-		/*
-		 * ip6_forward_rt.ro_dst.sin6_addr is equal to ip6->ip6_dst
-		 */
+		/* ip6_forward_rt.ro_dst.sin6_addr is equal to ip6->ip6_dst */
 		if (ip6_forward_rt.ro_rt == NULL ||
 		    !(ip6_forward_rt.ro_rt->rt_flags & RTF_UP)) {
 			if (ip6_forward_rt.ro_rt) {
 				RTFREE(ip6_forward_rt.ro_rt);
 				ip6_forward_rt.ro_rt = 0;
 			}
+
 			/* this probably fails but give it a try again */
 			rtalloc_ign((struct route *)&ip6_forward_rt,
 				    RTF_PRCLONING);
@@ -324,7 +160,7 @@ skip_ipsec:
 			return;
 		}
 	} else if ((rt = ip6_forward_rt.ro_rt) == NULL ||
-		 !IN6_ARE_ADDR_EQUAL(&ip6->ip6_dst, &dst->sin6_addr)) {
+		   !IN6_ARE_ADDR_EQUAL(&ip6->ip6_dst, &dst->sin6_addr)) {
 		if (ip6_forward_rt.ro_rt) {
 			RTFREE(ip6_forward_rt.ro_rt);
 			ip6_forward_rt.ro_rt = 0;
@@ -355,8 +191,9 @@ skip_ipsec:
 	 * unreachable error with Code 2 (beyond scope of source address).
 	 * [draft-ietf-ipngwg-icmp-v3-02.txt, Section 3.1]
 	 */
-	if (in6_addr2scopeid(m->m_pkthdr.rcvif, &ip6->ip6_src) !=
-	    in6_addr2scopeid(rt->rt_ifp, &ip6->ip6_src)) {
+	if (in6_addr2zoneid(m->m_pkthdr.rcvif, &ip6->ip6_src, &srczone) ||
+	    in6_addr2zoneid(rt->rt_ifp, &ip6->ip6_src, &dstzone) ||
+	    srczone != dstzone) {
 		ip6stat.ip6s_cantforward++;
 		ip6stat.ip6s_badscope++;
 		in6_ifstat_inc(rt->rt_ifp, ifs6_in_discard);
@@ -378,46 +215,17 @@ skip_ipsec:
 		return;
 	}
 
-	if (m->m_pkthdr.len > rt->rt_ifp->if_mtu) {
+	if (m->m_pkthdr.len > IN6_LINKMTU(rt->rt_ifp)) {
 		in6_ifstat_inc(rt->rt_ifp, ifs6_in_toobig);
 		if (mcopy) {
 			u_long mtu;
-#ifdef IPSEC
-			struct secpolicy *sp;
-			int ipsecerror;
-			size_t ipsechdrsiz;
-#endif
 
-			mtu = rt->rt_ifp->if_mtu;
-#ifdef IPSEC
-			/*
-			 * When we do IPsec tunnel ingress, we need to play
-			 * with if_mtu value (decrement IPsec header size
-			 * from mtu value).  The code is much simpler than v4
-			 * case, as we have the outgoing interface for
-			 * encapsulated packet as "rt->rt_ifp".
-			 */
-			sp = ipsec6_getpolicybyaddr(mcopy, IPSEC_DIR_OUTBOUND,
-				IP_FORWARDING, &ipsecerror);
-			if (sp) {
-				ipsechdrsiz = ipsec6_hdrsiz(mcopy,
-					IPSEC_DIR_OUTBOUND, NULL);
-				if (ipsechdrsiz < mtu)
-					mtu -= ipsechdrsiz;
-			}
-
-			/*
-			 * if mtu becomes less than minimum MTU,
-			 * tell minimum MTU (and I'll need to fragment it).
-			 */
-			if (mtu < IPV6_MMTU)
-				mtu = IPV6_MMTU;
-#endif
+			mtu = IN6_LINKMTU(rt->rt_ifp);
 			icmp6_error(mcopy, ICMP6_PACKET_TOO_BIG, 0, mtu);
 		}
 		m_freem(m);
 		return;
- 	}
+	}
 
 	if (rt->rt_flags & RTF_GATEWAY)
 		dst = (struct sockaddr_in6 *)rt->rt_gateway;
@@ -542,12 +350,10 @@ senderr:
 		return;
 	switch (error) {
 	case 0:
-#if 1
 		if (type == ND_REDIRECT) {
 			icmp6_redirect_output(mcopy, rt);
 			return;
 		}
-#endif
 		goto freecopy;
 
 	case EMSGSIZE:

@@ -91,6 +91,7 @@
 #include <net/if_dl.h>
 #include <net/if_media.h>
 #include <net/ifq_var.h>
+#include <net/if_ringmap.h>
 #include <net/toeplitz.h>
 #include <net/toeplitz2.h>
 #include <net/vlan/if_vlan_var.h>
@@ -108,6 +109,7 @@
 
 #include <dev/netif/ig_hal/e1000_api.h>
 #include <dev/netif/ig_hal/e1000_82571.h>
+#include <dev/netif/ig_hal/e1000_dragonfly.h>
 #include <dev/netif/emx/if_emx.h>
 
 #define DEBUG_HW 0
@@ -165,6 +167,23 @@ static const struct emx_device {
 	EMX_DEVICE(PCH_LPT_I217_V),
 	EMX_DEVICE(PCH_LPTLP_I218_LM),
 	EMX_DEVICE(PCH_LPTLP_I218_V),
+	EMX_DEVICE(PCH_I218_LM2),
+	EMX_DEVICE(PCH_I218_V2),
+	EMX_DEVICE(PCH_I218_LM3),
+	EMX_DEVICE(PCH_I218_V3),
+	EMX_DEVICE(PCH_SPT_I219_LM),
+	EMX_DEVICE(PCH_SPT_I219_V),
+	EMX_DEVICE(PCH_SPT_I219_LM2),
+	EMX_DEVICE(PCH_SPT_I219_V2),
+	EMX_DEVICE(PCH_LBG_I219_LM3),
+	EMX_DEVICE(PCH_SPT_I219_LM4),
+	EMX_DEVICE(PCH_SPT_I219_V4),
+	EMX_DEVICE(PCH_SPT_I219_LM5),
+	EMX_DEVICE(PCH_SPT_I219_V5),
+	EMX_DEVICE(PCH_CNP_I219_LM6),
+	EMX_DEVICE(PCH_CNP_I219_V6),
+	EMX_DEVICE(PCH_CNP_I219_LM7),
+	EMX_DEVICE(PCH_CNP_I219_V7),
 
 	/* required last entry */
 	EMX_DEVICE_NULL
@@ -204,7 +223,8 @@ static void	emx_intr_mask(void *);
 static void	emx_intr_body(struct emx_softc *, boolean_t);
 static void	emx_rxeof(struct emx_rxdata *, int);
 static void	emx_txeof(struct emx_txdata *);
-static void	emx_tx_collect(struct emx_txdata *);
+static void	emx_tx_collect(struct emx_txdata *, boolean_t);
+static void	emx_txgc_timer(void *);
 static void	emx_tx_purge(struct emx_softc *);
 static void	emx_enable_intr(struct emx_softc *);
 static void	emx_disable_intr(struct emx_softc *);
@@ -241,6 +261,9 @@ static void	emx_update_link_status(struct emx_softc *);
 static void	emx_smartspeed(struct emx_softc *);
 static void	emx_set_itr(struct emx_softc *, uint32_t);
 static void	emx_disable_aspm(struct emx_softc *);
+static void	emx_flush_tx_ring(struct emx_softc *);
+static void	emx_flush_rx_ring(struct emx_softc *);
+static void	emx_flush_txrx_ring(struct emx_softc *);
 
 static void	emx_print_debug_info(struct emx_softc *);
 static void	emx_print_nvm_info(struct emx_softc *);
@@ -251,10 +274,6 @@ static int	emx_sysctl_debug_info(SYSCTL_HANDLER_ARGS);
 static int	emx_sysctl_int_throttle(SYSCTL_HANDLER_ARGS);
 static int	emx_sysctl_tx_intr_nsegs(SYSCTL_HANDLER_ARGS);
 static int	emx_sysctl_tx_wreg_nsegs(SYSCTL_HANDLER_ARGS);
-#ifdef IFPOLL_ENABLE
-static int	emx_sysctl_npoll_rxoff(SYSCTL_HANDLER_ARGS);
-static int	emx_sysctl_npoll_txoff(SYSCTL_HANDLER_ARGS);
-#endif
 static void	emx_add_sysctl(struct emx_softc *);
 
 static void	emx_serialize_skipmain(struct emx_softc *);
@@ -306,6 +325,8 @@ static int	emx_debug_sbp = 0;
 static int	emx_82573_workaround = 1;
 static int	emx_msi_enable = 1;
 
+static char	emx_flowctrl[IFM_ETH_FC_STRLEN] = IFM_ETH_FC_NONE;
+
 TUNABLE_INT("hw.emx.int_throttle_ceil", &emx_int_throttle_ceil);
 TUNABLE_INT("hw.emx.rxd", &emx_rxd);
 TUNABLE_INT("hw.emx.rxr", &emx_rxr);
@@ -315,6 +336,7 @@ TUNABLE_INT("hw.emx.smart_pwr_down", &emx_smart_pwr_down);
 TUNABLE_INT("hw.emx.sbp", &emx_debug_sbp);
 TUNABLE_INT("hw.emx.82573_workaround", &emx_82573_workaround);
 TUNABLE_INT("hw.emx.msi.enable", &emx_msi_enable);
+TUNABLE_STR("hw.emx.flow_ctrl", emx_flowctrl, sizeof(emx_flowctrl));
 
 /* Global used in WOL setup with multiport cards */
 static int	emx_global_quad_port_a = 0;
@@ -339,6 +361,67 @@ emx_setup_rxdesc(emx_rxdesc_t *rxd, const struct emx_rxbuf *rxbuf)
 	rxd->rxd_bufaddr = htole64(rxbuf->paddr);
 	/* DD bit must be cleared */
 	rxd->rxd_staterr = 0;
+}
+
+static __inline void
+emx_free_txbuf(struct emx_txdata *tdata, struct emx_txbuf *tx_buffer)
+{
+
+	KKASSERT(tx_buffer->m_head != NULL);
+	KKASSERT(tdata->tx_nmbuf > 0);
+	tdata->tx_nmbuf--;
+
+	bus_dmamap_unload(tdata->txtag, tx_buffer->map);
+	m_freem(tx_buffer->m_head);
+	tx_buffer->m_head = NULL;
+}
+
+static __inline void
+emx_tx_intr(struct emx_txdata *tdata)
+{
+
+	emx_txeof(tdata);
+	if (!ifsq_is_empty(tdata->ifsq))
+		ifsq_devstart(tdata->ifsq);
+}
+
+static __inline void
+emx_try_txgc(struct emx_txdata *tdata, int16_t dec)
+{
+
+	if (tdata->tx_running > 0) {
+		tdata->tx_running -= dec;
+		if (tdata->tx_running <= 0 && tdata->tx_nmbuf &&
+		    tdata->num_tx_desc_avail < tdata->num_tx_desc &&
+		    tdata->num_tx_desc_avail + tdata->tx_intr_nsegs >
+		    tdata->num_tx_desc)
+			emx_tx_collect(tdata, TRUE);
+	}
+}
+
+static void
+emx_txgc_timer(void *xtdata)
+{
+	struct emx_txdata *tdata = xtdata;
+	struct ifnet *ifp = &tdata->sc->arpcom.ac_if;
+
+	if ((ifp->if_flags & (IFF_RUNNING | IFF_UP | IFF_NPOLLING)) !=
+	    (IFF_RUNNING | IFF_UP))
+		return;
+
+	if (!lwkt_serialize_try(&tdata->tx_serialize))
+		goto done;
+
+	if ((ifp->if_flags & (IFF_RUNNING | IFF_UP | IFF_NPOLLING)) !=
+	    (IFF_RUNNING | IFF_UP)) {
+		lwkt_serialize_exit(&tdata->tx_serialize);
+		return;
+	}
+	emx_try_txgc(tdata, EMX_TX_RUNNING_DEC);
+
+	lwkt_serialize_exit(&tdata->tx_serialize);
+done:
+	callout_reset(&tdata->tx_gc_timer, 1, emx_txgc_timer, tdata);
 }
 
 static __inline void
@@ -395,8 +478,7 @@ emx_rssinfo(struct mbuf *m, struct pktinfo *pi,
 		return NULL;
 	}
 
-	m->m_flags |= M_HASH;
-	m->m_pkthdr.hash = toeplitz_hash(hash);
+	m_sethash(m, toeplitz_hash(hash));
 	return pi;
 }
 
@@ -423,13 +505,12 @@ static int
 emx_attach(device_t dev)
 {
 	struct emx_softc *sc = device_get_softc(dev);
-	int error = 0, i, throttle, msi_enable, tx_ring_max;
+	int error = 0, i, throttle, msi_enable;
+	int tx_ring_max, ring_cnt;
 	u_int intr_flags;
 	uint16_t eeprom_data, device_id, apme_mask;
 	driver_intr_t *intr_func;
-#ifdef IFPOLL_ENABLE
-	int offset, offset_def;
-#endif
+	char flowctrl[IFM_ETH_FC_STRLEN];
 
 	/*
 	 * Setup RX rings
@@ -445,6 +526,7 @@ emx_attach(device_t dev)
 	for (i = 0; i < EMX_NTX_RING; ++i) {
 		sc->tx_data[i].sc = sc;
 		sc->tx_data[i].idx = i;
+		callout_init_mp(&sc->tx_data[i].tx_gc_timer);
 	}
 
 	/*
@@ -476,7 +558,8 @@ emx_attach(device_t dev)
 
 	KKASSERT(i == EMX_NSERIALIZE);
 
-	ifmedia_init(&sc->media, IFM_IMASK, emx_media_change, emx_media_status);
+	ifmedia_init(&sc->media, IFM_IMASK | IFM_ETH_FCMASK,
+	    emx_media_change, emx_media_status);
 	callout_init_mp(&sc->timer);
 
 	sc->dev = sc->osdep.dev = dev;
@@ -525,7 +608,7 @@ emx_attach(device_t dev)
 	    (sc->hw.mac.type == e1000_82571 ||
 	     sc->hw.mac.type == e1000_82572))
 		msi_enable = 0;
-
+again:
 	/*
 	 * Allocate interrupt
 	 */
@@ -550,8 +633,14 @@ emx_attach(device_t dev)
 	sc->intr_res = bus_alloc_resource_any(dev, SYS_RES_IRQ, &sc->intr_rid,
 	    intr_flags);
 	if (sc->intr_res == NULL) {
-		device_printf(dev, "Unable to allocate bus resource: "
-		    "interrupt\n");
+		device_printf(dev, "Unable to allocate bus resource: %s\n",
+		    sc->intr_type == PCI_INTR_TYPE_MSI ? "MSI" : "legacy intr");
+		if (!msi_enable) {
+			/* Retry with MSI. */
+			msi_enable = 1;
+			sc->flags &= ~EMX_FLAG_SHARED_INTR;
+			goto again;
+		}
 		error = ENXIO;
 		goto fail;
 	}
@@ -583,6 +672,16 @@ emx_attach(device_t dev)
 		 * XXX this goof is actually not used.
 		 */
 		sc->hw.flash_address = (uint8_t *)sc->flash;
+	} else if (sc->hw.mac.type >= e1000_pch_spt) {
+		/*
+		 * In the new SPT device flash is not a seperate BAR,
+		 * rather it is also in BAR0, so use the same tag and
+		 * an offset handle for the FLASH read/write macros
+		 * in the shared code.
+		 */
+		sc->osdep.flash_bus_space_tag = sc->osdep.mem_bus_space_tag;
+		sc->osdep.flash_bus_space_handle =
+		    sc->osdep.mem_bus_space_handle + E1000_FLASH_BASE_ADDR;
 	}
 
 	/* Do Shared Code initialization */
@@ -634,32 +733,27 @@ emx_attach(device_t dev)
 	/* This controls when hardware reports transmit completion status. */
 	sc->hw.mac.report_tx_early = 1;
 
-	/* Calculate # of RX rings */
-	sc->rx_ring_cnt = device_getenv_int(dev, "rxr", emx_rxr);
-	sc->rx_ring_cnt = if_ring_count2(sc->rx_ring_cnt, EMX_NRX_RING);
-
 	/*
-	 * Calculate # of TX rings
-	 *
-	 * XXX
-	 * I217/I218 claims to have 2 TX queues
-	 *
-	 * NOTE:
-	 * Don't enable multiple TX queues on 82574; it always gives
-	 * watchdog timeout on TX queue0, when multiple TCP streams are
-	 * received.  It was originally suspected that the hardware TX
-	 * checksum offloading caused this watchdog timeout, since only
-	 * TCP ACKs are sent during TCP receiving tests.  However, even
-	 * if the hardware TX checksum offloading is disable, TX queue0
-	 * still will give watchdog.
+	 * Calculate # of RX/TX rings
 	 */
+	ring_cnt = device_getenv_int(dev, "rxr", emx_rxr);
+	sc->rx_rmap = if_ringmap_alloc(dev, ring_cnt, EMX_NRX_RING);
+
 	tx_ring_max = 1;
 	if (sc->hw.mac.type == e1000_82571 ||
 	    sc->hw.mac.type == e1000_82572 ||
-	    sc->hw.mac.type == e1000_80003es2lan)
+	    sc->hw.mac.type == e1000_80003es2lan ||
+	    sc->hw.mac.type == e1000_pch_lpt ||
+	    sc->hw.mac.type == e1000_pch_spt ||
+	    sc->hw.mac.type == e1000_pch_cnp ||
+	    sc->hw.mac.type == e1000_82574)
 		tx_ring_max = EMX_NTX_RING;
-	sc->tx_ring_cnt = device_getenv_int(dev, "txr", emx_txr);
-	sc->tx_ring_cnt = if_ring_count2(sc->tx_ring_cnt, tx_ring_max);
+	ring_cnt = device_getenv_int(dev, "txr", emx_txr);
+	sc->tx_rmap = if_ringmap_alloc(dev, ring_cnt, tx_ring_max);
+
+	if_ringmap_match(dev, sc->rx_rmap, sc->tx_rmap);
+	sc->rx_ring_cnt = if_ringmap_count(sc->rx_rmap);
+	sc->tx_ring_cnt = if_ringmap_count(sc->tx_rmap);
 
 	/* Allocate RX/TX rings' busdma(9) stuffs */
 	error = emx_dma_alloc(sc);
@@ -713,6 +807,9 @@ emx_attach(device_t dev)
 		goto fail;
 	}
 
+	/* Disable ULP support */
+	e1000_disable_ulp_lpt_lp(&sc->hw, TRUE);
+
 	/* Determine if we have to control management hardware */
 	if (e1000_enable_mng_pass_thru(&sc->hw))
 		sc->flags |= EMX_FLAG_HAS_MGMT;
@@ -737,6 +834,14 @@ emx_attach(device_t dev)
 			e1000_read_nvm(&sc->hw,
 			    NVM_INIT_CONTROL3_PORT_A, 1, &eeprom_data);
 		}
+		break;
+
+	case e1000_pch_lpt:
+	case e1000_pch_spt:
+	case e1000_pch_cnp:
+		apme_mask = E1000_WUC_APME;
+		sc->flags |= EMX_FLAG_HAS_AMT;
+		eeprom_data = E1000_READ_REG(&sc->hw, E1000_WUC);
 		break;
 
 	default:
@@ -779,42 +884,13 @@ emx_attach(device_t dev)
 	/* XXX disable wol */
 	sc->wol = 0;
 
-#ifdef IFPOLL_ENABLE
-	/*
-	 * NPOLLING RX CPU offset
-	 */
-	if (sc->rx_ring_cnt == ncpus2) {
-		offset = 0;
-	} else {
-		offset_def = (sc->rx_ring_cnt * device_get_unit(dev)) % ncpus2;
-		offset = device_getenv_int(dev, "npoll.rxoff", offset_def);
-		if (offset >= ncpus2 ||
-		    offset % sc->rx_ring_cnt != 0) {
-			device_printf(dev, "invalid npoll.rxoff %d, use %d\n",
-			    offset, offset_def);
-			offset = offset_def;
-		}
-	}
-	sc->rx_npoll_off = offset;
-
-	/*
-	 * NPOLLING TX CPU offset
-	 */
-	if (sc->tx_ring_cnt == ncpus2) {
-		offset = 0;
-	} else {
-		offset_def = (sc->tx_ring_cnt * device_get_unit(dev)) % ncpus2;
-		offset = device_getenv_int(dev, "npoll.txoff", offset_def);
-		if (offset >= ncpus2 ||
-		    offset % sc->tx_ring_cnt != 0) {
-			device_printf(dev, "invalid npoll.txoff %d, use %d\n",
-			    offset, offset_def);
-			offset = offset_def;
-		}
-	}
-	sc->tx_npoll_off = offset;
-#endif
+	/* Initialized #of TX rings to use. */
 	sc->tx_ring_inuse = emx_get_txring_inuse(sc, FALSE);
+
+	/* Setup flow control. */
+	device_getenv_string(dev, "flow_ctrl", flowctrl, sizeof(flowctrl),
+	    emx_flowctrl);
+	sc->ifm_flowctrl = ifmedia_str2ethfc(flowctrl);
 
 	/* Setup OS specific network interface */
 	emx_setup_ifp(sc);
@@ -931,12 +1007,13 @@ emx_detach(device_t dev)
 
 	emx_dma_free(sc);
 
-	/* Free sysctl tree */
-	if (sc->sysctl_tree != NULL)
-		sysctl_ctx_free(&sc->sysctl_ctx);
-
 	if (sc->mta != NULL)
 		kfree(sc->mta, M_DEVBUF);
+
+	if (sc->rx_rmap != NULL)
+		if_ringmap_free(sc->rx_rmap);
+	if (sc->tx_rmap != NULL)
+		if_ringmap_free(sc->tx_rmap);
 
 	return (0);
 }
@@ -1012,7 +1089,7 @@ emx_start(struct ifnet *ifp, struct ifaltq_subque *ifsq)
 	while (!ifsq_is_empty(ifsq)) {
 		/* Now do we at least have a minimal? */
 		if (EMX_IS_OACTIVE(tdata)) {
-			emx_tx_collect(tdata);
+			emx_tx_collect(tdata, FALSE);
 			if (EMX_IS_OACTIVE(tdata)) {
 				ifsq_set_oactive(ifsq);
 				break;
@@ -1026,9 +1103,17 @@ emx_start(struct ifnet *ifp, struct ifaltq_subque *ifsq)
 
 		if (emx_encap(tdata, &m_head, &nsegs, &idx)) {
 			IFNET_STAT_INC(ifp, oerrors, 1);
-			emx_tx_collect(tdata);
+			emx_tx_collect(tdata, FALSE);
 			continue;
 		}
+
+		/*
+		 * TX interrupt are aggressively aggregated, so increasing
+		 * opackets at TX interrupt time will make the opackets
+		 * statistics vastly inaccurate; we do the opackets increment
+		 * now.
+		 */
+		IFNET_STAT_INC(ifp, opackets, 1);
 
 		if (nsegs >= tdata->tx_wreg_nsegs) {
 			E1000_WRITE_REG(&sc->hw, E1000_TDT(tdata->idx), idx);
@@ -1044,6 +1129,7 @@ emx_start(struct ifnet *ifp, struct ifaltq_subque *ifsq)
 	}
 	if (idx >= 0)
 		E1000_WRITE_REG(&sc->hw, E1000_TDT(tdata->idx), idx);
+	tdata->tx_running = EMX_TX_RUNNING;
 }
 
 static int
@@ -1078,6 +1164,8 @@ emx_ioctl(struct ifnet *ifp, u_long command, caddr_t data, struct ucred *cr)
 		case e1000_82572:
 		case e1000_82574:
 		case e1000_pch_lpt:
+		case e1000_pch_spt:
+		case e1000_pch_cnp:
 		case e1000_80003es2lan:
 			max_frame_size = 9234;
 			break;
@@ -1287,7 +1375,7 @@ emx_init(void *xsc)
 		polling = TRUE;
 #endif
 	sc->tx_ring_inuse = emx_get_txring_inuse(sc, polling);
-	ifq_set_subq_mask(&ifp->if_snd, sc->tx_ring_inuse - 1);
+	ifq_set_subq_divisor(&ifp->if_snd, sc->tx_ring_inuse);
 
 	/* Prepare transmit descriptors and buffers */
 	for (i = 0; i < sc->tx_ring_inuse; ++i)
@@ -1311,13 +1399,7 @@ emx_init(void *xsc)
 	/* Don't lose promiscuous settings */
 	emx_set_promisc(sc);
 
-	ifp->if_flags |= IFF_RUNNING;
-	for (i = 0; i < sc->tx_ring_inuse; ++i) {
-		ifsq_clr_oactive(sc->tx_data[i].ifsq);
-		ifsq_watchdog_start(&sc->tx_data[i].tx_watchdog);
-	}
-
-	callout_reset(&sc->timer, hz, emx_timer, sc);
+	/* Reset hardware counters */
 	e1000_clear_hw_cntrs_base_generic(&sc->hw);
 
 	/* MSI/X configuration for 82574 */
@@ -1351,6 +1433,19 @@ emx_init(void *xsc)
 	if ((sc->flags & (EMX_FLAG_HAS_MGMT | EMX_FLAG_HAS_AMT)) ==
 	    (EMX_FLAG_HAS_MGMT | EMX_FLAG_HAS_AMT))
 		emx_get_hw_control(sc);
+
+	ifp->if_flags |= IFF_RUNNING;
+	for (i = 0; i < sc->tx_ring_inuse; ++i) {
+		struct emx_txdata *tdata = &sc->tx_data[i];
+
+		ifsq_clr_oactive(tdata->ifsq);
+		ifsq_watchdog_start(&tdata->tx_watchdog);
+		if (!polling) {
+			callout_reset_bycpu(&tdata->tx_gc_timer, 1,
+			    emx_txgc_timer, tdata, ifsq_get_cpuid(tdata->ifsq));
+		}
+	}
+	callout_reset(&sc->timer, hz, emx_timer, sc);
 }
 
 static void
@@ -1403,9 +1498,7 @@ emx_intr_body(struct emx_softc *sc, boolean_t chk_asserted)
 			struct emx_txdata *tdata = &sc->tx_data[0];
 
 			lwkt_serialize_enter(&tdata->tx_serialize);
-			emx_txeof(tdata);
-			if (!ifsq_is_empty(tdata->ifsq))
-				ifsq_devstart(tdata->ifsq);
+			emx_tx_intr(tdata);
 			lwkt_serialize_exit(&tdata->tx_serialize);
 		}
 	}
@@ -1459,10 +1552,17 @@ emx_media_status(struct ifnet *ifp, struct ifmediareq *ifmr)
 	ifmr->ifm_status = IFM_AVALID;
 	ifmr->ifm_active = IFM_ETHER;
 
-	if (!sc->link_active)
+	if (!sc->link_active) {
+		if (sc->hw.mac.autoneg)
+			ifmr->ifm_active |= IFM_NONE;
+		else
+			ifmr->ifm_active |= sc->media.ifm_media;
 		return;
+	}
 
 	ifmr->ifm_status |= IFM_ACTIVE;
+	if (sc->ifm_flowctrl & IFM_ETH_FORCEPAUSE)
+		ifmr->ifm_active |= sc->ifm_flowctrl;
 
 	if (sc->hw.phy.media_type == e1000_media_type_fiber ||
 	    sc->hw.phy.media_type == e1000_media_type_internal_serdes) {
@@ -1485,6 +1585,8 @@ emx_media_status(struct ifnet *ifp, struct ifmediareq *ifmr)
 		else
 			ifmr->ifm_active |= IFM_HDX;
 	}
+	if (ifmr->ifm_active & IFM_FDX)
+		ifmr->ifm_active |= e1000_fc2ifmedia(sc->hw.fc.current_mode);
 }
 
 static int
@@ -1504,7 +1606,6 @@ emx_media_change(struct ifnet *ifp)
 		sc->hw.phy.autoneg_advertised = EMX_AUTONEG_ADV_DEFAULT;
 		break;
 
-	case IFM_1000_LX:
 	case IFM_1000_SX:
 	case IFM_1000_T:
 		sc->hw.mac.autoneg = EMX_DO_AUTO_NEG;
@@ -1512,29 +1613,52 @@ emx_media_change(struct ifnet *ifp)
 		break;
 
 	case IFM_100_TX:
+		if (IFM_OPTIONS(ifm->ifm_media) & IFM_FDX) {
+			sc->hw.mac.forced_speed_duplex = ADVERTISE_100_FULL;
+		} else {
+			if (IFM_OPTIONS(ifm->ifm_media) &
+			    (IFM_ETH_RXPAUSE | IFM_ETH_TXPAUSE)) {
+				if (bootverbose) {
+					if_printf(ifp, "Flow control is not "
+					    "allowed for half-duplex\n");
+				}
+				return EINVAL;
+			}
+			sc->hw.mac.forced_speed_duplex = ADVERTISE_100_HALF;
+		}
 		sc->hw.mac.autoneg = FALSE;
 		sc->hw.phy.autoneg_advertised = 0;
-		if ((ifm->ifm_media & IFM_GMASK) == IFM_FDX)
-			sc->hw.mac.forced_speed_duplex = ADVERTISE_100_FULL;
-		else
-			sc->hw.mac.forced_speed_duplex = ADVERTISE_100_HALF;
 		break;
 
 	case IFM_10_T:
+		if (IFM_OPTIONS(ifm->ifm_media) & IFM_FDX) {
+			sc->hw.mac.forced_speed_duplex = ADVERTISE_10_FULL;
+		} else {
+			if (IFM_OPTIONS(ifm->ifm_media) &
+			    (IFM_ETH_RXPAUSE | IFM_ETH_TXPAUSE)) {
+				if (bootverbose) {
+					if_printf(ifp, "Flow control is not "
+					    "allowed for half-duplex\n");
+				}
+				return EINVAL;
+			}
+			sc->hw.mac.forced_speed_duplex = ADVERTISE_10_HALF;
+		}
 		sc->hw.mac.autoneg = FALSE;
 		sc->hw.phy.autoneg_advertised = 0;
-		if ((ifm->ifm_media & IFM_GMASK) == IFM_FDX)
-			sc->hw.mac.forced_speed_duplex = ADVERTISE_10_FULL;
-		else
-			sc->hw.mac.forced_speed_duplex = ADVERTISE_10_HALF;
 		break;
 
 	default:
-		if_printf(ifp, "Unsupported media type\n");
-		break;
+		if (bootverbose) {
+			if_printf(ifp, "Unsupported media type %d\n",
+			    IFM_SUBTYPE(ifm->ifm_media));
+		}
+		return EINVAL;
 	}
+	sc->ifm_flowctrl = ifm->ifm_media & IFM_ETH_FCMASK;
 
-	emx_init(sc);
+	if (ifp->if_flags & IFF_RUNNING)
+		emx_init(sc);
 
 	return (0);
 }
@@ -1629,6 +1753,7 @@ emx_encap(struct emx_txdata *tdata, struct mbuf **m_headp,
 
 	KKASSERT(tdata->num_tx_desc_avail > nsegs);
 	tdata->num_tx_desc_avail -= nsegs;
+	tdata->tx_nmbuf++;
 
 	tx_buffer->m_head = m_head;
 	tx_buffer_mapped->map = tx_buffer->map;
@@ -1693,13 +1818,30 @@ emx_set_promisc(struct emx_softc *sc)
 static void
 emx_disable_promisc(struct emx_softc *sc)
 {
+	struct ifnet *ifp = &sc->arpcom.ac_if;
 	uint32_t reg_rctl;
+	int mcnt = 0;
 
 	reg_rctl = E1000_READ_REG(&sc->hw, E1000_RCTL);
+	reg_rctl &= ~(E1000_RCTL_UPE | E1000_RCTL_SBP);
 
-	reg_rctl &= ~E1000_RCTL_UPE;
-	reg_rctl &= ~E1000_RCTL_MPE;
-	reg_rctl &= ~E1000_RCTL_SBP;
+	if (ifp->if_flags & IFF_ALLMULTI) {
+		mcnt = EMX_MCAST_ADDR_MAX;
+	} else {
+		const struct ifmultiaddr *ifma;
+
+		TAILQ_FOREACH(ifma, &ifp->if_multiaddrs, ifma_link) {
+			if (ifma->ifma_addr->sa_family != AF_LINK)
+				continue;
+			if (mcnt == EMX_MCAST_ADDR_MAX)
+				break;
+			mcnt++;
+		}
+	}
+	/* Don't disable if in MAX groups */
+	if (mcnt < EMX_MCAST_ADDR_MAX)
+		reg_rctl &= ~E1000_RCTL_MPE;
+
 	E1000_WRITE_REG(&sc->hw, E1000_RCTL, reg_rctl);
 }
 
@@ -1776,6 +1918,8 @@ emx_update_link_status(struct emx_softc *sc)
 	switch (hw->phy.media_type) {
 	case e1000_media_type_copper:
 		if (hw->mac.get_link_status) {
+			if (hw->mac.type >= e1000_pch_spt)
+				msec_delay(50);
 			/* Do the work to read phy */
 			e1000_check_for_link(hw);
 			link_check = !hw->mac.get_link_status;
@@ -1820,11 +1964,19 @@ emx_update_link_status(struct emx_softc *sc)
 			E1000_WRITE_REG(hw, E1000_TARC(0), tarc0);
 		}
 		if (bootverbose) {
-			device_printf(dev, "Link is up %d Mbps %s\n",
+			char flowctrl[IFM_ETH_FC_STRLEN];
+
+			e1000_fc2str(hw->fc.current_mode, flowctrl,
+			    sizeof(flowctrl));
+			device_printf(dev, "Link is up %d Mbps %s, "
+			    "Flow control: %s\n",
 			    sc->link_speed,
-			    ((sc->link_duplex == FULL_DUPLEX) ?
-			    "Full Duplex" : "Half Duplex"));
+			    (sc->link_duplex == FULL_DUPLEX) ?
+			    "Full Duplex" : "Half Duplex",
+			    flowctrl);
 		}
+		if (sc->ifm_flowctrl & IFM_ETH_FORCEPAUSE)
+			e1000_force_flowctrl(hw, sc->ifm_flowctrl);
 		sc->link_active = 1;
 		sc->smartspeed = 0;
 		ifp->if_baudrate = sc->link_speed * 1000000;
@@ -1860,7 +2012,14 @@ emx_stop(struct emx_softc *sc)
 		ifsq_clr_oactive(tdata->ifsq);
 		ifsq_watchdog_stop(&tdata->tx_watchdog);
 		tdata->tx_flags &= ~EMX_TXFLAG_ENABLED;
+
+		tdata->tx_running = 0;
+		callout_stop(&tdata->tx_gc_timer);
 	}
+
+	/* I219 needs some special flushing to avoid hangs */
+	if (sc->hw.mac.type >= e1000_pch_spt)
+		emx_flush_txrx_ring(sc);
 
 	/*
 	 * Disable multiple receive queues.
@@ -1923,6 +2082,8 @@ emx_reset(struct emx_softc *sc)
 		break;
 
 	case e1000_pch_lpt:
+	case e1000_pch_spt:
+	case e1000_pch_cnp:
  		pba = E1000_PBA_26K;
  		break;
 
@@ -1957,12 +2118,14 @@ emx_reset(struct emx_softc *sc)
 
 	sc->hw.fc.pause_time = EMX_FC_PAUSE_TIME;
 	sc->hw.fc.send_xon = TRUE;
-	sc->hw.fc.requested_mode = e1000_fc_full;
+	sc->hw.fc.requested_mode = e1000_ifmedia2fc(sc->ifm_flowctrl);
 
 	/*
 	 * Device specific overrides/settings
 	 */
-	if (sc->hw.mac.type == e1000_pch_lpt) {
+	if (sc->hw.mac.type == e1000_pch_lpt ||
+	    sc->hw.mac.type == e1000_pch_spt ||
+	    sc->hw.mac.type == e1000_pch_cnp) {
 		sc->hw.fc.high_water = 0x5C20;
 		sc->hw.fc.low_water = 0x5048;
 		sc->hw.fc.pause_time = 0x0650;
@@ -1975,6 +2138,10 @@ emx_reset(struct emx_softc *sc)
 	} else if (sc->hw.mac.type == e1000_80003es2lan) {
 		sc->hw.fc.pause_time = 0xFFFF;
 	}
+
+	/* I219 needs some special flushing to avoid hangs */
+	if (sc->hw.mac.type >= e1000_pch_spt)
+		emx_flush_txrx_ring(sc);
 
 	/* Issue a global reset */
 	e1000_reset_hw(&sc->hw);
@@ -2016,12 +2183,14 @@ emx_setup_ifp(struct emx_softc *sc)
 	ifp->if_serialize_assert = emx_serialize_assert;
 #endif
 
+	ifp->if_nmbclusters = sc->rx_ring_cnt * sc->rx_data[0].num_rx_desc;
+
 	ifq_set_maxlen(&ifp->if_snd, sc->tx_data[0].num_tx_desc - 1);
 	ifq_set_ready(&ifp->if_snd);
 	ifq_set_subq_cnt(&ifp->if_snd, sc->tx_ring_cnt);
 
-	ifp->if_mapsubq = ifq_mapsubq_mask;
-	ifq_set_subq_mask(&ifp->if_snd, 0);
+	ifp->if_mapsubq = ifq_mapsubq_modulo;
+	ifq_set_subq_divisor(&ifp->if_snd, 1);
 
 	ether_ifattach(ifp, sc->hw.mac.addr, NULL);
 
@@ -2059,7 +2228,6 @@ emx_setup_ifp(struct emx_softc *sc)
 	    sc->hw.phy.media_type == e1000_media_type_internal_serdes) {
 		ifmedia_add(&sc->media, IFM_ETHER | IFM_1000_SX | IFM_FDX,
 			    0, NULL);
-		ifmedia_add(&sc->media, IFM_ETHER | IFM_1000_SX, 0, NULL);
 	} else {
 		ifmedia_add(&sc->media, IFM_ETHER | IFM_10_T, 0, NULL);
 		ifmedia_add(&sc->media, IFM_ETHER | IFM_10_T | IFM_FDX,
@@ -2070,12 +2238,10 @@ emx_setup_ifp(struct emx_softc *sc)
 		if (sc->hw.phy.type != e1000_phy_ife) {
 			ifmedia_add(&sc->media,
 				IFM_ETHER | IFM_1000_T | IFM_FDX, 0, NULL);
-			ifmedia_add(&sc->media,
-				IFM_ETHER | IFM_1000_T, 0, NULL);
 		}
 	}
 	ifmedia_add(&sc->media, IFM_ETHER | IFM_AUTO, 0, NULL);
-	ifmedia_set(&sc->media, IFM_ETHER | IFM_AUTO);
+	ifmedia_set(&sc->media, IFM_ETHER | IFM_AUTO | sc->ifm_flowctrl);
 }
 
 /*
@@ -2175,7 +2341,8 @@ emx_create_tx_ring(struct emx_txdata *tdata)
 
 	tsize = __VM_CACHELINE_ALIGN(
 	    sizeof(struct emx_txbuf) * tdata->num_tx_desc);
-	tdata->tx_buf = kmalloc_cachealign(tsize, M_DEVBUF, M_WAITOK | M_ZERO);
+	tdata->tx_buf = kmalloc(tsize, M_DEVBUF,
+				M_WAITOK | M_ZERO | M_CACHEALIGN);
 
 	/*
 	 * Create DMA tags for tx buffers
@@ -2237,15 +2404,20 @@ emx_create_tx_ring(struct emx_txdata *tdata)
 		tdata->tx_intr_nsegs = tdata->oact_tx_desc;
 
 	/*
-	 * Pullup extra 4bytes into the first data segment, see:
+	 * Pullup extra 4bytes into the first data segment for TSO, see:
 	 * 82571/82572 specification update errata #7
+	 *
+	 * Same applies to I217 (and maybe I218 and I219).
 	 *
 	 * NOTE:
 	 * 4bytes instead of 2bytes, which are mentioned in the errata,
 	 * are pulled; mainly to keep rest of the data properly aligned.
 	 */
 	if (tdata->sc->hw.mac.type == e1000_82571 ||
-	    tdata->sc->hw.mac.type == e1000_82572)
+	    tdata->sc->hw.mac.type == e1000_82572 ||
+	    tdata->sc->hw.mac.type == e1000_pch_lpt ||
+	    tdata->sc->hw.mac.type == e1000_pch_spt ||
+	    tdata->sc->hw.mac.type == e1000_pch_cnp)
 		tdata->tx_flags |= EMX_TXFLAG_TSO_PULLEX;
 
 	return (0);
@@ -2262,6 +2434,8 @@ emx_init_tx_ring(struct emx_txdata *tdata)
 	tdata->next_avail_tx_desc = 0;
 	tdata->next_tx_to_clean = 0;
 	tdata->num_tx_desc_avail = tdata->num_tx_desc;
+	tdata->tx_nmbuf = 0;
+	tdata->tx_running = 0;
 
 	tdata->tx_flags |= EMX_TXFLAG_ENABLED;
 	if (tdata->sc->tx_ring_inuse > 1) {
@@ -2276,7 +2450,7 @@ emx_init_tx_ring(struct emx_txdata *tdata)
 static void
 emx_init_tx_unit(struct emx_softc *sc)
 {
-	uint32_t tctl, tarc, tipg = 0;
+	uint32_t tctl, tarc, tipg = 0, txdctl;
 	int i;
 
 	for (i = 0; i < sc->tx_ring_inuse; ++i) {
@@ -2294,6 +2468,15 @@ emx_init_tx_unit(struct emx_softc *sc)
 		/* Setup the HW Tx Head and Tail descriptor pointers */
 		E1000_WRITE_REG(&sc->hw, E1000_TDT(i), 0);
 		E1000_WRITE_REG(&sc->hw, E1000_TDH(i), 0);
+
+		txdctl = 0x1f;		/* PTHRESH */
+		txdctl |= 1 << 8;	/* HTHRESH */
+		txdctl |= 1 << 16;	/* WTHRESH */
+		txdctl |= 1 << 22;	/* Reserved bit 22 must always be 1 */
+		txdctl |= E1000_TXDCTL_GRAN;
+		txdctl |= 1 << 25;	/* LWTHRESH */
+
+		E1000_WRITE_REG(&sc->hw, E1000_TXDCTL(i), txdctl);
 	}
 
 	/* Set the default values for the Tx Inter Packet Gap timer */
@@ -2321,18 +2504,37 @@ emx_init_tx_unit(struct emx_softc *sc)
 	E1000_WRITE_REG(&sc->hw, E1000_TIDV, 1);
 	E1000_WRITE_REG(&sc->hw, E1000_TADV, 0);
 
+	/*
+	 * Errata workaround (obtained from Linux).  This is necessary
+	 * to make multiple TX queues work on 82574.
+	 * XXX can't find it in any published errata though.
+	 */
+	txdctl = E1000_READ_REG(&sc->hw, E1000_TXDCTL(0));
+	E1000_WRITE_REG(&sc->hw, E1000_TXDCTL(1), txdctl);
+
 	if (sc->hw.mac.type == e1000_82571 ||
 	    sc->hw.mac.type == e1000_82572) {
 		tarc = E1000_READ_REG(&sc->hw, E1000_TARC(0));
 		tarc |= EMX_TARC_SPEED_MODE;
 		E1000_WRITE_REG(&sc->hw, E1000_TARC(0), tarc);
 	} else if (sc->hw.mac.type == e1000_80003es2lan) {
+		/* errata: program both queues to unweighted RR */
 		tarc = E1000_READ_REG(&sc->hw, E1000_TARC(0));
 		tarc |= 1;
 		E1000_WRITE_REG(&sc->hw, E1000_TARC(0), tarc);
 		tarc = E1000_READ_REG(&sc->hw, E1000_TARC(1));
 		tarc |= 1;
 		E1000_WRITE_REG(&sc->hw, E1000_TARC(1), tarc);
+	} else if (sc->hw.mac.type == e1000_82574) {
+		tarc = E1000_READ_REG(&sc->hw, E1000_TARC(0));
+		tarc |= EMX_TARC_ERRATA;
+		if (sc->tx_ring_inuse > 1) {
+			tarc |= (EMX_TARC_COMPENSATION_MODE | EMX_TARC_MQ_FIX);
+			E1000_WRITE_REG(&sc->hw, E1000_TARC(0), tarc);
+			E1000_WRITE_REG(&sc->hw, E1000_TARC(1), tarc);
+		} else {
+			E1000_WRITE_REG(&sc->hw, E1000_TARC(0), tarc);
+		}
 	}
 
 	/* Program the Transmit Control Register */
@@ -2352,6 +2554,15 @@ emx_init_tx_unit(struct emx_softc *sc)
 		tarc = E1000_READ_REG(&sc->hw, E1000_TARC(1));
 		tarc &= ~(1 << 28);
 		E1000_WRITE_REG(&sc->hw, E1000_TARC(1), tarc);
+	} else if (sc->hw.mac.type >= e1000_pch_spt) {
+		uint32_t reg;
+
+		reg = E1000_READ_REG(&sc->hw, E1000_IOSFPC);
+		reg |= E1000_RCTL_RDMTS_HEX;
+		E1000_WRITE_REG(&sc->hw, E1000_IOSFPC, reg);
+		reg = E1000_READ_REG(&sc->hw, E1000_TARC(0));
+		reg |= E1000_TARC0_CB_MULTIQ_3_REQ;
+		E1000_WRITE_REG(&sc->hw, E1000_TARC(0), reg);
 	}
 
 	if (sc->tx_ring_inuse > 1) {
@@ -2513,7 +2724,6 @@ emx_txcsum(struct emx_txdata *tdata, struct mbuf *mp,
 static void
 emx_txeof(struct emx_txdata *tdata)
 {
-	struct ifnet *ifp = &tdata->sc->arpcom.ac_if;
 	struct emx_txbuf *tx_buffer;
 	int first, num_avail;
 
@@ -2540,16 +2750,12 @@ emx_txeof(struct emx_txdata *tdata)
 			while (first != dd_idx) {
 				logif(pkt_txclean);
 
+				KKASSERT(num_avail < tdata->num_tx_desc);
 				num_avail++;
 
 				tx_buffer = &tdata->tx_buf[first];
-				if (tx_buffer->m_head) {
-					IFNET_STAT_INC(ifp, opackets, 1);
-					bus_dmamap_unload(tdata->txtag,
-							  tx_buffer->map);
-					m_freem(tx_buffer->m_head);
-					tx_buffer->m_head = NULL;
-				}
+				if (tx_buffer->m_head)
+					emx_free_txbuf(tdata, tx_buffer);
 
 				if (++first == tdata->num_tx_desc)
 					first = 0;
@@ -2573,12 +2779,12 @@ emx_txeof(struct emx_txdata *tdata)
 		if (tdata->num_tx_desc_avail == tdata->num_tx_desc)
 			tdata->tx_watchdog.wd_timer = 0;
 	}
+	tdata->tx_running = EMX_TX_RUNNING;
 }
 
 static void
-emx_tx_collect(struct emx_txdata *tdata)
+emx_tx_collect(struct emx_txdata *tdata, boolean_t gc)
 {
-	struct ifnet *ifp = &tdata->sc->arpcom.ac_if;
 	struct emx_txbuf *tx_buffer;
 	int tdh, first, num_avail, dd_idx = -1;
 
@@ -2586,8 +2792,13 @@ emx_tx_collect(struct emx_txdata *tdata)
 		return;
 
 	tdh = E1000_READ_REG(&tdata->sc->hw, E1000_TDH(tdata->idx));
-	if (tdh == tdata->next_tx_to_clean)
+	if (tdh == tdata->next_tx_to_clean) {
+		if (gc && tdata->tx_nmbuf > 0)
+			tdata->tx_running = EMX_TX_RUNNING;
 		return;
+	}
+	if (gc)
+		tdata->tx_gc++;
 
 	if (tdata->tx_dd_head != tdata->tx_dd_tail)
 		dd_idx = tdata->tx_dd[tdata->tx_dd_head];
@@ -2598,16 +2809,12 @@ emx_tx_collect(struct emx_txdata *tdata)
 	while (first != tdh) {
 		logif(pkt_txclean);
 
+		KKASSERT(num_avail < tdata->num_tx_desc);
 		num_avail++;
 
 		tx_buffer = &tdata->tx_buf[first];
-		if (tx_buffer->m_head) {
-			IFNET_STAT_INC(ifp, opackets, 1);
-			bus_dmamap_unload(tdata->txtag,
-					  tx_buffer->map);
-			m_freem(tx_buffer->m_head);
-			tx_buffer->m_head = NULL;
-		}
+		if (tx_buffer->m_head)
+			emx_free_txbuf(tdata, tx_buffer);
 
 		if (first == dd_idx) {
 			EMX_INC_TXDD_IDX(tdata->tx_dd_head);
@@ -2633,6 +2840,8 @@ emx_tx_collect(struct emx_txdata *tdata)
 		if (tdata->num_tx_desc_avail == tdata->num_tx_desc)
 			tdata->tx_watchdog.wd_timer = 0;
 	}
+	if (!gc || tdata->tx_nmbuf > 0)
+		tdata->tx_running = EMX_TX_RUNNING;
 }
 
 /*
@@ -2653,7 +2862,7 @@ emx_tx_purge(struct emx_softc *sc)
 		struct emx_txdata *tdata = &sc->tx_data[i];
 
 		if (tdata->tx_watchdog.wd_timer) {
-			emx_tx_collect(tdata);
+			emx_tx_collect(tdata, FALSE);
 			if (tdata->tx_watchdog.wd_timer) {
 				if_printf(&sc->arpcom.ac_if,
 				    "Link lost, TX pending, reinit\n");
@@ -2673,7 +2882,7 @@ emx_newbuf(struct emx_rxdata *rdata, int i, int init)
 	struct emx_rxbuf *rx_buffer;
 	int error, nseg;
 
-	m = m_getcl(init ? MB_WAIT : MB_DONTWAIT, MT_DATA, M_PKTHDR);
+	m = m_getcl(init ? M_WAITOK : M_NOWAIT, MT_DATA, M_PKTHDR);
 	if (m == NULL) {
 		if (init) {
 			if_printf(&rdata->sc->arpcom.ac_if,
@@ -2750,7 +2959,8 @@ emx_create_rx_ring(struct emx_rxdata *rdata)
 
 	rsize = __VM_CACHELINE_ALIGN(
 	    sizeof(struct emx_rxbuf) * rdata->num_rx_desc);
-	rdata->rx_buf = kmalloc_cachealign(rsize, M_DEVBUF, M_WAITOK | M_ZERO);
+	rdata->rx_buf = kmalloc(rsize, M_DEVBUF,
+				M_WAITOK | M_ZERO | M_CACHEALIGN);
 
 	/*
 	 * Create DMA tag for rx buffers
@@ -2831,11 +3041,8 @@ emx_free_tx_ring(struct emx_txdata *tdata)
 	for (i = 0; i < tdata->num_tx_desc; i++) {
 		struct emx_txbuf *tx_buffer = &tdata->tx_buf[i];
 
-		if (tx_buffer->m_head != NULL) {
-			bus_dmamap_unload(tdata->txtag, tx_buffer->map);
-			m_freem(tx_buffer->m_head);
-			tx_buffer->m_head = NULL;
-		}
+		if (tx_buffer->m_head != NULL)
+			emx_free_txbuf(tdata, tx_buffer);
 	}
 
 	tdata->tx_flags &= ~EMX_TXFLAG_FORCECTX;
@@ -2878,7 +3085,7 @@ emx_init_rx_unit(struct emx_softc *sc)
 {
 	struct ifnet *ifp = &sc->arpcom.ac_if;
 	uint64_t bus_addr;
-	uint32_t rctl, itr, rfctl;
+	uint32_t rctl, itr, rfctl, rxcsum;
 	int i;
 
 	/*
@@ -2886,7 +3093,9 @@ emx_init_rx_unit(struct emx_softc *sc)
 	 * up the descriptor ring
 	 */
 	rctl = E1000_READ_REG(&sc->hw, E1000_RCTL);
-	E1000_WRITE_REG(&sc->hw, E1000_RCTL, rctl & ~E1000_RCTL_EN);
+	/* Do not disable if ever enabled on this hardware */
+	if (sc->hw.mac.type != e1000_82574)
+		E1000_WRITE_REG(&sc->hw, E1000_RCTL, rctl & ~E1000_RCTL_EN);
 
 	/*
 	 * Set the interrupt throttling rate. Value is calculated
@@ -2899,12 +3108,11 @@ emx_init_rx_unit(struct emx_softc *sc)
 	emx_set_itr(sc, itr);
 
 	/* Use extended RX descriptor */
-	rfctl = E1000_RFCTL_EXTEN;
-
+	rfctl = E1000_READ_REG(&sc->hw, E1000_RFCTL);
+	rfctl |= E1000_RFCTL_EXTEN;
 	/* Disable accelerated ackknowledge */
 	if (sc->hw.mac.type == e1000_82574)
 		rfctl |= E1000_RFCTL_ACK_DIS;
-
 	E1000_WRITE_REG(&sc->hw, E1000_RFCTL, rfctl);
 
 	/*
@@ -2914,12 +3122,9 @@ emx_init_rx_unit(struct emx_softc *sc)
 	 * queue is to be supported, since we need it to figure out
 	 * packet type.
 	 */
+	rxcsum = E1000_READ_REG(&sc->hw, E1000_RXCSUM);
 	if ((ifp->if_capenable & IFCAP_RXCSUM) ||
 	    sc->rx_ring_cnt > 1) {
-		uint32_t rxcsum;
-
-		rxcsum = E1000_READ_REG(&sc->hw, E1000_RXCSUM);
-
 		/*
 		 * NOTE:
 		 * PCSD must be enabled to enable multiple
@@ -2927,15 +3132,18 @@ emx_init_rx_unit(struct emx_softc *sc)
 		 */
 		rxcsum |= E1000_RXCSUM_IPOFL | E1000_RXCSUM_TUOFL |
 			  E1000_RXCSUM_PCSD;
-		E1000_WRITE_REG(&sc->hw, E1000_RXCSUM, rxcsum);
+	} else {
+		rxcsum &= ~(E1000_RXCSUM_IPOFL | E1000_RXCSUM_TUOFL |
+			    E1000_RXCSUM_PCSD);
 	}
+	E1000_WRITE_REG(&sc->hw, E1000_RXCSUM, rxcsum);
 
 	/*
 	 * Configure multiple receive queue (RSS)
 	 */
 	if (sc->rx_ring_cnt > 1) {
 		uint8_t key[EMX_NRSSRK * EMX_RSSRK_SIZE];
-		uint32_t reta;
+		int r, j;
 
 		KASSERT(sc->rx_ring_cnt == EMX_NRX_RING,
 		    ("invalid number of RX ring (%d)", sc->rx_ring_cnt));
@@ -2961,20 +3169,25 @@ emx_init_rx_unit(struct emx_softc *sc)
 		}
 
 		/*
-		 * Configure RSS redirect table in following fashion:
-	 	 * (hash & ring_cnt_mask) == rdr_table[(hash & rdr_table_mask)]
+		 * Configure RSS redirect table.
 		 */
-		reta = 0;
-		for (i = 0; i < EMX_RETA_SIZE; ++i) {
-			uint32_t q;
+		if_ringmap_rdrtable(sc->rx_rmap, sc->rdr_table,
+		    EMX_RDRTABLE_SIZE);
 
-			q = (i % sc->rx_ring_cnt) << EMX_RETA_RINGIDX_SHIFT;
-			reta |= q << (8 * i);
+		r = 0;
+		for (j = 0; j < EMX_NRETA; ++j) {
+			uint32_t reta = 0;
+
+			for (i = 0; i < EMX_RETA_SIZE; ++i) {
+				uint32_t q;
+
+				q = sc->rdr_table[r] << EMX_RETA_RINGIDX_SHIFT;
+				reta |= q << (8 * i);
+				++r;
+			}
+			EMX_RSS_DPRINTF(sc, 1, "reta 0x%08x\n", reta);
+			E1000_WRITE_REG(&sc->hw, E1000_RETA(j), reta);
 		}
-		EMX_RSS_DPRINTF(sc, 1, "reta 0x%08x\n", reta);
-
-		for (i = 0; i < EMX_NRETA; ++i)
-			E1000_WRITE_REG(&sc->hw, E1000_RETA(i), reta);
 
 		/*
 		 * Enable multiple receive queues.
@@ -3019,6 +3232,20 @@ emx_init_rx_unit(struct emx_softc *sc)
 		E1000_WRITE_REG(&sc->hw, E1000_RDH(i), 0);
 		E1000_WRITE_REG(&sc->hw, E1000_RDT(i),
 		    sc->rx_data[i].num_rx_desc - 1);
+	}
+
+	/* Set PTHRESH for improved jumbo performance */
+	if (ifp->if_mtu > ETHERMTU && sc->hw.mac.type == e1000_82574) {
+		uint32_t rxdctl;
+
+		for (i = 0; i < sc->rx_ring_cnt; ++i) {
+			rxdctl = E1000_READ_REG(&sc->hw, E1000_RXDCTL(i));
+                	rxdctl |= 0x20;		/* PTHRESH */
+                	rxdctl |= 4 << 8;	/* HTHRESH */
+                	rxdctl |= 4 << 16;	/* WTHRESH */
+			rxdctl |= 1 << 24;	/* Switch to granularity */
+			E1000_WRITE_REG(&sc->hw, E1000_RXDCTL(i), rxdctl);
+		}
 	}
 
 	if (sc->hw.mac.type >= e1000_pch2lan) {
@@ -3359,7 +3586,7 @@ emx_is_valid_eaddr(const uint8_t *addr)
 /*
  * Enable PCI Wake On Lan capability
  */
-void
+static void
 emx_enable_wol(device_t dev)
 {
 	uint16_t cap, status;
@@ -3629,89 +3856,88 @@ emx_sysctl_stats(SYSCTL_HANDLER_ARGS)
 static void
 emx_add_sysctl(struct emx_softc *sc)
 {
-#if defined(EMX_RSS_DEBUG) || defined(EMX_TSS_DEBUG)
+	struct sysctl_ctx_list *ctx;
+	struct sysctl_oid *tree;
 	char pkt_desc[32];
 	int i;
-#endif
 
-	sysctl_ctx_init(&sc->sysctl_ctx);
-	sc->sysctl_tree = SYSCTL_ADD_NODE(&sc->sysctl_ctx,
-				SYSCTL_STATIC_CHILDREN(_hw), OID_AUTO,
-				device_get_nameunit(sc->dev),
-				CTLFLAG_RD, 0, "");
-	if (sc->sysctl_tree == NULL) {
-		device_printf(sc->dev, "can't add sysctl node\n");
-		return;
-	}
-
-	SYSCTL_ADD_PROC(&sc->sysctl_ctx, SYSCTL_CHILDREN(sc->sysctl_tree),
+	ctx = device_get_sysctl_ctx(sc->dev);
+	tree = device_get_sysctl_tree(sc->dev);
+	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree),
 			OID_AUTO, "debug", CTLTYPE_INT|CTLFLAG_RW, sc, 0,
 			emx_sysctl_debug_info, "I", "Debug Information");
 
-	SYSCTL_ADD_PROC(&sc->sysctl_ctx, SYSCTL_CHILDREN(sc->sysctl_tree),
+	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree),
 			OID_AUTO, "stats", CTLTYPE_INT|CTLFLAG_RW, sc, 0,
 			emx_sysctl_stats, "I", "Statistics");
 
-	SYSCTL_ADD_INT(&sc->sysctl_ctx, SYSCTL_CHILDREN(sc->sysctl_tree),
+	SYSCTL_ADD_INT(ctx, SYSCTL_CHILDREN(tree),
 	    OID_AUTO, "rxd", CTLFLAG_RD, &sc->rx_data[0].num_rx_desc, 0,
 	    "# of RX descs");
-	SYSCTL_ADD_INT(&sc->sysctl_ctx, SYSCTL_CHILDREN(sc->sysctl_tree),
+	SYSCTL_ADD_INT(ctx, SYSCTL_CHILDREN(tree),
 	    OID_AUTO, "txd", CTLFLAG_RD, &sc->tx_data[0].num_tx_desc, 0,
 	    "# of TX descs");
 
-	SYSCTL_ADD_PROC(&sc->sysctl_ctx, SYSCTL_CHILDREN(sc->sysctl_tree),
+	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree),
 	    OID_AUTO, "int_throttle_ceil", CTLTYPE_INT|CTLFLAG_RW, sc, 0,
 	    emx_sysctl_int_throttle, "I", "interrupt throttling rate");
-	SYSCTL_ADD_PROC(&sc->sysctl_ctx, SYSCTL_CHILDREN(sc->sysctl_tree),
+	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree),
 	    OID_AUTO, "tx_intr_nsegs", CTLTYPE_INT|CTLFLAG_RW, sc, 0,
 	    emx_sysctl_tx_intr_nsegs, "I", "# segments per TX interrupt");
-	SYSCTL_ADD_PROC(&sc->sysctl_ctx, SYSCTL_CHILDREN(sc->sysctl_tree),
+	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree),
 	    OID_AUTO, "tx_wreg_nsegs", CTLTYPE_INT|CTLFLAG_RW, sc, 0,
 	    emx_sysctl_tx_wreg_nsegs, "I",
 	    "# segments sent before write to hardware register");
 
-	SYSCTL_ADD_INT(&sc->sysctl_ctx, SYSCTL_CHILDREN(sc->sysctl_tree),
+	SYSCTL_ADD_INT(ctx, SYSCTL_CHILDREN(tree),
 	    OID_AUTO, "rx_ring_cnt", CTLFLAG_RD, &sc->rx_ring_cnt, 0,
 	    "# of RX rings");
-	SYSCTL_ADD_INT(&sc->sysctl_ctx, SYSCTL_CHILDREN(sc->sysctl_tree),
+	SYSCTL_ADD_INT(ctx, SYSCTL_CHILDREN(tree),
 	    OID_AUTO, "tx_ring_cnt", CTLFLAG_RD, &sc->tx_ring_cnt, 0,
 	    "# of TX rings");
-	SYSCTL_ADD_INT(&sc->sysctl_ctx, SYSCTL_CHILDREN(sc->sysctl_tree),
+	SYSCTL_ADD_INT(ctx, SYSCTL_CHILDREN(tree),
 	    OID_AUTO, "tx_ring_inuse", CTLFLAG_RD, &sc->tx_ring_inuse, 0,
 	    "# of TX rings used");
 
 #ifdef IFPOLL_ENABLE
-	SYSCTL_ADD_PROC(&sc->sysctl_ctx, SYSCTL_CHILDREN(sc->sysctl_tree),
-			OID_AUTO, "npoll_rxoff", CTLTYPE_INT|CTLFLAG_RW,
-			sc, 0, emx_sysctl_npoll_rxoff, "I",
-			"NPOLLING RX cpu offset");
-	SYSCTL_ADD_PROC(&sc->sysctl_ctx, SYSCTL_CHILDREN(sc->sysctl_tree),
-			OID_AUTO, "npoll_txoff", CTLTYPE_INT|CTLFLAG_RW,
-			sc, 0, emx_sysctl_npoll_txoff, "I",
-			"NPOLLING TX cpu offset");
+	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree),
+	    OID_AUTO, "tx_poll_cpumap", CTLTYPE_OPAQUE | CTLFLAG_RD,
+	    sc->tx_rmap, 0, if_ringmap_cpumap_sysctl, "I",
+	    "TX polling CPU map");
+	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree),
+	    OID_AUTO, "rx_poll_cpumap", CTLTYPE_OPAQUE | CTLFLAG_RD,
+	    sc->rx_rmap, 0, if_ringmap_cpumap_sysctl, "I",
+	    "RX polling CPU map");
 #endif
 
 #ifdef EMX_RSS_DEBUG
-	SYSCTL_ADD_INT(&sc->sysctl_ctx, SYSCTL_CHILDREN(sc->sysctl_tree),
+	SYSCTL_ADD_INT(ctx, SYSCTL_CHILDREN(tree),
 		       OID_AUTO, "rss_debug", CTLFLAG_RW, &sc->rss_debug,
 		       0, "RSS debug level");
 	for (i = 0; i < sc->rx_ring_cnt; ++i) {
 		ksnprintf(pkt_desc, sizeof(pkt_desc), "rx%d_pkt", i);
-		SYSCTL_ADD_ULONG(&sc->sysctl_ctx,
-		    SYSCTL_CHILDREN(sc->sysctl_tree), OID_AUTO,
+		SYSCTL_ADD_ULONG(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
 		    pkt_desc, CTLFLAG_RW, &sc->rx_data[i].rx_pkts,
 		    "RXed packets");
 	}
 #endif
-#ifdef EMX_TSS_DEBUG
 	for (i = 0; i < sc->tx_ring_cnt; ++i) {
+#ifdef EMX_TSS_DEBUG
 		ksnprintf(pkt_desc, sizeof(pkt_desc), "tx%d_pkt", i);
-		SYSCTL_ADD_ULONG(&sc->sysctl_ctx,
-		    SYSCTL_CHILDREN(sc->sysctl_tree), OID_AUTO,
+		SYSCTL_ADD_ULONG(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
 		    pkt_desc, CTLFLAG_RW, &sc->tx_data[i].tx_pkts,
 		    "TXed packets");
-	}
 #endif
+
+		ksnprintf(pkt_desc, sizeof(pkt_desc), "tx%d_nmbuf", i);
+		SYSCTL_ADD_INT(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
+		    pkt_desc, CTLFLAG_RD, &sc->tx_data[i].tx_nmbuf, 0,
+		    "# of pending TX mbufs");
+		ksnprintf(pkt_desc, sizeof(pkt_desc), "tx%d_gc", i);
+		SYSCTL_ADD_ULONG(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
+		    pkt_desc, CTLFLAG_RW, &sc->tx_data[i].tx_gc,
+		    "# of TX desc GC");
+	}
 }
 
 static int
@@ -3819,62 +4045,6 @@ emx_sysctl_tx_wreg_nsegs(SYSCTL_HANDLER_ARGS)
 
 	return 0;
 }
-
-#ifdef IFPOLL_ENABLE
-
-static int
-emx_sysctl_npoll_rxoff(SYSCTL_HANDLER_ARGS)
-{
-	struct emx_softc *sc = (void *)arg1;
-	struct ifnet *ifp = &sc->arpcom.ac_if;
-	int error, off;
-
-	off = sc->rx_npoll_off;
-	error = sysctl_handle_int(oidp, &off, 0, req);
-	if (error || req->newptr == NULL)
-		return error;
-	if (off < 0)
-		return EINVAL;
-
-	ifnet_serialize_all(ifp);
-	if (off >= ncpus2 || off % sc->rx_ring_cnt != 0) {
-		error = EINVAL;
-	} else {
-		error = 0;
-		sc->rx_npoll_off = off;
-	}
-	ifnet_deserialize_all(ifp);
-
-	return error;
-}
-
-static int
-emx_sysctl_npoll_txoff(SYSCTL_HANDLER_ARGS)
-{
-	struct emx_softc *sc = (void *)arg1;
-	struct ifnet *ifp = &sc->arpcom.ac_if;
-	int error, off;
-
-	off = sc->tx_npoll_off;
-	error = sysctl_handle_int(oidp, &off, 0, req);
-	if (error || req->newptr == NULL)
-		return error;
-	if (off < 0)
-		return EINVAL;
-
-	ifnet_serialize_all(ifp);
-	if (off >= ncpus2 || off % sc->tx_ring_cnt != 0) {
-		error = EINVAL;
-	} else {
-		error = 0;
-		sc->tx_npoll_off = off;
-	}
-	ifnet_deserialize_all(ifp);
-
-	return error;
-}
-
-#endif	/* IFPOLL_ENABLE */
 
 static int
 emx_dma_alloc(struct emx_softc *sc)
@@ -4016,9 +4186,8 @@ emx_npoll_tx(struct ifnet *ifp, void *arg, int cycle __unused)
 
 	ASSERT_SERIALIZED(&tdata->tx_serialize);
 
-	emx_txeof(tdata);
-	if (!ifsq_is_empty(tdata->ifsq))
-		ifsq_devstart(tdata->ifsq);
+	emx_tx_intr(tdata);
+	emx_try_txgc(tdata, 1);
 }
 
 static void
@@ -4040,40 +4209,31 @@ emx_npoll(struct ifnet *ifp, struct ifpoll_info *info)
 	ASSERT_IFNET_SERIALIZED_ALL(ifp);
 
 	if (info) {
-		int off;
+		int cpu;
 
 		info->ifpi_status.status_func = emx_npoll_status;
 		info->ifpi_status.serializer = &sc->main_serialize;
 
 		txr_cnt = emx_get_txring_inuse(sc, TRUE);
-		off = sc->tx_npoll_off;
 		for (i = 0; i < txr_cnt; ++i) {
 			struct emx_txdata *tdata = &sc->tx_data[i];
-			int idx = i + off;
 
-			KKASSERT(idx < ncpus2);
-			info->ifpi_tx[idx].poll_func = emx_npoll_tx;
-			info->ifpi_tx[idx].arg = tdata;
-			info->ifpi_tx[idx].serializer = &tdata->tx_serialize;
-			ifsq_set_cpuid(tdata->ifsq, idx);
+			cpu = if_ringmap_cpumap(sc->tx_rmap, i);
+			KKASSERT(cpu < netisr_ncpus);
+			info->ifpi_tx[cpu].poll_func = emx_npoll_tx;
+			info->ifpi_tx[cpu].arg = tdata;
+			info->ifpi_tx[cpu].serializer = &tdata->tx_serialize;
+			ifsq_set_cpuid(tdata->ifsq, cpu);
 		}
 
-		off = sc->rx_npoll_off;
 		for (i = 0; i < sc->rx_ring_cnt; ++i) {
 			struct emx_rxdata *rdata = &sc->rx_data[i];
-			int idx = i + off;
 
-			KKASSERT(idx < ncpus2);
-			info->ifpi_rx[idx].poll_func = emx_npoll_rx;
-			info->ifpi_rx[idx].arg = rdata;
-			info->ifpi_rx[idx].serializer = &rdata->rx_serialize;
-		}
-
-		if (ifp->if_flags & IFF_RUNNING) {
-			if (txr_cnt == sc->tx_ring_inuse)
-				emx_disable_intr(sc);
-			else
-				emx_init(sc);
+			cpu = if_ringmap_cpumap(sc->rx_rmap, i);
+			KKASSERT(cpu < netisr_ncpus);
+			info->ifpi_rx[cpu].poll_func = emx_npoll_rx;
+			info->ifpi_rx[cpu].arg = rdata;
+			info->ifpi_rx[cpu].serializer = &rdata->rx_serialize;
 		}
 	} else {
 		for (i = 0; i < sc->tx_ring_cnt; ++i) {
@@ -4082,15 +4242,9 @@ emx_npoll(struct ifnet *ifp, struct ifpoll_info *info)
 			ifsq_set_cpuid(tdata->ifsq,
 			    rman_get_cpuid(sc->intr_res));
 		}
-
-		if (ifp->if_flags & IFF_RUNNING) {
-			txr_cnt = emx_get_txring_inuse(sc, FALSE);
-			if (txr_cnt == sc->tx_ring_inuse)
-				emx_enable_intr(sc);
-			else
-				emx_init(sc);
-		}
 	}
+	if (ifp->if_flags & IFF_RUNNING)
+		emx_init(sc);
 }
 
 #endif	/* IFPOLL_ENABLE */
@@ -4309,4 +4463,126 @@ emx_get_txring_inuse(const struct emx_softc *sc, boolean_t polling)
 		return sc->tx_ring_cnt;
 	else
 		return 1;
+}
+
+/*
+ * Remove all descriptors from the TX ring.
+ *
+ * We want to clear all pending descriptors from the TX ring.  Zeroing
+ * happens when the HW reads the regs.  We assign the ring itself as
+ * the data of the next descriptor.  We don't care about the data we
+ * are about to reset the HW.
+ */
+static void
+emx_flush_tx_ring(struct emx_softc *sc)
+{
+	struct e1000_hw *hw = &sc->hw;
+	uint32_t tctl;
+	int i;
+
+	tctl = E1000_READ_REG(hw, E1000_TCTL);
+	E1000_WRITE_REG(hw, E1000_TCTL, tctl | E1000_TCTL_EN);
+
+	for (i = 0; i < sc->tx_ring_inuse; ++i) {
+		struct emx_txdata *tdata = &sc->tx_data[i];
+		struct e1000_tx_desc *txd;
+
+		if (E1000_READ_REG(hw, E1000_TDLEN(i)) == 0)
+			continue;
+
+		txd = &tdata->tx_desc_base[tdata->next_avail_tx_desc++];
+		if (tdata->next_avail_tx_desc == tdata->num_tx_desc)
+			tdata->next_avail_tx_desc = 0;
+
+		/* Just use the ring as a dummy buffer addr */
+		txd->buffer_addr = tdata->tx_desc_paddr;
+		txd->lower.data = htole32(E1000_TXD_CMD_IFCS | 512);
+		txd->upper.data = 0;
+
+		E1000_WRITE_REG(hw, E1000_TDT(i), tdata->next_avail_tx_desc);
+		usec_delay(250);
+	}
+}
+
+/*
+ * Remove all descriptors from the RX rings.
+ *
+ * Mark all descriptors in the RX rings as consumed and disable the RX rings.
+ */
+static void
+emx_flush_rx_ring(struct emx_softc *sc)
+{
+	struct e1000_hw	*hw = &sc->hw;
+	uint32_t rctl;
+	int i;
+
+	rctl = E1000_READ_REG(hw, E1000_RCTL);
+	E1000_WRITE_REG(hw, E1000_RCTL, rctl & ~E1000_RCTL_EN);
+	E1000_WRITE_FLUSH(hw);
+	usec_delay(150);
+
+	for (i = 0; i < sc->rx_ring_cnt; ++i) {
+		uint32_t rxdctl;
+
+		rxdctl = E1000_READ_REG(hw, E1000_RXDCTL(i));
+		/* Zero the lower 14 bits (prefetch and host thresholds) */
+		rxdctl &= 0xffffc000;
+		/*
+		 * Update thresholds: prefetch threshold to 31, host threshold
+		 * to 1 and make sure the granularity is "descriptors" and not
+		 * "cache lines".
+		 */
+		rxdctl |= (0x1F | (1 << 8) | E1000_RXDCTL_THRESH_UNIT_DESC);
+		E1000_WRITE_REG(hw, E1000_RXDCTL(i), rxdctl);
+	}
+
+	/* Momentarily enable the RX rings for the changes to take effect */
+	E1000_WRITE_REG(hw, E1000_RCTL, rctl | E1000_RCTL_EN);
+	E1000_WRITE_FLUSH(hw);
+	usec_delay(150);
+	E1000_WRITE_REG(hw, E1000_RCTL, rctl & ~E1000_RCTL_EN);
+}
+
+/*
+ * Remove all descriptors from the descriptor rings.
+ *
+ * In i219, the descriptor rings must be emptied before resetting the HW
+ * or before changing the device state to D3 during runtime (runtime PM).
+ *
+ * Failure to do this will cause the HW to enter a unit hang state which
+ * can only be released by PCI reset on the device.
+ */
+static void
+emx_flush_txrx_ring(struct emx_softc *sc)
+{
+	struct e1000_hw *hw = &sc->hw;
+	device_t dev = sc->dev;
+	uint16_t hang_state;
+	uint32_t fext_nvm11, tdlen;
+	int i;
+
+	/*
+	 * First, disable MULR fix in FEXTNVM11.
+	 */
+	fext_nvm11 = E1000_READ_REG(hw, E1000_FEXTNVM11);
+	fext_nvm11 |= E1000_FEXTNVM11_DISABLE_MULR_FIX;
+	E1000_WRITE_REG(hw, E1000_FEXTNVM11, fext_nvm11);
+
+	/* 
+	 * Do nothing if we're not in faulty state, or if the queue is
+	 * empty.
+	 */
+	tdlen = 0;
+	for (i = 0; i < sc->tx_ring_inuse; ++i)
+		tdlen += E1000_READ_REG(hw, E1000_TDLEN(i));
+	hang_state = pci_read_config(dev, EMX_PCICFG_DESC_RING_STATUS, 2);
+	if ((hang_state & EMX_FLUSH_DESC_REQUIRED) && tdlen)
+		emx_flush_tx_ring(sc);
+
+	/*
+	 * Recheck, maybe the fault is caused by the RX ring.
+	 */
+	hang_state = pci_read_config(dev, EMX_PCICFG_DESC_RING_STATUS, 2);
+	if (hang_state & EMX_FLUSH_DESC_REQUIRED)
+		emx_flush_rx_ring(sc);
 }

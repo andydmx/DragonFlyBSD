@@ -49,7 +49,7 @@
 #include <net/ifq_var.h>
 #include <sys/bus.h>	/* bus_dmamap_* */
 
-#include <net/netmap.h>
+#include <net/netmap/netmap.h>
 #include <net/netmap/netmap_kern.h>
 #include <net/netmap/netmap_mem2.h>
 
@@ -233,8 +233,7 @@ vm_page_getfake(vm_paddr_t paddr, vm_memattr_t memattr)
 {
 	vm_page_t m;
 
-	m = kmalloc(sizeof(struct vm_page), M_FICT_PAGES,
-	    M_WAITOK | M_ZERO);
+	m = kmalloc(sizeof(struct vm_page), M_FICT_PAGES, M_WAITOK | M_ZERO);
 	vm_page_initfake(m, paddr, memattr);
 	return (m);
 }

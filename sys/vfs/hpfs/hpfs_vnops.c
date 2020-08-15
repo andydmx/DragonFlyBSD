@@ -28,6 +28,7 @@
 
 #include <sys/param.h>
 #include <sys/systm.h>
+#include <sys/uio.h>
 #include <sys/kernel.h>
 #include <sys/proc.h>
 #include <sys/priv.h>
@@ -323,7 +324,7 @@ hpfs_read(struct vop_read_args *ap)
 			return (error);
 
 		toread = min(off + resid, min(64*1024, (runl+1)*DEV_BSIZE));
-		xfersz = (toread + DEV_BSIZE - 1) & ~(DEV_BSIZE - 1);
+		xfersz = roundup2(toread, DEV_BSIZE);
 		dprintf(("hpfs_read: bn: 0x%x (0x%x) toread: 0x%x (0x%x)\n",
 			bn, runl, toread, xfersz));
 
@@ -392,7 +393,7 @@ hpfs_write(struct vop_write_args *ap)
 
 		towrite = szmin(off + uio->uio_resid,
 				min(64*1024, (runl+1)*DEV_BSIZE));
-		xfersz = (towrite + DEV_BSIZE - 1) & ~(DEV_BSIZE - 1);
+		xfersz = roundup2(towrite, DEV_BSIZE);
 		dprintf(("hpfs_write: bn: 0x%x (0x%x) towrite: 0x%x (0x%x)\n",
 			bn, runl, towrite, xfersz));
 
@@ -448,7 +449,7 @@ hpfs_getattr(struct vop_getattr_args *ap)
 	dprintf(("hpfs_getattr(0x%x):\n", hp->h_no));
 
 #if defined(__DragonFly__)
-	vap->va_fsid = dev2udev(hp->h_dev);
+	vap->va_fsid = devid_from_dev(hp->h_dev);
 #else /* defined(__NetBSD__) */
 	vap->va_fsid = ip->i_dev;
 #endif
@@ -460,8 +461,7 @@ hpfs_getattr(struct vop_getattr_args *ap)
 	vap->va_rmajor = VNOVAL;
 	vap->va_rminor = VNOVAL;
 	vap->va_size = hp->h_fn.fn_size;
-	vap->va_bytes = ((hp->h_fn.fn_size + DEV_BSIZE-1) & ~(DEV_BSIZE-1)) +
-			DEV_BSIZE;
+	vap->va_bytes = roundup2(hp->h_fn.fn_size, DEV_BSIZE) + DEV_BSIZE;
 
 	if (!(hp->h_flag & H_PARVALID)) {
 		error = hpfs_validateparent(hp);

@@ -1,28 +1,22 @@
 /*-
+ * $FreeBSD: head/sbin/ifconfig/iflagg.c 249897 2013-04-25 16:34:04Z glebius $
  */
-
-#ifndef lint
-static const char rcsid[] =
-  "$FreeBSD: head/sbin/ifconfig/iflagg.c 249897 2013-04-25 16:34:04Z glebius $";
-#endif /* not lint */
 
 #include <sys/param.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/sockio.h>
 
-#include <stdlib.h>
-#include <unistd.h>
-
-#include <net/ethernet.h>
 #include <net/if.h>
-#include <net/lagg/if_lagg.h>
 #include <net/route.h>
+#include <net/ethernet.h>
+#include <net/lagg/if_lagg.h>
 
 #include <ctype.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdbool.h>
 #include <unistd.h>
 #include <err.h>
 #include <errno.h>
@@ -40,9 +34,17 @@ setlaggport(const char *val, int d, int s, const struct afswtch *afp)
 	strlcpy(rp.rp_ifname, name, sizeof(rp.rp_ifname));
 	strlcpy(rp.rp_portname, val, sizeof(rp.rp_portname));
 
-	/* Don't choke if the port is already in this lagg. */
-	if (ioctl(s, SIOCSLAGGPORT, &rp) && errno != EEXIST)
-		err(1, "SIOCSLAGGPORT");
+	/*
+	 * Do not exit with an error here.  Doing so permits a failed NIC
+	 * to take down an entire lagg.
+	 *
+	 * Don't error at all if the port is already in the lagg.
+	 */
+	if (ioctl(s, SIOCSLAGGPORT, &rp) && errno != EEXIST) {
+		warnx("%s %s: SIOCSLAGGPORT: %s",
+		      name, val, strerror(errno));
+		exit_code = 1;
+	}
 }
 
 static void
@@ -63,12 +65,12 @@ setlaggproto(const char *val, int d, int s, const struct afswtch *afp)
 {
 	struct lagg_protos lpr[] = LAGG_PROTOS;
 	struct lagg_reqall ra;
-	int i;
+	size_t i;
 
 	bzero(&ra, sizeof(ra));
 	ra.ra_proto = LAGG_PROTO_MAX;
 
-	for (i = 0; i < (sizeof(lpr) / sizeof(lpr[0])); i++) {
+	for (i = 0; i < nitems(lpr); i++) {
 		if (strcmp(val, lpr[i].lpr_name) == 0) {
 			ra.ra_proto = lpr[i].lpr_proto;
 			break;
@@ -147,7 +149,8 @@ lagg_status(int s)
 	struct lagg_reqflags rf;
 	struct lacp_opreq *lp;
 	const char *proto = "<unknown>";
-	int i, isport = 0;
+	bool isport = false;
+	size_t i;
 
 	bzero(&rp, sizeof(rp));
 	bzero(&ra, sizeof(ra));
@@ -156,7 +159,7 @@ lagg_status(int s)
 	strlcpy(rp.rp_portname, name, sizeof(rp.rp_portname));
 
 	if (ioctl(s, SIOCGLAGGPORT, &rp) == 0)
-		isport = 1;
+		isport = true;
 
 	strlcpy(ra.ra_ifname, name, sizeof(ra.ra_ifname));
 	ra.ra_size = sizeof(rpbuf);
@@ -169,8 +172,8 @@ lagg_status(int s)
 	if (ioctl(s, SIOCGLAGG, &ra) == 0) {
 		lp = (struct lacp_opreq *)&ra.ra_lacpreq;
 
-		for (i = 0; i < (sizeof(lpr) / sizeof(lpr[0])); i++) {
-			if (ra.ra_proto == lpr[i].lpr_proto) {
+		for (i = 0; i < nitems(lpr); i++) {
+			if ((int)ra.ra_proto == lpr[i].lpr_proto) {
 				proto = lpr[i].lpr_name;
 				break;
 			}
@@ -201,7 +204,7 @@ lagg_status(int s)
 			printf("\tlag id: %s\n",
 			    lacp_format_peer(lp, "\n\t\t "));
 
-		for (i = 0; i < ra.ra_ports; i++) {
+		for (i = 0; i < (size_t)ra.ra_ports; i++) {
 			lp = (struct lacp_opreq *)&rpbuf[i].rp_lacpreq;
 			printf("\tlaggport: %s ", rpbuf[i].rp_portname);
 			printb("flags", rpbuf[i].rp_flags, LAGG_PORT_BITS);
@@ -215,7 +218,7 @@ lagg_status(int s)
 
 		if (0 /* XXX */) {
 			printf("\tsupported aggregation protocols:\n");
-			for (i = 0; i < (sizeof(lpr) / sizeof(lpr[0])); i++)
+			for (i = 0; i < nitems(lpr); i++)
 				printf("\t\tlaggproto %s\n", lpr[i].lpr_name);
 		}
 	}
@@ -236,11 +239,9 @@ static struct afswtch af_lagg = {
 static __constructor(101) void
 lagg_ctor(void)
 {
-#define	N(a)	(sizeof(a) / sizeof(a[0]))
-	int i;
+	size_t i;
 
-	for (i = 0; i < N(lagg_cmds);  i++)
+	for (i = 0; i < nitems(lagg_cmds);  i++)
 		cmd_register(&lagg_cmds[i]);
 	af_register(&af_lagg);
-#undef N
 }

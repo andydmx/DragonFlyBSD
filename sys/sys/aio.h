@@ -14,29 +14,29 @@
  * of the author.  This software is distributed AS-IS.
  *
  * $FreeBSD: src/sys/sys/aio.h,v 1.13.2.8 2002/08/31 03:18:23 alc Exp $
- * $DragonFly: src/sys/sys/aio.h,v 1.5 2007/04/22 01:13:16 dillon Exp $
  */
 
 #ifndef _SYS_AIO_H_
 #define	_SYS_AIO_H_
 
-#ifndef _SYS_TYPES_H_
-#include <sys/types.h>
-#endif
-#ifndef _SYS_TIME_H_
-#include <sys/time.h>
-#endif
-#ifndef _SYS_SIGNAL_H_
+#include <sys/_pthreadtypes.h>
+#include <sys/_timespec.h>
 #include <sys/signal.h>
+#include <machine/stdint.h>
+
+#ifndef _OFF_T_DECLARED
+typedef	__off_t		off_t;
+#define	_OFF_T_DECLARED
 #endif
-#ifndef _SYS_QUEUE_H_
-#include <sys/queue.h>
+
+#ifndef _SIZE_T_DECLARED
+#define	_SIZE_T_DECLARED
+typedef	__size_t	size_t;
 #endif
-#ifndef _SYS_CALLOUT_H_
-#include <sys/callout.h>
-#endif
-#ifndef _SYS_EVENT_H_
-#include <sys/event.h>
+
+#ifndef _SSIZE_T_DECLARED
+#define	_SSIZE_T_DECLARED
+typedef	__ssize_t	ssize_t;
 #endif
 
 /*
@@ -50,7 +50,7 @@
  * LIO opcodes
  */
 #define	LIO_NOP			0x0
-#define LIO_WRITE		0x1
+#define	LIO_WRITE		0x1
 #define	LIO_READ		0x2
 
 /*
@@ -99,7 +99,8 @@ int	aio_write(struct aiocb *);
  *	"acb_list" is an array of "nacb_listent" I/O control blocks.
  *	when all I/Os are complete, the optional signal "sig" is sent.
  */
-int	lio_listio(int, struct aiocb * const [], int, struct sigevent *);
+int	lio_listio(int, struct aiocb * __restrict const[__restrict_arr], int,
+	    struct sigevent * __restrict);
 
 /*
  * Get completion status

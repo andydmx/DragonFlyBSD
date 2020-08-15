@@ -33,8 +33,10 @@
  */
 
 #include "hammer.h"
+
+#include <sys/tree.h>
 #include <libutil.h>
-#include <crypto/sha2/sha2.h>
+#include <openssl/sha.h>
 
 #define DEDUP_BUF (64 * 1024)
 
@@ -47,8 +49,8 @@ RB_PROTOTYPE2(sim_dedup_entry_rb_tree, sim_dedup_entry, rb_entry,
 
 struct sim_dedup_entry {
 	hammer_crc_t	crc;
-	u_int64_t	ref_blks; /* number of blocks referenced */
-	u_int64_t	ref_size; /* size of data referenced */
+	uint64_t	ref_blks; /* number of blocks referenced */
+	uint64_t	ref_size; /* size of data referenced */
 	RB_ENTRY(sim_dedup_entry) rb_entry;
 };
 
@@ -56,12 +58,12 @@ struct dedup_entry {
 	struct hammer_btree_leaf_elm leaf;
 	union {
 		struct {
-			u_int64_t ref_blks;
-			u_int64_t ref_size;
+			uint64_t ref_blks;
+			uint64_t ref_size;
 		} de;
 		RB_HEAD(sha_dedup_entry_rb_tree, sha_dedup_entry) fict_root;
 	} u;
-	u_int8_t flags;
+	uint8_t flags;
 	RB_ENTRY(dedup_entry) rb_entry;
 };
 
@@ -69,9 +71,9 @@ struct dedup_entry {
 
 struct sha_dedup_entry {
 	struct hammer_btree_leaf_elm	leaf;
-	u_int64_t			ref_blks;
-	u_int64_t			ref_size;
-	u_int8_t			sha_hash[SHA256_DIGEST_LENGTH];
+	uint64_t			ref_blks;
+	uint64_t			ref_size;
+	uint8_t				sha_hash[SHA256_DIGEST_LENGTH];
 	RB_ENTRY(sha_dedup_entry)	fict_entry;
 };
 
@@ -101,30 +103,31 @@ struct pass2_dedup_entry {
 #define DEDUP_PASS2	0x0001 /* process_btree_elm() mode */
 
 static int SigInfoFlag;
+static int SigAlrmFlag;
 static int64_t DedupDataReads;
 static int64_t DedupCurrentRecords;
 static int64_t DedupTotalRecords;
-static u_int32_t DedupCrcStart;
-static u_int32_t DedupCrcEnd;
-static u_int64_t MemoryUse;
+static uint32_t DedupCrcStart;
+static uint32_t DedupCrcEnd;
+static uint64_t MemoryUse;
 
 /* PFS global ids - we deal with just one PFS at a run */
-int glob_fd;
-struct hammer_ioc_pseudofs_rw glob_pfs;
+static int glob_fd;
+static struct hammer_ioc_pseudofs_rw glob_pfs;
 
 /*
  * Global accounting variables
  *
  * Last three don't have to be 64-bit, just to be safe..
  */
-u_int64_t dedup_alloc_size = 0;
-u_int64_t dedup_ref_size = 0;
-u_int64_t dedup_skipped_size = 0;
-u_int64_t dedup_crc_failures = 0;
-u_int64_t dedup_sha_failures = 0;
-u_int64_t dedup_underflows = 0;
-u_int64_t dedup_successes_count = 0;
-u_int64_t dedup_successes_bytes = 0;
+static uint64_t dedup_alloc_size;
+static uint64_t dedup_ref_size;
+static uint64_t dedup_skipped_size;
+static uint64_t dedup_crc_failures;
+static uint64_t dedup_sha_failures;
+static uint64_t dedup_underflows;
+static uint64_t dedup_successes_count;
+static uint64_t dedup_successes_bytes;
 
 static int rb_sim_dedup_entry_compare(struct sim_dedup_entry *sim_de1,
 				struct sim_dedup_entry *sim_de2);
@@ -137,7 +140,7 @@ static void scan_pfs(char *filesystem, scan_pfs_cb_t func, const char *id);
 static int collect_btree_elm(hammer_btree_leaf_elm_t scan_leaf, int flags);
 static int count_btree_elm(hammer_btree_leaf_elm_t scan_leaf, int flags);
 static int process_btree_elm(hammer_btree_leaf_elm_t scan_leaf, int flags);
-static int upgrade_chksum(hammer_btree_leaf_elm_t leaf, u_int8_t *sha_hash);
+static int upgrade_chksum(hammer_btree_leaf_elm_t leaf, uint8_t *sha_hash);
 static void dump_simulated_dedup(void);
 static void dump_real_dedup(void);
 static void dedup_usage(int code);
@@ -149,7 +152,8 @@ RB_GENERATE2(dedup_entry_rb_tree, dedup_entry, rb_entry,
 RB_GENERATE(sha_dedup_entry_rb_tree, sha_dedup_entry, fict_entry,
 		rb_sha_dedup_entry_compare);
 
-static int
+static
+int
 rb_sim_dedup_entry_compare(struct sim_dedup_entry *sim_de1,
 			struct sim_dedup_entry *sim_de2)
 {
@@ -161,7 +165,8 @@ rb_sim_dedup_entry_compare(struct sim_dedup_entry *sim_de1,
 	return (0);
 }
 
-static int
+static
+int
 rb_dedup_entry_compare(struct dedup_entry *de1, struct dedup_entry *de2)
 {
 	if (de1->leaf.data_crc < de2->leaf.data_crc)
@@ -172,7 +177,8 @@ rb_dedup_entry_compare(struct dedup_entry *de1, struct dedup_entry *de2)
 	return (0);
 }
 
-static int
+static
+int
 rb_sha_dedup_entry_compare(struct sha_dedup_entry *sha_de1,
 			struct sha_dedup_entry *sha_de2)
 {
@@ -198,8 +204,10 @@ hammer_cmd_dedup_simulate(char **av, int ac)
 {
 	struct sim_dedup_entry *sim_de;
 
-	if (ac != 1)
+	if (ac != 1) {
 		dedup_usage(1);
+		/* not reached */
+	}
 
 	glob_fd = getpfs(&glob_pfs, av[0]);
 
@@ -213,7 +221,7 @@ hammer_cmd_dedup_simulate(char **av, int ac)
 		MemoryUse = 0;
 
 		if (VerboseOpt) {
-			printf("b-tree pass  crc-range %08x-max\n",
+			printf("B-Tree pass  crc-range %08x-max\n",
 				DedupCrcStart);
 			fflush(stdout);
 		}
@@ -254,17 +262,39 @@ hammer_cmd_dedup(char **av, int ac)
 	struct dedup_entry *de;
 	struct sha_dedup_entry *sha_de;
 	struct pass2_dedup_entry *pass2_de;
+	char *tmp;
 	char buf[8];
+	int needfree = 0;
 
 	if (TimeoutOpt > 0)
 		alarm(TimeoutOpt);
 
-	if (ac != 1)
+	if (ac != 1) {
 		dedup_usage(1);
+		/* not reached */
+	}
 
 	STAILQ_INIT(&pass2_dedup_queue);
 
 	glob_fd = getpfs(&glob_pfs, av[0]);
+
+	/*
+	 * A cycle file is _required_ for resuming dedup after the timeout
+	 * specified with -t has expired. If no -c option, then place a
+	 * .dedup.cycle file either in the PFS snapshots directory or in
+	 * the default snapshots directory.
+	 */
+	if (!CyclePath) {
+		if (glob_pfs.ondisk->snapshots[0] != '/') {
+			asprintf(&tmp, "%s/%s/.dedup.cycle",
+			    SNAPSHOTS_BASE, av[0]);
+		} else {
+			asprintf(&tmp, "%s/.dedup.cycle",
+			    glob_pfs.ondisk->snapshots);
+		}
+		CyclePath = tmp;
+		needfree = 1;
+	}
 
 	/*
 	 * Pre-pass to cache the btree
@@ -282,7 +312,7 @@ hammer_cmd_dedup(char **av, int ac)
 		MemoryUse = 0;
 
 		if (VerboseOpt) {
-			printf("b-tree pass  crc-range %08x-max\n",
+			printf("B-Tree pass  crc-range %08x-max\n",
 				DedupCrcStart);
 			fflush(stdout);
 		}
@@ -333,7 +363,7 @@ hammer_cmd_dedup(char **av, int ac)
 	relpfs(glob_fd, &glob_pfs);
 
 	humanize_unsigned(buf, sizeof(buf), dedup_ref_size, "B", 1024);
-	printf("Dedup ratio = %.2f\n"
+	printf("Dedup ratio = %.2f (in this run)\n"
 	       "    %8s referenced\n",
 	       ((dedup_alloc_size != 0) ?
 			(double)dedup_ref_size / dedup_alloc_size : 0),
@@ -345,7 +375,7 @@ hammer_cmd_dedup(char **av, int ac)
 	printf("    %8s skipped\n", buf);
 	printf("    %8jd CRC collisions\n"
 	       "    %8jd SHA collisions\n"
-	       "    %8jd bigblock underflows\n"
+	       "    %8jd big-block underflows\n"
 	       "    %8jd new dedup records\n"
 	       "    %8jd new dedup bytes\n",
 	       (intmax_t)dedup_crc_failures,
@@ -354,15 +384,26 @@ hammer_cmd_dedup(char **av, int ac)
                (intmax_t)dedup_successes_count,
                (intmax_t)dedup_successes_bytes
 	);
+
+	/* Once completed remove cycle file */
+	hammer_reset_cycle();
+
+	/* We don't want to mess up with other directives */
+	if (needfree) {
+		free(tmp);
+		CyclePath = NULL;
+	}
 }
 
-static int
+static
+int
 count_btree_elm(hammer_btree_leaf_elm_t scan_leaf __unused, int flags __unused)
 {
 	return(1);
 }
 
-static int
+static
+int
 collect_btree_elm(hammer_btree_leaf_elm_t scan_leaf, int flags __unused)
 {
 	struct sim_dedup_entry *sim_de;
@@ -374,7 +415,7 @@ collect_btree_elm(hammer_btree_leaf_elm_t scan_leaf, int flags __unused)
 	 */
 	if (MemoryUse > MemoryLimit) {
 		DedupCrcEnd = DedupCrcStart +
-			      (u_int32_t)(DedupCrcEnd - DedupCrcStart - 1) / 2;
+			      (uint32_t)(DedupCrcEnd - DedupCrcStart - 1) / 2;
 		if (VerboseOpt) {
 			printf("memory limit  crc-range %08x-%08x\n",
 				DedupCrcStart, DedupCrcEnd);
@@ -400,7 +441,7 @@ collect_btree_elm(hammer_btree_leaf_elm_t scan_leaf, int flags __unused)
 			   scan_leaf->data_crc);
 
 	if (sim_de == NULL) {
-		sim_de = calloc(sizeof(*sim_de), 1);
+		sim_de = calloc(1, sizeof(*sim_de));
 		sim_de->crc = scan_leaf->data_crc;
 		RB_INSERT(sim_dedup_entry_rb_tree, &sim_dedup_tree, sim_de);
 		MemoryUse += sizeof(*sim_de);
@@ -411,16 +452,14 @@ collect_btree_elm(hammer_btree_leaf_elm_t scan_leaf, int flags __unused)
 	return (1);
 }
 
-static __inline int
+static __inline
+int
 validate_dedup_pair(hammer_btree_leaf_elm_t p, hammer_btree_leaf_elm_t q)
 {
-	if ((p->data_offset & HAMMER_OFF_ZONE_MASK) !=
-	    (q->data_offset & HAMMER_OFF_ZONE_MASK)) {
+	if (HAMMER_ZONE(p->data_offset) != HAMMER_ZONE(q->data_offset))
 		return (1);
-	}
-	if (p->data_len != q->data_len) {
+	if (p->data_len != q->data_len)
 		return (1);
-	}
 
 	return (0);
 }
@@ -431,7 +470,8 @@ validate_dedup_pair(hammer_btree_leaf_elm_t p, hammer_btree_leaf_elm_t q)
 #define DEDUP_UNDERFLOW		4
 #define DEDUP_VERS_FAILURE	5
 
-static __inline int
+static __inline
+int
 deduplicate(hammer_btree_leaf_elm_t p, hammer_btree_leaf_elm_t q)
 {
 	struct hammer_ioc_dedup dedup;
@@ -442,37 +482,32 @@ deduplicate(hammer_btree_leaf_elm_t p, hammer_btree_leaf_elm_t q)
 	 * If data_offset fields are the same there is no need to run ioctl,
 	 * candidate is already dedup'ed.
 	 */
-	if (p->data_offset == q->data_offset) {
+	if (p->data_offset == q->data_offset)
 		return (0);
-	}
 
 	dedup.elm1 = p->base;
 	dedup.elm2 = q->base;
 	RunningIoctl = 1;
 	if (ioctl(glob_fd, HAMMERIOC_DEDUP, &dedup) < 0) {
-		if (errno == EOPNOTSUPP) {
-			/* must be at least version 5 */
-			return (DEDUP_VERS_FAILURE);
-		}
+		if (errno == EOPNOTSUPP)
+			return (DEDUP_VERS_FAILURE); /* must be at least version 5 */
 		/* Technical failure - locking or w/e */
 		return (DEDUP_TECH_FAILURE);
 	}
-	if (dedup.head.flags & HAMMER_IOC_DEDUP_CMP_FAILURE) {
+	if (dedup.head.flags & HAMMER_IOC_DEDUP_CMP_FAILURE)
 		return (DEDUP_CMP_FAILURE);
-	}
-	if (dedup.head.flags & HAMMER_IOC_DEDUP_INVALID_ZONE) {
+	if (dedup.head.flags & HAMMER_IOC_DEDUP_INVALID_ZONE)
 		return (DEDUP_INVALID_ZONE);
-	}
-	if (dedup.head.flags & HAMMER_IOC_DEDUP_UNDERFLOW) {
+	if (dedup.head.flags & HAMMER_IOC_DEDUP_UNDERFLOW)
 		return (DEDUP_UNDERFLOW);
-	}
 	RunningIoctl = 0;
 	++dedup_successes_count;
 	dedup_successes_bytes += p->data_len;
 	return (0);
 }
 
-static int
+static
+int
 process_btree_elm(hammer_btree_leaf_elm_t scan_leaf, int flags)
 {
 	struct dedup_entry *de;
@@ -487,7 +522,7 @@ process_btree_elm(hammer_btree_leaf_elm_t scan_leaf, int flags)
 	 */
 	while (MemoryUse > MemoryLimit) {
 		DedupCrcEnd = DedupCrcStart +
-			      (u_int32_t)(DedupCrcEnd - DedupCrcStart - 1) / 2;
+			      (uint32_t)(DedupCrcEnd - DedupCrcStart - 1) / 2;
 		if (VerboseOpt) {
 			printf("memory limit  crc-range %08x-%08x\n",
 				DedupCrcStart, DedupCrcEnd);
@@ -521,7 +556,7 @@ process_btree_elm(hammer_btree_leaf_elm_t scan_leaf, int flags)
 	 */
 	de = RB_LOOKUP(dedup_entry_rb_tree, &dedup_tree, scan_leaf->data_crc);
 	if (de == NULL) {
-		de = calloc(sizeof(*de), 1);
+		de = calloc(1, sizeof(*de));
 		de->leaf = *scan_leaf;
 		RB_INSERT(dedup_entry_rb_tree, &dedup_tree, de);
 		MemoryUse += sizeof(*de);
@@ -572,7 +607,7 @@ process_btree_elm(hammer_btree_leaf_elm_t scan_leaf, int flags)
 		 * 'dataset'. Insert new entry into SHA subtree.
 		 */
 		if (sha_de == NULL) {
-			sha_de = calloc(sizeof(*sha_de), 1);
+			sha_de = calloc(1, sizeof(*sha_de));
 			sha_de->leaf = *scan_leaf;
 			memcpy(sha_de->sha_hash, temp.sha_hash,
 			       SHA256_DIGEST_LENGTH);
@@ -603,7 +638,7 @@ process_btree_elm(hammer_btree_leaf_elm_t scan_leaf, int flags)
 		 * zone (we can dedup only in LARGE_DATA and SMALL_DATA) don't
 		 * bother with the candidate and terminate early.
 		 *
-		 * If ioctl fails because of bigblock underflow replace the
+		 * If ioctl fails because of big-block underflow replace the
 		 * leaf node that found dedup entry represents with scan_leaf.
 		 */
 		error = deduplicate(&sha_de->leaf, scan_leaf);
@@ -623,10 +658,9 @@ process_btree_elm(hammer_btree_leaf_elm_t scan_leaf, int flags)
 				SHA256_DIGEST_LENGTH);
 			goto upgrade_stats_sha;
 		case DEDUP_VERS_FAILURE:
-			fprintf(stderr,
-				"HAMMER filesystem must be at least "
-				"version 5 to dedup\n");
-			exit (1);
+			errx(1, "HAMMER filesystem must be at least "
+				"version 5 to dedup");
+			/* not reached */
 		default:
 			fprintf(stderr, "Unknown error\n");
 			goto terminate_early;
@@ -666,10 +700,9 @@ sha256_failure:
 			de->leaf = *scan_leaf;
 			goto upgrade_stats;
 		case DEDUP_VERS_FAILURE:
-			fprintf(stderr,
-				"HAMMER filesystem must be at least "
-				"version 5 to dedup\n");
-			exit (1);
+			errx(1, "HAMMER filesystem must be at least "
+				"version 5 to dedup");
+			/* not reached */
 		default:
 			fprintf(stderr, "Unknown error\n");
 			goto terminate_early;
@@ -694,7 +727,7 @@ crc_failure:
 		 * candidate into Pass2 list and return - keep both trees
 		 * unmodified.
 		 */
-		sha_de = calloc(sizeof(*sha_de), 1);
+		sha_de = calloc(1, sizeof(*sha_de));
 		sha_de->leaf = de->leaf;
 		sha_de->ref_blks = de->u.de.ref_blks;
 		sha_de->ref_size = de->u.de.ref_size;
@@ -721,12 +754,11 @@ crc_failure:
 		 * SHA subtree. If upgrade fails insert the candidate into
 		 * Pass2 list.
 		 */
-		if (upgrade_chksum(scan_leaf, temp.sha_hash)) {
+		if (upgrade_chksum(scan_leaf, temp.sha_hash))
 			goto pass2_insert;
-		}
 		sha_de = RB_FIND(sha_dedup_entry_rb_tree, &de->u.fict_root,
 				 &temp);
-		if (sha_de != NULL)
+		if (sha_de != NULL) {
 			/* There is an entry with this SHA already, but the only
 			 * RB-tree element at this point is that entry we just
 			 * added. We know for sure these blocks are different
@@ -734,8 +766,9 @@ crc_failure:
 			 * collision.
 			 */
 			goto sha256_failure;
+		}
 
-		sha_de = calloc(sizeof(*sha_de), 1);
+		sha_de = calloc(1, sizeof(*sha_de));
 		sha_de->leaf = *scan_leaf;
 		memcpy(sha_de->sha_hash, temp.sha_hash, SHA256_DIGEST_LENGTH);
 		RB_INSERT(sha_dedup_entry_rb_tree, &de->u.fict_root, sha_de);
@@ -759,7 +792,7 @@ pass2_insert:
 	 * terminate_early
 	 */
 	if ((flags & DEDUP_PASS2) == 0) {
-		pass2_de = calloc(sizeof(*pass2_de), 1);
+		pass2_de = calloc(1, sizeof(*pass2_de));
 		pass2_de->leaf = *scan_leaf;
 		STAILQ_INSERT_TAIL(&pass2_dedup_queue, pass2_de, sq_entry);
 		dedup_skipped_size += scan_leaf->data_len;
@@ -775,8 +808,9 @@ terminate_early:
 	return (0);
 }
 
-static int
-upgrade_chksum(hammer_btree_leaf_elm_t leaf, u_int8_t *sha_hash)
+static
+int
+upgrade_chksum(hammer_btree_leaf_elm_t leaf, uint8_t *sha_hash)
 {
 	struct hammer_ioc_data data;
 	char *buf = malloc(DEDUP_BUF);
@@ -813,13 +847,22 @@ done:
 	return (error);
 }
 
-static void
+static
+void
+sigAlrm(int signo __unused)
+{
+	SigAlrmFlag = 1;
+}
+
+static
+void
 sigInfo(int signo __unused)
 {
 	SigInfoFlag = 1;
 }
 
-static void
+static
+void
 scan_pfs(char *filesystem, scan_pfs_cb_t func, const char *id)
 {
 	struct hammer_ioc_mirror_rw mirror;
@@ -834,9 +877,28 @@ scan_pfs(char *filesystem, scan_pfs_cb_t func, const char *id)
 	DedupDataReads = 0;
 	DedupCurrentRecords = 0;
 	signal(SIGINFO, sigInfo);
+	signal(SIGALRM, sigAlrm);
 
+	/*
+	 * Deduplication happens per element so hammer(8) is in full
+	 * control of the ioctl()s to actually perform it. SIGALRM
+	 * needs to be handled within hammer(8) but a checkpoint
+	 * is needed for resuming. Use cycle file for that.
+	 *
+	 * Try to obtain the previous obj_id from the cycle file and
+	 * if not available just start from the beginning.
+	 */
 	bzero(&mirror, sizeof(mirror));
 	hammer_key_beg_init(&mirror.key_beg);
+	hammer_get_cycle(&mirror.key_beg, &mirror.tid_beg);
+
+	if (mirror.key_beg.obj_id != (int64_t)HAMMER_MIN_OBJID) {
+		if (VerboseOpt) {
+			fprintf(stderr, "%s: mirror-read: Resuming at object %016jx\n",
+			    id, (uintmax_t)mirror.key_beg.obj_id);
+		}
+	}
+
 	hammer_key_end_init(&mirror.key_end);
 
 	mirror.tid_beg = glob_pfs.ondisk->sync_beg_tid;
@@ -865,14 +927,13 @@ scan_pfs(char *filesystem, scan_pfs_cb_t func, const char *id)
 		mirror.pfs_id = glob_pfs.pfs_id;
 		mirror.shared_uuid = glob_pfs.ondisk->shared_uuid;
 		if (ioctl(glob_fd, HAMMERIOC_MIRROR_READ, &mirror) < 0) {
-			fprintf(stderr, "Mirror-read %s failed: %s\n",
-				filesystem, strerror(errno));
-			exit(1);
+			err(1, "Mirror-read %s failed", filesystem);
+			/* not reached */
 		}
 		if (mirror.head.flags & HAMMER_IOC_HEAD_ERROR) {
-			fprintf(stderr, "Mirror-read %s fatal error %d\n",
+			errx(1, "Mirror-read %s fatal error %d",
 				filesystem, mirror.head.error);
-			exit(1);
+			/* not reached */
 		}
 		if (mirror.count) {
 			offset = 0;
@@ -880,8 +941,8 @@ scan_pfs(char *filesystem, scan_pfs_cb_t func, const char *id)
 				mrec = (void *)((char *)buf + offset);
 				bytes = HAMMER_HEAD_DOALIGN(mrec->head.rec_size);
 				if (offset + bytes > mirror.count) {
-					fprintf(stderr, "Misaligned record\n");
-					exit(1);
+					errx(1, "Misaligned record");
+					/* not reached */
 				}
 				assert((mrec->head.type &
 				       HAMMER_MRECF_TYPE_MASK) ==
@@ -905,8 +966,16 @@ scan_pfs(char *filesystem, scan_pfs_cb_t func, const char *id)
 			}
 		}
 		mirror.key_beg = mirror.key_cur;
-		if (DidInterrupt) {
-			fprintf(stderr, "Interrupted\n");
+		if (DidInterrupt || SigAlrmFlag) {
+			if (VerboseOpt) {
+				fprintf(stderr, "%s\n",
+				    (DidInterrupt ? "Interrupted" : "Timeout"));
+			}
+			hammer_set_cycle(&mirror.key_cur, mirror.tid_beg);
+			if (VerboseOpt) {
+				fprintf(stderr, "Cyclefile %s updated for "
+				    "continuation\n", CyclePath);
+			}
 			exit(1);
 		}
 		if (SigInfoFlag) {
@@ -938,11 +1007,13 @@ scan_pfs(char *filesystem, scan_pfs_cb_t func, const char *id)
 	} while (mirror.count != 0);
 
 	signal(SIGINFO, SIG_IGN);
+	signal(SIGALRM, SIG_IGN);
 
 	free(buf);
 }
 
-static void
+static
+void
 dump_simulated_dedup(void)
 {
 	struct sim_dedup_entry *sim_de;
@@ -951,13 +1022,14 @@ dump_simulated_dedup(void)
 	RB_FOREACH(sim_de, sim_dedup_entry_rb_tree, &sim_dedup_tree) {
 		printf("\tcrc=%08x cnt=%ju size=%ju\n",
 			sim_de->crc,
-			(intmax_t)sim_de->ref_blks,
-			(intmax_t)sim_de->ref_size);
+			(uintmax_t)sim_de->ref_blks,
+			(uintmax_t)sim_de->ref_size);
 	}
 	printf("end of dump ===\n");
 }
 
-static void
+static
+void
 dump_real_dedup(void)
 {
 	struct dedup_entry *de;
@@ -973,8 +1045,8 @@ dump_real_dedup(void)
 				printf("\t\tcrc=%08x cnt=%ju size=%ju\n\t"
 				       "\t\tsha=",
 				       sha_de->leaf.data_crc,
-				       (intmax_t)sha_de->ref_blks,
-				       (intmax_t)sha_de->ref_size);
+				       (uintmax_t)sha_de->ref_blks,
+				       (uintmax_t)sha_de->ref_size);
 				for (i = 0; i < SHA256_DIGEST_LENGTH; ++i)
 					printf("%02x", sha_de->sha_hash[i]);
 				printf("\n");
@@ -982,14 +1054,15 @@ dump_real_dedup(void)
 		} else {
 			printf("\tcrc=%08x cnt=%ju size=%ju\n",
 			       de->leaf.data_crc,
-			       (intmax_t)de->u.de.ref_blks,
-			       (intmax_t)de->u.de.ref_size);
+			       (uintmax_t)de->u.de.ref_blks,
+			       (uintmax_t)de->u.de.ref_size);
 		}
 	}
 	printf("end of dump ===\n");
 }
 
-static void
+static
+void
 dedup_usage(int code)
 {
 	fprintf(stderr,

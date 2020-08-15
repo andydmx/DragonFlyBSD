@@ -204,18 +204,25 @@ __elfN(loadfile)(char *filename, u_int64_t dest, struct preloaded_file **result)
     if (ef.kernel) {
 	char *mptr;
 	char *fpend;
+	char *modlocal;
 	const char *prefix = "";
 
-	mptr = malloc(strlen(fullpath) * 2 + 10 + 16);
+	mptr = malloc(256);
 	if (strncmp(fullpath, "/boot/", 6) != 0)
 		prefix = "/boot";
-	sprintf(mptr, "%s%s", prefix, fullpath);
+	snprintf(mptr, 256, "%s%s", prefix, fullpath);
 	setenv("kernelname", mptr, 1);
 
 	fpend = strrchr(mptr, '/');
 	*fpend = 0;
 	if (strcmp(mptr, "/boot") == 0)
-		sprintf(mptr, "/boot/modules");
+		snprintf(mptr, 256, "/boot/modules");
+
+	/* Append modules.local for kernel if requested */
+	modlocal = getenv("local_modules");
+	if (modlocal != NULL && strcmp(modlocal, "YES") == 0)
+		strncat(mptr, ";/boot/modules.local", 255);
+
 	/* this will be moved to "module_path" on boot */
 	setenv("exported_module_path", mptr, 1);
 	free(mptr);
@@ -287,21 +294,12 @@ __elfN(loadimage)(struct preloaded_file *fp, elf_file_t ef, u_int64_t off)
     firstaddr = lastaddr = 0;
     ehdr = ef->ehdr;
     if (ef->kernel) {
-#ifdef __i386__
+#if defined(__x86_64__) || defined(__i386__)
 #if __ELF_WORD_SIZE == 64
 	off = - (off & 0xffffffffff000000ull);/* x86_64 relocates after locore */
 #else
 	off = - (off & 0xff000000u);	/* i386 relocates after locore */
 #endif
-#elif defined(__arm__)
-	if (off & 0xf0000000u) {
-	    off = -(off & 0xf0000000u);
-	    ehdr->e_entry += off;
-#ifdef ELF_VERBOSE
-	    printf("Converted entry 0x%08x\n", ehdr->e_entry);
-#endif
-	} else
-	    off = 0;
 #else
 	off = 0;		/* other archs use direct mapped kernels */
 #endif
@@ -643,7 +641,7 @@ __elfN(parse_modmetadata)(struct preloaded_file *fp, elf_file_t ef)
 	error = __elfN(reloc_ptr)(fp, ef, v, &md, sizeof(md));
 	if (error == EOPNOTSUPP) {
 	    md.md_cval += ef->off;
-	    md.md_data += ef->off;
+	    md.md_data = (char *)md.md_data + ef->off;
 	} else if (error != 0)
 	    return (error);
 #endif

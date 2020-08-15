@@ -15,11 +15,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -36,8 +32,9 @@
  * SUCH DAMAGE.
  *
  * @(#)restore.h 8.3 (Berkeley) 9/13/94
- * $DragonFly: src/sbin/restore/restore.h,v 1.3 2006/04/03 01:58:49 dillon Exp $
  */
+
+#include <sys/param.h>
 
 /*
  * Flags
@@ -45,7 +42,7 @@
 extern int	cvtflag;	/* convert from old to new tape format */
 extern int	bflag;		/* set input block size */
 extern int	dflag;		/* print out debugging info */
-extern int	hflag;		/* restore heirarchies */
+extern int	hflag;		/* restore hierarchies */
 extern int	mflag;		/* restore by name instead of inode number */
 extern int	Nflag;		/* do not write the disk */
 extern int	uflag;		/* unlink symlink targets */
@@ -105,8 +102,8 @@ struct entry {
 /*
  * The entry describes the next file available on the tape
  */
-struct context {
-	char	*name;		/* name of file */
+extern struct context {
+	const char	*name;		/* name of file */
 	ufs1_ino_t ino;		/* inumber of file */
 	struct	ufs1_dinode *dip;	/* pointer to inode */
 	char	action;		/* action being taken on this file */
@@ -129,10 +126,8 @@ typedef struct rstdirdesc RST_DIR;
 /*
  * Useful macros
  */
-#define TSTINO(ino, map) \
-	(map[(u_int)((ino) - 1) / NBBY] &  (1 << ((u_int)((ino) - 1) % NBBY)))
-#define	SETINO(ino, map) \
-	map[(u_int)((ino) - 1) / NBBY] |=  1 << ((u_int)((ino) - 1) % NBBY)
+#define	TSTINO(ino, map)	isset(map, (u_int)((ino) - 1))
+#define	SETINO(ino, map)	setbit(map, (u_int)((ino) - 1))
 
 #define dprintf		if (dflag) fprintf
 #define vprintf		if (vflag) fprintf

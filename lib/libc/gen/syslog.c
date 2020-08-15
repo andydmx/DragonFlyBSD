@@ -28,7 +28,6 @@
  *
  * @(#)syslog.c	8.5 (Berkeley) 4/29/95
  * $FreeBSD: src/lib/libc/gen/syslog.c,v 1.39 2007/01/09 00:27:55 imp Exp $
- * $DragonFly: src/lib/libc/gen/syslog.c,v 1.9 2005/11/19 22:32:53 swildner Exp $
  */
 
 #include "namespace.h"
@@ -127,13 +126,12 @@ syslog(int pri, const char *fmt, ...)
 	va_end(ap);
 }
 
-void
-vsyslog(int pri, const char *fmt, va_list ap)
+static void
+vsyslog_unlocked(int pri, const char *fmt, va_list ap)
 {
-	int cnt;
 	char ch, *p;
 	time_t now;
-	int fd, saved_errno;
+	int cnt, fd, saved_errno, maxtries;
 	char *stdp, tbuf[2048], fmt_cpy[1024], timbuf[26], errstr[64];
 	FILE *fp, *fmt_fp;
 	struct bufcookie tbuf_cookie;
@@ -151,13 +149,9 @@ vsyslog(int pri, const char *fmt, va_list ap)
 
 	saved_errno = errno;
 
-	THREAD_LOCK();
-
 	/* Check priority against setlogmask values. */
-	if (!(LOG_MASK(LOG_PRI(pri)) & LogMask)) {
-		THREAD_UNLOCK();
+	if (!(LOG_MASK(LOG_PRI(pri)) & LogMask))
 		return;
-	}
 
 	/* Set default facility if none specified. */
 	if ((pri & LOG_FACMASK) == 0)
@@ -167,10 +161,8 @@ vsyslog(int pri, const char *fmt, va_list ap)
 	tbuf_cookie.base = tbuf;
 	tbuf_cookie.left = sizeof(tbuf);
 	fp = fwopen(&tbuf_cookie, writehook);
-	if (fp == NULL) {
-		THREAD_UNLOCK();
+	if (fp == NULL)
 		return;
-	}
 
 	/* Build the message. */
 	time(&now);
@@ -187,9 +179,8 @@ vsyslog(int pri, const char *fmt, va_list ap)
 		fprintf(fp, "%s", LogTag);
 	if (LogStat & LOG_PID)
 		fprintf(fp, "[%d]", getpid());
-	if (LogTag != NULL) {
+	if (LogTag != NULL)
 		fprintf(fp, ": ");
-	}
 
 	/* Check to see if we can skip expanding the %m */
 	if (strstr(fmt, "%m")) {
@@ -200,7 +191,6 @@ vsyslog(int pri, const char *fmt, va_list ap)
 		fmt_fp = fwopen(&fmt_cookie, writehook);
 		if (fmt_fp == NULL) {
 			fclose(fp);
-			THREAD_UNLOCK();
 			return;
 		}
 
@@ -261,7 +251,7 @@ vsyslog(int pri, const char *fmt, va_list ap)
 	connectlog();
 
 	/*
-	 * If the send() failed, there are two likely scenarios:
+	 * If the send() fails, there are three likely scenarios:
 	 *  1) syslogd was restarted
 	 *  2) /var/run/log is out of socket buffer space, which
 	 *     in most cases means local DoS.
@@ -275,23 +265,19 @@ vsyslog(int pri, const char *fmt, va_list ap)
 	 * broken syslogd will completely and utterly break the
 	 * entire system == bad.
 	 *
-	 * If we are working with a priveleged socket, then take
+	 * If we are working with a privileged socket, then take
 	 * only one attempt, because we don't want to freeze a
 	 * critical application like su(1) or sshd(8).
 	 *
 	 */
 	if (send(LogFile, tbuf, cnt, 0) < 0) {
-		int maxtries;
-
 		if (errno != ENOBUFS) {
 			disconnectlog();
 			connectlog();
 		}
 		for (maxtries = 10; maxtries; --maxtries) {
-			if (send(LogFile, tbuf, cnt, 0) >= 0) {
-				THREAD_UNLOCK();
+			if (send(LogFile, tbuf, cnt, 0) >= 0)
 				return;
-			}
 			if (status == CONNPRIV)
 				break;
 			if (errno != ENOBUFS)
@@ -299,7 +285,6 @@ vsyslog(int pri, const char *fmt, va_list ap)
 			_usleep(1000000 / 10);
 		}
 	} else {
-		THREAD_UNLOCK();
 		return;
 	}
 
@@ -309,7 +294,7 @@ vsyslog(int pri, const char *fmt, va_list ap)
 	 * Make sure the error reported is the one from the syslogd failure.
 	 */
 	if ((LogStat & LOG_CONS) &&
-	    (fd = _open(_PATH_CONSOLE, O_WRONLY|O_NONBLOCK, 0)) >= 0) {
+	    (fd = _open(_PATH_CONSOLE, O_WRONLY|O_NONBLOCK|O_CLOEXEC, 0)) >= 0) {
 		struct iovec iov[2];
 		struct iovec *v = iov;
 
@@ -322,7 +307,13 @@ vsyslog(int pri, const char *fmt, va_list ap)
 		_writev(fd, iov, 2);
 		_close(fd);
 	}
+}
 
+void
+vsyslog(int pri, const char *fmt, va_list ap)
+{
+	THREAD_LOCK();
+	vsyslog_unlocked(pri, fmt, ap);
 	THREAD_UNLOCK();
 }
 
@@ -349,16 +340,16 @@ connectlog(void)
 	struct sockaddr_un SyslogAddr;	/* AF_UNIX address of local logger */
 
 	if (LogFile == -1) {
-		if ((LogFile = _socket(AF_UNIX, SOCK_DGRAM, 0)) == -1)
+		if ((LogFile = _socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC,
+		    0)) == -1)
 			return;
-		_fcntl(LogFile, F_SETFD, 1);
 	}
 	if (LogFile != -1 && status == NOCONN) {
 		SyslogAddr.sun_len = sizeof(SyslogAddr);
 		SyslogAddr.sun_family = AF_UNIX;
 
 		/*
-		 * First try priveleged socket. If no success,
+		 * First try privileged socket. If no success,
 		 * then try default socket.
 		 */
 		strncpy(SyslogAddr.sun_path, _PATH_LOG_PRIV,
@@ -422,8 +413,10 @@ void
 closelog(void)
 {
 	THREAD_LOCK();
-	_close(LogFile);
-	LogFile = -1;
+	if (LogFile != -1) {
+		_close(LogFile);
+		LogFile = -1;
+	}
 	LogTag = NULL;
 	status = NOCONN;
 	THREAD_UNLOCK();

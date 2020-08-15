@@ -15,11 +15,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -37,14 +33,16 @@
  *
  *	@(#)timeb.h	8.2 (Berkeley) 1/21/94
  * $FreeBSD: src/sys/sys/timeb.h,v 1.6.2.1 2001/12/10 20:33:59 dwmalone Exp $
- * $DragonFly: src/sys/sys/timeb.h,v 1.4 2006/05/20 02:42:13 dillon Exp $
  */
 
 #ifndef _SYS_TIMEB_H_
-#define _SYS_TIMEB_H_
+#define	_SYS_TIMEB_H_
 
-#ifndef _SYS_TIME_H_
-#include <sys/time.h>
+#include <machine/stdint.h>
+
+#ifndef _TIME_T_DECLARED
+typedef	__time_t	time_t;
+#define	_TIME_T_DECLARED
 #endif
 
 /* The ftime(2) system call structure -- deprecated. */
@@ -62,8 +60,11 @@ struct timeb {
 #endif
 
 __BEGIN_DECLS
-int ftime (struct timeb *);
+#if __BSD_VISIBLE || (__XSI_VISIBLE && __XSI_VISIBLE < 700)
+int ftime(struct timeb *);					/* LEGACY */
+#endif
 __END_DECLS
+
 #endif /* _KERNEL */
 
 #endif

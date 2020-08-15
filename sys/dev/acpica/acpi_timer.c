@@ -53,13 +53,7 @@
 ACPI_MODULE_NAME("TIMER")
 
 static device_t			acpi_timer_dev;
-static struct resource		*acpi_timer_reg;
-static bus_space_handle_t	acpi_timer_bsh;
-static bus_space_tag_t		acpi_timer_bst;
-static sysclock_t		acpi_counter_mask;
-static sysclock_t		acpi_last_counter;
-
-#define ACPI_TIMER_FREQ		(14318182 / 4)
+static UINT32			acpi_timer_resolution;
 
 static sysclock_t acpi_timer_get_timecount(void);
 static sysclock_t acpi_timer_get_timecount24(void);
@@ -67,17 +61,16 @@ static sysclock_t acpi_timer_get_timecount_safe(void);
 static void acpi_timer_construct(struct cputimer *timer, sysclock_t oldclock);
 
 static struct cputimer acpi_cputimer = {
-	SLIST_ENTRY_INITIALIZER,
-	"ACPI",
-	CPUTIMER_PRI_ACPI,
-	CPUTIMER_ACPI,
-	acpi_timer_get_timecount_safe,
-	cputimer_default_fromhz,
-	cputimer_default_fromus,
-	acpi_timer_construct,
-	cputimer_default_destruct,
-	ACPI_TIMER_FREQ,
-	0, 0, 0
+	.next		= SLIST_ENTRY_INITIALIZER,
+	.name		= "ACPI",
+	.pri		= CPUTIMER_PRI_ACPI,
+	.type		= CPUTIMER_ACPI,
+	.count		= acpi_timer_get_timecount_safe,
+	.fromhz		= cputimer_default_fromhz,
+	.fromus		= cputimer_default_fromus,
+	.construct	= acpi_timer_construct,
+	.destruct	= cputimer_default_destruct,
+	.freq		= ACPI_PM_TIMER_FREQUENCY
 };
 
 static int	acpi_timer_identify(driver_t *driver, device_t parent);
@@ -99,17 +92,12 @@ static driver_t acpi_timer_driver = {
     "acpi_timer",
     acpi_timer_methods,
     0,
+    .gpri = KOBJ_GPRI_ACPI+2
 };
 
 static devclass_t acpi_timer_devclass;
 DRIVER_MODULE(acpi_timer, acpi, acpi_timer_driver, acpi_timer_devclass, NULL, NULL);
 MODULE_DEPEND(acpi_timer, acpi, 1, 1, 1);
-
-static inline uint32_t
-acpi_timer_read(void)
-{
-    return (bus_space_read_4(acpi_timer_bst, acpi_timer_bsh, 0));
-}
 
 /*
  * Locate the ACPI timer using the FADT, set up and allocate the I/O resources
@@ -119,8 +107,6 @@ static int
 acpi_timer_identify(driver_t *driver, device_t parent)
 {
     device_t dev;
-    u_long rlen, rstart;
-    int rid, rtype;
 
     /*
      * Just try once, do nothing if the 'acpi' bus is rescanned.
@@ -140,62 +126,30 @@ acpi_timer_identify(driver_t *driver, device_t parent)
     }
     acpi_timer_dev = dev;
 
-    switch (AcpiGbl_FADT.XPmTimerBlock.SpaceId) {
-    case ACPI_ADR_SPACE_SYSTEM_MEMORY:
-	rtype = SYS_RES_MEMORY;
-	break;
-    case ACPI_ADR_SPACE_SYSTEM_IO:
-	rtype = SYS_RES_IOPORT;
-	break;
-    default:
-	return (ENXIO);
-    }
-    rid = 0;
-    rlen = AcpiGbl_FADT.PmTimerLength;
-    rstart = AcpiGbl_FADT.XPmTimerBlock.Address;
-    if (bus_set_resource(dev, rtype, rid, rstart, rlen, -1)) {
-	device_printf(dev, "couldn't set resource (%s 0x%lx+0x%lx)\n",
-	    (rtype == SYS_RES_IOPORT) ? "port" : "mem", rstart, rlen);
-	return (ENXIO);
-    }
     return (0);
 }
 
 static int
 acpi_timer_probe(device_t dev)
 {
-    char desc[40];
-    int i, j, rid, rtype;
-
     ACPI_FUNCTION_TRACE((char *)(uintptr_t)__func__);
 
     if (dev != acpi_timer_dev)
 	return (ENXIO);
 
-    switch (AcpiGbl_FADT.XPmTimerBlock.SpaceId) {
-    case ACPI_ADR_SPACE_SYSTEM_MEMORY:
-	rtype = SYS_RES_MEMORY;
-	break;
-    case ACPI_ADR_SPACE_SYSTEM_IO:
-	rtype = SYS_RES_IOPORT;
-	break;
-    default:
+    if (ACPI_FAILURE(AcpiGetTimerResolution(&acpi_timer_resolution)))
 	return (ENXIO);
-    }
-    rid = 0;
-    acpi_timer_reg = bus_alloc_resource_any(dev, rtype, &rid, RF_ACTIVE);
-    if (acpi_timer_reg == NULL) {
-	device_printf(dev, "couldn't allocate resource (%s 0x%lx)\n",
-	    (rtype == SYS_RES_IOPORT) ? "port" : "mem",
-	    (u_long)AcpiGbl_FADT.XPmTimerBlock.Address);
-	return (ENXIO);
-    }
-    acpi_timer_bsh = rman_get_bushandle(acpi_timer_reg);
-    acpi_timer_bst = rman_get_bustag(acpi_timer_reg);
-    if ((AcpiGbl_FADT.Flags & ACPI_FADT_32BIT_TIMER) != 0)
-	acpi_counter_mask = 0xffffffff;
-    else
-	acpi_counter_mask = 0x00ffffff;
+
+    return (0);
+}
+
+static int
+acpi_timer_attach(device_t dev)
+{
+    char desc[40];
+    int i, j;
+
+    ACPI_FUNCTION_TRACE((char *)(uintptr_t)__func__);
 
     /*
      * If all tests of the counter succeed, use the ACPI-fast method.  If
@@ -206,7 +160,7 @@ acpi_timer_probe(device_t dev)
     for (i = 0; i < 10; i++)
 	j += acpi_timer_test();
     if (j == 10) {
-	if (acpi_counter_mask == 0xffffffff) {
+	if (acpi_timer_resolution == 32) {
 	    acpi_cputimer.name = "ACPI-fast";
 	    acpi_cputimer.count = acpi_timer_get_timecount;
 	} else {
@@ -214,47 +168,19 @@ acpi_timer_probe(device_t dev)
 	    acpi_cputimer.count = acpi_timer_get_timecount24;
 	}
     } else {
-	if (acpi_counter_mask == 0xffffffff)
-		acpi_cputimer.name = "ACPI-safe";
+	if (acpi_timer_resolution == 32)
+	    acpi_cputimer.name = "ACPI-safe";
 	else
-		acpi_cputimer.name = "ACPI-safe24";
+	    acpi_cputimer.name = "ACPI-safe24";
 	acpi_cputimer.count = acpi_timer_get_timecount_safe;
     }
 
-    ksprintf(desc, "%d-bit timer at 3.579545MHz",
-	    (AcpiGbl_FADT.Flags & ACPI_FADT_32BIT_TIMER) ? 32 : 24);
+    ksprintf(desc, "%u-bit timer at 3.579545MHz", acpi_timer_resolution);
     device_set_desc_copy(dev, desc);
 
     cputimer_register(&acpi_cputimer);
     cputimer_select(&acpi_cputimer, 0);
-    /* Release the resource, we'll allocate it again during attach. */
-    bus_release_resource(dev, rtype, rid, acpi_timer_reg);
-    return (0);
-}
 
-static int
-acpi_timer_attach(device_t dev)
-{
-    int rid, rtype;
-
-    ACPI_FUNCTION_TRACE((char *)(uintptr_t)__func__);
-
-    switch (AcpiGbl_FADT.XPmTimerBlock.SpaceId) {
-    case ACPI_ADR_SPACE_SYSTEM_MEMORY:
-	rtype = SYS_RES_MEMORY;
-	break;
-    case ACPI_ADR_SPACE_SYSTEM_IO:
-	rtype = SYS_RES_IOPORT;
-	break;
-    default:
-	return (ENXIO);
-    }
-    rid = 0;
-    acpi_timer_reg = bus_alloc_resource_any(dev, rtype, &rid, RF_ACTIVE);
-    if (acpi_timer_reg == NULL)
-	return (ENXIO);
-    acpi_timer_bsh = rman_get_bushandle(acpi_timer_reg);
-    acpi_timer_bst = rman_get_bustag(acpi_timer_reg);
     return (0);
 }
 
@@ -276,28 +202,63 @@ acpi_timer_construct(struct cputimer *timer, sysclock_t oldclock)
  * is only 24 bits then we have to keep track of the upper 8 bits on our
  * own.
  *
- * XXX we could probably get away with using a per-cpu field for this and
- * just use interrupt disablement instead of clock_lock.
+ * per-cpu tracking fields can cause problems on VMs if one or more cpus
+ * stalls long-enough for the timer to turn-over twice, so instead optimize
+ * the locking case by not updating acpi_cputimer.base until the timer
+ * has gone more than 1/16 its full range.
+ *
+ * These are horrible hacks, but at least the SMP interference is minimal
+ * with them.  Note that just reading the ACPI timer itself represents a
+ * bottleneck due to the slow I/O.
  */
 static sysclock_t
 acpi_timer_get_timecount24(void)
 {
-    sysclock_t counter;
+    sysclock_t last_counter;
+    sysclock_t next_counter;
+    uint32_t counter;
 
-    clock_lock();
-    counter = acpi_timer_read();
-    if (counter < acpi_last_counter)
-	acpi_cputimer.base += 0x01000000;
-    acpi_last_counter = counter;
-    counter += acpi_cputimer.base;
-    clock_unlock();
-    return (counter);
+    last_counter = acpi_cputimer.base;
+    for (;;) {
+	    cpu_ccfence();
+	    AcpiGetTimer(&counter);
+	    if (counter < (last_counter & 0x00FFFFFFU))
+		next_counter = ((last_counter + 0x01000000U) &
+			        0xFFFFFFFFFF000000LU) | counter;
+	    else
+		next_counter = (last_counter &
+			        0xFFFFFFFFFF000000LU) | counter;
+	    if (atomic_fcmpset_long(&acpi_cputimer.base, &last_counter,
+				    next_counter)) {
+		break;
+	    }
+    }
+    return next_counter;
 }
 
 static sysclock_t
 acpi_timer_get_timecount(void)
 {
-    return (acpi_timer_read() + acpi_cputimer.base);
+    sysclock_t last_counter;
+    sysclock_t next_counter;
+    uint32_t counter;
+
+    last_counter = acpi_cputimer.base;
+    for (;;) {
+	    cpu_ccfence();
+	    AcpiGetTimer(&counter);
+	    if (counter < (last_counter & 0xFFFFFFFFU))
+		next_counter = ((last_counter + 0x0100000000U) &
+			        0xFFFFFFFF00000000LU) | counter;
+	    else
+		next_counter = (last_counter &
+			        0xFFFFFFFF00000000LU) | counter;
+	    if (atomic_fcmpset_long(&acpi_cputimer.base, &last_counter,
+				    next_counter)) {
+		break;
+	    }
+    }
+    return next_counter;
 }
 
 /*
@@ -307,29 +268,55 @@ acpi_timer_get_timecount(void)
  * against the fact that the bits can be wrong in two directions.  If
  * we only cared about monosity, two reads would be enough.
  */
-static sysclock_t
-acpi_timer_get_timecount_safe(void)
+static __inline sysclock_t
+_acpi_timer_get_timecount_safe(void)
 {
     u_int u1, u2, u3;
 
-    if (acpi_counter_mask != 0xffffffff)
-	clock_lock();
-
-    u2 = acpi_timer_read();
-    u3 = acpi_timer_read();
+    AcpiGetTimer(&u2);
+    AcpiGetTimer(&u3);
     do {
 	u1 = u2;
 	u2 = u3;
-	u3 = acpi_timer_read();
+	AcpiGetTimer(&u3);
     } while (u1 > u2 || u2 > u3);
 
-    if (acpi_counter_mask != 0xffffffff) {
-	if (u2 < acpi_last_counter)
-	    acpi_cputimer.base += 0x01000000;
-	acpi_last_counter = u2;
-	clock_unlock();
+    return (u2);
+}
+
+static sysclock_t
+acpi_timer_get_timecount_safe(void)
+{
+    sysclock_t last_counter;
+    sysclock_t next_counter;
+    uint32_t counter;
+
+    last_counter = acpi_cputimer.base;
+    for (;;) {
+	    cpu_ccfence();
+	    counter = _acpi_timer_get_timecount_safe();
+
+	    if (acpi_timer_resolution == 32) {
+		    if (counter < (last_counter & 0xFFFFFFFFU))
+			next_counter = ((last_counter + 0x0100000000U) &
+					0xFFFFFFFF00000000LU) | counter;
+		    else
+			next_counter = (last_counter &
+					0xFFFFFFFF00000000LU) | counter;
+	    } else {
+		    if (counter < (last_counter & 0x00FFFFFFU))
+			next_counter = ((last_counter + 0x01000000U) &
+					0xFFFFFFFFFF000000LU) | counter;
+		    else
+			next_counter = (last_counter &
+					0xFFFFFFFFFF000000LU) | counter;
+	    }
+	    if (atomic_fcmpset_long(&acpi_cputimer.base, &last_counter,
+				    next_counter)) {
+		break;
+	    }
     }
-    return (u2 + acpi_cputimer.base);
+    return next_counter;
 }
 
 /*
@@ -390,17 +377,15 @@ acpi_timer_test(void)
     max = max2 = 0;
 
     /* Test the timer with interrupts disabled to get accurate results. */
-#if defined(__i386__)
-    s = read_eflags();
-#elif defined(__x86_64__)
+#if defined(__x86_64__)
     s = read_rflags();
 #else
-#error "no read_eflags"
+#error "no read_*flags"
 #endif
     cpu_disable_intr();
-    last = acpi_timer_read();
+    AcpiGetTimer(&last);
     for (n = 0; n < 2000; n++) {
-	this = acpi_timer_read();
+	AcpiGetTimer(&this);
 	delta = acpi_TimerDelta(this, last);
 	if (delta > max) {
 	    max2 = max;
@@ -412,12 +397,11 @@ acpi_timer_test(void)
 	    min = delta;
 	last = this;
     }
-#if defined(__i386__)
-    write_eflags(s);
-#elif defined(__x86_64__)
+    /* cpu_enable_intr(); restored to original by write_rflags() */
+#if defined(__x86_64__)
     write_rflags(s);
 #else
-#error "no read_eflags"
+#error "no read_*flags"
 #endif
 
     delta = max2 - min;

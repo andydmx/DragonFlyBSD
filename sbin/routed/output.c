@@ -10,11 +10,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgment:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -30,17 +26,11 @@
  * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
  *
+ * @(#)output.c	8.1 (Berkeley) 6/5/93
  * $FreeBSD: src/sbin/routed/output.c,v 1.5.2.1 2000/08/14 17:00:03 sheldonh Exp $
  */
 
 #include "defs.h"
-
-#if !defined(sgi) && !defined(__NetBSD__)
-static char sccsid[] __attribute__((unused)) = "@(#)output.c	8.1 (Berkeley) 6/5/93";
-#elif defined(__NetBSD__)
-__RCSID("$NetBSD$");
-#endif
-
 
 u_int update_seqno;
 
@@ -301,10 +291,10 @@ end_md5_auth(struct ws_buf *wb,
 	na2->a_family = RIP_AF_AUTH;
 	na2->a_type = htons(1);
 	na->au.a_md5.md5_pkt_len = htons(len);
-	MD5Init(&md5_ctx);
-	MD5Update(&md5_ctx, (u_char *)wb->buf, len);
-	MD5Update(&md5_ctx, ap->key, RIP_AUTH_MD5_LEN);
-	MD5Final(na2->au.au_pw, &md5_ctx);
+	MD5_Init(&md5_ctx);
+	MD5_Update(&md5_ctx, (u_char *)wb->buf, len);
+	MD5_Update(&md5_ctx, ap->key, RIP_AUTH_MD5_LEN);
+	MD5_Final(na2->au.au_pw, &md5_ctx);
 	wb->n++;
 }
 
@@ -447,8 +437,7 @@ supply_out(struct ag_info *ag)
  */
 /* ARGSUSED */
 static int
-walk_supply(struct radix_node *rn,
-	    struct walkarg *argp UNUSED)
+walk_supply(struct radix_node *rn, __unused struct walkarg *argp)
 {
 #define RT ((struct rt_entry *)rn)
 	u_short ags;
@@ -592,7 +581,7 @@ walk_supply(struct radix_node *rn,
 	 * Notice spare routes with the same metric that we are about to
 	 * advertise, to split the horizon on redundant, inactive paths.
 	 */
-	if (ws.ifp != 0
+	if (ws.ifp != NULL
 	    && !(ws.state & WS_ST_QUERY)
 	    && (ws.state & WS_ST_TO_ON_NET)
 	    && (!(RT->rt_state & RS_IF)

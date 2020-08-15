@@ -33,6 +33,8 @@
 #ifndef _MACHINE_MD_VAR_H_
 #define	_MACHINE_MD_VAR_H_
 
+#include <sys/types.h>
+
 #include <machine/globaldata.h>
 
 /*
@@ -42,14 +44,17 @@
 extern	u_long	atdevbase;	/* offset in virtual memory of ISA io mem */
 extern	int	busdma_swi_pending;
 extern	void	(*cpu_idle_hook)(void);
-extern	void	cpu_idle(void);
+void		cpu_idle(void);
 extern	u_int	cpu_exthigh;
 extern	u_int	via_feature_rng;
 extern	u_int	via_feature_xcrypt;
 extern	u_int	amd_feature;
 extern	u_int	amd_feature2;
+extern	u_long	cpu_ia32_arch_caps;
 extern	u_int	cpu_clflush_line_size;
 extern	u_int	cpu_stdext_feature;
+extern	u_int	cpu_stdext_feature2;
+extern	u_int	cpu_stdext_feature3;
 extern	u_int	cpu_thermal_feature;
 extern	u_int	cpu_mwait_feature;
 extern	u_int	cpu_mwait_extemu;
@@ -65,7 +70,7 @@ extern	char	kstack[];
 extern	char	sigcode[];
 extern	int	szsigcode;
 extern	uint64_t *vm_page_dump;
-extern	int	vm_page_dump_size;
+extern	vm_offset_t vm_page_dump_size;
 
 
 typedef void alias_for_inthand_t(u_int cs, u_int ef, u_int esp, u_int ss);
@@ -85,7 +90,6 @@ void	doreti_iret_fault(void) __asm(__STRING(doreti_iret_fault));
 void	enable_sse(void);
 void	fillw(int /*u_short*/ pat, void *base, size_t cnt);
 void	pagezero(void *addr);
-void	pagecopy(void *from, void *to);
 void	setidt_global(int idx, alias_for_inthand_t *func,
 	    int typ, int dpl, int ist);
 void	setidt(int idx, alias_for_inthand_t *func,
@@ -94,6 +98,7 @@ int	user_dbreg_trap(void);
 void	fpstate_drop(struct thread *td);
 
 int     npxdna(void);
+void	npxdna_quick(struct thread *td);
 void npxpush(struct __mcontext *mctx);
 void npxpop(struct __mcontext *mctx);
 
@@ -110,5 +115,6 @@ void	dump_add_page(vm_paddr_t);
 void	dump_drop_page(vm_paddr_t);
 boolean_t cpu_mwait_hint_valid(uint32_t);
 void	cpu_mwait_cx_no_bmsts(void);
+void	cpu_mwait_cx_no_bmarb(void);
 
 #endif /* !_MACHINE_MD_VAR_H_ */

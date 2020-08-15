@@ -3,11 +3,11 @@
  *
  * This code is derived from software contributed to The DragonFly Project
  * by Matthew Dillon <dillon@backplane.com>
- * 
+ *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
  * are met:
- * 
+ *
  * 1. Redistributions of source code must retain the above copyright
  *    notice, this list of conditions and the following disclaimer.
  * 2. Redistributions in binary form must reproduce the above copyright
@@ -17,7 +17,7 @@
  * 3. Neither the name of The DragonFly Project nor the names of its
  *    contributors may be used to endorse or promote products derived
  *    from this software without specific, prior written permission.
- * 
+ *
  * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
  * ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
  * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
@@ -30,9 +30,8 @@
  * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT
  * OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
- * 
+ *
  * $FreeBSD: src/lib/libkvm/kvm_getswapinfo.c,v 1.10.2.4 2003/01/12 09:23:13 dillon Exp $
- * $DragonFly: src/lib/libkvm/kvm_getswapinfo.c,v 1.5 2006/03/18 17:15:35 dillon Exp $
  */
 
 #define	_KERNEL_STRUCTURES
@@ -48,7 +47,6 @@
 
 #include <err.h>
 #include <fcntl.h>
-#include <kvm.h>
 #include <nlist.h>
 #include <paths.h>
 #include <stdio.h>
@@ -57,14 +55,15 @@
 #include <unistd.h>
 #include <limits.h>
 
+#include "kvm.h"
 #include "kvm_private.h"
 
 static struct nlist kvm_swap_nl[] = {
-	{ "_swapblist" },	/* new radix swap list		*/
-	{ "_swdevt" },		/* list of swap devices and sizes */
-	{ "_nswdev" },		/* number of swap devices */
-	{ "_dmmax" },		/* maximum size of a swap block */
-	{ "" }
+	{ .n_name = "_swapblist" },	/* new radix swap list */
+	{ .n_name = "_swdevt" },	/* list of swap devices and sizes */
+	{ .n_name = "_nswdev" },	/* number of swap devices */
+	{ .n_name = "_dmmax" },		/* maximum size of a swap block */
+	{ .n_name = "" }
 };
 
 #define NL_SWAPBLIST	0
@@ -115,13 +114,13 @@ static int kvm_getswapinfo_sysctl(kvm_t *kd, struct kvm_swap *swap_ary,
 
 int
 kvm_getswapinfo(
-	kvm_t *kd, 
+	kvm_t *kd,
 	struct kvm_swap *swap_ary,
-	int swap_max, 
+	int swap_max,
 	int flags
 ) {
 	int i, ti, swi;
-	int ttl;
+	swblk_t ttl;
 	struct swdevt *sw;
 	struct swdevt swinfo;
 
@@ -242,21 +241,24 @@ nlist_init(kvm_t *kd)
 
 static int
 scanradix(
-	blmeta_t *scan, 
+	blmeta_t *scan,
 	blmeta_t *scan_cache,
 	swblk_t blk,
 	int64_t radix,
 	swblk_t skip,
 	swblk_t count,
 	kvm_t *kd,
-	int dmmax, 
-	int nswdev,
+	int dmmaxr,
+	int nswdevr,
 	int64_t *availp,
 	int tab
 ) {
 	blmeta_t meta;
 	blmeta_t scan_array[BLIST_BMAP_RADIX];
-	int i;
+	int64_t avail_tmp = 0;
+	unsigned int iu;
+	int im;
+	int next_skip;
 
 	if (scan_cache) {
 		meta = *scan_cache;
@@ -274,10 +276,10 @@ scanradix(
 	 * Terminator
 	 */
 	if (meta.bm_bighint == (swblk_t)-1) {
-		printf("%*.*s(0x%06x,%lld) Terminator\n",
+		printf("%*.*s(0x%06jx,%jd) Terminator\n",
 		    TABME,
-		    blk,
-		    (long long)radix
+		    (intmax_t)blk,
+		    (intmax_t)radix
 		);
 		return(-1);
 	}
@@ -286,17 +288,17 @@ scanradix(
 		/*
 		 * Leaf bitmap
 		 */
-		printf("%*.*s(0x%06x,%lld) Bitmap %08x big=%d\n",
+		printf("%*.*s(0x%06jx,%jd) Bitmap %016jx big=%jd\n",
 		    TABME,
-		    blk,
-		    (long long)radix,
-		    (int)meta.u.bmu_bitmap,
-		    meta.bm_bighint
+		    (intmax_t)blk,
+		    (intmax_t)radix,
+		    (intmax_t)meta.u.bmu_bitmap,
+		    (intmax_t)meta.bm_bighint
 		);
 
 		if (meta.u.bmu_bitmap) {
-			for (i = 0; i < BLIST_BMAP_RADIX; ++i) {
-				if (meta.u.bmu_bitmap & (1 << i))
+			for (iu = 0; iu < BLIST_BMAP_RADIX; ++iu) {
+				if (meta.u.bmu_bitmap & (1LU << iu))
 					++*availp;
 			}
 		}
@@ -304,57 +306,53 @@ scanradix(
 		/*
 		 * Meta node if all free
 		 */
-		printf("%*.*s(0x%06x,%lld) Submap ALL-FREE (big=%d) {\n",
+		printf("%*.*s(0x%06jx,%jd) Submap ALL-FREE (big=%jd) {\n",
 		    TABME,
-		    blk,
-		    (long long)radix,
-		    meta.bm_bighint
+		    (intmax_t)blk,
+		    (intmax_t)radix,
+		    (intmax_t)meta.bm_bighint
 		);
 		*availp += radix;
 	} else if (meta.u.bmu_avail == 0) {
 		/*
 		 * Meta node if all used
 		 */
-		printf("%*.*s(0x%06x,%lld) Submap ALL-ALLOCATED (big=%d)\n",
+		printf("%*.*s(0x%06jx,%jd) Submap ALL-ALLOCATED (big=%jd)\n",
 		    TABME,
-		    blk,
-		    (long long)radix,
-		    meta.bm_bighint
+		    (intmax_t)blk,
+		    (intmax_t)radix,
+		    (intmax_t)meta.bm_bighint
 		);
 	} else {
 		/*
 		 * Meta node if not all free
 		 */
-		int i;
-		int next_skip;
-		int64_t avail_tmp = 0;
-
-		printf("%*.*s(0x%06x,%lld) Submap avail=%d big=%d {\n",
+		printf("%*.*s(0x%06jx,%jd) Submap avail=%jd big=%jd {\n",
 		    TABME,
-		    blk,
-		    (long long)radix,
-		    (int)meta.u.bmu_avail,
-		    meta.bm_bighint
+		    (intmax_t)blk,
+		    (intmax_t)radix,
+		    (intmax_t)meta.u.bmu_avail,
+		    (intmax_t)meta.bm_bighint
 		);
 
 		radix /= BLIST_META_RADIX;
 		next_skip = skip / BLIST_META_RADIX;
 
-		for (i = 1; i <= skip; i += next_skip) {
+		for (im = 1; im <= skip; im += next_skip) {
 			int r;
 			swblk_t vcount = (count > radix) ?
 					(swblk_t)radix : count;
 
 			r = scanradix(
-			    &scan[i],
-			    ((next_skip == 1) ? &scan_array[i] : NULL),
+			    &scan[im],
+			    ((next_skip == 1) ? &scan_array[im] : NULL),
 			    blk,
 			    radix,
 			    next_skip - 1,
 			    vcount,
 			    kd,
-			    dmmax,
-			    nswdev,
+			    dmmaxr,
+			    nswdevr,
 			    &avail_tmp,
 			    tab + 4
 			);
@@ -390,11 +388,11 @@ dump_blist(kvm_t *kd)
 
 	KGET2(swapblist, &blcopy, sizeof(blcopy), "*swapblist");
 
-	printf("radix tree: %d/%d/%lld blocks, %dK wired\n",
-		blcopy.bl_free,
-		blcopy.bl_blocks,
-		(long long)blcopy.bl_radix,
-		(int)((blcopy.bl_rootblks * sizeof(blmeta_t) + 1023)/
+	printf("radix tree: %jd/%jd/%jd blocks, %jdK wired\n",
+		(intmax_t)blcopy.bl_free,
+		(intmax_t)blcopy.bl_blocks,
+		(intmax_t)blcopy.bl_radix,
+		(intmax_t)((blcopy.bl_rootblks * sizeof(blmeta_t) + 1023)/
 		    1024)
 	);
 
@@ -416,7 +414,7 @@ dump_blist(kvm_t *kd)
 
 static
 int
-kvm_getswapinfo_sysctl(kvm_t *kd, struct kvm_swap *swap_ary,
+kvm_getswapinfo_sysctl(kvm_t *kd __unused, struct kvm_swap *swap_ary,
 		       int swap_max, int flags)
 {
 	size_t bytes = 0;

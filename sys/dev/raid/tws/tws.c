@@ -40,6 +40,8 @@
 
 #include <bus/cam/cam.h>
 #include <bus/cam/cam_ccb.h>
+#include <bus/cam/cam_xpt.h>
+#include <bus/cam/cam_xpt_periph.h>
 
 static int	tws_msi_enable = 1;
 
@@ -106,7 +108,7 @@ static struct dev_ops tws_ops = {
  * attach routine when we create the /dev entry.
  */
 
-int
+static int
 tws_open(struct dev_open_args *ap)
 {
     cdev_t dev = ap->a_head.a_dev;
@@ -117,7 +119,7 @@ tws_open(struct dev_open_args *ap)
     return (0);
 }
 
-int
+static int
 tws_close(struct dev_close_args *ap)
 {
     cdev_t dev = ap->a_head.a_dev;
@@ -128,7 +130,7 @@ tws_close(struct dev_close_args *ap)
     return (0);
 }
 
-int
+static int
 tws_read(struct dev_read_args *ap)
 {
     cdev_t dev = ap->a_head.a_dev;
@@ -139,7 +141,7 @@ tws_read(struct dev_read_args *ap)
     return (0);
 }
 
-int
+static int
 tws_write(struct dev_write_args *ap)
 {
     cdev_t dev = ap->a_head.a_dev;
@@ -208,17 +210,8 @@ tws_attach(device_t dev)
 #if _BYTE_ORDER == _BIG_ENDIAN
     TWS_TRACE(sc, "BIG endian", 0, 0);
 #endif
-    /* sysctl context setup */
-    sysctl_ctx_init(&sc->tws_clist);
-    sc->tws_oidp = SYSCTL_ADD_NODE(&sc->tws_clist,
-                                   SYSCTL_STATIC_CHILDREN(_hw), OID_AUTO,
-                                   device_get_nameunit(dev),
-                                   CTLFLAG_RD, 0, "");
-    if ( sc->tws_oidp == NULL ) {
-        tws_log(sc, SYSCTL_TREE_NODE_ADD);
-        goto attach_fail_1;
-    }
-    SYSCTL_ADD_STRING(&sc->tws_clist, SYSCTL_CHILDREN(sc->tws_oidp),
+    SYSCTL_ADD_STRING(device_get_sysctl_ctx(dev),
+		      SYSCTL_CHILDREN(device_get_sysctl_tree(dev)),
                       OID_AUTO, "driver_version", CTLFLAG_RD,
                       TWS_DRIVER_VERSION_STRING, 0, "TWS driver version");
 
@@ -345,7 +338,6 @@ attach_fail_1:
     lockuninit(&sc->sim_lock);
     lockuninit(&sc->gen_lock);
     lockuninit(&sc->io_lock);
-    sysctl_ctx_free(&sc->tws_clist);
     return (ENXIO);
 }
 
@@ -405,7 +397,7 @@ tws_detach(device_t dev)
 
     kfree(sc->reqs, M_TWS);
     kfree(sc->sense_bufs, M_TWS);
-    kfree(sc->scan_ccb, M_TWS);
+    xpt_free_ccb(&sc->scan_ccb->ccb_h);
     kfree(sc->aen_q.q, M_TWS);
     kfree(sc->trace_q.q, M_TWS);
     lockuninit(&sc->q_lock);
@@ -414,7 +406,6 @@ tws_detach(device_t dev)
     lockuninit(&sc->io_lock);
     destroy_dev(sc->tws_cdev);
     dev_ops_remove_minor(&tws_ops, device_get_unit(sc->tws_dev));
-    sysctl_ctx_free(&sc->tws_clist);
     return (0);
 }
 
@@ -548,7 +539,7 @@ tws_init(struct tws_softc *sc)
                       M_WAITOK | M_ZERO);
     sc->sense_bufs = kmalloc(sizeof(struct tws_sense) * tws_queue_depth, M_TWS,
                       M_WAITOK | M_ZERO);
-    sc->scan_ccb = kmalloc(sizeof(union ccb), M_TWS, M_WAITOK | M_ZERO);
+    sc->scan_ccb = xpt_alloc_ccb();
 
     if ( !tws_ctlr_ready(sc) )
         if( !tws_ctlr_reset(sc) )

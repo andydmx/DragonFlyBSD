@@ -52,7 +52,6 @@
 #include <sys/bus.h>
 #include <sys/module.h>
 #include <sys/lock.h>
-#include <sys/mutex.h>
 #include <sys/condvar.h>
 #include <sys/sysctl.h>
 #include <sys/unistd.h>
@@ -60,6 +59,8 @@
 #include <sys/malloc.h>
 #include <sys/priv.h>
 
+#include <net/if.h>
+#include <net/if_var.h>
 #include <net/ifq_var.h>
 
 #include <bus/u4b/usb.h>
@@ -453,8 +454,9 @@ udav_init(struct usb_ether *ue)
 
 	usbd_xfer_set_stall(sc->sc_xfer[UDAV_BULK_DT_WR]);
 
-/* XXX	ifp->if_drv_flags |= IFF_DRV_RUNNING;
- */
+#if 0 /* XXX */
+	ifp->if_drv_flags |= IFF_DRV_RUNNING;
+#endif
 	udav_start(ue);
 }
 
@@ -518,7 +520,7 @@ udav_setmulti(struct usb_ether *ue)
 			continue;
 		h = ether_crc32_be(LLADDR((struct sockaddr_dl *)
 		    ifma->ifma_addr), ETHER_ADDR_LEN) >> 26;
-		hashtbl[h / 8] |= 1 << (h % 8);
+		setbit(hashtbl, h);
 	}
 
 	/* disable all multicast */

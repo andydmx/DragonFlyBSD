@@ -21,11 +21,11 @@
  * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
  * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
  * THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ *
+ * $FreeBSD: head/sbin/ifconfig/regdomain.c 200587 2009-12-15 20:44:12Z gavin $
  */
-#ifndef lint
-static const char rcsid[] = "$FreeBSD: head/sbin/ifconfig/regdomain.c 200587 2009-12-15 20:44:12Z gavin $";
-#endif /* not lint */
 
+#include <sys/param.h>
 #include <sys/types.h>
 #include <sys/errno.h>
 #include <sys/mman.h>
@@ -60,16 +60,15 @@ struct mystate {
 	int			nident;
 };
 
-struct ident {
-	const void *id;
-	void *p;
-	enum { DOMAIN, COUNTRY, FREQBAND } type;
-};
+static int
+iseq(const char *a, const char *b)
+{
+	return (strcasecmp(a, b) == 0);
+}
 
 static void
 start_element(void *data, const char *name, const char **attr)
 {
-#define	iseq(a,b)	(strcasecmp(a,b) == 0)
 	struct mystate *mt;
 	const void *id, *ref, *mode;
 	int i;
@@ -165,13 +164,11 @@ start_element(void *data, const char *name, const char **attr)
 		LIST_INSERT_HEAD(&mt->rdp->freqbands, mt->freqband, next);
 		return;
 	}
-#undef iseq
 }
 
 static int
 decode_flag(struct mystate *mt, const char *p, int len)
 {
-#define	iseq(a,b)	(strcasecmp(a,b) == 0)
 	static const struct {
 		const char *name;
 		int len;
@@ -212,21 +209,19 @@ decode_flag(struct mystate *mt, const char *p, int len)
 		{ "INDOOR",	6,	REQ_INDOOR },
 		{ "OUTDOOR",	7,	REQ_OUTDOOR },
 	};
-	int i;
+	size_t i;
 
-	for (i = 0; i < sizeof(flags)/sizeof(flags[0]); i++)
+	for (i = 0; i < nitems(flags); i++)
 		if (len == flags[i].len && iseq(p, flags[i].name))
 			return flags[i].value;
 	warnx("unknown flag \"%.*s\" at line %ld ignored",
 	    len, p, XML_GetCurrentLineNumber(mt->parser));
 	return 0;
-#undef iseq
 }
 
 static void
 end_element(void *data, const char *name)
 {
-#define	iseq(a,b)	(strcasecmp(a,b) == 0)
 	struct mystate *mt;
 	int len;
 	char *p;
@@ -365,7 +360,6 @@ end_element(void *data, const char *name)
 done:
 	sbuf_delete(mt->sbuf[mt->level]);
 	mt->sbuf[mt->level--] = NULL;
-#undef iseq
 }
 
 static void
@@ -387,12 +381,12 @@ char_data(void *data, const XML_Char *s, int len)
 }
 
 static void *
-findid(struct regdata *rdp, const void *id, int type)
+findid(struct regdata *rdp, const void *id, enum IdentType type)
 {
 	struct ident *ip;
 
 	for (ip = rdp->ident; ip->id != NULL; ip++)
-		if (ip->type == type && strcasecmp(ip->id, id) == 0)
+		if (ip->type == type && iseq(ip->id, id))
 			return ip->p;
 	return NULL;
 }
@@ -662,7 +656,7 @@ lib80211_regdomain_findbyname(const struct regdata *rdp, const char *name)
 	const struct regdomain *dp;
 
 	LIST_FOREACH(dp, &rdp->domains, next) {
-		if (strcasecmp(dp->name, name) == 0)
+		if (iseq(dp->name, name))
 			return dp;
 	}
 	return NULL;
@@ -692,11 +686,11 @@ lib80211_country_findbyname(const struct regdata *rdp, const char *name)
 	const struct country *cp;
 	int len;
 
-	len = strlen(name);
 	LIST_FOREACH(cp, &rdp->countries, next) {
-		if (strcasecmp(cp->isoname, name) == 0)
+		if (iseq(cp->isoname, name))
 			return cp;
 	}
+	len = strlen(name);
 	LIST_FOREACH(cp, &rdp->countries, next) {
 		if (strncasecmp(cp->name, name, len) == 0)
 			return cp;

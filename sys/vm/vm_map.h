@@ -1,9 +1,13 @@
 /*
  * Copyright (c) 1991, 1993
  *	The Regents of the University of California.  All rights reserved.
+ * Copyright (c) 2003-2019 The DragonFly Project.  All rights reserved.
  *
  * This code is derived from software contributed to Berkeley by
  * The Mach Operating System project at Carnegie-Mellon University.
+ *
+ * This code is derived from software contributed to The DragonFly Project
+ * by Matthew Dillon <dillon@backplane.com>
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -13,11 +17,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -60,14 +60,12 @@
  *
  * any improvements or extensions that they make and grant Carnegie the
  * rights to redistribute these changes.
- *
- * $FreeBSD: src/sys/vm/vm_map.h,v 1.54.2.5 2003/01/13 22:51:17 dillon Exp $
  */
 
 /*
- *	Virtual memory map module definitions.
+ * Virtual memory map module definitions.  The vm_map houses the pmap
+ * structure which controls the mmu context for a process.
  */
-
 #ifndef	_VM_VM_MAP_H_
 #define	_VM_VM_MAP_H_
 
@@ -81,9 +79,6 @@
 #endif
 #ifndef _SYS_TREE_H_
 #include <sys/tree.h>
-#endif
-#ifndef _SYS_SYSREF_H_
-#include <sys/sysref.h>
 #endif
 #ifndef _SYS_LOCK_H_
 #include <sys/lock.h>
@@ -107,27 +102,12 @@
 struct vm_map_rb_tree;
 RB_PROTOTYPE(vm_map_rb_tree, vm_map_entry, rb_entry, rb_vm_map_compare);
 
-/*
- *	Types defined:
- *
- *	vm_map_t		the high-level address map data structure.
- *	vm_map_entry_t		an entry in an address map.
- */
-
 typedef u_int vm_flags_t;
 typedef u_int vm_eflags_t;
 
 /*
- * A vm_map_entry may reference an object, a submap, a uksmap, or a
- * direct user-kernel shared map.
+ * Aux structure depends on map type and/or flags.
  */
-union vm_map_object {
-	struct vm_object *vm_object;	/* object object */
-	struct vm_map *sub_map;		/* belongs to another map */
-	int	(*uksmap)(struct cdev *dev, vm_page_t fake);
-	void	*map_object;		/* generic */
-};
-
 union vm_map_aux {
 	vm_offset_t avail_ssize;	/* amt can grow if this is a stack */
 	vpte_t master_pde;		/* virtual page table root */
@@ -136,33 +116,129 @@ union vm_map_aux {
 };
 
 /*
- *	Address map entries consist of start and end addresses,
- *	a VM object (or sharing map) and offset into that object,
- *	and user-exported inheritance and protection information.
- *	Also included is control information for virtual copy operations.
+ * vm_map_entry identifiers, used as a debugging aid
+ */
+typedef enum {
+	VM_SUBSYS_UNKNOWN,
+	VM_SUBSYS_KMALLOC,
+	VM_SUBSYS_STACK,
+	VM_SUBSYS_IMGACT,
+	VM_SUBSYS_EFI,
+	VM_SUBSYS_RESERVED,
+	VM_SUBSYS_INIT,
+	VM_SUBSYS_PIPE,
+	VM_SUBSYS_PROC,
+	VM_SUBSYS_SHMEM,
+	VM_SUBSYS_SYSMAP,
+	VM_SUBSYS_MMAP,
+	VM_SUBSYS_BRK,
+	VM_SUBSYS_BOGUS,
+	VM_SUBSYS_BUF,
+	VM_SUBSYS_BUFDATA,
+	VM_SUBSYS_GD,
+	VM_SUBSYS_IPIQ,
+	VM_SUBSYS_PVENTRY,
+	VM_SUBSYS_PML4,
+	VM_SUBSYS_MAPDEV,
+	VM_SUBSYS_ZALLOC,
+
+	VM_SUBSYS_DM,
+	VM_SUBSYS_CONTIG,
+	VM_SUBSYS_DRM,
+	VM_SUBSYS_DRM_GEM,
+	VM_SUBSYS_DRM_SCAT,
+	VM_SUBSYS_DRM_VMAP,
+	VM_SUBSYS_DRM_TTM,
+	VM_SUBSYS_HAMMER,
+
+	VM_SUBSYS_VMPGHASH,
+
+	VM_SUBSYS_LIMIT		/* end of list */
+} vm_subsys_t;
+
+#define UKSMAPOP_ADD		1
+#define UKSMAPOP_REM		2
+#define UKSMAPOP_FAULT		3
+
+/*
+ * vm_map backing structure for specifying multiple backings.  This
+ * structure is NOT shared across pmaps but may be shared within a pmap.
+ * The offset is cumulatively added from its parent, allowing easy splits
+ * and merges.
+ */
+struct vm_map_backing {
+	vm_offset_t	start;		/* start address in pmap */
+	vm_offset_t	end;		/* end address in pmap */
+	struct pmap	*pmap;		/* for vm_object extents */
+
+	struct vm_map_backing	*backing_ba;	/* backing store */
+
+	/*
+	 * Keep track of extents, typically via a vm_object but for uksmaps
+	 * this can also be based off of a process or lwp.
+	 */
+	TAILQ_ENTRY(vm_map_backing) entry;
+
+	/*
+	 * A vm_map_entry may reference an object, a submap, a uksmap, or a
+	 * direct user-kernel shared map.
+	 */
+	union {
+		struct vm_object *object;	/* vm_object */
+		struct vm_map	*sub_map;	/* belongs to another map */
+		int		(*uksmap)(struct vm_map_backing *entry,
+					  int op,
+					  struct cdev *dev,
+					  vm_page_t fake);
+		void		*map_object;	/* generic */
+	};
+	void			*aux_info;
+
+	/*
+	 * The offset field typically represents the absolute offset in the
+	 * object, but can have other meanings for uksmaps.
+	 */
+	vm_ooffset_t		offset;
+	uint32_t		flags;
+	uint32_t		backing_count;	/* #entries backing us */
+};
+
+typedef struct vm_map_backing *vm_map_backing_t;
+
+#define VM_MAP_BACK_EXCL_HEUR	0x00000001U
+
+/*
+ * Address map entries consist of start and end addresses, a VM object
+ * (or sharing map) and offset into that object, and user-exported
+ * inheritance and protection information.  Also included is control
+ * information for virtual copy operations.
  *
- *	When used with MAP_STACK, avail_ssize is used to determine the
- *	limits of stack growth.
+ * The object information is now encapsulated in a vm_map_backing
+ * structure which contains the backing store chain, if any.  This
+ * structure is NOT shared.
  *
- *	When used with VM_MAPTYPE_VPAGETABLE, avail_ssize stores the
- *	page directory index.
+ * When used with MAP_STACK, avail_ssize is used to determine the limits
+ * of stack growth.
+ *
+ * When used with VM_MAPTYPE_VPAGETABLE, avail_ssize stores the page
+ * directory index.
  */
 struct vm_map_entry {
-	struct vm_map_entry *prev;	/* previous entry */
-	struct vm_map_entry *next;	/* next entry */
 	RB_ENTRY(vm_map_entry) rb_entry;
-	vm_offset_t start;		/* start address */
-	vm_offset_t end;		/* end address */
 	union vm_map_aux aux;		/* auxillary data */
-	union vm_map_object object;	/* object I point to */
-	vm_ooffset_t offset;		/* offset into object */
-	vm_eflags_t eflags;		/* map entry flags */
-	vm_maptype_t maptype;		/* type of VM mapping */
-	vm_prot_t protection;		/* protection code */
-	vm_prot_t max_protection;	/* maximum protection */
-	vm_inherit_t inheritance;	/* inheritance */
-	int wired_count;		/* can be paged if = 0 */
+	struct vm_map_backing ba;	/* backing object chain */
+	vm_eflags_t	eflags;		/* map entry flags */
+	vm_maptype_t	maptype;	/* type of VM mapping */
+	vm_prot_t	protection;	/* protection code */
+	vm_prot_t	max_protection;	/* maximum protection */
+	vm_inherit_t	inheritance;	/* inheritance */
+	int		wired_count;	/* can be paged if = 0 */
+	vm_subsys_t	id;		/* subsystem id */
 };
+
+typedef struct vm_map_entry *vm_map_entry_t;
+
+#define MAPENT_FREELIST(ent)		(ent)->rb_entry.rbe_left
 
 #define MAP_ENTRY_NOSYNC		0x0001
 #define MAP_ENTRY_STACK			0x0002
@@ -193,7 +269,14 @@ struct vm_map_entry {
  * single-insertion operations, including any necessary clipping.
  */
 #define MAP_RESERVE_COUNT	4
-#define MAP_RESERVE_SLOP	32
+#define MAP_RESERVE_SLOP	512
+#define MAP_RESERVE_HYST	(MAP_RESERVE_SLOP - MAP_RESERVE_SLOP / 8)
+
+/*
+ * vm_map_lookup wflags
+ */
+#define FW_WIRED	0x0001
+#define FW_DIDCOW	0x0002
 
 static __inline u_char   
 vm_map_entry_behavior(struct vm_map_entry *entry)
@@ -207,6 +290,40 @@ vm_map_entry_set_behavior(struct vm_map_entry *entry, u_char behavior)
 	entry->eflags = (entry->eflags & ~MAP_ENTRY_BEHAV_MASK) |
 		(behavior & MAP_ENTRY_BEHAV_MASK);
 }                       
+
+/*
+ * VA interlock for map (VPAGETABLE / vkernel support)
+ */
+struct vm_map_ilock {
+	struct vm_map_ilock *next;
+	int	flags;
+	vm_offset_t ran_beg;
+	vm_offset_t ran_end;	/* non-inclusive */
+};
+
+#define ILOCK_WAITING	0x00000001
+
+/*
+ * Hinting mechanism used by vm_map_findspace() to figure out where to start
+ * an iteration looking for a hole big enough for the requested allocation.
+ * This can be important in situations where large amounts of kernel memory
+ * are being managed.  For example, if the system is managing tens of
+ * thousands of processes or threads.
+ *
+ * If a hint is present it guarantees that no compatible hole exists prior
+ * to the (start) address.  The (start) address itself is not necessarily
+ * a hole.
+ */
+#define VM_MAP_FFCOUNT	4
+#define VM_MAP_FFMASK	(VM_MAP_FFCOUNT - 1)
+
+struct vm_map_freehint {
+	vm_offset_t	start;
+	vm_offset_t	length;
+	vm_offset_t	align;
+	int		unused01;
+};
+typedef struct vm_map_freehint vm_map_freehint_t;
 
 /*
  * Maps are doubly-linked lists of map entries, kept sorted by address.
@@ -223,24 +340,30 @@ vm_map_entry_set_behavior(struct vm_map_entry *entry, u_char behavior)
  * NOTE: The vm_map structure can be hard-locked with the lockmgr lock
  *	 or soft-serialized with the token, or both.
  */
+RB_HEAD(vm_map_rb_tree, vm_map_entry);
+
 struct vm_map {
-	struct vm_map_entry header;	/* List of entries */
-	RB_HEAD(vm_map_rb_tree, vm_map_entry) rb_root;
-	struct lock lock;		/* Lock for map data */
-	int nentries;			/* Number of entries */
-	vm_size_t size;			/* virtual size */
-	u_char system_map;		/* Am I a system map? */
-	vm_map_entry_t hint;		/* hint for quick lookups */
-	unsigned int timestamp;		/* Version number */
-	vm_map_entry_t first_free;	/* First free space hint */
-	vm_flags_t flags;		/* flags for this vm_map */
-	struct pmap *pmap;		/* Physical map */
-	u_int president_cache;		/* Remember president count */
-	u_int president_ticks;		/* Save ticks for cache */
+	struct		lock lock;	/* Lock for map data */
+	struct vm_map_rb_tree rb_root;	/* Organize map entries */
+	vm_offset_t	min_addr;	/* min address */
+	vm_offset_t	max_addr;	/* max address */
+	int		nentries;	/* Number of entries */
+	unsigned int	timestamp;	/* Version number */
+	vm_size_t	size;		/* virtual size */
+	u_char		system_map;	/* Am I a system map? */
+	u_char		freehint_newindex;
+	u_char		unused02;
+	u_char		unused03;
+	vm_flags_t	flags;		/* flags for this vm_map */
+	vm_map_freehint_t freehint[VM_MAP_FFCOUNT];
+	struct pmap	*pmap;		/* Physical map */
+	struct vm_map_ilock *ilock_base;/* interlocks */
+	struct spinlock	ilock_spin;	/* interlocks (spinlock for) */
 	struct lwkt_token token;	/* Soft serializer */
-#define	min_offset		header.start
-#define max_offset		header.end
+	vm_offset_t pgout_offset;	/* for RLIMIT_RSS scans */
 };
+
+typedef struct vm_map *vm_map_t;
 
 /*
  * vm_flags_t values
@@ -261,9 +384,9 @@ struct vmspace {
 #define vm_startcopy vm_rssize
 	segsz_t vm_rssize;	/* current resident set size in pages */
 	segsz_t vm_swrss;	/* resident set size before last swap */
-	segsz_t vm_tsize;	/* text size (pages) XXX */
-	segsz_t vm_dsize;	/* data size (pages) XXX */
-	segsz_t vm_ssize;	/* stack size (pages) */
+	segsz_t vm_tsize;	/* text size (bytes) */
+	segsz_t vm_dsize;	/* data size (bytes) */
+	segsz_t vm_ssize;	/* stack size (bytes) */
 	caddr_t vm_taddr;	/* user virtual address of text XXX */
 	caddr_t vm_daddr;	/* user virtual address of data XXX */
 	caddr_t vm_maxsaddr;	/* user VA at max stack growth */
@@ -275,6 +398,8 @@ struct vmspace {
 	u_int	vm_holdcnt;	/* temporary hold count and exit sequencing */
 	u_int	vm_refcnt;	/* normal ref count */
 };
+
+#define VM_REF_DELETED		0x80000000U
 
 #define VMSPACE_EXIT1		0x0001	/* partial exit */
 #define VMSPACE_EXIT2		0x0002	/* full exit */
@@ -411,8 +536,8 @@ vm_map_lock_upgrade(vm_map_t map) {
 /*
  *	Functions implemented as macros
  */
-#define		vm_map_min(map)		((map)->min_offset)
-#define		vm_map_max(map)		((map)->max_offset)
+#define		vm_map_min(map)		((map)->min_addr)
+#define		vm_map_max(map)		((map)->max_addr)
 #define		vm_map_pmap(map)	((map)->pmap)
 
 /*
@@ -431,62 +556,6 @@ static __inline long
 vmspace_resident_count(struct vmspace *vmspace)
 {
 	return pmap_resident_count(vmspace_pmap(vmspace));
-}
-
-/*
- * Calculates the proportional RSS and returning the
- * accrued result.  This is a loose value for statistics/display
- * purposes only and will only be updated if we can acquire
- * a non-blocking map lock.
- *
- * (used by userland or the kernel)
- */
-static __inline u_int
-vmspace_president_count(struct vmspace *vmspace)
-{
-	vm_map_t map = &vmspace->vm_map;
-	vm_map_entry_t cur;
-	vm_object_t object;
-	u_int count = 0;
-	u_int n;
-
-#ifdef _KERNEL
-	if (map->president_ticks == ticks / hz || vm_map_lock_read_try(map))
-		return(map->president_cache);
-#endif
-
-	for (cur = map->header.next; cur != &map->header; cur = cur->next) {
-		switch(cur->maptype) {
-		case VM_MAPTYPE_NORMAL:
-		case VM_MAPTYPE_VPAGETABLE:
-			if ((object = cur->object.vm_object) == NULL)
-				break;
-			if (object->type != OBJT_DEFAULT &&
-			    object->type != OBJT_SWAP) {
-				break;
-			}
-			/*
-			 * synchronize non-zero case, contents of field
-			 * can change at any time due to pmap ops.
-			 */
-			if ((n = object->agg_pv_list_count) != 0) {
-#ifdef _KERNEL
-				cpu_ccfence();
-#endif
-				count += object->resident_page_count / n;
-			}
-			break;
-		default:
-			break;
-		}
-	}
-#ifdef _KERNEL
-	map->president_cache = count;
-	map->president_ticks = ticks / hz;
-	vm_map_unlock_read(map);
-#endif
-
-	return(count);
 }
 
 /*
@@ -522,6 +591,7 @@ vmspace_president_count(struct vmspace *vmspace)
 #define VM_FAULT_UNSWAP		0x10	/* Remove backing store from the page */
 #define VM_FAULT_BURST_QUICK	0x20	/* Special case shared vm_object */
 #define VM_FAULT_WIRE_MASK	(VM_FAULT_CHANGE_WIRING|VM_FAULT_USER_WIRE)
+#define VM_FAULT_USERMODE	0x40
 
 #ifdef _KERNEL
 
@@ -535,24 +605,26 @@ int vm_map_entry_reserve(int);
 int vm_map_entry_kreserve(int);
 void vm_map_entry_release(int);
 void vm_map_entry_krelease(int);
-vm_map_t vm_map_create (vm_map_t, struct pmap *, vm_offset_t, vm_offset_t);
 int vm_map_delete (vm_map_t, vm_offset_t, vm_offset_t, int *);
 int vm_map_find (vm_map_t, void *, void *,
 		 vm_ooffset_t, vm_offset_t *, vm_size_t,
-		 vm_size_t,
-		 boolean_t, vm_maptype_t,
+		 vm_size_t, boolean_t,
+		 vm_maptype_t, vm_subsys_t id,
 		 vm_prot_t, vm_prot_t, int);
 int vm_map_findspace (vm_map_t, vm_offset_t, vm_size_t, vm_size_t,
 		      int, vm_offset_t *);
 vm_offset_t vm_map_hint(struct proc *, vm_offset_t, vm_prot_t);
 int vm_map_inherit (vm_map_t, vm_offset_t, vm_offset_t, vm_inherit_t);
 void vm_map_init (struct vm_map *, vm_offset_t, vm_offset_t, pmap_t);
-int vm_map_insert (vm_map_t, int *, void *, void *,
-		   vm_ooffset_t, vm_offset_t, vm_offset_t,
-		   vm_maptype_t,
+int vm_map_insert (vm_map_t, int *,
+		   void *, void *,
+		   vm_ooffset_t, void *,
+		   vm_offset_t, vm_offset_t,
+		   vm_maptype_t, vm_subsys_t id,
 		   vm_prot_t, vm_prot_t, int);
-int vm_map_lookup (vm_map_t *, vm_offset_t, vm_prot_t, vm_map_entry_t *, vm_object_t *,
-    vm_pindex_t *, vm_prot_t *, boolean_t *);
+int vm_map_lookup (vm_map_t *, vm_offset_t, vm_prot_t,
+		vm_map_entry_t *, struct vm_map_backing **,
+		vm_pindex_t *, vm_pindex_t *, vm_prot_t *, int *);
 void vm_map_lookup_done (vm_map_t, vm_map_entry_t, int);
 boolean_t vm_map_lookup_entry (vm_map_t, vm_offset_t, vm_map_entry_t *);
 int vm_map_wire (vm_map_t, vm_offset_t, vm_offset_t, int);
@@ -566,13 +638,18 @@ int vm_map_madvise (vm_map_t, vm_offset_t, vm_offset_t, int, off_t);
 void vm_map_simplify_entry (vm_map_t, vm_map_entry_t, int *);
 void vm_init2 (void);
 int vm_uiomove (vm_map_t, vm_object_t, off_t, int, vm_offset_t, int *);
-int vm_map_stack (vm_map_t, vm_offset_t, vm_size_t, int,
+int vm_map_stack (vm_map_t, vm_offset_t *, vm_size_t, int,
 		  vm_prot_t, vm_prot_t, int);
-int vm_map_growstack (struct proc *p, vm_offset_t addr);
-int vmspace_swap_count (struct vmspace *vmspace);
-int vmspace_anonymous_count (struct vmspace *vmspace);
+int vm_map_growstack (vm_map_t map, vm_offset_t addr);
+vm_offset_t vmspace_swap_count (struct vmspace *vmspace);
+vm_offset_t vmspace_anonymous_count (struct vmspace *vmspace);
 void vm_map_set_wired_quick(vm_map_t map, vm_offset_t addr, vm_size_t size, int *);
-void vm_map_transition_wait(vm_map_t map);
+void vm_map_transition_wait(vm_map_t map, int relock);
+
+void vm_map_interlock(vm_map_t map, struct vm_map_ilock *ilock,
+			vm_offset_t ran_beg, vm_offset_t ran_end);
+void vm_map_deinterlock(vm_map_t map, struct vm_map_ilock *ilock);
+
 
 #if defined(__x86_64__) && defined(_KERNEL_VIRTUAL)
 int vkernel_module_memory_alloc(vm_offset_t *, size_t);

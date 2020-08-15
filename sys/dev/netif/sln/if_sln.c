@@ -52,12 +52,12 @@
 
 #include <net/bpf.h>
 #include <net/ethernet.h>
-#include <net/ifq_var.h>
 #include <net/if.h>
+#include <net/if_var.h>
 #include <net/if_arp.h>
 #include <net/if_dl.h>
 #include <net/if_media.h>
-#include <net/if_var.h>
+#include <net/ifq_var.h>
 
 #include <vm/pmap.h>
 #include <vm/vm.h>
@@ -149,7 +149,7 @@ static devclass_t sln_devclass;
 DRIVER_MODULE(sln, pci, sln_driver, sln_devclass, NULL, NULL);
 
 static int
-sln_probe(struct device *dev)
+sln_probe(device_t dev)
 {
 	const struct sln_dev *d;
 	uint16_t did, vid;
@@ -751,14 +751,14 @@ sln_tx(struct ifnet *ifp, struct ifaltq_subque *ifsq)
 		if (m_head == NULL)
 			break;
 
-		MGETHDR(m_new, MB_DONTWAIT, MT_DATA);
+		MGETHDR(m_new, M_NOWAIT, MT_DATA);
 		if (m_new == NULL) {
 			if_printf(ifp, "no memory for tx descriptor");
 			m_freem(m_head);
 			break;
 		}
 		if ((m_head->m_pkthdr.len > MHLEN) || (60 > MHLEN)) {
-			MCLGET(m_new, MB_DONTWAIT);
+			MCLGET(m_new, M_NOWAIT);
 			if (!(m_new->m_flags & M_EXT)) {
 				m_freem(m_new);
 				m_freem(m_head);
@@ -909,8 +909,8 @@ sln_rx(struct sln_softc *sc)
 		rx_space = (u_long)((sc->sln_bufdata.sln_rx_buf + SL_RX_BUFLEN) - rx_bufpos);
 
 		if (pkt_size > rx_space) {
-			m = m_devget(rx_bufpos - 2, pkt_size + 2, 0, ifp, NULL);	/* 2 for etherer head
-											 * align */
+			/* 2 for etherer head align */
+			m = m_devget(rx_bufpos - 2, pkt_size + 2, 0, ifp);
 
 			if (m == NULL) {
 				IFNET_STAT_INC(ifp, ierrors, 1);
@@ -922,7 +922,7 @@ sln_rx(struct sln_softc *sc)
 				m_copyback(m, rx_space, pkt_size - rx_space, sc->sln_bufdata.sln_rx_buf);
 			}
 		} else {
-			m = m_devget(rx_bufpos - 2, pkt_size + 2, 0, ifp, NULL);
+			m = m_devget(rx_bufpos - 2, pkt_size + 2, 0, ifp);
 
 			if (m == NULL) {
 				u_long ierr;

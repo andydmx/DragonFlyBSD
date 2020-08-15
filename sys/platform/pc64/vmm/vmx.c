@@ -33,10 +33,9 @@
  * SUCH DAMAGE.
  */
 
-#include <sys/malloc.h>
 #include <sys/param.h>
+#include <sys/malloc.h>
 #include <sys/systm.h>
-#include <sys/types.h>
 #include <sys/thread.h>
 #include <sys/thread2.h>
 #include <sys/sysctl.h>
@@ -45,7 +44,6 @@
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <sys/vkernel.h>
-#include <sys/mplock2.h>
 #include <ddb/ddb.h>
 
 #include <cpu/cpu.h>
@@ -76,33 +74,35 @@ extern void trap(struct trapframe *frame);
 static int vmx_check_cpu_migration(void);
 static int execute_vmptrld(struct vmx_thread_info *vti);
 
-struct instr_decode syscall_asm = {
+#ifdef VMM_DEBUG
+static struct instr_decode syscall_asm = {
 	.opcode_bytes = 2,
 	.opcode.byte1 = 0x0F,
 	.opcode.byte2 = 0x05,
 };
+#endif
 
-struct vmx_ctl_info vmx_pinbased = {
+static struct vmx_ctl_info vmx_pinbased = {
 	.msr_addr = IA32_VMX_PINBASED_CTLS,
 	.msr_true_addr = IA32_VMX_TRUE_PINBASED_CTLS,
 };
 
-struct vmx_ctl_info vmx_procbased = {
+static struct vmx_ctl_info vmx_procbased = {
 	.msr_addr = IA32_VMX_PROCBASED_CTLS,
 	.msr_true_addr = IA32_VMX_TRUE_PROCBASED_CTLS,
 };
 
-struct vmx_ctl_info vmx_procbased2 = {
+static struct vmx_ctl_info vmx_procbased2 = {
 	.msr_addr = IA32_VMX_PROCBASED_CTLS2,
 	.msr_true_addr = IA32_VMX_PROCBASED_CTLS2,
 };
 
-struct vmx_ctl_info vmx_exit = {
+static struct vmx_ctl_info vmx_exit = {
 	.msr_addr = IA32_VMX_EXIT_CTLS,
 	.msr_true_addr = IA32_VMX_TRUE_EXIT_CTLS,
 };
 
-struct vmx_ctl_info vmx_entry = {
+static struct vmx_ctl_info vmx_entry = {
 	.msr_addr = IA32_VMX_ENTRY_CTLS,
 	.msr_true_addr = IA32_VMX_TRUE_ENTRY_CTLS,
 };
@@ -115,21 +115,21 @@ static struct sysctl_oid *vmx_sysctl_tree;
 static struct sysctl_ctx_list vmx_sysctl_ctx;
 
 /* Per cpu info */
-struct vmx_pcpu_info *pcpu_info;
+static struct vmx_pcpu_info *pcpu_info;
 
 /* VMX BASIC INFO */
-uint32_t vmx_revision;
-uint32_t vmx_region_size;
-uint8_t vmx_width_addr;
+static uint32_t vmx_revision;
+static uint32_t vmx_region_size;
+static uint8_t vmx_width_addr;
 
 /* IA32_VMX_EPT_VPID_CAP */
 uint64_t vmx_ept_vpid_cap;
 
 /* VMX fixed bits */
-uint64_t cr0_fixed_to_0;
-uint64_t cr4_fixed_to_0;
-uint64_t cr0_fixed_to_1;
-uint64_t cr4_fixed_to_1;
+static uint64_t cr0_fixed_to_0;
+static uint64_t cr4_fixed_to_0;
+static uint64_t cr0_fixed_to_1;
+static uint64_t cr4_fixed_to_1;
 
 /* VMX status */
 static uint8_t vmx_enabled = 0;
@@ -154,52 +154,47 @@ vmx_set_ctl_setting(struct vmx_ctl_info *vmx_ctl, uint32_t bit_no, setting_t val
 
 	/* Check if the value is known by VMM or set on DEFAULT */
 	switch(value) {
-		case DEFAULT:
-			/* Both settings are allowd
-			 * - step b.iii)
-			 *   or
-			 * - c.iii), c.iv)
-			 */
-			if (IS_ZERO_SETTING_ALLOWED(ctl_val, bit_no)
-			    && IS_ONE_SETTING_ALLOWED(ctl_val, bit_no)) {
+	case DEFAULT:
+		/*
+		 * Both settings are allowd
+		 * - step b.iii)
+		 *   or
+		 * - c.iii), c.iv)
+		 */
+		if (IS_ZERO_SETTING_ALLOWED(ctl_val, bit_no) &&
+		    IS_ONE_SETTING_ALLOWED(ctl_val, bit_no)) {
+			/* For c.iii) and c.iv) */
+			if (IS_TRUE_CTL_AVAIL(vmx_basic))
+				ctl_val = rdmsr(vmx_ctl->msr_addr);
 
-				/* For c.iii) and c.iv) */
-				if(IS_TRUE_CTL_AVAIL(vmx_basic))
-					ctl_val = rdmsr(vmx_ctl->msr_addr);
-
-				if (IS_ZERO_SETTING_ALLOWED(ctl_val, bit_no))
-					vmx_ctl->ctls &= ~BIT(bit_no);
-				else if (IS_ONE_SETTING_ALLOWED(ctl_val, bit_no))
-					vmx_ctl->ctls |= BIT(bit_no);
-
-			} else if (IS_ZERO_SETTING_ALLOWED(ctl_val, bit_no)) {
-				/* b.i), c.i) */
+			if (IS_ZERO_SETTING_ALLOWED(ctl_val, bit_no))
 				vmx_ctl->ctls &= ~BIT(bit_no);
-
-			} else if (IS_ONE_SETTING_ALLOWED(ctl_val, bit_no)) {
-				/* b.i), c.i) */
+			else if (IS_ONE_SETTING_ALLOWED(ctl_val, bit_no))
 				vmx_ctl->ctls |= BIT(bit_no);
-
-			} else {
-				return (EINVAL);
-			}
-			break;
-		case ZERO:
-			/* For b.ii) or c.ii) */
-			if (!IS_ZERO_SETTING_ALLOWED(ctl_val, bit_no))
-				return (EINVAL);
-
+		} else if (IS_ZERO_SETTING_ALLOWED(ctl_val, bit_no)) {
+			/* b.i), c.i) */
 			vmx_ctl->ctls &= ~BIT(bit_no);
-
-			break;
-		case ONE:
-			/* For b.ii) or c.ii) */
-			if (!IS_ONE_SETTING_ALLOWED(ctl_val, bit_no))
-				return (EINVAL);
-
+		} else if (IS_ONE_SETTING_ALLOWED(ctl_val, bit_no)) {
+			/* b.i), c.i) */
 			vmx_ctl->ctls |= BIT(bit_no);
+		} else {
+			return (EINVAL);
+		}
+		break;
+	case ZERO:
+		/* For b.ii) or c.ii) */
+		if (!IS_ZERO_SETTING_ALLOWED(ctl_val, bit_no))
+			return (EINVAL);
+		vmx_ctl->ctls &= ~BIT(bit_no);
+		break;
+	case ONE:
+		/* For b.ii) or c.ii) */
+		if (!IS_ONE_SETTING_ALLOWED(ctl_val, bit_no))
+			return (EINVAL);
 
-			break;
+		vmx_ctl->ctls |= BIT(bit_no);
+
+		break;
 	}
 	return 0;
 }
@@ -209,7 +204,7 @@ vmx_set_default_settings(struct vmx_ctl_info *vmx_ctl)
 {
 	int i;
 
-	for(i = 0; i < 32; i++) {
+	for (i = 0; i < 32; i++) {
 		vmx_set_ctl_setting(vmx_ctl, i, DEFAULT);
 	}
 }
@@ -218,7 +213,9 @@ static void
 alloc_vmxon_regions(void)
 {
 	int cpu;
-	pcpu_info = kmalloc(ncpus * sizeof(struct vmx_pcpu_info), M_TEMP, M_WAITOK | M_ZERO);
+
+	pcpu_info = kmalloc(ncpus * sizeof(struct vmx_pcpu_info),
+			    M_TEMP, M_WAITOK | M_ZERO);
 
 	for (cpu = 0; cpu < ncpus; cpu++) {
 
@@ -258,12 +255,12 @@ build_vmx_sysctl(void)
 		    OID_AUTO, "vmx",
 		    CTLFLAG_RD, 0, "VMX options");
 
-	SYSCTL_ADD_INT(&vmx_sysctl_ctx,
+	SYSCTL_ADD_UINT(&vmx_sysctl_ctx,
 	    SYSCTL_CHILDREN(vmx_sysctl_tree),
 	    OID_AUTO, "revision", CTLFLAG_RD,
 	    &vmx_revision, 0,
 	    "VMX revision");
-	SYSCTL_ADD_INT(&vmx_sysctl_ctx,
+	SYSCTL_ADD_UINT(&vmx_sysctl_ctx,
 	    SYSCTL_CHILDREN(vmx_sysctl_tree),
 	    OID_AUTO, "region_size", CTLFLAG_RD,
 	    &vmx_region_size, 0,
@@ -273,35 +270,35 @@ build_vmx_sysctl(void)
 	    OID_AUTO, "width_addr", CTLFLAG_RD,
 	    &vmx_width_addr, 0,
 	    "VMX width address");
-	SYSCTL_ADD_INT(&vmx_sysctl_ctx,
+	SYSCTL_ADD_UINT(&vmx_sysctl_ctx,
 	    SYSCTL_CHILDREN(vmx_sysctl_tree),
 	    OID_AUTO, "pinbased_ctls", CTLFLAG_RD,
 	    &vmx_pinbased.ctls, 0,
-	    "VMX width address");
-	SYSCTL_ADD_INT(&vmx_sysctl_ctx,
+	    "VMX pin-based controls");
+	SYSCTL_ADD_UINT(&vmx_sysctl_ctx,
 	    SYSCTL_CHILDREN(vmx_sysctl_tree),
 	    OID_AUTO, "procbased_ctls", CTLFLAG_RD,
 	    &vmx_procbased.ctls, 0,
-	    "VMX width address");
-	SYSCTL_ADD_INT(&vmx_sysctl_ctx,
+	    "VMX primary processor-based controls");
+	SYSCTL_ADD_UINT(&vmx_sysctl_ctx,
 	    SYSCTL_CHILDREN(vmx_sysctl_tree),
 	    OID_AUTO, "procbased2_ctls", CTLFLAG_RD,
 	    &vmx_procbased2.ctls, 0,
-	    "VMX width address");
-	SYSCTL_ADD_INT(&vmx_sysctl_ctx,
+	    "VMX secondary processor-based controls");
+	SYSCTL_ADD_UINT(&vmx_sysctl_ctx,
 	    SYSCTL_CHILDREN(vmx_sysctl_tree),
 	    OID_AUTO, "vmexit_ctls", CTLFLAG_RD,
 	    &vmx_exit.ctls, 0,
-	    "VMX width address");
-	SYSCTL_ADD_INT(&vmx_sysctl_ctx,
+	    "VMX exit controls");
+	SYSCTL_ADD_UINT(&vmx_sysctl_ctx,
 	    SYSCTL_CHILDREN(vmx_sysctl_tree),
 	    OID_AUTO, "vmentry_ctls", CTLFLAG_RD,
 	    &vmx_entry.ctls, 0,
-	    "VMX width address");
-	SYSCTL_ADD_INT(&vmx_sysctl_ctx,
+	    "VMX entry controls");
+	SYSCTL_ADD_ULONG(&vmx_sysctl_ctx,
 	    SYSCTL_CHILDREN(vmx_sysctl_tree),
 	    OID_AUTO, "ept_vpid_cap", CTLFLAG_RD,
-	    &vmx_ept_vpid_cap, 0,
+	    &vmx_ept_vpid_cap,
 	    "VMX EPT VPID CAP");
 }
 
@@ -430,8 +427,8 @@ vmx_init(void)
 	/* XXX - to implement in the feature */
 	/* Enable VPID feature */
 	err = vmx_set_ctl_setting(&vmx_procbased2,
-	    PROCBASED2_ENABLE_VPID,
-	    ONE);
+				  PROCBASED2_ENABLE_VPID,
+				  ONE);
 	if (err) {
 		kprintf("VMM: PROCBASED2_ENABLE_VPID not "
 			"supported by this CPU\n");
@@ -500,8 +497,10 @@ execute_vmxoff(void *dummy)
 {
 	invept_desc_t desc = { 0 };
 
-	if (invept(INVEPT_TYPE_ALL_CONTEXTS, (uint64_t*) &desc))
-		kprintf("VMM: execute_vmxoff: invet failed on cpu%d\n", mycpu->gd_cpuid);
+	if (invept(INVEPT_TYPE_ALL_CONTEXTS, (uint64_t*) &desc)) {
+		kprintf("VMM: execute_vmxoff: "
+			"invet failed on cpu%d\n", mycpu->gd_cpuid);
+	}
 
 	vmxoff();
 
@@ -516,37 +515,36 @@ execute_vmclear(void *data)
 	int err;
 	globaldata_t gd = mycpu;
 
-	if (pcpu_info[gd->gd_cpuid].loaded_vmx == vti) {
-		/*
-		 * Must set vti->launched to zero after vmclear'ing to
-		 * force a vmlaunch the next time.
-		 *
-		 * Must not clear the loaded_vmx field until after we call
-		 * vmclear on the region.  This field triggers the interlocked
-		 * cpusync from another cpu trying to destroy or reuse
-		 * the vti.  If we clear the field first, the other cpu will
-		 * not interlock and may race our vmclear() on the underlying
-		 * memory.
-		 */
+	/*
+	 * Must set vti->launched to zero after vmclear'ing to
+	 * force a vmlaunch the next time.
+	 *
+	 * Must not clear the loaded_vmx field until after we call
+	 * vmclear on the region.  This field triggers the interlocked
+	 * cpusync from another cpu trying to destroy or reuse
+	 * the vti.  If we clear the field first, the other cpu will
+	 * not interlock and may race our vmclear() on the underlying
+	 * memory.
+	 */
+	if (vti->last_cpu != -1) {
+		invept(INVEPT_TYPE_SINGLE_CONTEXT,
+		       (uint64_t*)&vti->invept_desc);
 		ERROR_IF(vmclear(vti->vmcs_region));
-error:
-		pcpu_info[gd->gd_cpuid].loaded_vmx = NULL;
-		vti->launched = 0;
 	}
-	return;
+error:
+	if (pcpu_info[gd->gd_cpuid].loaded_vmx == vti) {
+		pcpu_info[gd->gd_cpuid].loaded_vmx = NULL;
+	}
+	vti->launched = 0;
+	vti->last_cpu = -1;
 }
 
 static int
 execute_vmptrld(struct vmx_thread_info *vti)
 {
+	struct vmx_thread_info *loaded_vmx;
 	globaldata_t gd = mycpu;
-
-	/*
-	 * Must vmclear previous active vcms if it is different.
-	 */
-	if (pcpu_info[gd->gd_cpuid].loaded_vmx &&
-	    pcpu_info[gd->gd_cpuid].loaded_vmx != vti)
-		execute_vmclear(pcpu_info[gd->gd_cpuid].loaded_vmx);
+	int error;
 
 	/*
 	 * Make this the current VMCS.  Must set loaded_vmx field
@@ -554,14 +552,26 @@ execute_vmptrld(struct vmx_thread_info *vti)
 	 *
 	 * Must set vti->launched to zero after the vmptrld to force
 	 * a vmlaunch.
+	 *
+	 * NOTE! We should NOT vmclear the previous vmx, the spec allows
+	 *	 it to remain active (just not current).  vmclear()ing
+	 *	 it would really mess up performance.
 	 */
-	if (pcpu_info[gd->gd_cpuid].loaded_vmx != vti) {
-		vti->launched = 0;
+	loaded_vmx = pcpu_info[gd->gd_cpuid].loaded_vmx;
+	if (loaded_vmx != vti) {
+#if 0
+		/* this is not needed and messes up performance */
+		if (loaded_vmx)
+			execute_vmclear(loaded_vmx);
+#endif
+		/* current launched state does not change */
+		vti->last_cpu = gd->gd_cpuid;
+		error = vmptrld(vti->vmcs_region);
 		pcpu_info[gd->gd_cpuid].loaded_vmx = vti;
-		return (vmptrld(vti->vmcs_region));
 	} else {
-		return (0);
+		error = 0;
 	}
+	return error;
 }
 
 static int
@@ -645,59 +655,59 @@ static int vmx_set_guest_descriptor(descriptor_t type,
 	}
 
 	switch(type) {
-		case ES:
-			selector_enc = VMCS_GUEST_ES_SELECTOR;
-			rights_enc = VMCS_GUEST_ES_ACCESS_RIGHTS;
-			base_enc = VMCS_GUEST_ES_BASE;
-			limit_enc = VMCS_GUEST_ES_LIMIT;
-			break;
-		case CS:
-			selector_enc = VMCS_GUEST_CS_SELECTOR;
-			rights_enc = VMCS_GUEST_CS_ACCESS_RIGHTS;
-			base_enc = VMCS_GUEST_CS_BASE;
-			limit_enc = VMCS_GUEST_CS_LIMIT;
-			break;
-		case SS:
-			selector_enc = VMCS_GUEST_SS_SELECTOR;
-			rights_enc = VMCS_GUEST_SS_ACCESS_RIGHTS;
-			base_enc = VMCS_GUEST_SS_BASE;
-			limit_enc = VMCS_GUEST_SS_LIMIT;
-			break;
-		case DS:
-			selector_enc = VMCS_GUEST_DS_SELECTOR;
-			rights_enc = VMCS_GUEST_DS_ACCESS_RIGHTS;
-			base_enc = VMCS_GUEST_DS_BASE;
-			limit_enc = VMCS_GUEST_DS_LIMIT;
-			break;
-		case FS:
-			selector_enc = VMCS_GUEST_FS_SELECTOR;
-			rights_enc = VMCS_GUEST_FS_ACCESS_RIGHTS;
-			base_enc = VMCS_GUEST_FS_BASE;
-			limit_enc = VMCS_GUEST_FS_LIMIT;
-			break;
-		case GS:
-			selector_enc = VMCS_GUEST_GS_SELECTOR;
-			rights_enc = VMCS_GUEST_GS_ACCESS_RIGHTS;
-			base_enc = VMCS_GUEST_GS_BASE;
-			limit_enc = VMCS_GUEST_GS_LIMIT;
-			break;
-		case LDTR:
-			selector_enc = VMCS_GUEST_LDTR_SELECTOR;
-			rights_enc = VMCS_GUEST_LDTR_ACCESS_RIGHTS;
-			base_enc = VMCS_GUEST_LDTR_BASE;
-			limit_enc = VMCS_GUEST_LDTR_LIMIT;
-			break;
-		case TR:
-			selector_enc = VMCS_GUEST_TR_SELECTOR;
-			rights_enc = VMCS_GUEST_TR_ACCESS_RIGHTS;
-			base_enc = VMCS_GUEST_TR_BASE;
-			limit_enc = VMCS_GUEST_TR_LIMIT;
-			break;
-		default:
-			kprintf("VMM: vmx_set_guest_descriptor: unknown descriptor\n");
-			err = -1;
-			goto error;
-			break;
+	case ES:
+		selector_enc = VMCS_GUEST_ES_SELECTOR;
+		rights_enc = VMCS_GUEST_ES_ACCESS_RIGHTS;
+		base_enc = VMCS_GUEST_ES_BASE;
+		limit_enc = VMCS_GUEST_ES_LIMIT;
+		break;
+	case CS:
+		selector_enc = VMCS_GUEST_CS_SELECTOR;
+		rights_enc = VMCS_GUEST_CS_ACCESS_RIGHTS;
+		base_enc = VMCS_GUEST_CS_BASE;
+		limit_enc = VMCS_GUEST_CS_LIMIT;
+		break;
+	case SS:
+		selector_enc = VMCS_GUEST_SS_SELECTOR;
+		rights_enc = VMCS_GUEST_SS_ACCESS_RIGHTS;
+		base_enc = VMCS_GUEST_SS_BASE;
+		limit_enc = VMCS_GUEST_SS_LIMIT;
+		break;
+	case DS:
+		selector_enc = VMCS_GUEST_DS_SELECTOR;
+		rights_enc = VMCS_GUEST_DS_ACCESS_RIGHTS;
+		base_enc = VMCS_GUEST_DS_BASE;
+		limit_enc = VMCS_GUEST_DS_LIMIT;
+		break;
+	case FS:
+		selector_enc = VMCS_GUEST_FS_SELECTOR;
+		rights_enc = VMCS_GUEST_FS_ACCESS_RIGHTS;
+		base_enc = VMCS_GUEST_FS_BASE;
+		limit_enc = VMCS_GUEST_FS_LIMIT;
+		break;
+	case GS:
+		selector_enc = VMCS_GUEST_GS_SELECTOR;
+		rights_enc = VMCS_GUEST_GS_ACCESS_RIGHTS;
+		base_enc = VMCS_GUEST_GS_BASE;
+		limit_enc = VMCS_GUEST_GS_LIMIT;
+		break;
+	case LDTR:
+		selector_enc = VMCS_GUEST_LDTR_SELECTOR;
+		rights_enc = VMCS_GUEST_LDTR_ACCESS_RIGHTS;
+		base_enc = VMCS_GUEST_LDTR_BASE;
+		limit_enc = VMCS_GUEST_LDTR_LIMIT;
+		break;
+	case TR:
+		selector_enc = VMCS_GUEST_TR_SELECTOR;
+		rights_enc = VMCS_GUEST_TR_ACCESS_RIGHTS;
+		base_enc = VMCS_GUEST_TR_BASE;
+		limit_enc = VMCS_GUEST_TR_LIMIT;
+		break;
+	default:
+		kprintf("VMM: vmx_set_guest_descriptor: unknown descriptor\n");
+		err = -1;
+		goto error;
+		break;
 	}
 
 	ERROR_IF(vmwrite(selector_enc, selector));
@@ -728,7 +738,7 @@ vmx_vminit_master(struct vmm_guest_options *options)
 	struct vmm_proc *p_vmm;
 
 	oldvmspace = curthread->td_lwp->lwp_vmspace;
-	newvmspace = vmspace_fork(oldvmspace);
+	newvmspace = vmspace_fork(oldvmspace, NULL, NULL);
 
 	vmx_ept_pmap_pinit(vmspace_pmap(newvmspace));
 	bzero(vmspace_pmap(newvmspace)->pm_pml4, PAGE_SIZE);
@@ -762,14 +772,15 @@ vmx_vminit_master(struct vmm_guest_options *options)
 static int
 vmx_vminit(struct vmm_guest_options *options)
 {
-	struct vmx_thread_info * vti;
-	int err;
+	struct vmx_thread_info *vti;
+	struct vmx_thread_info *loaded_vmx;
 	struct tls_info guest_fs = curthread->td_tls.info[0];
 	struct tls_info guest_gs = curthread->td_tls.info[1];
+	globaldata_t gd;
+	int err;
 
-
-	vti = kmalloc(sizeof(struct vmx_thread_info), M_TEMP, M_WAITOK | M_ZERO);
-	curthread->td_vmm = (void*) vti;
+	vti = kmalloc(sizeof(*vti), M_TEMP, M_WAITOK | M_ZERO);
+	curthread->td_vmm = (void *)vti;
 
 	if (options->master) {
 		vmx_vminit_master(options);
@@ -784,26 +795,32 @@ vmx_vminit(struct vmm_guest_options *options)
 	vti->guest.tf_rflags &= ~PSL_C;
 
 	vti->vmcs_region_na = kmalloc(vmx_region_size + VMXON_REGION_ALIGN_SIZE,
-		    M_TEMP,
-		    M_WAITOK | M_ZERO);
+				      M_TEMP, M_WAITOK | M_ZERO);
 
 	/* Align address */
-	vti->vmcs_region = (unsigned char*) VMXON_REGION_ALIGN(vti->vmcs_region_na);
+	vti->vmcs_region = (unsigned char*)VMXON_REGION_ALIGN(vti->vmcs_region_na);
 	vti->last_cpu = -1;
 
 	vti->guest_cr3 = options->guest_cr3;
 	vti->vmm_cr3 = options->vmm_cr3;
 
-	/* In the first 31 bits put the vmx revision*/
+	/* In the first 31 bits put the vmx revision */
 	*((uint32_t *)vti->vmcs_region) = vmx_revision;
+
+	/*
+	 * Clear the currenetly loaded vmx, if any, so
+	 * we can initialize a new one right now.
+	 */
+	loaded_vmx = pcpu_info[mycpu->gd_cpuid].loaded_vmx;
+	if (loaded_vmx)
+		execute_vmclear(loaded_vmx);
 
 	/*
 	 * vmclear the vmcs to initialize it.
 	 */
-	ERROR_IF(vmclear(vti->vmcs_region));
-
 	crit_enter();
 
+	ERROR_IF(vmclear(vti->vmcs_region));
 	ERROR_IF(execute_vmptrld(vti));
 
 	/* Load the VMX controls */
@@ -813,8 +830,10 @@ vmx_vminit(struct vmm_guest_options *options)
 	ERROR_IF(vmwrite(VMCS_VMEXIT_CTLS, vmx_exit.ctls));
 	ERROR_IF(vmwrite(VMCS_VMENTRY_CTLS, vmx_entry.ctls));
 
-	/* Load HOST CRs */
-	ERROR_IF(vmwrite(VMCS_HOST_CR0, rcr0()));
+	/*
+	 * Load HOST CRs
+	 */
+	ERROR_IF(vmwrite(VMCS_HOST_CR0, rcr0() & ~CR0_TS));
 	ERROR_IF(vmwrite(VMCS_HOST_CR4, rcr4()));
 
 	/* Load HOST EFER and PAT */
@@ -880,10 +899,10 @@ vmx_vminit(struct vmm_guest_options *options)
 	ERROR_IF(vmx_set_guest_descriptor(LDTR, 0, VMCS_SEG_UNUSABLE, 0, 0));
 
 	/* Set the CR0/CR4 registers, removing the unsupported bits */
-	ERROR_IF(vmwrite(VMCS_GUEST_CR0, (CR0_PE | CR0_PG |
-	    cr0_fixed_to_1) & ~cr0_fixed_to_0));
+	vti->guest_cr0 = (CR0_PE | CR0_PG | cr0_fixed_to_1) & ~cr0_fixed_to_0;
+	ERROR_IF(vmwrite(VMCS_GUEST_CR0, vti->guest_cr0));
 	ERROR_IF(vmwrite(VMCS_GUEST_CR4, (CR4_PAE | CR4_FXSR | CR4_XMM | CR4_XSAVE |
-	    cr4_fixed_to_1) & ~ cr4_fixed_to_0));
+	    cr4_fixed_to_1) & ~cr4_fixed_to_0));
 
 	/* Don't set EFER_SCE for catching "syscall" instructions */
 	ERROR_IF(vmwrite(VMCS_GUEST_IA32_EFER, (EFER_LME | EFER_LMA)));
@@ -908,9 +927,29 @@ vmx_vminit(struct vmm_guest_options *options)
 	 */
 	ERROR_IF(vmwrite(VMCS_LINK_POINTER, ~0ULL));
 
-	/* The pointer to the EPT pagetable */
+	/*
+	 * The pointer to the EPT pagetable
+	 */
 	ERROR_IF(vmwrite(VMCS_EPTP, vmx_eptp(vti->vmm_cr3)));
 
+	/*
+	 * pcpu fields.  These change if the vti migrates between host
+	 * cpus.  Since we've already set vti->last_cpu, we must also
+	 * initialize the pcpu fields.
+	 */
+	gd = mycpu;
+	ERROR_IF(vmwrite(VMCS_HOST_GS_BASE, (uint64_t)gd));
+	ERROR_IF(vmwrite(VMCS_HOST_TR_BASE, (uint64_t)&gd->gd_prvspace->common_tss));
+
+	ERROR_IF(vmwrite(VMCS_HOST_GDTR_BASE, (uint64_t)&gdt[gd->gd_cpuid * NGDT]));
+	ERROR_IF(vmwrite(VMCS_HOST_IDTR_BASE, (uint64_t)r_idt_arr[gd->gd_cpuid].rd_base));
+
+	ERROR_IF(vmwrite(VMCS_GUEST_GDTR_BASE, (uint64_t)&gdt[gd->gd_cpuid * NGDT]));
+	ERROR_IF(vmwrite(VMCS_GUEST_GDTR_LIMIT, (uint64_t)(NGDT * sizeof(gdt[0]) - 1)));
+
+	/*
+	 * Finally, the ept descriptor.
+	 */
 	vti->invept_desc.eptp = vmx_eptp(vti->vmm_cr3);
 
 	crit_exit();
@@ -924,9 +963,14 @@ error:
 
 	kfree(vti->vmcs_region_na, M_TEMP);
 	kfree(vti, M_TEMP);
+
 	return err;
 }
 
+/*
+ * Destroy a context.  Make sure the context has been cleared and that
+ * no TLB translations are stlil cached for its EPT.
+ */
 static int
 vmx_vmdestroy(void)
 {
@@ -936,21 +980,24 @@ vmx_vmdestroy(void)
 
 	if (vti != NULL) {
 		vmx_check_cpu_migration();
-		if (vti->vmcs_region &&
-		    pcpu_info[mycpu->gd_cpuid].loaded_vmx == vti)
-			execute_vmclear(vti);
+		execute_vmclear(vti);
+		invept(INVEPT_TYPE_SINGLE_CONTEXT,
+		       (uint64_t*)&vti->invept_desc);
 
 		if (vti->vmcs_region_na != NULL) {
 			kfree(vti->vmcs_region_na, M_TEMP);
-			kfree(vti, M_TEMP);
 			error = 0;
 		}
+
 		curthread->td_vmm = NULL;
+		kfree(vti, M_TEMP);
+
 		lwkt_gettoken(&p->p_token);
 		if (p->p_nthreads == 1) {
 			kfree(p->p_vmm, M_TEMP);
 			p->p_vmm = NULL;
 		}
+		lwkt_reltoken(&p->p_token);
 	}
 	return error;
 }
@@ -963,29 +1010,28 @@ vmx_vmdestroy(void)
 static int
 vmx_check_cpu_migration(void)
 {
-	struct vmx_thread_info * vti;
+	struct vmx_thread_info *vti;
 	struct globaldata *gd;
 	cpumask_t mask;
 	int err;
 
 	gd = mycpu;
-	vti = (struct vmx_thread_info *) curthread->td_vmm;
+	vti = (struct vmx_thread_info *)curthread->td_vmm;
 	ERROR_IF(vti == NULL);
 
-	if (vti->last_cpu != -1 && vti->last_cpu != gd->gd_cpuid &&
-	    pcpu_info[vti->last_cpu].loaded_vmx == vti) {
+	if (vti->last_cpu != -1 && vti->last_cpu != gd->gd_cpuid) {
 		/*
-		 * Do not reset last_cpu to -1 here, leave it caching
-		 * the cpu whos per-cpu fields the VMCS is synchronized
-		 * with.  The pcpu_info[] check prevents unecessary extra
-		 * cpusyncs.
+		 * Clear the context on the remote cpu if it is still
+		 * holding it (can race, we check again in the callback).
 		 */
-		dkprintf("VMM: cpusync from %d to %d\n",
-			 gd->gd_cpuid, vti->last_cpu);
-
-		/* Clear the VMCS area if ran on another CPU */
 		CPUMASK_ASSBIT(mask, vti->last_cpu);
 		lwkt_cpusync_simple(mask, execute_vmclear, (void *)vti);
+
+		/*
+		 * Remote cpu may have raced us, we must make sure that
+		 * any reads were not reordered before the check.
+		 */
+		cpu_lfence();
 	}
 	return 0;
 error:
@@ -1001,41 +1047,37 @@ error:
 static inline int
 vmx_handle_cpu_migration(void)
 {
-	struct vmx_thread_info * vti;
+	struct vmx_thread_info *vti;
 	struct globaldata *gd;
 	int err;
 
 	gd = mycpu;
-	vti = (struct vmx_thread_info *) curthread->td_vmm;
+	vti = (struct vmx_thread_info *)curthread->td_vmm;
 	ERROR_IF(vti == NULL);
 
 	if (vti->last_cpu != gd->gd_cpuid) {
 		/*
 		 * We need to synchronize the per-cpu fields after changing
-		 * cpus.
+		 * cpus.  Also make sure there are no stale EPT translations
+		 * cached.
 		 */
 		dkprintf("VMM: vmx_handle_cpu_migration init per CPU data\n");
 
 		ERROR_IF(execute_vmptrld(vti));
 
+		invept(INVEPT_TYPE_SINGLE_CONTEXT,
+		       (uint64_t*)&vti->invept_desc);
+
 		/* Host related registers */
 		ERROR_IF(vmwrite(VMCS_HOST_GS_BASE, (uint64_t) gd)); /* mycpu points to %gs:0 */
-		ERROR_IF(vmwrite(VMCS_HOST_TR_BASE, (uint64_t) &gd->gd_prvspace->mdglobaldata.gd_common_tss));
+		ERROR_IF(vmwrite(VMCS_HOST_TR_BASE, (uint64_t) &gd->gd_prvspace->common_tss));
 
 		ERROR_IF(vmwrite(VMCS_HOST_GDTR_BASE, (uint64_t) &gdt[gd->gd_cpuid * NGDT]));
 		ERROR_IF(vmwrite(VMCS_HOST_IDTR_BASE, (uint64_t) r_idt_arr[gd->gd_cpuid].rd_base));
 
-
 		/* Guest related register */
 		ERROR_IF(vmwrite(VMCS_GUEST_GDTR_BASE, (uint64_t) &gdt[gd->gd_cpuid * NGDT]));
 		ERROR_IF(vmwrite(VMCS_GUEST_GDTR_LIMIT, (uint64_t) (NGDT * sizeof(gdt[0]) - 1)));
-
-		/*
-		 * Indicates which cpu the per-cpu fields are synchronized
-		 * with.  Does not indicate whether the vmcs is active on
-		 * that particular cpu.
-		 */
-		vti->last_cpu = gd->gd_cpuid;
 	} else if (pcpu_info[gd->gd_cpuid].loaded_vmx != vti) {
 		/*
 		 * We only need to vmptrld
@@ -1043,7 +1085,6 @@ vmx_handle_cpu_migration(void)
 		dkprintf("VMM: vmx_handle_cpu_migration: vmcs is not loaded\n");
 
 		ERROR_IF(execute_vmptrld(vti));
-
 	} /* else we don't need to do anything */
 	return 0;
 error:
@@ -1051,7 +1092,8 @@ error:
 	return err;
 }
 
-/* Load information about VMexit
+/*
+ * Load information about VMexit
  *
  * We still are with interrupts disabled/critical secion
  * because we must operate with the VMCS on the CPU
@@ -1121,13 +1163,14 @@ error:
 static int
 vmx_handle_vmexit(void)
 {
-	struct vmx_thread_info * vti;
+	struct vmx_thread_info *vti;
 	int exit_reason;
 	int exception_type;
 	int exception_number;
 	int err;
 	int func, regs[4];
-	int fault_type, rv;
+	int rv;
+	int fault_type = VM_PROT_NONE;
 	int fault_flags = 0;
 	struct lwp *lp = curthread->td_lwp;
 
@@ -1137,183 +1180,222 @@ vmx_handle_vmexit(void)
 
 	exit_reason = VMCS_BASIC_EXIT_REASON(vti->vmexit_reason);
 	switch (exit_reason) {
-		case EXIT_REASON_EXCEPTION:
-			dkprintf("VMM: handle_vmx_vmexit: EXIT_REASON_EXCEPTION with qualification "
-			    "%llx, interruption info %llx, interruption error %llx, instruction "
-			    "length %llx\n",
-			    (long long) vti->vmexit_qualification,
-			    (long long) vti->vmexit_interruption_info,
-			    (long long) vti->vmexit_interruption_error,
-			    (long long) vti->vmexit_instruction_length);
+	case EXIT_REASON_EXCEPTION:
+		dkprintf("VMM: handle_vmx_vmexit: "
+			 "EXIT_REASON_EXCEPTION with qualification "
+			 "%llx, interruption info %llx, "
+			 "interruption error %llx, instruction "
+			 "length %llx\n",
+			 (long long) vti->vmexit_qualification,
+			 (long long) vti->vmexit_interruption_info,
+			 (long long) vti->vmexit_interruption_error,
+			 (long long) vti->vmexit_instruction_length);
 
-			dkprintf("VMM: handle_vmx_vmexit: rax: %llx, rip: %llx, "
-			    "rsp: %llx,  rdi: %llx, rsi: %llx, %d, vti: %p, master: %p\n",
-			    (long long)vti->guest.tf_rax,
-			    (long long)vti->guest.tf_rip,
-			    (long long)vti->guest.tf_rsp,
-			    (long long)vti->guest.tf_rdi,
-			    (long long)vti->guest.tf_rsi, exit_reason, vti, curproc->p_vmm);
+		dkprintf("VMM: handle_vmx_vmexit: rax: %llx, rip: %llx, "
+			 "rsp: %llx,  rdi: %llx, "
+			 "rsi: %llx, %d, "
+			 "vti: %p, master: %p\n",
+			 (long long)vti->guest.tf_rax,
+			 (long long)vti->guest.tf_rip,
+			 (long long)vti->guest.tf_rsp,
+			 (long long)vti->guest.tf_rdi,
+			 (long long)vti->guest.tf_rsi,
+			 exit_reason, vti, curproc->p_vmm);
 
-			exception_type = VMCS_EXCEPTION_TYPE(vti->vmexit_interruption_info);
-			exception_number = VMCS_EXCEPTION_NUMBER(vti->vmexit_interruption_info);
+		exception_type =
+			VMCS_EXCEPTION_TYPE(vti->vmexit_interruption_info);
+		exception_number =
+			VMCS_EXCEPTION_NUMBER(vti->vmexit_interruption_info);
 
-			if (exception_type == VMCS_EXCEPTION_HARDWARE) {
-				switch (exception_number) {
-					case IDT_UD:
-						/*
-						 * Disabled "syscall" instruction and
-						 * now we catch it for executing
-						 */
-						dkprintf("VMM: handle_vmx_vmexit: VMCS_EXCEPTION_HARDWARE IDT_UD\n");
+		if (exception_type == VMCS_EXCEPTION_HARDWARE) {
+			switch (exception_number) {
+			case IDT_UD:
+				/*
+				 * Disabled "syscall" instruction and
+				 * now we catch it for execution
+				 */
+				dkprintf("VMM: handle_vmx_vmexit: "
+					 "VMCS_EXCEPTION_HARDWARE IDT_UD\n");
 #ifdef VMM_DEBUG
-						/* Check to see if its syscall asm instuction */
-						uint8_t instr[INSTRUCTION_MAX_LENGTH];
-						if (copyin((const void *) vti->guest.tf_rip, instr, vti->vmexit_instruction_length) &&
-						    instr_check(&syscall_asm,(void *) instr, (uint8_t) vti->vmexit_instruction_length)) {
-							kprintf("VMM: handle_vmx_vmexit: UD different from syscall: ");
-							db_disasm((db_addr_t) instr, FALSE, NULL);
-						}
+				/* Check to see if its syscall asm instuction */
+				uint8_t instr[INSTRUCTION_MAX_LENGTH];
+				if (copyin((const void *)vti->guest.tf_rip,
+					   instr,
+					   vti->vmexit_instruction_length) &&
+				    instr_check(&syscall_asm,(void *)instr,
+						(uint8_t)vti->vmexit_instruction_length)) {
+					kprintf("VMM: handle_vmx_vmexit: "
+						"UD different from syscall: ");
+					db_disasm((db_addr_t)instr, FALSE, NULL);
+				}
 #endif
-						/* Called to force a VMEXIT and invalidate TLB */
-						if (vti->guest.tf_rax == -1) {
-							vti->guest.tf_rip += vti->vmexit_instruction_length;
-							break;
-						}
-
-						vti->guest.tf_err = 2;
-						vti->guest.tf_trapno = T_FAST_SYSCALL;
-						vti->guest.tf_xflags = 0;
-
-						vti->guest.tf_rip += vti->vmexit_instruction_length;
-
-						syscall2(&vti->guest);
-
-						break;
-					case IDT_PF:
-						dkprintf("VMM: handle_vmx_vmexit: VMCS_EXCEPTION_HARDWARE IDT_PF at %llx\n",
-						    (long long) vti->guest.tf_rip);
-
-						if (vti->guest.tf_rip == 0) {
-							kprintf("VMM: handle_vmx_vmexit: Terminating...\n");
-							err = -1;
-							goto error;
-						}
-
-						vti->guest.tf_err = vti->vmexit_interruption_error;
-						vti->guest.tf_addr = vti->vmexit_qualification;
-						vti->guest.tf_xflags = 0;
-						vti->guest.tf_trapno = T_PAGEFLT;
-
-						/*
-						 * If we are a user process in the vkernel
-						 * pass the PF to the vkernel and will trigger
-						 * the user_trap()
-						 *
-						 * If we are the vkernel, send a SIGSEGV signal
-						 * to us that will trigger the execution of
-						 * kern_trap()
-						 *
-						 */
-
-						if (lp->lwp_vkernel && lp->lwp_vkernel->ve) {
-							vkernel_trap(lp, &vti->guest);
-						} else {
-							trapsignal(lp, SIGSEGV, SEGV_MAPERR);
-						}
-
-						break;
-					default:
-						kprintf("VMM: handle_vmx_vmexit: VMCS_EXCEPTION_HARDWARE unknown "
-						    "number %d rip: %llx, rsp: %llx\n", exception_number,
-						    (long long)vti->guest.tf_rip, (long long)vti->guest.tf_rsp);
-						err = -1;
-						goto error;
+				/* Called to force a VMEXIT and invalidate TLB */
+				if (vti->guest.tf_rax == -1) {
+					vti->guest.tf_rip +=
+						vti->vmexit_instruction_length;
+					break;
 				}
-			} else if (exception_type == VMCS_EXCEPTION_SOFTWARE) {
-				switch (exception_number) {
-					case 3:
-						dkprintf("VMM: handle_vmx_vmexit: VMCS_EXCEPTION_SOFTWARE "
-						    "number %d rip: %llx, rsp: %llx\n", exception_number,
-						    (long long)vti->guest.tf_rip, (long long)vti->guest.tf_rsp);
 
-						vti->guest.tf_trapno = T_BPTFLT;
-						vti->guest.tf_xflags = 0;
-						vti->guest.tf_err = 0;
-						vti->guest.tf_addr = 0;
+				vti->guest.tf_err = 2;
+				vti->guest.tf_trapno = T_FAST_SYSCALL;
+				vti->guest.tf_xflags = 0;
 
-						vti->guest.tf_rip += vti->vmexit_instruction_length;
+				vti->guest.tf_rip +=
+					vti->vmexit_instruction_length;
 
-						trap(&vti->guest);
+				syscall2(&vti->guest);
+				break;
+			case IDT_PF:
+				dkprintf("VMM: handle_vmx_vmexit: "
+					 "VMCS_EXCEPTION_HARDWARE IDT_PF "
+					 "at %llx\n",
+					 (long long) vti->guest.tf_rip);
 
-						break;
-					default:
-						kprintf("VMM: handle_vmx_vmexit: VMCS_EXCEPTION_SOFTWARE unknown "
-						    "number %d rip: %llx, rsp: %llx\n", exception_number,
-						    (long long)vti->guest.tf_rip, (long long)vti->guest.tf_rsp);
-						err = -1;
-						goto error;
+				vti->guest.tf_err =
+					vti->vmexit_interruption_error;
+				vti->guest.tf_addr =
+					vti->vmexit_qualification;
+				vti->guest.tf_xflags = 0;
+				vti->guest.tf_trapno = T_PAGEFLT;
+
+				/*
+				 * If we are a user process in the vkernel
+				 * pass the PF to the vkernel and will trigger
+				 * the user_trap()
+				 *
+				 * If we are the vkernel, send a SIGSEGV signal
+				 * to us that will trigger the execution of
+				 * kern_trap()
+				 *
+				 */
+				if (lp->lwp_vkernel && lp->lwp_vkernel->ve) {
+					vkernel_trap(lp, &vti->guest);
+				} else {
+					trapsignal(lp, SIGSEGV, SEGV_MAPERR);
 				}
-			} else {
-				kprintf("VMM: handle_vmx_vmexit: VMCS_EXCEPTION_ %d unknown\n", exception_type);
+				break;
+			case IDT_NM:
+				vti->guest.tf_err =
+					vti->vmexit_interruption_error;
+				vti->guest.tf_addr =
+					vti->vmexit_qualification;
+				vti->guest.tf_xflags = 0;
+				vti->guest.tf_trapno = T_DNA;
+				if (lp->lwp_vkernel && lp->lwp_vkernel->ve) {
+					vkernel_trap(lp, &vti->guest);
+				} else {
+					/* XXX */
+				}
+				break;
+			default:
+				kprintf("VMM: handle_vmx_vmexit: "
+					"VMCS_EXCEPTION_HARDWARE unknown "
+					"number %d rip: %llx, rsp: %llx\n",
+					exception_number,
+					(long long)vti->guest.tf_rip,
+					(long long)vti->guest.tf_rsp);
 				err = -1;
 				goto error;
 			}
-			break;
-		case EXIT_REASON_EXT_INTR:
-			dkprintf("VMM: handle_vmx_vmexit: EXIT_REASON_EXT_INTR\n");
-			break;
-		case EXIT_REASON_CPUID:
-			dkprintf("VMM: handle_vmx_vmexit: EXIT_REASON_CPUID\n");
+		} else if (exception_type == VMCS_EXCEPTION_SOFTWARE) {
+			switch (exception_number) {
+			case 3:
+				dkprintf("VMM: handle_vmx_vmexit: "
+					 "VMCS_EXCEPTION_SOFTWARE "
+					 "number %d rip: %llx, rsp: %llx\n",
+					 exception_number,
+					 (long long)vti->guest.tf_rip,
+					 (long long)vti->guest.tf_rsp);
 
-			/*
-			 * Execute CPUID instruction and pass
-			 * the result to the vkernel
-			 */
+				vti->guest.tf_trapno = T_BPTFLT;
+				vti->guest.tf_xflags = 0;
+				vti->guest.tf_err = 0;
+				vti->guest.tf_addr = 0;
 
-			func = vti->guest.tf_rax;
-			do_cpuid(func, regs);
+				vti->guest.tf_rip +=
+					vti->vmexit_instruction_length;
 
-			vti->guest.tf_rax = regs[0];
-			vti->guest.tf_rbx = regs[1];
-			vti->guest.tf_rcx = regs[2];
-			vti->guest.tf_rdx = regs[3];
-
-			vti->guest.tf_rip += vti->vmexit_instruction_length;
-
-			break;
-		case EXIT_REASON_EPT_FAULT:
-			/*
-			 * EPT_FAULT are resolved like normal PFs. Nothing special
-			 * - get the fault type
-			 * - get the fault address (which is a GPA)
-			 * - execute vm_fault on the vm_map
-			 */
-			dkprintf("VMM: handle_vmx_vmexit: EXIT_REASON_EPT_FAULT with qualification %lld,"
-			    "GPA: %llx, fault_Type: %d\n",(long long) vti->vmexit_qualification,
-			    (unsigned long long) vti->guest_physical_address, fault_type);
-
-			fault_type = vmx_ept_fault_type(vti->vmexit_qualification);
-
-			if (fault_type & VM_PROT_WRITE)
-				fault_flags = VM_FAULT_DIRTY;
-			else
-				fault_flags = VM_FAULT_NORMAL;
-
-			rv = vm_fault(&curthread->td_lwp->lwp_vmspace->vm_map,
-			    trunc_page(vti->guest_physical_address), fault_type, fault_flags);
-
-			if (rv != KERN_SUCCESS) {
-				kprintf("VMM: handle_vmx_vmexit: EXIT_REASON_EPT_FAULT couldn't resolve %llx\n",
-				    (unsigned long long) vti->guest_physical_address);
+				trap(&vti->guest);
+				break;
+			default:
+				kprintf("VMM: handle_vmx_vmexit: "
+					"VMCS_EXCEPTION_SOFTWARE unknown "
+					"number %d rip: %llx, rsp: %llx\n",
+					exception_number,
+					(long long)vti->guest.tf_rip,
+					(long long)vti->guest.tf_rsp);
 				err = -1;
 				goto error;
 			}
-			break;
-		default:
-			kprintf("VMM: handle_vmx_vmexit: unknown exit reason: %d with qualification %lld\n",
-			    exit_reason, (long long) vti->vmexit_qualification);
+		} else {
+			kprintf("VMM: handle_vmx_vmexit: "
+				"VMCS_EXCEPTION_ %d unknown\n",
+				exception_type);
 			err = -1;
 			goto error;
+		}
+		break;
+	case EXIT_REASON_EXT_INTR:
+		dkprintf("VMM: handle_vmx_vmexit: EXIT_REASON_EXT_INTR\n");
+		break;
+	case EXIT_REASON_CPUID:
+		dkprintf("VMM: handle_vmx_vmexit: EXIT_REASON_CPUID\n");
+
+		/*
+		 * Execute CPUID instruction and pass
+		 * the result to the vkernel
+		 */
+		func = vti->guest.tf_rax;
+		do_cpuid(func, regs);
+
+		vti->guest.tf_rax = regs[0];
+		vti->guest.tf_rbx = regs[1];
+		vti->guest.tf_rcx = regs[2];
+		vti->guest.tf_rdx = regs[3];
+
+		vti->guest.tf_rip += vti->vmexit_instruction_length;
+
+		break;
+	case EXIT_REASON_EPT_FAULT:
+		/*
+		 * EPT_FAULT are resolved like normal PFs. Nothing special
+		 * - get the fault type
+		 * - get the fault address (which is a GPA)
+		 * - execute vm_fault on the vm_map
+		 */
+		dkprintf("VMM: handle_vmx_vmexit: "
+			 "EXIT_REASON_EPT_FAULT with qualification %lld,"
+			 "GPA: %llx, fault_Type: %d\n",
+			 (long long)vti->vmexit_qualification,
+			 (unsigned long long)vti->guest_physical_address,
+			 fault_type);
+
+		fault_type = vmx_ept_fault_type(vti->vmexit_qualification);
+
+		if (fault_type & VM_PROT_WRITE)
+			fault_flags = VM_FAULT_DIRTY;
+		else
+			fault_flags = VM_FAULT_NORMAL;
+
+		rv = vm_fault(&curthread->td_lwp->lwp_vmspace->vm_map,
+			      trunc_page(vti->guest_physical_address),
+			      fault_type, fault_flags);
+
+		if (rv != KERN_SUCCESS) {
+			kprintf("VMM: handle_vmx_vmexit: "
+				"EXIT_REASON_EPT_FAULT couldn't resolve %jx\n",
+				(intmax_t)vti->guest_physical_address);
+			err = -1;
+			goto error;
+		}
+		break;
+	default:
+		kprintf("VMM: handle_vmx_vmexit: "
+			"unknown exit reason: %d with qualification %lld\n",
+			exit_reason,
+			(long long)vti->vmexit_qualification);
+		err = -1;
+		goto error;
 	}
 	return 0;
 error:
@@ -1323,7 +1405,7 @@ error:
 static int
 vmx_vmrun(void)
 {
-	struct vmx_thread_info * vti;
+	struct vmx_thread_info *vti;
 	struct globaldata *gd;
 	int err;
 	int ret;
@@ -1334,19 +1416,19 @@ vmx_vmrun(void)
 	struct trapframe *save_frame;
 	thread_t td = curthread;
 
-	vti = (struct vmx_thread_info *) td->td_vmm;
+	vti = (struct vmx_thread_info *)td->td_vmm;
 	save_frame = td->td_lwp->lwp_md.md_regs;
 	td->td_lwp->lwp_md.md_regs = &vti->guest;
 restart:
+	lwkt_user_yield();
 	crit_enter();
 
 	/*
-	 * This can change the cpu we are running on.
+	 * The userexit can change the cpu we are running on.
 	 */
 	trap_handle_userexit(&vti->guest, sticks);
 	gd = mycpu;
 
-	ERROR2_IF(vti == NULL);
 	ERROR2_IF(vmx_check_cpu_migration());
 	ERROR2_IF(vmx_handle_cpu_migration());
 
@@ -1357,7 +1439,6 @@ restart:
 	 * - loop again until there are no ASTFLTs
 	 */
 	cpu_disable_intr();
-	splz();
 	if (gd->gd_reqflags & RQF_AST_MASK) {
 		atomic_clear_int(&gd->gd_reqflags, RQF_AST_SIGNAL);
 		cpu_enable_intr();
@@ -1367,6 +1448,10 @@ restart:
 		/* CURRENT CPU CAN CHANGE */
 		goto restart;
 	}
+
+	/*
+	 * shouldn't be possible - REMOVE ME
+	 */
 	if (vti->last_cpu != gd->gd_cpuid) {
 		cpu_enable_intr();
 		crit_exit();
@@ -1402,17 +1487,25 @@ restart:
 		}
 
 		/*
-		 * More complex.  After sleeping we have to re-test
-		 * everything.
+		 * More complex, another thread has locked the VMM
+		 * (probably to do an EPT invalidation).  We have to
+		 * sleep or busy-wait until it is no longer locked.
+		 *
+		 * NOTE: For now we busy wait.  Sleeping messes up
+		 *	 performance when the vkernel has to synchronize
+		 *	 multiple cpu threads.  The thread will still
+		 *	 be subject to its user process priority.
 		 */
 		ATOMIC_CPUMASK_NANDBIT(td->td_proc->p_vmm_cpumask,
 				       gd->gd_cpuid);
 		cpu_enable_intr();
+#if 0
 		tsleep_interlock(&td->td_proc->p_vmm_cpulock, 0);
 		if (td->td_proc->p_vmm_cpulock & CPULOCK_EXCL) {
 			tsleep(&td->td_proc->p_vmm_cpulock, PINTERLOCKED,
 			       "vmminvl", hz);
 		}
+#endif
 		crit_exit();
 		goto restart;
 	}
@@ -1428,13 +1521,30 @@ restart:
 	ERROR_IF(vmwrite(VMCS_GUEST_SS_SELECTOR, vti->guest.tf_ss));
 	ERROR_IF(vmwrite(VMCS_GUEST_CR3, (uint64_t) vti->guest_cr3));
 
-	/*
-	 * FPU
-	 */
-	if (mdcpu->gd_npxthread != td) {
-		if (mdcpu->gd_npxthread)
-			npxsave(mdcpu->gd_npxthread->td_savefpu);
-		npxdna();
+	if (vti->guest.tf_xflags & PGEX_FPFAULT) {
+		if ((vti->guest_cr0 & CR0_TS) == 0) {
+			vti->guest_cr0 |= CR0_TS;
+			ERROR_IF(vmwrite(VMCS_GUEST_CR0,
+					 (uint64_t)vti->guest_cr0));
+		}
+	} else {
+		if (vti->guest_cr0 & CR0_TS) {
+			vti->guest_cr0 &= ~(long)CR0_TS;
+			ERROR_IF(vmwrite(VMCS_GUEST_CR0,
+					 (uint64_t)vti->guest_cr0));
+		}
+
+		/*
+		 * Make sure the correct FPU state is loaded for the guest.
+		 *
+		 * HOST_CR0 always clears CR0_TS so make sure this matches
+		 * regardless of the guest_cr0.
+		 */
+		if (mdcpu->gd_npxthread != td) {
+			if (mdcpu->gd_npxthread)
+				npxsave(mdcpu->gd_npxthread->td_savefpu);
+			npxdna();
+		}
 	}
 
 	/*
@@ -1449,25 +1559,31 @@ restart:
 	 * instructions. We have to execute a special instruction that
 	 * invalidates all EPT cache ("invept").
 	 *
-	 * pm_invgen it's a generation number which is incremented in the
-	 * pmap_inval_interlock, before doing any invalidates. The
-	 * pmap_inval_interlock will cause all the CPUs that are using
-	 * the EPT to VMEXIT and wait for the interlock to complete.
-	 * When they will VMENTER they will see that the generation
-	 * number had changed from their current and do a invept.
+	 * pm_invgen it's a generation number which is incremented in
+	 * pmap_inval_smp*(), before doing any invalidates.  This will
+	 * cause all CPUs thaat are using the EPT to VMEXIT and wait for
+	 * the interlock to complete.  When they VMENTER they will see that
+	 * the generation number had changed from their current and do a
+	 * invept.
 	 */
 	if (vti->eptgen != td->td_proc->p_vmspace->vm_pmap.pm_invgen) {
 		vti->eptgen = td->td_proc->p_vmspace->vm_pmap.pm_invgen;
 
 		ERROR_IF(invept(INVEPT_TYPE_SINGLE_CONTEXT,
-		    (uint64_t*)&vti->invept_desc));
+				(uint64_t*)&vti->invept_desc));
 	}
 
-	if (vti->launched) { /* vmresume called from vmx_trap.s */
+	gd->gd_flags |= GDF_VIRTUSER;
+	if (vti->launched) {
+		/*
+		 * vmresume called from vmx_trap.s
+		 */
 		dkprintf("\n\nVMM: vmx_vmrun: vmx_resume\n");
 		ret = vmx_resume(vti);
-
-	} else { /* vmlaunch called from vmx_trap.s */
+	} else {
+		/*
+		 * vmlaunch called from vmx_trap.s
+		 */
 		dkprintf("\n\nVMM: vmx_vmrun: vmx_launch\n");
 		vti->launched = 1;
 		ret = vmx_launch(vti);
@@ -1476,11 +1592,13 @@ restart:
 	/*
 	 * This is our return point from the vmlaunch/vmresume
 	 * There are two situations:
-	 * - the vmlaunch/vmresume executed successfully and they
+	 *
+	 * - The vmlaunch/vmresume executed successfully and they
 	 *   would return through "vmx_vmexit" which will restore
 	 *   the state (registers) and return here with the ret
 	 *   set to VM_EXIT (ret is actually %rax)
-	 * - the vmlaunch/vmresume failed to execute and will return
+	 *
+	 * - The vmlaunch/vmresume failed to execute and will return
 	 *   immediately with ret set to the error code
 	 */
 	if (ret == VM_EXIT) {
@@ -1495,12 +1613,19 @@ restart:
 		cpu_enable_intr();
 		trap_handle_userenter(td);
 		sticks = td->td_sticks;
+
 		crit_exit();
+		/* processing pending before clearing VIRTUSER */
+		gd->gd_flags &= ~GDF_VIRTUSER;
 
 		/*
 		 * Handle the VMEXIT reason
-		 * - if successful we VMENTER again
-		 * - if not, we exit
+		 * - if not successful, we exit
+		 * - otherwise we loop up and VMENTER again
+		 *
+		 * NOTE: current cpu can change (e.g. vmexit reason is
+		 *	 syscall by vkernel kernel to run a vkernel user
+		 *	 thread).
 		 */
 		if (vmx_handle_vmexit())
 			goto done;
@@ -1510,7 +1635,6 @@ restart:
 		 * VM execution
 		 */
 		goto restart;
-
 	} else {
 		vti->launched = 0;
 
@@ -1536,18 +1660,25 @@ restart:
 done:
 	kprintf("VMM: vmx_vmrun: returning with success\n");
 	return 0;
+	/* NOT REACHED */
+
 error:
 	ATOMIC_CPUMASK_NANDBIT(td->td_proc->p_vmm_cpumask, gd->gd_cpuid);
 	atomic_add_int(&td->td_proc->p_vmm_cpulock, -CPULOCK_INCR);
 	cpu_enable_intr();
+
 error2:
 	trap_handle_userenter(td);
 	td->td_lwp->lwp_md.md_regs = save_frame;
 	KKASSERT(CPUMASK_TESTMASK(td->td_proc->p_vmm_cpumask,
 				  gd->gd_cpumask) == 0);
 	/*atomic_clear_cpumask(&td->td_proc->p_vmm_cpumask, gd->gd_cpumask);*/
+
 	crit_exit();
+	/* processing pending before clearing VIRTUSER */
+	gd->gd_flags &= ~GDF_VIRTUSER;
 	kprintf("VMM: vmx_vmrun failed\n");
+
 	return err;
 }
 

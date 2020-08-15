@@ -15,11 +15,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -37,7 +33,6 @@
  *
  *	@(#)acct.h	8.4 (Berkeley) 1/9/95
  * $FreeBSD: src/sys/sys/acct.h,v 1.12 1999/12/29 04:24:36 peter Exp $
- * $DragonFly: src/sys/sys/acct.h,v 1.4 2006/05/20 02:42:13 dillon Exp $
  */
 
 #ifndef _SYS_ACCT_H_
@@ -54,12 +49,6 @@
  */
 typedef u_int16_t comp_t;
 
-#ifdef _KERNEL
-#define __dev_t udev_t
-#else
-#define __dev_t dev_t
-#endif
-
 #define AC_COMM_LEN 16
 struct acct {
 	char	  ac_comm[AC_COMM_LEN];	/* command name */
@@ -71,7 +60,7 @@ struct acct {
 	gid_t	  ac_gid;		/* group id */
 	u_int16_t ac_mem;		/* average memory usage */
 	comp_t	  ac_io;		/* count of IO blocks */
-	__dev_t	  ac_tty;		/* controlling tty */
+	dev_t	  ac_tty;		/* controlling tty */
 
 #define	AFORK	0x01			/* forked but not exec'ed */
 #define	ASU	0x02			/* used super-user permissions */
@@ -80,7 +69,6 @@ struct acct {
 #define	AXSIG	0x10			/* killed by a signal */
 	u_int8_t  ac_flag;		/* accounting flags */
 };
-#undef __dev_t
 
 /*
  * 1/AHZ is the granularity of the data encoded in the comp_t fields.

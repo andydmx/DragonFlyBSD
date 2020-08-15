@@ -10,11 +10,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -32,7 +28,6 @@
  *
  *	@(#)sockio.h	8.1 (Berkeley) 3/28/94
  * $FreeBSD: src/sys/sys/sockio.h,v 1.14.2.6 2002/02/07 15:12:37 ambrisko Exp $
- * $DragonFly: src/sys/sys/sockio.h,v 1.5 2007/09/30 04:37:27 sephe Exp $
  */
 
 #ifndef	_SYS_SOCKIO_H_
@@ -49,25 +44,18 @@
 #define	SIOCSPGRP	 _IOW('s',  8, int)		/* set process group */
 #define	SIOCGPGRP	 _IOR('s',  9, int)		/* get process group */
 
-#define	SIOCADDRT	 _IOW('r', 10, struct ortentry)	/* add route */
-#define	SIOCDELRT	 _IOW('r', 11, struct ortentry)	/* delete route */
 #define	SIOCGETVIFCNT	_IOWR('r', 15, struct sioc_vif_req)/* get vif pkt cnt */
 #define	SIOCGETSGCNT	_IOWR('r', 16, struct sioc_sg_req) /* get s,g pkt cnt */
 
 #define	SIOCSIFADDR	 _IOW('i', 12, struct ifreq)	/* set ifnet address */
-#define	OSIOCGIFADDR	_IOWR('i', 13, struct ifreq)	/* get ifnet address */
 #define	SIOCGIFADDR	_IOWR('i', 33, struct ifreq)	/* get ifnet address */
 #define	SIOCSIFDSTADDR	 _IOW('i', 14, struct ifreq)	/* set p-p address */
-#define	OSIOCGIFDSTADDR	_IOWR('i', 15, struct ifreq)	/* get p-p address */
 #define	SIOCGIFDSTADDR	_IOWR('i', 34, struct ifreq)	/* get p-p address */
 #define	SIOCSIFFLAGS	 _IOW('i', 16, struct ifreq)	/* set ifnet flags */
 #define	SIOCGIFFLAGS	_IOWR('i', 17, struct ifreq)	/* get ifnet flags */
-#define	OSIOCGIFBRDADDR	_IOWR('i', 18, struct ifreq)	/* get broadcast addr */
 #define	SIOCGIFBRDADDR	_IOWR('i', 35, struct ifreq)	/* get broadcast addr */
 #define	SIOCSIFBRDADDR	 _IOW('i', 19, struct ifreq)	/* set broadcast addr */
-#define	OSIOCGIFCONF	_IOWR('i', 20, struct ifconf)	/* get ifnet list */
 #define	SIOCGIFCONF	_IOWR('i', 36, struct ifconf)	/* get ifnet list */
-#define	OSIOCGIFNETMASK	_IOWR('i', 21, struct ifreq)	/* get net addr mask */
 #define	SIOCGIFNETMASK	_IOWR('i', 37, struct ifreq)	/* get net addr mask */
 #define	SIOCSIFNETMASK	 _IOW('i', 22, struct ifreq)	/* set net addr mask */
 #define	SIOCGIFMETRIC	_IOWR('i', 23, struct ifreq)	/* get IF metric */
@@ -87,7 +75,8 @@
 /* 36 SIOCGIFCONF */
 /* 37 SIOCGIFNETMASK */
 #define	SIOCGIFDATA	_IOWR('i', 38, struct ifreq)	/* get if_data */
-#define	SIOCSIFNAME	_IOW('i', 40, struct ifreq)	/* set IF name */
+#define	SIOCSIFNAME	 _IOW('i', 40, struct ifreq)	/* set IF name */
+#define	SIOCGIFALIAS	_IOWR('i', 41, struct ifaliasreq)/* get IF alias */
 
 #define	SIOCADDMULTI	 _IOW('i', 49, struct ifreq)	/* add m'cast addr */
 #define	SIOCDELMULTI	 _IOW('i', 50, struct ifreq)	/* del m'cast addr */
@@ -104,7 +93,7 @@
 #define	SIOCGIFSTATUS	_IOWR('i', 59, struct ifstat)	/* get IF status */
 #define	SIOCSIFLLADDR	 _IOW('i', 60, struct ifreq)	/* set linklevel addr */
 
-#define	SIOCSIFPHYADDR   _IOW('i', 70, struct ifaliasreq) /* set gif addres */
+#define	SIOCSIFPHYADDR	 _IOW('i', 70, struct ifaliasreq) /* set gif addres */
 #define	SIOCGIFPSRCADDR	_IOWR('i', 71, struct ifreq)	/* get gif psrc addr */
 #define	SIOCGIFPDSTADDR	_IOWR('i', 72, struct ifreq)	/* get gif pdst addr */
 #define	SIOCDIFPHYADDR	 _IOW('i', 73, struct ifreq)	/* delete gif addrs */
@@ -114,23 +103,24 @@
 #define	SIOCGPRIVATE_0	_IOWR('i', 80, struct ifreq)	/* Linux Private + 0 */
 #define	SIOCGPRIVATE_1	_IOWR('i', 81, struct ifreq)	/* Linux Private + 1 */
 
-#define	SIOCSDRVSPEC     _IOW('i', 123, struct ifdrv)   /* set driver-specific
+#define	SIOCIFGCLONERS	_IOWR('i', 120, struct if_clonereq) /* get cloners */
+#define	SIOCIFDESTROY	 _IOW('i', 121, struct ifreq)	/* destroy clone if */
+#define	SIOCIFCREATE	_IOWR('i', 122, struct ifreq)	/* create clone if */
+#define	SIOCSDRVSPEC	 _IOW('i', 123, struct ifdrv)   /* set driver-specific
 							   parameters */
-#define	SIOCGDRVSPEC    _IOWR('i', 123, struct ifdrv)   /* get driver-specific
+#define	SIOCGDRVSPEC	_IOWR('i', 123, struct ifdrv)   /* get driver-specific
 							   parameters */
+#define	SIOCIFCREATE2	_IOWR('i', 124, struct ifreq)	/* create clone if */
 
-#define SIOCIFGCLONERS	_IOWR('i', 120, struct if_clonereq) /* get cloners */
-#define SIOCIFDESTROY	 _IOW('i', 121, struct ifreq)	/* destroy clone if */
-#define SIOCIFCREATE	_IOWR('i', 122, struct ifreq)	/* create clone if */
-/* 123 SIOC[SG]DRVSPEC */
-#define SIOCIFCREATE2	_IOWR('i', 124, struct ifreq)	/* create clone if */
+#define	SIOCSIFPOLLCPU	 _IOW('i', 125, struct ifreq)	/* deprecated */
+#define	SIOCGIFPOLLCPU	_IOWR('i', 126, struct ifreq)	/* deprecated */
 
-#define SIOCSIFPOLLCPU	 _IOW('i', 125, struct ifreq)	/* deprecated */
-#define SIOCGIFPOLLCPU	_IOWR('i', 126, struct ifreq)	/* deprecated */
+#define	SIOCSIFTSOLEN	 _IOW('i', 127, struct ifreq)	/* set max TSO len */
+#define	SIOCGIFTSOLEN	_IOWR('i', 128, struct ifreq)	/* get max TSO len */
 
-#define SIOCSIFTSOLEN	 _IOW('i', 127, struct ifreq)	/* set max TSO len */
-#define SIOCGIFTSOLEN	_IOWR('i', 128, struct ifreq)	/* get max TSO len */
-
+#define	SIOCAIFGROUP	 _IOW('i', 135, struct ifgroupreq) /* add an ifgroup */
+#define	SIOCGIFGROUP	_IOWR('i', 136, struct ifgroupreq) /* get ifgroups */
+#define	SIOCDIFGROUP	 _IOW('i', 137, struct ifgroupreq) /* delete ifgroup */
 #define	SIOCGIFGMEMB	_IOWR('i', 138, struct ifgroupreq) /* get members */
 
 #endif /* !_SYS_SOCKIO_H_ */

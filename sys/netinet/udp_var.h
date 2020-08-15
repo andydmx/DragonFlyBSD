@@ -43,11 +43,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -119,6 +115,9 @@ struct	udpstat {
 	u_long	udps_noportmcast;
 	u_long	udps_pad[3];		/* pad to cache line size (64B) */
 };
+#ifdef _KERNEL
+CTASSERT((sizeof(struct udpstat) & __VM_CACHELINE_MASK) == 0);
+#endif
 
 /*
  * Names for UDP sysctl objects
@@ -158,6 +157,8 @@ extern int	log_in_vain;
 
 int			udp_addrcpu (in_addr_t faddr, in_port_t fport,
 				     in_addr_t laddr, in_port_t lport);
+int			udp_addrhash (in_addr_t faddr, in_port_t fport,
+				      in_addr_t laddr, in_port_t lport);
 struct lwkt_port	*udp_addrport (in_addr_t faddr, in_port_t fport,
 				     in_addr_t laddr, in_port_t lport);
 void			udp_ctlinput(netmsg_t msg);
@@ -167,9 +168,10 @@ void			udp_thread_init (void);
 int			udp_input (struct mbuf **, int *, int);
 void			udp_notify (struct inpcb *inp, int error);
 void			udp_shutdown (union netmsg *);
-struct lwkt_port	*udp_ctlport (int, struct sockaddr *, void *);
+struct lwkt_port	*udp_ctlport (int, struct sockaddr *, void *, int *);
 struct lwkt_port	*udp_initport(void);
-struct lwkt_port	*udp_cport (int);
+inp_notify_t		udp_get_inpnotify(int, const struct sockaddr *,
+			    struct ip **, int *);
 
 #endif	/* _KERNEL */
 

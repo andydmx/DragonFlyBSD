@@ -377,7 +377,7 @@ nss_configure(void)
 	confmod = statbuf.st_mtime;
 
 #ifdef NS_CACHING
-	handle = dlopen(NULL, RTLD_LAZY | RTLD_GLOBAL);
+	handle = libc_dlopen(NULL, RTLD_LAZY | RTLD_GLOBAL);
 	if (handle != NULL) {
 		nss_cache_cycle_prevention_func = dlsym(handle,
 			"_nss_cache_cycle_prevention_function");
@@ -490,7 +490,7 @@ nss_load_module(const char *source, nss_module_register_fn reg_fn)
 		if (snprintf(buf, sizeof(buf), "nss_%s.so.%d", mod.name,
 		    NSS_MODULE_INTERFACE_VERSION) >= (int)sizeof(buf))
 			goto fin;
-		mod.handle = dlopen(buf, RTLD_LOCAL|RTLD_LAZY);
+		mod.handle = libc_dlopen(buf, RTLD_LOCAL|RTLD_LAZY);
 		if (mod.handle == NULL) {
 #ifdef _NSS_DEBUG
 			/* This gets pretty annoying since the built-in
@@ -597,8 +597,6 @@ nss_method_lookup(const char *source, const char *database,
 	return (NULL);
 }
 
-
-__weak_reference(_nsdispatch, nsdispatch);
 
 int
 _nsdispatch(void *retval, const ns_dtab disp_tab[], const char *database,
@@ -742,3 +740,5 @@ fin:
 	errno = serrno;
 	return (result);
 }
+
+__weak_reference(_nsdispatch, nsdispatch);

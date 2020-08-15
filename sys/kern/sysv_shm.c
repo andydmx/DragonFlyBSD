@@ -28,12 +28,11 @@
  * THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-#include "opt_compat.h"
 #include "opt_sysvipc.h"
 
 #include <sys/param.h>
 #include <sys/systm.h>
-#include <sys/sysproto.h>
+#include <sys/sysmsg.h>
 #include <sys/kernel.h>
 #include <sys/sysctl.h>
 #include <sys/shm.h>
@@ -43,8 +42,6 @@
 #include <sys/stat.h>
 #include <sys/sysent.h>
 #include <sys/jail.h>
-
-#include <sys/mplock2.h>
 
 #include <vm/vm.h>
 #include <vm/vm_param.h>
@@ -57,8 +54,10 @@
 
 static MALLOC_DEFINE(M_SHM, "shm", "SVID compatible shared memory segments");
 
-static int shmget_allocate_segment (struct proc *p, struct shmget_args *uap, int mode);
-static int shmget_existing (struct proc *p, struct shmget_args *uap, int mode, int segnum);
+static int shmget_allocate_segment(struct proc *p, struct sysmsg *sysmsg,
+			const struct shmget_args *uap, int mode);
+static int shmget_existing(struct proc *p, struct sysmsg *sysmsg,
+			const struct shmget_args *uap, int mode, int segnum);
 
 #define	SHMSEG_FREE     	0x0200
 #define	SHMSEG_REMOVED  	0x0400
@@ -68,6 +67,7 @@ static int shmget_existing (struct proc *p, struct shmget_args *uap, int mode, i
 static int shm_last_free, shm_committed, shmalloced;
 int shm_nused;
 static struct shmid_ds	*shmsegs;
+static struct lwkt_token shm_token = LWKT_TOKEN_INITIALIZER(shm_token);
 
 struct shm_handle {
 	/* vm_offset_t kva; */
@@ -77,6 +77,7 @@ struct shm_handle {
 struct shmmap_state {
 	vm_offset_t va;
 	int shmid;
+	int reserved;
 };
 
 static void shm_deallocate_segment (struct shmid_ds *);
@@ -107,7 +108,20 @@ struct	shminfo shminfo = {
 	0
 };
 
-static int shm_allow_removed;
+/*
+ * allow-removed    Allow a shared memory segment to be attached by its shmid
+ *		    even after it has been deleted, as long as it was still
+ *		    being referenced by someone.  This is a trick used by
+ *		    chrome and other applications to avoid leaving shm
+ *		    segments hanging around after the application is killed
+ *		    or seg-faults unexpectedly.
+ *
+ * use-phys	    Shared memory segments are to use physical memory by
+ *		    default, which may allow the kernel to better-optimize
+ *		    the pmap and reduce overhead.  The pages are effectively
+ *		    wired.
+ */
+static int shm_allow_removed = 1;
 static int shm_use_phys = 1;
 
 TUNABLE_LONG("kern.ipc.shmmin", &shminfo.shmmin);
@@ -207,18 +221,20 @@ shm_delete_mapping(struct vmspace *vm, struct shmmap_state *shmmap_s)
  * MPALMOSTSAFE
  */
 int
-sys_shmdt(struct shmdt_args *uap)
+sys_shmdt(struct sysmsg *sysmsg, const struct shmdt_args *uap)
 {
 	struct thread *td = curthread;
 	struct proc *p = td->td_proc;
 	struct shmmap_state *shmmap_s;
+	struct prison *pr = p->p_ucred->cr_prison;
+
 	long i;
 	int error;
 
-	if (!jail_sysvipc_allowed && td->td_ucred->cr_prison != NULL)
+	if (pr && !PRISON_CAP_ISSET(pr->pr_caps, PRISON_CAP_SYS_SYSVIPC))
 		return (ENOSYS);
 
-	get_mplock();
+	lwkt_gettoken(&shm_token);
 	shmmap_s = (struct shmmap_state *)p->p_vmspace->vm_shm;
 	if (shmmap_s == NULL) {
 		error = EINVAL;
@@ -234,7 +250,8 @@ sys_shmdt(struct shmdt_args *uap)
 	else
 		error = shm_delete_mapping(p->p_vmspace, shmmap_s);
 done:
-	rel_mplock();
+	lwkt_reltoken(&shm_token);
+
 	return (error);
 }
 
@@ -242,10 +259,11 @@ done:
  * MPALMOSTSAFE
  */
 int
-sys_shmat(struct shmat_args *uap)
+sys_shmat(struct sysmsg *sysmsg, const struct shmat_args *uap)
 {
 	struct thread *td = curthread;
 	struct proc *p = td->td_proc;
+	struct prison *pr = p->p_ucred->cr_prison;
 	int error, flags;
 	long i;
 	struct shmid_ds *shmseg;
@@ -257,17 +275,19 @@ sys_shmat(struct shmat_args *uap)
 	vm_size_t align;
 	int rv;
 
-	if (!jail_sysvipc_allowed && td->td_ucred->cr_prison != NULL)
+	if (pr && !PRISON_CAP_ISSET(pr->pr_caps, PRISON_CAP_SYS_SYSVIPC))
 		return (ENOSYS);
 
-	get_mplock();
+	lwkt_gettoken(&shm_token);
 again:
 	shmmap_s = (struct shmmap_state *)p->p_vmspace->vm_shm;
 	if (shmmap_s == NULL) {
 		size = shminfo.shmseg * sizeof(struct shmmap_state);
 		shmmap_s = kmalloc(size, M_SHM, M_WAITOK);
-		for (i = 0; i < shminfo.shmseg; i++)
+		for (i = 0; i < shminfo.shmseg; i++) {
 			shmmap_s[i].shmid = -1;
+			shmmap_s[i].reserved = 0;
+		}
 		if (p->p_vmspace->vm_shm != NULL) {
 			kfree(shmmap_s, M_SHM);
 			goto again;
@@ -283,9 +303,18 @@ again:
 			(uap->shmflg & SHM_RDONLY) ? IPC_R : IPC_R|IPC_W);
 	if (error)
 		goto done;
+
+	/*
+	 * Find a free element and mark reserved.  This fixes races
+	 * against concurrent allocations due to the token being
+	 * interrupted by blocking operations.  The shmmap_s reservation
+	 * will be cleared upon completion or error.
+	 */
 	for (i = 0; i < shminfo.shmseg; i++) {
-		if (shmmap_s->shmid == -1)
+		if (shmmap_s->shmid == -1 && shmmap_s->reserved == 0) {
+			shmmap_s->reserved = 1;
 			break;
+		}
 		shmmap_s++;
 	}
 	if (i >= shminfo.shmseg) {
@@ -304,11 +333,13 @@ again:
 	if (uap->shmaddr) {
 		flags |= MAP_FIXED;
 		if (uap->shmflg & SHM_RND) {
-			attach_va = (vm_offset_t)uap->shmaddr & ~(SHMLBA-1);
+			attach_va =
+			    rounddown2((vm_offset_t)uap->shmaddr, SHMLBA);
 		} else if (((vm_offset_t)uap->shmaddr & (SHMLBA-1)) == 0) {
 			attach_va = (vm_offset_t)uap->shmaddr;
 		} else {
 			error = EINVAL;
+			shmmap_s->reserved = 0;
 			goto done;
 		}
 	} else {
@@ -331,18 +362,18 @@ again:
 
 	shm_handle = shmseg->shm_internal;
 	vm_object_hold(shm_handle->shm_object);
-	vm_object_chain_wait(shm_handle->shm_object, 0);
 	vm_object_reference_locked(shm_handle->shm_object);
 	rv = vm_map_find(&p->p_vmspace->vm_map, 
 			 shm_handle->shm_object, NULL,
 			 0, &attach_va, size,
 			 align,
 			 ((flags & MAP_FIXED) ? 0 : 1), 
-			 VM_MAPTYPE_NORMAL,
+			 VM_MAPTYPE_NORMAL, VM_SUBSYS_SHMEM,
 			 prot, prot, 0);
 	vm_object_drop(shm_handle->shm_object);
 	if (rv != KERN_SUCCESS) {
                 vm_object_deallocate(shm_handle->shm_object);
+		shmmap_s->reserved = 0;
 		error = ENOMEM;
 		goto done;
 	}
@@ -352,13 +383,15 @@ again:
 	KKASSERT(shmmap_s->shmid == -1);
 	shmmap_s->va = attach_va;
 	shmmap_s->shmid = uap->shmid;
+	shmmap_s->reserved = 0;
 	shmseg->shm_lpid = p->p_pid;
 	shmseg->shm_atime = time_second;
 	shmseg->shm_nattch++;
-	uap->sysmsg_resultp = (void *)attach_va;
+	sysmsg->sysmsg_resultp = (void *)attach_va;
 	error = 0;
 done:
-	rel_mplock();
+	lwkt_reltoken(&shm_token);
+
 	return error;
 }
 
@@ -366,18 +399,19 @@ done:
  * MPALMOSTSAFE
  */
 int
-sys_shmctl(struct shmctl_args *uap)
+sys_shmctl(struct sysmsg *sysmsg, const struct shmctl_args *uap)
 {
 	struct thread *td = curthread;
 	struct proc *p = td->td_proc;
+	struct prison *pr = p->p_ucred->cr_prison;
 	int error;
 	struct shmid_ds inbuf;
 	struct shmid_ds *shmseg;
 
-	if (!jail_sysvipc_allowed && td->td_ucred->cr_prison != NULL)
+	if (pr && !PRISON_CAP_ISSET(pr->pr_caps, PRISON_CAP_SYS_SYSVIPC))
 		return (ENOSYS);
 
-	get_mplock();
+	lwkt_gettoken(&shm_token);
 	shmseg = shm_find_segment_by_shmid(uap->shmid);
 	if (shmseg == NULL) {
 		error = EINVAL;
@@ -423,12 +457,14 @@ sys_shmctl(struct shmctl_args *uap)
 		break;
 	}
 done:
-	rel_mplock();
+	lwkt_reltoken(&shm_token);
+
 	return error;
 }
 
 static int
-shmget_existing(struct proc *p, struct shmget_args *uap, int mode, int segnum)
+shmget_existing(struct proc *p, struct sysmsg *sysmsg,
+		const struct shmget_args *uap, int mode, int segnum)
 {
 	struct shmid_ds *shmseg;
 	int error;
@@ -453,12 +489,13 @@ shmget_existing(struct proc *p, struct shmget_args *uap, int mode, int segnum)
 		return error;
 	if (uap->size && uap->size > shmseg->shm_segsz)
 		return EINVAL;
-	uap->sysmsg_result = IXSEQ_TO_IPCID(segnum, shmseg->shm_perm);
+	sysmsg->sysmsg_result = IXSEQ_TO_IPCID(segnum, shmseg->shm_perm);
 	return 0;
 }
 
 static int
-shmget_allocate_segment(struct proc *p, struct shmget_args *uap, int mode)
+shmget_allocate_segment(struct proc *p, struct sysmsg *sysmsg,
+			const struct shmget_args *uap, int mode)
 {
 	int i, segnum, shmid;
 	size_t size;
@@ -564,7 +601,7 @@ shmget_allocate_segment(struct proc *p, struct shmget_args *uap, int mode)
 		shmseg->shm_perm.mode &= ~SHMSEG_WANTED;
 		wakeup((caddr_t)shmseg);
 	}
-	uap->sysmsg_result = shmid;
+	sysmsg->sysmsg_result = shmid;
 	return 0;
 }
 
@@ -572,23 +609,25 @@ shmget_allocate_segment(struct proc *p, struct shmget_args *uap, int mode)
  * MPALMOSTSAFE
  */
 int
-sys_shmget(struct shmget_args *uap)
+sys_shmget(struct sysmsg *sysmsg, const struct shmget_args *uap)
 {
 	struct thread *td = curthread;
 	struct proc *p = td->td_proc;
+	struct prison *pr = p->p_ucred->cr_prison;
 	int segnum, mode, error;
 
-	if (!jail_sysvipc_allowed && td->td_ucred->cr_prison != NULL)
+	if (pr && !PRISON_CAP_ISSET(pr->pr_caps, PRISON_CAP_SYS_SYSVIPC))
 		return (ENOSYS);
 
 	mode = uap->shmflg & ACCESSPERMS;
-	get_mplock();
+
+	lwkt_gettoken(&shm_token);
 
 	if (uap->key != IPC_PRIVATE) {
 	again:
 		segnum = shm_find_segment_by_key(uap->key);
 		if (segnum >= 0) {
-			error = shmget_existing(p, uap, mode, segnum);
+			error = shmget_existing(p, sysmsg, uap, mode, segnum);
 			if (error == EAGAIN)
 				goto again;
 			goto done;
@@ -598,9 +637,10 @@ sys_shmget(struct shmget_args *uap)
 			goto done;
 		}
 	}
-	error = shmget_allocate_segment(p, uap, mode);
+	error = shmget_allocate_segment(p, sysmsg, uap, mode);
 done:
-	rel_mplock();
+	lwkt_reltoken(&shm_token);
+
 	return (error);
 }
 
@@ -611,7 +651,7 @@ shmfork(struct proc *p1, struct proc *p2)
 	size_t size;
 	int i;
 
-	get_mplock();
+	lwkt_gettoken(&shm_token);
 	size = shminfo.shmseg * sizeof(struct shmmap_state);
 	shmmap_s = kmalloc(size, M_SHM, M_WAITOK);
 	bcopy((caddr_t)p1->p_vmspace->vm_shm, (caddr_t)shmmap_s, size);
@@ -620,7 +660,7 @@ shmfork(struct proc *p1, struct proc *p2)
 		if (shmmap_s->shmid != -1)
 			shmsegs[IPCID_TO_IX(shmmap_s->shmid)].shm_nattch++;
 	}
-	rel_mplock();
+	lwkt_reltoken(&shm_token);
 }
 
 void
@@ -631,13 +671,13 @@ shmexit(struct vmspace *vm)
 
 	if ((base = (struct shmmap_state *)vm->vm_shm) != NULL) {
 		vm->vm_shm = NULL;
-		get_mplock();
+		lwkt_gettoken(&shm_token);
 		for (i = 0, shm = base; i < shminfo.shmseg; i++, shm++) {
 			if (shm->shmid != -1)
 				shm_delete_mapping(vm, shm);
 		}
 		kfree(base, M_SHM);
-		rel_mplock();
+		lwkt_reltoken(&shm_token);
 	}
 }
 

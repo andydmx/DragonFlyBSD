@@ -1,7 +1,5 @@
-/*-
- * Copyright (c) 2010 Isilon Systems, Inc.
- * Copyright (c) 2010 iX Systems, Inc.
- * Copyright (c) 2010 Panasas, Inc.
+/*
+ * Copyright (c) 2015-2019 François Tigeot <ftigeot@wolfpond.org>
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -28,33 +26,32 @@
 #ifndef	_LINUX_TYPES_H_
 #define	_LINUX_TYPES_H_
 
-#include <sys/types.h>
-#include <sys/stdbool.h>
+#include <uapi/linux/types.h>
 #include <linux/compiler.h>
-#include <asm/types.h>
 
-typedef uint64_t u64;
-
-typedef __u16 __le16;
-typedef __u16 __be16;
-typedef __u32 __le32;
-typedef __u32 __be32;
-typedef __u64 __le64;
-typedef __u64 __be64;
-#ifndef __bool_true_false_are_defined
-typedef _Bool bool;
-#define	true	TRUE
-#define	false	FALSE
-#endif
+typedef unsigned int gfp_t;
 
 typedef u64 phys_addr_t;
-
-typedef unsigned long kernel_ulong_t;
-typedef unsigned gfp_t;
+typedef uint64_t resource_size_t;
+typedef uint64_t dma_addr_t;
 typedef uint64_t loff_t;
-typedef vm_paddr_t resource_size_t;
 
-#define	DECLARE_BITMAP(n, bits)						\
+#define DECLARE_BITMAP(n, bits) \
 	unsigned long n[howmany(bits, sizeof(long) * 8)]
+
+#if !defined(__cplusplus) && !defined(bool)
+typedef _Bool	bool;
+#endif
+
+typedef unsigned short umode_t;
+
+typedef unsigned long pgoff_t;
+
+struct rcu_head {
+};
+
+typedef struct {
+	long counter;
+} atomic64_t;
 
 #endif	/* _LINUX_TYPES_H_ */

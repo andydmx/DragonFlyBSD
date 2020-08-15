@@ -29,7 +29,6 @@
  * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
  *
- * @(#) Copyright (c) 1984, 1993 The Regents of the University of California.  All rights reserved.
  * @(#)from: arp.c	8.2 (Berkeley) 1/2/94
  * $FreeBSD: src/usr.sbin/arp/arp.c,v 1.22.2.12 2003/04/16 10:02:37 ru Exp $
  */
@@ -68,34 +67,36 @@
 #include <string.h>
 #include <unistd.h>
 
-void search(u_long addr, void (*action)(struct sockaddr_dl *sdl,
+static void search(u_long addr, void (*action)(struct sockaddr_dl *sdl,
 	struct sockaddr_inarp *sin, struct rt_msghdr *rtm));
-void print_entry(struct sockaddr_dl *sdl,
+static void print_entry(struct sockaddr_dl *sdl,
 	struct sockaddr_inarp *addr, struct rt_msghdr *rtm);
-void nuke_entry(struct sockaddr_dl *sdl,
+static void nuke_entry(struct sockaddr_dl *sdl,
 	struct sockaddr_inarp *addr, struct rt_msghdr *rtm);
-int delete(char *host, char *info);
-void usage(void);
-int set(int argc, char **argv);
-int get(char *host);
-int file(char *name);
-void getsocket(void);
-int my_ether_aton(char *a, struct ether_addr *n);
-int rtmsg(int cmd);
-int get_ether_addr(u_int32_t ipaddr, struct ether_addr *hwaddr);
+static int delete(char *host, char *info);
+static void usage(void) __dead2;
+static int set(int argc, char **argv);
+static int get(char *host);
+static int file(char *name);
+static void getsocket(void);
+static int my_ether_aton(char *a, struct ether_addr *n);
+static int rtmsg(int cmd);
+static int get_ether_addr(u_int32_t ipaddr, struct ether_addr *hwaddr);
 
 static int pid;
 static int nflag;	/* no reverse dns lookups */
 static int aflag;	/* do it for all entries */
 static int cpuflag = -1;
 static int s = -1;
+static int rifindex = 0;
+static const char *rifname = NULL;
 
-struct	sockaddr_in so_mask;
-struct	sockaddr_inarp blank_sin, sin_m;
-struct	sockaddr_dl blank_sdl, sdl_m;
-int	flags, doing_proxy, proxy_only, found_entry;
-time_t	expire_time;
-struct	{
+static struct	sockaddr_in so_mask;
+static struct	sockaddr_inarp blank_sin, sin_m;
+static struct	sockaddr_dl blank_sdl, sdl_m;
+static int	flags, doing_proxy, proxy_only, found_entry;
+static time_t	expire_time;
+static struct	{
 	struct	rt_msghdr m_rtm;
 	char	m_space[512];
 }	m_rtmsg;
@@ -116,13 +117,16 @@ main(int argc, char **argv)
 	int rtn = 0;
 
 	pid = getpid();
-	while ((ch = getopt(argc, argv, "ac:ndfsS")) != -1)
+	while ((ch = getopt(argc, argv, "ac:i:ndfsS")) != -1)
 		switch((char)ch) {
 		case 'a':
 			aflag = 1;
 			break;
 		case 'c':
 			cpuflag = strtol(optarg, NULL, 0);
+			break;
+		case 'i':
+			rifname = optarg;
 			break;
 		case 'd':
 			SETFUNC(F_DELETE);
@@ -156,8 +160,20 @@ main(int argc, char **argv)
 	blank_sdl.sdl_len = sizeof(blank_sdl);
 	blank_sdl.sdl_family = AF_LINK;
 
-	if (!func)
+	if (func == 0)
 		func = F_GET;
+	if (rifname != NULL) {
+		if (func != F_GET && !(func == F_DELETE && aflag))
+			errx(1, "-i not applicable to this operation");
+		if ((rifindex = if_nametoindex(rifname)) == 0) {
+			if (errno == ENXIO)
+				errx(1, "interface %s does not exist",
+				     rifname);
+			else
+				err(1, "if_nametoindex(%s)", rifname);
+		}
+	}
+
 	switch (func) {
 	case F_GET:
 		if (aflag) {
@@ -202,7 +218,7 @@ main(int argc, char **argv)
 /*
  * Process a file to set standard arp entries
  */
-int
+static int
 file(char *name)
 {
 	FILE *fp;
@@ -237,7 +253,7 @@ file(char *name)
 	return(retval);
 }
 
-void
+static void
 getsocket(void)
 {
 	if (s < 0) {
@@ -250,7 +266,7 @@ getsocket(void)
 /*
  * Set an individual arp entry
  */
-int
+static int
 set(int argc, char **argv)
 {
 	struct hostent *hp;
@@ -349,7 +365,7 @@ overwrite:
 /*
  * Display an individual arp entry
  */
-int
+static int
 get(char *host)
 {
 	struct hostent *hp;
@@ -365,8 +381,11 @@ get(char *host)
 	}
 	search(addr->sin_addr.s_addr, print_entry);
 	if (found_entry == 0) {
-		printf("%s (%s) -- no entry\n",
+		printf("%s (%s) -- no entry",
 		    host, inet_ntoa(addr->sin_addr));
+		if (rifname)
+			printf(" on %s", rifname);
+		printf("\n");
 		return(1);
 	}
 	return(0);
@@ -375,7 +394,7 @@ get(char *host)
 /*
  * Delete an arp entry
  */
-int
+static int
 delete(char *host, char *info)
 {
 	struct hostent *hp;
@@ -450,7 +469,7 @@ delete:
 /*
  * Search the arp table and do some action on matching entries
  */
-void
+static void
 search(u_long addr, void (*action)(struct sockaddr_dl *sdl,
 	struct sockaddr_inarp *sin, struct rt_msghdr *rtm))
 {
@@ -486,6 +505,8 @@ search(u_long addr, void (*action)(struct sockaddr_dl *sdl,
 		sin2 = (struct sockaddr_inarp *)(rtm + 1);
 		sdl = (struct sockaddr_dl *)((char *)sin2 +
 			    RT_ROUNDUP(sin2->sin_len));
+		if (rifindex > 0 && rifindex != sdl->sdl_index)
+			continue;
 		if (addr) {
 			if (addr != sin2->sin_addr.s_addr)
 				continue;
@@ -499,7 +520,7 @@ search(u_long addr, void (*action)(struct sockaddr_dl *sdl,
 /*
  * Display an arp entry
  */
-void
+static void
 print_entry(struct sockaddr_dl *sdl,
 	struct sockaddr_inarp *addr, struct rt_msghdr *rtm)
 {
@@ -558,7 +579,7 @@ print_entry(struct sockaddr_dl *sdl,
 /*
  * Nuke an arp entry
  */
-void
+static void
 nuke_entry(struct sockaddr_dl *sdl __unused,
 	struct sockaddr_inarp *addr, struct rt_msghdr *rtm __unused)
 {
@@ -568,7 +589,7 @@ nuke_entry(struct sockaddr_dl *sdl __unused,
 	delete(ip, NULL);
 }
 
-int
+static int
 my_ether_aton(char *a, struct ether_addr *n)
 {
 	struct ether_addr *ea;
@@ -581,21 +602,21 @@ my_ether_aton(char *a, struct ether_addr *n)
 	return(0);
 }
 
-void
+static void
 usage(void)
 {
 	fprintf(stderr, "%s\n%s\n%s\n%s\n%s\n%s\n%s\n",
-		"usage: arp [-n] [-c cpu] hostname",
-		"       arp [-n] [-c cpu] -a",
+		"usage: arp [-n] [-c cpu] [-i interface] hostname",
+		"       arp [-n] [-c cpu] [-i interface] -a",
 		"       arp -d hostname [pub]",
-		"       arp -d -a",
+		"       arp -d [-i interface] -a",
 		"       arp -s hostname ether_addr [temp] [pub [only]]",
 		"       arp -S hostname ether_addr [temp] [pub [only]]",
 		"       arp -f filename");
 	exit(1);
 }
 
-int
+static int
 rtmsg(int cmd)
 {
 	static int seq;
@@ -668,7 +689,7 @@ doit:
  */
 #define MAX_IFS		32
 
-int
+static int
 get_ether_addr(u_int32_t ipaddr, struct ether_addr *hwaddr)
 {
 	struct ifreq *ifr, *ifend, *ifp;

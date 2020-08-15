@@ -10,11 +10,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -37,13 +33,17 @@
 #ifndef _SYS_USER_H_
 #define _SYS_USER_H_
 
+#ifdef _KERNEL
+#error "This file should only be included by userland programs."
+#endif
+
 /*
  * stuff that *used* to be included by user.h, or is now needed.  The
  * expectation here is that the user program wants to mess with kernel
  * structures.  To be sure we get kernel structures we have to define
  * _KERNEL_STRUCTURES.  Otherwise we might get the user version.
  *
- * This is a really aweful hack.  Fortunately nobody includes sys/user.h
+ * This is a really awful hack.  Fortunately nobody includes sys/user.h
  * unless they really, really, really need kinfo_proc.
  */
 #ifndef _KERNEL_STRUCTURES
@@ -65,8 +65,11 @@
 #ifndef _SYS_UCRED_H_
 #include <sys/ucred.h>
 #endif
-#ifndef _SYS_UIO_H_
-#include <sys/uio.h>
+#ifndef _SYS__IOVEC_H_
+#include <sys/_iovec.h>
+#endif
+#ifndef _SYS__UIO_H_
+#include <sys/_uio.h>
 #endif
 #ifndef _SYS_PROC_H_
 #include <sys/proc.h>
@@ -95,7 +98,6 @@
 #ifndef _MACHINE_PCB_H_
 #include <machine/pcb.h>
 #endif
-#include <machine/coredump.h>
 #include <sys/kinfo.h>
 
 #endif

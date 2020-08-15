@@ -1,13 +1,13 @@
 /*
  * Copyright (c) 2008 The DragonFly Project.  All rights reserved.
- * 
+ *
  * This code is derived from software contributed to The DragonFly Project
  * by Matthew Dillon <dillon@backplane.com>
- * 
+ *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
  * are met:
- * 
+ *
  * 1. Redistributions of source code must retain the above copyright
  *    notice, this list of conditions and the following disclaimer.
  * 2. Redistributions in binary form must reproduce the above copyright
@@ -17,7 +17,7 @@
  * 3. Neither the name of The DragonFly Project nor the names of its
  *    contributors may be used to endorse or promote products derived
  *    from this software without specific, prior written permission.
- * 
+ *
  * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
  * ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
  * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
@@ -146,8 +146,8 @@ typedef struct hammer_rterm_entry {
 typedef struct hammer_rterm {
 	RB_ENTRY(hammer_rterm)	rb_node;
 	int64_t			redo_objid;
-	u_int32_t		redo_localization;
-	u_int32_t		redo_flags;
+	uint32_t		redo_localization;
+	uint32_t		redo_flags;
 	hammer_off_t		redo_offset;
 	hammer_rterm_entry_t	term_list;
 } *hammer_rterm_t;
@@ -157,20 +157,20 @@ struct hammer_rterm_rb_tree;
 RB_HEAD(hammer_rterm_rb_tree, hammer_rterm);
 RB_PROTOTYPE(hammer_rterm_rb_tree, hammer_rterm, rb_node, hammer_rterm_rb_cmp);
 
-static int hammer_check_tail_signature(hammer_fifo_tail_t tail,
-			hammer_off_t end_off);
-static int hammer_check_head_signature(hammer_fifo_head_t head,
-			hammer_off_t beg_off);
+static int hammer_check_tail_signature(hammer_mount_t hmp,
+			hammer_fifo_tail_t tail, hammer_off_t end_off);
+static int hammer_check_head_signature(hammer_mount_t hmp,
+			hammer_fifo_head_t head, hammer_off_t beg_off);
 static void hammer_recover_copy_undo(hammer_off_t undo_offset,
 			char *src, char *dst, int bytes);
 static hammer_fifo_any_t hammer_recover_scan_fwd(hammer_mount_t hmp,
 			hammer_volume_t root_volume,
 			hammer_off_t *scan_offsetp,
-			int *errorp, struct hammer_buffer **bufferp);
+			int *errorp, hammer_buffer_t *bufferp);
 static hammer_fifo_any_t hammer_recover_scan_rev(hammer_mount_t hmp,
 			hammer_volume_t root_volume,
 			hammer_off_t *scan_offsetp,
-			int *errorp, struct hammer_buffer **bufferp);
+			int *errorp, hammer_buffer_t *bufferp);
 #if 0
 static void hammer_recover_debug_dump(int w, char *buf, int bytes);
 #endif
@@ -214,7 +214,7 @@ hammer_recover_stage1(hammer_mount_t hmp, hammer_volume_t root_volume)
 	hammer_fifo_any_t head;
 	hammer_off_t first_offset;
 	hammer_off_t last_offset;
-	u_int32_t seqno;
+	uint32_t seqno;
 	int error;
 	int degenerate_case = 0;
 
@@ -231,9 +231,9 @@ hammer_recover_stage1(hammer_mount_t hmp, hammer_volume_t root_volume)
 
 	if (first_offset > rootmap->alloc_offset ||
 	    last_offset > rootmap->alloc_offset) {
-		kprintf("HAMMER(%s) Illegal UNDO FIFO index range "
+		hvkprintf(root_volume,
+			"Illegal UNDO FIFO index range "
 			"%016jx, %016jx limit %016jx\n",
-			root_volume->ondisk->vol_name,
 			(intmax_t)first_offset,
 			(intmax_t)last_offset,
 			(intmax_t)rootmap->alloc_offset);
@@ -269,9 +269,8 @@ hammer_recover_stage1(hammer_mount_t hmp, hammer_volume_t root_volume)
 			}
 		}
 		if (error) {
-			kprintf("HAMMER(%s) recovery failure "
-				"during seqno backscan\n",
-				root_volume->ondisk->vol_name);
+			hvkprintf(root_volume,
+				"recovery failure during seqno backscan\n");
 			goto done;
 		}
 
@@ -288,9 +287,7 @@ hammer_recover_stage1(hammer_mount_t hmp, hammer_volume_t root_volume)
 		 *	 fwd iteration points to the end of the returned
 		 *	 record.
 		 */
-		kprintf("HAMMER(%s) recovery check seqno=%08x\n",
-			root_volume->ondisk->vol_name,
-			seqno);
+		hvkprintf(root_volume, "recovery check seqno=%08x\n", seqno);
 
 		scan_offset = first_offset;
 		scan_offset_save = scan_offset;
@@ -322,16 +319,16 @@ hammer_recover_stage1(hammer_mount_t hmp, hammer_volume_t root_volume)
 				bytes = last_offset - scan_offset;
 			} else {
 				bytes = rootmap->alloc_offset - scan_offset +
-					(last_offset & HAMMER_OFF_LONG_MASK);
+					HAMMER_OFF_LONG_ENCODE(last_offset);
 			}
 			if (bytes >
-			    (rootmap->alloc_offset & HAMMER_OFF_LONG_MASK) *
+			    HAMMER_OFF_LONG_ENCODE(rootmap->alloc_offset) *
 			    4 / 5) {
-				kprintf("HAMMER(%s) recovery forward scan is "
+				hvkprintf(root_volume,
+					"recovery forward scan is "
 					"grossly beyond the last_offset in "
 					"the volume header, this can't be "
-					"right.\n",
-					root_volume->ondisk->vol_name);
+					"right.\n");
 				error = EIO;
 				break;
 			}
@@ -344,18 +341,17 @@ hammer_recover_stage1(hammer_mount_t hmp, hammer_volume_t root_volume)
 		 */
 		hmp->undo_seqno = seqno;
 		if (error) {
-			kprintf("HAMMER(%s) recovery failure "
-				"during seqno fwdscan\n",
-				root_volume->ondisk->vol_name);
+			hvkprintf(root_volume,
+				"recovery failure during seqno fwdscan\n");
 			goto done;
 		}
 		last_offset = scan_offset;
-		kprintf("HAMMER(%s) recovery range %016jx-%016jx\n"
-			"HAMMER(%s) recovery nexto %016jx endseqno=%08x\n",
-			root_volume->ondisk->vol_name,
+		hvkprintf(root_volume,
+			"recovery range %016jx-%016jx\n",
 			(intmax_t)first_offset,
-			(intmax_t)last_offset,
-			root_volume->ondisk->vol_name,
+			(intmax_t)last_offset);
+		hvkprintf(root_volume,
+			"recovery nexto %016jx endseqno=%08x\n",
 			(intmax_t)rootmap->next_offset,
 			seqno);
 	}
@@ -369,7 +365,7 @@ hammer_recover_stage1(hammer_mount_t hmp, hammer_volume_t root_volume)
 		bytes = last_offset - first_offset;
 	} else {
 		bytes = rootmap->alloc_offset - first_offset +
-			(last_offset & HAMMER_OFF_LONG_MASK);
+			HAMMER_OFF_LONG_ENCODE(last_offset);
 	}
 	if (bytes == 0) {
 		degenerate_case = 1;
@@ -377,14 +373,14 @@ hammer_recover_stage1(hammer_mount_t hmp, hammer_volume_t root_volume)
 		goto done;
 	}
 
-	kprintf("HAMMER(%s) recovery undo  %016jx-%016jx (%jd bytes)%s\n",
-		root_volume->ondisk->vol_name,
+	hvkprintf(root_volume,
+		"recovery undo  %016jx-%016jx (%jd bytes)%s\n",
 		(intmax_t)first_offset,
 		(intmax_t)last_offset,
 		(intmax_t)bytes,
 		(hmp->ronly ? " (RO)" : "(RW)"));
-	if (bytes > (rootmap->alloc_offset & HAMMER_OFF_LONG_MASK)) {
-		kprintf("Undo size is absurd, unable to mount\n");
+	if (bytes > HAMMER_OFF_LONG_ENCODE(rootmap->alloc_offset)) {
+		hkprintf("Undo size is absurd, unable to mount\n");
 		error = EIO;
 		goto done;
 	}
@@ -406,8 +402,8 @@ hammer_recover_stage1(hammer_mount_t hmp, hammer_volume_t root_volume)
 		 */
 		error = hammer_recover_undo(hmp, root_volume, &head->undo);
 		if (error) {
-			kprintf("HAMMER(%s) UNDO record at %016jx failed\n",
-				root_volume->ondisk->vol_name,
+			hvkprintf(root_volume,
+				"UNDO record at %016jx failed\n",
 				(intmax_t)scan_offset - head->head.hdr_size);
 			break;
 		}
@@ -419,16 +415,15 @@ hammer_recover_stage1(hammer_mount_t hmp, hammer_volume_t root_volume)
 		if (head->head.hdr_type == HAMMER_HEAD_TYPE_REDO &&
 		    head->redo.redo_flags == HAMMER_REDO_SYNC) {
 			if (hmp->flags & HAMMER_MOUNT_REDO_RECOVERY_REQ) {
-				kprintf("HAMMER(%s) Ignoring extra REDO_SYNC "
-					"records in UNDO/REDO FIFO.\n",
-					root_volume->ondisk->vol_name
-				);
+				hvkprintf(root_volume,
+					"Ignoring extra REDO_SYNC "
+					"records in UNDO/REDO FIFO.\n");
 			} else {
 				hmp->flags |= HAMMER_MOUNT_REDO_RECOVERY_REQ;
 				hmp->recover_stage2_offset =
 					head->redo.redo_offset;
-				kprintf("HAMMER(%s) Found REDO_SYNC %016jx\n",
-					root_volume->ondisk->vol_name,
+				hvkprintf(root_volume,
+					"Found REDO_SYNC %016jx\n",
 					(intmax_t)head->redo.redo_offset);
 			}
 		}
@@ -451,11 +446,12 @@ hammer_recover_stage1(hammer_mount_t hmp, hammer_volume_t root_volume)
 			if (hmp->ronly == 0) {
 				hammer_recover_flush_buffers(hmp, root_volume,
 							     0);
-				kprintf("HAMMER(%s) Continuing recovery\n",
-					root_volume->ondisk->vol_name);
+				hvkprintf(root_volume, "Continuing recovery\n");
 			} else {
-				kprintf("HAMMER(%s) Recovery failure: Insufficient buffer cache to hold dirty buffers on read-only mount!\n",
-					root_volume->ondisk->vol_name);
+				hvkprintf(root_volume,
+					"Recovery failure: "
+					"Insufficient buffer cache to hold "
+					"dirty buffers on read-only mount!\n");
 				error = EIO;
 				break;
 			}
@@ -483,7 +479,7 @@ done:
 	 * range but will not be collapsed until stage 2.
 	 */
 	if (error == 0) {
-		hammer_modify_volume(NULL, root_volume, NULL, 0);
+		hammer_modify_volume_noundo(NULL, root_volume);
 		rootmap = &root_volume->ondisk->vol0_blockmap[HAMMER_ZONE_UNDO_INDEX];
 		rootmap->first_offset = first_offset;
 		rootmap->next_offset = last_offset;
@@ -494,11 +490,9 @@ done:
 		hammer_recover_flush_buffers(hmp, root_volume, -1);
 	}
 	if (degenerate_case == 0) {
-		kprintf("HAMMER(%s) recovery complete\n",
-			root_volume->ondisk->vol_name);
+		hvkprintf(root_volume, "recovery complete\n");
 	} else {
-		kprintf("HAMMER(%s) mounted clean, no recovery needed\n",
-			root_volume->ondisk->vol_name);
+		hvkprintf(root_volume, "mounted clean, no recovery needed\n");
 	}
 	return (error);
 }
@@ -532,7 +526,7 @@ hammer_recover_stage2(hammer_mount_t hmp, hammer_volume_t root_volume)
 	hammer_off_t last_offset;
 	hammer_off_t ext_offset;
 	struct hammer_rterm_rb_tree rterm_root;
-	u_int32_t seqno;
+	uint32_t seqno;
 	int error;
 	int verbose = 0;
 	int dorscan;
@@ -545,12 +539,10 @@ hammer_recover_stage2(hammer_mount_t hmp, hammer_volume_t root_volume)
 	RB_INIT(&rterm_root);
 
 	if (hammer_skip_redo == 1)
-		kprintf("HAMMER(%s) recovery redo marked as optional\n",
-		    root_volume->ondisk->vol_name);
+		hvkprintf(root_volume, "recovery redo marked as optional\n");
 
 	if (hammer_skip_redo == 2) {
-		kprintf("HAMMER(%s) recovery redo skipped.\n",
-		    root_volume->ondisk->vol_name);
+		hvkprintf(root_volume, "recovery redo skipped.\n");
 		return (0);
 	}
 
@@ -579,9 +571,9 @@ hammer_recover_stage2(hammer_mount_t hmp, hammer_volume_t root_volume)
 	hmp->flags |= HAMMER_MOUNT_REDO_RECOVERY_RUN;
 	ext_offset = hmp->recover_stage2_offset;
 	if (ext_offset == 0) {
-		kprintf("HAMMER(%s) REDO stage specified but no REDO_SYNC "
-			"offset, ignoring\n",
-			root_volume->ondisk->vol_name);
+		hvkprintf(root_volume,
+			"REDO stage specified but no REDO_SYNC "
+			"offset, ignoring\n");
 		goto done;
 	}
 
@@ -593,17 +585,17 @@ hammer_recover_stage2(hammer_mount_t hmp, hammer_volume_t root_volume)
 		bytes = last_offset - first_offset;
 	} else {
 		bytes = rootmap->alloc_offset - first_offset +
-			(last_offset & HAMMER_OFF_LONG_MASK);
+			HAMMER_OFF_LONG_ENCODE(last_offset);
 	}
-	kprintf("HAMMER(%s) recovery redo  %016jx-%016jx (%jd bytes)%s\n",
-		root_volume->ondisk->vol_name,
+	hvkprintf(root_volume,
+		"recovery redo  %016jx-%016jx (%jd bytes)%s\n",
 		(intmax_t)first_offset,
 		(intmax_t)last_offset,
 		(intmax_t)bytes,
 		(hmp->ronly ? " (RO)" : "(RW)"));
 	verbose = 1;
-	if (bytes > (rootmap->alloc_offset & HAMMER_OFF_LONG_MASK)) {
-		kprintf("Undo size is absurd, unable to mount\n");
+	if (bytes > HAMMER_OFF_LONG_ENCODE(rootmap->alloc_offset)) {
+		hkprintf("Undo size is absurd, unable to mount\n");
 		error = EIO;
 		goto fatal;
 	}
@@ -628,7 +620,7 @@ hammer_recover_stage2(hammer_mount_t hmp, hammer_volume_t root_volume)
 		} else if (ext_offset > last_offset) {
 			dorscan = 1;
 			ext_bytes = (rootmap->alloc_offset - ext_offset) +
-				    (first_offset & HAMMER_OFF_LONG_MASK);
+				    HAMMER_OFF_LONG_ENCODE(first_offset);
 		} else {
 			ext_bytes = -(ext_offset - first_offset);
 			dorscan = 0;
@@ -639,7 +631,7 @@ hammer_recover_stage2(hammer_mount_t hmp, hammer_volume_t root_volume)
 		 */
 		if (ext_offset < last_offset) {
 			ext_bytes = -((rootmap->alloc_offset - first_offset) +
-				    (ext_offset & HAMMER_OFF_LONG_MASK));
+				    HAMMER_OFF_LONG_ENCODE(ext_offset));
 			dorscan = 0;
 		} else if (ext_offset > first_offset) {
 			ext_bytes = -(ext_offset - first_offset);
@@ -652,8 +644,8 @@ hammer_recover_stage2(hammer_mount_t hmp, hammer_volume_t root_volume)
 
 	if (dorscan) {
 		scan_offset = first_offset;
-		kprintf("HAMMER(%s) Find extended redo  %016jx, %jd extbytes\n",
-			root_volume->ondisk->vol_name,
+		hvkprintf(root_volume,
+			"Find extended redo  %016jx, %jd extbytes\n",
 			(intmax_t)ext_offset,
 			(intmax_t)ext_bytes);
 		seqno = hmp->recover_stage2_seqno - 1;
@@ -677,16 +669,15 @@ hammer_recover_stage2(hammer_mount_t hmp, hammer_volume_t root_volume)
 				break;
 		}
 		if (error) {
-			kprintf("HAMMER(%s) Find extended redo failed %d, "
+			hvkprintf(root_volume,
+				"Find extended redo failed %d, "
 				"unable to run REDO\n",
-				root_volume->ondisk->vol_name,
 				error);
 			goto done;
 		}
 	} else {
-		kprintf("HAMMER(%s) Embedded extended redo %016jx, "
-			"%jd extbytes\n",
-			root_volume->ondisk->vol_name,
+		hvkprintf(root_volume,
+			"Embedded extended redo %016jx, %jd extbytes\n",
 			(intmax_t)ext_offset,
 			(intmax_t)ext_bytes);
 	}
@@ -715,8 +706,8 @@ hammer_recover_stage2(hammer_mount_t hmp, hammer_volume_t root_volume)
 		error = hammer_recover_redo_run(hmp, &rterm_root,
 						oscan_offset, &head->redo);
 		if (error) {
-			kprintf("HAMMER(%s) UNDO record at %016jx failed\n",
-				root_volume->ondisk->vol_name,
+			hvkprintf(root_volume,
+				"UNDO record at %016jx failed\n",
 				(intmax_t)scan_offset - head->head.hdr_size);
 			break;
 		}
@@ -763,14 +754,13 @@ done:
 fatal:
 	hmp->flags &= ~HAMMER_MOUNT_REDO_RECOVERY_RUN;
 	if (verbose) {
-		kprintf("HAMMER(%s) End redo recovery\n",
-			root_volume->ondisk->vol_name);
+		hvkprintf(root_volume, "End redo recovery\n");
 	}
 
 	if (error && hammer_skip_redo == 1)
-		kprintf("HAMMER(%s) recovery redo error %d, "
-		    " skipping.\n", root_volume->ondisk->vol_name,
-		    error);
+		hvkprintf(root_volume,
+			"recovery redo error %d, skipping.\n",
+			error);
 
 	return (hammer_skip_redo ? 0 : error);
 }
@@ -784,7 +774,7 @@ fatal:
 hammer_fifo_any_t
 hammer_recover_scan_rev(hammer_mount_t hmp, hammer_volume_t root_volume,
 			hammer_off_t *scan_offsetp,
-			int *errorp, struct hammer_buffer **bufferp)
+			int *errorp, hammer_buffer_t *bufferp)
 {
 	hammer_off_t scan_offset;
 	hammer_blockmap_t rootmap;
@@ -795,13 +785,12 @@ hammer_recover_scan_rev(hammer_mount_t hmp, hammer_volume_t root_volume,
 	scan_offset = *scan_offsetp;
 
 	if (hammer_debug_general & 0x0080)
-		kprintf("rev scan_offset %016jx\n", (intmax_t)scan_offset);
-	if (scan_offset == HAMMER_ZONE_ENCODE(HAMMER_ZONE_UNDO_INDEX, 0))
+		hdkprintf("rev scan_offset %016jx\n", (intmax_t)scan_offset);
+	if (scan_offset == HAMMER_ENCODE_UNDO(0))
 		scan_offset = rootmap->alloc_offset;
-	if (scan_offset - sizeof(*tail) <
-	    HAMMER_ZONE_ENCODE(HAMMER_ZONE_UNDO_INDEX, 0)) {
-		kprintf("HAMMER(%s) UNDO record at %016jx FIFO underflow\n",
-			root_volume->ondisk->vol_name,
+	if (scan_offset - sizeof(*tail) < HAMMER_ENCODE_UNDO(0)) {
+		hvkprintf(root_volume,
+			"UNDO record at %016jx FIFO underflow\n",
 			(intmax_t)scan_offset);
 		*errorp = EIO;
 		return (NULL);
@@ -809,17 +798,15 @@ hammer_recover_scan_rev(hammer_mount_t hmp, hammer_volume_t root_volume,
 	tail = hammer_bread(hmp, scan_offset - sizeof(*tail),
 			    errorp, bufferp);
 	if (*errorp) {
-		kprintf("HAMMER(%s) Unable to read UNDO TAIL "
-			"at %016jx\n",
-			root_volume->ondisk->vol_name,
+		hvkprintf(root_volume,
+			"Unable to read UNDO TAIL at %016jx\n",
 			(intmax_t)scan_offset - sizeof(*tail));
 		return (NULL);
 	}
 
-	if (hammer_check_tail_signature(tail, scan_offset) != 0) {
-		kprintf("HAMMER(%s) Illegal UNDO TAIL signature "
-			"at %016jx\n",
-			root_volume->ondisk->vol_name,
+	if (hammer_check_tail_signature(hmp, tail, scan_offset) != 0) {
+		hvkprintf(root_volume,
+			"Illegal UNDO TAIL signature at %016jx\n",
 			(intmax_t)scan_offset - sizeof(*tail));
 		*errorp = EIO;
 		return (NULL);
@@ -840,7 +827,7 @@ hammer_recover_scan_rev(hammer_mount_t hmp, hammer_volume_t root_volume,
 hammer_fifo_any_t
 hammer_recover_scan_fwd(hammer_mount_t hmp, hammer_volume_t root_volume,
 			hammer_off_t *scan_offsetp,
-			int *errorp, struct hammer_buffer **bufferp)
+			int *errorp, hammer_buffer_t *bufferp)
 {
 	hammer_off_t scan_offset;
 	hammer_blockmap_t rootmap;
@@ -850,29 +837,28 @@ hammer_recover_scan_fwd(hammer_mount_t hmp, hammer_volume_t root_volume,
 	scan_offset = *scan_offsetp;
 
 	if (hammer_debug_general & 0x0080)
-		kprintf("fwd scan_offset %016jx\n", (intmax_t)scan_offset);
+		hdkprintf("fwd scan_offset %016jx\n", (intmax_t)scan_offset);
 	if (scan_offset == rootmap->alloc_offset)
-		scan_offset = HAMMER_ZONE_ENCODE(HAMMER_ZONE_UNDO_INDEX, 0);
+		scan_offset = HAMMER_ENCODE_UNDO(0);
 
 	head = hammer_bread(hmp, scan_offset, errorp, bufferp);
 	if (*errorp) {
-		kprintf("HAMMER(%s) Unable to read UNDO HEAD at %016jx\n",
-			root_volume->ondisk->vol_name,
+		hvkprintf(root_volume,
+			"Unable to read UNDO HEAD at %016jx\n",
 			(intmax_t)scan_offset);
 		return (NULL);
 	}
 
-	if (hammer_check_head_signature(&head->head, scan_offset) != 0) {
-		kprintf("HAMMER(%s) Illegal UNDO TAIL signature "
-			"at %016jx\n",
-			root_volume->ondisk->vol_name,
+	if (hammer_check_head_signature(hmp, &head->head, scan_offset) != 0) {
+		hvkprintf(root_volume,
+			"Illegal UNDO TAIL signature at %016jx\n",
 			(intmax_t)scan_offset);
 		*errorp = EIO;
 		return (NULL);
 	}
 	scan_offset += head->head.hdr_size;
 	if (scan_offset == rootmap->alloc_offset)
-		scan_offset = HAMMER_ZONE_ENCODE(HAMMER_ZONE_UNDO_INDEX, 0);
+		scan_offset = HAMMER_ENCODE_UNDO(0);
 	*scan_offsetp = scan_offset;
 
 	return (head);
@@ -886,11 +872,11 @@ hammer_recover_scan_fwd(hammer_mount_t hmp, hammer_volume_t root_volume,
  */
 static __inline
 int
-_hammer_check_signature(hammer_fifo_head_t head, hammer_fifo_tail_t tail,
+_hammer_check_signature(hammer_mount_t hmp,
+			hammer_fifo_head_t head, hammer_fifo_tail_t tail,
 			hammer_off_t beg_off)
 {
 	hammer_off_t end_off;
-	u_int32_t crc;
 	int bytes;
 
 	/*
@@ -898,16 +884,14 @@ _hammer_check_signature(hammer_fifo_head_t head, hammer_fifo_tail_t tail,
 	 * head signature only for 8-byte PADs.
 	 */
 	if (head->hdr_signature != HAMMER_HEAD_SIGNATURE) {
-		kprintf("HAMMER: FIFO record bad head signature "
-			"%04x at %016jx\n",
+		hkprintf("FIFO record bad head signature %04x at %016jx\n",
 			head->hdr_signature,
 			(intmax_t)beg_off);
 		return(2);
 	}
 	if (head->hdr_size < HAMMER_HEAD_ALIGN ||
 	    (head->hdr_size & HAMMER_HEAD_ALIGN_MASK)) {
-		kprintf("HAMMER: FIFO record unaligned or bad size"
-			"%04x at %016jx\n",
+		hkprintf("FIFO record unaligned or bad size %04x at %016jx\n",
 			head->hdr_size,
 			(intmax_t)beg_off);
 		return(2);
@@ -917,21 +901,21 @@ _hammer_check_signature(hammer_fifo_head_t head, hammer_fifo_tail_t tail,
 	if (head->hdr_type != HAMMER_HEAD_TYPE_PAD ||
 	    (size_t)(end_off - beg_off) != sizeof(*tail)) {
 		if (head->hdr_type != tail->tail_type) {
-			kprintf("HAMMER: FIFO record head/tail type mismatch "
+			hkprintf("FIFO record head/tail type mismatch "
 				"%04x %04x at %016jx\n",
 				head->hdr_type, tail->tail_type,
 				(intmax_t)beg_off);
 			return(2);
 		}
 		if (head->hdr_size != tail->tail_size) {
-			kprintf("HAMMER: FIFO record head/tail size mismatch "
+			hkprintf("FIFO record head/tail size mismatch "
 				"%04x %04x at %016jx\n",
 				head->hdr_size, tail->tail_size,
 				(intmax_t)beg_off);
 			return(2);
 		}
 		if (tail->tail_signature != HAMMER_TAIL_SIGNATURE) {
-			kprintf("HAMMER: FIFO record bad tail signature "
+			hkprintf("FIFO record bad tail signature "
 				"%04x at %016jx\n",
 				tail->tail_signature,
 				(intmax_t)beg_off);
@@ -944,18 +928,14 @@ _hammer_check_signature(hammer_fifo_head_t head, hammer_fifo_tail_t tail,
 	 * least large enough to fit the head and tail.
 	 */
 	if (head->hdr_type != HAMMER_HEAD_TYPE_PAD) {
-		crc = crc32(head, HAMMER_FIFO_HEAD_CRCOFF) ^
-		      crc32(head + 1, head->hdr_size - sizeof(*head));
-		if (head->hdr_crc != crc) {
-			kprintf("HAMMER: FIFO record CRC failed %08x %08x "
-				"at %016jx\n",
-				head->hdr_crc, crc,
-				(intmax_t)beg_off);
+		if (hammer_crc_test_fifo_head(hmp->version,
+					      head, head->hdr_size) == 0) {
+			hkprintf("FIFO record CRC failed %08x at %016jx\n",
+				head->hdr_crc, (intmax_t)beg_off);
 			return(EIO);
 		}
 		if (head->hdr_size < sizeof(*head) + sizeof(*tail)) {
-			kprintf("HAMMER: FIFO record too small "
-				"%04x at %016jx\n",
+			hkprintf("FIFO record too small %04x at %016jx\n",
 				head->hdr_size,
 				(intmax_t)beg_off);
 			return(EIO);
@@ -968,13 +948,13 @@ _hammer_check_signature(hammer_fifo_head_t head, hammer_fifo_tail_t tail,
 	bytes = head->hdr_size;
 	tail = (void *)((char *)head + bytes - sizeof(*tail));
 	if (tail->tail_size != head->hdr_size) {
-		kprintf("HAMMER: Bad tail size %04x vs %04x at %016jx\n",
+		hkprintf("Bad tail size %04x vs %04x at %016jx\n",
 			tail->tail_size, head->hdr_size,
 			(intmax_t)beg_off);
 		return(EIO);
 	}
 	if (tail->tail_type != head->hdr_type) {
-		kprintf("HAMMER: Bad tail type %04x vs %04x at %016jx\n",
+		hkprintf("Bad tail type %04x vs %04x at %016jx\n",
 			tail->tail_type, head->hdr_type,
 			(intmax_t)beg_off);
 		return(EIO);
@@ -991,7 +971,8 @@ _hammer_check_signature(hammer_fifo_head_t head, hammer_fifo_tail_t tail,
  * but does not check beyond the signature, type, and size.
  */
 static int
-hammer_check_head_signature(hammer_fifo_head_t head, hammer_off_t beg_off)
+hammer_check_head_signature(hammer_mount_t hmp, hammer_fifo_head_t head,
+			    hammer_off_t beg_off)
 {
 	hammer_fifo_tail_t tail;
 	hammer_off_t end_off;
@@ -1011,7 +992,7 @@ hammer_check_head_signature(hammer_fifo_head_t head, hammer_off_t beg_off)
 	if ((beg_off ^ (end_off - 1)) & ~HAMMER_BUFMASK64)
 		return(1);
 	tail = (void *)((char *)head + head->hdr_size - sizeof(*tail));
-	return (_hammer_check_signature(head, tail, beg_off));
+	return (_hammer_check_signature(hmp, head, tail, beg_off));
 }
 
 /*
@@ -1023,7 +1004,8 @@ hammer_check_head_signature(hammer_fifo_head_t head, hammer_off_t beg_off)
  * but does not check beyond the signature, type, and size.
  */
 static int
-hammer_check_tail_signature(hammer_fifo_tail_t tail, hammer_off_t end_off)
+hammer_check_tail_signature(hammer_mount_t hmp, hammer_fifo_tail_t tail,
+			    hammer_off_t end_off)
 {
 	hammer_fifo_head_t head;
 	hammer_off_t beg_off;
@@ -1042,7 +1024,7 @@ hammer_check_tail_signature(hammer_fifo_tail_t tail, hammer_off_t end_off)
 	if ((beg_off ^ (end_off - 1)) & ~HAMMER_BUFMASK64)
 		return(1);
 	head = (void *)((char *)tail + sizeof(*tail) - tail->tail_size);
-	return (_hammer_check_signature(head, tail, beg_off));
+	return (_hammer_check_signature(hmp, head, tail, beg_off));
 }
 
 static int
@@ -1056,7 +1038,7 @@ hammer_recover_undo(hammer_mount_t hmp, hammer_volume_t root_volume,
 	int error;
 	int vol_no;
 	int bytes;
-	u_int32_t offset;
+	uint32_t offset;
 
 	/*
 	 * Only process UNDO records.  Flag if we find other records to
@@ -1072,7 +1054,7 @@ hammer_recover_undo(hammer_mount_t hmp, hammer_volume_t root_volume,
 		sizeof(struct hammer_fifo_tail);
 	if (bytes < 0 || undo->undo_data_bytes < 0 ||
 	    undo->undo_data_bytes > bytes) {
-		kprintf("HAMMER: Corrupt UNDO record, undo_data_bytes %d/%d\n",
+		hkprintf("Corrupt UNDO record, undo_data_bytes %d/%d\n",
 			undo->undo_data_bytes, bytes);
 		return(EIO);
 	}
@@ -1089,7 +1071,7 @@ hammer_recover_undo(hammer_mount_t hmp, hammer_volume_t root_volume,
 	offset = undo->undo_offset & HAMMER_BUFMASK;
 
 	if (offset + bytes > HAMMER_BUFSIZE) {
-		kprintf("HAMMER: Corrupt UNDO record, bad offset\n");
+		hkprintf("Corrupt UNDO record, bad offset\n");
 		return (EIO);
 	}
 
@@ -1098,11 +1080,11 @@ hammer_recover_undo(hammer_mount_t hmp, hammer_volume_t root_volume,
 		vol_no = HAMMER_VOL_DECODE(undo->undo_offset);
 		volume = hammer_get_volume(hmp, vol_no, &error);
 		if (volume == NULL) {
-			kprintf("HAMMER: UNDO record, "
-				"cannot access volume %d\n", vol_no);
+			hkprintf("UNDO record, cannot access volume %d\n",
+				vol_no);
 			break;
 		}
-		hammer_modify_volume(NULL, volume, NULL, 0);
+		hammer_modify_volume_noundo(NULL, volume);
 		hammer_recover_copy_undo(undo->undo_offset,
 					 (char *)(undo + 1),
 					 (char *)volume->ondisk + offset,
@@ -1126,12 +1108,11 @@ hammer_recover_undo(hammer_mount_t hmp, hammer_volume_t root_volume,
 		buffer = hammer_get_buffer(hmp, buf_offset, HAMMER_BUFSIZE,
 					   0, &error);
 		if (buffer == NULL) {
-			kprintf("HAMMER: UNDO record, "
-				"cannot access buffer %016jx\n",
+			hkprintf("UNDO record, cannot access buffer %016jx\n",
 				(intmax_t)undo->undo_offset);
 			break;
 		}
-		hammer_modify_buffer(NULL, buffer, NULL, 0);
+		hammer_modify_buffer_noundo(NULL, buffer);
 		hammer_recover_copy_undo(undo->undo_offset,
 					 (char *)(undo + 1),
 					 (char *)buffer->ondisk + offset,
@@ -1150,22 +1131,22 @@ hammer_recover_undo(hammer_mount_t hmp, hammer_volume_t root_volume,
 			hammer_rel_buffer(buffer, 0);
 		break;
 	default:
-		kprintf("HAMMER: Corrupt UNDO record\n");
+		hkprintf("Corrupt UNDO record\n");
 		error = EIO;
 	}
 	return (error);
 }
 
 static void
-hammer_recover_copy_undo(hammer_off_t undo_offset, 
+hammer_recover_copy_undo(hammer_off_t undo_offset,
 			 char *src, char *dst, int bytes)
 {
 	if (hammer_debug_general & 0x0080) {
-		kprintf("UNDO %016jx: %d\n",
+		hdkprintf("UNDO %016jx: %d\n",
 			(intmax_t)undo_offset, bytes);
 	}
 #if 0
-	kprintf("UNDO %016jx:", (intmax_t)undo_offset);
+	hkprintf("UNDO %016jx:", (intmax_t)undo_offset);
 	hammer_recover_debug_dump(22, dst, bytes);
 	kprintf("%22s", "to:");
 	hammer_recover_debug_dump(22, src, bytes);
@@ -1206,7 +1187,7 @@ hammer_recover_redo_rec(hammer_mount_t hmp, struct hammer_rterm_rb_tree *root,
 		rterm = nrterm;
 
 	if (bootverbose) {
-		kprintf("record record %016jx objid %016jx "
+		hkprintf("record record %016jx objid %016jx "
 			"offset %016jx flags %08x\n",
 			(intmax_t)scan_offset,
 			(intmax_t)redo->redo_objid,
@@ -1262,7 +1243,7 @@ hammer_recover_redo_run(hammer_mount_t hmp, struct hammer_rterm_rb_tree *root,
 		rterm = RB_FIND(hammer_rterm_rb_tree, root, &rtval);
 		if (rterm) {
 			if (bootverbose) {
-				kprintf("ignore record %016jx objid %016jx "
+				hkprintf("ignore record %016jx objid %016jx "
 					"offset %016jx flags %08x\n",
 					(intmax_t)scan_offset,
 					(intmax_t)redo->redo_objid,
@@ -1272,7 +1253,7 @@ hammer_recover_redo_run(hammer_mount_t hmp, struct hammer_rterm_rb_tree *root,
 			break;
 		}
 		if (bootverbose) {
-			kprintf("run    record %016jx objid %016jx "
+			hkprintf("run    record %016jx objid %016jx "
 				"offset %016jx flags %08x\n",
 				(intmax_t)scan_offset,
 				(intmax_t)redo->redo_objid,
@@ -1317,7 +1298,7 @@ hammer_recover_redo_exec(hammer_mount_t hmp, hammer_fifo_redo_t redo)
 {
 	struct hammer_transaction trans;
 	struct vattr va;
-	struct hammer_inode *ip;
+	hammer_inode_t ip;
 	struct vnode *vp = NULL;
 	int error;
 
@@ -1327,13 +1308,13 @@ hammer_recover_redo_exec(hammer_mount_t hmp, hammer_fifo_redo_t redo)
 			      HAMMER_MAX_TID, redo->redo_localization,
 			      0, &error);
 	if (ip == NULL) {
-		kprintf("unable to find objid %016jx:%08x\n",
+		hkprintf("unable to find objid %016jx:%08x\n",
 			(intmax_t)redo->redo_objid, redo->redo_localization);
 		goto done2;
 	}
 	error = hammer_get_vnode(ip, &vp);
 	if (error) {
-		kprintf("unable to acquire vnode for %016jx:%08x\n",
+		hkprintf("unable to acquire vnode for %016jx:%08x\n",
 			(intmax_t)redo->redo_objid, redo->redo_localization);
 		goto done1;
 	}
@@ -1342,7 +1323,7 @@ hammer_recover_redo_exec(hammer_mount_t hmp, hammer_fifo_redo_t redo)
 	case HAMMER_REDO_WRITE:
 		error = VOP_OPEN(vp, FREAD|FWRITE, proc0.p_ucred, NULL);
 		if (error) {
-			kprintf("vn_rdwr open %016jx:%08x returned %d\n",
+			hkprintf("vn_rdwr open %016jx:%08x returned %d\n",
 				(intmax_t)redo->redo_objid,
 				redo->redo_localization, error);
 			break;
@@ -1354,7 +1335,7 @@ hammer_recover_redo_exec(hammer_mount_t hmp, hammer_fifo_redo_t redo)
 				0, proc0.p_ucred, NULL);
 		vn_lock(vp, LK_EXCLUSIVE | LK_RETRY);
 		if (error) {
-			kprintf("write %016jx:%08x returned %d\n",
+			hkprintf("write %016jx:%08x returned %d\n",
 				(intmax_t)redo->redo_objid,
 				redo->redo_localization, error);
 		}
@@ -1365,7 +1346,7 @@ hammer_recover_redo_exec(hammer_mount_t hmp, hammer_fifo_redo_t redo)
 		va.va_size = redo->redo_offset;
 		error = VOP_SETATTR(vp, &va, proc0.p_ucred);
 		if (error) {
-			kprintf("setattr offset %016jx error %d\n",
+			hkprintf("setattr offset %016jx error %d\n",
 				(intmax_t)redo->redo_offset, error);
 		}
 		break;

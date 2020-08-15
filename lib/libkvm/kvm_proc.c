@@ -45,20 +45,20 @@
 #include <sys/user.h>	/* MUST BE FIRST */
 #include <sys/conf.h>
 #include <sys/param.h>
-#include <sys/proc.h>
 #include <sys/exec.h>
 #include <sys/stat.h>
 #include <sys/globaldata.h>
 #include <sys/ioctl.h>
 #include <sys/tty.h>
-#include <sys/file.h>
 #include <sys/jail.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stddef.h>
 #include <unistd.h>
 #include <nlist.h>
-#include <kvm.h>
 
+#include <cpu/pmap.h>
 #include <vm/vm.h>
 #include <vm/vm_param.h>
 #include <vm/swap_pager.h>
@@ -69,19 +69,10 @@
 #include <memory.h>
 #include <paths.h>
 
+#include "kvm.h"
 #include "kvm_private.h"
 
-#if used
-static char *
-kvm_readswap(kvm_t *kd, const struct proc *p, u_long va, u_long *cnt)
-{
-#if defined(__FreeBSD__) || defined(__DragonFly__)
-	/* XXX Stubbed out, our vm system is differnet */
-	_kvm_err(kd, kd->program, "kvm_readswap not implemented");
-	return(0);
-#endif
-}
-#endif
+dev_t	devid_from_dev(cdev_t dev);
 
 #define KREAD(kd, addr, obj) \
 	(kvm_read(kd, addr, (char *)(obj), sizeof(*obj)) != sizeof(*obj))
@@ -114,7 +105,7 @@ kinfo_resize_proc(kvm_t *kd, struct kinfo_proc *bp)
  * compiled by userland.
  */
 dev_t
-dev2udev(cdev_t dev)
+devid_from_dev(cdev_t dev)
 {
 	if (dev == NULL)
 		return NOUDEV;
@@ -156,7 +147,7 @@ kvm_firstlwp(kvm_t *kd, struct lwp *lwp, struct proc *proc)
 }
 
 /*
- * If the current element is the left side of the parent the next element 
+ * If the current element is the left side of the parent the next element
  * will be a left side traversal of the parent's right side.  If the parent
  * has no right side the next element will be the parent.
  *
@@ -166,7 +157,7 @@ kvm_firstlwp(kvm_t *kd, struct lwp *lwp, struct proc *proc)
  * If the parent is NULL we are done.
  */
 static uintptr_t
-kvm_nextlwp(kvm_t *kd, uintptr_t lwppos, struct lwp *lwp, struct proc *proc)
+kvm_nextlwp(kvm_t *kd, uintptr_t lwppos, struct lwp *lwp)
 {
 	uintptr_t nextpos;
 
@@ -347,7 +338,7 @@ kvm_proclist(kvm_t *kd, int what, int arg, struct proc *p,
 
 		case KERN_PROC_TTY:
 			if ((proc.p_flags & P_CONTROLT) == 0 ||
-			    dev2udev(proc.p_pgrp->pg_session->s_ttyp->t_dev)
+			    devid_from_dev(proc.p_pgrp->pg_session->s_ttyp->t_dev)
 					!= (dev_t)arg)
 				continue;
 			break;
@@ -409,7 +400,7 @@ kvm_proclist(kvm_t *kd, int what, int arg, struct proc *p,
 				free(wmesg);
 			if ((what & KERN_PROC_FLAG_LWP) == 0)
 				break;
-			lwppos = kvm_nextlwp(kd, lwppos, &lwp, &proc);
+			lwppos = kvm_nextlwp(kd, lwppos, &lwp);
 		}
 		if (lwppos == (uintptr_t)-1)
 			return(-1);
@@ -422,14 +413,14 @@ kvm_proclist(kvm_t *kd, int what, int arg, struct proc *p,
  * We reallocate kd->procbase as necessary.
  */
 static int
-kvm_deadprocs(kvm_t *kd, int what, int arg, u_long a_allproc,
-	      int allproc_hsize)
+kvm_deadprocs(kvm_t *kd, int what, int arg, int allproc_hsize, long procglob)
 {
 	struct kinfo_proc *bp;
 	struct proc *p;
 	struct proclist **pl;
 	int cnt, partcnt, n;
 	u_long nextoff;
+	u_long a_allproc;
 
 	cnt = partcnt = 0;
 	nextoff = 0;
@@ -441,7 +432,10 @@ kvm_deadprocs(kvm_t *kd, int what, int arg, u_long a_allproc,
 	pl = _kvm_malloc(kd, allproc_hsize * sizeof(struct proclist *));
 	for (n = 0; n < allproc_hsize; n++) {
 		pl[n] = _kvm_malloc(kd, sizeof(struct proclist));
-		nextoff = a_allproc + (n * sizeof(struct proclist));
+		a_allproc = procglob +
+			    sizeof(struct procglob) * n +
+			    offsetof(struct procglob, allproc);
+		nextoff = a_allproc;
 		if (KREAD(kd, (u_long)nextoff, pl[n])) {
 			_kvm_err(kd, kd->program, "can't read proclist at 0x%lx",
 				a_allproc);
@@ -474,13 +468,9 @@ kvm_getprocs(kvm_t *kd, int op, int arg, int *cnt)
 	int miblen = ((op & ~KERN_PROC_FLAGMASK) == KERN_PROC_ALL) ? 3 : 4;
 	size_t size;
 
-	if (kd->procbase != 0) {
-		free((void *)kd->procbase);
-		/*
-		 * Clear this pointer in case this call fails.  Otherwise,
-		 * kvm_close() will free it again.
-		 */
-		kd->procbase = 0;
+	if (kd->procbase != NULL) {
+		free(kd->procbase);
+		kd->procbase = NULL;
 	}
 	if (kvm_ishost(kd)) {
 		size = 0;
@@ -514,9 +504,10 @@ kvm_getprocs(kvm_t *kd, int op, int arg, int *cnt)
 		nprocs = size / sizeof(struct kinfo_proc);
 	} else {
 		struct nlist nl[4], *p;
+		u_long procglob;
 
 		nl[0].n_name = "_nprocs";
-		nl[1].n_name = "_allprocs";
+		nl[1].n_name = "_procglob";
 		nl[2].n_name = "_allproc_hsize";
 		nl[3].n_name = 0;
 
@@ -535,8 +526,8 @@ kvm_getprocs(kvm_t *kd, int op, int arg, int *cnt)
 			_kvm_err(kd, kd->program, "can't read allproc_hsize");
 			return (0);
 		}
-		nprocs = kvm_deadprocs(kd, op, arg, nl[1].n_value,
-				      allproc_hsize);
+		procglob = nl[1].n_value;
+		nprocs = kvm_deadprocs(kd, op, arg, allproc_hsize, procglob);
 #ifdef notdef
 		size = nprocs * sizeof(struct kinfo_proc);
 		(void)realloc(kd->procbase, size);
@@ -582,6 +573,8 @@ kvm_argv(kvm_t *kd, pid_t pid, u_long addr, int narg, int maxcnt)
 {
 	char *np, *cp, *ep, *ap;
 	u_long oaddr = -1;
+	u_long addr_min = VM_MIN_USER_ADDRESS;
+	u_long addr_max = VM_MAX_USER_ADDRESS;
 	int len, cc;
 	char **argv;
 
@@ -589,13 +582,11 @@ kvm_argv(kvm_t *kd, pid_t pid, u_long addr, int narg, int maxcnt)
 	 * Check that there aren't an unreasonable number of agruments,
 	 * and that the address is in user space.
 	 */
-	if (narg > 512 || 
-	    addr < VM_MIN_USER_ADDRESS || addr >= VM_MAX_USER_ADDRESS) {
+	if (narg > 512 || addr < addr_min || addr >= addr_max)
 		return (0);
-	}
 
 	/*
-	 * kd->argv : work space for fetching the strings from the target 
+	 * kd->argv : work space for fetching the strings from the target
 	 *            process's space, and is converted for returning to caller
 	 */
 	if (kd->argv == 0) {
@@ -660,7 +651,7 @@ kvm_argv(kvm_t *kd, pid_t pid, u_long addr, int narg, int maxcnt)
 	while (argv < kd->argv + narg && *argv != NULL) {
 
 		/* get the address that the current argv string is on */
-		addr = (u_long)*argv & ~(PAGE_SIZE - 1);
+		addr = rounddown2((u_long)*argv, PAGE_SIZE);
 
 		/* is it the same page as the last one? */
 		if (addr != oaddr) {
@@ -770,7 +761,7 @@ ps_str_e(struct ps_strings *p, u_long *addr, int *n)
  * being wrong are very low.
  */
 static int
-proc_verify(kvm_t *kd, const struct kinfo_proc *p)
+proc_verify(const struct kinfo_proc *p)
 {
 	struct kinfo_proc kp;
 	int mib[4];
@@ -826,7 +817,7 @@ kvm_doargv(kvm_t *kd, const struct kinfo_proc *kp, int nchr,
 	 * For live kernels, make sure this process didn't go away.
 	 */
 	if (ap != NULL && (kvm_ishost(kd) || kvm_isvkernel(kd)) &&
-	    !proc_verify(kd, kp))
+	    !proc_verify(kp))
 		ap = NULL;
 	return (ap);
 }
@@ -837,7 +828,7 @@ kvm_doargv(kvm_t *kd, const struct kinfo_proc *kp, int nchr,
 char **
 kvm_getargv(kvm_t *kd, const struct kinfo_proc *kp, int nchr)
 {
-	int oid[4];
+	int oid[8];
 	int i;
 	size_t bufsz;
 	static unsigned long buflen;
@@ -853,8 +844,8 @@ kvm_getargv(kvm_t *kd, const struct kinfo_proc *kp, int nchr)
 
 	if (!buflen) {
 		bufsz = sizeof(buflen);
-		i = sysctlbyname("kern.ps_arg_cache_limit", 
-		    &buflen, &bufsz, NULL, 0);
+		i = sysctlbyname("kern.ps_arg_cache_limit",
+				 &buflen, &bufsz, NULL, 0);
 		if (i == -1) {
 			buflen = 0;
 		} else {
@@ -870,8 +861,23 @@ kvm_getargv(kvm_t *kd, const struct kinfo_proc *kp, int nchr)
 		oid[1] = KERN_PROC;
 		oid[2] = KERN_PROC_ARGS;
 		oid[3] = kp->kp_pid;
-		bufsz = buflen;
-		i = sysctl(oid, 4, buf, &bufsz, 0, 0);
+		oid[4] = kp->kp_lwp.kl_tid;
+
+		/*
+		 * sysctl can take a pid in 5.7 or earlier.  In late
+		 * 5.7 the sysctl can take a pid (4 args) or pid + tid
+		 * (5 args).
+		 */
+		i = -1;
+		if (kp->kp_lwp.kl_tid > 0) {
+			bufsz = buflen;
+			i = sysctl(oid, 5, buf, &bufsz, 0, 0);
+		}
+		if (i < 0) {
+			bufsz = buflen;
+			i = sysctl(oid, 4, buf, &bufsz, 0, 0);
+		}
+
 		if (i == 0 && bufsz > 0) {
 			i = 0;
 			p = buf;

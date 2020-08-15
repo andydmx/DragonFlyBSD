@@ -7,6 +7,7 @@ MAN=	usbhid.3
 SHLIB_MAJOR= 4
 
 MLINKS=	usbhid.3 libusbhid.3 usbhid.3 hid_get_report_desc.3 \
+	usbhid.3 hid_get_report_id.3 \
 	usbhid.3 hid_dispose_report_desc.3 \
 	usbhid.3 hid_start_parse.3 usbhid.3 hid_end_parse.3 \
 	usbhid.3 hid_get_item.3 usbhid.3 hid_report_size.3 \
@@ -15,10 +16,11 @@ MLINKS=	usbhid.3 libusbhid.3 usbhid.3 hid_get_report_desc.3 \
 	usbhid.3 hid_parse_usage_page.3 usbhid.3 hid_parse_usage_in_page.3 \
 	usbhid.3 hid_init.3 \
 	usbhid.3 hid_get_data.3 usbhid.3 hid_set_data.3 \
+	usbhid.3 hid_get_report.3 usbhid.3 hid_set_report_id.3 \
+	usbhid.3 hid_set_immed.3 usbhid.3 hid_set_report.3 \
 	usbhid.3 hid_use_report_desc.3
 
-SRCS=	descr.c descr_compat.c parse.c usage.c data.c
-
+SRCS=	descr.c parse.c usage.c data.c
 INCS=	usbhid.h
 
 .if defined(COMPAT_32BIT)

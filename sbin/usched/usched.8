@@ -53,6 +53,16 @@ on
 .Tn CPUs
 given in
 .Ar cpumask .
+It assigns the
+.Ar program
+to the
+.Tn CPU
+with the smallest cpuid and adds the rest of the
+.Tn CPUs
+to the list of available
+.Tn CPUs
+for the
+.Ar program .
 The userland
 .Ar scheduler
 can have value
@@ -115,3 +125,6 @@ Using system default userland scheduler by specifying
 as
 .Sq default
 is not implemented.
+.Pp
+.Ar cpumask
+only supports up to 64 CPUs due to implementation of usched.

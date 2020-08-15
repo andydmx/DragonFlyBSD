@@ -7,16 +7,16 @@ SYSDIR?=		${.CURDIR}/../../..
 
 SRCS=	biosacpi.c bioscd.c biosdisk.c biosmem.c biospnp.c \
 	biospci.c biossmap.c bootinfo.c bootinfo32.c bootinfo64.c \
-	comconsole.c devicename.c elf32_freebsd.c \
-	elf64_freebsd.c gatea20.c \
+	comconsole.c devicename.c elf32_freebsd.c elf64_freebsd.c \
 	i386_copy.c i386_module.c nullconsole.c pxe.c pxetramp.s \
 	smbios.c time.c vidconsole.c x86_64_tramp.S
 
 CFLAGS+=	-ffreestanding
+CFLAGS+=	-fno-strict-aliasing
 BOOT_COMCONSOLE_PORT?= 0x3f8
 CFLAGS+=	-DCOMPORT=${BOOT_COMCONSOLE_PORT}
 
-BOOT_COMCONSOLE_SPEED?= 9600
+BOOT_COMCONSOLE_SPEED?= 115200
 CFLAGS+=	-DCOMSPEED=${BOOT_COMCONSOLE_SPEED}
 
 .ifdef(BOOT_BIOSDISK_DEBUG)
@@ -33,20 +33,5 @@ CFLAGS+=	-I${.CURDIR}/../../common -I${.CURDIR}/../btx/lib \
 		-I${.CURDIR}/../../.. -I.
 # the location of libstand
 CFLAGS+=	-I${.CURDIR}/../../../../lib/libstand/
-
-# If it's not there, don't consider it a target
-.if exists(${.CURDIR}/../../../cpu/i386/include)
-
-# Make "machine" required for all objects
-# (based on the more complete case in sys/arch/i386/boot/Makefile.inc)
-${SRCS:M*.c:R:S/$/.o/g}: machine
-
-beforedepend ${OBJS}: machine
-
-CLEANFILES+=	machine
-machine:
-	${LN} -sf ${.CURDIR}/../../../cpu/i386/include machine
-
-.endif
 
 .include <bsd.lib.mk>

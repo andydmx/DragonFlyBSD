@@ -24,7 +24,6 @@
  * SUCH DAMAGE.
  *
  * $FreeBSD: src/sys/kern/imgact_aout.c,v 1.59.2.5 2001/11/03 01:41:08 ps Exp $
- * $DragonFly: src/sys/kern/imgact_aout.c,v 1.14 2007/02/01 10:33:25 corecode Exp $
  */
 
 #include <sys/param.h>
@@ -37,7 +36,6 @@
 #include <sys/malloc.h>
 #include <sys/systm.h>
 #include <sys/proc.h>
-#include <sys/namei.h>
 #include <sys/pioctl.h>
 #include <sys/signalvar.h>
 #include <sys/stat.h>
@@ -52,14 +50,12 @@
 #include <vm/pmap.h>
 #include <vm/vm_map.h>
 #include <vm/vm_object.h>
-#include <sys/user.h>
 
 static int	exec_aout_imgact (struct image_params *imgp);
 
 struct sysentvec aout_sysvec = {
 	SYS_MAXSYSCALL,
 	sysent,
-	-1,
 	0,
 	0,
 	0,
@@ -69,7 +65,6 @@ struct sysentvec aout_sysvec = {
 	sendsig,
 	sigcode,
 	&szsigcode,
-	0,
 	"FreeBSD a.out",
 	NULL,
 	NULL,
@@ -151,7 +146,7 @@ exec_aout_imgact(struct image_params *imgp)
 		return (-1);
 
 	/* text + data can't exceed file size */
-	if (a_out->a_data + a_out->a_text > imgp->attr->va_size)
+	if (a_out->a_data + a_out->a_text > imgp->lvap->va_size)
 		return (EFAULT);
 
 	/*
@@ -185,13 +180,15 @@ exec_aout_imgact(struct image_params *imgp)
 
 	text_end = virtual_offset + a_out->a_text;
 	error = vm_map_insert(map, &count, object, NULL,
-		file_offset,
+		file_offset, NULL,
 		virtual_offset, text_end,
 		VM_MAPTYPE_NORMAL,
+		VM_SUBSYS_IMGACT,
 		VM_PROT_READ | VM_PROT_EXECUTE, VM_PROT_ALL,
 		MAP_COPY_ON_WRITE | MAP_PREFAULT | MAP_PREFAULT_RELOCK);
 
 	if (error) {
+		vm_object_deallocate_locked(object);
 		vm_object_drop(object);
 		vm_map_unlock(map);
 		vm_map_entry_release(count);
@@ -202,12 +199,14 @@ exec_aout_imgact(struct image_params *imgp)
 	if (a_out->a_data) {
 		vm_object_reference_locked(object);
 		error = vm_map_insert(map, &count, object, NULL,
-			file_offset + a_out->a_text,
+			file_offset + a_out->a_text, NULL,
 			text_end, data_end,
 			VM_MAPTYPE_NORMAL,
+			VM_SUBSYS_IMGACT,
 			VM_PROT_ALL, VM_PROT_ALL,
 			MAP_COPY_ON_WRITE | MAP_PREFAULT | MAP_PREFAULT_RELOCK);
 		if (error) {
+			vm_object_deallocate_locked(object);
 			vm_object_drop(object);
 			vm_map_unlock(map);
 			vm_map_entry_release(count);
@@ -218,8 +217,10 @@ exec_aout_imgact(struct image_params *imgp)
 
 	if (bss_size) {
 		error = vm_map_insert(map, &count, NULL, NULL,
-			0, data_end, data_end + bss_size,
+			0, NULL,
+			data_end, data_end + bss_size,
 			VM_MAPTYPE_NORMAL,
+			VM_SUBSYS_IMGACT,
 			VM_PROT_ALL, VM_PROT_ALL,
 			0);
 		if (error) {
@@ -232,8 +233,8 @@ exec_aout_imgact(struct image_params *imgp)
 	vm_map_entry_release(count);
 
 	/* Fill in process VM information */
-	vmspace->vm_tsize = a_out->a_text >> PAGE_SHIFT;
-	vmspace->vm_dsize = (a_out->a_data + bss_size) >> PAGE_SHIFT;
+	vmspace->vm_tsize = a_out->a_text;		/* in bytes */
+	vmspace->vm_dsize = a_out->a_data + bss_size;	/* in bytes */
 	vmspace->vm_taddr = (caddr_t) (uintptr_t) virtual_offset;
 	vmspace->vm_daddr = (caddr_t) (uintptr_t)
 			    (virtual_offset + a_out->a_text);

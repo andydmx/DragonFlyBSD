@@ -58,7 +58,7 @@ RB_GENERATE2(hammer_redo_rb_tree, hammer_inode, rb_redonode,
  */
 int
 hammer_generate_redo(hammer_transaction_t trans, hammer_inode_t ip,
-		     hammer_off_t file_off, u_int32_t flags,
+		     hammer_off_t file_off, uint32_t flags,
 		     void *base, int len)
 {
 	hammer_mount_t hmp;
@@ -83,12 +83,12 @@ hammer_generate_redo(hammer_transaction_t trans, hammer_inode_t ip,
 	/*
 	 * No undo recursion when modifying the root volume
 	 */
-	hammer_modify_volume(NULL, root_volume, NULL, 0);
+	hammer_modify_volume_noundo(NULL, root_volume);
 	hammer_lock_ex(&hmp->undo_lock);
 
 	/* undo had better not roll over (loose test) */
 	if (hammer_undo_space(trans) < len + HAMMER_BUFSIZE*3)
-		panic("hammer: insufficient undo FIFO space!");
+		hpanic("insufficient UNDO/REDO FIFO space for redo!");
 
 	/*
 	 * Loop until the undo for the entire range has been laid down.
@@ -99,10 +99,8 @@ hammer_generate_redo(hammer_transaction_t trans, hammer_inode_t ip,
 		 * Fetch the layout offset in the UNDO FIFO, wrap it as
 		 * necessary.
 		 */
-		if (undomap->next_offset == undomap->alloc_offset) {
-			undomap->next_offset =
-				HAMMER_ZONE_ENCODE(HAMMER_ZONE_UNDO_INDEX, 0);
-		}
+		if (undomap->next_offset == undomap->alloc_offset)
+			undomap->next_offset = HAMMER_ENCODE_UNDO(0);
 		next_offset = undomap->next_offset;
 
 		/*
@@ -111,13 +109,14 @@ hammer_generate_redo(hammer_transaction_t trans, hammer_inode_t ip,
 		 */
 		if ((next_offset & HAMMER_BUFMASK) == 0) {
 			redo = hammer_bnew(hmp, next_offset, &error, &buffer);
-			hammer_format_undo(redo, hmp->undo_seqno ^ 0x40000000);
+			hammer_format_undo(hmp,
+					   redo, hmp->undo_seqno ^ 0x40000000);
 		} else {
 			redo = hammer_bread(hmp, next_offset, &error, &buffer);
 		}
 		if (error)
 			break;
-		hammer_modify_buffer(NULL, buffer, NULL, 0);
+		hammer_modify_buffer_noundo(NULL, buffer);
 
 		/*
 		 * Calculate how big a media structure fits up to the next
@@ -180,8 +179,7 @@ hammer_generate_redo(hammer_transaction_t trans, hammer_inode_t ip,
 				ip->redo_fifo_start = next_offset;
 				if (RB_INSERT(hammer_redo_rb_tree,
 					      &hmp->rb_redo_root, ip)) {
-					panic("hammer_generate_redo: "
-					      "cannot insert inode %p on "
+					hpanic("cannot insert inode %p on "
 					      "redo FIFO", ip);
 				}
 				ip->flags |= HAMMER_INODE_RDIRTY;
@@ -203,13 +201,12 @@ hammer_generate_redo(hammer_transaction_t trans, hammer_inode_t ip,
 		} else if (n > len) {
 			n = len;
 		}
-		bytes = ((n + HAMMER_HEAD_ALIGN_MASK) &
-			 ~HAMMER_HEAD_ALIGN_MASK) +
+		bytes = HAMMER_HEAD_DOALIGN(n) +
 			(int)sizeof(struct hammer_fifo_redo) +
 			(int)sizeof(struct hammer_fifo_tail);
 		if (hammer_debug_general & 0x0080) {
-			kprintf("redo %016llx %d %d\n",
-				(long long)next_offset, bytes, n);
+			hdkprintf("redo %016jx %d %d\n",
+				(intmax_t)next_offset, bytes, n);
 		}
 
 		redo->head.hdr_signature = HAMMER_HEAD_SIGNATURE;
@@ -217,7 +214,6 @@ hammer_generate_redo(hammer_transaction_t trans, hammer_inode_t ip,
 		redo->head.hdr_size = bytes;
 		redo->head.hdr_seq = hmp->undo_seqno++;
 		redo->head.hdr_crc = 0;
-		redo->redo_mtime = trans->time;
 		redo->redo_offset = file_off;
 		redo->redo_flags = flags;
 
@@ -243,8 +239,7 @@ hammer_generate_redo(hammer_transaction_t trans, hammer_inode_t ip,
 		tail->tail_size = bytes;
 
 		KKASSERT(bytes >= sizeof(redo->head));
-		redo->head.hdr_crc = crc32(redo, HAMMER_FIFO_HEAD_CRCOFF) ^
-			     crc32(&redo->head + 1, bytes - sizeof(redo->head));
+		hammer_crc_set_fifo_head(hmp->version, &redo->head, bytes);
 		undomap->next_offset += bytes;
 		hammer_stats_redo += bytes;
 
@@ -330,7 +325,7 @@ hammer_generate_redo_sync(hammer_transaction_t trans)
 	}
 	if (redo_fifo_start) {
 		if (hammer_debug_io & 0x0004) {
-			kprintf("SYNC IP %p %016jx\n",
+			hdkprintf("SYNC IP %p %016jx\n",
 				ip, (intmax_t)redo_fifo_start);
 		}
 		hammer_generate_redo(trans, NULL, redo_fifo_start,
@@ -359,6 +354,7 @@ hammer_redo_fifo_end_flush(hammer_inode_t ip)
 {
 	hammer_mount_t hmp = ip->hmp;
 
+	hammer_lock_ex(&hmp->undo_lock);
 	if (ip->flags & HAMMER_INODE_RDIRTY) {
 		RB_REMOVE(hammer_redo_rb_tree, &hmp->rb_redo_root, ip);
 		ip->flags &= ~HAMMER_INODE_RDIRTY;
@@ -368,10 +364,9 @@ hammer_redo_fifo_end_flush(hammer_inode_t ip)
 	if (ip->redo_fifo_next) {
 		ip->redo_fifo_start = ip->redo_fifo_next;
 		if (RB_INSERT(hammer_redo_rb_tree, &hmp->rb_redo_root, ip)) {
-			panic("hammer_generate_redo: cannot reinsert "
-			      "inode %p on redo FIFO",
-			      ip);
+			hpanic("cannot reinsert inode %p on redo FIFO", ip);
 		}
 		ip->flags |= HAMMER_INODE_RDIRTY;
 	}
+	hammer_unlock(&hmp->undo_lock);
 }

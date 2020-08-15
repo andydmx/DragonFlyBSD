@@ -1,5 +1,4 @@
 /* $FreeBSD: src/lib/libstand/nfsv2.h,v 1.1.1.1.6.1 2000/05/04 13:47:51 ps Exp $ */
-/* $DragonFly: src/lib/libstand/nfsv2.h,v 1.2 2003/06/17 04:26:51 dillon Exp $ */
 /*	$NetBSD: nfsv2.h,v 1.2 1996/02/26 23:05:23 gwr Exp $	*/
 
 /*
@@ -17,11 +16,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -39,6 +34,9 @@
  *
  *	@(#)nfsv2.h	8.1 (Berkeley) 6/10/93
  */
+
+#ifndef _STAND_NFSV2_H_
+#define	_STAND_NFSV2_H_
 
 /*
  * nfs definitions as per the version 2 specs
@@ -167,3 +165,5 @@ struct nfsv2_statfs {
 	n_long	sf_bfree;
 	n_long	sf_bavail;
 };
+
+#endif /* !_STAND_NFSVS2_H_ */

@@ -41,9 +41,10 @@
 #include <sys/mount.h>
 #include <sys/signalvar.h>
 #include <sys/signal2.h>
+#include <sys/spinlock2.h>
 #include <sys/vnode.h>
 #include <sys/malloc.h>
-#include <sys/sysproto.h>
+#include <sys/sysmsg.h>
 #include <sys/mman.h>
 #include <sys/linker.h>
 #include <sys/fcntl.h>
@@ -85,7 +86,7 @@ d_close_t	mfsclose;
 d_strategy_t	mfsstrategy;
 
 static struct dev_ops mfs_ops = {
-	{ "MFS", -1, D_DISK },
+	{ "MFS", -1, D_DISK | D_NOEMERGPGR },
 	.d_open =	mfsopen,
 	.d_close =	mfsclose,
 	.d_read =	physread,
@@ -97,6 +98,7 @@ static struct dev_ops mfs_ops = {
  * mfs vfs operations.
  */
 static struct vfsops mfs_vfsops = {
+	.vfs_flags =		0,
 	.vfs_mount =     	mfs_mount,
 	.vfs_start =    	mfs_start,
 	.vfs_unmount =   	ffs_unmount,
@@ -473,14 +475,16 @@ mfs_start(struct mount *mp, int flags)
 		 */
 		if (gotsig) {
 			gotsig = 0;
-			if (dounmount(mp, 0) != 0) {
+			if (dounmount(mp, 0, 0) != 0) {
 				KKASSERT(td->td_proc);
+				lwkt_gettoken(&td->td_proc->p_token);
 				sig = CURSIG(td->td_lwp);
 				if (sig) {
 					spin_lock(&td->td_lwp->lwp_spin);
-					lwp_delsig(td->td_lwp, sig);
+					lwp_delsig(td->td_lwp, sig, 1);
 					spin_unlock(&td->td_lwp->lwp_spin);
 				}
+				lwkt_reltoken(&td->td_proc->p_token);
 			}
 		}
 		else if (tsleep((caddr_t)mfsp, PCATCH, "mfsidl", 0))
@@ -556,11 +560,14 @@ mfs_doio(struct bio *bio, struct mfsnode *mfsp)
 
 			bytes &= ~PAGE_MASK;
 			if (bytes != 0) {
+				struct sysmsg sysmsg;
+
+				bzero(&sysmsg, sizeof(sysmsg));
 				bzero(&uap, sizeof(uap));
 				uap.addr  = base;
 				uap.len   = bytes;
 				uap.behav = MADV_FREE;
-				sys_madvise(&uap);
+				sys_madvise(&sysmsg, &uap);
 			}
                 }
 		bp->b_error = 0;

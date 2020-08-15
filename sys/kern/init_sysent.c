@@ -5,38 +5,16 @@
  *               by running make sysent in the same directory.
  */
 
-#include "opt_compat.h"
-
-#ifdef __i386__
-#include "opt_compatdf12.h"
-#endif
-
 #include <sys/param.h>
 #include <sys/sysent.h>
-#include <sys/sysproto.h>
+#include <sys/sysmsg.h>
 #include <sys/statvfs.h>
-#include <emulation/43bsd/stat.h>
-#include <emulation/dragonfly12/stat.h>
 
-#define AS(name) ((sizeof(struct name) - sizeof(struct sysmsg)) / sizeof(register_t))
-
-#ifdef COMPAT_43
-#define compat(n, name) n, (sy_call_t *)__CONCAT(sys_,__CONCAT(o,name))
-#else
-#define compat(n, name) 0, (sy_call_t *)sys_nosys
-#endif
-
-#ifdef COMPAT_DF12
-#define compatdf12(n, name) n, (sy_call_t *)__CONCAT(sys_,__CONCAT(dfbsd12_,name))
-#else
-#define compatdf12(n, name) 0, (sy_call_t *)sys_nosys
-#endif
+#define AS(name) (sizeof(struct name) / sizeof(register_t))
 
 /* The casts are bogus but will do for now. */
 struct sysent sysent[] = {
-#ifdef COMPAT_43
-#endif
-	{ 0, (sy_call_t *)sys_nosys },			/* 0 = syscall */
+	{ 0, (sy_call_t *)sys_xsyscall },		/* 0 = syscall */
 	{ AS(exit_args), (sy_call_t *)sys_exit },	/* 1 = exit */
 	{ 0, (sy_call_t *)sys_fork },			/* 2 = fork */
 	{ AS(read_args), (sy_call_t *)sys_read },	/* 3 = read */
@@ -44,7 +22,7 @@ struct sysent sysent[] = {
 	{ AS(open_args), (sy_call_t *)sys_open },	/* 5 = open */
 	{ AS(close_args), (sy_call_t *)sys_close },	/* 6 = close */
 	{ AS(wait_args), (sy_call_t *)sys_wait4 },	/* 7 = wait4 */
-	{ compat(AS(ocreat_args),creat) },		/* 8 = old creat */
+	{ 0, (sy_call_t *)sys_nosys },			/* 8 = __nosys */
 	{ AS(link_args), (sy_call_t *)sys_link },	/* 9 = link */
 	{ AS(unlink_args), (sy_call_t *)sys_unlink },	/* 10 = unlink */
 	{ 0, (sy_call_t *)sys_nosys },			/* 11 = obsolete execv */
@@ -55,7 +33,7 @@ struct sysent sysent[] = {
 	{ AS(chown_args), (sy_call_t *)sys_chown },	/* 16 = chown */
 	{ AS(obreak_args), (sy_call_t *)sys_obreak },	/* 17 = break */
 	{ AS(getfsstat_args), (sy_call_t *)sys_getfsstat },	/* 18 = getfsstat */
-	{ compat(AS(olseek_args),lseek) },		/* 19 = old lseek */
+	{ 0, (sy_call_t *)sys_nosys },			/* 19 = obsolete old lseek */
 	{ 0, (sy_call_t *)sys_getpid },			/* 20 = getpid */
 	{ AS(mount_args), (sy_call_t *)sys_mount },	/* 21 = mount */
 	{ AS(unmount_args), (sy_call_t *)sys_unmount },	/* 22 = unmount */
@@ -74,9 +52,9 @@ struct sysent sysent[] = {
 	{ AS(fchflags_args), (sy_call_t *)sys_fchflags },	/* 35 = fchflags */
 	{ 0, (sy_call_t *)sys_sync },			/* 36 = sync */
 	{ AS(kill_args), (sy_call_t *)sys_kill },	/* 37 = kill */
-	{ compat(AS(ostat_args),stat) },		/* 38 = old stat */
+	{ 0, (sy_call_t *)sys_nosys },			/* 38 = obsolete old stat */
 	{ 0, (sy_call_t *)sys_getppid },		/* 39 = getppid */
-	{ compat(AS(olstat_args),lstat) },		/* 40 = old lstat */
+	{ 0, (sy_call_t *)sys_nosys },			/* 40 = obsolete old lstat */
 	{ AS(dup_args), (sy_call_t *)sys_dup },		/* 41 = dup */
 	{ 0, (sy_call_t *)sys_pipe },			/* 42 = pipe */
 	{ 0, (sy_call_t *)sys_getegid },		/* 43 = getegid */
@@ -98,17 +76,17 @@ struct sysent sysent[] = {
 	{ AS(execve_args), (sy_call_t *)sys_execve },	/* 59 = execve */
 	{ AS(umask_args), (sy_call_t *)sys_umask },	/* 60 = umask */
 	{ AS(chroot_args), (sy_call_t *)sys_chroot },	/* 61 = chroot */
-	{ compat(AS(ofstat_args),fstat) },		/* 62 = old fstat */
-	{ compat(AS(getkerninfo_args),getkerninfo) },	/* 63 = old getkerninfo */
-	{ compat(0,getpagesize) },			/* 64 = old getpagesize */
+	{ 0, (sy_call_t *)sys_nosys },			/* 62 = obsolete old fstat */
+	{ 0, (sy_call_t *)sys_nosys },			/* 63 = obsolete getkerninfo */
+	{ 0, (sy_call_t *)sys_nosys },			/* 64 = obsolete getpagesize */
 	{ AS(msync_args), (sy_call_t *)sys_msync },	/* 65 = msync */
 	{ 0, (sy_call_t *)sys_vfork },			/* 66 = vfork */
 	{ 0, (sy_call_t *)sys_nosys },			/* 67 = obsolete vread */
 	{ 0, (sy_call_t *)sys_nosys },			/* 68 = obsolete vwrite */
 	{ AS(sbrk_args), (sy_call_t *)sys_sbrk },	/* 69 = sbrk */
 	{ AS(sstk_args), (sy_call_t *)sys_sstk },	/* 70 = sstk */
-	{ compat(AS(ommap_args),mmap) },		/* 71 = old mmap */
-	{ compat(AS(ovadvise_args),vadvise) },		/* 72 = old vadvise */
+	{ 0, (sy_call_t *)sys_nosys },			/* 71 = obsolete old mmap */
+	{ 0, (sy_call_t *)sys_nosys },			/* 72 = obsolete vadvise */
 	{ AS(munmap_args), (sy_call_t *)sys_munmap },	/* 73 = munmap */
 	{ AS(mprotect_args), (sy_call_t *)sys_mprotect },	/* 74 = mprotect */
 	{ AS(madvise_args), (sy_call_t *)sys_madvise },	/* 75 = madvise */
@@ -120,11 +98,11 @@ struct sysent sysent[] = {
 	{ 0, (sy_call_t *)sys_getpgrp },		/* 81 = getpgrp */
 	{ AS(setpgid_args), (sy_call_t *)sys_setpgid },	/* 82 = setpgid */
 	{ AS(setitimer_args), (sy_call_t *)sys_setitimer },	/* 83 = setitimer */
-	{ compat(0,wait) },				/* 84 = old wait */
+	{ 0, (sy_call_t *)sys_nosys },			/* 84 = obsolete wait */
 	{ AS(swapon_args), (sy_call_t *)sys_swapon },	/* 85 = swapon */
 	{ AS(getitimer_args), (sy_call_t *)sys_getitimer },	/* 86 = getitimer */
-	{ compat(AS(gethostname_args),gethostname) },	/* 87 = old gethostname */
-	{ compat(AS(sethostname_args),sethostname) },	/* 88 = old sethostname */
+	{ 0, (sy_call_t *)sys_nosys },			/* 87 = obsolete gethostname */
+	{ 0, (sy_call_t *)sys_nosys },			/* 88 = obsolete sethostname */
 	{ 0, (sy_call_t *)sys_getdtablesize },		/* 89 = getdtablesize */
 	{ AS(dup2_args), (sy_call_t *)sys_dup2 },	/* 90 = dup2 */
 	{ 0, (sy_call_t *)sys_nosys },			/* 91 = getdopt */
@@ -135,22 +113,22 @@ struct sysent sysent[] = {
 	{ AS(setpriority_args), (sy_call_t *)sys_setpriority },	/* 96 = setpriority */
 	{ AS(socket_args), (sy_call_t *)sys_socket },	/* 97 = socket */
 	{ AS(connect_args), (sy_call_t *)sys_connect },	/* 98 = connect */
-	{ compat(AS(accept_args),accept) },		/* 99 = old accept */
+	{ 0, (sy_call_t *)sys_nosys },			/* 99 = obsolete old accept */
 	{ AS(getpriority_args), (sy_call_t *)sys_getpriority },	/* 100 = getpriority */
-	{ compat(AS(osend_args),send) },		/* 101 = old send */
-	{ compat(AS(orecv_args),recv) },		/* 102 = old recv */
+	{ 0, (sy_call_t *)sys_nosys },			/* 101 = obsolete send */
+	{ 0, (sy_call_t *)sys_nosys },			/* 102 = obsolete recv */
 	{ 0, (sy_call_t *)sys_nosys },			/* 103 = obsolete freebsd3_sigreturn */
 	{ AS(bind_args), (sy_call_t *)sys_bind },	/* 104 = bind */
 	{ AS(setsockopt_args), (sy_call_t *)sys_setsockopt },	/* 105 = setsockopt */
 	{ AS(listen_args), (sy_call_t *)sys_listen },	/* 106 = listen */
 	{ 0, (sy_call_t *)sys_nosys },			/* 107 = obsolete vtimes */
-	{ compat(AS(osigvec_args),sigvec) },		/* 108 = old sigvec */
-	{ compat(AS(osigblock_args),sigblock) },	/* 109 = old sigblock */
-	{ compat(AS(osigsetmask_args),sigsetmask) },	/* 110 = old sigsetmask */
+	{ 0, (sy_call_t *)sys_nosys },			/* 108 = obsolete 4.3 sigvec */
+	{ 0, (sy_call_t *)sys_nosys },			/* 109 = obsolete 4.3 sigblock */
+	{ 0, (sy_call_t *)sys_nosys },			/* 110 = obsolete 4.3 sigsetmask */
 	{ 0, (sy_call_t *)sys_nosys },			/* 111 = obsolete freebsd3_sigsuspend */
-	{ compat(AS(osigstack_args),sigstack) },	/* 112 = old sigstack */
-	{ compat(AS(orecvmsg_args),recvmsg) },		/* 113 = old recvmsg */
-	{ compat(AS(osendmsg_args),sendmsg) },		/* 114 = old sendmsg */
+	{ 0, (sy_call_t *)sys_nosys },			/* 112 = obsolete sigstack */
+	{ 0, (sy_call_t *)sys_nosys },			/* 113 = obsolete old recvmsg */
+	{ 0, (sy_call_t *)sys_nosys },			/* 114 = obsolete old sendmsg */
 	{ 0, (sy_call_t *)sys_nosys },			/* 115 = obsolete vtrace */
 	{ AS(gettimeofday_args), (sy_call_t *)sys_gettimeofday },	/* 116 = gettimeofday */
 	{ AS(getrusage_args), (sy_call_t *)sys_getrusage },	/* 117 = getrusage */
@@ -161,12 +139,12 @@ struct sysent sysent[] = {
 	{ AS(settimeofday_args), (sy_call_t *)sys_settimeofday },	/* 122 = settimeofday */
 	{ AS(fchown_args), (sy_call_t *)sys_fchown },	/* 123 = fchown */
 	{ AS(fchmod_args), (sy_call_t *)sys_fchmod },	/* 124 = fchmod */
-	{ compat(AS(recvfrom_args),recvfrom) },		/* 125 = old recvfrom */
+	{ 0, (sy_call_t *)sys_nosys },			/* 125 = obsolete old recvfrom */
 	{ AS(setreuid_args), (sy_call_t *)sys_setreuid },	/* 126 = setreuid */
 	{ AS(setregid_args), (sy_call_t *)sys_setregid },	/* 127 = setregid */
 	{ AS(rename_args), (sy_call_t *)sys_rename },	/* 128 = rename */
-	{ compat(AS(otruncate_args),truncate) },	/* 129 = old truncate */
-	{ compat(AS(oftruncate_args),ftruncate) },	/* 130 = old ftruncate */
+	{ 0, (sy_call_t *)sys_nosys },			/* 129 = obsolete old truncate */
+	{ 0, (sy_call_t *)sys_nosys },			/* 130 = obsolete old ftruncate */
 	{ AS(flock_args), (sy_call_t *)sys_flock },	/* 131 = flock */
 	{ AS(mkfifo_args), (sy_call_t *)sys_mkfifo },	/* 132 = mkfifo */
 	{ AS(sendto_args), (sy_call_t *)sys_sendto },	/* 133 = sendto */
@@ -177,30 +155,30 @@ struct sysent sysent[] = {
 	{ AS(utimes_args), (sy_call_t *)sys_utimes },	/* 138 = utimes */
 	{ 0, (sy_call_t *)sys_nosys },			/* 139 = obsolete 4.2 sigreturn */
 	{ AS(adjtime_args), (sy_call_t *)sys_adjtime },	/* 140 = adjtime */
-	{ compat(AS(ogetpeername_args),getpeername) },	/* 141 = old getpeername */
-	{ compat(0,gethostid) },			/* 142 = old gethostid */
-	{ compat(AS(osethostid_args),sethostid) },	/* 143 = old sethostid */
-	{ compat(AS(ogetrlimit_args),getrlimit) },	/* 144 = old getrlimit */
-	{ compat(AS(osetrlimit_args),setrlimit) },	/* 145 = old setrlimit */
-	{ compat(AS(okillpg_args),killpg) },		/* 146 = old killpg */
+	{ 0, (sy_call_t *)sys_nosys },			/* 141 = obsolete old getpeername */
+	{ 0, (sy_call_t *)sys_nosys },			/* 142 = obsolete 4.3 gethostid */
+	{ 0, (sy_call_t *)sys_nosys },			/* 143 = obsolete 4.3 sethostid */
+	{ 0, (sy_call_t *)sys_nosys },			/* 144 = obsolete old getrlimit */
+	{ 0, (sy_call_t *)sys_nosys },			/* 145 = obsolete old setrlimit */
+	{ 0, (sy_call_t *)sys_nosys },			/* 146 = obsolete 4.3 killpg */
 	{ 0, (sy_call_t *)sys_setsid },			/* 147 = setsid */
 	{ AS(quotactl_args), (sy_call_t *)sys_quotactl },	/* 148 = quotactl */
-	{ compat(0,quota) },				/* 149 = old quota */
-	{ compat(AS(getsockname_args),getsockname) },	/* 150 = old getsockname */
+	{ 0, (sy_call_t *)sys_nosys },			/* 149 = obsolete quota */
+	{ 0, (sy_call_t *)sys_nosys },			/* 150 = obsolete old getsockname */
 	{ 0, (sy_call_t *)sys_nosys },			/* 151 = sem_lock */
 	{ 0, (sy_call_t *)sys_nosys },			/* 152 = sem_wakeup */
 	{ 0, (sy_call_t *)sys_nosys },			/* 153 = asyncdaemon */
 	{ 0, (sy_call_t *)sys_nosys },			/* 154 = nosys */
 	{ AS(nfssvc_args), (sy_call_t *)sys_nosys },	/* 155 = nfssvc */
-	{ compat(AS(ogetdirentries_args),getdirentries) },	/* 156 = old getdirentries */
+	{ 0, (sy_call_t *)sys_nosys },			/* 156 = obsolete old getdirentries */
 	{ AS(statfs_args), (sy_call_t *)sys_statfs },	/* 157 = statfs */
 	{ AS(fstatfs_args), (sy_call_t *)sys_fstatfs },	/* 158 = fstatfs */
 	{ 0, (sy_call_t *)sys_nosys },			/* 159 = nosys */
 	{ 0, (sy_call_t *)sys_nosys },			/* 160 = nosys */
 	{ AS(getfh_args), (sy_call_t *)sys_getfh },	/* 161 = getfh */
-	{ AS(getdomainname_args), (sy_call_t *)sys_getdomainname },	/* 162 = getdomainname */
-	{ AS(setdomainname_args), (sy_call_t *)sys_setdomainname },	/* 163 = setdomainname */
-	{ AS(uname_args), (sy_call_t *)sys_uname },	/* 164 = uname */
+	{ 0, (sy_call_t *)sys_nosys },			/* 162 = obsolete getdomainname */
+	{ 0, (sy_call_t *)sys_nosys },			/* 163 = obsolete setdomainname */
+	{ 0, (sy_call_t *)sys_nosys },			/* 164 = obsolete uname */
 	{ AS(sysarch_args), (sy_call_t *)sys_sysarch },	/* 165 = sysarch */
 	{ AS(rtprio_args), (sy_call_t *)sys_rtprio },	/* 166 = rtprio */
 	{ 0, (sy_call_t *)sys_nosys },			/* 167 = nosys */
@@ -224,17 +202,17 @@ struct sysent sysent[] = {
 	{ 0, (sy_call_t *)sys_nosys },			/* 185 = lfs_markv */
 	{ 0, (sy_call_t *)sys_nosys },			/* 186 = lfs_segclean */
 	{ 0, (sy_call_t *)sys_nosys },			/* 187 = lfs_segwait */
-	{ compatdf12(AS(dfbsd12_stat_args),stat) },		/* 188 = old stat */
-	{ compatdf12(AS(dfbsd12_fstat_args),fstat) },	/* 189 = old fstat */
-	{ compatdf12(AS(dfbsd12_lstat_args),lstat) },	/* 190 = old lstat */
+	{ 0, (sy_call_t *)sys_nosys },			/* 188 = nosys */
+	{ 0, (sy_call_t *)sys_nosys },			/* 189 = nosys */
+	{ 0, (sy_call_t *)sys_nosys },			/* 190 = nosys */
 	{ AS(pathconf_args), (sy_call_t *)sys_pathconf },	/* 191 = pathconf */
 	{ AS(fpathconf_args), (sy_call_t *)sys_fpathconf },	/* 192 = fpathconf */
 	{ 0, (sy_call_t *)sys_nosys },			/* 193 = nosys */
 	{ AS(__getrlimit_args), (sy_call_t *)sys_getrlimit },	/* 194 = getrlimit */
 	{ AS(__setrlimit_args), (sy_call_t *)sys_setrlimit },	/* 195 = setrlimit */
-	{ compatdf12(AS(dfbsd12_getdirentries_args),getdirentries) },	/* 196 = old getdirentries */
+	{ 0, (sy_call_t *)sys_nosys },			/* 196 = nosys */
 	{ AS(mmap_args), (sy_call_t *)sys_mmap },	/* 197 = mmap */
-	{ 0, (sy_call_t *)sys_nosys },			/* 198 = __syscall */
+	{ 0, (sy_call_t *)sys_xsyscall },		/* 198 = __syscall */
 	{ AS(lseek_args), (sy_call_t *)sys_lseek },	/* 199 = lseek */
 	{ AS(truncate_args), (sy_call_t *)sys_truncate },	/* 200 = truncate */
 	{ AS(ftruncate_args), (sy_call_t *)sys_ftruncate },	/* 201 = ftruncate */
@@ -308,15 +286,15 @@ struct sysent sysent[] = {
 	{ 0, (sy_call_t *)sys_nosys },			/* 269 = nosys */
 	{ 0, (sy_call_t *)sys_nosys },			/* 270 = nosys */
 	{ 0, (sy_call_t *)sys_nosys },			/* 271 = nosys */
-	{ compatdf12(AS(dfbsd12_getdents_args),getdents) },	/* 272 = old getdents */
+	{ 0, (sy_call_t *)sys_nosys },			/* 272 = nosys */
 	{ 0, (sy_call_t *)sys_nosys },			/* 273 = nosys */
 	{ AS(lchmod_args), (sy_call_t *)sys_lchmod },	/* 274 = lchmod */
 	{ AS(lchown_args), (sy_call_t *)sys_lchown },	/* 275 = netbsd_lchown */
 	{ AS(lutimes_args), (sy_call_t *)sys_lutimes },	/* 276 = lutimes */
 	{ AS(msync_args), (sy_call_t *)sys_msync },	/* 277 = netbsd_msync */
-	{ 0, (sy_call_t *)sys_nosys },			/* 278 = obsolete { */
-	{ 0, (sy_call_t *)sys_nosys },			/* 279 = obsolete { */
-	{ 0, (sy_call_t *)sys_nosys },			/* 280 = obsolete { */
+	{ 0, (sy_call_t *)sys_nosys },			/* 278 = obsolete nstat */
+	{ 0, (sy_call_t *)sys_nosys },			/* 279 = obsolete nfstat */
+	{ 0, (sy_call_t *)sys_nosys },			/* 280 = obsolete nlstat */
 	{ 0, (sy_call_t *)sys_nosys },			/* 281 = nosys */
 	{ 0, (sy_call_t *)sys_nosys },			/* 282 = nosys */
 	{ 0, (sy_call_t *)sys_nosys },			/* 283 = nosys */
@@ -335,7 +313,7 @@ struct sysent sysent[] = {
 	{ 0, (sy_call_t *)sys_nosys },			/* 296 = nosys */
 	{ AS(fhstatfs_args), (sy_call_t *)sys_fhstatfs },	/* 297 = fhstatfs */
 	{ AS(fhopen_args), (sy_call_t *)sys_fhopen },	/* 298 = fhopen */
-	{ compatdf12(AS(dfbsd12_fhstat_args),fhstat) },	/* 299 = old fhstat */
+	{ 0, (sy_call_t *)sys_nosys },			/* 299 = nosys */
 	{ AS(modnext_args), (sy_call_t *)sys_modnext },	/* 300 = modnext */
 	{ AS(modstat_args), (sy_call_t *)sys_modstat },	/* 301 = modstat */
 	{ AS(modfnext_args), (sy_call_t *)sys_modfnext },	/* 302 = modfnext */
@@ -400,7 +378,7 @@ struct sysent sysent[] = {
 	{ AS(getresgid_args), (sy_call_t *)sys_getresgid },	/* 361 = getresgid */
 	{ 0, (sy_call_t *)sys_kqueue },			/* 362 = kqueue */
 	{ AS(kevent_args), (sy_call_t *)sys_kevent },	/* 363 = kevent */
-	{ AS(sctp_peeloff_args), (sy_call_t *)sys_sctp_peeloff },	/* 364 = sctp_peeloff */
+	{ 0, (sy_call_t *)sys_nosys },			/* 364 = sctp_peeloff */
 	{ 0, (sy_call_t *)sys_nosys },			/* 365 = nosys */
 	{ 0, (sy_call_t *)sys_nosys },			/* 366 = nosys */
 	{ 0, (sy_call_t *)sys_nosys },			/* 367 = nosys */
@@ -426,7 +404,7 @@ struct sysent sysent[] = {
 	{ 0, (sy_call_t *)sys_nosys },			/* 387 = nosys */
 	{ 0, (sy_call_t *)sys_nosys },			/* 388 = nosys */
 	{ 0, (sy_call_t *)sys_nosys },			/* 389 = nosys */
-	{ 0, (sy_call_t *)sys_nosys },			/* 390 = nosys */
+	{ AS(kenv_args), (sy_call_t *)sys_kenv },	/* 390 = kenv */
 	{ AS(lchflags_args), (sy_call_t *)sys_lchflags },	/* 391 = lchflags */
 	{ AS(uuidgen_args), (sy_call_t *)sys_uuidgen },	/* 392 = uuidgen */
 	{ AS(sendfile_args), (sy_call_t *)sys_sendfile },	/* 393 = sendfile */
@@ -573,4 +551,19 @@ struct sysent sysent[] = {
 	{ AS(vmm_guest_ctl_args), (sy_call_t *)sys_vmm_guest_ctl },	/* 534 = vmm_guest_ctl */
 	{ AS(vmm_guest_sync_addr_args), (sy_call_t *)sys_vmm_guest_sync_addr },	/* 535 = vmm_guest_sync_addr */
 	{ AS(procctl_args), (sy_call_t *)sys_procctl },	/* 536 = procctl */
+	{ AS(chflagsat_args), (sy_call_t *)sys_chflagsat },	/* 537 = chflagsat */
+	{ AS(pipe2_args), (sy_call_t *)sys_pipe2 },	/* 538 = pipe2 */
+	{ AS(utimensat_args), (sy_call_t *)sys_utimensat },	/* 539 = utimensat */
+	{ AS(futimens_args), (sy_call_t *)sys_futimens },	/* 540 = futimens */
+	{ AS(accept4_args), (sy_call_t *)sys_accept4 },	/* 541 = accept4 */
+	{ AS(lwp_setname_args), (sy_call_t *)sys_lwp_setname },	/* 542 = lwp_setname */
+	{ AS(ppoll_args), (sy_call_t *)sys_ppoll },	/* 543 = ppoll */
+	{ AS(lwp_setaffinity_args), (sy_call_t *)sys_lwp_setaffinity },	/* 544 = lwp_setaffinity */
+	{ AS(lwp_getaffinity_args), (sy_call_t *)sys_lwp_getaffinity },	/* 545 = lwp_getaffinity */
+	{ AS(lwp_create2_args), (sy_call_t *)sys_lwp_create2 },	/* 546 = lwp_create2 */
+	{ AS(getcpuclockid_args), (sy_call_t *)sys_getcpuclockid },	/* 547 = getcpuclockid */
+	{ AS(wait6_args), (sy_call_t *)sys_wait6 },	/* 548 = wait6 */
+	{ AS(lwp_getname_args), (sy_call_t *)sys_lwp_getname },	/* 549 = lwp_getname */
+	{ AS(getrandom_args), (sy_call_t *)sys_getrandom },	/* 550 = getrandom */
+	{ AS(__realpath_args), (sy_call_t *)sys___realpath },	/* 551 = __realpath */
 };

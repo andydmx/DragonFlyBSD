@@ -20,17 +20,13 @@
  * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
  * DEALINGS IN THE SOFTWARE.
  *
- * $FreeBSD: head/sys/dev/drm2/radeon/cayman_blit_shaders.h 254885 2013-08-25 19:37:15Z dumbbell $
  */
 
 #ifndef CAYMAN_BLIT_SHADERS_H
 #define CAYMAN_BLIT_SHADERS_H
 
-extern const u32 cayman_ps[];
-extern const u32 cayman_vs[];
 extern const u32 cayman_default_state[];
 
-extern const u32 cayman_ps_size, cayman_vs_size;
 extern const u32 cayman_default_size;
 
 #endif

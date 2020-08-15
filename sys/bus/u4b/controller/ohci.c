@@ -1,3 +1,4 @@
+/* $FreeBSD: head/sys/dev/usb/controller/ohci.c 267992 2014-06-28 03:56:17Z hselasky $ */
 /*-
  * Copyright (c) 2008 Hans Petter Selasky. All rights reserved.
  * Copyright (c) 1998 The NetBSD Foundation, Inc. All rights reserved.
@@ -41,7 +42,6 @@
 #include <sys/bus.h>
 #include <sys/module.h>
 #include <sys/lock.h>
-#include <sys/mutex.h>
 #include <sys/condvar.h>
 #include <sys/sysctl.h>
 #include <sys/unistd.h>
@@ -1610,7 +1610,7 @@ ohci_root_intr(ohci_softc_t *sc)
 	for (i = 1; i < m; i++) {
 		/* pick out CHANGE bits from the status register */
 		if (OREAD4(sc, OHCI_RH_PORT_STATUS(i)) >> 16) {
-			sc->sc_hub_idata[i / 8] |= 1 << (i % 8);
+			setbit(sc->sc_hub_idata, i);
 			DPRINTF("port %d changed\n", i);
 		}
 	}

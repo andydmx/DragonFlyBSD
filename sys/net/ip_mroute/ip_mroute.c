@@ -37,7 +37,6 @@
 #include <sys/sysctl.h>
 #include <sys/syslog.h>
 #include <sys/systm.h>
-#include <sys/thread2.h>
 #include <sys/time.h>
 #include <sys/in_cksum.h>
 
@@ -237,7 +236,7 @@ static int	X_ip_mrouter_done(void);
 static int	X_ip_mrouter_get(struct socket *so, struct sockopt *m);
 static int	X_ip_mrouter_set(struct socket *so, struct sockopt *m);
 static int	X_legal_vif_num(int vif);
-static int	X_mrt_ioctl(int cmd, caddr_t data);
+static int	X_mrt_ioctl(u_long cmd, caddr_t data);
 
 static int get_sg_cnt(struct sioc_sg_req *);
 static int get_vif_cnt(struct sioc_vif_req *);
@@ -493,7 +492,7 @@ X_ip_mrouter_get(struct socket *so, struct sockopt *sopt)
  * Handle ioctl commands to obtain information from the cache
  */
 static int
-X_mrt_ioctl(int cmd, caddr_t data)
+X_mrt_ioctl(u_long cmd, caddr_t data)
 {
     int error = 0;
 
@@ -705,7 +704,7 @@ set_assert(int i)
 /*
  * Configure API capabilities
  */
-int
+static int
 set_api_config(uint32_t *apival)
 {
     int i;
@@ -1131,7 +1130,8 @@ socket_send(struct socket *s, struct mbuf *mm, struct sockaddr_in *src)
 	if (ssb_appendaddr(&s->so_rcv, (struct sockaddr *)src, mm, NULL) != 0) {
 	    sorwakeup(s);
 	    return 0;
-	}
+	} else
+	    soroverflow(s);
     }
     m_freem(mm);
     return -1;
@@ -1253,7 +1253,7 @@ X_ip_mforward(struct ip *ip, struct ifnet *ifp, struct mbuf *m,
 		return ENOBUFS;
 	}
 
-	mb0 = m_copypacket(m, MB_DONTWAIT);
+	mb0 = m_copypacket(m, M_NOWAIT);
 	if (mb0 && (M_HASCL(mb0) || mb0->m_len < hlen))
 	    mb0 = m_pullup(mb0, hlen);
 	if (mb0 == NULL) {
@@ -1624,7 +1624,7 @@ phyint_send(struct ip *ip, struct vif *vifp, struct mbuf *m)
      * the IP header is actually copied, not just referenced,
      * so that ip_output() only scribbles on the copy.
      */
-    mb_copy = m_copypacket(m, MB_DONTWAIT);
+    mb_copy = m_copypacket(m, M_NOWAIT);
     if (mb_copy && (M_HASCL(mb_copy) || mb_copy->m_len < hlen))
 	mb_copy = m_pullup(mb_copy, hlen);
     if (mb_copy == NULL)
@@ -1654,13 +1654,13 @@ encap_send(struct ip *ip, struct vif *vifp, struct mbuf *m)
      * new mbuf so we can modify it.  Try to fill the new
      * mbuf since if we don't the ethernet driver will.
      */
-    MGETHDR(mb_copy, MB_DONTWAIT, MT_HEADER);
+    MGETHDR(mb_copy, M_NOWAIT, MT_HEADER);
     if (mb_copy == NULL)
 	return;
     mb_copy->m_data += max_linkhdr;
     mb_copy->m_len = sizeof(multicast_encap_iphdr);
 
-    if ((mb_copy->m_next = m_copypacket(m, MB_DONTWAIT)) == NULL) {
+    if ((mb_copy->m_next = m_copypacket(m, M_NOWAIT)) == NULL) {
 	m_freem(mb_copy);
 	return;
     }
@@ -2199,6 +2199,7 @@ X_rsvp_input(struct mbuf **mp, int *offp, int proto)
 	m_freem(m);
 	if (opts)
 	    m_freem(opts);
+	soroverflow(so);
 	if (rsvpdebug)
 	    kprintf("rsvp_input: Failed to append to socket\n");
     }
@@ -2568,7 +2569,7 @@ bw_upcalls_send(void)
      * Allocate a new mbuf, initialize it with the header and
      * the payload for the pending calls.
      */
-    MGETHDR(m, MB_DONTWAIT, MT_HEADER);
+    MGETHDR(m, M_NOWAIT, MT_HEADER);
     if (m == NULL) {
 	log(LOG_WARNING, "bw_upcalls_send: cannot allocate mbuf\n");
 	return;
@@ -2857,7 +2858,7 @@ pim_register_prepare(struct ip *ip, struct mbuf *m)
      * Copy the old packet & pullup its IP header into the
      * new mbuf so we can modify it.
      */
-    mb_copy = m_copypacket(m, MB_DONTWAIT);
+    mb_copy = m_copypacket(m, M_NOWAIT);
     if (mb_copy == NULL)
 	return NULL;
     mb_copy = m_pullup(mb_copy, ip->ip_hl << 2);
@@ -2902,7 +2903,7 @@ pim_register_send_upcall(struct ip *ip, struct vif *vifp,
     /*
      * Add a new mbuf with an upcall header
      */
-    MGETHDR(mb_first, MB_DONTWAIT, MT_HEADER);
+    MGETHDR(mb_first, M_NOWAIT, MT_HEADER);
     if (mb_first == NULL) {
 	m_freem(mb_copy);
 	return ENOBUFS;
@@ -2960,7 +2961,7 @@ pim_register_send_rp(struct ip *ip, struct vif *vifp,
     /*
      * Add a new mbuf with the encapsulating header
      */
-    MGETHDR(mb_first, MB_DONTWAIT, MT_HEADER);
+    MGETHDR(mb_first, M_NOWAIT, MT_HEADER);
     if (mb_first == NULL) {
 	m_freem(mb_copy);
 	return ENOBUFS;

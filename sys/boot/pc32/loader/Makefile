@@ -27,10 +27,10 @@ HAVE_ISABUS=	yes
 
 BOOT_DLOADER=	yes
 CFLAGS+=	-I${.CURDIR}/../../dloader
-.if exists(${.OBJDIR}/../../dloader/libdloader.a)
-LIBDLOADER=	${.OBJDIR}/../../dloader/libdloader.a
+.if exists(${.OBJDIR}/../../dloader32/libdloader32.a)
+LIBDLOADER=	${.OBJDIR}/../../dloader32/libdloader32.a
 .else
-LIBDLOADER=	${.CURDIR}/../../dloader/libdloader.a
+LIBDLOADER=	${.CURDIR}/../../dloader32/libdloader32.a
 .endif
 
 .if defined(LOADER_BZIP2_SUPPORT)
@@ -58,12 +58,9 @@ CFLAGS+=	-I${.CURDIR}/..
 
 # where to get libstand from
 #XXX need a better way to do this
-LIBSTAND=	${.CURDIR}/../../../../lib/libstand/libstand.a
+LIBSTAND=	${.CURDIR}/../../libstand32/libstand32.a
 .if !exists(${LIBSTAND})
-LIBSTAND=	${.OBJDIR}/../../../../lib/libstand/libstand.a
-.if !exists(${LIBSTAND})
-LIBSTAND=	-lstand
-.endif
+LIBSTAND=	${.OBJDIR}/../../libstand32/libstand32.a
 .endif
 CFLAGS+=	-I${.CURDIR}/../../../../lib/libstand/
 
@@ -88,8 +85,8 @@ vers.o: vers.c
 	${CC} ${CFLAGS} -c vers.c
 
 ${PROG}: ${PROG}.bin ${BTXLDR} ${BTXKERN} ${BTXCRT}
-	btxld -v -f aout -e ${LOADER_ADDRESS} -o ${.TARGET} -l ${BTXLDR} \
-		-b ${BTXKERN} ${PROG}.bin
+	${.OBJDIR}/../btxld/btxld.nx -v -f aout -e ${LOADER_ADDRESS} \
+	    -o ${.TARGET} -l ${BTXLDR} -b ${BTXKERN} ${PROG}.bin
 
 ${PROG}.bin: ${PROG}.sym
 	cp ${.ALLSRC} ${.TARGET}
@@ -116,14 +113,3 @@ FILES+=	${.CURDIR}/dloader.rc
 ${PROG}.sym: ${OBJS} ${LIBI386} ${LIBSTAND} ${LIBDLOADER} vers.o
 	${CC} ${COMPILER_LDFLAGS} -o ${.TARGET} ${BTXCRT} ${OBJS} vers.o \
 		${LIBDLOADER} ${LIBI386} ${LIBSTAND}
-
-# If it's not there, don't consider it a target
-.if exists(${.CURDIR}/../../../i386/include)
-beforedepend ${OBJS}: machine
-
-machine:
-	${LN} -sf ${.CURDIR}/../../../i386/include machine
-
-.endif
-
-CLEANFILES+=	machine

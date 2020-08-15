@@ -53,8 +53,6 @@
 #include <sys/kthread.h>
 #include <sys/spinlock.h>
 
-#include <machine/inttypes.h>
-
 #include <sys/md5.h>
 
 #include <net/if.h>
@@ -130,8 +128,8 @@ struct spinlock pf_spin = SPINLOCK_INITIALIZER(pf_spin, "pf_spin");
 struct radix_node_head	*pf_maskhead;
 
 /* state tables */
-struct pf_state_tree	 pf_statetbl[MAXCPU+1];	/* incls one global table */
-
+struct pf_state_tree	 *pf_statetbl;		/* incls one global table */
+struct pf_state		**purge_cur;
 struct pf_altqqueue	 pf_altqs[2];
 struct pf_palist	 pf_pabuf;
 struct pf_altqqueue	*pf_altqs_active;
@@ -351,9 +349,10 @@ static __inline int pf_state_compare_rkey(struct pf_state_key *,
 static __inline int pf_state_compare_id(struct pf_state *,
 				struct pf_state *);
 
-struct pf_src_tree tree_src_tracking[MAXCPU];
-struct pf_state_tree_id tree_id[MAXCPU];
-struct pf_state_queue state_list[MAXCPU];
+struct pf_src_tree *tree_src_tracking;
+struct pf_state_tree_id *tree_id;
+struct pf_state_queue *state_list;
+struct pf_counters *pf_counters;
 
 RB_GENERATE(pf_src_tree, pf_src_node, entry, pf_src_compare);
 RB_GENERATE(pf_state_tree, pf_state_key, entry, pf_state_compare_key);
@@ -469,20 +468,20 @@ pf_src_connlimit(struct pf_state *state)
 	int bad = 0;
 	int cpu = mycpu->gd_cpuid;
 
-	state->src_node->conn++;
+	atomic_add_int(&state->src_node->conn, 1);
 	state->src.tcp_est = 1;
 	pf_add_threshold(&state->src_node->conn_rate);
 
 	if (state->rule.ptr->max_src_conn &&
 	    state->rule.ptr->max_src_conn <
 	    state->src_node->conn) {
-		pf_status.lcounters[LCNT_SRCCONN]++;
+		PF_INC_LCOUNTER(LCNT_SRCCONN);
 		bad++;
 	}
 
 	if (state->rule.ptr->max_src_conn_rate.limit &&
 	    pf_check_threshold(&state->src_node->conn_rate)) {
-		pf_status.lcounters[LCNT_SRCCONNRATE]++;
+		PF_INC_LCOUNTER(LCNT_SRCCONNRATE);
 		bad++;
 	}
 
@@ -493,7 +492,7 @@ pf_src_connlimit(struct pf_state *state)
 		struct pfr_addr p;
 		u_int32_t	killed = 0;
 
-		pf_status.lcounters[LCNT_OVERLOAD_TABLE]++;
+		PF_INC_LCOUNTER(LCNT_OVERLOAD_TABLE);
 		if (pf_status.debug >= PF_DEBUG_MISC) {
 			kprintf("pf_src_connlimit: blocking address ");
 			pf_print_host(&state->src_node->addr, 0,
@@ -525,7 +524,7 @@ pf_src_connlimit(struct pf_state *state)
 			struct pf_state_key *sk;
 			struct pf_state *st;
 
-			pf_status.lcounters[LCNT_OVERLOAD_FLUSH]++;
+			PF_INC_LCOUNTER(LCNT_OVERLOAD_FLUSH);
 			RB_FOREACH(st, pf_state_tree_id, &tree_id[cpu]) {
 				sk = st->key[PF_SK_WIRE];
 				/*
@@ -571,6 +570,7 @@ pf_insert_src_node(struct pf_src_node **sn, struct pf_rule *rule,
 	struct pf_src_node	k;
 	int cpu = mycpu->gd_cpuid;
 
+	bzero(&k, sizeof(k));	/* avoid gcc warnings */
 	if (*sn == NULL) {
 		k.af = af;
 		PF_ACPY(&k.addr, src, af);
@@ -579,7 +579,7 @@ pf_insert_src_node(struct pf_src_node **sn, struct pf_rule *rule,
 			k.rule.ptr = rule;
 		else
 			k.rule.ptr = NULL;
-		pf_status.scounters[SCNT_SRC_NODE_SEARCH]++;
+		PF_INC_SCOUNTER(SCNT_SRC_NODE_SEARCH);
 		*sn = RB_FIND(pf_src_tree, &tree_src_tracking[cpu], &k);
 	}
 	if (*sn == NULL) {
@@ -588,7 +588,7 @@ pf_insert_src_node(struct pf_src_node **sn, struct pf_rule *rule,
 			(*sn) = kmalloc(sizeof(struct pf_src_node),
 					M_PFSRCTREEPL, M_NOWAIT|M_ZERO);
 		else
-			pf_status.lcounters[LCNT_SRCNODES]++;
+			PF_INC_LCOUNTER(LCNT_SRCNODES);
 		if ((*sn) == NULL)
 			return (-1);
 
@@ -623,12 +623,12 @@ pf_insert_src_node(struct pf_src_node **sn, struct pf_rule *rule,
 		(*sn)->ruletype = rule->action;
 		if ((*sn)->rule.ptr != NULL)
 			atomic_add_int(&(*sn)->rule.ptr->src_nodes, 1);
-		pf_status.scounters[SCNT_SRC_NODE_INSERT]++;
+		PF_INC_SCOUNTER(SCNT_SRC_NODE_INSERT);
 		atomic_add_int(&pf_status.src_nodes, 1);
 	} else {
 		if (rule->max_src_states &&
 		    (*sn)->states >= rule->max_src_states) {
-			pf_status.lcounters[LCNT_SRCSTATES]++;
+			PF_INC_LCOUNTER(LCNT_SRCSTATES);
 			return (-1);
 		}
 	}
@@ -813,7 +813,7 @@ pf_state_key_attach(struct pf_state_key *sk, struct pf_state *s, int idx)
 	 * in the state.
 	 */
 	if (s->state_flags & PFSTATE_STACK_GLOBAL) {
-		cpu = MAXCPU;
+		cpu = ncpus;
 		lockmgr(&pf_global_statetbl_lock, LK_EXCLUSIVE);
 	} else {
 		cpu = mycpu->gd_cpuid;
@@ -856,9 +856,9 @@ pf_state_key_attach(struct pf_state_key *sk, struct pf_state *s, int idx)
 	 * pf_global_statetbl_lock will be locked shared when testing and
 	 * not entering into the global state table.
 	 */
-	if (cpu != MAXCPU &&
+	if (cpu != ncpus &&
 	    (cur = RB_FIND(pf_state_rtree,
-			   (struct pf_state_rtree *)&pf_statetbl[MAXCPU],
+			   (struct pf_state_rtree *)&pf_statetbl[ncpus],
 			   sk)) != NULL) {
 		TAILQ_FOREACH(si, &cur->states, entry) {
 			/*
@@ -972,7 +972,7 @@ pf_state_key_detach(struct pf_state *s, int idx)
 	 * statetbl tree for this case.
 	 */
 	if (s->state_flags & PFSTATE_STACK_GLOBAL) {
-		cpu = MAXCPU;
+		cpu = ncpus;
 		lockmgr(&pf_global_statetbl_lock, LK_EXCLUSIVE);
 	} else {
 		cpu = mycpu->gd_cpuid;
@@ -1122,7 +1122,7 @@ pf_state_insert(struct pfi_kif *kif, struct pf_state_key *skw,
 		return (-1);
 	}
 	TAILQ_INSERT_TAIL(&state_list[cpu], s, entry_list);
-	pf_status.fcounters[FCNT_STATE_INSERT]++;
+	PF_INC_FCOUNTER(FCNT_STATE_INSERT);
 	atomic_add_int(&pf_status.states, 1);
 	pfi_kif_ref(kif, PFI_KIF_REF_STATE);
 	pfsync_insert_state(s);
@@ -1134,7 +1134,7 @@ pf_find_state_byid(struct pf_state_cmp *key)
 {
 	int cpu = mycpu->gd_cpuid;
 
-	pf_status.fcounters[FCNT_STATE_SEARCH]++;
+	PF_INC_FCOUNTER(FCNT_STATE_SEARCH);
 
 	return (RB_FIND(pf_state_tree_id, &tree_id[cpu],
 			(struct pf_state *)key));
@@ -1156,7 +1156,7 @@ pf_find_state(struct pfi_kif *kif, struct pf_state_key_cmp *key, u_int dir,
 	int cpu = mycpu->gd_cpuid;
 	int globalstl = 0;
 
-	pf_status.fcounters[FCNT_STATE_SEARCH]++;
+	PF_INC_FCOUNTER(FCNT_STATE_SEARCH);
 
 	if (dir == PF_OUT && m->m_pkthdr.pf.statekey &&
 	    ((struct pf_state_key *)m->m_pkthdr.pf.statekey)->reverse) {
@@ -1165,7 +1165,7 @@ pf_find_state(struct pfi_kif *kif, struct pf_state_key_cmp *key, u_int dir,
 		sk = RB_FIND(pf_state_tree, &pf_statetbl[cpu], skey);
 		if (sk == NULL) {
 			lockmgr(&pf_global_statetbl_lock, LK_SHARED);
-			sk = RB_FIND(pf_state_tree, &pf_statetbl[MAXCPU], skey);
+			sk = RB_FIND(pf_state_tree, &pf_statetbl[ncpus], skey);
 			if (sk == NULL) {
 				lockmgr(&pf_global_statetbl_lock, LK_RELEASE);
 				return (NULL);
@@ -1224,12 +1224,12 @@ pf_find_state_all(struct pf_state_key_cmp *key, u_int dir, int *more)
 	int cpu = mycpu->gd_cpuid;
 	int globalstl = 0;
 
-	pf_status.fcounters[FCNT_STATE_SEARCH]++;
+	PF_INC_FCOUNTER(FCNT_STATE_SEARCH);
 
 	sk = RB_FIND(pf_state_tree, &pf_statetbl[cpu], skey);
 	if (sk == NULL) {
 		lockmgr(&pf_global_statetbl_lock, LK_SHARED);
-		sk = RB_FIND(pf_state_tree, &pf_statetbl[MAXCPU], skey);
+		sk = RB_FIND(pf_state_tree, &pf_statetbl[ncpus], skey);
 		globalstl = 1;
 	}
 	if (sk != NULL) {
@@ -1371,12 +1371,49 @@ pf_state_expires(const struct pf_state *state)
 		end = pf_default_rule.timeout[PFTM_ADAPTIVE_END];
 		states = pf_status.states;
 	}
+
+	/*
+	 * If the number of states exceeds allowed values, adaptively
+	 * timeout the state more quickly.  This can be very dangerous
+	 * to legitimate connections, however, so defray the timeout
+	 * based on the packet count.
+	 *
+	 * Retain from 0-100% based on number of states.
+	 *
+	 * Recover up to 50% of the lost portion if there was
+	 * packet traffic (100 pkts = 50%).
+	 */
 	if (end && states > start && start < end) {
-		if (states < end)
-			return (state->expire + timeout * (end - states) /
-			    (end - start));
+		u_int32_t n;			/* timeout retention 0-100% */
+		u_int64_t pkts;
+#if 0
+		static struct krate boorate = { .freq = 1 };
+#endif
+
+		/*
+		 * Reduce timeout by n% (0-100)
+		 */
+		n = (states - start) * 100 / (end - start);
+		if (n > 100)
+			n = 0;
 		else
-			return (time_second);
+			n = 100 - n;
+
+		/*
+		 * But claw back some of the reduction based on packet
+		 * count associated with the state.
+		 */
+		pkts = state->packets[0] + state->packets[1];
+		if (pkts > 100)
+			pkts = 100;
+#if 0
+		krateprintf(&boorate, "timeout %-4u n=%u pkts=%-3lu -> %lu\n",
+			timeout, n, pkts, n + (100 - n) * pkts / 200);
+#endif
+
+		n += (100 - n) * pkts / 200;	/* recover by up-to 50% */
+		timeout = timeout * n / 100;
+
 	}
 	return (state->expire + timeout);
 }
@@ -1408,13 +1445,13 @@ pf_purge_expired_src_nodes(int waslocked)
 				 * decrements in rule should be ok, token is
 				 * held exclusively in this code path.
 				 */
-				 cur->rule.ptr->src_nodes--;
+				 atomic_add_int(&cur->rule.ptr->src_nodes, -1);
 				 if (cur->rule.ptr->states_cur <= 0 &&
 				     cur->rule.ptr->max_src_nodes <= 0)
 					 pf_rm_rule(NULL, cur->rule.ptr);
 			 }
 			 RB_REMOVE(pf_src_tree, &tree_src_tracking[cpu], cur);
-			 pf_status.scounters[SCNT_SRC_NODE_REMOVALS]++;
+			 PF_INC_SCOUNTER(SCNT_SRC_NODE_REMOVALS);
 			 atomic_add_int(&pf_status.src_nodes, -1);
 			 kfree(cur, M_PFSRCTREEPL);
 		}
@@ -1431,7 +1468,7 @@ pf_src_tree_remove_state(struct pf_state *s)
 
 	if (s->src_node != NULL) {
 		if (s->src.tcp_est)
-			--s->src_node->conn;
+			atomic_add_int(&s->src_node->conn, -1);
 		if (--s->src_node->states <= 0) {
 			timeout = s->rule.ptr->timeout[PFTM_SRC_NODE];
 			if (!timeout) {
@@ -1476,8 +1513,6 @@ pf_unlink_state(struct pf_state *cur)
 	pf_src_tree_remove_state(cur);
 	pf_detach_state(cur);
 }
-
-static struct pf_state	*purge_cur[MAXCPU];
 
 /*
  * callers should be at crit_enter() and hold pf_consistency_lock exclusively.
@@ -1527,7 +1562,7 @@ pf_free_state(struct pf_state *cur)
 	if (cur->tag)
 		pf_tag_unref(cur->tag);
 	kfree(cur, M_PFSTATEPL);
-	pf_status.fcounters[FCNT_STATE_REMOVALS]++;
+	PF_INC_FCOUNTER(FCNT_STATE_REMOVALS);
 	atomic_add_int(&pf_status.states, -1);
 }
 
@@ -1632,34 +1667,33 @@ pf_print_host(struct pf_addr *addr, u_int16_t p, sa_family_t af)
 #ifdef INET6
 	case AF_INET6: {
 		u_int16_t b;
-		u_int8_t i, curstart = 255, curend = 0,
-		    maxstart = 0, maxend = 0;
+		u_int8_t i, curstart, curend, maxstart, maxend;
+		curstart = curend = maxstart = maxend = 255;
 		for (i = 0; i < 8; i++) {
 			if (!addr->addr16[i]) {
 				if (curstart == 255)
 					curstart = i;
-				else
-					curend = i;
+				curend = i;
 			} else {
-				if (curstart) {
-					if ((curend - curstart) >
-					    (maxend - maxstart)) {
-						maxstart = curstart;
-						maxend = curend;
-						curstart = 255;
-					}
+				if ((curend - curstart) >
+				    (maxend - maxstart)) {
+					maxstart = curstart;
+					maxend = curend;
 				}
+				curstart = curend = 255;
 			}
+		}
+		if ((curend - curstart) >
+		    (maxend - maxstart)) {
+			maxstart = curstart;
+			maxend = curend;
 		}
 		for (i = 0; i < 8; i++) {
 			if (i >= maxstart && i <= maxend) {
-				if (maxend != 7) {
-					if (i == maxstart)
-						kprintf(":");
-				} else {
-					if (i == maxend)
-						kprintf(":");
-				}
+				if (i == 0)
+					kprintf(":");
+				if (i == maxend)
+					kprintf(":");
 			} else {
 				b = ntohs(addr->addr16[i]);
 				kprintf("%x", b);
@@ -2143,7 +2177,7 @@ pf_send_tcp(const struct pf_rule *r, sa_family_t af,
 	 * DragonFly doesn't zero the auxillary pkghdr fields, only fw_flags,
 	 * so make sure pf.flags is clear.
 	 */
-	m = m_gethdr(MB_DONTWAIT, MT_HEADER);
+	m = m_gethdr(M_NOWAIT, MT_HEADER);
 	if (m == NULL) {
 		return;
 	}
@@ -2677,6 +2711,8 @@ pf_map_addr(sa_family_t af, struct pf_rule *r, struct pf_addr *saddr,
 	int cpu = mycpu->gd_cpuid;
 	int tblidx;
 
+	bzero(hash, sizeof(hash));	/* avoid gcc warnings */
+
 	/*
 	 * NOTE! rpool->cur and rpool->tblidx can be iterators and thus
 	 *	 may represent a SMP race due to the shared nature of the
@@ -2697,7 +2733,7 @@ pf_map_addr(sa_family_t af, struct pf_rule *r, struct pf_addr *saddr,
 			k.rule.ptr = r;
 		else
 			k.rule.ptr = NULL;
-		pf_status.scounters[SCNT_SRC_NODE_SEARCH]++;
+		PF_INC_SCOUNTER(SCNT_SRC_NODE_SEARCH);
 		*sn = RB_FIND(pf_src_tree, &tree_src_tracking[cpu], &k);
 		if (*sn != NULL && !PF_AZERO(&(*sn)->raddr, af)) {
 			PF_ACPY(naddr, &(*sn)->raddr, af);
@@ -2881,7 +2917,8 @@ pf_get_sport(struct pf_pdesc *pd, sa_family_t af,
 	struct pf_state_key_cmp	key;
 	struct pf_addr		init_addr;
 	u_int16_t		cut;
-	u_int32_t		toeplitz_sport;
+	u_int32_t		hash_base = 0;
+	int			do_hash = 0;
 
 	bzero(&init_addr, sizeof(init_addr));
 	if (pf_map_addr(af, r, saddr, naddr, &init_addr, sn))
@@ -2912,16 +2949,17 @@ pf_get_sport(struct pf_pdesc *pd, sa_family_t af,
 		 */
 		switch(af) {
 		case AF_INET:
-			toeplitz_sport =
-				toeplitz_piecemeal_port(sport) ^
-				toeplitz_piecemeal_addr(saddr->v4.s_addr) ^
-				toeplitz_piecemeal_addr(naddr->v4.s_addr);
+			if (proto == IPPROTO_TCP) {
+				do_hash = 1;
+				hash_base = toeplitz_piecemeal_port(dport) ^
+				    toeplitz_piecemeal_addr(daddr->v4.s_addr) ^
+				    toeplitz_piecemeal_addr(naddr->v4.s_addr);
+			}
 			break;
 		case AF_INET6:
 			/* XXX TODO XXX */
 		default:
 			/* XXX TODO XXX */
-			toeplitz_sport = 0;
 			break;
 		}
 
@@ -2988,9 +3026,13 @@ pf_get_sport(struct pf_pdesc *pd, sa_family_t af,
 			/* low <= cut <= high */
 			for (tmp = cut; tmp <= high; ++(tmp)) {
 				key.port[1] = htons(tmp);
-				if ((toeplitz_piecemeal_port(key.port[1]) ^
-				     toeplitz_sport) & ncpus2_mask) {
-					continue;
+				if (do_hash) {
+					uint32_t hash;
+
+					hash = hash_base ^
+					toeplitz_piecemeal_port(key.port[1]);
+					if (netisr_hashcpu(hash) != mycpuid)
+						continue;
 				}
 				if (pf_find_state_all(&key, PF_IN, NULL) ==
 				    NULL && !in_baddynamic(tmp, proto)) {
@@ -3002,9 +3044,13 @@ pf_get_sport(struct pf_pdesc *pd, sa_family_t af,
 			}
 			for (tmp = cut - 1; tmp >= low; --(tmp)) {
 				key.port[1] = htons(tmp);
-				if ((toeplitz_piecemeal_port(key.port[1]) ^
-				     toeplitz_sport) & ncpus2_mask) {
-					continue;
+				if (do_hash) {
+					uint32_t hash;
+
+					hash = hash_base ^
+					toeplitz_piecemeal_port(key.port[1]);
+					if (netisr_hashcpu(hash) != mycpuid)
+						continue;
 				}
 				if (pf_find_state_all(&key, PF_IN, NULL) ==
 				    NULL && !in_baddynamic(tmp, proto)) {
@@ -4077,7 +4123,7 @@ pf_create_state(struct pf_rule *r, struct pf_rule *nr, struct pf_rule *a,
 
 	/* check maximums */
 	if (r->max_states && (r->states_cur >= r->max_states)) {
-		pf_status.lcounters[LCNT_STATES]++;
+		PF_INC_LCOUNTER(LCNT_STATES);
 		REASON_SET(&reason, PFRES_MAXSTATES);
 		return (PF_DROP);
 	}
@@ -4275,13 +4321,13 @@ csfailed:
 
 	if (sn != NULL && sn->states == 0 && sn->expire == 0) {
 		RB_REMOVE(pf_src_tree, &tree_src_tracking[cpu], sn);
-		pf_status.scounters[SCNT_SRC_NODE_REMOVALS]++;
+		PF_INC_SCOUNTER(SCNT_SRC_NODE_REMOVALS);
 		atomic_add_int(&pf_status.src_nodes, -1);
 		kfree(sn, M_PFSRCTREEPL);
 	}
 	if (nsn != sn && nsn != NULL && nsn->states == 0 && nsn->expire == 0) {
 		RB_REMOVE(pf_src_tree, &tree_src_tracking[cpu], nsn);
-		pf_status.scounters[SCNT_SRC_NODE_REMOVALS]++;
+		PF_INC_SCOUNTER(SCNT_SRC_NODE_REMOVALS);
 		atomic_add_int(&pf_status.src_nodes, -1);
 		kfree(nsn, M_PFSRCTREEPL);
 	}
@@ -4598,6 +4644,9 @@ pf_tcp_track_full(struct pf_state_peer *src, struct pf_state_peer *dst,
 		else if (src->state >= TCPS_CLOSING ||
 		    dst->state >= TCPS_CLOSING)
 			(*state)->timeout = PFTM_TCP_CLOSING;
+		else if ((th->th_flags & TH_SYN) &&
+			 ((*state)->state_flags & PFSTATE_SLOPPY))
+			(*state)->timeout = PFTM_TCP_FIRST_PACKET;
 		else
 			(*state)->timeout = PFTM_TCP_ESTABLISHED;
 
@@ -4800,6 +4849,9 @@ pf_tcp_track_sloppy(struct pf_state_peer *src, struct pf_state_peer *dst,
 	else if (src->state >= TCPS_CLOSING ||
 	    dst->state >= TCPS_CLOSING)
 		(*state)->timeout = PFTM_TCP_CLOSING;
+	else if ((th->th_flags & TH_SYN) &&
+		 ((*state)->state_flags & PFSTATE_SLOPPY))
+		(*state)->timeout = PFTM_TCP_FIRST_PACKET;
 	else
 		(*state)->timeout = PFTM_TCP_ESTABLISHED;
 
@@ -5123,8 +5175,8 @@ pf_test_state_icmp(struct pf_state **state, int direction, struct pfi_kif *kif,
 		   u_short *reason)
 {
 	struct pf_addr	*saddr = pd->src, *daddr = pd->dst;
-	u_int16_t	 icmpid = 0, *icmpsum;
-	u_int8_t	 icmptype;
+	u_int16_t	 icmpid = 0, *icmpsum = NULL;
+	u_int8_t	 icmptype = 0;
 	int		 state_icmp = 0;
 	int		 error;
 	struct pf_state_key_cmp key;
@@ -5897,6 +5949,12 @@ pf_routable(struct pf_addr *addr, sa_family_t af, struct pfi_kif *kif)
 		break;
 #ifdef INET6
 	case AF_INET6:
+		/*
+		 * Skip check for addresses with embedded interface scope,
+		 * as they would always match anyway.
+		 */
+		if (IN6_IS_SCOPE_EMBED(&addr->v6))
+			goto out;
 		dst6 = (struct sockaddr_in6 *)&ro.ro_dst;
 		dst6->sin6_family = AF_INET6;
 		dst6->sin6_len = sizeof(*dst6);
@@ -6000,9 +6058,6 @@ pf_route(struct mbuf **m, struct pf_rule *r, int dir, struct ifnet *oifp,
 	struct pf_src_node	*sn = NULL;
 	int			 error = 0;
 	int sw_csum;
-#ifdef IPSEC
-	struct m_tag		*mtag;
-#endif /* IPSEC */
 
 	ASSERT_LWKT_TOKEN_HELD(&pf_token);
 
@@ -6022,7 +6077,7 @@ pf_route(struct mbuf **m, struct pf_rule *r, int dir, struct ifnet *oifp,
 	}
 
 	if (r->rt == PF_DUPTO) {
-		if ((m0 = m_dup(*m, MB_DONTWAIT)) == NULL) {
+		if ((m0 = m_dup(*m, M_NOWAIT)) == NULL) {
 			return;
 		}
 	} else {
@@ -6212,7 +6267,7 @@ pf_route6(struct mbuf **m, struct pf_rule *r, int dir, struct ifnet *oifp,
 	}
 
 	if (r->rt == PF_DUPTO) {
-		if ((m0 = m_dup(*m, MB_DONTWAIT)) == NULL)
+		if ((m0 = m_dup(*m, M_NOWAIT)) == NULL)
 			return;
 	} else {
 		if ((r->rt == PF_REPLYTO) == (r->direction == dir))
@@ -6288,7 +6343,7 @@ pf_route6(struct mbuf **m, struct pf_rule *r, int dir, struct ifnet *oifp,
 	 * If the packet is too large for the outgoing interface,
 	 * send back an icmp6 error.
 	 */
-	if (IN6_IS_ADDR_LINKLOCAL(&dst->sin6_addr))
+	if (IN6_IS_SCOPE_EMBED(&dst->sin6_addr))
 		dst->sin6_addr.s6_addr16[1] = htons(ifp->if_index);
 	if ((u_long)m0->m_pkthdr.len <= ifp->if_mtu) {
 		nd6_output(ifp, ifp, m0, dst, NULL);
@@ -6482,6 +6537,11 @@ pf_test(int dir, struct ifnet *ifp, struct mbuf **m0,
 #ifdef ALTQ
 	int			 pqid = 0;
 #endif
+
+	if (m->m_pkthdr.fw_flags & IPFW_MBUF_CONTINUE) {
+		/* Skip us; continue in ipfw. */
+		return (PF_PASS);
+	}
 
 	if (!pf_status.running)
 		return (PF_PASS);

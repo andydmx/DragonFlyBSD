@@ -39,18 +39,16 @@
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/sockio.h>
-
-#include <stdlib.h>
-#include <unistd.h>
-
-#include <net/ethernet.h>
 #include <net/if.h>
-#include <net/bridge/if_bridgevar.h>
 #include <net/route.h>
+#include <net/ethernet.h>
+#include <net/bridge/if_bridgevar.h>
 
 #include <ctype.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 #include <err.h>
 #include <errno.h>
 
@@ -121,7 +119,7 @@ bridge_interfaces(int s, const char *prefix)
 	struct ifbreq *req;
 	char *inbuf = NULL, *ninbuf;
 	char *p, *pad;
-	int i, len = 8192;
+	size_t i, len = 8192;
 
 	pad = strdup(prefix);
 	if (pad == NULL)
@@ -150,14 +148,13 @@ bridge_interfaces(int s, const char *prefix)
 		printf("%s%s ", prefix, req->ifbr_ifsname);
 		printb("flags", req->ifbr_ifsflags, IFBIFBITS);
 		printf("\n");
-		
+
 		if (req->ifbr_ifsflags & IFBIF_STP) {
 			printf("%s", pad);
 			printf("port %u priority %u",
 			    req->ifbr_portno, req->ifbr_priority);
 			printf(" pathcost %u", req->ifbr_path_cost);
-			if (req->ifbr_state <
-			    sizeof(stpstates) / sizeof(stpstates[0]))
+			if (req->ifbr_state < nitems(stpstates))
 				printf(" %s", stpstates[req->ifbr_state]);
 			else
 				printf(" <unknown state %d>",
@@ -166,18 +163,18 @@ bridge_interfaces(int s, const char *prefix)
 			printf("%sbondweight %u\n",
 				pad, req->ifbr_bond_weight);
 			printf("%sdesignated root:   %016jx\n",
-				pad, (intmax_t)req->ifbr_designated_root);
+				pad, (uintmax_t)req->ifbr_designated_root);
 			printf("%sdesignated bridge: %016jx\n",
-				pad, (intmax_t)req->ifbr_designated_bridge);
+				pad, (uintmax_t)req->ifbr_designated_bridge);
 			printf("%sdesignated cost:   %u\n",
 				pad, req->ifbr_designated_cost);
 			printf("%sdesignated port:   %u\n",
 				pad, req->ifbr_designated_port);
 			if (verbose) {
 				printf("%speer root:   %016jx\n",
-					pad, (intmax_t)req->ifbr_peer_root);
+					pad, (uintmax_t)req->ifbr_peer_root);
 				printf("%speer bridge: %016jx\n",
-					pad, (intmax_t)req->ifbr_peer_bridge);
+					pad, (uintmax_t)req->ifbr_peer_bridge);
 				printf("%speer cost:   %u\n",
 					pad, req->ifbr_peer_cost);
 				printf("%speer port:   %u\n",
@@ -194,9 +191,9 @@ bridge_addresses(int s, const char *prefix)
 {
 	struct ifbaconf ifbac;
 	struct ifbareq *ifba;
-	char *inbuf = NULL, *ninbuf;
-	int i, len = 8192;
 	struct ether_addr ea;
+	char *inbuf = NULL, *ninbuf;
+	size_t i, len = 8192;
 
 	for (;;) {
 		ninbuf = realloc(inbuf, len);
@@ -593,11 +590,9 @@ static struct afswtch af_bridge = {
 static __constructor(101) void
 bridge_ctor(void)
 {
-#define	N(a)	(sizeof(a) / sizeof(a[0]))
-	int i;
+	size_t i;
 
-	for (i = 0; i < N(bridge_cmds);  i++)
+	for (i = 0; i < nitems(bridge_cmds);  i++)
 		cmd_register(&bridge_cmds[i]);
 	af_register(&af_bridge);
-#undef N
 }

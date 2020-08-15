@@ -10,7 +10,7 @@ CFLAGS+=	-DBTX_FLAGS=${BOOT_BTX_FLAGS}
 
 .if defined(BTX_SERIAL)
 BOOT_COMCONSOLE_PORT?= 0x3f8
-BOOT_COMCONSOLE_SPEED?= 9600
+BOOT_COMCONSOLE_SPEED?= 115200
 B2SIOFMT?=	0x3
 
 CFLAGS+=	-DBTX_SERIAL -DSIOPRT=${BOOT_COMCONSOLE_PORT} \
@@ -20,7 +20,7 @@ CFLAGS+=	-DBTX_SERIAL -DSIOPRT=${BOOT_COMCONSOLE_PORT} \
 all: btx
 
 btx: btx.o
-	${LD} ${LDFLAGS} -N -e start \
+	${LD} ${LDFLAGS:N-Wl,*} -N -e start \
 	--script ${.CURDIR}/btx.ldscript -o btx.out btx.o
 	objcopy -S -O binary btx.out ${.TARGET}
 

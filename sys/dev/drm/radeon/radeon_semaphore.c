@@ -22,87 +22,77 @@
  * next paragraph) shall be included in all copies or substantial portions
  * of the Software.
  *
- * $FreeBSD: head/sys/dev/drm2/radeon/radeon_semaphore.c 254885 2013-08-25 19:37:15Z dumbbell $
  */
-
 /*
  * Authors:
  *    Christian König <deathsimple@vodafone.de>
  */
 #include <drm/drmP.h>
 #include "radeon.h"
-
+#ifdef TRACE_TODO
+#include "radeon_trace.h"
+#endif
 
 int radeon_semaphore_create(struct radeon_device *rdev,
 			    struct radeon_semaphore **semaphore)
 {
 	int r;
 
-	*semaphore = kmalloc(sizeof(struct radeon_semaphore), M_DRM,
-			     M_WAITOK);
+	*semaphore = kmalloc(sizeof(struct radeon_semaphore), M_DRM, GFP_KERNEL);
 	if (*semaphore == NULL) {
 		return -ENOMEM;
 	}
 	r = radeon_sa_bo_new(rdev, &rdev->ring_tmp_bo,
-			     &(*semaphore)->sa_bo, 8, 8, true);
+			     &(*semaphore)->sa_bo, 8, 8);
 	if (r) {
-		drm_free(*semaphore, M_DRM);
+		kfree(*semaphore);
 		*semaphore = NULL;
 		return r;
 	}
 	(*semaphore)->waiters = 0;
 	(*semaphore)->gpu_addr = radeon_sa_bo_gpu_addr((*semaphore)->sa_bo);
-	*((uint64_t*)radeon_sa_bo_cpu_addr((*semaphore)->sa_bo)) = 0;
-	return 0;
-}
 
-void radeon_semaphore_emit_signal(struct radeon_device *rdev, int ring,
-			          struct radeon_semaphore *semaphore)
-{
-	--semaphore->waiters;
-	radeon_semaphore_ring_emit(rdev, ring, &rdev->ring[ring], semaphore, false);
-}
-
-void radeon_semaphore_emit_wait(struct radeon_device *rdev, int ring,
-			        struct radeon_semaphore *semaphore)
-{
-	++semaphore->waiters;
-	radeon_semaphore_ring_emit(rdev, ring, &rdev->ring[ring], semaphore, true);
-}
-
-/* caller must hold ring lock */
-int radeon_semaphore_sync_rings(struct radeon_device *rdev,
-				struct radeon_semaphore *semaphore,
-				int signaler, int waiter)
-{
-	int r;
-
-	/* no need to signal and wait on the same ring */
-	if (signaler == waiter) {
-		return 0;
-	}
-
-	/* prevent GPU deadlocks */
-	if (!rdev->ring[signaler].ready) {
-		dev_err(rdev->dev, "Trying to sync to a disabled ring!");
-		return -EINVAL;
-	}
-
-	r = radeon_ring_alloc(rdev, &rdev->ring[signaler], 8);
-	if (r) {
-		return r;
-	}
-	radeon_semaphore_emit_signal(rdev, signaler, semaphore);
-	radeon_ring_commit(rdev, &rdev->ring[signaler]);
-
-	/* we assume caller has already allocated space on waiters ring */
-	radeon_semaphore_emit_wait(rdev, waiter, semaphore);
-
-	/* for debugging lockup only, used by sysfs debug files */
-	rdev->ring[signaler].last_semaphore_signal_addr = semaphore->gpu_addr;
-	rdev->ring[waiter].last_semaphore_wait_addr = semaphore->gpu_addr;
+	*((uint64_t *)radeon_sa_bo_cpu_addr((*semaphore)->sa_bo)) = 0;
 
 	return 0;
+}
+
+bool radeon_semaphore_emit_signal(struct radeon_device *rdev, int ridx,
+				  struct radeon_semaphore *semaphore)
+{
+	struct radeon_ring *ring = &rdev->ring[ridx];
+
+#ifdef TRACE_TODO
+	trace_radeon_semaphore_signale(ridx, semaphore);
+#endif
+
+	if (radeon_semaphore_ring_emit(rdev, ridx, ring, semaphore, false)) {
+		--semaphore->waiters;
+
+		/* for debugging lockup only, used by sysfs debug files */
+		ring->last_semaphore_signal_addr = semaphore->gpu_addr;
+		return true;
+	}
+	return false;
+}
+
+bool radeon_semaphore_emit_wait(struct radeon_device *rdev, int ridx,
+				struct radeon_semaphore *semaphore)
+{
+	struct radeon_ring *ring = &rdev->ring[ridx];
+
+#ifdef TRACE_TODO
+	trace_radeon_semaphore_wait(ridx, semaphore);
+#endif
+
+	if (radeon_semaphore_ring_emit(rdev, ridx, ring, semaphore, true)) {
+		++semaphore->waiters;
+
+		/* for debugging lockup only, used by sysfs debug files */
+		ring->last_semaphore_wait_addr = semaphore->gpu_addr;
+		return true;
+	}
+	return false;
 }
 
 void radeon_semaphore_free(struct radeon_device *rdev,
@@ -117,6 +107,6 @@ void radeon_semaphore_free(struct radeon_device *rdev,
 			" hardware lockup imminent!\n", *semaphore);
 	}
 	radeon_sa_bo_free(rdev, &(*semaphore)->sa_bo, fence);
-	drm_free(*semaphore, M_DRM);
+	kfree(*semaphore);
 	*semaphore = NULL;
 }

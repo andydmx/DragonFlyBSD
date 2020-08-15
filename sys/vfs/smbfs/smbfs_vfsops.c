@@ -84,6 +84,7 @@ static int smbfs_init(struct vfsconf *vfsp);
 static int smbfs_uninit(struct vfsconf *vfsp);
 
 static struct vfsops smbfs_vfsops = {
+	.vfs_flags =		0,
 	.vfs_mount =    	smbfs_mount,
 	.vfs_unmount =    	smbfs_unmount,
 	.vfs_root =    		smbfs_root,
@@ -101,7 +102,7 @@ MODULE_DEPEND(smbfs, netsmb, NSMB_VERSION, NSMB_VERSION, NSMB_VERSION);
 MODULE_DEPEND(smbfs, libiconv, 1, 1, 2);
 MODULE_DEPEND(smbfs, libmchain, 1, 1, 1);
 
-long smbfs_pbuf_freecnt = -1;	/* start out unlimited */
+int smbfs_pbuf_freecnt = -1;	/* start out unlimited */
 
 static int
 smbfs_mount(struct mount *mp, char *path, caddr_t data, struct ucred *cred)
@@ -113,6 +114,7 @@ smbfs_mount(struct mount *mp, char *path, caddr_t data, struct ucred *cred)
 	struct vnode *vp;
 	struct smb_cred scred;
 	int error;
+	int hsize;
 	char *pc, *pe;
 
 	if (data == NULL) {
@@ -144,7 +146,9 @@ smbfs_mount(struct mount *mp, char *path, caddr_t data, struct ucred *cred)
 	smp = kmalloc(sizeof(*smp), M_SMBFSDATA, M_WAITOK | M_USE_RESERVE | M_ZERO);
 	mp->mnt_data = (qaddr_t)smp;
 	smp->sm_cred = crhold(cred);
-	smp->sm_hash = hashinit(desiredvnodes, M_SMBFSHASH, &smp->sm_hashlen);
+
+	hsize = vfs_inodehashsize();
+	smp->sm_hash = hashinit(hsize, M_SMBFSHASH, &smp->sm_hashlen);
 	if (smp->sm_hash == NULL)
 		goto bad;
 	lockinit(&smp->sm_hashlock, "smbfsh", 0, 0);
@@ -231,6 +235,9 @@ smbfs_unmount(struct mount *mp, int mntflags)
 	if (error)
 		return error;
 	smb_makescred(&scred, curthread, smp->sm_cred);
+	error = smb_share_lock(smp->sm_share, LK_EXCLUSIVE);
+	if (error)
+		goto out;
 	smb_share_put(smp->sm_share, &scred);
 	mp->mnt_data = (qaddr_t)0;
 
@@ -241,6 +248,7 @@ smbfs_unmount(struct mount *mp, int mntflags)
 	lockdestroy(&smp->sm_hashlock);
 	kfree(smp, M_SMBFSDATA);
 	mp->mnt_flag &= ~MNT_LOCAL;
+out:
 	return error;
 }
 
@@ -290,7 +298,7 @@ smbfs_root(struct mount *mp, struct vnode **vpp)
 int
 smbfs_init(struct vfsconf *vfsp)
 {
-	smbfs_pbuf_freecnt = nswbuf / 2 + 1;
+	smbfs_pbuf_freecnt = nswbuf_kva / 2 + 1;
 	SMBVDEBUG("done.\n");
 	return 0;
 }

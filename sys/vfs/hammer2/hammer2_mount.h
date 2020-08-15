@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2011-2014 The DragonFly Project.  All rights reserved.
+ * Copyright (c) 2011-2018 The DragonFly Project.  All rights reserved.
  *
  * This code is derived from software contributed to The DragonFly Project
  * by Matthew Dillon <dillon@backplane.com>
@@ -44,13 +44,16 @@
  */
 struct hammer2_mount_info {
 	const char	*volume;
-	int		hflags;		/* extended hammer mount flags */
+	int		hflags;		/* extended hammer2 mount flags */
 	int		cluster_fd;	/* cluster management pipe/socket */
 	char		reserved1[112];
 };
 
 #define HMNT2_NOAUTOSNAP	0x00000001
+#define HMNT2_LOCAL		0x00000002
+#define HMNT2_EMERG		0x00000004	/* emergency mode */
 
-#define HMNT2_USERFLAGS		(HMNT2_NOAUTOSNAP)
+#define HMNT2_USERFLAGS		(HMNT2_NOAUTOSNAP | HMNT2_LOCAL)
+#define HMNT2_DEVFLAGS		(HMNT2_LOCAL)
 
 #endif

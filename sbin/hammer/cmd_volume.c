@@ -39,13 +39,11 @@
  *   - volume-add: Add new volume to HAMMER filesystem
  *   - volume-del: Remove volume from HAMMER filesystem
  *   - volume-list: List volumes making up a HAMMER filesystem
+ *   - volume-blkdevs: List volumes making up a HAMMER filesystem
+ *     in blkdevs format
  */
 
 #include "hammer.h"
-#include <string.h>
-#include <stdlib.h>
-
-static uint64_t check_volume(const char *vol_name);
 
 /*
  * volume-add <device> <filesystem>
@@ -54,39 +52,51 @@ void
 hammer_cmd_volume_add(char **av, int ac)
 {
 	struct hammer_ioc_volume ioc;
+	volume_info_t volume;
 	int fd;
+	const char *device, *filesystem;
 
 	if (ac != 2) {
-		fprintf(stderr, "hammer volume-add <device> <filesystem>\n");
-		exit(1);
+		errx(1, "hammer volume-add <device> <filesystem>");
+		/* not reached */
 	}
 
-	char *device = av[0];
-	char *filesystem = av[1];
+	device = av[0];
+	filesystem = av[1];
 
         fd = open(filesystem, O_RDONLY);
 	if (fd < 0) {
-		fprintf(stderr, "hammer volume-add: unable to access %s: %s\n",
-			filesystem, strerror(errno));
-		exit(1);
+		err(1, "hammer volume-add: unable to access %s", filesystem);
+		/* not reached */
 	}
+
+	/*
+	 * Initialize and check the device
+	 */
+	volume = init_volume(device, O_RDONLY, -1);
+	assert(volume->vol_no == -1);
+	if (is_regfile(volume)) {
+		errx(1, "Not a block device: %s", device);
+		/* not reached */
+	}
+	close(volume->fd);
 
 	/*
 	 * volume-add ioctl
 	 */
 	bzero(&ioc, sizeof(ioc));
-	strncpy(ioc.device_name, device, MAXPATHLEN);
-	ioc.vol_size = check_volume(device);
-	ioc.boot_area_size = HAMMER_BOOT_NOMBYTES;
-	ioc.mem_area_size = HAMMER_MEM_NOMBYTES;
+	strncpy(ioc.device_name, device, sizeof(ioc.device_name) - 1);
+	ioc.vol_size = volume->size;
+	ioc.boot_area_size = init_boot_area_size(0, ioc.vol_size);
+	ioc.memory_log_size = init_memory_log_size(0, ioc.vol_size);
 
 	if (ioctl(fd, HAMMERIOC_ADD_VOLUME, &ioc) < 0) {
-		fprintf(stderr, "hammer volume-add ioctl: %s\n",
-			strerror(errno));
-		exit(1);
+		err(1, "hammer volume-add ioctl");
+		/* not reached */
 	}
 
 	close(fd);
+	hammer_cmd_volume_list(av + 1, ac - 1);
 }
 
 /*
@@ -96,37 +106,47 @@ void
 hammer_cmd_volume_del(char **av, int ac)
 {
 	struct hammer_ioc_volume ioc;
-	int fd;
+	int fd, retried = 0;
+	const char *device, *filesystem;
 
 	if (ac != 2) {
-		fprintf(stderr, "hammer volume-del <device> <filesystem>\n");
-		exit(1);
+		errx(1, "hammer volume-del <device> <filesystem>");
+		/* not reached */
 	}
 
-
-	char *device = av[0];
-	char *filesystem = av[1];
+	device = av[0];
+	filesystem = av[1];
 
         fd = open(filesystem, O_RDONLY);
 	if (fd < 0) {
-		fprintf(stderr, "hammer volume-del: unable to access %s: %s\n",
-			filesystem, strerror(errno));
-		exit(1);
+		err(1, "hammer volume-del: unable to access %s", filesystem);
+		/* not reached */
 	}
 
 	/*
 	 * volume-del ioctl
 	 */
 	bzero(&ioc, sizeof(ioc));
-	strncpy(ioc.device_name, device, MAXPATHLEN);
-
+	strncpy(ioc.device_name, device, sizeof(ioc.device_name) - 1);
+	if (ForceOpt)
+		ioc.flag |= HAMMER_IOC_VOLUME_REBLOCK;
+retry:
 	if (ioctl(fd, HAMMERIOC_DEL_VOLUME, &ioc) < 0) {
-		fprintf(stderr, "hammer volume-del ioctl: %s\n",
-			strerror(errno));
-		exit(1);
+		if ((errno == ENOTEMPTY) && (retried++ == 0)) {
+			printf("%s is not empty, ", device);
+			printf("do you want to reblock %s? [y/n] ", device);
+			fflush(stdout);
+			if (getyn() == 1) {
+				ioc.flag |= HAMMER_IOC_VOLUME_REBLOCK;
+				goto retry;
+			}
+		}
+		err(1, "hammer volume-del ioctl");
+		/* not reached */
 	}
 
 	close(fd);
+	hammer_cmd_volume_list(av + 1, ac - 1);
 }
 
 /*
@@ -136,92 +156,59 @@ void
 hammer_cmd_volume_list(char **av, int ac)
 {
 	struct hammer_ioc_volume_list ioc;
-	int fd;
+	char *device_name;
+	int vol_no, i;
 
-	if (ac != 1) {
-		fprintf(stderr, "hammer volume-list <filesystem>\n");
-		exit(1);
+	if (ac < 1) {
+		errx(1, "hammer volume-list <filesystem>");
+		/* not reached */
 	}
 
-	char *filesystem = av[0];
-
-	fd = open(filesystem, O_RDONLY);
-	if (fd < 0) {
-		fprintf(stderr,
-		    "hammer volume-list: unable to access %s: %s\n",
-		    filesystem, strerror(errno));
-		exit(1);
+	if (hammer_fs_to_vol(av[0], &ioc) == -1) {
+		errx(1, "hammer volume-list: failed");
+		/* not reached */
 	}
 
-	/*
-	 * volume-list ioctl
-	 */
-	bzero(&ioc, sizeof(ioc));
-	ioc.vols = malloc(HAMMER_MAX_VOLUMES *
-			  sizeof(struct hammer_ioc_volume));
-	if (ioc.vols == NULL) {
-		fprintf(stderr,
-		    "hammer volume-list: unable to allocate memory: %s\n",
-		    strerror(errno));
-		exit(1);
+	for (i = 0; i < ioc.nvols; i++) {
+		device_name = ioc.vols[i].device_name;
+		vol_no = ioc.vols[i].vol_no;
+		if (VerboseOpt) {
+			printf("%d\t%s%s\n", vol_no, device_name,
+				(vol_no == HAMMER_ROOT_VOLNO ?
+				" (Root Volume)" : ""));
+		} else {
+			printf("%s\n", device_name);
+		}
 	}
-	ioc.nvols = HAMMER_MAX_VOLUMES;
-
-	if (ioctl(fd, HAMMERIOC_LIST_VOLUMES, &ioc) < 0) {
-		fprintf(stderr, "hammer volume-list ioctl: %s\n",
-			strerror(errno));
-		free(ioc.vols);
-		exit(1);
-	}
-
-	int i;
-	for (i = 0; i < ioc.nvols; i++)
-		printf("%s\n", ioc.vols[i].device_name);
 
 	free(ioc.vols);
-	close(fd);
 }
 
 /*
- * Check basic volume characteristics.  HAMMER filesystems use a minimum
- * of a 16KB filesystem buffer size.
- *
- * Returns the size of the device.
- *
- * From newfs_hammer.c
+ * volume-blkdevs <filesystem>
  */
-static
-uint64_t
-check_volume(const char *vol_name)
+void
+hammer_cmd_volume_blkdevs(char **av, int ac)
 {
-	struct partinfo pinfo;
-	int fd;
+	struct hammer_ioc_volume_list ioc;
+	int i;
 
-	/*
-	 * Get basic information about the volume
-	 */
-	fd = open(vol_name, O_RDWR);
-	if (fd < 0)
-		errx(1, "Unable to open %s R+W", vol_name);
-
-	if (ioctl(fd, DIOCGPART, &pinfo) < 0) {
-		errx(1, "No block device: %s", vol_name);
-	}
-	/*
-	 * When formatting a block device as a HAMMER volume the
-	 * sector size must be compatible. HAMMER uses 16384 byte
-	 * filesystem buffers.
-	 */
-	if (pinfo.reserved_blocks) {
-		errx(1, "HAMMER cannot be placed in a partition "
-			"which overlaps the disklabel or MBR");
-	}
-	if (pinfo.media_blksize > 16384 ||
-	    16384 % pinfo.media_blksize) {
-		errx(1, "A media sector size of %d is not supported",
-		     pinfo.media_blksize);
+	if (ac < 1) {
+		errx(1, "hammer volume-blkdevs <filesystem>");
+		/* not reached */
 	}
 
-	close(fd);
-	return pinfo.media_size;
+	if (hammer_fs_to_vol(av[0], &ioc) == -1) {
+		errx(1, "hammer volume-list: failed");
+		/* not reached */
+	}
+
+	for (i = 0; i < ioc.nvols; i++) {
+		printf("%s", ioc.vols[i].device_name);
+		if (i != ioc.nvols - 1)
+			printf(":");
+	}
+	printf("\n");
+
+	free(ioc.vols);
 }

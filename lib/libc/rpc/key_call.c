@@ -79,11 +79,16 @@
  * implementations of these functions, and to call those in key_call().
  */
 
-cryptkeyres *(*__key_encryptsession_pk_LOCAL)() = NULL;
-cryptkeyres *(*__key_decryptsession_pk_LOCAL)() = NULL;
-des_block *(*__key_gendes_LOCAL)() = NULL;
+cryptkeyres *(*__key_encryptsession_pk_LOCAL)(uid_t, cryptkeyarg2 *) = NULL;
+cryptkeyres *(*__key_decryptsession_pk_LOCAL)(uid_t, cryptkeyarg2 *) = NULL;
+des_block *(*__key_gendes_LOCAL)(uid_t, struct svc_req *) = NULL;
 
 static int key_call( u_long, xdrproc_t, void *, xdrproc_t, void *);
+
+int key_decryptsession_pk(char *, netobj *, des_block *);
+int key_encryptsession_pk(char *, netobj *, des_block *);
+int key_get_conv(char *, des_block *);
+int key_setnet(struct key_netstarg *);
 
 int
 key_setsecret(const char *secretkey)

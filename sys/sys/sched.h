@@ -1,8 +1,3 @@
-#ifndef _SCHED_H_
-#define _SCHED_H_
-
-/* sched.h: POSIX 1003.1b Process Scheduling header */
-
 /*-
  * Copyright (c) 1996, 1997
  *	HD Associates, Inc.  All rights reserved.
@@ -36,20 +31,18 @@
  * SUCH DAMAGE.
  *
  * $FreeBSD: src/sys/posix4/sched.h,v 1.4 1999/12/29 04:55:02 peter Exp $
- * $DragonFly: src/sys/sys/sched.h,v 1.3 2003/08/27 06:30:04 rob Exp $
  */
 
-#include <sys/types.h>	/* For pid_t */
+/* sched.h: POSIX 1003.1b Process Scheduling header */
 
-#ifndef _KERNEL
-#include <time.h>		/* Per P1003.4 */
-#endif
+#ifndef _SCHED_H_
+#define	_SCHED_H_
 
 /* Scheduling policies
  */
-#define SCHED_FIFO  1
-#define SCHED_OTHER 2
-#define SCHED_RR    3
+#define	SCHED_FIFO	1
+#define	SCHED_OTHER	2
+#define	SCHED_RR	3
 
 struct sched_param
 {
@@ -58,20 +51,40 @@ struct sched_param
 
 #ifndef _KERNEL
 #include <sys/cdefs.h>
+#include <sys/types.h>		/* For pid_t */
+
+#include <time.h>		/* Per P1003.4 */
+
+#if __BSD_VISIBLE
+#include <sys/cpumask.h>
+
+#ifndef _CPU_SET_T_DECLARED
+#define	_CPU_SET_T_DECLARED
+typedef	cpumask_t		cpu_set_t;
+typedef	cpumask_t		cpuset_t;	/* FreeBSD compat */
+#endif
+#endif /* __BSD_VISIBLE */
 
 __BEGIN_DECLS
-int sched_setparam (pid_t, const struct sched_param *);
-int sched_getparam (pid_t, struct sched_param *);
+int sched_setparam(pid_t, const struct sched_param *);
+int sched_getparam(pid_t, struct sched_param *);
 
-int sched_setscheduler (pid_t, int, const struct sched_param *);
-int sched_getscheduler (pid_t);
+int sched_setscheduler(pid_t, int, const struct sched_param *);
+int sched_getscheduler(pid_t);
 
-int sched_yield (void);
-int sched_get_priority_max (int);
-int sched_get_priority_min (int);
-int sched_rr_get_interval (pid_t, struct timespec *);
+int sched_yield(void);
+int sched_get_priority_max(int);
+int sched_get_priority_min(int);
+int sched_rr_get_interval(pid_t, struct timespec *);
+
+#if __BSD_VISIBLE
+int sched_setaffinity(pid_t, size_t, const cpu_set_t *);
+int sched_getaffinity(pid_t, size_t, cpu_set_t *);
+
+int sched_getcpu(void);
+#endif
 __END_DECLS
 
-#endif
+#endif /* !_KERNEL */
 
 #endif /* _SCHED_H_ */

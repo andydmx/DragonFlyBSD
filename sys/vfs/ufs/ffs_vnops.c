@@ -32,6 +32,7 @@
 
 #include <sys/param.h>
 #include <sys/systm.h>
+#include <sys/uio.h>
 #include <sys/resourcevar.h>
 #include <sys/signalvar.h>
 #include <sys/kernel.h>
@@ -111,7 +112,7 @@ ffs_fsync(struct vop_fsync_args *ap)
 	/*
 	 * Flush all dirty buffers associated with a vnode.
 	 */
-	error = vfsync(vp, ap->a_waitfor, NIADDR + 1, ffs_checkdeferred,
+	error = vfsync(vp, ap->a_waitfor, UFS_NIADDR + 1, ffs_checkdeferred,
 		       softdep_sync_metadata);
 	if (error == 0)
 		error = ffs_update(vp, (ap->a_waitfor == MNT_WAIT));

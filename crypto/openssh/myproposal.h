@@ -1,4 +1,4 @@
-/* $OpenBSD: myproposal.h,v 1.29 2012/06/28 05:07:45 dtucker Exp $ */
+/* $OpenBSD: myproposal.h,v 1.67 2020/01/24 00:28:57 djm Exp $ */
 
 /*
  * Copyright (c) 2000 Markus Friedl.  All rights reserved.
@@ -24,89 +24,94 @@
  * THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-#include <openssl/opensslv.h>
-
-#ifdef OPENSSL_HAS_ECC
-# define KEX_ECDH_METHODS \
+#define KEX_SERVER_KEX	\
+	"curve25519-sha256," \
+	"curve25519-sha256@libssh.org," \
 	"ecdh-sha2-nistp256," \
 	"ecdh-sha2-nistp384," \
-	"ecdh-sha2-nistp521,"
-# define HOSTKEY_ECDSA_CERT_METHODS \
-	"ecdsa-sha2-nistp256-cert-v01@openssh.com," \
-	"ecdsa-sha2-nistp384-cert-v01@openssh.com," \
-	"ecdsa-sha2-nistp521-cert-v01@openssh.com,"
-# define HOSTKEY_ECDSA_METHODS \
-	"ecdsa-sha2-nistp256," \
-	"ecdsa-sha2-nistp384," \
-	"ecdsa-sha2-nistp521,"
-#else
-# define KEX_ECDH_METHODS
-# define HOSTKEY_ECDSA_CERT_METHODS
-# define HOSTKEY_ECDSA_METHODS
-#endif
+	"ecdh-sha2-nistp521," \
+	"diffie-hellman-group-exchange-sha256," \
+	"diffie-hellman-group16-sha512," \
+	"diffie-hellman-group18-sha512," \
+	"diffie-hellman-group14-sha256"
 
-/* Old OpenSSL doesn't support what we need for DHGEX-sha256 */
-#if OPENSSL_VERSION_NUMBER >= 0x00907000L
-# define KEX_SHA256_METHODS \
-	"diffie-hellman-group-exchange-sha256,"
-#else
-# define KEX_SHA256_METHODS
-#endif
-
-# define KEX_DEFAULT_KEX \
-	KEX_ECDH_METHODS \
-	KEX_SHA256_METHODS \
-	"diffie-hellman-group-exchange-sha1," \
-	"diffie-hellman-group14-sha1," \
-	"diffie-hellman-group1-sha1"
+#define KEX_CLIENT_KEX KEX_SERVER_KEX
 
 #define	KEX_DEFAULT_PK_ALG	\
-	HOSTKEY_ECDSA_CERT_METHODS \
+	"ecdsa-sha2-nistp256-cert-v01@openssh.com," \
+	"ecdsa-sha2-nistp384-cert-v01@openssh.com," \
+	"ecdsa-sha2-nistp521-cert-v01@openssh.com," \
+	"sk-ecdsa-sha2-nistp256-cert-v01@openssh.com," \
+	"ssh-ed25519-cert-v01@openssh.com," \
+	"sk-ssh-ed25519-cert-v01@openssh.com," \
+	"rsa-sha2-512-cert-v01@openssh.com," \
+	"rsa-sha2-256-cert-v01@openssh.com," \
 	"ssh-rsa-cert-v01@openssh.com," \
-	"ssh-dss-cert-v01@openssh.com," \
-	"ssh-rsa-cert-v00@openssh.com," \
-	"ssh-dss-cert-v00@openssh.com," \
-	HOSTKEY_ECDSA_METHODS \
-	"ssh-rsa," \
-	"ssh-dss"
+	"ecdsa-sha2-nistp256," \
+	"ecdsa-sha2-nistp384," \
+	"ecdsa-sha2-nistp521," \
+	"sk-ecdsa-sha2-nistp256@openssh.com," \
+	"ssh-ed25519," \
+	"sk-ssh-ed25519@openssh.com," \
+	"rsa-sha2-512," \
+	"rsa-sha2-256," \
+	"ssh-rsa"
 
-#define	KEX_DEFAULT_ENCRYPT \
+#define	KEX_SERVER_ENCRYPT \
+	"chacha20-poly1305@openssh.com," \
 	"aes128-ctr,aes192-ctr,aes256-ctr," \
-	"arcfour256,arcfour128," \
-	"aes128-cbc,3des-cbc,blowfish-cbc,cast128-cbc," \
-	"aes192-cbc,aes256-cbc,arcfour,rijndael-cbc@lysator.liu.se"
-#define KEX_ENCRYPT_INCLUDE_NONE KEX_DEFAULT_ENCRYPT \
-	",none"
-#ifdef HAVE_EVP_SHA256
-#define	SHA2_HMAC_MODES \
-	"hmac-sha2-256," \
-	"hmac-sha2-512,"
-#else
-# define SHA2_HMAC_MODES
-#endif
-#define	KEX_DEFAULT_MAC \
-	"hmac-md5," \
-	"hmac-sha1," \
-	"umac-64@openssh.com," \
-	SHA2_HMAC_MODES \
-	"hmac-ripemd160," \
-	"hmac-ripemd160@openssh.com," \
-	"hmac-sha1-96," \
-	"hmac-md5-96"
+	"aes128-gcm@openssh.com,aes256-gcm@openssh.com"
 
-#define	KEX_DEFAULT_COMP	"none,zlib@openssh.com,zlib"
+#define KEX_CLIENT_ENCRYPT KEX_SERVER_ENCRYPT
+
+#define	KEX_SERVER_MAC \
+	"umac-64-etm@openssh.com," \
+	"umac-128-etm@openssh.com," \
+	"hmac-sha2-256-etm@openssh.com," \
+	"hmac-sha2-512-etm@openssh.com," \
+	"hmac-sha1-etm@openssh.com," \
+	"umac-64@openssh.com," \
+	"umac-128@openssh.com," \
+	"hmac-sha2-256," \
+	"hmac-sha2-512," \
+	"hmac-sha1"
+
+#define KEX_CLIENT_MAC KEX_SERVER_MAC
+
+/* Not a KEX value, but here so all the algorithm defaults are together */
+#define	SSH_ALLOWED_CA_SIGALGS	\
+	"ecdsa-sha2-nistp256," \
+	"ecdsa-sha2-nistp384," \
+	"ecdsa-sha2-nistp521," \
+	"sk-ecdsa-sha2-nistp256@openssh.com," \
+	"ssh-ed25519," \
+	"sk-ssh-ed25519@openssh.com," \
+	"rsa-sha2-512," \
+	"rsa-sha2-256"
+
+#define	KEX_DEFAULT_COMP	"none,zlib@openssh.com"
 #define	KEX_DEFAULT_LANG	""
 
-
-static char *myproposal[PROPOSAL_MAX] = {
-	KEX_DEFAULT_KEX,
-	KEX_DEFAULT_PK_ALG,
-	KEX_DEFAULT_ENCRYPT,
-	KEX_DEFAULT_ENCRYPT,
-	KEX_DEFAULT_MAC,
-	KEX_DEFAULT_MAC,
-	KEX_DEFAULT_COMP,
-	KEX_DEFAULT_COMP,
-	KEX_DEFAULT_LANG,
+#define KEX_CLIENT \
+	KEX_CLIENT_KEX, \
+	KEX_DEFAULT_PK_ALG, \
+	KEX_CLIENT_ENCRYPT, \
+	KEX_CLIENT_ENCRYPT, \
+	KEX_CLIENT_MAC, \
+	KEX_CLIENT_MAC, \
+	KEX_DEFAULT_COMP, \
+	KEX_DEFAULT_COMP, \
+	KEX_DEFAULT_LANG, \
 	KEX_DEFAULT_LANG
-};
+
+#define KEX_SERVER \
+	KEX_SERVER_KEX, \
+	KEX_DEFAULT_PK_ALG, \
+	KEX_SERVER_ENCRYPT, \
+	KEX_SERVER_ENCRYPT, \
+	KEX_SERVER_MAC, \
+	KEX_SERVER_MAC, \
+	KEX_DEFAULT_COMP, \
+	KEX_DEFAULT_COMP, \
+	KEX_DEFAULT_LANG, \
+	KEX_DEFAULT_LANG

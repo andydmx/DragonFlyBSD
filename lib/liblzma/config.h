@@ -23,11 +23,20 @@
 /* Define to 1 if you have the <byteswap.h> header file. */
 /* #undef HAVE_BYTESWAP_H */
 
-/* Define to 1 if you have the MacOS X function CFLocaleCopyCurrent in the
+/* Define to 1 if Capsicum is available. */
+/* #undef HAVE_CAPSICUM */
+
+/* Define to 1 if the system has the type `CC_SHA256_CTX'. */
+/* #undef HAVE_CC_SHA256_CTX */
+
+/* Define to 1 if you have the `CC_SHA256_Init' function. */
+/* #undef HAVE_CC_SHA256_INIT */
+
+/* Define to 1 if you have the Mac OS X function CFLocaleCopyCurrent in the
    CoreFoundation framework. */
 /* #undef HAVE_CFLOCALECOPYCURRENT */
 
-/* Define to 1 if you have the MacOS X function CFPreferencesCopyAppValue in
+/* Define to 1 if you have the Mac OS X function CFPreferencesCopyAppValue in
    the CoreFoundation framework. */
 /* #undef HAVE_CFPREFERENCESCOPYAPPVALUE */
 
@@ -40,13 +49,26 @@
 /* Define to 1 if sha256 integrity check is enabled. */
 #define HAVE_CHECK_SHA256 1
 
+/* Define to 1 if you have the `clock_gettime' function. */
+/* #undef HAVE_CLOCK_GETTIME */
+
+/* Define to 1 if you have the <CommonCrypto/CommonDigest.h> header file. */
+/* #undef HAVE_COMMONCRYPTO_COMMONDIGEST_H */
+
 /* Define if the GNU dcgettext() function is already present or preinstalled.
    */
 /* #undef HAVE_DCGETTEXT */
 
+/* Define to 1 if you have the declaration of `CLOCK_MONOTONIC', and to 0 if
+   you don't. */
+/* #undef HAVE_DECL_CLOCK_MONOTONIC */
+
 /* Define to 1 if you have the declaration of `program_invocation_name', and
    to 0 if you don't. */
 #define HAVE_DECL_PROGRAM_INVOCATION_NAME 0
+
+/* Define to 1 if any of HAVE_DECODER_foo have been defined. */
+#define HAVE_DECODERS 1
 
 /* Define to 1 if arm decoder is enabled. */
 #define HAVE_DECODER_ARM 1
@@ -77,6 +99,9 @@
 
 /* Define to 1 if you have the <dlfcn.h> header file. */
 #define HAVE_DLFCN_H 1
+
+/* Define to 1 if any of HAVE_ENCODER_foo have been defined. */
+#define HAVE_ENCODERS 1
 
 /* Define to 1 if arm encoder is enabled. */
 #define HAVE_ENCODER_ARM 1
@@ -109,10 +134,10 @@
 #define HAVE_FCNTL_H 1
 
 /* Define to 1 if you have the `futimens' function. */
-/* #undef HAVE_FUTIMENS */
+#define HAVE_FUTIMENS 1
 
 /* Define to 1 if you have the `futimes' function. */
-#define HAVE_FUTIMES 1
+/* #undef HAVE_FUTIMES */
 
 /* Define to 1 if you have the `futimesat' function. */
 /* #undef HAVE_FUTIMESAT */
@@ -128,6 +153,12 @@
 
 /* Define if you have the iconv() function and it works. */
 /* #undef HAVE_ICONV */
+
+/* Define to 1 if you have the <immintrin.h> header file. */
+/* Disable for gcc47, but allow for newer clangs. */
+#if defined(__clang__) || (__GNUC__ > 4)
+#define HAVE_IMMINTRIN_H 1
+#endif
 
 /* Define to 1 if you have the <inttypes.h> header file. */
 #define HAVE_INTTYPES_H 1
@@ -159,11 +190,32 @@
 /* Define to 1 if getopt.h declares extern int optreset. */
 #define HAVE_OPTRESET 1
 
-/* Define if you have POSIX threads libraries and header files. */
-#define HAVE_PTHREAD 1
+/* Define to 1 if you have the `posix_fadvise' function. */
+#define HAVE_POSIX_FADVISE 1
+
+/* Define to 1 if you have the `pthread_condattr_setclock' function. */
+/* #undef HAVE_PTHREAD_CONDATTR_SETCLOCK */
 
 /* Have PTHREAD_PRIO_INHERIT. */
-#define HAVE_PTHREAD_PRIO_INHERIT 1
+/* #undef HAVE_PTHREAD_PRIO_INHERIT */
+
+/* Define to 1 if you have the `SHA256Init' function. */
+/* #undef HAVE_SHA256INIT */
+
+/* Define to 1 if the system has the type `SHA256_CTX'. */
+/* #undef HAVE_SHA256_CTX */
+
+/* Define to 1 if you have the <sha256.h> header file. */
+/* #undef HAVE_SHA256_H */
+
+/* Define to 1 if you have the `SHA256_Init' function. */
+/* #undef HAVE_SHA256_INIT */
+
+/* Define to 1 if the system has the type `SHA2_CTX'. */
+/* #undef HAVE_SHA2_CTX */
+
+/* Define to 1 if you have the <sha2.h> header file. */
+/* #undef HAVE_SHA2_H */
 
 /* Define to 1 if optimizing for size. */
 /* #undef HAVE_SMALL */
@@ -200,6 +252,9 @@
 
 /* Define to 1 if you have the <sys/byteorder.h> header file. */
 /* #undef HAVE_SYS_BYTEORDER_H */
+
+/* Define to 1 if you have the <sys/capsicum.h> header file. */
+/* #undef HAVE_SYS_CAPSICUM_H */
 
 /* Define to 1 if you have the <sys/endian.h> header file. */
 #define HAVE_SYS_ENDIAN_H 1
@@ -238,8 +293,26 @@
 /* Define to 1 if the system has the type `_Bool'. */
 #define HAVE__BOOL 1
 
+/* Define to 1 if you have the `_futime' function. */
+/* #undef HAVE__FUTIME */
+
+/* Define to 1 if _mm_movemask_epi8 is available. */
+#define HAVE__MM_MOVEMASK_EPI8 1
+
 /* Define to the sub-directory where libtool stores uninstalled libraries. */
 #define LT_OBJDIR ".libs/"
+
+/* Define to 1 when using POSIX threads (pthreads). */
+/* ONLY USED IN XZ(1) */
+/* #undef MYTHREAD_POSIX */
+
+/* Define to 1 when using Windows Vista compatible threads. This uses features
+   that are not available on Windows XP. */
+/* #undef MYTHREAD_VISTA */
+
+/* Define to 1 when using Windows 95 (and thus XP) compatible threads. This
+   avoids use of features that were added in Windows Vista. */
+/* #undef MYTHREAD_WIN95 */
 
 /* Define to 1 to disable debugging code. */
 #define NDEBUG 1
@@ -254,16 +327,16 @@
 #define PACKAGE_NAME "XZ Utils"
 
 /* Define to the full name and version of this package. */
-#define PACKAGE_STRING "XZ Utils 5.0.7"
+#define PACKAGE_STRING "XZ Utils 5.2.4"
 
 /* Define to the one symbol short name of this package. */
 #define PACKAGE_TARNAME "xz"
 
 /* Define to the home page for this package. */
-#define PACKAGE_URL "http://tukaani.org/xz/"
+#define PACKAGE_URL "https://tukaani.org/xz/"
 
 /* Define to the version of this package. */
-#define PACKAGE_VERSION "5.0.7"
+#define PACKAGE_VERSION "5.2.4"
 
 /* Define to necessary symbol if this constant uses a non-standard name on
    your system. */
@@ -276,8 +349,16 @@
 #define STDC_HEADERS 1
 
 /* Define to 1 if the number of available CPU cores can be detected with
+   cpuset(2). */
+/* #undef TUKLIB_CPUCORES_CPUSET */
+
+/* Define to 1 if the number of available CPU cores can be detected with
    pstat_getdynamic(). */
 /* #undef TUKLIB_CPUCORES_PSTAT_GETDYNAMIC */
+
+/* Define to 1 if the number of available CPU cores can be detected with
+   sched_getaffinity() */
+#define TUKLIB_CPUCORES_SCHED_GETAFFINITY 1
 
 /* Define to 1 if the number of available CPU cores can be detected with
    sysconf(_SC_NPROCESSORS_ONLN) or sysconf(_SC_NPROC_ONLN). */
@@ -285,7 +366,7 @@
 
 /* Define to 1 if the number of available CPU cores can be detected with
    sysctl(). */
-#define TUKLIB_CPUCORES_SYSCTL 1
+/* #undef TUKLIB_CPUCORES_SYSCTL */
 
 /* Define to 1 if the system supports fast unaligned access to 16-bit and
    32-bit integers. */
@@ -342,7 +423,7 @@
 
 
 /* Version number of package */
-#define VERSION "5.0.7"
+#define VERSION "5.2.4"
 
 /* Define WORDS_BIGENDIAN to 1 if your processor stores words with the most
    significant byte first (like Motorola and SPARC, unlike Intel). */

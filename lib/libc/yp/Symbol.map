@@ -1,4 +1,8 @@
-DF306.0 {
+DF404.0 {
+    _yp_check;
+    _yp_dobind;
+    xdr_datum;
+    xdr_ypresp_all_seq;
     yp_all;
     yp_bind;
     yp_first;
@@ -14,11 +18,4 @@ DF306.0 {
     ypprot_err;
     ypresp_allfn;
     ypresp_data;
-};
-
-DFprivate_1.0 {
-    _ypbindlist;
-    _yp_check;
-    _yp_dobind;
-    _yplib_timeout;
 };

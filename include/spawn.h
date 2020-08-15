@@ -30,12 +30,11 @@
 #define _SPAWN_H_
 
 #include <sys/cdefs.h>
-#include <sys/types.h>
-#include <sys/signal.h>
+#include <sys/_sigset.h>
+#include <machine/stdint.h>
 
-#if 0
 #ifndef _MODE_T_DECLARED
-typedef	__mode_t	mode_t;
+typedef	__uint16_t	mode_t;
 #define	_MODE_T_DECLARED
 #endif
 
@@ -45,9 +44,8 @@ typedef	__pid_t		pid_t;
 #endif
 
 #ifndef _SIGSET_T_DECLARED
+typedef	struct __sigset	sigset_t;
 #define	_SIGSET_T_DECLARED
-typedef	__sigset_t	sigset_t;
-#endif
 #endif
 
 struct sched_param;
@@ -65,18 +63,15 @@ typedef struct __posix_spawn_file_actions	*posix_spawn_file_actions_t;
 __BEGIN_DECLS
 /*
  * Spawn routines
- *
- * XXX both arrays should be __restrict, but this does not work when GCC
- * is invoked with -std=c99.
  */
 int posix_spawn(pid_t * __restrict, const char * __restrict,
 		const posix_spawn_file_actions_t *,
-		const posix_spawnattr_t * __restrict, char * const [],
-		char * const []);
+		const posix_spawnattr_t * __restrict,
+		char * const [__restrict_arr], char * const [__restrict_arr]);
 int posix_spawnp(pid_t * __restrict, const char * __restrict,
 		 const posix_spawn_file_actions_t *,
-		 const posix_spawnattr_t * __restrict, char * const [],
-		 char * const []);
+		 const posix_spawnattr_t * __restrict,
+		 char * const [__restrict_arr], char * const [__restrict_arr]);
 
 /*
  * File descriptor actions
@@ -106,7 +101,7 @@ int posix_spawnattr_getschedpolicy(const posix_spawnattr_t * __restrict,
 int posix_spawnattr_getsigdefault(const posix_spawnattr_t * __restrict,
 				  sigset_t * __restrict);
 int posix_spawnattr_getsigmask(const posix_spawnattr_t * __restrict,
-			       sigset_t * __restrict sigmask);
+			       sigset_t * __restrict);
 
 int posix_spawnattr_setflags(posix_spawnattr_t *, short);
 int posix_spawnattr_setpgroup(posix_spawnattr_t *, pid_t);

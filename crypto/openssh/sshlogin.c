@@ -1,4 +1,4 @@
-/* $OpenBSD: sshlogin.c,v 1.27 2011/01/11 06:06:09 djm Exp $ */
+/* $OpenBSD: sshlogin.c,v 1.34 2019/06/28 13:35:04 deraadt Exp $ */
 /*
  * Author: Tatu Ylonen <ylo@cs.hut.fi>
  * Copyright (c) 1995 Tatu Ylonen <ylo@cs.hut.fi>, Espoo, Finland
@@ -42,7 +42,6 @@
 #include "includes.h"
 
 #include <sys/types.h>
-#include <sys/param.h>
 #include <sys/socket.h>
 
 #include <netinet/in.h>
@@ -54,14 +53,17 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <limits.h>
 
+#include "sshlogin.h"
+#include "ssherr.h"
 #include "loginrec.h"
 #include "log.h"
-#include "buffer.h"
+#include "sshbuf.h"
+#include "misc.h"
 #include "servconf.h"
-#include "sshlogin.h"
 
-extern Buffer loginmsg;
+extern struct sshbuf *loginmsg;
 extern ServerOptions options;
 
 /*
@@ -88,8 +90,12 @@ static void
 store_lastlog_message(const char *user, uid_t uid)
 {
 #ifndef NO_SSH_LASTLOG
-	char *time_string, hostname[MAXHOSTNAMELEN] = "", buf[512];
+# ifndef CUSTOM_SYS_AUTH_GET_LASTLOGIN_MSG
+	char hostname[HOST_NAME_MAX+1] = "";
 	time_t last_login_time;
+# endif
+	char *time_string;
+	int r;
 
 	if (!options.print_lastlog)
 		return;
@@ -97,8 +103,10 @@ store_lastlog_message(const char *user, uid_t uid)
 # ifdef CUSTOM_SYS_AUTH_GET_LASTLOGIN_MSG
 	time_string = sys_auth_get_lastlogin_msg(user, uid);
 	if (time_string != NULL) {
-		buffer_append(&loginmsg, time_string, strlen(time_string));
-		xfree(time_string);
+		if ((r = sshbuf_put(loginmsg,
+		    time_string, strlen(time_string))) != 0)
+			fatal("%s: buffer error: %s", __func__, ssh_err(r));
+		free(time_string);
 	}
 # else
 	last_login_time = get_last_login_time(uid, user, hostname,
@@ -108,12 +116,13 @@ store_lastlog_message(const char *user, uid_t uid)
 		time_string = ctime(&last_login_time);
 		time_string[strcspn(time_string, "\n")] = '\0';
 		if (strcmp(hostname, "") == 0)
-			snprintf(buf, sizeof(buf), "Last login: %s\r\n",
+			r = sshbuf_putf(loginmsg, "Last login: %s\r\n",
 			    time_string);
 		else
-			snprintf(buf, sizeof(buf), "Last login: %s from %s\r\n",
+			r = sshbuf_putf(loginmsg, "Last login: %s from %s\r\n",
 			    time_string, hostname);
-		buffer_append(&loginmsg, buf, strlen(buf));
+		if (r != 0)
+			fatal("%s: buffer error: %s", __func__, ssh_err(r));
 	}
 # endif /* CUSTOM_SYS_AUTH_GET_LASTLOGIN_MSG */
 #endif /* NO_SSH_LASTLOG */

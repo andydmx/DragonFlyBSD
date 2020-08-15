@@ -1,4 +1,4 @@
-/* $OpenBSD: log.c,v 1.42 2011/06/17 21:44:30 djm Exp $ */
+/* $OpenBSD: log.c,v 1.51 2018/07/27 12:03:17 markus Exp $ */
 /*
  * Author: Tatu Ylonen <ylo@cs.hut.fi>
  * Copyright (c) 1995 Tatu Ylonen <ylo@cs.hut.fi>, Espoo, Finland
@@ -38,6 +38,7 @@
 
 #include <sys/types.h>
 
+#include <fcntl.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -45,15 +46,15 @@
 #include <syslog.h>
 #include <unistd.h>
 #include <errno.h>
-#if defined(HAVE_STRNVIS) && defined(HAVE_VIS_H)
+#if defined(HAVE_STRNVIS) && defined(HAVE_VIS_H) && !defined(BROKEN_STRNVIS)
 # include <vis.h>
 #endif
 
-#include "xmalloc.h"
 #include "log.h"
 
 static LogLevel log_level = SYSLOG_LEVEL_INFO;
 static int log_on_stderr = 1;
+static int log_stderr_fd = STDERR_FILENO;
 static int log_facility = LOG_AUTH;
 static char *argv0;
 static log_handler_fn *log_handler;
@@ -103,6 +104,12 @@ static struct {
 	{ "DEBUG3",	SYSLOG_LEVEL_DEBUG3 },
 	{ NULL,		SYSLOG_LEVEL_NOT_SET }
 };
+
+LogLevel
+log_level_get(void)
+{
+	return log_level;
+}
 
 SyslogFacility
 log_facility_number(char *name)
@@ -175,6 +182,16 @@ sigdie(const char *fmt,...)
 	_exit(1);
 }
 
+void
+logdie(const char *fmt,...)
+{
+	va_list args;
+
+	va_start(args, fmt);
+	do_log(SYSLOG_LEVEL_INFO, fmt, args);
+	va_end(args);
+	cleanup_exit(255);
+}
 
 /* Log this message (information that usually should go to the log). */
 
@@ -245,18 +262,7 @@ log_init(char *av0, LogLevel level, SyslogFacility facility, int on_stderr)
 
 	argv0 = av0;
 
-	switch (level) {
-	case SYSLOG_LEVEL_QUIET:
-	case SYSLOG_LEVEL_FATAL:
-	case SYSLOG_LEVEL_ERROR:
-	case SYSLOG_LEVEL_INFO:
-	case SYSLOG_LEVEL_VERBOSE:
-	case SYSLOG_LEVEL_DEBUG1:
-	case SYSLOG_LEVEL_DEBUG2:
-	case SYSLOG_LEVEL_DEBUG3:
-		log_level = level;
-		break;
-	default:
+	if (log_change_level(level) != 0) {
 		fprintf(stderr, "Unrecognized internal syslog level code %d\n",
 		    (int) level);
 		exit(1);
@@ -327,6 +333,49 @@ log_init(char *av0, LogLevel level, SyslogFacility facility, int on_stderr)
 	openlog(argv0 ? argv0 : __progname, LOG_PID, log_facility);
 	closelog();
 #endif
+}
+
+int
+log_change_level(LogLevel new_log_level)
+{
+	/* no-op if log_init has not been called */
+	if (argv0 == NULL)
+		return 0;
+
+	switch (new_log_level) {
+	case SYSLOG_LEVEL_QUIET:
+	case SYSLOG_LEVEL_FATAL:
+	case SYSLOG_LEVEL_ERROR:
+	case SYSLOG_LEVEL_INFO:
+	case SYSLOG_LEVEL_VERBOSE:
+	case SYSLOG_LEVEL_DEBUG1:
+	case SYSLOG_LEVEL_DEBUG2:
+	case SYSLOG_LEVEL_DEBUG3:
+		log_level = new_log_level;
+		return 0;
+	default:
+		return -1;
+	}
+}
+
+int
+log_is_on_stderr(void)
+{
+	return log_on_stderr && log_stderr_fd == STDERR_FILENO;
+}
+
+/* redirect what would usually get written to stderr to specified file */
+void
+log_redirect_stderr_to(const char *logfile)
+{
+	int fd;
+
+	if ((fd = open(logfile, O_WRONLY|O_CREAT|O_APPEND, 0600)) == -1) {
+		fprintf(stderr, "Couldn't open logfile %s: %s\n", logfile,
+		     strerror(errno));
+		exit(1);
+	}
+	log_stderr_fd = fd;
 }
 
 #define MSGBUFSIZ 1024
@@ -413,8 +462,9 @@ do_log(LogLevel level, const char *fmt, va_list args)
 		tmp_handler(level, fmtbuf, log_handler_ctx);
 		log_handler = tmp_handler;
 	} else if (log_on_stderr) {
-		snprintf(msgbuf, sizeof msgbuf, "%s\r\n", fmtbuf);
-		write(STDERR_FILENO, msgbuf, strlen(msgbuf));
+		snprintf(msgbuf, sizeof msgbuf, "%.*s\r\n",
+		    (int)sizeof msgbuf - 3, fmtbuf);
+		(void)write(log_stderr_fd, msgbuf, strlen(msgbuf));
 	} else {
 #if defined(HAVE_OPENLOG_R) && defined(SYSLOG_DATA_INIT)
 		openlog_r(argv0 ? argv0 : __progname, LOG_PID, log_facility, &sdata);

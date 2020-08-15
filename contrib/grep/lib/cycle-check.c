@@ -1,6 +1,6 @@
 /* help detect directory cycles efficiently
 
-   Copyright (C) 2003-2006, 2009-2014 Free Software Foundation, Inc.
+   Copyright (C) 2003-2006, 2009-2020 Free Software Foundation, Inc.
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -13,21 +13,21 @@
    GNU General Public License for more details.
 
    You should have received a copy of the GNU General Public License
-   along with this program.  If not, see <http://www.gnu.org/licenses/>.  */
+   along with this program.  If not, see <https://www.gnu.org/licenses/>.  */
 
 /* Written by Jim Meyering */
 
 #include <config.h>
 
+#include "cycle-check.h"
+
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <stdio.h>
-#include <assert.h>
 #include <stdlib.h>
-
 #include <stdbool.h>
 
-#include "cycle-check.h"
+#include "assure.h"
 
 #define CC_MAGIC 9827862
 
@@ -57,7 +57,7 @@ cycle_check_init (struct cycle_check_state *state)
 bool
 cycle_check (struct cycle_check_state *state, struct stat const *sb)
 {
-  assert (state->magic == CC_MAGIC);
+  assure (state->magic == CC_MAGIC);
 
   /* If the current directory ever happens to be the same
      as the one we last recorded for the cycle detection,

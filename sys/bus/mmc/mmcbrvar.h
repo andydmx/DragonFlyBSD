@@ -49,13 +49,14 @@
  * or the SD Card Association to disclose or distribute any technical
  * information, know-how or other confidential information to any third party.
  *
- * "$FreeBSD: src/sys/dev/mmc/mmcbrvar.h,v 1.6 2008/10/29 20:01:26 mav Exp $"
+ * $FreeBSD: src/sys/dev/mmc/mmcbrvar.h,v 1.6 2008/10/29 20:01:26 mav Exp $
  */
 
 #ifndef BUS_MMC_MMCBRVAR_H
 #define BUS_MMC_MMCBRVAR_H
 
-#include <bus/mmc/bridge.h>
+#include <bus/mmc/mmcreg.h>
+
 #include "mmcbr_if.h"
 
 enum mmcbr_device_ivars {
@@ -70,14 +71,15 @@ enum mmcbr_device_ivars {
     MMCBR_IVAR_OCR,
     MMCBR_IVAR_POWER_MODE,
     MMCBR_IVAR_VDD,
+    MMCBR_IVAR_VCCQ,
     MMCBR_IVAR_CAPS,
     MMCBR_IVAR_TIMING,
     MMCBR_IVAR_MAX_DATA,
-//    MMCBR_IVAR_,
+    MMCBR_IVAR_MAX_BUSY_TIMEOUT
 };
 
 /*
- * Simplified accessors for pci devices
+ * Simplified accessors for bridge devices
  */
 #define MMCBR_ACCESSOR(var, ivar, type)					\
 	__BUS_ACCESSOR(mmcbr, var, MMCBR, ivar, type)
@@ -93,19 +95,30 @@ MMCBR_ACCESSOR(mode, MODE, int)
 MMCBR_ACCESSOR(ocr, OCR, int)
 MMCBR_ACCESSOR(power_mode, POWER_MODE, int)
 MMCBR_ACCESSOR(vdd, VDD, int)
+MMCBR_ACCESSOR(vccq, VCCQ, int)
 MMCBR_ACCESSOR(caps, CAPS, int)
 MMCBR_ACCESSOR(timing, TIMING, int)
 MMCBR_ACCESSOR(max_data, MAX_DATA, int)
+MMCBR_ACCESSOR(max_busy_timeout, MAX_BUSY_TIMEOUT, u_int)
 
 static __inline int
 mmcbr_update_ios(device_t dev)
 {
+
 	return (MMCBR_UPDATE_IOS(device_get_parent(dev), dev));
+}
+
+static __inline int
+mmcbr_switch_vccq(device_t dev)
+{
+
+	return (MMCBR_SWITCH_VCCQ(device_get_parent(dev), dev));
 }
 
 static __inline int
 mmcbr_get_ro(device_t dev)
 {
+
 	return (MMCBR_GET_RO(device_get_parent(dev), dev));
 }
 

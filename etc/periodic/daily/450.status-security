@@ -1,7 +1,6 @@
 #!/bin/sh
 #
-# $FreeBSD: src/etc/periodic/daily/450.status-security,v 1.3.2.7 2002/05/21 03:20:49 brian Exp $
-# $DragonFly: src/etc/periodic/daily/450.status-security,v 1.2 2003/06/17 04:24:48 dillon Exp $
+# $FreeBSD: head/etc/periodic/daily/450.status-security 316548 2017-04-06 01:37:03Z asomers $
 #
 
 # If there is a global system configuration file, suck it in.
@@ -19,22 +18,29 @@ case "$daily_status_security_enable" in
 
 	case "$daily_status_security_inline" in
 	    [Yy][Ee][Ss])
-		export security_output="";;
-	    *)
-		export security_output="${daily_status_security_output}"
-		case "${daily_status_security_output}" in
-		    "")
-			;;
-		    /*)
-			echo "    (output logged separately)";;
-		    *)
-			echo "    (output mailed separately)";;
-		esac;;
+		daily_status_security_output="";;
 	esac
 
-	periodic security
-	rc=3;;
-
+	export security_output="${daily_status_security_output}"
+	rc=0
+	case "${daily_status_security_output}" in
+	    "")
+		if tempfile=`mktemp ${TMPDIR:-/tmp}/450.status-security.XXXXXX`
+		then
+			periodic security > $tempfile || rc=3
+			if [ -s "$tempfile" ]; then
+				cat "$tempfile"
+				rc=3
+			fi
+			rm -f "$tempfile"
+		fi;;
+	    /*)
+		echo "    (output logged separately)"
+		periodic security || rc=3;;
+	    *)
+		echo "    (output mailed separately)"
+		periodic security || rc=3;;
+	esac;;
     *)  rc=0;;
 esac
 

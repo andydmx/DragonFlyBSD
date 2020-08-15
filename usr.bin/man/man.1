@@ -1,241 +1,375 @@
-.\"	$NetBSD: man.1,v 1.26 2013/07/18 03:40:31 uwe Exp $
+.\"-
+.\"  Copyright (c) 2010 Gordon Tetlow
+.\"  All rights reserved.
 .\"
-.\" Copyright (c) 1989, 1990, 1993
-.\"	The Regents of the University of California.  All rights reserved.
+.\"  Redistribution and use in source and binary forms, with or without
+.\"  modification, are permitted provided that the following conditions
+.\"  are met:
+.\"  1. Redistributions of source code must retain the above copyright
+.\"     notice, this list of conditions and the following disclaimer.
+.\"  2. Redistributions in binary form must reproduce the above copyright
+.\"     notice, this list of conditions and the following disclaimer in the
+.\"     documentation and/or other materials provided with the distribution.
 .\"
-.\" Redistribution and use in source and binary forms, with or without
-.\" modification, are permitted provided that the following conditions
-.\" are met:
-.\" 1. Redistributions of source code must retain the above copyright
-.\"    notice, this list of conditions and the following disclaimer.
-.\" 2. Redistributions in binary form must reproduce the above copyright
-.\"    notice, this list of conditions and the following disclaimer in the
-.\"    documentation and/or other materials provided with the distribution.
-.\" 3. Neither the name of the University nor the names of its contributors
-.\"    may be used to endorse or promote products derived from this software
-.\"    without specific prior written permission.
+.\"  THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS ``AS IS'' AND
+.\"  ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+.\"  IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+.\"  ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE
+.\"  FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+.\"  DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+.\"  OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+.\"  HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+.\"  LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+.\"  OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+.\"  SUCH DAMAGE.
 .\"
-.\" THIS SOFTWARE IS PROVIDED BY THE REGENTS AND CONTRIBUTORS ``AS IS'' AND
-.\" ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-.\" IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
-.\" ARE DISCLAIMED.  IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE
-.\" FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
-.\" DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
-.\" OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
-.\" HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
-.\" LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
-.\" OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
-.\" SUCH DAMAGE.
+.\" $FreeBSD: head/usr.bin/man/man.1 337497 2018-08-08 19:24:20Z asomers $
 .\"
-.\"     @(#)man.1	8.2 (Berkeley) 1/2/94
-.\"
-.Dd October 5, 2013
+.Dd April 21, 2019
 .Dt MAN 1
 .Os
 .Sh NAME
 .Nm man
-.Nd display the on-line manual pages
-.Pq aka Dq Em man pages
+.Nd display online manual documentation pages
 .Sh SYNOPSIS
 .Nm
-.Oo Fl acw Ns \&| Ns Fl h Oc
-.Op Fl C Ar file
-.Op Fl M Ar path
-.Op Fl m Ar path
-.Op Fl S Ar srch
-.Oo
-.Op Fl s
-.Ar section
-.Oc
-.Ar name Ar ...
+.Op Fl adho
+.Op Fl t | w
+.Op Fl M Ar manpath
+.Op Fl P Ar pager
+.Op Fl S Ar mansect
+.Op Fl m Ar arch Ns Op : Ns Ar machine
+.Op Fl p Op Ar eprtv
+.Op Ar mansect
+.Ar page ...
+.Nm
+.Fl f
+.Ar keyword ...
 .Nm
 .Fl k
-.Op Fl C Ar file
-.Op Fl M Ar path
-.Op Fl m Ar path
-.Ar keyword Ar ...
-.Nm
-.Fl p
+.Ar keyword ...
 .Sh DESCRIPTION
 The
 .Nm
-utility displays the manual pages named on the command line.
-Its options are as follows:
+utility finds and displays online manual documentation pages.
+If
+.Ar mansect
+is provided,
+.Nm
+restricts the search to the specific section of the manual.
+.Pp
+The sections of the manual are:
+.Bl -enum -offset indent -compact
+.It
+.Dx
+General Commands Manual
+.It
+.Dx
+System Calls Manual
+.It
+.Dx
+Library Functions Manual
+.It
+.Dx
+Kernel Interfaces Manual
+.It
+.Dx
+File Formats Manual
+.It
+.Dx
+Games Manual
+.It
+.Dx
+Miscellaneous Information Manual
+.It
+.Dx
+System Manager's Manual
+.It
+.Dx
+Kernel Developer's Manual
+.El
+.Pp
+Options that
+.Nm
+understands:
 .Bl -tag -width indent
-.It Fl a
-Display all of the man pages for a specified
-.Ar section
-and
-.Ar name
-combination.
-(Normally, only the first man page found is displayed.)
-.It Fl C
-Use the specified
-.Ar file
-instead of the default configuration file.
-This permits users to configure their own man environment.
+.It Fl M Ar manpath
+Forces a specific colon separated manual path instead of the default
+search path.
 See
-.Xr man.conf 5
-for a description of the contents of this file.
-.It Fl c
-Copy the man page to the standard output instead of using
-.Xr more 1
-to paginate it.
-This is done by default if the standard output is not a terminal device.
-.It Fl h
-Display only the
-.Dq Tn SYNOPSIS
-lines of the requested man pages.
-For commands, this is typically the command line usage information.
-For library functions, this usually contains the required include
-files and function prototypes.
-.It Fl k
-Display the header lines for any man pages matching
-.Ar keyword Ns Pq s ,
-in the same manner as
-.Xr apropos 1 .
-.It Fl M
-Override the list of standard directories which
-.Nm
-searches for man pages.
-The supplied
-.Ar path
-must be a colon
-.Pq Dq \&:
-separated list of directories.
-This search path may also be set using the environment variable
-.Ev MANPATH .
-The subdirectories to be searched, and their search order,
-is specified by the
-.Dq _subdir
-line in the
-.Nm
-configuration file.
-.It Fl m
-Augment the list of standard directories which
-.Nm
-searches for man pages.
-The supplied
-.Ar path
-must be a colon
-.Pq Dq \&:
-separated list of directories.
-These directories will be searched before the standard directories or
-the directories specified using the
-.Fl M
-option or the
+.Xr manpath 1 .
+Overrides the
 .Ev MANPATH
 environment variable.
-The subdirectories to be searched, and their search order,
-is specified by the
-.Dq _subdir
-line in the
-.Nm
-configuration file.
-.It Fl p
-Print the search path for the manual pages.
-.It Fl s
-Restrict the directories that
-.Nm
-will search to the specified section.
+.It Fl P Ar pager
+Use specified pager.
+Defaults to
+.Dq Li "less -sR"
+if color support is enabled, or
+.Dq Li "less -s" .
+Overrides the
+.Ev MANPAGER
+environment variable, which in turn overrides the
+.Ev PAGER
+environment variable.
+.It Fl S Ar mansect
+Restricts manual sections searched to the specified colon delimited list.
+Defaults to
+.Dq Li 1:8:2:3:n:4:5:6:7:9:l .
+Overrides the
+.Ev MANSECT
+environment variable.
+.It Fl a
+Display all manual pages instead of just the first found for each
+.Ar page
+argument.
+.It Fl d
+Print extra debugging information.
+Repeat for increased verbosity.
+Does not display the manual page.
+.It Fl f
+Emulate
+.Xr whatis 1 .
+.It Fl h
+Display short help message and exit.
+.It Fl k
+Emulate
+.Xr apropos 1 .
+.It Fl m Ar arch Ns Op : Ns Ar machine
+Override the default architecture and machine settings allowing lookup of
+other platform specific manual pages.
+See
+.Sx IMPLEMENTATION NOTES
+for how this option changes the default behavior.
+Overrides the
+.Ev MACHINE_ARCH
+and
+.Ev MACHINE
+environment variables.
+.It Fl o
+Force use of non-localized manual pages.
+See
+.Sx IMPLEMENTATION NOTES
+for how locale specific searches work.
+Overrides the
+.Ev LC_ALL , LC_CTYPE ,
+and
+.Ev LANG
+environment variables.
+.It Fl p Op Cm eprtv
+Use the list of given preprocessors before running
+.Xr nroff 1
+or
+.Xr troff 1 .
+Valid preprocessors arguments:
+.Pp
+.Bl -tag -width indent -compact
+.It Cm e
+.Xr eqn 1
+.It Cm p
+.Xr pic 1
+.It Cm r
+.Xr refer 1
+.It Cm t
+.Xr tbl 1
+.It Cm v
+.Xr vgrind 1
+.El
+.Pp
+Overrides the
+.Ev MANROFFSEQ
+environment variable.
+.It Fl t
+Send manual page source through
+.Xr troff 1
+allowing transformation of the manual pages to other formats.
+.It Fl w
+Display the location of the manual page instead of the contents of
+the manual page.
+.El
+.Sh IMPLEMENTATION NOTES
+.Ss Locale Specific Searches
 The
 .Nm
-configuration file (see
-.Xr man.conf 5 )
-specifies the possible
-.Ar section
-values that are currently available.
-.It Fl S
-Display only man pages that have the specified string in the directory
-part of their filenames.
-This allows the man page search process criteria to be
-narrowed without having to change the MANPATH or
-.Dq _default
-variables.
-.It Fl w
-List the pathnames of the man pages which
+utility supports manual pages in different locales.
+The search behavior is dictated by the first of three
+environment variables with a nonempty string:
+.Ev LC_ALL , LC_CTYPE ,
+or
+.Ev LANG .
+If set,
 .Nm
-would display for the specified
-.Ar section
-and
-.Ar name
-combination.
+will search for locale specific manual pages using the following logic:
+.Pp
+.Bl -item -offset indent -compact
+.It
+.Va lang Ns _ Ns Va country Ns . Ns Va charset
+.It
+.Va lang Ns . Ns Va charset
+.It
+.Li en Ns . Ns Va charset
 .El
 .Pp
-If the
-.Ql Fl s
-option is not specified,
-there is more than one argument,
-the
-.Ql Fl k
-option is not used, and the first argument is a valid section, then that
-argument will be used as if specified by the
-.Ql Fl s
-option.
+For example, if
+.Ev LC_ALL
+is set to
+.Dq Li ja_JP.eucJP ,
+.Nm
+will search the following paths when considering section 1 manual pages in
+.Pa /usr/share/man :
 .Pp
-If
-.Ar name
-is given with a full or relative path then
+.Bl -item -offset indent -compact
+.It
+.Pa /usr/share/man/ja_JP.eucJP/man1
+.It
+.Pa /usr/share/man/ja.eucJP/man1
+.It
+.Pa /usr/share/man/en.eucJP/man1
+.It
+.Pa /usr/share/man/man1
+.El
+.Ss Platform Specific Searches
+The
 .Nm
-interprets it as a file specification, so that you can do
-.Nm
-.Cm ./foo.5
-or even
-.Nm
-.Cm /cd/foo/bar.1.gz .
-.Sh ENVIRONMENT
-.Bl -tag -width MANPATHX
-.It Ev MACHINE
-As some man pages are intended only for specific architectures,
-.Nm
-searches any subdirectories,
-with the same name as the current architecture,
-in every directory which it searches.
-Machine specific areas are checked before general areas.
-The current machine type may be overridden by setting the environment
-variable
+utility supports platform specific manual pages.
+The search behavior is dictated by the
+.Fl m
+option or the
+.Ev MACHINE_ARCH
+and
 .Ev MACHINE
-to the name of a specific architecture.
+environment variables.
+For example, if
+.Ev MACHINE_ARCH
+is set to
+.Dq Li aarch64
+and
+.Ev MACHINE
+is set to
+.Dq Li arm64 ,
+.Nm
+will search the following paths when considering section 4 manual pages in
+.Pa /usr/share/man :
+.Pp
+.Bl -item -offset indent -compact
+.It
+.Pa /usr/share/man/man4/aarch64
+.It
+.Pa /usr/share/man/man4/arm64
+.It
+.Pa /usr/share/man/man4
+.El
+.Ss Displaying Specific Manual Files
+The
+.Nm
+utility also supports displaying a specific manual page if passed a path
+to the file as long as it contains a
+.Ql /
+character.
+.Sh ENVIRONMENT
+The following environment variables affect the execution of
+.Nm :
+.Bl -tag -width ".Ev MANROFFSEQ"
+.It Ev LC_ALL , LC_CTYPE , LANG
+Used to find locale specific manual pages.
+Valid values can be found by running the
+.Xr locale 1
+command.
+See
+.Sx IMPLEMENTATION NOTES
+for details.
+Influenced by the
+.Fl o
+option.
+.It Ev MACHINE_ARCH , MACHINE
+Used to find platform specific manual pages.
+If unset, the output of
+.Dq Li "sysctl hw.machine_arch"
+and
+.Dq Li "sysctl hw.machine"
+is used respectively.
+See
+.Sx IMPLEMENTATION NOTES
+for details.
+Corresponds to the
+.Fl m
+option.
 .It Ev MANPATH
 The standard search path used by
-.Nm
-may be overridden by specifying a path in the
+.Xr man 1
+may be changed by specifying a path in the
 .Ev MANPATH
 environment variable.
-The format of the path is a colon
-.Pq Dq \&:
-separated list of directories.
-The subdirectories to be searched as well as their search order
-is specified by the
-.Dq _subdir
-line in the
-.Nm
-configuration file.
-.It Ev PAGER
-The pagination command used for writing the output.
-If the
+Invalid paths, or paths without manual databases, are ignored.
+Overridden by
+.Fl M .
+If
+.Ev MANPATH
+begins with a colon, it is appended to the default list;
+if it ends with a colon, it is prepended to the default list;
+or if it contains two adjacent colons,
+the standard search path is inserted between the colons.
+If none of these conditions are met, it overrides the
+standard search path.
+.It Ev MANROFFSEQ
+Used to determine the preprocessors for the manual source before running
+.Xr nroff 1
+or
+.Xr troff 1 .
+If unset, defaults to
+.Xr tbl 1 .
+Corresponds to the
+.Fl p
+option.
+.It Ev MANSECT
+Restricts manual sections searched to the specified colon delimited list.
+Corresponds to the
+.Fl S
+option.
+.It Ev MANWIDTH
+If set to a numeric value, used as the width manpages should be displayed.
+Otherwise, if set to a special value
+.Dq Li tty ,
+and output is to a terminal,
+the pages may be displayed over the whole width of the screen.
+.It Ev MANCOLOR
+If set, enables color support.
+.It Ev MANPAGER
+Program used to display files.
+.Pp
+If unset, and color support is enabled,
+.Dq Li "less -sR"
+is used.
+.Pp
+If unset, and color support is disabled, then
 .Ev PAGER
-environment variable is null or not set, the standard pagination program
-.Xr more 1
-will be used.
+is used.
+If that has no value either,
+.Dq Li "less -s"
+is used.
 .El
 .Sh FILES
-.Bl -hang -width /etc/man.conf -compact
+.Bl -tag -width indent -compact
 .It Pa /etc/man.conf
-default man configuration file.
+System configuration file.
+.It Pa /usr/local/etc/man.d/*.conf
+Local configuration files.
 .El
+.Sh EXIT STATUS
+.Ex -std
 .Sh SEE ALSO
 .Xr apropos 1 ,
+.Xr intro 1 ,
+.Xr mandoc 1 ,
+.Xr manpath 1 ,
 .Xr whatis 1 ,
-.Xr whereis 1 ,
+.Xr intro 2 ,
+.Xr intro 3 ,
+.Xr intro 4 ,
+.Xr intro 5 ,
 .Xr man.conf 5 ,
+.Xr intro 6 ,
+.Xr intro 7 ,
 .Xr mdoc 7 ,
-.Xr mdoc.samples 7
-.Sh STANDARDS
-.Nm
-conforms to
-.St -xcu5 .
-.Sh BUGS
-The on-line man pages are, by necessity, forgiving toward stupid
-display devices, causing a few man pages to be not as nicely formatted
-as their typeset counterparts.
+.Xr intro 8 ,
+.Xr intro 9

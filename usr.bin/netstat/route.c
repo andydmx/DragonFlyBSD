@@ -30,6 +30,7 @@
  * $FreeBSD: src/usr.bin/netstat/route.c,v 1.41.2.14 2002/07/17 02:22:22 kbyanc Exp $
  */
 
+#define _KERNEL_STRUCTURES
 #include <sys/kinfo.h>
 #include <sys/param.h>
 #include <sys/socket.h>
@@ -37,7 +38,7 @@
 
 #include <net/ethernet.h>
 #include <net/if.h>
-#include <net/if_var.h>
+#include <net/if_var.h>		/* for struct ifnet */
 #include <net/if_dl.h>
 #include <net/if_types.h>
 #include <net/route.h>
@@ -190,9 +191,6 @@ pr_family(int af1)
 		afname = "Internet6";
 		break;
 #endif /*INET6*/
-	case AF_ISO:
-		afname = "ISO";
-		break;
 	case AF_CCITT:
 		afname = "X.25";
 		break;
@@ -762,9 +760,9 @@ p_rtentry(struct rtentry *rt)
 	sa_u addr, mask;
 
 	/*
-	 * Don't print protocol-cloned routes unless -a.
+	 * Don't print protocol-cloned routes unless -a or -A.
 	 */
-	if (rt->rt_flags & RTF_WASCLONED && !aflag) {
+	if (rt->rt_flags & RTF_WASCLONED && !(aflag || Aflag)) {
 		if (kget(rt->rt_parent, parent) != 0)
 			return;
 		if (parent.rt_flags & RTF_PRCLONING)

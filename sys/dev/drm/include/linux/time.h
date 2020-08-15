@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2014 François Tigeot
+ * Copyright (c) 2014-2017 François Tigeot
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -27,8 +27,15 @@
 #ifndef _LINUX_TIME_H_
 #define _LINUX_TIME_H_
 
+#define USEC_PER_MSEC	1000L
+#define USEC_PER_SEC	1000000L
+
 #define NSEC_PER_USEC	1000L
+#define NSEC_PER_MSEC	1000000L
 #define NSEC_PER_SEC	1000000000L
+
+#include <linux/cache.h>
+#include <linux/math64.h>
 
 #include <sys/time.h>
 
@@ -68,9 +75,7 @@ timespec_sub(struct timespec lhs, struct timespec rhs)
 {
 	struct timespec ts;
 
-	ts.tv_sec = lhs.tv_sec;
-	ts.tv_nsec = lhs.tv_nsec;
-	timespecsub(&ts, &rhs);
+	timespecsub(&lhs, &rhs, &ts);
 
 	return ts;
 }
@@ -118,6 +123,12 @@ timespec_valid(const struct timespec *ts)
 	    ts->tv_nsec < 0 || ts->tv_nsec >= 1000000000)
 		return (0);
 	return (1);
+}
+
+static inline unsigned long
+get_seconds(void)
+{
+	return time_uptime;
 }
 
 #endif	/* _LINUX_TIME_H_ */

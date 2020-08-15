@@ -10,11 +10,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -35,7 +31,10 @@
  */
 
 #ifndef _SYS_WAIT_H_
-#define _SYS_WAIT_H_
+#define	_SYS_WAIT_H_
+
+#include <sys/cdefs.h>
+#include <machine/stdint.h>
 
 /*
  * This file holds definitions relevant to the wait4 system call
@@ -46,24 +45,22 @@
  * Macros to test the exit status returned by wait
  * and extract the relevant values.
  */
-#ifdef _POSIX_SOURCE
-#define	_W_INT(i)	(i)
-#else
-#define	_W_INT(w)	(*(int *)&(w))	/* convert union wait to int */
+#if __BSD_VISIBLE
 #define	WCOREFLAG	0200
 #endif
+#define	_W_INT(i)	(i)
 
 #define	_WSTATUS(x)	(_W_INT(x) & 0177)
 #define	_WSTOPPED	0177		/* _WSTATUS if process is stopped */
-#define WIFSTOPPED(x)	(_WSTATUS(x) == _WSTOPPED)
-#define WSTOPSIG(x)	(_W_INT(x) >> 8)
-#define WIFSIGNALED(x)	(_WSTATUS(x) != _WSTOPPED && _WSTATUS(x) != 0)
-#define WTERMSIG(x)	(_WSTATUS(x))
-#define WIFEXITED(x)	(_WSTATUS(x) == 0)
-#define WEXITSTATUS(x)	(_W_INT(x) >> 8)
-#define WIFCONTINUED(x)	(x == 19)	/* 19 == SIGCONT */
-#ifndef _POSIX_SOURCE
-#define WCOREDUMP(x)	(_W_INT(x) & WCOREFLAG)
+#define	WIFSTOPPED(x)	(_WSTATUS(x) == _WSTOPPED)
+#define	WSTOPSIG(x)	(_W_INT(x) >> 8)
+#define	WIFSIGNALED(x)	(_WSTATUS(x) != _WSTOPPED && _WSTATUS(x) != 0)
+#define	WTERMSIG(x)	(_WSTATUS(x))
+#define	WIFEXITED(x)	(_WSTATUS(x) == 0)
+#define	WEXITSTATUS(x)	(_W_INT(x) >> 8)
+#define	WIFCONTINUED(x)	(x == 19)	/* 19 == SIGCONT */
+#if __BSD_VISIBLE
+#define	WCOREDUMP(x)	(_W_INT(x) & WCOREFLAG)
 
 #define	W_EXITCODE(ret, sig)	((ret) << 8 | (sig))
 #define	W_STOPCODE(sig)		((sig) << 8 | _WSTOPPED)
@@ -78,92 +75,94 @@
  * this option is done, it is as though they were still running... nothing
  * about them is returned.
  */
-#define WNOHANG		1	/* don't hang in wait */
-#define WUNTRACED	2	/* tell about stopped, untraced children */
-#define WCONTINUED	4	/* Report a job control continued process. */
-#define WLINUXCLONE     0x80000000       /* wait for kthread spawned from linux_clone */
+#define	WNOHANG		0x0001	/* don't hang in wait */
+#define	WUNTRACED	0x0002	/* tell about stopped, untraced children */
+#define	WCONTINUED	0x0004	/* Report a job control continued process. */
+#define	WSTOPPED	WUNTRACED
+#define	WNOWAIT		0x0008
+#define	WEXITED		0x0010
+#define	WTRAPPED	0x0020
 
-#ifndef _POSIX_SOURCE
-/* POSIX extensions and 4.2/4.3 compatibility: */
+#if __BSD_VISIBLE
+#define	WLINUXCLONE	0x80000000 /* wait for kthread spawned from linux_clone */
 
 /*
  * Tokens for special values of the "pid" parameter to wait4.
  */
 #define	WAIT_ANY	(-1)	/* any process */
 #define	WAIT_MYPGRP	0	/* any process in my process group */
+#endif /* __BSD_VISIBLE */
 
-#include <machine/endian.h>
-
-/*
- * Deprecated:
- * Structure of the information in the status word returned by wait4.
- * If w_stopval==WSTOPPED, then the second structure describes
- * the information returned, else the first.
- */
-union wait {
-	int	w_status;		/* used in syscall */
-	/*
-	 * Terminated process status.
-	 */
-	struct {
-#if _BYTE_ORDER == _LITTLE_ENDIAN
-		unsigned int	w_Termsig:7,	/* termination signal */
-				w_Coredump:1,	/* core dump indicator */
-				w_Retcode:8,	/* exit code if w_termsig==0 */
-				w_Filler:16;	/* upper bits filler */
-#elif _BYTE_ORDER == _BIG_ENDIAN
-		unsigned int	w_Filler:16,	/* upper bits filler */
-				w_Retcode:8,	/* exit code if w_termsig==0 */
-				w_Coredump:1,	/* core dump indicator */
-				w_Termsig:7;	/* termination signal */
-#else
-#error "Byte order not implemented"
+#ifndef _ID_T_DECLARED
+#define	_ID_T_DECLARED
+typedef	__int64_t	id_t;	/* general id, can hold gid/pid/uid_t */
 #endif
-	} w_T;
-	/*
-	 * Stopped process status.  Returned
-	 * only for traced children unless requested
-	 * with the WUNTRACED option bit.
-	 */
-	struct {
-#if _BYTE_ORDER == _LITTLE_ENDIAN
-		unsigned int	w_Stopval:8,	/* == W_STOPPED if stopped */
-				w_Stopsig:8,	/* signal that stopped us */
-				w_Filler:16;	/* upper bits filler */
-#elif _BYTE_ORDER == _BIG_ENDIAN
-		unsigned int	w_Filler:16,	/* upper bits filler */
-				w_Stopsig:8,	/* signal that stopped us */
-				w_Stopval:8;	/* == W_STOPPED if stopped */
-#else
-#error "Byte order not implemented"
-#endif
-	} w_S;
-};
-#define	w_termsig	w_T.w_Termsig
-#define w_coredump	w_T.w_Coredump
-#define w_retcode	w_T.w_Retcode
-#define w_stopval	w_S.w_Stopval
-#define w_stopsig	w_S.w_Stopsig
 
-#define	WSTOPPED	_WSTOPPED
-#endif /* _POSIX_SOURCE */
+#ifndef _IDTYPE_T_DECLARED
+#define	_IDTYPE_T_DECLARED
+
+/* SEE ALSO SYS/PROCCTL.H */
+
+typedef	enum
+#if __BSD_VISIBLE
+	idtype
+#endif
+{
+	/*
+	 * These names were mostly lifted from Solaris source code and
+	 * still use Solaris style naming to avoid breaking any
+	 * OpenSolaris code which has been ported to FreeBSD/DragonFly.
+	 * There is no clear DragonFly counterpart for all of the names, but
+	 * some have a clear correspondence to DragonFly entities.
+	 *
+	 * The numerical values are kept synchronized with the Solaris
+	 * values.
+	 */
+	P_PID,			/* A process identifier. */
+	P_PPID,			/* A parent process identifier.	*/
+	P_PGID,			/* A process group identifier. */
+	P_SID,			/* A session identifier. */
+	P_CID,			/* A scheduling class identifier. */
+	P_UID,			/* A user identifier. */
+	P_GID,			/* A group identifier. */
+	P_ALL,			/* All processes. */
+	P_LWPID,		/* An LWP identifier. */
+	P_TASKID,		/* A task identifier. */
+	P_PROJID,		/* A project identifier. */
+	P_POOLID,		/* A pool identifier. */
+	P_JAILID,		/* A zone identifier. */
+	P_CTID,			/* A (process) contract identifier. */
+	P_CPUID,		/* CPU identifier. */
+	P_PSETID		/* Processor set identifier. */
+} idtype_t;			/* The type of id_t we are using. */
+
+#endif
 
 #if !defined(_KERNEL) || defined(_KERNEL_VIRTUAL)
-#ifndef _SYS_TYPES_H_
-#include <sys/types.h>
-#endif
-#ifndef _SYS_CDEFS_H_
-#include <sys/cdefs.h>
+#include <sys/_siginfo.h>
+
+#ifndef _PID_T_DECLARED
+typedef	__pid_t		pid_t;		/* process id */
+#define	_PID_T_DECLARED
 #endif
 
 __BEGIN_DECLS
-struct rusage;	/* forward declaration */
-
-pid_t	wait (int *);
-pid_t	waitpid (pid_t, int *, int);
-#ifndef _POSIX_SOURCE
-pid_t	wait3 (int *, int, struct rusage *);
-pid_t	wait4 (pid_t, int *, int, struct rusage *);
+pid_t	wait(int *);
+pid_t	waitpid(pid_t, int *, int);
+#if __POSIX_VISIBLE >= 200112
+int	waitid(idtype_t, id_t, siginfo_t *, int);
+#endif
+#if __BSD_VISIBLE || (__XSI_VISIBLE && __XSI_VISIBLE < 700)
+struct rusage;
+struct __wrusage;
+#endif
+#if __BSD_VISIBLE || (__XSI_VISIBLE && __XSI_VISIBLE < 600)
+pid_t	wait3(int *, int, struct rusage *);
+#endif
+#if __BSD_VISIBLE
+pid_t	wait4(pid_t, int *, int, struct rusage *);
+pid_t	wait6(idtype_t, id_t, int *, int, struct __wrusage *,
+	    siginfo_t *);
 #endif
 __END_DECLS
 #endif

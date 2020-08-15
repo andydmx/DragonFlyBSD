@@ -64,7 +64,6 @@
  * SUCH DAMAGE.
  *
  *	from: @(#)vm_page.c	7.4 (Berkeley) 5/7/91
- * $DragonFly: src/sys/vm/vm_contig.c,v 1.21 2006/12/28 21:24:02 dillon Exp $
  */
 
 /*
@@ -117,11 +116,12 @@
 #include <vm/vm_pager.h>
 #include <vm/vm_extern.h>
 
-#include <sys/thread2.h>
 #include <sys/spinlock2.h>
 #include <vm/vm_page2.h>
 
-static void vm_contig_pg_free(int start, u_long size);
+#include <machine/bus_dma.h>
+
+static void vm_contig_pg_free(vm_pindex_t start, u_long size);
 
 /*
  * vm_contig_pg_clean:
@@ -140,7 +140,7 @@ static void vm_contig_pg_free(int start, u_long size);
  * 	pageout (daemon) flush routine is invoked.
  */
 static void
-vm_contig_pg_clean(int queue, int count)
+vm_contig_pg_clean(int queue, vm_pindex_t count)
 {
 	vm_object_t object;
 	vm_page_t m, m_tmp;
@@ -151,7 +151,8 @@ vm_contig_pg_clean(int queue, int count)
 	 * Setup a local marker
 	 */
 	bzero(&marker, sizeof(marker));
-	marker.flags = PG_BUSY | PG_FICTITIOUS | PG_MARKER;
+	marker.flags = PG_FICTITIOUS | PG_MARKER;
+	marker.busy_count = PBUSY_LOCKED;
 	marker.queue = queue;
 	marker.wire_count = 1;
 
@@ -164,7 +165,8 @@ vm_contig_pg_clean(int queue, int count)
 	 * acquired before the pageq spinlock so it's easiest to simply
 	 * not hold it in the loop iteration.
 	 */
-	while (count-- > 0 && (m = TAILQ_NEXT(&marker, pageq)) != NULL) {
+	while ((long)count-- > 0 &&
+	       (m = TAILQ_NEXT(&marker, pageq)) != NULL) {
 		vm_page_and_queue_spin_lock(m);
 		if (m != TAILQ_NEXT(&marker, pageq)) {
 			vm_page_and_queue_spin_unlock(m);
@@ -244,14 +246,15 @@ vm_contig_pg_clean(int queue, int count)
  * Malloc()'s data structures have been used for collection of
  * statistics and for allocations of less than a page.
  */
-static int
+static vm_pindex_t
 vm_contig_pg_alloc(unsigned long size, vm_paddr_t low, vm_paddr_t high,
 		   unsigned long alignment, unsigned long boundary, int mflags)
 {
-	int i, q, start, pass;
+	vm_pindex_t i, q, start;
 	vm_offset_t phys;
 	vm_page_t pga = vm_page_array;
 	vm_page_t m;
+	int pass;
 	int pqtype;
 
 	size = round_page(size);
@@ -266,11 +269,23 @@ vm_contig_pg_alloc(unsigned long size, vm_paddr_t low, vm_paddr_t high,
 	 * See if we can get the pages from the contiguous page reserve
 	 * alist.  The returned pages will be allocated and wired but not
 	 * busied.
+	 *
+	 * If high is not set to BUS_SPACE_MAXADDR we try using our
+	 * free memory reserve first, otherwise we try it last.
+	 *
+	 * XXX Always use the dma reserve first for performance, until
+	 * we find a better way to differentiate the DRM API.
 	 */
-	m = vm_page_alloc_contig(
-		low, high, alignment, boundary, size, VM_MEMATTR_DEFAULT);
-	if (m)
-		return (m - &pga[0]);
+#if 0
+	if (high != BUS_SPACE_MAXADDR)
+#endif
+	{
+		m = vm_page_alloc_contig(
+			low, high, alignment, boundary,
+			size, VM_MEMATTR_DEFAULT);
+		if (m)
+			return (m - &pga[0]);
+	}
 
 	/*
 	 * Three passes (0, 1, 2).  Each pass scans the VM page list for
@@ -292,10 +307,11 @@ again:
 			if (((pqtype == PQ_FREE) || (pqtype == PQ_CACHE)) &&
 			    (phys >= low) && (phys < high) &&
 			    ((phys & (alignment - 1)) == 0) &&
-			    (((phys ^ (phys + size - 1)) & ~(boundary - 1)) == 0) &&
-			    m->busy == 0 && m->wire_count == 0 &&
-			    m->hold_count == 0 &&
-			    (m->flags & (PG_BUSY | PG_NEED_COMMIT)) == 0)
+			    ((rounddown2(phys ^ (phys + size - 1), boundary)) == 0) &&
+			    m->wire_count == 0 && m->hold_count == 0 &&
+			    (m->busy_count &
+			     (PBUSY_LOCKED | PBUSY_MASK)) == 0 &&
+			    (m->flags & PG_NEED_COMMIT) == 0)
 			{
 				break;
 			}
@@ -359,9 +375,10 @@ again:
 			if ((VM_PAGE_TO_PHYS(&m[0]) !=
 			    (VM_PAGE_TO_PHYS(&m[-1]) + PAGE_SIZE)) ||
 			    ((pqtype != PQ_FREE) && (pqtype != PQ_CACHE)) ||
-			    m->busy || m->wire_count ||
+			    m->wire_count ||
 			    m->hold_count ||
-			    (m->flags & (PG_BUSY | PG_NEED_COMMIT)))
+			    (m->busy_count & (PBUSY_LOCKED | PBUSY_MASK)) ||
+			    (m->flags & PG_NEED_COMMIT))
 			{
 				start++;
 				goto again;
@@ -386,9 +403,10 @@ again:
 			if (pqtype == PQ_CACHE &&
 			    m->hold_count == 0 &&
 			    m->wire_count == 0 &&
-			    (m->flags & (PG_UNMANAGED | PG_NEED_COMMIT)) == 0) {
+			    (m->flags & PG_NEED_COMMIT) == 0) {
 				vm_page_protect(m, VM_PROT_NONE);
-				KKASSERT((m->flags & PG_MAPPED) == 0);
+				KKASSERT((m->flags &
+					 (PG_MAPPED | PG_UNQUEUED)) == 0);
 				KKASSERT(m->dirty == 0);
 				vm_page_free(m);
 				--i;
@@ -406,19 +424,21 @@ again:
 			KKASSERT(m->object == NULL);
 			vm_page_unqueue_nowakeup(m);
 			m->valid = VM_PAGE_BITS_ALL;
-			if (m->flags & PG_ZERO)
-				vm_page_zero_count--;
 			KASSERT(m->dirty == 0,
 				("vm_contig_pg_alloc: page %p was dirty", m));
 			KKASSERT(m->wire_count == 0);
-			KKASSERT(m->busy == 0);
+			KKASSERT((m->busy_count & PBUSY_MASK) == 0);
 
 			/*
-			 * Clear all flags except PG_BUSY, PG_ZERO, and
-			 * PG_WANTED, then unbusy the now allocated page.
+			 * Clear all flags, set FICTITIOUS and UNQUEUED to
+			 * indicate the the pages are special, then unbusy
+			 * the now allocated page.
+			 *
+			 * XXX setting FICTITIOUS and UNQUEUED in the future.
+			 *     (also pair up with vm_contig_pg_free)
 			 */
-			vm_page_flag_clear(m, ~(PG_BUSY | PG_SBUSY |
-						PG_ZERO | PG_WANTED));
+			vm_page_flag_clear(m, ~PG_KEEP_NEWPAGE_MASK);
+			/* vm_page_flag_set(m, PG_FICTITIOUS | PG_UNQUEUED);*/
 			vm_page_wire(m);
 			vm_page_wakeup(m);
 		}
@@ -429,10 +449,26 @@ again:
 		return (start); /* aka &pga[start] */
 	}
 
+#if 0
+	/*
+	 * Failed, if we haven't already tried, allocate from our reserved
+	 * dma memory.
+	 *
+	 * XXX (see conditionalized code above)
+	 */
+	if (high == BUS_SPACE_MAXADDR) {
+		m = vm_page_alloc_contig(
+			low, high, alignment, boundary,
+			size, VM_MEMATTR_DEFAULT);
+		if (m)
+			return (m - &pga[0]);
+	}
+#endif
+
 	/*
 	 * Failed.
 	 */
-	return (-1);
+	return ((vm_pindex_t)-1);
 }
 
 /*
@@ -446,7 +482,7 @@ again:
  * No other requirements.
  */
 static void
-vm_contig_pg_free(int start, u_long size)
+vm_contig_pg_free(vm_pindex_t start, u_long size)
 {
 	vm_page_t pga = vm_page_array;
 	
@@ -473,7 +509,7 @@ vm_contig_pg_free(int start, u_long size)
  * No requirements.
  */
 static vm_offset_t
-vm_contig_pg_kmap(int start, u_long size, vm_map_t map, int flags)
+vm_contig_pg_kmap(vm_pindex_t start, u_long size, vm_map_t map, int flags)
 {
 	vm_offset_t addr;
 	vm_paddr_t pa;
@@ -483,12 +519,12 @@ vm_contig_pg_kmap(int start, u_long size, vm_map_t map, int flags)
 	if (size == 0)
 		panic("vm_contig_pg_kmap: size must not be 0");
 	size = round_page(size);
-	addr = kmem_alloc_pageable(&kernel_map, size);
+	addr = kmem_alloc_pageable(&kernel_map, size, VM_SUBSYS_CONTIG);
 	if (addr) {
 		pa = VM_PAGE_TO_PHYS(&pga[start]);
 		for (offset = 0; offset < size; offset += PAGE_SIZE)
-			pmap_kenter_quick(addr + offset, pa + offset);
-		smp_invltlb();
+			pmap_kenter_noinval(addr + offset, pa + offset);
+		pmap_invalidate_range(&kernel_pmap, addr, addr + size);
 		if (flags & M_ZERO)
 			bzero((void *)addr, size);
 	}
@@ -521,11 +557,11 @@ contigmalloc_map(unsigned long size, struct malloc_type *type,
 		 unsigned long alignment, unsigned long boundary,
 		 vm_map_t map)
 {
-	int index;
+	vm_pindex_t index;
 	void *rv;
 
 	index = vm_contig_pg_alloc(size, low, high, alignment, boundary, flags);
-	if (index < 0) {
+	if (index == (vm_pindex_t)-1) {
 		kprintf("contigmalloc_map: failed size %lu low=%llx "
 			"high=%llx align=%lu boundary=%lu flags=%08x\n",
 			size, (long long)low, (long long)high,
@@ -553,7 +589,7 @@ contigfree(void *addr, unsigned long size, struct malloc_type *type)
 		panic("vm_contig_pg_kmap: size must not be 0");
 	size = round_page(size);
 
-	pa = pmap_extract(&kernel_pmap, (vm_offset_t)addr);
+	pa = pmap_kextract((vm_offset_t)addr);
 	pmap_qremove((vm_offset_t)addr, size / PAGE_SIZE);
 	kmem_free(&kernel_map, (vm_offset_t)addr, size);
 

@@ -85,6 +85,7 @@ static driver_t acpi_acad_driver = {
     "acpi_acad",
     acpi_acad_methods,
     sizeof(struct acpi_acad_softc),
+    .gpri = KOBJ_GPRI_ACPI
 };
 
 static devclass_t acpi_acad_devclass;
@@ -113,13 +114,15 @@ acpi_acad_get_status(void *context)
     ACPI_SERIAL_BEGIN(acad);
     if (newstatus != -1 && sc->status != newstatus) {
 	sc->status = newstatus;
+	ACPI_SERIAL_END(acad);
 	power_profile_set_state(newstatus ? POWER_PROFILE_PERFORMANCE :
 	    POWER_PROFILE_ECONOMY);
 	ACPI_VPRINT(dev, acpi_device_get_parent_softc(dev),
 	    "%s Line\n", newstatus ? "On" : "Off");
 	acpi_UserNotify("ACAD", h, newstatus);
+    } else {
+	ACPI_SERIAL_END(acad);
     }
-    ACPI_SERIAL_END(acad);
 }
 
 static void
@@ -137,8 +140,7 @@ acpi_acad_notify_handler(ACPI_HANDLE h, UINT32 notify, void *context)
 	AcpiOsExecute(OSL_NOTIFY_HANDLER, acpi_acad_get_status, context);
 	break;
     default:
-	if (bootverbose)
-	    device_printf(dev, "unknown notify %#x\n", notify);
+	device_printf(dev, "unknown notify: %#x\n", notify);
 	break;
     }
 }

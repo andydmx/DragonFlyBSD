@@ -32,11 +32,10 @@
  * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
  *
- * $DragonFly: src/lib/libthread_xu/thread/thr_mutex.c,v 1.15 2008/05/09 16:03:27 dillon Exp $
  * $FreeBSD: src/lib/libpthread/thread/thr_rwlock.c,v 1.14 2004/01/08 15:37:09 deischen Exp $
- * $DragonFly: src/lib/libthread_xu/thread/thr_rwlock.c,v 1.7 2006/04/06 13:03:09 davidxu Exp $
  */
 
+#include <sys/lwp.h>
 #include <machine/atomic.h>
 #include <machine/tls.h>
 #include <errno.h>
@@ -54,7 +53,8 @@
 static int rdlock_count;
 
 int
-sysv_mutex_init(struct sysv_mutex *mutex) {
+sysv_mutex_init(struct sysv_mutex *mutex)
+{
 	if(mutex == NULL)
 		return (EINVAL);
 	mutex->_mutex_static_lock = 0;
@@ -93,7 +93,8 @@ sysv_mutex_unlock(struct sysv_mutex *mutex)
 }
 
 static int
-sysv_cond_wait(int *val, struct sysv_mutex *mutex) {
+sysv_cond_wait(int *val, struct sysv_mutex *mutex)
+{
 	sysv_mutex_unlock(mutex);
 
 	/* I use SYSV_TIMEOUT to avoid lossing a wakeup
@@ -104,14 +105,15 @@ sysv_cond_wait(int *val, struct sysv_mutex *mutex) {
 }
 
 static int
-sysv_cond_signal(int *val) {
+sysv_cond_signal(int *val)
+{
 	return (umtx_wakeup(val, 0));
 }
 
 int
 sysv_rwlock_init(struct sysv_rwlock *rwlock)
 {
-	int ret;
+	int ret = 0;
 
 	if (rwlock == NULL)
 		return (EINVAL);
@@ -125,7 +127,7 @@ sysv_rwlock_init(struct sysv_rwlock *rwlock)
 }
 
 int
-sysv_rwlock_unlock (struct sysv_rwlock *rwlock)
+sysv_rwlock_unlock(struct sysv_rwlock *rwlock)
 {
 	int ret;
 
@@ -160,7 +162,7 @@ sysv_rwlock_unlock (struct sysv_rwlock *rwlock)
 }
 
 int
-sysv_rwlock_wrlock (struct sysv_rwlock *rwlock)
+sysv_rwlock_wrlock(struct sysv_rwlock *rwlock)
 {
 	int ret;
 

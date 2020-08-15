@@ -30,7 +30,6 @@
  *
  *	@(#)if_sl.c	8.6 (Berkeley) 2/1/94
  * $FreeBSD: src/sys/net/if_sl.c,v 1.84.2.2 2002/02/13 00:43:10 dillon Exp $
- * $DragonFly: src/sys/net/sl/if_sl.c,v 1.32 2008/05/14 11:59:23 sephe Exp $
  */
 
 /*
@@ -62,11 +61,8 @@
  */
 
 #include "use_sl.h"
-
 #include "opt_inet.h"
-#if !defined(KLD_MODULE)
-#include "opt_slip.h"
-#endif
+
 #include <sys/param.h>
 #include <sys/systm.h>
 #include <sys/proc.h>
@@ -79,10 +75,9 @@
 #include <sys/fcntl.h>
 #include <sys/signalvar.h>
 #include <sys/tty.h>
-#include <sys/clist.h>
 #include <sys/kernel.h>
+#include <sys/sysctl.h>
 #include <sys/conf.h>
-#include <sys/thread2.h>
 
 #include <net/if.h>
 #include <net/if_types.h>
@@ -106,6 +101,12 @@
 
 static void slattach (void *);
 PSEUDO_SET(slattach, if_sl);
+
+/* Set to 0xC002 for broadcast instead of p-to-p */
+static int sliffopts = IFF_POINTOPOINT | SC_AUTOCOMP | IFF_MULTICAST;
+SYSCTL_INT(_net, OID_AUTO, sliffopts, CTLFLAG_RW,
+           &sliffopts, 0, "");
+TUNABLE_INT("net.sliffopts", &sliffopts);
 
 /*
  * SLRMAX is a hard limit on input packet size.  To simplify the code
@@ -152,7 +153,7 @@ PSEUDO_SET(slattach, if_sl);
 #define	SLMTU		552		/* default MTU */
 #endif
 #define	SLTMAX		1500		/* maximum MTU */
-#define	SLIP_HIWAT	roundup(50,CBSIZE)
+#define	SLIP_HIWAT	50
 #define	CLISTRESERVE	1024		/* Can't let clists get too low */
 
 /*
@@ -202,18 +203,12 @@ slattach(void *dummy)
 	struct sl_softc *sc;
 	int i = 0;
 
-	lwkt_gettoken(&tty_token);
 	linesw[SLIPDISC] = slipdisc;
 
 	for (sc = sl_softc; i < NSL; sc++) {
 		if_initname(&(sc->sc_if), "sl", i++);
 		sc->sc_if.if_mtu = SLMTU;
-		sc->sc_if.if_flags =
-#ifdef SLIP_IFF_OPTS
-		    SLIP_IFF_OPTS;
-#else
-		    IFF_POINTOPOINT | SC_AUTOCOMP | IFF_MULTICAST;
-#endif
+		sc->sc_if.if_flags = sliffopts;
 		sc->sc_if.if_type = IFT_SLIP;
 		sc->sc_if.if_ioctl = slioctl;
 		sc->sc_if.if_output = sloutput;
@@ -227,19 +222,17 @@ slattach(void *dummy)
 		if_attach(&sc->sc_if, NULL);
 		bpfattach(&sc->sc_if, DLT_SLIP, SLIP_HDRLEN);
 	}
-	lwkt_reltoken(&tty_token);
 }
 
 static int
 slinit(struct sl_softc *sc)
 {
-	lwkt_gettoken(&tty_token);
 	if (sc->sc_ep == NULL)
 		sc->sc_ep = kmalloc(SLBUFSIZE, M_DEVBUF, M_WAITOK);
 	sc->sc_buf = sc->sc_ep + SLBUFSIZE - SLRMAX;
 	sc->sc_mp = sc->sc_buf;
 	sl_compress_init(&sc->sc_comp, -1);
-	lwkt_reltoken(&tty_token);
+
 	return (1);
 }
 
@@ -266,13 +259,13 @@ slopen(cdev_t dev, struct tty *tp)
 		return (0);
 	}
 
-	for (nsl = NSL, sc = sl_softc; --nsl >= 0; sc++)
+	for (nsl = NSL, sc = sl_softc; --nsl >= 0; sc++) {
 		if (sc->sc_ttyp == NULL && !(sc->sc_flags & SC_STATIC)) {
 			if (slinit(sc) == 0) {
 				lwkt_reltoken(&tty_token);
 				return (ENOBUFS);
 			}
-			tp->t_sc = (caddr_t)sc;
+			tp->t_slsc = (caddr_t)sc;
 			sc->sc_ttyp = tp;
 			sc->sc_if.if_baudrate = tp->t_ospeed;
 			ttyflush(tp, FREAD | FWRITE);
@@ -288,19 +281,18 @@ slopen(cdev_t dev, struct tty *tp)
 			 * be enough.  Reserving cblocks probably makes
 			 * the CLISTRESERVE check unnecessary and wasteful.
 			 */
-			clist_alloc_cblocks(&tp->t_canq, 0, 0);
+			clist_alloc_cblocks(&tp->t_canq, 0);
 			clist_alloc_cblocks(&tp->t_outq,
-			    SLIP_HIWAT + 2 * sc->sc_if.if_mtu + 1,
 			    SLIP_HIWAT + 2 * sc->sc_if.if_mtu + 1);
-			clist_alloc_cblocks(&tp->t_rawq, 0, 0);
+			clist_alloc_cblocks(&tp->t_rawq, 0);
 
-			crit_enter();
 			if_up(&sc->sc_if);
-			crit_exit();
 			lwkt_reltoken(&tty_token);
 			return (0);
 		}
+	}
 	lwkt_reltoken(&tty_token);
+
 	return (ENXIO);
 }
 
@@ -314,12 +306,12 @@ slclose(struct tty *tp, int flag)
 	struct sl_softc *sc;
 
 	lwkt_gettoken(&tty_token);
+	lwkt_gettoken(&tp->t_token);
 	ttyflush(tp, FREAD | FWRITE);
-	crit_enter();
 
 	clist_free_cblocks(&tp->t_outq);
 	tp->t_line = 0;
-	sc = (struct sl_softc *)tp->t_sc;
+	sc = (struct sl_softc *)tp->t_slsc;
 	if (sc != NULL) {
 		if (sc->sc_outfill) {
 			sc->sc_outfill = 0;
@@ -332,7 +324,7 @@ slclose(struct tty *tp, int flag)
 		if_down(&sc->sc_if);
 		sc->sc_flags &= SC_STATIC;
 		sc->sc_ttyp = NULL;
-		tp->t_sc = NULL;
+		tp->t_slsc = NULL;
 		if (sc->sc_ep) {
 			kfree(sc->sc_ep, M_DEVBUF);
 			sc->sc_ep = NULL;
@@ -340,8 +332,9 @@ slclose(struct tty *tp, int flag)
 		sc->sc_mp = 0;
 		sc->sc_buf = 0;
 	}
-	crit_exit();
+	lwkt_reltoken(&tp->t_token);
 	lwkt_reltoken(&tty_token);
+
 	return 0;
 }
 
@@ -353,11 +346,11 @@ slclose(struct tty *tp, int flag)
 static int
 sltioctl(struct tty *tp, u_long cmd, caddr_t data, int flag, struct ucred *cred)
 {
-	struct sl_softc *sc = (struct sl_softc *)tp->t_sc, *nc, *tmpnc;
+	struct sl_softc *sc = (struct sl_softc *)tp->t_slsc, *nc, *tmpnc;
 	int nsl;
 
-	crit_enter();
 	lwkt_gettoken(&tty_token);
+	lwkt_gettoken(&tp->t_token);
 
 	switch (cmd) {
 	case SLIOCGUNIT:
@@ -386,16 +379,16 @@ sltioctl(struct tty *tp, u_long cmd, caddr_t data, int flag, struct ucred *cred)
 						if_down(&nc->sc_if);
 					sc->sc_flags &= ~SC_STATIC;
 					sc->sc_flags |= (nc->sc_flags & SC_STATIC);
-					tp->t_sc = sc = nc;
+					tp->t_slsc = sc = nc;
 					clist_alloc_cblocks(&tp->t_outq,
-					    SLIP_HIWAT + 2 * sc->sc_if.if_mtu + 1,
-					    SLIP_HIWAT + 2 * sc->sc_if.if_mtu + 1);
+					    SLIP_HIWAT +
+					    2 * sc->sc_if.if_mtu + 1);
 					sl_compress_init(&sc->sc_comp, -1);
 					goto slfound;
 				}
 			}
+			lwkt_reltoken(&tp->t_token);
 			lwkt_reltoken(&tty_token);
-			crit_exit();
 			return (ENXIO);
 		}
 	slfound:
@@ -439,12 +432,13 @@ sltioctl(struct tty *tp, u_long cmd, caddr_t data, int flag, struct ucred *cred)
 		break;
 
 	default:
+		lwkt_reltoken(&tp->t_token);
 		lwkt_reltoken(&tty_token);
-		crit_exit();
 		return (ENOIOCTL);
 	}
+	lwkt_reltoken(&tp->t_token);
 	lwkt_reltoken(&tty_token);
-	crit_exit();
+
 	return (0);
 }
 
@@ -491,9 +485,8 @@ sloutput_serialized(struct ifnet *ifp, struct ifaltq_subque *ifsq,
 		return (ENETRESET);		/* XXX ? */
 	}
 
-	crit_enter();
-
-	if ((ip->ip_tos & IPTOS_LOWDELAY) && !ifq_is_enabled(&sc->sc_if.if_snd)) {
+	if ((ip->ip_tos & IPTOS_LOWDELAY) &&
+	    !ifq_is_enabled(&sc->sc_if.if_snd)) {
 		if (IF_QFULL(&sc->sc_fastq)) {
 			IF_DROP(&sc->sc_fastq);
 			m_freem(m);
@@ -506,13 +499,11 @@ sloutput_serialized(struct ifnet *ifp, struct ifaltq_subque *ifsq,
 		error = ifsq_enqueue(ifsq, m, &pktattr);
 	}
 	if (error) {
-		IFNET_STAT_INC(&sc->sc_if, oerrors, 1);
-		crit_exit();
+		IFNET_STAT_INC(&sc->sc_if, oqdrops, 1);
 		return (error);
 	}
 	if (sc->sc_ttyp->t_outq.c_cc == 0)
 		slstart(sc->sc_ttyp);
-	crit_exit();
 	return (0);
 }
 
@@ -538,7 +529,7 @@ sloutput(struct ifnet *ifp, struct mbuf *m, struct sockaddr *dst,
 static int
 slstart(struct tty *tp)
 {
-	struct sl_softc *sc = (struct sl_softc *)tp->t_sc;
+	struct sl_softc *sc = (struct sl_softc *)tp->t_slsc;
 	struct ifaltq_subque *ifsq = ifq_get_subq_default(&sc->sc_if.if_snd);
 	struct mbuf *m;
 	u_char *cp;
@@ -546,7 +537,7 @@ slstart(struct tty *tp)
 	u_char bpfbuf[SLTMAX + SLIP_HDRLEN];
 	int len = 0;
 
-	lwkt_gettoken(&tty_token);
+	lwkt_gettoken(&tp->t_token);
 	for (;;) {
 		/*
 		 * Call output process whether or not there is more in the
@@ -559,7 +550,7 @@ slstart(struct tty *tp)
 			if (sc != NULL)
 				sc->sc_flags &= ~SC_OUTWAIT;
 			if (tp->t_outq.c_cc > SLIP_HIWAT) {
-				lwkt_reltoken(&tty_token);
+				lwkt_reltoken(&tp->t_token);
 				return 0;
 			}
 		}
@@ -568,22 +559,20 @@ slstart(struct tty *tp)
 		 * This happens briefly when the line shuts down.
 		 */
 		if (sc == NULL) {
-			lwkt_reltoken(&tty_token);
+			lwkt_reltoken(&tp->t_token);
 			return 0;
 		}
 
 		/*
 		 * Get a packet and send it to the interface.
 		 */
-		crit_enter();
 		IF_DEQUEUE(&sc->sc_fastq, m);
 		if (m)
 			IFNET_STAT_INC(&sc->sc_if, omcasts, 1);	/* XXX */
 		else
 			m = ifsq_dequeue(ifsq);
-		crit_exit();
 		if (m == NULL) {
-			lwkt_reltoken(&tty_token);
+			lwkt_reltoken(&tp->t_token);
 			return 0;
 		}
 
@@ -639,21 +628,8 @@ slstart(struct tty *tp)
 			bpf_reltoken();
 		}
 
-		/*
-		 * If system is getting low on clists, just flush our
-		 * output queue (if the stuff was important, it'll get
-		 * retransmitted). Note that SLTMAX is used instead of
-		 * the current if_mtu setting because connections that
-		 * have already been established still use the original
-		 * (possibly larger) mss.
-		 */
-		if (cfreecount < CLISTRESERVE + SLTMAX) {
-			m_freem(m);
-			IFNET_STAT_INC(&sc->sc_if, collisions, 1);
-			continue;
-		}
-
 		sc->sc_flags &= ~SC_OUTWAIT;
+
 		/*
 		 * The extra FRAME_END will start up a new packet, and thus
 		 * will flush any accumulated garbage.  We do this whenever
@@ -689,11 +665,12 @@ slstart(struct tty *tp)
 					 * Put n characters at once
 					 * into the tty output queue.
 					 */
-					if (b_to_q((char *)bp, cp - bp,
-					    &tp->t_outq))
+					if (clist_btoq((char *)bp, cp - bp,
+						       &tp->t_outq)) {
 						break;
+					}
 					IFNET_STAT_INC(&sc->sc_if, obytes,
-					    cp - bp);
+						       cp - bp);
 				}
 				/*
 				 * If there are characters left in the mbuf,
@@ -731,7 +708,8 @@ slstart(struct tty *tp)
 			IFNET_STAT_INC(&sc->sc_if, opackets, 1);
 		}
 	}
-	lwkt_reltoken(&tty_token);
+	lwkt_reltoken(&tp->t_token);
+
 	return 0;
 }
 
@@ -746,7 +724,7 @@ sl_btom(struct sl_softc *sc, int len)
 	if (len >= MCLBYTES)
 		return (NULL);
 
-	MGETHDR(m, MB_DONTWAIT, MT_DATA);
+	MGETHDR(m, M_NOWAIT, MT_DATA);
 	if (m == NULL)
 		return (NULL);
 
@@ -758,7 +736,7 @@ sl_btom(struct sl_softc *sc, int len)
 	 * guarantees that packet will fit in a cluster.
 	 */
 	if (len >= MHLEN) {
-		MCLGET(m, MB_DONTWAIT);
+		MCLGET(m, M_NOWAIT);
 		if ((m->m_flags & M_EXT) == 0) {
 			/*
 			 * we couldn't get a cluster - if memory's this
@@ -786,16 +764,28 @@ slinput(int c, struct tty *tp)
 	int len;
 	u_char chdr[CHDR_LEN];
 
-	lwkt_gettoken(&tty_token);
+#if 0
+	kprintf(" %02x", (unsigned char)c);
+	if ((unsigned char)c == 0xC0)
+		kprintf("\n");
+#endif
+
+	lwkt_gettoken(&tp->t_token);
 	tk_nin++;
-	sc = (struct sl_softc *)tp->t_sc;
+	sc = (struct sl_softc *)tp->t_slsc;
 	if (sc == NULL) {
-		lwkt_reltoken(&tty_token);
+		lwkt_reltoken(&tp->t_token);
+#if 0
+		kprintf("X");
+#endif
 		return 0;
 	}
 	if (c & TTY_ERRORMASK || (tp->t_state & TS_CONNECTED) == 0) {
 		sc->sc_flags |= SC_ERROR;
-		lwkt_reltoken(&tty_token);
+		lwkt_reltoken(&tp->t_token);
+#if 0
+		kprintf("Y");
+#endif
 		return 0;
 	}
 	c &= TTY_CHARMASK;
@@ -820,7 +810,7 @@ slinput(int c, struct tty *tp)
 					sc->sc_starttime = time_uptime;
 				if (sc->sc_abortcount >= ABT_COUNT) {
 					slclose(tp,0);
-					lwkt_reltoken(&tty_token);
+					lwkt_reltoken(&tp->t_token);
 					return 0;
 				}
 			}
@@ -843,7 +833,7 @@ slinput(int c, struct tty *tp)
 
 	case FRAME_ESCAPE:
 		sc->sc_escape = 1;
-		lwkt_reltoken(&tty_token);
+		lwkt_reltoken(&tp->t_token);
 		return 0;
 
 	case FRAME_END:
@@ -937,7 +927,7 @@ slinput(int c, struct tty *tp)
 	if (sc->sc_mp < sc->sc_ep + SLBUFSIZE) {
 		*sc->sc_mp++ = c;
 		sc->sc_escape = 0;
-		lwkt_reltoken(&tty_token);
+		lwkt_reltoken(&tp->t_token);
 		return 0;
 	}
 
@@ -949,7 +939,8 @@ error:
 newpack:
 	sc->sc_mp = sc->sc_buf = sc->sc_ep + SLBUFSIZE - SLRMAX;
 	sc->sc_escape = 0;
-	lwkt_reltoken(&tty_token);
+	lwkt_reltoken(&tp->t_token);
+
 	return 0;
 }
 
@@ -962,8 +953,6 @@ slioctl(struct ifnet *ifp, u_long cmd, caddr_t data, struct ucred *cr)
 	struct ifaddr *ifa = (struct ifaddr *)data;
 	struct ifreq *ifr = (struct ifreq *)data;
 	int error = 0;
-
-	crit_enter();
 
 	switch (cmd) {
 
@@ -1011,7 +1000,6 @@ slioctl(struct ifnet *ifp, u_long cmd, caddr_t data, struct ucred *cr)
 			tp = sl_softc[ifp->if_dunit].sc_ttyp;
 			if (tp != NULL)
 				clist_alloc_cblocks(&tp->t_outq,
-				    SLIP_HIWAT + 2 * ifp->if_mtu + 1,
 				    SLIP_HIWAT + 2 * ifp->if_mtu + 1);
 		}
 		break;
@@ -1019,8 +1007,6 @@ slioctl(struct ifnet *ifp, u_long cmd, caddr_t data, struct ucred *cr)
 	default:
 		error = EINVAL;
 	}
-
-	crit_exit();
 	return (error);
 }
 
@@ -1028,9 +1014,10 @@ static void
 sl_keepalive(void *chan)
 {
 	struct sl_softc *sc = chan;
+	struct tty *tp = sc->sc_ttyp;
 	struct pgrp *pg;
 
-	lwkt_gettoken(&tty_token);
+	lwkt_gettoken(&tp->t_token);
 	if (sc->sc_keepalive) {
 		if (sc->sc_flags & SC_KEEPALIVE) {
 			pg = sc->sc_ttyp->t_pgrp;
@@ -1047,7 +1034,7 @@ sl_keepalive(void *chan)
 	} else {
 		sc->sc_flags &= ~SC_KEEPALIVE;
 	}
-	lwkt_reltoken(&tty_token);
+	lwkt_reltoken(&tp->t_token);
 }
 
 static void
@@ -1056,15 +1043,13 @@ sl_outfill(void *chan)
 	struct sl_softc *sc = chan;
 	struct tty *tp = sc->sc_ttyp;
 
-	lwkt_gettoken(&tty_token);
+	lwkt_gettoken(&tp->t_token);
 
 	if (sc->sc_outfill && tp != NULL) {
 		if (sc->sc_flags & SC_OUTWAIT) {
-			crit_enter();
 			IFNET_STAT_INC(&sc->sc_if, obytes, 1);
 			clist_putc(FRAME_END, &tp->t_outq);
 			(*tp->t_oproc)(tp);
-			crit_exit();
 		} else
 			sc->sc_flags |= SC_OUTWAIT;
 		callout_reset(&sc->sc_oftimeout, sc->sc_outfill,
@@ -1072,5 +1057,7 @@ sl_outfill(void *chan)
 	} else {
 		sc->sc_flags &= ~SC_OUTWAIT;
 	}
-	lwkt_reltoken(&tty_token);
+	lwkt_reltoken(&tp->t_token);
 }
+
+MODULE_VERSION(if_sl, 1);

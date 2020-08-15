@@ -10,7 +10,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -28,7 +28,6 @@
  *
  *	@(#)unistd.h	8.2 (Berkeley) 1/7/94
  * $FreeBSD: src/sys/sys/unistd.h,v 1.50 2009/01/31 10:04:36 trhodes Exp $
- * $DragonFly: src/sys/sys/unistd.h,v 1.10 2008/09/22 09:13:21 hasso Exp $
  */
 
 #ifndef _SYS_UNISTD_H_
@@ -51,49 +50,51 @@
  * the POSIX standard; however, if the relevant sysconf() function
  * returns -1, the functions may be stubbed out.
  */
-#define	_POSIX_ADVISORY_INFO		-1
-#define	_POSIX_ASYNCHRONOUS_IO		0
-#define	_POSIX_BARRIERS			200112L
+#define	_POSIX_ADVISORY_INFO		-1	/* [ADV] */
+#define	_POSIX_ASYNCHRONOUS_IO		0	/* mandatory ([AIO]) */
+#define	_POSIX_BARRIERS			200112L	/* mandatory ([BAR]) */
 #define	_POSIX_CHOWN_RESTRICTED		1
-#define	_POSIX_CLOCK_SELECTION		-1
-#define	_POSIX_CPUTIME			-1
-#define	_POSIX_FSYNC			200112L
+#define	_POSIX_CLOCK_SELECTION		-1	/* XXX mandatory ([CS]) */
+#define	_POSIX_CPUTIME			200112L	/* [CPT] */
+#define	_POSIX_FSYNC			200112L	/* [FSC] */
 #define	_POSIX_IPV6			0
-#define	_POSIX_JOB_CONTROL		1
-#define	_POSIX_MAPPED_FILES		200112L
-#define	_POSIX_MEMLOCK			-1
-#define	_POSIX_MEMLOCK_RANGE		200112L
-#define	_POSIX_MEMORY_PROTECTION	200112L
-#define	_POSIX_MESSAGE_PASSING		200112L
-#define	_POSIX_MONOTONIC_CLOCK		200112L
+#define	_POSIX_JOB_CONTROL		1	/* mandatory */
+#define	_POSIX_MAPPED_FILES		200112L	/* mandatory ([MF]) */
+#define	_POSIX_MEMLOCK			-1	/* [ML] */
+#define	_POSIX_MEMLOCK_RANGE		200112L	/* [MLR] */
+#define	_POSIX_MEMORY_PROTECTION	200112L	/* mandatory ([MPR]) */
+#define	_POSIX_MESSAGE_PASSING		200112L	/* [MSG] */
+#define	_POSIX_MONOTONIC_CLOCK		200112L	/* [MON] */
 #define	_POSIX_NO_TRUNC			1
-#define	_POSIX_PRIORITIZED_IO		-1
-#define	_POSIX_PRIORITY_SCHEDULING	200112L
-#define	_POSIX_RAW_SOCKETS		200112L
-#define	_POSIX_REALTIME_SIGNALS		200112L
-#define	_POSIX_SEMAPHORES		200112L
-#define	_POSIX_SHARED_MEMORY_OBJECTS	200112L
-#define	_POSIX_SPIN_LOCKS		200112L
-#define	_POSIX_SPORADIC_SERVER		-1
-#define	_POSIX_SYNCHRONIZED_IO		-1
-#define	_POSIX_TIMEOUTS			200112L
-#define	_POSIX_TIMERS			200112L
-#define	_POSIX_TYPED_MEMORY_OBJECTS	-1
+#define	_POSIX_PRIORITIZED_IO		-1	/* [PIO] */
+#define	_POSIX_PRIORITY_SCHEDULING	200112L	/* [PS] */
+#define	_POSIX_RAW_SOCKETS		200112L	/* [RS] */
+#define	_POSIX_REALTIME_SIGNALS		200112L	/* mandatory ([RTS]) */
+#define	_POSIX_SEMAPHORES		200112L	/* mandatory ([SEM]) */
+#define	_POSIX_SHARED_MEMORY_OBJECTS	200112L	/* [SHM] */
+#define	_POSIX_SPIN_LOCKS		200112L	/* mandatory ([SPI]) */
+#define	_POSIX_SPORADIC_SERVER		-1	/* [SS] */
+#define	_POSIX_SYNCHRONIZED_IO		-1	/* [SIO] */
+#define	_POSIX_THREAD_CPUTIME		200112L	/* [TCT] */
+#define	_POSIX_TIMEOUTS			200112L	/* mandatory ([TMO]) */
+#define	_POSIX_TIMERS			200112L	/* XXX mandatory ([TMR]) */
+#define	_POSIX_TYPED_MEMORY_OBJECTS	-1	/* [TYM] */
 #define	_POSIX_VDISABLE			0xff
 
 #if __XSI_VISIBLE
 #define	_XOPEN_SHM			1
-#define	_XOPEN_STREAMS			-1
+#define	_XOPEN_STREAMS			-1	/* [XSR] obsolescent */
 #endif
 
 /*
  * Although we have saved user/group IDs, we do not use them in setuid
  * as described in POSIX 1003.1, because the feature does not work for
  * root.  We use the saved IDs in seteuid/setegid, which are not currently
- * part of the POSIX 1003.1 specification.  XXX revisit for 1003.1-2001
- * as this is now mandatory.
+ * part of the POSIX 1003.1 specification.  See comments in kern_prot.c.
+ *
+ * XXX revisit for 1003.1-2008 as this is now mandatory since 1003.1-2001.
  */
-#ifdef _NOT_AVAILABLE
+#if 0
 #define	_POSIX_SAVED_IDS	1 /* saved set-user-ID and set-group-ID */
 #endif
 
@@ -108,18 +109,23 @@
 #define	W_OK		0x02	/* test for write permission */
 #define	R_OK		0x04	/* test for read permission */
 
-/* whence values for lseek(2) */
+/*
+ * whence values for lseek(2)
+ * Always ensure that these are consistent with <fcntl.h> and <stdio.h>!
+ */
 #ifndef SEEK_SET
 #define	SEEK_SET	0	/* set file offset to offset */
+#endif
+#ifndef SEEK_CUR
 #define	SEEK_CUR	1	/* set file offset to current plus offset */
+#endif
+#ifndef SEEK_END
 #define	SEEK_END	2	/* set file offset to EOF plus offset */
 #endif
 #if __BSD_VISIBLE
 #define	SEEK_DATA	3	/* set file offset to next data past offset */
 #define	SEEK_HOLE	4	/* set file offset to next hole past offset */
-#endif
 
-#ifndef _POSIX_SOURCE
 /* whence values for lseek(2); renamed by POSIX 1003.1 */
 #define	L_SET		SEEK_SET
 #define	L_INCR		SEEK_CUR
@@ -151,6 +157,11 @@
 #define	_PC_REC_MIN_XFER_SIZE	16
 #define	_PC_REC_XFER_ALIGN	17
 #define	_PC_SYMLINK_MAX		18
+#endif
+
+#if __POSIX_VISIBLE >= 200809
+#define	_PC_2_SYMLINKS		22
+#define	_PC_TIMESTAMP_RESOLUTION 23
 #endif
 
 #if __BSD_VISIBLE
@@ -198,18 +209,6 @@
 #define	EXTEXIT_PROC	(0<<16)
 #define	EXTEXIT_LWP	(1<<16)
 #define	EXTEXIT_WHO(f)	((f) & (0xffff<<16))
-
-
-/*
- * Parameters for the creation of a new lwp.
- */
-struct lwp_params {
-	void (*func)(void *);	/* Function to start execution */
-	void *arg;		/* Parameter to this function */
-	void *stack;		/* Stack address to use */
-	lwpid_t *tid1;		/* Address to copy out new tid */
-	lwpid_t *tid2;		/* Same */
-};
 
 #endif /* __BSD_VISIBLE */
 

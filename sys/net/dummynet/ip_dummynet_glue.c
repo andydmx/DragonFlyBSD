@@ -1,13 +1,13 @@
 /*
  * Copyright (c) 2007 The DragonFly Project.  All rights reserved.
- * 
+ *
  * This code is derived from software contributed to The DragonFly Project
  * by Sepherosa Ziehau <sepherosa@gmail.com>
- * 
+ *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
  * are met:
- * 
+ *
  * 1. Redistributions of source code must retain the above copyright
  *    notice, this list of conditions and the following disclaimer.
  * 2. Redistributions in binary form must reproduce the above copyright
@@ -17,7 +17,7 @@
  * 3. Neither the name of The DragonFly Project nor the names of its
  *    contributors may be used to endorse or promote products derived
  *    from this software without specific, prior written permission.
- * 
+ *
  * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
  * ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
  * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
@@ -34,6 +34,7 @@
 
 #include <sys/param.h>
 #include <sys/kernel.h>
+#include <sys/malloc.h>
 #include <sys/mbuf.h>
 #include <sys/msgport.h>
 #include <sys/socketvar.h>
@@ -69,6 +70,7 @@ static int	ip_dn_sockopt_get(struct sockopt *);
 static int	ip_dn_sockopt_config(struct sockopt *);
 
 ip_dn_io_t	*ip_dn_io_ptr;
+ip_dn_ctl_t	*ip_dn_ctl_ptr;
 int		ip_dn_cpu = 0;
 
 TUNABLE_INT("net.inet.ip.dummynet.cpu", &ip_dn_cpu);
@@ -322,6 +324,7 @@ ip_dn_ip_input(netmsg_t nmsg)
 	struct dn_pkt *pkt;
 	ip_dn_unref_priv_t unref_priv;
 	void *priv;
+	struct ip *ip;
 
 	nmp = &nmsg->packet;
 	m = nmp->nm_packet;
@@ -345,6 +348,12 @@ ip_dn_ip_input(netmsg_t nmsg)
 
 	priv = pkt->dn_priv;
 	unref_priv = pkt->dn_unref_priv;
+
+	/* ip_input() expects ip_off/ip_len in network byte order. */
+	KKASSERT(m->m_len >= sizeof(*ip));
+	ip = mtod(m, struct ip *);
+	ip->ip_len = htons(ip->ip_len);
+	ip->ip_off = htons(ip->ip_off);
 
 	ip_input(m);
 

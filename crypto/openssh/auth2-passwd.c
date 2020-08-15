@@ -1,4 +1,4 @@
-/* $OpenBSD: auth2-passwd.c,v 1.9 2006/08/03 03:34:41 deraadt Exp $ */
+/* $OpenBSD: auth2-passwd.c,v 1.18 2020/02/26 13:40:09 jsg Exp $ */
 /*
  * Copyright (c) 2000 Markus Friedl.  All rights reserved.
  *
@@ -27,49 +27,46 @@
 
 #include <sys/types.h>
 
+#include <stdlib.h>
 #include <string.h>
 #include <stdarg.h>
+#include <stdio.h>
 
-#include "xmalloc.h"
 #include "packet.h"
+#include "ssherr.h"
 #include "log.h"
-#include "key.h"
+#include "sshkey.h"
 #include "hostfile.h"
 #include "auth.h"
-#include "buffer.h"
 #ifdef GSSAPI
 #include "ssh-gss.h"
 #endif
 #include "monitor_wrap.h"
+#include "misc.h"
 #include "servconf.h"
 
 /* import */
 extern ServerOptions options;
 
 static int
-userauth_passwd(Authctxt *authctxt)
+userauth_passwd(struct ssh *ssh)
 {
-	char *password, *newpass;
-	int authenticated = 0;
-	int change;
-	u_int len, newlen;
+	char *password;
+	int authenticated = 0, r;
+	u_char change;
+	size_t len;
 
-	change = packet_get_char();
-	password = packet_get_string(&len);
-	if (change) {
-		/* discard new password from packet */
-		newpass = packet_get_string(&newlen);
-		memset(newpass, 0, newlen);
-		xfree(newpass);
-	}
-	packet_check_eom();
+	if ((r = sshpkt_get_u8(ssh, &change)) != 0 ||
+	    (r = sshpkt_get_cstring(ssh, &password, &len)) != 0 ||
+	    (change && (r = sshpkt_get_cstring(ssh, NULL, NULL)) != 0) ||
+	    (r = sshpkt_get_end(ssh)) != 0)
+		fatal("%s: %s", __func__, ssh_err(r));
 
 	if (change)
 		logit("password change not supported");
-	else if (PRIVSEP(auth_password(authctxt, password)) == 1)
+	else if (PRIVSEP(auth_password(ssh, password)) == 1)
 		authenticated = 1;
-	memset(password, 0, len);
-	xfree(password);
+	freezero(password, len);
 	return authenticated;
 }
 

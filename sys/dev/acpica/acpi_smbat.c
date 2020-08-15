@@ -94,6 +94,7 @@ static driver_t	acpi_smbat_driver = {
 	"battery",
 	acpi_smbat_methods,
 	sizeof(struct acpi_smbat_softc),
+	.gpri = KOBJ_GPRI_ACPI
 };
 
 static devclass_t acpi_smbat_devclass;
@@ -125,6 +126,7 @@ acpi_smbat_attach(device_t dev)
 	uint32_t base;
 
 	sc = device_get_softc(dev);
+	ACPI_SERIAL_INIT(smbat);
 	if (ACPI_FAILURE(acpi_GetInteger(acpi_get_handle(dev), "_EC", &base))) {
 		device_printf(dev, "cannot get EC base address\n");
 		return (ENXIO);
@@ -169,7 +171,7 @@ acpi_smbat_info_expired(struct timespec *lastupdated)
 		return (TRUE);
 
 	getnanotime(&curtime);
-	timespecsub(&curtime, lastupdated);
+	timespecsub(&curtime, lastupdated, &curtime);
 	return (curtime.tv_sec < 0 ||
 	    curtime.tv_sec > acpi_battery_get_info_expire());
 }

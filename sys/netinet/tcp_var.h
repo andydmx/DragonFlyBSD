@@ -43,11 +43,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -82,6 +78,7 @@
  */
 extern int tcp_do_rfc1323;
 extern int tcp_low_rtobase;
+extern int tcp_ncr_linklocal;
 extern int tcp_ncr_rxtthresh_max;
 extern int tcp_do_sack;
 extern int tcp_do_smartsack;
@@ -135,6 +132,10 @@ struct scoreboard {
 struct netmsg_tcp_timer;
 struct netmsg_base;
 
+struct tcp_pcbport {
+	struct inpcbport	t_phd;
+} __cachealign;
+
 /*
  * Tcp control block, one per tcp; fields:
  * Organized for 16 byte cacheline efficiency.
@@ -144,6 +145,9 @@ struct tcpcb {
 	int	t_dupacks;		/* consecutive dup acks recd */
 	int	t_rxtthresh;		/* # dup acks to start fast rxt */
 	int	tt_cpu;			/* sanity check the cpu */
+
+	struct	tcp_pcbport *t_pcbport;	/* per-cpu local port cache for
+					 * accept(2)'ed sockets */
 
 	struct	tcp_callout *tt_rexmt;	/* retransmit timer */
 	struct	tcp_callout *tt_persist;/* retransmit persistence */
@@ -447,14 +451,26 @@ struct tcp_stats {
 
 	u_long	tcps_pad[6];		/* pad to cache line size (64B) */
 };
+#ifdef _KERNEL
+CTASSERT((sizeof(struct tcp_stats) & __VM_CACHELINE_MASK) == 0);
+#endif
 
 #ifdef _KERNEL
+
+#ifndef _NETINET_TCP_FSM_H_
+#include <netinet/tcp_fsm.h>
+#endif
+
+struct tcp_state_count {
+	u_long	tcps_count[TCP_NSTATES];
+} __cachealign;
 
 #define tcpstat	tcpstats_percpu[mycpuid]
 
 struct sockopt;
 
 extern struct tcp_stats		tcpstats_percpu[MAXCPU];
+extern struct tcp_state_count	tcpstate_count[MAXCPU];
 
 static const int tcprexmtthresh = 3;
 #endif
@@ -492,6 +508,8 @@ struct syncache {
 #define sc_route	sc_inc.inc_route
 #define sc_route6	sc_inc.inc6_route
 	u_int32_t	sc_tsrecent;
+	uint16_t	sc_hashval;		/* connection hash */
+	uint16_t	sc_pad;			/* explicit padding */
 	tcp_seq		sc_irs;			/* seq from peer */
 	tcp_seq		sc_iss;			/* our ISS */
 	u_long		sc_rxttime;		/* retransmit time */
@@ -504,11 +522,10 @@ struct syncache {
 #define SCF_NOOPT		0x01		/* no TCP options */
 #define SCF_WINSCALE		0x02		/* negotiated window scaling */
 #define SCF_TIMESTAMP		0x04		/* negotiated timestamps */
-#define SCF_UNUSED		0x08		/* unused */
+#define SCF_HASH		0x08		/* sc_hashval is valid */
 #define SCF_UNREACH		0x10		/* icmp unreachable received */
 #define	SCF_SACK_PERMITTED	0x20		/* saw SACK permitted option */
 #define SCF_SIGNATURE		0x40		/* send MD5 digests */
-#define SCF_MARKER		0x80		/* not a real entry */
 	int		sc_rxtused;		/* time spent in SYN|ACK rxt */
 	u_long		sc_sndwnd;		/* send window */
 	TAILQ_ENTRY(syncache) sc_hash;
@@ -618,10 +635,12 @@ SYSCTL_DECL(_net_inet_tcp);
 #define TCP_SACK_BLKEND(len, thflags) \
 	((len) + (((thflags) & TH_FIN) != 0))
 
-TAILQ_HEAD(tcpcbackqhead,tcpcb);
+struct tcpcbackq {
+	TAILQ_HEAD(, tcpcb)	head;
+} __cachealign;
 
 extern	struct inpcbinfo tcbinfo[];
-extern	struct tcpcbackqhead tcpcbackq[];
+extern	struct tcpcbackq tcpcbackq[];
 
 extern	int tcp_mssdflt;	/* XXX */
 extern	int tcp_minmss;
@@ -633,6 +652,8 @@ union netmsg;
 
 int	 tcp_addrcpu(in_addr_t faddr, in_port_t fport,
 	    in_addr_t laddr, in_port_t lport);
+int	 tcp_addrhash(in_addr_t faddr, in_port_t fport,
+	    in_addr_t laddr, in_port_t lport);
 struct lwkt_port *
 	tcp_addrport(in_addr_t faddr, in_port_t fport,
 	    in_addr_t laddr, in_port_t lport);
@@ -642,18 +663,20 @@ struct tcpcb *
 	 tcp_close (struct tcpcb *);
 void	 tcp_ctlinput(union netmsg *);
 void	 tcp_ctloutput(union netmsg *);
+struct netmsg_pr_ctloutput *tcp_ctloutmsg(struct sockopt *);
+inp_notify_t tcp_get_inpnotify(int cmd, const struct sockaddr *sa,
+	    int *arg, struct ip **ip0, int *cpuid);
 struct tcpcb *
 	 tcp_drop (struct tcpcb *, int);
 void	 tcp_drain (void);
 void	 tcp_init (void);
 void	 tcp_thread_init (void);
 int	 tcp_input (struct mbuf **, int *, int);
-void	 tcp_mss (struct tcpcb *, int);
+void	 tcp_rmx_init (struct tcpcb *, int);
 int	 tcp_mssopt (struct tcpcb *);
 void	 tcp_drop_syn_sent (struct inpcb *, int);
 void	 tcp_mtudisc (struct inpcb *, int);
-struct tcpcb *
-	 tcp_newtcpcb (struct inpcb *);
+void	 tcp_newtcpcb (struct inpcb *);
 int	 tcp_output(struct tcpcb *);
 int	 tcp_output_fair(struct tcpcb *);
 void	 tcp_output_init(struct tcpcb *);
@@ -702,7 +725,7 @@ void	 tcp_fillheaders (struct tcpcb *, void *, void *, boolean_t);
 struct lwkt_port *
 	 tcp_soport(struct socket *, struct sockaddr *, struct mbuf **);
 struct lwkt_port *
-	 tcp_ctlport(int, struct sockaddr *, void *);
+	 tcp_ctlport(int, struct sockaddr *, void *, int *);
 struct lwkt_port *
 	 tcp_initport(void);
 struct tcpcb *
@@ -713,7 +736,7 @@ void	 tcp_xmit_bandwidth_limit(struct tcpcb *tp, tcp_seq ack_seq);
 u_long	 tcp_initial_window(struct tcpcb *tp);
 void	 tcp_timer_keep_activity(struct tcpcb *tp, int thflags);
 void	 syncache_init(void);
-void	 syncache_unreach(struct in_conninfo *, struct tcphdr *);
+void	 syncache_unreach(struct in_conninfo *, const struct tcphdr *);
 int	 syncache_expand(struct in_conninfo *, struct tcphdr *,
 	     struct socket **, struct mbuf *);
 int	 syncache_add(struct in_conninfo *, struct tcpopt *,
@@ -732,6 +755,104 @@ extern	struct pr_usrreqs tcp_usrreqs;
 extern	u_long tcp_sendspace;
 extern	u_long tcp_recvspace;
 tcp_seq tcp_new_isn (struct tcpcb *);
+
+void	tcp_pcbport_create(struct tcpcb *);
+void	tcp_pcbport_destroy(struct tcpcb *);
+void	tcp_pcbport_merge_oncpu(struct tcpcb *);
+
+static __inline void
+tcp_pcbport_insert(struct tcpcb *ltp, struct inpcb *inp)
+{
+	struct inpcbport *phd;
+	int cpu;
+
+	if (inp->inp_lport != ltp->t_inpcb->inp_lport) {
+		/*
+		 * This could happen with 'ipfw forward'.
+		 */
+		in_pcbinsporthash_lport(inp);
+		return;
+	}
+
+	cpu = mycpuid;
+	KASSERT(cpu < netisr_ncpus, ("invalid cpu%d", cpu));
+	phd = &ltp->t_pcbport[cpu].t_phd;
+
+	/*
+	 * NOTE:
+	 * Set inp_porthash NULL and set inp_phd properly,
+	 * so that tcp_pcbport_remove() could tell that this
+	 * inpcb is on the listen tcpcb per-cpu port cache.
+	 */
+	inp->inp_porthash = NULL;
+	inp->inp_phd = phd;
+	LIST_INSERT_HEAD(&phd->phd_pcblist, inp, inp_portlist);
+}
+
+static __inline void
+tcp_pcbport_remove(struct inpcb *inp)
+{
+	if (inp->inp_porthash == NULL && inp->inp_phd != NULL) {
+		/*
+		 * On listen tcpcb per-cpu port cache.
+		 */
+		LIST_REMOVE(inp, inp_portlist);
+		inp->inp_phd = NULL;
+		/* NOTE: Don't whack inp_lport, which may be used later */
+	}
+}
+
+static __inline void
+_TCP_STATE_INC(const struct tcpcb *tp)
+{
+	tcpstate_count[mycpuid].tcps_count[tp->t_state]++;
+}
+
+static __inline void
+_TCP_STATE_DEC(const struct tcpcb *tp)
+{
+	tcpstate_count[mycpuid].tcps_count[tp->t_state]--;
+}
+
+static __inline void
+_TCP_STATE_SET(struct tcpcb *tp, int state)
+{
+	tp->t_state = state;
+	_TCP_STATE_INC(tp);
+}
+
+static __inline void
+TCP_STATE_INIT(struct tcpcb *tp)
+{
+	_TCP_STATE_SET(tp, TCPS_CLOSED);
+}
+
+static __inline void
+TCP_STATE_TERM(struct tcpcb *tp)
+{
+	KASSERT(tp->t_state != TCPS_TERMINATING, ("tcpcb was terminated"));
+	_TCP_STATE_DEC(tp);
+	tp->t_state = TCPS_TERMINATING;
+}
+
+static __inline void
+TCP_STATE_CHANGE(struct tcpcb *tp, int state)
+{
+	_TCP_STATE_DEC(tp);
+	_TCP_STATE_SET(tp, state);
+}
+
+static __inline void
+TCP_STATE_MIGRATE_START(const struct tcpcb *tp)
+{
+	_TCP_STATE_DEC(tp);
+}
+
+static __inline void
+TCP_STATE_MIGRATE_END(const struct tcpcb *tp)
+{
+	_TCP_STATE_INC(tp);
+}
 
 #endif /* _KERNEL */
 

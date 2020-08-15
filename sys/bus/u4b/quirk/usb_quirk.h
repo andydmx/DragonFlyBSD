@@ -1,5 +1,7 @@
-/* $FreeBSD$ */
+/* $FreeBSD: head/sys/dev/usb/quirk/usb_quirk.h 326255 2017-11-27 14:52:40Z pfg $ */
 /*-
+ * SPDX-License-Identifier: BSD-2-Clause-FreeBSD
+ *
  * Copyright (c) 2008 Hans Petter Selasky. All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -49,6 +51,8 @@ enum {
 	UQ_HID_IGNORE,		/* device should be ignored by hid class */
 	UQ_KBD_IGNORE,		/* device should be ignored by kbd class */
 	UQ_KBD_BOOTPROTO,	/* device should set the boot protocol */
+	UQ_KBD_DELAY_INIT,	/* add short delay during initialization */
+	UQ_KBD_DELAY_CTRL_MSG,	/* add short delay after sending ctl msg */
 	UQ_UMS_IGNORE,          /* device should be ignored by ums class */
 	UQ_MS_BAD_CLASS,	/* doesn't identify properly */
 	UQ_MS_LEADING_BYTE,	/* mouse sends an unknown leading byte */
@@ -102,11 +106,15 @@ enum {
 	UQ_MSC_EJECT_WAIT,		/* wait for the device to eject */
 	UQ_MSC_EJECT_SAEL_M460,		/* ejects after Sael USB commands */ 
 	UQ_MSC_EJECT_HUAWEISCSI,	/* ejects after Huawei SCSI command */
+	UQ_MSC_EJECT_HUAWEISCSI2,	/* ejects after Huawei SCSI 2 command */
 	UQ_MSC_EJECT_TCT,		/* ejects after TCT SCSI command */
 
 	UQ_BAD_MIDI,		/* device claims MIDI class, but isn't */
 	UQ_AU_VENDOR_CLASS,	/* audio device uses vendor and not audio class */
 	UQ_SINGLE_CMD_MIDI,	/* at most one command per USB packet */
+	UQ_MSC_DYMO_EJECT,	/* ejects Dymo MSC device */
+	UQ_AU_SET_SPDIF_CM6206,	/* enable S/PDIF audio output */
+	UQ_WMT_IGNORE,          /* device should be ignored by wmt driver */
 
 	USB_QUIRK_MAX
 };

@@ -188,10 +188,27 @@ amd64dfly_supply_pcb (struct regcache *regcache, struct pcb *pcb)
 
 static void (*super_mourn_inferior) (struct target_ops *ops);
 
+/* Work around vkernels not having PT_{GET,SET}DBREGS via ptrace(2) support. */
+static int
+is_vkernel(void)
+{
+	size_t len;
+	char buf[64];
+
+	len = sizeof(buf);
+	if (sysctlbyname("kern.vmm_guest", buf, &len, NULL, 0) < 0)
+		return 0;
+	if (strncmp("vkernel", buf, len) == 0)
+		return 1;
+	else
+		return 0;
+}
+
 static void
 amd64dfly_mourn_inferior (struct target_ops *ops)
 {
 #ifdef HAVE_PT_GETDBREGS
+  if (!is_vkernel())
   i386_cleanup_dregs ();
 #endif
   super_mourn_inferior (ops);
@@ -214,6 +231,7 @@ _initialize_amd64dfly_nat (void)
 
 #ifdef HAVE_PT_GETDBREGS
 
+  if (!is_vkernel()) {
   i386_use_watchpoints (t);
 
   i386_dr_low.set_control = amd64bsd_dr_set_control;
@@ -222,6 +240,7 @@ _initialize_amd64dfly_nat (void)
   i386_dr_low.get_status = amd64bsd_dr_get_status;
   i386_dr_low.get_control = amd64bsd_dr_get_control;
   i386_set_debug_register_length (8);
+  }
 
 #endif /* HAVE_PT_GETDBREGS */
 

@@ -69,6 +69,7 @@
 #include <sys/ctype.h>
 
 #include <net/if.h>
+#include <net/if_var.h>
 #include <net/ethernet.h>
 
 #include <netinet/in.h>
@@ -709,7 +710,7 @@ ng_bridge_rcvdata(hook_p hook, item_p item)
 			 * It's usable link but not the reserved (first) one.
 			 * Copy mbuf info for sending.
 			 */
-			m2 = m_dup(m, MB_DONTWAIT);	/* XXX m_copypacket() */
+			m2 = m_dup(m, M_NOWAIT);	/* XXX m_copypacket() */
 			if (m2 == NULL) {
 				link->stats.memoryFailures++;
 				NG_FREE_ITEM(item);

@@ -282,15 +282,6 @@ oce_attach(device_t dev)
 	if (rc)
 		goto vlan_free;
 
-	sysctl_ctx_init(&sc->sysctl_ctx);
-	sc->sysctl_tree = SYSCTL_ADD_NODE(&sc->sysctl_ctx,
-	    SYSCTL_STATIC_CHILDREN(_hw), OID_AUTO,
-	    device_get_nameunit(sc->dev), CTLFLAG_RD, 0, "");
-	if (sc->sysctl_tree == NULL) {
-		device_printf(sc->dev, "cannot add sysctl tree node\n");
-		rc = ENXIO;
-		goto vlan_free;
-	}
 	oce_add_sysctls(sc);
 
 	callout_init_mp(&sc->timer);
@@ -337,7 +328,7 @@ oce_detach(device_t dev)
 	oce_if_deactivate(sc);
 	UNLOCK(&sc->dev_lock);
 
-	callout_stop_sync(&sc->timer);
+	callout_terminate(&sc->timer);
 
 	if (sc->vlan_attach != NULL)
 		EVENTHANDLER_DEREGISTER(vlan_config, sc->vlan_attach);
@@ -351,8 +342,6 @@ oce_detach(device_t dev)
 	oce_hw_shutdown(sc);
 
 	bus_generic_detach(dev);
-
-	sysctl_ctx_free(&sc->sysctl_ctx);
 	return 0;
 }
 
@@ -481,7 +470,9 @@ oce_ioctl(struct ifnet *ifp, u_long command, caddr_t data, struct ucred *cr)
 		break;
 
 	case SIOCGPRIVATE_0:
-		rc = oce_handle_passthrough(ifp, data);
+		rc = priv_check_cred(cr, PRIV_ROOT, NULL_CRED_OKAY);
+		if (rc == 0)
+			rc = oce_handle_passthrough(ifp, data);
 		break;
 	default:
 		rc = ether_ioctl(ifp, command, data);
@@ -1015,7 +1006,7 @@ oce_tx_restart(POCE_SOFTC sc, struct oce_wq *wq)
 	if ((sc->ifp->if_flags & IFF_RUNNING) != IFF_RUNNING)
 		return;
 
-#if __FreeBSD_version >= 800000
+#if 0 /* __FreeBSD_version >= 800000 */
 	if (!drbr_empty(sc->ifp, wq->br))
 #else
 	if (!ifq_is_empty(&sc->ifp->if_snd))
@@ -1332,7 +1323,7 @@ oce_rx(struct oce_rq *rq, uint32_t rqe_idx, struct oce_nic_rx_cqe *cqe)
 		}
 
 		m->m_pkthdr.rcvif = sc->ifp;
-#if __FreeBSD_version >= 800000
+#if 0 /* __FreeBSD_version >= 800000 */
 		if (rq->queue_index)
 			m->m_pkthdr.flowid = (rq->queue_index - 1);
 		else
@@ -1456,8 +1447,9 @@ oce_cqe_portid_valid(POCE_SOFTC sc, struct oce_nic_rx_cqe *cqe)
 		port_id =  cqe_v1->u0.s.port;
 		if (sc->port_id != port_id)
 			return 0;
-	} else
+	} else {
 		;/* For BE3 legacy and Lancer this is dummy */
+	}
 
 	return 1;
 
@@ -1685,6 +1677,8 @@ oce_attach_ifp(POCE_SOFTC sc)
 
 	if_initname(sc->ifp,
 		    device_get_name(sc->dev), device_get_unit(sc->dev));
+
+	sc->ifp->if_nmbclusters = sc->nrqs * sc->rq[0]->cfg.q_len;
 
 	ifq_set_maxlen(&sc->ifp->if_snd, OCE_MAX_TX_DESC - 1);
 	ifq_set_ready(&sc->ifp->if_snd);

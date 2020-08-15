@@ -39,20 +39,18 @@
 #include <sys/param.h>
 #include <sys/systm.h>
 #include <sys/bus.h>
+#include <sys/kernel.h>
 #include <sys/malloc.h>
 #include <sys/syslog.h>
 #include <sys/rman.h>
+#include <sys/kbio.h>
 
 #include <machine/clock.h>
 
 #include "atkbdcreg.h"
+#include "kbdreg.h"
 
 #include <bus/isa/isareg.h>
-
-#if 0
-#define lwkt_gettoken(x)
-#define lwkt_reltoken(x)
-#endif
 
 /* constants */
 
@@ -140,6 +138,24 @@ atkbdc_attach_unit(int unit, atkbdc_softc_t *sc, struct resource *port0,
 			    rman_get_bushandle(port1));
 }
 
+extern int acpi_fadt_8042_nolegacy;
+int kicked_by_syscons = 0;
+
+static void
+atkbdc_fadt_done(void)
+{
+	if (kicked_by_syscons) {
+		/*
+		 * Configuring all keyboards is fine, because only atkbd
+		 * really does something here, anyway.
+		 */
+		kbd_configure(KB_CONF_PROBE_ONLY);
+	}
+}
+
+/* After fadt_probe in platform/pc64/acpica/acpi_fadt.c. */
+SYSINIT(atkbdc_kick, SI_BOOT2_PRESMP, SI_ORDER_THIRD, atkbdc_fadt_done, 0);
+
 /* the backdoor to the keyboard controller! XXX */
 int
 atkbdc_configure(void)
@@ -149,9 +165,13 @@ atkbdc_configure(void)
 	bus_space_handle_t h1;
 	int port0;
 	int port1;
-#if defined(__i386__) || defined(__x86_64__)
+#if defined(__x86_64__)
 	int i;
 #endif
+
+	kicked_by_syscons = 1;
+	if (acpi_fadt_8042_nolegacy != 0)
+		return ENXIO;
 
 	port0 = IO_KBD;
 	resource_int_value("atkbdc", 0, "port", &port0);
@@ -161,8 +181,8 @@ atkbdc_configure(void)
 #endif
 
 	/* XXX: tag should be passed from the caller */
-#if defined(__i386__)
-	tag = I386_BUS_SPACE_IO;
+#if defined(__x86_64__)
+	tag = X86_64_BUS_SPACE_IO;
 #else
 	tag = 0;	/* XXX */
 #endif
@@ -175,7 +195,7 @@ atkbdc_configure(void)
 	h1 = (bus_space_handle_t)port1;
 #endif
 
-#if defined(__i386__) || defined(__x86_64__)
+#if defined(__x86_64__)
 	/*
 	 * Check if we really have AT keyboard controller. Poll status
 	 * register until we get "all clear" indication. If no such

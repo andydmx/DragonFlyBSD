@@ -427,6 +427,7 @@ static const struct ng_parse_type ng_generic_nodeinfoarray_type = {
 	&ng_nodeinfoarray_type_info
 };
 
+#if 0 /* unused */
 /* Array type for a variable length array of struct typelist */
 static const struct ng_parse_array_info ng_typeinfoarray_type_info = {
 	&ng_generic_typeinfo_type,
@@ -436,6 +437,7 @@ static const struct ng_parse_type ng_generic_typeinfoarray_type = {
 	&ng_parse_array_type,
 	&ng_typeinfoarray_type_info
 };
+#endif
 
 /* Array type for array of struct linkinfo in struct hooklist */
 static const struct ng_parse_array_info ng_generic_linkinfo_array_type_info = {
@@ -447,7 +449,9 @@ static const struct ng_parse_type ng_generic_linkinfo_array_type = {
 	&ng_generic_linkinfo_array_type_info
 };
 
+#if 0 /* unused */
 DEFINE_PARSE_STRUCT_TYPE(typelist, TYPELIST, (&ng_generic_typeinfoarray_type));
+#endif
 DEFINE_PARSE_STRUCT_TYPE(hooklist, HOOKLIST,
 	(&ng_generic_nodeinfo_type, &ng_generic_linkinfo_array_type));
 DEFINE_PARSE_STRUCT_TYPE(listnodes, LISTNODES,
@@ -587,7 +591,7 @@ ng_make_node(const char *typename, node_p *nodepp)
 	 */
 	if (type->constructor != NULL) {
 		if ((error = ng_make_node_common(type, nodepp)) == 0) {
-			if ((error = ((*type->constructor)(*nodepp)) != 0)) {
+			if ((error = ((*type->constructor)(*nodepp))) != 0) {
 				NG_NODE_UNREF(*nodepp);
 			}
 		}
@@ -2762,8 +2766,8 @@ ngb_mod_event(module_t mod, int event, void *data)
 		lwkt_token_init(&ng_namehash_token, "ng namehash");
 		lwkt_token_init(&ng_topo_token, "ng topology");
 #ifdef	NETGRAPH_DEBUG
-		mtx_init(&ng_nodelist_mtx);
-		mtx_init(&ngq_mtx);
+		mtx_init(&ng_nodelist_mtx, "ng nodelist");
+		mtx_init(&ngq_mtx, "ng queue");
 #endif
 		ng_oc = objcache_create_mbacked(M_NETGRAPH,
 			    sizeof(struct ng_item), maxalloc, 0, bzero_ctor,
@@ -3259,7 +3263,7 @@ ng_callout(struct callout *c, node_p node, hook_p hook, int ticks,
 	NGI_FN(item) = fn;
 	NGI_ARG1(item) = arg1;
 	NGI_ARG2(item) = arg2;
-	oitem = c->c_arg;
+	oitem = callout_arg(c);
 	callout_reset(c, ticks, &ng_callout_trampoline, item);
 	return (0);
 }
@@ -3275,9 +3279,9 @@ ng_uncallout(struct callout *c, node_p node)
 	KASSERT(node != NULL, ("ng_uncallout: NULL node"));
 
 	rval = callout_stop(c);
-	item = c->c_arg;
+	item = callout_arg(c);
 	/* Do an extra check */
-	if ((rval > 0) && (c->c_func == &ng_callout_trampoline) &&
+	if ((rval > 0) && (callout_func(c) == &ng_callout_trampoline) &&
 	    (NGI_NODE(item) == node)) {
 		/*
 		 * We successfully removed it from the queue before it ran
@@ -3286,7 +3290,7 @@ ng_uncallout(struct callout *c, node_p node)
 		 */
 		NG_FREE_ITEM(item);
 	}
-	c->c_arg = NULL;
+	callout_set_arg(c, NULL);
 
 	return (rval);
 }

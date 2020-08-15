@@ -28,11 +28,15 @@
  * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
  * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
- *
- * @(#) Copyright (c) 1991, 1993 The Regents of the University of California.  All rights reserved.
- * @(#)main.c	8.6 (Berkeley) 5/28/95
- * $FreeBSD: head/bin/sh/main.c 253650 2013-07-25 15:08:41Z jilles $
  */
+
+#ifndef lint
+#if 0
+static char sccsid[] = "@(#)main.c	8.6 (Berkeley) 5/28/95";
+#endif
+#endif /* not lint */
+#include <sys/cdefs.h>
+__FBSDID("$FreeBSD$");
 
 #include <stdio.h>
 #include <signal.h>
@@ -72,7 +76,7 @@ int localeisutf8, initial_localeisutf8;
 static void reset(void);
 static void cmdloop(int);
 static void read_profile(const char *);
-static const char *find_dot_file(const char *);
+static char *find_dot_file(char *);
 
 /*
  * Main routine.  We initialize things, parse the arguments, execute
@@ -89,7 +93,7 @@ main(int argc, char *argv[])
 	volatile int state;
 	char *shinit;
 
-	setlocale(LC_ALL, "");
+	(void) setlocale(LC_ALL, "");
 	initcharset();
 	state = 0;
 	if (setjmp(main_handler.loc)) {
@@ -130,11 +134,13 @@ main(int argc, char *argv[])
 #endif
 	rootpid = getpid();
 	rootshell = 1;
+	INTOFF;
 	initvar();
 	setstackmark(&smark);
 	setstackmark(&smark2);
 	procargs(argc, argv);
 	pwd_init(iflag);
+	INTON;
 	if (iflag)
 		chkmail(1);
 	if (argv[0] && argv[0][0] == '-') {
@@ -175,8 +181,6 @@ reset(void)
 {
 	reseteval();
 	resetinput();
-	resetparser();
-	resetredir();
 }
 
 /*
@@ -223,7 +227,7 @@ cmdloop(int top)
 		popstackmark(&smark);
 		setstackmark(&smark);
 		if (evalskip != 0) {
-			if (evalskip == SKIPFILE)
+			if (evalskip == SKIPRETURN)
 				evalskip = 0;
 			break;
 		}
@@ -243,15 +247,11 @@ read_profile(const char *name)
 	int fd;
 	const char *expandedname;
 
-	expandedname = expandstr(__DECONST(char *, name));
+	expandedname = expandstr(name);
 	if (expandedname == NULL)
 		return;
 	INTOFF;
-#ifndef O_CLOEXEC
-	if ((fd = open(expandedname, O_RDONLY)) >= 0)
-#else
-	if ((fd = open(expandedname, O_RDONLY | O_CLOEXEC)) >= 0)
-#endif
+	if ((fd = open(expandedname, O_RDONLY | O_CLOEXEC_MAYBE)) >= 0)
 		setinputfd(fd, 1);
 	INTON;
 	if (fd < 0)
@@ -282,8 +282,8 @@ readcmdfile(const char *name)
  */
 
 
-static const char *
-find_dot_file(const char *basename)
+static char *
+find_dot_file(char *basename)
 {
 	char *fullname;
 	const char *path = pathval();
@@ -309,8 +309,7 @@ find_dot_file(const char *basename)
 int
 dotcmd(int argc, char **argv)
 {
-	const char *fullname;
-	char *filename;
+	char *filename, *fullname;
 
 	if (argc < 2)
 		error("missing filename");

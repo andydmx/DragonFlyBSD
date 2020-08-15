@@ -10,11 +10,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -31,13 +27,14 @@
  * SUCH DAMAGE.
  *
  * $FreeBSD: src/lib/libc/gen/getcwd.c,v 1.18 1999/09/28 13:24:13 marcel Exp $
- * $DragonFly: src/lib/libc/gen/getcwd.c,v 1.6 2005/04/26 06:04:56 joerg Exp $
  *
  * @(#)getcwd.c	8.5 (Berkeley) 2/7/95
  */
 
 #include <sys/param.h>
+#include <errno.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 
 int	__getcwd(char *pt, size_t size);
@@ -62,4 +59,15 @@ getcwd(char *pt, size_t size)
 	if (allocated)
 		free(pt);
 	return (NULL);
+}
+
+char *
+getwd(char *buf)
+{
+	char *p;
+
+	if ((p = getcwd(buf, MAXPATHLEN)) != NULL)
+		return(p);
+	strcpy(buf, strerror(errno));
+	return(NULL);
 }

@@ -23,7 +23,7 @@
  * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
  *
- * $FreeBSD: head/lib/libkiconv/xlat16_iconv.c 254273 2013-08-13 07:15:01Z peter $
+ * $FreeBSD: head/lib/libkiconv/xlat16_iconv.c 281550 2015-04-15 09:09:20Z tijl $
  */
 
 /*
@@ -41,6 +41,7 @@
 #include <dlfcn.h>
 #include <err.h>
 #include <errno.h>
+#include <iconv.h>
 #include <locale.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -58,20 +59,11 @@ struct xlat16_table {
 static struct xlat16_table kiconv_xlat16_open(const char *, const char *, int);
 static int chklocale(int, const char *);
 
-#ifdef ICONV_DLOPEN
-typedef void *iconv_t;
-static int my_iconv_init(void);
-static iconv_t (*my_iconv_open)(const char *, const char *);
-static size_t (*my_iconv)(iconv_t, const char **, size_t *, char **, size_t *);
-static int (*my_iconv_close)(iconv_t);
-#else
-#include <iconv.h>
 #define my_iconv_init() 0
 #define my_iconv_open iconv_open
 #define my_iconv iconv
 #define my_iconv_close iconv_close
-#endif
-static size_t my_iconv_char(iconv_t, const u_char **, size_t *, u_char **, size_t *);
+static size_t my_iconv_char(iconv_t, u_char **, size_t *, u_char **, size_t *);
 
 int
 kiconv_add_xlat16_cspair(const char *tocode, const char *fromcode, int flag)
@@ -221,8 +213,8 @@ kiconv_xlat16_open(const char *tocode, const char *fromcode, int lcase)
 			src[0] = (u_char)(c >> 8);
 			src[1] = (u_char)c;
 
-			ret = my_iconv_char(cd, (const u_char **)&srcp,
-			    &inbytesleft, &dstp, &outbytesleft);
+			ret = my_iconv_char(cd, &srcp, &inbytesleft,
+				&dstp, &outbytesleft);
 			if (ret == -1) {
 				table[us] = 0;
 				continue;
@@ -317,32 +309,11 @@ chklocale(int category, const char *code)
 	return (error);
 }
 
-#ifdef ICONV_DLOPEN
-static int
-my_iconv_init(void)
-{
-	void *iconv_lib;
-
-	iconv_lib = dlopen("libiconv.so", RTLD_LAZY | RTLD_GLOBAL);
-	if (iconv_lib == NULL) {
-		warn("Unable to load iconv library: %s\n", dlerror());
-		errno = ENOENT;
-		return (-1);
-	}
-	my_iconv_open = dlsym(iconv_lib, "iconv_open");
-	my_iconv = dlsym(iconv_lib, "iconv");
-	my_iconv_close = dlsym(iconv_lib, "iconv_close");
-
-	return (0);
-}
-#endif
-
 static size_t
-my_iconv_char(iconv_t cd, const u_char **ibuf, size_t * ilen, u_char **obuf,
+my_iconv_char(iconv_t cd, u_char **ibuf, size_t * ilen, u_char **obuf,
 	size_t * olen)
 {
-	const u_char *sp;
-	u_char *dp, ilocal[3], olocal[3];
+	u_char *sp, *dp, ilocal[3], olocal[3];
 	u_char c1, c2;
 	int ret;
 	size_t ir, or;
@@ -352,7 +323,7 @@ my_iconv_char(iconv_t cd, const u_char **ibuf, size_t * ilen, u_char **obuf,
 	ir = *ilen;
 
 	bzero(*obuf, *olen);
-	ret = my_iconv(cd, (const char **)&sp, ilen, (char **)&dp, olen);
+	ret = my_iconv(cd, (char **)&sp, ilen, (char **)&dp, olen);
 	c1 = (*obuf)[0];
 	c2 = (*obuf)[1];
 
@@ -375,7 +346,7 @@ my_iconv_char(iconv_t cd, const u_char **ibuf, size_t * ilen, u_char **obuf,
 	sp = ilocal;
 	dp = olocal;
 
-	if ((my_iconv(cd,(const char **)&sp, &ir, (char **)&dp, &or)) !=
+	if ((my_iconv(cd, (char **)&sp, &ir, (char **)&dp, &or)) !=
 	    (size_t)-1) {
 		if (olocal[0] != c1)
 			return (ret);
@@ -430,7 +401,7 @@ my_iconv_char(iconv_t cd, const u_char **ibuf, size_t * ilen, u_char **obuf,
 	sp = ilocal + 1;
 	dp = olocal;
 
-	if ((my_iconv(cd,(const char **)&sp, &ir, (char **)&dp, &or)) !=
+	if ((my_iconv(cd,(char **)&sp, &ir, (char **)&dp, &or)) !=
 	    (size_t)-1) {
 		if (olocal[0] == c2)
 			/*

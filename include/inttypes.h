@@ -1,4 +1,6 @@
 /*-
+ * SPDX-License-Identifier: BSD-2-Clause-FreeBSD
+ *
  * Copyright (c) 2001 Mike Barcroft <mike@FreeBSD.org>
  * All rights reserved.
  *
@@ -23,15 +25,24 @@
  * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
  *
- * $FreeBSD: src/include/inttypes.h,v 1.8 2002/09/22 08:06:45 tjr Exp $
- * $DragonFly: src/include/inttypes.h,v 1.1 2003/11/09 02:22:28 dillon Exp $
+ * $FreeBSD: head/include/inttypes.h 326192 2017-11-25 17:09:43Z pfg $
  */
 
 #ifndef _INTTYPES_H_
 #define	_INTTYPES_H_
 
 #include <machine/inttypes.h>
+#ifndef __cplusplus
+#include <machine/wchar.h>		/* for ___wchar_t */
+#endif
 #include <stdint.h>
+
+#ifndef __cplusplus
+#ifndef _WCHAR_T_DECLARED
+#define	_WCHAR_T_DECLARED
+typedef ___wchar_t	wchar_t;
+#endif
+#endif
 
 typedef struct {
 	intmax_t	quot;		/* Quotient. */
@@ -39,17 +50,18 @@ typedef struct {
 } imaxdiv_t;
 
 __BEGIN_DECLS
+#ifdef _XLOCALE_H_
+#include <xlocale/_inttypes.h>
+#endif
 intmax_t	imaxabs(intmax_t) __pure2;
 imaxdiv_t	imaxdiv(intmax_t, intmax_t) __pure2;
 
 intmax_t	strtoimax(const char * __restrict, char ** __restrict, int);
 uintmax_t	strtoumax(const char * __restrict, char ** __restrict, int);
-#ifndef __cplusplus
-intmax_t	wcstoimax(const __wchar_t * __restrict,
-		    __wchar_t ** __restrict, int);
-uintmax_t	wcstoumax(const __wchar_t * __restrict,
-		    __wchar_t ** __restrict, int);
-#endif
+intmax_t	wcstoimax(const wchar_t * __restrict,
+		    wchar_t ** __restrict, int);
+uintmax_t	wcstoumax(const wchar_t * __restrict,
+		    wchar_t ** __restrict, int);
 __END_DECLS
 
 #endif /* !_INTTYPES_H_ */

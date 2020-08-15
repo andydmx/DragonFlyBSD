@@ -48,7 +48,6 @@
 
 #include <sys/thread2.h>
 #include <sys/spinlock2.h>
-#include <sys/mplock2.h>
 
 #define MAXPRI			128
 #define PRIBASE_REALTIME	0
@@ -95,7 +94,7 @@ struct usched usched_dummy = {
 
 struct usched_dummy_pcpu {
 	int	rrcount;
-	struct thread helper_thread;
+	struct thread *helper_thread;
 	struct lwp *uschedcp;
 };
 
@@ -123,7 +122,7 @@ dummyinit(void *dummy)
 	spin_init(&dummy_spin, "uscheddummy");
 	ATOMIC_CPUMASK_NANDBIT(dummy_curprocmask, 0);
 }
-SYSINIT(runqueue, SI_BOOT2_USCHED, SI_ORDER_FIRST, dummyinit, NULL)
+SYSINIT(runqueue, SI_BOOT2_USCHED, SI_ORDER_FIRST, dummyinit, NULL);
 
 /*
  * DUMMY_ACQUIRE_CURPROC
@@ -311,7 +310,7 @@ dummy_setrunqueue(struct lwp *lp)
 			cpuid = BSFCPUMASK(mask);
 			ATOMIC_CPUMASK_NANDBIT(dummy_rdyprocmask, cpuid);
 			spin_unlock(&dummy_spin);
-			lwkt_schedule(&dummy_pcpu[cpuid].helper_thread);
+			lwkt_schedule(dummy_pcpu[cpuid].helper_thread);
 		} else {
 			spin_unlock(&dummy_spin);
 		}
@@ -495,7 +494,7 @@ dummy_sched_thread(void *dummy)
 			KKASSERT(tmpid != cpuid);
 			ATOMIC_CPUMASK_NANDBIT(dummy_rdyprocmask, tmpid);
 			spin_unlock(&dummy_spin);
-			lwkt_schedule(&dummy_pcpu[tmpid].helper_thread);
+			lwkt_schedule(dummy_pcpu[tmpid].helper_thread);
 		} else {
 			spin_unlock(&dummy_spin);
 		}
@@ -539,7 +538,7 @@ dummy_sched_thread_cpu_init(void)
 	if (bootverbose)
 	    kprintf(" %d", i);
 
-	lwkt_create(dummy_sched_thread, NULL, NULL, &dd->helper_thread, 
+	lwkt_create(dummy_sched_thread, NULL, &dd->helper_thread, NULL,
 		    TDF_NOSTART, i, "dsched %d", i);
 
 	/*
@@ -554,4 +553,4 @@ dummy_sched_thread_cpu_init(void)
 	kprintf("\n");
 }
 SYSINIT(uschedtd, SI_BOOT2_USCHED, SI_ORDER_SECOND,
-	dummy_sched_thread_cpu_init, NULL)
+	dummy_sched_thread_cpu_init, NULL);

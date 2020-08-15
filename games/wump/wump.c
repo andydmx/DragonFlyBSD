@@ -43,8 +43,8 @@
 
 #include <err.h>
 #include <sys/types.h>
-#include <sys/file.h>
 #include <sys/wait.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -73,7 +73,7 @@
 #define	plural(n)	(n == 1 ? "" : "s")
 
 /* simple cave data structure; +1 so we can index from '1' not '0' */
-struct room_record {
+static struct room_record {
 	int tunnel[MAX_LINKS_IN_ROOM];
 	int has_a_pit, has_a_bat;
 } cave[MAX_ROOMS_IN_CAVE+1];
@@ -82,45 +82,45 @@ struct room_record {
  * global variables so we can keep track of where the player is, how
  * many arrows they still have, where el wumpo is, and so on...
  */
-int player_loc = -1;			/* player location */
-int wumpus_loc = -1;			/* The Bad Guy location */
-int level = EASY;			/* level of play */
-int arrows_left;			/* arrows unshot */
+static int player_loc = -1;		/* player location */
+static int wumpus_loc = -1;		/* The Bad Guy location */
+static int level = EASY;		/* level of play */
+static int arrows_left;			/* arrows unshot */
 
 #ifdef DEBUG
-int debug = 0;
+static int debug = 0;
 #endif
 
-int pit_num = PIT_COUNT;		/* # pits in cave */
-int bat_num = BAT_COUNT;		/* # bats */
-int room_num = ROOMS_IN_CAVE;		/* # rooms in cave */
-int link_num = LINKS_IN_ROOM;		/* links per room  */
-int arrow_num = NUMBER_OF_ARROWS;	/* arrow inventory */
+static int pit_num = PIT_COUNT;		/* # pits in cave */
+static int bat_num = BAT_COUNT;		/* # bats */
+static int room_num = ROOMS_IN_CAVE;	/* # rooms in cave */
+static int link_num = LINKS_IN_ROOM;	/* links per room  */
+static int arrow_num = NUMBER_OF_ARROWS; /* arrow inventory */
 
-char answer[20];			/* user input */
+static char answer[20];			/* user input */
 
-int bats_nearby(void);
-void cave_init(void);
-void clear_things_in_cave(void);
-void display_room_stats(void);
-int getans(const char *);
-void initialize_things_in_cave(void);
-void instructions(void);
-int int_compare(const void *, const void *);
-void jump(int);
-void kill_wump(void);
-int move_to(char *);
-void move_wump(void);
-void no_arrows(void);
-void pit_kill(void);
-int pit_nearby(void);
-void pit_survive(void);
-int shoot(char *);
-void shoot_self(void);
-int take_action(void);
-void usage(void);
-void wump_kill(void);
-int wump_nearby(void);
+static int bats_nearby(void);
+static void cave_init(void);
+static void clear_things_in_cave(void);
+static void display_room_stats(void);
+static int getans(const char *);
+static void initialize_things_in_cave(void);
+static void instructions(void);
+static int int_compare(const void *, const void *);
+static void jump(int);
+static void kill_wump(void);
+static int move_to(char *);
+static void move_wump(void);
+static void no_arrows(void);
+static void pit_kill(void);
+static int pit_nearby(void);
+static void pit_survive(void);
+static int shoot(char *);
+static void shoot_self(void);
+static int take_action(void);
+static void usage(void) __dead2;
+static void wump_kill(void);
+static int wump_nearby(void);
 
 int
 main(int argc, char **argv)
@@ -156,12 +156,12 @@ main(int argc, char **argv)
 		case 'r':
 			room_num = atoi(optarg);
 			if (room_num < MIN_ROOMS_IN_CAVE) {
-				(void)fprintf(stderr,
+				fprintf(stderr,
 	"No self-respecting wumpus would live in such a small cave!\n");
 				exit(1);
 			}
 			if (room_num > MAX_ROOMS_IN_CAVE) {
-				(void)fprintf(stderr,
+				fprintf(stderr,
 	"Even wumpii can't furnish caves that large!\n");
 				exit(1);
 			}
@@ -169,7 +169,7 @@ main(int argc, char **argv)
 		case 't':
 			link_num = atoi(optarg);
 			if (link_num < 2) {
-				(void)fprintf(stderr,
+				fprintf(stderr,
 	"Wumpii like extra doors in their caves!\n");
 				exit(1);
 			}
@@ -181,7 +181,7 @@ main(int argc, char **argv)
 
 	if (link_num > MAX_LINKS_IN_ROOM ||
 	    link_num > room_num - (room_num / 4)) {
-		(void)fprintf(stderr,
+		fprintf(stderr,
 "Too many tunnels!  The cave collapsed!\n(Fortunately, the wumpus escaped!)\n");
 		exit(1);
 	}
@@ -192,13 +192,13 @@ main(int argc, char **argv)
 	}
 
 	if (bat_num > room_num / 2) {
-		(void)fprintf(stderr,
+		fprintf(stderr,
 "The wumpus refused to enter the cave, claiming it was too crowded!\n");
 		exit(1);
 	}
 
 	if (pit_num > room_num / 2) {
-		(void)fprintf(stderr,
+		fprintf(stderr,
 "The wumpus refused to enter the cave, claiming it was too dangerous!\n");
 		exit(1);
 	}
@@ -207,7 +207,7 @@ main(int argc, char **argv)
 	cave_init();
 
 	/* and we're OFF!  da dum, da dum, da dum, da dum... */
-	(void)printf(
+	printf(
 "\nYou're in a cave with %d rooms and %d tunnels leading from each room.\n\
 There are %d bat%s and %d pit%s scattered throughout the cave, and your\n\
 quiver holds %d custom super anti-evil Wumpus arrows.  Good luck.\n",
@@ -219,8 +219,8 @@ quiver holds %d custom super anti-evil Wumpus arrows.  Good luck.\n",
 		arrows_left = arrow_num;
 		do {
 			display_room_stats();
-			(void)printf("Move or shoot? (m-s) ");
-			(void)fflush(stdout);
+			printf("Move or shoot? (m-s) ");
+			fflush(stdout);
 			if (!fgets(answer, sizeof(answer), stdin))
 				break;
 		} while (!take_action());
@@ -236,7 +236,7 @@ quiver holds %d custom super anti-evil Wumpus arrows.  Good luck.\n",
 	return (0);
 }
 
-void
+static void
 display_room_stats(void)
 {
 	int i;
@@ -246,27 +246,27 @@ display_room_stats(void)
 	 * as describe whether there are pits, bats, & wumpii nearby.  It's
 	 * all pretty mindless, really.
 	 */
-	(void)printf(
+	printf(
 "\nYou are in room %d of the cave, and have %d arrow%s left.\n",
 	    player_loc, arrows_left, plural(arrows_left));
 
 	if (bats_nearby())
-		(void)printf("*rustle* *rustle* (must be bats nearby)\n");
+		printf("*rustle* *rustle* (must be bats nearby)\n");
 	if (pit_nearby())
-		(void)printf("*whoosh* (I feel a draft from some pits).\n");
+		printf("*whoosh* (I feel a draft from some pits).\n");
 	if (wump_nearby())
-		(void)printf("*sniff* (I can smell the evil Wumpus nearby!)\n");
+		printf("*sniff* (I can smell the evil Wumpus nearby!)\n");
 
-	(void)printf("There are tunnels to rooms %d, ",
+	printf("There are tunnels to rooms %d, ",
 	   cave[player_loc].tunnel[0]);
 
 	for (i = 1; i < link_num - 1; i++)
 		if (cave[player_loc].tunnel[i] <= room_num)
-			(void)printf("%d, ", cave[player_loc].tunnel[i]);
-	(void)printf("and %d.\n", cave[player_loc].tunnel[link_num - 1]);
+			printf("%d, ", cave[player_loc].tunnel[i]);
+	printf("and %d.\n", cave[player_loc].tunnel[link_num - 1]);
 }
 
-int
+static int
 take_action(void)
 {
 	/*
@@ -289,13 +289,13 @@ take_action(void)
 			return(0);
 		}
 	if (random() % 15 == 1)
-		(void)printf("Que pasa?\n");
+		printf("Que pasa?\n");
 	else
-		(void)printf("I don't understand!\n");
+		printf("I don't understand!\n");
 	return(0);
 }
 
-int
+static int
 move_to(char *room_number)
 {
 	int i, just_moved_by_bats, next_room, tunnel_available;
@@ -318,16 +318,16 @@ move_to(char *room_number)
 
 	while (next_room < 1 || next_room > room_num + 1) {
 		if (next_room < 0 && next_room != -1)
-(void)printf("Sorry, but we're constrained to a semi-Euclidean cave!\n");
+			printf("Sorry, but we're constrained to a semi-Euclidean cave!\n");
 		if (next_room > room_num + 1)
-(void)printf("What?  The cave surely isn't quite that big!\n");
+			printf("What?  The cave surely isn't quite that big!\n");
 		if (next_room == room_num + 1 &&
 		    cave[player_loc].tunnel[link_num-1] != next_room) {
-			(void)printf("What?  The cave isn't that big!\n");
+			printf("What?  The cave isn't that big!\n");
 			++next_room;
 		}
-		(void)printf("To which room do you wish to move? ");
-		(void)fflush(stdout);
+		printf("To which room do you wish to move? ");
+		fflush(stdout);
 		if (!fgets(answer, sizeof(answer), stdin))
 			return(1);
 		next_room = atoi(answer);
@@ -340,9 +340,9 @@ move_to(char *room_number)
 			tunnel_available = 1;
 
 	if (!tunnel_available) {
-		(void)printf("*Oof!*  (You hit the wall)\n");
+		printf("*Oof!*  (You hit the wall)\n");
 		if (random() % 6 == 1) {
-(void)printf("Your colorful comments awaken the wumpus!\n");
+			printf("Your colorful comments awaken the wumpus!\n");
 			move_wump();
 			if (wumpus_loc == player_loc) {
 				wump_kill();
@@ -373,7 +373,7 @@ move_to(char *room_number)
 		}
 
 		if (cave[next_room].has_a_bat) {
-			(void)printf(
+			printf(
 "*flap*  *flap*  *flap*  (humongous bats pick you up and move you%s!)\n",
 			    just_moved_by_bats ? " again": "");
 			next_room = player_loc = (random() % room_num) + 1;
@@ -386,7 +386,7 @@ move_to(char *room_number)
 	return(0);
 }
 
-int
+static int
 shoot(char *room_list)
 {
 	int chance, next, roomcnt;
@@ -407,14 +407,14 @@ shoot(char *room_list)
 	for (roomcnt = 1;; ++roomcnt, room_list = NULL) {
 		if (!(p = strtok(room_list, " \t\n"))) {
 			if (roomcnt == 1) {
-				(void)printf(
+				printf(
 			"The arrow falls to the ground at your feet!\n");
 				return(0);
 			} else
 				break;
 		}
 		if (roomcnt > 5) {
-			(void)printf(
+			printf(
 "The arrow wavers in its flight and can go no further!\n");
 			break;
 		}
@@ -425,7 +425,7 @@ shoot(char *room_list)
 
 		if (ok) {
 			if (next > room_num) {
-				(void)printf(
+				printf(
 "A faint gleam tells you the arrow has gone through a magic tunnel!\n");
 				arrow_location = (random() % room_num) + 1;
 			} else
@@ -433,17 +433,17 @@ shoot(char *room_list)
 		} else {
 			wumplink = (random() % link_num);
 			if (wumplink == player_loc)
-				(void)printf(
+				printf(
 "*thunk*  The arrow can't find a way from %d to %d and flys back into\n\
 your room!\n",
 				    arrow_location, next);
 			else if (cave[arrow_location].tunnel[wumplink] > room_num)
-				(void)printf(
+				printf(
 "*thunk*  The arrow flys randomly into a magic tunnel, thence into\n\
 room %d!\n",
 				    cave[arrow_location].tunnel[wumplink]);
 			else
-				(void)printf(
+				printf(
 "*thunk*  The arrow can't find a way from %d to %d and flys randomly\n\
 into room %d!\n",
 				    arrow_location, next,
@@ -453,12 +453,12 @@ into room %d!\n",
 		}
 		chance = random() % 10;
 		if (roomcnt == 3 && chance < 2) {
-			(void)printf(
+			printf(
 "Your bowstring breaks!  *twaaaaaang*\n\
 The arrow is weakly shot and can go no further!\n");
 			break;
 		} else if (roomcnt == 4 && chance < 6) {
-			(void)printf(
+			printf(
 "The arrow wavers in its flight and can go no further!\n");
 			break;
 		}
@@ -487,7 +487,7 @@ The arrow is weakly shot and can go no further!\n");
 		/* each time you shoot, it's more likely the wumpus moves */
 		static int lastchance = 2;
 
-		if (random() % level == EASY ? 12 : 9 < (lastchance += 2)) {
+		if (random() % (level == EASY ? 12 : 9) < (lastchance += 2)) {
 			move_wump();
 			if (wumpus_loc == player_loc)
 				wump_kill();
@@ -498,7 +498,7 @@ The arrow is weakly shot and can go no further!\n");
 	return(0);
 }
 
-void
+static void
 cave_init(void)
 {
 	int i, j, k, wumplink;
@@ -564,15 +564,15 @@ try_again:		wumplink = (random() % room_num) + 1;
 #ifdef DEBUG
 	if (debug)
 		for (i = 1; i <= room_num; ++i) {
-			(void)printf("<room %d  has tunnels to ", i);
+			printf("<room %d  has tunnels to ", i);
 			for (j = 0; j < link_num; ++j)
-				(void)printf("%d ", cave[i].tunnel[j]);
-			(void)printf(">\n");
+				printf("%d ", cave[i].tunnel[j]);
+			printf(">\n");
 		}
 #endif
 }
 
-void
+static void
 clear_things_in_cave(void)
 {
 	int i;
@@ -585,7 +585,7 @@ clear_things_in_cave(void)
 		cave[i].has_a_bat = cave[i].has_a_pit = 0;
 }
 
-void
+static void
 initialize_things_in_cave(void)
 {
 	int i, loc;
@@ -598,7 +598,7 @@ initialize_things_in_cave(void)
 		cave[loc].has_a_bat = 1;
 #ifdef DEBUG
 		if (debug)
-			(void)printf("<bat in room %d>\n", loc);
+			printf("<bat in room %d>\n", loc);
 #endif
 	}
 
@@ -609,14 +609,14 @@ initialize_things_in_cave(void)
 		cave[loc].has_a_pit = 1;
 #ifdef DEBUG
 		if (debug)
-			(void)printf("<pit in room %d>\n", loc);
+			printf("<pit in room %d>\n", loc);
 #endif
 	}
 
 	wumpus_loc = (random() % room_num) + 1;
 #ifdef DEBUG
 	if (debug)
-		(void)printf("<wumpus in room %d>\n", loc);
+		printf("<wumpus in room %d>\n", loc);
 #endif
 
 	do {
@@ -625,7 +625,7 @@ initialize_things_in_cave(void)
 	    (link_num / room_num < 0.4 ? wump_nearby() : 0) : 0));
 }
 
-int
+static int
 getans(const char *prompt)
 {
 	char buf[20];
@@ -636,21 +636,21 @@ getans(const char *prompt)
 	 * answered 'no'.
 	 */
 	for (;;) {
-		(void)printf("%s", prompt);
-		(void)fflush(stdout);
+		printf("%s", prompt);
+		fflush(stdout);
 		if (!fgets(buf, sizeof(buf), stdin))
 			return(0);
 		if (*buf == 'N' || *buf == 'n')
 			return(0);
 		if (*buf == 'Y' || *buf == 'y')
 			return(1);
-		(void)printf(
+		printf(
 "I don't understand your answer; please enter 'y' or 'n'!\n");
 	}
 	/* NOTREACHED */
 }
 
-int
+static int
 bats_nearby(void)
 {
 	int i;
@@ -662,7 +662,7 @@ bats_nearby(void)
 	return(0);
 }
 
-int
+static int
 pit_nearby(void)
 {
 	int i;
@@ -674,7 +674,7 @@ pit_nearby(void)
 	return(0);
 }
 
-int
+static int
 wump_nearby(void)
 {
 	int i, j;
@@ -691,13 +691,13 @@ wump_nearby(void)
 	return(0);
 }
 
-void
+static void
 move_wump(void)
 {
 	wumpus_loc = cave[wumpus_loc].tunnel[random() % link_num];
 }
 
-int
+static int
 int_compare(const void *va, const void *vb)
 {
 	const int	*a, *b;
@@ -708,7 +708,7 @@ int_compare(const void *va, const void *vb)
 	return(a < b ? -1 : 1);
 }
 
-void
+static void
 instructions(void)
 {
 	const char *pager;
@@ -724,7 +724,7 @@ instructions(void)
 		return;
 
 	if (access(_PATH_WUMPINFO, R_OK)) {
-		(void)printf(
+		printf(
 "Sorry, but the instruction file seems to have disappeared in a\n\
 puff of greasy black smoke! (poof)\n");
 		return;
@@ -742,30 +742,30 @@ puff of greasy black smoke! (poof)\n");
 			err(1, "open %s", _PATH_WUMPINFO);
 		if (dup2(fd, STDIN_FILENO) == -1)
 			err(1, "dup2");
-		(void)execl("/bin/sh", "sh", "-c", pager, NULL);
+		execl("/bin/sh", "sh", "-c", pager, NULL);
 		err(1, "exec sh -c %s", pager);
 	case -1:
 		err(1, "fork");
 	default:
-		(void)waitpid(pid, &status, 0);
+		waitpid(pid, &status, 0);
 		break;
 	}
 }
 
-void
+static void
 usage(void)
 {
-	(void)fprintf(stderr,
+	fprintf(stderr,
 "usage: wump [-h] [-a arrows] [-b bats] [-p pits] [-r rooms] [-t tunnels]\n");
 	exit(1);
 }
 
 /* messages */
 
-void
+static void
 wump_kill(void)
 {
-	(void)printf(
+	printf(
 "*ROAR* *chomp* *snurfle* *chomp*!\n\
 Much to the delight of the Wumpus, you walked right into his mouth,\n\
 making you one of the easiest dinners he's ever had!  For you, however,\n\
@@ -774,10 +774,10 @@ so long since the evil Wumpus cleaned his teeth that you immediately\n\
 passed out from the stench!\n");
 }
 
-void
+static void
 kill_wump(void)
 {
-	(void)printf(
+	printf(
 "*thwock!* *groan* *crash*\n\n\
 A horrible roar fills the cave, and you realize, with a smile, that you\n\
 have slain the evil Wumpus and won the game!  You don't want to tarry for\n\
@@ -786,20 +786,20 @@ dead Wumpus is also quite well known, a stench plenty enough to slay the\n\
 mightiest adventurer at a single whiff!!\n");
 }
 
-void
+static void
 no_arrows(void)
 {
-	(void)printf(
+	printf(
 "\nYou turn and look at your quiver, and realize with a sinking feeling\n\
 that you've just shot your last arrow (figuratively, too).  Sensing this\n\
 with its psychic powers, the evil Wumpus rampagees through the cave, finds\n\
 you, and with a mighty *ROAR* eats you alive!\n");
 }
 
-void
+static void
 shoot_self(void)
 {
-	(void)printf(
+	printf(
 "\n*Thwack!*  A sudden piercing feeling informs you that the ricochet\n\
 of your wild arrow has resulted in it wedging in your side, causing\n\
 extreme agony.  The evil Wumpus, with its psychic powers, realizes this\n\
@@ -807,19 +807,19 @@ and immediately rushes to your side, not to help, alas, but to EAT YOU!\n\
 (*CHOMP*)\n");
 }
 
-void
+static void
 jump(int where)
 {
-	(void)printf(
+	printf(
 "\nWith a jaunty step you enter the magic tunnel.  As you do, you\n\
 notice that the walls are shimmering and glowing.  Suddenly you feel\n\
 a very curious, warm sensation and find yourself in room %d!!\n", where);
 }
 
-void
+static void
 pit_kill(void)
 {
-	(void)printf(
+	printf(
 "*AAAUUUUGGGGGHHHHHhhhhhhhhhh...*\n\
 The whistling sound and updraft as you walked into this room of the\n\
 cave apparently wasn't enough to clue you in to the presence of the\n\
@@ -828,10 +828,10 @@ you fall many miles to the core of the earth.  Look on the bright side;\n\
 you can at least find out if Jules Verne was right...\n");
 }
 
-void
+static void
 pit_survive(void)
 {
-	(void)printf(
+	printf(
 "Without conscious thought you grab for the side of the cave and manage\n\
 to grasp onto a rocky outcrop.  Beneath your feet stretches the limitless\n\
 depths of a bottomless pit!  Rock crumbles beneath your feet!\n");

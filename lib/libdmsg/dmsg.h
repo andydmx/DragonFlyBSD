@@ -51,6 +51,17 @@
 
 #define DMSG_LISTEN_PORT	987
 
+#define dm_printf(level, ctl, ...)		\
+	if (DMsgDebugOpt >= (level))		\
+		fprintf(stderr, "libdmsg: " ctl, __VA_ARGS__)
+#define dmx_printf(level, ctl, ...)		\
+	if (DMsgDebugOpt >= (level))		\
+		fprintf(stderr, ctl, __VA_ARGS__)
+#define dmio_printf(iocom, level, ctl, ...)	\
+	if (DMsgDebugOpt >= (level))		\
+		fprintf(stderr, "libdmsg: " ctl, __VA_ARGS__)
+
+
 /***************************************************************************
  *				CRYPTO HANDSHAKE			   *
  ***************************************************************************
@@ -142,7 +153,7 @@ TAILQ_HEAD(dmsg_media_queue, dmsg_media);
 
 struct dmsg_media {
 	TAILQ_ENTRY(dmsg_media) entry;
-	uuid_t  mediaid;
+	uuid_t  media_id;
 	int     refs;
 	void	*usrhandle;
 };
@@ -157,6 +168,7 @@ typedef struct dmsg_media dmsg_media_t;
  */
 struct dmsg_state {
 	RB_ENTRY(dmsg_state) rbnode;		/* by state->msgid */
+	struct dmsg_state	*scan;		/* scan check */
 	TAILQ_HEAD(, dmsg_state) subq;		/* active stacked states */
 	TAILQ_ENTRY(dmsg_state) entry;		/* on parent subq */
 	struct dmsg_iocom *iocom;
@@ -168,7 +180,7 @@ struct dmsg_state {
 	uint64_t	msgid;
 	int		flags;
 	int		error;
-	int		refs;			/* prevent destruction */
+	unsigned int	refs;			/* prevent destruction */
 	void (*func)(struct dmsg_msg *);
 	union {
 		void *any;
@@ -179,13 +191,15 @@ struct dmsg_state {
 	dmsg_media_t	*media;
 };
 
-#define DMSG_STATE_INSERTED	0x0001
+#define DMSG_STATE_SUBINSERTED	0x0001
 #define DMSG_STATE_DYNAMIC	0x0002
-#define DMSG_STATE_NODEID	0x0004		/* manages a node id */
-#define DMSG_STATE_UNUSED_0008	0x0008
+#define DMSG_STATE_UNUSED0004	0x0004
+#define DMSG_STATE_ABORTING	0x0008
 #define DMSG_STATE_OPPOSITE	0x0010		/* initiated by other end */
 #define DMSG_STATE_CIRCUIT	0x0020		/* LNK_SPAN special case */
 #define DMSG_STATE_DYING	0x0040		/* indicates circuit failure */
+#define DMSG_STATE_RBINSERTED	0x0080
+#define DMSG_STATE_NEW		0x0400		/* defer abort processing */
 #define DMSG_STATE_ROOT		0x8000		/* iocom->state0 */
 
 /*
@@ -194,6 +208,8 @@ struct dmsg_state {
  * will point to &iocom->state0 for non-transactional messages.
  *
  * Message headers are embedded while auxillary data is separately allocated.
+ * The 'any' portion of the message is allocated dynamically based on
+ * hdr_size.
  */
 struct dmsg_msg {
 	TAILQ_ENTRY(dmsg_msg) qentry;
@@ -278,15 +294,13 @@ struct dmsg_iocom {
 	char		*label;			/* label for error reporting */
 	dmsg_ioq_t	ioq_rx;
 	dmsg_ioq_t	ioq_tx;
-	dmsg_msg_queue_t freeq;			/* free msgs hdr only */
-	dmsg_msg_queue_t freeq_aux;		/* free msgs w/aux_data */
 	dmsg_state_t	state0;			/* root state for stacking */
 	struct dmsg_state_tree  staterd_tree;   /* active transactions */
 	struct dmsg_state_tree  statewr_tree;   /* active transactions */
 	int	sock_fd;			/* comm socket or pipe */
 	int	alt_fd;				/* thread signal, tty, etc */
 	int	wakeupfds[2];			/* pipe wakes up iocom thread */
-	int	flags;
+	unsigned int	flags;
 	int	rxmisc;
 	int	txmisc;
 	void	(*signal_callback)(struct dmsg_iocom *);
@@ -346,6 +360,8 @@ struct dmsg_master_service_info {
 
 typedef struct dmsg_master_service_info dmsg_master_service_info_t;
 
+struct iovec;	/* forward decl for dmsg_crypto_encrypt() prototype */
+
 /*
  * node callbacks
  */
@@ -355,8 +371,8 @@ typedef struct dmsg_master_service_info dmsg_master_service_info_t;
 /*
  * icrc
  */
-uint32_t dmsg_icrc32(const void *buf, size_t size);
-uint32_t dmsg_icrc32c(const void *buf, size_t size, uint32_t crc);
+#define dmsg_icrc32(buf, size)		iscsi_crc32((buf), (size))
+#define dmsg_icrc32c(buf, size, crc)	iscsi_crc32_ext((buf), (size), (crc))
 
 /*
  * debug

@@ -21,11 +21,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -51,6 +47,7 @@
 
 #include <sys/param.h>
 #include <sys/systm.h>
+#include <sys/uio.h>
 #include <sys/resourcevar.h>
 #include <sys/kernel.h>
 #include <sys/stat.h>
@@ -77,14 +74,13 @@
 #include <vm/vnode_pager.h>
 
 #include <sys/buf2.h>
-#include <sys/thread2.h>
 
 #include <vfs/fifofs/fifo.h>
 
 #include "dir.h"
 #include "quota.h"
 #include "inode.h"
-#include "ext2mount.h"
+#include "ext2_mount.h"
 #include "ext2_fs_sb.h"
 #include "fs.h"
 #include "ext2_extern.h"
@@ -97,7 +93,6 @@ static int ext2_chown (struct vnode *, uid_t, gid_t, struct ucred *);
 static int ext2_close (struct vop_close_args *);
 static int ext2_getattr (struct vop_getattr_args *);
 static int ext2_makeinode (int mode, struct vnode *, struct vnode **, struct componentname *);
-static int ext2_mmap (struct vop_mmap_args *);
 static int ext2_open (struct vop_open_args *);
 static int ext2_pathconf (struct vop_pathconf_args *);
 static int ext2_print (struct vop_print_args *);
@@ -129,22 +124,6 @@ static int ext2_symlink (struct vop_old_symlink_args *);
 
 #include "ext2_readwrite.c"
 
-union _qcvt {
-	int64_t qcvt;
-	int32_t val[2];
-};
-#define SETHIGH(q, h) { \
-	union _qcvt tmp; \
-	tmp.qcvt = (q); \
-	tmp.val[_QUAD_HIGHWORD] = (h); \
-	(q) = tmp.qcvt; \
-}
-#define SETLOW(q, l) { \
-	union _qcvt tmp; \
-	tmp.qcvt = (q); \
-	tmp.val[_QUAD_LOWWORD] = (l); \
-	(q) = tmp.qcvt; \
-}
 #define VN_KNOTE(vp, b) \
 	KNOTE(&vp->v_pollinfo.vpi_kqinfo.ki_note, (b))
 
@@ -226,7 +205,7 @@ loop:
 
 	if (ap->a_waitfor == MNT_WAIT) {
 		bio_track_wait(&vp->v_track_write, 0, 0);
-#if DIAGNOSTIC
+#ifdef DIAGNOSTIC
 		if (!RB_EMPTY(&vp->v_rbdirty_tree)) {
 			vprint("ext2_fsync: dirty", vp);
 			goto loop;
@@ -1357,7 +1336,7 @@ ext2_getattr(struct vop_getattr_args *ap)
 	/*
 	 * Copy from inode table
 	 */
-	vap->va_fsid = dev2udev(ip->i_dev);
+	vap->va_fsid = devid_from_dev(ip->i_dev);
 	vap->va_fileid = ip->i_number;
 	vap->va_mode = ip->i_mode & ~IFMT;
 	vap->va_nlink = VFSTOEXT2(vp->v_mount)->um_i_effnlink_valid ?
@@ -1414,11 +1393,13 @@ ext2_setattr(struct vop_setattr_args *ap)
 			return (error);
 		/*
 		 * Note that a root chflags becomes a user chflags when
-		 * we are jailed, unless the jail.chflags_allowed sysctl
+		 * we are jailed, unless the jail vfs_chflags sysctl
 		 * is set.
 		 */
 		if (cred->cr_uid == 0 &&
-		    (!jailed(cred) || jail_chflags_allowed)) {
+		    (!jailed(cred) ||
+			PRISON_CAP_ISSET(cred->cr_prison->pr_caps,
+			    PRISON_CAP_VFS_CHFLAGS))) {
 			if ((ip->i_flags
 			    & (SF_NOUNLINK | SF_IMMUTABLE | SF_APPEND)) &&
 			    securelevel > 0)
@@ -1628,21 +1609,6 @@ good:
 	if (cred->cr_uid != 0 && (ouid != uid || ogid != gid))
 		ip->i_mode &= ~(ISUID | ISGID);
 	return (0);
-}
-
-/*
- * Mmap a file
- *
- * NB Currently unsupported.
- *
- * ext2_mmap(struct vnode *a_vp, int a_fflags, struct ucred *a_cred)
- */
-/* ARGSUSED */
-static
-int
-ext2_mmap(struct vop_mmap_args *ap)
-{
-	return (EINVAL);
 }
 
 /*
@@ -1887,7 +1853,6 @@ ext2_vinit(struct mount *mntp, struct vnode **vpp)
 {
 	struct inode *ip;
 	struct vnode *vp;
-	struct timeval tv;
 
 	vp = *vpp;
 	ip = VTOI(vp);
@@ -1917,14 +1882,12 @@ ext2_vinit(struct mount *mntp, struct vnode **vpp)
 
 	}
 
-	if (ip->i_number == ROOTINO)
+	if (ip->i_number == EXT2_ROOTINO)
 		vp->v_flag |= VROOT;
 	/*
 	 * Initialize modrev times
 	 */
-	getmicrouptime(&tv);
-	SETHIGH(ip->i_modrev, tv.tv_sec);
-	SETLOW(ip->i_modrev, tv.tv_usec * 4294);
+	ip->i_modrev = init_va_filerev();
 	*vpp = vp;
 	return (0);
 }
@@ -2046,7 +2009,6 @@ struct vop_ops ext2_vnode_vops = {
 	.vop_old_link =		ext2_link,
 	.vop_old_mkdir =	ext2_mkdir,
 	.vop_old_mknod =	ext2_mknod,
-	.vop_mmap =		ext2_mmap,
 	.vop_open =		ext2_open,
 	.vop_pathconf =		ext2_pathconf,
 	.vop_kqfilter =		ext2_kqfilter,

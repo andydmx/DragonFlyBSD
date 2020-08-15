@@ -13,11 +13,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -42,9 +38,6 @@
 
 #ifndef _SYS_TYPES_H_
 #include <sys/types.h>
-#endif
-#ifndef _SYS__POSIX_H_
-#include <sys/_posix.h>
 #endif
 #ifndef _SYS_QUEUE_H_
 #include <sys/queue.h>
@@ -73,17 +66,28 @@ struct ctlname {
 	int	ctl_type;	/* type of name */
 };
 
-#define CTLTYPE		0xf	/* Mask for the type */
-#define	CTLTYPE_NODE	1	/* name is a node */
-#define	CTLTYPE_INT	2	/* name describes an integer */
-#define	CTLTYPE_STRING	3	/* name describes a string */
-#define	CTLTYPE_QUAD	4	/* name describes a 64-bit number */
-#define	CTLTYPE_OPAQUE	5	/* name describes a structure */
+#define CTLTYPE		0x1f	/* Mask for the type */
+#define	CTLTYPE_NODE	0x01	/* name is a node */
+#define	CTLTYPE_INT	0x02	/* name describes an integer */
+#define	CTLTYPE_STRING	0x03	/* name describes a string */
+#define	CTLTYPE_S64	0x04	/* name describes a signed 64-bit number */
+#define	CTLTYPE_QUAD	CTLTYPE_S64 /* name describes a signed 64-bit number */
+#define	CTLTYPE_OPAQUE	0x05	/* name describes a structure */
 #define	CTLTYPE_STRUCT	CTLTYPE_OPAQUE	/* name describes a structure */
-#define	CTLTYPE_UINT	6	/* name describes an unsigned integer */
-#define	CTLTYPE_LONG	7	/* name describes a long */
-#define	CTLTYPE_ULONG	8	/* name describes an unsigned long */
-#define	CTLTYPE_UQUAD	9	/* name describes an unsigned 64-bit number */
+#define	CTLTYPE_UINT	0x06	/* name describes an unsigned integer */
+#define	CTLTYPE_LONG	0x07	/* name describes a long */
+#define	CTLTYPE_ULONG	0x08	/* name describes an unsigned long */
+#define	CTLTYPE_U64	0x09	/* name describes an unsigned 64-bit number */
+#define	CTLTYPE_UQUAD	CTLTYPE_U64 /* name describes an unsgn 64-bit number */
+#define	CTLTYPE_U8	0x0a	/* name describes an unsigned 8-bit number */
+#define	CTLTYPE_U16	0x0b	/* name describes an unsigned 16-bit number */
+#define	CTLTYPE_S8	0x0c	/* name describes a signed 8-bit number */
+#define	CTLTYPE_S16	0x0d	/* name describes a signed 16-bit number */
+#define	CTLTYPE_S32	0x0e	/* name describes a signed 32-bit number */
+#define	CTLTYPE_U32	0x0f	/* name describes an unsigned 32-bit number */
+
+#define CTLTYPE_BIT32(n) (0x10 | ((n) << CTLSHIFT_BITFLD))
+#define CTLTYPE_BIT64(n) (0x11 | ((n) << CTLSHIFT_BITFLD))
 
 #define	CTLFLAG_RD	0x80000000	/* Allow reads of variable */
 #define	CTLFLAG_WR	0x40000000	/* Allow writes to the variable */
@@ -95,6 +99,16 @@ struct ctlname {
 #define	CTLFLAG_SKIP	0x01000000	/* Skip this sysctl when listing */
 #define	CTLMASK_SECURE	0x00F00000	/* Secure level */
 #define	CTLFLAG_DYING	0x00010000	/* Oid is being removed */
+#define CTLFLAG_SHLOCK	0x00008000	/* shlock on write (def is exlock) */
+#define CTLFLAG_EXLOCK	0x00004000	/* exlock on read (def is shlock) */
+#define CTLFLAG_NOLOCK	0x00002000	/* no lock required */
+#define CTLFLAG_RSV12	0x00001000
+#define CTLMASK_BITFLD	0x00000FC0	/* bitfield extension */
+#define CTLFLAG_RSV5	0x00000020
+#define CTLMASK_TYPE	0x0000001F	/* type field */
+
+#define CTLSHIFT_BITFLD	6
+#define CTLINFO_MAXBITN	64
 
 /*
  * USE THIS instead of a hardwired number from the categories below
@@ -108,6 +122,9 @@ struct ctlname {
 #ifdef _KERNEL
 
 #include <sys/kernel.h>			/* for DATA_SET */
+#ifndef _SYS_LOCK_H_
+#include <sys/lock.h>
+#endif
 
 #define SYSCTL_HANDLER_ARGS struct sysctl_oid *oidp, void *arg1, int arg2, \
 	struct sysctl_req *req
@@ -150,17 +167,34 @@ struct sysctl_oid {
 	int		oid_refcnt;
 	u_int		 oid_running;
 	const char	*oid_descr;
+	struct lock	oid_lock;	/* per-node lock */
 };
 
-#define SYSCTL_IN(r, p, l) (r->newfunc)(r, p, l)
-#define SYSCTL_OUT(r, p, l) (r->oldfunc)(r, p, l)
+#define SYSCTL_IN(r, p, l)	(r->newfunc)(r, p, l)
+#define SYSCTL_OUT(r, p, l)	(r->oldfunc)(r, p, l)
+#define SYSCTL_OUT_STR(r, p)	(r->oldfunc)(r, p, strlen(p) + 1)
 
+int sysctl_handle_8(SYSCTL_HANDLER_ARGS);
+int sysctl_handle_16(SYSCTL_HANDLER_ARGS);
+int sysctl_handle_32(SYSCTL_HANDLER_ARGS);
+int sysctl_handle_64(SYSCTL_HANDLER_ARGS);
 int sysctl_handle_int(SYSCTL_HANDLER_ARGS);
 int sysctl_handle_long(SYSCTL_HANDLER_ARGS);
 int sysctl_handle_quad(SYSCTL_HANDLER_ARGS);
+int sysctl_handle_bit32(SYSCTL_HANDLER_ARGS);
+int sysctl_handle_bit64(SYSCTL_HANDLER_ARGS);
 int sysctl_handle_intptr(SYSCTL_HANDLER_ARGS);
 int sysctl_handle_string(SYSCTL_HANDLER_ARGS);
 int sysctl_handle_opaque(SYSCTL_HANDLER_ARGS);
+
+extern struct lock sysctllock;
+
+#define	SYSCTL_XLOCK()		_sysctl_xlock()
+#define	SYSCTL_XUNLOCK()	_sysctl_xunlock()
+#define	SYSCTL_SLOCK()		lockmgr(&mycpu->gd_sysctllock, LK_SHARED)
+#define	SYSCTL_SUNLOCK()	lockmgr(&mycpu->gd_sysctllock, LK_RELEASE)
+#define	SYSCTL_ASSERT_LOCKED() \
+	KKASSERT(lockstatus(&mycpu->gd_sysctllock, curthread) != 0)
 
 /*
  * These functions are used to add/remove an oid from the mib.
@@ -242,57 +276,165 @@ TAILQ_HEAD(sysctl_ctx_list, sysctl_ctx_entry);
 
 /* Oid for an int.  If ptr is NULL, val is returned. */
 #define	SYSCTL_INT(parent, nbr, name, access, ptr, val, descr)		\
-	SYSCTL_OID(parent, nbr, name, CTLTYPE_INT|(access),		\
+	SYSCTL_OID(parent, nbr, name,					\
+		CTLTYPE_INT|CTLFLAG_NOLOCK|(access),			\
 		ptr, val, sysctl_handle_int, "I", descr)
 
 #define SYSCTL_ADD_INT(ctx, parent, nbr, name, access, ptr, val, descr)	\
-	sysctl_add_oid(ctx, parent, nbr, name, CTLTYPE_INT|(access),	\
+	sysctl_add_oid(ctx, parent, nbr, name,				\
+		CTLTYPE_INT|CTLFLAG_NOLOCK|(access),			\
 	ptr, val, sysctl_handle_int, "I", descr)
 
 /* Oid for a quad.  If ptr is NULL, val is returned. */
 #define SYSCTL_QUAD(parent, nbr, name, access, ptr, val, descr)		\
-	SYSCTL_OID(parent, nbr, name, CTLTYPE_QUAD|(access),		\
+	SYSCTL_OID(parent, nbr, name,					\
+		CTLTYPE_QUAD|CTLFLAG_NOLOCK|(access),			\
 		ptr, val, sysctl_handle_quad, "Q", descr)
 
 #define SYSCTL_ADD_QUAD(ctx, parent, nbr, name, access, ptr, val, descr) \
-	sysctl_add_oid(ctx, parent, nbr, name, CTLTYPE_QUAD|(access),	\
-	ptr, val, sysctl_handle_quad, "Q", descr)
+	sysctl_add_oid(ctx, parent, nbr, name,				\
+		CTLTYPE_QUAD|CTLFLAG_NOLOCK|(access),			\
+		ptr, val, sysctl_handle_quad, "Q", descr)
 
 /* Oid for an unsigned quad.  If ptr is NULL, val is returned. */
 #define SYSCTL_UQUAD(parent, nbr, name, access, ptr, val, descr)	\
-	SYSCTL_OID(parent, nbr, name, CTLTYPE_UQUAD|(access),		\
+	SYSCTL_OID(parent, nbr, name,					\
+		CTLTYPE_UQUAD|CTLFLAG_NOLOCK|(access),			\
 		ptr, val, sysctl_handle_quad, "QU", descr)
 
 #define SYSCTL_ADD_UQUAD(ctx, parent, nbr, name, access, ptr, val, descr) \
-	sysctl_add_oid(ctx, parent, nbr, name, CTLTYPE_UQUAD|(access),	\
-	ptr, val, sysctl_handle_quad, "QU", descr)
+	sysctl_add_oid(ctx, parent, nbr, name,				\
+		CTLTYPE_UQUAD|CTLFLAG_NOLOCK|(access),			\
+		ptr, val, sysctl_handle_quad, "QU", descr)
 
 /* Oid for an unsigned int.  If ptr is NULL, val is returned. */
 #define SYSCTL_UINT(parent, nbr, name, access, ptr, val, descr)		\
-	SYSCTL_OID(parent, nbr, name, CTLTYPE_UINT|(access),		\
+	SYSCTL_OID(parent, nbr, name,					\
+		CTLTYPE_UINT|CTLFLAG_NOLOCK|(access),			\
 		ptr, val, sysctl_handle_int, "IU", descr)
 
 #define SYSCTL_ADD_UINT(ctx, parent, nbr, name, access, ptr, val, descr) \
-	sysctl_add_oid(ctx, parent, nbr, name, CTLTYPE_UINT|(access),	\
-	ptr, val, sysctl_handle_int, "IU", descr)
+	sysctl_add_oid(ctx, parent, nbr, name,				\
+		CTLTYPE_UINT|CTLFLAG_NOLOCK|(access),			\
+		ptr, val, sysctl_handle_int, "IU", descr)
 
 /* Oid for a long.  The pointer must be non NULL. */
 #define SYSCTL_LONG(parent, nbr, name, access, ptr, val, descr)		\
-	SYSCTL_OID(parent, nbr, name, CTLTYPE_LONG|(access),		\
+	SYSCTL_OID(parent, nbr, name,					\
+		CTLTYPE_LONG|CTLFLAG_NOLOCK|(access),			\
 		ptr, val, sysctl_handle_long, "L", descr)
 
 #define SYSCTL_ADD_LONG(ctx, parent, nbr, name, access, ptr, descr)	\
-	sysctl_add_oid(ctx, parent, nbr, name, CTLTYPE_LONG|(access),	\
-	ptr, 0, sysctl_handle_long, "L", descr)
+	sysctl_add_oid(ctx, parent, nbr, name,				\
+		CTLTYPE_LONG|CTLFLAG_NOLOCK|(access),			\
+		ptr, 0, sysctl_handle_long, "L", descr)
 
 /* Oid for a long.  The pointer must be non NULL. */
 #define SYSCTL_ULONG(parent, nbr, name, access, ptr, val, descr)	\
-	SYSCTL_OID(parent, nbr, name, CTLTYPE_ULONG|(access),		\
+	SYSCTL_OID(parent, nbr, name,					\
+		CTLTYPE_ULONG|CTLFLAG_NOLOCK|(access),			\
 		ptr, val, sysctl_handle_long, "LU", descr)
 
 #define SYSCTL_ADD_ULONG(ctx, parent, nbr, name, access, ptr, descr)	\
-	sysctl_add_oid(ctx, parent, nbr, name, CTLTYPE_ULONG|(access),	\
-	ptr, 0, sysctl_handle_long, "LU", descr)
+	sysctl_add_oid(ctx, parent, nbr, name,				\
+		CTLTYPE_ULONG|CTLFLAG_NOLOCK|(access),			\
+		ptr, 0, sysctl_handle_long, "LU", descr)
+
+/* Oid for a signed 8-bit int.  The pointer must be non NULL. */
+#define SYSCTL_S8(parent, nbr, name, access, ptr, val, descr)	\
+	SYSCTL_OID(parent, nbr, name, CTLTYPE_S8|(access),		\
+		ptr, val, sysctl_handle_8, "C", descr)
+
+#define SYSCTL_ADD_S8(ctx, parent, nbr, name, access, ptr, descr)	\
+	sysctl_add_oid(ctx, parent, nbr, name, CTLTYPE_S8|(access),	\
+	ptr, 0, sysctl_handle_8, "C", descr)
+
+/* Oid for a signed 16-bit int.  The pointer must be non NULL. */
+#define SYSCTL_S16(parent, nbr, name, access, ptr, val, descr)	\
+	SYSCTL_OID(parent, nbr, name, CTLTYPE_S16|(access),		\
+		ptr, val, sysctl_handle_16, "S", descr)
+
+#define SYSCTL_ADD_S16(ctx, parent, nbr, name, access, ptr, descr)	\
+	sysctl_add_oid(ctx, parent, nbr, name, CTLTYPE_S16|(access),	\
+	ptr, 0, sysctl_handle_16, "S", descr)
+
+/* Oid for a signed 32-bit int.  The pointer must be non NULL. */
+#define SYSCTL_S32(parent, nbr, name, access, ptr, val, descr)	\
+	SYSCTL_OID(parent, nbr, name, CTLTYPE_S32|(access),		\
+		ptr, val, sysctl_handle_32, "I", descr)
+
+#define SYSCTL_ADD_S32(ctx, parent, nbr, name, access, ptr, descr)	\
+	sysctl_add_oid(ctx, parent, nbr, name, CTLTYPE_S32|(access),	\
+	ptr, 0, sysctl_handle_32, "I", descr)
+
+/* Oid for a signed 64-bit int.  The pointer must be non NULL. */
+#define SYSCTL_S64(parent, nbr, name, access, ptr, val, descr)	\
+	SYSCTL_OID(parent, nbr, name, CTLTYPE_S64|(access),		\
+		ptr, val, sysctl_handle_64, "Q", descr)
+
+#define SYSCTL_ADD_S64(ctx, parent, nbr, name, access, ptr, descr)	\
+	sysctl_add_oid(ctx, parent, nbr, name, CTLTYPE_S64|(access),	\
+	ptr, 0, sysctl_handle_64, "Q", descr)
+
+/* Oid for an unsigned 8-bit int.  The pointer must be non NULL. */
+#define SYSCTL_U8(parent, nbr, name, access, ptr, val, descr)	\
+	SYSCTL_OID(parent, nbr, name, CTLTYPE_U8|(access),		\
+		ptr, val, sysctl_handle_8, "CU", descr)
+
+#define SYSCTL_ADD_U8(ctx, parent, nbr, name, access, ptr, descr)	\
+	sysctl_add_oid(ctx, parent, nbr, name, CTLTYPE_U8|(access),	\
+	ptr, 0, sysctl_handle_8, "CU", descr)
+
+/* Oid for an unsigned 16-bit int.  The pointer must be non NULL. */
+#define SYSCTL_U16(parent, nbr, name, access, ptr, val, descr)	\
+	SYSCTL_OID(parent, nbr, name, CTLTYPE_U16|(access),		\
+		ptr, val, sysctl_handle_16, "SU", descr)
+
+#define SYSCTL_ADD_U16(ctx, parent, nbr, name, access, ptr, descr)	\
+	sysctl_add_oid(ctx, parent, nbr, name, CTLTYPE_U16|(access),	\
+	ptr, 0, sysctl_handle_16, "SU", descr)
+
+/* Oid for an unsigned 32-bit int.  The pointer must be non NULL. */
+#define SYSCTL_U32(parent, nbr, name, access, ptr, val, descr)	\
+	SYSCTL_OID(parent, nbr, name, CTLTYPE_U32|(access),		\
+		ptr, val, sysctl_handle_32, "IU", descr)
+
+#define SYSCTL_ADD_U32(ctx, parent, nbr, name, access, ptr, descr)	\
+	sysctl_add_oid(ctx, parent, nbr, name, CTLTYPE_U32|(access),	\
+	ptr, 0, sysctl_handle_32, "IU", descr)
+
+/* Oid for an unsigned 64-bit int.  The pointer must be non NULL. */
+#define SYSCTL_U64(parent, nbr, name, access, ptr, val, descr)	\
+	SYSCTL_OID(parent, nbr, name, CTLTYPE_U64|(access),		\
+		ptr, val, sysctl_handle_64, "QU", descr)
+
+#define SYSCTL_ADD_U64(ctx, parent, nbr, name, access, ptr, descr)	\
+	sysctl_add_oid(ctx, parent, nbr, name, CTLTYPE_U64|(access),	\
+	ptr, 0, sysctl_handle_64, "QU", descr)
+
+/* Oid for a bit in a uint32_t.  If ptr is NULL, val is returned. */
+/* API passes and returns an integer */
+#define	SYSCTL_BIT32(parent, nbr, name, access, ptr, val, bit, descr)	\
+	SYSCTL_OID(parent, nbr, name,					\
+		CTLTYPE_BIT32(bit)|CTLFLAG_NOLOCK|(access),		\
+		ptr, val, sysctl_handle_bit32, "I", descr)
+
+#define SYSCTL_ADD_BIT32(ctx, parent, nbr, name, access, ptr, val, bit, descr) \
+	sysctl_add_oid(ctx, parent, nbr, name,				\
+	    CTLTYPE_BIT32(bit)|CTLFLAG_NOLOCK|(access),			\
+	    ptr, val, sysctl_handle_bit32, "I", descr)
+
+/* Oid for a bit in a uint64_t.  If ptr is NULL, val is returned. */
+/* API passes and returns an integer */
+#define	SYSCTL_BIT64(parent, nbr, name, access, ptr, val, bit, descr)	\
+	SYSCTL_OID(parent, nbr, name,					\
+		CTLTYPE_BIT64(bit)|CTLFLAG_NOLOCK|(access),		\
+		ptr, val, sysctl_handle_bit64, "I", descr)
+
+#define SYSCTL_ADD_BIT64(ctx, parent, nbr, name, access, ptr, val, bit, descr) \
+	sysctl_add_oid(ctx, parent, nbr, name,				\
+	    CTLTYPE_BIT64(bit)|CTLFLAG_NOLOCK|(access),			\
+	    ptr, val, sysctl_handle_bit64, "I", descr)
 
 /* Oid for an opaque object.  Specified by a pointer and a length. */
 #define SYSCTL_OPAQUE(parent, nbr, name, access, ptr, len, fmt, descr)	\
@@ -327,7 +469,7 @@ TAILQ_HEAD(sysctl_ctx_list, sysctl_ctx_entry);
 /*
  * Top-level identifiers
  */
-#define	CTL_UNSPEC	0		/* unused */
+#define	CTL_SYSCTL	0		/* "magic" numbers */
 #define	CTL_KERN	1		/* "high kernel": proc, limits */
 #define	CTL_VM		2		/* virtual memory */
 #define	CTL_VFS		3		/* file system, mount type is next */
@@ -337,7 +479,7 @@ TAILQ_HEAD(sysctl_ctx_list, sysctl_ctx_entry);
 #define	CTL_MACHDEP	7		/* machine dependent */
 #define	CTL_USER	8		/* user-level */
 #define	CTL_P1003_1B	9		/* POSIX 1003.1B */
-#define CTL_LWKT	10		/* light weight kernel threads */
+#define	CTL_LWKT	10		/* light weight kernel threads */
 #define	CTL_MAXID	11		/* number of valid top-level ids */
 
 #define CTL_NAMES { \
@@ -353,6 +495,16 @@ TAILQ_HEAD(sysctl_ctx_list, sysctl_ctx_entry);
 	{ "p1003_1b", CTLTYPE_NODE }, \
 	{ "lwkt", CTLTYPE_NODE }, \
 }
+
+/*
+ * CTL_SYSCTL identifiers
+ */
+#define	CTL_SYSCTL_DEBUG	0	/* printf all nodes */
+#define	CTL_SYSCTL_NAME		1	/* string name of OID */
+#define	CTL_SYSCTL_NEXT		2	/* next OID */
+#define	CTL_SYSCTL_NAME2OID	3	/* int array of name */
+#define	CTL_SYSCTL_OIDFMT	4	/* OID's kind and format */
+#define	CTL_SYSCTL_OIDDESCR	5	/* OID's description */
 
 /*
  * CTL_KERN identifiers
@@ -372,7 +524,7 @@ TAILQ_HEAD(sysctl_ctx_list, sysctl_ctx_entry);
 #define	KERN_VNODE		13	/* struct: vnode structures */
 #define	KERN_PROC		14	/* struct: process entries */
 #define	KERN_FILE		15	/* struct: file entries */
-#define	KERN_PROF		16	/* node: kernel profiling info */
+#define	KERN_UNUSED16		16	/* was: node: kernel profiling info */
 #define	KERN_POSIX1		17	/* int: POSIX.1 version */
 #define	KERN_NGROUPS		18	/* int: # of supplemental group ids */
 #define	KERN_JOB_CONTROL	19	/* int: is job control available */
@@ -385,7 +537,7 @@ TAILQ_HEAD(sysctl_ctx_list, sysctl_ctx_entry);
 #define	KERN_BOOTFILE		26	/* string: name of booted kernel */
 #define	KERN_MAXFILESPERPROC	27	/* int: max open files per proc */
 #define	KERN_MAXPROCPERUID 	28	/* int: max processes per uid */
-#define KERN_DUMPDEV		29	/* udev_t: device to dump on */
+#define	KERN_DUMPDEV		29	/* dev_t: device to dump on */
 #define	KERN_IPC		30	/* node: anything related to IPC */
 #define	KERN_DUMMY		31	/* unused */
 #define	KERN_PS_STRINGS		32	/* int: address of PS_STRINGS */
@@ -393,7 +545,8 @@ TAILQ_HEAD(sysctl_ctx_list, sysctl_ctx_entry);
 #define	KERN_LOGSIGEXIT		34	/* int: do we log sigexit procs? */
 #define	KERN_IOV_MAX		35	/* int: value of UIO_MAXIOV */
 #define KERN_MAXPOSIXLOCKSPERUID 36	/* int: max POSIX locks per uid */
-#define KERN_MAXID		37      /* number of valid kern ids */
+#define KERN_STATIC_TLS_EXTRA	37	/* int: extra tls space for rtld */
+#define KERN_MAXID		38      /* number of valid kern ids */
 
 #define CTL_KERN_NAMES { \
 	{ 0, 0 }, \
@@ -455,7 +608,7 @@ TAILQ_HEAD(sysctl_ctx_list, sysctl_ctx_entry);
 #define	KERN_PROC_ARGS		7	/* get/set arguments/proctitle */
 #define	KERN_PROC_CWD		8	/* get cwd */
 #define	KERN_PROC_PATHNAME      9	/* path to executable */
-
+#define KERN_PROC_SIGTRAMP	10	/* addr[2]: sigtramp addr range */
 
 #define KERN_PROC_FLAGMASK	0x10
 #define KERN_PROC_FLAG_LWP	0x10
@@ -491,23 +644,6 @@ TAILQ_HEAD(sysctl_ctx_list, sysctl_ctx_entry);
 #define HW_SENSORS	13		/* node: hardware sensors */
 #define HW_MAXID	14		/* number of valid hw ids */
 
-#define CTL_HW_NAMES { \
-	{ 0, 0 }, \
-	{ "machine", CTLTYPE_STRING }, \
-	{ "model", CTLTYPE_STRING }, \
-	{ "ncpu", CTLTYPE_INT }, \
-	{ "byteorder", CTLTYPE_INT }, \
-	{ "physmem", CTLTYPE_ULONG }, \
-	{ "usermem", CTLTYPE_UINT }, \
-	{ "pagesize", CTLTYPE_INT }, \
-	{ "disknames", CTLTYPE_STRUCT }, \
-	{ "diskstats", CTLTYPE_STRUCT }, \
-	{ "floatingpoint", CTLTYPE_INT }, \
-	{ "arch", CTLTYPE_STRING }, \
-	{ "platform", CTLTYPE_STRING }, \
-	{ "sensors", CTLTYPE_NODE }, \
-}
-
 /*
  * CTL_USER definitions
  */
@@ -520,17 +656,17 @@ TAILQ_HEAD(sysctl_ctx_list, sysctl_ctx_entry);
 #define	USER_EXPR_NEST_MAX	 7	/* int: EXPR_NEST_MAX */
 #define	USER_LINE_MAX		 8	/* int: LINE_MAX */
 #define	USER_RE_DUP_MAX		 9	/* int: RE_DUP_MAX */
-#define	USER_POSIX2_VERSION	10	/* int: POSIX2_VERSION */
-#define	USER_POSIX2_C_BIND	11	/* int: POSIX2_C_BIND */
-#define	USER_POSIX2_C_DEV	12	/* int: POSIX2_C_DEV */
-#define	USER_POSIX2_CHAR_TERM	13	/* int: POSIX2_CHAR_TERM */
-#define	USER_POSIX2_FORT_DEV	14	/* int: POSIX2_FORT_DEV */
-#define	USER_POSIX2_FORT_RUN	15	/* int: POSIX2_FORT_RUN */
-#define	USER_POSIX2_LOCALEDEF	16	/* int: POSIX2_LOCALEDEF */
-#define	USER_POSIX2_SW_DEV	17	/* int: POSIX2_SW_DEV */
-#define	USER_POSIX2_UPE		18	/* int: POSIX2_UPE */
-#define	USER_STREAM_MAX		19	/* int: POSIX2_STREAM_MAX */
-#define	USER_TZNAME_MAX		20	/* int: POSIX2_TZNAME_MAX */
+#define	USER_POSIX2_VERSION	10	/* int: _POSIX2_VERSION */
+#define	USER_POSIX2_C_BIND	11	/* int: _POSIX2_C_BIND */
+#define	USER_POSIX2_C_DEV	12	/* int: _POSIX2_C_DEV */
+#define	USER_POSIX2_CHAR_TERM	13	/* int: _POSIX2_CHAR_TERM */
+#define	USER_POSIX2_FORT_DEV	14	/* int: _POSIX2_FORT_DEV */
+#define	USER_POSIX2_FORT_RUN	15	/* int: _POSIX2_FORT_RUN */
+#define	USER_POSIX2_LOCALEDEF	16	/* int: _POSIX2_LOCALEDEF */
+#define	USER_POSIX2_SW_DEV	17	/* int: _POSIX2_SW_DEV */
+#define	USER_POSIX2_UPE		18	/* int: _POSIX2_UPE */
+#define	USER_STREAM_MAX		19	/* int: _POSIX2_STREAM_MAX */
+#define	USER_TZNAME_MAX		20	/* int: _POSIX2_TZNAME_MAX */
 #define	USER_MAXID		21	/* number of valid user ids */
 
 #define	CTL_USER_NAMES { \
@@ -575,11 +711,11 @@ TAILQ_HEAD(sysctl_ctx_list, sysctl_ctx_entry);
 #define CTL_P1003_1B_AIO_MAX			16	/* int */
 #define CTL_P1003_1B_AIO_PRIO_DELTA_MAX		17	/* int */
 #define CTL_P1003_1B_DELAYTIMER_MAX		18	/* int */
-#define CTL_P1003_1B_UNUSED1			19	/* int */
+#define CTL_P1003_1B_UNUSED19			19	/* int */
 #define CTL_P1003_1B_PAGESIZE			20	/* int */
 #define CTL_P1003_1B_RTSIG_MAX			21	/* int */
 #define CTL_P1003_1B_SEM_NSEMS_MAX		22	/* int */
-#define CTL_P1003_1B_SEM_VALUE_MAX		23	/* int */
+#define CTL_P1003_1B_UNUSED23			23	/* int */
 #define CTL_P1003_1B_SIGQUEUE_MAX		24	/* int */
 #define CTL_P1003_1B_TIMER_MAX			25	/* int */
 
@@ -627,6 +763,7 @@ SYSCTL_DECL(_vfs);
 SYSCTL_DECL(_net);
 SYSCTL_DECL(_debug);
 SYSCTL_DECL(_debug_sizeof);
+SYSCTL_DECL(_dev);
 SYSCTL_DECL(_hw);
 SYSCTL_DECL(_hw_bus);
 SYSCTL_DECL(_machdep);
@@ -634,7 +771,6 @@ SYSCTL_DECL(_user);
 SYSCTL_DECL(_compat);
 SYSCTL_DECL(_lwkt);
 SYSCTL_DECL(_security);
-SYSCTL_DECL(_dsched);
 
 /*
  * Common second-level oids.
@@ -678,6 +814,8 @@ int	sysctl_find_oid(int *name, u_int namelen, struct sysctl_oid **noid,
 			int *nindx, struct sysctl_req *req);
 
 int	sysctl_int_range(SYSCTL_HANDLER_ARGS, int low, int high);
+void	_sysctl_xlock(void);
+void	_sysctl_xunlock(void);
 
 struct sbuf;
 struct sbuf *sbuf_new_for_sysctl(struct sbuf *, char *, int,

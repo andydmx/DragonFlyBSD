@@ -31,6 +31,7 @@
 #include <sys/param.h>
 #include <sys/types.h>
 #include <sys/systm.h>
+#include <sys/uio.h>
 #include <sys/proc.h>
 #include <sys/namei.h>
 #include <sys/kernel.h>
@@ -387,7 +388,7 @@ ntfs_ntlookup(struct ntfsmount *ntmp, ino_t ino, struct ntnode **ipp)
 	vref(ip->i_devvp);
 
 	/* init lock and lock the newborn ntnode */
-	lockinit(&ip->i_lock, "ntnode", 0, LK_EXCLUSIVE);
+	lockinit(&ip->i_lock, "ntnode", 0, 0);
 	spin_init(&ip->i_interlock, "ntfsntlookup");
 	ntfs_ntget(ip);
 
@@ -644,6 +645,7 @@ ntfs_uastricmp(struct ntfsmount *ntmp, const wchar *ustr, size_t ustrlen,
 	int res;
 	wchar wc;
 
+	len = 0;	/* avoid gcc warnings */
 	if (ntmp->ntm_ic_l2u) {
 		for (i = 0, j = 0; i < ustrlen && j < astrlen; i++, j++) {
 			if (j < astrlen -1) {
@@ -1687,7 +1689,7 @@ ntfs_readattr(struct ntfsmount *ntmp, struct ntnode *ip, u_int32_t attrnum,
 		uup = kmalloc(ntfs_cntob(NTFS_COMPUNIT_CL), M_NTFSDECOMP,
 			      M_WAITOK);
 
-		cn = (ntfs_btocn(roff)) & (~(NTFS_COMPUNIT_CL - 1));
+		cn = rounddown2(ntfs_btocn(roff), NTFS_COMPUNIT_CL);
 		off = roff - ntfs_cntob(cn);
 
 		while (left) {
@@ -1830,7 +1832,7 @@ ntfs_runtocn(cn_t *cn,	struct ntfsmount *ntmp, u_int8_t *run, u_long len,
 	u_long          off = 0;
 	int             error = 0;
 
-#if NTFS_DEBUG
+#ifdef NTFS_DEBUG
 	int             i;
 	kprintf("ntfs_runtocn: run: 0x%p, %ld bytes, vcn:%ld\n",
 		run, len, (u_long) vcn);

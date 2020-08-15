@@ -1,7 +1,7 @@
 /*
  * SYS/THREAD2.H
  *
- * Implements inline procedure support for the LWKT subsystem. 
+ * Implements inline procedure support for the LWKT subsystem.
  *
  * Generally speaking these routines only operate on threads associated
  * with the current cpu.  For example, a higher priority thread pending
@@ -13,10 +13,8 @@
 #define _SYS_THREAD2_H_
 
 #ifndef _KERNEL
-
 #error "This file should not be included by userland programs."
-
-#else
+#endif
 
 /*
  * Userland will have its own globaldata which it includes prior to this.
@@ -27,7 +25,30 @@
 #ifndef _SYS_GLOBALDATA_H_
 #include <sys/globaldata.h>
 #endif
+#ifndef _SYS_CPUMASK_H_
+#include <sys/cpumask.h>
+#endif
 #include <machine/cpufunc.h>
+
+/*
+ * Don't let GCC reorder critical section count adjustments, because it
+ * will BLOW US UP if it does.
+ */
+static __inline void
+crit_enter_raw(thread_t td)
+{
+	cpu_ccfence();
+	++td->td_critcount;
+	cpu_ccfence();
+}
+
+static __inline void
+crit_exit_raw(thread_t td)
+{
+	cpu_ccfence();
+	--td->td_critcount;
+	cpu_ccfence();
+}
 
 /*
  * Is a token held either by the specified thread or held shared?
@@ -103,7 +124,7 @@ _lwkt_token_held_excl(lwkt_token_t tok, thread_t td)
 #define crit_exit_noyield(curtd)	_crit_exit_noyield((curtd))
 #endif
 
-extern void crit_exit_wrapper(__DEBUG_CRIT_ARG__);
+void crit_exit_wrapper(__DEBUG_CRIT_ARG__);
 
 /*
  * Track crit_enter()/crit_exit() pairs and warn on mismatches.
@@ -160,9 +181,8 @@ _debug_crit_exit(thread_t td, const char *id)
 static __inline void
 _crit_enter_quick(thread_t td __DEBUG_CRIT_ADD_ARG__)
 {
-    ++td->td_critcount;
+    crit_enter_raw(td);
     __DEBUG_CRIT_ENTER(td);
-    cpu_ccfence();
 }
 
 static __inline void
@@ -176,6 +196,7 @@ _crit_enter_hard(globaldata_t gd __DEBUG_CRIT_ADD_ARG__)
 {
     _crit_enter_quick(gd->gd_curthread __DEBUG_CRIT_PASS_ARG__);
     ++gd->gd_intr_nesting_level;
+    cpu_ccfence();
 }
 
 
@@ -195,12 +216,11 @@ static __inline void
 _crit_exit_noyield(thread_t td __DEBUG_CRIT_ADD_ARG__)
 {
     __DEBUG_CRIT_EXIT(td);
-    --td->td_critcount;
+    crit_exit_raw(td);
 #ifdef INVARIANTS
     if (__predict_false(td->td_critcount < 0))
 	crit_panic();
 #endif
-    cpu_ccfence();	/* prevent compiler reordering */
 }
 
 static __inline void
@@ -220,6 +240,7 @@ _crit_exit(globaldata_t gd __DEBUG_CRIT_ADD_ARG__)
 static __inline void
 _crit_exit_hard(globaldata_t gd __DEBUG_CRIT_ADD_ARG__)
 {
+    cpu_ccfence();
     --gd->gd_intr_nesting_level;
     _crit_exit_quick(gd->gd_curthread __DEBUG_CRIT_PASS_ARG__);
 }
@@ -284,7 +305,7 @@ lwkt_cpusync_init(lwkt_cpusync_t cs, cpumask_t mask,
 /*
  * IPIQ messaging wrappers.  IPIQ remote functions are passed three arguments:
  * a void * pointer, an integer, and a pointer to the trap frame (or NULL if
- * the trap frame is not known).  However, we wish to provide opaque 
+ * the trap frame is not known).  However, we wish to provide opaque
  * interfaces for simpler callbacks... the basic IPI messaging function as
  * used by the kernel takes a single argument.
  */
@@ -313,26 +334,13 @@ lwkt_send_ipiq2_mask(cpumask_t mask, ipifunc2_t func, void *arg1, int arg2)
 }
 
 static __inline int
-lwkt_send_ipiq_nowait(globaldata_t target, ipifunc1_t func, void *arg)
-{
-    return(lwkt_send_ipiq3_nowait(target, (ipifunc3_t)func, arg, 0));
-}
-
-static __inline int
-lwkt_send_ipiq2_nowait(globaldata_t target, ipifunc2_t func, 
-		       void *arg1, int arg2)
-{
-    return(lwkt_send_ipiq3_nowait(target, (ipifunc3_t)func, arg1, arg2));
-}
-
-static __inline int
 lwkt_send_ipiq_passive(globaldata_t target, ipifunc1_t func, void *arg)
 {
     return(lwkt_send_ipiq3_passive(target, (ipifunc3_t)func, arg, 0));
 }
 
 static __inline int
-lwkt_send_ipiq2_passive(globaldata_t target, ipifunc2_t func, 
+lwkt_send_ipiq2_passive(globaldata_t target, ipifunc2_t func,
 		       void *arg1, int arg2)
 {
     return(lwkt_send_ipiq3_passive(target, (ipifunc3_t)func, arg1, arg2));
@@ -350,6 +358,16 @@ lwkt_send_ipiq2_bycpu(int dcpu, ipifunc2_t func, void *arg1, int arg2)
     return(lwkt_send_ipiq3_bycpu(dcpu, (ipifunc3_t)func, arg1, arg2));
 }
 
-#endif	/* _KERNEL */
-#endif	/* _SYS_THREAD2_H_ */
+static __inline int
+lwkt_need_ipiq_process(globaldata_t gd)
+{
+    lwkt_ipiq_t ipiq;
 
+    if (CPUMASK_TESTNZERO(gd->gd_ipimask))
+	return 1;
+
+    ipiq = &gd->gd_cpusyncq;
+    return (ipiq->ip_rindex != ipiq->ip_windex);
+}
+
+#endif	/* _SYS_THREAD2_H_ */

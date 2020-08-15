@@ -10,11 +10,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -35,7 +31,7 @@
  */
 
 #ifndef _NETINET_IP_H_
-#define _NETINET_IP_H_
+#define	_NETINET_IP_H_
 
 #ifndef _SYS_TYPES_H_
 #include <sys/types.h>
@@ -93,7 +89,7 @@ struct ip {
 #define	IP_MAXPACKET	65535		/* maximum packet size */
 
 /*
- * Definitions for IP type of service (ip_tos)
+ * Definitions for IP type of service (ip_tos).
  */
 #define	IPTOS_LOWDELAY		0x10
 #define	IPTOS_THROUGHPUT	0x08
@@ -105,18 +101,43 @@ struct ip {
 #define	IPTOS_ECT		0x02	/* ECN-capable transport */
 #endif
 
+/*
+ * Definitions for IP precedence (also in ip_tos) (deprecated).
+ */
+#define	IPTOS_PREC_NETCONTROL		IPTOS_DSCP_CS7
+#define	IPTOS_PREC_INTERNETCONTROL	IPTOS_DSCP_CS6
+#define	IPTOS_PREC_CRITIC_ECP		IPTOS_DSCP_CS5
+#define	IPTOS_PREC_FLASHOVERRIDE	IPTOS_DSCP_CS4
+#define	IPTOS_PREC_FLASH		IPTOS_DSCP_CS3
+#define	IPTOS_PREC_IMMEDIATE		IPTOS_DSCP_CS2
+#define	IPTOS_PREC_PRIORITY		IPTOS_DSCP_CS1
+#define	IPTOS_PREC_ROUTINE		IPTOS_DSCP_CS0
 
 /*
- * Definitions for IP precedence (also in ip_tos) (hopefully unused)
+ * Definitions for DiffServ Codepoints as per RFC2474 and RFC5865.
  */
-#define	IPTOS_PREC_NETCONTROL		0xe0
-#define	IPTOS_PREC_INTERNETCONTROL	0xc0
-#define	IPTOS_PREC_CRITIC_ECP		0xa0
-#define	IPTOS_PREC_FLASHOVERRIDE	0x80
-#define	IPTOS_PREC_FLASH		0x60
-#define	IPTOS_PREC_IMMEDIATE		0x40
-#define	IPTOS_PREC_PRIORITY		0x20
-#define	IPTOS_PREC_ROUTINE		0x00
+#define	IPTOS_DSCP_CS0		0x00
+#define	IPTOS_DSCP_CS1		0x20
+#define	IPTOS_DSCP_AF11		0x28
+#define	IPTOS_DSCP_AF12		0x30
+#define	IPTOS_DSCP_AF13		0x38
+#define	IPTOS_DSCP_CS2		0x40
+#define	IPTOS_DSCP_AF21		0x48
+#define	IPTOS_DSCP_AF22		0x50
+#define	IPTOS_DSCP_AF23		0x58
+#define	IPTOS_DSCP_CS3		0x60
+#define	IPTOS_DSCP_AF31		0x68
+#define	IPTOS_DSCP_AF32		0x70
+#define	IPTOS_DSCP_AF33		0x78
+#define	IPTOS_DSCP_CS4		0x80
+#define	IPTOS_DSCP_AF41		0x88
+#define	IPTOS_DSCP_AF42		0x90
+#define	IPTOS_DSCP_AF43		0x98
+#define	IPTOS_DSCP_CS5		0xa0
+#define	IPTOS_DSCP_VA		0xb0
+#define	IPTOS_DSCP_EF		0xb8
+#define	IPTOS_DSCP_CS6		0xc0
+#define	IPTOS_DSCP_CS7		0xe0
 
 /*
  * ECN (Explicit Congestion Notification) codepoints in RFC3168
@@ -156,7 +177,7 @@ struct ip {
  */
 #define	IPOPT_OPTVAL		0		/* option ID */
 #define	IPOPT_OLEN		1		/* option length */
-#define IPOPT_OFFSET		2		/* offset within option */
+#define	IPOPT_OFFSET		2		/* offset within option */
 #define	IPOPT_MINOFF		4		/* min value of above */
 
 /*
@@ -184,12 +205,12 @@ struct	ip_timestamp {
 	} ipt_timestamp;
 };
 
-/* flag bits for ipt_flg */
+/* Flag bits for ipt_flg. */
 #define	IPOPT_TS_TSONLY		0		/* timestamps only */
 #define	IPOPT_TS_TSANDADDR	1		/* timestamps and addresses */
 #define	IPOPT_TS_PRESPEC	3		/* specified modules only */
 
-/* bits for security (not byte swapped) */
+/* Bits for security (not byte swapped). */
 #define	IPOPT_SECUR_UNCLASS	0x0000
 #define	IPOPT_SECUR_CONFID	0xf135
 #define	IPOPT_SECUR_EFTO	0x789a
@@ -205,7 +226,6 @@ struct	ip_timestamp {
 #define	IPDEFTTL	64		/* default ttl, from RFC 1340 */
 #define	IPFRAGTTL	60		/* time to live for frags, slowhz */
 #define	IPTTLDEC	1		/* subtracted when forwarding */
-
 #define	IP_MSS		576		/* default maximum segment size */
 
 /*

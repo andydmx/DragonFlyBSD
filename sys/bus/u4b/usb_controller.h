@@ -1,4 +1,4 @@
-/* $FreeBSD$ */
+/* $FreeBSD: head/sys/dev/usb/usb_controller.h 259023 2013-12-06 08:42:41Z hselasky $ */
 /*-
  * Copyright (c) 2008 Hans Petter Selasky. All rights reserved.
  *
@@ -143,7 +143,7 @@ struct usb_bus_methods {
 	/* Optional for host mode */
 
 	usb_error_t	(*set_address) (struct usb_device *, struct lock *, uint16_t);
-  
+
 	/* Optional for device and host mode */
 
 	usb_error_t	(*set_endpoint_mode) (struct usb_device *, struct usb_endpoint *, uint8_t);

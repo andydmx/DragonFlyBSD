@@ -42,6 +42,7 @@
 #endif
 
 #include <machine/db_machdep.h>		/* type definitions */
+#include <machine/stdarg.h>
 
 #ifndef _MACHINE_GLOBALDATA_H_
 #include <machine/globaldata.h>
@@ -50,8 +51,10 @@
 typedef void db_cmdfcn_t (db_expr_t addr, boolean_t have_addr,
 			      db_expr_t count, char *modif);
 
+#define DB_COMMAND_FLAG(cmd_name, func_name, flag) \
+	DB_SET(cmd_name, func_name, db_cmd_set, flag, NULL)
 #define DB_COMMAND(cmd_name, func_name) \
-	DB_SET(cmd_name, func_name, db_cmd_set, 0, NULL)
+	DB_COMMAND_FLAG(cmd_name, func_name, 0)
 #define DB_SHOW_COMMAND(cmd_name, func_name) \
 	DB_SET(cmd_name, func_name, db_show_cmd_set, 0, NULL)
 
@@ -115,6 +118,7 @@ void		kdb_init (void);
 
 db_cmdfcn_t	db_breakpoint_cmd;
 db_cmdfcn_t	db_continue_cmd;
+db_cmdfcn_t	db_invltlb_cmd;
 db_cmdfcn_t	db_delete_cmd;
 db_cmdfcn_t	db_deletehwatch_cmd;
 db_cmdfcn_t	db_deletewatch_cmd;

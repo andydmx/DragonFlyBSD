@@ -34,6 +34,9 @@
  * $FreeBSD: src/sbin/ifconfig/ifconfig.h,v 1.16.2.1 2005/07/21 12:25:40 rwatson Exp $
  */
 
+#ifndef IFCONFIG_IFCONFIG_H
+#define IFCONFIG_IFCONFIG_H
+
 struct afswtch;
 struct cmd;
 
@@ -81,7 +84,7 @@ void	callback_register(callback_func *, void *);
 	{ name, NEXTARG, { .c_func = func }, 1, NULL }
 
 
-struct rt_addrinfo;
+struct ifaddrs;
 struct addrinfo;
 
 enum {
@@ -103,7 +106,7 @@ struct afswtch {
 	 * is defined then it is invoked after all address status
 	 * is presented.
 	 */
-	void		(*af_status)(int, const struct rt_addrinfo *);
+	void		(*af_status)(int, const struct ifaddrs *);
 	void		(*af_other_status)(int);
 					/* parse address method */
 	void		(*af_getaddr)(const char *, int);
@@ -135,23 +138,26 @@ extern	struct ifreq ifr;
 extern	char name[IFNAMSIZ];	/* name of interface */
 extern	int supmedia;
 extern	int printkeys;
-extern	int printname;
-extern	int flags;
+extern	int printifname;
 extern	int newaddr;
 extern	int verbose;
+extern	int exit_code;
+extern	char *f_inet, *f_inet6, *f_ether, *f_addr, *f_scope;
 
 void	setifcap(const char *, int value, int s, const struct afswtch *);
 
-void	Perror(const char *cmd);
+void	Perror(const char *cmd) __dead2;
 void	printb(const char *s, unsigned value, const char *bits);
 
 void	ifmaybeload(const char *);
 
 typedef void clone_callback_func(int, struct ifreq *);
-void    clone_setdefcallback(const char *, clone_callback_func *);
+void	clone_setdefcallback(const char *, clone_callback_func *);
 
 /*
  * XXX expose this so modules that neeed to know of any pending
  * operations on ifmedia can avoid cmd line ordering confusion.
  */
 struct ifmediareq *ifmedia_getstate(int s);
+
+#endif  /* !IFCONFIG_IFCONFIG_H */

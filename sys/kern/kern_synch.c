@@ -46,11 +46,12 @@
 #include <sys/vmmeter.h>
 #include <sys/sysctl.h>
 #include <sys/lock.h>
-#include <sys/uio.h>
+#include <sys/priv.h>
+#include <sys/kcollect.h>
+#include <sys/malloc.h>
 #ifdef KTRACE
 #include <sys/ktrace.h>
 #endif
-#include <sys/xwait.h>
 #include <sys/ktr.h>
 #include <sys/serialize.h>
 
@@ -62,24 +63,29 @@
 #include <machine/cpu.h>
 #include <machine/smp.h>
 
-TAILQ_HEAD(tslpque, thread);
+#include <vm/vm_extern.h>
+
+struct tslpque {
+	TAILQ_HEAD(, thread)	queue;
+	const volatile void	*ident0;
+	const volatile void	*ident1;
+	const volatile void	*ident2;
+	const volatile void	*ident3;
+};
 
 static void sched_setup (void *dummy);
-SYSINIT(sched_setup, SI_SUB_KICK_SCHEDULER, SI_ORDER_FIRST, sched_setup, NULL)
+SYSINIT(sched_setup, SI_SUB_KICK_SCHEDULER, SI_ORDER_FIRST, sched_setup, NULL);
+static void sched_dyninit (void *dummy);
+SYSINIT(sched_dyninit, SI_BOOT1_DYNALLOC, SI_ORDER_FIRST, sched_dyninit, NULL);
 
-int	hogticks;
 int	lbolt;
 void	*lbolt_syncer;
-int	sched_quantum;		/* Roundrobin scheduling quantum in ticks. */
-int	ncpus;
-int	ncpus2, ncpus2_shift, ncpus2_mask;	/* note: mask not cpumask_t */
-int	ncpus_fit, ncpus_fit_mask;		/* note: mask not cpumask_t */
-int	safepri;
-int	tsleep_now_works;
-int	tsleep_crypto_dump = 0;
+__read_mostly int tsleep_crypto_dump = 0;
+__read_mostly int ncpus;
+__read_mostly int ncpus_fit, ncpus_fit_mask;	/* note: mask not cpumask_t */
+__read_mostly int safepri;
+__read_mostly int tsleep_now_works;
 
-static struct callout loadav_callout;
-static struct callout schedcpu_callout;
 MALLOC_DEFINE(M_TSLEEP, "tslpque", "tsleep queues");
 
 #define __DEALL(ident)	__DEQUALIFY(void *, ident)
@@ -97,12 +103,14 @@ KTR_INFO(KTR_TSLEEP, tsleep, ilockfail,  4, "interlock failed %p", const volatil
 #define logtsleep1(name)	KTR_LOG(tsleep_ ## name)
 #define logtsleep2(name, val)	KTR_LOG(tsleep_ ## name, val)
 
+__exclusive_cache_line
 struct loadavg averunnable =
 	{ {0, 0, 0}, FSCALE };	/* load average, of runnable procs */
 /*
  * Constants for averages over 1, 5, and 15 minutes
  * when sampling at 5 second intervals.
  */
+__read_mostly
 static fixpt_t cexp[3] = {
 	0.9200444146293232 * FSCALE,	/* exp(-1/12) */
 	0.9834714538216174 * FSCALE,	/* exp(-1/60) */
@@ -113,37 +121,65 @@ static void	endtsleep (void *);
 static void	loadav (void *arg);
 static void	schedcpu (void *arg);
 
+__read_mostly static int pctcpu_decay = 10;
+SYSCTL_INT(_kern, OID_AUTO, pctcpu_decay, CTLFLAG_RW,
+	   &pctcpu_decay, 0, "");
+
 /*
- * Adjust the scheduler quantum.  The quantum is specified in microseconds.
- * Note that 'tick' is in microseconds per tick.
+ * kernel uses `FSCALE', userland (SHOULD) use kern.fscale
+ */
+__read_mostly int fscale __unused = FSCALE;	/* exported to systat */
+SYSCTL_INT(_kern, OID_AUTO, fscale, CTLFLAG_RD, 0, FSCALE, "");
+
+/*
+ * Issue a wakeup() from userland (debugging)
  */
 static int
-sysctl_kern_quantum(SYSCTL_HANDLER_ARGS)
+sysctl_wakeup(SYSCTL_HANDLER_ARGS)
 {
-	int error, new_val;
+	uint64_t ident = 1;
+	int error = 0;
 
-	new_val = sched_quantum * ustick;
-	error = sysctl_handle_int(oidp, &new_val, 0, req);
-        if (error != 0 || req->newptr == NULL)
-		return (error);
-	if (new_val < ustick)
-		return (EINVAL);
-	sched_quantum = new_val / ustick;
-	hogticks = 2 * sched_quantum;
-	return (0);
+	if (req->newptr != NULL) {
+		if (priv_check(curthread, PRIV_ROOT))
+			return (EPERM);
+		error = SYSCTL_IN(req, &ident, sizeof(ident));
+		if (error)
+			return error;
+		kprintf("issue wakeup %016jx\n", ident);
+		wakeup((void *)(intptr_t)ident);
+	}
+	if (req->oldptr != NULL) {
+		error = SYSCTL_OUT(req, &ident, sizeof(ident));
+	}
+	return error;
 }
 
-SYSCTL_PROC(_kern, OID_AUTO, quantum, CTLTYPE_INT|CTLFLAG_RW,
-	0, sizeof sched_quantum, sysctl_kern_quantum, "I", "");
+static int
+sysctl_wakeup_umtx(SYSCTL_HANDLER_ARGS)
+{
+	uint64_t ident = 1;
+	int error = 0;
 
-static int pctcpu_decay = 10;
-SYSCTL_INT(_kern, OID_AUTO, pctcpu_decay, CTLFLAG_RW, &pctcpu_decay, 0, "");
+	if (req->newptr != NULL) {
+		if (priv_check(curthread, PRIV_ROOT))
+			return (EPERM);
+		error = SYSCTL_IN(req, &ident, sizeof(ident));
+		if (error)
+			return error;
+		kprintf("issue wakeup %016jx, PDOMAIN_UMTX\n", ident);
+		wakeup_domain((void *)(intptr_t)ident, PDOMAIN_UMTX);
+	}
+	if (req->oldptr != NULL) {
+		error = SYSCTL_OUT(req, &ident, sizeof(ident));
+	}
+	return error;
+}
 
-/*
- * kernel uses `FSCALE', userland (SHOULD) use kern.fscale 
- */
-int     fscale __unused = FSCALE;	/* exported to systat */
-SYSCTL_INT(_kern, OID_AUTO, fscale, CTLFLAG_RD, 0, FSCALE, "");
+SYSCTL_PROC(_debug, OID_AUTO, wakeup, CTLTYPE_UQUAD|CTLFLAG_RW, 0, 0,
+	    sysctl_wakeup, "Q", "issue wakeup(addr)");
+SYSCTL_PROC(_debug, OID_AUTO, wakeup_umtx, CTLTYPE_UQUAD|CTLFLAG_RW, 0, 0,
+	    sysctl_wakeup_umtx, "Q", "issue wakeup(addr, PDOMAIN_UMTX)");
 
 /*
  * Recompute process priorities, once a second.
@@ -154,7 +190,7 @@ SYSCTL_INT(_kern, OID_AUTO, fscale, CTLFLAG_RD, 0, FSCALE, "");
  * a 1-second recalc to help out.
  *
  * This code also allows us to store sysclock_t data in the process structure
- * without fear of an overrun, since sysclock_t are guarenteed to hold 
+ * without fear of an overrun, since sysclock_t are guarenteed to hold
  * several seconds worth of count.
  *
  * WARNING!  callouts can preempt normal threads.  However, they will not
@@ -166,11 +202,13 @@ static int schedcpu_resource(struct proc *p, void *data __unused);
 static void
 schedcpu(void *arg)
 {
-	allproc_scan(schedcpu_stats, NULL);
-	allproc_scan(schedcpu_resource, NULL);
-	wakeup((caddr_t)&lbolt);
-	wakeup(lbolt_syncer);
-	callout_reset(&schedcpu_callout, hz, schedcpu, NULL);
+	allproc_scan(schedcpu_stats, NULL, 1);
+	allproc_scan(schedcpu_resource, NULL, 1);
+	if (mycpu->gd_cpuid == 0) {
+		wakeup((caddr_t)&lbolt);
+		wakeup(lbolt_syncer);
+	}
+	callout_reset(&mycpu->gd_schedcpu_callout, hz, schedcpu, NULL);
 }
 
 /*
@@ -205,6 +243,10 @@ schedcpu_stats(struct proc *p, void *data __unused)
 		 * Only recalculate processes that are active or have slept
 		 * less then 2 seconds.  The schedulers understand this.
 		 * Otherwise decay by 50% per second.
+		 *
+		 * NOTE: uload_update is called separately from kern_synch.c
+		 *	 when slptime == 1, removing the thread's
+		 *	 uload/ucount.
 		 */
 		if (lp->lwp_slptime <= 1) {
 			p->p_usched->recalculate(lp);
@@ -264,7 +306,7 @@ schedcpu_resource(struct proc *p, void *data __unused)
 		}
 	}
 
-	switch(plimit_testcpulimit(p->p_limit, ttime)) {
+	switch(plimit_testcpulimit(p, ttime)) {
 	case PLIMIT_TESTCPU_KILL:
 		killproc(p, "exceeded maximum CPU limit");
 		break;
@@ -304,39 +346,24 @@ updatepcpu(struct lwp *lp, int cpticks, int ttlticks)
 }
 
 /*
- * tsleep/wakeup hash table parameters.  Try to find the sweet spot for
- * like addresses being slept on.
- */
-#define TABLESIZE	4001
-#define LOOKUP(x)	(((u_int)(uintptr_t)(x)) % TABLESIZE)
-
-static cpumask_t slpque_cpumasks[TABLESIZE];
-
-/*
- * General scheduler initialization.  We force a reschedule 25 times
- * a second by default.  Note that cpu0 is initialized in early boot and
- * cannot make any high level calls.
+ * Handy macros to calculate hash indices.  LOOKUP() calculates the
+ * global cpumask hash index, TCHASHSHIFT() converts that into the
+ * pcpu hash index.
  *
- * Each cpu has its own sleep queue.
+ * By making the pcpu hash arrays smaller we save a significant amount
+ * of memory at very low cost.  The real cost is in IPIs, which are handled
+ * by the much larger global cpumask hash table.
  */
-void
-sleep_gdinit(globaldata_t gd)
-{
-	static struct tslpque slpque_cpu0[TABLESIZE];
-	int i;
+#define LOOKUP_PRIME	66555444443333333ULL
+#define LOOKUP(x)	((((uintptr_t)(x) + ((uintptr_t)(x) >> 18)) ^	\
+			  LOOKUP_PRIME) % slpque_tablesize)
+#define TCHASHSHIFT(x)	((x) >> 4)
 
-	if (gd->gd_cpuid == 0) {
-		sched_quantum = (hz + 24) / 25;
-		hogticks = 2 * sched_quantum;
+__read_mostly static uint32_t	slpque_tablesize;
+__read_mostly static cpumask_t *slpque_cpumasks;
 
-		gd->gd_tsleep_hash = slpque_cpu0;
-	} else {
-		gd->gd_tsleep_hash = kmalloc(sizeof(slpque_cpu0), 
-					    M_TSLEEP, M_WAITOK | M_ZERO);
-	}
-	for (i = 0; i < TABLESIZE; ++i)
-		TAILQ_INIT(&gd->gd_tsleep_hash[i]);
-}
+SYSCTL_UINT(_kern, OID_AUTO, slpque_tablesize, CTLFLAG_RD, &slpque_tablesize,
+    0, "");
 
 /*
  * This is a dandy function that allows us to interlock tsleep/wakeup
@@ -359,22 +386,62 @@ static __inline void
 _tsleep_interlock(globaldata_t gd, const volatile void *ident, int flags)
 {
 	thread_t td = gd->gd_curthread;
-	int id;
+	struct tslpque *qp;
+	uint32_t cid;
+	uint32_t gid;
+
+	if (ident == NULL) {
+		kprintf("tsleep_interlock: NULL ident %s\n", td->td_comm);
+		print_backtrace(5);
+	}
 
 	crit_enter_quick(td);
 	if (td->td_flags & TDF_TSLEEPQ) {
-		id = LOOKUP(td->td_wchan);
-		TAILQ_REMOVE(&gd->gd_tsleep_hash[id], td, td_sleepq);
-		if (TAILQ_FIRST(&gd->gd_tsleep_hash[id]) == NULL) {
-			ATOMIC_CPUMASK_NANDBIT(slpque_cpumasks[id],
+		/*
+		 * Shortcut if unchanged
+		 */
+		if (td->td_wchan == ident &&
+		    td->td_wdomain == (flags & PDOMAIN_MASK)) {
+			crit_exit_quick(td);
+			return;
+		}
+
+		/*
+		 * Remove current sleepq
+		 */
+		cid = LOOKUP(td->td_wchan);
+		gid = TCHASHSHIFT(cid);
+		qp = &gd->gd_tsleep_hash[gid];
+		TAILQ_REMOVE(&qp->queue, td, td_sleepq);
+		if (TAILQ_FIRST(&qp->queue) == NULL) {
+			qp->ident0 = NULL;
+			qp->ident1 = NULL;
+			qp->ident2 = NULL;
+			qp->ident3 = NULL;
+			ATOMIC_CPUMASK_NANDBIT(slpque_cpumasks[cid],
 					       gd->gd_cpuid);
 		}
 	} else {
 		td->td_flags |= TDF_TSLEEPQ;
 	}
-	id = LOOKUP(ident);
-	TAILQ_INSERT_TAIL(&gd->gd_tsleep_hash[id], td, td_sleepq);
-	ATOMIC_CPUMASK_ORBIT(slpque_cpumasks[id], gd->gd_cpuid);
+	cid = LOOKUP(ident);
+	gid = TCHASHSHIFT(cid);
+	qp = &gd->gd_tsleep_hash[gid];
+	TAILQ_INSERT_TAIL(&qp->queue, td, td_sleepq);
+	if (qp->ident0 != ident && qp->ident1 != ident &&
+	    qp->ident2 != ident && qp->ident3 != ident) {
+		if (qp->ident0 == NULL)
+			qp->ident0 = ident;
+		else if (qp->ident1 == NULL)
+			qp->ident1 = ident;
+		else if (qp->ident2 == NULL)
+			qp->ident2 = ident;
+		else if (qp->ident3 == NULL)
+			qp->ident3 = ident;
+		else
+			qp->ident0 = (void *)(intptr_t)-1;
+	}
+	ATOMIC_CPUMASK_ORBIT(slpque_cpumasks[cid], gd->gd_cpuid);
 	td->td_wchan = ident;
 	td->td_wdomain = flags & PDOMAIN_MASK;
 	crit_exit_quick(td);
@@ -394,16 +461,20 @@ static __inline void
 _tsleep_remove(thread_t td)
 {
 	globaldata_t gd = mycpu;
-	int id;
+	struct tslpque *qp;
+	uint32_t cid;
+	uint32_t gid;
 
 	KKASSERT(td->td_gd == gd && IN_CRITICAL_SECT(td));
 	KKASSERT((td->td_flags & TDF_MIGRATING) == 0);
 	if (td->td_flags & TDF_TSLEEPQ) {
 		td->td_flags &= ~TDF_TSLEEPQ;
-		id = LOOKUP(td->td_wchan);
-		TAILQ_REMOVE(&gd->gd_tsleep_hash[id], td, td_sleepq);
-		if (TAILQ_FIRST(&gd->gd_tsleep_hash[id]) == NULL) {
-			ATOMIC_CPUMASK_NANDBIT(slpque_cpumasks[id],
+		cid = LOOKUP(td->td_wchan);
+		gid = TCHASHSHIFT(cid);
+		qp = &gd->gd_tsleep_hash[gid];
+		TAILQ_REMOVE(&qp->queue, td, td_sleepq);
+		if (TAILQ_FIRST(&qp->queue) == NULL) {
+			ATOMIC_CPUMASK_NANDBIT(slpque_cpumasks[cid],
 					       gd->gd_cpuid);
 		}
 		td->td_wchan = NULL;
@@ -480,7 +551,6 @@ tsleep(const volatile void *ident, int flags, const char *wmesg, int timo)
 	logtsleep2(tsleep_beg, ident);
 	gd = td->td_gd;
 	KKASSERT(td != &gd->gd_idlethread);	/* you must be kidding! */
-	td->td_wakefromcpu = -1;		/* overwritten by _wakeup */
 
 	/*
 	 * NOTE: all of this occurs on the current cpu, including any
@@ -519,6 +589,31 @@ tsleep(const volatile void *ident, int flags, const char *wmesg, int timo)
 	 */
 	if (lp) {
 		lwkt_gettoken(&lp->lwp_token);
+
+		/*
+		 * If the umbrella process is in the SCORE state then
+		 * make sure that the thread is flagged going into a
+		 * normal sleep to allow the core dump to proceed, otherwise
+		 * the coredump can end up waiting forever.  If the normal
+		 * sleep is woken up, the thread will enter a stopped state
+		 * upon return to userland.
+		 *
+		 * We do not want to interrupt or cause a thread exist at
+		 * this juncture because that will mess-up the state the
+		 * coredump is trying to save.
+		 */
+		if (p->p_stat == SCORE) {
+			lwkt_gettoken(&p->p_token);
+			if ((lp->lwp_mpflags & LWP_MP_WSTOP) == 0) {
+				atomic_set_int(&lp->lwp_mpflags, LWP_MP_WSTOP);
+				++p->p_nstopped;
+			}
+			lwkt_reltoken(&p->p_token);
+		}
+
+		/*
+		 * PCATCH requested.
+		 */
 		if (catch) {
 			/*
 			 * Early termination if PCATCH was set and a
@@ -533,7 +628,7 @@ tsleep(const volatile void *ident, int flags, const char *wmesg, int timo)
 
 			/*
 			 * Causes ksignal to wake us up if a signal is
-			 * received (interlocked with p->p_token).
+			 * received (interlocked with lp->lwp_token).
 			 */
 			lp->lwp_flags |= LWP_SINTR;
 		}
@@ -555,16 +650,22 @@ tsleep(const volatile void *ident, int flags, const char *wmesg, int timo)
 	}
 
 	/*
-	 * If the interlocked flag is set but our cpu bit in the slpqueue
-	 * is no longer set, then a wakeup was processed inbetween the
-	 * tsleep_interlock() (ours or the callers), and here.  This can
-	 * occur under numerous circumstances including when we release the
-	 * current process.
+	 * For PINTERLOCKED operation, TDF_TSLEEPQ might not be set if
+	 * a wakeup() was processed before the thread could go to sleep.
+	 *
+	 * If TDF_TSLEEPQ is set, make sure the ident matches the recorded
+	 * ident.  If it does not then the thread slept inbetween the
+	 * caller's initial tsleep_interlock() call and the caller's tsleep()
+	 * call.
 	 *
 	 * Extreme loads can cause the sending of an IPI (e.g. wakeup()'s)
 	 * to process incoming IPIs, thus draining incoming wakeups.
 	 */
 	if ((td->td_flags & TDF_TSLEEPQ) == 0) {
+		logtsleep2(ilockfail, ident);
+		goto resume;
+	} else if (td->td_wchan != ident ||
+		   td->td_wdomain != (flags & PDOMAIN_MASK)) {
 		logtsleep2(ilockfail, ident);
 		goto resume;
 	}
@@ -623,7 +724,7 @@ tsleep(const volatile void *ident, int flags, const char *wmesg, int timo)
 		lwkt_switch();
 	}
 
-	/* 
+	/*
 	 * Make sure we haven't switched cpus while we were asleep.  It's
 	 * not supposed to happen.  Cleanup our temporary flags.
 	 */
@@ -637,6 +738,9 @@ tsleep(const volatile void *ident, int flags, const char *wmesg, int timo)
 	 */
 	if (timo) {
 		while (td->td_flags & TDF_TIMEOUT_RUNNING) {
+			/* else we won't get rescheduled! */
+			if (lp->lwp_stat != LSSTOP)
+				lp->lwp_stat = LSSLEEP;
 			lwkt_deschedule_self(td);
 			td->td_wmesg = "tsrace";
 			lwkt_switch();
@@ -647,7 +751,7 @@ tsleep(const volatile void *ident, int flags, const char *wmesg, int timo)
 			error = EWOULDBLOCK;
 		} else {
 			/* does not block when on same cpu */
-			callout_stop(&thandle);
+			callout_cancel(&thandle);
 		}
 	}
 	td->td_flags &= ~TDF_TSLEEP_DESCHEDULED;
@@ -665,7 +769,7 @@ tsleep(const volatile void *ident, int flags, const char *wmesg, int timo)
 
 	/*
 	 * Figure out the correct error return.  If interrupted by a
-	 * signal we want to return EINTR or ERESTART.  
+	 * signal we want to return EINTR or ERESTART.
 	 */
 resume:
 	if (lp) {
@@ -677,11 +781,20 @@ resume:
 					error = ERESTART;
 			}
 		}
+
 		lp->lwp_flags &= ~LWP_SINTR;
+
+		/*
+		 * Unconditionally set us to LSRUN on resume.  lwp_stat could
+		 * be in a weird state due to the goto resume, particularly
+		 * when tsleep() is called from tstop().
+		 */
+		lp->lwp_stat = LSRUN;
 		lwkt_reltoken(&lp->lwp_token);
 	}
 	logtsleep1(tsleep_end);
 	crit_exit_quick(td);
+
 	return (error);
 }
 
@@ -704,6 +817,7 @@ ssleep(const volatile void *ident, struct spinlock *spin, int flags,
 	_tsleep_interlock(gd, ident, flags);
 	spin_unlock_quick(gd, spin);
 	error = tsleep(ident, flags | PINTERLOCKED, wmesg, timo);
+	KKASSERT(gd == mycpu);
 	_spin_lock_quick(gd, spin, wmesg);
 
 	return (error);
@@ -739,7 +853,7 @@ mtxsleep(const volatile void *ident, struct mtx *mtx, int flags,
 	_tsleep_interlock(gd, ident, flags);
 	mtx_unlock(mtx);
 	error = tsleep(ident, flags | PINTERLOCKED, wmesg, timo);
-	mtx_lock_ex_quick(mtx, wmesg);
+	mtx_lock_ex_quick(mtx);
 
 	return (error);
 }
@@ -796,7 +910,7 @@ lwkt_sleep(const char *wmesg, int flags)
 			return(EINTR);
 		else
 			return(ERESTART);
-			
+
 	}
 	td->td_flags |= TDF_BLOCKED | TDF_SINTR;
 	td->td_wmesg = wmesg;
@@ -844,10 +958,14 @@ endtsleep(void *arg)
 
 	if (lp) {
 		/*
-		 * callout timer should never be set in tstop() because
-		 * it passes a timeout of 0.
+		 * callout timer should normally never be set in tstop()
+		 * because it passes a timeout of 0.  However, there is a
+		 * case during thread exit (which SSTOP's all the threads)
+		 * for which tstop() must break out and can (properly) leave
+		 * the thread in LSSTOP.
 		 */
-		KKASSERT(lp->lwp_stat != LSSTOP);
+		KKASSERT(lp->lwp_stat != LSSTOP ||
+			 (lp->lwp_mpflags & LWP_MP_WEXIT));
 		setrunnable(lp);
 		lwkt_reltoken(&lp->lwp_token);
 	} else {
@@ -881,17 +999,20 @@ _wakeup(void *ident, int domain)
 	struct thread *ntd;
 	globaldata_t gd;
 	cpumask_t mask;
-	int id;
+	uint32_t cid;
+	uint32_t gid;
+	int wids = 0;
 
 	crit_enter();
 	logtsleep2(wakeup_beg, ident);
 	gd = mycpu;
-	id = LOOKUP(ident);
-	qp = &gd->gd_tsleep_hash[id];
+	cid = LOOKUP(ident);
+	gid = TCHASHSHIFT(cid);
+	qp = &gd->gd_tsleep_hash[gid];
 restart:
-	for (td = TAILQ_FIRST(qp); td != NULL; td = ntd) {
+	for (td = TAILQ_FIRST(&qp->queue); td != NULL; td = ntd) {
 		ntd = TAILQ_NEXT(td, td_sleepq);
-		if (td->td_wchan == ident && 
+		if (td->td_wchan == ident &&
 		    td->td_wdomain == (domain & PDOMAIN_MASK)
 		) {
 			KKASSERT(td->td_gd == gd);
@@ -904,6 +1025,44 @@ restart:
 			}
 			goto restart;
 		}
+		if (td->td_wchan == qp->ident0)
+			wids |= 1;
+		else if (td->td_wchan == qp->ident1)
+			wids |= 2;
+		else if (td->td_wchan == qp->ident2)
+			wids |= 4;
+		else if (td->td_wchan == qp->ident3)
+			wids |= 8;
+		else
+			wids |= 16;	/* force ident0 to be retained (-1) */
+	}
+
+	/*
+	 * Because a bunch of cpumask array entries cover the same queue, it
+	 * is possible for our bit to remain set in some of them and cause
+	 * spurious wakeup IPIs later on.  Make sure that the bit is cleared
+	 * when a spurious IPI occurs to prevent further spurious IPIs.
+	 */
+	if (TAILQ_FIRST(&qp->queue) == NULL) {
+		ATOMIC_CPUMASK_NANDBIT(slpque_cpumasks[cid], gd->gd_cpuid);
+		qp->ident0 = NULL;
+		qp->ident1 = NULL;
+		qp->ident2 = NULL;
+		qp->ident3 = NULL;
+	} else {
+		if ((wids & 1) == 0) {
+			if ((wids & 16) == 0) {
+				qp->ident0 = NULL;
+			} else {
+				KKASSERT(qp->ident0 == (void *)(intptr_t)-1);
+			}
+		}
+		if ((wids & 2) == 0)
+			qp->ident1 = NULL;
+		if ((wids & 4) == 0)
+			qp->ident2 = NULL;
+		if ((wids & 8) == 0)
+			qp->ident3 = NULL;
 	}
 
 	/*
@@ -913,23 +1072,65 @@ restart:
 	 * to continue checking cpus.
 	 *
 	 * It should be noted that this scheme is actually less expensive then
-	 * the old scheme when waking up multiple threads, since we send 
+	 * the old scheme when waking up multiple threads, since we send
 	 * only one IPI message per target candidate which may then schedule
 	 * multiple threads.  Before we could have wound up sending an IPI
 	 * message for each thread on the target cpu (!= current cpu) that
 	 * needed to be woken up.
 	 *
 	 * NOTE: Wakeups occuring on remote cpus are asynchronous.  This
-	 * should be ok since we are passing idents in the IPI rather then
-	 * thread pointers.
+	 *	 should be ok since we are passing idents in the IPI rather
+	 *	 then thread pointers.
+	 *
+	 * NOTE: We MUST mfence (or use an atomic op) prior to reading
+	 *	 the cpumask, as another cpu may have written to it in
+	 *	 a fashion interlocked with whatever the caller did before
+	 *	 calling wakeup().  Otherwise we might miss the interaction
+	 *	 (kern_mutex.c can cause this problem).
+	 *
+	 *	 lfence is insufficient as it may allow a written state to
+	 *	 reorder around the cpumask load.
 	 */
 	if ((domain & PWAKEUP_MYCPU) == 0) {
-		mask = slpque_cpumasks[id];
+		globaldata_t tgd;
+		const volatile void *id0;
+		int n;
+
+		cpu_mfence();
+		/* cpu_lfence(); */
+		mask = slpque_cpumasks[cid];
 		CPUMASK_ANDMASK(mask, gd->gd_other_cpus);
+		while (CPUMASK_TESTNZERO(mask)) {
+			n = BSRCPUMASK(mask);
+			CPUMASK_NANDBIT(mask, n);
+			tgd = globaldata_find(n);
+
+			/*
+			 * Both ident0 compares must from a single load
+			 * to avoid ident0 update races crossing the two
+			 * compares.
+			 */
+			qp = &tgd->gd_tsleep_hash[gid];
+			id0 = qp->ident0;
+			cpu_ccfence();
+			if (id0 == (void *)(intptr_t)-1) {
+				lwkt_send_ipiq2(tgd, _wakeup, ident,
+						domain | PWAKEUP_MYCPU);
+				++tgd->gd_cnt.v_wakeup_colls;
+			} else if (id0 == ident ||
+				   qp->ident1 == ident ||
+				   qp->ident2 == ident ||
+				   qp->ident3 == ident) {
+				lwkt_send_ipiq2(tgd, _wakeup, ident,
+						domain | PWAKEUP_MYCPU);
+			}
+		}
+#if 0
 		if (CPUMASK_TESTNZERO(mask)) {
 			lwkt_send_ipiq2_mask(mask, _wakeup, ident,
 					     domain | PWAKEUP_MYCPU);
 		}
+#endif
 	}
 done:
 	logtsleep1(wakeup_end);
@@ -1118,7 +1319,7 @@ setrunnable(struct lwp *lp)
 
 /*
  * The process is stopped due to some condition, usually because p_stat is
- * set to SSTOP, but also possibly due to being traced.  
+ * set to SSTOP, but also possibly due to being traced.
  *
  * Caller must hold p->p_token
  *
@@ -1168,7 +1369,12 @@ tstop(void)
 			PRELE(q);
 		}
 	}
-	while (p->p_stat == SSTOP) {
+
+	/*
+	 * Wait here while in a stopped state, interlocked with lwp_token.
+	 * We must break-out if the whole process is trying to exit.
+	 */
+	while (STOPLWP(p, lp)) {
 		lp->lwp_stat = LSSTOP;
 		tsleep(p, 0, "stop", 0);
 	}
@@ -1180,22 +1386,36 @@ tstop(void)
 
 /*
  * Compute a tenex style load average of a quantity on
- * 1, 5 and 15 minute intervals.
+ * 1, 5 and 15 minute intervals.  This is a pcpu callout.
+ *
+ * We segment the lwp scan on a pcpu basis.  This does NOT
+ * mean the associated lwps are on this cpu, it is done
+ * just to break the work up.
+ *
+ * The callout on cpu0 rolls up the stats from the other
+ * cpus.
  */
 static int loadav_count_runnable(struct lwp *p, void *data);
 
 static void
 loadav(void *arg)
 {
+	globaldata_t gd = mycpu;
 	struct loadavg *avg;
 	int i, nrun;
 
 	nrun = 0;
-	alllwp_scan(loadav_count_runnable, &nrun);
-	avg = &averunnable;
-	for (i = 0; i < 3; i++) {
-		avg->ldavg[i] = (cexp[i] * avg->ldavg[i] +
-		    nrun * FSCALE * (FSCALE - cexp[i])) >> FSHIFT;
+	alllwp_scan(loadav_count_runnable, &nrun, 1);
+	gd->gd_loadav_nrunnable = nrun;
+	if (gd->gd_cpuid == 0) {
+		avg = &averunnable;
+		nrun = 0;
+		for (i = 0; i < ncpus; ++i)
+			nrun += globaldata_find(i)->gd_loadav_nrunnable;
+		for (i = 0; i < 3; i++) {
+			avg->ldavg[i] = (cexp[i] * avg->ldavg[i] +
+			    (long)nrun * FSCALE * (FSCALE - cexp[i])) >> FSHIFT;
+		}
 	}
 
 	/*
@@ -1203,7 +1423,8 @@ loadav(void *arg)
 	 * random variation to avoid synchronisation with processes that
 	 * run at regular intervals.
 	 */
-	callout_reset(&loadav_callout, hz * 4 + (int)(krandom() % (hz * 2 + 1)),
+	callout_reset(&gd->gd_loadav_callout,
+		      hz * 4 + (int)(krandom() % (hz * 2 + 1)),
 		      loadav, NULL);
 }
 
@@ -1228,15 +1449,150 @@ loadav_count_runnable(struct lwp *lp, void *data)
 	return(0);
 }
 
-/* ARGSUSED */
-static void
-sched_setup(void *dummy)
+/*
+ * Regular data collection
+ */
+static uint64_t
+collect_load_callback(int n)
 {
-	callout_init_mp(&loadav_callout);
-	callout_init_mp(&schedcpu_callout);
+	int fscale = averunnable.fscale;
 
-	/* Kick off timeout driven events by calling first time. */
-	schedcpu(NULL);
-	loadav(NULL);
+	return ((averunnable.ldavg[0] * 100 + (fscale >> 1)) / fscale);
 }
 
+static void
+sched_setup(void *dummy __unused)
+{
+	globaldata_t save_gd = mycpu;
+	globaldata_t gd;
+	int n;
+
+	kcollect_register(KCOLLECT_LOAD, "load", collect_load_callback,
+			  KCOLLECT_SCALE(KCOLLECT_LOAD_FORMAT, 0));
+
+	/*
+	 * Kick off timeout driven events by calling first time.  We
+	 * split the work across available cpus to help scale it,
+	 * it can eat a lot of cpu when there are a lot of processes
+	 * on the system.
+	 */
+	for (n = 0; n < ncpus; ++n) {
+		gd = globaldata_find(n);
+		lwkt_setcpu_self(gd);
+		callout_init_mp(&gd->gd_loadav_callout);
+		callout_init_mp(&gd->gd_schedcpu_callout);
+		schedcpu(NULL);
+		loadav(NULL);
+	}
+	lwkt_setcpu_self(save_gd);
+}
+
+/*
+ * Extremely early initialization, dummy-up the tables so we don't have
+ * to conditionalize for NULL in _wakeup() and tsleep_interlock().  Even
+ * though the system isn't blocking this early, these functions still
+ * try to access the hash table.
+ *
+ * This setup will be overridden once sched_dyninit() -> sleep_gdinit()
+ * is called.
+ */
+void
+sleep_early_gdinit(globaldata_t gd)
+{
+	static struct tslpque	dummy_slpque;
+	static cpumask_t dummy_cpumasks;
+
+	slpque_tablesize = 1;
+	gd->gd_tsleep_hash = &dummy_slpque;
+	slpque_cpumasks = &dummy_cpumasks;
+	TAILQ_INIT(&dummy_slpque.queue);
+}
+
+/*
+ * PCPU initialization.  Called after KMALLOC is operational, by
+ * sched_dyninit() for cpu 0, and by mi_gdinit() for other cpus later.
+ *
+ * WARNING! The pcpu hash table is smaller than the global cpumask
+ *	    hash table, which can save us a lot of memory when maxproc
+ *	    is set high.
+ */
+void
+sleep_gdinit(globaldata_t gd)
+{
+	struct thread *td;
+	size_t hash_size;
+	uint32_t n;
+	uint32_t i;
+
+	/*
+	 * This shouldn't happen, that is there shouldn't be any threads
+	 * waiting on the dummy tsleep queue this early in the boot.
+	 */
+	if (gd->gd_cpuid == 0) {
+		struct tslpque *qp = &gd->gd_tsleep_hash[0];
+		TAILQ_FOREACH(td, &qp->queue, td_sleepq) {
+			kprintf("SLEEP_GDINIT SWITCH %s\n", td->td_comm);
+		}
+	}
+
+	/*
+	 * Note that we have to allocate one extra slot because we are
+	 * shifting a modulo value.  TCHASHSHIFT(slpque_tablesize - 1) can
+	 * return the same value as TCHASHSHIFT(slpque_tablesize).
+	 */
+	n = TCHASHSHIFT(slpque_tablesize) + 1;
+
+	hash_size = sizeof(struct tslpque) * n;
+	gd->gd_tsleep_hash = (void *)kmem_alloc3(&kernel_map, hash_size,
+						 VM_SUBSYS_GD,
+						 KM_CPU(gd->gd_cpuid));
+	memset(gd->gd_tsleep_hash, 0, hash_size);
+	for (i = 0; i < n; ++i)
+		TAILQ_INIT(&gd->gd_tsleep_hash[i].queue);
+}
+
+/*
+ * Dynamic initialization after the memory system is operational.
+ */
+static void
+sched_dyninit(void *dummy __unused)
+{
+	int tblsize;
+	int tblsize2;
+	int n;
+
+	/*
+	 * Calculate table size for slpque hash.  We want a prime number
+	 * large enough to avoid overloading slpque_cpumasks when the
+	 * system has a large number of sleeping processes, which will
+	 * spam IPIs on wakeup().
+	 *
+	 * While it is true this is really a per-lwp factor, generally
+	 * speaking the maxproc limit is a good metric to go by.
+	 */
+	for (tblsize = maxproc | 1; ; tblsize += 2) {
+		if (tblsize % 3 == 0)
+			continue;
+		if (tblsize % 5 == 0)
+			continue;
+		tblsize2 = (tblsize / 2) | 1;
+		for (n = 7; n < tblsize2; n += 2) {
+			if (tblsize % n == 0)
+				break;
+		}
+		if (n == tblsize2)
+			break;
+	}
+
+	/*
+	 * PIDs are currently limited to 6 digits.  Cap the table size
+	 * at double this.
+	 */
+	if (tblsize > 2000003)
+		tblsize = 2000003;
+
+	slpque_tablesize = tblsize;
+	slpque_cpumasks = kmalloc(sizeof(*slpque_cpumasks) * slpque_tablesize,
+				  M_TSLEEP, M_WAITOK | M_ZERO);
+	sleep_gdinit(mycpu);
+}

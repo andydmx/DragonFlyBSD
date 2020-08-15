@@ -57,8 +57,8 @@
 #include <limits.h>
 #include <pwd.h>
 #include <grp.h>
-#include <md5.h>
 #include <inttypes.h>
+#include <openssl/md5.h>
 
 #include "pfctl_parser.h"
 #include "pfctl.h"
@@ -3050,7 +3050,7 @@ port_item	: portrange			{
 		}
 		| unaryop portrange	{
 			if ($2.t) {
-				yyerror("':' cannot be used with an other "
+				yyerror("':' cannot be used with another "
 				    "port operator");
 				YYERROR;
 			}
@@ -3065,7 +3065,7 @@ port_item	: portrange			{
 		}
 		| portrange PORTBINARY portrange	{
 			if ($1.t || $3.t) {
-				yyerror("':' cannot be used with an other "
+				yyerror("':' cannot be used with another "
 				    "port operator");
 				YYERROR;
 			}
@@ -3778,10 +3778,10 @@ hashkey		: /* empty */
 				$$ = calloc(1, sizeof(struct pf_poolhashkey));
 				if ($$ == NULL)
 					err(1, "hashkey: calloc");
-				MD5Init(&context);
-				MD5Update(&context, (unsigned char *)$1,
+				MD5_Init(&context);
+				MD5_Update(&context, (unsigned char *)$1,
 				    strlen($1));
-				MD5Final((unsigned char *)$$, &context);
+				MD5_Final((unsigned char *)$$, &context);
 				$$->key32[0] = htonl($$->key32[0]);
 				$$->key32[1] = htonl($$->key32[1]);
 				$$->key32[2] = htonl($$->key32[2]);

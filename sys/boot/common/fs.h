@@ -10,11 +10,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -31,8 +27,7 @@
  * SUCH DAMAGE.
  *
  *	@(#)fs.h	8.13 (Berkeley) 3/21/95
- * $FreeBSD$
- * $DragonFly: src/sys/boot/common/fs.h,v 1.1 2003/11/10 06:08:31 dillon Exp $
+ * $FreeBSD: head/sys/ufs/ffs/fs.h 111238 2003-02-22 00:19:26Z mckusick $
  */
 
 #ifndef _UFS_FFS_FS_H_
@@ -352,10 +347,14 @@ struct fs {
 	int32_t	 fs_magic;		/* magic number */
 };
 
-/* Sanity checking. */
-#ifdef CTASSERT
-CTASSERT(sizeof(struct fs) == 1376);
+#ifndef CTASSERT
+#define CTASSERT(x)		_CTASSERT(x, __LINE__)
+#define _CTASSERT(x, y)		__CTASSERT(x, y)
+#define __CTASSERT(x, y)	typedef char __assert_ ## y [(x) ? 1 : -1]
 #endif
+
+/* Sanity checking. */
+CTASSERT(sizeof(struct fs) == 1376);
 
 /*
  * Filesystem identification

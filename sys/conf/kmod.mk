@@ -77,11 +77,18 @@ KMODMODE?=	${BINMODE}
 
 .SUFFIXES: .out .o .c .cc .cxx .C .y .l .s .S
 
-.if !defined(NO_WERROR) && (${CCVER} == "gcc44" || ${CCVER} == "gcc47")
+.if !defined(NO_WERROR) && (${CCVER} == "gcc47" || ${CCVER} == "gcc80")
 WERROR=-Werror
 .endif
 
-CFLAGS+=	${COPTS} -D_KERNEL ${CWARNFLAGS} ${WERROR}
+COPTFLAGS?=-O2 -pipe
+
+# useful for debugging
+#.warning "KMOD-PREFILTER ${CFLAGS}"
+
+WORLD_CCOPTLEVEL=	# XXX prevent world opt level affecting kernel modules
+CFLAGS=		${COPTFLAGS} ${KCFLAGS} ${COPTS} -D_KERNEL
+CFLAGS+=	${CWARNFLAGS} ${WERROR}
 CFLAGS+=	-DKLD_MODULE
 
 # Don't use any standard include directories.
@@ -97,10 +104,10 @@ CFLAGS+=	-nostdinc ${_ICFLAGS}
 # need any -I paths for this.  Similar defaults for .PATH can't be
 # set because there are no standard paths for non-headers.
 #
-# NOTE!  Traditional architecture paths such as <i386/i386/blah.h>
-# must run through the "machine_base" softlink using 
-# <machine_base/i386/blah.h>.  An explicit cross-architecture path must
-# operate relative to /usr/src/sys using e.g. <arch/i386/i386/blah.h>
+# NOTE!  Traditional platform paths such as <platform/pc64/blah.h>
+# must run through the "machine_base" softlink using
+# <machine_base/blah.h>.  An explicit cross-platform path must
+# operate relative to /usr/src/sys using e.g. <platform/pc64/isa/blah.h>
 #
 CFLAGS+=	-I. -I@
 
@@ -118,6 +125,7 @@ CLEANDIRS+=	${_MACHINE_FWD}
 .endif
 .endif
 CFLAGS+=	-I${_MACHINE_FWD}/include
+
 .include "kern.fwd.mk"
 
 # Add a -I path to standard headers like <stddef.h>.  Use a relative
@@ -136,24 +144,22 @@ CFLAGS+=	-I@/../include -I${DESTDIR}/usr/include
 
 .if defined(BUILDING_WITH_KERNEL) && \
     exists(${BUILDING_WITH_KERNEL}/opt_global.h)
-CFLAGS+=	-include ${BUILDING_WITH_KERNEL}/opt_global.h
+CFLAGS+=	-DHAVE_KERNEL_OPTION_HEADERS -include ${BUILDING_WITH_KERNEL}/opt_global.h
 .endif
 
 CFLAGS+=	${DEBUG_FLAGS}
-.if ${MACHINE_ARCH} == x86_64
+.if ${MACHINE_ARCH} == "x86_64"
 CFLAGS+=	-fno-omit-frame-pointer
 .endif
 
-.include <bsd.patch.mk>
-
 .if defined(FIRMWS)
-AWK=/usr/bin/awk
+#AWK=/usr/bin/awk
 .if !exists(@)
 ${KMOD:S/$/.c/}: @
 .else
 ${KMOD:S/$/.c/}: @/tools/fw_stub.awk
 .endif
-	${AWK} -f @/tools/fw_stub.awk ${FIRMWS} -m${KMOD} -c${KMOD:S/$/.c/g} \
+	${AWK} -f @/tools/fw_stub.awk ${FIRMWS} -m ${KMOD} -c ${KMOD:S/$/.c/g} \
 	    ${FIRMWARE_LICENSE:C/.+/-l/}${FIRMWARE_LICENSE}
 
 SRCS+=	${KMOD:S/$/.c/}
@@ -176,23 +182,31 @@ OBJS+=	${_firmw:C/\:.*$/.fwo/}
 .endfor
 .endif
 
-OBJS+=  ${SRCS:N*.h:N*.patch:R:S/$/.o/g}
+OBJS+=  ${SRCS:N*.h:R:S/$/.o/g}
 
 .if !defined(PROG)
 PROG=	${KMOD}.ko
 .endif
 
+# In case of LTO provide all standard CFLAGS!
+.if ${CFLAGS:M-flto}
+ELDFLAGS+= ${CFLAGS}
+.endif
+
 .if ${MACHINE_ARCH} != x86_64
 ${PROG}: ${KMOD}.kld
-	${LD} -Bshareable ${LDFLAGS} -o ${.TARGET} ${KMOD}.kld
+	${CC} ${ELDFLAGS} -nostdlib -Wl,--hash-style=sysv \
+	-Wl,-Bshareable ${LDFLAGS} -o ${.TARGET} ${KMOD}.kld
 .endif
 
 .if ${MACHINE_ARCH} != x86_64
 ${KMOD}.kld: ${OBJS}
-	${LD} ${LDFLAGS} -r -o ${.TARGET} ${OBJS}
+	${CC} ${ELDFLAGS} -nostdlib -Wl,--hash-style=sysv \
+	${LDFLAGS} -r -o ${.TARGET} ${OBJS}
 .else
 ${PROG}: ${OBJS}
-	${LD} ${LDFLAGS} -r -d -o ${.TARGET} ${OBJS}
+	${CC} ${ELDFLAGS} -nostdlib -Wl,--hash-style=sysv \
+	${LDFLAGS} -r -Wl,-d -o ${.TARGET} ${OBJS}
 .endif
 
 # links to platform and cpu architecture include files.  If we are
@@ -231,7 +245,7 @@ SYSDIR=	${_dir}
 .endif
 S=	${SYSDIR}
 
-#	path=`(cd $$path && /bin/pwd)` ; 
+#	path=`(cd $$path && /bin/pwd)` ;
 
 ${_ILINKS}:
 	@case ${.TARGET} in \
@@ -310,12 +324,16 @@ MFILES?= kern/bus_if.m kern/device_if.m bus/iicbus/iicbb_if.m \
     bus/ppbus/ppbus_if.m bus/smbus/smbus_if.m bus/u4b/usb_if.m \
     dev/acpica/acpi_if.m dev/acpica/acpi_wmi_if.m dev/disk/nata/ata_if.m \
     dev/disk/sdhci/sdhci_if.m \
+    dev/sound/pci/hda/hdac_if.m \
     dev/sound/pcm/ac97_if.m dev/sound/pcm/channel_if.m \
     dev/sound/pcm/feeder_if.m dev/sound/pcm/mixer_if.m \
+    dev/sound/midi/mpu_if.m dev/sound/midi/mpufoi_if.m \
+    dev/sound/midi/synth_if.m  \
     libiconv/iconv_converter_if.m dev/agp/agp_if.m opencrypto/cryptodev_if.m \
     bus/mmc/mmcbus_if.m bus/mmc/mmcbr_if.m \
     dev/virtual/virtio/virtio/virtio_bus_if.m \
-    dev/virtual/virtio/virtio/virtio_if.m
+    dev/misc/coremctl/coremctl_if.m kern/cpu_if.m \
+    bus/gpio/gpio_if.m
 
 .for _srcsrc in ${MFILES}
 .for _ext in c h
@@ -336,17 +354,6 @@ ${_src}: @/tools/makeobjops.awk @/${_srcsrc}
 .endfor # _src
 .endfor # _ext
 .endfor # _srcsrc
-
-#.for _ext in c h
-#.if ${SRCS:Mvnode_if.${_ext}} != ""
-#CLEANFILES+=	vnode_if.${_ext}
-#vnode_if.${_ext}: @
-#.if exists(@)
-#vnode_if.${_ext}: @/tools/vnode_if.awk @/kern/vnode_if.src
-#.endif
-#	awk -f @/tools/vnode_if.awk -- -${_ext} @/kern/vnode_if.src
-#.endif
-#.endfor
 
 .if !empty(SRCS:Mmiidevs.h)
 CLEANFILES+=	miidevs.h
@@ -421,11 +428,11 @@ assym.s: @/kern/genassym.sh
 .endif
 	sh @/kern/genassym.sh genassym.o > ${.TARGET}
 .if exists(@)
-genassym.o: @/platform/${MACHINE_PLATFORM}/${MACHINE_ARCH}/genassym.c          
+genassym.o: @/platform/${MACHINE_PLATFORM}/${MACHINE_ARCH}/genassym.c
 .endif
 genassym.o: @ ${SRCS:Mopt_*.h}
-	${CC} -c ${CFLAGS:N-fno-common:N-mcmodel=small} ${WERROR} \
-	@/platform/${MACHINE_PLATFORM}/${MACHINE_ARCH}/genassym.c
+	${CC} -c ${CFLAGS:N-fno-common:N-flto:N-mcmodel=small} -fcommon \
+	${WERROR} @/platform/${MACHINE_PLATFORM}/${MACHINE_ARCH}/genassym.c
 .endif
 
 regress:

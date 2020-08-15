@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2003,2004 The DragonFly Project.  All rights reserved.
+ * Copyright (c) 2003-2016 The DragonFly Project.  All rights reserved.
  * 
  * This code is derived from software contributed to The DragonFly Project
  * by Matthew Dillon <dillon@backplane.com>
@@ -64,18 +64,15 @@
 
 #include <machine/stdarg.h>
 #include <machine/smp.h>
+#include <machine/clock.h>
 #include <machine/atomic.h>
 
-#ifdef _KERNEL_VIRTUAL
-#include <pthread.h>
-#endif
-
 struct ipiq_stats {
-    __int64_t ipiq_count;	/* total calls to lwkt_send_ipiq*() */
-    __int64_t ipiq_fifofull;	/* number of fifo full conditions detected */
-    __int64_t ipiq_avoided;	/* interlock with target avoids cpu ipi */
-    __int64_t ipiq_passive;	/* passive IPI messages */
-    __int64_t ipiq_cscount;	/* number of cpu synchronizations */
+    int64_t ipiq_count;		/* total calls to lwkt_send_ipiq*() */
+    int64_t ipiq_fifofull;	/* number of fifo full conditions detected */
+    int64_t ipiq_avoided;	/* interlock with target avoids cpu ipi */
+    int64_t ipiq_passive;	/* passive IPI messages */
+    int64_t ipiq_cscount;	/* number of cpu synchronizations */
 } __cachealign;
 
 static struct ipiq_stats ipiq_stats_percpu[MAXCPU];
@@ -103,8 +100,6 @@ SYSCTL_INT(_lwkt, OID_AUTO, panic_ipiq_count, CTLFLAG_RW, &panic_ipiq_count, 0, 
 KTR_INFO_MASTER(ipiq);
 KTR_INFO(KTR_IPIQ, ipiq, send_norm, 0, IPIQ_STRING, IPIQ_ARGS);
 KTR_INFO(KTR_IPIQ, ipiq, send_pasv, 1, IPIQ_STRING, IPIQ_ARGS);
-KTR_INFO(KTR_IPIQ, ipiq, send_nbio, 2, IPIQ_STRING, IPIQ_ARGS);
-KTR_INFO(KTR_IPIQ, ipiq, send_fail, 3, IPIQ_STRING, IPIQ_ARGS);
 KTR_INFO(KTR_IPIQ, ipiq, receive, 4, IPIQ_STRING, IPIQ_ARGS);
 KTR_INFO(KTR_IPIQ, ipiq, sync_start, 5, "cpumask=%08lx", unsigned long mask);
 KTR_INFO(KTR_IPIQ, ipiq, sync_end, 6, "cpumask=%08lx", unsigned long mask);
@@ -117,29 +112,30 @@ KTR_INFO(KTR_IPIQ, ipiq, sync_quick, 9, "cpumask=%08lx", unsigned long mask);
 #define logipiq2(name, arg)	\
 	KTR_LOG(ipiq_ ## name, arg)
 
+static void lwkt_process_ipiq_nested(void);
 static int lwkt_process_ipiq_core(globaldata_t sgd, lwkt_ipiq_t ip, 
-				  struct intrframe *frame);
+				  struct intrframe *frame, int limit);
 static void lwkt_cpusync_remote1(lwkt_cpusync_t cs);
 static void lwkt_cpusync_remote2(lwkt_cpusync_t cs);
 
-#define IPIQ_SYSCTL(name) \
-static int \
-sysctl_##name(SYSCTL_HANDLER_ARGS) \
-{ \
-    __int64_t val = 0; \
-    int cpu, error; \
- \
-    for (cpu = 0; cpu < ncpus; ++cpu) \
-	val += ipiq_stats_percpu[cpu].name; \
- \
-    error = sysctl_handle_quad(oidp, &val, 0, req); \
-    if (error || req->newptr == NULL) \
-	return error; \
- \
-    for (cpu = 0; cpu < ncpus; ++cpu) \
-    	ipiq_stats_percpu[cpu].name = val; \
- \
-    return 0; \
+#define IPIQ_SYSCTL(name)				\
+static int						\
+sysctl_##name(SYSCTL_HANDLER_ARGS)			\
+{							\
+    int64_t val = 0;					\
+    int cpu, error;					\
+							\
+    for (cpu = 0; cpu < ncpus; ++cpu)			\
+	val += ipiq_stats_percpu[cpu].name;		\
+							\
+    error = sysctl_handle_quad(oidp, &val, 0, req);	\
+    if (error || req->newptr == NULL)			\
+	return error;					\
+							\
+    for (cpu = 0; cpu < ncpus; ++cpu)			\
+    	ipiq_stats_percpu[cpu].name = val;		\
+							\
+    return 0;						\
 }
 
 IPIQ_SYSCTL(ipiq_count);
@@ -186,9 +182,9 @@ lwkt_send_ipiq3(globaldata_t target, ipifunc3_t func, void *arg1, int arg2)
 {
     lwkt_ipiq_t ip;
     int windex;
-#ifdef _KERNEL_VIRTUAL
-    int repeating = 0;
-#endif
+    int level1;
+    int level2;
+    long rflags;
     struct globaldata *gd = mycpu;
 
     logipiq(send_norm, func, arg1, arg2, gd, target);
@@ -197,7 +193,7 @@ lwkt_send_ipiq3(globaldata_t target, ipifunc3_t func, void *arg1, int arg2)
 	func(arg1, arg2, NULL);
 	logipiq(send_end, func, arg1, arg2, gd, target);
 	return(0);
-    } 
+    }
     crit_enter();
     ++gd->gd_intr_nesting_level;
 #ifdef INVARIANTS
@@ -212,44 +208,97 @@ lwkt_send_ipiq3(globaldata_t target, ipifunc3_t func, void *arg1, int arg2)
      * Do not allow the FIFO to become full.  Interrupts must be physically
      * enabled while we liveloop to avoid deadlocking the APIC.
      *
-     * The target ipiq may have gotten filled up due to passive IPIs and thus
-     * not be aware that its queue is too full, so be sure to issue an
-     * ipiq interrupt to the target cpu.
+     * When we are not nested inside a processing loop we allow the FIFO
+     * to get 1/2 full.  Once it exceeds 1/2 full we must wait for it to
+     * drain, executing any incoming IPIs while we wait.
+     *
+     * When we are nested we allow the FIFO to get almost completely full.
+     * This allows us to queue IPIs sent from IPI callbacks.  The processing
+     * code will only process incoming FIFOs that are trying to drain while
+     * we wait, and only to the only-slightly-less-full point, to avoid a
+     * deadlock.
+     *
+     * We are guaranteed
      */
-    if (ip->ip_windex - ip->ip_rindex > MAXCPUFIFO / 2) {
-#if defined(__i386__)
-	unsigned int eflags = read_eflags();
-#elif defined(__x86_64__)
-	unsigned long rflags = read_rflags();
-#endif
 
+    if (gd->gd_processing_ipiq == 0) {
+	level1 = MAXCPUFIFO / 2;
+	level2 = MAXCPUFIFO / 4;
+    } else {
+	level1 = MAXCPUFIFO - 3;
+	level2 = MAXCPUFIFO - 5;
+    }
+
+    if (ip->ip_windex - ip->ip_rindex > level1) {
+#ifndef _KERNEL_VIRTUAL
+	uint64_t tsc_base = rdtsc();
+#endif
+	int repeating = 0;
+	int olimit;
+
+	rflags = read_rflags();
 	cpu_enable_intr();
 	++ipiq_stat(gd).ipiq_fifofull;
 	DEBUG_PUSH_INFO("send_ipiq3");
-	while (ip->ip_windex - ip->ip_rindex > MAXCPUFIFO / 4) {
-	    if (atomic_poll_acquire_int(&target->gd_npoll)) {
-		logipiq(cpu_send, func, arg1, arg2, gd, target);
-		cpu_send_ipiq(target->gd_cpuid);
-	    }
+	olimit = atomic_swap_int(&ip->ip_drain, level2);
+	while (ip->ip_windex - ip->ip_rindex > level2) {
 	    KKASSERT(ip->ip_windex - ip->ip_rindex != MAXCPUFIFO - 1);
-	    lwkt_process_ipiq();
+	    lwkt_process_ipiq_nested();
 	    cpu_pause();
+
+	    /*
+	     * Check for target not draining issue.  This should be fixed but
+	     * leave the code in-place anyway as it can recover an otherwise
+	     * dead system.
+	     */
 #ifdef _KERNEL_VIRTUAL
 	    if (repeating++ > 10)
-		    pthread_yield();
+		    vkernel_yield();
+#else
+	    if (rdtsc() - tsc_base > tsc_frequency) {
+		++repeating;
+		if (repeating > 10) {
+			kprintf("send_ipiq %d->%d tgt not draining (%d) sniff=%p,%p\n",
+				gd->gd_cpuid, target->gd_cpuid, repeating,
+				target->gd_sample_pc, target->gd_sample_sp);
+			smp_sniff();
+			cpu_disable_intr();
+			ATOMIC_CPUMASK_ORBIT(target->gd_ipimask, gd->gd_cpuid);
+			cpu_send_ipiq(target->gd_cpuid);
+			cpu_enable_intr();
+		} else {
+			kprintf("send_ipiq %d->%d tgt not draining (%d)\n",
+				gd->gd_cpuid, target->gd_cpuid, repeating);
+			smp_sniff();
+		}
+		tsc_base = rdtsc();
+	    }
 #endif
 	}
+	atomic_swap_int(&ip->ip_drain, olimit);
 	DEBUG_POP_INFO();
-#if defined(__i386__)
-	write_eflags(eflags);
-#elif defined(__x86_64__)
+#if defined(__x86_64__)
 	write_rflags(rflags);
+#else
+#error "no write_*flags"
 #endif
     }
 
     /*
-     * Queue the new message
+     * Queue the new message and signal the target cpu.  For now we need to
+     * physically disable interrupts because the target will not get signalled
+     * by other cpus once we set target->gd_npoll and we don't want to get
+     * interrupted.
+     *
+     * XXX not sure why this is a problem, the critical section should prevent
+     *     any stalls (incoming interrupts except Xinvltlb and Xsnoop will
+     *	   just be made pending).
      */
+    rflags = read_rflags();
+#ifndef _KERNEL_VIRTUAL
+    cpu_disable_intr();
+#endif
+
     windex = ip->ip_windex & MAXCPUFIFO_MASK;
     ip->ip_info[windex].func = func;
     ip->ip_info[windex].arg1 = arg1;
@@ -261,12 +310,14 @@ lwkt_send_ipiq3(globaldata_t target, ipifunc3_t func, void *arg1, int arg2)
     /*
      * signal the target cpu that there is work pending.
      */
-    if (atomic_poll_acquire_int(&target->gd_npoll)) {
+    if (atomic_swap_int(&target->gd_npoll, 1) == 0) {
 	logipiq(cpu_send, func, arg1, arg2, gd, target);
 	cpu_send_ipiq(target->gd_cpuid);
     } else {
 	++ipiq_stat(gd).ipiq_avoided;
     }
+    write_rflags(rflags);
+
     --gd->gd_intr_nesting_level;
     crit_exit();
     logipiq(send_end, func, arg1, arg2, gd, target);
@@ -276,8 +327,8 @@ lwkt_send_ipiq3(globaldata_t target, ipifunc3_t func, void *arg1, int arg2)
 
 /*
  * Similar to lwkt_send_ipiq() but this function does not actually initiate
- * the IPI to the target cpu unless the FIFO has become too full, so it is
- * very fast.
+ * the IPI to the target cpu unless the FIFO is greater than 1/4 full.
+ * This function is usually very fast.
  *
  * This function is used for non-critical IPI messages, such as memory
  * deallocations.  The queue will typically be flushed by the target cpu at
@@ -291,58 +342,32 @@ lwkt_send_ipiq3_passive(globaldata_t target, ipifunc3_t func,
 {
     lwkt_ipiq_t ip;
     int windex;
-#ifdef _KERNEL_VIRTUAL
-    int repeating = 0;
-#endif
     struct globaldata *gd = mycpu;
 
     KKASSERT(target != gd);
-    crit_enter();
+    crit_enter_gd(gd);
     ++gd->gd_intr_nesting_level;
-    logipiq(send_pasv, func, arg1, arg2, gd, target);
-#ifdef INVARIANTS
-    if (gd->gd_intr_nesting_level > 20)
-	panic("lwkt_send_ipiq: TOO HEAVILY NESTED!");
-#endif
-    KKASSERT(curthread->td_critcount);
-    ++ipiq_stat(gd).ipiq_count;
-    ++ipiq_stat(gd).ipiq_passive;
     ip = &gd->gd_ipiq[target->gd_cpuid];
 
     /*
-     * Do not allow the FIFO to become full.  Interrupts must be physically
-     * enabled while we liveloop to avoid deadlocking the APIC.
+     * If the FIFO is too full send the IPI actively.
+     *
+     * WARNING! This level must be low enough not to trigger a wait loop
+     *		in the active sending code since we are not signalling the
+     *		target cpu.
      */
-    if (ip->ip_windex - ip->ip_rindex > MAXCPUFIFO / 2) {
-#if defined(__i386__)
-	unsigned int eflags = read_eflags();
-#elif defined(__x86_64__)
-	unsigned long rflags = read_rflags();
-#endif
-
-	cpu_enable_intr();
-	++ipiq_stat(gd).ipiq_fifofull;
-	DEBUG_PUSH_INFO("send_ipiq3_passive");
-	while (ip->ip_windex - ip->ip_rindex > MAXCPUFIFO / 4) {
-	    if (atomic_poll_acquire_int(&target->gd_npoll)) {
-		logipiq(cpu_send, func, arg1, arg2, gd, target);
-		cpu_send_ipiq(target->gd_cpuid);
-	    }
-	    KKASSERT(ip->ip_windex - ip->ip_rindex != MAXCPUFIFO - 1);
-	    lwkt_process_ipiq();
-	    cpu_pause();
-#ifdef _KERNEL_VIRTUAL
-	    if (repeating++ > 10)
-		    pthread_yield();
-#endif
-	}
-	DEBUG_POP_INFO();
-#if defined(__i386__)
-	write_eflags(eflags);
-#elif defined(__x86_64__)
-	write_rflags(rflags);
-#endif
+    if (ip->ip_windex - ip->ip_rindex >= MAXCPUFIFO / 4) {
+	--gd->gd_intr_nesting_level;
+	crit_exit_gd(gd);
+	return lwkt_send_ipiq3(target, func, arg1, arg2);
     }
+
+    /*
+     * Else we can do it passively.
+     */
+    logipiq(send_pasv, func, arg1, arg2, gd, target);
+    ++ipiq_stat(gd).ipiq_count;
+    ++ipiq_stat(gd).ipiq_passive;
 
     /*
      * Queue the new message
@@ -367,62 +392,6 @@ lwkt_send_ipiq3_passive(globaldata_t target, ipifunc3_t func,
 }
 
 /*
- * Send an IPI request without blocking, return 0 on success, ENOENT on 
- * failure.  The actual queueing of the hardware IPI may still force us
- * to spin and process incoming IPIs but that will eventually go away
- * when we've gotten rid of the other general IPIs.
- */
-int
-lwkt_send_ipiq3_nowait(globaldata_t target, ipifunc3_t func, 
-		       void *arg1, int arg2)
-{
-    lwkt_ipiq_t ip;
-    int windex;
-    struct globaldata *gd = mycpu;
-
-    logipiq(send_nbio, func, arg1, arg2, gd, target);
-    KKASSERT(curthread->td_critcount);
-    if (target == gd) {
-	func(arg1, arg2, NULL);
-	logipiq(send_end, func, arg1, arg2, gd, target);
-	return(0);
-    } 
-    crit_enter();
-    ++gd->gd_intr_nesting_level;
-    ++ipiq_stat(gd).ipiq_count;
-    ip = &gd->gd_ipiq[target->gd_cpuid];
-
-    if (ip->ip_windex - ip->ip_rindex >= MAXCPUFIFO * 2 / 3) {
-	logipiq(send_fail, func, arg1, arg2, gd, target);
-	--gd->gd_intr_nesting_level;
-	crit_exit();
-	return(ENOENT);
-    }
-    windex = ip->ip_windex & MAXCPUFIFO_MASK;
-    ip->ip_info[windex].func = func;
-    ip->ip_info[windex].arg1 = arg1;
-    ip->ip_info[windex].arg2 = arg2;
-    cpu_sfence();
-    ++ip->ip_windex;
-    ATOMIC_CPUMASK_ORBIT(target->gd_ipimask, gd->gd_cpuid);
-
-    /*
-     * This isn't a passive IPI, we still have to signal the target cpu.
-     */
-    if (atomic_poll_acquire_int(&target->gd_npoll)) {
-	logipiq(cpu_send, func, arg1, arg2, gd, target);
-	cpu_send_ipiq(target->gd_cpuid);
-    } else {
-	++ipiq_stat(gd).ipiq_avoided;
-    }
-    --gd->gd_intr_nesting_level;
-    crit_exit();
-
-    logipiq(send_end, func, arg1, arg2, gd, target);
-    return(0);
-}
-
-/*
  * deprecated, used only by fast int forwarding.
  */
 int
@@ -434,18 +403,43 @@ lwkt_send_ipiq3_bycpu(int dcpu, ipifunc3_t func, void *arg1, int arg2)
 /*
  * Send a message to several target cpus.  Typically used for scheduling.
  * The message will not be sent to stopped cpus.
+ *
+ * To prevent treating low-numbered cpus as favored sons, the IPIs are
+ * issued in order starting at mycpu upward, then from 0 through mycpu.
+ * This is particularly important to prevent random scheduler pickups
+ * from favoring cpu 0.
  */
 int
 lwkt_send_ipiq3_mask(cpumask_t mask, ipifunc3_t func, void *arg1, int arg2)
 {
     int cpuid;
     int count = 0;
+    cpumask_t amask;
 
     CPUMASK_NANDMASK(mask, stopped_cpus);
-    while (CPUMASK_TESTNZERO(mask)) {
-	cpuid = BSFCPUMASK(mask);
+
+    /*
+     * All cpus in mask which are >= mycpu
+     */
+    CPUMASK_ASSBMASK(amask, mycpu->gd_cpuid);
+    CPUMASK_INVMASK(amask);
+    CPUMASK_ANDMASK(amask, mask);
+    while (CPUMASK_TESTNZERO(amask)) {
+	cpuid = BSFCPUMASK(amask);
 	lwkt_send_ipiq3(globaldata_find(cpuid), func, arg1, arg2);
-	CPUMASK_NANDBIT(mask, cpuid);
+	CPUMASK_NANDBIT(amask, cpuid);
+	++count;
+    }
+
+    /*
+     * All cpus in mask which are < mycpu
+     */
+    CPUMASK_ASSBMASK(amask, mycpu->gd_cpuid);
+    CPUMASK_ANDMASK(amask, mask);
+    while (CPUMASK_TESTNZERO(amask)) {
+	cpuid = BSFCPUMASK(amask);
+	lwkt_send_ipiq3(globaldata_find(cpuid), func, arg1, arg2);
+	CPUMASK_NANDBIT(amask, cpuid);
 	++count;
     }
     return(count);
@@ -470,10 +464,10 @@ lwkt_wait_ipiq(globaldata_t target, int seq)
     if (target != mycpu) {
 	ip = &mycpu->gd_ipiq[target->gd_cpuid];
 	if ((int)(ip->ip_xindex - seq) < 0) {
-#if defined(__i386__)
-	    unsigned int eflags = read_eflags();
-#elif defined(__x86_64__)
+#if defined(__x86_64__)
 	    unsigned long rflags = read_rflags();
+#else
+#error "no read_*flags"
 #endif
 	    int64_t time_tgt = tsc_get_target(1000000000LL);
 	    int time_loops = 10;
@@ -490,7 +484,7 @@ lwkt_wait_ipiq(globaldata_t target, int seq)
 		crit_exit();
 #ifdef _KERNEL_VIRTUAL
 		if (repeating++ > 10)
-			pthread_yield();
+			vkernel_yield();
 #endif
 
 		/*
@@ -516,29 +510,27 @@ lwkt_wait_ipiq(globaldata_t target, int seq)
 		cpu_lfence();
 	    }
 	    DEBUG_POP_INFO();
-#if defined(__i386__)
-	    write_eflags(eflags);
-#elif defined(__x86_64__)
+#if defined(__x86_64__)
 	    write_rflags(rflags);
+#else
+#error "no write_*flags"
 #endif
 	}
     }
 }
 
-int
-lwkt_seq_ipiq(globaldata_t target)
-{
-    lwkt_ipiq_t ip;
-
-    ip = &mycpu->gd_ipiq[target->gd_cpuid];
-    return(ip->ip_windex);
-}
-
 /*
- * Called from IPI interrupt (like a fast interrupt), which has placed
- * us in a critical section.  The MP lock may or may not be held.
- * May also be called from doreti or splz, or be reentrantly called
- * indirectly through the ip_info[].func we run.
+ * Called from IPI interrupt (like a fast interrupt), and numerous
+ * other locations, and might also be called recursively.  Caller must
+ * hold a critical section across this call.
+ *
+ * When called from doreti, splz, or an IPI interrupt, npoll is cleared
+ * by the caller using an atomic xchgl, thus synchronizing the incoming
+ * ipimask against npoll.  A new IPI will be received if new traffic
+ * occurs verses the windex we read.
+ *
+ * However, ipimask might not be synchronized when called from other
+ * locations.  Our processing will be more heuristic.
  *
  * There are two versions, one where no interrupt frame is available (when
  * called from the send code and from splz, and one where an interrupt
@@ -560,17 +552,25 @@ lwkt_process_ipiq(void)
 
     ++gd->gd_processing_ipiq;
 again:
-    cpu_lfence();
     mask = gd->gd_ipimask;
-    ATOMIC_CPUMASK_NANDMASK(gd->gd_ipimask, mask);
+    cpu_ccfence();
     while (CPUMASK_TESTNZERO(mask)) {
 	n = BSFCPUMASK(mask);
 	if (n != gd->gd_cpuid) {
 	    sgd = globaldata_find(n);
 	    ip = sgd->gd_ipiq;
 	    if (ip != NULL) {
-		while (lwkt_process_ipiq_core(sgd, &ip[gd->gd_cpuid], NULL))
+		ip += gd->gd_cpuid;
+		while (lwkt_process_ipiq_core(sgd, ip, NULL, 0))
 		    ;
+		/*
+		 * Can't NAND before-hand as it will prevent recursive
+		 * processing.  Sender will adjust windex before adjusting
+		 * ipimask.
+		 */
+		ATOMIC_CPUMASK_NANDBIT(gd->gd_ipimask, n);
+		if (ip->ip_rindex != ip->ip_windex)
+			ATOMIC_CPUMASK_ORBIT(gd->gd_ipimask, n);
 	    }
 	}
 	CPUMASK_NANDBIT(mask, n);
@@ -581,22 +581,15 @@ again:
      * active cpusync we only run the list once and do not re-flag
      * as the thread itself is processing its interlock.
      */
-    if (lwkt_process_ipiq_core(gd, &gd->gd_cpusyncq, NULL)) {
+    if (lwkt_process_ipiq_core(gd, &gd->gd_cpusyncq, NULL, 0)) {
 	if (gd->gd_curthread->td_cscount == 0)
 	    goto again;
 	/* need_ipiq(); do not reflag */
     }
 
     /*
-     * Interlock to allow more IPI interrupts.  Recheck ipimask after
-     * releasing gd_npoll.
+     * Interlock to allow more IPI interrupts.
      */
-    if (CPUMASK_TESTNZERO(gd->gd_ipimask))
-	goto again;
-    atomic_poll_release_int(&gd->gd_npoll);
-    cpu_mfence();
-    if (CPUMASK_TESTNZERO(gd->gd_ipimask))
-	goto again;
     --gd->gd_processing_ipiq;
 }
 
@@ -609,53 +602,107 @@ lwkt_process_ipiq_frame(struct intrframe *frame)
     cpumask_t mask;
     int n;
 
+    ++gd->gd_processing_ipiq;
 again:
-    cpu_lfence();
     mask = gd->gd_ipimask;
-    ATOMIC_CPUMASK_NANDMASK(gd->gd_ipimask, mask);
+    cpu_ccfence();
     while (CPUMASK_TESTNZERO(mask)) {
 	n = BSFCPUMASK(mask);
 	if (n != gd->gd_cpuid) {
 	    sgd = globaldata_find(n);
 	    ip = sgd->gd_ipiq;
 	    if (ip != NULL) {
-		while (lwkt_process_ipiq_core(sgd, &ip[gd->gd_cpuid], frame))
+		ip += gd->gd_cpuid;
+		while (lwkt_process_ipiq_core(sgd, ip, frame, 0))
 		    ;
+		/*
+		 * Can't NAND before-hand as it will prevent recursive
+		 * processing.  Sender will adjust windex before adjusting
+		 * ipimask.
+		 */
+		ATOMIC_CPUMASK_NANDBIT(gd->gd_ipimask, n);
+		if (ip->ip_rindex != ip->ip_windex)
+			ATOMIC_CPUMASK_ORBIT(gd->gd_ipimask, n);
 	    }
 	}
 	CPUMASK_NANDBIT(mask, n);
     }
     if (gd->gd_cpusyncq.ip_rindex != gd->gd_cpusyncq.ip_windex) {
-	if (lwkt_process_ipiq_core(gd, &gd->gd_cpusyncq, frame)) {
+	if (lwkt_process_ipiq_core(gd, &gd->gd_cpusyncq, frame, 0)) {
 	    if (gd->gd_curthread->td_cscount == 0)
 		goto again;
 	    /* need_ipiq(); do not reflag */
 	}
     }
-
-    /*
-     * Interlock to allow more IPI interrupts.  Recheck ipimask after
-     * releasing gd_npoll.
-     */
-    if (CPUMASK_TESTNZERO(gd->gd_ipimask))
-	goto again;
-    atomic_poll_release_int(&gd->gd_npoll);
-    cpu_mfence();
-    if (CPUMASK_TESTNZERO(gd->gd_ipimask))
-	goto again;
+    --gd->gd_processing_ipiq;
 }
 
-#if 0
-static int iqticks[SMP_MAXCPU];
-static int iqcount[SMP_MAXCPU];
-#endif
-#if 0
-static int iqterm[SMP_MAXCPU];
-#endif
+/*
+ * Only process incoming IPIQs from draining senders and only process them
+ * to the point where the draining sender is able to continue.  This is
+ * necessary to avoid deadlocking the IPI subsystem because we are acting on
+ * incoming messages and the callback may queue additional messages.
+ *
+ * We only want to have to act on senders that are blocked to limit the
+ * number of additional messages sent.  At the same time, recipients are
+ * trying to drain our own queue.  Theoretically this create a pipeline that
+ * cannot deadlock.
+ */
+static void
+lwkt_process_ipiq_nested(void)
+{
+    globaldata_t gd = mycpu;
+    globaldata_t sgd;
+    lwkt_ipiq_t ip;
+    cpumask_t mask;
+    int n;
+    int limit;
 
+    ++gd->gd_processing_ipiq;
+again:
+    mask = gd->gd_ipimask;
+    cpu_ccfence();
+    while (CPUMASK_TESTNZERO(mask)) {
+	n = BSFCPUMASK(mask);
+	if (n != gd->gd_cpuid) {
+	    sgd = globaldata_find(n);
+	    ip = sgd->gd_ipiq;
+
+	    /*
+	     * NOTE: We do not mess with the cpumask at all, instead we allow
+	     *	     the top-level ipiq processor deal with it.
+	     */
+	    if (ip != NULL) {
+		ip += gd->gd_cpuid;
+		if ((limit = ip->ip_drain) != 0) {
+		    lwkt_process_ipiq_core(sgd, ip, NULL, limit);
+		    /* no gd_ipimask when doing limited processing */
+		}
+	    }
+	}
+	CPUMASK_NANDBIT(mask, n);
+    }
+
+    /*
+     * Process pending cpusyncs.  If the current thread has a cpusync
+     * active cpusync we only run the list once and do not re-flag
+     * as the thread itself is processing its interlock.
+     */
+    if (lwkt_process_ipiq_core(gd, &gd->gd_cpusyncq, NULL, 0)) {
+	if (gd->gd_curthread->td_cscount == 0)
+	    goto again;
+	/* need_ipiq(); do not reflag */
+    }
+    --gd->gd_processing_ipiq;
+}
+
+/*
+ * Process incoming IPI requests until only <limit> are left (0 to exhaust
+ * all incoming IPI requests).
+ */
 static int
 lwkt_process_ipiq_core(globaldata_t sgd, lwkt_ipiq_t ip, 
-		       struct intrframe *frame)
+		       struct intrframe *frame, int limit)
 {
     globaldata_t mygd = mycpu;
     int ri;
@@ -664,37 +711,13 @@ lwkt_process_ipiq_core(globaldata_t sgd, lwkt_ipiq_t ip,
     void *copy_arg1;
     int copy_arg2;
 
-#if 0
-    if (iqticks[mygd->gd_cpuid] != ticks) {
-	    iqticks[mygd->gd_cpuid] = ticks;
-	    iqcount[mygd->gd_cpuid] = 0;
-    }
-    if (++iqcount[mygd->gd_cpuid] > 3000000) {
-	kprintf("cpu %d ipiq maxed cscount %d spin %d\n",
-		mygd->gd_cpuid,
-		mygd->gd_curthread->td_cscount,
-		mygd->gd_spinlocks);
-	iqcount[mygd->gd_cpuid] = 0;
-#if 0
-	if (++iqterm[mygd->gd_cpuid] > 10)
-		panic("cpu %d ipiq maxed", mygd->gd_cpuid);
-#endif
-	int i;
-	for (i = 0; i < ncpus; ++i) {
-		if (globaldata_find(i)->gd_infomsg)
-			kprintf(" %s", globaldata_find(i)->gd_infomsg);
-	}
-	kprintf("\n");
-    }
-#endif
-
     /*
      * Clear the originating core from our ipimask, we will process all
      * incoming messages.
      *
      * Obtain the current write index, which is modified by a remote cpu.
      * Issue a load fence to prevent speculative reads of e.g. data written
-     * by the other cpu prior to it updating the index.
+     * by the other cpu prior to them updating the windex.
      */
     KKASSERT(curthread->td_critcount);
     wi = ip->ip_windex;
@@ -710,33 +733,31 @@ lwkt_process_ipiq_core(globaldata_t sgd, lwkt_ipiq_t ip,
      *	     may make, it is possible for both rindex and windex to advance and
      *	     thus for rindex to advance passed our cached windex.
      *
-     * NOTE: A load fence is required to prevent speculative loads prior
-     *	     to the loading of ip_rindex.  Even though stores might be
-     *	     ordered, loads are probably not.  A memory fence is required
-     *	     to prevent reordering of the loads after the ip_rindex update.
+     *	     We must process only through our cached (wi) to ensure that
+     *	     speculative reads of ip_info[] content do not occur without
+     *	     a memory barrier.
      *
      * NOTE: Single pass only.  Returns non-zero if the queue is not empty
      *	     on return.
+     *
+     * NOTE: Our 'wi' guarantees that memory loads will not be out of order.
+     *	     Do NOT reload wi with windex in the below loop unless you also
+     *	     issue another lfence after reloading it.
      */
-    while (wi - (ri = ip->ip_rindex) > 0) {
+    while (wi - (ri = ip->ip_rindex) > limit) {
 	ri &= MAXCPUFIFO_MASK;
-	cpu_lfence();
 	copy_func = ip->ip_info[ri].func;
 	copy_arg1 = ip->ip_info[ri].arg1;
 	copy_arg2 = ip->ip_info[ri].arg2;
-	cpu_mfence();
+	cpu_ccfence();
 	++ip->ip_rindex;
-	KKASSERT((ip->ip_rindex & MAXCPUFIFO_MASK) ==
-		 ((ri + 1) & MAXCPUFIFO_MASK));
 	logipiq(receive, copy_func, copy_arg1, copy_arg2, sgd, mycpu);
 #ifdef INVARIANTS
 	if (ipiq_debug && (ip->ip_rindex & 0xFFFFFF) == 0) {
 		kprintf("cpu %d ipifunc %p %p %d (frame %p)\n",
 			mycpu->gd_cpuid,
 			copy_func, copy_arg1, copy_arg2,
-#if defined(__i386__)
-			(frame ? (void *)frame->if_eip : NULL));
-#elif defined(__x86_64__)
+#if defined(__x86_64__)
 			(frame ? (void *)frame->if_rip : NULL));
 #else
 			NULL);
@@ -765,9 +786,9 @@ lwkt_process_ipiq_core(globaldata_t sgd, lwkt_ipiq_t ip,
     --mygd->gd_intr_nesting_level;
 
     /*
-     * Return non-zero if there is still more in the queue.
+     * Return non-zero if there is still more in the queue.  Don't worry
+     * about fencing, we will get another interrupt if necessary.
      */
-    cpu_lfence();
     return (ip->ip_rindex != ip->ip_windex);
 }
 
@@ -846,7 +867,7 @@ lwkt_cpusync_interlock(lwkt_cpusync_t cs)
 	    lwkt_process_ipiq();
 	    cpu_pause();
 #ifdef _KERNEL_VIRTUAL
-	    pthread_yield();
+	    vkernel_yield();
 #endif
 	}
 	DEBUG_POP_INFO();
@@ -886,7 +907,7 @@ lwkt_cpusync_deinterlock(lwkt_cpusync_t cs)
 	    lwkt_process_ipiq();
 	    cpu_pause();
 #ifdef _KERNEL_VIRTUAL
-	    pthread_yield();
+	    vkernel_yield();
 #endif
 	}
 	DEBUG_POP_INFO();
@@ -935,7 +956,7 @@ lwkt_cpusync_quick(lwkt_cpusync_t cs)
 	    lwkt_process_ipiq();
 	    cpu_pause();
 #ifdef _KERNEL_VIRTUAL
-	    pthread_yield();
+	    vkernel_yield();
 #endif
 	}
 
@@ -991,7 +1012,7 @@ lwkt_cpusync_remote2(lwkt_cpusync_t cs)
 
 	cpu_pause();
 #ifdef _KERNEL_VIRTUAL
-	pthread_yield();
+	vkernel_yield();
 #endif
 	cpu_lfence();
 
@@ -1001,16 +1022,6 @@ lwkt_cpusync_remote2(lwkt_cpusync_t cs)
 	 * better-detect spin loops.
 	 */
 	ip = &gd->gd_cpusyncq;
-#if 0
-	if (ip->ip_rindex == ip->ip_windex) {
-		__asm __volatile("cli");
-		if (ip->ip_rindex == ip->ip_windex) {
-			__asm __volatile("sti; hlt");
-		} else {
-			__asm __volatile("sti");
-		}
-	}
-#endif
 
 	wi = ip->ip_windex & MAXCPUFIFO_MASK;
 	ip->ip_info[wi].func = (ipifunc3_t)(ipifunc1_t)lwkt_cpusync_remote2;
@@ -1028,3 +1039,113 @@ lwkt_cpusync_remote2(lwkt_cpusync_t cs)
 	}
     }
 }
+
+#define LWKT_IPIQ_NLATENCY	8
+#define LWKT_IPIQ_NLATENCY_MASK	(LWKT_IPIQ_NLATENCY - 1)
+
+struct lwkt_ipiq_latency_log {
+	int		idx;	/* unmasked index */
+	int		pad;
+	uint64_t	latency[LWKT_IPIQ_NLATENCY];
+};
+
+static struct lwkt_ipiq_latency_log	lwkt_ipiq_latency_logs[MAXCPU];
+static uint64_t save_tsc;
+
+/*
+ * IPI callback (already in a critical section)
+ */
+static void
+lwkt_ipiq_latency_testfunc(void *arg __unused)
+{
+	uint64_t delta_tsc;
+	struct globaldata *gd;
+	struct lwkt_ipiq_latency_log *lat;
+
+	/*
+	 * Get delta TSC (assume TSCs are synchronized) as quickly as
+	 * possible and then convert to nanoseconds.
+	 */
+	delta_tsc = rdtsc_ordered() - save_tsc;
+	delta_tsc = delta_tsc * 1000000000LU / tsc_frequency;
+
+	/*
+	 * Record in our save array.
+	 */
+	gd = mycpu;
+	lat = &lwkt_ipiq_latency_logs[gd->gd_cpuid];
+	lat->latency[lat->idx & LWKT_IPIQ_NLATENCY_MASK] = delta_tsc;
+	++lat->idx;
+}
+
+/*
+ * Send IPI from cpu0 to other cpus
+ *
+ * NOTE: Machine must be idle for test to run dependably, and also probably
+ *	 a good idea not to be running powerd.
+ *
+ * NOTE: Caller should use 'usched :1 <command>' to lock itself to cpu 0.
+ *	 See 'ipitest' script in /usr/src/test/sysperf/ipitest
+ */
+static int
+lwkt_ipiq_latency_test(SYSCTL_HANDLER_ARGS)
+{
+	struct globaldata *gd;
+	int cpu = 0, orig_cpu, error;
+
+	error = sysctl_handle_int(oidp, &cpu, arg2, req);
+	if (error || req->newptr == NULL)
+		return error;
+
+	if (cpu == 0)
+		return 0;
+	else if (cpu >= ncpus || cpu < 0)
+		return EINVAL;
+
+	orig_cpu = mycpuid;
+	lwkt_migratecpu(0);
+
+	gd = globaldata_find(cpu);
+
+	save_tsc = rdtsc_ordered();
+	lwkt_send_ipiq(gd, lwkt_ipiq_latency_testfunc, NULL);
+
+	lwkt_migratecpu(orig_cpu);
+	return 0;
+}
+
+SYSCTL_NODE(_debug, OID_AUTO, ipiq, CTLFLAG_RW, 0, "");
+SYSCTL_PROC(_debug_ipiq, OID_AUTO, latency_test, CTLTYPE_INT | CTLFLAG_RW,
+    NULL, 0, lwkt_ipiq_latency_test, "I",
+    "ipi latency test, arg: remote cpuid");
+
+static int
+lwkt_ipiq_latency(SYSCTL_HANDLER_ARGS)
+{
+	struct lwkt_ipiq_latency_log *latency = arg1;
+	uint64_t lat[LWKT_IPIQ_NLATENCY];
+	int i;
+
+	for (i = 0; i < LWKT_IPIQ_NLATENCY; ++i)
+		lat[i] = latency->latency[i];
+
+	return sysctl_handle_opaque(oidp, lat, sizeof(lat), req);
+}
+
+static void
+lwkt_ipiq_latency_init(void *dummy __unused)
+{
+	int cpu;
+
+	for (cpu = 0; cpu < ncpus; ++cpu) {
+		char name[32];
+
+		ksnprintf(name, sizeof(name), "latency%d", cpu);
+		SYSCTL_ADD_PROC(NULL, SYSCTL_STATIC_CHILDREN(_debug_ipiq),
+		    OID_AUTO, name, CTLTYPE_OPAQUE | CTLFLAG_RD,
+		    &lwkt_ipiq_latency_logs[cpu], 0, lwkt_ipiq_latency,
+		    "LU", "7 latest ipi latency measurement results");
+	}
+}
+SYSINIT(lwkt_ipiq_latency, SI_SUB_CONFIGURE, SI_ORDER_ANY,
+    lwkt_ipiq_latency_init, NULL);

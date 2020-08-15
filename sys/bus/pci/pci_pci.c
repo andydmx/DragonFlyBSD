@@ -126,7 +126,7 @@ pcib_probe(device_t dev)
     if ((pci_get_class(dev) == PCIC_BRIDGE) &&
 	(pci_get_subclass(dev) == PCIS_BRIDGE_PCI)) {
 	device_set_desc(dev, "PCI-PCI bridge");
-#if defined(__i386__) || defined(__x86_64__)
+#if defined(__x86_64__)
 	/* PCIBIOS PCI-PCI bridge is -2000 */
 	if (ioapic_enable)
 		return (-1000);
@@ -298,15 +298,15 @@ pcib_attach_common(device_t dev)
 	 * disable all hot-plug interrupts on the PCI Express root
 	 * port or down stream port for now.
 	 */
-#define HPINTRS	(PCIEM_SLTCTL_HPINTR_MASK | PCIEM_SLTCTL_HPINTR_EN)
+#define HPINTRS	(PCIEM_SLOTCTL_HPINTR_MASK | PCIEM_SLOTCTL_HPINTR_EN)
 
 	ptr = pci_get_pciecap_ptr(dev);
-	slot_ctrl = pci_read_config(dev, ptr + PCIER_SLOTCTRL, 2);
+	slot_ctrl = pci_read_config(dev, ptr + PCIER_SLOTCTL, 2);
 	if (slot_ctrl & HPINTRS) {
 	    device_printf(dev, "Disable PCI Express hot-plug "
 	    		  "interrupts(0x%04x)\n", slot_ctrl & HPINTRS);
 	    slot_ctrl &= ~HPINTRS;
-	    pci_write_config(dev, ptr + PCIER_SLOTCTRL, slot_ctrl, 2);
+	    pci_write_config(dev, ptr + PCIER_SLOTCTL, slot_ctrl, 2);
 	}
 
 #undef HPINTRS
@@ -323,6 +323,13 @@ pcib_attach_common(device_t dev)
      *     pick 255; the only tradeoff here is that configuration transactions
      *     would be more widely routed than absolutely necessary.
      */
+
+    /*
+     * Always enable busmastering on bridges so that transactions
+     * initiated on the secondary bus are passed through to the
+     * primary bus.
+     */
+    pci_enable_busmaster(dev);
 }
 
 int

@@ -71,7 +71,6 @@
 #include <sys/syscallsubr.h>
 */
 #include <sys/sysctl.h>
-#include <sys/thread2.h>
 #include <sys/vnode.h>
 
 #include <netgraph7/ng_message.h>
@@ -572,7 +571,7 @@ ng_attach_cntl(struct socket *so)
 	priv->refs++;
 
 	/* Initialize mutex. */
-	mtx_init(&priv->mtx);
+	mtx_init(&priv->mtx, "ng_socket");
 
 	/* Make the generic node components */
 	if ((error = ng_make_node_common(&typestruct, &priv->node)) != 0) {
@@ -940,7 +939,7 @@ ngs_rcvmsg(node_p node, item_p item, hook_p lasthook)
 
 	/* Copy the message itself into an mbuf chain. */
 	m = m_devget((caddr_t)msg, sizeof(struct ng_mesg) + msg->header.arglen,
-	    0, NULL, NULL);
+		     0, NULL);
 
 	/*
 	 * Here we free the message. We need to do that
@@ -954,11 +953,14 @@ ngs_rcvmsg(node_p node, item_p item, hook_p lasthook)
 	}
 
 	/* Send it up to the socket. */
+	lwkt_gettoken(&so->so_rcv.ssb_token);
 	if (sbappendaddr((struct sockbuf *)&so->so_rcv, (struct sockaddr *)&addr, m, NULL) == 0) {
+		lwkt_reltoken(&so->so_rcv.ssb_token);
 		TRAP_ERROR;
 		m_freem(m);
 		return (ENOBUFS);
 	}
+	lwkt_reltoken(&so->so_rcv.ssb_token);
 	sorwakeup(so);
 	
 	return (error);
@@ -997,11 +999,14 @@ ngs_rcvdata(hook_p hook, item_p item)
 	addr->sg_data[addrlen] = '\0';
 
 	/* Try to tell the socket which hook it came in on. */
+	lwkt_gettoken(&so->so_rcv.ssb_token);
 	if (sbappendaddr((struct sockbuf *)&so->so_rcv, (struct sockaddr *)addr, m, NULL) == 0) {
+		lwkt_reltoken(&so->so_rcv.ssb_token);
 		m_freem(m);
 		TRAP_ERROR;
 		return (ENOBUFS);
 	}
+	lwkt_reltoken(&so->so_rcv.ssb_token);
 	sorwakeup(so);
 	return (0);
 }

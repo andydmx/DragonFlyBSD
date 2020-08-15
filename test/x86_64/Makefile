@@ -122,7 +122,7 @@ world32: checkq
 
 world64: checkq
 	cd ${SRCDIR} && \
-	    make -j 4 TARGET_ARCH=x86_64 TARGET_PLATFORM=pc64 NO_GCC44=1 \
+	    make -j 4 TARGET_ARCH=x86_64 TARGET_PLATFORM=pc64 NO_ALTCOMPILER=1 \
 	    buildworld
 
 kernel64: checkq
@@ -135,7 +135,7 @@ kernel64: checkq
 #
 quickworld64: checkq
 	cd ${SRCDIR} && \
-	    make -j 4 TARGET_ARCH=x86_64 TARGET_PLATFORM=pc64 NO_GCC44=1 \
+	    make -j 4 TARGET_ARCH=x86_64 TARGET_PLATFORM=pc64 NO_ALTCOMPILER=1 \
 	    quickworld
 
 quickkernel64: checkq
@@ -149,7 +149,7 @@ quickkernel64: checkq
 #       have a dependency on mount.
 #
 root64:	check
-	vnconfig -c -T -S ${ROOTSIZE} -s labels \
+	vnconfig -c -T -S ${ROOTSIZE} \
 	    `cat ${QEMUDIR}/vn.which` ${QEMUDIR}/root.img
 	dd if=/dev/zero of=/dev/`cat ${QEMUDIR}/vn.which` bs=32k count=4
 	fdisk -IB `cat ${QEMUDIR}/vn.which`
@@ -163,7 +163,7 @@ root64:	check
 	vnconfig -u `cat ${QEMUDIR}/vn.which` > /dev/null 2>&1
 
 mount: check
-	vnconfig -c -s labels `cat ${QEMUDIR}/vn.which` ${QEMUDIR}/root.img
+	vnconfig -c `cat ${QEMUDIR}/vn.which` ${QEMUDIR}/root.img
 	fsck -p /dev/`cat ${QEMUDIR}/vn.which`s1a
 	mount /dev/`cat ${QEMUDIR}/vn.which`s1a ${QEMUDIR}/root
 	@echo "Mounted ${QEMUDIR}/root"
@@ -176,7 +176,7 @@ umount: check
 install64: mount
 	cd ${SRCDIR} && \
 	    make -j 4 TARGET_ARCH=x86_64 TARGET_PLATFORM=pc64 \
-		 DESTDIR=${QEMUDIR}/root NO_GCC44=1 installworld
+		 DESTDIR=${QEMUDIR}/root NO_ALTCOMPILER=1 installworld
 	cd ${SRCDIR}/etc && \
 	    make -j 4 TARGET_ARCH=x86_64 TARGET_PLATFORM=pc64 \
 		 DESTDIR=${QEMUDIR}/root distribution
@@ -201,7 +201,7 @@ reinstall64: mount
 	@echo "      64 bit kernel"
 	cd ${SRCDIR} && \
 	    make -j 4 TARGET_ARCH=x86_64 TARGET_PLATFORM=pc64 \
-		 DESTDIR=${QEMUDIR}/root NO_GCC44=1 installworld
+		 DESTDIR=${QEMUDIR}/root NO_ALTCOMPILER=1 installworld
 
 reinstallkernel64: mount
 	cd ${SRCDIR} && \

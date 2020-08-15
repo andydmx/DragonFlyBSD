@@ -67,13 +67,13 @@ static struct dos_partition historical_bogus_partition_table[NDOSPART] = {
 	{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, },
 	{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, },
 	{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, },
-	{ 0x80, 0, 1, 0, DOSPTYP_386BSD, 255, 255, 255, 0, 50000, },
+	{ 0x80, 0, 1, 0, DOSPTYP_DFLYBSD, 255, 255, 255, 0, 50000, },
 };
 static struct dos_partition historical_bogus_partition_table_fixed[NDOSPART] = {
 	{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, },
 	{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, },
 	{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, },
-	{ 0x80, 0, 1, 0, DOSPTYP_386BSD, 254, 255, 255, 0, 50000, },
+	{ 0x80, 0, 1, 0, DOSPTYP_DFLYBSD, 254, 255, 255, 0, 50000, },
 };
 
 static int check_part (char *sname, struct dos_partition *dp,
@@ -125,12 +125,14 @@ reread_mbr:
 	 * Read master boot record.
 	 */
 	wdev = dev;
-	bp = geteblk((int)info->d_media_blksize);
+	bp = getpbuf_mem(NULL);
+	KKASSERT((int)info->d_media_blksize <= bp->b_bufsize);
 	bp->b_bio1.bio_offset = (off_t)mbr_offset * info->d_media_blksize;
 	bp->b_bio1.bio_done = biodone_sync;
 	bp->b_bio1.bio_flags |= BIO_SYNC;
 	bp->b_bcount = info->d_media_blksize;
 	bp->b_cmd = BUF_CMD_READ;
+	bp->b_flags |= B_FAILONDIS;
 	dev_dstrategy(wdev, &bp->b_bio1);
 	if (biowait(&bp->b_bio1, "mbrrd") != 0) {
 		if ((info->d_dsflags & DSO_MBRQUIET) == 0) {
@@ -165,8 +167,7 @@ reread_mbr:
 	 * to GPT processing.
 	 */
 	for (dospart = 0, dp = dp0; dospart < NDOSPART; dospart++, dp++) {
-		if (dospart == 0 &&
-		    (dp->dp_typ == DOSPTYP_PMBR || dp->dp_typ == DOSPTYP_GPT)) {
+		if (dospart == 0 && dp->dp_typ == DOSPTYP_PMBR) {
 			if (bootverbose)
 				kprintf(
 	    "%s: Found GPT in slice #%d\n", sname, dospart + 1);
@@ -205,7 +206,8 @@ reread_mbr:
 	/*
 	 * TODO:
 	 * Perhaps skip entries with 0 size.
-	 * Perhaps only look at entries of type DOSPTYP_386BSD.
+	 * Perhaps only look at entries of type DOSPTYP_386BSD or
+	 * DOSPTYP_DFLYBSD
 	 */
 	max_ncyls = 0;
 	max_nsectors = 0;
@@ -316,7 +318,7 @@ reread_mbr:
 
 done:
 	bp->b_flags |= B_INVAL | B_AGE;
-	brelse(bp);
+	relpbuf(bp, NULL);
 	if (error == EINVAL)
 		error = 0;
 	return (error);
@@ -432,12 +434,14 @@ mbr_extended(cdev_t dev, struct disk_info *info, struct diskslices *ssp,
 	}
 
 	/* Read extended boot record. */
-	bp = geteblk((int)info->d_media_blksize);
+	bp = getpbuf_mem(NULL);
+	KKASSERT((int)info->d_media_blksize <= bp->b_bufsize);
 	bp->b_bio1.bio_offset = (off_t)ext_offset * info->d_media_blksize;
 	bp->b_bio1.bio_done = biodone_sync;
 	bp->b_bio1.bio_flags |= BIO_SYNC;
 	bp->b_bcount = info->d_media_blksize;
 	bp->b_cmd = BUF_CMD_READ;
+	bp->b_flags |= B_FAILONDIS;
 	dev_dstrategy(dev, &bp->b_bio1);
 	if (biowait(&bp->b_bio1, "mbrrd") != 0) {
 		diskerr(&bp->b_bio1, dev,
@@ -510,7 +514,7 @@ mbr_extended(cdev_t dev, struct disk_info *info, struct diskslices *ssp,
 
 done:
 	bp->b_flags |= B_INVAL | B_AGE;
-	brelse(bp);
+	relpbuf(bp, NULL);
 }
 
 static int

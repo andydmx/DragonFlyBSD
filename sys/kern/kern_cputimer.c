@@ -30,8 +30,6 @@
  * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT
  * OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
- * 
- * $DragonFly: src/sys/kern/kern_cputimer.c,v 1.5 2008/06/05 18:06:32 swildner Exp $
  */
 /*
  * Generic cputimer - access to a reliable, free-running counter.
@@ -45,28 +43,42 @@
 #include <sys/serialize.h>
 #include <sys/systimer.h>
 #include <sys/sysctl.h>
-#include <sys/thread2.h>
+
+extern void	pcpu_timer_process(void);
+extern void	pcpu_timer_process_frame(struct intrframe *);
+
+static uint64_t dummy_cpucounter_count(void);
 
 static sysclock_t dummy_cputimer_count(void);
 
 static struct cputimer dummy_cputimer = {
-    SLIST_ENTRY_INITIALIZER,
-    "dummy",
-    CPUTIMER_PRI_DUMMY,
-    CPUTIMER_DUMMY,
-    dummy_cputimer_count,
-    cputimer_default_fromhz,
-    cputimer_default_fromus,
-    cputimer_default_construct,
-    cputimer_default_destruct,
-    1000000,
-    (1000000LL << 32) / 1000000,
-    (1000000000LL << 32) / 1000000,
-    0
+    .next		= SLIST_ENTRY_INITIALIZER,
+    .name		= "dummy",
+    .pri		= CPUTIMER_PRI_DUMMY,
+    .type		= CPUTIMER_DUMMY,
+    .count		= dummy_cputimer_count,
+    .fromhz		= cputimer_default_fromhz,
+    .fromus		= cputimer_default_fromus,
+    .construct		= cputimer_default_construct,
+    .destruct		= cputimer_default_destruct,
+    .freq		= 1000000,
+    .freq64_usec	= (1000000LL << 32) / 1000000,
+    .freq64_nsec	= (1000000000LL << 32) / 1000000
+};
+
+static struct cpucounter dummy_cpucounter = {
+	.freq		= 1000000ULL,
+	.count		= dummy_cpucounter_count,
+	.flags		= CPUCOUNTER_FLAG_MPSYNC,
+	.prio		= CPUCOUNTER_PRIO_DUMMY,
+	.type		= CPUCOUNTER_DUMMY
 };
 
 struct cputimer *sys_cputimer = &dummy_cputimer;
 SLIST_HEAD(, cputimer) cputimerhead = SLIST_HEAD_INITIALIZER(&cputimerhead);
+
+static SLIST_HEAD(, cpucounter) cpucounterhead =
+    SLIST_HEAD_INITIALIZER(cpucounterhead);
 
 static int	cputimer_intr_ps_reqs;
 static struct lwkt_serialize cputimer_intr_ps_slize =
@@ -100,6 +112,7 @@ cputimer_select(struct cputimer *timer, int pri)
 	    sys_cputimer = timer;
 	    timer->construct(timer, oldclock);
 	    cputimer_intr_config(timer);
+	    systimer_changed();
 	}
     }
 }
@@ -178,15 +191,15 @@ cputimer_set_frequency(struct cputimer *timer, sysclock_t freq)
 }
 
 sysclock_t
-cputimer_default_fromhz(int freq)
+cputimer_default_fromhz(int64_t freq)
 {
     return(sys_cputimer->freq / freq + 1);
 }
 
 sysclock_t
-cputimer_default_fromus(int us)
+cputimer_default_fromus(int64_t us)
 {
-    return((int64_t)sys_cputimer->freq * us / 1000000);
+    return muldivu64(us, sys_cputimer->freq, 1000000);
 }
 
 /*
@@ -274,10 +287,10 @@ SYSCTL_PROC(_kern_cputimer, OID_AUTO, select, CTLTYPE_STRING|CTLFLAG_RD,
 	    NULL, 0, sysctl_cputimer_reglist, "A", "");
 SYSCTL_PROC(_kern_cputimer, OID_AUTO, name, CTLTYPE_STRING|CTLFLAG_RD,
 	    NULL, 0, sysctl_cputimer_name, "A", "");
-SYSCTL_PROC(_kern_cputimer, OID_AUTO, clock, CTLTYPE_UINT|CTLFLAG_RD,
-	    NULL, 0, sysctl_cputimer_clock, "IU", "");
-SYSCTL_PROC(_kern_cputimer, OID_AUTO, freq, CTLTYPE_INT|CTLFLAG_RD,
-	    NULL, 0, sysctl_cputimer_freq, "I", "");
+SYSCTL_PROC(_kern_cputimer, OID_AUTO, clock, CTLTYPE_ULONG|CTLFLAG_RD,
+	    NULL, 0, sysctl_cputimer_clock, "LU", "");
+SYSCTL_PROC(_kern_cputimer, OID_AUTO, freq, CTLTYPE_LONG|CTLFLAG_RD,
+	    NULL, 0, sysctl_cputimer_freq, "L", "");
 
 static struct cputimer_intr *sys_cputimer_intr;
 static uint32_t cputimer_intr_caps;
@@ -448,7 +461,7 @@ cputimer_intr_initclocks(void)
 }
 /* NOTE: Must be SECOND to allow platform initialization to go first */
 SYSINIT(cputimer_intr, SI_BOOT2_CLOCKREG, SI_ORDER_SECOND,
-	cputimer_intr_initclocks, NULL)
+	cputimer_intr_initclocks, NULL);
 
 static int
 sysctl_cputimer_intr_reglist(SYSCTL_HANDLER_ARGS)
@@ -512,8 +525,8 @@ SYSCTL_NODE(_kern_cputimer, OID_AUTO, intr, CTLFLAG_RW, NULL,
 
 SYSCTL_PROC(_kern_cputimer_intr, OID_AUTO, reglist, CTLTYPE_STRING|CTLFLAG_RD,
 	    NULL, 0, sysctl_cputimer_intr_reglist, "A", "");
-SYSCTL_PROC(_kern_cputimer_intr, OID_AUTO, freq, CTLTYPE_INT|CTLFLAG_RD,
-	    NULL, 0, sysctl_cputimer_intr_freq, "I", "");
+SYSCTL_PROC(_kern_cputimer_intr, OID_AUTO, freq, CTLTYPE_LONG|CTLFLAG_RD,
+	    NULL, 0, sysctl_cputimer_intr_freq, "L", "");
 SYSCTL_PROC(_kern_cputimer_intr, OID_AUTO, select, CTLTYPE_STRING|CTLFLAG_RW,
 	    NULL, 0, sysctl_cputimer_intr_select, "A", "");
 
@@ -573,4 +586,84 @@ cputimer_intr_powersave_remreq(void)
     }
 
     lwkt_serialize_exit(&cputimer_intr_ps_slize);
+}
+
+static __inline void
+cputimer_intr_pcpuhand(void)
+{
+    struct cputimer_intr *cti = sys_cputimer_intr;
+
+    if (cti->pcpuhand != NULL)
+	cti->pcpuhand(cti);
+}
+
+static void
+pcpu_timer_process_oncpu(struct globaldata *gd, struct intrframe *frame)
+{
+	sysclock_t count;
+
+	cputimer_intr_pcpuhand();
+
+	gd->gd_timer_running = 0;
+
+	count = sys_cputimer->count();
+	if (TAILQ_FIRST(&gd->gd_systimerq) != NULL)
+		systimer_intr(&count, 0, frame);
+}
+
+void
+pcpu_timer_process(void)
+{
+	pcpu_timer_process_oncpu(mycpu, NULL);
+}
+
+void
+pcpu_timer_process_frame(struct intrframe *frame)
+{
+	pcpu_timer_process_oncpu(mycpu, frame);
+}
+
+static uint64_t
+dummy_cpucounter_count(void)
+{
+	struct timeval tv;
+
+	microuptime(&tv);
+	return ((tv.tv_sec * 1000000ULL) + tv.tv_usec);
+}
+
+const struct cpucounter *
+cpucounter_find_pcpu(void)
+{
+	const struct cpucounter *cc, *ret;
+
+	ret = &dummy_cpucounter;
+	SLIST_FOREACH(cc, &cpucounterhead, link) {
+		if (cc->prio > ret->prio)
+			ret = cc;
+	}
+	return (ret);
+}
+
+const struct cpucounter *
+cpucounter_find(void)
+{
+	const struct cpucounter *cc, *ret;
+
+	ret = &dummy_cpucounter;
+	SLIST_FOREACH(cc, &cpucounterhead, link) {
+		if ((cc->flags & CPUCOUNTER_FLAG_MPSYNC) &&
+		    cc->prio > ret->prio)
+			ret = cc;
+	}
+	KASSERT(ret->flags & CPUCOUNTER_FLAG_MPSYNC,
+	    ("cpucounter %u is not MPsync", ret->type));
+	return (ret);
+}
+
+void
+cpucounter_register(struct cpucounter *cc)
+{
+
+	SLIST_INSERT_HEAD(&cpucounterhead, cc, link);
 }

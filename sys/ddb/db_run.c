@@ -24,7 +24,6 @@
  * rights to redistribute these changes.
  *
  * $FreeBSD: src/sys/ddb/db_run.c,v 1.18 1999/08/28 00:41:10 peter Exp $
- * $DragonFly: src/sys/ddb/db_run.c,v 1.8 2008/08/25 17:01:37 dillon Exp $
  */
 
 /*
@@ -104,9 +103,7 @@ db_stop_at_pc(boolean_t *is_breakpoint)
 		return (TRUE);	/* stop here */
 	    }
 	} else if (*is_breakpoint) {
-#ifdef __i386__			/* XXx */
-		ddb_regs.tf_eip += 1;
-#elif defined(__x86_64__)
+#ifdef __x86_64__
 		ddb_regs.tf_rip += 1;
 #endif
 	}
@@ -176,7 +173,7 @@ db_restart_at_pc(boolean_t watchpt)
 	if ((db_run_mode == STEP_COUNT) ||
 	    (db_run_mode == STEP_RETURN) ||
 	    (db_run_mode == STEP_CALLT)) {
-	    db_expr_t		ins;
+	    db_expr_t	ins __unused;	/* seems used but gcc thinks not */
 
 	    /*
 	     * We are about to execute this instruction,
@@ -297,7 +294,7 @@ db_clear_single_step(db_regs_t *regs)
 
 #endif /* SOFTWARE_SSTEP */
 
-extern int	db_cmd_loop_done;
+extern boolean_t	db_cmd_loop_done;
 
 /* single-step */
 /*ARGSUSED*/
@@ -320,7 +317,7 @@ db_single_step_cmd(db_expr_t addr, boolean_t have_addr, db_expr_t count,
 	db_load_count = 0;
 	db_store_count = 0;
 
-	db_cmd_loop_done = 1;
+	db_cmd_loop_done = TRUE;
 }
 
 /* trace and print until call/return */
@@ -340,7 +337,7 @@ db_trace_until_call_cmd(db_expr_t addr, boolean_t have_addr, db_expr_t count,
 	db_load_count = 0;
 	db_store_count = 0;
 
-	db_cmd_loop_done = 1;
+	db_cmd_loop_done = TRUE;
 }
 
 /*ARGSUSED*/
@@ -360,7 +357,7 @@ db_trace_until_matching_cmd(db_expr_t addr, boolean_t have_addr,
 	db_load_count = 0;
 	db_store_count = 0;
 
-	db_cmd_loop_done = 1;
+	db_cmd_loop_done = TRUE;
 }
 
 /* continue */
@@ -377,5 +374,5 @@ db_continue_cmd(db_expr_t addr, boolean_t have_addr, db_expr_t count,
 	db_load_count = 0;
 	db_store_count = 0;
 
-	db_cmd_loop_done = 1;
+	db_cmd_loop_done = TRUE;
 }

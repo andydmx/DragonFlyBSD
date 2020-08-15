@@ -33,6 +33,7 @@
  */
 #include <sys/param.h>
 #include <sys/systm.h>
+#include <sys/uio.h>
 #include <sys/kernel.h>
 #include <sys/proc.h>
 #include <sys/priv.h>
@@ -570,7 +571,13 @@ smbfs_rename(struct vop_old_rename_args *ap)
 				goto out_cacherem;
 		}
 		error = smbfs_smb_rename(VTOSMB(fvp), VTOSMB(tdvp),
-		    tcnp->cn_nameptr, tcnp->cn_namelen, &scred);
+					 tcnp->cn_nameptr, tcnp->cn_namelen,
+					 &scred);
+		if (error == 0) {
+			smbfs_attr_cacherename(fvp,
+					       tcnp->cn_nameptr,
+					       tcnp->cn_namelen);
+		}
 	}
 
 out_cacherem:
@@ -714,7 +721,7 @@ smbfs_readdir(struct vop_readdir_args *ap)
 	}
 #endif
 	error = vn_lock(vp, LK_EXCLUSIVE | LK_RETRY | LK_FAILRECLAIM);
-	if (error) {
+	if (error == 0) {
 		error = smbfs_readvnode(vp, uio, ap->a_cred);
 		vn_unlock(vp);
 	}

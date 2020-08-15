@@ -37,11 +37,14 @@
  * $Id: survey.c,v 1.17 2005/02/06 21:05:18 cpressey Exp $
  */
 
-#include <sys/types.h>
+#include <sys/param.h>
+#include <sys/diskslice.h>
 #include <sys/sysctl.h>
 
+#include <fcntl.h>
 #include <stdio.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "libaura/dict.h"
 
@@ -112,7 +115,7 @@ parse_slice_info(char *line, int *slice,
 
 	/*
 	 * Part        Start        Size Type Flags
-	 *    1:          63     2128833 0xa5 0x80
+	 *    1:          63     2128833 0x6c 0x80
 	 */
 	if ((word = strtok(line, " \t")) == NULL)	/* 1: */
 		return(0);
@@ -123,7 +126,7 @@ parse_slice_info(char *line, int *slice,
 	if ((word = strtok(NULL, " \t")) == NULL)	/* 2128833 */
 		return(0);
 	*size = strtoul(word, NULL, 10);
-	if ((word = strtok(NULL, " \t")) == NULL)	/* 0xa5 */
+	if ((word = strtok(NULL, " \t")) == NULL)	/* 0x6c */
 		return(0);
 	if (!hex_to_int(word, type))
 		return(0);
@@ -151,11 +154,16 @@ survey_storage(struct i_fn_args *a)
 	struct disk *d = NULL;
 	int number = 0;
 	int failure = 0;
+	int ndisks = 0;
+	int fd;
 	size_t len;
 	struct aura_dict *di;
 	void *rk;
 	size_t rk_len;
+	struct partinfo diskpart;
+	char diskpath[PATH_MAX];
 
+	sleep(1);		/* give devfs time to probe */
 	disks_free(a->s);
 
 	len = sizeof(mem);
@@ -185,18 +193,33 @@ survey_storage(struct i_fn_args *a)
 			continue;
 
 		aura_dict_store(di, disk, strlen(disk) + 1, "", 1);
+		ndisks++;
 	}
+
+	if (ndisks == 0)
+		failure |= 1;
 
 	cmds = commands_new();
 	cmd = command_add(cmds, "%s%s -n '' >%ssurvey.txt",
 	    a->os_root, cmd_name(a, "ECHO"), a->tmp);
 	command_set_log_mode(cmd, COMMAND_LOG_SILENT);
 
-	aura_dict_rewind(di);
-	while (!aura_dict_eof(di)) {
-		aura_dict_get_current_key(di, &rk, &rk_len),
-
+	for (aura_dict_rewind(di); !aura_dict_eof(di); aura_dict_next(di) ) {
+		aura_dict_get_current_key(di, &rk, &rk_len);
 		disk = (char *)rk;
+
+		/*
+		 * Attempt to get media information from the disk. This information
+		 * might be used later on for partitioning. Any disk that does not
+		 * provide the information will be discarded as not suitable for
+		 * an installation.
+		 */
+		bzero(&diskpart, sizeof(diskpart));
+		snprintf(diskpath, PATH_MAX, "/dev/%s", disk);
+		if ((fd = open(diskpath, O_RDONLY)) < 0)
+			continue;
+		if (ioctl(fd, DIOCGPART, &diskpart) < 0)
+			continue;
 
 		cmd = command_add(cmds, "%s%s '@DISK' >>%ssurvey.txt",
 		    a->os_root, cmd_name(a, "ECHO"), a->tmp);
@@ -211,14 +234,12 @@ survey_storage(struct i_fn_args *a)
 		cmd = command_add(cmds, "%s%s '@DESC' >>%ssurvey.txt",
 		    a->os_root, cmd_name(a, "ECHO"), a->tmp);
 		command_set_log_mode(cmd, COMMAND_LOG_SILENT);
-		cmd = command_add(cmds, "%s%s -w '^%s: [0-9]*MB' %s%s >>%ssurvey.txt || %s%s '%s' >>%ssurvey.txt",
-		    a->os_root, cmd_name(a, "GREP"),
-		    disk,
-		    a->os_root, cmd_name(a, "DMESG_BOOT"),
-		    a->tmp,
+		cmd = command_add(cmds, "%s%s '%s: %luMB' >>%ssurvey.txt",
 		    a->os_root, cmd_name(a, "ECHO"),
 		    disk,
+		    diskpart.media_size / 1024 / 1024,
 		    a->tmp);
+		close(fd);
 		cmd = command_add(cmds, "%s%s '@END' >>%ssurvey.txt",
 		    a->os_root, cmd_name(a, "ECHO"), a->tmp);
 		command_set_log_mode(cmd, COMMAND_LOG_SILENT);
@@ -257,8 +278,6 @@ survey_storage(struct i_fn_args *a)
 		cmd = command_add(cmds, "%s%s '@END' >>%ssurvey.txt",
 		    a->os_root, cmd_name(a, "ECHO"), a->tmp);
 		command_set_log_mode(cmd, COMMAND_LOG_SILENT);
-
-		aura_dict_next(di);
 	}
 
 	cmd = command_add(cmds, "%s%s '.' >>%ssurvey.txt",
@@ -302,7 +321,7 @@ survey_storage(struct i_fn_args *a)
 			/*
 			 * /dev/ad3: 2112 cyl 16 hd 63 sec
 			 * Part        Start        Size Type Flags
-			 *    1:          63     2128833 0xa5 0x80
+			 *    1:          63     2128833 0x6c 0x80
 			 */
 			while (d != NULL && strcmp(line, "@END") != 0 && fgets_chomp(line, 255, f)) {
 				if (strncmp(line, "/dev/", 5) == 0) {

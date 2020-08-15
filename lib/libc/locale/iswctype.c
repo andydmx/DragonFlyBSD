@@ -18,7 +18,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -44,7 +44,7 @@
 int
 iswalnum(wint_t wc)
 {
-	return (__istype(wc, _CTYPE_A|_CTYPE_D));
+	return (__istype(wc, _CTYPE_A|_CTYPE_N));
 }
 
 #undef iswalpha
@@ -79,7 +79,7 @@ iswcntrl(wint_t wc)
 int
 iswdigit(wint_t wc)
 {
-	return (__isctype(wc, _CTYPE_D));
+	return (__istype(wc, _CTYPE_D));
 }
 
 #undef iswgraph
@@ -114,7 +114,7 @@ iswlower(wint_t wc)
 int
 iswnumber(wint_t wc)
 {
-	return (__istype(wc, _CTYPE_D));
+	return (__istype(wc, _CTYPE_N));
 }
 
 #undef iswphonogram	
@@ -170,7 +170,7 @@ iswupper(wint_t wc)
 int
 iswxdigit(wint_t wc)
 {
-	return (__isctype(wc, _CTYPE_X));
+	return (__istype(wc, _CTYPE_X));
 }
 
 #undef towlower

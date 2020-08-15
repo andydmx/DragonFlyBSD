@@ -327,7 +327,7 @@ TAILQ_HEAD(carp_if, carp_softc_container);
 
 SYSCTL_DECL(_net_inet_carp);
 
-static int carp_opts[CARPCTL_MAXID] = { 0, 1, 0, 1, 0, 0 }; /* XXX for now */
+static int carp_opts[CARPCTL_MAXID] = { 0, 1, 0, 1, 0, 0, 1 }; /* XXX for now */
 SYSCTL_INT(_net_inet_carp, CARPCTL_ALLOW, allow, CTLFLAG_RW,
     &carp_opts[CARPCTL_ALLOW], 0, "Accept incoming CARP packets");
 SYSCTL_INT(_net_inet_carp, CARPCTL_PREEMPT, preempt, CTLFLAG_RW,
@@ -336,6 +336,8 @@ SYSCTL_INT(_net_inet_carp, CARPCTL_LOG, log, CTLFLAG_RW,
     &carp_opts[CARPCTL_LOG], 0, "log bad carp packets");
 SYSCTL_INT(_net_inet_carp, CARPCTL_ARPBALANCE, arpbalance, CTLFLAG_RW,
     &carp_opts[CARPCTL_ARPBALANCE], 0, "balance arp responses");
+SYSCTL_INT(_net_inet_carp, CARPCTL_SETROUTE, setroute, CTLFLAG_RW,
+    &carp_opts[CARPCTL_SETROUTE], 0, "set route");
 
 static int carp_suppress_preempt = 0;
 SYSCTL_INT(_net_inet_carp, OID_AUTO, suppress_preempt, CTLFLAG_RD,
@@ -370,7 +372,7 @@ static int	carp_hmac_verify(struct carp_softc *, uint32_t *,
 static void	carp_setroute(struct carp_softc *, int);
 static void	carp_proto_input_c(struct carp_softc *, struct mbuf *,
 		    struct carp_header *, sa_family_t);
-static int 	carp_clone_create(struct if_clone *, int, caddr_t);
+static int 	carp_clone_create(struct if_clone *, int, caddr_t, caddr_t);
 static int 	carp_clone_destroy(struct ifnet *);
 static void	carp_detach(struct carp_softc *, boolean_t, boolean_t);
 static void	carp_prepare_ad(struct carp_softc *, struct carp_header *);
@@ -613,7 +615,8 @@ carp_setroute(struct carp_softc *sc, int cmd)
 }
 
 static int
-carp_clone_create(struct if_clone *ifc, int unit, caddr_t param __unused)
+carp_clone_create(struct if_clone *ifc, int unit,
+		  caddr_t params __unused, caddr_t data __unused)
 {
 	struct carp_softc *sc;
 	struct ifnet *ifp;
@@ -684,9 +687,9 @@ carp_clone_destroy_dispatch(netmsg_t msg)
 	sc->sc_dead = TRUE;
 	carp_detach(sc, TRUE, FALSE);
 
-	callout_stop_sync(&sc->sc_ad_tmo);
-	callout_stop_sync(&sc->sc_md_tmo);
-	callout_stop_sync(&sc->sc_md6_tmo);
+	callout_cancel(&sc->sc_ad_tmo);
+	callout_cancel(&sc->sc_md_tmo);
+	callout_cancel(&sc->sc_md6_tmo);
 
 	crit_enter();
 	lwkt_dropmsg(&sc->sc_ad_msg.base.lmsg);
@@ -1172,7 +1175,8 @@ carp_proto_input_c(struct carp_softc *sc, struct mbuf *m,
 			   cifp->if_xname);
 			carp_set_state(sc, BACKUP);
 			carp_setrun(sc, 0);
-			carp_setroute(sc, RTM_DELETE);
+			if (carp_opts[CARPCTL_SETROUTE])
+				carp_setroute(sc, RTM_DELETE);
 		}
 		break;
 
@@ -1242,7 +1246,7 @@ carp_input(void *v, struct mbuf *m)
 		if ((sc->sc_if.if_flags & IFF_UP) == 0)
 			continue;
 
-		m0 = m_dup(m, MB_DONTWAIT);
+		m0 = m_dup(m, M_NOWAIT);
 		if (m0 == NULL)
 			continue;
 
@@ -1349,7 +1353,7 @@ carp_send_ad(struct carp_softc *sc)
 	if (sc->sc_ia != NULL) {
 		struct ip *ip;
 
-		MGETHDR(m, MB_DONTWAIT, MT_HEADER);
+		MGETHDR(m, M_NOWAIT, MT_HEADER);
 		if (m == NULL) {
 			IFNET_STAT_INC(cifp, oerrors, 1);
 			carpstats.carps_onomem++;
@@ -1418,7 +1422,7 @@ carp_send_ad(struct carp_softc *sc)
 	if (sc->sc_ia6) {
 		struct ip6_hdr *ip6;
 
-		MGETHDR(m, MB_DONTWAIT, MT_HEADER);
+		MGETHDR(m, M_NOWAIT, MT_HEADER);
 		if (m == NULL) {
 			IFNET_STAT_INC(cifp, oerrors, 1);
 			carpstats.carps_onomem++;
@@ -1602,8 +1606,7 @@ carp_iamatch(const struct in_ifaddr *ia)
 {
 	const struct carp_softc *sc = ia->ia_ifp->if_softc;
 
-	KASSERT(&curthread->td_msgport == netisr_cpuport(0),
-	    ("not in netisr0"));
+	ASSERT_NETISR0;
 
 #ifdef notyet
 	if (carp_opts[CARPCTL_ARPBALANCE])
@@ -1664,7 +1667,7 @@ carp_macmatch6(void *v, struct mbuf *m, const struct in6_addr *taddr)
 				struct ifnet *ifp = &sc->sc_if;
 
 				mtag = m_tag_get(PACKET_TAG_CARP,
-				    sizeof(struct ifnet *), MB_DONTWAIT);
+				    sizeof(struct ifnet *), M_NOWAIT);
 				if (mtag == NULL) {
 					/* better a bit than nothing */
 					return (IF_LLADDR(ifp));
@@ -1752,7 +1755,8 @@ carp_master_down(struct carp_softc *sc)
 		carp_send_na(sc);
 #endif /* INET6 */
 		carp_setrun(sc, 0);
-		carp_setroute(sc, RTM_ADD);
+		if (carp_opts[CARPCTL_SETROUTE])
+			carp_setroute(sc, RTM_ADD);
 		break;
 	}
 }
@@ -1776,7 +1780,8 @@ carp_setrun(struct carp_softc *sc, sa_family_t af)
 	    (sc->sc_naddrs || sc->sc_naddrs6)) {
 		/* Nothing */
 	} else {
-		carp_setroute(sc, RTM_DELETE);
+		if (carp_opts[CARPCTL_SETROUTE])
+			carp_setroute(sc, RTM_DELETE);
 		return;
 	}
 
@@ -1791,11 +1796,13 @@ carp_setrun(struct carp_softc *sc, sa_family_t af)
 			CARP_DEBUG("%s: INIT -> MASTER (preempting)\n",
 				   cifp->if_xname);
 			carp_set_state(sc, MASTER);
-			carp_setroute(sc, RTM_ADD);
+			if (carp_opts[CARPCTL_SETROUTE])
+				carp_setroute(sc, RTM_ADD);
 		} else {
 			CARP_DEBUG("%s: INIT -> BACKUP\n", cifp->if_xname);
 			carp_set_state(sc, BACKUP);
-			carp_setroute(sc, RTM_DELETE);
+			if (carp_opts[CARPCTL_SETROUTE])
+				carp_setroute(sc, RTM_DELETE);
 			carp_setrun(sc, 0);
 		}
 		break;
@@ -2414,7 +2421,8 @@ carp_ioctl_setvh_dispatch(netmsg_t msg)
 			callout_stop(&sc->sc_ad_tmo);
 			carp_set_state(sc, BACKUP);
 			carp_setrun(sc, 0);
-			carp_setroute(sc, RTM_DELETE);
+			if (carp_opts[CARPCTL_SETROUTE])
+				carp_setroute(sc, RTM_DELETE);
 			break;
 
 		case MASTER:
@@ -3074,8 +3082,7 @@ carp_ifaddr(void *arg __unused, struct ifnet *ifp,
 	if (ifa->ifa_addr->sa_family != AF_INET)
 		return;
 
-	KASSERT(&curthread->td_msgport == netisr_cpuport(0),
-	    ("not in netisr0"));
+	ASSERT_NETISR0;
 
 	if (ifp->if_type == IFT_CARP) {
 		/*
@@ -3181,6 +3188,10 @@ carp_proto_ctlinput(netmsg_t msg)
 	struct sockaddr *sa = msg->ctlinput.nm_arg;
 	struct in_ifaddr_container *iac;
 
+	/* We only process PRC_IFDOWN and PRC_IFUP commands */
+	if (cmd != PRC_IFDOWN && cmd != PRC_IFUP)
+		goto done;
+
 	TAILQ_FOREACH(iac, &in_ifaddrheads[mycpuid], ia_link) {
 		struct in_ifaddr *ia = iac->ia;
 		struct ifnet *ifp = ia->ia_ifp;
@@ -3199,7 +3210,7 @@ carp_proto_ctlinput(netmsg_t msg)
 			break;
 		}
 	}
-
+done:
 	lwkt_replymsg(&msg->lmsg, 0);
 }
 

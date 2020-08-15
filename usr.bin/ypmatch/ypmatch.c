@@ -27,7 +27,6 @@
  * SUCH DAMAGE.
  *
  * $FreeBSD: src/usr.bin/ypmatch/ypmatch.c,v 1.7.2.2 2002/02/15 00:46:56 des Exp $
- * $DragonFly: src/usr.bin/ypmatch/ypmatch.c,v 1.3 2003/10/04 20:36:55 hmp Exp $
  */
 
 #include <sys/param.h>
@@ -45,7 +44,7 @@
 #include <rpcsvc/yp_prot.h>
 #include <rpcsvc/ypclnt.h>
 
-struct ypalias {
+static const struct ypalias {
 	const char *alias, *name;
 } ypaliases[] = {
 	{ "passwd", "passwd.byname" },
@@ -69,7 +68,7 @@ usage(void)
 }
 
 int
-main(int argc, char **argv)
+main(int argc, char *argv[])
 {
 	char *domainname = NULL;
 	char *inkey, *inmap, *outbuf;
@@ -82,7 +81,7 @@ main(int argc, char **argv)
 	while ((c = getopt(argc, argv, "xd:kt")) != -1)
 		switch (c) {
 		case 'x':
-			for (i = 0; i<sizeof ypaliases/sizeof ypaliases[0]; i++)
+			for (i = 0; i < NELEM(ypaliases); i++)
 				printf("Use \"%s\" for \"%s\"\n",
 					ypaliases[i].alias,
 					ypaliases[i].name);
@@ -107,7 +106,7 @@ main(int argc, char **argv)
 		yp_get_default_domain(&domainname);
 
 	inmap = argv[argc-1];
-	for (i = 0; (!notrans) && i<sizeof ypaliases/sizeof ypaliases[0]; i++)
+	for (i = 0; (!notrans) && i < NELEM(ypaliases); i++)
 		if (strcmp(inmap, ypaliases[i].alias) == 0)
 			inmap = __DECONST(char *, ypaliases[i].name);
 	for (; optind < argc-1; optind++) {

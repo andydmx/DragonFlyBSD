@@ -39,7 +39,6 @@
 #include <sys/callout.h>
 #include <sys/kernel.h>
 #include <sys/lock.h>
-#include <sys/mutex.h>
 #include <sys/proc.h>
 #include <sys/sched.h>
 #include <sys/module.h>
@@ -48,7 +47,6 @@
 
 #include <sys/bus.h>
 #include <sys/rman.h>
-#include <sys/thread2.h>
 
 #include <emulation/ndis/pe_var.h>
 #include <emulation/ndis/resource_var.h>

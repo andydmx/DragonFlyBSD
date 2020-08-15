@@ -46,10 +46,6 @@
 #include <vm/vm_extern.h>
 #include <sys/lock.h>
 #include <vm/vm_map.h>
-#include <sys/user.h>
-#ifdef GPROF 
-#include <sys/gmon.h>
-#endif
 
 #include <machine/smp.h>
 #include <machine_base/apic/apicreg.h>
@@ -58,12 +54,14 @@
 #include <machine/cputypes.h>
 #include <machine_base/apic/lapic.h>
 #include <machine_base/apic/ioapic.h>
+#include <machine_base/acpica/acpi_md_cpu.h>
 #include <machine/psl.h>
 #include <machine/segments.h>
 #include <machine/tss.h>
 #include <machine/specialreg.h>
 #include <machine/globaldata.h>
 #include <machine/pmap_inval.h>
+#include <machine/clock.h>
 
 #include <machine/md_var.h>		/* setidt() */
 #include <machine_base/icu/icu.h>	/* IPIs */
@@ -136,10 +134,9 @@
 int	current_postcode;
 
 /** XXX FIXME: what system files declare these??? */
-extern struct region_descriptor r_gdt;
 
-extern int nkpt;
 extern int naps;
+extern int _udatasel;
 
 int64_t tsc0_offset;
 extern int64_t tsc_offsets[];
@@ -176,8 +173,21 @@ static cpumask_t smp_lapic_mask = CPUMASK_INITIALIZER_ONLYONE;
 cpumask_t smp_active_mask = CPUMASK_INITIALIZER_ONLYONE;
 cpumask_t smp_finalize_mask = CPUMASK_INITIALIZER_ONLYONE;
 
-SYSCTL_INT(_machdep, OID_AUTO, smp_active, CTLFLAG_RD, &smp_active_mask, 0, "");
+SYSCTL_OPAQUE(_machdep, OID_AUTO, smp_active, CTLFLAG_RD,
+	      &smp_active_mask, sizeof(smp_active_mask), "LU", "");
 static u_int	bootMP_size;
+static u_int	report_invlpg_src;
+SYSCTL_INT(_machdep, OID_AUTO, report_invlpg_src, CTLFLAG_RW,
+	&report_invlpg_src, 0, "");
+static u_int	report_invltlb_src;
+SYSCTL_INT(_machdep, OID_AUTO, report_invltlb_src, CTLFLAG_RW,
+	&report_invltlb_src, 0, "");
+static int	optimized_invltlb;
+SYSCTL_INT(_machdep, OID_AUTO, optimized_invltlb, CTLFLAG_RW,
+	&optimized_invltlb, 0, "");
+static int	all_but_self_ipi_enable = 1;
+SYSCTL_INT(_machdep, OID_AUTO, all_but_self_ipi_enable, CTLFLAG_RW,
+	&all_but_self_ipi_enable, 0, "");
 
 /* Local data for detecting CPU TOPOLOGY */
 static int core_bits = 0;
@@ -237,8 +247,7 @@ init_secondary(void)
 
 	ps = CPU_prvspace[myid];
 
-	gdt_segs[GPROC0_SEL].ssd_base =
-		(long) &ps->mdglobaldata.gd_common_tss;
+	gdt_segs[GPROC0_SEL].ssd_base = (long)&ps->common_tss;
 	ps->mdglobaldata.mi.gd_prvspace = ps;
 
 	/* We fill the 32-bit segment descriptors */
@@ -261,6 +270,10 @@ init_secondary(void)
 
 	lidt(&r_idt_arr[mdcpu->mi.gd_cpuid]);
 
+	load_ds(_udatasel);
+	load_es(_udatasel);
+	load_fs(_udatasel);
+
 #if 0
 	lldt(_default_ldt);
 	mdcpu->gd_currentldt = _default_ldt;
@@ -271,17 +284,36 @@ init_secondary(void)
 
 	md = mdcpu;	/* loaded through %gs:0 (mdglobaldata.mi.gd_prvspace)*/
 
-	md->gd_common_tss.tss_rsp0 = 0;	/* not used until after switch */
+	/*
+	 * TSS entry point for interrupts, traps, and exceptions
+	 * (sans NMI).  This will always go to near the top of the pcpu
+	 * trampoline area.  Hardware-pushed data will be copied into
+	 * the trap-frame on entry, and (if necessary) returned to the
+	 * trampoline on exit.
+	 *
+	 * We store some pcb data for the trampoline code above the
+	 * stack the cpu hw pushes into, and arrange things so the
+	 * address of tr_pcb_rsp is the same as the desired top of
+	 * stack.
+	 */
+	ps->common_tss.tss_rsp0 = (register_t)&ps->trampoline.tr_pcb_rsp;
+	ps->trampoline.tr_pcb_rsp = ps->common_tss.tss_rsp0;
+	ps->trampoline.tr_pcb_gs_kernel = (register_t)md;
+	ps->trampoline.tr_pcb_cr3 = KPML4phys;	/* adj to user cr3 live */
+	ps->dbltramp.tr_pcb_gs_kernel = (register_t)md;
+	ps->dbltramp.tr_pcb_cr3 = KPML4phys;
+	ps->dbgtramp.tr_pcb_gs_kernel = (register_t)md;
+	ps->dbgtramp.tr_pcb_cr3 = KPML4phys;
+
 #if 0 /* JG XXX */
-	md->gd_common_tss.tss_ioopt = (sizeof md->gd_common_tss) << 16;
+	ps->common_tss.tss_ioopt = (sizeof ps->common_tss) << 16;
 #endif
 	md->gd_tss_gdt = &gdt[myid * NGDT + GPROC0_SEL];
 	md->gd_common_tssd = *md->gd_tss_gdt;
 
 	/* double fault stack */
-	md->gd_common_tss.tss_ist1 =
-		(long)&md->mi.gd_prvspace->idlestack[
-			sizeof(md->mi.gd_prvspace->idlestack)];
+	ps->common_tss.tss_ist1 = (register_t)&ps->dbltramp.tr_pcb_rsp;
+	ps->common_tss.tss_ist2 = (register_t)&ps->dbgtramp.tr_pcb_rsp;
 
 	ltr(gsel_tss);
 
@@ -302,7 +334,7 @@ init_secondary(void)
 	msr = ((u_int64_t)GSEL(GCODE_SEL, SEL_KPL) << 32) |
 	      ((u_int64_t)GSEL(GUCODE32_SEL, SEL_UPL) << 48);
 	wrmsr(MSR_STAR, msr);
-	wrmsr(MSR_SF_MASK, PSL_NT|PSL_T|PSL_I|PSL_C|PSL_D|PSL_IOPL);
+	wrmsr(MSR_SF_MASK, PSL_NT|PSL_T|PSL_I|PSL_C|PSL_D|PSL_IOPL|PSL_AC);
 
 	pmap_set_opt();		/* PSE/4MB pages, etc */
 	pmap_init_pat();	/* Page Attribute Table */
@@ -316,8 +348,12 @@ init_secondary(void)
 	/* set up FPU state on the AP */
 	npxinit();
 
+	/* If BSP is in the X2APIC mode, put the AP into the X2APIC mode. */
+	if (x2apic_enable)
+		lapic_x2apic_enter(FALSE);
+
 	/* disable the APIC, just to be SURE */
-	lapic->svr &= ~APIC_SVR_ENABLE;
+	LAPIC_WRITE(svr, (LAPIC_READ(svr) & ~APIC_SVR_ENABLE));
 }
 
 /*******************************************************************
@@ -337,7 +373,7 @@ mp_start_aps(void *dummy __unused)
 		mp_bsp_simple_setup();
 	}
 }
-SYSINIT(startaps, SI_BOOT2_START_APS, SI_ORDER_FIRST, mp_start_aps, NULL)
+SYSINIT(startaps, SI_BOOT2_START_APS, SI_ORDER_FIRST, mp_start_aps, NULL);
 
 /*
  * start each AP in our list
@@ -421,10 +457,6 @@ start_all_aps(u_int boot_addr)
 		}
 		if (smibest > 250000)
 			smibest = 0;
-		if (smibest) {
-			smibest = smibest * (int64_t)1000000 /
-				  get_apic_timer_frequency();
-		}
 	}
 	if (smibest)
 		kprintf("SMI Frequency (worst case): %d Hz (%d us)\n",
@@ -435,7 +467,8 @@ start_all_aps(u_int boot_addr)
 		/* This is a bit verbose, it will go away soon.  */
 
 		pssize = sizeof(struct privatespace);
-		ps = (void *)kmem_alloc(&kernel_map, pssize);
+		ps = (void *)kmem_alloc3(&kernel_map, pssize, VM_SUBSYS_GD,
+					 KM_CPU(x));
 		CPU_prvspace[x] = ps;
 #if 0
 		kprintf("ps %d %p %d\n", x, ps, pssize);
@@ -448,8 +481,14 @@ start_all_aps(u_int boot_addr)
 		mi_gdinit(&gd->mi, x);
 		cpu_gdinit(gd, x);
 		ipiq_size = sizeof(struct lwkt_ipiq) * (naps + 1);
-		gd->mi.gd_ipiq = (void *)kmem_alloc(&kernel_map, ipiq_size);
+		gd->mi.gd_ipiq = (void *)kmem_alloc3(&kernel_map, ipiq_size,
+						     VM_SUBSYS_IPIQ, KM_CPU(x));
 		bzero(gd->mi.gd_ipiq, ipiq_size);
+
+		gd->gd_acpi_id = CPUID_TO_ACPIID(gd->mi.gd_cpuid);
+
+		/* initialize arc4random. */
+		arc4_init_pcpu(x);
 
 		/* setup a vector to our boot code */
 		*((volatile u_short *) WARMBOOT_OFF) = WARMBOOT_TARGET;
@@ -471,8 +510,10 @@ start_all_aps(u_int boot_addr)
 			CHECK_PRINT("trace");	/* show checkpoints */
 			/* better panic as the AP may be running loose */
 			kprintf("panic y/n? [y] ");
+			cnpoll(TRUE);
 			if (cngetc() != 'n')
 				panic("bye-bye");
+			cnpoll(FALSE);
 		}
 		CHECK_PRINT("trace");		/* show checkpoints */
 	}
@@ -480,13 +521,9 @@ start_all_aps(u_int boot_addr)
 	/* set ncpus to 1 + highest logical cpu.  Not all may have come up */
 	ncpus = x;
 
-	/* ncpus2 -- ncpus rounded down to the nearest power of 2 */
 	for (shift = 0; (1 << shift) <= ncpus; ++shift)
 		;
 	--shift;
-	ncpus2_shift = shift;
-	ncpus2 = 1 << shift;
-	ncpus2_mask = ncpus2 - 1;
 
 	/* ncpus_fit -- ncpus rounded up to the nearest power of 2 */
 	if ((1 << shift) < ncpus)
@@ -498,9 +535,18 @@ start_all_aps(u_int boot_addr)
 	mycpu->gd_other_cpus = smp_startup_mask;
 	CPUMASK_NANDBIT(mycpu->gd_other_cpus, mycpu->gd_cpuid);
 
+	malloc_reinit_ncpus();
+
+	gd = (struct mdglobaldata *)mycpu;
+	gd->gd_acpi_id = CPUID_TO_ACPIID(mycpu->gd_cpuid);
+
 	ipiq_size = sizeof(struct lwkt_ipiq) * ncpus;
-	mycpu->gd_ipiq = (void *)kmem_alloc(&kernel_map, ipiq_size);
+	mycpu->gd_ipiq = (void *)kmem_alloc3(&kernel_map, ipiq_size,
+					     VM_SUBSYS_IPIQ, KM_CPU(0));
 	bzero(mycpu->gd_ipiq, ipiq_size);
+
+	/* initialize arc4random. */
+	arc4_init_pcpu(0);
 
 	/* restore the warmstart vector */
 	*(u_long *) WARMBOOT_OFF = mpbioswarmvec;
@@ -618,7 +664,6 @@ start_ap(struct mdglobaldata *gd, u_int boot_addr, int smibest)
 {
 	int     physical_cpu;
 	int     vector;
-	u_long  icr_lo, icr_hi;
 
 	POSTCODE(START_AP_POST);
 
@@ -668,23 +713,16 @@ start_ap(struct mdglobaldata *gd, u_int boot_addr, int smibest)
 	 */
 
 	/*
-	 * Setup the address for the target AP.  We can setup
-	 * icr_hi once and then just trigger operations with
-	 * icr_lo.
-	 */
-	icr_hi = lapic->icr_hi & ~APIC_ID_MASK;
-	icr_hi |= (physical_cpu << 24);
-	icr_lo = lapic->icr_lo & 0xfff00000;
-	lapic->icr_hi = icr_hi;
-
-	/*
 	 * Do an INIT IPI: assert RESET
 	 *
 	 * Use edge triggered mode to assert INIT
 	 */
-	lapic->icr_lo = icr_lo | 0x00004500;
-	while (lapic->icr_lo & APIC_DELSTAT_MASK)
-		 /* spin */ ;
+	lapic_seticr_sync(physical_cpu,
+	    APIC_DESTMODE_PHY |
+	    APIC_DEST_DESTFLD |
+	    APIC_TRIGMOD_EDGE |
+	    APIC_LEVEL_ASSERT |
+	    APIC_DELMODE_INIT);
 
 	/*
 	 * The spec calls for a 10ms delay but we may have to use a
@@ -711,9 +749,12 @@ start_ap(struct mdglobaldata *gd, u_int boot_addr, int smibest)
 	 * Use level triggered mode to deassert.  It is unclear
 	 * why we need to do this.
 	 */
-	lapic->icr_lo = icr_lo | 0x00008500;
-	while (lapic->icr_lo & APIC_DELSTAT_MASK)
-		 /* spin */ ;
+	lapic_seticr_sync(physical_cpu,
+	    APIC_DESTMODE_PHY |
+	    APIC_DEST_DESTFLD |
+	    APIC_TRIGMOD_LEVEL |
+	    APIC_LEVEL_DEASSERT |
+	    APIC_DELMODE_INIT);
 	u_sleep(150);				/* wait 150us */
 
 	/*
@@ -723,10 +764,14 @@ start_ap(struct mdglobaldata *gd, u_int boot_addr, int smibest)
 	 * the previous INIT IPI has already run. and this STARTUP IPI will
 	 * run. OR the previous INIT IPI was ignored. and this STARTUP IPI
 	 * will run.
+	 *
+	 * XXX set APIC_LEVEL_ASSERT
 	 */
-	lapic->icr_lo = icr_lo | 0x00000600 | vector;
-	while (lapic->icr_lo & APIC_DELSTAT_MASK)
-		 /* spin */ ;
+	lapic_seticr_sync(physical_cpu,
+	    APIC_DESTMODE_PHY |
+	    APIC_DEST_DESTFLD |
+	    APIC_DELMODE_STARTUP |
+	    vector);
 	u_sleep(200);		/* wait ~200uS */
 
 	/*
@@ -734,10 +779,14 @@ start_ap(struct mdglobaldata *gd, u_int boot_addr, int smibest)
 	 * the previous STARTUP IPI was cancelled by a latched INIT IPI. OR
 	 * this STARTUP IPI will be ignored, as only ONE STARTUP IPI is
 	 * recognized after hardware RESET or INIT IPI.
+	 *
+	 * XXX set APIC_LEVEL_ASSERT
 	 */
-	lapic->icr_lo = icr_lo | 0x00000600 | vector;
-	while (lapic->icr_lo & APIC_DELSTAT_MASK)
-		 /* spin */ ;
+	lapic_seticr_sync(physical_cpu,
+	    APIC_DESTMODE_PHY |
+	    APIC_DEST_DESTFLD |
+	    APIC_DELMODE_STARTUP |
+	    vector);
 
 	/* Resume normal operation */
 	cpu_enable_intr();
@@ -786,137 +835,486 @@ smitest(void)
  * TLB is not flushed.  If the caller wishes to flush the current cpu's
  * TLB the caller must call cpu_invltlb() in addition to smp_invltlb().
  *
+ * This routine may be called concurrently from multiple cpus.  When this
+ * happens, smp_invltlb() can wind up sticking around in the confirmation
+ * while() loop at the end as additional cpus are added to the global
+ * cpumask, until they are acknowledged by another IPI.
+ *
  * NOTE: If for some reason we were unable to start all cpus we cannot
  *	 safely use broadcast IPIs.
  */
 
-static cpumask_t smp_invltlb_req;
+cpumask_t smp_smurf_mask;
+static cpumask_t smp_invltlb_mask;
+#define LOOPRECOVER
+#define LOOPMASK_IN
+#ifdef LOOPMASK_IN
+cpumask_t smp_in_mask;
+#endif
+cpumask_t smp_invmask;
+extern cpumask_t smp_idleinvl_mask;
+extern cpumask_t smp_idleinvl_reqs;
 
-#define SMP_INVLTLB_DEBUG
+/*
+ * Atomically OR bits in *mask to smp_smurf_mask.  Adjust *mask to remove
+ * bits that do not need to be IPId.  These bits are still part of the command,
+ * but the target cpus have already been signalled and do not need to be
+ * sigalled again.
+ */
+#include <sys/spinlock.h>
+#include <sys/spinlock2.h>
 
+static __noinline
+void
+smp_smurf_fetchset(cpumask_t *mask)
+{
+	cpumask_t omask;
+	int i;
+	__uint64_t obits;
+	__uint64_t nbits;
+
+	i = 0;
+	while (i < CPUMASK_ELEMENTS) {
+		obits = smp_smurf_mask.ary[i];
+		cpu_ccfence();
+		nbits = obits | mask->ary[i];
+		if (atomic_cmpset_long(&smp_smurf_mask.ary[i], obits, nbits)) {
+			omask.ary[i] = obits;
+			++i;
+		}
+	}
+	CPUMASK_NANDMASK(*mask, omask);
+}
+
+/*
+ * This is a mechanism which guarantees that cpu_invltlb() will be executed
+ * on idle cpus without having to signal or wake them up.  The invltlb will be
+ * executed when they wake up, prior to any scheduling or interrupt thread.
+ *
+ * (*mask) is modified to remove the cpus we successfully negotiate this
+ * function with.  This function may only be used with semi-synchronous
+ * commands (typically invltlb's or semi-synchronous invalidations which
+ * are usually associated only with kernel memory).
+ */
+void
+smp_smurf_idleinvlclr(cpumask_t *mask)
+{
+	if (optimized_invltlb) {
+		ATOMIC_CPUMASK_ORMASK(smp_idleinvl_reqs, *mask);
+		/* cpu_lfence() not needed */
+		CPUMASK_NANDMASK(*mask, smp_idleinvl_mask);
+	}
+}
+
+/*
+ * Issue cpu_invltlb() across all cpus except the current cpu.
+ *
+ * This function will arrange to avoid idle cpus, but still gurantee that
+ * invltlb is run on them when they wake up prior to any scheduling or
+ * nominal interrupt.
+ */
 void
 smp_invltlb(void)
 {
 	struct mdglobaldata *md = mdcpu;
-#ifdef SMP_INVLTLB_DEBUG
-	long count = 0;
-	long xcount = 0;
+	cpumask_t mask;
+	unsigned long rflags;
+#ifdef LOOPRECOVER
+	tsc_uclock_t tsc_base = rdtsc();
+	int repeats = 0;
 #endif
-	cpumask_t tmpmask;
-	cpumask_t tmpmask2;
 
-	crit_enter_gd(&md->mi);
-	CPUMASK_ASSZERO(md->gd_invltlb_ret);
-	++md->mi.gd_cnt.v_smpinvltlb;
-	ATOMIC_CPUMASK_ORBIT(smp_invltlb_req, md->mi.gd_cpuid);
-#ifdef SMP_INVLTLB_DEBUG
-again:
-#endif
-	if (CPUMASK_CMPMASKEQ(smp_startup_mask, smp_active_mask)) {
-		all_but_self_ipi(XINVLTLB_OFFSET);
-	} else {
-		tmpmask = smp_active_mask;
-		CPUMASK_NANDMASK(tmpmask, md->mi.gd_cpumask);
-		selected_apic_ipi(tmpmask, XINVLTLB_OFFSET, APIC_DELMODE_FIXED);
+	if (report_invltlb_src > 0) {
+		if (--report_invltlb_src <= 0)
+			print_backtrace(8);
 	}
 
-#ifdef SMP_INVLTLB_DEBUG
-	if (xcount)
-		kprintf("smp_invltlb: ipi sent\n");
-#endif
-	for (;;) {
-		tmpmask = smp_active_mask;
-		tmpmask2 = tmpmask;
-		CPUMASK_ANDMASK(tmpmask, md->gd_invltlb_ret);
-		CPUMASK_NANDMASK(tmpmask, md->mi.gd_cpumask);
-		CPUMASK_NANDMASK(tmpmask2, md->mi.gd_cpumask);
+	/*
+	 * Disallow normal interrupts, set all active cpus except our own
+	 * in the global smp_invltlb_mask.
+	 */
+	++md->mi.gd_cnt.v_smpinvltlb;
+	crit_enter_gd(&md->mi);
 
-		if (CPUMASK_CMPMASKEQ(tmpmask, tmpmask2))
-			break;
-		cpu_mfence();
+	/*
+	 * Bits we want to set in smp_invltlb_mask.  We do not want to signal
+	 * our own cpu.  Also try to remove bits associated with idle cpus
+	 * that we can flag for auto-invltlb.
+	 */
+	mask = smp_active_mask;
+	CPUMASK_NANDBIT(mask, md->mi.gd_cpuid);
+	smp_smurf_idleinvlclr(&mask);
+
+	rflags = read_rflags();
+	cpu_disable_intr();
+	ATOMIC_CPUMASK_ORMASK(smp_invltlb_mask, mask);
+
+	/*
+	 * IPI non-idle cpus represented by mask.  The omask calculation
+	 * removes cpus from the mask which already have a Xinvltlb IPI
+	 * pending (avoid double-queueing the IPI).
+	 *
+	 * We must disable real interrupts when setting the smurf flags or
+	 * we might race a XINVLTLB before we manage to send the ipi's for
+	 * the bits we set.
+	 *
+	 * NOTE: We are not signalling ourselves, mask already does NOT
+	 * include our own cpu.
+	 */
+	smp_smurf_fetchset(&mask);
+
+	/*
+	 * Issue the IPI.  Note that the XINVLTLB IPI runs regardless of
+	 * the critical section count on the target cpus.
+	 */
+	CPUMASK_ORMASK(mask, md->mi.gd_cpumask);
+	if (all_but_self_ipi_enable &&
+	    (all_but_self_ipi_enable >= 2 ||
+	     CPUMASK_CMPMASKEQ(smp_startup_mask, mask))) {
+		all_but_self_ipi(XINVLTLB_OFFSET);
+	} else {
+		CPUMASK_NANDMASK(mask, md->mi.gd_cpumask);
+		selected_apic_ipi(mask, XINVLTLB_OFFSET, APIC_DELMODE_FIXED);
+	}
+
+	/*
+	 * Wait for acknowledgement by all cpus.  smp_inval_intr() will
+	 * temporarily enable interrupts to avoid deadlocking the lapic,
+	 * and will also handle running cpu_invltlb() and remote invlpg
+	 * command son our cpu if some other cpu requests it of us.
+	 *
+	 * WARNING! I originally tried to implement this as a hard loop
+	 *	    checking only smp_invltlb_mask (and issuing a local
+	 *	    cpu_invltlb() if requested), with interrupts enabled
+	 *	    and without calling smp_inval_intr().  This DID NOT WORK.
+	 *	    It resulted in weird races where smurf bits would get
+	 *	    cleared without any action being taken.
+	 */
+	smp_inval_intr();
+	CPUMASK_ASSZERO(mask);
+	while (CPUMASK_CMPMASKNEQ(smp_invltlb_mask, mask)) {
+		smp_inval_intr();
 		cpu_pause();
-#ifdef SMP_INVLTLB_DEBUG
-		/* DEBUGGING */
-		if (++count == 400000000) {
-			print_backtrace(-1);
-			kprintf("smp_invltlb: endless loop %08lx %08lx, "
-				"rflags %016jx retry",
-			      (long)CPUMASK_LOWMASK(md->gd_invltlb_ret),
-			      (long)CPUMASK_LOWMASK(smp_invltlb_req),
-			      (intmax_t)read_rflags());
-			__asm __volatile ("sti");
-			++xcount;
-			if (xcount > 2)
-				lwkt_process_ipiq();
-			if (xcount > 3) {
-				int bcpu;
-				globaldata_t xgd;
-
-				tmpmask = smp_active_mask;
-				CPUMASK_NANDMASK(tmpmask, md->gd_invltlb_ret);
-				CPUMASK_NANDMASK(tmpmask, md->mi.gd_cpumask);
-				bcpu = BSFCPUMASK(tmpmask);
-
-				kprintf("bcpu %d\n", bcpu);
-				xgd = globaldata_find(bcpu);
-				kprintf("thread %p %s\n", xgd->gd_curthread, xgd->gd_curthread->td_comm);
+#ifdef LOOPRECOVER
+		if (tsc_frequency && rdtsc() - tsc_base > tsc_frequency) {
+			/*
+			 * cpuid 	- cpu doing the waiting
+			 * invltlb_mask - IPI in progress
+			 */
+			kprintf("smp_invltlb %d: waited too long inv=%08jx "
+				"smurf=%08jx "
+#ifdef LOOPMASK_IN
+				"in=%08jx "
+#endif
+				"idle=%08jx/%08jx\n",
+				md->mi.gd_cpuid,
+				smp_invltlb_mask.ary[0],
+				smp_smurf_mask.ary[0],
+#ifdef LOOPMASK_IN
+				smp_in_mask.ary[0],
+#endif
+				smp_idleinvl_mask.ary[0],
+				smp_idleinvl_reqs.ary[0]);
+			mdcpu->gd_xinvaltlb = 0;
+			ATOMIC_CPUMASK_NANDMASK(smp_smurf_mask,
+						smp_invltlb_mask);
+			smp_invlpg(&smp_active_mask);
+			tsc_base = rdtsc();
+			if (++repeats > 10) {
+				kprintf("smp_invltlb: giving up\n");
+				CPUMASK_ASSZERO(smp_invltlb_mask);
 			}
-			if (xcount > 5)
-				Debugger("giving up");
-			count = 0;
-			goto again;
 		}
 #endif
 	}
-	ATOMIC_CPUMASK_NANDBIT(smp_invltlb_req, md->mi.gd_cpuid);
+	write_rflags(rflags);
 	crit_exit_gd(&md->mi);
 }
 
 /*
- * Called from Xinvltlb assembly with interrupts disabled.  We didn't
- * bother to bump the critical section count or nested interrupt count
- * so only do very low level operations here.
+ * Called from a critical section with interrupts hard-disabled.
+ * This function issues an XINVLTLB IPI and then executes any pending
+ * command on the current cpu before returning.
  */
 void
-smp_invltlb_intr(void)
+smp_invlpg(cpumask_t *cmdmask)
 {
 	struct mdglobaldata *md = mdcpu;
-	struct mdglobaldata *omd;
 	cpumask_t mask;
-	int cpu;
 
-	cpu_mfence();
-	mask = smp_invltlb_req;
-	cpu_invltlb();
-	while (CPUMASK_TESTNZERO(mask)) {
-		cpu = BSFCPUMASK(mask);
-		CPUMASK_NANDBIT(mask, cpu);
-		omd = (struct mdglobaldata *)globaldata_find(cpu);
-		ATOMIC_CPUMASK_ORBIT(omd->gd_invltlb_ret, md->mi.gd_cpuid);
+	if (report_invlpg_src > 0) {
+		if (--report_invlpg_src <= 0)
+			print_backtrace(8);
 	}
+
+	/*
+	 * Disallow normal interrupts, set all active cpus in the pmap,
+	 * plus our own for completion processing (it might or might not
+	 * be part of the set).
+	 */
+	mask = smp_active_mask;
+	CPUMASK_ANDMASK(mask, *cmdmask);
+	CPUMASK_ORMASK(mask, md->mi.gd_cpumask);
+
+	/*
+	 * Avoid double-queuing IPIs, which can deadlock us.  We must disable
+	 * real interrupts when setting the smurf flags or we might race a
+	 * XINVLTLB before we manage to send the ipi's for the bits we set.
+	 *
+	 * NOTE: We might be including our own cpu in the smurf mask.
+	 */
+	smp_smurf_fetchset(&mask);
+
+	/*
+	 * Issue the IPI.  Note that the XINVLTLB IPI runs regardless of
+	 * the critical section count on the target cpus.
+	 *
+	 * We do not include our own cpu when issuing the IPI.
+	 */
+	if (all_but_self_ipi_enable &&
+	    (all_but_self_ipi_enable >= 2 ||
+	     CPUMASK_CMPMASKEQ(smp_startup_mask, mask))) {
+		all_but_self_ipi(XINVLTLB_OFFSET);
+	} else {
+		CPUMASK_NANDMASK(mask, md->mi.gd_cpumask);
+		selected_apic_ipi(mask, XINVLTLB_OFFSET, APIC_DELMODE_FIXED);
+	}
+
+	/*
+	 * This will synchronously wait for our command to complete,
+	 * as well as process commands from other cpus.  It also handles
+	 * reentrancy.
+	 *
+	 * (interrupts are disabled and we are in a critical section here)
+	 */
+	smp_inval_intr();
+}
+
+/*
+ * Issue rip/rsp sniffs
+ */
+void
+smp_sniff(void)
+{
+	globaldata_t gd = mycpu;
+	int dummy;
+	register_t rflags;
+
+	/*
+	 * Ignore all_but_self_ipi_enable here and just use it.
+	 */
+	rflags = read_rflags();
+	cpu_disable_intr();
+	all_but_self_ipi(XSNIFF_OFFSET);
+	gd->gd_sample_pc = smp_sniff;
+	gd->gd_sample_sp = &dummy;
+	write_rflags(rflags);
+}
+
+void
+cpu_sniff(int dcpu)
+{
+	globaldata_t rgd = globaldata_find(dcpu);
+	register_t rflags;
+	int dummy;
+
+	/*
+	 * Ignore all_but_self_ipi_enable here and just use it.
+	 */
+	rflags = read_rflags();
+	cpu_disable_intr();
+	single_apic_ipi(dcpu, XSNIFF_OFFSET, APIC_DELMODE_FIXED);
+	rgd->gd_sample_pc = cpu_sniff;
+	rgd->gd_sample_sp = &dummy;
+	write_rflags(rflags);
+}
+
+/*
+ * Called from Xinvltlb assembly with interrupts hard-disabled and in a
+ * critical section.  gd_intr_nesting_level may or may not be bumped
+ * depending on entry.
+ *
+ * THIS CODE IS INTENDED TO EXPLICITLY IGNORE THE CRITICAL SECTION COUNT.
+ * THAT IS, THE INTERRUPT IS INTENDED TO FUNCTION EVEN WHEN MAINLINE CODE
+ * IS IN A CRITICAL SECTION.
+ */
+void
+smp_inval_intr(void)
+{
+	struct mdglobaldata *md = mdcpu;
+	cpumask_t cpumask;
+#ifdef LOOPRECOVER
+	tsc_uclock_t tsc_base = rdtsc();
+#endif
+
+#if 0
+	/*
+	 * The idle code is in a critical section, but that doesn't stop
+	 * Xinvltlb from executing, so deal with the race which can occur
+	 * in that situation.  Otherwise r-m-w operations by pmap_inval_intr()
+	 * may have problems.
+	 */
+	if (ATOMIC_CPUMASK_TESTANDCLR(smp_idleinvl_reqs, md->mi.gd_cpuid)) {
+		ATOMIC_CPUMASK_NANDBIT(smp_invltlb_mask, md->mi.gd_cpuid);
+		cpu_invltlb();
+		cpu_mfence();
+	}
+#endif
+
+	/*
+	 * This is a real mess.  I'd like to just leave interrupts disabled
+	 * but it can cause the lapic to deadlock if too many interrupts queue
+	 * to it, due to the idiotic design of the lapic.  So instead we have
+	 * to enter a critical section so normal interrupts are made pending
+	 * and track whether this one was reentered.
+	 */
+	if (md->gd_xinvaltlb) {		/* reentrant on cpu */
+		md->gd_xinvaltlb = 2;
+		return;
+	}
+	md->gd_xinvaltlb = 1;
+
+	/*
+	 * Check only those cpus with active Xinvl* commands pending.
+	 *
+	 * We are going to enable interrupts so make sure we are in a
+	 * critical section.  This is necessary to avoid deadlocking
+	 * the lapic and to ensure that we execute our commands prior to
+	 * any nominal interrupt or preemption.
+	 *
+	 * WARNING! It is very important that we only clear out but in
+	 *	    smp_smurf_mask once for each interrupt we take.  In
+	 *	    this case, we clear it on initial entry and only loop
+	 *	    on the reentrancy detect (caused by another interrupt).
+	 */
+	cpumask = smp_invmask;
+#ifdef LOOPMASK_IN
+	ATOMIC_CPUMASK_ORBIT(smp_in_mask, md->mi.gd_cpuid);
+#endif
+loop:
+	cpu_enable_intr();
+	ATOMIC_CPUMASK_NANDBIT(smp_smurf_mask, md->mi.gd_cpuid);
+
+	/*
+	 * Specific page request(s), and we can't return until all bits
+	 * are zero.
+	 */
+	for (;;) {
+		int toolong;
+
+		/*
+		 * Also execute any pending full invalidation request in
+		 * this loop.
+		 */
+		if (CPUMASK_TESTBIT(smp_invltlb_mask, md->mi.gd_cpuid)) {
+			ATOMIC_CPUMASK_NANDBIT(smp_invltlb_mask,
+					       md->mi.gd_cpuid);
+			cpu_invltlb();
+			cpu_mfence();
+		}
+
+#ifdef LOOPRECOVER
+		if (tsc_frequency && rdtsc() - tsc_base > tsc_frequency) {
+			/*
+			 * cpuid 	- cpu doing the waiting
+			 * invmask	- IPI in progress
+			 * invltlb_mask - which ones are TLB invalidations?
+			 */
+			kprintf("smp_inval_intr %d inv=%08jx tlbm=%08jx "
+				"smurf=%08jx "
+#ifdef LOOPMASK_IN
+				"in=%08jx "
+#endif
+				"idle=%08jx/%08jx\n",
+				md->mi.gd_cpuid,
+				smp_invmask.ary[0],
+				smp_invltlb_mask.ary[0],
+				smp_smurf_mask.ary[0],
+#ifdef LOOPMASK_IN
+				smp_in_mask.ary[0],
+#endif
+				smp_idleinvl_mask.ary[0],
+				smp_idleinvl_reqs.ary[0]);
+			tsc_base = rdtsc();
+			toolong = 1;
+		} else {
+			toolong = 0;
+		}
+#else
+		toolong = 0;
+#endif
+
+		/*
+		 * We can only add bits to the cpumask to test during the
+		 * loop because the smp_invmask bit is cleared once the
+		 * originator completes the command (the targets may still
+		 * be cycling their own completions in this loop, afterwords).
+		 *
+		 * lfence required prior to all tests as this Xinvltlb
+		 * interrupt could race the originator (already be in progress
+		 * wnen the originator decides to issue, due to an issue by
+		 * another cpu).
+		 */
+		cpu_lfence();
+		CPUMASK_ORMASK(cpumask, smp_invmask);
+		/*cpumask = smp_active_mask;*/	/* XXX */
+		cpu_lfence();
+
+		if (pmap_inval_intr(&cpumask, toolong) == 0) {
+			/*
+			 * Clear our smurf mask to allow new IPIs, but deal
+			 * with potential races.
+			 */
+			break;
+		}
+
+		/*
+		 * Test if someone sent us another invalidation IPI, break
+		 * out so we can take it to avoid deadlocking the lapic
+		 * interrupt queue (? stupid intel, amd).
+		 */
+		if (md->gd_xinvaltlb == 2)
+			break;
+		/*
+		if (CPUMASK_TESTBIT(smp_smurf_mask, md->mi.gd_cpuid))
+			break;
+		*/
+	}
+
+	/*
+	 * Full invalidation request
+	 */
+	if (CPUMASK_TESTBIT(smp_invltlb_mask, md->mi.gd_cpuid)) {
+		ATOMIC_CPUMASK_NANDBIT(smp_invltlb_mask,
+				       md->mi.gd_cpuid);
+		cpu_invltlb();
+		cpu_mfence();
+	}
+
+	/*
+	 * Check to see if another Xinvltlb interrupt occurred and loop up
+	 * if it did.
+	 */
+	cpu_disable_intr();
+	if (md->gd_xinvaltlb == 2) {
+		md->gd_xinvaltlb = 1;
+		goto loop;
+	}
+#ifdef LOOPMASK_IN
+	ATOMIC_CPUMASK_NANDBIT(smp_in_mask, md->mi.gd_cpuid);
+#endif
+	md->gd_xinvaltlb = 0;
 }
 
 void
 cpu_wbinvd_on_all_cpus_callback(void *arg)
 {
-    wbinvd();
-}
-
-void
-smp_invlpg_range_cpusync(void *arg)
-{
-	vm_offset_t eva, sva, addr;
-	sva = ((struct smp_invlpg_range_cpusync_arg *)arg)->sva;
-	eva = ((struct smp_invlpg_range_cpusync_arg *)arg)->eva;
-
-	for (addr = sva; addr < eva; addr += PAGE_SIZE) {
-		cpu_invlpg((void *)addr);
-	}
+	wbinvd();
 }
 
 /*
  * When called the executing CPU will send an IPI to all other CPUs
- *  requesting that they halt execution.
+ * requesting that they halt execution.
  *
  * Usually (but not necessarily) called with 'other_cpus' as its arg.
  *
@@ -1046,12 +1444,12 @@ ap_init(void)
 	ATOMIC_CPUMASK_NANDBIT(mycpu->gd_other_cpus, mycpu->gd_cpuid);
 
 	/* A quick check from sanity claus */
-	cpu_id = APICID_TO_CPUID((lapic->id & 0xff000000) >> 24);
+	cpu_id = APICID_TO_CPUID(LAPIC_READID);
 	if (mycpu->gd_cpuid != cpu_id) {
 		kprintf("SMP: assigned cpuid = %d\n", mycpu->gd_cpuid);
 		kprintf("SMP: actual cpuid = %d lapicid %d\n",
-			cpu_id, (lapic->id & 0xff000000) >> 24);
-#if JGXXX
+			cpu_id, LAPIC_READID);
+#if 0 /* JGXXX */
 		kprintf("PTD[MPPTDI] = %p\n", (void *)PTD[MPPTDI]);
 #endif
 		panic("cpuid mismatch! boom!!");
@@ -1143,8 +1541,9 @@ ap_init(void)
 	 * Once the critical section has exited, normal interrupt processing
 	 * may occur.
 	 */
+	atomic_swap_int(&mycpu->gd_npoll, 0);
 	lwkt_process_ipiq();
-	crit_exit_noyield(mycpu->gd_curthread);
+	crit_exit();
 
 	/*
 	 * Final final, allow the waiting BSP to resume the boot process,
@@ -1201,8 +1600,11 @@ ap_finish(void)
 	}
 }
 
-SYSINIT(finishsmp, SI_BOOT2_FINISH_SMP, SI_ORDER_FIRST, ap_finish, NULL)
+SYSINIT(finishsmp, SI_BOOT2_FINISH_SMP, SI_ORDER_FIRST, ap_finish, NULL);
 
+/*
+ * Interrupts must be hard-disabled by caller
+ */
 void
 cpu_send_ipiq(int dcpu)
 {
@@ -1229,15 +1631,23 @@ cpu_send_ipiq_passive(int dcpu)
 static void
 mp_bsp_simple_setup(void)
 {
+	struct mdglobaldata *gd;
 	size_t ipiq_size;
 
 	/* build our map of 'other' CPUs */
 	mycpu->gd_other_cpus = smp_startup_mask;
 	CPUMASK_NANDBIT(mycpu->gd_other_cpus, mycpu->gd_cpuid);
 
+	gd = (struct mdglobaldata *)mycpu;
+	gd->gd_acpi_id = CPUID_TO_ACPIID(mycpu->gd_cpuid);
+
 	ipiq_size = sizeof(struct lwkt_ipiq) * ncpus;
-	mycpu->gd_ipiq = (void *)kmem_alloc(&kernel_map, ipiq_size);
+	mycpu->gd_ipiq = (void *)kmem_alloc(&kernel_map, ipiq_size,
+					    VM_SUBSYS_IPIQ);
 	bzero(mycpu->gd_ipiq, ipiq_size);
+
+	/* initialize arc4random. */
+	arc4_init_pcpu(0);
 
 	pmap_set_opt();
 
@@ -1331,23 +1741,135 @@ static void
 detect_amd_topology(int count_htt_cores)
 {
 	int shift = 0;
-	if ((cpu_feature & CPUID_HTT)
-			&& (amd_feature2 & AMDID2_CMP)) {
-		
+	if ((cpu_feature & CPUID_HTT) && (amd_feature2 & AMDID2_CMP)) {
 		if (cpu_procinfo2 & AMDID_COREID_SIZE) {
-			core_bits = (cpu_procinfo2 & AMDID_COREID_SIZE)
-			    >> AMDID_COREID_SIZE_SHIFT;
+			core_bits = (cpu_procinfo2 & AMDID_COREID_SIZE) >>
+				    AMDID_COREID_SIZE_SHIFT;
 		} else {
 			core_bits = (cpu_procinfo2 & AMDID_CMP_CORES) + 1;
 			for (shift = 0; (1 << shift) < core_bits; ++shift)
 				;
 			core_bits = shift;
 		}
-
 		logical_CPU_bits = count_htt_cores >> core_bits;
 		for (shift = 0; (1 << shift) < logical_CPU_bits; ++shift)
 			;
 		logical_CPU_bits = shift;
+
+		kprintf("core_bits %d logical_CPU_bits %d\n",
+			core_bits - logical_CPU_bits, logical_CPU_bits);
+
+		if (amd_feature2 & AMDID2_TOPOEXT) {
+			u_int p[4];	/* eax,ebx,ecx,edx */
+			int nodes;
+
+			cpuid_count(0x8000001e, 0, p);
+
+			switch(((p[1] >> 8) & 3) + 1) {
+			case 1:
+				logical_CPU_bits = 0;
+				break;
+			case 2:
+				logical_CPU_bits = 1;
+				break;
+			case 3:
+			case 4:
+				logical_CPU_bits = 2;
+				break;
+			}
+
+			/*
+			 * Nodes are kind of a stand-in for packages*sockets,
+			 * but can be thought of in terms of Numa domains.
+			 */
+			nodes = ((p[2] >> 8) & 7) + 1;
+			switch(nodes) {
+			case 8:
+			case 7:
+			case 6:
+			case 5:
+				--core_bits;
+				/* fallthrough */
+			case 4:
+			case 3:
+				--core_bits;
+				/* fallthrough */
+			case 2:
+				--core_bits;
+				/* fallthrough */
+			case 1:
+				break;
+			}
+			core_bits -= logical_CPU_bits;
+			kprintf("%d-way htt, %d Nodes, %d cores/node\n",
+				(int)(((p[1] >> 8) & 3) + 1),
+				nodes,
+				1 << core_bits);
+
+		}
+#if 0
+		if (amd_feature2 & AMDID2_TOPOEXT) {
+			u_int p[4];
+			int i;
+			int type;
+			int level;
+			int share_count;
+
+			logical_CPU_bits = 0;
+			core_bits = 0;
+
+			for (i = 0; i < 256; ++i)  {
+				cpuid_count(0x8000001d, i, p);
+				type = p[0] & 0x1f;
+				level = (p[0] >> 5) & 0x7;
+				share_count = 1 + ((p[0] >> 14) & 0xfff);
+
+				if (type == 0)
+					break;
+				kprintf("Topology probe i=%2d type=%d "
+					"level=%d share_count=%d\n",
+					i, type, level, share_count);
+				shift = 0;
+				while ((1 << shift) < share_count)
+					++shift;
+
+				switch(type) {
+				case 1:
+					/*
+					 * CPUID_TYPE_SMT
+					 *
+					 * Logical CPU (SMT)
+					 */
+					logical_CPU_bits = shift;
+					break;
+				case 2:
+					/*
+					 * CPUID_TYPE_CORE
+					 *
+					 * Physical subdivision of a package
+					 */
+					core_bits = logical_CPU_bits +
+						    shift;
+					break;
+				case 3:
+					/*
+					 * CPUID_TYPE_CACHE
+					 *
+					 * CPU L1/L2/L3 cache
+					 */
+					break;
+				case 4:
+					/*
+					 * CPUID_TYPE_PKG
+					 *
+					 * Package aka chip, equivalent to
+					 * socket
+					 */
+					break;
+				}
+			}
+		}
+#endif
 	} else {
 		for (shift = 0; (1 << shift) < count_htt_cores; ++shift)
 			;
@@ -1363,6 +1885,7 @@ amd_get_compute_unit_id(void *arg)
 
 	do_cpuid(0x8000001e, regs);
 	cpu_node_t * mynode = get_cpu_node_by_cpuid(mycpuid);
+
 	/* 
 	 * AMD - CPUID Specification September 2010
 	 * page 34 - //ComputeUnitID = ebx[0:7]//
@@ -1389,11 +1912,11 @@ fix_amd_topology(void)
 		kprintf("%d-%d; \n",
 			i, get_cpu_node_by_cpuid(i)->compute_unit_id);
 	}
-
 	return 0;
 }
 
-/* Calculate
+/*
+ * Calculate
  * - logical_CPU_bits
  * - core_bits
  * With the values above (for AMD or INTEL) we are able to generally
@@ -1407,34 +1930,31 @@ detect_cpu_topology(void)
 	static int topology_detected = 0;
 	int count = 0;
 	
-	if (topology_detected) {
+	if (topology_detected)
 		goto OUT;
-	}
-	
 	if ((cpu_feature & CPUID_HTT) == 0) {
 		core_bits = 0;
 		logical_CPU_bits = 0;
 		goto OUT;
-	} else {
-		count = (cpu_procinfo & CPUID_HTT_CORES)
-		    >> CPUID_HTT_CORE_SHIFT;
-	}	
-
-	if (cpu_vendor_id == CPU_VENDOR_INTEL) {
-		detect_intel_topology(count);	
-	} else if (cpu_vendor_id == CPU_VENDOR_AMD) {
-		detect_amd_topology(count);
 	}
+	count = (cpu_procinfo & CPUID_HTT_CORES) >> CPUID_HTT_CORE_SHIFT;
+
+	if (cpu_vendor_id == CPU_VENDOR_INTEL)
+		detect_intel_topology(count);	
+	else if (cpu_vendor_id == CPU_VENDOR_AMD)
+		detect_amd_topology(count);
+	topology_detected = 1;
 
 OUT:
-	if (bootverbose)
-		kprintf("Bits within APICID: logical_CPU_bits: %d; core_bits: %d\n",
-		    logical_CPU_bits, core_bits);
-
-	topology_detected = 1;
+	if (bootverbose) {
+		kprintf("Bits within APICID: logical_CPU_bits: %d; "
+			"core_bits: %d\n",
+			logical_CPU_bits, core_bits);
+	}
 }
 
-/* Interface functions to calculate chip_ID,
+/*
+ * Interface functions to calculate chip_ID,
  * core_number and logical_number
  * Ref: http://wiki.osdev.org/Detecting_CPU_Topology_(80x86)
  */
@@ -1446,15 +1966,21 @@ get_chip_ID(int cpuid)
 }
 
 int
+get_chip_ID_from_APICID(int apicid)
+{
+	return apicid >> (logical_CPU_bits + core_bits);
+}
+
+int
 get_core_number_within_chip(int cpuid)
 {
-	return (get_apicid_from_cpuid(cpuid) >> logical_CPU_bits) &
-	    ( (1 << core_bits) -1);
+	return ((get_apicid_from_cpuid(cpuid) >> logical_CPU_bits) &
+		((1 << core_bits) - 1));
 }
 
 int
 get_logical_CPU_number_within_core(int cpuid)
 {
-	return get_apicid_from_cpuid(cpuid) &
-	    ( (1 << logical_CPU_bits) -1);
+	return (get_apicid_from_cpuid(cpuid) &
+		((1 << logical_CPU_bits) - 1));
 }

@@ -36,7 +36,7 @@
 
 #include <sys/param.h>
 #include <sys/systm.h>
-#include <sys/sysproto.h>
+#include <sys/sysmsg.h>
 #include <sys/buf.h>
 #include <sys/proc.h>
 #include <sys/priv.h>
@@ -57,8 +57,6 @@
 #include <vm/vm_zone.h>
 #include <vm/vm_param.h>
 
-#include <sys/thread2.h>
-#include <sys/mplock2.h>
 #include <sys/mutex2.h>
 #include <sys/spinlock2.h>
 
@@ -72,10 +70,10 @@
 static struct swdevt should_be_malloced[NSWAPDEV];
 struct swdevt *swdevt = should_be_malloced;	/* exported to pstat/systat */
 static swblk_t nswap;		/* first block after the interleaved devs */
-static struct mtx swap_mtx = MTX_INITIALIZER;
+static struct mtx swap_mtx = MTX_INITIALIZER("swpmtx");
 int nswdev = NSWAPDEV;				/* exported to pstat/systat */
-int vm_swap_size;
-int vm_swap_max;
+swblk_t vm_swap_size;
+swblk_t vm_swap_max;
 
 static int swapoff_one(int index);
 struct vnode *swapdev_vp;
@@ -86,6 +84,9 @@ struct vnode *swapdev_vp;
  * vn_strategy() for swapdev_vp.  Perform swap strategy interleave device
  * selection.
  *
+ * This function supports the KVABIO API.  If the underlying vnode/device
+ * does not, it will make appropriate adjustments.
+ *
  * No requirements.
  */
 static int
@@ -94,10 +95,11 @@ swapdev_strategy(struct vop_strategy_args *ap)
 	struct bio *bio = ap->a_bio;
 	struct bio *nbio;
 	struct buf *bp = bio->bio_buf;
-	int sz, off, seg, index, blkno, nblkno;
+	swblk_t sz, off, seg, blkno, nblkno;
+	int index;
 	struct swdevt *sp;
 	sz = howmany(bp->b_bcount, PAGE_SIZE);
-	blkno = (int)(bio->bio_offset >> PAGE_SHIFT);
+	blkno = (swblk_t)(bio->bio_offset >> PAGE_SHIFT);
 
 	/*
 	 * Convert interleaved swap into per-device swap.  Note that
@@ -106,22 +108,22 @@ swapdev_strategy(struct vop_strategy_args *ap)
 	 */
 	nbio = push_bio(bio);
 	if (nswdev > 1) {
-		off = blkno % dmmax;
-		if (off + sz > dmmax) {
+		off = blkno % SWB_DMMAX;
+		if (off + sz > SWB_DMMAX) {
 			bp->b_error = EINVAL;
 			bp->b_flags |= B_ERROR;
 			biodone(bio);
 			return 0;
 		}
-		seg = blkno / dmmax;
+		seg = blkno / SWB_DMMAX;
 		index = seg % nswdev;
 		seg /= nswdev;
-		nbio->bio_offset = (off_t)(seg * dmmax + off) << PAGE_SHIFT;
+		nbio->bio_offset = (off_t)(seg * SWB_DMMAX + off) << PAGE_SHIFT;
 	} else {
 		index = 0;
 		nbio->bio_offset = bio->bio_offset;
 	}
-	nblkno = (int)(nbio->bio_offset >> PAGE_SHIFT);
+	nblkno = (swblk_t)(nbio->bio_offset >> PAGE_SHIFT);
 	sp = &swdevt[index];
 	if (nblkno + sz > sp->sw_nblks) {
 		bp->b_error = EINVAL;
@@ -148,6 +150,7 @@ swapdev_strategy(struct vop_strategy_args *ap)
 	 * device's DMA limits.
 	 */
 	vn_strategy(sp->sw_vp, nbio);
+
 	return 0;
 }
 
@@ -188,7 +191,7 @@ VNODEOP_SET(swapdev_vnode_vops);
  * No requirements.
  */
 int
-sys_swapon(struct swapon_args *uap)
+sys_swapon(struct sysmsg *sysmsg, const struct swapon_args *uap)
 {
 	struct thread *td = curthread;
 	struct vattr attr;
@@ -201,7 +204,6 @@ sys_swapon(struct swapon_args *uap)
 		return (error);
 
 	mtx_lock(&swap_mtx);
-	get_mplock();
 	vp = NULL;
 	error = nlookup_init(&nd, uap->name, UIO_USERSPACE, NLC_FOLLOW);
 	if (error == 0)
@@ -210,7 +212,6 @@ sys_swapon(struct swapon_args *uap)
 		error = cache_vref(&nd.nl_nch, nd.nl_cred, &vp);
 	nlookup_done(&nd);
 	if (error) {
-		rel_mplock();
 		mtx_unlock(&swap_mtx);
 		return (error);
 	}
@@ -227,7 +228,6 @@ sys_swapon(struct swapon_args *uap)
 	}
 	if (error)
 		vrele(vp);
-	rel_mplock();
 	mtx_unlock(&swap_mtx);
 
 	return (error);
@@ -236,7 +236,7 @@ sys_swapon(struct swapon_args *uap)
 /*
  * Swfree(index) frees the index'th portion of the swap map.
  * Each of the nswdev devices provides 1/nswdev'th of the swap
- * space, which is laid out with blocks of dmmax pages circularly
+ * space, which is laid out with blocks of SWB_DMMAX pages circularly
  * among the devices.
  *
  * The new swap code uses page-sized blocks.  The old swap code used
@@ -263,12 +263,17 @@ swaponvp(struct thread *td, struct vnode *vp, u_quad_t nblks)
 	lwkt_gettoken(&vm_token);	/* needed for vm_swap_size and blist */
 	mtx_lock(&swap_mtx);
 
+	/*
+	 * Setup swapdev_vp.  We support the KVABIO API for this vnode's
+	 * strategy function.
+	 */
 	if (!swapdev_vp) {
 		error = getspecialvnode(VT_NON, NULL, &swapdev_vnode_vops_p,
 				    &swapdev_vp, 0, 0);
 		if (error)
 			panic("Cannot get vnode for swapdev");
 		swapdev_vp->v_type = VNON;	/* Untyped */
+		vsetflags(swapdev_vp, VKVABIO);
 		vx_unlock(swapdev_vp);
 	}
 
@@ -337,8 +342,8 @@ swaponvp(struct thread *td, struct vnode *vp, u_quad_t nblks)
 	 * this test also ensures.
 	 */
 	if (nblks > BLIST_MAXBLKS / nswdev) {
-		kprintf("exceeded maximum of %d blocks per swap unit\n",
-			(int)BLIST_MAXBLKS / nswdev);
+		kprintf("exceeded maximum of %ld blocks per swap unit\n",
+			(long)BLIST_MAXBLKS / nswdev);
 		vn_lock(vp, LK_EXCLUSIVE | LK_RETRY);
 		VOP_CLOSE(vp, FREAD | FWRITE, NULL);
 		vn_unlock(vp);
@@ -347,17 +352,18 @@ swaponvp(struct thread *td, struct vnode *vp, u_quad_t nblks)
 	}
 
 	sp->sw_vp = vp;
-	sp->sw_dev = dev2udev(dev);
+	sp->sw_dev = devid_from_dev(dev);
 	sp->sw_device = dev;
 	sp->sw_flags = SW_FREED;
 	sp->sw_nused = 0;
 
 	/*
-	 * nblks, nswap, and dmmax are PAGE_SIZE'd parameters now, not
+	 * nblks, nswap, and SWB_DMMAX are PAGE_SIZE'd parameters now, not
 	 * DEV_BSIZE'd.   aligned_nblks is used to calculate the
 	 * size of the swap bitmap, taking into account the stripe size.
 	 */
-	aligned_nblks = (swblk_t)((nblks + (dmmax - 1)) & ~(u_long)(dmmax - 1));
+	aligned_nblks = (swblk_t)((nblks + SWB_DMMASK) &
+				  ~(u_swblk_t)SWB_DMMASK);
 	sp->sw_nblks = aligned_nblks;
 
 	if (aligned_nblks * nswdev > nswap)
@@ -368,9 +374,9 @@ swaponvp(struct thread *td, struct vnode *vp, u_quad_t nblks)
 	else
 		blist_resize(&swapblist, nswap, 0);
 
-	for (dvbase = dmmax; dvbase < aligned_nblks; dvbase += dmmax) {
-		blk = min(aligned_nblks - dvbase, dmmax);
-		vsbase = index * dmmax + dvbase * nswdev;
+	for (dvbase = SWB_DMMAX; dvbase < aligned_nblks; dvbase += SWB_DMMAX) {
+		blk = min(aligned_nblks - dvbase, SWB_DMMAX);
+		vsbase = index * SWB_DMMAX + dvbase * nswdev;
 		blist_free(swapblist, vsbase, blk);
 		vm_swap_size += blk;
 		vm_swap_max += blk;
@@ -394,7 +400,7 @@ done:
  * No requirements.
  */
 int
-sys_swapoff(struct swapoff_args *uap)
+sys_swapoff(struct sysmsg *sysmsg, const struct swapoff_args *uap)
 {
 	struct vnode *vp;
 	struct nlookupdata nd;
@@ -406,7 +412,6 @@ sys_swapoff(struct swapoff_args *uap)
 		return (error);
 
 	mtx_lock(&swap_mtx);
-	get_mplock();
 	vp = NULL;
 	error = nlookup_init(&nd, uap->name, UIO_USERSPACE, NLC_FOLLOW);
 	if (error == 0)
@@ -425,9 +430,9 @@ sys_swapoff(struct swapoff_args *uap)
 	goto done;
 found:
 	error = swapoff_one(index);
+	swap_pager_newswap();
 
 done:
-	rel_mplock();
 	mtx_unlock(&swap_mtx);
 	return (error);
 }
@@ -457,7 +462,8 @@ swapoff_one(int index)
 	 */
 	for (q = 0; q < PQ_L2_SIZE; ++q) {
 		bzero(&marker, sizeof(marker));
-		marker.flags = PG_BUSY | PG_FICTITIOUS | PG_MARKER;
+		marker.flags = PG_FICTITIOUS | PG_MARKER;
+		marker.busy_count = PBUSY_LOCKED;
 		marker.queue = PQ_ACTIVE + q;
 		marker.pc = q;
 		marker.wire_count = 1;
@@ -530,9 +536,9 @@ swapoff_one(int index)
 	 * Prevent further allocations on this device
 	 */
 	sp->sw_flags |= SW_CLOSING;
-	for (dvbase = dmmax; dvbase < aligned_nblks; dvbase += dmmax) {
-		blk = min(aligned_nblks - dvbase, dmmax);
-		vsbase = index * dmmax + dvbase * nswdev;
+	for (dvbase = SWB_DMMAX; dvbase < aligned_nblks; dvbase += SWB_DMMAX) {
+		blk = min(aligned_nblks - dvbase, SWB_DMMAX);
+		vsbase = index * SWB_DMMAX + dvbase * nswdev;
 		vm_swap_size -= blist_fill(swapblist, vsbase, blk);
 		vm_swap_max -= blk;
 	}
@@ -586,10 +592,10 @@ void
 swapacctspace(swblk_t base, swblk_t count)
 {
 	int index;
-	int seg;
+	swblk_t seg;
 
 	vm_swap_size += count;
-	seg = base / dmmax;
+	seg = base / SWB_DMMAX;
 	index = seg % nswdev;
 	swdevt[index].sw_nused -= count;
 }

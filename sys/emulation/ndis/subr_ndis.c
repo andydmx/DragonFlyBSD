@@ -60,7 +60,6 @@
 #include <sys/mutex.h>
 #include <sys/socket.h>
 #include <sys/sysctl.h>
-#include <sys/_timespec.h>
 #include <sys/queue.h>
 #include <sys/proc.h>
 #include <sys/filedesc.h>
@@ -70,7 +69,7 @@
 #include <sys/kthread.h>
 #include <sys/linker.h>
 #include <sys/mount.h>
-#include <sys/sysproto.h>
+#include <sys/sysmsg.h>
 
 #include <net/if.h>
 #include <net/if_arp.h>
@@ -82,7 +81,6 @@
 
 #include <sys/bus.h>
 #include <sys/rman.h>
-#include <sys/mplock2.h>
 
 #include <netproto/802_11/ieee80211_var.h>
 #include <netproto/802_11/ieee80211_ioctl.h>
@@ -105,8 +103,6 @@
 #include <vm/pmap.h>
 #include <vm/vm_kern.h>
 #include <vm/vm_map.h>
-
-#include <stdarg.h>
 
 static char ndis_filepath[MAXPATHLEN];
 
@@ -599,7 +595,7 @@ NdisReadConfiguration(ndis_status *status, ndis_config_parm **parm,
 	 * See if registry key is already in a list of known keys
 	 * included with the driver.
 	 */
-	TAILQ_FOREACH(e, &sc->ndis_ctx, link) {
+	TAILQ_FOREACH(e, device_get_sysctl_ctx(sc->ndis_dev), link) {
 		oidp = e->entry;
 		if (strcasecmp(oidp->oid_name, keystr) == 0) {
 			if (strcmp((char *)oidp->oid_arg1, "UNSET") == 0) {
@@ -696,7 +692,7 @@ NdisWriteConfiguration(ndis_status *status, ndis_handle cfg,
 
 	/* See if the key already exists. */
 
-	TAILQ_FOREACH(e, &sc->ndis_ctx, link) {
+	TAILQ_FOREACH(e, device_get_sysctl_ctx(sc->ndis_dev), link) {
 		oidp = e->entry;
 		if (strcasecmp(oidp->oid_name, keystr) == 0) {
 			/* Found it, set the value. */
@@ -901,7 +897,7 @@ NdisWriteErrorLogEntry(ndis_handle adapter, ndis_error_code code,
 	uint32_t numerrors, ...)
 {
 	ndis_miniport_block	*block;
-	va_list			ap;
+	__va_list		ap;
 	int			i, error;
 	char			*str = NULL;
 	uint16_t		flags;
@@ -938,11 +934,11 @@ NdisWriteErrorLogEntry(ndis_handle adapter, ndis_error_code code,
 
 	if (ifp != NULL && ifp->if_flags & IFF_DEBUG) {
 		device_printf(dev, "NDIS NUMERRORS: %x\n", numerrors);
-		va_start(ap, numerrors);
+		__va_start(ap, numerrors);
 		for (i = 0; i < numerrors; i++)
 			device_printf(dev, "argptr: %p\n",
-			    va_arg(ap, void *));
-		va_end(ap);
+			    __va_arg(ap, void *));
+		__va_end(ap);
 	}
 
 	if (as.as_len)

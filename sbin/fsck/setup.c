@@ -34,7 +34,6 @@
 #include <sys/param.h>
 #include <sys/stat.h>
 #include <sys/diskslice.h>
-#include <sys/file.h>
 
 #include <vfs/ufs/dinode.h>
 #include <vfs/ufs/fs.h>
@@ -42,13 +41,32 @@
 #include <ctype.h>
 #include <err.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <string.h>
 
 #include "fsck.h"
 
+struct bufarea sblk;		/* file system superblock */
+struct inoinfo **inphead, **inpsort;	/* Inode cache data structures. */
+long numdirs, dirhash, listmax, inplast, dirhashmask;
+long	dev_bsize;		/* computed value of DEV_BSIZE */
+long	secsize;		/* actual disk sector size */
+char	fflag;			/* force check, ignore clean flag */
+int	bflag;			/* location of alternate super block */
+int	cvtlevel;		/* convert to newer file system format */
+int	doinglevel1;		/* converting to new cylinder group format */
+int	doinglevel2;		/* converting to new inode format */
+char	usedsoftdep;		/* just fix soft dependency inconsistencies */
+char	havesb;			/* superblock has been read */
+int	fsreadfd;		/* file descriptor for reading file system */
+int	fswritefd;		/* file descriptor for writing file system */
+ufs_daddr_t maxfsblock;		/* number of blocks in the file system */
+char	*blockmap;		/* ptr to primary blk allocation map */
+ufs1_ino_t	maxino;			/* number of inodes in file system */
+
+
 struct bufarea asblk;
 #define altsblock (*asblk.b_un.b_fs)
-#define POWEROF2(num)	(((num) & ((num) - 1)) == 0)
 
 static void badsb(int listerr, char *s);
 static int readsb(int listerr);
@@ -205,12 +223,12 @@ setup(char *dev)
 		doinglevel2++;
 		sblock.fs_inodefmt = FS_44INODEFMT;
 		sizepb = sblock.fs_bsize;
-		sblock.fs_maxfilesize = sblock.fs_bsize * NDADDR - 1;
-		for (i = 0; i < NIADDR; i++) {
+		sblock.fs_maxfilesize = sblock.fs_bsize * UFS_NDADDR - 1;
+		for (i = 0; i < UFS_NIADDR; i++) {
 			sizepb *= NINDIR(&sblock);
 			sblock.fs_maxfilesize += sizepb;
 		}
-		sblock.fs_maxsymlinklen = MAXSYMLINKLEN;
+		sblock.fs_maxsymlinklen = UFS1_MAXSYMLINKLEN;
 		sblock.fs_qbmask = ~sblock.fs_bmask;
 		sblock.fs_qfmask = ~sblock.fs_fmask;
 		sbdirty();

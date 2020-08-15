@@ -95,7 +95,6 @@
 #include <sys/module.h>
 #include <sys/bus.h>
 #include <sys/rman.h> 
-#include <sys/thread2.h>
 
 #include <net/ethernet.h>
 #include <net/if.h>
@@ -1016,7 +1015,7 @@ read_another:
 	/*
 	 * Allocate a header mbuf from the kernel.
 	 */
-	MGETHDR(m, MB_DONTWAIT, MT_DATA);
+	MGETHDR(m, M_NOWAIT, MT_DATA);
 	if (m == NULL)
 		goto out;
 
@@ -1026,7 +1025,7 @@ read_another:
 	/*
 	 * Attach an mbuf cluster
 	 */
-	MCLGET(m, MB_DONTWAIT);
+	MCLGET(m, M_NOWAIT);
 
 	/*
 	 * Insist on getting a cluster

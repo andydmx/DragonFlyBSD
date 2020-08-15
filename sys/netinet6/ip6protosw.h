@@ -45,11 +45,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -95,7 +91,7 @@ struct pr_usrreqs;
  * argument type for the last arg of pr_ctlinput().
  * should be consulted only with AF_INET6 family.
  *
- * IPv6 ICMP IPv6 [exthdrs] finalhdr paylaod
+ * IPv6 ICMP IPv6 [exthdrs] finalhdr payload
  * ^    ^    ^              ^
  * |    |    ip6c_ip6       ip6c_off
  * |    ip6c_icmp6

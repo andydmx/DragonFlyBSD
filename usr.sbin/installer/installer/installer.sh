@@ -4,12 +4,20 @@
 # $Id: installer,v 1.20 2005/04/13 03:32:16 cpressey Exp $
 
 ### SUBS ###
+cleanup()
+{
+	killall -q dfuife_curses dfuibe_installer
+}
 
 background_backend()
 {
 	RENDEZVOUS=$1
 	TRANSPORT=$2
-	$pfi_backend -r $RENDEZVOUS -t $TRANSPORT >/dev/null 2>&1
+	$pfi_backend \
+	    -o $SOURCE_DIR \
+	    -r $RENDEZVOUS \
+	    -t $TRANSPORT \
+	    >/dev/null 2>&1
 	RESULT=$?
 	case "$RESULT" in
 	0)
@@ -20,6 +28,41 @@ background_backend()
 	*)
 		;;
 	esac
+}
+
+is_serial()
+{
+	# Detect if we are currently connected via a serial console
+	if [ "X`/usr/bin/kenv -q console`" == "Xcomconsole" ]; then
+		return 0 # return success
+	fi
+	return 1
+}
+
+setup_term()
+{
+	# If TERM has not been set manually (ie: still 'dialup' or from /etc/ttyd), we ask the user what they want to use
+	if [ "X`tty |cut -c6-9`" == "Xttyd" ]; then
+		newterm=${TERM}
+		if [ "X`/usr/bin/kenv smbios.bios.vendor`" == "XSeaBIOS" ]; then
+			# installation on a virtial machine uses this type of simulated bios often, so we can do better than vt100 (eg:vt220-co, vt320-co, cons50-w)
+			newterm="xterm"
+		elif [ "X${TERM}" == "Xdialup" ]; then
+			newterm="vt100"
+		fi
+		echo ""
+		echo -n "What is your terminal type (provide value termcap name)? [${newterm}]: "
+		read input
+		[ "${input}" = '' ] && input=$newterm
+		export TERM="${input}"
+		echo "set new TERM=$TERM"
+	fi
+	TTY_BAUD=`stty speed`
+	if [ $TTY_BAUD -lt 38400 ]; then
+		echo -n "Your serial connection is quite slow ($TTY_BAUD), causing installer slow down. Continue Anyway ? [Y/n]: "
+		read input
+		[ "${input}" == "N" ] || [ "${input}" == "n" ] && exit 0
+	fi
 }
 
 installer_start()
@@ -64,11 +107,21 @@ installer_start()
 	esac
 
 	if [ "X$pfi_frontend" = "Xauto" ]; then
-		if [ "X$DISPLAY" = "X" ]; then
-			if [ "X$LIVECD" = "X" ]; then
+		if [ "X$TTY_INST" = "X" ]; then
+			if $(is_serial); then
+				setup_term
+				RENDEZVOUS="installer"
+				pfi_dfui_transport="npipe"
+				TTY=$(tty)
 				pfi_frontend="curseslog"
 			else
-				pfi_frontend="cursesvty"
+				if $(is_installmedia); then
+					TTY=/dev/ttyv1
+					pfi_frontend="cursesvty"
+				else
+					TTY=$(tty)
+					pfi_frontend="curseslog"
+				fi
 			fi
 		else
 			pfi_frontend="cursesx11"
@@ -77,11 +130,17 @@ installer_start()
 
 	case "X$pfi_frontend" in
 	Xqt)
-		$pfi_backend -r $RENDEZVOUS -t $pfi_dfui_transport
+		$pfi_backend \
+		    -o $SOURCE_DIR \
+		    -r $RENDEZVOUS \
+		    -t $pfi_dfui_transport
 		RESULT=$?
 		;;
 	Xcgi)
-		$pfi_backend -r $RENDEZVOUS -t $pfi_dfui_transport
+		$pfi_backend \
+		    -o $SOURCE_DIR \
+		    -r $RENDEZVOUS \
+		    -t $pfi_dfui_transport
 		RESULT=$?
 		;;
 	Xcursesvty)
@@ -145,7 +204,10 @@ installer_start()
 		fi
 		rm -f /tmp/ps.txt
 		sleep 1
-		$pfi_backend -r $RENDEZVOUS -t $pfi_dfui_transport
+		$pfi_backend \
+		    -o $SOURCE_DIR \
+		    -r $RENDEZVOUS \
+		    -t $pfi_dfui_transport
 		RESULT=$?
 		sleep 1
 		killall dfuife_curses
@@ -170,31 +232,45 @@ installer_start()
 	esac
 }
 
+is_installmedia()
+{
+    local _ttyv1=$(grep -w "^ttyv1" /etc/ttys)
+    local guest=$(sysctl -n kern.vmm_guest)
+
+    #
+    # ttyv1 isn't configured for the install media so use
+    # that as a clue for now. Vkernels will be forced
+    # to use 'curseslog' to avoid polluting its only
+    # terminal.
+    #
+    [ "${guest}" = "vkernel" ] && return 1;
+
+    if [ -z "${_ttyv1}" ]; then
+	return 0	# Return success, it's a USB image, ISO etc.
+    else
+	return 1
+    fi
+}
+
 ### MAIN ###
 
 if [ $# -gt 1 ]; then
 	echo "usage: installer [source_directory]"
 	exit 1
+elif [ $# = 1 -a ! -d $1 ]; then
+	echo "source_directory does not exist or is no directory"
+	exit 1
 fi
 
-# Check if we are booted from a LiveCD, DVD etc. ttyv1 isn't configured in
-# this case, so use that as a clue for now. Also, we have to use /dev/console
-# in vkernels.
+trap cleanup EXIT SIGTERM SIGINT
+
 #
-_ttyv1=`grep -w "^ttyv1" /etc/ttys`
-if [ "`sysctl -n kern.vmm_guest`" = "vkernel" ]; then
-	SOURCE_DIR=/
-	TTY=/dev/console
-elif [ -z "$_ttyv1" ]; then
-	LIVECD=YES
-	SOURCE_DIR=/
-	TTY=/dev/ttyv1
-elif [ $# = 1 -a -d $1 ]; then
-	SOURCE_DIR=$1/
-	TTY=/dev/`w | awk '{ print $2 }' | tail -n1`
+# Source directory for the installation
+#
+if [ $# = 1 ]; then
+	SOURCE_DIR=$1
 else
 	SOURCE_DIR=/
-	TTY=/dev/`w | awk '{ print $2 }' | tail -n1`
 fi
 
 ps auwwwxxx > /tmp/ps.txt

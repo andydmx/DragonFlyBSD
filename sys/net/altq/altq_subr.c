@@ -1,5 +1,4 @@
 /*	$KAME: altq_subr.c,v 1.23 2004/04/20 16:10:06 itojun Exp $	*/
-/*	$DragonFly: src/sys/net/altq/altq_subr.c,v 1.12 2008/05/14 11:59:23 sephe Exp $ */
 
 /*
  * Copyright (C) 1997-2003
@@ -50,6 +49,8 @@
 #include <net/if_dl.h>
 #include <net/if_types.h>
 #include <net/ifq_var.h>
+#include <net/netmsg2.h>
+#include <net/netisr2.h>
 
 #include <netinet/in.h>
 #include <netinet/in_systm.h>
@@ -72,6 +73,7 @@
  * internal function prototypes
  */
 static void	tbr_timeout(void *);
+static void	tbr_timeout_dispatch(netmsg_t);
 static int	altq_enable_locked(struct ifaltq *);
 static int	altq_disable_locked(struct ifaltq *);
 static int	altq_detach_locked(struct ifaltq *);
@@ -80,6 +82,7 @@ static int	tbr_set_locked(struct ifaltq *, struct tb_profile *);
 int (*altq_input)(struct mbuf *, int) = NULL;
 static int tbr_timer = 0;	/* token bucket regulator timer */
 static struct callout tbr_callout;
+static struct netmsg_base tbr_timeout_netmsg;
 
 int pfaltq_running;	/* keep track of running state */
 
@@ -309,7 +312,7 @@ tbr_set_locked(struct ifaltq *ifq, struct tb_profile *profile)
 	if (otbr != NULL)
 		kfree(otbr, M_ALTQ);
 	else if (tbr_timer == 0) {
-		callout_reset(&tbr_callout, 1, tbr_timeout, NULL);
+		callout_reset_bycpu(&tbr_callout, 1, tbr_timeout, NULL, 0);
 		tbr_timer = 1;
 	}
 	return (0);
@@ -326,19 +329,38 @@ tbr_set(struct ifaltq *ifq, struct tb_profile *profile)
 	return error;
 }
 
+static void
+tbr_timeout(void *arg __unused)
+{
+	struct lwkt_msg *lmsg = &tbr_timeout_netmsg.lmsg;
+
+	KASSERT(mycpuid == 0, ("not on cpu0"));
+	crit_enter();
+	if (lmsg->ms_flags & MSGF_DONE)
+		lwkt_sendmsg_oncpu(netisr_cpuport(0), lmsg);
+	crit_exit();
+}
+
 /*
  * tbr_timeout goes through the interface list, and kicks the drivers
  * if necessary.
  */
 static void
-tbr_timeout(void *arg)
+tbr_timeout_dispatch(netmsg_t nmsg)
 {
-	struct ifnet *ifp;
-	int active;
+	const struct ifnet_array *arr;
+	int active, i;
+
+	ASSERT_NETISR0;
+
+	crit_enter();
+	lwkt_replymsg(&nmsg->lmsg, 0);	/* reply ASAP */
+	crit_exit();
 
 	active = 0;
-	crit_enter();
-	for (ifp = TAILQ_FIRST(&ifnet); ifp; ifp = TAILQ_NEXT(ifp, if_list)) {
+	arr = ifnet_array_get();
+	for (i = 0; i < arr->ifnet_count; ++i) {
+		struct ifnet *ifp = arr->ifnet_arr[i];
 		struct ifaltq_subque *ifsq;
 
 		if (ifp->if_snd.altq_tbr == NULL)
@@ -352,7 +374,6 @@ tbr_timeout(void *arg)
 			ifsq_deserialize_hw(ifsq);
 		}
 	}
-	crit_exit();
 	if (active > 0)
 		callout_reset(&tbr_callout, 1, tbr_timeout, NULL);
 	else
@@ -395,9 +416,13 @@ altq_pfattach(struct pf_altq *a)
 	if (a->altq_disc == NULL)
 		return EINVAL;
 
+	ifnet_lock();
+
 	ifp = ifunit(a->ifname);
-	if (ifp == NULL)
+	if (ifp == NULL) {
+		ifnet_unlock();
 		return EINVAL;
+	}
 	ifq = &ifp->if_snd;
 
 	ifq_lock_all(ifq);
@@ -443,6 +468,7 @@ altq_pfattach(struct pf_altq *a)
 	}
 back:
 	ifq_unlock_all(ifq);
+	ifnet_unlock();
 	return (error);
 }
 
@@ -458,14 +484,20 @@ altq_pfdetach(struct pf_altq *a)
 	struct ifaltq *ifq;
 	int error = 0;
 
+	ifnet_lock();
+
 	ifp = ifunit(a->ifname);
-	if (ifp == NULL)
+	if (ifp == NULL) {
+		ifnet_unlock();
 		return (EINVAL);
+	}
 	ifq = &ifp->if_snd;
 
 	/* if this discipline is no longer referenced, just return */
-	if (a->altq_disc == NULL)
+	if (a->altq_disc == NULL) {
+		ifnet_unlock();
 		return (0);
+	}
 
 	ifq_lock_all(ifq);
 
@@ -479,6 +511,7 @@ altq_pfdetach(struct pf_altq *a)
 
 back:
 	ifq_unlock_all(ifq);
+	ifnet_unlock();
 	return (error);
 }
 
@@ -800,7 +833,9 @@ uint32_t machclk_per_tick = 0;
 void
 init_machclk(void)
 {
-	callout_init(&tbr_callout);
+	callout_init_mp(&tbr_callout);
+	netmsg_init(&tbr_timeout_netmsg, NULL, &netisr_adone_rport,
+	    MSGF_PRIORITY, tbr_timeout_dispatch);
 
 #ifdef ALTQ_NOPCC
 	machclk_usepcc = 0;
@@ -808,59 +843,28 @@ init_machclk(void)
 	machclk_usepcc = 1;
 #endif
 
-#if defined(__i386__) || defined(__x86_64__)
-	if (!tsc_mpsync)
+#if defined(__x86_64__)
+	if (tsc_mpsync && tsc_present)
+		machclk_freq = tsc_frequency;
+	else
 		machclk_usepcc = 0;
 #else
 	machclk_usepcc = 0;
 #endif
 
-	if (!machclk_usepcc) {
-		/* emulate 256MHz using microtime() */
+	if (machclk_usepcc) {
+#ifdef ALTQ_DEBUG
+		kprintf("altq: CPU clock: %juHz\n", (uintmax_t)machclk_freq);
+#endif
+	} else {
+		/* emulate 256MHz using microuptime() */
 		machclk_freq = 1000000LLU << MACHCLK_SHIFT;
-		machclk_per_tick = machclk_freq / hz;
 #ifdef ALTQ_DEBUG
 		kprintf("altq: emulate %juHz cpu clock\n",
 		    (uintmax_t)machclk_freq);
 #endif
-		return;
 	}
-
-	/*
-	 * If the clock frequency (of Pentium TSC) is accessible,
-	 * just use it.
-	 */
-#ifdef _RDTSC_SUPPORTED_
-	if (tsc_present)
-		machclk_freq = (uint64_t)tsc_frequency;
-#endif
-
-	/*
-	 * If we don't know the clock frequency, measure it.
-	 */
-	if (machclk_freq == 0) {
-		static int	wait;
-		struct timeval	tv_start, tv_end;
-		uint64_t	start, end, diff;
-		int		timo;
-
-		microtime(&tv_start);
-		start = read_machclk();
-		timo = hz;	/* 1 sec */
-		tsleep(&wait, PCATCH, "init_machclk", timo);
-		microtime(&tv_end);
-		end = read_machclk();
-		diff = (uint64_t)(tv_end.tv_sec - tv_start.tv_sec) * 1000000
-		    + tv_end.tv_usec - tv_start.tv_usec;
-		if (diff != 0)
-			machclk_freq = (end - start) * 1000000 / diff;
-	}
-
 	machclk_per_tick = machclk_freq / hz;
-
-#ifdef ALTQ_DEBUG
-	kprintf("altq: CPU clock: %juHz\n", (uintmax_t)machclk_freq);
-#endif
 }
 
 uint64_t
@@ -877,9 +881,9 @@ read_machclk(void)
 	} else {
 		struct timeval tv;
 
-		microtime(&tv);
-		val = (((uint64_t)(tv.tv_sec - boottime.tv_sec) * 1000000
-		    + tv.tv_usec) << MACHCLK_SHIFT);
+		microuptime(&tv);
+		val = (((uint64_t)tv.tv_sec * 1000000 + tv.tv_usec) <<
+		    MACHCLK_SHIFT);
 	}
 	return (val);
 }

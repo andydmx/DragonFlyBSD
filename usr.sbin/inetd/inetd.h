@@ -10,11 +10,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -31,7 +27,6 @@
  * SUCH DAMAGE.
  *
  * $FreeBSD: src/usr.sbin/inetd/inetd.h,v 1.4.2.4 2002/08/21 10:00:24 ume Exp $
- * $DragonFly: src/usr.sbin/inetd/inetd.h,v 1.3 2003/11/03 19:31:37 eirikn Exp $
  */
 
 #include <sys/time.h>
@@ -50,7 +45,6 @@
 #define MUX_TYPE	1
 #define MUXPLUS_TYPE	2
 #define TTCP_TYPE	3
-#define FAITH_TYPE	4
 #define ISMUX(sep)	(((sep)->se_type == MUX_TYPE) || \
 			 ((sep)->se_type == MUXPLUS_TYPE))
 #define ISMUXPLUS(sep)	((sep)->se_type == MUXPLUS_TYPE)
@@ -90,9 +84,6 @@ struct	servtab {
 	char	*se_server_name;	/* server program without path */
 #define	MAXARGV 20
 	char	*se_argv[MAXARGV+1];	/* program arguments */
-#ifdef IPSEC
-	char	*se_policy;		/* IPsec policy string */
-#endif
 	int	se_fd;			/* open descriptor */
 	union {				/* bound address */
 		struct	sockaddr se_un_ctrladdr;

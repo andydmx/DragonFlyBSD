@@ -67,38 +67,38 @@
 /*
  * parameter variables
  */
-int	pgnm;			/* starting page number */
-int	clcnt;			/* number of columns */
-int	colwd;			/* column data width - multiple columns */
-int	across;			/* mult col flag; write across page */
-int	dspace;			/* double space flag */
-char	inchar;			/* expand input char */
-int	ingap;			/* expand input gap */
-int	pausefst;		/* Pause before first page */
-int	pauseall;		/* Pause before each page */
-int	formfeed;		/* use formfeed as trailer */
-char	*header;		/* header name instead of file name */
-char	ochar;			/* contract output char */
-int	ogap;			/* contract output gap */
-int	lines;			/* number of lines per page */
-int	merge;			/* merge multiple files in output */
-char	nmchar;			/* line numbering append char */
-int	nmwd;			/* width of line number field */
-int	offst;			/* number of page offset spaces */
-int	nodiag;			/* do not report file open errors */
-char	schar;			/* text column separation character */
-int	sflag;			/* -s option for multiple columns */
-int	nohead;			/* do not write head and trailer */
-int	pgwd;			/* page width with multiple col output */
-char	*timefrmt;		/* time conversion string */
+static int	pgnm;			/* starting page number */
+static int	clcnt;			/* number of columns */
+static int	colwd;			/* column data width - multiple columns */
+static int	across;			/* mult col flag; write across page */
+static int	dspace;			/* double space flag */
+static char	inchar;			/* expand input char */
+static int	ingap;			/* expand input gap */
+static int	pausefst;		/* Pause before first page */
+static int	pauseall;		/* Pause before each page */
+static int	formfeed;		/* use formfeed as trailer */
+static char	*header;		/* header name instead of file name */
+static char	ochar;			/* contract output char */
+static int	ogap;			/* contract output gap */
+static int	lines;			/* number of lines per page */
+static int	merge;			/* merge multiple files in output */
+static char	nmchar;			/* line numbering append char */
+static int	nmwd;			/* width of line number field */
+static int	offst;			/* number of page offset spaces */
+static int	nodiag;			/* do not report file open errors */
+static char	schar;			/* text column separation character */
+static int	sflag;			/* -s option for multiple columns */
+static int	nohead;			/* do not write head and trailer */
+static int	pgwd;			/* page width with multiple col output */
+static char	*timefrmt;		/* time conversion string */
 
 /*
  * misc globals
  */
-FILE	*err;			/* error message file pointer */
-int	addone;			/* page length is odd with double space */
-int	errcnt;			/* error count on file processing */
-char	digs[] = "0123456789";	/* page number translation map */
+static FILE	*err;			/* error message file pointer */
+static int	addone;			/* page length is odd with double space */
+static int	errcnt;			/* error count on file processing */
+static char	digs[] = "0123456789";	/* page number translation map */
 
 int
 main(int argc, char **argv)
@@ -120,6 +120,7 @@ main(int argc, char **argv)
 			ret_val = horzcol(argc, argv);
 		else
 			ret_val = vertcol(argc, argv);
+		free(timefrmt);
 	} else
 		usage();
 	flsh_errs();
@@ -172,7 +173,7 @@ onecol(int argc, char **argv)
 	char *hbuf;
 	char *ohbuf;
 	FILE *inf;
-	char *fname;
+	const char *fname;
 	int mor;
 
 	if (nmwd)
@@ -324,7 +325,7 @@ vertcol(int argc, char **argv)
 	char *buf;
 	char *hbuf;
 	char *ohbuf;
-	char *fname;
+	const char *fname;
 	FILE *inf;
 	int ips = 0;
 	int cps = 0;
@@ -522,7 +523,7 @@ vertcol(int argc, char **argv)
 				for (i = 0; i < pln; ++i) {
 					ips = 0;
 					ops = 0;
-					if (offst&& otln(buf,offst,&ips,&ops,1))
+					if (offst && otln(buf,offst,&ips,&ops,1))
 						return(1);
 					tvc = i;
 
@@ -620,7 +621,7 @@ vertcol(int argc, char **argv)
  * horzcol:	print files with more than one column of output across a page
  */
 int
-horzcol(int argc, char **argv)
+horzcol(int argc, char *argv[])
 {
 	char *ptbf;
 	int pln;
@@ -634,7 +635,7 @@ horzcol(int argc, char **argv)
 	char *buf;
 	char *hbuf;
 	char *ohbuf;
-	char *fname;
+	const char *fname;
 	FILE *inf;
 	int ips = 0;
 	int cps = 0;
@@ -763,7 +764,7 @@ horzcol(int argc, char **argv)
  *		more than one file concurrently
  */
 int
-mulfile(int argc, char **argv)
+mulfile(int argc, char *argv[])
 {
 	char *ptbf;
 	int j;
@@ -780,7 +781,7 @@ mulfile(int argc, char **argv)
 	char *buf;
 	char *hbuf;
 	char *ohbuf;
-	char *fname;
+	const char *fname;
 	int ips = 0;
 	int cps = 0;
 	int ops = 0;
@@ -1247,7 +1248,7 @@ inskip(FILE *inf, int pgcnt, int lncnt)
  *	dt	if set skips the date processing (used with -m)
  */
 FILE *
-nxtfile(int argc, char **argv, char **fname, char *buf, int dt)
+nxtfile(int argc, char **argv, const char **fname, char *buf, int dt)
 {
 	FILE *inf = NULL;
 	struct timeval tv;
@@ -1408,7 +1409,7 @@ addnum(char *buf, int wdth, int line)
  *	pagcnt	page number
  */
 int
-prhead(char *buf, char *fname, int pagcnt)
+prhead(char *buf, const char *fname, int pagcnt)
 {
 	int ips = 0;
 	int ops = 0;
@@ -1422,8 +1423,8 @@ prhead(char *buf, char *fname, int pagcnt)
 	 * restrictions. The specification for header line format
 	 * in the spec clearly does not limit length. No pr currently
 	 * restricts header length. However if we need to truncate in
-	 * an reasonable way, adjust the length of the printf by
-	 * changing HDFMT to allow a length max as an arguement printf.
+	 * a reasonable way, adjust the length of the printf by
+	 * changing HDFMT to allow a length max as an argument to printf.
 	 * buf (which contains the offset spaces and time field could
 	 * also be trimmed
 	 *
@@ -1503,7 +1504,7 @@ prtail(int cnt, int incomp)
  * terminate():	when a SIGINT is recvd
  */
 void
-terminate(int which_sig)
+terminate(int which_sig __unused)
 {
 	flsh_errs();
 	exit(1);
@@ -1557,7 +1558,7 @@ usage(void)
  *		checks on options
  */
 int
-setup(int argc, char **argv)
+setup(int argc, char *argv[])
 {
 	int c;
 	int d_first;
@@ -1589,7 +1590,7 @@ setup(int argc, char **argv)
 			break;
 		case '-':
 			if ((clcnt = atoi(eoptarg)) < 1) {
-			    (void)fputs("pr: -columns must be 1 or more\n",err);
+			    (void)fputs("pr: -columns must be 1 or more\n", err);
 			    return(1);
 			}
 			if (clcnt > 1)
@@ -1812,7 +1813,7 @@ setup(int argc, char **argv)
 	(void) setlocale(LC_TIME, (Lflag != NULL) ? Lflag : "");
 
 	d_first = (*nl_langinfo(D_MD_ORDER) == 'd');
-	timefrmt = d_first ? TIMEFMTD : TIMEFMTM;
+	timefrmt = strdup(d_first ? TIMEFMTD : TIMEFMTM);
 
 	return(0);
 }

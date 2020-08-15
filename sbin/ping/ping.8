@@ -27,9 +27,8 @@
 .\"
 .\"     @(#)ping.8	8.2 (Berkeley) 12/11/93
 .\" $FreeBSD: src/sbin/ping/ping.8,v 1.54 2006/04/05 12:30:42 glebius Exp $
-.\" $DragonFly: src/sbin/ping/ping.8,v 1.5 2007/05/29 10:21:41 hasso Exp $
 .\"
-.Dd April 4, 2006
+.Dd June 26, 2020
 .Dt PING 8
 .Os
 .Sh NAME
@@ -48,7 +47,6 @@ packets to network hosts
 .Op Fl l Ar preload
 .Op Fl M Cm mask | time
 .Op Fl m Ar ttl
-.Op Fl P Ar policy
 .Op Fl p Ar pattern
 .Op Fl S Ar src_addr
 .Op Fl s Ar packetsize
@@ -64,7 +62,6 @@ packets to network hosts
 .Op Fl l Ar preload
 .Op Fl M Cm mask | time
 .Op Fl m Ar ttl
-.Op Fl P Ar policy
 .Op Fl p Ar pattern
 .Op Fl S Ar src_addr
 .Op Fl s Ar packetsize
@@ -216,13 +213,6 @@ Numeric output only.
 No attempt will be made to lookup symbolic names for host addresses.
 .It Fl o
 Exit successfully after receiving one reply packet.
-.It Fl P Ar policy
-.Ar policy
-specifies IPsec policy for the ping session.
-For details please refer to
-.Xr ipsec 4
-and
-.Xr ipsec_set_policy 3 .
 .It Fl p Ar pattern
 You may specify up to 16
 .Dq pad
@@ -504,7 +494,7 @@ packets that they use for
 packets, for example either 30 or 60.
 Others may use completely wild values.
 .El
-.Sh DIAGNOSTICS
+.Sh EXIT STATUS
 The
 .Nm
 utility returns an exit status of zero if at least one response was
@@ -518,8 +508,10 @@ if an error occurred.
 .Sh SEE ALSO
 .Xr netstat 1 ,
 .Xr ifconfig 8 ,
+.Xr ping6 8 ,
 .Xr routed 8 ,
-.Xr traceroute 8
+.Xr traceroute 8 ,
+.Xr traceroute6 8
 .Sh HISTORY
 The
 .Nm

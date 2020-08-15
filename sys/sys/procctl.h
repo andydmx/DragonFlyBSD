@@ -37,15 +37,21 @@
 
 #if defined(_KERNEL) || defined(_KERNEL_STRUCTURES)
 #include <sys/lock.h>
+#else
+#include <sys/types.h>
 #endif
+
+#ifndef _IDTYPE_T_DECLARED
+#define _IDTYPE_T_DECLARED
+/* SEE ALSO SYS/WAIT.H */
 
 typedef enum idtype {
 	/*
 	 * These names were mostly lifted from Solaris source code and
 	 * still use Solaris style naming to avoid breaking any
-	 * OpenSolaris code which has been ported to FreeBSD.  There
-	 * is no clear FreeBSD counterpart for all of the names, but
-	 * some have a clear correspondence to FreeBSD entities.
+	 * OpenSolaris code which has been ported to FreeBSD/DragonFly.
+	 * There is no clear DragonFly counterpart for all of the names, but
+	 * some have a clear correspondence to DragonFly entities.
 	 *
 	 * The numerical values are kept synchronized with the Solaris
 	 * values.
@@ -67,6 +73,8 @@ typedef enum idtype {
 	P_CPUID,		/* CPU identifier. */
 	P_PSETID		/* Processor set identifier. */
 } idtype_t;			/* The type of id_t we are using. */
+
+#endif
 
 struct reaper_status {
 	uint32_t	flags;

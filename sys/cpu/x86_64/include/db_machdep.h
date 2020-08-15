@@ -40,12 +40,13 @@ typedef	long		db_expr_t;	/* expression - signed */
 typedef struct x86_64_saved_state db_regs_t;
 
 #ifdef _KERNEL
+#define	DDB_EXPR_FMT	"l"		/* expression is long */
 extern db_regs_t        ddb_regs;       /* register state */
 #define DDB_REGS        (&ddb_regs)
 
-extern	db_addr_t	PC_REGS(db_regs_t *regs);
-extern	db_addr_t	SP_REGS(db_regs_t *regs);
-extern	db_addr_t	BP_REGS(db_regs_t *regs);
+db_addr_t		PC_REGS(db_regs_t *);
+db_addr_t		SP_REGS(db_regs_t *);
+db_addr_t		BP_REGS(db_regs_t *);
 
 #endif
 
@@ -79,8 +80,7 @@ extern	db_addr_t	BP_REGS(db_regs_t *regs);
 #define inst_store(ins)		0
 
 /*
- * There no interesting addresses below _kstack = 0xefbfe000.  There
- * are small absolute values for GUPROF, but we don't want to see them.
+ * There no interesting addresses below _kstack = 0xefbfe000.
  * Treat "negative" addresses below _kstack as non-small to allow for
  * future reductions of _kstack and to avoid sign extension problems.
  *

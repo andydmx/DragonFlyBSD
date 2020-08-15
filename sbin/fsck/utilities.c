@@ -42,6 +42,14 @@
 #include "fsck.h"
 
 long	diskreads, totalreads;	/* Disk cache statistics */
+struct bufarea bufhead;		/* head of list of other blks in filesys */
+char	*cdevname;		/* name of device being checked */
+char	yflag;			/* assume a yes response */
+char	nflag;			/* assume a no response */
+int	debug;			/* output debugging info */
+char	resolved;		/* cleared if unresolved changes => not clean */
+int	fsmodified;		/* 1 => write done to file system */
+int	got_siginfo;		/* received a SIGINFO */
 
 static void rwerror(char *mesg, ufs_daddr_t blk);
 
@@ -427,7 +435,7 @@ getpathname(char *namebuf, ufs1_ino_t curdir, ufs1_ino_t ino)
 	struct inodesc idesc;
 	static int busy = 0;
 
-	if (curdir == ino && ino == ROOTINO) {
+	if (curdir == ino && ino == UFS_ROOTINO) {
 		strcpy(namebuf, "/");
 		return;
 	}
@@ -447,7 +455,7 @@ getpathname(char *namebuf, ufs1_ino_t curdir, ufs1_ino_t ino)
 		idesc.id_parent = curdir;
 		goto namelookup;
 	}
-	while (ino != ROOTINO) {
+	while (ino != UFS_ROOTINO) {
 		idesc.id_number = ino;
 		idesc.id_func = findino;
 		idesc.id_name = "..";
@@ -469,7 +477,7 @@ getpathname(char *namebuf, ufs1_ino_t curdir, ufs1_ino_t ino)
 		ino = idesc.id_number;
 	}
 	busy = 0;
-	if (ino != ROOTINO)
+	if (ino != UFS_ROOTINO)
 		*--cp = '?';
 	memmove(namebuf, cp, (size_t)(&namebuf[MAXPATHLEN] - cp));
 }

@@ -1,18 +1,16 @@
 # $FreeBSD: src/sys/modules/acpi/acpi/Makefile,v 1.3 2004/01/08 16:38:32 njl Exp $
 
-CONTRIBDIR=	${SYSDIR}/${ACPICA_DIR}
-
 SYSDIR?= ${.CURDIR}/../..
 .if ACPI_DEBUG_LOCKS || ACPI_DEBUG_MEMMAP || ACPI_DEBUG_CACHE
-CFLAGS+=	-I${.OBJDIR}/include
+KCFLAGS+=	-I${.OBJDIR}/include
 .if ACPI_DEBUG_LOCKS
-CFLAGS+=	-DACPI_DEBUG_LOCKS
+KCFLAGS+=	-DACPI_DEBUG_LOCKS
 .endif
 .if ACPI_DEBUG_MEMMAP
-CFLAGS+=	-DACPI_DEBUG_MEMMAP
+KCFLAGS+=	-DACPI_DEBUG_MEMMAP
 .endif
 .if ACPI_DEBUG_CACHE
-CFLAGS+=	-DACPI_DEBUG_CACHE
+KCFLAGS+=	-DACPI_DEBUG_CACHE
 .endif
 .endif
 
@@ -31,21 +29,23 @@ KMOD	= acpi
 
 # ACPICA sources
 SRCS+=	ahids.c ahuuids.c
-#SRCS+=	dbcmds.c dbconvert.c dbdisply.c dbexec.c dbfileio.c dbhistry.c
-#SRCS+=	dbinput.c dbstats.c dbtest.c dbutils.c dbxface.c
-#SRCS+=	dbmethod.c dbnames.c
-#SRCS+=	dmbuffer.c dmdeferred.c dmnames.c dmobject.c dmopcode.c
-#SRCS+=	dmresrc.c dmresrcl.c dmresrcl2.c dmresrcs.c dmutils.c dmwalk.c
-SRCS+=	dsfield.c dsinit.c dsmethod.c dsmthdat.c
-SRCS+=	dsobject.c dsopcode.c dsutils.c dswexec.c dswload.c
+SRCS+=	dbcmds.c dbconvert.c dbdisply.c dbexec.c dbfileio.c dbhistry.c
+SRCS+=	dbinput.c dbmethod.c dbnames.c dbobject.c
+SRCS+=	dbstats.c dbtest.c dbutils.c dbxface.c
+SRCS+=	dmbuffer.c dmcstyle.c dmdeferred.c dmnames.c dmopcode.c
+SRCS+=	dmresrc.c dmresrcl.c dmresrcl2.c dmresrcs.c dmutils.c dmwalk.c
+SRCS+=	dsdebug.c dsfield.c dsinit.c dsmethod.c dsmthdat.c
+SRCS+=	dsobject.c dsopcode.c dspkginit.c dsutils.c dswexec.c dswload.c
 SRCS+=	dswscope.c dswstate.c dsargs.c dscontrol.c dswload2.c
 SRCS+=	evevent.c evglock.c evgpe.c evgpeblk.c evgpeinit.c evgpeutil.c
 SRCS+=	evhandler.c evmisc.c evregion.c evrgnini.c evsci.c evxface.c evxfgpe.c
-SRCS+=	evxfevnt.c evxfregn.c exconfig.c exconvrt.c excreate.c
+SRCS+=	evxfevnt.c evxfregn.c
+SRCS+=	exconcat.c exconfig.c exconvrt.c excreate.c
 SRCS+=	exdump.c exfield.c exfldio.c exmisc.c exmutex.c
 SRCS+=	exnames.c exoparg1.c exoparg2.c exoparg3.c exoparg6.c
 SRCS+=	exprep.c exregion.c exresnte.c exresolv.c exresop.c
-SRCS+=	exstore.c exstoren.c exstorob.c exsystem.c exutils.c exdebug.c
+SRCS+=	exserial.c exstore.c exstoren.c exstorob.c exsystem.c
+SRCS+=	extrace.c exutils.c exdebug.c
 SRCS+=	hwacpi.c hwesleep.c hwgpe.c hwregs.c hwsleep.c
 SRCS+=	hwtimer.c hwvalid.c hwxface.c hwpci.c hwxfsleep.c
 SRCS+=	nsarguments.c nsaccess.c nsalloc.c nsconvert.c nsdump.c nseval.c
@@ -57,13 +57,14 @@ SRCS+=	pstree.c psutils.c pswalk.c psxface.c
 SRCS+=	rsaddr.c rscalc.c rscreate.c rsdump.c rsdumpinfo.c rsinfo.c rsio.c
 SRCS+=	rsirq.c rslist.c rsmemory.c rsmisc.c rsserial.c rsutils.c
 SRCS+=	rsxface.c tbdata.c tbfadt.c tbfind.c tbinstal.c tbprint.c
-SRCS+=	tbutils.c tbxface.c tbxfload.c tbxfroot.c utalloc.c utbuffer.c
-SRCS+=	utaddress.c utcopy.c
+SRCS+=	tbutils.c tbxface.c tbxfload.c tbxfroot.c
+SRCS+=	utalloc.c utascii.c utbuffer.c utaddress.c utcopy.c
 SRCS+=	utdebug.c utdecode.c utdelete.c uterror.c uteval.c utexcep.c
 SRCS+=	utglobal.c uthex.c utids.c utinit.c utlock.c
-SRCS+=	utmath.c utmisc.c utmutex.c utobject.c utosi.c utownerid.c utpredef.c
-SRCS+=	utresrc.c utstate.c utstring.c utuuid.c utxface.c
-SRCS+=	utxferror.c utxfinit.c
+SRCS+=	utmath.c utmisc.c utmutex.c utnonansi.c
+SRCS+=	utobject.c utosi.c utownerid.c utpredef.c
+SRCS+=	utresrc.c utresdecode.c utstate.c utstring.c utstrsuppt.c utstrtoul64.c
+SRCS+=	utuuid.c utxface.c utxferror.c utxfinit.c
 
 # OSD layer
 #
@@ -71,7 +72,6 @@ SRCS+=  acpi.c acpi_acad.c acpi_battery.c acpi_button.c acpi_cmbat.c
 SRCS+=	acpi_cpu.c acpi_cpu_cstate.c acpi_cpu_pstate.c acpi_smbat.c
 SRCS+=  acpi_ec.c acpi_isab.c acpi_lid.c
 SRCS+=  acpi_package.c
-# The PCI part of ACPI5 doesn't work with the current infrastructure
 SRCS+=	acpi_pci.c acpi_pcib.c acpi_pcib_acpi.c acpi_pcib_pci.c
 SRCS+=	acpi_pci_link.c
 SRCS+=  acpi_powerres.c acpi_quirk.c acpi_resource.c acpi_thermal.c
@@ -81,18 +81,20 @@ SRCS+=  OsdHardware.c OsdInterrupt.c OsdMemory.c OsdSchedule.c
 SRCS+=  OsdStream.c OsdSynch.c OsdTable.c OsdEnvironment.c
 SRCS+=  opt_acpi.h opt_ddb.h opt_ktr.h
 SRCS+=  device_if.h bus_if.h pci_if.h pcib_if.h isa_if.h acpi_if.h
-SRCS+=  acpi_quirks.h acpi_wmi_if.h
+SRCS+=  acpi_quirks.h acpi_wmi_if.h cpu_if.h
 
+.if !defined(BUILDING_WITH_KERNEL)
 .if ACPI_NO_SEMAPHORES
-CFLAGS+=-DACPI_NO_SEMAPHORES
+KCFLAGS+=-DACPI_NO_SEMAPHORES
 .endif
 .if ACPI_DEBUG
-CFLAGS+=-DACPI_DEBUG
+KCFLAGS+=-DACPI_DEBUG
 opt_ddb.h: Makefile
 	echo "#define DDB 1" > ${.TARGET}
 .else
 opt_ddb.h: Makefile
 	echo -n > ${.TARGET}
+.endif
 .endif
 
 # Machine-specific code for P-State
@@ -102,20 +104,25 @@ SRCS+=	acpi_cstate_machdep.c
 # Machine-specific code for CPU
 SRCS+=	acpi_cpu_machdep.c
 # Machine-specific code such as sleep/wakeup
-SRCS+=	acpi_machdep.c acpi_wakecode.h
-SRCS+=	acpi_wakeup.c
-.if ${MACHINE_ARCH} == "i386" || ${MACHINE_ARCH} == "x86_64"
-# APIC enumerators
-#SRCS+=	madt.c
+SRCS+=	acpi_machdep.c acpi_wakeup.c
+.if ${MACHINE_ARCH} == "x86_64"
 SRCS+=	pmtimer.c
 .endif
-CLEANFILES+=	acpi_wakecode.h acpi_wakecode.o acpi_wakecode.bin
+#SRCS+=	acpi_wakecode.h
+#CLEANFILES+=	acpi_wakecode.h acpi_wakecode.o acpi_wakecode.bin
 
-acpi_wakecode.h: acpi_wakecode.S
-	${MAKE} -f ${SYSDIR}/${OSACPI_MD_DIR}/Makefile \
-		MAKESRCPATH=${SYSDIR}/${OSACPI_MD_DIR}
+#acpi_wakecode.h: acpi_wakecode.bin
+#	file2c -sx 'static char wakecode[] = {' '};' < acpi_wakecode.bin > ${.TARGET}
+#acpi_wakecode.bin: acpi_wakecode.o
+#	objcopy -S -O binary acpi_wakecode.o ${.TARGET}
 
-SUBDIR=	acpi_asus acpi_dock acpi_fujitsu acpi_hp acpi_panasonic acpi_sony
-SUBDIR+=acpi_thinkpad acpi_toshiba acpi_video acpi_wmi aibs
+#acpi_wakecode.o: acpi_wakecode.S
+
+SUBDIR=	acpi_asus acpi_dock acpi_fujitsu acpi_hp acpi_panasonic acpi_pvpanic
+SUBDIR+=acpi_sony acpi_thinkpad acpi_toshiba acpi_video acpi_wmi aibs
+
+# Empty for concurrent build
+#
+SUBDIR_ORDERED=
 
 .include <bsd.kmod.mk>

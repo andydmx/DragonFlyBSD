@@ -10,10 +10,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by John Birrell.
- * 4. Neither the name of the author nor the names of any co-contributors
+ * 3. Neither the name of the author nor the names of any co-contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -30,33 +27,47 @@
  * SUCH DAMAGE.
  *
  * $FreeBSD: src/lib/libpthread/thread/thr_exit.c,v 1.39 2004/10/23 23:37:54 davidxu Exp $
- * $DragonFly: src/lib/libthread_xu/thread/thr_exit.c,v 1.9 2007/03/13 00:19:29 corecode Exp $
  */
 
 #include "namespace.h"
 #include <machine/tls.h>
-
 #include <errno.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
 #include "un-namespace.h"
 
+#include "libc_private.h"
 #include "thr_private.h"
+
+static void	exit_thread(void) __dead2;
+
+void
+_thread_exitf(const char *fname, int lineno, const char *fmt, ...)
+{
+	va_list ap;
+
+	/* Write an error message to the standard error file descriptor: */
+	_thread_printf(STDERR_FILENO, "Fatal error '");
+
+	va_start(ap, fmt);
+	_thread_vprintf(STDERR_FILENO, fmt, ap);
+	va_end(ap);
+
+	_thread_printf(STDERR_FILENO, "' at line %d in file %s (errno = %d)\n",
+	    lineno, fname, errno);
+
+	abort();
+}
 
 void
 _thread_exit(const char *fname, int lineno, const char *msg)
 {
-
-	/* Write an error message to the standard error file descriptor: */
-	_thread_printf(2,
-	    "Fatal error '%s' at line %d in file %s (errno = %d)\n",
-	    msg, lineno, fname, errno);
-
-	abort();
+	_thread_exitf(fname, lineno, "%s", msg);
 }
 
 /*
@@ -92,16 +103,14 @@ _pthread_exit(void *status)
 
 	/* Check if this thread is already in the process of exiting: */
 	if ((curthread->cancelflags & THR_CANCEL_EXITING) != 0) {
-		char msg[128];
-		snprintf(msg, sizeof(msg), "Thread %p has called "
+		PANIC("Thread %p has called "
 		    "pthread_exit() from a destructor. POSIX 1003.1 "
 		    "1996 s16.2.5.2 does not allow this!", curthread);
-		PANIC(msg);
 	}
 
 	/* Flag this thread as exiting. */
 	atomic_set_int(&curthread->cancelflags, THR_CANCEL_EXITING);
-	
+
 	_thr_exit_cleanup();
 
 	/* Save the return value: */
@@ -109,6 +118,18 @@ _pthread_exit(void *status)
 	while (curthread->cleanup != NULL) {
 		_pthread_cleanup_pop(1);
 	}
+	/* Call TLS destructors, if any. */
+	_thread_finalize();
+
+	exit_thread();
+}
+
+__strong_reference(_pthread_exit, pthread_exit);
+
+static void
+exit_thread(void)
+{
+	struct pthread *curthread = tls_get_curthread();
 
 	/* Check if there is thread specific data: */
 	if (curthread->specific != NULL) {
@@ -134,7 +155,7 @@ _pthread_exit(void *status)
 		THR_GCLIST_ADD(curthread);
 	THREAD_LIST_UNLOCK(curthread);
 	if (curthread->joiner)
-		_thr_umtx_wake(&curthread->state, INT_MAX);
+		_thr_umtx_wake(&curthread->state, 0);
 	if (SHOULD_REPORT_EVENT(curthread, TD_DEATH))
 		_thr_report_death(curthread);
 	/* Exit and set terminated to once we're really dead. */
@@ -142,5 +163,3 @@ _pthread_exit(void *status)
 	PANIC("thr_exit() returned");
 	/* Never reach! */
 }
-
-__strong_reference(_pthread_exit, pthread_exit);

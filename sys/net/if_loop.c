@@ -42,21 +42,21 @@
 #include <sys/systm.h>
 #include <sys/kernel.h>
 #include <sys/lock.h>
+#include <sys/malloc.h>
 #include <sys/mbuf.h>
 #include <sys/socket.h>
 #include <sys/sockio.h>
 
-#include <sys/mplock2.h>
-
 #include <net/if.h>
 #include <net/if_types.h>
+#include <net/if_clone.h>
 #include <net/ifq_var.h>
 #include <net/netisr.h>
 #include <net/route.h>
 #include <net/bpf.h>
 #include <net/bpfdesc.h>
 
-#ifdef	INET
+#ifdef INET
 #include <netinet/in.h>
 #include <netinet/in_var.h>
 #endif
@@ -69,17 +69,18 @@
 #include <netinet/ip6.h>
 #endif
 
-static void	loopattach(void *);
-static int	looutput(struct ifnet *, struct mbuf *, struct sockaddr *,
-			 struct rtentry *);
-static int	loioctl(struct ifnet *, u_long, caddr_t, struct ucred *);
-static void	lortrequest(int, struct rtentry *);
+static int	lo_clone_create(struct if_clone *, int, caddr_t, caddr_t);
+static int	lo_clone_destroy(struct ifnet *);
+
+static int	lo_output(struct ifnet *, struct mbuf *, struct sockaddr *,
+		    struct rtentry *);
+static int	lo_ioctl(struct ifnet *, u_long, caddr_t, struct ucred *);
+static void	lo_rtrequest(int, struct rtentry *);
 #ifdef ALTQ
 static void	lo_altqstart(struct ifnet *, struct ifaltq_subque *);
 #endif
-PSEUDO_SET(loopattach, if_loop);
 
-#ifdef TINY_LOMTU
+#if defined(TINY_LOMTU)
 #define	LOMTU	(1024+512)
 #elif defined(LARGE_LOMTU)
 #define LOMTU	131072
@@ -89,45 +90,71 @@ PSEUDO_SET(loopattach, if_loop);
 
 #define LO_CSUM_FEATURES	(CSUM_IP | CSUM_UDP | CSUM_TCP)
 
-struct	ifnet loif[NLOOP];
+struct ifnet	*loif;
 
-/* ARGSUSED */
+static struct if_clone lo_cloner = IF_CLONE_INITIALIZER("lo",
+    lo_clone_create, lo_clone_destroy, NLOOP, IF_MAXUNIT);
+
 static void
-loopattach(void *dummy)
+lo_sysinit(void *dummy __unused)
+{
+	if_clone_attach(&lo_cloner);
+}
+SYSINIT(lo_sysinit, SI_SUB_PSEUDO, SI_ORDER_ANY, lo_sysinit, NULL);
+
+static int
+lo_clone_create(struct if_clone *ifc, int unit,
+		caddr_t params __unused, caddr_t data __unused)
 {
 	struct ifnet *ifp;
-	int i;
 
-	for (i = 0, ifp = loif; i < NLOOP; i++, ifp++) {
-		if_initname(ifp, "lo", i);
-		ifp->if_mtu = LOMTU;
-		ifp->if_flags = IFF_LOOPBACK | IFF_MULTICAST;
-		ifp->if_capabilities = IFCAP_HWCSUM;
-		ifp->if_hwassist = LO_CSUM_FEATURES;
-		ifp->if_capenable = ifp->if_capabilities;
-		ifp->if_ioctl = loioctl;
-		ifp->if_output = looutput;
-		ifp->if_type = IFT_LOOP;
-		ifq_set_maxlen(&ifp->if_snd, ifqmaxlen);
-		ifq_set_ready(&ifp->if_snd);
+	ifp = kmalloc(sizeof(*ifp), M_IFNET, M_WAITOK | M_ZERO);
+	if_initname(ifp, ifc->ifc_name, unit);
+	ifp->if_mtu = LOMTU;
+	ifp->if_flags = IFF_LOOPBACK | IFF_MULTICAST;
+	ifp->if_capabilities = IFCAP_HWCSUM | IFCAP_RSS;
+	ifp->if_hwassist = LO_CSUM_FEATURES;
+	ifp->if_capenable = ifp->if_capabilities;
+	ifp->if_ioctl = lo_ioctl;
+	ifp->if_output = lo_output;
+	ifp->if_type = IFT_LOOP;
+	ifq_set_maxlen(&ifp->if_snd, ifqmaxlen);
+	ifq_set_ready(&ifp->if_snd);
 #ifdef ALTQ
-	        ifp->if_start = lo_altqstart;
+	ifp->if_start = lo_altqstart;
 #endif
-		if_attach(ifp, NULL);
-		bpfattach(ifp, DLT_NULL, sizeof(u_int));
+	if_attach(ifp, NULL);
+	bpfattach(ifp, DLT_NULL, sizeof(u_int));
+
+	if (loif == NULL) {
+		KASSERT(unit == 0, ("loif is %s", ifp->if_xname));
+		loif = ifp;
 	}
+	return (0);
 }
 
 static int
-looutput(struct ifnet *ifp, struct mbuf *m, struct sockaddr *dst,
-	 struct rtentry *rt)
+lo_clone_destroy(struct ifnet *ifp)
+{
+	if (loif == ifp)
+		return (EPERM);
+
+	bpfdetach(ifp);
+	if_detach(ifp);
+	kfree(ifp, M_IFNET);
+	return (0);
+}
+
+static int
+lo_output(struct ifnet *ifp, struct mbuf *m, struct sockaddr *dst,
+    struct rtentry *rt)
 {
 	M_ASSERTPKTHDR(m);
 
 	if (rt && rt->rt_flags & (RTF_REJECT|RTF_BLACKHOLE)) {
 		m_freem(m);
 		return (rt->rt_flags & RTF_BLACKHOLE ? 0 :
-		        rt->rt_flags & RTF_HOST ? EHOSTUNREACH : ENETUNREACH);
+			rt->rt_flags & RTF_HOST ? EHOSTUNREACH : ENETUNREACH);
 	}
 
 	IFNET_STAT_INC(ifp, opackets, 1);
@@ -138,7 +165,7 @@ looutput(struct ifnet *ifp, struct mbuf *m, struct sockaddr *dst,
 	case AF_INET6:
 		break;
 	default:
-		kprintf("looutput: af=%d unexpected\n", dst->sa_family);
+		kprintf("lo_output: af=%d unexpected\n", dst->sa_family);
 		m_freem(m);
 		return (EAFNOSUPPORT);
 	}
@@ -156,6 +183,8 @@ looutput(struct ifnet *ifp, struct mbuf *m, struct sockaddr *dst,
 		if (csum_flags & CSUM_DATA_VALID)
 			m->m_pkthdr.csum_data = 0xffff;
 	}
+	if ((ifp->if_capenable & IFCAP_RSS) == 0)
+		m->m_flags &= ~M_HASH;
 	return (if_simloop(ifp, m, dst->sa_family, 0));
 }
 
@@ -223,7 +252,7 @@ rel:
 		 */
 		ifq_classify(&ifp->if_snd, m, af, &pktattr);
 
-		M_PREPEND(m, sizeof(int32_t), MB_DONTWAIT);
+		M_PREPEND(m, sizeof(int32_t), M_NOWAIT);
 		if (m == NULL)
 			return(ENOBUFS);
 		afp = mtod(m, int32_t *);
@@ -289,11 +318,6 @@ lo_altqstart(struct ifnet *ifp, struct ifaltq_subque *ifsq)
 			isr = NETISR_IPV6;
 			break;
 #endif
-#ifdef ISO
-		case AF_ISO:
-			isr = NETISR_ISO;
-			break;
-#endif
 		default:
 			kprintf("lo_altqstart: can't handle af%d\n", af);
 			m_freem(m);
@@ -309,7 +333,7 @@ lo_altqstart(struct ifnet *ifp, struct ifaltq_subque *ifsq)
 
 /* ARGSUSED */
 static void
-lortrequest(int cmd, struct rtentry *rt)
+lo_rtrequest(int cmd, struct rtentry *rt)
 {
 	if (rt) {
 		rt->rt_rmx.rmx_mtu = rt->rt_ifp->if_mtu; /* for ISO */
@@ -327,7 +351,7 @@ lortrequest(int cmd, struct rtentry *rt)
  */
 /* ARGSUSED */
 static int
-loioctl(struct ifnet *ifp, u_long cmd, caddr_t data, struct ucred *cr)
+lo_ioctl(struct ifnet *ifp, u_long cmd, caddr_t data, struct ucred *cr)
 {
 	struct ifaddr *ifa;
 	struct ifreq *ifr = (struct ifreq *)data;
@@ -337,7 +361,7 @@ loioctl(struct ifnet *ifp, u_long cmd, caddr_t data, struct ucred *cr)
 	case SIOCSIFADDR:
 		ifp->if_flags |= IFF_UP | IFF_RUNNING;
 		ifa = (struct ifaddr *)data;
-		ifa->ifa_rtrequest = lortrequest;
+		ifa->ifa_rtrequest = lo_rtrequest;
 		/*
 		 * Everything else is done at a higher level.
 		 */
@@ -374,14 +398,16 @@ loioctl(struct ifnet *ifp, u_long cmd, caddr_t data, struct ucred *cr)
 		break;
 
 	case SIOCSIFCAP:
-		mask = (ifr->ifr_reqcap ^ ifp->if_capenable) & IFCAP_HWCSUM;
-		if (mask) {
-			ifp->if_capenable ^= mask;
+		mask = ifr->ifr_reqcap ^ ifp->if_capenable;
+		if (mask & IFCAP_HWCSUM) {
+			ifp->if_capenable ^= (mask & IFCAP_HWCSUM);
 			if (IFCAP_TXCSUM & ifp->if_capenable)
 				ifp->if_hwassist = LO_CSUM_FEATURES;
 			else
 				ifp->if_hwassist = 0;
 		}
+		if (mask & IFCAP_RSS)
+			ifp->if_capenable ^= IFCAP_RSS;
 		break;
 
 	default:

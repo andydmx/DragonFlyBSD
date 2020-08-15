@@ -1,9 +1,7 @@
 #	@(#)Makefile	8.1 (Berkeley) 6/5/93
 # $FreeBSD: src/share/man/man8/Makefile,v 1.13.2.12 2002/07/16 14:05:30 ru Exp $
-# $DragonFly: src/share/man/man8/Makefile,v 1.10 2008/08/30 20:27:25 swildner Exp $
 
-MAN=	adding_user.8 \
-	crash.8 \
+MAN=	crash.8 \
 	dhcp.8 \
 	diskless.8 \
 	intro.8 \
@@ -12,6 +10,7 @@ MAN=	adding_user.8 \
 	rc.subr.8 \
 	sticky.8 \
 	swapcache.8 \
+	${_uefi.8} \
 	yp.8
 
 MLINKS=	rc.8 rc.d.8 \
@@ -23,8 +22,8 @@ MLINKS+=yp.8 nis.8 \
 	yp.8 NIS.8 \
 	yp.8 YP.8
 
-.if ${MACHINE_ARCH} == "i386"
-SUBDIR=	man8.${MACHINE_ARCH}
+.if ${MACHINE_ARCH} == "x86_64"
+_uefi.8= uefi.8
 .endif
 
 .include <bsd.prog.mk>

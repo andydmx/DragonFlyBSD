@@ -50,6 +50,7 @@
 #include <sys/socketvar2.h>
 
 #include <net/if.h>
+#include <net/if_var.h>
 #include <net/route.h>
 
 struct	fileops socketops = {
@@ -132,6 +133,9 @@ soo_ioctl(struct file *fp, u_long cmd, caddr_t data,
 	so = (struct socket *)fp->f_data;
 
 	switch (cmd) {
+	case FIONBIO:
+		error = 0;
+		break;
 	case FIOASYNC:
 		if (*(int *)data) {
 			sosetstate(so, SS_ASYNC);
@@ -209,7 +213,9 @@ soo_stat(struct file *fp, struct stat *ub, struct ucred *cred)
 	ub->st_size = so->so_rcv.ssb_cc;
 	ub->st_uid = so->so_cred->cr_uid;
 	ub->st_gid = so->so_cred->cr_gid;
+	ub->st_ino = so->so_inum;
 	error = so_pru_sense(so, ub);
+
 	return (error);
 }
 

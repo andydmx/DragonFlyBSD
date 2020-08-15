@@ -38,21 +38,30 @@
 #include <sys/param.h>
 #include <sys/systm.h>
 #include <sys/sysctl.h>
+#include <sys/uio.h>
 #include <sys/proc.h>
 #include <sys/mount.h>
 #include <sys/vnode.h>
 #include <sys/malloc.h>
-#include <sys/thread2.h>
+#include <sys/spinlock.h>
+
+#include <sys/spinlock2.h>
 
 #include <vfs/procfs/procfs.h>
 
-#define PFS_HSIZE	256
-#define PFS_HMASK	(PFS_HSIZE - 1)
+#define PFS_HSIZE	1031
 
-static struct pfsnode *pfshead[PFS_HSIZE];
-static int pfsvplock;
+struct pfshead {
+	struct spinlock	spin;
+	struct pfsnode	*first;
+} __cachealign;
 
-#define PFSHASH(pid)	&pfshead[(pid) & PFS_HMASK]
+static struct pfshead	pfshead[PFS_HSIZE];
+static struct lock	procfslk = LOCK_INITIALIZER("pvplk", 0, 0);
+
+MALLOC_DEFINE(M_PROCFS, "procfs", "procfs v_data");
+
+#define PFSHASH(pid)	&pfshead[((pid) & ~PFS_DEAD) % PFS_HSIZE]
 
 /*
  * Allocate a pfsnode/vnode pair.  If no error occurs the returned vnode
@@ -69,7 +78,7 @@ static int pfsvplock;
  * A single lock is kept for the entire list.  this is needed because the
  * getnewvnode() function can block waiting for a vnode to become free,
  * in which case there may be more than one process trying to get the same
- * vnode.  this lock is only taken if we are going to call getnewvnode, 
+ * vnode.  this lock is only taken if we are going to call getnewvnode,
  * since the kernel itself is single-threaded.
  *
  * If an entry is found on the list, then call vget() to take a reference
@@ -81,26 +90,30 @@ procfs_allocvp(struct mount *mp, struct vnode **vpp, long pid, pfstype pfs_type)
 {
 	struct pfsnode *pfs;
 	struct vnode *vp;
-	struct pfsnode **pp;
+	struct pfshead *ph;
 	int error;
 
-	pp = PFSHASH(pid);
+	ph = PFSHASH(pid);
 loop:
-	for (pfs = *pp; pfs; pfs = pfs->pfs_next) {
+	spin_lock(&ph->spin);
+	for (pfs = ph->first; pfs; pfs = pfs->pfs_next) {
 		if (pfs->pfs_pid == pid && pfs->pfs_type == pfs_type &&
 		    PFSTOV(pfs)->v_mount == mp) {
 			vp = PFSTOV(pfs);
 			vhold(vp);
+			spin_unlock(&ph->spin);
 			if (vget(vp, LK_EXCLUSIVE)) {
 				vdrop(vp);
 				goto loop;
 			}
+			vdrop(vp);
 
 			/*
 			 * Make sure the vnode is still in the cache after
 			 * getting the interlock to avoid racing a free.
 			 */
-			for (pfs = *pp; pfs; pfs = pfs->pfs_next) {
+			spin_lock(&ph->spin);
+			for (pfs = ph->first; pfs; pfs = pfs->pfs_next) {
 				if (PFSTOV(pfs) == vp &&
 				    pfs->pfs_pid == pid && 
 				    pfs->pfs_type == pfs_type &&
@@ -108,28 +121,25 @@ loop:
 					break;
 				}
 			}
-			vdrop(vp);
 			if (pfs == NULL || PFSTOV(pfs) != vp) {
+				spin_unlock(&ph->spin);
 				vput(vp);
 				goto loop;
 
 			}
-			KKASSERT(vp->v_data == pfs);
+			spin_unlock(&ph->spin);
 			*vpp = vp;
 			return (0);
 		}
 	}
+	spin_unlock(&ph->spin);
 
 	/*
 	 * otherwise lock the vp list while we call getnewvnode
 	 * since that can block.
 	 */
-	if (pfsvplock & PROCFS_LOCKED) {
-		pfsvplock |= PROCFS_WANT;
-		(void) tsleep((caddr_t) &pfsvplock, 0, "pfsavp", 0);
+	if (lockmgr(&procfslk, LK_EXCLUSIVE|LK_SLEEPFAIL))
 		goto loop;
-	}
-	pfsvplock |= PROCFS_LOCKED;
 
 	/*
 	 * Do the MALLOC before the getnewvnode since doing so afterward
@@ -139,11 +149,11 @@ loop:
 	 * XXX this may not matter anymore since getnewvnode now returns
 	 * a VX locked vnode.
 	 */
-	pfs = kmalloc(sizeof(struct pfsnode), M_TEMP, M_WAITOK);
+	pfs = kmalloc(sizeof(struct pfsnode), M_PROCFS, M_WAITOK);
 
 	error = getnewvnode(VT_PROCFS, mp, vpp, 0, 0);
 	if (error) {
-		kfree(pfs, M_TEMP);
+		kfree(pfs, M_PROCFS);
 		goto out;
 	}
 	vp = *vpp;
@@ -155,8 +165,8 @@ loop:
 	pfs->pfs_type = pfs_type;
 	pfs->pfs_vnode = vp;
 	pfs->pfs_flags = 0;
-	pfs->pfs_lockowner = 0;
 	pfs->pfs_fileno = PROCFS_FILENO(pid, pfs_type);
+	lockinit(&pfs->pfs_lock, "pfslk", 0, 0);
 
 	switch (pfs_type) {
 	case Proot:	/* /proc = dr-xr-xr-x */
@@ -223,16 +233,14 @@ loop:
 	}
 
 	/* add to procfs vnode list */
-	pfs->pfs_next = *pp;
-	*pp = pfs;
+	spin_lock(&ph->spin);
+	pfs->pfs_next = ph->first;
+	ph->first = pfs;
+	spin_unlock(&ph->spin);
+	vx_downgrade(vp);
 
 out:
-	pfsvplock &= ~PROCFS_LOCKED;
-
-	if (pfsvplock & PROCFS_WANT) {
-		pfsvplock &= ~PROCFS_WANT;
-		wakeup((caddr_t) &pfsvplock);
-	}
+	lockmgr(&procfslk, LK_RELEASE);
 
 	return (error);
 }
@@ -240,20 +248,27 @@ out:
 int
 procfs_freevp(struct vnode *vp)
 {
-	struct pfsnode **pfspp;
+	struct pfshead *ph;
+	struct pfsnode **pp;
 	struct pfsnode *pfs;
 
 	pfs = VTOPFS(vp);
 	vp->v_data = NULL;
+	ph = PFSHASH(pfs->pfs_pid);
 
-	pfspp = PFSHASH(pfs->pfs_pid);
-	while (*pfspp != pfs && *pfspp)
-		pfspp = &(*pfspp)->pfs_next;
-	KKASSERT(*pfspp);
-	*pfspp = pfs->pfs_next;
+	spin_lock(&ph->spin);
+	pp = &ph->first;
+	while (*pp != pfs) {
+		KKASSERT(*pp != NULL);
+		pp = &(*pp)->pfs_next;
+	}
+	*pp = pfs->pfs_next;
+	spin_unlock(&ph->spin);
+
 	pfs->pfs_next = NULL;
 	pfs->pfs_vnode = NULL;
-	kfree(pfs, M_TEMP);
+	kfree(pfs, M_PROCFS);
+
 	return (0);
 }
 
@@ -353,14 +368,18 @@ procfs_rw(struct vop_read_args *ap)
 		rtval = EACCES;
 		goto out;
 	}
-	/* XXX lwp */
+
+	/*
+	 * XXX lwp
+	 */
 	lp = FIRST_LWP_IN_PROC(p);
+	if (lp == NULL) {
+		rtval = EINVAL;
+		goto out;
+	}
 	LWPHOLD(lp);
 
-	while (pfs->pfs_lockowner) {
-		tsleep(&pfs->pfs_lockowner, 0, "pfslck", 0);
-	}
-	pfs->pfs_lockowner = curproc->p_pid;
+	lockmgr(&pfs->pfs_lock, LK_EXCLUSIVE);
 
 	switch (pfs->pfs_type) {
 	case Pnote:
@@ -414,9 +433,7 @@ procfs_rw(struct vop_read_args *ap)
 	}
 	LWPRELE(lp);
 
-	pfs->pfs_lockowner = 0;
-	wakeup(&pfs->pfs_lockowner);
-
+	lockmgr(&pfs->pfs_lock, LK_RELEASE);
 out:
 	pfs_pdone(p);
 
@@ -481,6 +498,7 @@ vfs_findname(vfs_namemap_t *nm, char *buf, int buflen)
 void
 procfs_exit(struct thread *td)
 {
+	struct pfshead *ph;
 	struct pfsnode *pfs;
 	struct vnode *vp;
 	pid_t pid;
@@ -506,17 +524,23 @@ procfs_exit(struct thread *td)
 	 * The hash table can also get ripped out from under us when
 	 * we block so take the easy way out and restart the scan.
 	 */
-again:
-	pfs = *PFSHASH(pid);
-	while (pfs) {
-		if (pfs->pfs_pid == pid) {
-			vp = PFSTOV(pfs);
-			vx_get(vp);
-			pfs->pfs_pid |= PFS_DEAD; /* does not effect hash */
-			vx_put(vp);
-			goto again;
+	for (;;) {
+		ph = PFSHASH(pid);
+		spin_lock(&ph->spin);
+		for (pfs = ph->first; pfs; pfs = pfs->pfs_next) {
+			if (pfs->pfs_pid == pid)
+				break;
 		}
-		pfs = pfs->pfs_next;
+		if (pfs == NULL) {
+			spin_unlock(&ph->spin);
+			break;
+		}
+		vp = PFSTOV(pfs);
+		vhold(vp);
+		spin_unlock(&ph->spin);
+		vx_get(vp);
+		pfs->pfs_pid |= PFS_DEAD; /* does not effect hash */
+		vx_put(vp);
+		vdrop(vp);
 	}
 }
-

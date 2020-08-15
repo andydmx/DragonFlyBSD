@@ -1,22 +1,17 @@
 #	@(#)Makefile	8.2 (Berkeley) 4/4/94
 # $FreeBSD: src/libexec/ftpd/Makefile,v 1.57 2006/06/05 15:50:34 yar Exp $
-# $DragonFly: src/libexec/ftpd/Makefile,v 1.3 2004/01/23 14:55:52 joerg Exp $
 
 PROG=	ftpd
 MAN=	ftpd.8 ftpchroot.5
-SRCS=	ftpd.c ftpcmd.y logwtmp.c popen.c
+SRCS=	ftpd.c ftpcmd.y logwtmpx.c popen.c
 
 CFLAGS+=-DSETPROCTITLE -DLOGIN_CAP -DVIRTUAL_HOSTING
 CFLAGS+=-I${.CURDIR}
 YFLAGS=
 WARNS?=	2
-WFORMAT=0
 
 DPADD=	${LIBUTIL} ${LIBCRYPT}
 LDADD=	-lutil -lcrypt
-
-DPADD+=	${LIBOPIE} ${LIBMD}
-LDADD+=	-lopie -lmd
 
 LSDIR=	../../bin/ls
 .PATH:	${.CURDIR}/${LSDIR}
@@ -24,10 +19,6 @@ SRCS+=	ls.c cmp.c print.c util.c
 CFLAGS+=-Dmain=ls_main -I${.CURDIR}/${LSDIR}
 DPADD+=	${LIBM}
 LDADD+=	-lm
-
-.PATH:	${.CURDIR}/../../usr.sbin/nscd
-SRCS+=	pidfile.c
-CFLAGS+=-I${.CURDIR}/../../usr.sbin/nscd
 
 .if !defined(NO_INET6)
 CFLAGS+=-DINET6
@@ -37,6 +28,17 @@ CFLAGS+=-DINET6
 CFLAGS+=-DUSE_PAM
 DPADD+= ${LIBPAM}
 LDADD+= ${MINUSLPAM}
+LDFLAGS+= ${LDFLAGSPAM}
+.endif
+
+.if defined(NOMD5)
+CFLAGS+= -DNOMD5
+.else
+SRCS+= site_md5.c
+CFLAGS+=	${PRIVATELIB_CFLAGS}
+DPADD+=		${LIBCRYPTO}
+LDADD+=		-lprivate_crypto
+LDFLAGS+=	${PRIVATELIB_LDFLAGS}
 .endif
 
 .include <bsd.prog.mk>

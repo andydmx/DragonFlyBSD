@@ -39,7 +39,6 @@
  * ----------------------------------------------------------------------------
  *
  * $FreeBSD: src/sys/sys/disk.h,v 1.16.2.3 2001/06/20 16:11:01 scottl Exp $
- * $DragonFly: src/sys/sys/disk.h,v 1.18 2007/07/30 08:02:40 dillon Exp $
  */
 
 #ifndef _SYS_DISK_H_
@@ -142,9 +141,9 @@ struct disk {
 	cdev_t			d_cdev;		/* special whole-disk part */
 	struct diskslices	*d_slice;
 	struct disk_info	d_info;		/* info structure for media */
-	void			*d_dsched_priv1;/* I/O scheduler priv. data */
-	void			*d_dsched_priv2;/* I/O scheduler priv. data */
-	struct dsched_policy	*d_sched_policy;/* I/O scheduler policy */
+	void			*d_unused01;
+	void			*d_unused02;
+	void			*d_unused03;
 	const char		*d_disktype;	/* Disk type information */
 	LIST_ENTRY(disk)	d_list;
 	kdmsg_iocom_t		d_iocom;	/* cluster import/export */
@@ -187,7 +186,7 @@ int bounds_check_with_mediasize(struct bio *bio, int secsize, uint64_t mediasize
 void disk_iocom_init(struct disk *dp);
 void disk_iocom_update(struct disk *dp);
 void disk_iocom_uninit(struct disk *dp);
-int disk_iocom_ioctl(struct disk *dp, int cmd, void *data);
+int disk_iocom_ioctl(struct disk *dp, u_long cmd, void *data);
 void disk_clusterctl_wakeup(kdmsg_iocom_t *iocom);
 
 typedef struct disk_msg {

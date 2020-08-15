@@ -10,11 +10,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -73,7 +69,7 @@
 #ifdef __GNUC__
 
 #define __word_swap_int_var(x) \
-__extension__ ({ register __uint32_t __X = (x); \
+__extension__ ({ __uint32_t __X = (x); \
    __asm ("rorl $16, %0" : "+r" (__X)); \
    __X; })
 
@@ -92,7 +88,7 @@ __extension__ ({ register __uint32_t __X = (x); \
 #endif	/* __OPTIMIZE__ */
 
 #define __byte_swap_int_var(x) \
-__extension__ ({ register __uint32_t __X = (x); \
+__extension__ ({ __uint32_t __X = (x); \
    __asm ("bswap %0" : "+r" (__X)); \
    __X; })
 
@@ -113,7 +109,7 @@ __extension__ ({ register __uint32_t __X = (x); \
 #endif	/* __OPTIMIZE__ */
 
 #define __byte_swap_long_var(x) \
-__extension__ ({ register __uint64_t __X = (x); \
+__extension__ ({ __uint64_t __X = (x); \
    __asm ("bswap %0" : "+r" (__X)); \
    __X; })
 
@@ -143,7 +139,7 @@ __extension__ ({ register __uint64_t __X = (x); \
 #endif	/* __i386__ */
 
 #define __byte_swap_word_var(x) \
-__extension__ ({ register __uint16_t __X = (x); \
+__extension__ ({ __uint16_t __X = (x); \
    __asm ("xchgb %h0, %b0" : "+Q" (__X)); \
    __X; })
 
@@ -162,21 +158,21 @@ __extension__ ({ register __uint16_t __X = (x); \
 
 #endif	/* __OPTIMIZE__ */
 
-static __inline __uint64_t
+static __inline __always_inline __uint64_t
 __bswap64(__uint64_t _x)
 {
 
 	return (__byte_swap_long(_x));
 }
 
-static __inline __uint32_t
+static __inline __always_inline __uint32_t
 __bswap32(__uint32_t _x)
 {
 
 	return (__byte_swap_int(_x));
 }
 
-static __inline __uint16_t
+static __inline __always_inline __uint16_t
 __bswap16(__uint16_t _x)
 {
 

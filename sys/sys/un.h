@@ -10,11 +10,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -32,51 +28,52 @@
  *
  *	@(#)un.h	8.3 (Berkeley) 2/19/95
  * $FreeBSD: src/sys/sys/un.h,v 1.17.2.1 2002/03/09 05:22:23 dd Exp $
- * $DragonFly: src/sys/sys/un.h,v 1.5 2006/05/20 02:42:13 dillon Exp $
  */
 
 #ifndef _SYS_UN_H_
-#define _SYS_UN_H_
+#define	_SYS_UN_H_
 
-#ifndef _SYS_TYPES_H_
-#include <sys/types.h>
-#endif
+#include <machine/stdint.h>
 
-#ifndef _SYS_FILE_H_
-#include <sys/file.h>
+#ifndef _SA_FAMILY_T_DECLARED
+typedef	__uint8_t	sa_family_t;
+#define	_SA_FAMILY_T_DECLARED
 #endif
 
 /*
  * Definitions for UNIX IPC domain.
  */
-struct	sockaddr_un {
-	u_char	sun_len;		/* sockaddr len including null */
-	u_char	sun_family;		/* AF_UNIX */
-	char	sun_path[104];		/* path name (gag) */
+struct sockaddr_un {
+	__uint8_t	sun_len;	/* sockaddr len including null */
+	sa_family_t	sun_family;	/* AF_UNIX */
+	char		sun_path[104];	/* path name (gag) */
 };
 
+#if __BSD_VISIBLE
 /* Socket options. */
-#define LOCAL_PEERCRED		0x001		/* retrieve peer credentails */
+#define	LOCAL_PEERCRED		0x001		/* retrieve peer credentails */
+#endif
 
 #ifdef _KERNEL
 struct mbuf;
 struct socket;
-struct sockopt;
+union netmsg;
 
-int	uipc_usrreq (struct socket *so, int req, struct mbuf *m,
-		struct mbuf *nam, struct mbuf *control);
-void	uipc_ctloutput (union netmsg *msg);
-int	unp_connect2 (struct socket *so, struct socket *so2);
-void	unp_dispose (struct mbuf *m);
-void	unp_revoke_gc (struct file *fx);
-int	unp_externalize (struct mbuf *rights);
-void	unp_init (void);
+int	uipc_usrreq(struct socket *so, int req, struct mbuf *m,
+	    struct mbuf *nam, struct mbuf *control);
+void	uipc_ctloutput(union netmsg *msg);
+int	unp_connect2(struct socket *so, struct socket *so2);
+void	unp_dispose(struct mbuf *m);
+int	unp_externalize(struct mbuf *rights, int flags);
+void	unp_init(void);
 extern	struct pr_usrreqs uipc_usrreqs;
 #else /* !_KERNEL */
 
+#if __BSD_VISIBLE
 /* actual length of an initialized sockaddr_un */
-#define SUN_LEN(su) \
+#define	SUN_LEN(su) \
 	(sizeof(*(su)) - sizeof((su)->sun_path) + strlen((su)->sun_path))
+#endif
 
 #endif /* _KERNEL */
 

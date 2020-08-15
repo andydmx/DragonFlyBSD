@@ -28,7 +28,7 @@
  */
 
 /*
- * 6.8 : Debugging support
+ * Debugging Support
  */
 
 #include "opt_ddb.h"
@@ -43,6 +43,8 @@
 #include "accommon.h"
 #include "acpivar.h"
 #include "acdebug.h"
+
+ACPI_MODULE_NAME("DEBUG")
 
 ACPI_STATUS
 AcpiOsGetLine(char *Buffer, UINT32 BufferLength, UINT32 *BytesRead)
@@ -92,22 +94,60 @@ AcpiOsSignal(UINT32 Function, void *Info)
     return (AE_OK);
 }
 
-#if 0				/* XXX */
 #ifdef ACPI_DEBUGGER
-void
-acpi_EnterDebugger(void)
+ACPI_STATUS
+AcpiOsInitializeDebugger(void)
 {
-    ACPI_PARSE_OBJECT	obj;
-    static int		initted = 0;
+	return (AE_OK);
+}
 
-    if (!initted) {
-	kprintf("Initialising ACPICA debugger...\n");
-	AcpiDbInitialize();
-	initted = 1;
-    }
+void
+AcpiOsTerminateDebugger(void)
+{
+}
 
+ACPI_STATUS
+AcpiOsWaitCommandReady(void)
+{
+	ACPI_STATUS Status;
+
+	/* Force output to console until a command is entered */
+
+	AcpiDbSetOutputDestination(ACPI_DB_CONSOLE_OUTPUT);
+
+	/* Different prompt if method is executing */
+
+	if (!AcpiGbl_MethodExecuting)
+		AcpiOsPrintf("%1c ", ACPI_DEBUGGER_COMMAND_PROMPT);
+	else
+		AcpiOsPrintf("%1c ", ACPI_DEBUGGER_EXECUTE_PROMPT);
+
+	/* Get the user input line */
+
+	Status = AcpiOsGetLine(AcpiGbl_DbLineBuf,
+	    ACPI_DB_LINE_BUFFER_SIZE, NULL);
+
+	if (ACPI_FAILURE (Status) && Status != AE_CTRL_TERMINATE)
+		ACPI_EXCEPTION ((AE_INFO, Status,
+			"While parsing/handling command line"));
+	return (Status);
+}
+
+ACPI_STATUS
+AcpiOsNotifyCommandComplete(void)
+{
+	return (AE_OK);
+}
+
+DB_COMMAND(acpidb, db_cmd_acpidb)
+{
     kprintf("Entering ACPICA debugger...\n");
-    AcpiDbUserCommands('A', &obj);
+    while (!AcpiGbl_DbTerminateLoop) {
+	if (ACPI_FAILURE(AcpiOsWaitCommandReady()))
+	    break;
+	AcpiDbCommandDispatch(AcpiGbl_DbLineBuf, NULL, NULL);
+    }
+    AcpiGbl_DbTerminateLoop = FALSE;
+    kprintf("Leaving ACPICA debugger...\n");
 }
 #endif /* ACPI_DEBUGGER */
-#endif

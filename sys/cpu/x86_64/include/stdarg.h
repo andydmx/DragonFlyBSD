@@ -10,11 +10,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -53,8 +49,6 @@ typedef __va_list		__gnuc_va_list;	/* compatibility w/GNU headers*/
 /*
  * Standard va types and macros
  */
-#define	__va_size(type) \
-	(((sizeof(type) + sizeof(int) - 1) / sizeof(int)) * sizeof(int))
 
 #ifdef __GNUC__
 
@@ -70,6 +64,8 @@ typedef __va_list		__gnuc_va_list;	/* compatibility w/GNU headers*/
 #else /* !__GNUC__ */
 
 /* Provide a free-standing implementation */
+#define __va_size(type) \
+	(((sizeof(type) + sizeof(int) - 1) / sizeof(int)) * sizeof(int))
 #define __va_start(ap, last) \
 	((ap) = (__va_list)&(last) + __va_size(last))
 #define __va_arg(ap, type) \

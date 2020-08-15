@@ -13,11 +13,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -39,6 +35,7 @@
 
 #include <sys/param.h>
 #include <sys/systm.h>
+#include <sys/uio.h>
 #include <sys/kernel.h>
 #include <sys/malloc.h>
 #include <sys/fcntl.h>
@@ -51,7 +48,7 @@
 #include "quota.h"
 #include "dinode.h"
 #include "inode.h"
-#include "ext2mount.h"
+#include "ext2_mount.h"
 #include "ext2_extern.h"
 
 static MALLOC_DEFINE(M_EXT2DQUOT, "EXT2 quota", "EXT2 quota entries");
@@ -64,7 +61,7 @@ static char *quotatypes[] = INITQFNAMES;
 static int ext2_chkdqchg (struct inode *, long, struct ucred *, int);
 static int ext2_chkiqchg (struct inode *, long, struct ucred *, int);
 static int ext2_dqget (struct vnode *,
-		u_long, struct ext2mount *, int, struct ext2_dquot **);
+		u_long, struct ext2_mount *, int, struct ext2_dquot **);
 static int ext2_dqsync (struct vnode *, struct ext2_dquot *);
 static void ext2_dqflush (struct vnode *);
 
@@ -84,7 +81,7 @@ static void ext2_chkdquot (struct inode *);
 int
 ext2_getinoquota(struct inode *ip)
 {
-	struct ext2mount *ump;
+	struct ext2_mount *ump;
 	struct vnode *vp = ITOV(ip);
 	int error;
 
@@ -342,7 +339,7 @@ ext2_chkiqchg(struct inode *ip, long change, struct ucred *cred, int type)
 static void
 ext2_chkdquot(struct inode *ip)
 {
-	struct ext2mount *ump = VFSTOEXT2(ITOV(ip)->v_mount);
+	struct ext2_mount *ump = VFSTOEXT2(ITOV(ip)->v_mount);
 	int i;
 
 	for (i = 0; i < MAXQUOTAS; i++) {
@@ -374,7 +371,7 @@ static int ext2_quotaon_scan(struct mount *mp, struct vnode *vp, void *data);
 int
 ext2_quotaon(struct ucred *cred, struct mount *mp, int type, caddr_t fname)
 {
-	struct ext2mount *ump = VFSTOEXT2(mp);
+	struct ext2_mount *ump = VFSTOEXT2(mp);
 	struct vnode *vp, **vpp;
 	struct ext2_dquot *dq;
 	int error;
@@ -458,7 +455,7 @@ int
 ext2_quotaoff(struct mount *mp, int type)
 {
 	struct vnode *qvp;
-	struct ext2mount *ump = VFSTOEXT2(mp);
+	struct ext2_mount *ump = VFSTOEXT2(mp);
 	int error;
 	struct scaninfo scaninfo;
 
@@ -534,7 +531,7 @@ ext2_setquota(struct mount *mp, u_long id, int type, caddr_t addr)
 {
 	struct ext2_dquot *dq;
 	struct ext2_dquot *ndq;
-	struct ext2mount *ump = VFSTOEXT2(mp);
+	struct ext2_mount *ump = VFSTOEXT2(mp);
 	struct ext2_dqblk newlim;
 	int error;
 
@@ -590,7 +587,7 @@ int
 ext2_setuse(struct mount *mp, u_long id, int type, caddr_t addr)
 {
 	struct ext2_dquot *dq;
-	struct ext2mount *ump = VFSTOEXT2(mp);
+	struct ext2_mount *ump = VFSTOEXT2(mp);
 	struct ext2_dquot *ndq;
 	struct ext2_dqblk usage;
 	int error;
@@ -636,7 +633,7 @@ static int ext2_qsync_scan(struct mount *mp, struct vnode *vp, void *data);
 int
 ext2_qsync(struct mount *mp)
 {
-	struct ext2mount *ump = VFSTOEXT2(mp);
+	struct ext2_mount *ump = VFSTOEXT2(mp);
 	struct scaninfo scaninfo;
 	int i;
 
@@ -699,7 +696,9 @@ static long ext2_numdquot, ext2_desireddquot = DQUOTINC;
 void
 ext2_dqinit(void)
 {
-	ext2_dqhashtbl = hashinit(desiredvnodes, M_EXT2DQUOT, &ext2_dqhash);
+	int hsize = vfs_inodehashsize();
+
+	ext2_dqhashtbl = hashinit(hsize, M_EXT2DQUOT, &ext2_dqhash);
 	TAILQ_INIT(&ext2_dqfreelist);
 }
 
@@ -708,7 +707,7 @@ ext2_dqinit(void)
  * reading the information from the file if necessary.
  */
 static int
-ext2_dqget(struct vnode *vp, u_long id, struct ext2mount *ump, int type,
+ext2_dqget(struct vnode *vp, u_long id, struct ext2_mount *ump, int type,
       struct ext2_dquot **dqp)
 {
 	struct ext2_dquot *dq;
@@ -741,13 +740,16 @@ ext2_dqget(struct vnode *vp, u_long id, struct ext2mount *ump, int type,
 		*dqp = dq;
 		return (0);
 	}
+
 	/*
 	 * Not in cache, allocate a new one.
 	 */
-	if (TAILQ_EMPTY(&ext2_dqfreelist) && ext2_numdquot < MAXQUOTAS * desiredvnodes)
+	if (TAILQ_EMPTY(&ext2_dqfreelist) &&
+	    ext2_numdquot < MAXQUOTAS * maxvnodes) {
 		ext2_desireddquot += DQUOTINC;
+	}
 	if (ext2_numdquot < ext2_desireddquot) {
-		dq = (struct ext2_dquot *)kmalloc(sizeof *dq, M_EXT2DQUOT, M_WAITOK | M_ZERO);
+		dq = kmalloc(sizeof *dq, M_EXT2DQUOT, M_WAITOK | M_ZERO);
 		ext2_numdquot++;
 	} else {
 		if ((dq = TAILQ_FIRST(&ext2_dqfreelist)) == NULL) {

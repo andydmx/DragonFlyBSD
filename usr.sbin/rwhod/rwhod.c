@@ -29,7 +29,6 @@
  * @(#) Copyright (c) 1983, 1993 The Regents of the University of California.  All rights reserved.
  * @(#)rwhod.c	8.1 (Berkeley) 6/6/93
  * $FreeBSD: src/usr.sbin/rwhod/rwhod.c,v 1.13.2.2 2000/12/23 15:28:12 iedowse Exp $
- * $DragonFly: src/usr.sbin/rwhod/rwhod.c,v 1.24 2007/12/27 15:29:40 matthias Exp $ 
  */
 
 #include <sys/param.h>
@@ -58,8 +57,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <syslog.h>
+#include <timeconv.h>
 #include <unistd.h>
-#include <utmp.h>
+#include <utmpx.h>
 #include <pwd.h>
 #include <grp.h>
 
@@ -108,14 +108,14 @@
 #define INADDR_WHOD_GROUP (u_long)0xe0000103      /* 224.0.1.3 */
 					  /* (belongs in protocols/rwhod.h) */
 
-int			insecure_mode;
-int			quiet_mode;
-int			iff_flag = IFF_POINTOPOINT;
-int			multicast_mode  = NO_MULTICAST;
-int			multicast_scope;
-struct sockaddr_in	multicast_addr;
+static int			insecure_mode;
+static int			quiet_mode;
+static int			iff_flag = IFF_POINTOPOINT;
+static int			multicast_mode  = NO_MULTICAST;
+static int			multicast_scope;
+static struct sockaddr_in	multicast_addr;
 
-char	myname[MAXHOSTNAMELEN];
+static char	myname[MAXHOSTNAMELEN];
 
 /*
  * We communicate with each neighbor in a list constructed at the time we're
@@ -130,29 +130,29 @@ struct	neighbor {
 	int	n_flags;		/* should forward?, interface flags */
 };
 
-struct	neighbor *neighbors;
-struct	whod mywd;
-struct	servent *sp;
-int	s, utmpf;
-volatile sig_atomic_t	onsighup;
+static struct	neighbor *neighbors;
+static struct	whod mywd;
+static struct	servent *sp;
+static int	s;
+static volatile sig_atomic_t	onsighup;
 
 #define	WHDRSIZE	(sizeof(mywd) - sizeof(mywd.wd_we))
 
-void	 run_as(uid_t *, gid_t *);
-int	 configure(int);
-void	 getboottime(void);
-void	 send_host_information(void);
-void	 hup(int);
-void	 quit(const char *, int);
-void	 rt_xaddrs(caddr_t, caddr_t, struct rt_addrinfo *);
-int	 verify(char *, int);
-void	 handleread(int);
-static void usage(void);
-void	 timeadd(struct timeval *, time_t, struct timeval *);
+static void	 run_as(uid_t *, gid_t *);
+static int	 configure(int);
+static void	 getboottime(void);
+static void	 send_host_information(void);
+static void	 hup(int);
+static void	 quit(const char *, int) __dead2;
+static void	 rt_xaddrs(caddr_t, caddr_t, struct rt_addrinfo *);
+static int	 verify(char *, int);
+static void	 handleread(int);
+static void	 usage(void) __dead2;
+static void	 timeadd(struct timeval *, time_t, struct timeval *);
 
 #ifdef DEBUG
-char	*interval(int, const char *);
-ssize_t	Sendto(int, const void *, size_t, int,
+static char	*interval(int, const char *);
+static ssize_t	Sendto(int, const void *, size_t, int,
 		     const struct sockaddr *, int);
 #else
 #define Sendto sendto
@@ -170,7 +170,7 @@ main(int argc, char *argv[])
 	gid_t unpriv_gid;
 	long tmp;
 	time_t delta = 0;
-	struct timeval next, now;
+	struct timeval next = { .tv_sec = 0 }, now;
 
 	if (getuid())
 		errx(1, "not super user");
@@ -250,10 +250,6 @@ main(int argc, char *argv[])
 	if ((cp = strchr(myname, '.')) != NULL)
 		*cp = '\0';
 	strlcpy(mywd.wd_hostname, myname, sizeof(mywd.wd_hostname));
-	utmpf = open(_PATH_UTMP, O_RDONLY|O_CREAT, 0644);
-	if (utmpf < 0)
-		quit(_PATH_UTMP, WITH_ERRNO);
-
 	getboottime();
 	if ((s = socket(AF_INET, SOCK_DGRAM, 0)) < 0)
 		quit("socket", WITH_ERRNO);
@@ -306,13 +302,13 @@ main(int argc, char *argv[])
 	}
 }
 
-void
+static void
 timeadd(struct timeval *now, time_t delta, struct timeval *next)
 {
 	(next)->tv_sec = (now)->tv_sec + delta;
 }
 
-void
+static void
 handleread(int sock)
 {
 	struct sockaddr_in from;
@@ -361,7 +357,7 @@ handleread(int sock)
 		syslog(LOG_WARNING, "%s: %m", path);
 		return;
 	}
-#if ENDIAN != BIG_ENDIAN
+#if _BYTE_ORDER != _BIG_ENDIAN
 	{
 		int i, n = (cc - WHDRSIZE)/sizeof(struct whoent);
 		struct whoent *we;
@@ -394,13 +390,13 @@ usage(void)
 	exit(1);
 }
 
-void
+static void
 hup(int signo __unused)
 {
 	onsighup = 1;
 }
 
-void
+static void
 run_as(uid_t *uid, gid_t *gid)
 {
 	struct passwd *pw;
@@ -424,7 +420,7 @@ run_as(uid_t *uid, gid_t *gid)
  * and other funnies before allowing a file
  * to be created.  Sorry, but blanks aren't allowed.
  */
-int
+static int
 verify(char *name, int maxlen)
 {
 	int size = 0;
@@ -438,81 +434,52 @@ verify(char *name, int maxlen)
 	return (size > 0);
 }
 
-int	utmptime;
-int	utmpent;
-int	utmpsize;
-struct	utmp *utmp;
-int	alarmcount;
-
-void
+static void
 send_host_information(void)
 {
 	struct neighbor *np;
-	struct whoent *we = mywd.wd_we, *wlast;
-	int i;
+	struct whoent *we = mywd.wd_we, *wend;
 	struct stat stb;
+	struct utmpx *ut;
+	static int alarmcount = 0;
 	double avenrun[3];
 	time_t now;
-	int cc;
+	int i, cc;
 
 	now = time(NULL);
 	if (alarmcount % 10 == 0)
 		getboottime();
 	alarmcount++;
-	fstat(utmpf, &stb);
-	if ((stb.st_mtime != utmptime) || (stb.st_size > utmpsize)) {
-		utmptime = stb.st_mtime;
-		if (stb.st_size > utmpsize) {
-			utmpsize = stb.st_size + 10 * sizeof(struct utmp);
-			utmp = reallocf(utmp, utmpsize);
-			if (utmp == NULL) {
-				syslog(LOG_WARNING, "malloc failed: %m");
-				utmpsize = 0;
-				return;
-			}
-		}
-		lseek(utmpf, (off_t)0, L_SET);
-		cc = read(utmpf, (char *)utmp, stb.st_size);
-		if (cc < 0) {
-			syslog(LOG_ERR, "read(%s): %m", _PATH_UTMP);
-			return;
-		}
-		wlast = &mywd.wd_we[1024 / sizeof(struct whoent) - 1];
-		utmpent = cc / sizeof(struct utmp);
-		for (i = 0; i < utmpent; i++)
-			if (utmp[i].ut_name[0]) {
-				memcpy(we->we_utmp.out_line, utmp[i].ut_line,
-				   sizeof(utmp[i].ut_line));
-				memcpy(we->we_utmp.out_name, utmp[i].ut_name,
-				   sizeof(utmp[i].ut_name));
-				we->we_utmp.out_time = htonl(utmp[i].ut_time);
-				if (we >= wlast)
-					break;
-				we++;
-			}
-		utmpent = we - mywd.wd_we;
+	wend = &mywd.wd_we[1024 / sizeof(struct whoent)];
+	setutxent();
+	while ((ut = getutxent()) != NULL && we < wend) {
+		if (ut->ut_type != USER_PROCESS)
+			continue;
+		strncpy(we->we_utmp.out_line, ut->ut_line,
+		   sizeof(we->we_utmp.out_line));
+		strncpy(we->we_utmp.out_name, ut->ut_user,
+		   sizeof(we->we_utmp.out_name));
+		we->we_utmp.out_time =
+		    htonl(_time_to_time32(ut->ut_tv.tv_sec));
+		we++;
 	}
+	endutxent();
 
-	/*
-	 * The test on utmpent looks silly---after all, if no one is
-	 * logged on, why worry about efficiency?---but is useful on
-	 * (e.g.) compute servers.
-	 */
-	if (utmpent && chdir(_PATH_DEV)) {
+	if (chdir(_PATH_DEV)) {
 		syslog(LOG_ERR, "chdir(%s): %m", _PATH_DEV);
 		exit(1);
 	}
 
-	we = mywd.wd_we;
-	for (i = 0; i < utmpent; i++) {
+	wend = we;
+	for (we = mywd.wd_we; we < wend; we++) {
 		if (stat(we->we_utmp.out_line, &stb) >= 0)
 			we->we_idle = htonl(now - stb.st_atime);
 		we++;
 	}
-	getloadavg(avenrun, sizeof(avenrun)/sizeof(avenrun[0]));
+	getloadavg(avenrun, NELEM(avenrun));
 	for (i = 0; i < 3; i++)
 		mywd.wd_loadav[i] = htonl((u_long)(avenrun[i] * 100));
-	cc = (char *)we - (char *)&mywd;
+	cc = (char *)wend - (char *)&mywd;
 	mywd.wd_sendtime = htonl(time(0));
 	mywd.wd_vers = WHODVERSION;
 	mywd.wd_type = WHODTYPE_STATUS;
@@ -538,13 +505,13 @@ send_host_information(void)
 		} else Sendto(s, (char *)&mywd, cc, 0,
 				np->n_addr, np->n_addrlen);
 	}
-	if (utmpent && chdir(_PATH_RWHODIR)) {
+	if (chdir(_PATH_RWHODIR)) {
 		syslog(LOG_ERR, "chdir(%s): %m", _PATH_RWHODIR);
 		exit(1);
 	}
 }
 
-void
+static void
 getboottime(void)
 {
 	int mib[2];
@@ -564,7 +531,7 @@ getboottime(void)
  * If wrterrno == WITH_ERRNO, we will print
  * errno. If not, we leave errno out.
  */
-void
+static void
 quit(const char *msg, int wrterrno)
 {
 	if (wrterrno)
@@ -574,7 +541,7 @@ quit(const char *msg, int wrterrno)
 	exit(1);
 }
 
-void
+static void
 rt_xaddrs(caddr_t cp, caddr_t cplim, struct rt_addrinfo *rtinfo)
 {
 	struct sockaddr *sa;
@@ -593,7 +560,7 @@ rt_xaddrs(caddr_t cp, caddr_t cplim, struct rt_addrinfo *rtinfo)
  * Figure out device configuration and select
  * networks which deserve status information.
  */
-int
+static int
 configure(int c_sock)
 {
 	struct neighbor *np;
@@ -724,7 +691,7 @@ configure(int c_sock)
 }
 
 #ifdef DEBUG
-ssize_t
+static ssize_t
 Sendto(int s_debug, const void *buf, size_t cc, int flags,
        const struct sockaddr *to, int tolen)
 {
@@ -766,7 +733,7 @@ Sendto(int s_debug, const void *buf, size_t cc, int flags,
 	return(ret);
 }
 
-char *
+static char *
 interval(int inter_time, const char *updown)
 {
 	static char resbuf[32];

@@ -59,8 +59,10 @@
 #define KDGETLED	_IOR('K', 65, int)
 #define KDSETLED	_IO('K', 66 /*, int */)
 
+#if 0 /* deprecated ioctl */
 /* set keyboard repeat rate (obsolete, use KDSETREPEAT below) */
 #define KDSETRAD	_IO('K', 67 /*, int */)
+#endif
 
 /* see console.h for the definition of the following ioctl */
 #if 0 /* notdef */
@@ -119,6 +121,20 @@ struct keymap {
 };
 typedef struct keymap keymap_t;
 
+#ifdef _KERNEL
+struct okeyent_t {
+        u_char          map[NUM_STATES];
+        u_char          spcl;
+        u_char          flgs;
+};
+
+struct okeymap {
+        u_short         n_keys;
+        struct okeyent_t key[NUM_KEYS];
+};
+typedef struct okeymap okeymap_t;
+#endif /* _KERNEL */
+
 #endif /* !_KEYMAP_DECLARED */
 
 /* defines for "special" keys (spcl bit set in keymap) */
@@ -144,7 +160,7 @@ typedef struct keymap keymap_t;
 #define META		0x84		/* meta key			*/
 #define RBT		0x85		/* boot machine			*/
 #define DBG		0x86		/* call debugger		*/
-#define SUSP		0x87		/* suspend power (APM)		*/
+#define SUSP		0x87		/* suspend power		*/
 #define SPSC		0x88		/* toggle splash/text screen	*/
 
 #define F_ACC		DGRA		/* first accent key		*/
@@ -166,7 +182,7 @@ typedef struct keymap keymap_t;
 #define DCAR		0x97		/* caron			*/
 #define L_ACC		DCAR		/* last accent key		*/
 
-#define STBY		0x98		/* Go into standby mode (apm)   */
+#define STBY		0x98		/* Go into standby mode		*/
 #define PREV		0x99		/* switch to previous screen 	*/
 #define PNC		0x9a		/* force system panic */
 #define LSHA		0x9b		/* left shift key / alt lock	*/
@@ -221,6 +237,10 @@ typedef struct fkeyarg	fkeyarg_t;
 #endif
 #define GIO_KEYMAP 	_IOR('k', 6, keymap_t)
 #define PIO_KEYMAP 	_IOW('k', 7, keymap_t)
+#ifdef _KERNEL
+#define OGIO_KEYMAP     _IOR('k', 6, okeymap_t)
+#define OPIO_KEYMAP     _IOW('k', 7, okeymap_t)
+#endif /* _KERNEL */
 #define GIO_DEADKEYMAP 	_IOR('k', 8, accentmap_t)
 #define PIO_DEADKEYMAP 	_IOW('k', 9, accentmap_t)
 #define GIO_KEYMAPENT 	_IOWR('k', 10, keyarg_t)

@@ -29,77 +29,21 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
-
 /*
  * This file implements initial version of device-mapper zero target.
  */
-#include <sys/types.h>
-#include <sys/param.h>
-
-#include <sys/buf.h>
-
 #include <dev/disk/dm/dm.h>
-
-/*
- * Zero target init function. This target doesn't need
- * target specific config area.
- */
-static int
-dm_target_zero_init(dm_dev_t * dmv, void **target_config, char *argv)
-{
-
-	kprintf("Zero target init function called!!\n");
-
-	dmv->dev_type = DM_ZERO_DEV;
-
-	*target_config = NULL;
-
-	return 0;
-}
-
-/* Status routine called to get params string. */
-static char *
-dm_target_zero_status(void *target_config)
-{
-	return NULL;
-}
-
 
 /*
  * This routine does IO operations.
  */
 static int
-dm_target_zero_strategy(dm_table_entry_t * table_en, struct buf * bp)
+dm_target_zero_strategy(dm_table_entry_t *table_en, struct buf *bp)
 {
-
-	/* printf("Zero target read function called %d!!\n", bp->b_bcount); */
-
 	memset(bp->b_data, 0, bp->b_bcount);
 	bp->b_resid = 0;
 	biodone(&bp->b_bio1);
 
-	return 0;
-}
-
-/* Doesn't not need to do anything here. */
-static int
-dm_target_zero_destroy(dm_table_entry_t * table_en)
-{
-	table_en->target_config = NULL;
-
-	return 0;
-}
-
-/* Doesn't not need to do anything here. */
-static int
-dm_target_zero_deps(dm_table_entry_t * table_en, prop_array_t prop_array)
-{
-	return 0;
-}
-/* Unsuported for this target. */
-static int
-dm_target_zero_upcall(dm_table_entry_t * table_en, struct buf * bp)
-{
 	return 0;
 }
 
@@ -119,14 +63,7 @@ dmtz_mod_handler(module_t mod, int type, void *unused)
 		dmt->version[0] = 1;
 		dmt->version[1] = 0;
 		dmt->version[2] = 0;
-		strlcpy(dmt->name, "zero", DM_MAX_TYPE_NAME);
-		dmt->init = &dm_target_zero_init;
-		dmt->status = &dm_target_zero_status;
 		dmt->strategy = &dm_target_zero_strategy;
-		dmt->deps = &dm_target_zero_deps;
-		dmt->destroy = &dm_target_zero_destroy;
-		dmt->upcall = &dm_target_zero_upcall;
-		dmt->dump = NULL;
 
 		err = dm_target_insert(dmt);
 		if (err == 0)
@@ -134,12 +71,9 @@ dmtz_mod_handler(module_t mod, int type, void *unused)
 		break;
 
 	case MOD_UNLOAD:
-		err = dm_target_rem("zero");
+		err = dm_target_remove("zero");
 		if (err == 0)
 			kprintf("dm_target_zero: unloaded\n");
-		break;
-
-	default:
 		break;
 	}
 

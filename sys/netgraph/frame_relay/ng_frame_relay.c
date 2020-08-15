@@ -319,7 +319,7 @@ ngfrm_newhook(node_p node, hook_p hook, const char *name)
 /*
  * Count up the size of the address header if we don't already know
  */
-int
+static int
 ngfrm_addrlen(char *hdr)
 {
 	if (hdr[0] & BYTEX_EA)
@@ -371,7 +371,7 @@ ngfrm_rcvdata(hook_p hook, struct mbuf *m, meta_p meta)
 	alen = sc->addrlen;
 	if (alen == 0)
 		alen = 2;	/* default value for transmit */
-	M_PREPEND(m, alen, MB_DONTWAIT);
+	M_PREPEND(m, alen, M_NOWAIT);
 	if (m == NULL) {
 		error = ENOBUFS;
 		goto bad;

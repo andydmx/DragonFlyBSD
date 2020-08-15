@@ -10,10 +10,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by John Birrell.
- * 4. Neither the name of the author nor the names of any co-contributors
+ * 3. Neither the name of the author nor the names of any co-contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -29,12 +26,10 @@
  * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
  *
- * $DragonFly: src/lib/libthread_xu/thread/thr_kill.c,v 1.4 2006/04/06 13:03:09 davidxu Exp $
  */
 
 #include "namespace.h"
 #include <machine/tls.h>
-
 #include <errno.h>
 #include <signal.h>
 #include <pthread.h>
@@ -45,19 +40,22 @@
 int
 _pthread_kill(pthread_t pthread, int sig)
 {
-	struct pthread *curthread = tls_get_curthread();
+	struct pthread *curthread;
 	int ret;
 
 	/* Check for invalid signal numbers: */
 	if (sig < 0 || sig > _SIG_MAXSIG)
 		/* Invalid signal: */
-		ret = EINVAL;
+		return (EINVAL);
+
+	curthread = tls_get_curthread();
+
 	/*
 	 * Ensure the thread is in the list of active threads, and the
 	 * signal is valid (signal 0 specifies error checking only) and
 	 * not being ignored:
 	 */
-	else if ((ret = _thr_ref_add(curthread, pthread, /*include dead*/0))
+	if ((ret = _thr_ref_add(curthread, pthread, /*include dead*/0))
 	    == 0) {
 		if (sig > 0)
 			_thr_send_sig(pthread, sig);

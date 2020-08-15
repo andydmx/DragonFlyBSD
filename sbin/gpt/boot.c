@@ -30,8 +30,6 @@
  * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT
  * OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
- * 
- * $DragonFly: src/sbin/gpt/boot.c,v 1.2 2008/08/21 23:10:04 thomas Exp $
  */
 
 #include <sys/types.h>
@@ -78,7 +76,7 @@ bootset(int fd)
 		err(1, "unable to find uuid for 'DragonFly Label32'");
 	entry = 0;
 	block = 0;
-	size = 768 * 1024 * 1024 / 512;
+	size = (off_t)1024 * 1024 * 1024 / 512;		/* 1GB */
 
 	gpt = map_find(MAP_TYPE_PRI_GPT_HDR);
 	if (gpt == NULL)
@@ -174,7 +172,7 @@ bootset(int fd)
 	mbr->mbr_part[1].part_size_lo = htole16(size);
 	mbr->mbr_part[1].part_size_hi = htole16(size >> 16);
 
-	mbr->mbr_part[1].part_typ = 165;
+	mbr->mbr_part[1].part_typ = 108;
 	mbr->mbr_part[1].part_flag = 0x80;
 
 	gpt_write(fd, map);

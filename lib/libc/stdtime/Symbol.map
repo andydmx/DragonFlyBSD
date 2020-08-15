@@ -1,4 +1,4 @@
-DF306.0 {
+DF404.0 {
     _int_to_time;
     _long_to_time;
     _time32_to_time;
@@ -11,6 +11,7 @@ DF306.0 {
     asctime_r;
     ctime;
     ctime_r;
+    daylight;
     difftime;
     gmtime;
     gmtime_r;
@@ -20,12 +21,23 @@ DF306.0 {
     offtime;
     posix2time;
     strftime;
+    strftime_l;
     strptime;
-    time2posix;
+    strptime_l;
     timegm;
+    time2posix;
     timelocal;
     timeoff;
+    timezone;
     tzname;
     tzset;
     tzsetwall;
+};
+
+DF406.0 {
+    timespec_get;
+};
+
+DF510.0 {
+    getdate;
 };

@@ -10,11 +10,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -37,8 +33,9 @@
 #ifndef _SYS_MOUNT_H_
 #define _SYS_MOUNT_H_
 
-#include <sys/ucred.h>
+#include <sys/queue.h>
 #include <sys/tree.h>
+#include <sys/ucred.h>
 
 #ifndef _KERNEL
 #if !defined(_POSIX_C_SOURCE) && !defined(_XOPEN_SOURCE)
@@ -47,9 +44,6 @@
 #endif /* !_KERNEL */
 
 #if defined(_KERNEL) || defined(_KERNEL_STRUCTURES)
-#ifndef _SYS_QUEUE_H_
-#include <sys/queue.h>
-#endif
 #ifndef _SYS_LOCK_H_
 #include <sys/lock.h>
 #endif
@@ -63,6 +57,7 @@
 #include <sys/thread.h>
 #endif
 #include <sys/vfs_quota.h>
+#include <sys/mplock2.h>
 #endif
 
 struct thread;
@@ -73,6 +68,8 @@ struct statvfs;
 struct vmntvnodescan_info;
 
 typedef struct fsid { int32_t val[2]; } fsid_t;	/* file system id type */
+
+#define fsidcmp(a, b) memcmp((a), (b), sizeof(fsid_t))
 
 /*
  * File identifier.  These are unique per filesystem on a single machine.
@@ -85,7 +82,7 @@ struct fid {
 	u_short		fid_len;		/* length of data in bytes */
 	u_short		fid_ext;		/* extended data 	   */
 	char		fid_data[MAXFIDSZ];	/* data (variable length) */
-};
+} __packed;
 
 /*
  * file system statistics
@@ -205,6 +202,12 @@ struct vfs_acct {
  *		 mnt_token interlocks operations which adjust the mount
  *		 structure and will also be held through VFS operations
  *		 for VFSes not flagged MPSAFE.
+ *
+ *		 The VFS should pre-set VFCF_MPSAFE in the VFS_SET() to
+ *		 avoid use of the mplock during mounting.  This will also
+ *		 cause MNTK_ALL_MPSAFE to be set in mnt_kern_flags.  If the
+ *		 VFS does not set VFCF_MPSAFE then it can set individual
+ *		 MNTK_*_MPSAFE flags in mnt_kern_flags.
  */
 TAILQ_HEAD(vnodelst, vnode);
 TAILQ_HEAD(journallst, journal);
@@ -213,7 +216,8 @@ struct mount {
 	TAILQ_ENTRY(mount) mnt_list;		/* mount list */
 	struct vfsops	*mnt_op;		/* operations on fs */
 	struct vfsconf	*mnt_vfc;		/* configuration info */
-	long		mnt_namecache_gen;	/* ++ to clear negative hits */
+	u_int		mnt_namecache_gen;	/* ++ to clear negative hits */
+	u_int		mnt_pbuf_count;		/* pbuf usage limit */
 	struct vnode	*mnt_syncer;		/* syncer vnode */
 	struct syncer_ctx *mnt_syncer_ctx;	/* syncer process context */
 	struct vnodelst	mnt_nvnodelist;		/* list of vnodes this mount */
@@ -232,7 +236,7 @@ struct mount {
 
 	/*
 	 * ops vectors have a fixed stacking order.  All primary calls run
-	 * through mnt_vn_ops.  This field is typically assigned to 
+	 * through mnt_vn_ops.  This field is typically assigned to
 	 * mnt_vn_norm_ops.  If journaling has been enabled this field is
 	 * usually assigned to mnt_vn_journal_ops.
 	 */
@@ -245,7 +249,10 @@ struct mount {
 	struct vop_ops	*mnt_vn_fifo_ops;	/* for use by the VFS */
 	struct nchandle mnt_ncmountpt;		/* mount point */
 	struct nchandle mnt_ncmounton;		/* mounted on */
+	char		mnt_pad[16];		/* (try to cache-align refs) */
+	struct ucred	*mnt_cred;		/* for cr_prison */
 	int		mnt_refs;		/* nchandle references */
+	int		mnt_hold;		/* prevent kfree */
 	struct lwkt_token mnt_token;		/* token lock if not MPSAFE */
 	struct journallst mnt_jlist;		/* list of active journals */
 	u_int8_t	*mnt_jbitmap;		/* streamid bitmap */
@@ -254,6 +261,7 @@ struct mount {
 	struct bio_ops	*mnt_bioops;		/* BIO ops (hammer, softupd) */
 
 	struct vfs_acct	mnt_acct;		/* vfs space accounting */
+	RB_ENTRY(mount)	mnt_node;		/* mnt_stat.f_fsid */
 };
 
 #endif /* _KERNEL || _KERNEL_STRUCTURES */
@@ -266,7 +274,7 @@ struct mount {
 #define	MNT_NOEXEC	0x00000004	/* can't exec from filesystem */
 #define	MNT_NOSUID	0x00000008	/* don't honor setuid bits on fs */
 #define	MNT_NODEV	0x00000010	/* don't interpret special files */
-#define	MNT_UNION	0x00000020	/* union with underlying filesystem */
+#define	MNT_AUTOMOUNTED	0x00000020	/* mounted by automountd(8) */
 #define	MNT_ASYNC	0x00000040	/* file system written asynchronously */
 #define	MNT_SUIDDIR	0x00100000	/* special handling of SUID on dirs */
 #define	MNT_SOFTDEP	0x00200000	/* soft updates being done */
@@ -303,14 +311,14 @@ struct mount {
  * but the 'mount' program may need changing to handle this.
  */
 #define	MNT_VISFLAGMASK	(MNT_RDONLY	| MNT_SYNCHRONOUS | MNT_NOEXEC	| \
-			MNT_NOSUID	| MNT_NODEV	| MNT_UNION	| \
+			MNT_NOSUID	| MNT_NODEV			| \
 			MNT_ASYNC	| MNT_EXRDONLY	| MNT_EXPORTED	| \
 			MNT_DEFEXPORTED	| MNT_EXPORTANON| MNT_EXKERB	| \
 			MNT_LOCAL	| MNT_USER	| MNT_QUOTA	| \
 			MNT_ROOTFS	| MNT_NOATIME	| MNT_NOCLUSTERR| \
 			MNT_NOCLUSTERW	| MNT_SUIDDIR	| MNT_SOFTDEP	| \
 			MNT_IGNORE	| MNT_NOSYMFOLLOW | MNT_EXPUBLIC| \
-			MNT_TRIM)
+			MNT_TRIM	| MNT_AUTOMOUNTED)
 /*
  * External filesystem command modifier flags.
  * Unmount can use the MNT_FORCE flag.
@@ -336,6 +344,7 @@ struct mount {
  * MNTK_NOSTKMNT prevents mounting another filesystem inside the flagged one.
  */
 #define MNTK_UNMOUNTF	0x00000001	/* forced unmount in progress */
+#define MNTK_QUICKHALT	0x00008000	/* quick unmount on halt */
 #define MNTK_MPSAFE	0x00010000	/* call vops without mnt_token lock */
 #define MNTK_RD_MPSAFE	0x00020000	/* vop_read is MPSAFE */
 #define MNTK_WR_MPSAFE	0x00040000	/* vop_write is MPSAFE */
@@ -362,6 +371,7 @@ struct mount {
 #define MNTSCAN_FORWARD		0x0001
 #define MNTSCAN_REVERSE		0x0002
 #define MNTSCAN_NOBUSY		0x0004
+#define MNTSCAN_NOUNLOCK	0x0008
 
 #define MNTINS_FIRST		0x0001
 #define MNTINS_LAST		0x0002
@@ -386,35 +396,29 @@ struct mount {
 
 /*
  * VFS MPLOCK helper.
+ *
+ * We have to cache the supplied mp because in certain situations
+ * the related vnode might go away across the use case (vop_strategy()).
  */
-#define VFS_MPLOCK_DECLARE	int xlock_mpsafe
+#define VFS_MPLOCK_DECLARE	struct mount *xlock_mp
 
-#define VFS_MPLOCK1(mp)		VFS_MPLOCK_FLAG(mp, MNTK_MPSAFE)
-
-#define VFS_MPLOCK2(mp)							\
-		do {							\
-			if (xlock_mpsafe) {				\
-				get_mplock();	/* TEMPORARY */		\
-				lwkt_gettoken(&mp->mnt_token);		\
-				xlock_mpsafe = 0;			\
-			}						\
-		} while(0)
+#define VFS_MPLOCK(mp)		VFS_MPLOCK_FLAG(mp, MNTK_MPSAFE)
 
 #define VFS_MPLOCK_FLAG(mp, flag)					\
 		do {							\
 			if (mp->mnt_kern_flag & flag) {			\
-				xlock_mpsafe = 1;			\
+				xlock_mp = NULL;			\
 			} else {					\
+				xlock_mp = (mp);			\
 				get_mplock();	/* TEMPORARY */		\
-				lwkt_gettoken(&mp->mnt_token);		\
-				xlock_mpsafe = 0;			\
+				lwkt_gettoken(&xlock_mp->mnt_token);	\
 			}						\
 		} while(0)
 
-#define VFS_MPUNLOCK(mp)						\
+#define VFS_MPUNLOCK()						\
 		do {							\
-			if (xlock_mpsafe == 0) {			\
-				lwkt_reltoken(&mp->mnt_token);		\
+			if (xlock_mp) {					\
+				lwkt_reltoken(&xlock_mp->mnt_token);	\
 				rel_mplock();	/* TEMPORARY */		\
 			}						\
 		} while(0)
@@ -469,9 +473,6 @@ struct nfs_public {
  * type of filesystem supported by the kernel. These are searched at
  * mount time to identify the requested filesystem.
  */
-#ifndef _SYS_QUEUE_H_
-#include <sys/queue.h>
-#endif
 struct vfsconf {
 	struct	vfsops *vfc_vfsops;	/* filesystem operations vector */
 	char	vfc_name[MFSNAMELEN];	/* filesystem type name */
@@ -499,6 +500,26 @@ struct ovfsconf {
 #define VFCF_SYNTHETIC	0x00080000	/* data does not represent real files */
 #define	VFCF_LOOPBACK	0x00100000	/* aliases some other mounted FS */
 #define	VFCF_UNICODE	0x00200000	/* stores file names as Unicode*/
+#define VFCF_MPSAFE	0x00400000	/* VFS is fully MPSAFE */
+
+/* vfsquery flags */
+#define VQ_NOTRESP	0x0001	/* server down */
+#define VQ_NEEDAUTH	0x0002	/* server bad auth */
+#define VQ_LOWDISK	0x0004	/* we're low on space */
+#define VQ_MOUNT	0x0008	/* new filesystem arrived */
+#define VQ_UNMOUNT	0x0010	/* filesystem has left */
+#define VQ_DEAD		0x0020	/* filesystem is dead, needs force unmount */
+#define VQ_ASSIST	0x0040	/* filesystem needs assistance from external
+				   program */
+#define VQ_NOTRESPLOCK	0x0080	/* server lockd down */
+#define VQ_FLAG0100	0x0100	/* placeholder */
+#define VQ_FLAG0200	0x0200	/* placeholder */
+#define VQ_FLAG0400	0x0400	/* placeholder */
+#define VQ_FLAG0800	0x0800	/* placeholder */
+#define VQ_FLAG1000	0x1000	/* placeholder */
+#define VQ_FLAG2000	0x2000	/* placeholder */
+#define VQ_FLAG4000	0x4000	/* placeholder */
+#define VQ_FLAG8000	0x8000	/* placeholder */
 
 #ifdef _KERNEL
 
@@ -555,6 +576,7 @@ typedef void vfs_account_t(struct mount *mp,
 			uid_t uid, gid_t gid, int64_t delta);
 typedef void vfs_ncpgen_set_t(struct mount *mp, struct namecache *ncp);
 typedef int vfs_ncpgen_test_t(struct mount *mp, struct namecache *ncp);
+typedef int vfs_modifying_t(struct mount *mp);
 
 int vfs_mount(struct mount *mp, char *path, caddr_t data, struct ucred *cred);
 int vfs_start(struct mount *mp, int flags);
@@ -577,9 +599,10 @@ int vfs_uninit(struct vfsconf *vfc, struct vfsconf *vfsp);
 int vfs_extattrctl(struct mount *mp, int cmd, struct vnode *vp,
 		    int attrnamespace, const char *attrname,
 		    struct ucred *cred);
-
+int vfs_modifying(struct mount *mp);
 
 struct vfsops {
+	long		vfs_flags;
 	vfs_mount_t 	*vfs_mount;
 	vfs_start_t 	*vfs_start;
 	vfs_unmount_t 	*vfs_unmount;
@@ -600,7 +623,10 @@ struct vfsops {
 	vfs_account_t	*vfs_account;
 	vfs_ncpgen_set_t	*vfs_ncpgen_set;
 	vfs_ncpgen_test_t	*vfs_ncpgen_test;
+	vfs_modifying_t	*vfs_modifying;
 };
+
+#define VFSOPSF_NOSYNCERTHR	0x00000001
 
 #define VFS_MOUNT(MP, PATH, DATA, CRED)		\
 	vfs_mount(MP, PATH, DATA, CRED)
@@ -641,6 +667,8 @@ struct vfsops {
 	MP->mnt_op->vfs_ncpgen_set(MP, NCP)
 #define VFS_NCPGEN_TEST(MP, NCP) \
 	MP->mnt_op->vfs_ncpgen_test(MP, NCP)
+#define VFS_MODIFYING(MP) \
+	MP->mnt_op->vfs_modifying(MP)
 
 #endif
 
@@ -685,20 +713,25 @@ struct netcred {
  * Network export information
  */
 struct netexport {
-	struct	netcred ne_defexported;		      /* Default export */
-	struct	radix_node_head *ne_rtable[AF_MAX+1]; /* Individual exports */
+	struct	netcred ne_defexported;		/* Default export */
+	struct	radix_node_head *ne_inethead;	/* IPv4 radix */
+	struct	radix_node_head *ne_inet6head;	/* IPv6 radix */
+	struct	radix_node_head *ne_maskhead;	/* Shared mask radix */
 };
+#define NE_LOCK(nep)		lwkt_getpooltoken(nep)
+#define NE_UNLOCK(nep)		lwkt_relpooltoken(nep)
+#define NE_ASSERT_LOCKED(nep)	\
+    ASSERT_LWKT_TOKEN_HELD(lwkt_token_pool_lookup(nep))
 
 #endif
 
 #ifdef _KERNEL
-
-extern	char *mountrootfsname;
-
 /*
  * exported vnode operations
  */
-int	dounmount (struct mount *, int);
+void	mount_hold(struct mount *);
+void	mount_drop(struct mount *);
+int	dounmount (struct mount *, int, int);
 int	vfs_setpublicfs			    /* set publicly exported fs */
 	  (struct mount *, struct netexport *, const struct export_args *);
 int	vfs_lock (struct mount *);         /* lock a vfs */
@@ -711,14 +744,14 @@ struct	netcred *vfs_export_lookup	    /* lookup host in fs export list */
 	  (struct mount *, struct netexport *, struct sockaddr *);
 int	vfs_allocate_syncvnode (struct mount *);
 void	vfs_getnewfsid (struct mount *);
-int	vfs_setfsid(struct mount *mp, fsid_t *template);
+void	vfs_setfsid(struct mount *mp, fsid_t *template);
 cdev_t	vfs_getrootfsid (struct mount *);
 struct	mount *vfs_getvfs (fsid_t *);      /* return vfs given fsid */
 int	vfs_modevent (module_t, int, void *);
 int	vfs_mountedon (struct vnode *);    /* is a vfs mounted on vp */
 int	vfs_rootmountalloc (char *, char *, struct mount **);
 void	vfs_unbusy (struct mount *);
-void	vfs_unmountall (void);
+void	vfs_unmountall (int halting);
 int	vfs_register (struct vfsconf *);
 int	vfs_unregister (struct vfsconf *);
 extern	struct nfs_public nfs_pub;
@@ -748,6 +781,7 @@ vfs_account_t	vfs_stdaccount;
 vfs_account_t	vfs_noaccount;
 vfs_ncpgen_set_t	vfs_stdncpgen_set;
 vfs_ncpgen_test_t	vfs_stdncpgen_test;
+vfs_modifying_t	vfs_stdmodifying;
 
 struct vop_access_args;
 int vop_helper_access(struct vop_access_args *ap, uid_t ino_uid, gid_t ino_gid,

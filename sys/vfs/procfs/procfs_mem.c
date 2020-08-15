@@ -34,7 +34,6 @@
  *	@(#)procfs_mem.c	8.5 (Berkeley) 6/15/94
  *
  * $FreeBSD: src/sys/miscfs/procfs/procfs_mem.c,v 1.46.2.3 2002/01/22 17:22:59 nectar Exp $
- * $DragonFly: src/sys/vfs/procfs/procfs_mem.c,v 1.16 2007/04/29 18:25:40 dillon Exp $
  */
 
 /*
@@ -44,6 +43,7 @@
 
 #include <sys/param.h>
 #include <sys/systm.h>
+#include <sys/uio.h>
 #include <sys/proc.h>
 #include <sys/priv.h>
 #include <sys/vnode.h>
@@ -57,13 +57,9 @@
 #include <vm/vm_kern.h>
 #include <vm/vm_object.h>
 #include <vm/vm_page.h>
-#include <sys/user.h>
 #include <sys/ptrace.h>
 
 #include <machine/vmm.h>
-
-#include <sys/thread2.h>
-#include <sys/sysref2.h>
 
 static int	procfs_rwmem (struct proc *curp,
 				  struct proc *p, struct uio *uio);
@@ -104,7 +100,7 @@ procfs_rwmem(struct proc *curp, struct proc *p, struct uio *uio)
 	if (writing)
 		reqprot |= VM_PROT_WRITE | VM_PROT_OVERRIDE_WRITE;
 
-	kva = kmem_alloc_pageable(&kernel_map, PAGE_SIZE);
+	kva = kmem_alloc_pageable(&kernel_map, PAGE_SIZE, VM_SUBSYS_PROC);
 
 	/*
 	 * Only map in one page at a time.  We don't have to, but it
@@ -115,6 +111,7 @@ procfs_rwmem(struct proc *curp, struct proc *p, struct uio *uio)
 		vm_offset_t page_offset;	/* offset into page */
 		size_t len;
 		vm_page_t m;
+		int busy;
 
 		uva = (vm_offset_t) uio->uio_offset;
 
@@ -142,9 +139,13 @@ procfs_rwmem(struct proc *curp, struct proc *p, struct uio *uio)
 
 		/*
 		 * Fault the page on behalf of the process
+		 *
+		 * XXX busied page on write fault can deadlock against our
+		 *     uiomove.
 		 */
 		m = vm_fault_page(map, pageno, reqprot,
-				  VM_FAULT_NORMAL, &error);
+				  VM_FAULT_NORMAL,
+				  &error, &busy);
 		if (error) {
 			KKASSERT(m == NULL);
 			error = EFAULT;
@@ -152,7 +153,7 @@ procfs_rwmem(struct proc *curp, struct proc *p, struct uio *uio)
 		}
 
 		/*
-		 * Cleanup tmap then create a temporary KVA mapping and
+		 * Cleanup pmap then create a temporary KVA mapping and
 		 * do the I/O.  We can switch between cpus so don't bother
 		 * synchronizing across all cores.
 		 */
@@ -161,9 +162,12 @@ procfs_rwmem(struct proc *curp, struct proc *p, struct uio *uio)
 		pmap_kremove_quick(kva);
 
 		/*
-		 * release the page and we are done
+		 * Release the page and we are done
 		 */
-		vm_page_unhold(m);
+		if (busy)
+			vm_page_wakeup(m);
+		else
+			vm_page_unhold(m);
 	} while (error == 0 && uio->uio_resid > 0);
 
 	vmspace_drop(vm);

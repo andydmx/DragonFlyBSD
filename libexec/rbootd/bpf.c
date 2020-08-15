@@ -180,7 +180,7 @@ BpfOpen(void)
 		};
 #undef	RMP
 		static struct bpf_program bpf_pgm = {
-		    sizeof(bpf_insn)/sizeof(bpf_insn[0]), bpf_insn
+		    NELEM(bpf_insn), bpf_insn
 		};
 
 		if (ioctl(BpfFd, BIOCSETF, (caddr_t)&bpf_pgm) < 0) {
@@ -228,19 +228,11 @@ BpfGetIntfName(char **errmsg)
 	ifc.ifc_len = sizeof ibuf;
 	ifc.ifc_buf = (caddr_t)ibuf;
 
-#ifdef OSIOCGIFCONF
-	if (ioctl(fd, OSIOCGIFCONF, (char *)&ifc) < 0 ||
-	    ifc.ifc_len < sizeof(struct ifreq)) {
-		(void) strcpy(errbuf, "bpf: ioctl(OSIOCGIFCONF): %m");
-		return(NULL);
-	}
-#else
 	if (ioctl(fd, SIOCGIFCONF, (char *)&ifc) < 0 ||
 	    ifc.ifc_len < sizeof(struct ifreq)) {
 		(void) strcpy(errbuf, "bpf: ioctl(SIOCGIFCONF): %m");
 		return(NULL);
 	}
-#endif
 	ifrp = ibuf;
 	ifend = (struct ifreq *)((char *)ibuf + ifc.ifc_len);
 

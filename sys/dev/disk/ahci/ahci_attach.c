@@ -72,6 +72,8 @@ static const struct ahci_device ahci_devices[] = {
 	    ahci_nvidia_mcp_attach, ahci_pci_detach, "NVidia-MCP77-SATA" },
 	{ PCI_VENDOR_NVIDIA,	PCI_PRODUCT_NVIDIA_MCP79_AHCI_1,
 	    ahci_nvidia_mcp_attach, ahci_pci_detach, "NVidia-MCP79-SATA" },
+	{ PCI_VENDOR_NVIDIA,	PCI_PRODUCT_NVIDIA_MCP79_AHCI_9,
+	    ahci_nvidia_mcp_attach, ahci_pci_detach, "NVidia-MCP79-SATA" },
 	{ 0, 0,
 	    ahci_pci_attach, ahci_pci_detach, "AHCI-PCI-SATA" }
 };
@@ -109,7 +111,9 @@ static const struct ahci_pciid ahci_msi_blacklist[] = {
 };
 
 static int	ahci_msi_enable = 1;
+int	ahci_synchronous_boot = 1;
 TUNABLE_INT("hw.ahci.msi.enable", &ahci_msi_enable);
+TUNABLE_INT("hw.ahci.synchronous_boot", &ahci_synchronous_boot);
 
 /*
  * Match during probe and attach.  The device does not yet have a softc.
@@ -204,10 +208,11 @@ ahci_pci_attach(device_t dev)
 	uint16_t vid, did;
 	u_int32_t pi, reg;
 	u_int32_t cap, cap2;
+	u_int32_t chip;
 	u_int irq_flags;
 	bus_addr_t addr;
 	int i, error, msi_enable, rev, fbs;
-	const char *revision;
+	char revbuf[32];
 
 	if (pci_read_config(dev, PCIR_COMMAND, 2) & 0x0400) {
 		device_printf(dev, "BIOS disabled PCI interrupt, "
@@ -216,12 +221,46 @@ ahci_pci_attach(device_t dev)
 			pci_read_config(dev, PCIR_COMMAND, 2) & ~0x0400, 2);
 	}
 
+	/*
+	 * Chip quirks.  Sigh.  The AHCI spec is not in the least confusing
+	 * when it comes to how the FR and CR bits work, but some AHCI
+	 * chipsets (aka Marvell) either don't have the bits at all or they
+	 * implement them poorly.
+	 */
+	chip = ((uint16_t)pci_get_device(dev) << 16) |
+		(uint16_t)pci_get_vendor(dev);
+
+	switch(chip) {
+	case 0x91721b4b:
+		device_printf(dev,
+			      "Enable 88SE9172 workarounds for broken chip\n");
+		sc->sc_flags |= AHCI_F_IGN_FR;
+		sc->sc_flags |= AHCI_F_IGN_CR;
+		break;
+	case 0x92151b4b:
+		device_printf(dev,
+			      "Enable 88SE9215 workarounds for broken chip\n");
+		sc->sc_flags |= AHCI_F_IGN_FR;
+		sc->sc_flags |= AHCI_F_IGN_CR;
+		break;
+	case 0x92301b4b:
+		device_printf(dev,
+			      "Enable 88SE9230 workarounds for broken chip\n");
+		sc->sc_flags |= AHCI_F_CYCLE_FR;
+		break;
+	case 0x07f410de:
+		device_printf(dev,
+			      "Enable nForce 630i workarounds for broken chip\n");
+		sc->sc_flags |= AHCI_F_IGN_FR;
+		sc->sc_flags |= AHCI_F_IGN_CR;
+		break;
+	}
+
 	sc->sc_dev = dev;
 
 	/*
 	 * Map the AHCI controller's IRQ and BAR(5) (hardware registers)
 	 */
-
 	msi_enable = ahci_msi_enable;
 
 	vid = pci_get_vendor(dev);
@@ -279,11 +318,14 @@ ahci_pci_attach(device_t dev)
 	 * command tags and set up the DMA tags.  Adjust the saved
 	 * sc_cap according to override flags.
 	 */
-	cap = sc->sc_cap = ahci_read(sc, AHCI_REG_CAP);
+	cap = ahci_read(sc, AHCI_REG_CAP);
 	if (sc->sc_flags & AHCI_F_NO_NCQ)
-		sc->sc_cap &= ~AHCI_REG_CAP_SNCQ;
+		cap &= ~AHCI_REG_CAP_SNCQ;
 	if (sc->sc_flags & AHCI_F_FORCE_FBSS)
-		sc->sc_cap |= AHCI_REG_CAP_FBSS;
+		cap |= AHCI_REG_CAP_FBSS;
+	if (sc->sc_flags & AHCI_F_FORCE_SCLO)
+		cap |= AHCI_REG_CAP_SCLO;
+	sc->sc_cap = cap;
 
 	/*
 	 * We assume at least 4 commands.
@@ -309,19 +351,23 @@ ahci_pci_attach(device_t dev)
 	fbs = (cap & AHCI_REG_CAP_FBSS) ? 16 : 1;
 	error = 0;
 
+	sc->sc_rfis_size = sizeof(struct ahci_rfis) * fbs;
+
 	error += bus_dma_tag_create(
 			NULL,				/* parent tag */
-			256 * fbs,			/* alignment */
+			sc->sc_rfis_size,		/* alignment */
 			PAGE_SIZE,			/* boundary */
 			addr,				/* loaddr? */
 			BUS_SPACE_MAXADDR,		/* hiaddr */
 			NULL,				/* filter */
 			NULL,				/* filterarg */
-			sizeof(struct ahci_rfis) * fbs,	/* [max]size */
+			sc->sc_rfis_size,		/* [max]size */
 			1,				/* maxsegs */
-			sizeof(struct ahci_rfis) * fbs,	/* maxsegsz */
+			sc->sc_rfis_size,		/* maxsegsz */
 			0,				/* flags */
 			&sc->sc_tag_rfis);		/* return tag */
+
+	sc->sc_cmdlist_size = sc->sc_ncmds * sizeof(struct ahci_cmd_hdr);
 
 	error += bus_dma_tag_create(
 			NULL,				/* parent tag */
@@ -331,9 +377,9 @@ ahci_pci_attach(device_t dev)
 			BUS_SPACE_MAXADDR,		/* hiaddr */
 			NULL,				/* filter */
 			NULL,				/* filterarg */
-			sc->sc_ncmds * sizeof(struct ahci_cmd_hdr),
+			sc->sc_cmdlist_size,
 			1,				/* maxsegs */
-			sc->sc_ncmds * sizeof(struct ahci_cmd_hdr),
+			sc->sc_cmdlist_size,
 			0,				/* flags */
 			&sc->sc_tag_cmdh);		/* return tag */
 
@@ -396,52 +442,31 @@ ahci_pci_attach(device_t dev)
 	/* check the revision */
 	reg = ahci_read(sc, AHCI_REG_VS);
 
-	switch (reg) {
-	case AHCI_REG_VS_0_95:
-		revision = "AHCI 0.95";
-		break;
-	case AHCI_REG_VS_1_0:
-		revision = "AHCI 1.0";
-		break;
-	case AHCI_REG_VS_1_1:
-		revision = "AHCI 1.1";
-		break;
-	case AHCI_REG_VS_1_2:
-		revision = "AHCI 1.2";
-		break;
-	case AHCI_REG_VS_1_3:
-		revision = "AHCI 1.3";
-		break;
-	case AHCI_REG_VS_1_4:
-		revision = "AHCI 1.4";
-		break;
-	case AHCI_REG_VS_1_5:
-		revision = "AHCI 1.5";	/* future will catch up to us */
-		break;
-	default:
-		device_printf(sc->sc_dev,
-			      "Warning: Unknown AHCI revision 0x%08x\n", reg);
-		revision = "AHCI <unknown>";
-		break;
+	if (reg & 0x0000FF) {
+		ksnprintf(revbuf, sizeof(revbuf), "AHCI %d.%d.%d",
+			  (reg >> 16), (uint8_t)(reg >> 8), (uint8_t)reg);
+	} else {
+		ksnprintf(revbuf, sizeof(revbuf), "AHCI %d.%d",
+			  (reg >> 16), (uint8_t)(reg >> 8));
 	}
 	sc->sc_vers = reg;
 
 	if (reg >= AHCI_REG_VS_1_3) {
 		cap2 = ahci_read(sc, AHCI_REG_CAP2);
 		device_printf(dev,
-			      "%s cap 0x%b cap2 0x%b, %d ports, "
+			      "%s cap 0x%pb%i cap2 0x%pb%i, %d ports, "
 			      "%d tags/port, gen %s\n",
-			      revision,
-			      cap, AHCI_FMT_CAP,
-			      cap2, AHCI_FMT_CAP2,
+			      revbuf,
+			      AHCI_FMT_CAP, cap,
+			      AHCI_FMT_CAP2, cap2,
 			      AHCI_REG_CAP_NP(cap), sc->sc_ncmds, gen);
 	} else {
 		cap2 = 0;
 		device_printf(dev,
-			      "%s cap 0x%b, %d ports, "
+			      "%s cap 0x%pb%i, %d ports, "
 			      "%d tags/port, gen %s\n",
-			      revision,
-			      cap, AHCI_FMT_CAP,
+			      revbuf,
+			      AHCI_FMT_CAP, cap,
 			      AHCI_REG_CAP_NP(cap), sc->sc_ncmds, gen);
 	}
 	sc->sc_cap2 = cap2;
@@ -449,6 +474,11 @@ ahci_pci_attach(device_t dev)
 	pi = ahci_read(sc, AHCI_REG_PI);
 	DPRINTF(AHCI_D_VERBOSE, "%s: ports implemented: 0x%08x\n",
 	    DEVNAME(sc), pi);
+
+	sc->sc_ipm_disable = AHCI_PREG_SCTL_IPM_NOPARTIAL |
+			     AHCI_PREG_SCTL_IPM_NOSLUMBER;
+	if (sc->sc_cap2 & AHCI_REG_CAP2_SDS)
+		sc->sc_ipm_disable |= AHCI_PREG_SCTL_IPM_NODEVSLP;
 
 #ifdef AHCI_COALESCE
 	/* Naive coalescing support - enable for all ports. */
@@ -509,7 +539,8 @@ noccc:
 	 * ready to go.
 	 */
 	if (error == 0) {
-		error = bus_setup_intr(dev, sc->sc_irq, INTR_MPSAFE,
+		error = bus_setup_intr(dev, sc->sc_irq, INTR_MPSAFE |
+							INTR_HIFREQ,
 				       ahci_intr, sc,
 				       &sc->sc_irq_handle, NULL);
 	}
@@ -544,11 +575,13 @@ noccc:
 	ahci_intr(sc);
 
 	/*
+	 * Synchronously wait for some of the AHCI devices to initialize.
+	 *
 	 * All ports are probing in parallel.  Wait for them to finish
 	 * and then issue the cam attachment and bus scan serially so
 	 * the 'da' assignments are deterministic.
 	 */
-	for (i = 0; i < AHCI_MAX_PORTS; i++) {
+	for (i = 0; i < AHCI_MAX_PORTS && ahci_synchronous_boot; i++) {
 		if ((ap = sc->sc_ports[i]) != NULL) {
 			while (ap->ap_signal & AP_SIGF_INIT)
 				tsleep(&ap->ap_signal, 0, "ahprb2", hz);
@@ -557,7 +590,7 @@ noccc:
 				ahci_cam_changed(ap, NULL, -1);
 				ahci_os_unlock_port(ap);
 				while ((ap->ap_flags & AP_F_SCAN_COMPLETED) == 0) {
-					tsleep(&ap->ap_flags, 0, "ahprb2", hz);
+					tsleep(&ap->ap_flags, 0, "ahprb3", hz);
 				}
 			} else {
 				ahci_os_unlock_port(ap);

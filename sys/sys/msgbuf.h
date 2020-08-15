@@ -10,11 +10,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -42,13 +38,22 @@
 #include <sys/types.h>
 #endif
 
+/*
+ * NOTE!  The indices are not masked against msg_size.  All accessors
+ *	  must mask the indices against msg_size to get actual buffer
+ *	  indexes.  For relative block sizes, simple subtraction can be
+ *	  used using unsigned integers.
+ */
 struct	msgbuf {
-#define	MSG_MAGIC	0x063062
+#define	MSG_MAGIC	0x063064
+#define	MSG_OMAGIC	0x063062
 	unsigned int	msg_magic;
 	unsigned int	msg_size;		/* size of buffer area */
-	unsigned int	msg_bufx;		/* write pointer */
-	unsigned int	msg_bufr;		/* read pointer */
+	unsigned int	msg_bufx;		/* write index - kernel */
+	unsigned int	msg_bufr;		/* base index  - kernel */
 	char * 		msg_ptr;		/* pointer to buffer */
+	unsigned int	msg_bufl;		/* read index - log device */
+	unsigned int	msg_unused01;
 };
 
 #ifdef _KERNEL
@@ -57,7 +62,7 @@ extern struct	msgbuf *msgbufp;
 void	msgbufinit	(void *ptr, size_t size);
 
 #if !defined(MSGBUF_SIZE)
-#define	MSGBUF_SIZE	131072
+#define	MSGBUF_SIZE	1048576
 #endif
 
 #endif

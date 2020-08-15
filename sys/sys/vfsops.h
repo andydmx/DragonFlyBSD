@@ -1,13 +1,13 @@
 /*
  * Copyright (c) 2004 The DragonFly Project.  All rights reserved.
- * 
+ *
  * This code is derived from software contributed to The DragonFly Project
  * by Matthew Dillon <dillon@backplane.com>
- * 
+ *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
  * are met:
- * 
+ *
  * 1. Redistributions of source code must retain the above copyright
  *    notice, this list of conditions and the following disclaimer.
  * 2. Redistributions in binary form must reproduce the above copyright
@@ -17,7 +17,7 @@
  * 3. Neither the name of The DragonFly Project nor the names of its
  *    contributors may be used to endorse or promote products derived
  *    from this software without specific, prior written permission.
- * 
+ *
  * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
  * ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
  * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
@@ -30,8 +30,6 @@
  * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT
  * OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
- *
- * $DragonFly: src/sys/sys/vfsops.h,v 1.32 2008/06/19 23:27:36 dillon Exp $
  */
 
 /*
@@ -39,7 +37,7 @@
  * fixed set of vectors.
  *
  * In DragonFly the ultimate goal is to thread the VFS, which means that
- * the dispatch functions will eventually be called from the context of 
+ * the dispatch functions will eventually be called from the context of
  * a management thread rather then directly called by a process.  This
  * requires us to divorce direct process dependancies (in particular ioctl
  * and UIO's).  In addition, it is our intention to implement kernel
@@ -64,6 +62,7 @@
 #ifndef _SYS_VFSOPS_H_
 #define	_SYS_VFSOPS_H_
 
+#ifdef _KERNEL
 #ifndef _SYS_ACL_H_
 #include <sys/acl.h>
 #endif
@@ -151,6 +150,14 @@ struct vop_getattr_args {
 	struct vop_generic_args a_head;
 	struct vnode *a_vp;
 	struct vattr *a_vap;
+	struct file *a_fp; /* FUSE */
+};
+
+struct vop_getattr_lite_args {
+	struct vop_generic_args a_head;
+	struct vnode *a_vp;
+	struct vattr_lite *a_lvap;
+	struct file *a_fp; /* FUSE */
 };
 
 struct vop_setattr_args {
@@ -158,6 +165,7 @@ struct vop_setattr_args {
 	struct vnode *a_vp;
 	struct vattr *a_vap;
 	struct ucred *a_cred;
+	struct file *a_fp; /* FUSE */
 };
 
 struct vop_read_args {
@@ -166,6 +174,7 @@ struct vop_read_args {
 	struct uio *a_uio;
 	int a_ioflag;
 	struct ucred *a_cred;
+	struct file *a_fp; /* FUSE */
 };
 
 struct vop_write_args {
@@ -174,6 +183,7 @@ struct vop_write_args {
 	struct uio *a_uio;
 	int a_ioflag;
 	struct ucred *a_cred;
+	struct file *a_fp; /* FUSE */
 };
 
 struct vop_ioctl_args {
@@ -211,6 +221,7 @@ struct vop_fsync_args {
 	struct vnode *a_vp;
 	int a_waitfor;
 	int a_flags;
+	struct file *a_fp; /* FUSE */
 };
 
 struct vop_old_remove_args {
@@ -269,6 +280,7 @@ struct vop_readdir_args {
 	int *a_eofflag;
 	int *a_ncookies;
 	off_t **a_cookies;
+	struct file *a_fp; /* FUSE */
 };
 
 struct vop_readlink_args {
@@ -356,7 +368,7 @@ struct vop_putpages_args {
 	struct vnode *a_vp;
 	struct vm_page **a_m;
 	int a_count;
-	int a_sync;
+	int a_flags;
 	int *a_rtvals;
 	vm_ooffset_t a_offset;
 };
@@ -570,7 +582,7 @@ struct vop_nrename_args {
  * function wrappers to implement hooks for per-mount management functions
  * such as journaling and cache coherency protocols.  The second section is
  * the function dispatch for the VFSs.  The functions are supposed to run
- * in the context of the VFS's thread (if it has one) and should not be 
+ * in the context of the VFS's thread (if it has one) and should not be
  * directly called from random kernel code.  Note that VOCALL()s are direct
  * calls used for chaining vop_ops structures from a VFS context.
  */
@@ -591,6 +603,7 @@ struct vop_ops {
 	int	(*vop_close)(struct vop_close_args *);
 	int	(*vop_access)(struct vop_access_args *);
 	int	(*vop_getattr)(struct vop_getattr_args *);
+	int	(*vop_getattr_lite)(struct vop_getattr_lite_args *);
 	int	(*vop_setattr)(struct vop_setattr_args *);
 	int	(*vop_read)(struct vop_read_args *);
 	int	(*vop_write)(struct vop_write_args *);
@@ -648,6 +661,7 @@ struct vop_ops {
 	int	(*vop_nrename)(struct vop_nrename_args *);
 #define vop_ops_last_field	vop_nrename
 };
+#endif	/* _KERNEL */
 
 /*
  * vop_mountctl() operations
@@ -660,6 +674,7 @@ struct vop_ops {
  * structures.  The vop_args_union can hold any VOP call argument structure.
  * Note that vu_head is broken out.
  */
+#if 0
 union vop_args_union {
 	struct vop_generic_args vu_head;
 	struct vop_generic_args vu_default;
@@ -719,6 +734,7 @@ union vop_args_union {
 	struct vop_nrmdir_args vu_nrmdir;
 	struct vop_nrename_args vu_nrename;
 };
+#endif
 
 #ifdef _KERNEL
 
@@ -730,14 +746,14 @@ union vop_args_union {
  * routine directly in order to allow DragonFly to properly wrap the operation
  * in a message and dispatch it to the correct thread.
  */
-int vop_old_lookup(struct vop_ops *ops, struct vnode *dvp, 
+int vop_old_lookup(struct vop_ops *ops, struct vnode *dvp,
 		struct vnode **vpp, struct componentname *cnp);
 int vop_old_create(struct vop_ops *ops, struct vnode *dvp,
 		struct vnode **vpp, struct componentname *cnp,
 		struct vattr *vap);
-int vop_old_whiteout(struct vop_ops *ops, struct vnode *dvp, 
+int vop_old_whiteout(struct vop_ops *ops, struct vnode *dvp,
 		struct componentname *cnp, int flags);
-int vop_old_mknod(struct vop_ops *ops, struct vnode *dvp, 
+int vop_old_mknod(struct vop_ops *ops, struct vnode *dvp,
 		struct vnode **vpp, struct componentname *cnp,
 		struct vattr *vap);
 int vop_open(struct vop_ops *ops, struct vnode *vp, int mode,
@@ -746,13 +762,16 @@ int vop_close(struct vop_ops *ops, struct vnode *vp, int fflag,
 		struct file *file);
 int vop_access(struct vop_ops *ops, struct vnode *vp, int mode, int flags,
 		struct ucred *cred);
-int vop_getattr(struct vop_ops *ops, struct vnode *vp, struct vattr *vap);
+int vop_getattr(struct vop_ops *ops, struct vnode *vp, struct vattr *vap,
+		struct file *fp);
+int vop_getattr_lite(struct vop_ops *ops, struct vnode *vp,
+		struct vattr_lite *vap);
 int vop_setattr(struct vop_ops *ops, struct vnode *vp, struct vattr *vap,
-		struct ucred *cred);
+		struct ucred *cred, struct file *fp);
 int vop_read(struct vop_ops *ops, struct vnode *vp, struct uio *uio,
-		int ioflag, struct ucred *cred);
+		int ioflag, struct ucred *cred, struct file *fp);
 int vop_write(struct vop_ops *ops, struct vnode *vp, struct uio *uio,
-		int ioflag, struct ucred *cred);
+		int ioflag, struct ucred *cred, struct file *fp);
 int vop_ioctl(struct vop_ops *ops, struct vnode *vp, u_long command,
 		caddr_t data, int fflag, struct ucred *cred,
 		struct sysmsg *msg);
@@ -761,7 +780,8 @@ int vop_poll(struct vop_ops *ops, struct vnode *vp, int events,
 int vop_kqfilter(struct vop_ops *ops, struct vnode *vp, struct knote *kn);
 int vop_mmap(struct vop_ops *ops, struct vnode *vp, int fflags,
 		struct ucred *cred);
-int vop_fsync(struct vop_ops *ops, struct vnode *vp, int waitfor, int flags);
+int vop_fsync(struct vop_ops *ops, struct vnode *vp, int waitfor, int flags,
+		struct file *fp);
 int vop_old_remove(struct vop_ops *ops, struct vnode *dvp,
 		struct vnode *vp, struct componentname *cnp);
 int vop_old_link(struct vop_ops *ops, struct vnode *tdvp,
@@ -779,8 +799,8 @@ int vop_old_symlink(struct vop_ops *ops, struct vnode *dvp,
 		struct vnode **vpp, struct componentname *cnp,
 		struct vattr *vap, char *target);
 int vop_readdir(struct vop_ops *ops, struct vnode *vp, struct uio *uio,
-		struct ucred *cred, int *eofflag, 
-		int *ncookies, off_t **cookies);
+		struct ucred *cred, int *eofflag,
+		int *ncookies, off_t **cookies, struct file *fp);
 int vop_readlink(struct vop_ops *ops, struct vnode *vp, struct uio *uio,
 		struct ucred *cred);
 int vop_inactive(struct vop_ops *ops, struct vnode *vp);
@@ -801,7 +821,7 @@ int vop_reallocblks(struct vop_ops *ops, struct vnode *vp,
 int vop_getpages(struct vop_ops *ops, struct vnode *vp, struct vm_page **m,
 		int count, int reqpage, vm_ooffset_t offset, int seqaccess);
 int vop_putpages(struct vop_ops *ops, struct vnode *vp, struct vm_page **m,
-		int count, int sync, int *rtvals, vm_ooffset_t offset);
+		int count, int flags, int *rtvals, vm_ooffset_t offset);
 int vop_freeblks(struct vop_ops *ops, struct vnode *vp,
 		off_t offset, int length);
 int vop_getacl(struct vop_ops *ops, struct vnode *vp, acl_type_t type,
@@ -847,8 +867,8 @@ int vop_nrename(struct vop_ops *ops,
 
 /*
  * Kernel VOP forwarding wrappers.  These are called when a VFS such as
- * nullfs or unionfs needs to push down into another VFS, changing the 
- * a_ops pointer and consequentially necessitating additional 
+ * nullfs needs to push down into another VFS, changing the
+ * a_ops pointer and consequentially necessitating additional
  * cache management.
  *
  * Note that this is different from vop_ops chaining within the same
@@ -865,6 +885,7 @@ int vop_open_ap(struct vop_open_args *ap);
 int vop_close_ap(struct vop_close_args *ap);
 int vop_access_ap(struct vop_access_args *ap);
 int vop_getattr_ap(struct vop_getattr_args *ap);
+int vop_getattr_lite_ap(struct vop_getattr_lite_args *ap);
 int vop_setattr_ap(struct vop_setattr_args *ap);
 int vop_read_ap(struct vop_read_args *ap);
 int vop_write_ap(struct vop_write_args *ap);
@@ -927,6 +948,7 @@ extern struct syslink_desc vop_open_desc;
 extern struct syslink_desc vop_close_desc;
 extern struct syslink_desc vop_access_desc;
 extern struct syslink_desc vop_getattr_desc;
+extern struct syslink_desc vop_getattr_lite_desc;
 extern struct syslink_desc vop_setattr_desc;
 extern struct syslink_desc vop_read_desc;
 extern struct syslink_desc vop_write_desc;
@@ -975,12 +997,13 @@ extern struct syslink_desc vop_nremove_desc;
 extern struct syslink_desc vop_nrmdir_desc;
 extern struct syslink_desc vop_nrename_desc;
 
-#endif
+#endif	/* _KERNEL */
 
 /*
  * VOP_*() convenience macros extract the operations vector and make the
  * vop_*() call.
  */
+#ifdef _KERNEL
 #define VOP_OPEN(vp, mode, cred, fp)			\
 	vop_open(*(vp)->v_ops, vp, mode, cred, fp)
 #define VOP_CLOSE(vp, fflag, fp)			\
@@ -991,14 +1014,24 @@ extern struct syslink_desc vop_nrename_desc;
 	vop_access(*(vp)->v_ops, vp, mode, AT_EACCESS, cred)
 #define VOP_ACCESS_FLAGS(vp, mode, flags, cred)		\
 	vop_access(*(vp)->v_ops, vp, mode, flags, cred)
+#define VOP_GETATTR_FP(vp, vap, fp)			\
+	vop_getattr(*(vp)->v_ops, vp, vap, fp) /* FUSE */
 #define VOP_GETATTR(vp, vap)				\
-	vop_getattr(*(vp)->v_ops, vp, vap)
+	VOP_GETATTR_FP(vp, vap, NULL)
+#define VOP_GETATTR_LITE(vp, lvap)			\
+	vop_getattr_lite(*(vp)->v_ops, vp, lvap)
+#define VOP_SETATTR_FP(vp, vap, cred, fp)		\
+	vop_setattr(*(vp)->v_ops, vp, vap, cred, fp) /* FUSE */
 #define VOP_SETATTR(vp, vap, cred)			\
-	vop_setattr(*(vp)->v_ops, vp, vap, cred)
+	VOP_SETATTR_FP(vp, vap, cred, NULL)
+#define VOP_READ_FP(vp, uio, ioflag, cred, fp)		\
+	vop_read(*(vp)->v_ops, vp, uio, ioflag, cred, fp) /* FUSE */
 #define VOP_READ(vp, uio, ioflag, cred)			\
-	vop_read(*(vp)->v_ops, vp, uio, ioflag, cred)
+	VOP_READ_FP(vp, uio, ioflag, cred, NULL)
+#define VOP_WRITE_FP(vp, uio, ioflag, cred, fp)		\
+	vop_write(*(vp)->v_ops, vp, uio, ioflag, cred, fp) /* FUSE */
 #define VOP_WRITE(vp, uio, ioflag, cred)		\
-	vop_write(*(vp)->v_ops, vp, uio, ioflag, cred)
+	VOP_WRITE_FP(vp, uio, ioflag, cred, NULL)
 #define VOP_IOCTL(vp, command, data, fflag, cred, msg)	\
 	vop_ioctl(*(vp)->v_ops, vp, command, data, fflag, cred, msg)
 #define VOP_POLL(vp, events, cred)			\
@@ -1007,10 +1040,14 @@ extern struct syslink_desc vop_nrename_desc;
 	vop_kqfilter(*(vp)->v_ops, vp, kn)
 #define VOP_MMAP(vp, fflags, cred)			\
 	vop_mmap(*(vp)->v_ops, vp, fflags, cred)
+#define VOP_FSYNC_FP(vp, waitfor, flags, fp)		\
+	vop_fsync(*(vp)->v_ops, vp, waitfor, flags, fp) /* FUSE*/
 #define VOP_FSYNC(vp, waitfor, flags)			\
-	vop_fsync(*(vp)->v_ops, vp, waitfor, flags)
+	VOP_FSYNC_FP(vp, waitfor, flags, NULL)
+#define VOP_READDIR_FP(vp, uio, cred, eofflag, ncookies, cookies, fp)	\
+	vop_readdir(*(vp)->v_ops, vp, uio, cred, eofflag, ncookies, cookies, fp) /* FUSE */
 #define VOP_READDIR(vp, uio, cred, eofflag, ncookies, cookies)		\
-	vop_readdir(*(vp)->v_ops, vp, uio, cred, eofflag, ncookies, cookies)
+	VOP_READDIR_FP(vp, uio, cred, eofflag, ncookies, cookies, NULL)
 #define VOP_READLINK(vp, uio, cred)			\
 	vop_readlink(*(vp)->v_ops, vp, uio, cred)
 #define VOP_INACTIVE(vp)				\
@@ -1031,8 +1068,8 @@ extern struct syslink_desc vop_nrename_desc;
 	vop_reallocblks(*(vp)->v_ops, vp, buflist)
 #define VOP_GETPAGES(vp, m, count, reqpage, off, seqaccess)		\
 	vop_getpages(*(vp)->v_ops, vp, m, count, reqpage, off, seqaccess)
-#define VOP_PUTPAGES(vp, m, count, sync, rtvals, off)	\
-	vop_putpages(*(vp)->v_ops, vp, m, count, sync, rtvals, off)
+#define VOP_PUTPAGES(vp, m, count, flags, rtvals, off)	\
+	vop_putpages(*(vp)->v_ops, vp, m, count, flags, rtvals, off)
 #define VOP_FREEBLKS(vp, offset, length)		\
 	vop_freeblks(*(vp)->v_ops, vp, offset, length)
 #define VOP_GETACL(vp, type, aclp, cred)		\
@@ -1107,6 +1144,7 @@ extern struct syslink_desc vop_nrename_desc;
 	vop_nrmdir((nch)->mount->mnt_vn_use_ops, nch, dvp, cred)
 #define VOP_NREMOVE(nch, dvp, cred)			\
 	vop_nremove((nch)->mount->mnt_vn_use_ops, nch, dvp, cred)
+#endif	/* _KERNEL */
 
-#endif
+#endif	/* !_SYS_VFSOPS_H_ */
 

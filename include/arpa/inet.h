@@ -12,11 +12,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- * 	This product includes software developed by the University of
- * 	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -55,7 +51,6 @@
  *	@(#)inet.h	8.1 (Berkeley) 6/2/93
  *	$Id: inet.h,v 1.2.18.1 2005/04/27 05:00:50 sra Exp $
  * $FreeBSD: src/include/arpa/inet.h,v 1.30 2007/08/24 20:25:52 bms Exp $
- * $DragonFly: src/include/arpa/inet.h,v 1.5 2005/07/13 12:49:56 joerg Exp $
  */
 
 #ifndef _ARPA_INET_H_
@@ -63,14 +58,32 @@
 
 /* External definitions for functions in inet(3) */
 
-#include <sys/types.h>
 #include <sys/cdefs.h>
-
-/* Required for byteorder(3) functions. */
-#include <machine/endian.h>
+#include <machine/endian.h>	/* Required for byteorder(3) functions. */
+#include <machine/stdint.h>	/* for __size_t, __socklen_t */
+#ifndef _KERNEL
+#include <stdint.h>		/* for uint16_t, uint32_t as per POSIX */
+#endif
 
 #define	INET_ADDRSTRLEN		16
 #define	INET6_ADDRSTRLEN	46
+
+#ifndef _IN_ADDR_T_DECLARED
+typedef	__uint32_t	in_addr_t;	/* base type for internet address */
+#define	_IN_ADDR_T_DECLARED
+#endif
+
+#ifndef _IN_PORT_T_DECLARED
+typedef	__uint16_t	in_port_t;
+#define	_IN_PORT_T_DECLARED
+#endif
+
+#if __BSD_VISIBLE
+#ifndef _SIZE_T_DECLARED
+#define	_SIZE_T_DECLARED
+typedef	__size_t	size_t;
+#endif
+#endif
 
 /*
  * XXX socklen_t is used by a POSIX.1-2001 interface, but not required by
@@ -86,17 +99,6 @@ struct in_addr {
 	in_addr_t s_addr;
 };
 #define	_STRUCT_IN_ADDR_DECLARED
-#endif
-
-#ifndef _STRUCT_IN6_ADDR_DECLARED
-struct in6_addr {
-	union {
-		uint8_t   __u6_addr8[16];
-		uint16_t  __u6_addr16[8];
-		uint32_t  __u6_addr32[4];
-	} __u6_addr;                    /* 128-bit IP6 address */
-};
-#define _STRUCT_IN6_ADDR_DECLARED
 #endif
 
 /* XXX all new diversions!! argh!! */
@@ -122,14 +124,14 @@ struct in6_addr {
 
 __BEGIN_DECLS
 in_addr_t	 inet_addr(const char *);
-/*const*/ char	*inet_ntoa(struct in_addr);
-char		*inet_ntoa_r(struct in_addr, char *buf, socklen_t size);
+char		*inet_ntoa(struct in_addr);
 const char	*inet_ntop(int, const void * __restrict, char * __restrict,
 		    socklen_t);
 int		 inet_pton(int, const char * __restrict, void * __restrict);
 
 #if __BSD_VISIBLE
 int		 inet_aton(const char *, struct in_addr *);
+char		*inet_ntoa_r(struct in_addr, char *buf, socklen_t size);
 in_addr_t	 inet_lnaof(struct in_addr);
 struct in_addr	 inet_makeaddr(in_addr_t, in_addr_t);
 char		*inet_neta(in_addr_t, char *, size_t);

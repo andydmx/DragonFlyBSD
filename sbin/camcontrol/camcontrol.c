@@ -39,13 +39,13 @@
 #include <err.h>
 #include <libutil.h>
 
-#include <cam/cam.h>
-#include <cam/cam_debug.h>
-#include <cam/cam_ccb.h>
-#include <cam/scsi/scsi_all.h>
-#include <cam/scsi/scsi_da.h>
-#include <cam/scsi/scsi_pass.h>
-#include <cam/scsi/scsi_message.h>
+#include <bus/cam/cam.h>
+#include <bus/cam/cam_debug.h>
+#include <bus/cam/cam_ccb.h>
+#include <bus/cam/scsi/scsi_all.h>
+#include <bus/cam/scsi/scsi_da.h>
+#include <bus/cam/scsi/scsi_pass.h>
+#include <bus/cam/scsi/scsi_message.h>
 #include <sys/nata.h>
 #include <camlib.h>
 #include "camcontrol.h"
@@ -689,7 +689,7 @@ scsidoinquiry(struct cam_device *device, int argc, char **argv,
 		return(error);
 
 	if (arglist & CAM_ARG_GET_SERIAL)
-		scsiserial(device, retry_count, timeout);
+		error = scsiserial(device, retry_count, timeout);
 
 	if (error != 0)
 		return(error);
@@ -3469,7 +3469,7 @@ retry:
 					bcopy(&lundata->luns[i].lundata[j+1],
 					      &tmp_lun[1], sizeof(tmp_lun) - 1);
 					fprintf(stdout, "%#jx",
-					       (intmax_t)scsi_8btou64(tmp_lun));
+					       (uintmax_t)scsi_8btou64(tmp_lun));
 					no_more = 1;
 				} else {
 					fprintf(stderr, "Unknown Extended LUN"
@@ -3716,9 +3716,9 @@ bailout:
 #endif /* MINIMALISTIC */
 
 void 
-usage(int verbose)
+usage(int _verbose)
 {
-	fprintf(verbose ? stdout : stderr,
+	fprintf(_verbose ? stdout : stderr,
 "usage:  camcontrol <command>  [device id][generic args][command args]\n"
 "        camcontrol devlist    [-b][-v]\n"
 #ifndef MINIMALISTIC
@@ -3751,7 +3751,7 @@ usage(int verbose)
 "        camcontrol format     [dev_id][generic args][-q][-r][-w][-y]\n"
 #endif /* MINIMALISTIC */
 "        camcontrol help\n");
-	if (!verbose)
+	if (!_verbose)
 		return;
 #ifndef MINIMALISTIC
 	fprintf(stdout,

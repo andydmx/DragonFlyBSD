@@ -30,7 +30,6 @@
  * SUCH DAMAGE.
  *
  * $FreeBSD: src/usr.sbin/ypserv/yp_access.c,v 1.23 2006/05/31 22:31:08 cperciva Exp $
- * $DragonFly: src/usr.sbin/ypserv/yp_access.c,v 1.5 2006/06/13 12:38:37 corecode Exp $
  */
 
 #include <stdlib.h>
@@ -54,10 +53,8 @@
 #include "tcpd.h"
 #endif
 
-extern int debug;
-
-			/* NIS v1 */
-const char *yp_procs[] = {
+static const char *yp_procs[] = {
+	/* NIS v1 */
 	"ypoldproc_null",
 	"ypoldproc_domain",
 	"ypoldproc_domain_nonack",
@@ -92,7 +89,7 @@ struct securenet {
 	struct securenet *next;
 };
 
-struct securenet *securenets;
+static struct securenet *securenets;
 
 #define LINEBUFSZ 1024
 
@@ -286,7 +283,7 @@ not privileged", map, inet_ntoa(rqhost->sin_addr), ntohs(rqhost->sin_port));
 	if (status_securenets == 0) {
 #endif
 	/*
-	 * One of the following two events occured:
+	 * One of the following two events occurred:
 	 *
 	 * (1) The /var/yp/securenets exists and the remote host does not
 	 *     match any of the networks specified in it.

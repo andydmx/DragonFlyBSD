@@ -11,16 +11,18 @@ CFLAGS+=	-I${BASEDIR}/src -I${.OBJDIR}
 CFLAGS+=	-I${BASEDIR}/lib -I${.CURDIR}/../libgreputils
 CFLAGS+=	-DHAVE_CONFIG_H
 
+.if defined(BOOTSTRAPPING)
+CFLAGS+=	-DBOOTSTRAPPING
+.endif
+
 DPADD=		../libgreputils/libgreputils.a
 LDADD=		../libgreputils/libgreputils.a
 BINDIR?=	/usr/bin
 
 SRCS=		grep.c \
 		searchutils.c \
-		dfa.c \
 		dfasearch.c \
 		kwset.c \
-		kwsearch.c \
-		pcresearch.c
+		kwsearch.c
 
 .include <bsd.prog.mk>

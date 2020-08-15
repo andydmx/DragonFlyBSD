@@ -68,6 +68,8 @@
 #include <net/ifq_var.h>
 #include <net/route.h>
 #include <net/if_clone.h>
+#include <net/netmsg2.h>
+#include <net/netisr2.h>
 
 #ifdef INET
 #include <netinet/in.h>
@@ -99,7 +101,7 @@ static MALLOC_DEFINE(M_GRE, GRENAME, "Generic Routing Encapsulation");
 
 struct gre_softc_head gre_softc_list;
 
-static int	gre_clone_create(struct if_clone *, int, caddr_t);
+static int	gre_clone_create(struct if_clone *, int, caddr_t, caddr_t);
 static int	gre_clone_destroy(struct ifnet *);
 static int	gre_ioctl(struct ifnet *, u_long, caddr_t, struct ucred *);
 static int	gre_output(struct ifnet *, struct mbuf *, struct sockaddr *,
@@ -108,7 +110,8 @@ static int	gre_output(struct ifnet *, struct mbuf *, struct sockaddr *,
 static struct if_clone gre_cloner = IF_CLONE_INITIALIZER("gre",
     gre_clone_create, gre_clone_destroy, 0, IF_MAXUNIT);
 
-static int gre_compute_route(struct gre_softc *sc);
+static int	gre_compute_route(struct gre_softc *sc, struct route *);
+static int	gre_check_route(struct gre_softc *sc);
 
 static void	greattach(void);
 
@@ -125,10 +128,10 @@ static const struct protosw in_gre_protosw =
 
 	.pr_input = gre_input,
 	.pr_output = rip_output,
-	.pr_ctlinput = rip_ctlinput,
+	.pr_ctlinput = NULL,
 	.pr_ctloutput = rip_ctloutput,
 
-	.pr_ctlport = cpu0_ctlport,
+	.pr_ctlport = NULL,
 	.pr_usrreqs = &rip_usrreqs
     };
 
@@ -141,10 +144,10 @@ static const struct protosw in_mobile_protosw =
 
 	.pr_input = gre_mobile_input,
 	.pr_output = rip_output,
-	.pr_ctlinput = rip_ctlinput,
+	.pr_ctlinput = NULL,
 	.pr_ctloutput = rip_ctloutput,
 
-	.pr_ctlport = cpu0_ctlport,
+	.pr_ctlport = NULL,
 	.pr_usrreqs = &rip_usrreqs
     };
 
@@ -178,7 +181,8 @@ greattach(void)
 }
 
 static int
-gre_clone_create(struct if_clone *ifc, int unit, caddr_t param __unused)
+gre_clone_create(struct if_clone *ifc, int unit,
+		 caddr_t params __unused, caddr_t data __unused)
 {
 	struct gre_softc *sc;
 
@@ -200,6 +204,8 @@ gre_clone_create(struct if_clone *ifc, int unit, caddr_t param __unused)
 	sc->sc_if.if_flags |= IFF_LINK0;
 	sc->encap = NULL;
 	sc->called = 0;
+	sc->route_pcpu = kmalloc(netisr_ncpus * sizeof(struct route), M_GRE,
+	    M_WAITOK | M_ZERO);
 	if_attach(&sc->sc_if, NULL);
 	bpfattach(&sc->sc_if, DLT_NULL, sizeof(u_int32_t));
 	LIST_INSERT_HEAD(&gre_softc_list, sc, sc_list);
@@ -210,6 +216,7 @@ static int
 gre_clone_destroy(struct ifnet *ifp)
 {
 	struct gre_softc *sc = ifp->if_softc;
+	int cpu;
 
 #ifdef INET
 	if (sc->encap != NULL)
@@ -219,6 +226,13 @@ gre_clone_destroy(struct ifnet *ifp)
 	bpfdetach(ifp);
 	if_detach(ifp);
 
+	for (cpu = 0; cpu < netisr_ncpus; ++cpu) {
+		if (sc->route_pcpu[cpu].ro_rt != NULL) {
+			rtfree_async(sc->route_pcpu[cpu].ro_rt);
+			sc->route_pcpu[cpu].ro_rt = NULL;
+		}
+	}
+	kfree(sc->route_pcpu, M_GRE);
 	kfree(sc, M_GRE);
 
 	return 0;
@@ -238,6 +252,10 @@ gre_output_serialized(struct ifnet *ifp, struct mbuf *m, struct sockaddr *dst,
 	struct ip *ip;
 	u_short etype = 0;
 	struct mobile_h mob_h;
+	struct route *ro;
+	struct sockaddr_in *ro_dst;
+
+	ASSERT_NETISR_NCPUS(mycpuid);
 
 	/*
 	 * gre may cause infinite recursion calls when misconfigured.
@@ -256,6 +274,22 @@ gre_output_serialized(struct ifnet *ifp, struct mbuf *m, struct sockaddr *dst,
 		m_freem(m);
 		error = ENETDOWN;
 		goto end;
+	}
+
+	ro = &sc->route_pcpu[mycpuid];
+	ro_dst = (struct sockaddr_in *)&ro->ro_dst;
+	if (ro->ro_rt != NULL &&
+	    ((ro->ro_rt->rt_flags & RTF_UP) == 0 ||
+	     ro_dst->sin_addr.s_addr != sc->g_dst.s_addr)) {
+		RTFREE(ro->ro_rt);
+		ro->ro_rt = NULL;
+	}
+	if (ro->ro_rt == NULL) {
+		error = gre_compute_route(sc, ro);
+		if (error) {
+			m_freem(m);
+			goto end;
+		}
 	}
 
 	gh = NULL;
@@ -312,7 +346,7 @@ gre_output_serialized(struct ifnet *ifp, struct mbuf *m, struct sockaddr *dst,
 
 			if ((m->m_data - msiz) < m->m_pktdat) {
 				/* need new mbuf */
-				MGETHDR(m0, MB_DONTWAIT, MT_HEADER);
+				MGETHDR(m0, M_NOWAIT, MT_HEADER);
 				if (m0 == NULL) {
 					m_freem(m);
 					error = ENOBUFS;
@@ -353,7 +387,7 @@ gre_output_serialized(struct ifnet *ifp, struct mbuf *m, struct sockaddr *dst,
 			error = EAFNOSUPPORT;
 			goto end;
 		}
-		M_PREPEND(m, sizeof(struct greip), MB_DONTWAIT);
+		M_PREPEND(m, sizeof(struct greip), M_NOWAIT);
 	} else {
 		m_freem(m);
 		error = EINVAL;
@@ -387,7 +421,7 @@ gre_output_serialized(struct ifnet *ifp, struct mbuf *m, struct sockaddr *dst,
 	IFNET_STAT_INC(ifp, opackets, 1);
 	IFNET_STAT_INC(ifp, obytes, m->m_pkthdr.len);
 	/* send it off */
-	error = ip_output(m, NULL, &sc->route, 0, NULL, NULL);
+	error = ip_output(m, NULL, ro, IP_DEBUGROUTE, NULL, NULL);
   end:
 	sc->called = 0;
 	if (error)
@@ -530,9 +564,10 @@ gre_ioctl(struct ifnet *ifp, u_long cmd, caddr_t data, struct ucred *cr)
 				kprintf("%s: unable to attach encap\n",
 				    if_name(&sc->sc_if));
 #endif
-			if (sc->route.ro_rt != 0) /* free old route */
-				RTFREE(sc->route.ro_rt);
-			if (gre_compute_route(sc) == 0)
+			ifnet_deserialize_all(ifp);
+			error = gre_check_route(sc);
+			ifnet_serialize_all(ifp);
+			if (!error)
 				ifp->if_flags |= IFF_RUNNING;
 			else
 				ifp->if_flags &= ~IFF_RUNNING;
@@ -650,12 +685,16 @@ gre_ioctl(struct ifnet *ifp, u_long cmd, caddr_t data, struct ucred *cr)
  * at least a default route which matches.
  */
 static int
-gre_compute_route(struct gre_softc *sc)
+gre_compute_route(struct gre_softc *sc, struct route *ro)
 {
-	struct route *ro;
+#ifdef DIAGNOSTIC
+	char abuf[INET_ADDRSTRLEN];
+#endif
 	u_int32_t a, b, c;
 
-	ro = &sc->route;
+	ASSERT_NETISR_NCPUS(mycpuid);
+	KASSERT(ro == &sc->route_pcpu[mycpuid], ("route mismatch"));
+	KASSERT(ro->ro_rt == NULL, ("rtentry not freed"));
 
 	memset(ro, 0, sizeof(struct route));
 	((struct sockaddr_in *)&ro->ro_dst)->sin_addr = sc->g_dst;
@@ -680,7 +719,7 @@ gre_compute_route(struct gre_softc *sc)
 
 #ifdef DIAGNOSTIC
 	kprintf("%s: searching a route to %s", if_name(&sc->sc_if),
-	    inet_ntoa(((struct sockaddr_in *)&ro->ro_dst)->sin_addr));
+	    kinet_ntoa(((struct sockaddr_in *)&ro->ro_dst)->sin_addr, abuf));
 #endif
 
 	rtalloc(ro);
@@ -708,11 +747,43 @@ gre_compute_route(struct gre_softc *sc)
 
 #ifdef DIAGNOSTIC
 	kprintf(", choosing %s with gateway %s", if_name(ro->ro_rt->rt_ifp),
-	    inet_ntoa(((struct sockaddr_in *)(ro->ro_rt->rt_gateway))->sin_addr));
+	    kinet_ntoa(
+	        ((struct sockaddr_in *)(ro->ro_rt->rt_gateway))->sin_addr, abuf));
 	kprintf("\n");
 #endif
 
 	return 0;
+}
+
+static void
+gre_check_route_handler(netmsg_t msg)
+{
+	struct gre_softc *sc = msg->base.lmsg.u.ms_resultp;
+	struct route *ro;
+	int error;
+
+	ASSERT_NETISR0;
+
+	ro = &sc->route_pcpu[mycpuid];
+	if (ro->ro_rt != NULL) {
+		RTFREE(ro->ro_rt);
+		ro->ro_rt = NULL;
+	}
+	error = gre_compute_route(sc, ro);
+
+	netisr_replymsg(&msg->base, error);
+}
+
+static int
+gre_check_route(struct gre_softc *sc)
+{
+	struct netmsg_base msg;
+
+	netmsg_init(&msg, NULL, &curthread->td_msgport, MSGF_PRIORITY,
+	    gre_check_route_handler);
+	msg.lmsg.u.ms_resultp = sc;
+
+	return (netisr_domsg(&msg, 0));
 }
 
 /*

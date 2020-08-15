@@ -24,7 +24,6 @@
  * SUCH DAMAGE.
  *
  * $FreeBSD: src/lib/libstand/sbrk.c,v 1.2.2.1 2000/05/18 08:00:57 ps Exp $
- * $DragonFly: src/lib/libstand/sbrk.c,v 1.2 2003/06/17 04:26:51 dillon Exp $
  */
 
 /*
@@ -35,30 +34,30 @@
 #include "stand.h"
 
 static size_t	maxheap, heapsize = 0;
-static void	*heapbase;
+static void	*sbrkbase;
 
 void
 setheap(void *base, void *top)
 {
     /* Align start address to 16 bytes for the malloc code. Sigh. */
-    heapbase = (void *)(((uintptr_t)base + 15) & ~15);
-    maxheap = top - heapbase;
+    sbrkbase = (void *)(((uintptr_t)base + 15) & ~15);
+    maxheap = top - sbrkbase;
 }
 
 char *
 getheap(size_t *sizep)
 {
     *sizep = maxheap;
-    return heapbase;
+    return sbrkbase;
 }
 
 char *
-sbrk(int incr)
+sbrk(intptr_t incr)
 {
     char	*ret;
     
     if ((heapsize + incr) <= maxheap) {
-	ret = heapbase + heapsize;
+	ret = sbrkbase + heapsize;
 	bzero(ret, incr);
 	heapsize += incr;
 	return(ret);
@@ -66,4 +65,3 @@ sbrk(int incr)
     errno = ENOMEM;
     return((char *)-1);
 }
-

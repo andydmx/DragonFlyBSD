@@ -17,11 +17,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Lawrence Berkeley Laboratory and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -103,7 +99,15 @@ static	ssize_t recvrpc(struct iodesc *, void *, size_t, time_t);
 static	int rpc_getport(struct iodesc *, n_long, n_long);
 
 int rpc_xid;
-int rpc_port = 0x400;	/* predecrement */
+static int rpc_port = 0x400;
+
+int
+rpc_newport(void)
+{
+	if (rpc_port <= 256)		/* recycle after a while */
+		rpc_port = 0x400;
+	return (--rpc_port);
+}
 
 /*
  * Make a rpc call; return length of answer

@@ -634,7 +634,6 @@ safe_feed(struct safe_softc *sc, struct safe_ringentry *re)
 	WRITE_REG(sc, SAFE_HI_RD_DESCR, 0);
 }
 
-#define	N(a)	(sizeof(a) / sizeof (a[0]))
 static void
 safe_setup_enckey(struct safe_session *ses, caddr_t key)
 {
@@ -643,7 +642,7 @@ safe_setup_enckey(struct safe_session *ses, caddr_t key)
 	bcopy(key, ses->ses_key, ses->ses_klen / 8);
 
 	/* PE is little-endian, insure proper byte order */
-	for (i = 0; i < N(ses->ses_key); i++)
+	for (i = 0; i < nitems(ses->ses_key); i++)
 		ses->ses_key[i] = htole32(ses->ses_key[i]);
 }
 
@@ -662,7 +661,8 @@ safe_setup_mackey(struct safe_session *ses, int algo, caddr_t key, int klen)
 		MD5Init(&md5ctx);
 		MD5Update(&md5ctx, key, klen);
 		MD5Update(&md5ctx, hmac_ipad_buffer, MD5_HMAC_BLOCK_LEN - klen);
-		bcopy(md5ctx.state, ses->ses_hminner, sizeof(md5ctx.state));
+		/* gcc8 craps out on -Warray-bounds w/ optimized bcopy */
+		_bcopy(&md5ctx.A, ses->ses_hminner, sizeof(md5ctx.A) * 4);
 	} else {
 		SHA1Init(&sha1ctx);
 		SHA1Update(&sha1ctx, key, klen);
@@ -678,7 +678,8 @@ safe_setup_mackey(struct safe_session *ses, int algo, caddr_t key, int klen)
 		MD5Init(&md5ctx);
 		MD5Update(&md5ctx, key, klen);
 		MD5Update(&md5ctx, hmac_opad_buffer, MD5_HMAC_BLOCK_LEN - klen);
-		bcopy(md5ctx.state, ses->ses_hmouter, sizeof(md5ctx.state));
+		/* gcc8 craps out on -Warray-bounds w/ optimized bcopy */
+		_bcopy(&md5ctx.A, ses->ses_hmouter, sizeof(md5ctx.A) * 4);
 	} else {
 		SHA1Init(&sha1ctx);
 		SHA1Update(&sha1ctx, key, klen);
@@ -691,12 +692,11 @@ safe_setup_mackey(struct safe_session *ses, int algo, caddr_t key, int klen)
 		key[i] ^= HMAC_OPAD_VAL;
 
 	/* PE is little-endian, insure proper byte order */
-	for (i = 0; i < N(ses->ses_hminner); i++) {
+	for (i = 0; i < nitems(ses->ses_hminner); i++) {
 		ses->ses_hminner[i] = htole32(ses->ses_hminner[i]);
 		ses->ses_hmouter[i] = htole32(ses->ses_hmouter[i]);
 	}
 }
-#undef N
 
 /*
  * Allocate a new 'session' and return an encoded session id.  'sidp'
@@ -790,7 +790,7 @@ safe_newsession(device_t dev, u_int32_t *sidp, struct cryptoini *cri)
 	if (encini) {
 		/* get an IV */
 		/* XXX may read fewer than requested */
-		read_random(ses->ses_iv, sizeof(ses->ses_iv));
+		read_random(ses->ses_iv, sizeof(ses->ses_iv), 0);
 
 		ses->ses_klen = encini->cri_klen;
 		if (encini->cri_key != NULL)
@@ -1321,15 +1321,15 @@ safe_process(device_t dev, struct cryptop *crp, int hint)
 				totlen = re->re_src_mapsize;
 				if (re->re_src_m->m_flags & M_PKTHDR) {
 					len = MHLEN;
-					MGETHDR(m, MB_DONTWAIT, MT_DATA);
+					MGETHDR(m, M_NOWAIT, MT_DATA);
 					if (m && !m_dup_pkthdr(m, re->re_src_m,
-					    MB_DONTWAIT)) {
+					    M_NOWAIT)) {
 						m_free(m);
 						m = NULL;
 					}
 				} else {
 					len = MLEN;
-					MGET(m, MB_DONTWAIT, MT_DATA);
+					MGET(m, M_NOWAIT, MT_DATA);
 				}
 				if (m == NULL) {
 					safestats.st_nombuf++;
@@ -1337,7 +1337,7 @@ safe_process(device_t dev, struct cryptop *crp, int hint)
 					goto errout;
 				}
 				if (totlen >= MINCLSIZE) {
-					MCLGET(m, MB_DONTWAIT);
+					MCLGET(m, M_NOWAIT);
 					if ((m->m_flags & M_EXT) == 0) {
 						m_free(m);
 						safestats.st_nomcl++;
@@ -1353,7 +1353,7 @@ safe_process(device_t dev, struct cryptop *crp, int hint)
 
 				while (totlen > 0) {
 					if (top) {
-						MGET(m, MB_DONTWAIT, MT_DATA);
+						MGET(m, M_NOWAIT, MT_DATA);
 						if (m == NULL) {
 							m_freem(top);
 							safestats.st_nombuf++;
@@ -1364,7 +1364,7 @@ safe_process(device_t dev, struct cryptop *crp, int hint)
 						len = MLEN;
 					}
 					if (top && totlen >= MINCLSIZE) {
-						MCLGET(m, MB_DONTWAIT);
+						MCLGET(m, M_NOWAIT);
 						if ((m->m_flags & M_EXT) == 0) {
 							*mp = m;
 							m_freem(top);

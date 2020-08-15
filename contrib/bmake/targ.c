@@ -1,4 +1,4 @@
-/*	$NetBSD: targ.c,v 1.57 2012/06/12 19:21:51 joerg Exp $	*/
+/*	$NetBSD: targ.c,v 1.63 2020/07/03 08:02:55 rillig Exp $	*/
 
 /*
  * Copyright (c) 1988, 1989, 1990, 1993
@@ -69,14 +69,14 @@
  */
 
 #ifndef MAKE_NATIVE
-static char rcsid[] = "$NetBSD: targ.c,v 1.57 2012/06/12 19:21:51 joerg Exp $";
+static char rcsid[] = "$NetBSD: targ.c,v 1.63 2020/07/03 08:02:55 rillig Exp $";
 #else
 #include <sys/cdefs.h>
 #ifndef lint
 #if 0
 static char sccsid[] = "@(#)targ.c	8.2 (Berkeley) 3/19/94";
 #else
-__RCSID("$NetBSD: targ.c,v 1.57 2012/06/12 19:21:51 joerg Exp $");
+__RCSID("$NetBSD: targ.c,v 1.63 2020/07/03 08:02:55 rillig Exp $");
 #endif
 #endif /* not lint */
 #endif
@@ -269,7 +269,7 @@ Targ_NewGN(const char *name)
     Lst_AtEnd(allGNs, gn);
 #endif
 
-    return (gn);
+    return gn;
 }
 
 #ifdef CLEANUP
@@ -292,10 +292,8 @@ TargFreeGN(void *gnp)
 
 
     free(gn->name);
-    if (gn->uname)
-	free(gn->uname);
-    if (gn->path)
-	free(gn->path);
+    free(gn->uname);
+    free(gn->path);
     /* gn->fname points to name allocated when file was opened, don't free */
 
     Lst_Destroy(gn->iParents, NULL);
@@ -391,7 +389,7 @@ Targ_FindList(Lst names, int flags)
     nodes = Lst_Init(FALSE);
 
     if (Lst_Open(names) == FAILURE) {
-	return (nodes);
+	return nodes;
     }
     while ((ln = Lst_Next(names)) != NULL) {
 	name = (char *)Lst_Datum(ln);
@@ -408,7 +406,7 @@ Targ_FindList(Lst names, int flags)
 	}
     }
     Lst_Close(names);
-    return (nodes);
+    return nodes;
 }
 
 /*-
@@ -430,9 +428,9 @@ Boolean
 Targ_Ignore(GNode *gn)
 {
     if (ignoreErrors || gn->type & OP_IGNORE) {
-	return (TRUE);
+	return TRUE;
     } else {
-	return (FALSE);
+	return FALSE;
     }
 }
 
@@ -455,9 +453,9 @@ Boolean
 Targ_Silent(GNode *gn)
 {
     if (beSilent || gn->type & OP_SILENT) {
-	return (TRUE);
+	return TRUE;
     } else {
-	return (FALSE);
+	return FALSE;
     }
 }
 
@@ -480,9 +478,9 @@ Boolean
 Targ_Precious(GNode *gn)
 {
     if (allPrecious || (gn->type & (OP_PRECIOUS|OP_DOUBLEDEP))) {
-	return (TRUE);
+	return TRUE;
     } else {
-	return (FALSE);
+	return FALSE;
     }
 }
 
@@ -523,10 +521,10 @@ TargPrintName(void *gnp, void *pflags MAKE_ATTR_UNUSED)
 
 
 int
-Targ_PrintCmd(void *cmd, void *dummy)
+Targ_PrintCmd(void *cmd, void *dummy MAKE_ATTR_UNUSED)
 {
     fprintf(debug_file, "\t%s\n", (char *)cmd);
-    return (dummy ? 0 : 0);
+    return 0;
 }
 
 /*-
@@ -551,7 +549,7 @@ Targ_FmtTime(time_t tm)
 
     parts = localtime(&tm);
     (void)strftime(buf, sizeof buf, "%k:%M:%S %b %d, %Y", parts);
-    return(buf);
+    return buf;
 }
 
 /*-
@@ -700,7 +698,7 @@ Targ_PrintNode(void *gnp, void *passp)
 	    Lst_ForEach(gn->cohorts, Targ_PrintNode, &pass);
 	}
     }
-    return (0);
+    return 0;
 }
 
 /*-
@@ -796,7 +794,7 @@ TargPropagateNode(void *gnp, void *junk MAKE_ATTR_UNUSED)
 
     if (gn->type & OP_DOUBLEDEP)
 	Lst_ForEach(gn->cohorts, TargPropagateCohort, gnp);
-    return (0);
+    return 0;
 }
 
 /*-
@@ -824,7 +822,7 @@ TargPropagateCohort(void *cgnp, void *pgnp)
     GNode	  *pgn = (GNode *)pgnp;
 
     cgn->type |= pgn->type & ~OP_OPMASK;
-    return (0);
+    return 0;
 }
 
 /*-

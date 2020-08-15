@@ -43,13 +43,6 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *        This product includes software developed by the NetBSD
- *        Foundation, Inc. and its contributors.
- * 4. Neither the name of The NetBSD Foundation nor the names of its
- *    contributors may be used to endorse or promote products derived
- *    from this software without specific prior written permission.
  *
  * THIS SOFTWARE IS PROVIDED BY THE NETBSD FOUNDATION, INC. AND CONTRIBUTORS
  * ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
@@ -68,8 +61,15 @@
 #define	_USB_SERIAL_H_
 
 #include <sys/tty.h>
+#include <sys/ttydefaults.h>	/* for TTYDEF_* */
 #include <sys/fcntl.h>
 #include <sys/sysctl.h>
+#include <sys/timepps.h>
+
+/* We should seriously clean this up! */
+#define SET(t, f)	(t) |= (f)
+#define CLR(t, f)	(t) &= ~((unsigned)(f))
+#define ISSET(t, f)	((t) & (f))
 
 /* Module interface related macros */
 #define	UCOM_MODVER	1
@@ -161,12 +161,24 @@ struct ucom_softc {
 	struct ucom_cfg_task	sc_line_state_task[2];
 	struct ucom_cfg_task	sc_status_task[2];
 	struct ucom_param_task	sc_param_task[2];
+	/* pulse capturing support, PPS */
+	struct pps_state	sc_pps;
 	/* Used to set "UCOM_FLAG_GP_DATA" flag: */
 	struct usb_proc_msg	*sc_last_start_xfer;
 	const struct ucom_callback *sc_callback;
 	struct ucom_super_softc *sc_super;
 	struct tty *sc_tty;
 	struct dev *sc_dev;
+	cdev_t sc_cdev;			/* this is the /dev/ttyUX */
+	cdev_t sc_cdev_init;		/* /dev/ttyUX.init */
+	cdev_t sc_cdev_lock;		/* /dev/ttyUX.lock */
+	cdev_t sc_cdev2;		/* /dev/cuaUX */
+	cdev_t sc_cdev2_init;		/* /dev/cuaUX.init */
+	cdev_t sc_cdev2_lock;		/* /dev/cuaUX.lock */
+	struct termios sc_it_in;	/* Initial state in */
+	struct termios sc_it_out;	/* Initial state out */
+	struct termios sc_lt_in;	/* Lockstate in */
+	struct termios sc_lt_out;	/* Lockstate out */
 	struct lock *sc_lock;
 	void   *sc_parent;
 	int sc_subunit;
@@ -195,6 +207,7 @@ struct ucom_softc {
 #define	UCOM_LS_RTS	0x02
 #define	UCOM_LS_BREAK	0x04
 #define	UCOM_LS_RING	0x08
+	u_char	hotchar;
 	uint8_t sc_jitterbuf[UCOM_JITTERBUF_SIZE];
 };
 

@@ -118,6 +118,10 @@ ldns_fget_token_l(FILE *f, char *token, const char *delim, size_t limit, int *li
 			if (line_nr) {
 				*line_nr = *line_nr + 1;
 			}
+			if (limit > 0 && (i >= limit || (size_t)(t-token) >= limit)) {
+				*t = '\0';
+				return -1;
+			}
 			*t++ = ' ';
 			prev_c = c;
 			continue;
@@ -135,7 +139,7 @@ ldns_fget_token_l(FILE *f, char *token, const char *delim, size_t limit, int *li
 		if (c != '\0' && c != '\n') {
 			i++;
 		}
-		if (limit > 0 && i >= limit) {
+		if (limit > 0 && (i >= limit || (size_t)(t-token) >= limit)) {
 			*t = '\0';
 			return -1;
 		}
@@ -161,7 +165,9 @@ ldns_fget_token_l(FILE *f, char *token, const char *delim, size_t limit, int *li
 	return (ssize_t)i;
 
 tokenread:
-	ldns_fskipcs_l(f, del, line_nr);
+	if(*del == '"') /* do not skip over quotes, they are significant */
+		ldns_fskipcs_l(f, del+1, line_nr);
+	else	ldns_fskipcs_l(f, del, line_nr);
 	*t = '\0';
 	if (p != 0) {
 		return -1;
@@ -308,7 +314,7 @@ ldns_bget_token(ldns_buffer *b, char *token, const char *delim, size_t limit)
 		}
 
 		i++;
-		if (limit > 0 && i >= limit) {
+		if (limit > 0 && (i >= limit || (size_t)(t-token) >= limit)) {
 			*t = '\0';
 			return -1;
 		}
@@ -331,7 +337,9 @@ ldns_bget_token(ldns_buffer *b, char *token, const char *delim, size_t limit)
 	return (ssize_t)i;
 
 tokenread:
-	ldns_bskipcs(b, del);
+	if(*del == '"') /* do not skip over quotes, they are significant */
+		ldns_bskipcs(b, del+1);
+	else	ldns_bskipcs(b, del);
 	*t = '\0';
 
 	if (p != 0) {
@@ -340,18 +348,6 @@ tokenread:
 	return (ssize_t)i;
 }
 
-void
-ldns_bskipc(ldns_buffer *buffer, char c)
-{
-        while (c == (char) ldns_buffer_read_u8_at(buffer, ldns_buffer_position(buffer))) {
-                if (ldns_buffer_available_at(buffer,
-					buffer->_position + sizeof(char), sizeof(char))) {
-                        buffer->_position += sizeof(char);
-                } else {
-                        return;
-                }
-        }
-}
 
 void
 ldns_bskipcs(ldns_buffer *buffer, const char *s)
@@ -375,12 +371,6 @@ ldns_bskipcs(ldns_buffer *buffer, const char *s)
                 }
         }
 }
-
-void
-ldns_fskipc(ATTR_UNUSED(FILE *fp), ATTR_UNUSED(char c))
-{
-}
-
 
 void
 ldns_fskipcs(FILE *fp, const char *s)

@@ -32,29 +32,33 @@
  * OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
  */
+
+#include <assert.h>
 #include <fcntl.h>
 #include <err.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-#include <sys/mount.h>
+#include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/mount.h>
 #include <unistd.h>
 #include <uuid.h>
 
 #include "libhammer.h"
 
 char *
-libhammer_find_pfs_mount(int pfsid, uuid_t parentuuid, int ismaster)
+libhammer_find_pfs_mount(uuid_t *unique_uuid)
 {
-	struct hammer_ioc_info hi;
+	struct hammer_ioc_pseudofs_rw pfs;
+	struct hammer_pseudofs_data pfsd;
 	struct statfs *mntbuf;
 	int mntsize;
 	int curmount;
 	int fd;
 	size_t	mntbufsize;
-	char *trailstr;
+	uuid_t uuid;
 	char *retval;
 
 	retval = NULL;
@@ -64,64 +68,83 @@ libhammer_find_pfs_mount(int pfsid, uuid_t parentuuid, int ismaster)
 	if (mntsize <= 0)
 		return retval;
 
-	mntbufsize = (mntsize) * sizeof(struct statfs);
+	mntbufsize = mntsize * sizeof(struct statfs);
 	mntbuf = _libhammer_malloc(mntbufsize);
-	if (mntbuf == NULL) {
-		perror("show_info");
-		exit(EXIT_FAILURE);
-	}
 
 	mntsize = getfsstat(mntbuf, (long)mntbufsize, MNT_NOWAIT);
 	curmount = mntsize - 1;
-
-	asprintf(&trailstr, ":%05d", pfsid);
 
 	/*
 	 * Iterate all the mounted points looking for the PFS passed to
 	 * this function.
 	 */
 	while(curmount >= 0) {
+		struct statfs *mnt = &mntbuf[curmount];
 		/*
-		 * We need to avoid that PFS belonging to other HAMMER
-		 * filesystems are showed as mounted, so we compare
-		 * against the FSID, which is presumable to be unique.
+		 * Discard any non null(5) or hammer(5) filesystems as synthetic
+		 * filesystems like procfs(5) could accept ioctl calls and thus
+		 * produce bogus results.
 		 */
-		bzero(&hi, sizeof(hi));
-		if ((fd = open(mntbuf[curmount].f_mntfromname, O_RDONLY)) < 0) {
+		if ((strcmp("hammer", mnt->f_fstypename) != 0) &&
+		    (strcmp("null", mnt->f_fstypename) != 0)) {
+			curmount--;
+			continue;
+		}
+		bzero(&pfs, sizeof(pfs));
+		bzero(&pfsd, sizeof(pfsd));
+		pfs.pfs_id = -1;
+		pfs.ondisk = &pfsd;
+		pfs.bytes = sizeof(struct hammer_pseudofs_data);
+		fd = open(mnt->f_mntonname, O_RDONLY);
+		if (fd < 0 || (ioctl(fd, HAMMERIOC_GET_PSEUDOFS, &pfs) < 0)) {
+			close(fd);
 			curmount--;
 			continue;
 		}
 
-		if ((ioctl(fd, HAMMERIOC_GET_INFO, &hi)) < 0) {
-			curmount--;
-			continue;
+		memcpy(&uuid, &pfs.ondisk->unique_uuid, sizeof(uuid));
+		if (uuid_compare(unique_uuid, &uuid, NULL) == 0) {
+			retval = strdup(mnt->f_mntonname);
+			close(fd);
+			break;
 		}
 
-		if (strstr(mntbuf[curmount].f_mntfromname, trailstr) != NULL &&
-		    (uuid_compare(&hi.vol_fsid, &parentuuid, NULL)) == 0) {
-			if (ismaster) {
-				if (strstr(mntbuf[curmount].f_mntfromname,
-				    "@@-1") != NULL) {
-					retval =
-					    strdup(mntbuf[curmount].f_mntonname);
-					break;
-				}
-			} else {
-				if (strstr(mntbuf[curmount].f_mntfromname,
-				    "@@0x") != NULL ) {
-					retval =
-					    strdup(mntbuf[curmount].f_mntonname);
-					break;
-				}
-			}
-		}
 		curmount--;
 		close(fd);
 	}
-	free(trailstr);
+	free(mntbuf);
 
 	return retval;
 }
+
+/*
+ * Find out the path that can be used to open(2) a PFS
+ * when it is not mounted. It allocates *path so the
+ * caller is in charge of freeing it up.
+ */
+void
+libhammer_pfs_canonical_path(char * mtpt, libhammer_pfsinfo_t pip, char **path)
+{
+	struct statfs st;
+
+	assert(pip != NULL);
+	assert(mtpt != NULL);
+
+	if ((statfs(mtpt, &st) < 0) ||
+	    ((strcmp("hammer", st.f_fstypename) != 0) &&
+	    (strcmp("null", st.f_fstypename) != 0))) {
+		*path = NULL;
+		return;
+	}
+
+	if (pip->ismaster)
+		asprintf(path, "%s/@@-1:%.5d", mtpt,
+		    pip->pfs_id);
+	else
+		asprintf(path, "%s/@@0x%016jx:%.5d", mtpt,
+		    pip->end_tid, pip->pfs_id);
+}
+
 
 /*
  * Allocate len bytes of memory and return the pointer.

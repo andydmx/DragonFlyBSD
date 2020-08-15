@@ -30,15 +30,16 @@
  *
  *	@(#)vm_meter.c	8.4 (Berkeley) 1/4/94
  * $FreeBSD: src/sys/vm/vm_meter.c,v 1.34.2.7 2002/10/10 19:28:22 dillon Exp $
- * $DragonFly: src/sys/vm/vm_meter.c,v 1.15 2008/04/28 18:04:08 dillon Exp $
  */
 
 #include <sys/param.h>
 #include <sys/proc.h>
 #include <sys/systm.h>
 #include <sys/kernel.h>
+#include <sys/malloc.h>
 #include <sys/resource.h>
 #include <sys/vmmeter.h>
+#include <sys/kcollect.h>
 
 #include <vm/vm.h>
 #include <vm/vm_page.h>
@@ -50,36 +51,49 @@
 #include <vm/vm_object.h>
 #include <sys/sysctl.h>
 
-struct vmstats vmstats;
+/*
+ * WARNING: vmstats represents the final say, but individual cpu's may
+ *	    accumualte adjustments in gd->gd_vmstats_adj.  These are
+ *	    synchronized to the global vmstats in hardclock.
+ *
+ *	    In addition, most individual cpus check vmstats using a local
+ *	    copy of the global vmstats in gd->gd_vmstats.  Hardclock also
+ *	    sychronizes the copy.  The pageout code and vm_page_alloc will
+ *	    also synchronize their local copies as necessary.
+ *
+ *	    Other consumers should not expect perfect values.
+ */
+__exclusive_cache_line struct vmstats vmstats;
 
 static int maxslp = MAXSLP;
 
-SYSCTL_UINT(_vm, VM_V_FREE_MIN, v_free_min,
+SYSCTL_ULONG(_vm, VM_V_FREE_MIN, v_free_min,
 	CTLFLAG_RW, &vmstats.v_free_min, 0,
 	"Minimum number of pages desired free");
-SYSCTL_UINT(_vm, VM_V_FREE_TARGET, v_free_target,
+SYSCTL_ULONG(_vm, VM_V_FREE_TARGET, v_free_target,
 	CTLFLAG_RW, &vmstats.v_free_target, 0,
 	"Number of pages desired free");
-SYSCTL_UINT(_vm, VM_V_FREE_RESERVED, v_free_reserved,
+SYSCTL_ULONG(_vm, VM_V_FREE_RESERVED, v_free_reserved,
 	CTLFLAG_RW, &vmstats.v_free_reserved, 0,
 	"Number of pages reserved for deadlock");
-SYSCTL_UINT(_vm, VM_V_INACTIVE_TARGET, v_inactive_target,
+SYSCTL_ULONG(_vm, VM_V_INACTIVE_TARGET, v_inactive_target,
 	CTLFLAG_RW, &vmstats.v_inactive_target, 0,
 	"Number of pages desired inactive");
-SYSCTL_UINT(_vm, VM_V_CACHE_MIN, v_cache_min,
+SYSCTL_ULONG(_vm, VM_V_CACHE_MIN, v_cache_min,
 	CTLFLAG_RW, &vmstats.v_cache_min, 0,
 	"Min number of pages desired on cache queue");
-SYSCTL_UINT(_vm, VM_V_CACHE_MAX, v_cache_max,
+SYSCTL_ULONG(_vm, VM_V_CACHE_MAX, v_cache_max,
 	CTLFLAG_RW, &vmstats.v_cache_max, 0,
 	"Max number of pages in cached obj");
-SYSCTL_UINT(_vm, VM_V_PAGEOUT_FREE_MIN, v_pageout_free_min,
+SYSCTL_ULONG(_vm, VM_V_PAGEOUT_FREE_MIN, v_pageout_free_min,
 	CTLFLAG_RW, &vmstats.v_pageout_free_min, 0,
 	"Min number pages reserved for kernel");
-SYSCTL_UINT(_vm, OID_AUTO, v_free_severe,
+SYSCTL_ULONG(_vm, OID_AUTO, v_free_severe,
 	CTLFLAG_RW, &vmstats.v_free_severe, 0, "");
 
-SYSCTL_STRUCT(_vm, VM_LOADAVG, loadavg, CTLFLAG_RD, 
-    &averunnable, loadavg, "Machine loadaverage history");
+SYSCTL_STRUCT(_vm, VM_LOADAVG, loadavg,
+	CTLFLAG_RD | CTLFLAG_NOLOCK,
+	&averunnable, loadavg, "Machine loadaverage history");
 
 static int do_vmtotal_callback(struct proc *p, void *data);
 
@@ -116,7 +130,7 @@ do_vmtotal(SYSCTL_HANDLER_ARGS)
 	/*
 	 * Calculate process statistics.
 	 */
-	allproc_scan(do_vmtotal_callback, &total);
+	allproc_scan(do_vmtotal_callback, &total, 0);
 
 	/*
 	 * Adjust for sysctl return.  Add real memory into virtual memory.
@@ -140,33 +154,24 @@ do_vmtotal_callback(struct proc *p, void *data)
 	if (p->p_flags & P_SYSTEM)
 		return(0);
 
-	lwkt_gettoken(&p->p_token);
+	lwkt_gettoken_shared(&p->p_token);
 
 	FOREACH_LWP_IN_PROC(lp, p) {
 		switch (lp->lwp_stat) {
 		case LSSTOP:
 		case LSSLEEP:
-			if ((p->p_flags & P_SWAPPEDOUT) == 0) {
-				if ((lp->lwp_flags & LWP_SINTR) == 0)
-					totalp->t_dw++;
-				else if (lp->lwp_slptime < maxslp)
-					totalp->t_sl++;
-			} else if (lp->lwp_slptime < maxslp) {
-				totalp->t_sw++;
-			}
+			if ((lp->lwp_flags & LWP_SINTR) == 0)
+				totalp->t_dw++;
+			else if (lp->lwp_slptime < maxslp)
+				totalp->t_sl++;
 			if (lp->lwp_slptime >= maxslp)
 				goto out;
 			break;
-
 		case LSRUN:
-			if (p->p_flags & P_SWAPPEDOUT)
-				totalp->t_sw++;
-			else
-				totalp->t_rq++;
+			totalp->t_rq++;
 			if (p->p_stat == SIDL)
 				goto out;
 			break;
-
 		default:
 			goto out;
 		}
@@ -212,7 +217,7 @@ do_vmmeter(SYSCTL_HANDLER_ARGS)
 			*(u_int *)((char *)&vmm + off) +=
 				*(u_int *)((char *)&gd->gd_cnt + off);
 		}
-		
+
 	}
 	vmm.v_intr += vmm.v_ipi + vmm.v_timer;
 	return (sysctl_handle_opaque(oidp, &vmm, sizeof(vmm), req));
@@ -266,13 +271,13 @@ vcnt_intr(SYSCTL_HANDLER_ARGS)
 #define VMMETEROFF(var)	offsetof(struct vmmeter, var)
 
 SYSCTL_PROC(_vm, OID_AUTO, vmtotal, CTLTYPE_OPAQUE|CTLFLAG_RD,
-    0, sizeof(struct vmtotal), do_vmtotal, "S,vmtotal", 
+    0, sizeof(struct vmtotal), do_vmtotal, "S,vmtotal",
     "System virtual memory aggregate");
 SYSCTL_PROC(_vm, OID_AUTO, vmstats, CTLTYPE_OPAQUE|CTLFLAG_RD,
-    0, sizeof(struct vmstats), do_vmstats, "S,vmstats", 
+    0, sizeof(struct vmstats), do_vmstats, "S,vmstats",
     "System virtual memory statistics");
 SYSCTL_PROC(_vm, OID_AUTO, vmmeter, CTLTYPE_OPAQUE|CTLFLAG_RD,
-    0, sizeof(struct vmmeter), do_vmmeter, "S,vmmeter", 
+    0, sizeof(struct vmmeter), do_vmmeter, "S,vmmeter",
     "System statistics");
 SYSCTL_NODE(_vm, OID_AUTO, stats, CTLFLAG_RW, 0, "VM meter stats");
 SYSCTL_NODE(_vm_stats, OID_AUTO, sys, CTLFLAG_RW, 0, "VM meter sys stats");
@@ -365,51 +370,48 @@ SYSCTL_PROC(_vm_stats_vm, OID_AUTO, v_kthreadpages, CTLTYPE_UINT|CTLFLAG_RD,
 SYSCTL_UINT(_vm_stats_vm, OID_AUTO,
 	v_page_size, CTLFLAG_RD, &vmstats.v_page_size, 0,
 	"Page size in bytes");
-SYSCTL_UINT(_vm_stats_vm, OID_AUTO,
-	v_page_count, CTLFLAG_RD, &vmstats.v_page_count, 0, 
+SYSCTL_ULONG(_vm_stats_vm, OID_AUTO,
+	v_page_count, CTLFLAG_RD, &vmstats.v_page_count, 0,
 	"Total number of pages in system");
-SYSCTL_UINT(_vm_stats_vm, OID_AUTO,
+SYSCTL_ULONG(_vm_stats_vm, OID_AUTO,
 	v_free_reserved, CTLFLAG_RD, &vmstats.v_free_reserved, 0,
 	"Number of pages reserved for deadlock");
-SYSCTL_UINT(_vm_stats_vm, OID_AUTO,
+SYSCTL_ULONG(_vm_stats_vm, OID_AUTO,
 	v_free_target, CTLFLAG_RD, &vmstats.v_free_target, 0,
 	"Number of pages desired free");
-SYSCTL_UINT(_vm_stats_vm, OID_AUTO,
+SYSCTL_ULONG(_vm_stats_vm, OID_AUTO,
 	v_free_min, CTLFLAG_RD, &vmstats.v_free_min, 0,
 	"Minimum number of pages desired free");
-SYSCTL_UINT(_vm_stats_vm, OID_AUTO,
+SYSCTL_ULONG(_vm_stats_vm, OID_AUTO,
 	v_free_count, CTLFLAG_RD, &vmstats.v_free_count, 0,
 	"Number of pages free");
-SYSCTL_UINT(_vm_stats_vm, OID_AUTO,
+SYSCTL_ULONG(_vm_stats_vm, OID_AUTO,
 	v_wire_count, CTLFLAG_RD, &vmstats.v_wire_count, 0,
 	"Number of pages wired down");
-SYSCTL_UINT(_vm_stats_vm, OID_AUTO,
+SYSCTL_ULONG(_vm_stats_vm, OID_AUTO,
 	v_active_count, CTLFLAG_RD, &vmstats.v_active_count, 0,
 	"Number of pages active");
-SYSCTL_UINT(_vm_stats_vm, OID_AUTO,
+SYSCTL_ULONG(_vm_stats_vm, OID_AUTO,
 	v_inactive_target, CTLFLAG_RD, &vmstats.v_inactive_target, 0,
 	"Number of pages desired inactive");
-SYSCTL_UINT(_vm_stats_vm, OID_AUTO,
+SYSCTL_ULONG(_vm_stats_vm, OID_AUTO,
 	v_inactive_count, CTLFLAG_RD, &vmstats.v_inactive_count, 0,
 	"Number of pages inactive");
-SYSCTL_UINT(_vm_stats_vm, OID_AUTO,
+SYSCTL_ULONG(_vm_stats_vm, OID_AUTO,
 	v_cache_count, CTLFLAG_RD, &vmstats.v_cache_count, 0,
 	"Number of pages on buffer cache queue");
-SYSCTL_UINT(_vm_stats_vm, OID_AUTO,
+SYSCTL_ULONG(_vm_stats_vm, OID_AUTO,
 	v_cache_min, CTLFLAG_RD, &vmstats.v_cache_min, 0,
 	"Min number of pages desired on cache queue");
-SYSCTL_UINT(_vm_stats_vm, OID_AUTO,
+SYSCTL_ULONG(_vm_stats_vm, OID_AUTO,
 	v_cache_max, CTLFLAG_RD, &vmstats.v_cache_max, 0,
 	"Max number of pages in cached obj");
-SYSCTL_UINT(_vm_stats_vm, OID_AUTO,
+SYSCTL_ULONG(_vm_stats_vm, OID_AUTO,
 	v_pageout_free_min, CTLFLAG_RD, &vmstats.v_pageout_free_min, 0,
 	"Min number pages reserved for kernel");
-SYSCTL_UINT(_vm_stats_vm, OID_AUTO,
+SYSCTL_ULONG(_vm_stats_vm, OID_AUTO,
 	v_interrupt_free_min, CTLFLAG_RD, &vmstats.v_interrupt_free_min, 0,
 	"Reserved number of pages for int code");
-SYSCTL_INT(_vm_stats_misc, OID_AUTO,
-	zero_page_count, CTLFLAG_RD, &vm_page_zero_count, 0,
-	"Number of zeroing pages");
 
 /*
  * No requirements.
@@ -430,6 +432,76 @@ do_vmmeter_pcpu(SYSCTL_HANDLER_ARGS)
 	}
 	vmm.v_intr += vmm.v_ipi + vmm.v_timer;
 	return (sysctl_handle_opaque(oidp, &vmm, sizeof(vmm), req));
+}
+
+/*
+ * Callback for long-term slow data collection on 10-second interval.
+ *
+ * Return faults, set data for other entries.
+ */
+#define PTOB(value)	((uint64_t)(value) << PAGE_SHIFT)
+
+static uint64_t
+collect_vmstats_callback(int n)
+{
+	static struct vmmeter last_vmm;
+	struct vmmeter cur_vmm;
+	const int boffset = offsetof(struct vmmeter, vmmeter_uint_begin);
+	const int eoffset = offsetof(struct vmmeter, vmmeter_uint_end);
+	uint64_t total;
+
+	/*
+	 * The hardclock already rolls up vmstats for us.
+	 */
+	kcollect_setvalue(KCOLLECT_MEMFRE, PTOB(vmstats.v_free_count));
+	kcollect_setvalue(KCOLLECT_MEMCAC, PTOB(vmstats.v_cache_count));
+	kcollect_setvalue(KCOLLECT_MEMINA, PTOB(vmstats.v_inactive_count));
+	kcollect_setvalue(KCOLLECT_MEMACT, PTOB(vmstats.v_active_count));
+	kcollect_setvalue(KCOLLECT_MEMWIR, PTOB(vmstats.v_wire_count));
+
+	/*
+	 * Collect pcpu statistics for things like faults.
+	 */
+	bzero(&cur_vmm, sizeof(cur_vmm));
+        for (n = 0; n < ncpus; ++n) {
+                struct globaldata *gd = globaldata_find(n);
+                int off;
+
+                for (off = boffset; off <= eoffset; off += sizeof(u_int)) {
+                        *(u_int *)((char *)&cur_vmm + off) +=
+                                *(u_int *)((char *)&gd->gd_cnt + off);
+                }
+
+        }
+
+	total = cur_vmm.v_cow_faults - last_vmm.v_cow_faults;
+	last_vmm.v_cow_faults = cur_vmm.v_cow_faults;
+	kcollect_setvalue(KCOLLECT_COWFAULT, total);
+
+	total = cur_vmm.v_zfod - last_vmm.v_zfod;
+	last_vmm.v_zfod = cur_vmm.v_zfod;
+	kcollect_setvalue(KCOLLECT_ZFILL, total);
+
+	total = cur_vmm.v_syscall - last_vmm.v_syscall;
+	last_vmm.v_syscall = cur_vmm.v_syscall;
+	kcollect_setvalue(KCOLLECT_SYSCALLS, total);
+
+	total = cur_vmm.v_intr - last_vmm.v_intr;
+	last_vmm.v_intr = cur_vmm.v_intr;
+	kcollect_setvalue(KCOLLECT_INTR, total);
+
+	total = cur_vmm.v_ipi - last_vmm.v_ipi;
+	last_vmm.v_ipi = cur_vmm.v_ipi;
+	kcollect_setvalue(KCOLLECT_IPI, total);
+
+	total = cur_vmm.v_timer - last_vmm.v_timer;
+	last_vmm.v_timer = cur_vmm.v_timer;
+	kcollect_setvalue(KCOLLECT_TIMER, total);
+
+	total = cur_vmm.v_vm_faults - last_vmm.v_vm_faults;
+	last_vmm.v_vm_faults = cur_vmm.v_vm_faults;
+
+	return total;
 }
 
 /*
@@ -459,5 +531,83 @@ vmmeter_init(void *dummy __unused)
 				gd, sizeof(struct vmmeter), do_vmmeter_pcpu,
 				"S,vmmeter", "System per-cpu statistics");
 	}
+	kcollect_register(KCOLLECT_VMFAULT, "fault", collect_vmstats_callback,
+			  KCOLLECT_SCALE(KCOLLECT_VMFAULT_FORMAT, 0));
+	kcollect_register(KCOLLECT_COWFAULT, "cow", NULL,
+			  KCOLLECT_SCALE(KCOLLECT_COWFAULT_FORMAT, 0));
+	kcollect_register(KCOLLECT_ZFILL, "zfill", NULL,
+			  KCOLLECT_SCALE(KCOLLECT_ZFILL_FORMAT, 0));
+
+	kcollect_register(KCOLLECT_MEMFRE, "free", NULL,
+			  KCOLLECT_SCALE(KCOLLECT_MEMFRE_FORMAT,
+					 PTOB(vmstats.v_page_count)));
+	kcollect_register(KCOLLECT_MEMCAC, "cache", NULL,
+			  KCOLLECT_SCALE(KCOLLECT_MEMCAC_FORMAT,
+					 PTOB(vmstats.v_page_count)));
+	kcollect_register(KCOLLECT_MEMINA, "inact", NULL,
+			  KCOLLECT_SCALE(KCOLLECT_MEMINA_FORMAT,
+					 PTOB(vmstats.v_page_count)));
+	kcollect_register(KCOLLECT_MEMACT, "act", NULL,
+			  KCOLLECT_SCALE(KCOLLECT_MEMACT_FORMAT,
+					 PTOB(vmstats.v_page_count)));
+	kcollect_register(KCOLLECT_MEMWIR, "wired", NULL,
+			  KCOLLECT_SCALE(KCOLLECT_MEMWIR_FORMAT,
+					 PTOB(vmstats.v_page_count)));
+
+	kcollect_register(KCOLLECT_SYSCALLS, "syscalls", NULL,
+			  KCOLLECT_SCALE(KCOLLECT_SYSCALLS_FORMAT, 0));
+
+	kcollect_register(KCOLLECT_INTR, "intr", NULL,
+			  KCOLLECT_SCALE(KCOLLECT_INTR_FORMAT, 0));
+	kcollect_register(KCOLLECT_IPI, "ipi", NULL,
+			  KCOLLECT_SCALE(KCOLLECT_IPI_FORMAT, 0));
+	kcollect_register(KCOLLECT_TIMER, "timer", NULL,
+			  KCOLLECT_SCALE(KCOLLECT_TIMER_FORMAT, 0));
 }
 SYSINIT(vmmeter, SI_SUB_PSEUDO, SI_ORDER_ANY, vmmeter_init, 0);
+
+/*
+ * Rolls up accumulated pcpu adjustments to vmstats counts into the global
+ * structure, copy the global structure into our pcpu structure.  Critical
+ * path checks will use our pcpu structure.
+ *
+ * This is somewhat expensive and only called when needed, and by the
+ * hardclock.
+ */
+void
+vmstats_rollup(void)
+{
+	int cpu;
+
+	for (cpu = 0; cpu < ncpus; ++cpu) {
+		vmstats_rollup_cpu(globaldata_find(cpu));
+	}
+	mycpu->gd_vmstats = vmstats;
+}
+
+void
+vmstats_rollup_cpu(globaldata_t gd)
+{
+	long value;
+
+	if (gd->gd_vmstats_adj.v_free_count) {
+		value = atomic_swap_long(&gd->gd_vmstats_adj.v_free_count, 0);
+		atomic_add_long(&vmstats.v_free_count, value);
+	}
+	if (gd->gd_vmstats_adj.v_cache_count) {
+		value = atomic_swap_long(&gd->gd_vmstats_adj.v_cache_count, 0);
+		atomic_add_long(&vmstats.v_cache_count, value);
+	}
+	if (gd->gd_vmstats_adj.v_inactive_count) {
+		value=atomic_swap_long(&gd->gd_vmstats_adj.v_inactive_count, 0);
+		atomic_add_long(&vmstats.v_inactive_count, value);
+	}
+	if (gd->gd_vmstats_adj.v_active_count) {
+		value = atomic_swap_long(&gd->gd_vmstats_adj.v_active_count, 0);
+		atomic_add_long(&vmstats.v_active_count, value);
+	}
+	if (gd->gd_vmstats_adj.v_wire_count) {
+		value = atomic_swap_long(&gd->gd_vmstats_adj.v_wire_count, 0);
+		atomic_add_long(&vmstats.v_wire_count, value);
+	}
+}

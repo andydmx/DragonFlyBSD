@@ -26,7 +26,6 @@
  * SUCH DAMAGE.
  *
  * $FreeBSD: src/usr.sbin/ppp/chap.c,v 1.61.2.7 2002/09/01 02:12:23 brian Exp $
- * $DragonFly: src/usr.sbin/ppp/chap.c,v 1.2 2003/06/17 04:30:00 dillon Exp $
  */
 
 #include <sys/param.h>
@@ -39,10 +38,6 @@
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
-#ifndef NODES
-#include <md4.h>
-#endif
-#include <md5.h>
 #include <paths.h>
 #include <signal.h>
 #include <stdio.h>
@@ -51,6 +46,10 @@
 #include <sys/wait.h>
 #include <termios.h>
 #include <unistd.h>
+#ifndef NODES
+#include <openssl/md4.h>
+#endif
+#include <openssl/md5.h>
 
 #include "layer.h"
 #include "mbuf.h"
@@ -95,7 +94,7 @@
 static const char * const chapcodes[] = {
   "???", "CHALLENGE", "RESPONSE", "SUCCESS", "FAILURE"
 };
-#define MAXCHAPCODE (sizeof chapcodes / sizeof chapcodes[0] - 1)
+#define MAXCHAPCODE (NELEM(chapcodes) - 1)
 
 static void
 ChapOutput(struct physical *physical, u_int code, u_int id,
@@ -164,9 +163,9 @@ chap_BuildAnswer(char *name, char *key, u_char id, char *challenge
        * expkey = | k\0e\0y\0 |
        *           -----------
        */
-      MD4Init(&MD4context);
-      MD4Update(&MD4context, expkey, klen << 1);
-      MD4Final(digest, &MD4context);
+      MD4_Init(&MD4context);
+      MD4_Update(&MD4context, expkey, klen << 1);
+      MD4_Final(digest, &MD4context);
 
       /*
        *           ---- -------- ---------------- ------- ------
@@ -236,11 +235,11 @@ chap_BuildAnswer(char *name, char *key, u_char id, char *challenge
     digest = result;
     *digest++ = 16;				/* value size */
 
-    MD5Init(&MD5context);
-    MD5Update(&MD5context, &id, 1);
-    MD5Update(&MD5context, key, klen);
-    MD5Update(&MD5context, challenge + 1, *challenge);
-    MD5Final(digest, &MD5context);
+    MD5_Init(&MD5context);
+    MD5_Update(&MD5context, &id, 1);
+    MD5_Update(&MD5context, key, klen);
+    MD5_Update(&MD5context, challenge + 1, *challenge);
+    MD5_Final(digest, &MD5context);
 
     memcpy(digest + 16, name, nlen);
     /*

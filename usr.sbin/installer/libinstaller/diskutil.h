@@ -50,8 +50,9 @@ struct disk;
 struct slice;
 struct subpartition;
 
-#define FS_HAMMER	0
-#define FS_UFS		1
+#define FS_UFS		0
+#define FS_HAMMER	1
+#define FS_HAMMER2	2
 
 #ifdef NEEDS_DISKUTIL_STRUCTURE_DEFINITIONS
 
@@ -68,7 +69,7 @@ struct disk {
 	struct disk *prev;
 	struct slice *slice_head;
 	struct slice *slice_tail;
-	char *desc;			/* from whereever we get the best */
+	char *desc;			/* from wherever we get the best */
 	int number;			/* Position in kern.disks */
 	char *device;			/* `ad0', `da1', and such */
 	char *serno;			/* serial number */
@@ -130,6 +131,7 @@ struct disk		*disk_new(struct storage *, const char *);
 struct disk		*disk_find(const struct storage *, const char *);
 struct disk		*disk_next(const struct disk *);
 void			 disks_free(struct storage *);
+unsigned long		 disk_get_capacity(const struct disk *);
 void			 disk_set_number(struct disk *, const int);
 void			 disk_set_desc(struct disk *, const char *);
 void			 disk_set_serno(struct disk *, const char *);
@@ -160,6 +162,8 @@ struct subpartition	*slice_subpartition_first(const struct slice *);
 
 struct subpartition	*subpartition_new_hammer(struct slice *, const char *,
 						 long, int);
+struct subpartition	*subpartition_new_hammer2(struct slice *, const char *,
+						 long, int);
 struct subpartition	*subpartition_new_ufs(struct slice *, const char *,
 					      long, int, int, long, long, int);
 int			 subpartition_count(const struct slice *);
@@ -173,6 +177,7 @@ struct subpartition	*subpartition_next(const struct subpartition *);
 int 			 subpartition_get_pfs(const struct subpartition *);
 const char		*subpartition_get_mountpoint(const struct subpartition *);
 const char		*subpartition_get_device_name(const struct subpartition *);
+const char		*subpartition_get_mapper_name(const struct subpartition *, int);
 char			 subpartition_get_letter(const struct subpartition *);
 unsigned long		 subpartition_get_fsize(const struct subpartition *);
 unsigned long		 subpartition_get_bsize(const struct subpartition *);

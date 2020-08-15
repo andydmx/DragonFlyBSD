@@ -124,7 +124,6 @@
 
 	-a  Same as `set boot_askname'
 	-C  Same as `set boot_cdrom'
-	-c  Same as `set boot_userconfig'
 	-d  Same as `set boot_ddb'
 	-g  Same as `set boot_gdb'
 	-h  Same as `set boot_serial'
@@ -567,7 +566,7 @@
 
 			"crypt:ufs:/dev/ad0s0a:secvolume"
 
-		See mkinitrd.8 man page (on booted system) for full description.
+		See initrd.7 man page (on booted system) for full description.
 
 ################################################################################
 # Tshow DShow values of kernel environment variable

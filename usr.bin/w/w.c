@@ -29,7 +29,6 @@
  * @(#) Copyright (c) 1980, 1991, 1993, 1994 The Regents of the University of California.  All rights reserved.
  * @(#)w.c	8.4 (Berkeley) 4/16/94
  * $FreeBSD: src/usr.bin/w/w.c,v 1.38.2.6 2002/03/12 19:51:51 phantom Exp $
- * $DragonFly: src/usr.bin/w/w.c,v 1.10 2007/02/18 16:15:24 corecode Exp $
  */
 
 /*
@@ -66,12 +65,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#ifdef SUPPORT_UTMP
-#include <utmp.h>
-#endif
-#ifdef SUPPORT_UTMPX
 #include <utmpx.h>
-#endif
 #include <vis.h>
 
 #include <arpa/nameser.h>
@@ -80,9 +74,6 @@
 #include "extern.h"
 
 struct timeval	boottime;
-#ifdef SUPPORT_UTMP
-struct utmp	utmp;
-#endif
 struct winsize	ws;
 kvm_t	       *kd;
 time_t		now;		/* the current time of day */
@@ -101,7 +92,7 @@ char		domain[MAXHOSTNAMELEN];
 int maxname = 8, maxline = 3, maxhost = 16;
 
 /*
- * One of these per active utmp entry.
+ * One of these per active utmpx entry.
  */
 struct	entry {
 	struct	entry *next;
@@ -121,10 +112,8 @@ struct	entry {
 #define debugproc(p) *((struct kinfo_proc **)&(p)->kp_spare[0])
 
 static void		 pr_header(time_t *, int);
-#if defined(SUPPORT_UTMP) || defined(SUPPORT_UTMPX)
 static struct stat	*ttystat(char *, int);
 static void	process(struct entry *);
-#endif
 static void		 usage(int);
 static int		 this_is_uptime(const char *s);
 
@@ -139,12 +128,7 @@ main(int argc, char **argv)
 	in_addr_t l;
 	int ch, i, nentries, nusers, wcmd, longidle, dropgid;
 	char *memf, *nlistf, *p, *x;
-#ifdef SUPPORT_UTMP
-	struct utmp *ut;
-#endif
-#ifdef SUPPORT_UTMPX
 	struct utmpx *utx;
-#endif
 	char buf[MAXHOSTNAMELEN], errbuf[_POSIX2_LINE_MAX];
 
 	(void)setlocale(LC_ALL, "");
@@ -211,18 +195,12 @@ main(int argc, char **argv)
 		errx(1, "%s", errbuf);
 
 	(void)time(&now);
-#ifdef SUPPORT_UTMPX
 	setutxent();
-#endif
-#ifdef SUPPORT_UTMP
-	setutent();
-#endif
 
 	if (*argv)
 		sel_users = argv;
 
 	nusers = 0;
-#ifdef SUPPORT_UTMPX
 	while ((utx = getutxent()) != NULL) {
 		if (utx->ut_type != USER_PROCESS)
 			continue;
@@ -267,59 +245,7 @@ main(int argc, char **argv)
 		if (wcmd != 0)
 			process(ep);
 	}
-#endif
-
-#ifdef SUPPORT_UTMP
-	while ((ut = getutent()) != NULL) {
-		if (ut->ut_name[0] == '\0')
-			continue;
-		++nusers;
-		if (sel_users) {
-			int usermatch;
-			char **user;
-
-			usermatch = 0;
-			for (user = sel_users; !usermatch && *user; user++)
-				if (!strncmp(ut->ut_name, *user, UT_NAMESIZE))
-					usermatch = 1;
-			if (!usermatch)
-				continue;
-		}
-
-		/* Don't process entries that we have utmpx for */
-		for (ep = ehead; ep != NULL; ep = ep->next) {
-			if (strncmp(ep->line, ut->ut_line,
-			    sizeof(ut->ut_line)) == 0)
-				break;
-		}
-		if (ep != NULL) {
-			--nusers; /* Duplicate entry */
-			continue;
-		}
-
-		if ((ep = calloc(1, sizeof(struct entry))) == NULL)
-			err(1, NULL);
-		(void)memcpy(ep->name, ut->ut_name, sizeof(ut->ut_name));
-		(void)memcpy(ep->line, ut->ut_line, sizeof(ut->ut_line));
-		(void)memcpy(ep->host, ut->ut_host, sizeof(ut->ut_host));
-		ep->name[sizeof(ut->ut_name)] = '\0';
-		ep->line[sizeof(ut->ut_line)] = '\0';
-		ep->host[sizeof(ut->ut_host)] = '\0';
-		ep->tv.tv_sec = ut->ut_time;
-
-		*nextp = ep;
-		nextp = &(ep->next);
-		if (wcmd != 0)
-			process(ep);
-	}
-#endif
-
-#ifdef SUPPORT_UTMPX
 	endutxent();
-#endif
-#ifdef SUPPORT_UTMP
-	endutent();
-#endif	
 	
 	if (header || wcmd == 0) {
 		pr_header(&now, nusers);
@@ -410,9 +336,7 @@ main(int argc, char **argv)
 			save->next = *nextp;
 			*nextp = save;
 		}
-	}
-#if defined(SUPPORT_UTMP) && defined(SUPPORT_UTMPX)
-	else if (ehead != NULL) {
+	} else if (ehead != NULL) {
 		struct entry *from = ehead, *save;
 
 		ehead = NULL;
@@ -427,7 +351,6 @@ main(int argc, char **argv)
 			*nextp = save;
 		}
 	}
-#endif
 
 	if (!nflag) {
 		if (gethostname(domain, sizeof(domain)) < 0 ||
@@ -447,7 +370,8 @@ main(int argc, char **argv)
 		p = *host_buf ? host_buf : "-";
 		if ((x = strchr(p, ':')) != NULL)
 			*x++ = '\0';
-		if (!nflag && isdigit(*p) && (l = inet_addr(p)) != -1 &&
+		if (!nflag && isdigit(*p) &&
+		    (l = inet_addr(p)) != INADDR_NONE &&
 		    (hp = gethostbyaddr(&l, sizeof(l), AF_INET))) {
 			if (domain[0] != '\0') {
 				p = hp->h_name;
@@ -513,10 +437,11 @@ pr_header(time_t *nowp, int nusers)
 	char buf[256];
 
 	/*
-	 * Print time of day.
+	 * Print time of day. (use "AM"/"PM" for all locales)
 	 */
-	(void)strftime(buf, sizeof(buf)	- 1,
-		       use_ampm	? "%l:%M%p" : "%k:%M", localtime(nowp));
+	(void)strftime_l(buf, sizeof(buf) - 1,
+		       use_ampm	? "%l:%M%p" : "%k:%M",
+		       localtime(nowp), NULL);
 	buf[sizeof(buf) - 1] = '\0';
 	(void)printf("%s ", buf);
 
@@ -557,11 +482,11 @@ pr_header(time_t *nowp, int nusers)
 	/*
 	 * Print 1, 5, and 15 minute load averages.
 	 */
-	if (getloadavg(avenrun, sizeof(avenrun) / sizeof(avenrun[0])) == -1)
+	if (getloadavg(avenrun, NELEM(avenrun)) == -1)
 		(void)printf(", no load average information available\n");
 	else {
 		(void)printf(", load averages:");
-		for (i = 0; i < (sizeof(avenrun) / sizeof(avenrun[0])); i++) {
+		for (i = 0; i < (int)NELEM(avenrun); i++) {
 			if (use_comma && i > 0)
 				(void)printf(",");
 			(void)printf(" %.2f", avenrun[i]);
@@ -609,7 +534,6 @@ this_is_uptime(const char *s)
 	return (-1);
 }
 
-#if defined(SUPPORT_UTMP) || defined(SUPPORT_UTMPX)
 static void
 process(struct entry *ep)
 {
@@ -655,4 +579,3 @@ process(struct entry *ep)
 	if ((ep->idle = now - touched) < 0)
 		ep->idle = 0;
 }
-#endif

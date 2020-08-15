@@ -30,16 +30,17 @@
 #include "opt_acpi.h"
 #include <sys/param.h>
 #include <sys/bus.h>
+#include <sys/cpuhelper.h>
 #include <sys/kernel.h>
 #include <sys/malloc.h>
 #include <sys/globaldata.h>
 #include <sys/power.h>
 #include <sys/proc.h>
 #include <sys/sbuf.h>
-#include <sys/thread2.h>
 #include <sys/serialize.h>
 #include <sys/msgport2.h>
 #include <sys/microtime_pcpu.h>
+#include <sys/cpu_topology.h>
 
 #include <bus/pci/pcivar.h>
 #include <machine/atomic.h>
@@ -47,10 +48,6 @@
 #include <machine/md_var.h>
 #include <machine/smp.h>
 #include <sys/rman.h>
-
-#include <net/netisr2.h>
-#include <net/netmsg2.h>
-#include <net/if_var.h>
 
 #include "acpi.h"
 #include "acpivar.h"
@@ -64,12 +61,6 @@
 /* Hooks for the ACPICA debugging infrastructure */
 #define _COMPONENT	ACPI_PROCESSOR
 ACPI_MODULE_NAME("PROCESSOR")
-
-struct netmsg_acpi_cst {
-	struct netmsg_base base;
-	struct acpi_cst_softc *sc;
-	int		val;
-};
 
 #define MAX_CX_STATES	 8
 
@@ -94,6 +85,9 @@ struct acpi_cst_softc {
 };
 
 #define ACPI_CST_FLAG_PROBING	0x1
+#define ACPI_CST_FLAG_ATTACHED	0x2
+/* Match C-states of other hyperthreads on the same core */
+#define ACPI_CST_FLAG_MATCH_HT	0x4
 
 #define PCI_VENDOR_INTEL	0x8086
 #define PCI_DEVICE_82371AB_3	0x7113	/* PIIX4 chipset for quirks. */
@@ -139,6 +133,8 @@ static int	acpi_cst_shutdown(device_t);
 static void	acpi_cst_notify(device_t);
 static void	acpi_cst_postattach(void *);
 static void	acpi_cst_idle(void);
+static void	acpi_cst_copy(struct acpi_cst_softc *,
+		    const struct acpi_cst_softc *);
 
 static void	acpi_cst_cx_probe(struct acpi_cst_softc *);
 static void	acpi_cst_cx_probe_fadt(struct acpi_cst_softc *);
@@ -165,6 +161,12 @@ static int	acpi_cst_global_lowest_use_sysctl(SYSCTL_HANDLER_ARGS);
 static int	acpi_cst_cx_setup(struct acpi_cst_cx *cx);
 static void	acpi_cst_c1_halt_enter(const struct acpi_cst_cx *);
 static void	acpi_cst_cx_io_enter(const struct acpi_cst_cx *);
+
+int		acpi_cst_force_bmarb;
+TUNABLE_INT("hw.acpi.cpu.cst.force_bmarb", &acpi_cst_force_bmarb);
+
+int		acpi_cst_force_bmsts;
+TUNABLE_INT("hw.acpi.cpu.cst.force_bmsts", &acpi_cst_force_bmsts);
 
 static device_method_t acpi_cst_methods[] = {
     /* Device interface */
@@ -195,6 +197,7 @@ static driver_t acpi_cst_driver = {
     "cpu_cst",
     acpi_cst_methods,
     sizeof(struct acpi_cst_softc),
+    .gpri = KOBJ_GPRI_ACPI+2
 };
 
 static devclass_t acpi_cst_devclass;
@@ -225,7 +228,7 @@ acpi_cst_probe(device_t dev)
     }
 
     /* Mark this processor as in-use and save our derived id for attach. */
-    acpi_cst_softc[cpu_id] = (void *)1;
+    acpi_cst_softc[cpu_id] = device_get_softc(dev);
     device_set_desc(dev, "ACPI CPU C-State");
 
     return (0);
@@ -256,6 +259,7 @@ acpi_cst_attach(device_t dev)
     if (ACPI_FAILURE(status)) {
 	device_printf(dev, "attach failed to get Processor obj - %s\n",
 		      AcpiFormatException(status));
+	acpi_cst_softc[sc->cst_cpuid] = NULL;
 	return (ENXIO);
     }
     obj = (ACPI_OBJECT *)buf.Pointer;
@@ -279,6 +283,8 @@ acpi_cst_attach(device_t dev)
 
     /* Probe for Cx state support. */
     acpi_cst_cx_probe(sc);
+
+    sc->cst_flags |= ACPI_CST_FLAG_ATTACHED;
 
     return (0);
 }
@@ -456,6 +462,16 @@ acpi_cst_cx_probe_fadt(struct acpi_cst_softc *sc)
     }
 }
 
+static void
+acpi_cst_copy(struct acpi_cst_softc *dst_sc,
+    const struct acpi_cst_softc *src_sc)
+{
+    dst_sc->cst_non_c3 = src_sc->cst_non_c3;
+    dst_sc->cst_cx_count = src_sc->cst_cx_count;
+    memcpy(dst_sc->cst_cx_states, src_sc->cst_cx_states,
+        sizeof(dst_sc->cst_cx_states));
+}
+
 /*
  * Parse a _CST package and set up its Cx states.  Since the _CST object
  * can change dynamically, our notify handler may call this function
@@ -474,10 +490,8 @@ acpi_cst_cx_probe_cst(struct acpi_cst_softc *sc, int reprobe)
 
     ACPI_FUNCTION_TRACE((char *)(uintptr_t)__func__);
 
-#ifdef INVARIANTS
     if (reprobe)
-	KKASSERT(&curthread->td_msgport == netisr_cpuport(sc->cst_cpuid));
-#endif
+	cpuhelper_assert(sc->cst_cpuid, true);
 
     buf.Pointer = NULL;
     buf.Length = ACPI_ALLOCATE_BUFFER;
@@ -502,7 +516,7 @@ acpi_cst_cx_probe_cst(struct acpi_cst_softc *sc, int reprobe)
 	count = MAX_CX_STATES;
     }
 
-    sc->cst_flags |= ACPI_CST_FLAG_PROBING;
+    sc->cst_flags |= ACPI_CST_FLAG_PROBING | ACPI_CST_FLAG_MATCH_HT;
     cpu_sfence();
 
     /*
@@ -536,6 +550,13 @@ acpi_cst_cx_probe_cst(struct acpi_cst_softc *sc, int reprobe)
 	    error = acpi_cst_cx_setup(cx_ptr);
 	    if (error)
 		panic("C1 CST HALT setup failed: %d", error);
+	    if (sc->cst_cx_count != 0) {
+		/*
+		 * C1 is not the first C-state; something really stupid
+		 * is going on ...
+		 */
+		sc->cst_flags &= ~ACPI_CST_FLAG_MATCH_HT;
+	    }
 	    cx_ptr++;
 	    sc->cst_cx_count++;
 	    continue;
@@ -558,6 +579,15 @@ acpi_cst_cx_probe_cst(struct acpi_cst_softc *sc, int reprobe)
 	 */
 	KASSERT(cx_ptr->res == NULL, ("still has res"));
 	acpi_PkgRawGas(pkg, 0, &cx_ptr->gas);
+
+	/*
+	 * We match number of C2/C3 for hyperthreads, only if the
+	 * register is "Fixed Hardware", e.g. on most of the Intel
+	 * CPUs.  We don't have much to do for the rest of the
+	 * register types.
+	 */
+	if (cx_ptr->gas.SpaceId != ACPI_ADR_SPACE_FIXED_HARDWARE)
+	    sc->cst_flags &= ~ACPI_CST_FLAG_MATCH_HT;
 
 	cx_ptr->rid = sc->cst_parent->cpu_next_rid;
 	acpi_bus_alloc_gas(sc->cst_dev, &cx_ptr->res_type, &cx_ptr->rid,
@@ -587,6 +617,46 @@ acpi_cst_cx_probe_cst(struct acpi_cst_softc *sc, int reprobe)
 	}
     }
     AcpiOsFree(buf.Pointer);
+
+    if (sc->cst_flags & ACPI_CST_FLAG_MATCH_HT) {
+	cpumask_t mask;
+
+	mask = get_cpumask_from_level(sc->cst_cpuid, CORE_LEVEL);
+	if (CPUMASK_TESTNZERO(mask)) {
+	    int cpu;
+
+	    for (cpu = 0; cpu < ncpus; ++cpu) {
+		struct acpi_cst_softc *sc1 = acpi_cst_softc[cpu];
+
+		if (sc1 == NULL || sc1 == sc ||
+		    (sc1->cst_flags & ACPI_CST_FLAG_ATTACHED) == 0 ||
+		    (sc1->cst_flags & ACPI_CST_FLAG_MATCH_HT) == 0)
+		    continue;
+		if (!CPUMASK_TESTBIT(mask, sc1->cst_cpuid))
+		    continue;
+
+		if (sc1->cst_cx_count != sc->cst_cx_count) {
+		    struct acpi_cst_softc *src_sc, *dst_sc;
+
+		    if (bootverbose) {
+			device_printf(sc->cst_dev,
+			    "inconstent C-state count: %d, %s has %d\n",
+			    sc->cst_cx_count,
+			    device_get_nameunit(sc1->cst_dev),
+			    sc1->cst_cx_count);
+		    }
+		    if (sc1->cst_cx_count > sc->cst_cx_count) {
+			src_sc = sc1;
+			dst_sc = sc;
+		    } else {
+			src_sc = sc;
+			dst_sc = sc1;
+		    }
+		    acpi_cst_copy(dst_sc, src_sc);
+		}
+	    }
+	}
+    }
 
     if (reprobe) {
 	/* If there are C3(+) states, always enable bus master wakeup */
@@ -618,25 +688,22 @@ acpi_cst_cx_probe_cst(struct acpi_cst_softc *sc, int reprobe)
 }
 
 static void
-acpi_cst_cx_reprobe_cst_handler(netmsg_t msg)
+acpi_cst_cx_reprobe_cst_handler(struct cpuhelper_msg *msg)
 {
-    struct netmsg_acpi_cst *rmsg = (struct netmsg_acpi_cst *)msg;
     int error;
 
-    error = acpi_cst_cx_probe_cst(rmsg->sc, 1);
-    lwkt_replymsg(&rmsg->base.lmsg, error);
+    error = acpi_cst_cx_probe_cst(msg->ch_cbarg, 1);
+    cpuhelper_replymsg(msg, error);
 }
 
 static int
 acpi_cst_cx_reprobe_cst(struct acpi_cst_softc *sc)
 {
-    struct netmsg_acpi_cst msg;
+    struct cpuhelper_msg msg;
 
-    netmsg_init(&msg.base, NULL, &curthread->td_msgport, MSGF_PRIORITY,
-	acpi_cst_cx_reprobe_cst_handler);
-    msg.sc = sc;
-
-    return lwkt_domsg(netisr_cpuport(sc->cst_cpuid), &msg.base.lmsg, 0);
+    cpuhelper_initmsg(&msg, &curthread->td_msgport,
+        acpi_cst_cx_reprobe_cst_handler, sc, MSGF_PRIORITY);
+    return (cpuhelper_domsg(&msg, sc->cst_cpuid));
 }
 
 /*
@@ -737,24 +804,21 @@ acpi_cst_support_list(struct acpi_cst_softc *sc)
 }	
 
 static void
-acpi_cst_c3_bm_rld_handler(netmsg_t msg)
+acpi_cst_c3_bm_rld_handler(struct cpuhelper_msg *msg)
 {
-    struct netmsg_acpi_cst *rmsg = (struct netmsg_acpi_cst *)msg;
 
     AcpiWriteBitRegister(ACPI_BITREG_BUS_MASTER_RLD, 1);
-    lwkt_replymsg(&rmsg->base.lmsg, 0);
+    cpuhelper_replymsg(msg, 0);
 }
 
 static void
 acpi_cst_c3_bm_rld(struct acpi_cst_softc *sc)
 {
-    struct netmsg_acpi_cst msg;
+    struct cpuhelper_msg msg;
 
-    netmsg_init(&msg.base, NULL, &curthread->td_msgport, MSGF_PRIORITY,
-	acpi_cst_c3_bm_rld_handler);
-    msg.sc = sc;
-
-    lwkt_domsg(netisr_cpuport(sc->cst_cpuid), &msg.base.lmsg, 0);
+    cpuhelper_initmsg(&msg, &curthread->td_msgport,
+	acpi_cst_c3_bm_rld_handler, sc, MSGF_PRIORITY);
+    cpuhelper_domsg(&msg, sc->cst_cpuid);
 }
 
 static void
@@ -927,8 +991,7 @@ acpi_cst_notify(device_t dev)
 {
     struct acpi_cst_softc *sc = device_get_softc(dev);
 
-    KASSERT(curthread->td_type != TD_TYPE_NETISR,
-        ("notify in netisr%d", mycpuid));
+    cpuhelper_assert(mycpuid, false);
 
     lwkt_serialize_enter(&acpi_cst_slize);
 
@@ -1103,26 +1166,24 @@ acpi_cst_set_lowest_oncpu(struct acpi_cst_softc *sc, int val)
 }
 
 static void
-acpi_cst_set_lowest_handler(netmsg_t msg)
+acpi_cst_set_lowest_handler(struct cpuhelper_msg *msg)
 {
-    struct netmsg_acpi_cst *rmsg = (struct netmsg_acpi_cst *)msg;
     int error;
 
-    error = acpi_cst_set_lowest_oncpu(rmsg->sc, rmsg->val);
-    lwkt_replymsg(&rmsg->base.lmsg, error);
+    error = acpi_cst_set_lowest_oncpu(msg->ch_cbarg, msg->ch_cbarg1);
+    cpuhelper_replymsg(msg, error);
 }
 
 static int
 acpi_cst_set_lowest(struct acpi_cst_softc *sc, int val)
 {
-    struct netmsg_acpi_cst msg;
+    struct cpuhelper_msg msg;
 
-    netmsg_init(&msg.base, NULL, &curthread->td_msgport, MSGF_PRIORITY,
-	acpi_cst_set_lowest_handler);
-    msg.sc = sc;
-    msg.val = val;
+    cpuhelper_initmsg(&msg, &curthread->td_msgport,
+	acpi_cst_set_lowest_handler, sc, MSGF_PRIORITY);
+    msg.ch_cbarg1 = val;
 
-    return lwkt_domsg(netisr_cpuport(sc->cst_cpuid), &msg.base.lmsg, 0);
+    return (cpuhelper_domsg(&msg, sc->cst_cpuid));
 }
 
 static int
@@ -1216,11 +1277,7 @@ acpi_cst_global_lowest_use_sysctl(SYSCTL_HANDLER_ARGS)
 static void
 acpi_cst_c1_halt(void)
 {
-    splz();
-    if ((mycpu->gd_reqflags & RQF_IDLECHECK_WK_MASK) == 0)
-        __asm __volatile("sti; hlt");
-    else
-        __asm __volatile("sti; pause");
+    cpu_idle_halt();
 }
 
 static void

@@ -28,7 +28,7 @@
 .\"
 .\" $FreeBSD: src/share/man/man4/crypto.4,v 1.9 2009/03/03 07:58:01 brueffer Exp $
 .\"
-.Dd August 21, 2010
+.Dd April 21, 2018
 .Dt CRYPTO 4
 .Os
 .Sh NAME
@@ -93,7 +93,7 @@ asymmetric cryptographic features are potentially available from
 .It Dv CRYPTO_AES_CBC
 .It Dv CRYPTO_AES_XTS
 .It Dv CRYPTO_AES_CTR
-.It Dv CRYPTO_AES_GCM16
+.It Dv CRYPTO_AES_GCM_16
 .It Dv CRYPTO_AES_GMAC
 .It Dv CRYPTO_AES_128_GMAC
 .It Dv CRYPTO_AES_192_GMAC
@@ -118,9 +118,7 @@ crypto access device
 .El
 .Sh SEE ALSO
 .Xr aesni 4 ,
-.Xr glxsb 4 ,
 .Xr hifn 4 ,
-.Xr ipsec 4 ,
 .Xr padlock 4 ,
 .Xr safe 4 ,
 .Xr ubsec 4 ,

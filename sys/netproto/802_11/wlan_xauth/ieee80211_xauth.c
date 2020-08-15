@@ -22,9 +22,10 @@
  * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
  * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
  * THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- *
- * $FreeBSD: head/sys/net80211/ieee80211_xauth.c 178354 2008-04-20 20:35:46Z sam $
  */
+
+#include <sys/cdefs.h>
+__FBSDID("$FreeBSD$");
 
 /*
  * External authenticator placeholder module.
@@ -43,6 +44,7 @@
 #include <sys/param.h>
 #include <sys/kernel.h>
 #include <sys/systm.h> 
+#include <sys/malloc.h>   
 #include <sys/mbuf.h>   
 #include <sys/module.h>
 
@@ -50,6 +52,7 @@
 
 #include <net/if.h>
 #include <net/if_media.h>
+#include <net/ifq_var.h>
 #include <net/ethernet.h>
 #include <net/route.h>
 

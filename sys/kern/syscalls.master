@@ -3,12 +3,11 @@
 ;
 ; System call name/number master file.
 ; Processed to create kern/init_sysent.c, kern/syscalls.c, sys/syscall.h,
-;                     sys/syscall.mk, sys/sysproto.h and sys/sysunion.h
+;                     sys/syscall.mk, and sys/sysmsg.h
 
 ; Columns: number type nargs namespc name alt{name,tag,rtyp}/comments
 ;	number	system call number, must be in order
-;	type	one of STD, OBSOL, UNIMPL, COMPAT, CPT_NOA, LIBCOMPAT,
-;		NODEF, NOARGS, NOPROTO, NOIMPL
+;	type	one of STD, OBSOL, UNIMPL, NODEF, NOARGS, NOPROTO, NOIMPL
 ;	name	pseudo-prototype of syscall routine
 ;		If one of the following alts is different, then all appear:
 ;	altname	name of system call if different
@@ -21,8 +20,6 @@
 
 ; types:
 ;	STD	always included
-;	COMPAT	included on COMPAT #ifdef
-;	LIBCOMPAT included on COMPAT #ifdef, and placed in syscall.h
 ;	OBSOL	obsolete, not included in system, only specifies name
 ;	UNIMPL	not implemented, placeholder only
 
@@ -30,14 +27,8 @@
 
 #include <sys/param.h>
 #include <sys/sysent.h>
-#include <sys/sysproto.h>
+#include <sys/sysmsg.h>
 #include <sys/statvfs.h>
-
-#ifdef COMPAT_43
-#include <emulation/43bsd/stat.h>
-#endif
-
-#include <emulation/dragonfly12/stat.h>
 
 ; Reserved/unimplemented system calls in the range 0-150 inclusive
 ; are reserved for use in future Berkeley releases.
@@ -45,7 +36,7 @@
 ; redistributions should be placed in the reserved range at the end
 ; of the current calls.
 
-0	STD	{ int nosys(void); } syscall nosys_args int
+0	NOARGS	{ int xsyscall(void); } syscall nosys_args int
 1	STD	{ void exit(int rval); }
 2	STD	{ int fork(void); }
 3	STD	{ ssize_t read(int fd, void *buf, size_t nbyte); }
@@ -57,7 +48,7 @@
 6	STD	{ int close(int fd); }
 7	STD	{ int wait4(int pid, int *status, int options, \
 			    struct rusage *rusage); } wait4 wait_args int
-8	COMPAT	{ int creat(char *path, int mode); }
+8	STD	{ int nosys(void); } __nosys nosys_args int
 9	STD	{ int link(char *path, char *link); }
 10	STD	{ int unlink(char *path); }
 11	OBSOL	execv
@@ -69,7 +60,7 @@
 17	STD	{ int obreak(char *nsize); } break obreak_args int
 18	STD	{ int getfsstat(struct statfs *buf, long bufsize, \
 			    int flags); }
-19	COMPAT	{ long lseek(int fd, long offset, int whence); }
+19	OBSOL	old lseek
 20	STD	{ pid_t getpid(void); }
 21	STD	{ int mount(char *type, char *path, int flags, \
 			    caddr_t data); }
@@ -88,27 +79,24 @@
 31	STD	{ int getpeername(int fdes, caddr_t asa, int *alen); }
 32	STD	{ int getsockname(int fdes, caddr_t asa, int *alen); }
 33	STD	{ int access(char *path, int flags); }
-34	STD	{ int chflags(char *path, int flags); }
-35	STD	{ int fchflags(int fd, int flags); }
+34	STD	{ int chflags(const char *path, u_long flags); }
+35	STD	{ int fchflags(int fd, u_long flags); }
 36	STD	{ int sync(void); }
 37	STD	{ int kill(int pid, int signum); }
-38	COMPAT	{ int stat(char *path, struct ostat *ub); }
+38	OBSOL	old stat
 39	STD	{ pid_t getppid(void); }
-40	COMPAT	{ int lstat(char *path, struct ostat *ub); }
-41	STD	{ int dup(u_int fd); }
+40	OBSOL	old lstat
+41	STD	{ int dup(int fd); }
 42	STD	{ int pipe(void); }
 43	STD	{ gid_t getegid(void); }
 44	STD	{ int profil(caddr_t samples, size_t size, \
-			    size_t offset, u_int scale); }
+			    u_long offset, u_int scale); }
 45	STD	{ int ktrace(const char *fname, int ops, int facs, \
 			    int pid); }
 46	OBSOL	freebsd3_sigaction
 47	STD	{ gid_t getgid(void); }
 48	OBSOL	freebsd3_sigprocmask
-; XXX note nonstandard (bogus) calling convention - the libc stub passes
-; us the mask, not a pointer to it, and we return the old mask as the
-; (int) return value.
-49	STD	{ int getlogin(char *namebuf, u_int namelen); }
+49	STD	{ int getlogin(char *namebuf, size_t namelen); }
 50	STD	{ int setlogin(char *namebuf); }
 51	STD	{ int acct(char *path); }
 52	OBSOL	freebsd3_sigpending
@@ -121,20 +109,17 @@
 59	STD	{ int execve(char *fname, char **argv, char **envv); }
 60	STD	{ int umask(int newmask); } umask umask_args int
 61	STD	{ int chroot(char *path); }
-62	COMPAT	{ int fstat(int fd, struct ostat *sb); }
-63	COMPAT	{ int getkerninfo(int op, char *where, size_t *size, \
-			    int arg); } getkerninfo getkerninfo_args int
-64	COMPAT	{ int getpagesize(void); } \
-			    getpagesize getpagesize_args int
+62	OBSOL	old fstat
+63	OBSOL	getkerninfo
+64	OBSOL	getpagesize
 65	STD	{ int msync(void *addr, size_t len, int flags); }
 66	STD	{ pid_t vfork(void); }
 67	OBSOL	vread
 68	OBSOL	vwrite
-69	STD	{ int sbrk(int incr); }
-70	STD	{ int sstk(int incr); }
-71	COMPAT	{ int mmap(void *addr, int len, int prot, \
-			    int flags, int fd, long pos); }
-72	COMPAT	{ int vadvise(int anom); } vadvise ovadvise_args int
+69	STD	{ caddr_t sbrk(size_t incr); }
+70	STD	{ int sstk(size_t incr); }
+71	OBSOL	old mmap
+72	OBSOL	vadvise
 73	STD	{ int munmap(void *addr, size_t len); }
 74	STD	{ int mprotect(void *addr, size_t len, int prot); }
 75	STD	{ int madvise(void *addr, size_t len, int behav); }
@@ -148,15 +133,13 @@
 82	STD	{ int setpgid(int pid, int pgid); }
 83	STD	{ int setitimer(u_int which, struct itimerval *itv, \
 			    struct itimerval *oitv); }
-84	COMPAT	{ int wait(void); }
+84	OBSOL	wait
 85	STD	{ int swapon(char *name); }
 86	STD	{ int getitimer(u_int which, struct itimerval *itv); }
-87	COMPAT	{ int gethostname(char *hostname, u_int len); } \
-			    gethostname gethostname_args int
-88	COMPAT	{ int sethostname(char *hostname, u_int len); } \
-			    sethostname sethostname_args int
+87	OBSOL	gethostname
+88	OBSOL	sethostname
 89	STD	{ int getdtablesize(void); }
-90	STD	{ int dup2(u_int from, u_int to); }
+90	STD	{ int dup2(int from, int to); }
 91	UNIMPL	getdopt
 92	STD	{ int fcntl(int fd, int cmd, long arg); }
 ; XXX should be		{ int fcntl(int fd, int cmd, ...); }
@@ -169,28 +152,23 @@
 96	STD	{ int setpriority(int which, int who, int prio); }
 97	STD	{ int socket(int domain, int type, int protocol); }
 98	STD	{ int connect(int s, caddr_t name, int namelen); }
-99	CPT_NOA	{ int accept(int s, caddr_t name, int *anamelen); } \
-			    accept accept_args int
+99	OBSOL	old accept
 100	STD	{ int getpriority(int which, int who); }
-101	COMPAT	{ int send(int s, caddr_t buf, int len, int flags); }
-102	COMPAT	{ int recv(int s, caddr_t buf, int len, int flags); }
+101	OBSOL	send
+102	OBSOL	recv
 103	OBSOL	freebsd3_sigreturn
 104	STD	{ int bind(int s, caddr_t name, int namelen); }
 105	STD	{ int setsockopt(int s, int level, int name, \
 			    caddr_t val, int valsize); }
 106	STD	{ int listen(int s, int backlog); }
 107	OBSOL	vtimes
-108	COMPAT	{ int sigvec(int signum, struct sigvec *nsv, \
-			    struct sigvec *osv); }
-109	COMPAT	{ int sigblock(int mask); }
-110	COMPAT	{ int sigsetmask(int mask); }
+108	OBSOL	4.3 sigvec
+109	OBSOL	4.3 sigblock
+110	OBSOL	4.3 sigsetmask
 111	OBSOL	freebsd3_sigsuspend
-; XXX note nonstandard (bogus) calling convention - the libc stub passes
-; us the mask, not a pointer to it.
-112	COMPAT	{ int sigstack(struct sigstack *nss, \
-			    struct sigstack *oss); }
-113	COMPAT	{ int recvmsg(int s, struct omsghdr *msg, int flags); }
-114	COMPAT	{ int sendmsg(int s, caddr_t msg, int flags); }
+112	OBSOL	sigstack
+113	OBSOL	old recvmsg
+114	OBSOL	old sendmsg
 115	OBSOL	vtrace
 116	STD	{ int gettimeofday(struct timeval *tp, \
 			    struct timezone *tzp); }
@@ -205,14 +183,12 @@
 			    struct timezone *tzp); }
 123	STD	{ int fchown(int fd, int uid, int gid); }
 124	STD	{ int fchmod(int fd, int mode); }
-125	CPT_NOA	{ int recvfrom(int s, caddr_t buf, size_t len, \
-			    int flags, caddr_t from, int *fromlenaddr); } \
-			    recvfrom recvfrom_args int
+125	OBSOL	old recvfrom
 126	STD	{ int setreuid(int ruid, int euid); }
 127	STD	{ int setregid(int rgid, int egid); }
 128	STD	{ int rename(char *from, char *to); }
-129	COMPAT	{ int truncate(char *path, long length); }
-130	COMPAT	{ int ftruncate(int fd, long length); }
+129	OBSOL	old truncate
+130	OBSOL	old ftruncate
 131	STD	{ int flock(int fd, int how); }
 132	STD	{ int mkfifo(char *path, int mode); }
 133	STD	{ int sendto(int s, caddr_t buf, size_t len, \
@@ -226,18 +202,17 @@
 139	OBSOL	4.2 sigreturn
 140	STD	{ int adjtime(struct timeval *delta, \
 			    struct timeval *olddelta); }
-141	COMPAT	{ int getpeername(int fdes, caddr_t asa, int *alen); }
-142	COMPAT	{ long gethostid(void); }
-143	COMPAT	{ int sethostid(long hostid); }
-144	COMPAT	{ int getrlimit(u_int which, struct orlimit *rlp); }
-145	COMPAT	{ int setrlimit(u_int which, struct orlimit *rlp); }
-146	COMPAT	{ int killpg(int pgid, int signum); }
+141	OBSOL	old getpeername
+142	OBSOL	4.3 gethostid
+143	OBSOL	4.3 sethostid
+144	OBSOL	old getrlimit
+145	OBSOL	old setrlimit
+146	OBSOL	4.3 killpg
 147	STD	{ int setsid(void); }
 148	STD	{ int quotactl(char *path, int cmd, int uid, \
 			    caddr_t arg); }
-149	COMPAT	{ int quota(void); }
-150	CPT_NOA	{ int getsockname(int fdec, caddr_t asa, int *alen); }\
-			    getsockname getsockname_args int
+149	OBSOL	quota
+150	OBSOL	old getsockname
 
 ; Syscalls 151-180 inclusive are reserved for vendor-specific
 ; system calls.  (This includes various calls added for compatibity
@@ -249,17 +224,16 @@
 154	UNIMPL	nosys
 ; 155 is initialized by the NFS code, if present.
 155	NOIMPL	{ int nfssvc(int flag, caddr_t argp); }
-156	COMPAT	{ int getdirentries(int fd, char *buf, u_int count, \
-			    long *basep); }
+156	OBSOL	old getdirentries
 157	STD	{ int statfs(char *path, struct statfs *buf); }
 158	STD	{ int fstatfs(int fd, struct statfs *buf); }
 159	UNIMPL	nosys
 160	UNIMPL	nosys
 ; 161 is initialized by the NFS code, if present.
 161	STD	{ int getfh(char *fname, struct fhandle *fhp); }
-162	STD	{ int getdomainname(char *domainname, int len); }
-163	STD	{ int setdomainname(char *domainname, int len); }
-164	STD	{ int uname(struct utsname *name); }
+162	OBSOL	getdomainname
+163	OBSOL	setdomainname
+164	OBSOL	uname
 165	STD	{ int sysarch(int op, char *parms); }
 166	STD	{ int rtprio(int function, pid_t pid, \
 			    struct rtprio *rtp); }
@@ -288,9 +262,9 @@
 185	UNIMPL	lfs_markv
 186	UNIMPL	lfs_segclean
 187	UNIMPL	lfs_segwait
-188	COMPAT_DF12	{ int stat(const char *path, struct dfbsd12_stat *ub); }
-189	COMPAT_DF12	{ int fstat(int fd, struct dfbsd12_stat *sb); }
-190	COMPAT_DF12	{ int lstat(const char *path, struct dfbsd12_stat *ub); }
+188	UNIMPL	nosys
+189	UNIMPL	nosys
+190	UNIMPL	nosys
 191	STD	{ int pathconf(char *path, int name); }
 192	STD	{ int fpathconf(int fd, int name); }
 193	UNIMPL	nosys
@@ -300,11 +274,10 @@
 195	STD	{ int setrlimit(u_int which, \
 			    struct rlimit *rlp); } \
 			    setrlimit __setrlimit_args int
-196	COMPAT_DF12	{ int getdirentries(int fd, char *buf, \
-				    u_int count, long *basep); }
+196	UNIMPL	nosys
 197	STD	{ caddr_t mmap(caddr_t addr, size_t len, int prot, \
 			    int flags, int fd, int pad, off_t pos); }
-198	STD	{ int nosys(void); } __syscall __syscall_args int
+198	NOPROTO	{ int xsyscall(void); } __syscall nosys_args int
 199	STD	{ off_t lseek(int fd, int pad, off_t offset, \
 			    int whence); }
 200	STD	{ int truncate(char *path, int pad, off_t length); }
@@ -348,7 +321,7 @@
 224	STD	{ int msgctl(int msqid, int cmd, \
 			    struct msqid_ds *buf); }
 225	STD	{ int msgget(key_t key, int msgflg); }
-226	STD	{ int msgsnd(int msqid, void *msgp, size_t msgsz, \
+226	STD	{ int msgsnd(int msqid, const void *msgp, size_t msgsz, \
 			    int msgflg); }
 227	STD	{ int msgrcv(int msqid, void *msgp, size_t msgsz, \
 			    long msgtyp, int msgflg); }
@@ -405,15 +378,15 @@
 269	UNIMPL	nosys
 270	UNIMPL	nosys
 271	UNIMPL	nosys
-272	COMPAT_DF12	{ int getdents(int fd, char *buf, size_t count); }
+272	UNIMPL	nosys
 273	UNIMPL	nosys
 274	STD	{ int lchmod(char *path, mode_t mode); }
 275	NOPROTO { int lchown(char *path, uid_t uid, gid_t gid); } netbsd_lchown lchown_args int
 276	STD	{ int lutimes(char *path, struct timeval *tptr); }
 277	NOPROTO	{ int msync(void *addr, size_t len, int flags); } netbsd_msync msync_args int
-278	OBSOL	{ int nstat(char *path, struct nstat *ub); }
-279	OBSOL	{ int nfstat(int fd, struct nstat *sb); }
-280	OBSOL	{ int nlstat(char *path, struct nstat *ub); }
+278	OBSOL	nstat
+279	OBSOL	nfstat
+280	OBSOL	nlstat
 281	UNIMPL	nosys
 282	UNIMPL	nosys
 283	UNIMPL	nosys
@@ -423,20 +396,20 @@
 287	UNIMPL	nosys
 288	UNIMPL	nosys
 ; 289 and 290 from NetBSD (OpenBSD: 267 and 268)
-289	STD	{ ssize_t extpreadv(int fd, struct iovec *iovp, \
-				  u_int iovcnt, int flags, off_t offset); }
-290	STD	{ ssize_t extpwritev(int fd, struct iovec *iovp,\
-				  u_int iovcnt, int flags, off_t offset); }
+289	STD	{ ssize_t extpreadv(int fd, const struct iovec *iovp, \
+				  int iovcnt, int flags, off_t offset); }
+290	STD	{ ssize_t extpwritev(int fd, const struct iovec *iovp, \
+				  int iovcnt, int flags, off_t offset); }
 291	UNIMPL	nosys
 292	UNIMPL	nosys
 293	UNIMPL	nosys
 294	UNIMPL	nosys
 295	UNIMPL	nosys
 296	UNIMPL	nosys
-; XXX 297 is 300 in NetBSD 
+; XXX 297 is 300 in NetBSD
 297	STD	{ int fhstatfs(const struct fhandle *u_fhp, struct statfs *buf); }
 298	STD	{ int fhopen(const struct fhandle *u_fhp, int flags); }
-299	COMPAT_DF12 	{ int fhstat(const struct fhandle *u_fhp, struct dfbsd12_stat *sb); }
+299	UNIMPL	nosys
 ; syscall numbers for FreeBSD
 300	STD	{ int modnext(int modid); }
 301	STD	{ int modstat(int modid, struct module_stat* stat); }
@@ -526,7 +499,7 @@
 			    const struct kevent *changelist, int nchanges, \
 			    struct kevent *eventlist, int nevents, \
 			    const struct timespec *timeout); }
-364	STD	{ int sctp_peeloff(int sd, caddr_t name ); }
+364	UNIMPL	sctp_peeloff
 ; 365-392 used by FreeBSD-current
 365	UNIMPL	nosys
 366	UNIMPL	nosys
@@ -553,8 +526,8 @@
 387	UNIMPL	nosys
 388	UNIMPL	nosys
 389	UNIMPL	nosys
-390	UNIMPL	nosys
-391	STD	{ int lchflags(char *path, int flags); }
+390	STD	{ int kenv(int what, const char *name, char *value, int len); }
+391	STD	{ int lchflags(const char *path, u_long flags); }
 392	STD	{ int uuidgen(struct uuid *store, int count); }
 393	STD	{ int sendfile(int fd, int s, off_t offset, size_t nbytes, \
 				struct sf_hdtr *hdtr, off_t *sbytes, int flags); }
@@ -655,7 +628,7 @@
 483	STD	{ int extconnect(int s, int flags, caddr_t name, int namelen); }
 484	OBSOL	syslink
 485	STD	{ int mcontrol(void *addr, size_t len, int behav, off_t value); }
-486	STD	{ int vmspace_create(void *id, int type, void *data); } 
+486	STD	{ int vmspace_create(void *id, int type, void *data); }
 487	STD	{ int vmspace_destroy(void *id); }
 488	STD	{ int vmspace_ctl(void *id, int cmd, 		\
 					  struct trapframe *tframe,	\
@@ -666,7 +639,7 @@
 490	STD	{ int vmspace_munmap(void *id, void *addr,	\
 					  size_t len); }
 491	STD	{ int vmspace_mcontrol(void *id, void *addr, 	\
-					  size_t len, int behav, off_t value); } 
+					  size_t len, int behav, off_t value); }
 492	STD	{ ssize_t vmspace_pread(void *id, void *buf, \
 			    size_t nbyte, int flags, off_t offset); }
 493	STD	{ ssize_t vmspace_pwrite(void *id, const void *buf, \
@@ -743,3 +716,20 @@
 534	STD	{ int vmm_guest_ctl(int op, struct vmm_guest_options *options); }
 535	STD	{ int vmm_guest_sync_addr(long *dstaddr, long *srcaddr); }
 536	STD	{ int procctl(idtype_t idtype, id_t id, int cmd, void *data); }
+537	STD	{ int chflagsat(int fd, const char *path, u_long flags, int atflags);}
+538	STD	{ int pipe2(int *fildes, int flags); }
+539	STD	{ int utimensat(int fd, const char *path, const struct timespec *ts, int flags); }
+540	STD	{ int futimens(int fd, const struct timespec *ts); }
+541	STD	{ int accept4(int s, caddr_t name, int *anamelen, int flags); }
+542	STD	{ int lwp_setname(lwpid_t tid, const char *name); }
+543	STD	{ int ppoll(struct pollfd *fds, u_int nfds, \
+			const struct timespec *ts, const sigset_t *sigmask); }
+544	STD	{ int lwp_setaffinity(pid_t pid, lwpid_t tid, const cpumask_t *mask); }
+545	STD	{ int lwp_getaffinity(pid_t pid, lwpid_t tid, cpumask_t *mask); }
+546	STD	{ int lwp_create2(struct lwp_params *params, const cpumask_t *mask); }
+547	STD	{ int getcpuclockid(pid_t pid, lwpid_t lwp_id, clockid_t *clock_id); }
+548	STD	{ int wait6(idtype_t idtype, id_t id, int *status, int options, \
+				struct __wrusage *wrusage, siginfo_t *info); }
+549	STD	{ int lwp_getname(lwpid_t tid, char *name, size_t len); }
+550	STD	{ ssize_t getrandom(void *buf, size_t len, unsigned flags); }
+551	STD	{ ssize_t __realpath(const char *path, char *buf, size_t len); }

@@ -36,6 +36,7 @@
 #include <sys/systm.h>
 #include <sys/buf.h>
 #include <sys/conf.h>
+#include <sys/malloc.h>
 #include <sys/proc.h>
 #include <sys/vnode.h>
 #include <sys/mount.h>
@@ -208,7 +209,7 @@ ffs_realloccg(struct inode *ip, ufs_daddr_t lbprev, ufs_daddr_t bpref,
 	}
 
 	if(bp->b_bio2.bio_offset == NOOFFSET) {
-		if( lbprev >= NDADDR)
+		if (lbprev >= UFS_NDADDR)
 			panic("ffs_realloccg: lbprev out of range");
 		bp->b_bio2.bio_offset = fsbtodoff(fs, bprev);
 	}
@@ -357,7 +358,7 @@ ffs_reallocblks(struct vop_reallocblks_args *ap)
 #ifdef DIAGNOSTIC
 	off_t boffset;
 #endif
-	struct indir start_ap[NIADDR + 1], end_ap[NIADDR + 1], *idp;
+	struct indir start_ap[UFS_NIADDR + 1], end_ap[UFS_NIADDR + 1], *idp;
 	int i, len, slen, start_lvl, end_lvl, pref, ssize;
 
 	if (doreallocblks == 0)
@@ -404,7 +405,7 @@ ffs_reallocblks(struct vop_reallocblks_args *ap)
 	if (start_lvl == 0) {
 		sbap = &ip->i_db[0];
 		soff = start_lbn;
-		slen = NDADDR - soff;
+		slen = UFS_NDADDR - soff;
 	} else {
 		idp = &start_ap[start_lvl - 1];
 		if (bread(vp, lblktodoff(fs, idp->in_lbn), (int)fs->fs_bsize, &sbp)) {
@@ -443,7 +444,7 @@ ffs_reallocblks(struct vop_reallocblks_args *ap)
 	 * in the first blockmap (from soff).
 	 */
 	if (ssize > slen) {
-		panic("ffs_reallocblks: range spans more then two blockmaps!"
+		panic("ffs_reallocblks: range spans more than two blockmaps!"
 			" start_lbn %ld len %d (%d/%d)",
 			(long)start_lbn, len, slen, ssize);
 	}
@@ -532,10 +533,12 @@ ffs_reallocblks(struct vop_reallocblks_args *ap)
 		kprintf("\n\tnew:");
 #endif
 	for (blkno = newblk, i = 0; i < len; i++, blkno += fs->fs_frag) {
-		if (!DOINGSOFTDEP(vp))
+		if (!DOINGSOFTDEP(vp) &&
+		    buflist->bs_children[i]->b_bio2.bio_offset != NOOFFSET) {
 			ffs_blkfree(ip,
 			    dofftofsb(fs, buflist->bs_children[i]->b_bio2.bio_offset),
 			    fs->fs_bsize);
+		}
 		buflist->bs_children[i]->b_bio2.bio_offset = fsbtodoff(fs, blkno);
 #ifdef DIAGNOSTIC
 		if (!ffs_checkblk(ip,
@@ -800,7 +803,7 @@ ffs_blkpref(struct inode *ip, ufs_daddr_t lbn, int indx, ufs_daddr_t *bap)
 
 	fs = ip->i_fs;
 	if (indx % fs->fs_maxbpg == 0 || bap[indx - 1] == 0) {
-		if (lbn < NDADDR + NINDIR(fs)) {
+		if (lbn < UFS_NDADDR + NINDIR(fs)) {
 			cg = ino_to_cg(fs, ip->i_number);
 			return (fs->fs_fpg * cg + fs->fs_frag);
 		}
@@ -1488,7 +1491,13 @@ ffs_blkfree_cg(struct fs * fs, struct vnode * i_devvp, cdev_t i_dev, ino_t i_num
 	int i, error, cg, blk, frags, bbase;
 	uint8_t *blksfree;
 
-	VOP_FREEBLKS(i_devvp, fsbtodoff(fs, bno), size);
+#if 0
+	/*
+	 * ffs_blkfree() handles TRIM if UFS is mounted with the 'trim'
+	 * option, do not issue an unconditional duplicate here!
+	 * VOP_FREEBLKS(i_devvp, fsbtodoff(fs, bno), size);
+	 */
+#endif
 	if ((uint)size > fs->fs_bsize || fragoff(fs, size) != 0 ||
 	    fragnum(fs, bno) + numfrags(fs, size) > fs->fs_frag) {
 		kprintf("dev=%s, bno = %ld, bsize = %ld, size = %ld, fs = %s\n",
@@ -1678,7 +1687,7 @@ ffs_blkfree(struct inode *ip, ufs_daddr_t bno, long size)
 	tp->i_number = ip->i_number;
 	tp->size = size;
 
-	bp = getnewbuf(0,0,0,1);
+	bp = getnewbuf(0, 0, 0, 1);
 	BUF_KERNPROC(bp);
 	bp->b_cmd = BUF_CMD_FREEBLKS;
 	bp->b_bio1.bio_offset =  fsbtodoff(ip->i_fs, bno);

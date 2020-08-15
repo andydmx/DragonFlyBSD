@@ -84,6 +84,7 @@
 #include <machine/clock.h>
 
 #include <net/if.h>
+#include <net/if_var.h>
 #include <net/if_media.h>
 
 #include "mii.h"
@@ -407,7 +408,7 @@ tlphy_auto(struct tlphy_softc *sc, int waitfor)
 	return (error);
 }
 
-void
+static void
 tlphy_acomp(struct tlphy_softc *sc)
 {
 	int aner, anlpar;

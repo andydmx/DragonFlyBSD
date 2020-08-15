@@ -151,13 +151,11 @@ hpfs_mount(struct mount *mp, char *path, caddr_t data, struct ucred *cred)
 				kprintf("hpfs_mount: vfs_export failed %d\n",
 					error);
 			}
-			goto success;
 		} else {
 			dprintf(("name [FAILED]\n"));
 			error = EINVAL;
-			goto success;
 		}
-		dprintf(("\n"));
+		goto success;
 	}
 
 	/*
@@ -320,7 +318,7 @@ hpfs_mountfs(struct vnode *devvp, struct mount *mp, struct hpfs_args *argsp)
 
 	vput(vp);
 
-	mp->mnt_stat.f_fsid.val[0] = (long)dev2udev(dev);
+	mp->mnt_stat.f_fsid.val[0] = (long)devid_from_dev(dev);
 	mp->mnt_stat.f_fsid.val[1] = mp->mnt_vfc->vfc_typenum;
 	mp->mnt_maxsymlinklen = 0;
 	mp->mnt_flag |= MNT_LOCAL;
@@ -547,17 +545,18 @@ hpfs_vget(struct mount *mp, struct vnode *dvp, ino_t ino, struct vnode **vpp)
 	hp->h_flag &= ~H_INVAL;
 
 	/* Return the locked and refd vnode */
+	vx_downgrade(vp);
 	*vpp = vp;
 
 	return (0);
 }
 
 static struct vfsops hpfs_vfsops = {
+	.vfs_flags =		0,
 	.vfs_mount =    	hpfs_mount,
 	.vfs_unmount =  	hpfs_unmount,
 	.vfs_root =     	hpfs_root,
 	.vfs_statfs =   	hpfs_statfs,
-	.vfs_sync =     	vfs_stdsync,
 	.vfs_vget =     	hpfs_vget,
 	.vfs_fhtovp =   	hpfs_fhtovp,
 	.vfs_checkexp =  	hpfs_checkexp,

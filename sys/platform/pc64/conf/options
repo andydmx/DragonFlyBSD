@@ -1,14 +1,9 @@
-DISABLE_PSE
-PMAP_SHPGPERPROC	opt_pmap.h
 PPC_PROBE_CHIPSET	opt_ppc.h
 PPC_DEBUG		opt_ppc.h
 MAXMEM
-PERFMON			opt_perfmon.h
-POWERFAIL_NMI		opt_trap.h
 AUTO_EOI_1		opt_auto_eoi.h
 AUTO_EOI_2		opt_auto_eoi.h
 CONSPEED		opt_comconsole.h
-I586_PMC_GUPROF		opt_i586_guprof.h
 BROKEN_KEYBOARD_RESET	opt_reset.h
 
 # Options for emulators.  These should only be used at config time, so
@@ -16,15 +11,13 @@ BROKEN_KEYBOARD_RESET	opt_reset.h
 # (see src/sys/conf/options), except for broken debugging options.
 NDISAPI			opt_dontuse.h
 
-# x86_64 SMP options
-CPU_ENABLE_EST		opt_cpu.h
+# x86_64 CPU options
 CPU_DISABLE_AVX		opt_cpu.h
-
-# The cpu type
-#
 HAMMER_CPU		opt_cpu.h
+
 MAXCONS			opt_syscons.h
 SC_ALT_MOUSE_IMAGE	opt_syscons.h
+SC_BORDER_COLOR		opt_syscons.h
 SC_DEBUG_LEVEL		opt_syscons.h
 SC_DFLT_FONT		opt_syscons.h
 SC_DISABLE_DDBKEY	opt_syscons.h
@@ -60,3 +53,6 @@ KBD_MAXRETRY		opt_kbd.h
 KBD_MAXWAIT		opt_kbd.h
 KBD_RESETDELAY		opt_kbd.h
 KBDIO_DEBUG		opt_kbd.h
+
+# EFI Runtime services support
+EFIRT			opt_dontuse.h

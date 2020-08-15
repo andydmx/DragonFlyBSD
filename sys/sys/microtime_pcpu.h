@@ -66,10 +66,11 @@ microtime_pcpu_get(union microtime_pcpu *t)
 
 static __inline int
 microtime_pcpu_diff(const union microtime_pcpu *s,
-    const union microtime_pcpu *e)
+		    const union microtime_pcpu *e)
 {
 	if (tsc_invariant) {
-		return (((e->tsc - s->tsc) * 1000000) / tsc_frequency);
+		return (((e->tsc - s->tsc) * 1000000) /
+			(tsc_sclock_t)tsc_frequency);
 	} else {
 		return ((e->tv.tv_usec - s->tv.tv_usec) +
 			(e->tv.tv_sec - s->tv.tv_sec) * 1000000);

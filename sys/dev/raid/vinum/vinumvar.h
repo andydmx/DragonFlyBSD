@@ -250,7 +250,7 @@ struct devcode {
  * These definitions help catch
  * userland/kernel mismatches.
  */
-#if VINUMDEBUG
+#ifdef VINUMDEBUG
 
 /* normal super device */
 #define VINUM_WRONGSUPERDEV_NAME	VINUM_DIR "/control"
@@ -337,7 +337,7 @@ struct _vinum_conf {
 #define VINUM_MAXACTIVE  30000	/* max number of active requests */
 	int active;		/* current number of requests outstanding */
 	int maxactive;		/* max number of requests ever outstanding */
-#if VINUMDEBUG
+#ifdef VINUMDEBUG
 	struct request *lastrq;
 	struct bio *lastbio;
 #endif
@@ -469,7 +469,7 @@ struct drive {
 	} *freelist;
 	struct partinfo partinfo;	/* partition information */
 	/* XXX kludge until we get this struct cleaned up */
-#if _KERNEL
+#ifdef _KERNEL
 	struct vnode *vp;
 	struct cdev *dev;
 #else
@@ -747,9 +747,4 @@ enum debugflags {
 					 * harmless warnings  */
 };
 
-#ifdef _KERNEL
-#ifdef __i386__
-#define longjmp LongJmp			/* test our longjmps */
-#endif
-#endif
 #endif

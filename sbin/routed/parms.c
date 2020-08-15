@@ -10,11 +10,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgment:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -30,19 +26,13 @@
  * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
  *
+ * @(#)if.c	8.1 (Berkeley) 6/5/93
  * $FreeBSD: src/sbin/routed/parms.c,v 1.7.2.1 2000/08/14 17:00:03 sheldonh Exp $
  */
 
 #include "defs.h"
 #include "pathnames.h"
 #include <sys/stat.h>
-
-#if !defined(sgi) && !defined(__NetBSD__)
-static char sccsid[] __attribute__((unused)) = "@(#)if.c	8.1 (Berkeley) 6/5/93";
-#elif defined(__NetBSD__)
-__RCSID("$NetBSD$");
-#endif
-
 
 struct parm *parms;
 struct intnet *intnets;
@@ -435,7 +425,7 @@ parse_ts(time_t *tp,
 	 u_int bufsize)
 {
 	struct tm tm;
-#if defined(sgi) || defined(__NetBSD__)
+#if defined(__NetBSD__)
 	char *ptr;
 #endif
 
@@ -448,7 +438,7 @@ parse_ts(time_t *tp,
 	}
 	strcat(buf,"\n");
 	memset(&tm, 0, sizeof(tm));
-#if defined(sgi) || defined(__NetBSD__)
+#if defined(__NetBSD__)
 	ptr = strptime(buf, "%y/%m/%d@%H:%M\n", &tm);
 	if (ptr == NULL || *ptr != '\0') {
 		sprintf(buf,"bad timestamp %.25s", val0);

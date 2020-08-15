@@ -1,6 +1,6 @@
 #
 # RCSid:
-#	$Id: autodep.mk,v 1.32 2010/04/19 17:37:56 sjg Exp $
+#	$Id: autodep.mk,v 1.37 2020/04/17 21:08:17 sjg Exp $
 #
 #	@(#) Copyright (c) 1999-2010, Simon J. Gerraty
 #
@@ -16,21 +16,20 @@
 
 # This module provides automagic dependency generation along the
 # lines suggested in the GNU make.info
-# The depend target is mainly for backwards compatability,
+# The depend target is mainly for backwards compatibility,
 # dependencies are normally updated as part of compilation.
 
-# set MKDEP=autodep and dep.mk will include us
 .if !target(__${.PARSEFILE}__)
 __${.PARSEFILE}__:
-
-# different versions of bsd.dep.mk use these
-MKDEP=autodep
-MKDEPCMD=autodep
 
 DEPENDFILE?= .depend
 .for d in ${DEPENDFILE:N.depend}
 # bmake only groks .depend
-.-include "$d"
+.if ${MAKE_VERSION} < 20160218
+.-include <$d>
+.else
+.dinclude <$d>
+.endif
 .endfor
 
 # it does nothing if SRCS is not defined or is empty
@@ -71,6 +70,7 @@ CFLAGS_MD?=-MD
 CFLAGS_MF?=-MF ${.TARGET:T:R}.d -MT ${.TARGET:T:R}.o
 CFLAGS+= ${CFLAGS_MD} ${CFLAGS_MF}
 RM?= rm
+MAKE_SHELL?= sh
 
 # watch out for people who don't use CPPFLAGS
 CPPFLAGS_MD=${CFLAGS:M-[IUD]*} ${CPPFLAGS} 
@@ -80,6 +80,9 @@ CXXFLAGS_MD=${CXXFLAGS:M-[IUD]*} ${CPPFLAGS}
 CC_MD?=${CC}
 CXX_MD?=${CXX}
 
+# should have been set by sys.mk
+CXX_SUFFIXES?= .cc .cpp .cxx .C
+
 # so we can do an explicit make depend, but not otherwise
 .if make(depend)
 .SUFFIXES:	.d
@@ -88,26 +91,26 @@ CXX_MD?=${CXX}
 .y.d:
 	@echo updating dependencies for $<
 	@${YACC} ${YFLAGS} $<
-	@${SHELL} -ec "${CC_MD} -M ${CPPFLAGS_MD} y.tab.c | sed '/:/s/^/$@ /' > $@" || { ${RM} -f y.tab.c $@; false; }
+	@${MAKE_SHELL} -ec "${CC_MD} -M ${CPPFLAGS_MD} y.tab.c | sed '/:/s/^/$@ /' > $@" || { ${RM} -f y.tab.c $@; false; }
 	@${RM} -f y.tab.c
 
 .l.d:
 	@echo updating dependencies for $<
 	${LEX} ${LFLAGS} $<
-	@${SHELL} -ec "${CC_MD} -M ${CPPFLAGS_MD} lex.yy.c | sed '/:/s/^/$@ /' > $@" || { ${RM} -f lex.yy.c $@; false; }
+	@${MAKE_SHELL} -ec "${CC_MD} -M ${CPPFLAGS_MD} lex.yy.c | sed '/:/s/^/$@ /' > $@" || { ${RM} -f lex.yy.c $@; false; }
 	@${RM} -f lex.yy.c
 
 .c.d:
 	@echo updating dependencies for $<
-	@${SHELL} -ec "${CC_MD} -M ${CPPFLAGS_MD} $< | sed '/:/s/^/$@ /' > $@" || { ${RM} -f $@; false; }
+	@${MAKE_SHELL} -ec "${CC_MD} -M ${CPPFLAGS_MD} $< | sed '/:/s/^/$@ /' > $@" || { ${RM} -f $@; false; }
 
 .s.d .S.d:
 	@echo updating dependencies for $<
-	@${SHELL} -ec "${CC_MD} -M ${CPPFLAGS_MD} ${AINC} $< | sed '/:/s/^/$@ /' > $@" || { ${RM} -f $@; false; }
+	@${MAKE_SHELL} -ec "${CC_MD} -M ${CPPFLAGS_MD} ${AINC} $< | sed '/:/s/^/$@ /' > $@" || { ${RM} -f $@; false; }
 
-.cc.d .cpp.d .C.d .cxx.d:
+${CXX_SUFFIXES:%=%.d}:
 	@echo updating dependencies for $<
-	@${SHELL} -ec "${CXX_MD} -M ${CXXFLAGS_MD} $< | sed '/:/s/^/$@ /' > $@" || { ${RM} -f $@; false; }
+	@${MAKE_SHELL} -ec "${CXX_MD} -M ${CXXFLAGS_MD} $< | sed '/:/s/^/$@ /' > $@" || { ${RM} -f $@; false; }
 .else
 .y.d:
 	${YACC} ${YFLAGS} $<
@@ -125,7 +128,7 @@ CXX_MD?=${CXX}
 .s.d .S.d:
 	${CC_MD} ${CFLAGS_MD:S/D//} ${CPPFLAGS_MD} ${AINC} $< > $@ || { ${RM} -f $@; false; }
 
-.cc.d .cpp.d .C.d .cxx.d:
+${CXX_SUFFIXES:%=%.d}:
 	${CXX_MD} ${CFLAGS_MD:S/D//} ${CXXFLAGS_MD} $< > $@ || { ${RM} -f $@; false; }
 .endif
 

@@ -21,17 +21,23 @@
  * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
  * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
  * THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- *
- * $FreeBSD: head/sys/net80211/ieee80211_ratectl.c 214894 2010-11-06 18:17:20Z bschmidt $
  */
+
+#include <sys/cdefs.h>
+__FBSDID("$FreeBSD$");
 
 #include <sys/param.h>
 #include <sys/kernel.h>
+#include <sys/sbuf.h>
 #include <sys/systm.h>
 #include <sys/socket.h>
+#include <sys/malloc.h>
 
 #include <net/if.h>
+#include <net/if_var.h>
 #include <net/if_media.h>
+#include <net/ethernet.h>
+#include <net/route.h>
 
 #include <netproto/802_11/ieee80211_var.h>
 #include <netproto/802_11/ieee80211_ratectl.h>
@@ -64,12 +70,68 @@ ieee80211_ratectl_unregister(int type)
 	ratectls[type] = NULL;
 }
 
+static void
+ieee80211_ratectl_sysctl_stats_node_iter(void *arg, struct ieee80211_node *ni)
+{
+
+	struct sbuf *sb = (struct sbuf *) arg;
+#if defined(__DragonFly__)
+	sbuf_printf(sb, "MAC: %6s\n", ether_sprintf(ni->ni_macaddr));
+#else
+	sbuf_printf(sb, "MAC: %6D\n", ni->ni_macaddr, ":");
+#endif
+	ieee80211_ratectl_node_stats(ni, sb);
+	sbuf_printf(sb, "\n");
+}
+
+static int
+ieee80211_ratectl_sysctl_stats(SYSCTL_HANDLER_ARGS)
+{
+	struct ieee80211vap *vap = arg1;
+	struct ieee80211com *ic = vap->iv_ic;
+	struct sbuf sb;
+	int error;
+
+#if defined(__DragonFly__)
+#else
+	error = sysctl_wire_old_buffer(req, 0);
+	if (error)
+		return (error);
+#endif
+	sbuf_new_for_sysctl(&sb, NULL, 8, req);
+#if defined(__DragonFly__)
+#else
+	sbuf_clear_flags(&sb, SBUF_INCLUDENUL);
+#endif
+
+	IEEE80211_LOCK(ic);
+	ieee80211_iterate_nodes(&ic->ic_sta,
+	    ieee80211_ratectl_sysctl_stats_node_iter,
+	    &sb);
+	IEEE80211_UNLOCK(ic);
+
+	error = sbuf_finish(&sb);
+	sbuf_delete(&sb);
+	return (error);
+}
+
 void
 ieee80211_ratectl_init(struct ieee80211vap *vap)
 {
 	if (vap->iv_rate == ratectls[IEEE80211_RATECTL_NONE])
 		ieee80211_ratectl_set(vap, IEEE80211_RATECTL_AMRR);
 	vap->iv_rate->ir_init(vap);
+
+	/* Attach generic stats sysctl */
+#if defined(__DragonFly__)
+	SYSCTL_ADD_PROC(vap->iv_sysctl, SYSCTL_CHILDREN(vap->iv_oid), OID_AUTO,
+	    "rate_stats", CTLTYPE_STRING | CTLFLAG_RD, vap,
+	    0, ieee80211_ratectl_sysctl_stats, "A", "ratectl node stats");
+#else
+	SYSCTL_ADD_PROC(vap->iv_sysctl, SYSCTL_CHILDREN(vap->iv_oid), OID_AUTO,
+	    "rate_stats", CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_MPSAFE, vap,
+	    0, ieee80211_ratectl_sysctl_stats, "A", "ratectl node stats");
+#endif
 }
 
 void

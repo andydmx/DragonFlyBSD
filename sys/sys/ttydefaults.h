@@ -1,4 +1,6 @@
 /*-
+ * SPDX-License-Identifier: BSD-3-Clause
+ *
  * Copyright (c) 1982, 1986, 1993
  *	The Regents of the University of California.  All rights reserved.
  * (c) UNIX System Laboratories, Inc.
@@ -15,11 +17,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -36,8 +34,7 @@
  * SUCH DAMAGE.
  *
  *	@(#)ttydefaults.h	8.4 (Berkeley) 1/21/94
- * $FreeBSD: src/sys/sys/ttydefaults.h,v 1.13.2.1 2001/03/06 03:37:08 jkh Exp $
- * $DragonFly: src/sys/sys/ttydefaults.h,v 1.3 2003/10/13 21:08:50 dillon Exp $
+ * $FreeBSD: head/sys/sys/ttydefaults.h 326023 2017-11-20 19:43:44Z pfg $
  */
 
 /*
@@ -49,39 +46,48 @@
 /*
  * Defaults on "first" open.
  */
-#define	TTYDEF_IFLAG	(BRKINT	| ICRNL	| IMAXBEL | IXON | IXANY)
-#define TTYDEF_OFLAG	(OPOST | ONLCR)
-#define TTYDEF_LFLAG	(ECHO | ICANON | ISIG | IEXTEN | ECHOE|ECHOKE|ECHOCTL)
+#define	TTYDEF_IFLAG	(BRKINT | ICRNL | IMAXBEL | IXON | IXANY)
+#define	TTYDEF_OFLAG	(OPOST | ONLCR)
+#define	TTYDEF_LFLAG_NOECHO (ICANON | ISIG | IEXTEN)
+#define	TTYDEF_LFLAG_ECHO (TTYDEF_LFLAG_NOECHO | ECHO | ECHOE | ECHOKE | ECHOCTL)
+#define	TTYDEF_LFLAG	TTYDEF_LFLAG_ECHO
 #define	TTYDEF_CFLAG	(CREAD | CS8 | HUPCL)
-#define TTYDEF_SPEED	(B9600)
+#define	TTYDEF_SPEED	(B115200)
 
 /*
  * Control Character Defaults
  */
-#define CTRL(x)	(x&037)
-#define CCHECKPT	CTRL('e')
-#define	CEOF		CTRL('d')
+/*
+ * XXX: A lot of code uses lowercase characters, but control-character
+ * conversion is actually only valid when applied to uppercase
+ * characters. We just treat lowercase characters as if they were
+ * inserted as uppercase.
+ */
+#define	CTRL(x) ((x) >= 'a' && (x) <= 'z' ? \
+	((x) - 'a' + 1) : (((x) - 'A' + 1) & 0x7f))
+#define	CCHECKPT	CTRL('E')
+#define	CEOF		CTRL('D')
 #define	CEOL		0xff		/* XXX avoid _POSIX_VDISABLE */
-#define	CERASE		0177
-#define	CERASE2		CTRL('h')
-#define	CINTR		CTRL('c')
-#define	CSTATUS		CTRL('t')
-#define	CKILL		CTRL('u')
+#define	CERASE		CTRL('?')
+#define	CERASE2		CTRL('H')
+#define	CINTR		CTRL('C')
+#define	CSTATUS		CTRL('T')
+#define	CKILL		CTRL('U')
 #define	CMIN		1
-#define	CQUIT		034		/* FS, ^\ */
-#define	CSUSP		CTRL('z')
+#define	CQUIT		CTRL('\\')
+#define	CSUSP		CTRL('Z')
 #define	CTIME		0
-#define	CDSUSP		CTRL('y')
-#define	CSTART		CTRL('q')
-#define	CSTOP		CTRL('s')
-#define	CLNEXT		CTRL('v')
-#define	CDISCARD 	CTRL('o')
-#define	CWERASE 	CTRL('w')
-#define	CREPRINT 	CTRL('r')
+#define	CDSUSP		CTRL('Y')
+#define	CSTART		CTRL('Q')
+#define	CSTOP		CTRL('S')
+#define	CLNEXT		CTRL('V')
+#define	CDISCARD	CTRL('O')
+#define	CWERASE		CTRL('W')
+#define	CREPRINT	CTRL('R')
 #define	CEOT		CEOF
 /* compat */
 #define	CBRK		CEOL
-#define CRPRNT		CREPRINT
+#define	CRPRNT		CREPRINT
 #define	CFLUSH		CDISCARD
 
 /* PROTECTED INCLUSION ENDS HERE */
@@ -91,10 +97,17 @@
  * #define TTYDEFCHARS to include an array of default control characters.
  */
 #ifdef TTYDEFCHARS
-static cc_t	ttydefchars[NCCS] = {
-	CEOF,	CEOL,	CEOL,	CERASE, CWERASE, CKILL, CREPRINT,
-	CERASE2, CINTR,	CQUIT,	CSUSP,	CDSUSP,	CSTART,	CSTOP,	CLNEXT,
-	CDISCARD, CMIN,	CTIME,  CSTATUS, _POSIX_VDISABLE
+
+#include <sys/cdefs.h>
+#include <sys/_termios.h>
+
+static const cc_t ttydefchars[] = {
+	CEOF, CEOL, CEOL, CERASE, CWERASE, CKILL, CREPRINT, CERASE2, CINTR,
+	CQUIT, CSUSP, CDSUSP, CSTART, CSTOP, CLNEXT, CDISCARD, CMIN, CTIME,
+	CSTATUS, _POSIX_VDISABLE
 };
+_Static_assert(sizeof(ttydefchars) / sizeof(cc_t) == NCCS,
+    "Size of ttydefchars does not match NCCS");
+
 #undef TTYDEFCHARS
-#endif
+#endif /* TTYDEFCHARS */

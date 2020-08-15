@@ -1,4 +1,9 @@
 /*
+ * @(#)res_mkquery.c	8.1 (Berkeley) 6/4/93
+ * $Id: res_mkquery.c,v 1.6.672.1 2008/04/03 02:12:21 marka Exp $
+ */
+
+/*
  * Copyright (c) 1985, 1993
  *    The Regents of the University of California.  All rights reserved.
  * 
@@ -10,11 +15,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- * 	This product includes software developed by the University of
- * 	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  * 
@@ -67,11 +68,6 @@
  * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT
  * OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
-
-#if defined(LIBC_SCCS) && !defined(lint)
-static const char sccsid[] = "@(#)res_mkquery.c	8.1 (Berkeley) 6/4/93";
-static const char rcsid[] = "$Id: res_mkquery.c,v 1.6.672.1 2008/04/03 02:12:21 marka Exp $";
-#endif /* LIBC_SCCS and not lint */
 
 #include "port_before.h"
 #include <sys/types.h>
@@ -132,7 +128,7 @@ res_nmkquery(res_state statp,
 	dpp = dnptrs;
 	*dpp++ = buf;
 	*dpp++ = NULL;
-	lastdnptr = dnptrs + sizeof dnptrs / sizeof dnptrs[0];
+	lastdnptr = dnptrs + NELEM(dnptrs);
 	/*
 	 * perform opcode specific processing
 	 */
@@ -230,6 +226,8 @@ res_nopt(res_state statp,
 	*cp++ = 0;				/*%< "." */
 	ns_put16(ns_t_opt, cp);			/*%< TYPE */
 	cp += INT16SZ;
+	if (anslen > 0xffff)
+		anslen = 0xffff;
 	ns_put16(anslen & 0xffff, cp);		/*%< CLASS = UDP payload size */
 	cp += INT16SZ;
 	*cp++ = NOERROR;			/*%< extended RCODE */

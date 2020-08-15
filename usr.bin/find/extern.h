@@ -10,7 +10,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -80,7 +80,7 @@ creat_f	c_xdev;
 exec_f	f_Xmin;
 exec_f	f_Xtime;
 exec_f	f_always_true;
-exec_f	f_closeparen;
+exec_f	f_closeparen __dead2;
 exec_f	f_delete;
 exec_f	f_depth;
 exec_f	f_empty;
@@ -98,14 +98,14 @@ exec_f	f_newer;
 exec_f	f_nogroup;
 exec_f	f_not;
 exec_f	f_nouser;
-exec_f	f_openparen;
+exec_f	f_openparen __dead2;
 exec_f	f_or;
 exec_f	f_path;
 exec_f	f_perm;
 exec_f	f_print;
 exec_f	f_print0;
 exec_f	f_prune;
-exec_f	f_quit;
+exec_f	f_quit __dead2;
 exec_f	f_regex;
 exec_f	f_size;
 exec_f	f_sparse;

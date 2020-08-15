@@ -102,6 +102,7 @@ void	ifmedia_removeall( struct ifmedia *ifm);
 
 /* Add one supported medium to a struct ifmedia. */
 void	ifmedia_add(struct ifmedia *ifm, int mword, int data, void *aux);
+int	ifmedia_add_nodup(struct ifmedia *ifm, int mword, int data, void *aux);
 
 /* Add an array (of ifmedia_entry) media to a struct ifmedia. */
 void	ifmedia_list_add(struct ifmedia *mp, struct ifmedia_entry *lp,
@@ -109,6 +110,7 @@ void	ifmedia_list_add(struct ifmedia *mp, struct ifmedia_entry *lp,
 
 /* Set default media type on initialization. */
 void	ifmedia_set(struct ifmedia *ifm, int mword);
+int	ifmedia_tryset(struct ifmedia *ifm, int mword);
 
 /* Common ioctl function for getting/setting media, called by driver. */
 int	ifmedia_ioctl(struct ifnet *ifp, struct ifreq *ifr,
@@ -164,10 +166,10 @@ uint64_t ifmedia_baudrate(int);
 #define IFM_40G_SR4     28              /* 40GBase-SR4 */
 #define IFM_40G_LR4     29              /* 40GBase-LR4 */
 
-
 #define	IFM_ETH_MASTER	0x00000100	/* master mode (1000baseT) */
 #define	IFM_ETH_RXPAUSE	0x00000200	/* receive PAUSE frames */
 #define	IFM_ETH_TXPAUSE	0x00000400	/* transmit PAUSE frames */
+#define	IFM_ETH_FORCEPAUSE	0x00000800 /* force flow control settings */
 
 /*
  * IEEE 802.11 Wireless
@@ -268,7 +270,8 @@ uint64_t ifmedia_baudrate(int);
 #define	IFM_MSHIFT	16		/* Mode shift */
 #define	IFM_GMASK	0x0ff00000	/* Global options */
 	/* Ethernet flow control mask */
-#define	IFM_ETH_FMASK	(IFM_FLOW | IFM_ETH_RXPAUSE | IFM_ETH_TXPAUSE)
+#define	IFM_ETH_FCMASK	(IFM_ETH_RXPAUSE | IFM_ETH_TXPAUSE | IFM_ETH_FORCEPAUSE)
+#define	IFM_ETH_FMASK	(IFM_FLOW | IFM_ETH_FCMASK)
 
 #define	IFM_NMIN	IFM_ETHER	/* lowest Network type */
 #define	IFM_NMAX	IFM_NMASK	/* highest Network type */
@@ -374,6 +377,15 @@ struct ifmedia_description {
 }
 
 #define	IFM_SUBTYPE_ETHERNET_OPTION_DESCRIPTIONS {			\
+	{ IFM_ETH_MASTER,	"master" },				\
+	{ IFM_ETH_RXPAUSE,	"rxpause" },				\
+	{ IFM_ETH_TXPAUSE,	"txpause" },				\
+	{ IFM_ETH_FORCEPAUSE,	"forcepause" },				\
+	{ 0, NULL },							\
+}
+
+#define	IFM_SUBTYPE_ETHERNET_OPTION_ALIAS {				\
+	{ IFM_ETH_TXPAUSE | IFM_ETH_RXPAUSE,	"flowcontrol" },	\
 	{ 0, NULL },							\
 }
 
@@ -399,6 +411,7 @@ struct ifmedia_description {
 	{ IFM_IEEE80211_OFDM3, "OFDM/3Mbps" },				\
 	{ IFM_IEEE80211_OFDM4, "OFDM/4.5Mbps" },			\
 	{ IFM_IEEE80211_OFDM27, "OFDM/27Mbps" },			\
+	{ IFM_IEEE80211_MCS, "MCS" },					\
 	{ 0, NULL },							\
 }
 
@@ -437,6 +450,7 @@ struct ifmedia_description {
 	{ IFM_IEEE80211_OFDM3, "OFDM3" },				\
 	{ IFM_IEEE80211_OFDM4, "OFDM4.5" },				\
 	{ IFM_IEEE80211_OFDM27, "OFDM27" },				\
+	{ IFM_IEEE80211_MCS, "MCS" },					\
 	{ 0, NULL },							\
 }
 
@@ -565,7 +579,7 @@ struct ifmedia_baudrate {
 	{ IFM_IEEE80211|IFM_IEEE80211_FH2, IF_Mbps(2) },		\
 	{ IFM_IEEE80211|IFM_IEEE80211_DS1, IF_Mbps(1) },		\
 	{ IFM_IEEE80211|IFM_IEEE80211_DS2, IF_Mbps(2) },		\
-	{ IFM_IEEE80211|IFM_IEEE80211_DS5, IF_Mbps(5) },		\
+	{ IFM_IEEE80211|IFM_IEEE80211_DS5, IF_Kbps(5500) },		\
 	{ IFM_IEEE80211|IFM_IEEE80211_DS11, IF_Mbps(11) },		\
 	{ IFM_IEEE80211|IFM_IEEE80211_DS22, IF_Mbps(22) },		\
 	{ IFM_IEEE80211|IFM_IEEE80211_OFDM6, IF_Mbps(6) },		\
@@ -580,4 +594,23 @@ struct ifmedia_baudrate {
 									\
 	{ 0, 0 },							\
 }
+
+#ifdef _KERNEL
+
+/* Ethernet flow control strings for tunables */
+#define IFM_ETH_FC_STRLEN		16
+#define IFM_ETH_FC_FULL			"full"
+#define IFM_ETH_FC_RXPAUSE		"rxpause"
+#define IFM_ETH_FC_TXPAUSE		"txpause"
+#define IFM_ETH_FC_NONE			"none"
+#define IFM_ETH_FC_FORCE_FULL		"force-full"
+#define IFM_ETH_FC_FORCE_RXPAUSE	"force-rxpause"
+#define IFM_ETH_FC_FORCE_TXPAUSE	"force-txpause"
+#define IFM_ETH_FC_FORCE_NONE		"force-none"
+
+/* String to flow control media options */
+int	ifmedia_str2ethfc(const char *);
+
+#endif	/* _KERNEL */
+
 #endif	/* _NET_IF_MEDIA_H_ */

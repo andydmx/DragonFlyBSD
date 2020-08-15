@@ -33,9 +33,6 @@
  *
  * Ancestors:
  *	@(#)lofs_vnops.c	1.2 (Berkeley) 6/18/92
- * $FreeBSD: src/sys/miscfs/nullfs/null_vnops.c,v 1.38.2.6 2002/07/31 00:32:28 semenu Exp $
- * $DragonFly: src/sys/vfs/nullfs/null_vnops.c,v 1.30 2008/09/17 21:44:25 dillon Exp $
- *	...and...
  *	@(#)null_vnodeops.c 1.20 92/07/07 UCLA Ficus project
  *
  * $FreeBSD: src/sys/miscfs/nullfs/null_vnops.c,v 1.38.2.6 2002/07/31 00:32:28 semenu Exp $
@@ -90,7 +87,7 @@
  *
  * Unlike the old code, this implementation is not a general skeleton overlay
  * filesystem: to get more comprehensive overlaying, we will need vnode
- * operation dispatch. Other overlay filesystems, like unionfs might be
+ * operation dispatch. Other overlay filesystems might be
  * able to get on with a hybrid solution: overlay some vnodes, and rely
  * on namecache API for the rest.
  */
@@ -103,7 +100,6 @@
 #include <sys/mount.h>
 #include <sys/mountctl.h>
 #include <sys/proc.h>
-#include <sys/namei.h>
 #include <sys/malloc.h>
 #include <sys/buf.h>
 #include "null.h"

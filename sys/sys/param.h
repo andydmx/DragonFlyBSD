@@ -15,11 +15,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -42,9 +38,12 @@
 #ifndef _SYS_PARAM_H_
 #define _SYS_PARAM_H_
 
-#define BSD	200708		/* XXX kern.osrevision */
-#define BSD4_3	1		/* XXX obsolete */
-#define BSD4_4	1		/* XXX obsolete */
+/*
+ * Historic BSD #defines -- probably will remain untouched for all time.
+ */
+#define BSD	199506		/* System version (year & month). */
+#define BSD4_3	1
+#define BSD4_4	1
 
 /*
  * __DragonFly_version number.  The number doesn't really meaningfully
@@ -114,9 +113,113 @@
  * 300901 - drm/i915 hardware context support added
  * 400000 - 4.0 release
  * 400100 - 4.1 development
+ * 400101 - Removal of SCTP support.
+ * 400102 - Sound system update from FreeBSD
+ * 400103 - Milestone - availability of gcc50 in base
+ * 400104 - struct lwp_params (a public struct) members renaming
+ * 400105 - Switch to gcc50 as the primary compiler
+ * 400106 - Added pipe2() system call
+ * 400107 - Add futimens() and utimensat() syscalls
+ * 400200 - 4.2 release
+ * 400300 - 4.3 development
+ * 400301 - posix compliant iconv (no const qualifier)
+ * 400302 - Replacement of libm with OpenBSD's libm
+ * 400303 - environ and __progname are no longer linkable symbols
+ * 400304 - Activate symbol versioning for libc.so (still on version 8)
+ * 400305 - Add accept4() system call
+ * 400306 - Add libexecinfo to base
+ * 400307 - drm/i915 kernel module renamed to i915.ko
+ * 400308 - <malloc.h> removal
+ * 400309 - Add lwp_setname() system call
+ * 400400 - 4.4 release
+ * 400500 - 4.5 development
+ * 400501 - unionfs removal
+ * 400502 - private libraries: ssh ldns edit ncurses
+ * 400503 - libarchive-3.0.2 import (add bsdcat)
+ * 400600 - 4.6 release
+ * 400700 - 4.7 development
+ * 400701 - getline() visibility changes
+ * 400702 - private library: libressl
+ * 400703 - resolved conflicts of md, crypt and ressl libraries
+ * 400704 - binutils update to 2.27
+ * 400705 - lwp_{set,get}affinity()
+ * 400706 - sched_{set,get}affinity()
+ * 400707 - pthread_{set,get}affinity_np()
+ * 400708 - lwp_create2()
+ * 400709 - pthread_attr_{set,get}affinity_np()
+ * 400710 - sched_getcpu();
+ * 400711 - move lwp syscalls to sys/lwp.h
+ * 400712 - restore lwp syscalls (except lwp_create*) declaration
+ * 400713 - add sysctl kern.cp_times
+ * 400800 - 4.8 release
+ * 400900 - 4.9 development
+ * 400901 - moved sigtramp, NX protection, sigtramp sysctl
+ * 400902 - change CPU_SETSIZE to signed; allow proc to change self affinity
+ * 400903 - malloc_type cleanup
+ * 400904 - pad rtstatistics
+ * 400905 - PTHREAD_STACK_MIN increase: 1024 => 16384
+ * 400906 - lwpid_t >=1, instead of >=0
+ * 400907 - pthread_getthreadid_np()
+ * 400908 - {clock,pthread}_getcpuclockid()
+ * 400909 - deleted ortentry, SIOC{ADD,DEL}RT, RTM_OLD{ADD,DEL}
+ * 400910 - routing table is only available on netisr_ncpus
+ * 500000 - 5.0 release
+ * 500100 - 5.1 development
+ * 500101 - kernel ppp removal
+ * 500102 - <sys/sysref{,2}.h> inclusions removed from some public headers
+ * 500103 - faith removal
+ * 500104 - cfmakesane()
+ * 500105 - _SC_LEVEL1_DCACHE_LINESIZE sysconf()
+ * 500106 - %b and %r formats removal
+ * 500107 - <machine/apm_bios.h> removal
+ * 500200 - 5.2 release
+ * 500300 - 5.3 development
+ * 500301 - rename some public UFS constants
+ * 500302 - move IOCTLTRIM to a better header and rename it to DAIOCTRIM
+ * 500303 - get rid of sgtty (superseded by termios)
+ * 500304 - remove IPSEC/FAST_IPSEC
+ * 500305 - remove <sys/ioctl_compat.h> for good
+ * 500306 - strsuftoll(), strsuftollx()
+ * 500307 - tcsetsid()
+ * 500308 - xdr_uint16_t()
+ * 500309 - drop support for some ancient ioctls (OSIOCGIF*)
+ * 500310 - remove more unimplemented ioctls
+ * 500311 - add VIS_ALL to vis(3)
+ * 500312 - OpenPAM Resedacea upgrade
+ * 500313 - remove vmnet support from tap(4) (VMIO_* ioctls)
+ * 500314 - add TAPGIFNAME to tap(4)
+ * 500315 - add TUNGIFNAME to tun(4)
+ * 500316 - add SIOC[ADG]IFGROUP, SIOCGIFGMEMB ioctl
+ * 500317 - add wait6() and waitid() syscalls
+ * 500400 - 5.4 release
+ * 500500 - 5.5 development
+ * 500501 - reallocarray() added to libc
+ * 500502 - puffs etc. removed
+ * 500503 - Lowered DATA rlimit supported by mmap(), libc sbrk() emulation
+ *	    had to be rewritten.  libc brk() removed entirely.  These changes
+ *	    are required to allow mmap hints to utilize lowered data rlimits.
+ * 500504 - removed <sys/semaphore.h>, only <semaphore.h> remains
+ * 500505 - rename <sys/termios.h> to <termios.h>
+ * 500506 - LibreSSL, OpenSSH, XZ, libarchive update, libopie/libmd deprecation
+ * 500600 - 5.6 release
+ * 500700 - 5.7 development
+ * 500701 - libopie/libmd removal
+ * 500702 - TCP_KEEP* milliseconds -> seconds
+ * 500703 - Static TLS bindings support for late-loaded shared libraries
+ * 500704 - Announce IP6 address flag changes via route(4)
+ * 500705 - Move us to utmpx only, delete utmp
+ * 500706 - Switch to the now common three argument versions of the
+ *	    timespecadd() and timespecsub() macros in <sys/time.h>
+ * 500707 - libradius/libtacplus removal
+ * 500708 - Handle SIOCSIFMTU directly in tap(4) to support MTU > 1500
+ * 500709 - Implement lwp_getname() and signal safety
+ * 500710 - Implement getrandom() and __realpath() system calls
+ * 500800 - 5.8 release
+ * 500900 - 5.9 development
+ * 500901 - fparseln() was moved from libutil to libc
  */
 #undef __DragonFly_version
-#define __DragonFly_version 400100	/* propagated to newvers */
+#define __DragonFly_version 500901	/* propagated to newvers */
 
 #include <sys/_null.h>
 
@@ -129,19 +232,19 @@
  * Redefined constants are from POSIX 1003.1 limits file.
  *
  * MAXCOMLEN should be >= sizeof(ac_comm) (see <acct.h>)
- * MAXLOGNAME should be == UT_NAMESIZE+1 (see <utmp.h>)
  */
 #include <sys/syslimits.h>
 
 #define MAXCOMLEN	16		/* max command name remembered */
 #define MAXINTERP	32		/* max interpreter file name length */
-#define MAXLOGNAME	17		/* max login name length (incl. NUL) */
+#define MAXLOGNAME	33		/* max login name length (incl. NUL) */
 #define MAXUPRC		CHILD_MAX	/* max simultaneous processes */
 #define NCARGS		ARG_MAX		/* max bytes for an exec function */
 #define NGROUPS		NGROUPS_MAX	/* max number groups */
 #define NOFILE		OPEN_MAX	/* max open files per process */
 #define NOGROUP		65535		/* marker for empty group set member */
 #define MAXHOSTNAMELEN	256		/* max hostname size */
+#define SPECNAMELEN	63		/* max length of devicename */
 
 /* More types and definitions used throughout the kernel. */
 #ifdef _KERNEL
@@ -160,6 +263,7 @@
 #endif
 
 /* Machine type dependent parameters. */
+#include <machine/alignbytes.h>
 #include <machine/param.h>
 #ifndef _KERNEL
 #include <machine/limits.h>
@@ -182,11 +286,12 @@
 
 #define NZERO	0		/* default "nice" */
 
+#define NBBY	8		/* number of bits in a byte */
 #define NBPW	sizeof(int)	/* number of bytes per word (integer) */
 
 #define CMASK	022		/* default file mask: S_IWGRP|S_IWOTH */
 #if defined(_KERNEL) || defined(_KERNEL_STRUCTURES)
-#define NOUDEV	(udev_t)(-1)	/* non-existent device */
+#define NOUDEV	(dev_t)(-1)	/* non-existent device */
 #define NOMAJ	256		/* non-existent device */
 #endif
 
@@ -209,28 +314,13 @@
  *		and may be made smaller at the risk of not being able to use
  *		filesystems which require a block size exceeding MAXBSIZE.
  *
- * BKVASIZE -	Nominal buffer space per buffer, in bytes.  BKVASIZE is the
- *		minimum KVM memory reservation the kernel is willing to make.
- *		Filesystems can of course request smaller chunks.  Actual 
- *		backing memory uses a chunk size of a page (PAGE_SIZE).
- *
- *		If you make BKVASIZE too small you risk seriously fragmenting
- *		the buffer KVM map which may slow things down a bit.  If you
- *		make it too big the kernel will not be able to optimally use 
- *		the KVM memory reserved for the buffer cache and will wind 
- *		up with too-few buffers.
- *
- *		By default we now use maximally-sized reservations.  But on
- *		32-bit machines we reduce this 16KB.  Maximally-sized
- *		reservations greatly reduces defragmentation and buffer_map
- *		messing around and is more SMP-friendly.
+ * NBUFCALCSIZE - Calculate sufficient buffer cache buffers for the memory
+ *		desired as if each buffer were sized to this value (actual
+ *		real memory use).  Hysteresis works both ways.
  */
 #define MAXBSIZE	65536		/* must be power of 2 */
-#ifndef BKVASIZE
-#define BKVASIZE	MAXBSIZE	/* must be power of 2 */
-#endif
+#define NBUFCALCSIZE	16384		/* for nbuf calculation only */
 
-#define BKVAMASK	(BKVASIZE-1)
 #define MAXFRAG 	8
 
 /*
@@ -255,7 +345,7 @@
 #ifndef howmany
 #define howmany(x, y)	(((x)+((y)-1))/(y))
 #endif
-#define nitems(x)	(sizeof((x)) / sizeof((x)[0]))
+#define nitems(x)	NELEM(x)
 #define rounddown(x, y)	(((x)/(y))*(y))
 #define rounddown2(x, y) ((x) & ~((y) - 1))	   /* y power of two */
 #define roundup(x, y)	((((x)+((y)-1))/(y))*(y))  /* to any y */
@@ -268,6 +358,21 @@
  */
 #define trunc_page64(x)           ((x) & ~(int64_t)PAGE_MASK)
 #define round_page64(x)           (((x) + PAGE_MASK) & ~(int64_t)PAGE_MASK)
+
+/*
+ * Round p (pointer or byte index) up to a correctly-aligned value
+ * for all data types (int, long, ...).   The result is unsigned int
+ * and must be cast to any desired pointer type.  Single underscore
+ * versions are for FreeBSD/OpenBSD compat.
+ */
+#define _ALIGNBYTES	__ALIGNBYTES
+#define _ALIGN(p)	__ALIGNPTR(p)
+#ifndef ALIGNBYTES
+#define ALIGNBYTES	__ALIGNBYTES
+#endif
+#ifndef ALIGN
+#define ALIGN(p)	__ALIGNPTR(p)
+#endif
 
 /* Macros for min/max. */
 #define MIN(a,b) (((a)<(b))?(a):(b))
@@ -310,7 +415,7 @@
 
 #define dbtoc(db)			/* calculates devblks to pages */ \
 	((db + (ctodb(1) - 1)) >> (PAGE_SHIFT - DEV_BSHIFT))
- 
+
 #define ctodb(db)			/* calculates pages to devblks */ \
 	((db) << (PAGE_SHIFT - DEV_BSHIFT))
 

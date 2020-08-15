@@ -36,6 +36,7 @@
 #include <sys/param.h>
 #include <sys/systm.h>
 #include <sys/kernel.h>
+#include <sys/malloc.h>
 #include <sys/mount.h>
 #include <sys/namecache.h>
 #include <sys/vnode.h>
@@ -89,6 +90,7 @@ devfs_vfs_mount(struct mount *mp, char *path, caddr_t data, struct ucred *cred)
 
 	mp->mnt_flag |= MNT_LOCAL;
 	mp->mnt_kern_flag |= MNTK_NOSTKMNT | MNTK_ALL_MPSAFE;
+	mp->mnt_kern_flag |= MNTK_QUICKHALT;   /* no teardown needed on halt */
 	mp->mnt_data = NULL;
 	vfs_getnewfsid(mp);
 
@@ -266,11 +268,11 @@ devfs_vfs_ncpgen_test(struct mount *mp, struct namecache *ncp)
 }
 
 static struct vfsops devfs_vfsops = {
+	.vfs_flags	= 0,
 	.vfs_mount 	= devfs_vfs_mount,
 	.vfs_unmount	= devfs_vfs_unmount,
 	.vfs_root 	= devfs_vfs_root,
 	.vfs_statfs	= devfs_vfs_statfs,
-	.vfs_sync 	= vfs_stdsync,
 	.vfs_vget	= devfs_vfs_vget,
 	.vfs_vptofh	= devfs_vfs_vptofh,
 	.vfs_fhtovp	= devfs_vfs_fhtovp,
@@ -278,5 +280,5 @@ static struct vfsops devfs_vfsops = {
 	.vfs_ncpgen_test	= devfs_vfs_ncpgen_test
 };
 
-VFS_SET(devfs_vfsops, devfs, VFCF_SYNTHETIC);
+VFS_SET(devfs_vfsops, devfs, VFCF_SYNTHETIC | VFCF_MPSAFE);
 MODULE_VERSION(devfs, 1);

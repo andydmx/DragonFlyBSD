@@ -16,11 +16,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Lawrence Berkeley Laboratory and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -36,6 +32,9 @@
  * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
  */
+
+#ifndef _STAND_RPC_H_
+#define	_STAND_RPC_H_
 
 /* XXX defines we can't easily get from system includes */
 #define	PMAPPORT		111
@@ -54,8 +53,7 @@ ssize_t	rpc_call(struct iodesc *, n_long, n_long, n_long,
 void	rpc_fromaddr(void *, struct in_addr *, u_short *);
 int	rpc_pmap_getcache(struct in_addr, u_int, u_int);
 void	rpc_pmap_putcache(struct in_addr, u_int, u_int, int);
-
-extern int rpc_port;	/* decrement before bind */
+int	rpc_newport(void);
 
 /*
  * How much space to leave in front of RPC requests.
@@ -66,3 +64,5 @@ extern int rpc_port;	/* decrement before bind */
  *  2: Auth NULL
  */
 #define	RPC_HEADER_WORDS 28
+
+#endif /* !_STAND_RPC_H_ */

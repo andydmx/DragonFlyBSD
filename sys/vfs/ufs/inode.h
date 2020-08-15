@@ -15,11 +15,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -37,7 +33,6 @@
  *
  *	@(#)inode.h	8.9 (Berkeley) 5/14/95
  * $FreeBSD: src/sys/ufs/ufs/inode.h,v 1.28.2.2 2001/09/29 12:52:52 iedowse Exp $
- * $DragonFly: src/sys/vfs/ufs/inode.h,v 1.12 2006/09/10 01:26:41 dillon Exp $
  */
 
 #ifndef _UFS_UFS_INODE_H_
@@ -111,9 +106,11 @@ struct inode {
 };
 
 #define	i_atime		i_din.di_atime
+#define	i_atime_ext	i_din.di_atime_ext
 #define	i_atimensec	i_din.di_atimensec
 #define	i_blocks	i_din.di_blocks
 #define	i_ctime		i_din.di_ctime
+#define	i_ctime_ext	i_din.di_ctime_ext
 #define	i_ctimensec	i_din.di_ctimensec
 #define	i_db		i_din.di_db
 #define	i_flags		i_din.di_flags
@@ -122,6 +119,7 @@ struct inode {
 #define	i_ib		i_din.di_ib
 #define	i_mode		i_din.di_mode
 #define	i_mtime		i_din.di_mtime
+#define	i_mtime_ext	i_din.di_mtime_ext
 #define	i_mtimensec	i_din.di_mtimensec
 #define	i_nlink		i_din.di_nlink
 #define	i_rdev		i_din.di_rdev
@@ -141,6 +139,7 @@ struct inode {
 #define	IN_EXLOCK	0x0040		/* File has exclusive lock. */
 #define	IN_HASHED	0x0080		/* Inode is on hash list */
 #define	IN_LAZYMOD	0x0100		/* Modified, but don't write yet. */
+#define IN_NOCOPYWRITE	0x0200		/* Special NOCOPY write */
 
 #if defined(_KERNEL) || defined(_KERNEL_STRUCTURES)
 
@@ -151,7 +150,6 @@ struct inode {
 struct indir {
 	ufs_daddr_t in_lbn;		/* Logical block number. */
 	int	in_off;			/* Offset in buffer. */
-	int	in_exists;		/* Flag if the block exists. */
 };
 
 /* Convert between inode pointers and vnode pointers. */

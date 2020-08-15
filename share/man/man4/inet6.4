@@ -1,5 +1,4 @@
 .\"	$FreeBSD: src/share/man/man4/inet6.4,v 1.4.2.9 2002/05/15 16:45:30 ume Exp $
-.\"	$DragonFly: src/share/man/man4/inet6.4,v 1.6 2008/06/15 19:20:05 swildner Exp $
 .\"	$KAME: inet6.4,v 1.21 2001/04/05 01:00:18 itojun Exp $
 .\"
 .\" Copyright (C) 1995, 1996, 1997, and 1998 WIDE Project.
@@ -29,7 +28,7 @@
 .\" OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
 .\" SUCH DAMAGE.
 .\"
-.Dd June 15, 2008
+.Dd November 25, 2017
 .Dt INET6 4
 .Os
 .Sh NAME
@@ -79,7 +78,7 @@ family utilize the following addressing structure:
 .Bd -literal -offset indent
 struct sockaddr_in6 {
 	u_int8_t	sin6_len;
-	u_int8_t	sin6_family;
+	sa_family_t	sin6_family;
 	u_int16_t	sin6_port;
 	u_int32_t	sin6_flowinfo;
 	struct in6_addr	sin6_addr;
@@ -315,17 +314,6 @@ The node must be a host
 (not a router)
 for the option to be meaningful.
 Defaults to off.
-.It Dv IPV6CTL_KEEPFAITH
-.Pq ip6.keepfaith
-Boolean: enable/disable
-.Dq FAITH
-TCP relay IPv6-to-IPv4 translator code in the kernel.
-Refer
-.Xr faith 4
-and
-.Xr faithd 8
-for detail.
-Defaults to off.
 .It Dv IPV6CTL_LOG_INTERVAL
 .Pq ip6.log_interval
 Integer: default interval between
@@ -389,14 +377,6 @@ Defaults to on.
 Integer: default interval between
 .Tn IPv6
 router renumbering prefix babysitting, in seconds.
-.It Dv IPV6CTL_V6ONLY
-.Pq ip6.v6only
-Boolean: enable/disable the prohibited use of
-.Tn IPv4
-mapped address on
-.Dv AF_INET6
-sockets.
-Defaults to on.
 .It Dv IPV6CTL_RTEXPIRE
 .Pq ip6.rtexpire
 Integer: lifetime in seconds of protocol-cloned

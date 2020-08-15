@@ -32,134 +32,161 @@
  * SUCH DAMAGE.
  */
 
+#ifndef HAMMER_UTIL_H_
+#define HAMMER_UTIL_H_
+
 #include <sys/types.h>
-#include <sys/tree.h>
+#include <sys/stat.h>
+#include <sys/time.h>
 #include <sys/queue.h>
+#include <sys/mount.h>
+#include <sys/wait.h>
+#include <sys/ioctl.h>
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdarg.h>
+#include <stddef.h>
+#include <string.h>
+#include <ctype.h>
+#include <dirent.h>
+#include <errno.h>
+#include <err.h>
+#include <fcntl.h>
+#include <libgen.h>
+#include <limits.h>
+#include <signal.h>
+#include <time.h>
+#include <unistd.h>
+#include <assert.h>
 
 #include <vfs/hammer/hammer_disk.h>
-#include <uuid.h>
-
-/*
- * Cache management - so the user code can keep its memory use under control
- */
-struct volume_info;
-struct buffer_info;
-
-TAILQ_HEAD(volume_list, volume_info);
-
-struct cache_info {
-	TAILQ_ENTRY(cache_info) entry;
-	union {
-		struct volume_info *volume;
-		struct buffer_info *buffer;
-	} u;
-	enum cache_type { ISVOLUME, ISBUFFER } type;
-	int refs;	/* structural references */
-	int modified;	/* ondisk modified flag */
-	int delete;	/* delete flag - delete on last ref */
-};
+#include <vfs/hammer/hammer_ioctl.h>
+#include <vfs/hammer/hammer_crc.h>
 
 #define HAMMER_BUFLISTS		64
 #define HAMMER_BUFLISTMASK	(HAMMER_BUFLISTS - 1)
 
 /*
- * These structures are used by newfs_hammer to track the filesystem
- * buffers it constructs while building the filesystem.  No attempt
- * is made to try to make this efficient.
+ * These structures are used by hammer(8) and newfs_hammer(8)
+ * to track the filesystem buffers.
+ *
+ * vol_free_off and vol_free_end are zone-2 offsets.
+ * These two are initialized only when newly creating a filesystem.
  */
-struct volume_info {
-	struct cache_info	cache;
+typedef struct volume_info {
 	TAILQ_ENTRY(volume_info) entry;
+	const char		*name;
+	const char		*type;
 	int			vol_no;
-	hammer_off_t		vol_alloc;	/* volume-relative offset */
-	hammer_off_t		vol_free_off;	/* zone-2 offset */
-	hammer_off_t		vol_free_end;	/* zone-2 offset */
-
-	char			*name;
+	int			rdonly;
 	int			fd;
 	off_t			size;
 	off_t			device_offset;
-	const char		*type;
 
-	struct hammer_volume_ondisk *ondisk;
+	hammer_off_t		vol_free_off;
+	hammer_off_t		vol_free_end;
+
+	hammer_volume_ondisk_t ondisk;
 
 	TAILQ_HEAD(, buffer_info) buffer_lists[HAMMER_BUFLISTS];
-};
+} *volume_info_t;
 
-struct buffer_info {
-	struct cache_info	cache;
+typedef struct cache_info {
+	TAILQ_ENTRY(cache_info) entry;
+	int			refs;		/* structural references */
+	int			modified;	/* ondisk modified flag */
+	int			delete;		/* delete flag - delete on last ref */
+} *cache_info_t;
+
+typedef struct buffer_info {
+	struct cache_info	cache;		/* must be at offset 0 */
 	TAILQ_ENTRY(buffer_info) entry;
-	hammer_off_t		buf_offset;	/* full hammer offset spec */
+	hammer_off_t		zone2_offset;	/* zone-2 offset */
 	int64_t			raw_offset;	/* physical offset */
-	int			flags;		/* origination flags */
-	int			use_count;	/* read count */
-	struct volume_info	*volume;
+	volume_info_t		volume;
 	void			*ondisk;
-};
+} *buffer_info_t;
 
-#define HAMMER_BUFINFO_READAHEAD	0x0001
+/*
+ * Data structure for zone statistics.
+ */
+typedef struct zone_stat {
+	int64_t			blocks;		/* number of big-blocks */
+	int64_t			items;		/* number of items */
+	int64_t			used;		/* bytes used */
+} *zone_stat_t;
 
-extern uuid_t Hammer_FSType;
-extern uuid_t Hammer_FSId;
-extern int64_t BootAreaSize;
-extern int64_t MemAreaSize;
-extern int64_t UndoBufferSize;
-extern int DebugOpt;
-extern const char *ScoreBoardFile;
-extern const char *RestrictTarget;
-extern int NumVolumes;
-extern int RootVolNo;
-extern struct volume_list VolList;
+extern hammer_uuid_t Hammer_FSType;
+extern hammer_uuid_t Hammer_FSId;
 extern int UseReadBehind;
 extern int UseReadAhead;
-extern int AssertOnFailure;
+extern int DebugOpt;
+extern uint32_t HammerVersion;
+extern const char *zone_labels[];
 
-uint32_t crc32(const void *buf, size_t size);
-uint32_t crc32_ext(const void *buf, size_t size, uint32_t ocrc);
-
-struct volume_info *setup_volume(int32_t vol_no, const char *filename,
-				int isnew, int oflags);
-struct volume_info *get_volume(int32_t vol_no);
-struct volume_info *test_volume(int32_t vol_no);
-struct buffer_info *get_buffer(hammer_off_t buf_offset, int isnew);
-void *get_buffer_data(hammer_off_t buf_offset, struct buffer_info **bufferp,
-				int isnew);
-hammer_node_ondisk_t get_node(hammer_off_t node_offset,
-				struct buffer_info **bufp);
-
-void rel_volume(struct volume_info *volume);
-void rel_buffer(struct buffer_info *buffer);
-
-hammer_off_t blockmap_lookup(hammer_off_t bmap_off,
-				struct hammer_blockmap_layer1 *layer1,
-				struct hammer_blockmap_layer2 *layer2,
-				int *errorp);
-void format_blockmap(hammer_blockmap_t blockmap, hammer_off_t zone_base);
-void format_undomap(hammer_volume_ondisk_t ondisk);
-
-void *alloc_btree_element(hammer_off_t *offp);
-void *alloc_data_element(hammer_off_t *offp, int32_t data_len,
-			 struct buffer_info **data_bufferp);
-
-int hammer_btree_cmp(hammer_base_elm_t key1, hammer_base_elm_t key2);
-void hammer_key_beg_init(hammer_base_elm_t base);
-void hammer_key_end_init(hammer_base_elm_t base);
-int hammer_crc_test_leaf(void *data, hammer_btree_leaf_elm_t leaf);
-
-void format_freemap(struct volume_info *root_vol, hammer_blockmap_t blockmap);
-int64_t initialize_freemap(struct volume_info *vol);
-
+volume_info_t init_volume(const char *filename, int oflags, int32_t vol_no);
+volume_info_t load_volume(const char *filename, int oflags, int verify_volume);
+int is_regfile(const volume_info_t volume);
+void assert_volume_offset(const volume_info_t volume);
+volume_info_t get_volume(int32_t vol_no);
+volume_info_t get_root_volume(void);
+void rel_buffer(buffer_info_t buffer);
+void *get_buffer_data(hammer_off_t buf_offset, buffer_info_t *bufferp,
+			int isnew);
+hammer_node_ondisk_t alloc_btree_node(hammer_off_t *offp,
+			buffer_info_t *data_bufferp);
+void *alloc_meta_element(hammer_off_t *offp, int32_t data_len,
+			buffer_info_t *data_bufferp);
+void format_blockmap(volume_info_t root_vol, int zone, hammer_off_t offset);
+void format_freemap(volume_info_t root_vol);
+int64_t initialize_freemap(volume_info_t volume);
+int64_t count_freemap(const volume_info_t volume);
+void format_undomap(volume_info_t root_vol, int64_t *undo_buffer_size);
+void print_blockmap(const volume_info_t volume);
 void flush_all_volumes(void);
-void flush_volume(struct volume_info *vol);
-void flush_buffer(struct buffer_info *buf);
+void flush_volume(volume_info_t volume);
+void flush_buffer(buffer_info_t buffer);
+int64_t init_boot_area_size(int64_t value, off_t avg_vol_size);
+int64_t init_memory_log_size(int64_t value, off_t avg_vol_size);
 
-void hammer_cache_set(int bytes);
-void hammer_cache_add(struct cache_info *cache, enum cache_type type);
-void hammer_cache_del(struct cache_info *cache);
-void hammer_cache_used(struct cache_info *cache);
+hammer_off_t bootstrap_bigblock(volume_info_t volume);
+hammer_off_t alloc_undo_bigblock(volume_info_t volume);
+void *alloc_blockmap(int zone, int bytes, hammer_off_t *result_offp,
+			buffer_info_t *bufferp);
+hammer_off_t blockmap_lookup(hammer_off_t bmap_off, int *errorp);
+hammer_off_t blockmap_lookup_save(hammer_off_t bmap_off,
+				hammer_blockmap_layer1_t layer1,
+				hammer_blockmap_layer2_t layer2,
+				int *errorp);
+
+int hammer_parse_cache_size(const char *arg);
+void hammer_cache_add(cache_info_t cache);
+void hammer_cache_del(cache_info_t cache);
+void hammer_cache_used(cache_info_t cache);
 void hammer_cache_flush(void);
 
-void score_printf(size_t i, size_t w, const char *ctl, ...) __printflike(3, 4);
+void hammer_key_beg_init(hammer_base_elm_t base);
+void hammer_key_end_init(hammer_base_elm_t base);
+int getyn(void);
+const char *sizetostr(off_t size);
+int hammer_fs_to_vol(const char *fs, struct hammer_ioc_volume_list *iocp);
+int hammer_fs_to_rootvol(const char *fs, char *buf, int len);
+zone_stat_t hammer_init_zone_stat(void);
+zone_stat_t hammer_init_zone_stat_bits(void);
+void hammer_cleanup_zone_stat(zone_stat_t stats);
+void hammer_add_zone_stat(zone_stat_t stats, hammer_off_t offset, int bytes);
+void hammer_add_zone_stat_layer2(zone_stat_t stats,
+			hammer_blockmap_layer2_t layer2);
+void hammer_print_zone_stat(const zone_stat_t stats);
 
-void panic(const char *ctl, ...) __printflike(1, 2);
+void hammer_uuid_create(hammer_uuid_t *uuid);
+int hammer_uuid_from_string(const char *str, hammer_uuid_t *uuid);
+int hammer_uuid_to_string(const hammer_uuid_t *uuid, char **str);
+int hammer_uuid_name_lookup(hammer_uuid_t *uuid, const char *str);
+int hammer_uuid_compare(const hammer_uuid_t *uuid1, const hammer_uuid_t *uuid2);
 
+#define hwarn(format, args...)	warn("WARNING: "format,## args)
+#define hwarnx(format, args...)	warnx("WARNING: "format,## args)
+
+#endif /* !HAMMER_UTIL_H_ */

@@ -36,7 +36,6 @@
 #include <sys/proc.h>
 #include <sys/tty.h>
 #include <sys/thread2.h>
-#include <sys/mplock2.h>
 
 #include <machine/console.h>
 #include <sys/mouse.h>
@@ -75,6 +74,8 @@ static void mouse_cut_extend(scr_stat *scp);
 static void mouse_paste(scr_stat *scp);
 #endif /* SC_NO_CUTPASTE */
 
+static struct lwkt_token scmouse_tok = LWKT_TOKEN_INITIALIZER(scmouse_tok);
+
 #ifndef SC_NO_CUTPASTE
 /* allocate a cut buffer */
 void
@@ -104,11 +105,12 @@ sc_mouse_move(scr_stat *scp, int x, int y)
     crit_enter();
     scp->mouse_xpos = scp->mouse_oldxpos = x;
     scp->mouse_ypos = scp->mouse_oldypos = y;
-    if (scp->font_size <= 0)
+    if (scp->font_height <= 0)
 	scp->mouse_pos = scp->mouse_oldpos = 0;
     else
 	scp->mouse_pos = scp->mouse_oldpos = 
-	    (y/scp->font_size - scp->yoff)*scp->xsize + x/8 - scp->xoff;
+	    (y / scp->font_height - scp->yoff) * scp->xsize +
+	    x / scp->font_width - scp->xoff;
     scp->status |= MOUSE_MOVED;
     crit_exit();
 }
@@ -117,28 +119,29 @@ sc_mouse_move(scr_stat *scp, int x, int y)
 static void
 set_mouse_pos(scr_stat *scp)
 {
-    if (scp->mouse_xpos < scp->xoff*8)
-	scp->mouse_xpos = scp->xoff*8;
-    if (scp->mouse_ypos < scp->yoff*scp->font_size)
-	scp->mouse_ypos = scp->yoff*scp->font_size;
+    if (scp->mouse_xpos < scp->xoff * scp->font_width)
+	scp->mouse_xpos = scp->xoff * scp->font_width;
+    if (scp->mouse_ypos < scp->yoff * scp->font_height)
+	scp->mouse_ypos = scp->yoff * scp->font_height;
     if (ISGRAPHSC(scp)) {
-        if (scp->mouse_xpos > scp->xpixel-1)
-	    scp->mouse_xpos = scp->xpixel-1;
-        if (scp->mouse_ypos > scp->ypixel-1)
-	    scp->mouse_ypos = scp->ypixel-1;
+        if (scp->mouse_xpos > scp->xpixel - 1)
+	    scp->mouse_xpos = scp->xpixel - 1;
+        if (scp->mouse_ypos > scp->ypixel - 1)
+	    scp->mouse_ypos = scp->ypixel - 1;
 	return;
     } else {
-	if (scp->mouse_xpos > (scp->xsize + scp->xoff)*8 - 1)
-	    scp->mouse_xpos = (scp->xsize + scp->xoff)*8 - 1;
-	if (scp->mouse_ypos > (scp->ysize + scp->yoff)*scp->font_size - 1)
-	    scp->mouse_ypos = (scp->ysize + scp->yoff)*scp->font_size - 1;
+	if (scp->mouse_xpos > (scp->xsize + scp->xoff) * scp->font_width - 1)
+	    scp->mouse_xpos = (scp->xsize + scp->xoff) * scp->font_width - 1;
+	if (scp->mouse_ypos > (scp->ysize + scp->yoff) * scp->font_height - 1)
+	    scp->mouse_ypos = (scp->ysize + scp->yoff) * scp->font_height - 1;
     }
 
-    if (scp->mouse_xpos != scp->mouse_oldxpos || scp->mouse_ypos != scp->mouse_oldypos) {
+    if (scp->mouse_xpos != scp->mouse_oldxpos ||
+	scp->mouse_ypos != scp->mouse_oldypos) {
 	scp->status |= MOUSE_MOVED;
     	scp->mouse_pos =
-	    (scp->mouse_ypos/scp->font_size - scp->yoff)*scp->xsize 
-		+ scp->mouse_xpos/8 - scp->xoff;
+	    (scp->mouse_ypos / scp->font_height - scp->yoff) * scp->xsize +
+	    scp->mouse_xpos / scp->font_width - scp->xoff;
 #ifndef SC_NO_CUTPASTE
 	if ((scp->status & MOUSE_VISIBLE) && (scp->status & MOUSE_CUTTING))
 	    mouse_cut(scp);
@@ -154,13 +157,13 @@ sc_draw_mouse_image(scr_stat *scp)
     if (ISGRAPHSC(scp))
 	return;
 
-    ++scp->sc->videoio_in_progress;
+    atomic_add_int(&scp->sc->videoio_in_progress, 1);
     (*scp->rndr->draw_mouse)(scp, scp->mouse_xpos, scp->mouse_ypos, TRUE);
     scp->mouse_oldpos = scp->mouse_pos;
     scp->mouse_oldxpos = scp->mouse_xpos;
     scp->mouse_oldypos = scp->mouse_ypos;
     scp->status |= MOUSE_VISIBLE;
-    --scp->sc->videoio_in_progress;
+    atomic_add_int(&scp->sc->videoio_in_progress, -1);
 }
 
 void
@@ -172,13 +175,14 @@ sc_remove_mouse_image(scr_stat *scp)
     if (ISGRAPHSC(scp))
 	return;
 
-    ++scp->sc->videoio_in_progress;
+    atomic_add_int(&scp->sc->videoio_in_progress, 1);
     (*scp->rndr->draw_mouse)(scp,
-			     (scp->mouse_oldpos%scp->xsize + scp->xoff)*8,
-			     (scp->mouse_oldpos/scp->xsize + scp->yoff)
-				 * scp->font_size,
+			     (scp->mouse_oldpos%scp->xsize + scp->xoff) *
+			      scp->font_width,
+			     (scp->mouse_oldpos/scp->xsize + scp->yoff) *
+			      scp->font_height,
 			     FALSE);
-    size = scp->xsize*scp->ysize;
+    size = scp->xsize * scp->ysize;
     i = scp->mouse_oldpos;
     mark_for_update(scp, i);
     mark_for_update(scp, i);
@@ -190,7 +194,7 @@ sc_remove_mouse_image(scr_stat *scp)
 	mark_for_update(scp, i + 1);
     }
     scp->status &= ~MOUSE_VISIBLE;
-    --scp->sc->videoio_in_progress;
+    atomic_add_int(&scp->sc->videoio_in_progress, -1);
 }
 
 int
@@ -378,8 +382,7 @@ mouse_cut_start(scr_stat *scp)
 	    /* if the pointer is on trailing blank chars, mark towards eol */
 	    i = skip_spc_left(scp, scp->mouse_pos) + 1;
 	    crit_enter();
-	    scp->mouse_cut_start =
-	        (scp->mouse_pos / scp->xsize) * scp->xsize + i;
+	    scp->mouse_cut_start = rounddown(scp->mouse_pos, scp->xsize) + i;
 	    scp->mouse_cut_end =
 	        (scp->mouse_pos / scp->xsize + 1) * scp->xsize - 1;
 	    crit_exit();
@@ -438,7 +441,7 @@ mouse_cut_word(scr_stat *scp)
 	scp->mouse_cut_end = -1;
 	crit_exit();
 
-	sol = (scp->mouse_pos / scp->xsize) * scp->xsize;
+	sol = rounddown(scp->mouse_pos, scp->xsize);
 	eol = sol + scp->xsize;
 	c = sc_vtb_getc(&scp->vtb, scp->mouse_pos);
 	if (IS_SPACE_CHAR(c)) {
@@ -506,8 +509,7 @@ mouse_cut_line(scr_stat *scp)
 	}
 
 	/* mark the entire line */
-	scp->mouse_cut_start =
-	    (scp->mouse_pos / scp->xsize) * scp->xsize;
+	scp->mouse_cut_start = rounddown(scp->mouse_pos, scp->xsize);
 	scp->mouse_cut_end = scp->mouse_cut_start + scp->xsize - 1;
 	mark_for_update(scp, scp->mouse_cut_start);
 	mark_for_update(scp, scp->mouse_cut_end);
@@ -578,14 +580,14 @@ sc_mouse_exit1_proc(struct proc *p)
     scp = p->p_drv_priv;
     KKASSERT(scp != NULL);
 
-    get_mplock();
+    lwkt_gettoken(&scmouse_tok);
     KKASSERT(scp->mouse_proc == p);
     KKASSERT(scp->mouse_pid == p->p_pid);
 
     scp->mouse_signal = 0;
     scp->mouse_proc = NULL;
     scp->mouse_pid = 0;
-    rel_mplock();
+    lwkt_reltoken(&scmouse_tok);
 
     PRELE(p);
     p->p_flags &= ~P_SCMOUSE;
@@ -635,28 +637,28 @@ sc_mouse_ioctl(struct tty *tp, u_long cmd, caddr_t data, int flag)
 	 * Setup a process to receive signals on mouse events.
 	 */
 	case MOUSE_MODE:
-	    get_mplock();
+	    lwkt_gettoken(&scmouse_tok);
 
 	    if (!ISSIGVALID(mouse->u.mode.signal)) {
 		/* Setting MOUSE_MODE w/ an invalid signal is used to disarm */
 		if (scp->mouse_proc == curproc) {
 		    sc_mouse_exit1_proc(curproc);
-		    rel_mplock();
+		    lwkt_reltoken(&scmouse_tok);
 		    return 0;
 		} else {
-		    rel_mplock();
+		    lwkt_reltoken(&scmouse_tok);
 		    return EINVAL;
 		}
 	    } else {
 		/* Only one mouse process per syscons */
 		if (scp->mouse_proc) {
-		    rel_mplock();
+		    lwkt_reltoken(&scmouse_tok);
 		    return EINVAL;
 		}
 
 		/* Only one syscons signal source per process */
 		if (curproc->p_flags & P_SCMOUSE) {
-		    rel_mplock();
+		    lwkt_reltoken(&scmouse_tok);
 		    return EINVAL;
 		}
 
@@ -673,7 +675,7 @@ sc_mouse_ioctl(struct tty *tp, u_long cmd, caddr_t data, int flag)
 	        curproc->p_drv_priv = scp;
 	        PHOLD(curproc);
 
-	        rel_mplock();
+		lwkt_reltoken(&scmouse_tok);
 	        return 0;
             }
 	    /*NOTREACHED*/
@@ -767,14 +769,14 @@ sc_mouse_ioctl(struct tty *tp, u_long cmd, caddr_t data, int flag)
 
 	    cur_scp->status &= ~MOUSE_HIDDEN;
 
-	    get_mplock();
+	    lwkt_gettoken(&scmouse_tok);
 	    if (cur_scp->mouse_signal) {
 		KKASSERT(cur_scp->mouse_proc != NULL);
 		ksignal(cur_scp->mouse_proc, cur_scp->mouse_signal);
-		rel_mplock();
+		lwkt_reltoken(&scmouse_tok);
 	        break;
 	    }
-	    rel_mplock();
+	    lwkt_reltoken(&scmouse_tok);
 
 	    if (ISGRAPHSC(cur_scp) || (cut_buffer == NULL))
 		break;
@@ -817,14 +819,14 @@ sc_mouse_ioctl(struct tty *tp, u_long cmd, caddr_t data, int flag)
 
 	    cur_scp->status &= ~MOUSE_HIDDEN;
 
-	    get_mplock();
+	    lwkt_gettoken(&scmouse_tok);
 	    if (cur_scp->mouse_signal) {
 		KKASSERT(cur_scp->mouse_proc != NULL);
 		ksignal(cur_scp->mouse_proc, cur_scp->mouse_signal);
-		rel_mplock();
+		lwkt_reltoken(&scmouse_tok);
 	        break;
 	    }
-	    rel_mplock();
+	    lwkt_reltoken(&scmouse_tok);
 
 	    if (ISGRAPHSC(cur_scp) || (cut_buffer == NULL))
 		break;
@@ -883,7 +885,8 @@ sc_mouse_ioctl(struct tty *tp, u_long cmd, caddr_t data, int flag)
 		sc_remove_all_mouse(scp->sc);
 #ifndef SC_NO_FONT_LOADING
 		if (ISTEXTSC(cur_scp) && (cur_scp->font != NULL))
-		    sc_load_font(cur_scp, 0, cur_scp->font_size, cur_scp->font,
+		    sc_load_font(cur_scp, 0, cur_scp->font_height,
+				 cur_scp->font,
 				 cur_scp->sc->mouse_char, 4);
 #endif
 		scp->sc->mouse_char = mouse->u.mouse_char;

@@ -21,7 +21,7 @@
  * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
  * THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
- * $FreeBSD$
+ * $FreeBSD: head/sys/dev/usb/usbdi.h 267240 2014-06-08 20:10:29Z hselasky $
  */
 #ifndef _USB_USBDI_H_
 #define _USB_USBDI_H_
@@ -403,22 +403,12 @@ struct usb_attach_arg {
  */
 struct usb_callout {
 	struct callout co;
-	struct lock *uco_lock;
-	void (*uco_func)(void *);
-	void *uco_arg;
-	int uco_flags;
 };
 
-void usb_callout_timeout_wrapper(void *arg);
-void usb_callout_init_mtx_dfly(struct usb_callout *uco, struct lock *lock,
-	 int flags); 
-void usb_callout_reset_dfly(struct usb_callout *uco, int ticks,
-	 timeout_t *func, void *arg);    
-
-#define	usb_callout_init_mtx(c,m,f) usb_callout_init_mtx_dfly(c, m, f) 
-#define	usb_callout_reset(c,t,f,d) usb_callout_reset_dfly(c, t, f, d)
+#define	usb_callout_init_mtx(c,m,f) callout_init_lk(&(c)->co, m) 
+#define	usb_callout_reset(c,t,f,d)  callout_reset(&(c)->co, t, f, d)
 #define	usb_callout_stop(c) callout_stop(&(c)->co)
-#define	usb_callout_drain(c) callout_stop_sync(&(c)->co)
+#define	usb_callout_drain(c) callout_drain(&(c)->co)
 #define	usb_callout_pending(c) callout_pending(&(c)->co)
 
 /* USB transfer states */
@@ -579,6 +569,7 @@ int	usbd_xfer_is_stalled(struct usb_xfer *xfer);
 void	usbd_xfer_set_flag(struct usb_xfer *xfer, int flag);
 void	usbd_xfer_clr_flag(struct usb_xfer *xfer, int flag);
 uint16_t usbd_xfer_get_timestamp(struct usb_xfer *xfer);
+uint8_t usbd_xfer_maxp_was_clamped(struct usb_xfer *xfer);
 
 void	usbd_copy_in(struct usb_page_cache *cache, usb_frlength_t offset,
 	    const void *ptr, usb_frlength_t len);
@@ -595,6 +586,8 @@ void	usbd_m_copy_in(struct usb_page_cache *cache, usb_frlength_t dst_offset,
 void	usbd_frame_zero(struct usb_page_cache *cache, usb_frlength_t offset,
 	    usb_frlength_t len);
 void	usbd_start_re_enumerate(struct usb_device *udev);
+usb_error_t
+	usbd_start_set_config(struct usb_device *, uint8_t);
 
 int	usb_fifo_attach(struct usb_device *udev, void *priv_sc,
 	    struct lock *priv_lock, struct usb_fifo_methods *pm,

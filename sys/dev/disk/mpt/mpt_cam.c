@@ -96,6 +96,11 @@
  * $FreeBSD: src/sys/dev/mpt/mpt_cam.c,v 1.84 2012/02/11 12:03:44 marius Exp $
  */
 
+#include <bus/cam/cam.h>
+#include <bus/cam/cam_ccb.h>
+#include <bus/cam/cam_xpt.h>
+#include <bus/cam/cam_xpt_periph.h>
+
 #include <dev/disk/mpt/mpt.h>
 #include <dev/disk/mpt/mpt_cam.h>
 #include <dev/disk/mpt/mpt_raid.h>
@@ -407,6 +412,8 @@ cleanup:
 static int
 mpt_read_config_info_fc(struct mpt_softc *mpt)
 {
+	struct sysctl_ctx_list *ctx;
+	struct sysctl_oid *tree;
 	char *topology = NULL;
 	int rv;
 
@@ -465,28 +472,27 @@ mpt_read_config_info_fc(struct mpt_softc *mpt)
 	    mpt->mpt_fcport_page0.WWPN.Low,
 	    mpt->mpt_fcport_speed);
 	MPT_UNLOCK(mpt);
-	{
-		ksnprintf(mpt->scinfo.fc.wwnn,
-		    sizeof (mpt->scinfo.fc.wwnn), "0x%08x%08x",
-		    mpt->mpt_fcport_page0.WWNN.High,
-		    mpt->mpt_fcport_page0.WWNN.Low);
+	ctx = device_get_sysctl_ctx(mpt->dev);
+	tree = device_get_sysctl_tree(mpt->dev);
 
-		ksnprintf(mpt->scinfo.fc.wwpn,
-		    sizeof (mpt->scinfo.fc.wwpn), "0x%08x%08x",
-		    mpt->mpt_fcport_page0.WWPN.High,
-		    mpt->mpt_fcport_page0.WWPN.Low);
+	ksnprintf(mpt->scinfo.fc.wwnn,
+	    sizeof (mpt->scinfo.fc.wwnn), "0x%08x%08x",
+	    mpt->mpt_fcport_page0.WWNN.High,
+	    mpt->mpt_fcport_page0.WWNN.Low);
 
-		SYSCTL_ADD_STRING(&mpt->mpt_sysctl_ctx,
-		       SYSCTL_CHILDREN(mpt->mpt_sysctl_tree), OID_AUTO,
-		       "wwnn", CTLFLAG_RD, mpt->scinfo.fc.wwnn, 0,
-		       "World Wide Node Name");
+	ksnprintf(mpt->scinfo.fc.wwpn,
+	    sizeof (mpt->scinfo.fc.wwpn), "0x%08x%08x",
+	    mpt->mpt_fcport_page0.WWPN.High,
+	    mpt->mpt_fcport_page0.WWPN.Low);
 
-		SYSCTL_ADD_STRING(&mpt->mpt_sysctl_ctx,
-		       SYSCTL_CHILDREN(mpt->mpt_sysctl_tree), OID_AUTO,
-		       "wwpn", CTLFLAG_RD, mpt->scinfo.fc.wwpn, 0,
-		       "World Wide Port Name");
+	SYSCTL_ADD_STRING(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
+	       "wwnn", CTLFLAG_RD, mpt->scinfo.fc.wwnn, 0,
+	       "World Wide Node Name");
 
-	}
+	SYSCTL_ADD_STRING(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
+	       "wwpn", CTLFLAG_RD, mpt->scinfo.fc.wwpn, 0,
+	       "World Wide Port Name");
+
 	MPT_LOCK(mpt);
 	return (0);
 }
@@ -2353,7 +2359,7 @@ static void
 mpt_cam_rescan_callback(struct cam_periph *periph, union ccb *ccb)
 {
     xpt_free_path(ccb->ccb_h.path);
-    kfree(ccb, M_TEMP);
+    xpt_free_ccb(&ccb->ccb_h);
 }
 
 static int
@@ -2407,21 +2413,20 @@ mpt_cam_event(struct mpt_softc *mpt, request_t *req,
 		 * Allocate a CCB, create a wildcard path for this bus,
 		 * and schedule a rescan.
 		 */
-		ccb = kmalloc(sizeof(union ccb), M_TEMP, M_WAITOK | M_ZERO);
+		ccb = xpt_alloc_ccb();
 
 		if (xpt_create_path(&ccb->ccb_h.path, xpt_periph, pathid,
 		    CAM_TARGET_WILDCARD, CAM_LUN_WILDCARD) != CAM_REQ_CMP) {
 			mpt_prt(mpt, "unable to create path for rescan\n");
-			kfree(ccb, M_TEMP);
+			xpt_free_ccb(&ccb->ccb_h);
 			break;
 		}
 
-		xpt_setup_ccb(&ccb->ccb_h, ccb->ccb_h.path, 5/*priority (low)*/);
+		xpt_setup_ccb(&ccb->ccb_h, ccb->ccb_h.path, /*lowpri*/5);
 		ccb->ccb_h.func_code = XPT_SCAN_BUS;
 		ccb->ccb_h.cbfcnp = mpt_cam_rescan_callback;
 		ccb->crcn.flags = CAM_FLAG_NONE;
 		xpt_action(ccb);
-
 		/* scan is now in progress */
 
 		break;
@@ -2502,7 +2507,7 @@ mpt_cam_event(struct mpt_softc *mpt, request_t *req,
 	{
 		struct cam_sim *sim;
 		struct cam_path *tmppath;
-		struct ccb_relsim crs;
+		struct ccb_relsim *crs;
 		PTR_EVENT_DATA_QUEUE_FULL pqf;
 		lun_id_t lun_id;
 
@@ -2523,16 +2528,18 @@ mpt_cam_event(struct mpt_softc *mpt, request_t *req,
 				    "XPT_REL_SIMQ");
 				break;
 			}
-			xpt_setup_ccb(&crs.ccb_h, tmppath, 5);
-			crs.ccb_h.func_code = XPT_REL_SIMQ;
-			crs.ccb_h.flags = CAM_DEV_QFREEZE;
-			crs.release_flags = RELSIM_ADJUST_OPENINGS;
-			crs.openings = pqf->CurrentDepth - 1;
-			xpt_action((union ccb *)&crs);
-			if (crs.ccb_h.status != CAM_REQ_CMP) {
+			crs = &xpt_alloc_ccb()->crs;
+			xpt_setup_ccb(&crs->ccb_h, tmppath, 5);
+			crs->ccb_h.func_code = XPT_REL_SIMQ;
+			crs->ccb_h.flags = CAM_DEV_QFREEZE;
+			crs->release_flags = RELSIM_ADJUST_OPENINGS;
+			crs->openings = pqf->CurrentDepth - 1;
+			xpt_action((union ccb *)crs);
+			if (crs->ccb_h.status != CAM_REQ_CMP) {
 				mpt_prt(mpt, "XPT_REL_SIMQ failed\n");
 			}
 			xpt_free_path(tmppath);
+			xpt_free_ccb(&crs->ccb_h);
 		}
 		break;
 	}
@@ -2555,22 +2562,21 @@ mpt_cam_event(struct mpt_softc *mpt, request_t *req,
 			sim = mpt->sim;
 		switch(psdsc->ReasonCode) {
 		case MPI_EVENT_SAS_DEV_STAT_RC_ADDED:
-			ccb = kmalloc(sizeof(union ccb), M_TEMP,
-			    M_WAITOK | M_ZERO);
+			ccb = xpt_alloc_ccb();
 			if (xpt_create_path(&ccb->ccb_h.path, xpt_periph,
 			    cam_sim_path(sim), psdsc->TargetID,
 			    CAM_LUN_WILDCARD) != CAM_REQ_CMP) {
 				mpt_prt(mpt,
 				    "unable to create path for rescan\n");
-				kfree(ccb, M_TEMP);
+				xpt_free_ccb(&ccb->ccb_h);
 				break;
 			}
-			xpt_setup_ccb(&ccb->ccb_h, ccb->ccb_h.path,
-			    5/*priority (low)*/);
+			xpt_setup_ccb(&ccb->ccb_h, ccb->ccb_h.path, /*lopri*/5);
 			ccb->ccb_h.func_code = XPT_SCAN_BUS;
 			ccb->ccb_h.cbfcnp = mpt_cam_rescan_callback;
 			ccb->crcn.flags = CAM_FLAG_NONE;
 			xpt_action(ccb);
+			/* scan now in progress */
 			break;
 		case MPI_EVENT_SAS_DEV_STAT_RC_NOT_RESPONDING:
 			if (xpt_create_path(&tmppath, NULL, cam_sim_path(sim),
@@ -4788,7 +4794,7 @@ mpt_scsi_tgt_status(struct mpt_softc *mpt, union ccb *ccb, request_t *cmd_req,
 			} else {
 				mpt_prt(mpt, "mpt_scsi_tgt_status: CHECK CONDI"
 				    "TION but no sense data?\n");
-				memset(&rsp, 0, MPT_SENSE_SIZE);
+				memset(&rsp[8], 0, MPT_SENSE_SIZE);
 			}
 			for (i = 8; i < (8 + (MPT_SENSE_SIZE >> 2)); i++) {
 				rsp[i] = htobe32(rsp[i]);

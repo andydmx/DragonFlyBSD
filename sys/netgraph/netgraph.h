@@ -4,7 +4,7 @@
  *
  * Copyright (c) 1996-1999 Whistle Communications, Inc.
  * All rights reserved.
- * 
+ *
  * Subject to the following obligations and disclaimer of warranty, use and
  * redistribution of this software, in source or object code forms, with or
  * without modifications are expressly permitted by Whistle Communications;
@@ -15,7 +15,7 @@
  *    Communications, Inc. trademarks, including the mark "WHISTLE
  *    COMMUNICATIONS" on advertising, endorsements, or otherwise except as
  *    such appears in the above copyright notice or in the software.
- * 
+ *
  * THIS SOFTWARE IS BEING PROVIDED BY WHISTLE COMMUNICATIONS "AS IS", AND
  * TO THE MAXIMUM EXTENT PERMITTED BY LAW, WHISTLE COMMUNICATIONS MAKES NO
  * REPRESENTATIONS OR WARRANTIES, EXPRESS OR IMPLIED, REGARDING THIS SOFTWARE,
@@ -46,9 +46,6 @@
 #ifndef _SYS_QUEUE_H_
 #include <sys/queue.h>
 #endif
-#ifndef _SYS_MALLOC_H_
-#include <sys/malloc.h>
-#endif
 #ifndef _SYS_MODULE_H_
 #include <sys/module.h>
 #endif
@@ -60,10 +57,8 @@
 #endif
 
 #ifndef _KERNEL
-
 #error "This file should not be included in user level programs"
-
-#else
+#endif
 
 #define NG_ABI_VERSION NG_VERSION
 
@@ -318,7 +313,9 @@ MODULE_DEPEND(ng_##typename, netgraph,	NG_ABI_VERSION,			\
 	NETGRAPH_INIT_ORDERED(tn, tp, SI_SUB_PSEUDO, SI_ORDER_ANY)
 
 /* Special malloc() type for netgraph structs and ctrl messages */
+#ifdef MALLOC_DECLARE
 MALLOC_DECLARE(M_NETGRAPH);
+#endif
 
 /* declare the base of the netgraph sysctl hierarchy */
 /* but only if this file cares about sysctls */
@@ -356,6 +353,4 @@ void	ng_unname(node_p node);
 void	ng_unref(node_p node);
 int	ng_wait_node(node_p node, char *msg);
 
-#endif	/* _KERNEL */
 #endif	/* _NETGRAPH_NETGRAPH_H_ */
-

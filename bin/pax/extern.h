@@ -14,11 +14,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -36,7 +32,6 @@
  *
  *	@(#)extern.h	8.2 (Berkeley) 4/18/94
  * $FreeBSD: src/bin/pax/extern.h,v 1.6.2.2 2001/08/01 05:03:11 obrien Exp $
- * $DragonFly: src/bin/pax/extern.h,v 1.5 2006/09/27 19:18:00 pavalos Exp $
  */
 
 /*
@@ -101,18 +96,6 @@ int buf_fill (void);
 int buf_flush (int);
 
 /*
- * cache.c
- */
-int uidtb_start (void);
-int gidtb_start (void);
-int usrtb_start (void);
-int grptb_start (void);
-char * name_uid (uid_t, int);
-char * name_gid (gid_t, int);
-int uid_name (char *, uid_t *);
-int gid_name (char *, gid_t *);
-
-/*
  * cpio.c
  */
 int cpio_strd (void);
@@ -169,7 +152,7 @@ int next_file (ARCHD *);
  */
 void ls_list (ARCHD *, time_t, FILE *);
 void ls_tty (ARCHD *);
-int l_strncpy (char *, char *, int);
+int l_strncpy (char *, const char *, int);
 u_long asc_ul (char *, int, int);
 int ul_asc (u_long, char *, int, int);
 u_quad_t asc_uqd (char *, int, int);
@@ -189,7 +172,7 @@ void options (int, char **);
 OPLIST * opt_next (void);
 int opt_add (char *);
 int bad_opt (void);
-char *chdname;
+extern char *chdname;
 
 /*
  * pat_rep.c
@@ -239,7 +222,7 @@ extern char *tempfile;
 extern char *tempbase;
 
 int main (int, char **);
-void sig_cleanup (int);
+void sig_cleanup (int) __dead2;
 
 /*
  * sel_subs.c

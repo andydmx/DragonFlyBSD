@@ -1,13 +1,13 @@
 /*
  * Copyright (c) 2008-2012 The DragonFly Project.  All rights reserved.
- * 
+ *
  * This code is derived from software contributed to The DragonFly Project
  * by Matthew Dillon <dillon@backplane.com>
- * 
+ *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
  * are met:
- * 
+ *
  * 1. Redistributions of source code must retain the above copyright
  *    notice, this list of conditions and the following disclaimer.
  * 2. Redistributions in binary form must reproduce the above copyright
@@ -17,7 +17,7 @@
  * 3. Neither the name of The DragonFly Project nor the names of its
  *    contributors may be used to endorse or promote products derived
  *    from this software without specific, prior written permission.
- * 
+ *
  * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
  * ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
  * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
@@ -52,6 +52,8 @@ static int hammer_reblock_leaf_node(struct hammer_ioc_reblock *reblock,
 				hammer_cursor_t cursor, hammer_btree_elm_t elm);
 static int hammer_reblock_int_node(struct hammer_ioc_reblock *reblock,
 				hammer_cursor_t cursor, hammer_btree_elm_t elm);
+static void hammer_move_node(hammer_cursor_t cursor, hammer_btree_elm_t elm,
+				hammer_node_t onode, hammer_node_t nnode);
 
 int
 hammer_ioc_reblock(hammer_transaction_t trans, hammer_inode_t ip,
@@ -63,15 +65,7 @@ hammer_ioc_reblock(hammer_transaction_t trans, hammer_inode_t ip,
 	int error;
 	int seq;
 	int slop;
-
-	/*
-	 * A fill level <= 20% is considered an emergency.  free_level is
-	 * inverted from fill_level.
-	 */
-	if (reblock->free_level >= HAMMER_LARGEBLOCK_SIZE * 8 / 10)
-		slop = HAMMER_CHKSPC_EMERGENCY;
-	else
-		slop = HAMMER_CHKSPC_REBLOCK;
+	uint32_t key_end_localization;
 
 	if ((reblock->key_beg.localization | reblock->key_end.localization) &
 	    HAMMER_LOCALIZE_PSEUDOFS_MASK) {
@@ -79,12 +73,34 @@ hammer_ioc_reblock(hammer_transaction_t trans, hammer_inode_t ip,
 	}
 	if (reblock->key_beg.obj_id >= reblock->key_end.obj_id)
 		return(EINVAL);
-	if (reblock->free_level < 0)
+	if (reblock->free_level < 0 ||
+	    reblock->free_level > HAMMER_BIGBLOCK_SIZE)
 		return(EINVAL);
 
+	/*
+	 * A fill_percentage <= 20% is considered an emergency.  free_level is
+	 * inverted from fill_percentage.
+	 */
+	if (reblock->free_level >= HAMMER_BIGBLOCK_SIZE * 8 / 10)
+		slop = HAMMER_CHKSPC_EMERGENCY;
+	else
+		slop = HAMMER_CHKSPC_REBLOCK;
+
+	/*
+	 * Ioctl caller has only set localization type to reblock.
+	 * Initialize cursor key localization with ip localization.
+	 */
 	reblock->key_cur = reblock->key_beg;
 	reblock->key_cur.localization &= HAMMER_LOCALIZE_MASK;
-	reblock->key_cur.localization += ip->obj_localization;
+	if (reblock->allpfs == 0)
+		reblock->key_cur.localization |= ip->obj_localization;
+
+	key_end_localization = reblock->key_end.localization;
+	key_end_localization &= HAMMER_LOCALIZE_MASK;
+	if (reblock->allpfs == 0)
+		key_end_localization |= ip->obj_localization;
+	else
+		key_end_localization |= pfs_to_lo(HAMMER_MAX_PFSID);
 
 	checkspace_count = 0;
 	seq = trans->hmp->flusher.done;
@@ -102,9 +118,7 @@ retry:
 	cursor.key_beg.rec_type = HAMMER_MIN_RECTYPE;
 	cursor.key_beg.obj_type = 0;
 
-	cursor.key_end.localization = (reblock->key_end.localization &
-					HAMMER_LOCALIZE_MASK) +
-				      ip->obj_localization;
+	cursor.key_end.localization = key_end_localization;
 	cursor.key_end.obj_id = reblock->key_end.obj_id;
 	cursor.key_end.key = HAMMER_MAX_KEY;
 	cursor.key_end.create_tid = HAMMER_MAX_TID - 1;
@@ -135,6 +149,14 @@ retry:
 		reblock->key_cur.localization = elm->base.localization;
 
 		/*
+		 * Filesystem went read-only during rebalancing
+		 */
+		if (trans->hmp->ronly) {
+			error = EROFS;
+			break;
+		}
+
+		/*
 		 * Yield to more important tasks
 		 */
 		if ((error = hammer_signal_check(trans->hmp)) != 0)
@@ -142,7 +164,7 @@ retry:
 
 		/*
 		 * If there is insufficient free space it may be due to
-		 * reserved bigblocks, which flushing might fix.
+		 * reserved big-blocks, which flushing might fix.
 		 *
 		 * We must force a retest in case the unlocked cursor is
 		 * moved to the end of the leaf, or moved to an internal
@@ -257,11 +279,17 @@ hammer_reblock_helper(struct hammer_ioc_reblock *reblock,
 	if (cursor->node->ondisk->type != HAMMER_BTREE_TYPE_LEAF)
 		goto skip;
 	if (elm->leaf.base.btype != HAMMER_BTREE_TYPE_RECORD)
-		return(0);
+		return(EINVAL);
 	tmp_offset = elm->leaf.data_offset;
 	if (tmp_offset == 0)
 		goto skip;
-	if (error)
+
+	/*
+	 * If reblock->vol_no is specified we only want to reblock data
+	 * in that volume, but ignore everything else.
+	 */
+	if (reblock->vol_no != -1 &&
+	    reblock->vol_no != HAMMER_VOL_DECODE(tmp_offset))
 		goto skip;
 
 	/*
@@ -293,7 +321,16 @@ hammer_reblock_helper(struct hammer_ioc_reblock *reblock,
 		reblock->data_byte_count += elm->leaf.data_len;
 		bytes = hammer_blockmap_getfree(hmp, tmp_offset, &cur, &error);
 		if (hammer_debug_general & 0x4000)
-			kprintf("D %6d/%d\n", bytes, reblock->free_level);
+			hdkprintf("D %6d/%d\n", bytes, reblock->free_level);
+		/*
+		 * Start data reblock if
+		 * 1. there is no error
+		 * 2. the data and allocator offset are not in the same
+		 *    big-block, or free level threshold is 0
+		 * 3. free bytes in the data's big-block is larger than
+		 *    free level threshold (means if threshold is 0 then
+		 *    do reblock no matter what).
+		 */
 		if (error == 0 && (cur == 0 || reblock->free_level == 0) &&
 		    bytes >= reblock->free_level) {
 			/*
@@ -318,17 +355,14 @@ hammer_reblock_helper(struct hammer_ioc_reblock *reblock,
 			ondisk = cursor->node->ondisk;
 			elm = &ondisk->elms[cursor->index];
 			if (cursor->flags & HAMMER_CURSOR_RETEST) {
-				kprintf("hammer: debug: retest on "
-					"reblocker uncache\n");
+				hkprintf("debug: retest on reblocker uncache\n");
 				error = EDEADLK;
 			} else if (ondisk->type != HAMMER_BTREE_TYPE_LEAF ||
 				   cursor->index >= ondisk->count) {
-				kprintf("hammer: debug: shifted on "
-					"reblocker uncache\n");
+				hkprintf("debug: shifted on reblocker uncache\n");
 				error = EDEADLK;
 			} else if (bcmp(&elm->leaf, &leaf, sizeof(leaf))) {
-				kprintf("hammer: debug: changed on "
-					"reblocker uncache\n");
+				hkprintf("debug: changed on reblocker uncache\n");
 				error = EDEADLK;
 			}
 			if (error == 0)
@@ -349,16 +383,35 @@ skip:
 	/*
 	 * Reblock a B-Tree internal or leaf node.  A leaf node is reblocked
 	 * on initial entry only (element 0).  An internal node is reblocked
-	 * when entered upward from its first leaf node only (also element 0).
+	 * when entered upward from its first leaf node only (also element 0,
+	 * see hammer_btree_iterate() where cursor moves up and may return).
 	 * Further revisits of the internal node (index > 0) are ignored.
 	 */
 	tmp_offset = cursor->node->node_offset;
+
+	/*
+	 * If reblock->vol_no is specified we only want to reblock data
+	 * in that volume, but ignore everything else.
+	 */
+	if (reblock->vol_no != -1 &&
+	    reblock->vol_no != HAMMER_VOL_DECODE(tmp_offset))
+		goto end;
+
 	if (cursor->index == 0 &&
 	    error == 0 && (reblock->head.flags & HAMMER_IOC_DO_BTREE)) {
 		++reblock->btree_count;
 		bytes = hammer_blockmap_getfree(hmp, tmp_offset, &cur, &error);
 		if (hammer_debug_general & 0x4000)
-			kprintf("B %6d/%d\n", bytes, reblock->free_level);
+			hdkprintf("B %6d/%d\n", bytes, reblock->free_level);
+		/*
+		 * Start node reblock if
+		 * 1. there is no error
+		 * 2. the node and allocator offset are not in the same
+		 *    big-block, or free level threshold is 0
+		 * 3. free bytes in the node's big-block is larger than
+		 *    free level threshold (means if threshold is 0 then
+		 *    do reblock no matter what).
+		 */
 		if (error == 0 && (cur == 0 || reblock->free_level == 0) &&
 		    bytes >= reblock->free_level) {
 			error = hammer_cursor_upgrade(cursor);
@@ -380,7 +433,7 @@ skip:
 							reblock, cursor, elm);
 					break;
 				default:
-					panic("Illegal B-Tree node type");
+					hpanic("Illegal B-Tree node type");
 				}
 			}
 			if (error == 0) {
@@ -388,7 +441,7 @@ skip:
 			}
 		}
 	}
-
+end:
 	hammer_cursor_downgrade(cursor);
 	return(error);
 }
@@ -401,13 +454,14 @@ static int
 hammer_reblock_data(struct hammer_ioc_reblock *reblock,
 		    hammer_cursor_t cursor, hammer_btree_elm_t elm)
 {
-	struct hammer_buffer *data_buffer = NULL;
+	hammer_buffer_t data_buffer = NULL;
+	hammer_off_t odata_offset;
 	hammer_off_t ndata_offset;
+	hammer_crc_t ncrc;
 	int error;
 	void *ndata;
 
-	error = hammer_btree_extract(cursor, HAMMER_CURSOR_GET_DATA |
-					     HAMMER_CURSOR_GET_LEAF);
+	error = hammer_btree_extract_data(cursor);
 	if (error)
 		return (error);
 	ndata = hammer_alloc_data(cursor->trans, elm->leaf.data_len,
@@ -421,12 +475,18 @@ hammer_reblock_data(struct hammer_ioc_reblock *reblock,
 	/*
 	 * Move the data.  Note that we must invalidate any cached
 	 * data buffer in the cursor before calling blockmap_free.
-	 * The blockmap_free may free up the entire large-block and
+	 * The blockmap_free may free up the entire big-block and
 	 * will not be able to invalidate it if the cursor is holding
-	 * a data buffer cached in that large block.
+	 * a data buffer cached in that big-block.
+	 *
+	 * Unconditionally regenerate the CRC.  This is a slightly hack
+	 * to ensure that the crc method is the latest for the filesystem
+	 * version (e.g. upgrade from v6 to v7).
 	 */
-	hammer_modify_buffer(cursor->trans, data_buffer, NULL, 0);
+	hammer_modify_buffer_noundo(cursor->trans, data_buffer);
 	bcopy(cursor->data, ndata, elm->leaf.data_len);
+	ncrc = hammer_crc_get_leaf(cursor->trans->hmp->version, ndata,
+				   &elm->leaf);
 	hammer_modify_buffer_done(data_buffer);
 	hammer_cursor_invalidate_cache(cursor);
 
@@ -435,9 +495,17 @@ hammer_reblock_data(struct hammer_ioc_reblock *reblock,
 
 	hammer_modify_node(cursor->trans, cursor->node,
 			   &elm->leaf.data_offset, sizeof(hammer_off_t));
+	odata_offset = elm->leaf.data_offset;
 	elm->leaf.data_offset = ndata_offset;
+	elm->leaf.data_crc = ncrc;
 	hammer_modify_node_done(cursor->node);
 
+	if (hammer_debug_general & 0x4000) {
+		hdkprintf("%08x %016jx -> %016jx\n",
+			(elm ? elm->base.localization : -1),
+			(intmax_t)odata_offset,
+			(intmax_t)ndata_offset);
+	}
 done:
 	if (data_buffer)
 		hammer_rel_buffer(data_buffer, 0);
@@ -468,45 +536,25 @@ hammer_reblock_leaf_node(struct hammer_ioc_reblock *reblock,
 	if (nnode == NULL)
 		return (error);
 
-	/*
-	 * Move the node
-	 */
 	hammer_lock_ex(&nnode->lock);
 	hammer_modify_node_noundo(cursor->trans, nnode);
-	bcopy(onode->ondisk, nnode->ondisk, sizeof(*nnode->ondisk));
 
-	if (elm) {
-		/*
-		 * We are not the root of the B-Tree 
-		 */
-		hammer_modify_node(cursor->trans, cursor->parent,
-				   &elm->internal.subtree_offset,
-				   sizeof(elm->internal.subtree_offset));
-		elm->internal.subtree_offset = nnode->node_offset;
-		hammer_modify_node_done(cursor->parent);
-	} else {
-		/*
-		 * We are the root of the B-Tree
-		 */
-                hammer_volume_t volume;
-                        
-                volume = hammer_get_root_volume(cursor->trans->hmp, &error);
-                KKASSERT(error == 0);
+	hammer_move_node(cursor, elm, onode, nnode);
 
-                hammer_modify_volume_field(cursor->trans, volume,
-					   vol0_btree_root);
-                volume->ondisk->vol0_btree_root = nnode->node_offset;
-                hammer_modify_volume_done(volume);
-                hammer_rel_volume(volume, 0);
-        }
-
+	/*
+	 * Clean up.
+	 *
+	 * The new node replaces the current node in the cursor.  The cursor
+	 * expects it to be locked so leave it locked.  Discard onode.
+	 */
 	hammer_cursor_replaced_node(onode, nnode);
 	hammer_delete_node(cursor->trans, onode);
 
 	if (hammer_debug_general & 0x4000) {
-		kprintf("REBLOCK LNODE %016llx -> %016llx\n",
-			(long long)onode->node_offset,
-			(long long)nnode->node_offset);
+		hdkprintf("%08x %016jx -> %016jx\n",
+			(elm ? elm->base.localization : -1),
+			(intmax_t)onode->node_offset,
+			(intmax_t)nnode->node_offset);
 	}
 	hammer_modify_node_done(nnode);
 	cursor->node = nnode;
@@ -532,60 +580,26 @@ hammer_reblock_int_node(struct hammer_ioc_reblock *reblock,
 	hammer_node_t onode;
 	hammer_node_t nnode;
 	int error;
-	int i;
 
 	hammer_node_lock_init(&lockroot, cursor->node);
 	error = hammer_btree_lock_children(cursor, 1, &lockroot, NULL);
 	if (error)
 		goto done;
 
+	/*
+	 * Don't supply a hint when allocating the leaf.  Fills are done
+	 * from the leaf upwards.
+	 */
 	onode = cursor->node;
 	nnode = hammer_alloc_btree(cursor->trans, 0, &error);
 
 	if (nnode == NULL)
 		goto done;
 
-	/*
-	 * Move the node.  Adjust the parent's pointer to us first.
-	 */
 	hammer_lock_ex(&nnode->lock);
 	hammer_modify_node_noundo(cursor->trans, nnode);
-	bcopy(onode->ondisk, nnode->ondisk, sizeof(*nnode->ondisk));
 
-	if (elm) {
-		/*
-		 * We are not the root of the B-Tree 
-		 */
-		hammer_modify_node(cursor->trans, cursor->parent,
-				   &elm->internal.subtree_offset,
-				   sizeof(elm->internal.subtree_offset));
-		elm->internal.subtree_offset = nnode->node_offset;
-		hammer_modify_node_done(cursor->parent);
-	} else {
-		/*
-		 * We are the root of the B-Tree
-		 */
-                hammer_volume_t volume;
-                        
-                volume = hammer_get_root_volume(cursor->trans->hmp, &error);
-                KKASSERT(error == 0);
-
-                hammer_modify_volume_field(cursor->trans, volume,
-					   vol0_btree_root);
-                volume->ondisk->vol0_btree_root = nnode->node_offset;
-                hammer_modify_volume_done(volume);
-                hammer_rel_volume(volume, 0);
-        }
-
-	/*
-	 * Now adjust our children's pointers to us.
-	 */
-	for (i = 0; i < nnode->ondisk->count; ++i) {
-		elm = &nnode->ondisk->elms[i];
-		error = btree_set_parent(cursor->trans, nnode, elm);
-		if (error)
-			panic("reblock internal node: fixup problem");
-	}
+	hammer_move_node(cursor, elm, onode, nnode);
 
 	/*
 	 * Clean up.
@@ -597,9 +611,10 @@ hammer_reblock_int_node(struct hammer_ioc_reblock *reblock,
 	hammer_delete_node(cursor->trans, onode);
 
 	if (hammer_debug_general & 0x4000) {
-		kprintf("REBLOCK INODE %016llx -> %016llx\n",
-			(long long)onode->node_offset,
-			(long long)nnode->node_offset);
+		hdkprintf("%08x %016jx -> %016jx\n",
+			(elm ? elm->base.localization : -1),
+			(intmax_t)onode->node_offset,
+			(intmax_t)nnode->node_offset);
 	}
 	hammer_modify_node_done(nnode);
 	cursor->node = nnode;
@@ -612,3 +627,57 @@ done:
 	return (error);
 }
 
+/*
+ * nnode is a newly allocated node, and now elm becomes the node
+ * element within nnode's parent that represents a pointer to nnode,
+ * or nnode becomes the root node if elm does not exist.
+ */
+static void
+hammer_move_node(hammer_cursor_t cursor, hammer_btree_elm_t elm,
+		 hammer_node_t onode, hammer_node_t nnode)
+{
+	int error, i;
+
+	bcopy(onode->ondisk, nnode->ondisk, sizeof(*nnode->ondisk));
+
+	/*
+	 * Adjust the parent's pointer to us first.
+	 */
+	if (elm) {
+		/*
+		 * We are not the root of the B-Tree
+		 */
+		KKASSERT(hammer_is_internal_node_elm(elm));
+		hammer_modify_node(cursor->trans, cursor->parent,
+				   &elm->internal.subtree_offset,
+				   sizeof(elm->internal.subtree_offset));
+		elm->internal.subtree_offset = nnode->node_offset;
+		hammer_modify_node_done(cursor->parent);
+	} else {
+		/*
+		 * We are the root of the B-Tree
+		 */
+		hammer_volume_t volume;
+		volume = hammer_get_root_volume(cursor->trans->hmp, &error);
+		KKASSERT(error == 0);
+
+		hammer_modify_volume_field(cursor->trans, volume,
+					   vol0_btree_root);
+		volume->ondisk->vol0_btree_root = nnode->node_offset;
+		hammer_modify_volume_done(volume);
+		hammer_rel_volume(volume, 0);
+	}
+
+	/*
+	 * Now adjust our children's pointers to us
+	 * if we are an internal node.
+	 */
+	if (nnode->ondisk->type == HAMMER_BTREE_TYPE_INTERNAL) {
+		for (i = 0; i < nnode->ondisk->count; ++i) {
+			error = btree_set_parent_of_child(cursor->trans, nnode,
+					&nnode->ondisk->elms[i]);
+			if (error)
+				hpanic("reblock internal node: fixup problem");
+		}
+	}
+}

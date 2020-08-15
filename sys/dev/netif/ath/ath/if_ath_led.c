@@ -28,6 +28,7 @@
  */
 
 #include <sys/cdefs.h>
+__FBSDID("$FreeBSD$");
 
 /*
  * Driver for the Atheros Wireless LAN controller.
@@ -51,7 +52,6 @@
 #include <sys/mbuf.h>
 #include <sys/malloc.h>
 #include <sys/lock.h>
-#include <sys/mutex.h>
 #include <sys/kernel.h>
 #include <sys/socket.h>
 #include <sys/sockio.h>
@@ -118,7 +118,10 @@
 void
 ath_led_config(struct ath_softc *sc)
 {
+
+	ATH_LOCK(sc);
 	ath_power_set_power_state(sc, HAL_PM_AWAKE);
+	ATH_UNLOCK(sc);
 
 	/* Software LED blinking - GPIO controlled LED */
 	if (sc->sc_softled) {
@@ -143,7 +146,9 @@ ath_led_config(struct ath_softc *sc)
 			    HAL_GPIO_OUTPUT_MUX_MAC_NETWORK_LED);
 	}
 
+	ATH_LOCK(sc);
 	ath_power_restore_power_state(sc);
+	ATH_UNLOCK(sc);
 }
 
 static void
@@ -151,9 +156,7 @@ ath_led_done(void *arg)
 {
 	struct ath_softc *sc = arg;
 
-	wlan_serialize_enter();
 	sc->sc_blinking = 0;
-	wlan_serialize_exit();
 }
 
 /*
@@ -165,10 +168,8 @@ ath_led_off(void *arg)
 {
 	struct ath_softc *sc = arg;
 
-	wlan_serialize_enter();
 	ath_hal_gpioset(sc->sc_ah, sc->sc_ledpin, !sc->sc_ledon);
 	callout_reset(&sc->sc_ledtimer, sc->sc_ledoff, ath_led_done, sc);
-	wlan_serialize_exit();
 }
 
 /*
@@ -178,7 +179,6 @@ static void
 ath_led_blink(struct ath_softc *sc, int on, int off)
 {
 	DPRINTF(sc, ATH_DEBUG_LED, "%s: on %u off %u\n", __func__, on, off);
-	wlan_assert_serialized();
 	ath_hal_gpioset(sc->sc_ah, sc->sc_ledpin, sc->sc_ledon);
 	sc->sc_blinking = 1;
 	sc->sc_ledoff = off;

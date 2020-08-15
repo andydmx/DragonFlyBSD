@@ -37,12 +37,11 @@
  * STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
  * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED
  * OF THE POSSIBILITY OF SUCH DAMAGE.
- *
  */
 
 /*
  * Many kernel routines will have a use for good random numbers,
- * for example, for truely random TCP sequence numbers, which prevent
+ * for example, for truly random TCP sequence numbers, which prevent
  * certain forms of TCP spoofing attacks.
  * 
  */
@@ -53,9 +52,6 @@
 #ifndef _SYS_TYPES_H_
 #include <sys/types.h>
 #endif
-#ifndef _SYS_INTERRUPT_H_
-#include <sys/interrupt.h>
-#endif
 #ifndef _SYS_IOCCOM_H_
 #include <sys/ioccom.h>
 #endif
@@ -65,22 +61,37 @@
 #define	MEM_RETURNIRQ	_IOR('r', 3, u_int16_t)	/* obsolete */
 #define	MEM_FINDIRQ	_IOWR('r', 4, u_int16_t) /* next interrupt */
 
+/*
+ * getrandom()
+ */
+#define GRND_RANDOM	0x0001
+#define GRND_NONBLOCK	0x0002
+#define GRND_INSECURE	0x0004
+
 #ifdef _KERNEL
 
 /*
  * XXX: consider only statically allocating some, and allocating
  *      most others dynamically.
  */
-#define RAND_SRC_UNKNOWN	0x00
-#define RAND_SRC_SEEDING	0x01
-#define RAND_SRC_TIMING		0x02
-#define RAND_SRC_INTR		0x03
-#define RAND_SRC_RDRAND		0x04
-#define RAND_SRC_PADLOCK	0x05
-#define RAND_SRC_GLXSB		0x06
-#define RAND_SRC_HIFN		0x07
-#define RAND_SRC_UBSEC		0x08
-#define RAND_SRC_SAFE		0x09
+#define RAND_SRC_UNKNOWN	0x0000
+#define RAND_SRC_SEEDING	0x0001
+#define RAND_SRC_TIMING		0x0002
+#define RAND_SRC_INTR		0x0003
+#define RAND_SRC_RDRAND		0x0004
+#define RAND_SRC_PADLOCK	0x0005
+#define RAND_SRC_GLXSB		0x0006
+#define RAND_SRC_HIFN		0x0007
+#define RAND_SRC_UBSEC		0x0008
+#define RAND_SRC_SAFE		0x0009
+#define RAND_SRC_VIRTIO		0x000a
+#define RAND_SRC_THREAD1	0x000b
+#define RAND_SRC_THREAD2	0x000c
+#define RAND_SRC_THREAD3	0x000d
+
+#define RAND_SRC_MASK		0x00FF
+
+#define RAND_SRCF_PCPU		0x0100
 
 /* Type of the cookie passed to add_interrupt_randomness. */
 
@@ -94,24 +105,17 @@ struct random_softc {
 void rand_initialize(void);
 void add_keyboard_randomness(u_char scancode);
 void add_interrupt_randomness(int intr);
-#ifdef notused
-void add_blkdev_randomness(int major);
-#endif
 int add_buffer_randomness(const char *, int);
 int add_buffer_randomness_src(const char *, int, int srcid);
 
-#ifdef notused
-void get_random_bytes(void *buf, u_int nbytes);
-#endif
-u_int read_random(void *buf, u_int size);
-u_int read_random_unlimited(void *buf, u_int size);
-#ifdef notused
-u_int write_random(const char *buf, u_int nbytes);
-#endif
-struct thread;
+u_int read_random(void *buf, u_int size, int unlimited);
 struct knote;
 int random_filter_read(struct knote *kn, long hint);
 
 #endif /* _KERNEL */
+
+__BEGIN_DECLS
+ssize_t getrandom(void *buf, size_t buflen, unsigned int flags);
+__END_DECLS
 
 #endif /* !_SYS_RANDOM_H_ */

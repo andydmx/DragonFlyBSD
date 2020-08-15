@@ -22,9 +22,9 @@
  * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
  * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
- *
- * $FreeBSD: head/sys/dev/usb/net/if_axge.c 271832 2014-09-18 21:09:22Z glebius $
  */
+
+/* $FreeBSD: head/sys/dev/usb/net/if_axge.c 276701 2015-01-05 15:04:17Z hselasky $ */
 
 /*
  * ASIX Electronics AX88178A/AX88179 USB 2.0/3.0 gigabit ethernet driver.
@@ -36,6 +36,7 @@
 #include <sys/condvar.h>
 #include <sys/kernel.h>
 #include <sys/lock.h>
+#include <sys/malloc.h>	/* for M_NOWAIT */
 #include <sys/module.h>
 #include <sys/socket.h>
 #include <sys/sysctl.h>
@@ -759,7 +760,7 @@ axge_setmulti(struct usb_ether *ue)
 			continue;
 		h = ether_crc32_be(LLADDR((struct sockaddr_dl *)
 		    ifma->ifma_addr), ETHER_ADDR_LEN) >> 26;
-		hashtbl[h / 8] |= 1 << (h % 8);
+		setbit(hashtbl, h);
 	}
 
 	axge_write_mem(sc, AXGE_ACCESS_MAC, 8, AXGE_MFA, (void *)&hashtbl, 8);

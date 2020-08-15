@@ -58,7 +58,6 @@
 #include <sys/bus.h>
 #include <sys/rman.h>
 #include <sys/random.h>
-#include <sys/thread2.h>
 #include <sys/uio.h>
 
 #include <vm/vm.h>
@@ -1919,14 +1918,14 @@ hifn_crypto(
 			totlen = cmd->src_mapsize;
 			if (cmd->src_m->m_flags & M_PKTHDR) {
 				len = MHLEN;
-				MGETHDR(m0, MB_DONTWAIT, MT_DATA);
-				if (m0 && !m_dup_pkthdr(m0, cmd->src_m, MB_DONTWAIT)) {
+				MGETHDR(m0, M_NOWAIT, MT_DATA);
+				if (m0 && !m_dup_pkthdr(m0, cmd->src_m, M_NOWAIT)) {
 					m_free(m0);
 					m0 = NULL;
 				}
 			} else {
 				len = MLEN;
-				MGET(m0, MB_DONTWAIT, MT_DATA);
+				MGET(m0, M_NOWAIT, MT_DATA);
 			}
 			if (m0 == NULL) {
 				hifnstats.hst_nomem_mbuf++;
@@ -1934,7 +1933,7 @@ hifn_crypto(
 				goto err_srcmap;
 			}
 			if (totlen >= MINCLSIZE) {
-				MCLGET(m0, MB_DONTWAIT);
+				MCLGET(m0, M_NOWAIT);
 				if ((m0->m_flags & M_EXT) == 0) {
 					hifnstats.hst_nomem_mcl++;
 					err = dma->cmdu ? ERESTART : ENOMEM;
@@ -1948,7 +1947,7 @@ hifn_crypto(
 			mlast = m0;
 
 			while (totlen > 0) {
-				MGET(m, MB_DONTWAIT, MT_DATA);
+				MGET(m, M_NOWAIT, MT_DATA);
 				if (m == NULL) {
 					hifnstats.hst_nomem_mbuf++;
 					err = dma->cmdu ? ERESTART : ENOMEM;
@@ -1957,7 +1956,7 @@ hifn_crypto(
 				}
 				len = MLEN;
 				if (totlen >= MINCLSIZE) {
-					MCLGET(m, MB_DONTWAIT);
+					MCLGET(m, M_NOWAIT);
 					if ((m->m_flags & M_EXT) == 0) {
 						hifnstats.hst_nomem_mcl++;
 						err = dma->cmdu ? ERESTART : ENOMEM;
@@ -2441,8 +2440,9 @@ hifn_newsession(device_t dev, u_int32_t *sidp, struct cryptoini *cri)
 		case CRYPTO_AES_CBC:
 			/* XXX this may read fewer, does it matter? */
 			read_random(ses->hs_iv,
-				c->cri_alg == CRYPTO_AES_CBC ?
-					HIFN_AES_IV_LENGTH : HIFN_IV_LENGTH);
+				(c->cri_alg == CRYPTO_AES_CBC ?
+					HIFN_AES_IV_LENGTH : HIFN_IV_LENGTH),
+				0);
 			/*FALLTHROUGH*/
 		case CRYPTO_ARC4:
 			if (cry)

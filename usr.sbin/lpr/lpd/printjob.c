@@ -11,11 +11,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -423,12 +419,12 @@ printit(struct printer *pp, char *file)
 	 *		M -- "mail" to user when done printing
 	 *              Z -- "locale" for pr
 	 *
-	 *      getline reads a line and expands tabs to blanks
+	 *      get_line reads a line and expands tabs to blanks
 	 */
 
 	/* pass 1 */
 
-	while (getline(cfp))
+	while (get_line(cfp))
 		switch (line[0]) {
 		case 'H':
 			strlcpy(origin_host, line + 1, sizeof(origin_host));
@@ -553,7 +549,7 @@ printit(struct printer *pp, char *file)
 
 pass2:
 	fseek(cfp, 0L, 0);
-	while (getline(cfp))
+	while (get_line(cfp))
 		switch (line[0]) {
 		case 'L':	/* identification line */
 			if (!pp->no_header && pp->header_last)
@@ -861,7 +857,7 @@ start:
 
 /*
  * Send the daemon control file (cf) and any data files.
- * Return -1 if a non-recoverable error occured, 1 if a recoverable error and
+ * Return -1 if a non-recoverable error occurred, 1 if a recoverable error and
  * 0 if all is well.
  */
 static int
@@ -895,7 +891,7 @@ sendit(struct printer *pp, char *file)
 	 * pass 1
 	 */
 	err = OK;
-	while (getline(cfp)) {
+	while (get_line(cfp)) {
 	again:
 		if (line[0] == 'S') {
 			cp = line+1;
@@ -927,7 +923,7 @@ sendit(struct printer *pp, char *file)
 		} else if (line[0] >= 'a' && line[0] <= 'z') {
 			dfcopies = 1;
 			strcpy(last, line);
-			while ((i = getline(cfp)) != 0) {
+			while ((i = get_line(cfp)) != 0) {
 				if (strcmp(last, line) != 0)
 					break;
 				dfcopies++;
@@ -956,7 +952,7 @@ sendit(struct printer *pp, char *file)
 	 * pass 2
 	 */
 	fseek(cfp, 0L, 0);
-	while (getline(cfp))
+	while (get_line(cfp))
 		if (line[0] == 'U' && !strchr(line+1, '/'))
 			unlink(line+1);
 	/*

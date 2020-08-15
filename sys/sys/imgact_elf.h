@@ -36,7 +36,7 @@
 
 #ifdef _KERNEL
 
-#define	AUXARGS_ENTRY(pos, id, val) {suword(pos++, id); suword(pos++, val);}
+#define	AUXARGS_ENTRY(pos, id, val) {suword64(pos++, id); suword64(pos++, val);}
 
 struct lwp;
 struct file;
@@ -95,7 +95,6 @@ int	__elfN(coredump)           (struct lwp *, int, struct vnode *, off_t);
 int     generic_elf_coredump       (struct lwp *lp, int sig, struct file *fp,
 				    off_t limit);
 extern Elf_Brandnote 	__elfN(dragonfly_brandnote);
-extern Elf_Brandnote	__elfN(freebsd_brandnote);
 
 #endif /* _KERNEL */
 

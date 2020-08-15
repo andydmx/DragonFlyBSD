@@ -28,7 +28,7 @@
 .\"     @(#)ps.1	8.3 (Berkeley) 4/18/94
 .\" $FreeBSD: src/bin/ps/ps.1,v 1.24.2.7 2002/06/20 22:43:33 charnier Exp $
 .\"
-.Dd September 2, 2008
+.Dd August 23, 2016
 .Dt PS 1
 .Os
 .Sh NAME
@@ -36,7 +36,7 @@
 .Nd process status
 .Sh SYNOPSIS
 .Nm
-.Op Fl aCcefHhjlmrRSTuvwx
+.Op Fl AaCcefHhjlmrRSTuvwx
 .Op Fl M Ar core
 .Op Fl N Ar system
 .Op Fl O Ar fmt
@@ -77,6 +77,9 @@ Display information about other users' processes as well as your own.
 This can be disabled by setting the
 .Va security.ps_showallprocs
 sysctl to zero.
+.It Fl A
+Same as
+.Fl ax .
 .It Fl c
 Change the ``command'' column output to just contain the executable name,
 rather than the full command line.
@@ -278,9 +281,6 @@ for example,
 in a garbage collect).
 .It Li E
 The process is trying to exit.
-.It Li L
-The process has pages locked in core (for example, for raw
-.Tn I/O ) .
 .It Li N
 The process has reduced CPU scheduling priority (see
 .Xr setpriority 2 ) .
@@ -350,7 +350,8 @@ accounting flag (alias
 .It Cm batch
 batchness of the process (higher numbers mean less interactivity)
 .It Cm command
-command and arguments
+command and arguments (alias
+.Cm args )
 .It Cm cpu
 short-term CPU usage factor (for scheduling)
 .It Cm f
@@ -499,14 +500,12 @@ wait channel (as a symbolic name)
 exit or stop status (valid only for stopped or zombie process)
 .El
 .Sh FILES
-.Bl -tag -width /var/db/kvm_kernel.db -compact
+.Bl -tag -width ".Pa /boot/kernel/kernel" -compact
 .It Pa /dev/kmem
 default kernel memory
 .It Pa /var/run/dev.db
 /dev name database
-.It Pa /var/db/kvm_kernel.db
-system namelist database
-.It Pa /boot/kernel
+.It Pa /boot/kernel/kernel
 default system namelist
 .It Pa /proc
 the mount point of
@@ -524,7 +523,8 @@ the mount point of
 The
 .Nm
 command appeared in
-.At v4 .
+.At v3
+in section 8 of the manual.
 .Sh BUGS
 Since
 .Nm

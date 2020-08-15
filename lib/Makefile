@@ -4,78 +4,80 @@
 # To satisfy shared library or ELF linkage when only the libraries being
 # built are visible:
 #
-# ${_libc_r} must be built before libpthread.
-# libcom_err must be built before libpam.
-# libcrypt must be built before libpam.
-# libmd must be built before libarchive, libopie, libradius, and libtacplus.
-# libncurses must be built before libdialog and libedit.
-# libradius must be built before libpam.
+# [Handled by /usr/src/Makefile.inc1, before this Makefile triggers]
+#    libthread_xu must be built before libpthread.
+#    libprop must be built before libdevattr
+#
+# libcrypt must be built before libfetch, libarchive.
+# libz must be built before libarchive, libmagic, libssh.
+# libbz2 must be built before libarchive
+# liblmza must be built before libarchive.
+# libncurses must be built before libedit.
 # libsbuf must be built before libcam.
-# libtacplus must be built before libpam.
-# libthread_xu must be built before libpthread.
-# libutil must be built before libpam.
-# libpthread must be built before libprop.
+# libpcap must be built before libipfw3.
+# libpthread must be built before librt, and libusb.
+# libutil must be built before libssh.
+# libldns must be built before libssh.
 #
 # Otherwise, the SUBDIR list should be in alphabetical order.
 
-SUBDIR_ORDERED=	${_libc_r} \
-	libcom_err \
+SUBDIR_ORDERED= \
+	librecrypto \
+	libressl \
 	libcrypt \
-	libmd \
-	libncurses \
-	libradius \
-	libsbuf \
-	libtacplus \
-	libthread_xu \
+	libbz2 \
+	liblzma \
+	libz \
 	libutil \
-	libpthread
+	libypclnt \
+	libncurses \
+	libsbuf \
+	libthread_xu \
+	libpthread \
+	libfetch \
+	libedit \
+	libcam \
+	libpcap \
+	libprop \
+	librt \
+	libusb \
+	libexecinfo \
+	libldns \
+	libssh
+
 SUBDIR=	${SUBDIR_ORDERED} \
 	csu \
 	i18n_module \
 	libalias \
 	libarchive \
 	libbluetooth \
-	libbz2 \
 	libc \
 	libc_rtld \
 	libcalendar \
-	libcam \
 	libcompat \
 	libdevattr \
 	libdevinfo \
 	libdevstat \
 	libdl \
 	libdm \
-	${xxxlibdmsg} \
-	libedit \
+	${_libdmsg} \
+	libefivar \
 	libevtr \
 	libexpat \
-	libfetch \
 	libfsid \
 	libftpio \
 	libhammer \
-	libipsec \
+	libipfw3 \
 	libkcore \
 	libkiconv \
 	libkinfo \
 	libkvm \
-	libldns \
-	liblzma \
 	libm \
 	libmagic \
-	libmandoc \
-	${_libmilter} \
 	${_libnetgraph} \
-	libopie \
 	libpam \
-	libpcap \
 	libposix1e \
-	libprop \
-	libpuffs \
-	librefuse \
 	librpcsvc \
-	librt \
-	libsctp \
 	libsdp \
 	${_libsm} \
 	libsmb \
@@ -84,29 +86,16 @@ SUBDIR=	${SUBDIR_ORDERED} \
 	libstand \
 	libtcplay \
 	libtelnet \
-	libusb \
 	libu4bhid \
 	libvgl \
 	libwrap \
-	liby \
-	libypclnt \
-	libz \
-	pam_module
+	liby
 
-.if exists(${.CURDIR}/compat/${MACHINE_ARCH}/Makefile)
-SUBDIR+= compat/${MACHINE_ARCH}
+.if make(install)
+SUBDIR:=	libc ${SUBDIR:Nlibc}
 .endif
 
-.if !defined(NO_LIBC_R)
-_libc_r=	libc_r
-.endif
-
-.if !defined(NO_SENDMAIL)
-_libmilter=	libmilter
-_libsm=		libsm
-_libsmdb=	libsmdb
-_libsmutil=	libsmutil
-.endif
+_libdmsg=	libdmsg
 
 .if defined(WANT_NETGRAPH7) 
 _libnetgraph=	libnetgraph7

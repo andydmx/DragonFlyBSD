@@ -50,6 +50,8 @@
 
 #include <net/if.h>
 #include <net/ifq_var.h>
+#include <net/netmsg2.h>
+#include <net/netisr2.h>
 #include <netinet/in.h>
 
 #include <net/pf/pfvar.h>
@@ -230,10 +232,16 @@ cbq_add_altq(struct pf_altq *a)
 	cbq_state_t	*cbqp;
 	struct ifnet	*ifp;
 
-	if ((ifp = ifunit(a->ifname)) == NULL)
+	ifnet_lock();
+
+	if ((ifp = ifunit(a->ifname)) == NULL) {
+		ifnet_unlock();
 		return (EINVAL);
-	if (!ifq_is_ready(&ifp->if_snd))
+	}
+	if (!ifq_is_ready(&ifp->if_snd)) {
+		ifnet_unlock();
 		return (ENODEV);
+	}
 
 	/* allocate and initialize cbq_state_t */
 	cbqp = kmalloc(sizeof(*cbqp), M_ALTQ, M_WAITOK | M_ZERO);
@@ -241,6 +249,8 @@ cbq_add_altq(struct pf_altq *a)
 	cbqp->cbq_qlen = 0;
 	cbqp->ifnp.ifq_ = &ifp->if_snd;	    /* keep the ifq */
 	ifq_purge_all(&ifp->if_snd);
+
+	ifnet_unlock();
 
 	/* keep the state in pf_altq */
 	a->altq_disc = cbqp;
@@ -251,11 +261,15 @@ cbq_add_altq(struct pf_altq *a)
 int
 cbq_remove_altq(struct pf_altq *a)
 {
-	cbq_state_t	*cbqp;
+	cbq_state_t *cbqp;
+	struct ifaltq *ifq;
 
 	if ((cbqp = a->altq_disc) == NULL)
 		return (EINVAL);
 	a->altq_disc = NULL;
+
+	ifq = cbqp->ifnp.ifq_;
+	CBQ_LOCK(ifq);
 
 	cbq_clear_interface(cbqp);
 
@@ -263,6 +277,8 @@ cbq_remove_altq(struct pf_altq *a)
 		cbq_class_destroy(cbqp, cbqp->ifnp.default_);
 	if (cbqp->ifnp.root_)
 		cbq_class_destroy(cbqp, cbqp->ifnp.root_);
+
+	CBQ_UNLOCK(ifq);
 
 	/* deallocate cbq_state_t */
 	kfree(cbqp, M_ALTQ);
@@ -461,21 +477,28 @@ cbq_getqstats(struct pf_altq *a, void *ubuf, int *nbytes)
 	if (*nbytes < sizeof(stats))
 		return (EINVAL);
 
+	ifnet_lock();
+
 	/* XXX not MP safe */
-	if ((cbqp = altq_lookup(a->ifname, ALTQT_CBQ)) == NULL)
+	if ((cbqp = altq_lookup(a->ifname, ALTQT_CBQ)) == NULL) {
+		ifnet_unlock();
 		return (EBADF);
+	}
 	ifq = cbqp->ifnp.ifq_;
 
 	CBQ_LOCK(ifq);
 
 	if ((cl = clh_to_clp(cbqp, a->qid)) == NULL) {
 		CBQ_UNLOCK(ifq);
+		ifnet_unlock();
 		return (EINVAL);
 	}
 
 	get_class_stats(&stats, cl);
 
 	CBQ_UNLOCK(ifq);
+
+	ifnet_unlock();
 
 	if ((error = copyout((caddr_t)&stats, ubuf, sizeof(stats))) != 0)
 		return (error);

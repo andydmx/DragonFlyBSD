@@ -63,7 +63,7 @@ static	void		list_cmd(void),
 			delete_cmd(void),
 			edit_cmd(void),
 			poke_daemon(void),
-			check_error(char *),
+			check_error(const char *),
 			parse_args(int c, char *v[]);
 static	int		replace_cmd(void);
 
@@ -285,7 +285,7 @@ delete_cmd(void)
 
 
 static void
-check_error(char *msg)
+check_error(const char *msg)
 {
 	CheckErrorCount++;
 	fprintf(stderr, "\"%s\":%d: %s\n", Filename, LineNumber-1, msg);
@@ -486,7 +486,7 @@ edit_cmd(void)
 static int
 replace_cmd(void)
 {
-	char	n[MAX_FNAME], envstr[MAX_ENVSTR], tn[MAX_FNAME];
+	char	n[MAX_FNAME - 5], envstr[MAX_ENVSTR], tn[MAX_FNAME];
 	FILE	*tmp;
 	int	ch, eof;
 	entry	*e;

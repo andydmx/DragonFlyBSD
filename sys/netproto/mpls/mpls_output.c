@@ -27,11 +27,10 @@
  * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT
  * OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
- *
- * $DragonFly: src/sys/netproto/mpls/mpls_output.c,v 1.2 2008/08/05 15:11:32 nant Exp $
  */
 
 #include <sys/param.h>
+#include <sys/malloc.h>	/* for M_NOWAIT */
 #include <sys/mbuf.h>
 #include <sys/systm.h>
 
@@ -125,7 +124,7 @@ mpls_output(struct mbuf *m, struct rtentry *rt)
 			return (ENOTSUP);
 		}
 	}
-	
+
 	return (error);
 }
 
@@ -155,7 +154,7 @@ mpls_push(struct mbuf **m, mpls_label_t label, mpls_s_t s, mpls_exp_t exp, mpls_
 	struct mpls *mpls;
 	u_int32_t buf = 0;	/* Silence warning */
 
-	M_PREPEND(*m, sizeof(struct mpls), MB_DONTWAIT);
+	M_PREPEND(*m, sizeof(struct mpls), M_NOWAIT);
 	if (*m == NULL)
 		return (ENOBUFS);
 
@@ -165,7 +164,7 @@ mpls_push(struct mbuf **m, mpls_label_t label, mpls_s_t s, mpls_exp_t exp, mpls_
 	MPLS_SET_TTL(buf, ttl);
 	mpls = mtod(*m, struct mpls *);
 	mpls->mpls_shim = htonl(buf);
-	
+
 	return (0);
 }
 
@@ -190,7 +189,7 @@ mpls_swap(struct mbuf *m, mpls_label_t label) {
 	MPLS_SET_LABEL(buf, label);
 	MPLS_SET_TTL(buf, ttl); /* XXX tunnel mode: uniform, pipe, short pipe */
 	mpls->mpls_shim = htonl(buf);
-	
+
 	return (0);
 }
 

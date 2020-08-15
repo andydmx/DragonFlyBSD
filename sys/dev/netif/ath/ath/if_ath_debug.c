@@ -28,6 +28,11 @@
  */
 
 #include <sys/cdefs.h>
+__FBSDID("$FreeBSD$");
+
+#if defined(__DragonFly__)
+#define CTLFLAG_RWTUN	CTLFLAG_RW
+#endif
 
 #include "opt_inet.h"
 #include "opt_ath.h"
@@ -39,7 +44,6 @@
 #include <sys/mbuf.h>
 #include <sys/malloc.h>
 #include <sys/lock.h>
-#include <sys/mutex.h>
 #include <sys/kernel.h>
 #include <sys/socket.h>
 #include <sys/sockio.h>
@@ -50,6 +54,11 @@
 #include <sys/kthread.h>
 #include <sys/taskqueue.h>
 #include <sys/priv.h>
+
+#if defined(__DragonFly__)
+#else
+#include <machine/bus.h>
+#endif
 
 #include <net/if.h>
 #include <net/if_dl.h>
@@ -80,7 +89,7 @@
 #include <dev/netif/ath/ath_hal/ah_diagcodes.h>
 
 #ifdef ATH_TX99_DIAG
-#include <dev/netif/ath/ath_tx99/ath_tx99.h>
+#include <dev/netif/ath/ath/ath_tx99/ath_tx99.h>
 #endif
 
 #ifdef ATH_DEBUG
@@ -89,9 +98,8 @@
 uint64_t ath_debug = 0;
 
 SYSCTL_DECL(_hw_ath);
-SYSCTL_QUAD(_hw_ath, OID_AUTO, debug, CTLFLAG_RW, &ath_debug,
+SYSCTL_QUAD(_hw_ath, OID_AUTO, debug, CTLFLAG_RWTUN, &ath_debug,
 	    0, "control debugging printfs");
-TUNABLE_QUAD("hw.ath.debug", &ath_debug);
 
 void
 ath_printrxbuf(struct ath_softc *sc, const struct ath_buf *bf,

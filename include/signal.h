@@ -10,11 +10,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -39,59 +35,72 @@
 #define	_SIGNAL_H_
 
 #include <sys/cdefs.h>
-#include <sys/_posix.h>
-#include <machine/stdint.h>
 #include <sys/signal.h>
+#if __BSD_VISIBLE
 #include <sys/time.h>
+#include <sys/types.h>
+#else
+#include <sys/_timespec.h>
+#endif
 
-#if !defined(_ANSI_SOURCE) && !defined(_POSIX_SOURCE)
-extern __const char *__const sys_signame[NSIG];
-extern __const char *__const sys_siglist[NSIG];
-extern __const int sys_nsig;
+#if __BSD_VISIBLE
+extern const char * const sys_signame[NSIG];
+extern const char * const sys_siglist[NSIG];
+extern const int sys_nsig;
 #endif
 
 __BEGIN_DECLS
-int	raise (int);
-#ifndef	_ANSI_SOURCE
-int	kill (__pid_t, int);
-int	pthread_kill (pthread_t, int);
-int	pthread_sigmask (int, const sigset_t * __restrict,
+int	raise(int);
+
+#if __POSIX_VISIBLE
+int	kill(pid_t, int);
+int	pthread_kill(pthread_t, int);
+int	pthread_sigmask(int, const sigset_t * __restrict,
 	    sigset_t * __restrict);
-int	sigaction (int, const struct sigaction *, struct sigaction *);
-int	sigaddset (sigset_t *, int);
-int	sigdelset (sigset_t *, int);
-int	sigemptyset (sigset_t *);
-int	sigfillset (sigset_t *);
-int	sigismember (const sigset_t *, int);
-int	sigpending (sigset_t *);
-int	sigprocmask (int, const sigset_t *, sigset_t *);
-int	sigsuspend (const sigset_t *);
-int	sigwait (const sigset_t *, int *);
+int	sigaction(int, const struct sigaction * __restrict,
+	    struct sigaction * __restrict);
+int	sigaddset(sigset_t *, int);
+int	sigdelset(sigset_t *, int);
+int	sigemptyset(sigset_t *);
+int	sigfillset(sigset_t *);
+int	sigismember(const sigset_t *, int);
+int	sigpending(sigset_t *);
+int	sigprocmask(int, const sigset_t * __restrict, sigset_t * __restrict);
+int	sigsuspend(const sigset_t *);
+int	sigwait(const sigset_t * __restrict, int * __restrict);
+#endif /* __POSIX_VISIBLE */
 
+#if __XSI_VISIBLE
+int	killpg(pid_t, int);
+int	sigaltstack(const stack_t * __restrict, stack_t * __restrict);
+int	siginterrupt(int, int);
+int	sigpause(int);
+#endif /* __XSI_VISIBLE */
 
-#ifdef _P1003_1B_VISIBLE
-
-__BEGIN_DECLS
-int sigqueue (__pid_t, int, const union sigval);
-int sigtimedwait (const sigset_t *, siginfo_t *, const struct timespec *);
-int sigwaitinfo (const sigset_t *, siginfo_t *);
-__END_DECLS
-
+#if __POSIX_VISIBLE >= 199506
+#if 0
+int	sigqueue(pid_t, int, union sigval);
 #endif
-#ifndef _POSIX_SOURCE
-int	killpg (__pid_t, int);
-int	lwp_kill (__pid_t, lwpid_t, int);
-int	sigaltstack (const stack_t *, stack_t *); 
-int	sigblock (int);
-int	siginterrupt (int, int);
-int	sigpause (int);
-int	sigreturn (ucontext_t *);
-int	sigsetmask (int);
-int	sigstack (const struct sigstack *, struct sigstack *);
-int	sigvec (int, struct sigvec *, struct sigvec *);
-void	psignal (unsigned int, const char *);
-#endif /* !_POSIX_SOURCE */
-#endif /* !_ANSI_SOURCE */
+int	sigtimedwait(const sigset_t * __restrict, siginfo_t * __restrict,
+	    const struct timespec * __restrict);
+int	sigwaitinfo(const sigset_t * __restrict, siginfo_t * __restrict);
+#endif
+
+#if __POSIX_VISIBLE >= 200809
+void	psiginfo(const siginfo_t *, const char *);
+void	psignal(int, const char *);
+#endif
+
+#if __BSD_VISIBLE
+#ifndef _LWP_KILL_DECLARED
+int	lwp_kill(pid_t, lwpid_t, int);
+#define	_LWP_KILL_DECLARED
+#endif
+int	sigblock(int);
+int	sigreturn(ucontext_t *);
+int	sigsetmask(int);
+int	sigvec(int, struct sigvec *, struct sigvec *);
+#endif /* __BSD_VISIBLE */
 __END_DECLS
 
 #endif /* !_SIGNAL_H_ */

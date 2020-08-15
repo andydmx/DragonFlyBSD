@@ -114,7 +114,6 @@
 #include <sys/conf.h>
 #include <sys/uio.h>
 #include <sys/fcntl.h>
-/*#include <sys/input.h>*/
 #include <sys/vnode.h>
 #include <sys/sysctl.h>
 #include <sys/event.h>
@@ -125,8 +124,6 @@
 #include "cyapa.h"
 
 #include "smbus_if.h"
-#include "bus_if.h"
-#include "device_if.h"
 
 #define CYAPA_BUFSIZE	128			/* power of 2 */
 #define CYAPA_BUFMASK	(CYAPA_BUFSIZE - 1)

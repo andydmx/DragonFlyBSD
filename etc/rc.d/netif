@@ -31,15 +31,18 @@
 . /etc/rc.subr
 . /etc/network.subr
 
-name="network"
-start_cmd="network_start"
-stop_cmd="network_stop"
+name="netif"
+rcvar=`set_rcvar`
+start_cmd="netif_start"
+stop_cmd="netif_stop"
 cloneup_cmd="clone_up"
 clonedown_cmd="clone_down"
-extra_commands="cloneup clonedown"
+wlanup_cmd="wlan_up"
+wlandown_cmd="wlan_down"
+extra_commands="cloneup clonedown wlanup wlandown"
 _cmdifn=
 
-network_start()
+netif_start()
 {
 	# Set the list of interfaces to work on.
 	#
@@ -49,6 +52,9 @@ network_start()
 		#
 		# We're operating as a general network start routine.
 		#
+
+		# Create IEEE 802.11 interfaces
+		wlan_up
 
 		# Create cloned interfaces
 		clone_up
@@ -61,15 +67,10 @@ network_start()
 	fi
 
 	# Configure the interface(s).
-	network_common ifn_start verbose
-
-	# Give our interfaces a little time to come up
-	# before we start pounding them.  In particular, dhclient
-	# and named can get mightily confused.
-	sleep 2
+	netif_common ifn_start verbose
 }
 
-network_stop()
+netif_stop()
 {
 	# Set the list of interfaces to work on.
 	#
@@ -78,24 +79,25 @@ network_stop()
 	echo -n "Stopping network:"
 
 	# Deconfigure the interface(s)
-	network_common ifn_stop
+	netif_common ifn_stop
 	echo '.'
 }
 
-# network_common routine verbose
+# netif_common routine verbose
 #	Common configuration subroutine for network interfaces. This
 #	routine takes all the preparatory steps needed for configuring
 #	an interface and then calls $routine. If $verbose is specified,
 #	it will call ifconfig(8) to show, in long format, the configured
 #	interfaces. If $verbose is not given, it will simply output the
 #	configured interface(s).
-network_common()
+#
+netif_common()
 {
 	_func=
 	_verbose=
 
 	if [ -z "$1" ]; then
-		err 1 "network_common(): No function name specified."
+		err 1 "netif_common(): No function name specified."
 	else
 		_func="$1"
 	fi
@@ -142,13 +144,16 @@ network_common()
 	debug "The following interfaces were not configured: $_fail"
 }
 
+# ifn_start ifn
+#	Bring up and configure an interface.
+#
 ifn_start()
 {
 	local ifn cfg
 	ifn="$1"
 	cfg=1
 
-	[ -z "$ifn" ] && return 1
+	[ -z "$ifn" ] && err 1 "ifn_start called without an interface"
 
 	ifscript_up ${ifn} && cfg=0
 	ifconfig_up ${ifn} && cfg=0
@@ -158,53 +163,34 @@ ifn_start()
 	return $cfg
 }
 
+# ifn_stop ifn
+#	Shutdown and de-configure an interface.
+#
 ifn_stop()
 {
 	local ifn cfg
 	ifn="$1"
 	cfg=1
 
-	[ -z "$ifn" ] && return 1
+	[ -z "$ifn" ] && err 1 "ifn_stop called without an interface"
 
+	childif_destroy ${ifn} && cfg=0
 	ifalias_down ${ifn} && cfg=0
 	ifconfig_down ${ifn} && cfg=0
 	ifscript_down ${ifn} && cfg=0
-	childif_destroy ${ifn} && cfg=0
 
 	return $cfg
 }
 
-# childif_create
+# childif_create ifn
 #	Create and configure child interfaces.  Return 0 if child
 #	interfaces are created.
 #
 childif_create()
 {
-	local cfg child child_vlans child_wlans create_args debug_flags ifn i
+	local cfg child child_vlans create_args ifn i
 	cfg=1
 	ifn=$1
-
-	# Create wireless interfaces
-	child_wlans=`get_if_var $ifn wlans_IF`
-
-	for child in ${child_wlans}; do
-		create_args="wlandev $ifn `get_if_var $child create_args_IF`"
-		debug_flags="`get_if_var $child wlandebug_IF`"
-
-		if expr $child : 'wlan[0-9][0-9]*$' >/dev/null 2>&1; then
-			ifconfig $child create ${create_args} && cfg=0
-			if [ -n "${debug_flags}" ]; then
-				wlandebug -i $child ${debug_flags}
-			fi
-		else
-			i=`ifconfig wlan create ${create_args}`
-			if [ -n "${debug_flags}" ]; then
-				wlandebug -i $i ${debug_flags}
-			fi
-			ifconfig $i name $child && cfg=0
-		fi
-		ifn_start $child
-	done
 
 	# Create vlan interfaces
 	child_vlans=`get_if_var $ifn vlans_IF`
@@ -229,17 +215,21 @@ childif_create()
 	return ${cfg}
 }
 
-# childif_destroy
+# childif_destroy ifn
 #	Destroy child interfaces.
 #
 childif_destroy()
 {
-	local cfg child child_vlans child_wlans ifn
+	local cfg child child_vlans ifn
 	cfg=1
+	ifn=$1
 
-	child_wlans=`get_if_var $ifn wlans_IF`
-	for child in ${child_wlans}; do
-		if ! `ifconfig -n $child > /dev/null 2>&1`; then
+	child_vlans=`get_if_var $ifn vlans_IF`
+	for child in ${child_vlans}; do
+		if expr $child : '[1-9][0-9]*$' >/dev/null 2>&1; then
+			child="${ifn}.${child}"
+		fi
+		if ! ifexists $child; then
 			continue
 		fi
 		ifn_stop $child
@@ -249,5 +239,7 @@ childif_destroy()
 	return ${cfg}
 }
 
+# Load the old "network" config file also for compatibility
+load_rc_config network
 load_rc_config $name
 run_rc_command $*

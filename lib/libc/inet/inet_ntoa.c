@@ -10,11 +10,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -29,12 +25,10 @@
  * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
  * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
+ *
+ * @(#)inet_ntoa.c	8.1 (Berkeley) 6/4/93
+ * $Id: inet_ntoa.c,v 1.2 2005/04/27 04:56:21 sra Exp $
  */
-
-#if defined(LIBC_SCCS) && !defined(lint)
-static const char sccsid[] = "@(#)inet_ntoa.c	8.1 (Berkeley) 6/4/93";
-static const char rcsid[] = "$Id: inet_ntoa.c,v 1.2 2005/04/27 04:56:21 sra Exp $";
-#endif /* LIBC_SCCS and not lint */
 
 #include "port_before.h"
 
@@ -76,6 +70,7 @@ inet_ntoa_r(struct in_addr in, char *buf, socklen_t size)
 */
 #undef inet_ntoa
 __weak_reference(__inet_ntoa, inet_ntoa);
+#undef inet_ntoa_r
 __weak_reference(__inet_ntoa_r, inet_ntoa_r);
 #endif
 /*! \file */

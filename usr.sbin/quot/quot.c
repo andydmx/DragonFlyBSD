@@ -114,7 +114,7 @@ get_inode(int fd, struct fs *super, ino_t ino)
 		if (!ip
 		    && !(ip = (struct ufs1_dinode *)malloc(INOSZ(super))))
 			errx(1, "allocate inodes");
-		last = (ino / INOCNT(super)) * INOCNT(super);
+		last = rounddown(ino, INOCNT(super));
 		if (lseek(fd, (off_t)ino_to_fsba(super, last) << super->fs_fshift, 0) < (off_t)0
 		    || read(fd,ip,INOSZ(super)) != (ssize_t)INOSZ(super))
 			err(1, "read inodes");
@@ -136,7 +136,7 @@ virtualblocks(struct fs *super, struct ufs1_dinode *ip)
 	
 	sz = ip->di_size;
 #ifdef	COMPAT
-	if (lblkno(super,sz) >= NDADDR) {
+	if (lblkno(super,sz) >= UFS_NDADDR) {
 		nblk = blkroundup(super,sz);
 		if (sz == nblk)
 			nblk += super->fs_bsize;
@@ -146,10 +146,10 @@ virtualblocks(struct fs *super, struct ufs1_dinode *ip)
 	
 #else	/* COMPAT */
 	
-	if (lblkno(super,sz) >= NDADDR) {
+	if (lblkno(super,sz) >= UFS_NDADDR) {
 		nblk = blkroundup(super,sz);
 		sz = lblkno(super,nblk);
-		sz = (sz - NDADDR + NINDIR(super) - 1) / NINDIR(super);
+		sz = (sz - UFS_NDADDR + NINDIR(super) - 1) / NINDIR(super);
 		while (sz > 0) {
 			nblk += sz * super->fs_bsize;
 			/* sz - 1 rounded up */
@@ -374,7 +374,7 @@ dofsizes(int fd, struct fs *super, char *name)
 					errx(1, "allocate fsize structure");
 				fp->fsz_next = *fsp;
 				*fsp = fp;
-				fp->fsz_first = (ksz / FSZCNT) * FSZCNT;
+				fp->fsz_first = rounddown(ksz, FSZCNT);
 				fp->fsz_last = fp->fsz_first + FSZCNT;
 				for (i = FSZCNT; --i >= 0;) {
 					fp->fsz_count[i] = 0;

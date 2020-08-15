@@ -1,13 +1,13 @@
 /*
  * Copyright (c) 2007-2008 The DragonFly Project.  All rights reserved.
- * 
+ *
  * This code is derived from software contributed to The DragonFly Project
  * by Matthew Dillon <dillon@backplane.com>
- * 
+ *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
  * are met:
- * 
+ *
  * 1. Redistributions of source code must retain the above copyright
  *    notice, this list of conditions and the following disclaimer.
  * 2. Redistributions in binary form must reproduce the above copyright
@@ -17,7 +17,7 @@
  * 3. Neither the name of The DragonFly Project nor the names of its
  *    contributors may be used to endorse or promote products derived
  *    from this software without specific, prior written permission.
- * 
+ *
  * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
  * ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
  * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
@@ -32,19 +32,9 @@
  * SUCH DAMAGE.
  */
 
-#include <sys/param.h>
-#include <sys/systm.h>
-#include <sys/kernel.h>
-#include <sys/fcntl.h>
+#include <sys/mountctl.h>
 #include <sys/namecache.h>
-#include <sys/vnode.h>
-#include <sys/lockf.h>
-#include <sys/event.h>
-#include <sys/stat.h>
-#include <sys/dirent.h>
-#include <sys/file.h>
-#include <vm/vm_extern.h>
-#include <vm/swap_pager.h>
+#include <sys/buf2.h>
 #include <vfs/fifofs/fifo.h>
 
 #include "hammer.h"
@@ -52,7 +42,6 @@
 /*
  * USERFS VNOPS
  */
-/*static int hammer_vop_vnoperate(struct vop_generic_args *);*/
 static int hammer_vop_fsync(struct vop_fsync_args *);
 static int hammer_vop_read(struct vop_read_args *);
 static int hammer_vop_write(struct vop_write_args *);
@@ -115,7 +104,7 @@ struct vop_ops hammer_vnode_vops = {
 	.vop_nremove =		hammer_vop_nremove,
 	.vop_nrename =		hammer_vop_nrename,
 	.vop_nrmdir =		hammer_vop_nrmdir,
-	.vop_markatime = 	hammer_vop_markatime,
+	.vop_markatime =	hammer_vop_markatime,
 	.vop_setattr =		hammer_vop_setattr,
 	.vop_bmap =		hammer_vop_bmap,
 	.vop_strategy =		hammer_vop_strategy,
@@ -133,7 +122,7 @@ struct vop_ops hammer_spec_vops = {
 	.vop_write =		vop_stdnowrite,
 	.vop_access =		hammer_vop_access,
 	.vop_close =		hammer_vop_close,
-	.vop_markatime = 	hammer_vop_markatime,
+	.vop_markatime =	hammer_vop_markatime,
 	.vop_getattr =		hammer_vop_getattr,
 	.vop_inactive =		hammer_vop_inactive,
 	.vop_reclaim =		hammer_vop_reclaim,
@@ -147,7 +136,7 @@ struct vop_ops hammer_fifo_vops = {
 	.vop_write =		hammer_vop_fifowrite,
 	.vop_access =		hammer_vop_access,
 	.vop_close =		hammer_vop_fifoclose,
-	.vop_markatime = 	hammer_vop_markatime,
+	.vop_markatime =	hammer_vop_markatime,
 	.vop_getattr =		hammer_vop_getattr,
 	.vop_inactive =		hammer_vop_inactive,
 	.vop_reclaim =		hammer_vop_reclaim,
@@ -163,24 +152,11 @@ hammer_knote(struct vnode *vp, int flags)
 		KNOTE(&vp->v_pollinfo.vpi_kqinfo.ki_note, flags);
 }
 
-#ifdef DEBUG_TRUNCATE
-struct hammer_inode *HammerTruncIp;
-#endif
-
 static int hammer_dounlink(hammer_transaction_t trans, struct nchandle *nch,
 			   struct vnode *dvp, struct ucred *cred,
 			   int flags, int isdir);
 static int hammer_vop_strategy_read(struct vop_strategy_args *ap);
 static int hammer_vop_strategy_write(struct vop_strategy_args *ap);
-
-#if 0
-static
-int
-hammer_vop_vnoperate(struct vop_generic_args *)
-{
-	return (VOCALL(&hammer_vnode_vops, ap));
-}
-#endif
 
 /*
  * hammer_vop_fsync { vp, waitfor }
@@ -257,8 +233,7 @@ mode1:
 		 * made to the file are write or write-extends.
 		 */
 		if ((ip->flags & HAMMER_INODE_REDO) &&
-		    (ip->flags & HAMMER_INODE_MODMASK_NOREDO) == 0
-		) {
+		    (ip->flags & HAMMER_INODE_MODMASK_NOREDO) == 0) {
 			++hammer_count_fsyncs;
 			hammer_flusher_flush_undos(hmp, mode);
 			ip->redo_count = 0;
@@ -303,14 +278,14 @@ skip:
 		int dorelock;
 
 		if ((ap->a_vp->v_flag & VRECLAIMED) == 0) {
-			vx_unlock(ap->a_vp);
+			vn_unlock(ap->a_vp);
 			dorelock = 1;
 		} else {
 			dorelock = 0;
 		}
 		hammer_wait_inode(ip);
 		if (dorelock)
-			vx_lock(ap->a_vp);
+			vn_relock(ap->a_vp, LK_EXCLUSIVE);
 	}
 	if (ip->vp && (ip->flags & HAMMER_INODE_MODMASK) == 0)
 		vclrisdirty(ip->vp);
@@ -342,6 +317,8 @@ hammer_vop_read(struct vop_read_args *ap)
 	int got_trans;
 	size_t resid;
 
+	if (ap->a_vp->v_type == VDIR)
+		return (EISDIR);
 	if (ap->a_vp->v_type != VREG)
 		return (EINVAL);
 	ip = VTOI(ap->a_vp);
@@ -366,8 +343,8 @@ hammer_vop_read(struct vop_read_args *ap)
 	 * Allow the UIO's size to override the sequential heuristic.
 	 */
 	blksize = hammer_blocksize(uio->uio_offset);
-	seqcount = (uio->uio_resid + (BKVASIZE - 1)) / BKVASIZE;
-	ioseqcount = (ap->a_ioflag >> 16);
+	seqcount = howmany(uio->uio_resid, MAXBSIZE);
+	ioseqcount = ap->a_ioflag >> IO_SEQSHIFT;
 	if (seqcount < ioseqcount)
 		seqcount = ioseqcount;
 
@@ -437,10 +414,13 @@ hammer_vop_read(struct vop_read_args *ap)
 			}
 			error = cluster_readx(ap->a_vp,
 					     file_limit, base_offset,
-					     blksize, uio->uio_resid,
-					     seqcount * BKVASIZE, &bp);
+					     blksize, B_NOTMETA,
+					     uio->uio_resid,
+					     seqcount * MAXBSIZE,
+					     &bp);
 		} else {
-			error = breadnx(ap->a_vp, base_offset, blksize,
+			error = breadnx(ap->a_vp, base_offset,
+					blksize, B_NOTMETA,
 					NULL, NULL, 0, &bp);
 		}
 		if (error) {
@@ -448,13 +428,13 @@ hammer_vop_read(struct vop_read_args *ap)
 			break;
 		}
 skip:
-		if ((hammer_debug_io & 0x0001) && (bp->b_flags & B_IODEBUG)) {
-			kprintf("doff %016jx read file %016jx@%016jx\n",
+		if ((hammer_debug_io & 0x0001) && (bp->b_flags & B_IOISSUED)) {
+			hdkprintf("zone2_offset %016jx read file %016jx@%016jx\n",
 				(intmax_t)bp->b_bio2.bio_offset,
 				(intmax_t)ip->obj_id,
 				(intmax_t)bp->b_loffset);
 		}
-		bp->b_flags &= ~B_IODEBUG;
+		bp->b_flags &= ~B_IOISSUED;
 		if (blksize == HAMMER_XBUFSIZE)
 			bp->b_flags |= B_CLUSTEROK;
 
@@ -515,9 +495,10 @@ int
 hammer_vop_write(struct vop_write_args *ap)
 {
 	struct hammer_transaction trans;
-	struct hammer_inode *ip;
+	hammer_inode_t ip;
 	hammer_mount_t hmp;
 	thread_t td;
+	struct vnode *vp;
 	struct uio *uio;
 	int offset;
 	off_t base_offset;
@@ -530,13 +511,14 @@ hammer_vop_write(struct vop_write_args *ap)
 	int seqcount;
 	int bigwrite;
 
-	if (ap->a_vp->v_type != VREG)
+	vp = ap->a_vp;
+	if (vp->v_type != VREG)
 		return (EINVAL);
 	ip = VTOI(ap->a_vp);
 	hmp = ip->hmp;
 	error = 0;
 	kflags = 0;
-	seqcount = ap->a_ioflag >> 16;
+	seqcount = ap->a_ioflag >> IO_SEQSHIFT;
 
 	if (ip->flags & HAMMER_INODE_RO)
 		return (EROFS);
@@ -546,6 +528,21 @@ hammer_vop_write(struct vop_write_args *ap)
 	 */
 	hammer_start_transaction(&trans, hmp);
 	uio = ap->a_uio;
+
+	/*
+	 * Use v_lastwrite_ts if file not open for writing
+	 * (i.e. a late msync)
+	 */
+	if (uio->uio_segflg == UIO_NOCOPY) {
+		if (vp->v_flag & VLASTWRITETS) {
+			trans.time = vp->v_lastwrite_ts.tv_sec * 1000000 +
+				     vp->v_lastwrite_ts.tv_nsec / 1000;
+		} else {
+			trans.time = ip->ino_data.mtime;
+		}
+	} else {
+		vclrflags(vp, VLASTWRITETS);
+	}
 
 	/*
 	 * Check append mode
@@ -669,7 +666,7 @@ hammer_vop_write(struct vop_write_args *ap)
 			if (uio->uio_offset > ip->ino_data.size)
 				trivial = 0;
 			else
-				trivial = 1;
+				trivial = NVEXTF_TRIVIAL;
 			nvextendbuf(ap->a_vp,
 				    ip->ino_data.size,
 				    nsize,
@@ -700,7 +697,7 @@ hammer_vop_write(struct vop_write_args *ap)
 		} else if (offset == 0 && uio->uio_resid >= blksize) {
 			/*
 			 * Even though we are entirely overwriting the buffer
-			 * we may still have to zero it out to avoid a 
+			 * we may still have to zero it out to avoid a
 			 * mmap/write visibility issue.
 			 */
 			bp = getblk(ap->a_vp, base_offset, blksize, GETBLK_BHEAVY, 0);
@@ -787,7 +784,7 @@ hammer_vop_write(struct vop_write_args *ap)
 
 		/*
 		 * Once we dirty the buffer any cached zone-X offset
-		 * becomes invalid.  HAMMER NOTE: no-history mode cannot 
+		 * becomes invalid.  HAMMER NOTE: no-history mode cannot
 		 * allow overwriting over the same data sector unless
 		 * we provide UNDOs for the old data, which we don't.
 		 */
@@ -861,12 +858,11 @@ static
 int
 hammer_vop_access(struct vop_access_args *ap)
 {
-	struct hammer_inode *ip = VTOI(ap->a_vp);
+	hammer_inode_t ip = VTOI(ap->a_vp);
 	uid_t uid;
 	gid_t gid;
 	int error;
 
-	++hammer_stats_file_iopsr;
 	uid = hammer_to_unix_xid(&ip->ino_data.uid);
 	gid = hammer_to_unix_xid(&ip->ino_data.gid);
 
@@ -929,8 +925,8 @@ int
 hammer_vop_ncreate(struct vop_ncreate_args *ap)
 {
 	struct hammer_transaction trans;
-	struct hammer_inode *dip;
-	struct hammer_inode *nip;
+	hammer_inode_t dip;
+	hammer_inode_t nip;
 	struct nchandle *nch;
 	hammer_mount_t hmp;
 	int error;
@@ -949,7 +945,6 @@ hammer_vop_ncreate(struct vop_ncreate_args *ap)
 	 */
 	lwkt_gettoken(&hmp->fs_token);
 	hammer_start_transaction(&trans, hmp);
-	++hammer_stats_file_iopsw;
 
 	/*
 	 * Create a new filesystem object of the requested type.  The
@@ -971,11 +966,11 @@ hammer_vop_ncreate(struct vop_ncreate_args *ap)
 	 * Add the new filesystem object to the directory.  This will also
 	 * bump the inode's link count.
 	 */
-	error = hammer_ip_add_directory(&trans, dip,
+	error = hammer_ip_add_direntry(&trans, dip,
 					nch->ncp->nc_name, nch->ncp->nc_nlen,
 					nip);
 	if (error)
-		hkprintf("hammer_ip_add_directory error %d\n", error);
+		hkprintf("hammer_ip_add_direntry error %d\n", error);
 
 	/*
 	 * Finish up.
@@ -1012,7 +1007,7 @@ static
 int
 hammer_vop_getattr(struct vop_getattr_args *ap)
 {
-	struct hammer_inode *ip = VTOI(ap->a_vp);
+	hammer_inode_t ip = VTOI(ap->a_vp);
 	struct vattr *vap = ap->a_vap;
 
 	/*
@@ -1029,10 +1024,9 @@ hammer_vop_getattr(struct vop_getattr_args *ap)
 	 * by stat is different from the more involved fsid used in the
 	 * mount structure.
 	 */
-	++hammer_stats_file_iopsr;
 	hammer_lock_sh(&ip->lock);
-	vap->va_fsid = ip->pfsm->fsid_udev ^ (u_int32_t)ip->obj_asof ^
-		       (u_int32_t)(ip->obj_asof >> 32);
+	vap->va_fsid = ip->pfsm->fsid_udev ^ (uint32_t)ip->obj_asof ^
+		       (uint32_t)(ip->obj_asof >> 32);
 
 	vap->va_fileid = ip->ino_leaf.base.obj_id;
 	vap->va_mode = ip->ino_data.mode;
@@ -1047,16 +1041,20 @@ hammer_vop_getattr(struct vop_getattr_args *ap)
 	 * Special case for @@PFS softlinks.  The actual size of the
 	 * expanded softlink is "@@0x%016llx:%05d" == 26 bytes.
 	 * or for MAX_TID is    "@@-1:%05d" == 10 bytes.
+	 *
+	 * Note that userspace hammer command does not allow users to
+	 * create a @@PFS softlink under an existing other PFS (id!=0)
+	 * so the ip localization here for @@PFS softlink is always 0.
 	 */
 	if (ip->ino_data.obj_type == HAMMER_OBJTYPE_SOFTLINK &&
 	    ip->ino_data.size == 10 &&
 	    ip->obj_asof == HAMMER_MAX_TID &&
-	    ip->obj_localization == 0 &&
+	    ip->obj_localization == HAMMER_DEF_LOCALIZATION &&
 	    strncmp(ip->ino_data.ext.symlink, "@@PFS", 5) == 0) {
-		    if (ip->pfsm->pfsd.mirror_flags & HAMMER_PFSD_SLAVE)
-			    vap->va_size = 26;
-		    else
-			    vap->va_size = 10;
+		if (hammer_is_pfs_slave(&ip->pfsm->pfsd))
+			vap->va_size = 26;
+		else
+			vap->va_size = 10;
 	}
 
 	/*
@@ -1076,17 +1074,15 @@ hammer_vop_getattr(struct vop_getattr_args *ap)
 	vap->va_gen = 1;	/* hammer inums are unique for all time */
 	vap->va_blocksize = HAMMER_BUFSIZE;
 	if (ip->ino_data.size >= HAMMER_XDEMARC) {
-		vap->va_bytes = (ip->ino_data.size + HAMMER_XBUFMASK64) &
-				~HAMMER_XBUFMASK64;
-	} else if (ip->ino_data.size > HAMMER_BUFSIZE / 2) {
-		vap->va_bytes = (ip->ino_data.size + HAMMER_BUFMASK64) &
-				~HAMMER_BUFMASK64;
+		vap->va_bytes = HAMMER_XBUFSIZE64_DOALIGN(ip->ino_data.size);
+	} else if (ip->ino_data.size > HAMMER_HBUFSIZE) {
+		vap->va_bytes = HAMMER_BUFSIZE64_DOALIGN(ip->ino_data.size);
 	} else {
-		vap->va_bytes = (ip->ino_data.size + 15) & ~15;
+		vap->va_bytes = HAMMER_DATA_DOALIGN(ip->ino_data.size);
 	}
 
 	vap->va_type = hammer_get_vnode_type(ip->ino_data.obj_type);
-	vap->va_filerev = 0; 	/* XXX */
+	vap->va_filerev = 0;	/* XXX */
 	vap->va_uid_uuid = ip->ino_data.uid;
 	vap->va_gid_uuid = ip->ino_data.gid;
 	vap->va_fsid_uuid = ip->hmp->fsid;
@@ -1130,8 +1126,8 @@ hammer_vop_nresolve(struct vop_nresolve_args *ap)
 	int flags;
 	int ispfs;
 	int64_t obj_id;
-	u_int32_t localization;
-	u_int32_t max_iterations;
+	uint32_t localization;
+	uint32_t max_iterations;
 
 	/*
 	 * Misc initialization, plus handle as-of name extensions.  Look for
@@ -1149,7 +1145,6 @@ hammer_vop_nresolve(struct vop_nresolve_args *ap)
 
 	lwkt_gettoken(&hmp->fs_token);
 	hammer_simple_transaction(&trans, hmp);
-	++hammer_stats_file_iopsr;
 
 	for (i = 0; i < nlen; ++i) {
 		if (ncp->nc_name[i] == '@' && ncp->nc_name[i+1] == '@') {
@@ -1167,7 +1162,7 @@ hammer_vop_nresolve(struct vop_nresolve_args *ap)
 	nlen = i;
 
 	/*
-	 * If this is a PFS softlink we dive into the PFS
+	 * If this is a PFS we dive into the PFS root inode
 	 */
 	if (ispfs && nlen == 0) {
 		ip = hammer_get_inode(&trans, dip, HAMMER_OBJID_ROOT,
@@ -1222,11 +1217,11 @@ hammer_vop_nresolve(struct vop_nresolve_args *ap)
 	 *
 	 * The key range is inclusive of both key_beg and key_end.
 	 */
-	namekey = hammer_directory_namekey(dip, ncp->nc_name, nlen,
+	namekey = hammer_direntry_namekey(dip, ncp->nc_name, nlen,
 					   &max_iterations);
 
 	error = hammer_init_cursor(&trans, &cursor, &dip->cache[1], dip);
-	cursor.key_beg.localization = dip->obj_localization +
+	cursor.key_beg.localization = dip->obj_localization |
 				      hammer_dir_localization(dip);
         cursor.key_beg.obj_id = dip->obj_id;
 	cursor.key_beg.key = namekey;
@@ -1276,11 +1271,10 @@ hammer_vop_nresolve(struct vop_nresolve_args *ap)
 				      asof, localization,
 				      flags, &error);
 		if (error == ENOENT) {
-			kprintf("HAMMER: WARNING: Missing "
-				"inode for dirent \"%s\"\n"
-				"\tobj_id = %016llx, asof=%016llx, lo=%08x\n",
+			hkprintf("WARNING: Missing inode for dirent \"%s\"\n"
+				"\tobj_id = %016jx, asof=%016jx, lo=%08x\n",
 				ncp->nc_name,
-				(long long)obj_id, (long long)asof,
+				(intmax_t)obj_id, (intmax_t)asof,
 				localization);
 			error = 0;
 			ip = hammer_get_dummy_inode(&trans, dip, obj_id,
@@ -1313,9 +1307,7 @@ done:
  * Locate the parent directory of a directory vnode.
  *
  * dvp is referenced but not locked.  *vpp must be returned referenced and
- * locked.  A parent_obj_id of 0 does not necessarily indicate that we are
- * at the root, instead it could indicate that the directory we were in was
- * removed.
+ * locked.  A parent_obj_id of 0 indicates that we are at the root.
  *
  * NOTE: as-of sequences are not linked into the directory structure.  If
  * we are at the root with a different asof then the mount point, reload
@@ -1328,11 +1320,11 @@ int
 hammer_vop_nlookupdotdot(struct vop_nlookupdotdot_args *ap)
 {
 	struct hammer_transaction trans;
-	struct hammer_inode *dip;
-	struct hammer_inode *ip;
+	hammer_inode_t dip;
+	hammer_inode_t ip;
 	hammer_mount_t hmp;
 	int64_t parent_obj_id;
-	u_int32_t parent_obj_localization;
+	uint32_t parent_obj_localization;
 	hammer_tid_t asof;
 	int error;
 
@@ -1347,18 +1339,21 @@ hammer_vop_nlookupdotdot(struct vop_nlookupdotdot_args *ap)
 	lwkt_gettoken(&hmp->fs_token);
 	parent_obj_id = dip->ino_data.parent_obj_id;
 	if (dip->obj_id == HAMMER_OBJID_ROOT)
-		parent_obj_localization = dip->ino_data.ext.obj.parent_obj_localization;
+		parent_obj_localization = HAMMER_DEF_LOCALIZATION;
 	else
 		parent_obj_localization = dip->obj_localization;
 
+	/*
+	 * It's probably a PFS root when dip->ino_data.parent_obj_id is 0.
+	 */
 	if (parent_obj_id == 0) {
 		if (dip->obj_id == HAMMER_OBJID_ROOT &&
 		   asof != hmp->asof) {
 			parent_obj_id = dip->obj_id;
 			asof = hmp->asof;
 			*ap->a_fakename = kmalloc(19, M_TEMP, M_WAITOK);
-			ksnprintf(*ap->a_fakename, 19, "0x%016llx",
-				  (long long)dip->obj_asof);
+			ksnprintf(*ap->a_fakename, 19, "0x%016jx",
+				  (intmax_t)dip->obj_asof);
 		} else {
 			*ap->a_vpp = NULL;
 			lwkt_reltoken(&hmp->fs_token);
@@ -1367,7 +1362,6 @@ hammer_vop_nlookupdotdot(struct vop_nlookupdotdot_args *ap)
 	}
 
 	hammer_simple_transaction(&trans, hmp);
-	++hammer_stats_file_iopsr;
 
 	ip = hammer_get_inode(&trans, dip, parent_obj_id,
 			      asof, parent_obj_localization,
@@ -1391,13 +1385,13 @@ int
 hammer_vop_nlink(struct vop_nlink_args *ap)
 {
 	struct hammer_transaction trans;
-	struct hammer_inode *dip;
-	struct hammer_inode *ip;
+	hammer_inode_t dip;
+	hammer_inode_t ip;
 	struct nchandle *nch;
 	hammer_mount_t hmp;
 	int error;
 
-	if (ap->a_dvp->v_mount != ap->a_vp->v_mount)	
+	if (ap->a_dvp->v_mount != ap->a_vp->v_mount)
 		return(EXDEV);
 
 	nch = ap->a_nch;
@@ -1420,14 +1414,13 @@ hammer_vop_nlink(struct vop_nlink_args *ap)
 	 */
 	lwkt_gettoken(&hmp->fs_token);
 	hammer_start_transaction(&trans, hmp);
-	++hammer_stats_file_iopsw;
 
 	/*
 	 * Add the filesystem object to the directory.  Note that neither
 	 * dip nor ip are referenced or locked, but their vnodes are
 	 * referenced.  This function will bump the inode's link count.
 	 */
-	error = hammer_ip_add_directory(&trans, dip,
+	error = hammer_ip_add_direntry(&trans, dip,
 					nch->ncp->nc_name, nch->ncp->nc_nlen,
 					ip);
 
@@ -1456,8 +1449,8 @@ int
 hammer_vop_nmkdir(struct vop_nmkdir_args *ap)
 {
 	struct hammer_transaction trans;
-	struct hammer_inode *dip;
-	struct hammer_inode *nip;
+	hammer_inode_t dip;
+	hammer_inode_t nip;
 	struct nchandle *nch;
 	hammer_mount_t hmp;
 	int error;
@@ -1476,7 +1469,6 @@ hammer_vop_nmkdir(struct vop_nmkdir_args *ap)
 	 */
 	lwkt_gettoken(&hmp->fs_token);
 	hammer_start_transaction(&trans, hmp);
-	++hammer_stats_file_iopsw;
 
 	/*
 	 * Create a new filesystem object of the requested type.  The
@@ -1486,7 +1478,6 @@ hammer_vop_nmkdir(struct vop_nmkdir_args *ap)
 				    dip, nch->ncp->nc_name, nch->ncp->nc_nlen,
 				    NULL, &nip);
 	if (error) {
-		hkprintf("hammer_mkdir error %d\n", error);
 		hammer_done_transaction(&trans);
 		*ap->a_vpp = NULL;
 		lwkt_reltoken(&hmp->fs_token);
@@ -1496,7 +1487,7 @@ hammer_vop_nmkdir(struct vop_nmkdir_args *ap)
 	 * Add the new filesystem object to the directory.  This will also
 	 * bump the inode's link count.
 	 */
-	error = hammer_ip_add_directory(&trans, dip,
+	error = hammer_ip_add_direntry(&trans, dip,
 					nch->ncp->nc_name, nch->ncp->nc_nlen,
 					nip);
 	if (error)
@@ -1534,8 +1525,8 @@ int
 hammer_vop_nmknod(struct vop_nmknod_args *ap)
 {
 	struct hammer_transaction trans;
-	struct hammer_inode *dip;
-	struct hammer_inode *nip;
+	hammer_inode_t dip;
+	hammer_inode_t nip;
 	struct nchandle *nch;
 	hammer_mount_t hmp;
 	int error;
@@ -1554,7 +1545,6 @@ hammer_vop_nmknod(struct vop_nmknod_args *ap)
 	 */
 	lwkt_gettoken(&hmp->fs_token);
 	hammer_start_transaction(&trans, hmp);
-	++hammer_stats_file_iopsw;
 
 	/*
 	 * Create a new filesystem object of the requested type.  The
@@ -1576,7 +1566,7 @@ hammer_vop_nmknod(struct vop_nmknod_args *ap)
 	 * Add the new filesystem object to the directory.  This will also
 	 * bump the inode's link count.
 	 */
-	error = hammer_ip_add_directory(&trans, dip,
+	error = hammer_ip_add_direntry(&trans, dip,
 					nch->ncp->nc_name, nch->ncp->nc_nlen,
 					nip);
 
@@ -1612,7 +1602,6 @@ hammer_vop_open(struct vop_open_args *ap)
 {
 	hammer_inode_t ip;
 
-	++hammer_stats_file_iopsr;
 	ip = VTOI(ap->a_vp);
 
 	if ((ap->a_mode & FWRITE) && (ip->flags & HAMMER_INODE_RO))
@@ -1639,7 +1628,7 @@ hammer_vop_readdir(struct vop_readdir_args *ap)
 {
 	struct hammer_transaction trans;
 	struct hammer_cursor cursor;
-	struct hammer_inode *ip;
+	hammer_inode_t ip;
 	hammer_mount_t hmp;
 	struct uio *uio;
 	hammer_base_elm_t base;
@@ -1651,7 +1640,6 @@ hammer_vop_readdir(struct vop_readdir_args *ap)
 	int r;
 	int dtype;
 
-	++hammer_stats_file_iopsr;
 	ip = VTOI(ap->a_vp);
 	uio = ap->a_uio;
 	saveoff = uio->uio_offset;
@@ -1715,7 +1703,7 @@ hammer_vop_readdir(struct vop_readdir_args *ap)
 	 * directly translate to a 64 bit 'seek' position.
 	 */
 	hammer_init_cursor(&trans, &cursor, &ip->cache[1], ip);
-	cursor.key_beg.localization = ip->obj_localization +
+	cursor.key_beg.localization = ip->obj_localization |
 				      hammer_dir_localization(ip);
 	cursor.key_beg.obj_id = ip->obj_id;
 	cursor.key_beg.create_tid = 0;
@@ -1740,11 +1728,8 @@ hammer_vop_readdir(struct vop_readdir_args *ap)
 		KKASSERT(cursor.leaf->data_len > HAMMER_ENTRY_NAME_OFF);
 
 		if (base->obj_id != ip->obj_id)
-			panic("readdir: bad record at %p", cursor.node);
+			hpanic("bad record at %p", cursor.node);
 
-		/*
-		 * Convert pseudo-filesystems into softlinks
-		 */
 		dtype = hammer_get_dtype(cursor.leaf->base.obj_type);
 		r = vop_write_dirent(
 			     &error, uio, cursor.data->entry.obj_id,
@@ -1798,10 +1783,10 @@ hammer_vop_readlink(struct vop_readlink_args *ap)
 {
 	struct hammer_transaction trans;
 	struct hammer_cursor cursor;
-	struct hammer_inode *ip;
+	hammer_inode_t ip;
 	hammer_mount_t hmp;
 	char buf[32];
-	u_int32_t localization;
+	uint32_t localization;
 	hammer_pseudofs_inmem_t pfsm;
 	int error;
 
@@ -1816,6 +1801,10 @@ hammer_vop_readlink(struct vop_readlink_args *ap)
 	 * Also expand special "@@PFS%05d" softlinks (expansion only
 	 * occurs for non-historical (current) accesses made from the
 	 * primary filesystem).
+	 *
+	 * Note that userspace hammer command does not allow users to
+	 * create a @@PFS softlink under an existing other PFS (id!=0)
+	 * so the ip localization here for @@PFS softlink is always 0.
 	 */
 	if (ip->ino_data.size <= HAMMER_INODE_BASESYMLEN) {
 		char *ptr;
@@ -1825,33 +1814,26 @@ hammer_vop_readlink(struct vop_readlink_args *ap)
 		bytes = (int)ip->ino_data.size;
 		if (bytes == 10 &&
 		    ip->obj_asof == HAMMER_MAX_TID &&
-		    ip->obj_localization == 0 &&
+		    ip->obj_localization == HAMMER_DEF_LOCALIZATION &&
 		    strncmp(ptr, "@@PFS", 5) == 0) {
 			hammer_simple_transaction(&trans, hmp);
 			bcopy(ptr + 5, buf, 5);
 			buf[5] = 0;
-			localization = strtoul(buf, NULL, 10) << 16;
+			localization = pfs_to_lo(strtoul(buf, NULL, 10));
 			pfsm = hammer_load_pseudofs(&trans, localization,
 						    &error);
 			if (error == 0) {
-				if (pfsm->pfsd.mirror_flags &
-				    HAMMER_PFSD_SLAVE) {
+				if (hammer_is_pfs_slave(&pfsm->pfsd)) {
 					/* vap->va_size == 26 */
 					ksnprintf(buf, sizeof(buf),
-						  "@@0x%016llx:%05d",
-						  (long long)pfsm->pfsd.sync_end_tid,
-						  localization >> 16);
+						  "@@0x%016jx:%05d",
+						  (intmax_t)pfsm->pfsd.sync_end_tid,
+						  lo_to_pfs(localization));
 				} else {
 					/* vap->va_size == 10 */
 					ksnprintf(buf, sizeof(buf),
 						  "@@-1:%05d",
-						  localization >> 16);
-#if 0
-					ksnprintf(buf, sizeof(buf),
-						  "@@0x%016llx:%05d",
-						  (long long)HAMMER_MAX_TID,
-						  localization >> 16);
-#endif
+						  lo_to_pfs(localization));
 				}
 				ptr = buf;
 				bytes = strlen(buf);
@@ -1869,14 +1851,13 @@ hammer_vop_readlink(struct vop_readlink_args *ap)
 	 * Long version
 	 */
 	hammer_simple_transaction(&trans, hmp);
-	++hammer_stats_file_iopsr;
 	hammer_init_cursor(&trans, &cursor, &ip->cache[1], ip);
 
 	/*
 	 * Key range (begin and end inclusive) to scan.  Directory keys
 	 * directly translate to a 64 bit 'seek' position.
 	 */
-	cursor.key_beg.localization = ip->obj_localization +
+	cursor.key_beg.localization = ip->obj_localization |
 				      HAMMER_LOCALIZE_MISC;
 	cursor.key_beg.obj_id = ip->obj_id;
 	cursor.key_beg.create_tid = 0;
@@ -1913,7 +1894,7 @@ int
 hammer_vop_nremove(struct vop_nremove_args *ap)
 {
 	struct hammer_transaction trans;
-	struct hammer_inode *dip;
+	hammer_inode_t dip;
 	hammer_mount_t hmp;
 	int error;
 
@@ -1927,7 +1908,6 @@ hammer_vop_nremove(struct vop_nremove_args *ap)
 
 	lwkt_gettoken(&hmp->fs_token);
 	hammer_start_transaction(&trans, hmp);
-	++hammer_stats_file_iopsw;
 	error = hammer_dounlink(&trans, ap->a_nch, ap->a_dvp, ap->a_cred, 0, 0);
 	hammer_done_transaction(&trans);
 	if (error == 0)
@@ -1946,16 +1926,16 @@ hammer_vop_nrename(struct vop_nrename_args *ap)
 	struct hammer_transaction trans;
 	struct namecache *fncp;
 	struct namecache *tncp;
-	struct hammer_inode *fdip;
-	struct hammer_inode *tdip;
-	struct hammer_inode *ip;
+	hammer_inode_t fdip;
+	hammer_inode_t tdip;
+	hammer_inode_t ip;
 	hammer_mount_t hmp;
 	struct hammer_cursor cursor;
 	int64_t namekey;
-	u_int32_t max_iterations;
+	uint32_t max_iterations;
 	int nlen, error;
 
-	if (ap->a_fdvp->v_mount != ap->a_tdvp->v_mount)	
+	if (ap->a_fdvp->v_mount != ap->a_tdvp->v_mount)
 		return(EXDEV);
 	if (ap->a_fdvp->v_mount != ap->a_fnch->ncp->nc_vp->v_mount)
 		return(EXDEV);
@@ -1985,7 +1965,6 @@ hammer_vop_nrename(struct vop_nrename_args *ap)
 
 	lwkt_gettoken(&hmp->fs_token);
 	hammer_start_transaction(&trans, hmp);
-	++hammer_stats_file_iopsw;
 
 	/*
 	 * Remove tncp from the target directory and then link ip as
@@ -1997,7 +1976,7 @@ hammer_vop_nrename(struct vop_nrename_args *ap)
 	error = hammer_dounlink(&trans, ap->a_tnch, ap->a_tdvp,
 				ap->a_cred, 0, -1);
 	if (error == 0 || error == ENOENT) {
-		error = hammer_ip_add_directory(&trans, tdip,
+		error = hammer_ip_add_direntry(&trans, tdip,
 						tncp->nc_name, tncp->nc_nlen,
 						ip);
 		if (error == 0) {
@@ -2018,11 +1997,11 @@ hammer_vop_nrename(struct vop_nrename_args *ap)
 	 *
 	 * The key range is inclusive of both key_beg and key_end.
 	 */
-	namekey = hammer_directory_namekey(fdip, fncp->nc_name, fncp->nc_nlen,
+	namekey = hammer_direntry_namekey(fdip, fncp->nc_name, fncp->nc_nlen,
 					   &max_iterations);
 retry:
 	hammer_init_cursor(&trans, &cursor, &fdip->cache[1], fdip);
-	cursor.key_beg.localization = fdip->obj_localization +
+	cursor.key_beg.localization = fdip->obj_localization |
 				      hammer_dir_localization(fdip);
         cursor.key_beg.obj_id = fdip->obj_id;
 	cursor.key_beg.key = namekey;
@@ -2059,12 +2038,12 @@ retry:
 	/*
 	 * If all is ok we have to get the inode so we can adjust nlinks.
 	 *
-	 * WARNING: hammer_ip_del_directory() may have to terminate the
+	 * WARNING: hammer_ip_del_direntry() may have to terminate the
 	 * cursor to avoid a recursion.  It's ok to call hammer_done_cursor()
 	 * twice.
 	 */
 	if (error == 0)
-		error = hammer_ip_del_directory(&trans, &cursor, fdip, ip);
+		error = hammer_ip_del_direntry(&trans, &cursor, fdip, ip);
 
 	/*
 	 * XXX A deadlock here will break rename's atomicy for the purposes
@@ -2098,7 +2077,7 @@ retry:
 				vrele(vp);
 				break;
 			}
-			kprintf("Debug: HAMMER ip/vp race2 avoided\n");
+			hdkprintf("ip/vp race2 avoided\n");
 		}
 	}
 
@@ -2116,7 +2095,7 @@ int
 hammer_vop_nrmdir(struct vop_nrmdir_args *ap)
 {
 	struct hammer_transaction trans;
-	struct hammer_inode *dip;
+	hammer_inode_t dip;
 	hammer_mount_t hmp;
 	int error;
 
@@ -2130,7 +2109,6 @@ hammer_vop_nrmdir(struct vop_nrmdir_args *ap)
 
 	lwkt_gettoken(&hmp->fs_token);
 	hammer_start_transaction(&trans, hmp);
-	++hammer_stats_file_iopsw;
 	error = hammer_dounlink(&trans, ap->a_nch, ap->a_dvp, ap->a_cred, 0, 1);
 	hammer_done_transaction(&trans);
 	if (error == 0)
@@ -2147,7 +2125,7 @@ int
 hammer_vop_markatime(struct vop_markatime_args *ap)
 {
 	struct hammer_transaction trans;
-	struct hammer_inode *ip;
+	hammer_inode_t ip;
 	hammer_mount_t hmp;
 
 	ip = VTOI(ap->a_vp);
@@ -2160,7 +2138,6 @@ hammer_vop_markatime(struct vop_markatime_args *ap)
 		return (0);
 	lwkt_gettoken(&hmp->fs_token);
 	hammer_start_transaction(&trans, hmp);
-	++hammer_stats_file_iopsw;
 
 	ip->ino_data.atime = trans.time;
 	hammer_modify_inode(&trans, ip, HAMMER_INODE_ATIME);
@@ -2178,7 +2155,7 @@ int
 hammer_vop_setattr(struct vop_setattr_args *ap)
 {
 	struct hammer_transaction trans;
-	struct hammer_inode *ip;
+	hammer_inode_t ip;
 	struct vattr *vap;
 	hammer_mount_t hmp;
 	int modflags;
@@ -2189,7 +2166,7 @@ hammer_vop_setattr(struct vop_setattr_args *ap)
 #if 0
 	int64_t aligned_size;
 #endif
-	u_int32_t flags;
+	uint32_t flags;
 
 	vap = ap->a_vap;
 	ip = ap->a_vp->v_data;
@@ -2208,7 +2185,6 @@ hammer_vop_setattr(struct vop_setattr_args *ap)
 
 	lwkt_gettoken(&hmp->fs_token);
 	hammer_start_transaction(&trans, hmp);
-	++hammer_stats_file_iopsw;
 	error = 0;
 
 	if (vap->va_flags != VNOVAL) {
@@ -2238,8 +2214,8 @@ hammer_vop_setattr(struct vop_setattr_args *ap)
 		mode_t cur_mode = ip->ino_data.mode;
 		uid_t cur_uid = hammer_to_unix_xid(&ip->ino_data.uid);
 		gid_t cur_gid = hammer_to_unix_xid(&ip->ino_data.gid);
-		uuid_t uuid_uid;
-		uuid_t uuid_gid;
+		hammer_uuid_t uuid_uid;
+		hammer_uuid_t uuid_gid;
 
 		error = vop_helper_chown(ap->a_vp, vap->va_uid, vap->va_gid,
 					 ap->a_cred,
@@ -2247,12 +2223,9 @@ hammer_vop_setattr(struct vop_setattr_args *ap)
 		if (error == 0) {
 			hammer_guid_to_uuid(&uuid_uid, cur_uid);
 			hammer_guid_to_uuid(&uuid_gid, cur_gid);
-			if (bcmp(&uuid_uid, &ip->ino_data.uid,
-				 sizeof(uuid_uid)) ||
-			    bcmp(&uuid_gid, &ip->ino_data.gid,
-				 sizeof(uuid_gid)) ||
-			    ip->ino_data.mode != cur_mode
-			) {
+			if (kuuid_compare(&uuid_uid, &ip->ino_data.uid) ||
+			    kuuid_compare(&uuid_gid, &ip->ino_data.gid) ||
+			    ip->ino_data.mode != cur_mode) {
 				ip->ino_data.uid = uuid_uid;
 				ip->ino_data.gid = uuid_gid;
 				ip->ino_data.mode = cur_mode;
@@ -2315,6 +2288,7 @@ hammer_vop_setattr(struct vop_setattr_args *ap)
 			ip->ino_data.mtime = trans.time;
 			/* XXX safe to use SDIRTY instead of DDIRTY here? */
 			modflags |= HAMMER_INODE_MTIME | HAMMER_INODE_DDIRTY;
+			vclrflags(ap->a_vp, VLASTWRITETS);
 
 			/*
 			 * On-media truncation is cached in the inode until
@@ -2323,32 +2297,12 @@ hammer_vop_setattr(struct vop_setattr_args *ap)
 			 */
 			if (truncating) {
 				hammer_ip_frontend_trunc(ip, vap->va_size);
-#ifdef DEBUG_TRUNCATE
-				if (HammerTruncIp == NULL)
-					HammerTruncIp = ip;
-#endif
 				if ((ip->flags & HAMMER_INODE_TRUNCATED) == 0) {
 					ip->flags |= HAMMER_INODE_TRUNCATED;
 					ip->trunc_off = vap->va_size;
 					hammer_inode_dirty(ip);
-#ifdef DEBUG_TRUNCATE
-					if (ip == HammerTruncIp)
-					kprintf("truncate1 %016llx\n",
-						(long long)ip->trunc_off);
-#endif
 				} else if (ip->trunc_off > vap->va_size) {
 					ip->trunc_off = vap->va_size;
-#ifdef DEBUG_TRUNCATE
-					if (ip == HammerTruncIp)
-					kprintf("truncate2 %016llx\n",
-						(long long)ip->trunc_off);
-#endif
-				} else {
-#ifdef DEBUG_TRUNCATE
-					if (ip == HammerTruncIp)
-					kprintf("truncate3 %016llx (ignored)\n",
-						(long long)vap->va_size);
-#endif
 				}
 			}
 
@@ -2379,6 +2333,7 @@ hammer_vop_setattr(struct vop_setattr_args *ap)
 			ip->ino_data.size = vap->va_size;
 			ip->ino_data.mtime = trans.time;
 			modflags |= HAMMER_INODE_MTIME | HAMMER_INODE_DDIRTY;
+			vclrflags(ap->a_vp, VLASTWRITETS);
 			kflags |= NOTE_ATTRIB;
 			break;
 		default:
@@ -2396,6 +2351,7 @@ hammer_vop_setattr(struct vop_setattr_args *ap)
 		ip->ino_data.mtime = hammer_timespec_to_time(&vap->va_mtime);
 		modflags |= HAMMER_INODE_MTIME;
 		kflags |= NOTE_ATTRIB;
+		vclrflags(ap->a_vp, VLASTWRITETS);
 	}
 	if (vap->va_mode != (mode_t)VNOVAL) {
 		mode_t   cur_mode = ip->ino_data.mode;
@@ -2428,8 +2384,8 @@ int
 hammer_vop_nsymlink(struct vop_nsymlink_args *ap)
 {
 	struct hammer_transaction trans;
-	struct hammer_inode *dip;
-	struct hammer_inode *nip;
+	hammer_inode_t dip;
+	hammer_inode_t nip;
 	hammer_record_t record;
 	struct nchandle *nch;
 	hammer_mount_t hmp;
@@ -2452,7 +2408,6 @@ hammer_vop_nsymlink(struct vop_nsymlink_args *ap)
 	 */
 	lwkt_gettoken(&hmp->fs_token);
 	hammer_start_transaction(&trans, hmp);
-	++hammer_stats_file_iopsw;
 
 	/*
 	 * Create a new filesystem object of the requested type.  The
@@ -2482,7 +2437,7 @@ hammer_vop_nsymlink(struct vop_nsymlink_args *ap)
 			record = hammer_alloc_mem_record(nip, bytes);
 			record->type = HAMMER_MEM_RECORD_GENERAL;
 
-			record->leaf.base.localization = nip->obj_localization +
+			record->leaf.base.localization = nip->obj_localization |
 							 HAMMER_LOCALIZE_MISC;
 			record->leaf.base.key = HAMMER_FIXKEY_SYMLINK;
 			record->leaf.base.rec_type = HAMMER_RECTYPE_FIX;
@@ -2501,7 +2456,7 @@ hammer_vop_nsymlink(struct vop_nsymlink_args *ap)
 		}
 	}
 	if (error == 0)
-		error = hammer_ip_add_directory(&trans, dip, nch->ncp->nc_name,
+		error = hammer_ip_add_direntry(&trans, dip, nch->ncp->nc_name,
 						nch->ncp->nc_nlen, nip);
 
 	/*
@@ -2532,7 +2487,7 @@ int
 hammer_vop_nwhiteout(struct vop_nwhiteout_args *ap)
 {
 	struct hammer_transaction trans;
-	struct hammer_inode *dip;
+	hammer_inode_t dip;
 	hammer_mount_t hmp;
 	int error;
 
@@ -2546,7 +2501,6 @@ hammer_vop_nwhiteout(struct vop_nwhiteout_args *ap)
 
 	lwkt_gettoken(&hmp->fs_token);
 	hammer_start_transaction(&trans, hmp);
-	++hammer_stats_file_iopsw;
 	error = hammer_dounlink(&trans, ap->a_nch, ap->a_dvp,
 				ap->a_cred, ap->a_flags, -1);
 	hammer_done_transaction(&trans);
@@ -2562,11 +2516,10 @@ static
 int
 hammer_vop_ioctl(struct vop_ioctl_args *ap)
 {
-	struct hammer_inode *ip = ap->a_vp->v_data;
+	hammer_inode_t ip = ap->a_vp->v_data;
 	hammer_mount_t hmp = ip->hmp;
 	int error;
 
-	++hammer_stats_file_iopsr;
 	lwkt_gettoken(&hmp->fs_token);
 	error = hammer_ioctl(ip, ap->a_command, ap->a_data,
 			     ap->a_fflag, ap->a_cred);
@@ -2579,12 +2532,13 @@ int
 hammer_vop_mountctl(struct vop_mountctl_args *ap)
 {
 	static const struct mountctl_opt extraopt[] = {
-		{ HMNT_NOHISTORY, 	"nohistory" },
+		{ HMNT_NOHISTORY,	"nohistory" },
 		{ HMNT_MASTERID,	"master" },
+		{ HMNT_NOMIRROR,	"nomirror" },
 		{ 0, NULL}
 
 	};
-	struct hammer_mount *hmp;
+	hammer_mount_t hmp;
 	struct mount *mp;
 	int usedbytes;
 	int error;
@@ -2593,7 +2547,7 @@ hammer_vop_mountctl(struct vop_mountctl_args *ap)
 	usedbytes = 0;
 	mp = ap->a_head.a_ops->head.vv_mount;
 	KKASSERT(mp->mnt_data != NULL);
-	hmp = (struct hammer_mount *)mp->mnt_data;
+	hmp = (hammer_mount_t)mp->mnt_data;
 
 	lwkt_gettoken(&hmp->fs_token);
 
@@ -2606,7 +2560,6 @@ hammer_vop_mountctl(struct vop_mountctl_args *ap)
 				      (const struct export_args *)ap->a_ctl);
 		break;
 	case MOUNTCTL_MOUNTFLAGS:
-	{
 		/*
 		 * Call standard mountctl VOP function
 		 * so we get user mount flags.
@@ -2626,7 +2579,6 @@ hammer_vop_mountctl(struct vop_mountctl_args *ap)
 
 		*ap->a_res += usedbytes;
 		break;
-	}
 	default:
 		error = vop_stdmountctl(ap);
 		break;
@@ -2667,9 +2619,6 @@ hammer_vop_strategy(struct vop_strategy_args *ap)
 		biodone(ap->a_bio);
 		break;
 	}
-
-	/* hammer_dump_dedup_cache(((hammer_inode_t)ap->a_vp->v_data)->hmp); */
-
 	return (error);
 }
 
@@ -2689,8 +2638,8 @@ int
 hammer_vop_strategy_read(struct vop_strategy_args *ap)
 {
 	struct hammer_transaction trans;
-	struct hammer_inode *ip;
-	struct hammer_inode *dip;
+	hammer_inode_t ip;
+	hammer_inode_t dip;
 	hammer_mount_t hmp;
 	struct hammer_cursor cursor;
 	hammer_base_elm_t base;
@@ -2723,8 +2672,7 @@ hammer_vop_strategy_read(struct vop_strategy_args *ap)
 	 * device.
 	 */
 	nbio = push_bio(bio);
-	if ((nbio->bio_offset & HAMMER_OFF_ZONE_MASK) ==
-	    HAMMER_ZONE_LARGE_DATA) {
+	if (hammer_is_zone_large_data(nbio->bio_offset)) {
 		if (hammer_double_buffer == 0) {
 			lwkt_gettoken(&hmp->fs_token);
 			error = hammer_io_direct_read(hmp, nbio, NULL);
@@ -2738,7 +2686,7 @@ hammer_vop_strategy_read(struct vop_strategy_args *ap)
 		 * only compatible buffer sizes (meaning those generated
 		 * by normal filesystem buffers) are legal.
 		 */
-		if (hammer_live_dedup == 0 && (bp->b_flags & B_PAGING) == 0) {
+		if ((bp->b_flags & B_PAGING) == 0) {
 			lwkt_gettoken(&hmp->fs_token);
 			error = hammer_io_indirect_read(hmp, nbio, NULL);
 			lwkt_reltoken(&hmp->fs_token);
@@ -2759,7 +2707,7 @@ hammer_vop_strategy_read(struct vop_strategy_args *ap)
 	 * stored in the actual records represent BASE+LEN, not BASE.  The
 	 * first record containing bio_offset will have a key > bio_offset.
 	 */
-	cursor.key_beg.localization = ip->obj_localization +
+	cursor.key_beg.localization = ip->obj_localization |
 				      HAMMER_LOCALIZE_MISC;
 	cursor.key_beg.obj_id = ip->obj_id;
 	cursor.key_beg.create_tid = 0;
@@ -2775,7 +2723,7 @@ hammer_vop_strategy_read(struct vop_strategy_args *ap)
 	if (ip->ino_data.obj_type == HAMMER_OBJTYPE_DBFILE) {
 		cursor.key_beg.rec_type = HAMMER_RECTYPE_DB;
 		cursor.key_end.rec_type = HAMMER_RECTYPE_DB;
-		cursor.key_end.key = 0x7FFFFFFFFFFFFFFFLL;
+		cursor.key_end.key = HAMMER_MAX_KEY;
 	} else
 #endif
 	{
@@ -2784,7 +2732,7 @@ hammer_vop_strategy_read(struct vop_strategy_args *ap)
 		cursor.key_end.rec_type = HAMMER_RECTYPE_DATA;
 		tmp64 = ran_end + MAXPHYS + 1;	/* work-around GCC-4 bug */
 		if (tmp64 < ran_end)
-			cursor.key_end.key = 0x7FFFFFFFFFFFFFFFLL;
+			cursor.key_end.key = HAMMER_MAX_KEY;
 		else
 			cursor.key_end.key = ran_end + MAXPHYS + 1;
 	}
@@ -2839,7 +2787,7 @@ hammer_vop_strategy_read(struct vop_strategy_args *ap)
 		rec_offset += roff;
 		n = cursor.leaf->data_len - roff;
 		if (n <= 0) {
-			kprintf("strategy_read: bad n=%d roff=%d\n", n, roff);
+			hdkprintf("bad n=%d roff=%d\n", n, roff);
 			n = 0;
 		} else if (n > bp->b_bufsize - boff) {
 			n = bp->b_bufsize - boff;
@@ -2901,46 +2849,28 @@ hammer_vop_strategy_read(struct vop_strategy_args *ap)
 			/*
 			 * Direct read case
 			 */
-			KKASSERT((disk_offset & HAMMER_OFF_ZONE_MASK) ==
-				 HAMMER_ZONE_LARGE_DATA);
+			KKASSERT(hammer_is_zone_large_data(disk_offset));
 			nbio->bio_offset = disk_offset;
 			error = hammer_io_direct_read(hmp, nbio, cursor.leaf);
-			if (hammer_live_dedup && error == 0)
-				hammer_dedup_cache_add(ip, cursor.leaf);
 			goto done;
 		} else if (isdedupable) {
 			/*
 			 * Async I/O case for reading from backing store
 			 * and copying the data to the filesystem buffer.
-			 * live-dedup has to verify the data anyway if it
-			 * gets a hit later so we can just add the entry
-			 * now.
 			 */
-			KKASSERT((disk_offset & HAMMER_OFF_ZONE_MASK) ==
-				 HAMMER_ZONE_LARGE_DATA);
+			KKASSERT(hammer_is_zone_large_data(disk_offset));
 			nbio->bio_offset = disk_offset;
-			if (hammer_live_dedup)
-				hammer_dedup_cache_add(ip, cursor.leaf);
 			error = hammer_io_indirect_read(hmp, nbio, cursor.leaf);
 			goto done;
 		} else if (n) {
 			error = hammer_ip_resolve_data(&cursor);
 			if (error == 0) {
-				if (hammer_live_dedup && isdedupable)
-					hammer_dedup_cache_add(ip, cursor.leaf);
 				bcopy((char *)cursor.data + roff,
 				      (char *)bp->b_data + boff, n);
 			}
 		}
 		if (error)
 			break;
-
-		/*
-		 * We have to be sure that the only elements added to the
-		 * dedup cache are those which are already on-media.
-		 */
-		if (hammer_live_dedup && hammer_cursor_ondisk(&cursor))
-			hammer_dedup_cache_add(ip, cursor.leaf);
 
 		/*
 		 * Iterate until we have filled the request.
@@ -2984,8 +2914,8 @@ done:
 	 * Cache the b-tree node for the last data read in cache[1].
 	 *
 	 * If we hit the file EOF then also cache the node in the
-	 * governing director's cache[3], it will be used to initialize
-	 * the inode's cache[1] for any inodes looked up via the directory.
+	 * governing directory's cache[3], it will be used to initialize
+	 * the new inode's cache[1] for any inodes looked up via the directory.
 	 *
 	 * This doesn't reduce disk accesses since the B-Tree chain is
 	 * likely cached, but it does reduce cpu overhead when looking
@@ -3014,9 +2944,9 @@ done:
  *
  * This routine may return EOPNOTSUPP if the opration is not supported for
  * the specified offset.  The contents of the pointer arguments do not
- * need to be initialized in that case. 
+ * need to be initialized in that case.
  *
- * If a disk address is available and properly aligned return 0 with 
+ * If a disk address is available and properly aligned return 0 with
  * *doffsetp set to the zone-2 address, and *runp / *runb set appropriately
  * to the run-length relative to that offset.  Callers may assume that
  * *doffsetp is valid if 0 is returned, even if *runp is not sufficiently
@@ -3027,7 +2957,7 @@ int
 hammer_vop_bmap(struct vop_bmap_args *ap)
 {
 	struct hammer_transaction trans;
-	struct hammer_inode *ip;
+	hammer_inode_t ip;
 	hammer_mount_t hmp;
 	struct hammer_cursor cursor;
 	hammer_base_elm_t base;
@@ -3043,7 +2973,6 @@ hammer_vop_bmap(struct vop_bmap_args *ap)
 	int	error;
 	int	blksize;
 
-	++hammer_stats_file_iopsr;
 	ip = ap->a_vp->v_data;
 	hmp = ip->hmp;
 
@@ -3067,10 +2996,7 @@ hammer_vop_bmap(struct vop_bmap_args *ap)
 	 */
 	lwkt_gettoken(&hmp->fs_token);
 	hammer_simple_transaction(&trans, hmp);
-#if 0
-	kprintf("bmap_beg %016llx ip->cache %p\n",
-		(long long)ap->a_loffset, ip->cache[1]);
-#endif
+
 	hammer_init_cursor(&trans, &cursor, &ip->cache[1], ip);
 
 	/*
@@ -3078,7 +3004,7 @@ hammer_vop_bmap(struct vop_bmap_args *ap)
 	 * stored in the actual records represent BASE+LEN, not BASE.  The
 	 * first record containing bio_offset will have a key > bio_offset.
 	 */
-	cursor.key_beg.localization = ip->obj_localization +
+	cursor.key_beg.localization = ip->obj_localization |
 				      HAMMER_LOCALIZE_MISC;
 	cursor.key_beg.obj_id = ip->obj_id;
 	cursor.key_beg.create_tid = 0;
@@ -3101,7 +3027,7 @@ hammer_vop_bmap(struct vop_bmap_args *ap)
 	cursor.key_end.rec_type = HAMMER_RECTYPE_DATA;
 	tmp64 = ran_end + MAXPHYS + 1;	/* work-around GCC-4 bug */
 	if (tmp64 < ran_end)
-		cursor.key_end.key = 0x7FFFFFFFFFFFFFFFLL;
+		cursor.key_end.key = HAMMER_MAX_KEY;
 	else
 		cursor.key_end.key = ran_end + MAXPHYS + 1;
 
@@ -3168,31 +3094,13 @@ hammer_vop_bmap(struct vop_bmap_args *ap)
 			}
 			last_offset = rec_offset + rec_len;
 			last_disk_offset = disk_offset + rec_len;
-
-			if (hammer_live_dedup)
-				hammer_dedup_cache_add(ip, cursor.leaf);
 		}
-		
 		error = hammer_ip_next(&cursor);
 	}
 
-#if 0
-	kprintf("BMAP %016llx:  %016llx - %016llx\n",
-		(long long)ap->a_loffset,
-		(long long)base_offset,
-		(long long)last_offset);
-	kprintf("BMAP %16s:  %016llx - %016llx\n", "",
-		(long long)base_disk_offset,
-		(long long)last_disk_offset);
-#endif
-
-	if (cursor.node) {
+	if (cursor.node)
 		hammer_cache_node(&ip->cache[1], cursor.node);
-#if 0
-		kprintf("bmap_end2 %016llx ip->cache %p\n",
-			(long long)ap->a_loffset, ip->cache[1]);
-#endif
-	}
+
 	hammer_done_cursor(&cursor);
 	hammer_done_transaction(&trans);
 	lwkt_reltoken(&hmp->fs_token);
@@ -3226,7 +3134,7 @@ hammer_vop_bmap(struct vop_bmap_args *ap)
 	 */
 	disk_offset = base_disk_offset + (ap->a_loffset - base_offset);
 
-	if ((disk_offset & HAMMER_OFF_ZONE_MASK) != HAMMER_ZONE_LARGE_DATA) {
+	if (!hammer_is_zone_large_data(disk_offset)) {
 		/*
 		 * Only large-data zones can be direct-IOd
 		 */
@@ -3317,7 +3225,7 @@ hammer_vop_strategy_write(struct vop_strategy_args *ap)
 	}
 
 	/*
-	 * Reserve space and issue a direct-write from the front-end. 
+	 * Reserve space and issue a direct-write from the front-end.
 	 * NOTE: The direct_io code will hammer_bread/bcopy smaller
 	 * allocations.
 	 *
@@ -3335,10 +3243,10 @@ hammer_vop_strategy_write(struct vop_strategy_args *ap)
 	 */
 	KKASSERT((bio->bio_offset & HAMMER_BUFMASK) == 0);
 	KKASSERT(bio->bio_offset < ip->ino_data.size);
-	if (bio->bio_offset || ip->ino_data.size > HAMMER_BUFSIZE / 2)
+	if (bio->bio_offset || ip->ino_data.size > HAMMER_HBUFSIZE)
 		bytes = bp->b_bufsize;
 	else
-		bytes = ((int)ip->ino_data.size + 15) & ~15;
+		bytes = HAMMER_DATA_DOALIGN_WITH(int, ip->ino_data.size);
 
 	record = hammer_ip_add_bulk(ip, bio->bio_offset, bp->b_data,
 				    bytes, &error);
@@ -3353,13 +3261,7 @@ hammer_vop_strategy_write(struct vop_strategy_args *ap)
 			record->flags |= HAMMER_RECF_REDO;
 			bp->b_flags &= ~B_VFSFLAG1;
 		}
-		if (record->flags & HAMMER_RECF_DEDUPED) {
-			bp->b_resid = 0;
-			hammer_ip_replace_bulk(hmp, record);
-			biodone(ap->a_bio);
-		} else {
-			hammer_io_direct_write(hmp, bio, record);
-		}
+		hammer_io_direct_write(hmp, bio, record);
 		if (ip->rsv_recs > 1 && hmp->rsv_recs > hammer_limit_recs)
 			hammer_flush_inode(ip, 0);
 	} else {
@@ -3379,7 +3281,7 @@ hammer_vop_strategy_write(struct vop_strategy_args *ap)
  */
 static int
 hammer_dounlink(hammer_transaction_t trans, struct nchandle *nch,
-		struct vnode *dvp, struct ucred *cred, 
+		struct vnode *dvp, struct ucred *cred,
 		int flags, int isdir)
 {
 	struct namecache *ncp;
@@ -3388,7 +3290,7 @@ hammer_dounlink(hammer_transaction_t trans, struct nchandle *nch,
 	hammer_mount_t hmp;
 	struct hammer_cursor cursor;
 	int64_t namekey;
-	u_int32_t max_iterations;
+	uint32_t max_iterations;
 	int nlen, error;
 
 	/*
@@ -3405,11 +3307,11 @@ hammer_dounlink(hammer_transaction_t trans, struct nchandle *nch,
 	if (dip->flags & HAMMER_INODE_RO)
 		return (EROFS);
 
-	namekey = hammer_directory_namekey(dip, ncp->nc_name, ncp->nc_nlen,
+	namekey = hammer_direntry_namekey(dip, ncp->nc_name, ncp->nc_nlen,
 					   &max_iterations);
 retry:
 	hammer_init_cursor(trans, &cursor, &dip->cache[1], dip);
-	cursor.key_beg.localization = dip->obj_localization +
+	cursor.key_beg.localization = dip->obj_localization |
 				      hammer_dir_localization(dip);
         cursor.key_beg.obj_id = dip->obj_id;
 	cursor.key_beg.key = namekey;
@@ -3462,11 +3364,11 @@ retry:
 				      0, &error);
 		hammer_lock_sh(&cursor.ip->lock);
 		if (error == ENOENT) {
-			kprintf("HAMMER: WARNING: Removing "
-				"dirent w/missing inode \"%s\"\n"
-				"\tobj_id = %016llx\n",
+			hkprintf("WARNING: Removing dirent w/missing inode "
+				"\"%s\"\n"
+				"\tobj_id = %016jx\n",
 				ncp->nc_name,
-				(long long)cursor.data->entry.obj_id);
+				(intmax_t)cursor.data->entry.obj_id);
 			error = 0;
 		}
 
@@ -3505,7 +3407,7 @@ retry:
 			error = hammer_ip_check_directory_empty(trans, ip);
 			hammer_lock_cursor(&cursor);
 			if (cursor.flags & HAMMER_CURSOR_RETEST) {
-				kprintf("HAMMER: Warning: avoided deadlock "
+				hkprintf("Warning: avoided deadlock "
 					"on rmdir '%s'\n",
 					ncp->nc_name);
 				error = EDEADLK;
@@ -3515,12 +3417,12 @@ retry:
 		/*
 		 * Delete the directory entry.
 		 *
-		 * WARNING: hammer_ip_del_directory() may have to terminate
+		 * WARNING: hammer_ip_del_direntry() may have to terminate
 		 * the cursor to avoid a deadlock.  It is ok to call
 		 * hammer_done_cursor() twice.
 		 */
 		if (error == 0) {
-			error = hammer_ip_del_directory(trans, &cursor,
+			error = hammer_ip_del_direntry(trans, &cursor,
 							dip, ip);
 		}
 		hammer_done_cursor(&cursor);
@@ -3559,7 +3461,7 @@ retry:
 					vrele(vp);
 					break;
 				}
-				kprintf("Debug: HAMMER ip/vp race1 avoided\n");
+				hdkprintf("ip/vp race1 avoided\n");
 			}
 		}
 		if (ip)

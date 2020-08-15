@@ -28,7 +28,6 @@
  *
  *	@(#)raw_cb.c	8.1 (Berkeley) 6/10/93
  * $FreeBSD: src/sys/net/raw_cb.c,v 1.16 1999/08/28 00:48:27 peter Exp $
- * $DragonFly: src/sys/net/raw_cb.c,v 1.11 2006/09/05 00:55:46 dillon Exp $
  */
 
 #include <sys/param.h>
@@ -39,9 +38,12 @@
 #include <sys/protosw.h>
 
 #include <net/raw_cb.h>
+#include <net/netisr2.h>
 
 /*
  * Routines to manage the raw protocol control blocks.
+ *
+ * All of them must run in netisr0.
  *
  * TODO:
  *	hash lookups by protocol family/protocol + address family
@@ -67,6 +69,8 @@ raw_attach(struct socket *so, int proto, struct rlimit *rl)
 	struct rawcb *rp = sotorawcb(so);
 	int error;
 
+	ASSERT_NETISR0;
+
 	/*
 	 * It is assumed that raw_attach is called
 	 * after space has been allocated for the
@@ -80,7 +84,9 @@ raw_attach(struct socket *so, int proto, struct rlimit *rl)
 	rp->rcb_socket = so;
 	rp->rcb_proto.sp_family = so->so_proto->pr_domain->dom_family;
 	rp->rcb_proto.sp_protocol = proto;
+
 	LIST_INSERT_HEAD(&rawcb_list, rp, list);
+
 	return (0);
 }
 
@@ -93,9 +99,12 @@ raw_detach(struct rawcb *rp)
 {
 	struct socket *so = rp->rcb_socket;
 
+	ASSERT_NETISR0;
+
+	LIST_REMOVE(rp, list);
+
 	so->so_pcb = NULL;
 	sofree(so);		/* remove pcb ref */
-	LIST_REMOVE(rp, list);
 	kfree(rp, M_PCB);
 }
 
@@ -105,6 +114,8 @@ raw_detach(struct rawcb *rp)
 void
 raw_disconnect(struct rawcb *rp)
 {
+	ASSERT_NETISR0;
+
 	if (rp->rcb_socket->so_state & SS_NOFDREF)
 		raw_detach(rp);
 }
@@ -118,10 +129,12 @@ raw_bind(struct socket *so, struct mbuf *nam)
 	struct sockaddr *addr = mtod(nam, struct sockaddr *);
 	struct rawcb *rp;
 
+	ASSERT_NETISR0;
+
 	if (ifnet == NULL)
 		return (EADDRNOTAVAIL);
 	rp = sotorawcb(so);
-	nam = m_copym(nam, 0, M_COPYALL, MB_TRYWAIT);
+	nam = m_copym(nam, 0, M_COPYALL, M_WAITOK);
 	rp->rcb_laddr = mtod(nam, struct sockaddr *);
 	return (0);
 }

@@ -47,11 +47,9 @@
 #include <sys/event.h>
 #include <sys/signalvar.h>
 #include <sys/machintr.h>
+#include <sys/vnode.h>
 
 #include <machine/stdarg.h>	/* for device_printf() */
-
-#include <sys/thread2.h>
-#include <sys/mplock2.h>
 
 SYSCTL_NODE(_hw, OID_AUTO, bus, CTLFLAG_RW, NULL, NULL);
 SYSCTL_NODE(, OID_AUTO, dev, CTLFLAG_RW, NULL, NULL);
@@ -281,7 +279,7 @@ static d_ioctl_t	devioctl;
 static d_kqfilter_t	devkqfilter;
 
 static struct dev_ops devctl_ops = {
-	{ "devctl", 0, 0 },
+	{ "devctl", 0, D_MPSAFE },
 	.d_open =	devopen,
 	.d_close =	devclose,
 	.d_read =	devread,
@@ -300,38 +298,54 @@ TAILQ_HEAD(devq, dev_event_info);
 static struct dev_softc
 {
 	int	inuse;
-	int	nonblock;
 	struct lock lock;
 	struct kqinfo kq;
 	struct devq devq;
 	struct proc *async_proc;
 } devsoftc;
 
+/*
+ * Chicken-and-egg problem with devfs, get the queue operational early.
+ */
+static void
+predevinit(void)
+{
+	lockinit(&devsoftc.lock, "dev mtx", 0, 0);
+	TAILQ_INIT(&devsoftc.devq);
+}
+SYSINIT(predevinit, SI_SUB_CREATE_INIT, SI_ORDER_ANY, predevinit, 0);
+
 static void
 devinit(void)
 {
+	/*
+	 * WARNING! make_dev() can call back into devctl_queue_data()
+	 *	    immediately.
+	 */
 	make_dev(&devctl_ops, 0, UID_ROOT, GID_WHEEL, 0600, "devctl");
-	lockinit(&devsoftc.lock, "dev mtx", 0, 0);
-	TAILQ_INIT(&devsoftc.devq);
 }
 
 static int
 devopen(struct dev_open_args *ap)
 {
-	if (devsoftc.inuse)
+	lockmgr(&devsoftc.lock, LK_EXCLUSIVE);
+	if (devsoftc.inuse) {
+		lockmgr(&devsoftc.lock, LK_RELEASE);
 		return (EBUSY);
+	}
 	/* move to init */
 	devsoftc.inuse = 1;
-	devsoftc.nonblock = 0;
 	devsoftc.async_proc = NULL;
+	lockmgr(&devsoftc.lock, LK_RELEASE);
+
 	return (0);
 }
 
 static int
 devclose(struct dev_close_args *ap)
 {
-	devsoftc.inuse = 0;
 	lockmgr(&devsoftc.lock, LK_EXCLUSIVE);
+	devsoftc.inuse = 0;
 	wakeup(&devsoftc);
 	lockmgr(&devsoftc.lock, LK_RELEASE);
 
@@ -355,7 +369,7 @@ devread(struct dev_read_args *ap)
 
 	lockmgr(&devsoftc.lock, LK_EXCLUSIVE);
 	while (TAILQ_EMPTY(&devsoftc.devq)) {
-		if (devsoftc.nonblock) {
+		if (ap->a_ioflag & IO_NDELAY) {
 			lockmgr(&devsoftc.lock, LK_RELEASE);
 			return (EAGAIN);
 		}
@@ -386,10 +400,6 @@ devioctl(struct dev_ioctl_args *ap)
 	switch (ap->a_cmd) {
 
 	case FIONBIO:
-		if (*(int*)ap->a_data)
-			devsoftc.nonblock = 1;
-		else
-			devsoftc.nonblock = 0;
 		return (0);
 	case FIOASYNC:
 		if (*(int*)ap->a_data)
@@ -414,7 +424,8 @@ static void dev_filter_detach(struct knote *);
 static int dev_filter_read(struct knote *, long);
 
 static struct filterops dev_filtops =
-	{ FILTEROP_ISFD, NULL, dev_filter_detach, dev_filter_read };
+	{ FILTEROP_ISFD | FILTEROP_MPSAFE, NULL,
+	  dev_filter_detach, dev_filter_read };
 
 static int
 devkqfilter(struct dev_kqfilter_args *ap)
@@ -594,9 +605,12 @@ devaddq(const char *type, const char *what, device_t dev)
 	devctl_queue_data(data);
 	return;
 bad:
-	kfree(pnp, M_BUS);
-	kfree(loc, M_BUS);
-	kfree(data, M_BUS);
+	if (pnp != NULL)
+		kfree(pnp, M_BUS);
+	if (loc != NULL)
+		kfree(loc, M_BUS);
+	if (loc != NULL)
+		kfree(data, M_BUS);
 	return;
 }
 
@@ -698,7 +712,7 @@ sysctl_devctl_disable(SYSCTL_HANDLER_ARGS)
 
 /* End of /dev/devctl code */
 
-TAILQ_HEAD(,device)	bus_data_devices;
+TAILQ_HEAD(,bsd_device)	bus_data_devices;
 static int bus_data_generation = 1;
 
 kobj_method_t null_methods[] = {
@@ -1078,9 +1092,21 @@ devclass_alloc_unit(devclass_t dc, int *unitp)
 				 M_INTWAIT | M_ZERO);
 		if (newlist == NULL)
 			return(ENOMEM);
-		bcopy(dc->devices, newlist, sizeof(device_t) * dc->maxunit);
-		if (dc->devices)
+		/*
+		 * WARNING: Due to gcc builtin optimization,
+		 *	    calling bcopy causes gcc to assume
+		 *	    that the source and destination args
+		 *	    cannot be NULL and optimize-away later
+		 *	    conditional tests to determine if dc->devices
+		 *	    is NULL.  In this situation, in fact,
+		 *	    dc->devices CAN be NULL w/ maxunit == 0.
+		 */
+		if (dc->devices) {
+			bcopy(dc->devices,
+			      newlist,
+			      sizeof(device_t) * dc->maxunit);
 			kfree(dc->devices, M_BUS);
+		}
 		dc->devices = newlist;
 		dc->maxunit = newsize;
 	}
@@ -1151,7 +1177,7 @@ make_device(device_t parent, const char *name, int unit)
 	} else
 		dc = NULL;
 
-	dev = kmalloc(sizeof(struct device), M_BUS, M_INTWAIT | M_ZERO);
+	dev = kmalloc(sizeof(struct bsd_device), M_BUS, M_INTWAIT | M_ZERO);
 	if (!dev)
 		return(0);
 
@@ -1220,9 +1246,10 @@ device_add_child_ordered(device_t dev, int order, const char *name, int unit)
 		return child;
 	child->order = order;
 
-	TAILQ_FOREACH(place, &dev->children, link)
+	TAILQ_FOREACH(place, &dev->children, link) {
 		if (place->order > order)
 			break;
+	}
 
 	if (place) {
 		/*
@@ -1263,7 +1290,6 @@ device_delete_child(device_t dev, device_t child)
 		devclass_delete_device(child->devclass, child);
 	TAILQ_REMOVE(&dev->children, child, link);
 	TAILQ_REMOVE(&bus_data_devices, child, devlink);
-	device_set_desc(child, NULL);
 	kobj_delete((kobj_t)child, M_BUS);
 
 	bus_data_generation_update();
@@ -1380,7 +1406,7 @@ device_probe_child(device_t dev, device_t child)
 		return(0);
 
 	for (; dc; dc = dc->parent) {
-    		for (dl = first_matching_driver(dc, child); dl;
+		for (dl = first_matching_driver(dc, child); dl;
 		     dl = next_matching_driver(dc, child, dl)) {
 			PDEBUG(("Trying %s", DRIVERNAME(dl->driver)));
 			device_set_driver(child, dl->driver);
@@ -1405,7 +1431,102 @@ device_probe_child(device_t dev, device_t child)
 			 * certainly doesn't match.
 			 */
 			if (result > 0) {
-				device_set_driver(child, 0);
+				device_set_driver(child, NULL);
+				continue;
+			}
+
+			/*
+			 * A priority lower than SUCCESS, remember the
+			 * best matching driver. Initialise the value
+			 * of pri for the first match.
+			 */
+			if (best == NULL || result > pri) {
+				best = dl;
+				pri = result;
+				continue;
+			}
+		}
+		/*
+	         * If we have unambiguous match in this devclass,
+	         * don't look in the parent.
+	         */
+	        if (best && pri == 0)
+			break;
+	}
+
+	/*
+	 * If we found a driver, change state and initialise the devclass.
+	 */
+	if (best) {
+		if (!child->devclass)
+			device_set_devclass(child, best->driver->name);
+		device_set_driver(child, best->driver);
+		if (pri < 0) {
+			/*
+			 * A bit bogus. Call the probe method again to make
+			 * sure that we have the right description.
+			 */
+			DEVICE_PROBE(child);
+		}
+
+		bus_data_generation_update();
+		child->state = DS_ALIVE;
+		return(0);
+	}
+
+	return(ENXIO);
+}
+
+int
+device_probe_child_gpri(device_t dev, device_t child, u_int gpri)
+{
+	devclass_t dc;
+	driverlink_t best = NULL;
+	driverlink_t dl;
+	int result, pri = 0;
+	int hasclass = (child->devclass != NULL);
+
+	dc = dev->devclass;
+	if (!dc)
+		panic("device_probe_child: parent device has no devclass");
+
+	if (child->state == DS_ALIVE)
+		return(0);
+
+	for (; dc; dc = dc->parent) {
+		for (dl = first_matching_driver(dc, child); dl;
+			dl = next_matching_driver(dc, child, dl)) {
+			/*
+			 * GPRI handling, only probe drivers with the
+			 * specific GPRI.
+			 */
+			if (dl->driver->gpri != gpri)
+				continue;
+
+			PDEBUG(("Trying %s", DRIVERNAME(dl->driver)));
+			device_set_driver(child, dl->driver);
+			if (!hasclass)
+				device_set_devclass(child, dl->driver->name);
+			result = DEVICE_PROBE(child);
+			if (!hasclass)
+				device_set_devclass(child, 0);
+
+			/*
+			 * If the driver returns SUCCESS, there can be
+			 * no higher match for this device.
+			 */
+			if (result == 0) {
+				best = dl;
+				pri = 0;
+				break;
+			}
+
+			/*
+			 * The driver returned an error so it
+			 * certainly doesn't match.
+			 */
+			if (result > 0) {
+				device_set_driver(child, NULL);
 				continue;
 			}
 
@@ -1425,7 +1546,7 @@ device_probe_child(device_t dev, device_t child)
 	         * don't look in the parent.
 	         */
 	        if (best && pri == 0)
-	    	        break;
+			break;
 	}
 
 	/*
@@ -1769,6 +1890,7 @@ device_set_driver(device_t dev, driver_t *driver)
 		kfree(dev->softc, M_BUS);
 		dev->softc = NULL;
 	}
+	device_set_desc(dev, NULL);
 	kobj_delete((kobj_t) dev, 0);
 	dev->driver = driver;
 	if (driver) {
@@ -1813,6 +1935,62 @@ device_probe_and_attach(device_t dev)
 
 	/*
 	 * Output the exact device chain prior to the attach in case the  
+	 * system locks up during attach, and generate the full info after
+	 * the attach so correct irq and other information is displayed.
+	 */
+	if (bootverbose && !device_is_quiet(dev)) {
+		device_t tmp;
+
+		kprintf("%s", device_get_nameunit(dev));
+		for (tmp = dev->parent; tmp; tmp = tmp->parent)
+			kprintf(".%s", device_get_nameunit(tmp));
+		kprintf("\n");
+	}
+	if (!device_is_quiet(dev))
+		device_print_child(bus, dev);
+	if ((dev->flags & DF_ASYNCPROBE) && do_async_attach) {
+		kprintf("%s: probing asynchronously\n",
+			device_get_nameunit(dev));
+		dev->state = DS_INPROGRESS;
+		device_attach_async(dev);
+		error = 0;
+	} else {
+		error = device_doattach(dev);
+	}
+	return(error);
+}
+
+int
+device_probe_and_attach_gpri(device_t dev, u_int gpri)
+{
+	device_t bus = dev->parent;
+	int error = 0;
+
+	if (dev->state >= DS_ALIVE)
+		return(0);
+
+	if ((dev->flags & DF_ENABLED) == 0) {
+		if (bootverbose) {
+			device_print_prettyname(dev);
+			kprintf("not probed (disabled)\n");
+		}
+		return(0);
+	}
+
+	error = device_probe_child_gpri(bus, dev, gpri);
+	if (error) {
+#if 0
+		if (!(dev->flags & DF_DONENOMATCH)) {
+			BUS_PROBE_NOMATCH(bus, dev);
+			devnomatch(dev);
+			dev->flags |= DF_DONENOMATCH;
+		}
+#endif
+		return(error);
+	}
+
+	/*
+	 * Output the exact device chain prior to the attach in case the
 	 * system locks up during attach, and generate the full info after
 	 * the attach so correct irq and other information is displayed.
 	 */
@@ -2071,11 +2249,24 @@ resource_kenv(const char *name, int unit, const char *resname, long *result)
 	const char *env;
 	char buf[64];
 
+	/*
+	 * DragonFly style loader.conf hinting
+	 */
 	ksnprintf(buf, sizeof(buf), "%s%d.%s", name, unit, resname);
 	if ((env = kgetenv(buf)) != NULL) {
 		*result = strtol(env, NULL, 0);
 		return(0);
 	}
+
+	/*
+	 * Also support FreeBSD style loader.conf hinting
+	 */
+	ksnprintf(buf, sizeof(buf), "hint.%s.%d.%s", name, unit, resname);
+	if ((env = kgetenv(buf)) != NULL) {
+		*result = strtol(env, NULL, 0);
+		return(0);
+	}
+
 	return (ENOENT);
 }
 
@@ -2124,6 +2315,26 @@ resource_string_value(const char *name, int unit, const char *resname,
 {
 	int error;
 	struct config_resource *res;
+	char buf[64];
+	const char *env;
+
+	/*
+	 * DragonFly style loader.conf hinting
+	 */
+	ksnprintf(buf, sizeof(buf), "%s%d.%s", name, unit, resname);
+	if ((env = kgetenv(buf)) != NULL) {
+		*result = env;
+		return 0;
+	}
+
+	/*
+	 * Also support FreeBSD style loader.conf hinting
+	 */
+	ksnprintf(buf, sizeof(buf), "hint.%s.%d.%s", name, unit, resname);
+	if ((env = kgetenv(buf)) != NULL) {
+		*result = env;
+		return 0;
+	}
 
 	if ((error = resource_find(name, unit, resname, &res)) != 0)
 		return(error);
@@ -2318,7 +2529,7 @@ resource_cfgload(void *dummy __unused)
 		}
 	}
 }
-SYSINIT(cfgload, SI_BOOT1_POST, SI_ORDER_ANY + 50, resource_cfgload, 0)
+SYSINIT(cfgload, SI_BOOT1_POST, SI_ORDER_ANY + 50, resource_cfgload, 0);
 
 
 /*======================================*/
@@ -2431,8 +2642,8 @@ resource_list_alloc(struct resource_list *rl,
 
 	if (isdefault) {
 		start = rle->start;
-		count = max(count, rle->count);
-		end = max(rle->end, start + count - 1);
+		count = ulmax(count, rle->count);
+		end = ulmax(rle->end, start + count - 1);
 	}
 	cpuid = rle->cpuid;
 
@@ -2581,6 +2792,18 @@ bus_generic_attach(device_t dev)
 
 	TAILQ_FOREACH(child, &dev->children, link) {
 		device_probe_and_attach(child);
+	}
+
+	return(0);
+}
+
+int
+bus_generic_attach_gpri(device_t dev, u_int gpri)
+{
+	device_t child;
+
+	TAILQ_FOREACH(child, &dev->children, link) {
+		device_probe_and_attach_gpri(child, gpri);
 	}
 
 	return(0);
@@ -3584,7 +3807,7 @@ sysctl_devices(SYSCTL_HANDLER_ARGS)
 	int			*name = (int *)arg1;
 	u_int			namelen = arg2;
 	int			index;
-	struct device		*dev;
+	device_t		dev;
 	struct u_device		udev;	/* XXX this is a bit big */
 	int			error;
 
@@ -3684,7 +3907,32 @@ device_getenv_int(device_t dev, const char *knob, int def)
 {
 	char env[128];
 
+	/* Deprecated; for compat */
 	ksnprintf(env, sizeof(env), "hw.%s.%s", device_get_nameunit(dev), knob);
 	kgetenv_int(env, &def);
+
+	/* Prefer dev.driver.unit.knob */
+	ksnprintf(env, sizeof(env), "dev.%s.%d.%s",
+	    device_get_name(dev), device_get_unit(dev), knob);
+	kgetenv_int(env, &def);
+
 	return def;
+}
+
+void
+device_getenv_string(device_t dev, const char *knob, char * __restrict data,
+    int dlen, const char * __restrict def)
+{
+	char env[128];
+
+	strlcpy(data, def, dlen);
+
+	/* Deprecated; for compat */
+	ksnprintf(env, sizeof(env), "hw.%s.%s", device_get_nameunit(dev), knob);
+	kgetenv_string(env, data, dlen);
+
+	/* Prefer dev.driver.unit.knob */
+	ksnprintf(env, sizeof(env), "dev.%s.%d.%s",
+	    device_get_name(dev), device_get_unit(dev), knob);
+	kgetenv_string(env, data, dlen);
 }

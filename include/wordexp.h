@@ -24,21 +24,20 @@
  * SUCH DAMAGE.
  *
  * $FreeBSD: src/include/wordexp.h,v 1.5 2004/06/30 13:55:08 tjr Exp $
- * $DragonFly: src/include/wordexp.h,v 1.1 2008/10/06 21:01:37 swildner Exp $
  */
 
 #ifndef _WORDEXP_H_
 #define	_WORDEXP_H_
 
 #include <sys/cdefs.h>
-#include <sys/types.h>
+#include <machine/stdint.h>
 
-#if __XSI_VISIBLE && !defined(_SIZE_T_DECLARED)
+#ifndef _SIZE_T_DECLARED
 typedef	__size_t	size_t;
 #define	_SIZE_T_DECLARED
 #endif
 
-typedef struct {
+typedef	struct {
 	__size_t	we_wordc;	/* count of words matched */
 	char		**we_wordv;	/* pointer to list of words */
 	__size_t	we_offs;	/* slots to reserve in we_wordv */
@@ -63,7 +62,7 @@ typedef struct {
 #define	WRDE_BADVAL	2		/* undefined variable */
 #define	WRDE_CMDSUB	3		/* command substitution not allowed */
 #define	WRDE_NOSPACE	4		/* no memory for result */
-#if __XSI_VISIBLE
+#if __BSD_VISIBLE || (__XSI_VISIBLE && __XSI_VISIBLE < 700)
 #define	WRDE_NOSYS	5		/* obsolete, reserved */
 #endif
 #define	WRDE_SYNTAX	6		/* shell syntax error */

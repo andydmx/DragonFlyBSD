@@ -23,6 +23,8 @@
  * SUCH DAMAGE.
  */
 
+/* $FreeBSD: head/sys/dev/usb/controller/xhci_pci.c 276717 2015-01-05 20:22:18Z hselasky $ */
+
 #include <sys/stdint.h>
 #include <sys/param.h>
 #include <sys/queue.h>
@@ -32,7 +34,6 @@
 #include <sys/bus.h>
 #include <sys/module.h>
 #include <sys/lock.h>
-#include <sys/mutex.h>
 #include <sys/condvar.h>
 #include <sys/sysctl.h>
 #include <sys/unistd.h>
@@ -84,7 +85,6 @@ static devclass_t xhci_devclass;
 DRIVER_MODULE(xhci, pci, xhci_driver, xhci_devclass, NULL, NULL);
 MODULE_DEPEND(xhci, usb, 1, 1, 1);
 
-
 static const char *
 xhci_pci_match(device_t self)
 {
@@ -97,11 +97,29 @@ xhci_pci_match(device_t self)
 	case 0x10421b21:
 		return ("ASMedia ASM1042 USB 3.0 controller");
 
+	case 0x0f358086:
+		return ("Intel BayTrail USB 3.0 controller");
+	case 0x9c318086:
 	case 0x1e318086:
 		return ("Intel Panther Point USB 3.0 controller");
 	case 0x8c318086:
 		return ("Intel Lynx Point USB 3.0 controller");
-
+	case 0x8cb18086:
+		return ("Intel Wildcat Point USB 3.0 controller");
+	case 0x8d318086:
+		return ("Intel Wellsburg USB 3.0 controller");
+	case 0x9cb18086:
+		return ("Intel Wildcat Point-LP USB 3.0 controller");
+	case 0x9d2f8086:
+		return ("Intel Sunrise Point-LP USB 3.0 controller");
+	case 0xa12f8086:
+		return ("Intel Sunrise Point USB 3.0 controller");
+	case 0xa1af8086:
+		return ("Intel Lewisburg USB 3.0 controller");
+	case 0xa2af8086:
+		return ("Intel Union Point USB 3.0 controller");
+	case 0xa01b177d:
+		return ("Cavium ThunderX USB 3.0 controller");
 	default:
 		break;
 	}
@@ -134,6 +152,7 @@ static void
 xhci_interrupt_poll(void *_sc)
 {
 	struct xhci_softc *sc = _sc;
+
 	USB_BUS_UNLOCK(&sc->sc_bus);
 	xhci_interrupt(sc);
 	USB_BUS_LOCK(&sc->sc_bus);
@@ -144,6 +163,8 @@ static int
 xhci_pci_port_route(device_t self, uint32_t set, uint32_t clear)
 {
 	uint32_t temp;
+	uint32_t usb3_mask;
+	uint32_t usb2_mask;
 
 	temp = pci_read_config(self, PCI_XHCI_INTEL_USB3_PSSEN, 4) |
 	    pci_read_config(self, PCI_XHCI_INTEL_XUSB2PR, 4);
@@ -151,8 +172,12 @@ xhci_pci_port_route(device_t self, uint32_t set, uint32_t clear)
 	temp |= set;
 	temp &= ~clear;
 
-	pci_write_config(self, PCI_XHCI_INTEL_USB3_PSSEN, temp, 4);
-	pci_write_config(self, PCI_XHCI_INTEL_XUSB2PR, temp, 4);
+	/* Don't set bits which the hardware doesn't support */
+	usb3_mask = pci_read_config(self, PCI_XHCI_INTEL_USB3PRM, 4);
+	usb2_mask = pci_read_config(self, PCI_XHCI_INTEL_USB2PRM, 4);
+
+	pci_write_config(self, PCI_XHCI_INTEL_USB3_PSSEN, temp & usb3_mask, 4);
+	pci_write_config(self, PCI_XHCI_INTEL_XUSB2PR, temp & usb2_mask, 4);
 
 	device_printf(self, "Port routing mask set to 0x%08x\n", temp);
 
@@ -163,31 +188,54 @@ static int
 xhci_pci_attach(device_t self)
 {
 	struct xhci_softc *sc = device_get_softc(self);
-	int count, err, rid;
-
-	/* XXX check for 64-bit capability */
-
-	if (xhci_init(sc, self)) {
-		device_printf(self, "Could not initialize softc\n");
-		goto error;
-	}
-
-	pci_enable_busmaster(self);
+	int err, rid;
+	uint8_t usedma32;
+#if defined(__DragonFly__)
+	int irq_flags;
+#else
+	int count;
+#endif
 
 	rid = PCI_XHCI_CBMEM;
 	sc->sc_io_res = bus_alloc_resource_any(self, SYS_RES_MEMORY, &rid,
-	    RF_ACTIVE);
+					       RF_ACTIVE);
 	if (!sc->sc_io_res) {
 		device_printf(self, "Could not map memory\n");
-		goto error;
+		return (ENOMEM);
 	}
 	sc->sc_io_tag = rman_get_bustag(sc->sc_io_res);
 	sc->sc_io_hdl = rman_get_bushandle(sc->sc_io_res);
 	sc->sc_io_size = rman_get_size(sc->sc_io_res);
 
-	usb_callout_init_mtx(&sc->sc_callout, &sc->sc_bus.bus_lock, 0);
+	/* check for USB 3.0 controllers which don't support 64-bit DMA */
+	switch (pci_get_devid(self)) {
+	case 0x01941033:	/* NEC uPD720200 USB 3.0 controller */
+	case 0x00141912:	/* NEC uPD720201 USB 3.0 controller */
+	case 0x78141022:	/* AMD A10-7300, tested does not work w/64-bit DMA */
+		usedma32 = 1;
+		break;
+	default:
+		usedma32 = 0;
+		break;
+	}
 
-	sc->sc_irq_rid = 0;
+	if (xhci_init(sc, self, usedma32)) {
+		device_printf(self, "Could not initialize softc\n");
+		bus_release_resource(self, SYS_RES_MEMORY, PCI_XHCI_CBMEM,
+		    sc->sc_io_res);
+		return (ENXIO);
+	}
+
+	pci_enable_busmaster(self);
+
+	usb_callout_init_mtx(&sc->sc_callout, &sc->sc_bus.bus_lock, 0);
+	USB_BUS_LOCK(&sc->sc_bus);
+
+	rid = 0;
+#if defined(__DragonFly__)
+	pci_alloc_1intr(self, xhci_use_msi, &rid, &irq_flags);
+	sc->sc_irq_rid = rid;
+#else
 	if (xhci_use_msi) {
 		count = pci_msi_count(self);
 		if (count >= 1) {
@@ -199,11 +247,26 @@ xhci_pci_attach(device_t self)
 			}
 		}
 	}
-	sc->sc_irq_res = bus_alloc_resource_any(self, SYS_RES_IRQ,
-	    &sc->sc_irq_rid, RF_SHAREABLE | RF_ACTIVE);
-	if (sc->sc_irq_res == NULL) {
-		device_printf(self, "Could not allocate IRQ\n");
-		goto error;
+#endif
+
+	/*
+	 * hw.usb.xhci.use_polling=1 to force polling.
+	 */
+	if (xhci_use_polling() == 0) {
+#if defined(__DragonFly__)
+		sc->sc_irq_res = bus_alloc_resource_any(self, SYS_RES_IRQ,
+							&rid, irq_flags);
+#else
+		sc->sc_irq_res = bus_alloc_resource_any(
+					self, SYS_RES_IRQ,
+					&sc->sc_irq_rid,
+					RF_SHAREABLE | RF_ACTIVE);
+#endif
+		if (sc->sc_irq_res == NULL) {
+			pci_release_msi(self);
+			device_printf(self, "Could not allocate IRQ\n");
+			/* goto error; FALLTHROUGH - use polling */
+		}
 	}
 	sc->sc_bus.bdev = device_add_child(self, "usbus", -1);
 	if (sc->sc_bus.bdev == NULL) {
@@ -216,25 +279,31 @@ xhci_pci_attach(device_t self)
 
 	if (sc->sc_irq_res != NULL) {
 		err = bus_setup_intr(self, sc->sc_irq_res, INTR_MPSAFE,
-		    (driver_intr_t *)xhci_interrupt, sc, &sc->sc_intr_hdl, NULL);
+				     (driver_intr_t *)xhci_interrupt, sc,
+				     &sc->sc_intr_hdl, NULL);
 		if (err != 0) {
-			device_printf(self, "Could not setup IRQ, err=%d\n", err);
+			bus_release_resource(self, SYS_RES_IRQ,
+					     rman_get_rid(sc->sc_irq_res),
+					     sc->sc_irq_res);
+			sc->sc_irq_res = NULL;
+			pci_release_msi(self);
+			device_printf(self,
+				      "Could not setup IRQ, err=%d\n",
+				      err);
 			sc->sc_intr_hdl = NULL;
 		}
-	}
-	if (sc->sc_irq_res == NULL || sc->sc_intr_hdl == NULL ||
-	    xhci_use_polling() != 0) {
-		device_printf(self, "Interrupt polling at %dHz\n", hz);
-		USB_BUS_LOCK(&sc->sc_bus);
-		xhci_interrupt_poll(sc);
-		USB_BUS_UNLOCK(&sc->sc_bus);
 	}
 
 	/* On Intel chipsets reroute ports from EHCI to XHCI controller. */
 	switch (pci_get_devid(self)) {
+	case 0x0f358086:	/* BayTrail */
+	case 0x9c318086:	/* Panther Point */
 	case 0x1e318086:	/* Panther Point */
 	case 0x8c318086:	/* Lynx Point */
+	case 0x8cb18086:	/* Wildcat Point */
+	case 0x9cb18086:	/* Wildcat Point-LP */
 		sc->sc_port_route = &xhci_pci_port_route;
+		sc->sc_imod_default = XHCI_IMOD_DEFAULT_LP;
 		break;
 	default:
 		break;
@@ -247,16 +316,30 @@ xhci_pci_attach(device_t self)
 	if (err == 0)
 		err = xhci_start_controller(sc);
 
-	if (err == 0)
+	if (sc->sc_irq_res == NULL || sc->sc_intr_hdl == NULL) {
+		if (xhci_use_polling() != 0) {
+			device_printf(self, "Interrupt polling at %dHz\n", hz);
+			xhci_interrupt_poll(sc);
+		} else {
+			goto error;
+		}
+	}
+	USB_BUS_UNLOCK(&sc->sc_bus);
+
+	if (err == 0) {
 		err = device_probe_and_attach(sc->sc_bus.bdev);
+	}
 
 	if (err) {
-		device_printf(self, "XHCI halt/start/probe failed err=%d\n", err);
+		device_printf(self,
+			      "XHCI halt/start/probe failed err=%d\n",
+			      err);
 		goto error;
 	}
 	return (0);
 
 error:
+	USB_BUS_UNLOCK(&sc->sc_bus);
 	xhci_pci_detach(self);
 	return (ENXIO);
 }
@@ -275,10 +358,8 @@ xhci_pci_detach(device_t self)
 	/* during module unload there are lots of children leftover */
 	device_delete_children(self);
 
-	if (sc->sc_io_res) {
-		usb_callout_drain(&sc->sc_callout);
-		xhci_halt_controller(sc);
-	}
+	usb_callout_drain(&sc->sc_callout);
+	xhci_halt_controller(sc);
 
 	pci_disable_busmaster(self);
 
@@ -287,11 +368,10 @@ xhci_pci_detach(device_t self)
 		sc->sc_intr_hdl = NULL;
 	}
 	if (sc->sc_irq_res) {
-		if (sc->sc_irq_rid == 1)
-			pci_release_msi(self);
-		bus_release_resource(self, SYS_RES_IRQ, sc->sc_irq_rid,
-		    sc->sc_irq_res);
+		bus_release_resource(self, SYS_RES_IRQ,
+		    rman_get_rid(sc->sc_irq_res), sc->sc_irq_res);
 		sc->sc_irq_res = NULL;
+		pci_release_msi(self);
 	}
 	if (sc->sc_io_res) {
 		bus_release_resource(self, SYS_RES_MEMORY, PCI_XHCI_CBMEM,
@@ -319,33 +399,31 @@ xhci_pci_take_controller(device_t self)
 	eec = -1;
 
 	/* Synchronise with the BIOS if it owns the controller. */
-	for (eecp = XHCI_HCS0_XECP(cparams) << 2; eecp != 0 && XHCI_XECP_NEXT(eec);
-	    eecp += XHCI_XECP_NEXT(eec) << 2) {
+	for (eecp = XHCI_HCS0_XECP(cparams) << 2;
+	     eecp != 0 && XHCI_XECP_NEXT(eec);
+	     eecp += XHCI_XECP_NEXT(eec) << 2) {
 		eec = XREAD4(sc, capa, eecp);
 
 		if (XHCI_XECP_ID(eec) != XHCI_ID_USB_LEGACY)
 			continue;
-		bios_sem = XREAD1(sc, capa, eecp +
-		    XHCI_XECP_BIOS_SEM);
+		bios_sem = XREAD1(sc, capa, eecp + XHCI_XECP_BIOS_SEM);
 		if (bios_sem == 0)
 			continue;
 		device_printf(sc->sc_bus.bdev, "waiting for BIOS "
-		    "to give up control\n");
-		XWRITE1(sc, capa, eecp +
-		    XHCI_XECP_OS_SEM, 1);
+			      "to give up control\n");
+		XWRITE1(sc, capa, eecp + XHCI_XECP_OS_SEM, 1);
 		to = 500;
 		while (1) {
-			bios_sem = XREAD1(sc, capa, eecp +
-			    XHCI_XECP_BIOS_SEM);
+			bios_sem = XREAD1(sc, capa, eecp + XHCI_XECP_BIOS_SEM);
 			if (bios_sem == 0)
 				break;
 
 			if (--to == 0) {
 				device_printf(sc->sc_bus.bdev,
-				    "timed out waiting for BIOS\n");
+					      "timed out waiting for BIOS\n");
 				break;
 			}
-			usb_pause_mtx(NULL, hz / 100);	/* wait 10ms */
+			usb_pause_mtx(NULL, hz / 100 + 1); /* wait 10ms */
 		}
 	}
 	return (0);

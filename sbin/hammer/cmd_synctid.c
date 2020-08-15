@@ -51,20 +51,27 @@ hammer_cmd_synctid(char **av, int ac)
 	bzero(&synctid, sizeof(synctid));
 	synctid.op = HAMMER_SYNCTID_SYNC2;
 
-	if (ac == 0 || ac > 2)
+	if (ac == 0 || ac > 2) {
 		synctid_usage(1);
+		/* not reached */
+	}
 	filesystem = av[0];
 	if (ac == 2) {
-		if (strcmp(av[1], "quick") == 0)
+		if (strcmp(av[1], "quick") == 0) {
 			synctid.op = HAMMER_SYNCTID_SYNC1;
-		else
+		} else {
 			synctid_usage(1);
+			/* not reached */
+		}
 	}
 	fd = open(filesystem, O_RDONLY);
-	if (fd < 0)
+	if (fd < 0) {
 		err(1, "Unable to open %s", filesystem);
+		/* not reached */
+	}
 	if (ioctl(fd, HAMMERIOC_SYNCTID, &synctid) < 0) {
-		fprintf(stderr, "Synctid %s failed: %s\n", filesystem, strerror(errno));
+		err(1, "Synctid %s failed", filesystem);
+		/* not reached */
 	} else {
 		printf("0x%016jx\n", (uintmax_t)synctid.tid);
 	}

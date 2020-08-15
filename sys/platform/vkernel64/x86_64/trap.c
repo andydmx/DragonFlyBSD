@@ -58,7 +58,6 @@
 #include <sys/syscall.h>
 #include <sys/sysctl.h>
 #include <sys/sysent.h>
-#include <sys/uio.h>
 #include <sys/vmmeter.h>
 #include <sys/malloc.h>
 #ifdef KTRACE
@@ -66,8 +65,7 @@
 #endif
 #include <sys/ktr.h>
 #include <sys/vkernel.h>
-#include <sys/sysproto.h>
-#include <sys/sysunion.h>
+#include <sys/sysmsg.h>
 #include <sys/vmspace.h>
 
 #include <vm/vm.h>
@@ -92,20 +90,14 @@
 #include <sys/thread2.h>
 #include <sys/mplock2.h>
 
-#define MAKEMPSAFE(have_mplock)			\
-	if (have_mplock == 0) {			\
-		get_mplock();			\
-		have_mplock = 1;		\
-	}
-
 int (*pmath_emulate) (struct trapframe *);
-
-extern int trapwrite (unsigned addr);
 
 static int trap_pfault (struct trapframe *, int, vm_offset_t);
 static void trap_fatal (struct trapframe *, int, vm_offset_t);
 void dblfault_handler (void);
 extern int vmm_enabled;
+
+static struct krate segfltrate = { 1 };
 
 #if 0
 extern inthand_t IDTVEC(syscall);
@@ -154,12 +146,6 @@ SYSCTL_INT(_machdep, OID_AUTO, ddb_on_nmi, CTLFLAG_RW,
 static int panic_on_nmi = 1;
 SYSCTL_INT(_machdep, OID_AUTO, panic_on_nmi, CTLFLAG_RW,
 	&panic_on_nmi, 0, "Panic on NMI");
-static int fast_release;
-SYSCTL_INT(_machdep, OID_AUTO, fast_release, CTLFLAG_RW,
-	&fast_release, 0, "Passive Release was optimal");
-static int slow_release;
-SYSCTL_INT(_machdep, OID_AUTO, slow_release, CTLFLAG_RW,
-	&slow_release, 0, "Passive Release was nonoptimal");
 
 /*
  * Passively intercepts the thread switch function to increase
@@ -201,6 +187,7 @@ userret(struct lwp *lp, struct trapframe *frame, int sticks)
 {
 	struct proc *p = lp->lwp_proc;
 	int sig;
+	int ptok;
 
 	/*
 	 * Charge system time if profiling.  Note: times are in microseconds.
@@ -223,7 +210,7 @@ recheck:
 	/*
 	 * Block here if we are in a stopped state.
 	 */
-	if (p->p_stat == SSTOP) {
+	if (STOPLWP(p, lp)) {
 		lwkt_gettoken(&p->p_token);
 		tstop();
 		lwkt_reltoken(&p->p_token);
@@ -253,28 +240,8 @@ recheck:
 	 *
 	 * WARNING!  postsig() can exit and not return.
 	 */
-	if ((sig = CURSIG_TRACE(lp)) != 0) {
-		lwkt_gettoken(&p->p_token);
-		postsig(sig);
-		lwkt_reltoken(&p->p_token);
-		goto recheck;
-	}
-
-	/*
-	 * block here if we are swapped out, but still process signals
-	 * (such as SIGKILL).  proc0 (the swapin scheduler) is already
-	 * aware of our situation, we do not have to wake it up.
-	 */
-	if (p->p_flags & P_SWAPPEDOUT) {
-		lwkt_gettoken(&p->p_token);
-		get_mplock();
-		p->p_flags |= P_SWAPWAIT;
-		swapin_request();
-		if (p->p_flags & P_SWAPWAIT)
-			tsleep(p, PCATCH, "SWOUT", 0);
-		p->p_flags &= ~P_SWAPWAIT;
-		rel_mplock();
-		lwkt_reltoken(&p->p_token);
+	if ((sig = CURSIG_LCK_TRACE(lp, &ptok)) != 0) {
+		postsig(sig, ptok);
 		goto recheck;
 	}
 
@@ -306,7 +273,7 @@ userexit(struct lwp *lp)
 	 * Handle stop requests at kernel priority.  Any requests queued
 	 * after this loop will generate another AST.
 	 */
-	while (lp->lwp_proc->p_stat == SSTOP) {
+	while (STOPLWP(lp->lwp_proc, lp)) {
 		lwkt_gettoken(&lp->lwp_proc->p_token);
 		tstop();
 		lwkt_reltoken(&lp->lwp_proc->p_token);
@@ -372,7 +339,6 @@ user_trap(struct trapframe *frame)
 	struct proc *p;
 	int sticks = 0;
 	int i = 0, ucode = 0, type, code;
-	int have_mplock = 0;
 #ifdef INVARIANTS
 	int crit_count = td->td_critcount;
 	lwkt_tokref_t curstop = td->td_toks_stop;
@@ -406,7 +372,6 @@ user_trap(struct trapframe *frame)
 	if (db_active) {
 		eva = (frame->tf_trapno == T_PAGEFLT ? rcr2() : 0);
 		++gd->gd_trap_nesting_level;
-		MAKEMPSAFE(have_mplock);
 		trap_fatal(frame, TRUE, eva);
 		--gd->gd_trap_nesting_level;
 		goto out2;
@@ -493,7 +458,6 @@ user_trap(struct trapframe *frame)
 
 #if NISA > 0
 	case T_NMI:
-		MAKEMPSAFE(have_mplock);
 		/* machine/parity/power fail/"kitchen sink" faults */
 		if (isa_nmi(code) == 0) {
 #ifdef DDB
@@ -547,8 +511,10 @@ user_trap(struct trapframe *frame)
 		 * when it tries to use the FP unit.  Restore the
 		 * state here
 		 */
-		if (npxdna(frame))
+		if (npxdna(frame)) {
+			gd->gd_cnt.v_trap++;
 			goto out;
+		}
 		if (!pmath_emulate) {
 			i = SIGFPE;
 			ucode = FPE_FPU_NP_TRAP;
@@ -591,7 +557,6 @@ user_trap(struct trapframe *frame)
 	if (*p->p_sysent->sv_transtrap)
 		i = (*p->p_sysent->sv_transtrap)(i, type);
 
-	MAKEMPSAFE(have_mplock);
 	trapsignal(lp, i, ucode);
 
 #ifdef DEBUG
@@ -608,8 +573,6 @@ out:
 	userret(lp, frame, sticks);
 	userexit(lp);
 out2:	;
-	if (have_mplock)
-		rel_mplock();
 	KTR_LOG(kernentry_trap_ret, lp->lwp_proc->p_pid, lp->lwp_tid);
 #ifdef INVARIANTS
 	KASSERT(crit_count == td->td_critcount,
@@ -630,7 +593,6 @@ kern_trap(struct trapframe *frame)
 	struct lwp *lp;
 	struct proc *p;
 	int i = 0, ucode = 0, type, code;
-	int have_mplock = 0;
 #ifdef INVARIANTS
 	int crit_count = td->td_critcount;
 	lwkt_tokref_t curstop = td->td_toks_stop;
@@ -648,7 +610,6 @@ kern_trap(struct trapframe *frame)
 #ifdef DDB
 	if (db_active) {
 		++gd->gd_trap_nesting_level;
-		MAKEMPSAFE(have_mplock);
 		trap_fatal(frame, FALSE, eva);
 		--gd->gd_trap_nesting_level;
 		goto out2;
@@ -764,17 +725,14 @@ kernel_trap:
 		 * Otherwise, debugger traps "can't happen".
 		 */
 #ifdef DDB
-		MAKEMPSAFE(have_mplock);
 		if (kdb_trap (type, 0, frame))
 			goto out2;
 #endif
 		break;
 	case T_DIVIDE:
-		MAKEMPSAFE(have_mplock);
 		trap_fatal(frame, FALSE, eva);
 		goto out2;
 	case T_NMI:
-		MAKEMPSAFE(have_mplock);
 		trap_fatal(frame, FALSE, eva);
 		goto out2;
 	case T_SYSCALL80:
@@ -796,7 +754,7 @@ kernel_trap:
 	if (*p->p_sysent->sv_transtrap)
 		i = (*p->p_sysent->sv_transtrap)(i, type);
 
-	MAKEMPSAFE(have_mplock);
+	gd->gd_cnt.v_trap++;
 	trapsignal(lp, i, ucode);
 
 #ifdef DEBUG
@@ -811,8 +769,6 @@ kernel_trap:
 
 out2:
 	;
-	if (have_mplock)
-		rel_mplock();
 #ifdef INVARIANTS
 	KASSERT(crit_count == td->td_critcount,
 		("trap: critical section count mismatch! %d/%d",
@@ -859,6 +815,8 @@ trap_pfault(struct trapframe *frame, int usermode, vm_offset_t eva)
 
 	if (frame->tf_err & PGEX_W)
 		ftype = VM_PROT_READ | VM_PROT_WRITE;
+	else if (frame->tf_err & PGEX_I)
+		ftype = VM_PROT_EXECUTE;
 	else
 		ftype = VM_PROT_READ;
 
@@ -869,6 +827,7 @@ trap_pfault(struct trapframe *frame, int usermode, vm_offset_t eva)
 		 */
 		PHOLD(lp->lwp_proc);
 
+#if 0
 		/*
 		 * Grow the stack if necessary
 		 */
@@ -878,15 +837,16 @@ trap_pfault(struct trapframe *frame, int usermode, vm_offset_t eva)
 		 * a growable stack region, or if the stack
 		 * growth succeeded.
 		 */
-		if (!grow_stack (lp->lwp_proc, va)) {
+		if (!grow_stack (map, va)) {
 			rv = KERN_FAILURE;
 			PRELE(lp->lwp_proc);
 			goto nogo;
 		}
+#endif
 
 		fault_flags = 0;
 		if (usermode)
-			fault_flags |= VM_FAULT_BURST;
+			fault_flags |= VM_FAULT_BURST | VM_FAULT_USERMODE;
 		if (ftype & VM_PROT_WRITE)
 			fault_flags |= VM_FAULT_DIRTY;
 		else
@@ -919,8 +879,11 @@ nogo:
 	 * kludge is needed to pass the fault address to signal handlers.
 	 */
 	struct proc *p = td->td_proc;
-	kprintf("seg-fault accessing address %p rip=%p pid=%d p_comm=%s\n",
-		(void *)va, (void *)frame->tf_rip, p->p_pid, p->p_comm);
+	krateprintf(&segfltrate,
+		    "seg-fault accessing address %p "
+		    "rip=%p pid=%d p_comm=%s\n",
+		    (void *)va,
+		    (void *)frame->tf_rip, p->p_pid, p->p_comm);
 	/* Debugger("seg-fault"); */
 
 	return((rv == KERN_PROTECTION_FAILURE) ? SIGBUS : SIGSEGV);
@@ -1024,12 +987,12 @@ trap_fatal(struct trapframe *frame, int usermode, vm_offset_t eva)
 void
 dblfault_handler(void)
 {
-#if JG
+#if 0 /* JG */
 	struct mdglobaldata *gd = mdcpu;
 #endif
 
 	kprintf("\nFatal double fault:\n");
-#if JG
+#if 0 /* JG */
 	kprintf("rip = 0x%lx\n", gd->gd_common_tss.tss_rip);
 	kprintf("rsp = 0x%lx\n", gd->gd_common_tss.tss_rsp);
 	kprintf("rbp = 0x%lx\n", gd->gd_common_tss.tss_rbp);
@@ -1040,62 +1003,12 @@ dblfault_handler(void)
 }
 
 /*
- * Compensate for 386 brain damage (missing URKR).
- * This is a little simpler than the pagefault handler in trap() because
- * it the page tables have already been faulted in and high addresses
- * are thrown out early for other reasons.
- */
-int
-trapwrite(unsigned addr)
-{
-	struct lwp *lp;
-	vm_offset_t va;
-	struct vmspace *vm;
-	int rv;
-
-	va = trunc_page((vm_offset_t)addr);
-	/*
-	 * XXX - MAX is END.  Changed > to >= for temp. fix.
-	 */
-	if (va >= VM_MAX_USER_ADDRESS)
-		return (1);
-
-	lp = curthread->td_lwp;
-	vm = lp->lwp_vmspace;
-
-	PHOLD(lp->lwp_proc);
-
-	if (!grow_stack (lp->lwp_proc, va)) {
-		PRELE(lp->lwp_proc);
-		return (1);
-	}
-
-	/*
-	 * fault the data page
-	 */
-	rv = vm_fault(&vm->vm_map, va, VM_PROT_WRITE, VM_FAULT_DIRTY);
-
-	PRELE(lp->lwp_proc);
-
-	if (rv != KERN_SUCCESS)
-		return 1;
-
-	return (0);
-}
-
-/*
- *	syscall2 -	MP aware system call request C handler
+ * syscall2 -	MP aware system call request C handler
  *
- *	A system call is essentially treated as a trap except that the
- *	MP lock is not held on entry or return.  We are responsible for
- *	obtaining the MP lock if necessary and for handling ASTs
- *	(e.g. a task switch) prior to return.
- *
- *	In general, only simple access and manipulation of curproc and
- *	the current stack is allowed without having to hold MP lock.
- *
- *	MPSAFE - note that large sections of this routine are run without
- *		 the MP lock.
+ * A system call is essentially treated as a trap except that the
+ * MP lock is not held on entry or return.  We are responsible for
+ * obtaining the MP lock if necessary and for handling ASTs
+ * (e.g. a task switch) prior to return.
  */
 void
 syscall2(struct trapframe *frame)
@@ -1103,7 +1016,6 @@ syscall2(struct trapframe *frame)
 	struct thread *td = curthread;
 	struct proc *p = td->td_proc;
 	struct lwp *lp = td->td_lwp;
-	caddr_t params;
 	struct sysent *callp;
 	register_t orig_tf_rflags;
 	int sticks;
@@ -1113,12 +1025,10 @@ syscall2(struct trapframe *frame)
 	int crit_count = td->td_critcount;
 	lwkt_tokref_t curstop = td->td_toks_stop;
 #endif
-	int have_mplock = 0;
-	register_t *argp;
+	struct sysmsg sysmsg;
+	union sysunion *argp;
 	u_int code;
-	int reg, regcnt;
-	union sysunion args;
-	register_t *argsdst;
+	const int regcnt = 6;
 
 	mycpu->gd_cnt.v_syscall++;
 
@@ -1127,8 +1037,6 @@ syscall2(struct trapframe *frame)
 
 	userenter(td, p);	/* lazy raise our priority */
 
-	reg = 0;
-	regcnt = 6;
 	/*
 	 * Misc
 	 */
@@ -1141,9 +1049,11 @@ syscall2(struct trapframe *frame)
 	 * Restore the virtual kernel context and return from its system
 	 * call.  The current frame is copied out to the virtual kernel.
 	 */
-	if (lp->lwp_vkernel && lp->lwp_vkernel->ve) {
+	if (__predict_false(lp->lwp_vkernel && lp->lwp_vkernel->ve)) {
 		vkernel_trap(lp, frame);
 		error = EJUSTRETURN;
+		callp = NULL;
+		code = 0;
 		goto out;
 	}
 
@@ -1151,59 +1061,39 @@ syscall2(struct trapframe *frame)
 	 * Get the system call parameters and account for time
 	 */
 	lp->lwp_md.md_regs = frame;
-	params = (caddr_t)frame->tf_rsp + sizeof(register_t);
 	code = frame->tf_rax;
 
-	if (p->p_sysent->sv_prepsyscall) {
-		(*p->p_sysent->sv_prepsyscall)(
-			frame, (int *)(&args.nosys.sysmsg + 1),
-			&code, &params);
-	} else {
-		if (code == SYS_syscall || code == SYS___syscall) {
-			code = frame->tf_rdi;
-			reg++;
-			regcnt--;
-		}
-	}
-
-	if (p->p_sysent->sv_mask)
-		code &= p->p_sysent->sv_mask;
-
 	if (code >= p->p_sysent->sv_size)
-		callp = &p->p_sysent->sv_table[0];
-	else
-		callp = &p->p_sysent->sv_table[code];
-
-	narg = callp->sy_narg & SYF_ARGMASK;
+		code = SYS___nosys;
+	argp = (union sysunion *)&frame->tf_rdi;
+	callp = &p->p_sysent->sv_table[code];
 
 	/*
 	 * On x86_64 we get up to six arguments in registers. The rest are
 	 * on the stack. The first six members of 'struct trapframe' happen
 	 * to be the registers used to pass arguments, in exactly the right
 	 * order.
+	 *
+	 * Any arguments beyond available argument-passing registers must
+	 * be copyin()'d from the user stack.
 	 */
-	argp = &frame->tf_rdi;
-	argp += reg;
-	argsdst = (register_t *)(&args.nosys.sysmsg + 1);
-	/*
-	 * JG can we overflow the space pointed to by 'argsdst'
-	 * either with 'bcopy' or with 'copyin'?
-	 */
-	bcopy(argp, argsdst, sizeof(register_t) * regcnt);
-	/*
-	 * copyin is MP aware, but the tracing code is not
-	 */
-	if (narg > regcnt) {
+	narg = callp->sy_narg;
+	if (__predict_false(narg > regcnt)) {
+		register_t *argsdst;
+		caddr_t params;
+
+		argsdst = (register_t *)&sysmsg.extargs;
+		bcopy(argp, argsdst, sizeof(register_t) * regcnt);
+		params = (caddr_t)frame->tf_rsp + sizeof(register_t);
+
 		KASSERT(params != NULL, ("copyin args with no params!"));
 		error = copyin(params, &argsdst[regcnt],
-			(narg - regcnt) * sizeof(register_t));
+			       (narg - regcnt) * sizeof(register_t));
+		argp = (void *)argsdst;
 		if (error) {
 #ifdef KTRACE
 			if (KTRPOINT(td, KTR_SYSCALL)) {
-				MAKEMPSAFE(have_mplock);
-
-				ktrsyscall(lp, code, narg,
-					(void *)(&args.nosys.sysmsg + 1));
+				ktrsyscall(lp, code, narg, argp);
 			}
 #endif
 			goto bad;
@@ -1212,8 +1102,7 @@ syscall2(struct trapframe *frame)
 
 #ifdef KTRACE
 	if (KTRPOINT(td, KTR_SYSCALL)) {
-		MAKEMPSAFE(have_mplock);
-		ktrsyscall(lp, code, narg, (void *)(&args.nosys.sysmsg + 1));
+		ktrsyscall(lp, code, narg, argp);
 	}
 #endif
 
@@ -1222,14 +1111,14 @@ syscall2(struct trapframe *frame)
 	 * returns use %rax and %rdx.  %rdx is left unchanged for system
 	 * calls which return only one result.
 	 */
-	args.sysmsg_fds[0] = 0;
-	args.sysmsg_fds[1] = frame->tf_rdx;
+	sysmsg.sysmsg_fds[0] = 0;
+	sysmsg.sysmsg_fds[1] = frame->tf_rdx;
 
 	/*
 	 * The syscall might manipulate the trap frame. If it does it
 	 * will probably return EJUSTRETURN.
 	 */
-	args.sysmsg_frame = frame;
+	sysmsg.sysmsg_frame = frame;
 
 	STOPEVENT(p, S_SCE, narg);	/* MP aware */
 
@@ -1237,7 +1126,7 @@ syscall2(struct trapframe *frame)
 	 * NOTE: All system calls run MPSAFE now.  The system call itself
 	 *	 is responsible for getting the MP lock.
 	 */
-	error = (*callp->sy_call)(&args);
+	error = (*callp->sy_call)(&sysmsg, &argp);
 
 #if 0
 	kprintf("system call %d returned %d\n", code, error);
@@ -1255,8 +1144,8 @@ out:
 		 */
 		p = curproc;
 		lp = curthread->td_lwp;
-		frame->tf_rax = args.sysmsg_fds[0];
-		frame->tf_rdx = args.sysmsg_fds[1];
+		frame->tf_rax = sysmsg.sysmsg_fds[0];
+		frame->tf_rdx = sysmsg.sysmsg_fds[1];
 		frame->tf_rflags &= ~PSL_C;
 		break;
 	case ERESTART:
@@ -1290,7 +1179,6 @@ bad:
 	 * Traced syscall.  trapsignal() is not MP aware.
 	 */
 	if (orig_tf_rflags & PSL_T) {
-		MAKEMPSAFE(have_mplock);
 		frame->tf_rflags &= ~PSL_T;
 		trapsignal(lp, SIGTRAP, 0);
 	}
@@ -1302,8 +1190,7 @@ bad:
 
 #ifdef KTRACE
 	if (KTRPOINT(td, KTR_SYSRET)) {
-		MAKEMPSAFE(have_mplock);
-		ktrsysret(lp, code, error, args.sysmsg_result);
+		ktrsysret(lp, code, error, sysmsg.sysmsg_result);
 	}
 #endif
 
@@ -1315,11 +1202,6 @@ bad:
 	STOPEVENT(p, S_SCX, code);
 
 	userexit(lp);
-	/*
-	 * Release the MP lock if we had to get it
-	 */
-	if (have_mplock)
-		rel_mplock();
 	KTR_LOG(kernentry_syscall_ret, lp->lwp_proc->p_pid, lp->lwp_tid, error);
 #ifdef INVARIANTS
 	KASSERT(&td->td_toks_base == td->td_toks_stop,
@@ -1329,6 +1211,69 @@ bad:
 		("syscall: extra tokens held after trap! %ld",
 		td->td_toks_stop - &td->td_toks_base));
 #endif
+}
+
+/*
+ * Handles the syscall() and __syscall() API
+ */
+void xsyscall(struct sysmsg *sysmsg, struct nosys_args *uap);
+
+int
+sys_xsyscall(struct sysmsg *sysmsg, const struct nosys_args *uap)
+{
+	struct trapframe *frame;
+	struct sysent *callp;
+	union sysunion *argp;
+	struct thread *td;
+	const int regcnt = 5;	/* number of args passed in registers */
+	u_int code;
+	int error;
+	int narg;
+
+	td = curthread;
+	frame = sysmsg->sysmsg_frame;
+	code = (u_int)frame->tf_rdi;
+	if (code >= td->td_proc->p_sysent->sv_size)
+		code = SYS___nosys;
+	argp = (union sysunion *)(&frame->tf_rdi + 1);
+	callp = &td->td_proc->p_sysent->sv_table[code];
+	narg = callp->sy_narg;
+
+	/*
+	 * On x86_64 we get up to six arguments in registers.  The rest are
+	 * on the stack.  However, for syscall() and __syscall() the syscall
+	 * number is inserted as the first argument, so the limit is reduced
+	 * by one to five.
+	 */
+	if (__predict_false(narg > regcnt)) {
+		register_t *argsdst;
+		caddr_t params;
+
+		argsdst = (register_t *)&sysmsg->extargs;
+		bcopy(argp, argsdst, sizeof(register_t) * regcnt);
+		params = (caddr_t)frame->tf_rsp + sizeof(register_t);
+		error = copyin(params, &argsdst[regcnt],
+			       (narg - regcnt) * sizeof(register_t));
+		argp = (void *)argsdst;
+		if (error)
+			return error;
+	}
+
+#ifdef KTRACE
+	if (KTRPOINTP(td->td_proc, td, KTR_SYSCALL)) {
+		ktrsyscall(td->td_lwp, code, narg, argp);
+	}
+#endif
+
+	error = (*callp->sy_call)(sysmsg, argp);
+
+#ifdef KTRACE
+	if (KTRPOINTP(td->td_proc, td, KTR_SYSRET)) {
+		ktrsysret(td->td_lwp, code, error, sysmsg->sysmsg_result);
+	}
+#endif
+
+	return error;
 }
 
 /*
@@ -1358,6 +1303,16 @@ void
 generic_lwp_return(struct lwp *lp, struct trapframe *frame)
 {
 	struct proc *p = lp->lwp_proc;
+
+	/*
+	 * Check for exit-race.  If one lwp exits the process concurrent with
+	 * another lwp creating a new thread, the two operations may cross
+	 * each other resulting in the newly-created lwp not receiving a
+	 * KILL signal.
+	 */
+	if (p->p_flags & P_WEXIT) {
+		lwpsignal(p, lp, SIGKILL);
+	}
 
 	/*
 	 * Newly forked processes are given a kernel priority.  We have to
@@ -1398,6 +1353,7 @@ void
 go_user(struct intrframe *frame)
 {
 	struct trapframe *tf = (void *)&frame->if_rdi;
+	globaldata_t gd;
 	int r;
 	void *id;
 
@@ -1412,15 +1368,31 @@ go_user(struct intrframe *frame)
 	 * user_trap() when we break out of it (usually due to a signal).
 	 */
 	for (;;) {
+#if 1
+		/*
+		 * Always make the FPU state correct.  This should generally
+		 * be faster because the cost of taking a #NM fault through
+		 * the vkernel to the real kernel is astronomical.
+		 */
+		crit_enter();
+		tf->tf_xflags &= ~PGEX_FPFAULT;
+		if (mdcpu->gd_npxthread != curthread) {
+			if (mdcpu->gd_npxthread)
+				npxsave(mdcpu->gd_npxthread->td_savefpu);
+			npxdna(tf);
+		}
+#else
 		/*
 		 * Tell the real kernel whether it is ok to use the FP
-		 * unit or not.
+		 * unit or not, allowing us to take a T_DNA exception
+		 * if the context tries to use the FP.
 		 */
 		if (mdcpu->gd_npxthread == curthread) {
 			tf->tf_xflags &= ~PGEX_FPFAULT;
 		} else {
 			tf->tf_xflags |= PGEX_FPFAULT;
 		}
+#endif
 
 		/*
 		 * Run emulated user process context.  This call interlocks
@@ -1434,9 +1406,27 @@ go_user(struct intrframe *frame)
 		else
 			id = &curproc->p_vmspace->vm_pmap;
 
-		r = vmspace_ctl(id, VMSPACE_CTL_RUN, tf, &curthread->td_savevext);
+		/*
+		 * The GDF_VIRTUSER hack helps statclock() figure out who
+		 * the tick belongs to.
+		 */
+		gd = mycpu;
+		gd->gd_flags |= GDF_VIRTUSER;
+		r = vmspace_ctl(id, VMSPACE_CTL_RUN, tf,
+				&curthread->td_savevext);
 
 		frame->if_xflags |= PGEX_U;
+
+		/*
+		 * Immediately save the user FPU state.  The vkernel is a
+		 * user program and libraries like libc will use the FP
+		 * unit.
+		 */
+		if (mdcpu->gd_npxthread == curthread) {
+			npxsave(mdcpu->gd_npxthread->td_savefpu);
+		}
+		crit_exit();
+		gd->gd_flags &= ~GDF_VIRTUSER;
 #if 0
 		kprintf("GO USER %d trap %ld EVA %08lx RIP %08lx RSP %08lx XFLAGS %02lx/%02lx\n",
 			r, tf->tf_trapno, tf->tf_addr, tf->tf_rip, tf->tf_rsp,

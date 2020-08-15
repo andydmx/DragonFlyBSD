@@ -69,7 +69,6 @@
  */
 
 #include "opt_ntp.h"
-#include "opt_ifpoll.h"
 #include "opt_pctrack.h"
 
 #include <sys/param.h>
@@ -82,18 +81,21 @@
 #include <sys/resource.h>
 #include <sys/resourcevar.h>
 #include <sys/signalvar.h>
+#include <sys/priv.h>
 #include <sys/timex.h>
 #include <sys/timepps.h>
 #include <sys/upmap.h>
-#include <vm/vm.h>
 #include <sys/lock.h>
+#include <sys/sysctl.h>
+#include <sys/kcollect.h>
+
+#include <vm/vm.h>
 #include <vm/pmap.h>
 #include <vm/vm_map.h>
 #include <vm/vm_extern.h>
-#include <sys/sysctl.h>
 
 #include <sys/thread2.h>
-#include <sys/mplock2.h>
+#include <sys/spinlock2.h>
 
 #include <machine/cpu.h>
 #include <machine/limits.h>
@@ -102,20 +104,12 @@
 #include <machine/specialreg.h>
 #include <machine/clock.h>
 
-#ifdef GPROF
-#include <sys/gmon.h>
-#endif
-
-#ifdef IFPOLL_ENABLE
-extern void ifpoll_init_pcpu(int);
-#endif
-
 #ifdef DEBUG_PCTRACK
 static void do_pctrack(struct intrframe *frame, int which);
 #endif
 
 static void initclocks (void *dummy);
-SYSINIT(clocks, SI_BOOT2_CLOCKS, SI_ORDER_FIRST, initclocks, NULL)
+SYSINIT(clocks, SI_BOOT2_CLOCKS, SI_ORDER_FIRST, initclocks, NULL);
 
 /*
  * Some of these don't belong here, but it's easiest to concentrate them.
@@ -128,15 +122,46 @@ struct kinfo_pcheader cputime_pcheader = { PCTRACK_SIZE, PCTRACK_ARYSIZE };
 struct kinfo_pctrack cputime_pctrack[MAXCPU][PCTRACK_SIZE];
 #endif
 
+__read_mostly static int sniff_enable = 1;
+__read_mostly static int sniff_target = -1;
+__read_mostly static int clock_debug2 = 0;
+SYSCTL_INT(_kern, OID_AUTO, sniff_enable, CTLFLAG_RW, &sniff_enable, 0 , "");
+SYSCTL_INT(_kern, OID_AUTO, sniff_target, CTLFLAG_RW, &sniff_target, 0 , "");
+SYSCTL_INT(_debug, OID_AUTO, clock_debug2, CTLFLAG_RW, &clock_debug2, 0 , "");
+
 static int
 sysctl_cputime(SYSCTL_HANDLER_ARGS)
 {
 	int cpu, error = 0;
+	int root_error;
 	size_t size = sizeof(struct kinfo_cputime);
+	struct kinfo_cputime tmp;
+
+	/*
+	 * NOTE: For security reasons, only root can sniff %rip
+	 */
+	root_error = priv_check_cred(curthread->td_ucred, PRIV_ROOT, 0);
 
 	for (cpu = 0; cpu < ncpus; ++cpu) {
-		if ((error = SYSCTL_OUT(req, &cputime_percpu[cpu], size)))
+		tmp = cputime_percpu[cpu];
+		if (root_error == 0) {
+			tmp.cp_sample_pc =
+				(int64_t)globaldata_find(cpu)->gd_sample_pc;
+			tmp.cp_sample_sp =
+				(int64_t)globaldata_find(cpu)->gd_sample_sp;
+		}
+		if ((error = SYSCTL_OUT(req, &tmp, size)) != 0)
 			break;
+	}
+
+	if (root_error == 0) {
+		if (sniff_enable) {
+			int n = sniff_target;
+			if (n < 0)
+				smp_sniff();
+			else if (n < ncpus)
+				cpu_sniff(n);
+		}
 	}
 
 	return (error);
@@ -147,7 +172,7 @@ SYSCTL_PROC(_kern, OID_AUTO, cputime, (CTLTYPE_OPAQUE|CTLFLAG_RD), 0, 0,
 static int
 sysctl_cp_time(SYSCTL_HANDLER_ARGS)
 {
-	long cpu_states[5] = {0};
+	long cpu_states[CPUSTATES] = {0};
 	int cpu, error = 0;
 	size_t size = sizeof(cpu_states);
 
@@ -165,7 +190,29 @@ sysctl_cp_time(SYSCTL_HANDLER_ARGS)
 }
 
 SYSCTL_PROC(_kern, OID_AUTO, cp_time, (CTLTYPE_LONG|CTLFLAG_RD), 0, 0,
-	sysctl_cp_time, "LU", "CPU time statistics");
+    sysctl_cp_time, "LU", "CPU time statistics");
+
+static int
+sysctl_cp_times(SYSCTL_HANDLER_ARGS)
+{
+	long cpu_states[CPUSTATES] = {0};
+	int cpu, error;
+	size_t size = sizeof(cpu_states);
+
+	for (error = 0, cpu = 0; error == 0 && cpu < ncpus; ++cpu) {
+		cpu_states[CP_USER] = cputime_percpu[cpu].cp_user;
+		cpu_states[CP_NICE] = cputime_percpu[cpu].cp_nice;
+		cpu_states[CP_SYS] = cputime_percpu[cpu].cp_sys;
+		cpu_states[CP_INTR] = cputime_percpu[cpu].cp_intr;
+		cpu_states[CP_IDLE] = cputime_percpu[cpu].cp_idle;
+		error = SYSCTL_OUT(req, cpu_states, size);
+	}
+
+	return (error);
+}
+
+SYSCTL_PROC(_kern, OID_AUTO, cp_times, (CTLTYPE_LONG|CTLFLAG_RD), 0, 0,
+    sysctl_cp_times, "LU", "per-CPU time statistics");
 
 /*
  * boottime is used to calculate the 'real' uptime.  Do not confuse this with
@@ -177,10 +224,17 @@ SYSCTL_PROC(_kern, OID_AUTO, cp_time, (CTLTYPE_LONG|CTLFLAG_RD), 0, 0,
  * The gd_time_seconds and gd_cpuclock_base fields remain fairly monotonic.
  * Slight adjustments to gd_cpuclock_base are made to phase-lock it to
  * the real time.
+ *
+ * WARNING! time_second can backstep on time corrections. Also, unlike
+ *          time_second, time_uptime is not a "real" time_t (seconds
+ *          since the Epoch) but seconds since booting.
  */
-struct timespec boottime;	/* boot time (realtime) for reference only */
-time_t time_second;		/* read-only 'passive' uptime in seconds */
-time_t time_uptime;		/* read-only 'passive' uptime in seconds */
+__read_mostly struct timespec boottime;	/* boot time (realtime) for ref only */
+__read_mostly struct timespec ticktime0;/* updated every tick */
+__read_mostly struct timespec ticktime2;/* updated every tick */
+__read_mostly int ticktime_update;
+__read_mostly time_t time_second;	/* read-only 'passive' rt in seconds */
+__read_mostly time_t time_uptime;	/* read-only 'passive' ut in seconds */
 
 /*
  * basetime is used to calculate the compensated real time of day.  The
@@ -194,9 +248,15 @@ time_t time_uptime;		/* read-only 'passive' uptime in seconds */
  * used on both SMP and UP systems to avoid MP races between cpu's and
  * interrupt races on UP systems.
  */
+struct hardtime {
+	__uint32_t time_second;
+	sysclock_t cpuclock_base;
+};
+
 #define BASETIME_ARYSIZE	16
 #define BASETIME_ARYMASK	(BASETIME_ARYSIZE - 1)
 static struct timespec basetime[BASETIME_ARYSIZE];
+static struct hardtime hardtime[BASETIME_ARYSIZE];
 static volatile int basetime_index;
 
 static int
@@ -228,11 +288,15 @@ static void statclock(systimer_t info, int, struct intrframe *frame);
 static void schedclock(systimer_t info, int, struct intrframe *frame);
 static void getnanotime_nbt(struct timespec *nbt, struct timespec *tsp);
 
-int	ticks;			/* system master ticks at hz */
-int	clocks_running;		/* tsleep/timeout clocks operational */
+/*
+ * Use __read_mostly for ticks and sched_ticks because these variables are
+ * used all over the kernel and only updated once per tick.
+ */
+__read_mostly int ticks;		/* system master ticks at hz */
+__read_mostly int sched_ticks;		/* global schedule clock ticks */
+__read_mostly int clocks_running;	/* tsleep/timeout clocks operational */
 int64_t	nsec_adj;		/* ntpd per-tick adjustment in nsec << 32 */
 int64_t	nsec_acc;		/* accumulator */
-int	sched_ticks;		/* global schedule clock ticks */
 
 /* NTPD time correction fields */
 int64_t	ntp_tick_permanent;	/* per-tick adjustment in nsec << 32 */
@@ -243,6 +307,7 @@ int32_t	ntp_tick_delta;		/* current adjustment rate */
 int32_t	ntp_default_tick_delta;	/* adjustment rate for ntp_delta */
 time_t	ntp_leap_second;	/* time of next leap second */
 int	ntp_leap_insert;	/* whether to insert or remove a second */
+struct spinlock ntp_spin;
 
 /*
  * Finish initializing clock frequencies and start all clocks running.
@@ -252,10 +317,11 @@ static void
 initclocks(void *dummy)
 {
 	/*psratio = profhz / stathz;*/
+	spin_init(&ntp_spin, "ntp");
 	initclocks_pcpu();
 	clocks_running = 1;
 	if (kpmap) {
-	    kpmap->tsc_freq = (uint64_t)tsc_frequency;
+	    kpmap->tsc_freq = tsc_frequency;
 	    kpmap->tick_freq = hz;
 	}
 }
@@ -277,8 +343,9 @@ initclocks_pcpu(void)
 	if (gd->gd_cpuid == 0) {
 	    gd->gd_time_seconds = 1;
 	    gd->gd_cpuclock_base = sys_cputimer->count();
+	    hardtime[0].time_second = gd->gd_time_seconds;
+	    hardtime[0].cpuclock_base = gd->gd_cpuclock_base;
 	} else {
-	    /* XXX */
 	    gd->gd_time_seconds = globaldata_find(0)->gd_time_seconds;
 	    gd->gd_cpuclock_base = globaldata_find(0)->gd_cpuclock_base;
 	}
@@ -286,6 +353,49 @@ initclocks_pcpu(void)
 	systimer_intr_enable();
 
 	crit_exit();
+}
+
+/*
+ * Called on a 10-second interval after the system is operational.
+ * Return the collection data for USERPCT and install the data for
+ * SYSTPCT and IDLEPCT.
+ */
+static
+uint64_t
+collect_cputime_callback(int n)
+{
+	static long cpu_base[CPUSTATES];
+	long cpu_states[CPUSTATES];
+	long total;
+	long acc;
+	long lsb;
+
+	bzero(cpu_states, sizeof(cpu_states));
+	for (n = 0; n < ncpus; ++n) {
+		cpu_states[CP_USER] += cputime_percpu[n].cp_user;
+		cpu_states[CP_NICE] += cputime_percpu[n].cp_nice;
+		cpu_states[CP_SYS] += cputime_percpu[n].cp_sys;
+		cpu_states[CP_INTR] += cputime_percpu[n].cp_intr;
+		cpu_states[CP_IDLE] += cputime_percpu[n].cp_idle;
+	}
+
+	acc = 0;
+	for (n = 0; n < CPUSTATES; ++n) {
+		total = cpu_states[n] - cpu_base[n];
+		cpu_base[n] = cpu_states[n];
+		cpu_states[n] = total;
+		acc += total;
+	}
+	if (acc == 0)		/* prevent degenerate divide by 0 */
+		acc = 1;
+	lsb = acc / (10000 * 2);
+	kcollect_setvalue(KCOLLECT_SYSTPCT,
+			  (cpu_states[CP_SYS] + lsb) * 10000 / acc);
+	kcollect_setvalue(KCOLLECT_IDLEPCT,
+			  (cpu_states[CP_IDLE] + lsb) * 10000 / acc);
+	kcollect_setvalue(KCOLLECT_INTRPCT,
+			  (cpu_states[CP_INTR] + lsb) * 10000 / acc);
+	return((cpu_states[CP_USER] + cpu_states[CP_NICE] + lsb) * 10000 / acc);
 }
 
 /*
@@ -313,27 +423,65 @@ initclocks_other(void *dummy)
 		 * (8254 gets reset).  The sysclock will never jump backwards.
 		 * Our time sync is based on the actual sysclock, not the
 		 * ticks count.
+		 *
+		 * Install statclock before hardclock to prevent statclock
+		 * from misinterpreting gd_flags for tick assignment when
+		 * they overlap.  Also offset the statclock by half of
+		 * its interval to try to avoid being coincident with
+		 * callouts.
 		 */
-		systimer_init_periodic_nq(&gd->gd_hardclock, hardclock,
-					  NULL, hz);
-		systimer_init_periodic_nq(&gd->gd_statclock, statclock,
-					  NULL, stathz);
+		systimer_init_periodic_flags(&gd->gd_statclock, statclock,
+					  NULL, stathz,
+					  SYSTF_MSSYNC | SYSTF_FIRST |
+					  SYSTF_OFFSET50 | SYSTF_OFFSETCPU);
+		systimer_init_periodic_flags(&gd->gd_hardclock, hardclock,
+					  NULL, hz,
+					  SYSTF_MSSYNC | SYSTF_OFFSETCPU);
+	}
+	lwkt_setcpu_self(ogd);
+
+	/*
+	 * Regular data collection
+	 */
+	kcollect_register(KCOLLECT_USERPCT, "user", collect_cputime_callback,
+			  KCOLLECT_SCALE(KCOLLECT_USERPCT_FORMAT, 0));
+	kcollect_register(KCOLLECT_SYSTPCT, "syst", NULL,
+			  KCOLLECT_SCALE(KCOLLECT_SYSTPCT_FORMAT, 0));
+	kcollect_register(KCOLLECT_IDLEPCT, "idle", NULL,
+			  KCOLLECT_SCALE(KCOLLECT_IDLEPCT_FORMAT, 0));
+}
+SYSINIT(clocks2, SI_BOOT2_POST_SMP, SI_ORDER_ANY, initclocks_other, NULL);
+
+/*
+ * This method is called on just the BSP, after all the usched implementations
+ * are initialized. This avoids races between usched initialization functions
+ * and usched_schedulerclock().
+ */
+static
+void
+initclocks_usched(void *dummy)
+{
+	struct globaldata *ogd = mycpu;
+	struct globaldata *gd;
+	int n;
+
+	for (n = 0; n < ncpus; ++n) {
+		lwkt_setcpu_self(globaldata_find(n));
+		gd = mycpu;
+
 		/* XXX correct the frequency for scheduler / estcpu tests */
-		systimer_init_periodic_nq(&gd->gd_schedclock, schedclock,
-					  NULL, ESTCPUFREQ);
-#ifdef IFPOLL_ENABLE
-		ifpoll_init_pcpu(gd->gd_cpuid);
-#endif
+		systimer_init_periodic_flags(&gd->gd_schedclock, schedclock,
+					  NULL, ESTCPUFREQ, SYSTF_MSSYNC);
 	}
 	lwkt_setcpu_self(ogd);
 }
-SYSINIT(clocks2, SI_BOOT2_POST_SMP, SI_ORDER_ANY, initclocks_other, NULL)
+SYSINIT(clocks3, SI_BOOT2_USCHED, SI_ORDER_ANY, initclocks_usched, NULL);
 
 /*
  * This sets the current real time of day.  Timespecs are in seconds and
  * nanoseconds.  We do not mess with gd_time_seconds and gd_cpuclock_base,
  * instead we adjust basetime so basetime + gd_* results in the current
- * time of day.  This way the gd_* fields are guarenteed to represent
+ * time of day.  This way the gd_* fields are guaranteed to represent
  * a monotonically increasing 'uptime' value.
  *
  * When set_timeofday() is called from userland, the system call forces it
@@ -350,6 +498,7 @@ set_timeofday(struct timespec *ts)
 	 */
 	crit_enter();
 	ni = (basetime_index + 1) & BASETIME_ARYMASK;
+	cpu_lfence();
 	nbt = &basetime[ni];
 	nanouptime(nbt);
 	nbt->tv_sec = ts->tv_sec - nbt->tv_sec;
@@ -366,11 +515,12 @@ set_timeofday(struct timespec *ts)
 	 * can simply assign boottime to basetime.  
 	 *
 	 * Note that nanouptime() is based on gd_time_seconds which is drift
-	 * compensated up to a point (it is guarenteed to remain monotonically
+	 * compensated up to a point (it is guaranteed to remain monotonically
 	 * increasing).  gd_time_seconds is thus our best uptime guess and
 	 * suitable for use in the boottime calculation.  It is already taken
 	 * into account in the basetime calculation above.
 	 */
+	spin_lock(&ntp_spin);
 	boottime.tv_sec = nbt->tv_sec;
 	ntp_delta = 0;
 
@@ -380,31 +530,37 @@ set_timeofday(struct timespec *ts)
 	 */
 	cpu_sfence();
 	basetime_index = ni;
+	spin_unlock(&ntp_spin);
 
 	crit_exit();
 }
 	
 /*
- * Each cpu has its own hardclock, but we only increments ticks and softticks
+ * Each cpu has its own hardclock, but we only increment ticks and softticks
  * on cpu #0.
  *
  * NOTE! systimer! the MP lock might not be held here.  We can only safely
  * manipulate objects owned by the current cpu.
  */
 static void
-hardclock(systimer_t info, int in_ipi __unused, struct intrframe *frame)
+hardclock(systimer_t info, int in_ipi, struct intrframe *frame)
 {
 	sysclock_t cputicks;
 	struct proc *p;
 	struct globaldata *gd = mycpu;
 
+	if ((gd->gd_reqflags & RQF_IPIQ) == 0 && lwkt_need_ipiq_process(gd)) {
+		/* Defer to doreti on passive IPIQ processing */
+		need_ipiq();
+	}
+
 	/*
-	 * Realtime updates are per-cpu.  Note that timer corrections as
-	 * returned by microtime() and friends make an additional adjustment
-	 * using a system-wise 'basetime', but the running time is always
-	 * taken from the per-cpu globaldata area.  Since the same clock
-	 * is distributing (XXX SMP) to all cpus, the per-cpu timebases
-	 * stay in synch.
+	 * We update the compensation base to calculate fine-grained time
+	 * from the sys_cputimer on a per-cpu basis in order to avoid
+	 * having to mess around with locks.  sys_cputimer is assumed to
+	 * be consistent across all cpus.  CPU N copies the base state from
+	 * CPU 0 using the same FIFO trick that we use for basetime (so we
+	 * don't catch a CPU 0 update in the middle).
 	 *
 	 * Note that we never allow info->time (aka gd->gd_hardclock.time)
 	 * to reverse index gd_cpuclock_base, but that it is possible for
@@ -413,12 +569,29 @@ hardclock(systimer_t info, int in_ipi __unused, struct intrframe *frame)
 	 * timers count events, though everything should resynch again
 	 * immediately.
 	 */
-	cputicks = info->time - gd->gd_cpuclock_base;
-	if (cputicks >= sys_cputimer->freq) {
-		++gd->gd_time_seconds;
-		gd->gd_cpuclock_base += sys_cputimer->freq;
-		if (gd->gd_cpuid == 0)
-			++time_uptime;	/* uncorrected monotonic 1-sec gran */
+	if (gd->gd_cpuid == 0) {
+		int ni;
+
+		cputicks = info->time - gd->gd_cpuclock_base;
+		if (cputicks >= sys_cputimer->freq) {
+			cputicks /= sys_cputimer->freq;
+			if (cputicks != 0 && cputicks != 1)
+				kprintf("Warning: hardclock missed > 1 sec\n");
+			gd->gd_time_seconds += cputicks;
+			gd->gd_cpuclock_base += sys_cputimer->freq * cputicks;
+			/* uncorrected monotonic 1-sec gran */
+			time_uptime += cputicks;
+		}
+		ni = (basetime_index + 1) & BASETIME_ARYMASK;
+		hardtime[ni].time_second = gd->gd_time_seconds;
+		hardtime[ni].cpuclock_base = gd->gd_cpuclock_base;
+	} else {
+		int ni;
+
+		ni = basetime_index;
+		cpu_lfence();
+		gd->gd_time_seconds = hardtime[ni].time_second;
+		gd->gd_cpuclock_base = hardtime[ni].cpuclock_base;
 	}
 
 	/*
@@ -432,7 +605,23 @@ hardclock(systimer_t info, int in_ipi __unused, struct intrframe *frame)
 	    int leap;
 	    int ni;
 
+	    /*
+	     * Update system-wide ticks
+	     */
 	    ++ticks;
+
+	    /*
+	     * Update system-wide ticktime for getnanotime() and getmicrotime()
+	     */
+	    nanotime(&nts);
+	    atomic_add_int_nonlocked(&ticktime_update, 1);
+	    cpu_sfence();
+	    if (ticktime_update & 2)
+		ticktime2 = nts;
+	    else
+		ticktime0 = nts;
+	    cpu_sfence();
+	    atomic_add_int_nonlocked(&ticktime_update, 1);
 
 #if 0
 	    if (tco->tc_poll_pps) 
@@ -447,6 +636,12 @@ hardclock(systimer_t info, int in_ipi __unused, struct intrframe *frame)
 	    ni = (basetime_index + 1) & BASETIME_ARYMASK;
 	    nbt = &basetime[ni];
 	    *nbt = basetime[basetime_index];
+
+	    /*
+	     * ntp adjustments only occur on cpu 0 and are protected by
+	     * ntp_spin.  This spinlock virtually never conflicts.
+	     */
+	    spin_lock(&ntp_spin);
 
 	    /*
 	     * Apply adjtime corrections.  (adjtime() API)
@@ -506,6 +701,7 @@ hardclock(systimer_t info, int in_ipi __unused, struct intrframe *frame)
 		    --nbt->tv_sec;
 		}
 	    }
+	    spin_unlock(&ntp_spin);
 
 	    /************************************************************
 	     *			LEAP SECOND CORRECTION			*
@@ -549,6 +745,13 @@ hardclock(systimer_t info, int in_ipi __unused, struct intrframe *frame)
 		 * Update the time_second 'approximate time' global.
 		 */
 		time_second = nts.tv_sec;
+
+		/*
+		 * Clear the IPC hint for the currently running thread once
+		 * per second, allowing us to disconnect the hint from a
+		 * thread which may no longer care.
+		 */
+		curthread->td_wakefromcpu = -1;
 	    }
 
 	    /*
@@ -583,6 +786,13 @@ hardclock(systimer_t info, int in_ipi __unused, struct intrframe *frame)
 	 * softticks are handled for all cpus
 	 */
 	hardclock_softtick(gd);
+
+	/*
+	 * Rollup accumulated vmstats, copy-back for critical path checks.
+	 */
+	vmstats_rollup_cpu(gd);
+	vfscache_rollup_cpu(gd);
+	mycpu->gd_vmstats = vmstats;
 
 	/*
 	 * ITimer handling is per-tick, per-cpu.
@@ -636,10 +846,7 @@ hardclock(systimer_t info, int in_ipi __unused, struct intrframe *frame)
 static void
 statclock(systimer_t info, int in_ipi, struct intrframe *frame)
 {
-#ifdef GPROF
-	struct gmonparam *g;
-	int i;
-#endif
+	globaldata_t gd = mycpu;
 	thread_t td;
 	struct proc *p;
 	int bump;
@@ -656,20 +863,21 @@ statclock(systimer_t info, int in_ipi, struct intrframe *frame)
 	 *	 MPSAFE at early boot.
 	 */
 	cv = sys_cputimer->count();
-	scv = mycpu->statint.gd_statcv;
+	scv = gd->statint.gd_statcv;
 	if (scv == 0) {
 		bump = 1;
 	} else {
-		bump = (sys_cputimer->freq64_usec * (cv - scv)) >> 32;
+		bump = muldivu64(sys_cputimer->freq64_usec,
+				 (cv - scv), 1L << 32);
 		if (bump < 0)
 			bump = 0;
 		if (bump > 1000000)
 			bump = 1000000;
 	}
-	mycpu->statint.gd_statcv = cv;
+	gd->statint.gd_statcv = cv;
 
 #if 0
-	stv = &mycpu->gd_stattv;
+	stv = &gd->gd_stattv;
 	if (stv->tv_sec == 0) {
 	    bump = 1;
 	} else {
@@ -685,6 +893,14 @@ statclock(systimer_t info, int in_ipi, struct intrframe *frame)
 
 	td = curthread;
 	p = td->td_proc;
+
+	/*
+	 * If this is an interrupt thread used for the clock interrupt, adjust
+	 * td to the thread it is preempting.  If a frame is available, it will
+	 * be related to the thread being preempted.
+	 */
+	if ((td->td_flags & TDF_CLKTHREAD) && td->td_preempted)
+		td = td->td_preempted;
 
 	if (frame && CLKF_USERMODE(frame)) {
 		/*
@@ -703,31 +919,16 @@ statclock(systimer_t info, int in_ipi, struct intrframe *frame)
 		else
 			cpu_time.cp_user += bump;
 	} else {
-		int intr_nest = mycpu->gd_intr_nesting_level;
+		int intr_nest = gd->gd_intr_nesting_level;
 
 		if (in_ipi) {
 			/*
 			 * IPI processing code will bump gd_intr_nesting_level
 			 * up by one, which breaks following CLKF_INTR testing,
-			 * so we substract it by one here.
+			 * so we subtract it by one here.
 			 */
 			--intr_nest;
 		}
-#ifdef GPROF
-		/*
-		 * Kernel statistics are just like addupc_intr, only easier.
-		 */
-		g = &_gmonparam;
-		if (g->state == GMON_PROF_ON && frame) {
-			i = CLKF_PC(frame) - g->lowpc;
-			if (i < g->textsize) {
-				i /= HISTFRACTION * sizeof(*g->kcount);
-				g->kcount[i]++;
-			}
-		}
-#endif
-
-#define IS_INTR_RUNNING	((frame && CLKF_INTR(intr_nest)) || CLKF_INTR_TD(td))
 
 		/*
 		 * Came from kernel mode, so we were:
@@ -744,33 +945,63 @@ statclock(systimer_t info, int in_ipi, struct intrframe *frame)
 		 * XXX assume system if frame is NULL.  A NULL frame 
 		 * can occur if ipi processing is done from a crit_exit().
 		 */
-		if (IS_INTR_RUNNING)
-			td->td_iticks += bump;
-		else
-			td->td_sticks += bump;
-
-		if (IS_INTR_RUNNING) {
+		if ((frame && CLKF_INTR(intr_nest)) ||
+		    cpu_interrupt_running(td)) {
 			/*
 			 * If we interrupted an interrupt thread, well,
 			 * count it as interrupt time.
 			 */
+			td->td_iticks += bump;
 #ifdef DEBUG_PCTRACK
 			if (frame)
 				do_pctrack(frame, PCTRACK_INT);
 #endif
 			cpu_time.cp_intr += bump;
+		} else if (gd->gd_flags & GDF_VIRTUSER) {
+			/*
+			 * The vkernel doesn't do a good job providing trap
+			 * frames that we can test.  If the GDF_VIRTUSER
+			 * flag is set we probably interrupted user mode.
+			 *
+			 * We also use this flag on the host when entering
+			 * VMM mode.
+			 */
+			td->td_uticks += bump;
+
+			/*
+			 * Charge the time as appropriate
+			 */
+			if (p && p->p_nice > NZERO)
+				cpu_time.cp_nice += bump;
+			else
+				cpu_time.cp_user += bump;
 		} else {
-			if (td == &mycpu->gd_idlethread) {
+			if (clock_debug2 > 0) {
+				--clock_debug2;
+				kprintf("statclock preempt %s (%p %p)\n", td->td_comm, td, &gd->gd_idlethread);
+			}
+			td->td_sticks += bump;
+			if (td == &gd->gd_idlethread) {
 				/*
-				 * Even if the current thread is the idle
-				 * thread it could be due to token contention
-				 * in the LWKT scheduler.  Count such as
-				 * system time.
+				 * We want to count token contention as
+				 * system time.  When token contention occurs
+				 * the cpu may only be outside its critical
+				 * section while switching through the idle
+				 * thread.  In this situation, various flags
+				 * will be set in gd_reqflags.
+				 *
+				 * INTPEND is not necessarily useful because
+				 * it will be set if the clock interrupt
+				 * happens to be on an interrupt thread, the
+				 * cpu_interrupt_running() call does a better
+				 * job so we've already handled it.
 				 */
-				if (mycpu->gd_reqflags & RQF_IDLECHECK_WK_MASK)
+				if (gd->gd_reqflags &
+				    (RQF_IDLECHECK_WK_MASK & ~RQF_INTPEND)) {
 					cpu_time.cp_sys += bump;
-				else
+				} else {
 					cpu_time.cp_idle += bump;
+				}
 			} else {
 				/*
 				 * System thread was running.
@@ -782,8 +1013,6 @@ statclock(systimer_t info, int in_ipi, struct intrframe *frame)
 				cpu_time.cp_sys += bump;
 			}
 		}
-
-#undef IS_INTR_RUNNING
 	}
 }
 
@@ -867,9 +1096,9 @@ schedclock(systimer_t info, int in_ipi __unused, struct intrframe *frame)
 		 */
 		if ((ru = &lp->lwp_proc->p_ru) &&
 		    (vm = lp->lwp_proc->p_vmspace) != NULL) {
-			ru->ru_ixrss += pgtok(vm->vm_tsize);
-			ru->ru_idrss += pgtok(vm->vm_dsize);
-			ru->ru_isrss += pgtok(vm->vm_ssize);
+			ru->ru_ixrss += pgtok(btoc(vm->vm_tsize));
+			ru->ru_idrss += pgtok(btoc(vm->vm_dsize));
+			ru->ru_isrss += pgtok(btoc(vm->vm_ssize));
 			if (lwkt_trytoken(&vm->vm_map.token)) {
 				rss = pgtok(vmspace_resident_count(vm));
 				if (ru->ru_maxrss < rss)
@@ -886,7 +1115,7 @@ schedclock(systimer_t info, int in_ipi __unused, struct intrframe *frame)
 /*
  * Compute number of ticks for the specified amount of time.  The 
  * return value is intended to be used in a clock interrupt timed
- * operation and guarenteed to meet or exceed the requested time.
+ * operation and guaranteed to meet or exceed the requested time.
  * If the representation overflows, return INT_MAX.  The minimum return
  * value is 1 ticks and the function will average the calculation up.
  * If any value greater then 0 microseconds is supplied, a value
@@ -924,8 +1153,7 @@ tvtohz_high(struct timeval *tv)
 #endif
 		ticks = 1;
 	} else if (sec <= INT_MAX / hz) {
-		ticks = (int)(sec * hz + 
-			    ((u_long)usec + (ustick - 1)) / ustick) + 1;
+		ticks = (int)(sec * hz + howmany((u_long)usec, ustick)) + 1;
 	} else {
 		ticks = INT_MAX;
 	}
@@ -956,8 +1184,7 @@ tstohz_high(struct timespec *ts)
 #endif
 		ticks = 1;
 	} else if (sec <= INT_MAX / hz) {
-		ticks = (int)(sec * hz +
-			    ((u_long)nsec + (nstick - 1)) / nstick) + 1;
+		ticks = (int)(sec * hz + howmany((u_long)nsec, nstick)) + 1;
 	} else {
 		ticks = INT_MAX;
 	}
@@ -1007,6 +1234,8 @@ tstohz_low(struct timespec *ts)
 
 /*
  * Start profiling on a process.
+ *
+ * Caller must hold p->p_token();
  *
  * Kernel profiling passes proc0 which never exits and hence
  * keeps the profile clock running constantly.
@@ -1079,17 +1308,22 @@ SYSCTL_PROC(_kern, KERN_CLOCKRATE, clockrate, CTLTYPE_STRUCT|CTLFLAG_RD,
  * time relative to system boot, these are well suited for time
  * interval measurements.
  *
- * Each cpu independantly maintains the current time of day, so all
+ * Each cpu independently maintains the current time of day, so all
  * we need to do to protect ourselves from changes is to do a loop
  * check on the seconds field changing out from under us.
  *
  * The system timer maintains a 32 bit count and due to various issues
- * it is possible for the calculated delta to occassionally exceed
+ * it is possible for the calculated delta to occasionally exceed
  * sys_cputimer->freq.  If this occurs the sys_cputimer->freq64_nsec
  * multiplication can easily overflow, so we deal with the case.  For
  * uniformity we deal with the case in the usec case too.
  *
  * All the [get][micro,nano][time,uptime]() routines are MPSAFE.
+ *
+ * NEW CODE (!)
+ *
+ *	cpu 0 now maintains global ticktimes and an update counter.  The
+ *	getnanotime() and getmicrotime() routines use these globals.
  */
 void
 getmicrouptime(struct timeval *tvp)
@@ -1106,7 +1340,7 @@ getmicrouptime(struct timeval *tvp)
 		tvp->tv_sec += delta / sys_cputimer->freq;
 		delta %= sys_cputimer->freq;
 	}
-	tvp->tv_usec = (sys_cputimer->freq64_usec * delta) >> 32;
+	tvp->tv_usec = muldivu64(sys_cputimer->freq64_usec, delta, 1L << 32);
 	if (tvp->tv_usec >= 1000000) {
 		tvp->tv_usec -= 1000000;
 		++tvp->tv_sec;
@@ -1128,7 +1362,7 @@ getnanouptime(struct timespec *tsp)
 		tsp->tv_sec += delta / sys_cputimer->freq;
 		delta %= sys_cputimer->freq;
 	}
-	tsp->tv_nsec = (sys_cputimer->freq64_nsec * delta) >> 32;
+	tsp->tv_nsec = muldivu64(sys_cputimer->freq64_nsec, delta, 1L << 32);
 }
 
 void
@@ -1146,7 +1380,7 @@ microuptime(struct timeval *tvp)
 		tvp->tv_sec += delta / sys_cputimer->freq;
 		delta %= sys_cputimer->freq;
 	}
-	tvp->tv_usec = (sys_cputimer->freq64_usec * delta) >> 32;
+	tvp->tv_usec = muldivu64(sys_cputimer->freq64_usec, delta, 1L << 32);
 }
 
 void
@@ -1164,7 +1398,7 @@ nanouptime(struct timespec *tsp)
 		tsp->tv_sec += delta / sys_cputimer->freq;
 		delta %= sys_cputimer->freq;
 	}
-	tsp->tv_nsec = (sys_cputimer->freq64_nsec * delta) >> 32;
+	tsp->tv_nsec = muldivu64(sys_cputimer->freq64_nsec, delta, 1L << 32);
 }
 
 /*
@@ -1173,55 +1407,58 @@ nanouptime(struct timespec *tsp)
 void
 getmicrotime(struct timeval *tvp)
 {
-	struct globaldata *gd = mycpu;
-	struct timespec *bt;
-	sysclock_t delta;
+	struct timespec ts;
+	int counter;
 
 	do {
-		tvp->tv_sec = gd->gd_time_seconds;
-		delta = gd->gd_hardclock.time - gd->gd_cpuclock_base;
-	} while (tvp->tv_sec != gd->gd_time_seconds);
-
-	if (delta >= sys_cputimer->freq) {
-		tvp->tv_sec += delta / sys_cputimer->freq;
-		delta %= sys_cputimer->freq;
-	}
-	tvp->tv_usec = (sys_cputimer->freq64_usec * delta) >> 32;
-
-	bt = &basetime[basetime_index];
-	tvp->tv_sec += bt->tv_sec;
-	tvp->tv_usec += bt->tv_nsec / 1000;
-	while (tvp->tv_usec >= 1000000) {
-		tvp->tv_usec -= 1000000;
-		++tvp->tv_sec;
-	}
+		counter = *(volatile int *)&ticktime_update;
+		cpu_lfence();
+		switch(counter & 3) {
+		case 0:			/* ticktime2 completed update */
+			ts = ticktime2;
+			break;
+		case 1:			/* ticktime0 update in progress */
+			ts = ticktime2;
+			break;
+		case 2:			/* ticktime0 completed update */
+			ts = ticktime0;
+			break;
+		case 3:			/* ticktime2 update in progress */
+			ts = ticktime0;
+			break;
+		}
+		cpu_lfence();
+	} while (counter != *(volatile int *)&ticktime_update);
+	tvp->tv_sec = ts.tv_sec;
+	tvp->tv_usec = ts.tv_nsec / 1000;
 }
 
 void
 getnanotime(struct timespec *tsp)
 {
-	struct globaldata *gd = mycpu;
-	struct timespec *bt;
-	sysclock_t delta;
+	struct timespec ts;
+	int counter;
 
 	do {
-		tsp->tv_sec = gd->gd_time_seconds;
-		delta = gd->gd_hardclock.time - gd->gd_cpuclock_base;
-	} while (tsp->tv_sec != gd->gd_time_seconds);
-
-	if (delta >= sys_cputimer->freq) {
-		tsp->tv_sec += delta / sys_cputimer->freq;
-		delta %= sys_cputimer->freq;
-	}
-	tsp->tv_nsec = (sys_cputimer->freq64_nsec * delta) >> 32;
-
-	bt = &basetime[basetime_index];
-	tsp->tv_sec += bt->tv_sec;
-	tsp->tv_nsec += bt->tv_nsec;
-	while (tsp->tv_nsec >= 1000000000) {
-		tsp->tv_nsec -= 1000000000;
-		++tsp->tv_sec;
-	}
+		counter = *(volatile int *)&ticktime_update;
+		cpu_lfence();
+		switch(counter & 3) {
+		case 0:			/* ticktime2 completed update */
+			ts = ticktime2;
+			break;
+		case 1:			/* ticktime0 update in progress */
+			ts = ticktime2;
+			break;
+		case 2:			/* ticktime0 completed update */
+			ts = ticktime0;
+			break;
+		case 3:			/* ticktime2 update in progress */
+			ts = ticktime0;
+			break;
+		}
+		cpu_lfence();
+	} while (counter != *(volatile int *)&ticktime_update);
+	*tsp = ts;
 }
 
 static void
@@ -1239,7 +1476,7 @@ getnanotime_nbt(struct timespec *nbt, struct timespec *tsp)
 		tsp->tv_sec += delta / sys_cputimer->freq;
 		delta %= sys_cputimer->freq;
 	}
-	tsp->tv_nsec = (sys_cputimer->freq64_nsec * delta) >> 32;
+	tsp->tv_nsec = muldivu64(sys_cputimer->freq64_nsec, delta, 1L << 32);
 
 	tsp->tv_sec += nbt->tv_sec;
 	tsp->tv_nsec += nbt->tv_nsec;
@@ -1266,9 +1503,10 @@ microtime(struct timeval *tvp)
 		tvp->tv_sec += delta / sys_cputimer->freq;
 		delta %= sys_cputimer->freq;
 	}
-	tvp->tv_usec = (sys_cputimer->freq64_usec * delta) >> 32;
+	tvp->tv_usec = muldivu64(sys_cputimer->freq64_usec, delta, 1L << 32);
 
 	bt = &basetime[basetime_index];
+	cpu_lfence();
 	tvp->tv_sec += bt->tv_sec;
 	tvp->tv_usec += bt->tv_nsec / 1000;
 	while (tvp->tv_usec >= 1000000) {
@@ -1293,9 +1531,10 @@ nanotime(struct timespec *tsp)
 		tsp->tv_sec += delta / sys_cputimer->freq;
 		delta %= sys_cputimer->freq;
 	}
-	tsp->tv_nsec = (sys_cputimer->freq64_nsec * delta) >> 32;
+	tsp->tv_nsec = muldivu64(sys_cputimer->freq64_nsec, delta, 1L << 32);
 
 	bt = &basetime[basetime_index];
+	cpu_lfence();
 	tsp->tv_sec += bt->tv_sec;
 	tsp->tv_nsec += bt->tv_nsec;
 	while (tsp->tv_nsec >= 1000000000) {
@@ -1305,8 +1544,14 @@ nanotime(struct timespec *tsp)
 }
 
 /*
- * note: this is not exactly synchronized with real time.  To do that we
- * would have to do what microtime does and check for a nanoseconds overflow.
+ * Get an approximate time_t.  It does not have to be accurate.  This
+ * function is called only from KTR and can be called with the system in
+ * any state so do not use a critical section or other complex operation
+ * here.
+ *
+ * NOTE: This is not exactly synchronized with real time.  To do that we
+ *	 would have to do what microtime does and check for a nanoseconds
+ *	 overflow.
  */
 time_t
 get_approximate_time_t(void)
@@ -1400,7 +1645,10 @@ pps_event(struct pps_state *pps, sysclock_t count, int event)
 	sysclock_t delta;
 	pps_seq_t *pseq;
 	int foff;
+#ifdef PPS_SYNC
 	int fhard;
+#endif
+	int ni;
 
 	gd = mycpu;
 
@@ -1409,14 +1657,18 @@ pps_event(struct pps_state *pps, sysclock_t count, int event)
 		tsp = &pps->ppsinfo.assert_timestamp;
 		osp = &pps->ppsparam.assert_offset;
 		foff = pps->ppsparam.mode & PPS_OFFSETASSERT;
+#ifdef PPS_SYNC
 		fhard = pps->kcmode & PPS_CAPTUREASSERT;
+#endif
 		pcount = &pps->ppscount[0];
 		pseq = &pps->ppsinfo.assert_sequence;
 	} else {
 		tsp = &pps->ppsinfo.clear_timestamp;
 		osp = &pps->ppsparam.clear_offset;
 		foff = pps->ppsparam.mode & PPS_OFFSETCLEAR;
+#ifdef PPS_SYNC
 		fhard = pps->kcmode & PPS_CAPTURECLEAR;
+#endif
 		pcount = &pps->ppscount[1];
 		pseq = &pps->ppsinfo.clear_sequence;
 	}
@@ -1436,8 +1688,10 @@ pps_event(struct pps_state *pps, sysclock_t count, int event)
 		ts.tv_sec += delta / sys_cputimer->freq;
 		delta %= sys_cputimer->freq;
 	}
-	ts.tv_nsec = (sys_cputimer->freq64_nsec * delta) >> 32;
-	bt = &basetime[basetime_index];
+	ts.tv_nsec = muldivu64(sys_cputimer->freq64_nsec, delta, 1L << 32);
+	ni = basetime_index;
+	cpu_lfence();
+	bt = &basetime[ni];
 	ts.tv_sec += bt->tv_sec;
 	ts.tv_nsec += bt->tv_nsec;
 	while (ts.tv_nsec >= 1000000000) {
@@ -1449,7 +1703,7 @@ pps_event(struct pps_state *pps, sysclock_t count, int event)
 	*tsp = ts;
 
 	if (foff) {
-		timespecadd(tsp, osp);
+		timespecadd(tsp, osp, tsp);
 		if (tsp->tv_nsec < 0) {
 			tsp->tv_nsec += 1000000000;
 			tsp->tv_sec -= 1;
@@ -1465,7 +1719,8 @@ pps_event(struct pps_state *pps, sysclock_t count, int event)
 				 sys_cputimer->freq64_nsec * 
 				 (tcount % sys_cputimer->freq)) >> 32;
 		} else {
-			delta = (sys_cputimer->freq64_nsec * tcount) >> 32;
+			delta = muldivu64(sys_cputimer->freq64_nsec,
+					  tcount, 1L << 32);
 		}
 		hardpps(tsp, delta);
 	}
@@ -1477,7 +1732,7 @@ pps_event(struct pps_state *pps, sysclock_t count, int event)
  *
  * Returns -1 if the TSC is not supported.
  */
-int64_t
+tsc_uclock_t
 tsc_get_target(int ns)
 {
 #if defined(_RDTSC_SUPPORTED_)
@@ -1522,6 +1777,11 @@ tsc_delay(int ns)
 
 	clk = tsc_get_target(ns);
 	cpu_pause();
-	while (tsc_test_target(clk) == 0)
+	cpu_pause();
+	while (tsc_test_target(clk) == 0) {
 		cpu_pause();
+		cpu_pause();
+		cpu_pause();
+		cpu_pause();
+	}
 }

@@ -17,7 +17,6 @@
  * Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
  */
 
-#undef _XOPEN_SOURCE
 #include "dmlib.h"
 #include "libdm-targets.h"
 #include "libdm-common.h"
@@ -370,7 +369,7 @@ get_dev_name(char *d_name, uint32_t d_major, uint32_t d_minor)
 		snprintf(d_buf, MAXPATHLEN, "/dev/%s", dire->d_name);
 
 		if ((err = stat(d_buf, &st)) < 0)
-			printf("stat failed with %d", err);
+			printf("stat failed with %d\n", err);
 
 		if (st.st_mode & S_IFBLK){
 			if ((major(st.st_rdev) == d_major) && (minor(st.st_rdev) == d_minor)) {

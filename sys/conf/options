@@ -2,9 +2,9 @@
 #
 #        On the handling of kernel options
 #
-# All kernel options should be listed in LINT, with suitable
+# All kernel options should be listed in LINT64, with suitable
 # descriptions.  Negative options (options that make some code not
-# compile) should be commented out; LINT should compile as much code
+# compile) should be commented out; LINT64 should compile as much code
 # as possible.  Try to structure option-using code so that a single
 # option only switch code on, or only switch code off, to make it
 # possible to have a full compile-test.  If necessary, you can include
@@ -33,36 +33,6 @@
 # Adaptec Array Controller driver options
 AAC_DEBUG		opt_aac.h
 
-# Adaptec aic7xxx SCSI controller options
-AHC_ALLOW_MEMIO		opt_aic7xxx.h	# Allow PCI devices to use memory
-					# mapped I/O
-
-AHC_TMODE_ENABLE	opt_aic7xxx.h	# Bitmap of units to enable
-					# targetmode operations.
-
-AHC_DUMP_EEPROM		opt_aic7xxx.h	# Dump the contents of our
-					# configuration prom.
-
-AHC_DEBUG		opt_aic7xxx.h	# Compile in Aic7xxx Debugging code.
-
-AHC_DEBUG_OPTS		opt_aic7xxx.h	# Aic7xxx driver debugging options.
-					# See sys/dev/aic7xxx/aic7xxx.h
-
-AHC_REG_PRETTY_PRINT	opt_aic7xxx.h	# Print register bitfields in debug
-					# output.  Adds ~15k to driver.
-
-# Adaptec aic79xx SCSI controller options
-AHD_DEBUG		opt_aic79xx.h	# Compile in Aic79xx Debugging code.
-
-AHD_DEBUG_OPTS		opt_aic79xx.h	# Aic79xx driver debugging options.
-					# See sys/dev/aic7xxx/aic79xx.h
-
-AHD_TMODE_ENABLE	opt_aic79xx.h	# Bitmap of units to enable
-					# targetmode operations.
-
-AHD_REG_PRETTY_PRINT	opt_aic79xx.h	# Print register bitfields in debug
-					# output.  Adds ~15k to driver.
-
 ADW_ALLOW_MEMIO		opt_adw.h	# Allow PCI devices to use memory
 					# mapped I/O
 AMR_DEBUG		opt_amr.h
@@ -74,7 +44,6 @@ ACPI_NO_SEMAPHORES	opt_acpi.h
 ACPI_ENABLE_PCI		opt_acpi.h
 
 # Miscellaneous options.
-COMPAT_43	opt_compat.h
 COMPILING_LINT	opt_lint.h
 DDB
 DDB_TRACE
@@ -106,15 +75,12 @@ MSGMNI		opt_sysvipc.h
 MSGSEG		opt_sysvipc.h
 MSGSSZ		opt_sysvipc.h
 MSGTQL		opt_sysvipc.h
+NO_SYSCTL_DESCR	opt_global.h
 UCONSOLE
 ICMP_BANDLIM
-SHOW_BUSYBUFS
-DIRECTIO	opt_directio.h
 
 # POSIX kernel options
-P1003_1B			opt_posix.h
 _KPOSIX_PRIORITY_SCHEDULING	opt_posix.h
-_KPOSIX_VERSION			opt_posix.h
 
 # Do we want the config file compiled into the kernel?
 INCLUDE_CONFIG_FILE	opt_config.h
@@ -124,22 +90,22 @@ INCLUDE_CONFIG_FILE	opt_config.h
 # dependencies.  Unusability is enforced by hiding the defines for the
 # options in a never-included header.
 EXT2FS		opt_dontuse.h
-FDESC		opt_dontuse.h
 HAMMER		opt_dontuse.h
+HAMMER2		opt_dontuse.h
 HPFS		opt_dontuse.h
 MFS		opt_dontuse.h
 MSDOSFS		opt_dontuse.h
 NTFS		opt_dontuse.h
 NULLFS		opt_dontuse.h
-PORTAL		opt_dontuse.h
 PROCFS		opt_dontuse.h
-PUFFS		opt_dontuse.h
 SMBFS		opt_dontuse.h
 TMPFS		opt_dontuse.h
 UDF		opt_dontuse.h
+AUTOFS		opt_dontuse.h
+FUSE		opt_dontuse.h
 
 # These static filesystems has one slightly bogus static dependency in
-# sys/platform/.../i386/autoconf.c.  If any of these filesystems are
+# sys/platform/.../x86_64/autoconf.c.  If any of these filesystems are
 # statically compiled into the kernel, code for mounting them as root
 # filesystems will be enabled - but look below.  Boot-code is purposely
 # unavailable for the LKM-based versions.
@@ -154,7 +120,6 @@ NTFS_ICONV	opt_dontuse.h
 
 # SMB/CIFS requester
 NETSMB		opt_netsmb.h
-NETSMBCRYPTO	opt_netsmb.h
 
 # If you are following the conditions in the copyright,
 # you can enable soft-updates which will speed up a lot of things
@@ -169,12 +134,7 @@ UFS_DIRHASH	opt_ufs.h
 # <filesystem>_ROOT option to control if it usable as root.  This list
 # allows these options to be present in config files already (though
 # they won't make any difference yet).
-FFS_ROOT	opt_ffs.h
 NFS_ROOT	opt_nfsroot.h
-
-# The union static file system has bogus static dependencies, so it isn't
-# hidden yet.
-UNION
 
 # Options used only in subr_param.c.
 HZ		opt_param.h
@@ -226,7 +186,7 @@ SYM_SETUP_LP_PROBE_MAP	opt_sym.h	#-Low Priority Probe Map (bits)
 					# Allows the ncr to take precedence
 					# 1 (1<<0) -> 810a, 860
 					# 2 (1<<1) -> 825a, 875, 885, 895
-					# 4 (1<<2) -> 895a, 896, 1510d 
+					# 4 (1<<2) -> 895a, 896, 1510d
 SYM_SETUP_SCSI_DIFF	opt_sym.h	#-HVD support for 825a, 875, 885
 					# disabled:0 (default), enabled:1
 SYM_SETUP_PCI_PARITY	opt_sym.h	#-PCI parity checking
@@ -246,6 +206,27 @@ ISP_TARGET_MODE		opt_isp.h
 # Options used in the 'nata' ATA/ATAPI driver
 ATA_STATIC_ID		opt_ata.h
 
+# Options used in the 'nata' chipset driver
+ATA_NO_ACARD		opt_ata.h
+ATA_NO_ACERLABS		opt_ata.h
+ATA_NO_AHCI		opt_ata.h
+ATA_NO_AMD		opt_ata.h
+ATA_NO_CYPRESS		opt_ata.h
+ATA_NO_CYRIX		opt_ata.h
+ATA_NO_HIGHPOINT	opt_ata.h
+ATA_NO_INTEL		opt_ata.h
+ATA_NO_ITE		opt_ata.h
+ATA_NO_JMICRON		opt_ata.h
+ATA_NO_MARVELL		opt_ata.h
+ATA_NO_NATIONAL		opt_ata.h
+ATA_NO_NETCELL		opt_ata.h
+ATA_NO_NVIDIA		opt_ata.h
+ATA_NO_PROMISE		opt_ata.h
+ATA_NO_SERVERWORKS	opt_ata.h
+ATA_NO_SILICONIMAGE	opt_ata.h
+ATA_NO_SIS		opt_ata.h
+ATA_NO_VIA		opt_ata.h
+
 # Net stuff.
 # altq stuff
 ALTQ			opt_global.h
@@ -263,22 +244,17 @@ ACCEPT_FILTER_HTTP
 BOOTP			opt_bootp.h
 BOOTP_COMPAT		opt_bootp.h
 BOOTP_NFSROOT		opt_bootp.h
-BOOTP_NFSV3		opt_bootp.h
 BOOTP_WIRED_TO		opt_bootp.h
 CARP			opt_carp.h
 MROUTING		opt_mrouting.h
 PIM			opt_mrouting.h
 INET			opt_inet.h
 INET6			opt_inet6.h
-IPSEC			opt_ipsec.h
-IPSEC_ESP		opt_ipsec.h
-IPSEC_DEBUG		opt_ipsec.h
-IPSEC_FILTERGIF		opt_ipsec.h
-FAST_IPSEC		opt_ipsec.h
 IPDIVERT
 DUMMYNET		opt_ipdn.h
 DUMMYNET_DEBUG		opt_ipdn.h
 IPFIREWALL		opt_ipfw.h
+IPFIREWALL3		opt_ipfw.h
 IPFIREWALL_DEBUG	opt_ipfw.h
 IPFIREWALL_VERBOSE	opt_ipfw.h
 IPFIREWALL_VERBOSE_LIMIT	opt_ipfw.h
@@ -290,12 +266,8 @@ IPV6FIREWALL_DEFAULT_TO_ACCEPT	opt_ip6fw.h
 IPSTEALTH
 LIBMCHAIN
 MPLS			opt_mpls.h
-PPP_BSDCOMP		opt_ppp.h
-PPP_DEFLATE		opt_ppp.h
-PPP_FILTER		opt_ppp.h
-SLIP_IFF_OPTS		opt_slip.h
 TCPDEBUG
-TCP_SIGNATURE		opt_inet.h
+#TCP_SIGNATURE		opt_inet.h
 TCP_DROP_SYNFIN		opt_tcp_input.h
 ICMPPRINTFS
 
@@ -410,7 +382,7 @@ AGP_DEBUG		opt_agp.h
 
 # DRM options
 DRM_DEBUG		opt_drm.h
-DRM_LINUX		opt_drm.h
+VGA_SWITCHEROO		opt_drm.h
 
 # DPT driver debug flags
 DPT_MEASURE_PERFORMANCE	opt_dpt.h
@@ -428,7 +400,6 @@ VP0_DEBUG		opt_vpo.h
 LPT_DEBUG		opt_lpt.h
 PLIP_DEBUG		opt_plip.h
 LOCKF_DEBUG		opt_debug_lockf.h
-SI_DEBUG		opt_debug_si.h
 
 # Fb options
 FB_DEBUG		opt_fb.h
@@ -451,7 +422,6 @@ DEBUG_CRIT_SECTIONS	opt_global.h
 DIAGNOSTIC		opt_global.h
 INVARIANTS		opt_global.h
 VFS_BIO_DEBUG		opt_global.h
-DEBUG_INTERRUPTS	opt_global.h
 SOCKBUF_DEBUG		opt_global.h
 PANIC_DEBUG		opt_global.h
 MBUF_DEBUG		opt_global.h
@@ -470,9 +440,6 @@ KEY
 
 # Size of the kernel message buffer
 MSGBUF_SIZE		opt_msgbuf.h
-
-# PCI related options
-COMPAT_OLDPCI
 
 # NFS options
 NFS_MINATTRTIMO		opt_nfs.h
@@ -498,7 +465,7 @@ BKTR_OVERRIDE_DBX		opt_bktr.h
 BKTR_OVERRIDE_MSP		opt_bktr.h
 BKTR_SYSTEM_DEFAULT		opt_bktr.h
 BKTR_ALLOC_PAGES		opt_bktr.h
-BKTR_USE_PLL			opt_bktr.h	
+BKTR_USE_PLL			opt_bktr.h
 BKTR_GPIO_ACCESS		opt_bktr.h
 BKTR_NO_MSP_RESET		opt_bktr.h
 BKTR_430_FX_MODE		opt_bktr.h
@@ -517,6 +484,9 @@ BUS_DEBUG		opt_bus.h
 # options for USB support
 OHCI_DEBUG		opt_usb.h
 USB_DEBUG		opt_usb.h
+
+# options for the Realtek RTL8188*U/RTL8192CU driver (urtwn)
+URTWN_WITHOUT_UCODE	opt_urtwn.h
 
 # Vinum options
 VINUMDEBUG		opt_vinum.h
@@ -556,7 +526,6 @@ KTR_ALL				opt_ktr.h
 KTR_ACPI_EC			opt_ktr.h
 KTR_CTXSW			opt_ktr.h
 KTR_DMCRYPT			opt_ktr.h
-KTR_DSCHED_BFQ			opt_ktr.h
 KTR_ETHERNET			opt_ktr.h
 KTR_HAMMER			opt_ktr.h
 KTR_IFQ				opt_ktr.h
@@ -566,18 +535,19 @@ KTR_IF_EMX			opt_ktr.h
 KTR_IF_START			opt_ktr.h
 KTR_IPIQ			opt_ktr.h
 KTR_KERNENTRY			opt_ktr.h
+KTR_LAPIC			opt_ktr.h
 KTR_MEMORY			opt_ktr.h
 KTR_SERIALIZER			opt_ktr.h
 KTR_SPIN_CONTENTION		opt_ktr.h
 KTR_TESTLOG			opt_ktr.h
 KTR_TOKENS			opt_ktr.h
 KTR_TSLEEP			opt_ktr.h
-KTR_USB_MEMORY			opt_ktr.h
 KTR_USCHED_BSD4			opt_ktr.h
 KTR_USCHED_DFLY			opt_ktr.h
 KTR_VERBOSE			opt_ktr.h
 KTR_IF_POLL			opt_ktr.h
 KTR_UDP				opt_ktr.h
+KTR_SOWAKEUP			opt_ktr.h
 
 # NTFS options
 NTFS_DEBUG			opt_ntfs.h
@@ -591,9 +561,7 @@ ATH_DIAGAPI		opt_ath.h
 ATH_ENABLE_DFS		opt_ath.h
 #ATH_ENABLE_RADIOTAP_VENDOR_EXT opt_ath.h
 ATH_KTR_INTR_DEBUG	opt_ath.h
-ATH_RXBUF		opt_ath.h
 #ATH_TX99_DIAG		opt_ath.h
-ATH_TXBUF		opt_ath.h
 
 # ...and its HAL
 AH_AR5416_INTERRUPT_MITIGATION opt_ah.h
@@ -605,7 +573,6 @@ AH_INTERRUPT_DEBUGGING	opt_ah.h
 AH_MAXCHAN		opt_ah.h
 AH_NEED_DESC_SWAP	opt_ah.h
 AH_PRIVATE_DIAG		opt_ah.h
-AH_REGOPS_FUNC		opt_ah.h
 AH_RXCFG_SDMAMW_4BYTES	opt_ah.h
 AH_SUPPORT_AR5416	opt_ah.h
 AH_SUPPORT_AR9130	opt_ah.h
@@ -632,9 +599,6 @@ BWN_TXRING_SLOTS	opt_bwn.h
 # siba_bwn driver
 SIBA_DEBUG		opt_siba.h
 
-# ed driver
-ED_NO_MIIBUS		opt_ed.h
-
 # emx driver
 EMX_RSS_DEBUG		opt_emx.h
 EMX_TSO_DEBUG		opt_emx.h
@@ -651,8 +615,14 @@ IGB_MSIX_DEBUG		opt_igb.h
 # ix driver
 IX_RSS_DEBUG		opt_ix.h
 
+# Options for the Intel 802.11ac wireless driver
+IWM_DEBUG		opt_iwm.h
+
 # Options for the Intel 802.11n wireless driver
 IWN_DEBUG		opt_iwn.h
+
+# Options for the Intel 3945ABG wireless driver
+WPI_DEBUG		opt_wpi.h
 
 # dcons options
 DCONS_BUF_SIZE		opt_dcons.h
@@ -662,23 +632,6 @@ DCONS_FORCE_GDB		opt_dcons.h
 
 # deprecated drivers and options
 I_WANT_DEPRECATED_STUFF	opt_deprecated.h
-
-# SCTP
-SCTP			opt_sctp.h
-SCTP_DEBUG		opt_sctp.h
-SCTP_USE_ADLER32	opt_sctp.h
-SCTP_HIGH_SPEED		opt_sctp.h
-SCTP_STAT_LOGGING	opt_sctp.h
-SCTP_CWND_LOGGING	opt_sctp.h
-SCTP_BLK_LOGGING	opt_sctp.h
-SCTP_STR_LOGGING	opt_sctp.h
-SCTP_FR_LOGGING		opt_sctp.h
-SCTP_MAP_LOGGING	opt_sctp.h
-
-# DSCHED stuff
-DSCHED_AS		opt_dsched.h
-DSCHED_BFQ		opt_dsched.h
-DSCHED_FQ		opt_dsched.h
 
 # Receive Side Scaling (now basecode)
 RSS_DEBUG		opt_rss.h
@@ -690,7 +643,6 @@ ERROR_LED_ON_PANIC	opt_panic.h
 # 802.11 support layer
 IEEE80211_DEBUG		opt_wlan.h
 IEEE80211_DEBUG_REFCNT	opt_wlan.h
-IEEE80211_AMPDU_AGE	opt_wlan.h
 IEEE80211_SUPPORT_MESH	opt_wlan.h
 IEEE80211_SUPPORT_SUPERG	opt_wlan.h
 IEEE80211_SUPPORT_TDMA	opt_wlan.h
@@ -708,10 +660,23 @@ TDMA_TXRATE_QUARTER_DEFAULT	opt_tdma.h
 TDMA_TXRATE_11NA_DEFAULT	opt_tdma.h
 TDMA_TXRATE_11NG_DEFAULT	opt_tdma.h
 
+# Sound options
+SND_DEBUG		opt_snd.h
+SND_DIAGNOSTIC		opt_snd.h
+SND_FEEDER_MULTIFORMAT	opt_snd.h
+SND_FEEDER_FULL_MULTIFORMAT	opt_snd.h
+SND_FEEDER_RATE_HP	opt_snd.h
+SND_OLDSTEREO		opt_snd.h
+
 PANIC_REBOOT_WAIT_TIME	opt_panic.h
+
+# Evdev protocol support
+EVDEV_SUPPORT		opt_evdev.h
+EVDEV_DEBUG		opt_evdev.h
+
+# Sysctl debugging
+SYSCTL_DEBUG		opt_sysctl.h
 
 # Obsolete options (will be removed in the future)
 #
-SYSVMSG			opt_dontuse.h
-SYSVSEM			opt_dontuse.h
-SYSVSHM			opt_dontuse.h
+# [none at the moment]

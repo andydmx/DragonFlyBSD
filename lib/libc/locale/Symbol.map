@@ -1,7 +1,4 @@
-DF306.0 {
-	_CurrentRuneLocale;
-	_DefaultRuneLocale;
-	_ThreadRuneLocale;
+DF404.0 {
 	___mb_cur_max;
 	___mb_cur_max_l;
 	___runetype;
@@ -28,6 +25,10 @@ DF306.0 {
 	__tolower;
 	__toupper;
 	__wcwidth;
+	__wcwidth_l;
+	_CurrentRuneLocale;
+	_DefaultRuneLocale;
+	_ThreadRuneLocale;
 	btowc;
 	btowc_l;
 	c16rtomb;
@@ -116,6 +117,8 @@ DF306.0 {
 	isxdigit_l;
 	localeconv;
 	localeconv_l;
+	mbintowcr;
+	mbintowcr_l;
 	mblen;
 	mblen_l;
 	mbrlen;
@@ -144,11 +147,6 @@ DF306.0 {
 	querylocale;
 	rpmatch;
 	setlocale;
-	strcoll_l;
-	strfmon_l;
-	strftime_l;
-	strptime_l;
-	strxfrm_l;
 	toascii;
 	tolower;
 	tolower_l;
@@ -161,9 +159,10 @@ DF306.0 {
 	towupper;
 	towupper_l;
 	uselocale;
+	utf8towcr;
 	wcrtomb;
 	wcrtomb_l;
-	wcscoll_l;
+	wcrtoutf8;
 	wcsftime;
 	wcsftime_l;
 	wcsnrtombs;
@@ -190,7 +189,6 @@ DF306.0 {
 	wcstoull_l;
 	wcstoumax;
 	wcstoumax_l;
-	wcsxfrm_l;
 	wctob;
 	wctob_l;
 	wctomb;
@@ -200,9 +198,10 @@ DF306.0 {
 	wctype;
 	wctype_l;
 	wcwidth;
-DFprivate_1.0 {
-    _PathLocale;
-    __detect_path_locale;
-    __collate_load_error;
-    __collate_range_cmp;
+	wcwidth_l;
 };
+
+/*
+DFprivate_1.0 {
+};
+*/

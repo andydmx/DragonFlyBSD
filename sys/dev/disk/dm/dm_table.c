@@ -30,11 +30,9 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
-#include <sys/types.h>
 #include <sys/param.h>
-
 #include <sys/malloc.h>
-
+#include <cpu/atomic.h>
 #include <dev/disk/dm/dm.h>
 
 /*
@@ -51,9 +49,6 @@
  * simply use shared/exclusive locking to ensure this.
  */
 
-static int dm_table_busy(dm_table_head_t *, uint8_t);
-static void dm_table_unbusy(dm_table_head_t *);
-
 /*
  * Function to increment table user reference counter. Return id
  * of table_id table.
@@ -61,7 +56,7 @@ static void dm_table_unbusy(dm_table_head_t *);
  * DM_TABLE_INACTIVE will return inactive table id.
  */
 static int
-dm_table_busy(dm_table_head_t * head, uint8_t table_id)
+dm_table_busy(dm_table_head_t *head, uint8_t table_id)
 {
 	uint8_t id;
 
@@ -78,11 +73,12 @@ dm_table_busy(dm_table_head_t * head, uint8_t table_id)
 
 	return id;
 }
+
 /*
  * Function release table lock and eventually wakeup all waiters.
  */
 static void
-dm_table_unbusy(dm_table_head_t * head)
+dm_table_unbusy(dm_table_head_t *head)
 {
 	KKASSERT(head->io_cnt != 0);
 
@@ -90,11 +86,12 @@ dm_table_unbusy(dm_table_head_t * head)
 
 	lockmgr(&head->table_mtx, LK_RELEASE);
 }
+
 /*
  * Return current active table to caller, increment io_cnt reference counter.
  */
 dm_table_t *
-dm_table_get_entry(dm_table_head_t * head, uint8_t table_id)
+dm_table_get_entry(dm_table_head_t *head, uint8_t table_id)
 {
 	uint8_t id;
 
@@ -102,19 +99,21 @@ dm_table_get_entry(dm_table_head_t * head, uint8_t table_id)
 
 	return &head->tables[id];
 }
+
 /*
  * Decrement io reference counter and release shared lock.
  */
 void
-dm_table_release(dm_table_head_t * head, uint8_t table_id)
+dm_table_release(dm_table_head_t *head, uint8_t table_id)
 {
 	dm_table_unbusy(head);
 }
+
 /*
  * Switch table from inactive to active mode. Have to wait until io_cnt is 0.
  */
 void
-dm_table_switch_tables(dm_table_head_t * head)
+dm_table_switch_tables(dm_table_head_t *head)
 {
 	lockmgr(&head->table_mtx, LK_EXCLUSIVE);
 
@@ -122,12 +121,13 @@ dm_table_switch_tables(dm_table_head_t * head)
 
 	lockmgr(&head->table_mtx, LK_RELEASE);
 }
+
 /*
  * Destroy all table data. This function can run when there are no
  * readers on table lists.
  */
 int
-dm_table_destroy(dm_table_head_t * head, uint8_t table_id)
+dm_table_destroy(dm_table_head_t *head, uint8_t table_id)
 {
 	dm_table_t *tbl;
 	dm_table_entry_t *table_en;
@@ -135,7 +135,7 @@ dm_table_destroy(dm_table_head_t * head, uint8_t table_id)
 
 	lockmgr(&head->table_mtx, LK_EXCLUSIVE);
 
-	aprint_debug("dm_Table_destroy called with %d--%d\n", table_id, head->io_cnt);
+	dmdebug("table_id=%d io_cnt=%d\n", table_id, head->io_cnt);
 
 	if (table_id == DM_TABLE_ACTIVE)
 		id = head->cur_active_table;
@@ -144,48 +144,47 @@ dm_table_destroy(dm_table_head_t * head, uint8_t table_id)
 
 	tbl = &head->tables[id];
 
-	while (!SLIST_EMPTY(tbl)) {	/* List Deletion. */
-		table_en = SLIST_FIRST(tbl);
-		/*
-		 * Remove target specific config data. After successfull
-		 * call table_en->target_config must be set to NULL.
-		 */
-		table_en->target->destroy(table_en);
+	while ((table_en = TAILQ_FIRST(tbl)) != NULL) {
+		TAILQ_REMOVE(tbl, table_en, next);
+
+		if (table_en->target->destroy)
+			table_en->target->destroy(table_en);
+		table_en->target_config = NULL;
+
+		dm_table_free_deps(table_en);
+
 		/* decrement the refcount for the target */
 		dm_target_unbusy(table_en->target);
 
-		SLIST_REMOVE_HEAD(tbl, next);
-
 		kfree(table_en, M_DM);
 	}
+	KKASSERT(TAILQ_EMPTY(tbl));
 
 	lockmgr(&head->table_mtx, LK_RELEASE);
 
 	return 0;
 }
+
 /*
  * Return length of active or inactive table in device.
  */
 static uint64_t
-_dm_table_size(dm_table_head_t * head, int table)
+_dm_table_size(dm_table_head_t *head, int table)
 {
 	dm_table_t *tbl;
 	dm_table_entry_t *table_en;
 	uint64_t length;
-	uint8_t id;
 
 	length = 0;
 
-	id = dm_table_busy(head, table);
-
 	/* Select active table */
-	tbl = &head->tables[id];
+	tbl = dm_table_get_entry(head, table);
 
 	/*
 	 * Find out what tables I want to select.
 	 * if length => rawblkno then we should used that table.
 	 */
-	SLIST_FOREACH(table_en, tbl, next) {
+	TAILQ_FOREACH(table_en, tbl, next) {
 		length += table_en->length;
 	}
 
@@ -210,23 +209,20 @@ dm_inactive_table_size(dm_table_head_t *head)
  * Return > 0 if table is at least one table entry (returns number of entries)
  * and return 0 if there is not. Target count returned from this function
  * doesn't need to be true when userspace user receive it (after return
- * there can be dm_dev_resume_ioctl), therfore this isonly informative.
+ * there can be dm_dev_resume_ioctl), therefore this is only informative.
  */
 int
-dm_table_get_target_count(dm_table_head_t * head, uint8_t table_id)
+dm_table_get_target_count(dm_table_head_t *head, uint8_t table_id)
 {
 	dm_table_entry_t *table_en;
 	dm_table_t *tbl;
 	uint32_t target_count;
-	uint8_t id;
 
 	target_count = 0;
 
-	id = dm_table_busy(head, table_id);
+	tbl = dm_table_get_entry(head, table_id);
 
-	tbl = &head->tables[id];
-
-	SLIST_FOREACH(table_en, tbl, next)
+	TAILQ_FOREACH(table_en, tbl, next)
 	    target_count++;
 
 	dm_table_unbusy(head);
@@ -234,34 +230,85 @@ dm_table_get_target_count(dm_table_head_t * head, uint8_t table_id)
 	return target_count;
 }
 
-
 /*
- * Initialize table_head structures, I'm trying to keep this structure as
+ * Initialize dm_table_head_t structures, I'm trying to keep this structure as
  * opaque as possible.
  */
 void
-dm_table_head_init(dm_table_head_t * head)
+dm_table_head_init(dm_table_head_t *head)
 {
 	head->cur_active_table = 0;
 	head->io_cnt = 0;
 
 	/* Initialize tables. */
-	SLIST_INIT(&head->tables[0]);
-	SLIST_INIT(&head->tables[1]);
+	TAILQ_INIT(&head->tables[0]);
+	TAILQ_INIT(&head->tables[1]);
 
 	lockinit(&head->table_mtx, "dmtbl", 0, LK_CANRECURSE);
 }
+
 /*
  * Destroy all variables in table_head
  */
 void
-dm_table_head_destroy(dm_table_head_t * head)
+dm_table_head_destroy(dm_table_head_t *head)
 {
-	KKASSERT(lockcount(&head->table_mtx) == 0);
+	KKASSERT(!lockinuse(&head->table_mtx));
 
-	/* tables doens't exists when I call this routine, therefore it
+	/* tables don't exist when I call this routine, therefore it
 	 * doesn't make sense to have io_cnt != 0 */
 	KKASSERT(head->io_cnt == 0);
 
 	lockuninit(&head->table_mtx);
+}
+
+void
+dm_table_init_target(dm_table_entry_t *table_en, void *cfg)
+{
+	table_en->target_config = cfg;
+}
+
+int
+dm_table_add_deps(dm_table_entry_t *table_en, dm_pdev_t *pdev)
+{
+	dm_table_head_t *head;
+	dm_mapping_t *map;
+
+	KKASSERT(pdev);
+
+	head = &table_en->dev->table_head;
+	lockmgr(&head->table_mtx, LK_SHARED);
+
+	TAILQ_FOREACH(map, &table_en->pdev_maps, next) {
+		if (map->data.pdev->udev == pdev->udev) {
+			lockmgr(&head->table_mtx, LK_RELEASE);
+			return -1;
+		}
+	}
+
+	map = kmalloc(sizeof(*map), M_DM, M_WAITOK | M_ZERO);
+	map->data.pdev = pdev;
+	TAILQ_INSERT_TAIL(&table_en->pdev_maps, map, next);
+
+	lockmgr(&head->table_mtx, LK_RELEASE);
+
+	return 0;
+}
+
+void
+dm_table_free_deps(dm_table_entry_t *table_en)
+{
+	dm_table_head_t *head;
+	dm_mapping_t *map;
+
+	head = &table_en->dev->table_head;
+	lockmgr(&head->table_mtx, LK_SHARED);
+
+	while ((map = TAILQ_FIRST(&table_en->pdev_maps)) != NULL) {
+		TAILQ_REMOVE(&table_en->pdev_maps, map, next);
+		kfree(map, M_DM);
+	}
+	KKASSERT(TAILQ_EMPTY(&table_en->pdev_maps));
+
+	lockmgr(&head->table_mtx, LK_RELEASE);
 }

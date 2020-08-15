@@ -68,8 +68,8 @@
 #include <sys/spinlock.h>
 
 #include <sys/buf2.h>
-#include <sys/mplock2.h>
 
+#include <bus/mmc/bridge.h>
 #include <bus/mmc/mmcvar.h>
 #include <bus/mmc/mmcreg.h>
 
@@ -81,7 +81,6 @@ struct mmcsd_softc {
 	struct lock sc_lock;
 	struct disk disk;
 	struct devstat device_stats;
-	int unit;
 	struct thread *td;
 	struct bio_queue_head bio_queue;
 	daddr_t eblock, eend;	/* Range remaining after the last erase. */
@@ -113,7 +112,7 @@ static int mmcsd_bus_bit_width(device_t dev);
 #define MMCSD_ASSERT_UNLOCKED(_sc) KKASSERT(lockstatus(&(_sc)->sc_lock, curthread) == 0);
 
 static struct dev_ops mmcsd_ops = {
-	{ "mmcsd", 0, D_DISK },
+	{ "mmcsd", 0, D_DISK | D_MPSAFE },
 	.d_open = mmcsd_open,
 	.d_close = mmcsd_close,
 	.d_strategy = mmcsd_strategy,
@@ -149,16 +148,23 @@ mmcsd_attach(device_t dev)
 	    DEVSTAT_TYPE_DIRECT | DEVSTAT_TYPE_IF_OTHER,
 	    DEVSTAT_PRIORITY_DISK);
 
-	dsk = disk_create(sc->unit, &sc->disk, &mmcsd_ops);
-	dsk->si_drv1 = sc;
-	sc->dev_t = dsk;
+	bioq_init(&sc->bio_queue);
 
-	dsk->si_iosize_max = 4*1024*1024;	/* Maximum defined SD card AU size. */
+	sc->running = 1;
+	sc->suspend = 0;
+	sc->eblock = sc->eend = 0;
+	kthread_create(mmcsd_task, sc, &sc->td, "mmc/sd card task");
 
+	/*
+	 * Probe capacity
+	 */
 	bzero(&info, sizeof(info));
 	info.d_media_blksize = sector_size;
 	info.d_media_blocks = mmc_get_media_size(dev);
-	disk_setdiskinfo(&sc->disk, &info);
+	info.d_secpertrack = 1024;
+	info.d_nheads = 1;
+	info.d_secpercyl = info.d_secpertrack * info.d_nheads;
+	info.d_ncylinders =  (u_int)(info.d_media_blocks / info.d_secpercyl);
 
 	/*
 	 * Display in most natural units.  There's no cards < 1MB.
@@ -168,25 +174,34 @@ mmcsd_attach(device_t dev)
 	 * SDHC is good to 2TiB however, which isn't too ugly at
 	 * 2048GiBm, so we note it in passing here and don't add the
 	 * code to print TiB).
+	 *
+	 * 1MiB == 1 << 20
 	 */
-	mb = (info.d_media_blksize * info.d_media_blocks) >> 20;	/* 1MiB == 1 << 20 */
+	mb = (info.d_media_blksize * info.d_media_blocks) >> 20;
 	unit = 'M';
 	if (mb >= 10240) {		/* 1GiB = 1024 MiB */
 		unit = 'G';
 		mb /= 1024;
 	}
+
 	device_printf(dev, "%ju%cB <%s Memory Card>%s at %s %dMHz/%dbit\n",
 	    mb, unit, mmcsd_card_name(dev),
 	    mmc_get_read_only(dev) ? " (read-only)" : "",
 	    device_get_nameunit(device_get_parent(dev)),
 	    mmc_get_tran_speed(dev) / 1000000, mmcsd_bus_bit_width(dev));
 
-	bioq_init(&sc->bio_queue);
+	/*
+	 * SC is fully initialized, we can attach the drive now.  The
+	 * instant we do the kernel will start probing it.
+	 */
+	dsk = disk_create(device_get_unit(dev), &sc->disk, &mmcsd_ops);
+	dsk->si_drv1 = sc;
+	sc->dev_t = dsk;
 
-	sc->running = 1;
-	sc->suspend = 0;
-	sc->eblock = sc->eend = 0;
-	kthread_create(mmcsd_task, sc, &sc->td, "mmc/sd card task");
+	/* Maximum defined SD card AU size. */
+	dsk->si_iosize_max = 4*1024*1024;
+
+	disk_setdiskinfo(&sc->disk, &info);
 
 	return (0);
 }
@@ -210,7 +225,8 @@ mmcsd_detach(device_t dev)
 	}
 	MMCSD_UNLOCK(sc);
 
-	/* Flush the request queue.
+	/*
+	 * Flush the request queue.
 	 *
 	 * XXX: Return all queued I/O with ENXIO. Is this correct?
 	 */
@@ -267,13 +283,13 @@ mmcsd_resume(device_t dev)
 }
 
 static int
-mmcsd_open(struct dev_open_args *ap)
+mmcsd_open(struct dev_open_args *ap __unused)
 {
 	return (0);
 }
 
 static int
-mmcsd_close(struct dev_close_args *ap)
+mmcsd_close(struct dev_close_args *ap __unused)
 {
 	return (0);
 }
@@ -289,7 +305,6 @@ mmcsd_strategy(struct dev_strategy_args *ap)
 	MMCSD_LOCK(sc);
 	if (sc->running > 0 || sc->suspend > 0) {
 		bioqdisksort(&sc->bio_queue, bio);
-		devstat_start_transaction(&sc->device_stats);
 		MMCSD_UNLOCK(sc);
 		wakeup(sc);
 	} else {
@@ -356,8 +371,7 @@ mmcsd_rw(struct mmcsd_softc *sc, struct bio *bio)
 		}
 //		kprintf("Len %d  %lld-%lld flags %#x sz %d\n",
 //		    (int)data.len, (long long)block, (long long)end, data.flags, sz);
-		MMCBUS_WAIT_FOR_REQUEST(device_get_parent(dev), dev,
-		    &req);
+		MMCBUS_WAIT_FOR_REQUEST(device_get_parent(dev), dev, &req);
 		if (req.cmd->error != MMC_ERR_NONE)
 			break;
 		block += numblocks;
@@ -408,8 +422,7 @@ mmcsd_delete(struct mmcsd_softc *sc, struct bio *bio)
 	if (!mmc_get_high_cap(dev))
 		cmd.arg <<= 9;
 	cmd.flags = MMC_RSP_R1 | MMC_CMD_AC;
-	MMCBUS_WAIT_FOR_REQUEST(device_get_parent(dev), dev,
-	    &req);
+	MMCBUS_WAIT_FOR_REQUEST(device_get_parent(dev), dev, &req);
 	if (req.cmd->error != MMC_ERR_NONE) {
 	    kprintf("erase err1: %d\n", req.cmd->error);
 	    return (block);
@@ -427,8 +440,7 @@ mmcsd_delete(struct mmcsd_softc *sc, struct bio *bio)
 		cmd.arg <<= 9;
 	cmd.arg--;
 	cmd.flags = MMC_RSP_R1 | MMC_CMD_AC;
-	MMCBUS_WAIT_FOR_REQUEST(device_get_parent(dev), dev,
-	    &req);
+	MMCBUS_WAIT_FOR_REQUEST(device_get_parent(dev), dev, &req);
 	if (req.cmd->error != MMC_ERR_NONE) {
 	    kprintf("erase err2: %d\n", req.cmd->error);
 	    return (block);
@@ -440,8 +452,7 @@ mmcsd_delete(struct mmcsd_softc *sc, struct bio *bio)
 	cmd.opcode = MMC_ERASE;
 	cmd.arg = 0;
 	cmd.flags = MMC_RSP_R1B | MMC_CMD_AC;
-	MMCBUS_WAIT_FOR_REQUEST(device_get_parent(dev), dev,
-	    &req);
+	MMCBUS_WAIT_FOR_REQUEST(device_get_parent(dev), dev, &req);
 	if (req.cmd->error != MMC_ERR_NONE) {
 	    kprintf("erase err3 %d\n", req.cmd->error);
 	    return (block);
@@ -497,7 +508,6 @@ mmcsd_task(void *arg)
 	daddr_t block, end;
 	device_t dev;
 
-	get_mplock();
 	dev = sc->dev;
 
 	while (1) {
@@ -509,8 +519,9 @@ mmcsd_task(void *arg)
 			if (bio == NULL)
 				lksleep(sc, &sc->sc_lock, 0, "jobqueue", 0);
 		} while (bio == NULL);
-		bp = bio->bio_buf;
 		MMCSD_UNLOCK(sc);
+		bp = bio->bio_buf;
+		devstat_start_transaction(&sc->device_stats);
 		if (bp->b_cmd != BUF_CMD_READ && mmc_get_read_only(dev)) {
 			bp->b_error = EROFS;
 			bp->b_resid = bp->b_bcount;
@@ -537,6 +548,8 @@ mmcsd_task(void *arg)
 			bp->b_error = EIO;
 			bp->b_resid = (end - block) * sz;
 			bp->b_flags |= B_ERROR;
+		} else {
+			bp->b_resid = 0;
 		}
 		devstat_end_transaction_buf(&sc->device_stats, bp);
 		biodone(bio);
@@ -546,8 +559,6 @@ out:
 	sc->running = -1;
 	MMCSD_UNLOCK(sc);
 	wakeup(sc);
-
-	rel_mplock();
 }
 
 static const char *

@@ -27,7 +27,6 @@
  * SUCH DAMAGE.
  *
  * $FreeBSD: src/usr.bin/basename/basename.c,v 1.15 2004/07/15 06:15:10 tjr Exp $
- * $DragonFly: src/usr.bin/basename/basename.c,v 1.11 2007/08/28 15:36:44 pavalos Exp $
  *
  * @(#) Copyright (c) 1991, 1993, 1994 The Regents of the University of California.  All rights reserved.
  * @(#)basename.c	8.4 (Berkeley) 5/4/95
@@ -43,8 +42,8 @@
 #include <unistd.h>
 #include <wchar.h>
 
-void stripsuffix(char *, const char *, size_t);
-void usage(void);
+static void stripsuffix(char *, const char *, size_t);
+static void usage(void) __dead2;
 
 int
 main(int argc, char **argv)
@@ -100,19 +99,16 @@ main(int argc, char **argv)
 	exit(0);
 }
 
-void
+static void
 stripsuffix(char *p, const char *suffix, size_t suffixlen)
 {
 	char *q;
-#ifndef NO_WCHAR
 	char *r;
 	mbstate_t mbs;
 	size_t n;
-#endif
 
 	if (suffixlen && (q = strchr(p, '\0') - suffixlen) > p &&
 	    strcmp(suffix, q) == 0) {
-#ifndef NO_WCHAR
 		/* Ensure that the match occurred on a character boundary. */
 		memset(&mbs, 0, sizeof(mbs));
 		for (r = p; r < q; r += n) {
@@ -124,12 +120,11 @@ stripsuffix(char *p, const char *suffix, size_t suffixlen)
 		}
 		/* Chop off the suffix. */
 		if (q == r)
-#endif
 			*q = '\0';
 	}
 }
 
-void
+static void
 usage(void)
 {
 

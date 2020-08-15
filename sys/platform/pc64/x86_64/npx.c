@@ -50,7 +50,6 @@
 #include <sys/signalvar.h>
 
 #include <sys/thread2.h>
-#include <sys/mplock2.h>
 
 #include <machine/cputypes.h>
 #include <machine/frame.h>
@@ -88,7 +87,7 @@ static struct krate badfprate = { 1 };
 static	void	fpusave		(union savefpu *);
 static	void	fpurstor	(union savefpu *);
 
-uint32_t npx_mxcsr_mask = 0xFFBF;	/* this is the default */
+__read_mostly uint32_t npx_mxcsr_mask = 0xFFBF;	/* this is the default */
 
 /*
  * Probe the npx_mxcsr_mask as described in the intel document
@@ -128,7 +127,6 @@ void npxinit(void)
 	 * fnsave to throw away any junk in the fpu.  npxsave() initializes
 	 * the fpu and sets npxthread = NULL as important side effects.
 	 */
-
 	npxsave(&dummy);
 	crit_enter();
 	stop_emulating();
@@ -335,12 +333,24 @@ static char fpetable[128] = {
 int
 npxdna(void)
 {
-	thread_t td = curthread;
+	struct mdglobaldata *md = mdcpu;
+	thread_t td;
 	int didinit = 0;
 
-	if (mdcpu->gd_npxthread != NULL) {
+	td = md->mi.gd_curthread;
+
+	/*
+	 * npxthread is almost always NULL.  When it isn't NULL it can
+	 * only be exactly equal to 'td'.  This case occurs when the switch
+	 * code pro-actively restores the FPU state due to the trap() code
+	 * being interruptable (e.g. such as by an interrupt thread).
+	 */
+	if (__predict_false(md->gd_npxthread != NULL)) {
+		if (md->gd_npxthread == td) {
+			return 1;
+		}
 		kprintf("npxdna: npxthread = %p, curthread = %p\n",
-		       mdcpu->gd_npxthread, curthread);
+		       md->gd_npxthread, td);
 		panic("npxdna");
 	}
 
@@ -364,10 +374,12 @@ npxdna(void)
 	 * fpstate.
 	 */
 	stop_emulating();
+
 	/*
 	 * Record new context early in case frstor causes an IRQ13.
 	 */
-	mdcpu->gd_npxthread = td;
+	md->gd_npxthread = td;
+
 	/*
 	 * The following frstor may cause an IRQ13 when the state being
 	 * restored has a pending error.  The error will appear to have been
@@ -387,12 +399,34 @@ npxdna(void)
 			    td->td_comm, td->td_savefpu->sv_xmm.sv_env.en_mxcsr,
 			    didinit);
 		td->td_savefpu->sv_xmm.sv_env.en_mxcsr &= npx_mxcsr_mask;
-		lwpsignal(curproc, curthread->td_lwp, SIGFPE);
+		lwpsignal(td->td_proc, td->td_lwp, SIGFPE);
 	}
 	fpurstor(td->td_savefpu);
 	crit_exit();
 
 	return (1);
+}
+
+/*
+ * From cpu heavy restore (already in critical section, gd_npxthread is NULL),
+ * and TDF_USINGFP is already set.  Actively restore the FPU state to avoid
+ * excessive npxdna traps.
+ */
+void
+npxdna_quick(thread_t newtd)
+{
+	stop_emulating();
+	mdcpu->gd_npxthread = newtd;
+	if ((newtd->td_savefpu->sv_xmm.sv_env.en_mxcsr & ~npx_mxcsr_mask) &&
+	    cpu_fxsr) {
+		krateprintf(&badfprate,
+			    "%s: FXRSTR: illegal FP MXCSR %08x\n",
+			    newtd->td_comm,
+			    newtd->td_savefpu->sv_xmm.sv_env.en_mxcsr);
+		newtd->td_savefpu->sv_xmm.sv_env.en_mxcsr &= npx_mxcsr_mask;
+		lwpsignal(newtd->td_proc, newtd->td_lwp, SIGFPE);
+	}
+	fpurstor(newtd->td_savefpu);
 }
 
 /*
@@ -418,11 +452,15 @@ npxdna(void)
 void
 npxsave(union savefpu *addr)
 {
+	struct mdglobaldata *md;
+
+	md = mdcpu;
 	crit_enter();
 	stop_emulating();
 	fpusave(addr);
-	mdcpu->gd_npxthread = NULL;
+	md->gd_npxthread = NULL;
 	fninit();
+	fpurstor(&md->gd_zerofpu);	/* security wipe */
 	start_emulating();
 	crit_exit();
 }

@@ -1,7 +1,8 @@
 PROG=	kgdb
 SRCS=	kgdb.c kthr.c kld.c trgt.c trgt_${MACHINE_ARCH}.c
 
-CFLAGS+= -I${.OBJDIR}/../libgdb -I${.CURDIR}/../libgdb -I${BASEDIR}/include
+CFLAGS+= -I${.OBJDIR}/../libgdb -I${.CURDIR}/../libgdb -I${.CURDIR}/..
+CFLAGS+= -I${BASEDIR}/include
 CFLAGS+= -I${BASEDIR}/bfd -I${BASEDIR}/gdb -I${.CURDIR}/../libbfd
 CFLAGS+= -I${.OBJDIR}/../libbfd -I${BASEDIR}/gdb/common
 CFLAGS+= -D_KERNEL_STRUCTURES
@@ -15,7 +16,10 @@ LDADD+= -L../libbfd -lbfd
 LDADD+= -L../libiberty -liberty
 LDADD+= -L../libdecnumber -ldecnumber
 LDADD+= -L../libgnu -lgnu
-LDADD+= -lncurses -lm -lz -lkvm -llzma
+LDADD+= -lprivate_ncurses -lm -lz -lkvm -llzma
+
+CFLAGS+=	-I${_SHLIBDIRPREFIX}/usr/include/priv
+LDFLAGS+=	${PRIVATELIB_LDFLAGS}
 
 WARNS?=	2
 

@@ -42,7 +42,6 @@
 #include <sys/namecache.h>
 #include <sys/nlookup.h>
 #include <sys/proc.h>
-#include <sys/thread2.h>
 #include <sys/devfs.h>
 
 struct mount	*synth_mp;
@@ -69,10 +68,9 @@ getsynthvnode(const char *devname)
 		++synth_synced;
 	}
 
-	error = nlookup_init_root(&nd,
-	     devname, UIO_SYSSPACE, NLC_FOLLOW,
-	     cred, &synth_mp->mnt_ncmountpt,
-	     &synth_mp->mnt_ncmountpt);
+	error = nlookup_init_root(&nd, devname, UIO_SYSSPACE, NLC_FOLLOW,
+				  cred, &synth_mp->mnt_ncmountpt,
+				  &synth_mp->mnt_ncmountpt);
 
 	if (error) {
 		panic("synth: nlookup_init_root failed with %d", error);
@@ -135,4 +133,4 @@ synthinit(void *arg __unused)
 	synth_inited = 1;
 }
 
-SYSINIT(synthinit, SI_SUB_VFS, SI_ORDER_ANY, synthinit, NULL)
+SYSINIT(synthinit, SI_SUB_VFS, SI_ORDER_ANY, synthinit, NULL);

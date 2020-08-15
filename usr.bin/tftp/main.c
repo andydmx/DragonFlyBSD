@@ -39,7 +39,6 @@
 #include <sys/param.h>
 #include <sys/types.h>
 #include <sys/socket.h>
-#include <sys/file.h>
 
 #include <netinet/in.h>
 
@@ -47,6 +46,7 @@
 
 #include <ctype.h>
 #include <err.h>
+#include <fcntl.h>
 #include <histedit.h>
 #include <netdb.h>
 #include <setjmp.h>
@@ -63,7 +63,7 @@
 
 struct	sockaddr_storage peeraddr;
 int	f;
-int	trace;
+int	tftp_trace;
 int	verbose;
 int	connected;
 char	mode[32];
@@ -71,15 +71,15 @@ char	line[MAXLINE];
 int	margc;
 #define	MAX_MARGV	20
 char	*margv[MAX_MARGV];
-jmp_buf	toplevel;
+extern jmp_buf	toplevel;
 volatile int txrx_error;
-void	intr(int);
+void	intr(int) __dead2;
 
 void	get(int, char **);
 void	help(int, char **);
 void	modecmd(int, char **);
 void	put(int, char **);
-void	quit(int, char **);
+void	quit(int, char **) __dead2;
 void	setascii(int, char **);
 void	setbinary(int, char **);
 void	setpeer0(char *, const char *);
@@ -533,7 +533,7 @@ status(int argc __unused, char **argv __unused)
 	else
 		printf("Not connected.\n");
 	printf("Mode: %s Verbose: %s Tracing: %s\n", mode,
-		verbose ? "on" : "off", trace ? "on" : "off");
+		verbose ? "on" : "off", tftp_trace ? "on" : "off");
 	printf("Rexmt-interval: %d seconds, Max-timeout: %d seconds\n",
 		rexmtval, maxtimeout);
 }
@@ -724,8 +724,8 @@ help(int argc, char **argv)
 void
 settrace(int argc __unused, char **argv __unused)
 {
-	trace = !trace;
-	printf("Packet tracing %s.\n", trace ? "on" : "off");
+	tftp_trace = !tftp_trace;
+	printf("Packet tracing %s.\n", tftp_trace ? "on" : "off");
 }
 
 void

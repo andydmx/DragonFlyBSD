@@ -26,7 +26,6 @@
  * SUCH DAMAGE.
  *
  * $FreeBSD: src/sys/sys/poll.h,v 1.6.2.1 2000/08/21 12:25:58 sheldonh Exp $
- * $DragonFly: src/sys/sys/poll.h,v 1.7 2008/01/12 06:01:27 nant Exp $
  */
 
 #ifndef _SYS_POLL_H_
@@ -87,12 +86,23 @@ struct pollfd {
 
 #include <sys/cdefs.h>
 
+#if __BSD_VISIBLE
+#ifndef _SYS_SIGNAL_H_
+#include <sys/signal.h>
+#endif
+#ifndef _SYS_TIME_H_
+#include <sys/time.h>
+#endif
+#endif
+
 __BEGIN_DECLS
-/*
- * XXX logically, poll() should be declared in <poll.h>, but SVR4 at
- * least has it here in <sys/poll.h>.
- */
-int	poll (struct pollfd *, nfds_t, int);
+#if __POSIX_VISIBLE >= 200809 || __XSI_VISIBLE
+int	poll(struct pollfd *, nfds_t, int);
+#endif
+#if __BSD_VISIBLE
+int	ppoll(struct pollfd *, nfds_t, const struct timespec *,
+	    const sigset_t *);
+#endif
 __END_DECLS
 
 #endif /* !_KERNEL */

@@ -31,7 +31,6 @@
  * SUCH DAMAGE.
  *
  * $FreeBSD: src/lib/libstand/qdivrem.c,v 1.2 1999/08/28 00:05:33 peter Exp $
- * $DragonFly: src/lib/libstand/qdivrem.c,v 1.4 2005/12/11 02:27:26 swildner Exp $
  * 	From: Id: qdivrem.c,v 1.7 1997/11/07 09:20:40 phk Exp
  */
 
@@ -45,14 +44,13 @@
 #define	B	(1 << HALF_BITS)	/* digit base */
 
 /* Combine two `digits' to make a single two-digit number. */
-#define	COMBINE(a, b) (((u_long)(a) << HALF_BITS) | (b))
+#define	COMBINE(a, b) (((u_int)(a) << HALF_BITS) | (b))
+
+_Static_assert(sizeof(int) / 2 == sizeof(short),
+	"Bitwise functions in libstand are broken on this architecture");
 
 /* select a type for digits in base B: use unsigned short if they fit */
-#if ULONG_MAX == 0xffffffff && USHRT_MAX >= 0xffff
 typedef unsigned short digit;
-#else
-typedef u_long digit;
-#endif
 
 /*
  * Shift p[0]..p[len] left `sh' bits, ignoring any bits that
@@ -70,20 +68,20 @@ shl(digit *p, int len, int sh)
 }
 
 /*
- * __qdivrem(u, v, rem) returns u/v and, optionally, sets *rem to u%v.
+ * __udivmoddi4(u, v, rem) returns u/v and, optionally, sets *rem to u%v.
  *
  * We do this in base 2-sup-HALF_BITS, so that all intermediate products
- * fit within u_long.  As a consequence, the maximum length dividend and
+ * fit within u_int.  As a consequence, the maximum length dividend and
  * divisor are 4 `digits' in this base (they are shorter if they have
  * leading zeros).
  */
 u_quad_t
-__qdivrem(u_quad_t uq, u_quad_t vq, u_quad_t *arq)
+__udivmoddi4(u_quad_t uq, u_quad_t vq, u_quad_t *arq)
 {
 	union uu tmp;
 	digit *u, *v, *q;
 	digit v1, v2;
-	u_long qhat, rhat, t;
+	u_int qhat, rhat, t;
 	int m, n, d, j, i;
 	digit uspace[5], vspace[5], qspace[5];
 
@@ -134,7 +132,7 @@ __qdivrem(u_quad_t uq, u_quad_t vq, u_quad_t *arq)
 	v[4] = LHALF(tmp.ul[L]);
 	for (n = 4; v[1] == 0; v++) {
 		if (--n == 1) {
-			u_long rbj;	/* r*B+u[j] (not root boy jim) */
+			u_int rbj;	/* r*B+u[j] (not root boy jim) */
 			digit q1, q2, q3, q4;
 
 			/*
@@ -210,7 +208,7 @@ __qdivrem(u_quad_t uq, u_quad_t vq, u_quad_t *arq)
 			rhat = uj1;
 			goto qhat_too_big;
 		} else {
-			u_long nn = COMBINE(uj0, uj1);
+			u_int nn = COMBINE(uj0, uj1);
 			qhat = nn / v1;
 			rhat = nn % v1;
 		}
@@ -281,7 +279,7 @@ u_quad_t
 __udivdi3(u_quad_t a, u_quad_t b)
 {
 
-	return (__qdivrem(a, b, (u_quad_t *)0));
+	return (__udivmoddi4(a, b, (u_quad_t *)0));
 }
 
 /*
@@ -292,6 +290,6 @@ __umoddi3(u_quad_t a, u_quad_t b)
 {
 	u_quad_t r;
 
-	(void)__qdivrem(a, b, &r);
+	(void)__udivmoddi4(a, b, &r);
 	return (r);
 }

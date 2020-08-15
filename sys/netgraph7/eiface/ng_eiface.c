@@ -153,9 +153,10 @@ ng_eiface_ioctl(struct ifnet *ifp, u_long command, caddr_t data, struct ucred *c
 				ifp->if_flags |= IFF_RUNNING;
 			}
 		} else {
-			if (ifp->if_flags & IFF_RUNNING)
+			if (ifp->if_flags & IFF_RUNNING) {
 				ifq_clr_oactive(&ifp->if_snd);
 				ifp->if_flags &= ~(IFF_RUNNING);
+			}
 		}
 		break;
 
@@ -456,8 +457,12 @@ ng_eiface_rcvmsg(node_p node, item_p item, hook_p lasthook)
 			/* Determine size of response and allocate it */
 			buflen = 0;
 			TAILQ_FOREACH(ifac, &ifp->if_addrheads[mycpuid],
-				      ifa_link)
+				      ifa_link) {
+				/* Ignore marker */
+				if (ifac->ifa->ifa_addr->sa_family == AF_UNSPEC)
+					continue;
 				buflen += SA_SIZE(ifac->ifa->ifa_addr);
+			}
 			NG_MKRESPONSE(resp, msg, buflen, M_WAITOK | M_NULLOK);
 			if (resp == NULL) {
 				error = ENOMEM;
@@ -470,6 +475,10 @@ ng_eiface_rcvmsg(node_p node, item_p item, hook_p lasthook)
 				      ifa_link) {
 				struct ifaddr *ifa = ifac->ifa;
 				const int len = SA_SIZE(ifa->ifa_addr);
+
+				/* Ignore marker */
+				if (ifa->ifa_addr->sa_family == AF_UNSPEC)
+					continue;
 
 				if (buflen < len) {
 					log(LOG_ERR, "%s: len changed?\n",

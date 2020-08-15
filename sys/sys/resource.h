@@ -10,11 +10,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -32,24 +28,36 @@
  *
  *	@(#)resource.h	8.4 (Berkeley) 1/9/95
  * $FreeBSD: src/sys/sys/resource.h,v 1.12.2.2 2002/08/20 18:42:20 dillon Exp $
- * $DragonFly: src/sys/sys/resource.h,v 1.10 2008/06/18 09:36:07 hasso Exp $
  */
 
 #ifndef _SYS_RESOURCE_H_
 #define	_SYS_RESOURCE_H_
 
-#ifndef _SYS_TYPES_H_
-#include <sys/types.h>
-#endif
+#include <sys/cdefs.h>
+#include <machine/stdint.h>
 #include <sys/_timeval.h>
 
+/* XXX not used by our {get,set}priority(), defined here for XSI conformance */
+#ifndef _ID_T_DECLARED
+#define	_ID_T_DECLARED
+typedef	__int64_t	id_t;	/* general id, can hold gid/pid/uid_t */
+#endif
+
+#ifndef _RLIM_T_DECLARED
+#define	_RLIM_T_DECLARED
+typedef	__rlim_t	rlim_t;	/* resource limit */
+#endif
+
+#if __BSD_VISIBLE
 /*
  * Process priority specifications to get/setpriority.
  */
 #define	PRIO_MIN	-20
 #define	PRIO_MAX	20
-#define IOPRIO_MIN	1
-#define IOPRIO_MAX	10
+
+#define	IOPRIO_MIN	1
+#define	IOPRIO_MAX	10
+#endif
 
 #define	PRIO_PROCESS	0
 #define	PRIO_PGRP	1
@@ -58,7 +66,6 @@
 /*
  * Resource utilization information.
  */
-
 #define	RUSAGE_SELF	0
 #define	RUSAGE_CHILDREN	-1
 
@@ -83,6 +90,13 @@ struct	rusage {
 #define	ru_last		ru_nivcsw
 };
 
+#if __BSD_VISIBLE
+struct __wrusage {
+	struct rusage   wru_self;
+	struct rusage   wru_children;
+};
+#endif
+
 /*
  * Resource limits
  */
@@ -91,24 +105,30 @@ struct	rusage {
 #define	RLIMIT_DATA	2		/* data size */
 #define	RLIMIT_STACK	3		/* stack size */
 #define	RLIMIT_CORE	4		/* core file size */
+#if __BSD_VISIBLE
 #define	RLIMIT_RSS	5		/* resident set size */
 #define	RLIMIT_MEMLOCK	6		/* locked-in-memory address space */
 #define	RLIMIT_NPROC	7		/* number of processes */
+#endif
 #define	RLIMIT_NOFILE	8		/* number of open files */
+#if __BSD_VISIBLE
 #define	RLIMIT_SBSIZE	9		/* maximum size of all socket buffers */
-#define	RLIMIT_VMEM	10		/* virtual process size (inclusive of mmap) */
-#define	RLIMIT_AS       RLIMIT_VMEM     /* standard name for address space size */
+#endif
+#define	RLIMIT_AS	10		/* standard name for address space size */
+#if __BSD_VISIBLE
+#define	RLIMIT_VMEM	RLIMIT_AS	/* virtual process size (inclusive of mmap) */
 #define	RLIMIT_POSIXLOCKS 11		/* maximum number of POSIX locks per user */
 
 #define	RLIM_NLIMITS	12		/* number of resource limits */
+#endif
 
-#define	RLIM_INFINITY	((rlim_t)(((u_quad_t)1 << 63) - 1))
-
+#define	RLIM_INFINITY	((rlim_t)(((__uint64_t)1 << 63) - 1))	/* no limit */
+#define	RLIM_SAVED_MAX	RLIM_INFINITY	/* unrepresentable hard limit */
+#define	RLIM_SAVED_CUR	RLIM_INFINITY	/* unrepresentable soft limit */
 
 /*
  * Resource limit string identifiers
  */
-
 #ifdef _RLIMIT_IDENT
 static char *rlimit_ident[] = {
 	"cpu",
@@ -126,48 +146,44 @@ static char *rlimit_ident[] = {
 };
 #endif
 
-struct orlimit {
-	int32_t	rlim_cur;		/* current (soft) limit */
-	int32_t	rlim_max;		/* maximum value for rlim_cur */
-};
-
 struct rlimit {
 	rlim_t	rlim_cur;		/* current (soft) limit */
 	rlim_t	rlim_max;		/* maximum value for rlim_cur */
 };
 
+#if __BSD_VISIBLE
 struct loadavg {
-	fixpt_t	ldavg[3];
+	__uint64_t ldavg[3];		/* 64-bits to avoid overflow */
 	long	fscale;
 };
 
 /*
  * CPU state fields as reported by the sysctl kern.cp_time
  */
-#define CP_USER         0
-#define CP_NICE         1
-#define CP_SYS          2
-#define CP_INTR         3
-#define CP_IDLE         4
-#define CPUSTATES       5
+#define	CP_USER         0
+#define	CP_NICE         1
+#define	CP_SYS          2
+#define	CP_INTR         3
+#define	CP_IDLE         4
+#define	CPUSTATES       5
+#endif /* __BSD_VISIBLE */
 
 #ifdef _KERNEL
 extern struct loadavg averunnable;
 
-int	dosetrlimit (u_int which, struct rlimit *limp);
-
+int	dosetrlimit(unsigned int which, struct rlimit *limp);
 #else
-#include <sys/cdefs.h>
-
 __BEGIN_DECLS
-int	getpriority (int, int);
-int	ioprio_get (int, int);
-int	getrlimit (int, struct rlimit *);
-int	getrusage (int, struct rusage *);
-int	setpriority (int, int, int);
-int	ioprio_set (int, int, int);
-int	setrlimit (int, const struct rlimit *);
+int	getpriority(int, int); /* XXX should take id_t as second arg */
+int	getrlimit(int, struct rlimit *);
+int	getrusage(int, struct rusage *);
+int	setpriority(int, int, int); /* XXX should take id_t as second arg */
+int	setrlimit(int, const struct rlimit *);
+#if __BSD_VISIBLE
+int	ioprio_get(int, int);
+int	ioprio_set(int, int, int);
+#endif
 __END_DECLS
-
 #endif	/* _KERNEL */
+
 #endif	/* !_SYS_RESOURCE_H_ */

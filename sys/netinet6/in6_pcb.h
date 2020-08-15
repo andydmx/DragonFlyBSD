@@ -43,11 +43,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -73,6 +69,10 @@
 
 #ifndef _SYS_TYPES_H_
 #include <sys/types.h>
+#endif
+
+#ifndef _NETINET_IN_PCB_H_
+#include <netinet/in_pcb.h>
 #endif
 
 #define	satosin6(sa)	((struct sockaddr_in6 *)(sa))
@@ -106,7 +106,7 @@ void	in6_pcbdisconnect (struct inpcb *);
 int	in6_pcbladdr (struct inpcb *, struct sockaddr *,
 			  struct in6_addr **, struct thread *);
 struct	inpcb *
-	in6_pcblookup_local (struct inpcbportinfo *, const struct in6_addr *,
+	in6_pcblookup_local (struct inpcbporthead *, const struct in6_addr *,
 			     u_int, int, struct ucred *);
 struct	inpcb *
 	in6_pcblookup_hash (struct inpcbinfo *,
@@ -114,17 +114,12 @@ struct	inpcb *
 				u_int, int, struct ifnet *);
 void	in6_pcbnotify (struct inpcbinfo *, struct sockaddr *,
 			   in_port_t, const struct sockaddr *, in_port_t,
-			   int, int, void (*)(struct inpcb *, int));
+			   int, int, inp_notify_t);
 void	in6_rtchange (struct inpcb *, int);
 void	in6_setpeeraddr_dispatch (union netmsg *);
 void	in6_setsockaddr_dispatch (union netmsg *);
 int	in6_setpeeraddr (struct socket *so, struct sockaddr **nam);
-int	in6_setsockaddr (struct socket *so, struct sockaddr **nam);
-void	in6_mapped_sockaddr_dispatch(union netmsg *msg);
-int	in6_mapped_sockaddr (struct socket *so, struct sockaddr **nam);
-int	in6_mapped_peeraddr (struct socket *so, struct sockaddr **nam);
-void	in6_mapped_savefaddr (struct socket *so, const struct sockaddr *faddr);
-void	in6_mapped_peeraddr_dispatch(netmsg_t msg);
+void	in6_savefaddr (struct socket *so, const struct sockaddr *faddr);
 struct	in6_addr *in6_selectsrc (struct sockaddr_in6 *,
 				     struct ip6_pktopts *,
 				     struct ip6_moptions *,

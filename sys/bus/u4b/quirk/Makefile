@@ -1,5 +1,5 @@
 #
-# $FreeBSD: src/sys/modules/usb/quirk/Makefile,v 1.1 2009/02/23 18:32:59 thompsa Exp $
+# $FreeBSD: head/sys/modules/usb/quirk/Makefile 188943 2009-02-23 18:32:59Z thompsa $
 #
 # Copyright (c) 2008 Hans Petter Selasky. All rights reserved.
 #
@@ -26,7 +26,7 @@
 #
 
 KMOD=	usb_quirk
-SRCS=	bus_if.h device_if.h usb_if.h opt_bus.h opt_usb.h usbdevs.h \
+SRCS=	bus_if.h device_if.h opt_usb.h usbdevs.h \
 	usb_quirk.c
 
 .include <bsd.kmod.mk>

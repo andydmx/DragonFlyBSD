@@ -33,24 +33,32 @@
 #include <sys/param.h>
 #include <sys/systm.h>
 #include <sys/buf.h>
-#include <sys/sysproto.h>
+#include <sys/sysmsg.h>
 #include <sys/resourcevar.h>
 #include <sys/signalvar.h>
 #include <sys/kernel.h>
 #include <sys/sysent.h>
-#include <sys/sysunion.h>
 #include <sys/proc.h>
 #include <sys/priv.h>
 #include <sys/time.h>
 #include <sys/vnode.h>
 #include <sys/sysctl.h>
 #include <sys/kern_syscall.h>
+#include <sys/upmap.h>
 #include <vm/vm.h>
 #include <vm/vm_extern.h>
 
 #include <sys/msgport2.h>
+#include <sys/spinlock2.h>
 #include <sys/thread2.h>
-#include <sys/mplock2.h>
+
+extern struct spinlock ntp_spin;
+
+#define CPUCLOCK_BIT			0x80000000
+#define	CPUCLOCK_ID_MASK		~CPUCLOCK_BIT
+#define	CPUCLOCK2LWPID(clock_id)	(((clockid_t)(clock_id) >> 32) & CPUCLOCK_ID_MASK)
+#define	CPUCLOCK2PID(clock_id)		((clock_id) & CPUCLOCK_ID_MASK)
+#define MAKE_CPUCLOCK(pid, lwp_id)	((clockid_t)(lwp_id) << 32 | (pid) | CPUCLOCK_BIT)
 
 struct timezone tz;
 
@@ -66,6 +74,10 @@ struct timezone tz;
 
 static int	settime(struct timeval *);
 static void	timevalfix(struct timeval *);
+static void	realitexpire(void *arg);
+
+static int sysctl_gettimeofday_quick(SYSCTL_HANDLER_ARGS);
+
 
 /*
  * Nanosleep tries very hard to sleep for a precisely requested time
@@ -83,8 +95,10 @@ SYSCTL_INT(_kern, OID_AUTO, nanosleep_min_us, CTLFLAG_RW,
 	   &nanosleep_min_us, 0, "");
 SYSCTL_INT(_kern, OID_AUTO, nanosleep_hard_us, CTLFLAG_RW,
 	   &nanosleep_hard_us, 0, "");
-SYSCTL_INT(_kern, OID_AUTO, gettimeofday_quick, CTLFLAG_RW,
-	   &gettimeofday_quick, 0, "");
+SYSCTL_PROC(_kern, OID_AUTO, gettimeofday_quick, CTLTYPE_INT | CTLFLAG_RW,
+	   0, 0, sysctl_gettimeofday_quick, "I", "Quick mode gettimeofday");
+
+static struct lock masterclock_lock = LOCK_INITIALIZER("mstrclk", 0, 0);
 
 static int
 settime(struct timeval *tv)
@@ -152,22 +166,36 @@ settime(struct timeval *tv)
 }
 
 static void
-get_curthread_cputime(struct timespec *ats)
+get_process_cputime(struct proc *p, struct timespec *ats)
 {
-	struct thread *td = curthread;
+	struct rusage ru;
 
-	crit_enter();
-	/*
-	 * These are 64-bit fields but the actual values should never reach
-	 * the limit. We don't care about overflows.
-	 */
-	ats->tv_sec = td->td_uticks / 1000000;
-	ats->tv_sec += td->td_sticks / 1000000;
-	ats->tv_sec += td->td_iticks / 1000000;
-	ats->tv_nsec = (td->td_uticks % 1000000) * 1000;
-	ats->tv_nsec += (td->td_sticks % 1000000) * 1000;
-	ats->tv_nsec += (td->td_iticks % 1000000) * 1000;
-	crit_exit();
+	lwkt_gettoken(&p->p_token);
+	calcru_proc(p, &ru);
+	lwkt_reltoken(&p->p_token);
+	timevaladd(&ru.ru_utime, &ru.ru_stime);
+	TIMEVAL_TO_TIMESPEC(&ru.ru_utime, ats);
+}
+
+static void
+get_process_usertime(struct proc *p, struct timespec *ats)
+{
+	struct rusage ru;
+
+	lwkt_gettoken(&p->p_token);
+	calcru_proc(p, &ru);
+	lwkt_reltoken(&p->p_token);
+	TIMEVAL_TO_TIMESPEC(&ru.ru_utime, ats);
+}
+
+static void
+get_thread_cputime(struct thread *td, struct timespec *ats)
+{
+	struct timeval sys, user;
+
+	calcru(td->td_lwp, &user, &sys);
+	timevaladd(&user, &sys);
+	TIMEVAL_TO_TIMESPEC(&user, ats);
 }
 
 /*
@@ -176,9 +204,11 @@ get_curthread_cputime(struct timespec *ats)
 int
 kern_clock_gettime(clockid_t clock_id, struct timespec *ats)
 {
-	int error = 0;
 	struct proc *p;
+	struct lwp *lp;
+	lwpid_t lwp_id;
 
+	p = curproc;
 	switch(clock_id) {
 	case CLOCK_REALTIME:
 	case CLOCK_REALTIME_PRECISE:
@@ -198,37 +228,48 @@ kern_clock_gettime(clockid_t clock_id, struct timespec *ats)
 		getnanouptime(ats);
 		break;
 	case CLOCK_VIRTUAL:
-		p = curproc;
-		ats->tv_sec = p->p_timer[ITIMER_VIRTUAL].it_value.tv_sec;
-		ats->tv_nsec = p->p_timer[ITIMER_VIRTUAL].it_value.tv_usec *
-			       1000;
+		get_process_usertime(p, ats);
 		break;
 	case CLOCK_PROF:
 	case CLOCK_PROCESS_CPUTIME_ID:
-		p = curproc;
-		ats->tv_sec = p->p_timer[ITIMER_PROF].it_value.tv_sec;
-		ats->tv_nsec = p->p_timer[ITIMER_PROF].it_value.tv_usec *
-			       1000;
+		get_process_cputime(p, ats);
 		break;
 	case CLOCK_SECOND:
 		ats->tv_sec = time_second;
 		ats->tv_nsec = 0;
 		break;
 	case CLOCK_THREAD_CPUTIME_ID:
-		get_curthread_cputime(ats);
+		get_thread_cputime(curthread, ats);
 		break;
 	default:
-		error = EINVAL;
-		break;
+		if ((clock_id & CPUCLOCK_BIT) == 0)
+			return (EINVAL);
+		if ((p = pfind(CPUCLOCK2PID(clock_id))) == NULL)
+			return (EINVAL);
+		lwp_id = CPUCLOCK2LWPID(clock_id);
+		if (lwp_id == 0) {
+			get_process_cputime(p, ats);
+		} else {
+			lwkt_gettoken(&p->p_token);
+			lp = lwp_rb_tree_RB_LOOKUP(&p->p_lwp_tree, lwp_id);
+			if (lp == NULL) {
+				lwkt_reltoken(&p->p_token);
+				PRELE(p);
+				return (EINVAL);
+			}
+			get_thread_cputime(lp->lwp_thread, ats);
+			lwkt_reltoken(&p->p_token);
+		}
+		PRELE(p);
 	}
-	return (error);
+	return (0);
 }
 
 /*
  * MPSAFE
  */
 int
-sys_clock_gettime(struct clock_gettime_args *uap)
+sys_clock_gettime(struct sysmsg *sysmsg, const struct clock_gettime_args *uap)
 {
 	struct timespec ats;
 	int error;
@@ -254,8 +295,11 @@ kern_clock_settime(clockid_t clock_id, struct timespec *ats)
 	if (ats->tv_nsec < 0 || ats->tv_nsec >= 1000000000)
 		return (EINVAL);
 
+	lockmgr(&masterclock_lock, LK_EXCLUSIVE);
 	TIMESPEC_TO_TIMEVAL(&atv, ats);
 	error = settime(&atv);
+	lockmgr(&masterclock_lock, LK_RELEASE);
+
 	return (error);
 }
 
@@ -263,7 +307,7 @@ kern_clock_settime(clockid_t clock_id, struct timespec *ats)
  * MPALMOSTSAFE
  */
 int
-sys_clock_settime(struct clock_settime_args *uap)
+sys_clock_settime(struct sysmsg *sysmsg, const struct clock_settime_args *uap)
 {
 	struct timespec ats;
 	int error;
@@ -271,9 +315,8 @@ sys_clock_settime(struct clock_settime_args *uap)
 	if ((error = copyin(uap->tp, &ats, sizeof(ats))) != 0)
 		return (error);
 
-	get_mplock();
 	error = kern_clock_settime(uap->clock_id, &ats);
-	rel_mplock();
+
 	return (error);
 }
 
@@ -283,7 +326,7 @@ sys_clock_settime(struct clock_settime_args *uap)
 int
 kern_clock_getres(clockid_t clock_id, struct timespec *ts)
 {
-	int error;
+	ts->tv_sec = 0;
 
 	switch(clock_id) {
 	case CLOCK_REALTIME:
@@ -295,43 +338,40 @@ kern_clock_getres(clockid_t clock_id, struct timespec *ts)
 	case CLOCK_UPTIME:
 	case CLOCK_UPTIME_FAST:
 	case CLOCK_UPTIME_PRECISE:
-	case CLOCK_THREAD_CPUTIME_ID:
-	case CLOCK_PROCESS_CPUTIME_ID:
 		/*
-		 * Round up the result of the division cheaply
-		 * by adding 1.  Rounding up is especially important
-		 * if rounding down would give 0.  Perfect rounding
-		 * is unimportant.
+		 * Minimum reportable resolution is 1ns.  Rounding is
+		 * otherwise unimportant.
 		 */
-		ts->tv_sec = 0;
-		ts->tv_nsec = 1000000000 / sys_cputimer->freq + 1;
-		error = 0;
+		ts->tv_nsec = 999999999 / sys_cputimer->freq + 1;
 		break;
 	case CLOCK_VIRTUAL:
 	case CLOCK_PROF:
 		/* Accurately round up here because we can do so cheaply. */
-		ts->tv_sec = 0;
 		ts->tv_nsec = (1000000000 + hz - 1) / hz;
-		error = 0;
 		break;
 	case CLOCK_SECOND:
 		ts->tv_sec = 1;
 		ts->tv_nsec = 0;
-		error = 0;
+		break;
+	case CLOCK_THREAD_CPUTIME_ID:
+	case CLOCK_PROCESS_CPUTIME_ID:
+		ts->tv_nsec = 1000;
 		break;
 	default:
-		error = EINVAL;
-		break;
+		if ((clock_id & CPUCLOCK_BIT) != 0)
+			ts->tv_nsec = 1000;
+		else
+			return (EINVAL);
 	}
 
-	return(error);
+	return (0);
 }
 
 /*
  * MPSAFE
  */
 int
-sys_clock_getres(struct clock_getres_args *uap)
+sys_clock_getres(struct sysmsg *sysmsg, const struct clock_getres_args *uap)
 {
 	int error;
 	struct timespec ts;
@@ -339,6 +379,53 @@ sys_clock_getres(struct clock_getres_args *uap)
 	error = kern_clock_getres(uap->clock_id, &ts);
 	if (error == 0)
 		error = copyout(&ts, uap->tp, sizeof(ts));
+
+	return (error);
+}
+
+static int
+kern_getcpuclockid(pid_t pid, lwpid_t lwp_id, clockid_t *clock_id)
+{
+	struct proc *p;
+	int error = 0;
+
+	if (pid == 0) {
+		p = curproc;
+		pid = p->p_pid;
+		PHOLD(p);
+	} else {
+		p = pfind(pid);
+		if (p == NULL)
+			return (ESRCH);
+	}
+	/* lwp_id can be 0 when called by clock_getcpuclockid() */
+	if (lwp_id < 0) {
+		error = EINVAL;
+		goto out;
+	}
+	lwkt_gettoken(&p->p_token);
+	if (lwp_id > 0 &&
+	    lwp_rb_tree_RB_LOOKUP(&p->p_lwp_tree, lwp_id) == NULL) {
+		lwkt_reltoken(&p->p_token);
+		error = ESRCH;
+		goto out;
+	}
+	*clock_id = MAKE_CPUCLOCK(pid, lwp_id);
+	lwkt_reltoken(&p->p_token);
+out:
+	PRELE(p);
+	return (error);
+}
+
+int
+sys_getcpuclockid(struct sysmsg *sysmsg, const struct getcpuclockid_args *uap)
+{
+	clockid_t clk_id;
+	int error;
+
+	error = kern_getcpuclockid(uap->pid, uap->lwp_id, &clk_id);
+	if (error == 0)
+		error = copyout(&clk_id, uap->clock_id, sizeof(clockid_t));
 
 	return (error);
 }
@@ -385,7 +472,7 @@ nanosleep1(struct timespec *rqt, struct timespec *rmt)
 	if (rqt->tv_sec < 0 || (rqt->tv_sec == 0 && rqt->tv_nsec == 0))
 		return (0);
 	nanouptime(&ts);
-	timespecadd(&ts, rqt);		/* ts = target timestamp compare */
+	timespecadd(&ts, rqt, &ts);	/* ts = target timestamp compare */
 	TIMESPEC_TO_TIMEVAL(&tv, rqt);	/* tv = sleep interval */
 
 	for (;;) {
@@ -422,7 +509,7 @@ nanosleep1(struct timespec *rqt, struct timespec *rmt)
 			if (error == ERESTART)
 				error = EINTR;
 			if (rmt != NULL) {
-				timespecsub(&ts, &ts2);
+				timespecsub(&ts, &ts2, &ts);
 				if (ts.tv_sec < 0)
 					timespecclear(&ts);
 				*rmt = ts;
@@ -431,8 +518,7 @@ nanosleep1(struct timespec *rqt, struct timespec *rmt)
 		}
 		if (timespeccmp(&ts2, &ts, >=))
 			return (0);
-		ts3 = ts;
-		timespecsub(&ts3, &ts2);
+		timespecsub(&ts, &ts2, &ts3);
 		TIMESPEC_TO_TIMEVAL(&tv, &ts3);
 	}
 }
@@ -441,7 +527,7 @@ nanosleep1(struct timespec *rqt, struct timespec *rmt)
  * MPSAFE
  */
 int
-sys_nanosleep(struct nanosleep_args *uap)
+sys_nanosleep(struct sysmsg *sysmsg, const struct nanosleep_args *uap)
 {
 	int error;
 	struct timespec rqt;
@@ -475,7 +561,7 @@ sys_nanosleep(struct nanosleep_args *uap)
  * which does not have to access a hardware timer.
  */
 int
-sys_gettimeofday(struct gettimeofday_args *uap)
+sys_gettimeofday(struct sysmsg *sysmsg, const struct gettimeofday_args *uap)
 {
 	struct timeval atv;
 	int error = 0;
@@ -499,7 +585,7 @@ sys_gettimeofday(struct gettimeofday_args *uap)
  * MPALMOSTSAFE
  */
 int
-sys_settimeofday(struct settimeofday_args *uap)
+sys_settimeofday(struct sysmsg *sysmsg, const struct settimeofday_args *uap)
 {
 	struct thread *td = curthread;
 	struct timeval atv;
@@ -527,17 +613,21 @@ sys_settimeofday(struct settimeofday_args *uap)
 	    (error = copyin((caddr_t)uap->tzp, (caddr_t)&atz, sizeof(atz))))
 		return (error);
 
-	get_mplock();
+	lockmgr(&masterclock_lock, LK_EXCLUSIVE);
 	if (uap->tv && (error = settime(&atv))) {
-		rel_mplock();
+		lockmgr(&masterclock_lock, LK_RELEASE);
 		return (error);
 	}
-	rel_mplock();
+	lockmgr(&masterclock_lock, LK_RELEASE);
+
 	if (uap->tzp)
 		tz = atz;
 	return (0);
 }
 
+/*
+ * WARNING! Run with ntp_spin held
+ */
 static void
 kern_adjtime_common(void)
 {
@@ -557,75 +647,41 @@ kern_adjtime_common(void)
 void
 kern_adjtime(int64_t delta, int64_t *odelta)
 {
-	int origcpu;
-
-	if ((origcpu = mycpu->gd_cpuid) != 0)
-		lwkt_setcpu_self(globaldata_find(0));
-
-	crit_enter();
+	spin_lock(&ntp_spin);
 	*odelta = ntp_delta;
 	ntp_delta = delta;
 	kern_adjtime_common();
-	crit_exit();
-
-	if (origcpu != 0)
-		lwkt_setcpu_self(globaldata_find(origcpu));
+	spin_unlock(&ntp_spin);
 }
 
 static void
 kern_get_ntp_delta(int64_t *delta)
 {
-	int origcpu;
-
-	if ((origcpu = mycpu->gd_cpuid) != 0)
-		lwkt_setcpu_self(globaldata_find(0));
-
-	crit_enter();
 	*delta = ntp_delta;
-	crit_exit();
-
-	if (origcpu != 0)
-		lwkt_setcpu_self(globaldata_find(origcpu));
 }
 
 void
 kern_reladjtime(int64_t delta)
 {
-	int origcpu;
-
-	if ((origcpu = mycpu->gd_cpuid) != 0)
-		lwkt_setcpu_self(globaldata_find(0));
-
-	crit_enter();
+	spin_lock(&ntp_spin);
 	ntp_delta += delta;
 	kern_adjtime_common();
-	crit_exit();
-
-	if (origcpu != 0)
-		lwkt_setcpu_self(globaldata_find(origcpu));
+	spin_unlock(&ntp_spin);
 }
 
 static void
 kern_adjfreq(int64_t rate)
 {
-	int origcpu;
-
-	if ((origcpu = mycpu->gd_cpuid) != 0)
-		lwkt_setcpu_self(globaldata_find(0));
-
-	crit_enter();
+	spin_lock(&ntp_spin);
 	ntp_tick_permanent = rate;
-	crit_exit();
-
-	if (origcpu != 0)
-		lwkt_setcpu_self(globaldata_find(origcpu));
+	spin_unlock(&ntp_spin);
 }
 
 /*
  * MPALMOSTSAFE
  */
 int
-sys_adjtime(struct adjtime_args *uap)
+sys_adjtime(struct sysmsg *sysmsg, const struct adjtime_args *uap)
 {
 	struct thread *td = curthread;
 	struct timeval atv;
@@ -646,9 +702,7 @@ sys_adjtime(struct adjtime_args *uap)
 	 * overshoot and start taking us away from the desired final time.
 	 */
 	ndelta = (int64_t)atv.tv_sec * 1000000000 + atv.tv_usec * 1000;
-	get_mplock();
 	kern_adjtime(ndelta, &odelta);
-	rel_mplock();
 
 	if (uap->olddelta) {
 		atv.tv_sec = odelta / 1000000000;
@@ -782,7 +836,7 @@ SYSCTL_PROC(_kern_ntp, OID_AUTO, adjust,
  * MPALMOSTSAFE
  */
 int
-sys_getitimer(struct getitimer_args *uap)
+sys_getitimer(struct sysmsg *sysmsg, const struct getitimer_args *uap)
 {
 	struct proc *p = curproc;
 	struct timeval ctv;
@@ -817,12 +871,13 @@ sys_getitimer(struct getitimer_args *uap)
  * MPALMOSTSAFE
  */
 int
-sys_setitimer(struct setitimer_args *uap)
+sys_setitimer(struct sysmsg *sysmsg, const struct setitimer_args *uap)
 {
 	struct itimerval aitv;
 	struct timeval ctv;
 	struct itimerval *itvp;
 	struct proc *p = curproc;
+	struct getitimer_args gitargs;
 	int error;
 
 	if (uap->which > ITIMER_PROF)
@@ -831,9 +886,14 @@ sys_setitimer(struct setitimer_args *uap)
 	if (itvp && (error = copyin((caddr_t)itvp, (caddr_t)&aitv,
 	    sizeof(struct itimerval))))
 		return (error);
-	if ((uap->itv = uap->oitv) &&
-	    (error = sys_getitimer((struct getitimer_args *)uap)))
-		return (error);
+
+	if (uap->oitv) {
+		gitargs.which = uap->which;
+		gitargs.itv = uap->oitv;
+		error = sys_getitimer(sysmsg, &gitargs);
+		if (error)
+			return error;
+	}
 	if (itvp == NULL)
 		return (0);
 	if (itimerfix(&aitv.it_value))
@@ -845,7 +905,7 @@ sys_setitimer(struct setitimer_args *uap)
 	lwkt_gettoken(&p->p_token);
 	if (uap->which == ITIMER_REAL) {
 		if (timevalisset(&p->p_realtimer.it_value))
-			callout_stop_sync(&p->p_ithandle);
+			callout_cancel(&p->p_ithandle);
 		if (timevalisset(&aitv.it_value)) 
 			callout_reset(&p->p_ithandle,
 			    tvtohz_high(&aitv.it_value), realitexpire, p);
@@ -879,6 +939,7 @@ sys_setitimer(struct setitimer_args *uap)
  * that here since we want to appear to be in sync with the clock
  * interrupt even when we're delayed.
  */
+static
 void
 realitexpire(void *arg)
 {
@@ -911,22 +972,28 @@ done:
 }
 
 /*
- * Check that a proposed value to load into the .it_value or
- * .it_interval part of an interval timer is acceptable, and
- * fix it to have at least minimal value (i.e. if it is less
- * than the resolution of the clock, round it up.)
- *
- * MPSAFE
+ * Used to validate itimer timeouts and utimes*() timespecs.
  */
 int
 itimerfix(struct timeval *tv)
 {
-
-	if (tv->tv_sec < 0 || tv->tv_sec > 100000000 ||
-	    tv->tv_usec < 0 || tv->tv_usec >= 1000000)
+	if (tv->tv_sec < 0 || tv->tv_usec < 0 || tv->tv_usec >= 1000000)
 		return (EINVAL);
 	if (tv->tv_sec == 0 && tv->tv_usec != 0 && tv->tv_usec < ustick)
 		tv->tv_usec = ustick;
+	return (0);
+}
+
+/*
+ * Used to validate timeouts and utimes*() timespecs.
+ */
+int
+itimespecfix(struct timespec *ts)
+{
+	if (ts->tv_sec < 0 || ts->tv_nsec < 0 || ts->tv_nsec >= 1000000000ULL)
+		return (EINVAL);
+	if (ts->tv_sec == 0 && ts->tv_nsec != 0 && ts->tv_nsec < nstick)
+		ts->tv_nsec = nstick;
 	return (0);
 }
 
@@ -1069,4 +1136,20 @@ ppsratecheck(struct timeval *lasttime, int *curpps, int maxpps)
 		(*curpps)++;		/* NB: ignore potential overflow */
 		return (maxpps < 0 || *curpps < maxpps);
 	}
+}
+
+static int
+sysctl_gettimeofday_quick(SYSCTL_HANDLER_ARGS)
+{
+	int error;
+	int gtod;
+
+	gtod = gettimeofday_quick;
+	error = sysctl_handle_int(oidp, &gtod, 0, req);
+	if (error || req->newptr == NULL)
+		return error;
+	gettimeofday_quick = gtod;
+	if (kpmap)
+		kpmap->fast_gtod = gtod;
+	return 0;
 }

@@ -47,6 +47,9 @@
 #include <rpcsvc/nis.h>
 #include "un-namespace.h"
 
+int __rpc_get_time_offset(struct timeval *, nis_server *, char *, char **,
+	struct sockaddr_in *);
+
 extern int	_rpc_dtablesize(void);
 
 #ifdef TESTING
@@ -249,7 +252,7 @@ __rpc_get_time_offset(struct timeval *td,	/* Time difference			*/
 	char			ut[64], ipuaddr[64];
 	endpoint		teps[32];
 	nis_server		tsrv;
-	void			(*oldsig)() = NULL; /* old alarm handler */
+	sig_t			oldsig = NULL; /* old alarm handler */
 	struct sockaddr_in	sin;
 	socklen_t		len;
 	int			s = RPC_ANYSOCK;
@@ -418,7 +421,7 @@ __rpc_get_time_offset(struct timeval *td,	/* Time difference			*/
 		} else {
 			int res;
 
-			oldsig = (void (*)())signal(SIGALRM, alarm_hndler);
+			oldsig = signal(SIGALRM, alarm_hndler);
 			saw_alarm = 0; /* global tracking the alarm */
 			alarm(20); /* only wait 20 seconds */
 			res = _connect(s, (struct sockaddr *)&sin, sizeof(sin));

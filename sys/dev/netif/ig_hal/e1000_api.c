@@ -1,6 +1,6 @@
 /******************************************************************************
 
-  Copyright (c) 2001-2012, Intel Corporation 
+  Copyright (c) 2001-2016, Intel Corporation
   All rights reserved.
   
   Redistribution and use in source and binary forms, with or without 
@@ -30,7 +30,7 @@
   POSSIBILITY OF SUCH DAMAGE.
 
 ******************************************************************************/
-/*$FreeBSD:$*/
+/*$FreeBSD$*/
 
 #include "e1000_api.h"
 
@@ -155,11 +155,9 @@ s32 e1000_set_mac_type(struct e1000_hw *hw)
 	DEBUGFUNC("e1000_set_mac_type");
 
 	switch (hw->device_id) {
-#ifndef NO_82542_SUPPORT
 	case E1000_DEV_ID_82542:
 		mac->type = e1000_82542;
 		break;
-#endif
 	case E1000_DEV_ID_82543GC_FIBER:
 	case E1000_DEV_ID_82543GC_COPPER:
 		mac->type = e1000_82543;
@@ -296,8 +294,29 @@ s32 e1000_set_mac_type(struct e1000_hw *hw)
 	case E1000_DEV_ID_PCH_LPT_I217_V:
 	case E1000_DEV_ID_PCH_LPTLP_I218_LM:
 	case E1000_DEV_ID_PCH_LPTLP_I218_V:
+	case E1000_DEV_ID_PCH_I218_LM2:
+	case E1000_DEV_ID_PCH_I218_V2:
+	case E1000_DEV_ID_PCH_I218_LM3:
+	case E1000_DEV_ID_PCH_I218_V3:
 		mac->type = e1000_pch_lpt;
- 		break;
+		break;
+	case E1000_DEV_ID_PCH_SPT_I219_LM:
+	case E1000_DEV_ID_PCH_SPT_I219_V:
+	case E1000_DEV_ID_PCH_SPT_I219_LM2:
+	case E1000_DEV_ID_PCH_SPT_I219_V2:
+	case E1000_DEV_ID_PCH_LBG_I219_LM3:
+	case E1000_DEV_ID_PCH_SPT_I219_LM4:
+	case E1000_DEV_ID_PCH_SPT_I219_V4:
+	case E1000_DEV_ID_PCH_SPT_I219_LM5:
+	case E1000_DEV_ID_PCH_SPT_I219_V5:
+		mac->type = e1000_pch_spt;
+		break;
+	case E1000_DEV_ID_PCH_CNP_I219_LM6:
+	case E1000_DEV_ID_PCH_CNP_I219_V6:
+	case E1000_DEV_ID_PCH_CNP_I219_LM7:
+	case E1000_DEV_ID_PCH_CNP_I219_V7:
+		mac->type = e1000_pch_cnp;
+		break;
 	case E1000_DEV_ID_82575EB_COPPER:
 	case E1000_DEV_ID_82575EB_FIBER_SERDES:
 	case E1000_DEV_ID_82575GB_QUAD_COPPER:
@@ -356,6 +375,7 @@ s32 e1000_set_mac_type(struct e1000_hw *hw)
 
 	case E1000_DEV_ID_I354_BACKPLANE_1GBPS:
 	case E1000_DEV_ID_I354_SGMII:
+	case E1000_DEV_ID_I354_BACKPLANE_2_5GBPS:
 		mac->type = e1000_i354;
 		break;
 	default:
@@ -411,11 +431,9 @@ s32 e1000_setup_init_funcs(struct e1000_hw *hw, bool init_device)
 	 * the functions in that family.
 	 */
 	switch (hw->mac.type) {
-#ifndef NO_82542_SUPPORT
 	case e1000_82542:
 		e1000_init_function_pointers_82542(hw);
 		break;
-#endif
 	case e1000_82543:
 	case e1000_82544:
 		e1000_init_function_pointers_82543(hw);
@@ -449,6 +467,8 @@ s32 e1000_setup_init_funcs(struct e1000_hw *hw, bool init_device)
 	case e1000_pchlan:
 	case e1000_pch2lan:
 	case e1000_pch_lpt:
+	case e1000_pch_spt:
+	case e1000_pch_cnp:
 		e1000_init_function_pointers_ich8lan(hw);
 		break;
 	case e1000_82575:
@@ -832,10 +852,12 @@ void e1000_config_collision_dist(struct e1000_hw *hw)
  *
  *  Sets a Receive Address Register (RAR) to the specified address.
  **/
-void e1000_rar_set(struct e1000_hw *hw, u8 *addr, u32 index)
+int e1000_rar_set(struct e1000_hw *hw, u8 *addr, u32 index)
 {
 	if (hw->mac.ops.rar_set)
-		hw->mac.ops.rar_set(hw, addr, index);
+		return hw->mac.ops.rar_set(hw, addr, index);
+
+	return E1000_SUCCESS;
 }
 
 /**
@@ -1211,21 +1233,6 @@ s32 e1000_read_pba_string(struct e1000_hw *hw, u8 *pba_num, u32 pba_num_size)
 s32 e1000_read_pba_length(struct e1000_hw *hw, u32 *pba_num_size)
 {
 	return e1000_read_pba_length_generic(hw, pba_num_size);
-}
-
-/**
- *  e1000_read_pba_num - Read device part number
- *  @hw: pointer to the HW structure
- *  @pba_num: pointer to device part number
- *
- *  Reads the product board assembly (PBA) number from the EEPROM and stores
- *  the value in pba_num.
- *  Currently no func pointer exists and all implementations are handled in the
- *  generic version of this function.
- **/
-s32 e1000_read_pba_num(struct e1000_hw *hw, u32 *pba_num)
-{
-	return e1000_read_pba_num_generic(hw, pba_num);
 }
 
 /**

@@ -1,4 +1,6 @@
-/*
+/*-
+ * SPDX-License-Identifier: BSD-3-Clause
+ *
  * Copyright (c) 1983, 1993
  *	The Regents of the University of California.  All rights reserved.
  *
@@ -10,11 +12,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -30,8 +28,7 @@
  * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
  *
- * $FreeBSD: src/lib/libc/gen/psignal.c,v 1.5 2000/01/27 23:06:19 jasone Exp $
- * $DragonFly: src/lib/libc/gen/psignal.c,v 1.5 2005/11/13 00:07:42 swildner Exp $
+ * $FreeBSD: head/lib/libc/gen/psignal.c 335898 2018-07-03 17:31:45Z jhb $
  *
  * @(#)psignal.c	8.1 (Berkeley) 6/4/93
  */
@@ -47,11 +44,11 @@
 #include "un-namespace.h"
 
 void
-psignal(unsigned int sig, const char *s)
+psignal(int sig, const char *s)
 {
 	const char *c;
 
-	if (sig < NSIG)
+	if (sig >= 0 && sig < NSIG)
 		c = sys_siglist[sig];
 	else
 		c = "Unknown signal";
@@ -61,4 +58,10 @@ psignal(unsigned int sig, const char *s)
 	}
 	_write(STDERR_FILENO, c, strlen(c));
 	_write(STDERR_FILENO, "\n", 1);
+}
+
+void
+psiginfo(const siginfo_t *si, const char *s)
+{
+	psignal(si->si_signo, s);
 }

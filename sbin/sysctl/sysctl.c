@@ -31,10 +31,6 @@
  * $FreeBSD: src/sbin/sysctl/sysctl.c,v 1.25.2.11 2003/05/01 22:48:08 trhodes Exp $
  */
 
-#ifdef __i386__
-#include <sys/diskslice.h>	/* used for bootdev parsing */
-#include <sys/reboot.h>		/* used for bootdev parsing */
-#endif
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/sysctl.h>
@@ -42,20 +38,25 @@
 #include <sys/sensors.h>
 #include <sys/param.h>
 
-#include <machine/inttypes.h>
+#ifdef __x86_64__
+#include <sys/efi.h>
+#include <machine/metadata.h>
+#endif
 
 #include <ctype.h>
 #include <err.h>
 #include <errno.h>
+#include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
 static int	aflag, bflag, dflag, eflag, Nflag, nflag, oflag, xflag;
+static int	iflag, qflag;
 
 static int	oidfmt(int *, size_t, char *, u_int *);
-static void	parse(const char *);
+static int	parse(const char *);
 static int	show_var(int *, size_t);
 static int	sysctl_all(int *, size_t);
 static void	set_T_dev_t(const char *, void **, size_t *);
@@ -66,8 +67,8 @@ usage(void)
 {
 
 	fprintf(stderr, "%s\n%s\n",
-	    "usage: sysctl [-bdeNnox] variable[=value] ...",
-	    "       sysctl [-bdeNnox] -a");
+	    "usage: sysctl [-AbdeiNnoqwxX] variable[=value] ...",
+	    "       sysctl [-bdeiNnoqwxX] -a");
 	exit(1);
 }
 
@@ -75,10 +76,12 @@ int
 main(int argc, char **argv)
 {
 	int ch;
+	int warncount;
+
 	setbuf(stdout,0);
 	setbuf(stderr,0);
 
-	while ((ch = getopt(argc, argv, "AabdeNnowxX")) != -1) {
+	while ((ch = getopt(argc, argv, "AabdeiNnoqwxX")) != -1) {
 		switch (ch) {
 		case 'A':
 			/* compatibility */
@@ -96,6 +99,9 @@ main(int argc, char **argv)
 		case 'e':
 			eflag = 1;
 			break;
+		case 'i':
+			iflag = 1;
+			break;
 		case 'N':
 			Nflag = 1;
 			break;
@@ -104,6 +110,9 @@ main(int argc, char **argv)
 			break;
 		case 'o':
 			oflag = 1;
+			break;
+		case 'q':
+			qflag = 1;
 			break;
 		case 'w':
 			/* compatibility */
@@ -129,9 +138,11 @@ main(int argc, char **argv)
 		exit(sysctl_all(0, 0));
 	if (argc == 0)
 		usage();
+	warncount = 0;
 	while (argc-- > 0)
-		parse(*argv++);
-	exit(0);
+		warncount += parse(*argv++);
+
+	return warncount;
 }
 
 /*
@@ -139,19 +150,25 @@ main(int argc, char **argv)
  * Lookup and print out the MIB entry if it exists.
  * Set a new value if requested.
  */
-static void
+static int
 parse(const char *string)
 {
 	size_t len;
 	int i, j;
 	void *newval = NULL;
+	int8_t i8val;
+	uint8_t u8val;
+	int16_t i16val;
+	uint16_t u16val;
+	int32_t i32val;
+	uint32_t u32val;
+	int64_t i64val;
+	uint64_t u64val;
 	int intval;
 	unsigned int uintval;
 	long longval;
 	unsigned long ulongval;
 	size_t newsize = 0;
-	quad_t quadval;
-	u_quad_t uquadval;
 	int mib[CTL_MAXNAME];
 	char *cp, fmt[BUFSIZ];
 	const char *name;
@@ -175,6 +192,10 @@ parse(const char *string)
 
 	len = CTL_MAXNAME;
 	if (sysctlnametomib(name, mib, &len) < 0) {
+		if (iflag)
+			return 0;
+		if (qflag)
+			return 1;
 		if (errno == ENOENT) {
 			errx(1, "unknown oid '%s'", name);
 		} else {
@@ -182,8 +203,12 @@ parse(const char *string)
 		}
 	}
 
-	if (oidfmt(mib, len, fmt, &kind))
-		err(1, "couldn't find format of oid '%s'", name);
+	if (oidfmt(mib, len, fmt, &kind)) {
+		warn("couldn't find format of oid '%s'", name);
+		if (iflag)
+			return 1;
+		exit(1);
+	}
 
 	if (newval == NULL) {
 		if ((kind & CTLTYPE) == CTLTYPE_NODE) {
@@ -202,12 +227,15 @@ parse(const char *string)
 	
 		switch (kind & CTLTYPE) {
 			case CTLTYPE_INT:
-				if (!strcmp(fmt, "IK") == 0) {
+			case CTLTYPE_BIT32(0):
+			case CTLTYPE_BIT64(0):
+				if (!(strcmp(fmt, "IK") == 0)) {
 					if (!set_IK(newval, &intval))
 						errx(1, "invalid value '%s'",
 						    (char *)newval);
-				} else
+				} else {
 					intval = (int) strtol(newval, NULL, 0);
+				}
 				newval = &intval;
 				newsize = sizeof(intval);
 				break;
@@ -228,15 +256,45 @@ parse(const char *string)
 				break;
 			case CTLTYPE_STRING:
 				break;
-			case CTLTYPE_QUAD:
-				quadval = strtoq(newval, NULL, 0);
-				newval = &quadval;
-				newsize = sizeof(quadval);
+			case CTLTYPE_S8:
+				i8val = (int8_t)strtol(newval, NULL, 0);
+				newval = &i8val;
+				newsize = sizeof(i8val);
 				break;
-			case CTLTYPE_UQUAD:
-				uquadval = strtouq(newval, NULL, 0);
-				newval = &uquadval;
-				newsize = sizeof(uquadval);
+			case CTLTYPE_S16:
+				i16val = (int16_t)strtol(newval, NULL, 0);
+				newval = &i16val;
+				newsize = sizeof(i16val);
+				break;
+			case CTLTYPE_S32:
+				i32val = (int32_t)strtol(newval, NULL, 0);
+				newval = &i32val;
+				newsize = sizeof(i32val);
+				break;
+			case CTLTYPE_S64:
+				i64val = strtoimax(newval, NULL, 0);
+				newval = &i64val;
+				newsize = sizeof(i64val);
+				break;
+			case CTLTYPE_U8:
+				u8val = (uint8_t)strtoul(newval, NULL, 0);
+				newval = &u8val;
+				newsize = sizeof(u8val);
+				break;
+			case CTLTYPE_U16:
+				u16val = (uint16_t)strtoul(newval, NULL, 0);
+				newval = &u16val;
+				newsize = sizeof(u16val);
+				break;
+			case CTLTYPE_U32:
+				u32val = (uint32_t)strtoul(newval, NULL, 0);
+				newval = &u32val;
+				newsize = sizeof(u32val);
+				break;
+			case CTLTYPE_U64:
+				u64val = strtoumax(newval, NULL, 0);
+				newval = &u64val;
+				newsize = sizeof(u64val);
 				break;
 			case CTLTYPE_OPAQUE:
 				if (strcmp(fmt, "T,dev_t") == 0 ||
@@ -269,7 +327,7 @@ parse(const char *string)
 					string);
 			default:
 				warn("%s", string);
-				return;
+				return 1;
 			}
 		}
 		if (!bflag)
@@ -284,28 +342,30 @@ parse(const char *string)
 
 	if (name_allocated != NULL)
 		free(name_allocated);
+
+	return 0;
 }
 
 /* These functions will dump out various interesting structures. */
 
 static int
-S_clockinfo(int l2, void *p)
+S_clockinfo(size_t l2, void *p)
 {
 	struct clockinfo *ci = (struct clockinfo*)p;
 	if (l2 != sizeof(*ci))
-		err(1, "S_clockinfo %d != %zu", l2, sizeof(*ci));
+		err(1, "S_clockinfo %zu != %zu", l2, sizeof(*ci));
 	printf("{ hz = %d, tick = %d, tickadj = %d, profhz = %d, stathz = %d }",
 		ci->hz, ci->tick, ci->tickadj, ci->profhz, ci->stathz);
 	return (0);
 }
 
 static int
-S_loadavg(int l2, void *p)
+S_loadavg(size_t l2, void *p)
 {
 	struct loadavg *tv = (struct loadavg*)p;
 
 	if (l2 != sizeof(*tv))
-		err(1, "S_loadavg %d != %zu", l2, sizeof(*tv));
+		err(1, "S_loadavg %zu != %zu", l2, sizeof(*tv));
 
 	printf("{ %.2f %.2f %.2f }",
 		(double)tv->ldavg[0]/(double)tv->fscale,
@@ -315,14 +375,14 @@ S_loadavg(int l2, void *p)
 }
 
 static int
-S_timespec(int l2, void *p)
+S_timespec(size_t l2, void *p)
 {
 	struct timespec *ts = (struct timespec*)p;
 	time_t tv_sec;
 	char *p1, *p2;
 
 	if (l2 != sizeof(*ts))
-		err(1, "S_timespec %d != %zu", l2, sizeof(*ts));
+		err(1, "S_timespec %zu != %zu", l2, sizeof(*ts));
 	printf("{ sec = %ld, nsec = %ld } ",
 		ts->tv_sec, ts->tv_nsec);
 	tv_sec = ts->tv_sec;
@@ -335,14 +395,14 @@ S_timespec(int l2, void *p)
 }
 
 static int
-S_timeval(int l2, void *p)
+S_timeval(size_t l2, void *p)
 {
 	struct timeval *tv = (struct timeval*)p;
 	time_t tv_sec;
 	char *p1, *p2;
 
 	if (l2 != sizeof(*tv))
-		err(1, "S_timeval %d != %zu", l2, sizeof(*tv));
+		err(1, "S_timeval %zu != %zu", l2, sizeof(*tv));
 	printf("{ sec = %ld, usec = %ld } ",
 		tv->tv_sec, tv->tv_usec);
 	tv_sec = tv->tv_sec;
@@ -355,12 +415,12 @@ S_timeval(int l2, void *p)
 }
 
 static int
-S_sensor(int l2, void *p)
+S_sensor(size_t l2, void *p)
 {
 	struct sensor *s = (struct sensor *)p;
 
 	if (l2 != sizeof(*s)) {
-		warnx("S_sensor %d != %zu", l2, sizeof(*s));
+		warnx("S_sensor %zu != %zu", l2, sizeof(*s));
 		return (1);
 	}
 
@@ -388,6 +448,9 @@ S_sensor(int l2, void *p)
 		case SENSOR_VOLTS_DC:
 			printf("%.2f VDC", s->value / 1000000.0);
 			break;
+		case SENSOR_WATTS:
+			printf("%.2f W", s->value / 1000000.0);
+			break;
 		case SENSOR_AMPS:
 			printf("%.2f A", s->value / 1000000.0);
 			break;
@@ -400,6 +463,10 @@ S_sensor(int l2, void *p)
 		case SENSOR_INDICATOR:
 			printf("%s", s->value ? "On" : "Off");
 			break;
+		case SENSOR_FREQ:
+			printf("%jd Hz", (intmax_t)s->value);
+			break;
+		case SENSOR_ECC:
 		case SENSOR_INTEGER:
 			printf("%jd", (intmax_t)s->value);
 			break;
@@ -491,12 +558,94 @@ S_sensor(int l2, void *p)
 	return (0);
 }
 
+#ifdef __x86_64__
 static int
-T_dev_t(int l2, void *p)
+S_efi_map(size_t l2, void *p)
+{
+	struct efi_map_header *efihdr;
+	struct efi_md *map;
+	const char *type;
+	size_t efisz;
+	int ndesc, i;
+
+	static const char *types[] = {
+		"Reserved",
+		"LoaderCode",
+		"LoaderData",
+		"BootServicesCode",
+		"BootServicesData",
+		"RuntimeServicesCode",
+		"RuntimeServicesData",
+		"ConventionalMemory",
+		"UnusableMemory",
+		"ACPIReclaimMemory",
+		"ACPIMemoryNVS",
+		"MemoryMappedIO",
+		"MemoryMappedIOPortSpace",
+		"PalCode"
+	};
+
+	/*
+	 * Memory map data provided by UEFI via the GetMemoryMap
+	 * Boot Services API.
+	 */
+	if (l2 < sizeof(*efihdr)) {
+		warnx("S_efi_map length less than header");
+		return (1);
+	}
+	efihdr = p;
+	efisz = (sizeof(struct efi_map_header) + 0xf) & ~0xf;
+	map = (struct efi_md *)((uint8_t *)efihdr + efisz);
+
+	if (efihdr->descriptor_size == 0)
+		return (0);
+	if (l2 != efisz + efihdr->memory_size) {
+		warnx("S_efi_map length mismatch %zu vs %zu", l2, efisz +
+		    efihdr->memory_size);
+		return (1);
+	}
+	ndesc = efihdr->memory_size / efihdr->descriptor_size;
+
+	printf("\n%23s %12s %12s %8s %4s",
+	    "Type", "Physical", "Virtual", "#Pages", "Attr");
+
+	for (i = 0; i < ndesc; i++,
+	    map = efi_next_descriptor(map, efihdr->descriptor_size)) {
+		if (map->md_type <= EFI_MD_TYPE_PALCODE)
+			type = types[map->md_type];
+		else
+			type = "<INVALID>";
+		printf("\n%23s %012lx %12p %08lx ", type, map->md_phys,
+		    map->md_virt, map->md_pages);
+		if (map->md_attr & EFI_MD_ATTR_UC)
+			printf("UC ");
+		if (map->md_attr & EFI_MD_ATTR_WC)
+			printf("WC ");
+		if (map->md_attr & EFI_MD_ATTR_WT)
+			printf("WT ");
+		if (map->md_attr & EFI_MD_ATTR_WB)
+			printf("WB ");
+		if (map->md_attr & EFI_MD_ATTR_UCE)
+			printf("UCE ");
+		if (map->md_attr & EFI_MD_ATTR_WP)
+			printf("WP ");
+		if (map->md_attr & EFI_MD_ATTR_RP)
+			printf("RP ");
+		if (map->md_attr & EFI_MD_ATTR_XP)
+			printf("XP ");
+		if (map->md_attr & EFI_MD_ATTR_RT)
+			printf("RUNTIME");
+	}
+	return (0);
+}
+#endif
+
+static int
+T_dev_t(size_t l2, void *p)
 {
 	dev_t *d = (dev_t *)p;
 	if (l2 != sizeof(*d))
-		err(1, "T_dev_T %d != %zu", l2, sizeof(*d));
+		err(1, "T_dev_T %zu != %zu", l2, sizeof(*d));
 	if ((int)(*d) != -1) {
 		if (minor(*d) > 255 || minor(*d) < 0)
 			printf("{ major = %d, minor = 0x%x }",
@@ -598,55 +747,6 @@ oidfmt(int *oid, size_t len, char *fmt, u_int *kind)
 	return 0;
 }
 
-#ifdef __i386__
-/*
- * Code to map a bootdev major number into a suitable device name.
- * Major numbers are mapped into names as in boot2.c
- */
-struct _foo {
-	int majdev;
-	const char *name;
-} maj2name[] = {
-	{ 30,	"ad" },
-	{ 0,	"wd" },
-	{ 1,	"wfd" },
-	{ 2,	"fd" },
-	{ 4,	"da" },
-	{ -1,	NULL }	/* terminator */
-};
-
-static int
-machdep_bootdev(u_long value)
-{
-	int majdev, unit, slice, part;
-	struct _foo *p;
-
-	if ((value & B_MAGICMASK) != B_DEVMAGIC) {
-		printf("invalid (0x%08lx)", value);
-		return 0;
-	}
-	majdev = B_TYPE(value);
-	unit = B_UNIT(value);
-	slice = B_SLICE(value);
-	part = B_PARTITION(value);
-	if (majdev == 2) {	/* floppy, as known to the boot block... */
-		printf("/dev/fd%d", unit);
-		return 0;
-	}
-	for (p = maj2name; p->name != NULL && p->majdev != majdev ; p++) ;
-	if (p->name != NULL) {	/* found */
-		if (slice == WHOLE_DISK_SLICE)
-			printf("/dev/%s%d%c", p->name, unit, part);
-		else
-			printf("/dev/%s%ds%d%c",
-			    p->name, unit, slice - BASE_SLICE + 1, part + 'a');
-	} else
-		printf("unknown (major %d unit %d slice %d part %d)",
-			majdev, unit, slice, part);
-	return 0;
-}
-#endif
-
 /*
  * This formats and outputs the value of one variable
  *
@@ -665,7 +765,7 @@ show_var(int *oid, size_t nlen)
 	int i;
 	size_t j, len;
 	u_int kind;
-	int (*func)(int, void *);
+	int (*func)(size_t, void *);
 	int error = 0;
 
 	qoid[0] = 0;
@@ -729,6 +829,22 @@ show_var(int *oid, size_t nlen)
 		fwrite(p, nul == NULL ? (int)len : nul - p, 1, stdout);
 		return (0);
 		
+	case 'C':
+		if (!nflag)
+			printf("%s%s", name, sep);
+		fmt++;
+		spacer = "";
+		while (len >= sizeof(char)) {
+			if(*fmt == 'U')
+				printf("%s%hhu", spacer, *(unsigned char *)p);
+			else
+				printf("%s%hhd", spacer, *(char *)p);
+			spacer = " ";
+			len -= sizeof(char);
+			p += sizeof(char);
+		}
+		goto done;
+
 	case 'I':
 		if (!nflag)
 			printf("%s%s", name, sep);
@@ -751,10 +867,6 @@ show_var(int *oid, size_t nlen)
 		if (!nflag)
 			printf("%s%s", name, sep);
 		fmt++;
-#ifdef __i386__
-		if (!strcmp(name, "machdep.guessed_bootdev"))
-			return machdep_bootdev(*(unsigned long *)p);
-#endif
 		spacer = "";
 		while (len >= sizeof(long)) {
 			if(*fmt == 'U')
@@ -794,6 +906,24 @@ show_var(int *oid, size_t nlen)
 
 	case 'T':
 	case 'S':
+		if (fmt[0] == 'S' && fmt[1] != ',') {
+			if (!nflag)
+				printf("%s%s", name, sep);
+			fmt++;
+			spacer = "";
+			while (len >= sizeof(short)) {
+				if(*fmt == 'U')
+					printf("%s%hu", spacer,
+					    *(unsigned short *)p);
+				else
+					printf("%s%hd", spacer, *(short *)p);
+				spacer = " ";
+				len -= sizeof(short);
+				p += sizeof(short);
+			}
+			goto done;
+		}
+			
 		if (!oflag && !xflag) {
 			i = 0;
 			if (strcmp(fmt, "S,clockinfo") == 0)
@@ -806,6 +936,10 @@ show_var(int *oid, size_t nlen)
 				func = S_loadavg;
 			else if (strcmp(fmt, "S,sensor") == 0)
 				func = S_sensor;
+#ifdef __x86_64__
+			else if (strcmp(fmt, "S,efi_map_header") == 0)
+				func = S_efi_map;
+#endif
 			else if (strcmp(fmt, "T,dev_t") == 0)
 				func = T_dev_t;
 			else if (strcmp(fmt, "T,udev_t") == 0)

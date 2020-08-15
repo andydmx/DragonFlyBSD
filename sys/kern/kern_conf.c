@@ -75,7 +75,7 @@ minor(cdev_t dev)
 }
 
 /*
- * Compatibility function with old udev_t format to convert the
+ * Compatibility function with old dev_t format to convert the
  * non-consecutive minor space into a consecutive minor space.
  */
 int
@@ -94,15 +94,15 @@ lminor(cdev_t dev)
 /*
  * Convert a device pointer to an old style device number.  Return NOUDEV
  * if the device is invalid or if the device (maj,min) cannot be converted
- * to an old style udev_t.
+ * to an old style dev_t.
  */
-udev_t
-dev2udev(cdev_t dev)
+dev_t
+devid_from_dev(cdev_t dev)
 {
 	if (dev == NULL)
 		return NOUDEV;
 
-	return (udev_t)dev->si_inode;
+	return (dev_t)dev->si_inode;
 }
 
 /*
@@ -115,12 +115,12 @@ dev2udev(cdev_t dev)
  * has not been registered.
  */
 cdev_t
-udev2dev(udev_t x, int b)
+dev_from_devid(dev_t x, int b)
 {
 	if (x == NOUDEV || b != 0)
 		return(NULL);
 
-	return devfs_find_device_by_udev(x);
+	return devfs_find_device_by_devid(x);
 }
 
 int
@@ -135,7 +135,7 @@ dev_is_good(cdev_t dev)
  * Various user device number extraction and conversion routines
  */
 int
-uminor(udev_t dev)
+uminor(dev_t dev)
 {
 	if (dev == NOUDEV)
 		return(-1);
@@ -143,19 +143,35 @@ uminor(udev_t dev)
 }
 
 int
-umajor(udev_t dev)
+umajor(dev_t dev)
 {
 	if (dev == NOUDEV)
 		return(-1);
 	return((dev & 0xff00) >> 8);
 }
 
-udev_t
+dev_t
 makeudev(int x, int y)
 {
 	if ((x & 0xffffff00) || (y & 0x0000ff00))
 		return NOUDEV;
 	return ((x << 8) | y);
+}
+
+/*
+ * Put a NUL-terminated ASCII number (base == 32) for use as device suffix.
+ * The buffer pointed to by `nbuf' must have length >= MAKEDEV_MINNBUF.
+ */
+char *
+makedev_unit_b32(char *nbuf, uintmax_t num)
+{
+	char *p = &nbuf[MAKEDEV_MINNBUF - 1];
+
+	*p = '\0';
+	do {
+		*--p = hex2ascii(num % 32);
+	} while (num /= 32);
+	return (p);
 }
 
 /*
@@ -183,8 +199,7 @@ make_dev(struct dev_ops *ops, int minor, uid_t uid, gid_t gid,
 
 	devfs_dev = devfs_new_cdev(ops, minor, NULL);
 	__va_start(ap, fmt);
-	kvsnrprintf(devfs_dev->si_name, sizeof(devfs_dev->si_name),
-		    32, fmt, ap);
+	kvsnprintf(devfs_dev->si_name, sizeof(devfs_dev->si_name), fmt, ap);
 	__va_end(ap);
 
 	devfs_debug(DEVFS_DEBUG_INFO,
@@ -214,8 +229,7 @@ make_dev_covering(struct dev_ops *ops, struct dev_ops *bops, int minor,
 
 	devfs_dev = devfs_new_cdev(ops, minor, bops);
 	__va_start(ap, fmt);
-	kvsnrprintf(devfs_dev->si_name, sizeof(devfs_dev->si_name),
-		    32, fmt, ap);
+	kvsnprintf(devfs_dev->si_name, sizeof(devfs_dev->si_name), fmt, ap);
 	__va_end(ap);
 
 	devfs_debug(DEVFS_DEBUG_INFO,
@@ -245,8 +259,7 @@ make_only_devfs_dev(struct dev_ops *ops, int minor, uid_t uid, gid_t gid,
 	 * Set additional fields (XXX DEVFS interface goes here)
 	 */
 	__va_start(ap, fmt);
-	kvsnrprintf(devfs_dev->si_name, sizeof(devfs_dev->si_name),
-		    32, fmt, ap);
+	kvsnprintf(devfs_dev->si_name, sizeof(devfs_dev->si_name), fmt, ap);
 	__va_end(ap);
 
 	devfs_create_dev(devfs_dev, uid, gid, perms);
@@ -274,8 +287,7 @@ make_only_dev(struct dev_ops *ops, int minor, uid_t uid, gid_t gid,
 	 * Set additional fields (XXX DEVFS interface goes here)
 	 */
 	__va_start(ap, fmt);
-	kvsnrprintf(devfs_dev->si_name, sizeof(devfs_dev->si_name),
-		    32, fmt, ap);
+	kvsnprintf(devfs_dev->si_name, sizeof(devfs_dev->si_name), fmt, ap);
 	__va_end(ap);
 
 	reference_dev(devfs_dev);
@@ -303,8 +315,7 @@ make_only_dev_covering(struct dev_ops *ops, struct dev_ops *bops, int minor,
 	 * Set additional fields (XXX DEVFS interface goes here)
 	 */
 	__va_start(ap, fmt);
-	kvsnrprintf(devfs_dev->si_name, sizeof(devfs_dev->si_name),
-		    32, fmt, ap);
+	kvsnprintf(devfs_dev->si_name, sizeof(devfs_dev->si_name), fmt, ap);
 	__va_end(ap);
 
 	reference_dev(devfs_dev);
@@ -366,7 +377,7 @@ make_dev_alias(cdev_t target, const char *fmt, ...)
 	char *name;
 
 	__va_start(ap, fmt);
-	kvasnrprintf(&name, PATH_MAX, 32, fmt, ap);
+	kvasnprintf(&name, PATH_MAX, fmt, ap);
 	__va_end(ap);
 
 	devfs_make_alias(name, target);
@@ -382,7 +393,7 @@ destroy_dev_alias(cdev_t target, const char *fmt, ...)
 	char *name;
 
 	__va_start(ap, fmt);
-	kvasnrprintf(&name, PATH_MAX, 32, fmt, ap);
+	kvasnprintf(&name, PATH_MAX, fmt, ap);
 	__va_end(ap);
 
 	devfs_destroy_alias(name, target);
@@ -402,7 +413,7 @@ make_autoclone_dev(struct dev_ops *ops, struct devfs_bitmap *bitmap,
 	char *name;
 
 	__va_start(ap, fmt);
-	kvasnrprintf(&name, PATH_MAX, 32, fmt, ap);
+	kvasnprintf(&name, PATH_MAX, fmt, ap);
 	__va_end(ap);
 
 	if (bitmap != NULL)

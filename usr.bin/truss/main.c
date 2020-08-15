@@ -55,6 +55,9 @@
 #include "truss.h"
 #include "extern.h"
 
+char procfs_path[FILENAME_MAX];
+int have_procfs;
+
 /*
  * These should really be parameterized -- I don't like having globals,
  * but this is the easiest way, right now, to deal with them.
@@ -62,7 +65,7 @@
 
 int Procfd;
 
-static inline void
+static void
 usage(void)
 {
   fprintf(stderr, "%s\n%s\n",
@@ -76,11 +79,6 @@ struct ex_types {
   void (*enter_syscall)(struct trussinfo *, int);
   int (*exit_syscall)(struct trussinfo *, int);
 } ex_types[] = {
-#ifdef __i386__
-  { "DragonFly ELF32", i386_syscall_entry, i386_syscall_exit },
-  { "FreeBSD ELF32", i386_syscall_entry, i386_syscall_exit },
-  { "Linux ELF32", i386_linux_syscall_entry, i386_linux_syscall_exit },
-#endif
 #ifdef __x86_64__
   { "DragonFly ELF64", x86_64_syscall_entry, x86_64_syscall_exit },
   { "FreeBSD ELF64", x86_64_syscall_entry, x86_64_syscall_exit },

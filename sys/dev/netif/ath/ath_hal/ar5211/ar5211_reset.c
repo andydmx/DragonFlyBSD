@@ -154,6 +154,7 @@ static void ar5211SetOperatingMode(struct ath_hal *, int opmode);
 HAL_BOOL
 ar5211Reset(struct ath_hal *ah, HAL_OPMODE opmode,
 	struct ieee80211_channel *chan, HAL_BOOL bChannelChange,
+	HAL_RESET_TYPE resetType,
 	HAL_STATUS *status)
 {
 uint32_t softLedCfg, softLedState;
@@ -912,7 +913,7 @@ getNoiseFloorThresh(struct ath_hal *ah, const struct ieee80211_channel *chan,
 }
 
 /*
- * Read the NF and check it against the noise floor threshhold
+ * Read the NF and check it against the noise floor threshold
  *
  * Returns: TRUE if the NF is good
  */
@@ -1441,7 +1442,7 @@ ar5211SetPowerTable(struct ath_hal *ah, PCDACS_EEPROM *pSrcStruct,
 		}
 
 	/* Find the first power level with a pcdac */
-	pwr = (uint16_t)(PWR_STEP * ((minScaledPwr - PWR_MIN + PWR_STEP / 2) / PWR_STEP)  + PWR_MIN);
+	pwr = (uint16_t)(rounddown(minScaledPwr - PWR_MIN + PWR_STEP / 2, PWR_STEP)  + PWR_MIN);
 
 	/* Write all the first pcdac entries based off the pcdacMin */
 	pcdacTableIndex = 0;
@@ -1711,6 +1712,8 @@ ar5211GetScaledPower(uint16_t channel, uint16_t pcdacValue,
 		&lrPcdac, &urPcdac);
 
 	/* get the power index for the pcdac value */
+	lPwr = 0;	/* avoid gcc warnings */
+	uPwr = 0;	/* avoid gcc warnings */
 	ar5211FindValueInList(lFreq, llPcdac, pSrcStruct, &lPwr);
 	ar5211FindValueInList(lFreq, ulPcdac, pSrcStruct, &uPwr);
 	lScaledPwr = ar5211GetInterpolatedValue(pcdacValue,
@@ -1815,6 +1818,9 @@ ar5211GetLowerUpperValues(uint16_t value,
 	const uint16_t listEndValue = *(pList + listSize - 1);
 	uint32_t target = value * EEP_SCALE;
 	int i;
+
+	*pLowerValue = 0;	/* avoid gcc warnings */
+	*pUpperValue = 0;	/* avoid gcc warnings */
 
 	/*
 	 * See if value is lower than the first value in the list

@@ -48,22 +48,23 @@
 	__weak_reference(imprecise_## x, x);\
 	WARN_IMPRECISE(x)
 
+#define DECLARE_FORMER_IMPRECISE(f) \
+	__sym_compat(f ## l, imprecise_ ## f ## l, DF306.1); \
+	long double imprecise_ ## f ## l(long double v) { return f(v); }
+
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmissing-prototypes"
+
+__sym_compat(powl, imprecise_powl, DF306.1);
 long double
-imprecise_powl(long double x, long double y)
-{
+imprecise_powl(long double x, long double y) { return pow(x, y); }
 
-	return pow(x, y);
-}
-DECLARE_WEAK(powl);
+DECLARE_FORMER_IMPRECISE(cosh);
+DECLARE_FORMER_IMPRECISE(erfc);
+DECLARE_FORMER_IMPRECISE(erf);
+DECLARE_FORMER_IMPRECISE(sinh);
+DECLARE_FORMER_IMPRECISE(tanh);
+DECLARE_FORMER_IMPRECISE(tgamma);
+DECLARE_FORMER_IMPRECISE(lgamma);
 
-#define DECLARE_IMPRECISE(f) \
-	long double imprecise_ ## f ## l(long double v) { return f(v); }\
-	DECLARE_WEAK(f ## l)
-
-DECLARE_IMPRECISE(cosh);
-DECLARE_IMPRECISE(erfc);
-DECLARE_IMPRECISE(erf);
-DECLARE_IMPRECISE(lgamma);
-DECLARE_IMPRECISE(sinh);
-DECLARE_IMPRECISE(tanh);
-DECLARE_IMPRECISE(tgamma);
+#pragma GCC diagnostic pop

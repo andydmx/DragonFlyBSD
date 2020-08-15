@@ -3,12 +3,12 @@
 
 PROG=	newfs_hammer
 MAN=	newfs_hammer.8
-CFLAGS+= -I${.CURDIR}/../../sys -I${.CURDIR}/../hammer -DALIST_NO_DEBUG
+CFLAGS+= -I${.CURDIR}/../../sys -I${.CURDIR}/../hammer
 SRCS= newfs_hammer.c
 
 .PATH: ${.CURDIR}/../../sys/libkern
-SRCS+= crc32.c
+SRCS+= crc32.c icrc32.c
 .PATH: ${.CURDIR}/../hammer
-SRCS+= ondisk.c cache.c blockmap.c
+SRCS+= ondisk.c cache.c blockmap.c misc.c uuid.c
 
 .include <bsd.prog.mk>

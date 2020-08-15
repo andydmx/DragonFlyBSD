@@ -42,11 +42,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -261,6 +257,7 @@ struct ip6_frag {
  */
 #define IPV6_MAXHLIM	255	/* maximun hoplimit */
 #define IPV6_DEFHLIM	64	/* default hlim */
+#define IPV6_MINHLIM	40	/* minimum hop limit */
 #define IPV6_FRAGTTL	120	/* ttl for fragment packets, in slowtimo tick */
 #define IPV6_HLIMDEC	1	/* subtracted when forwaeding */
 

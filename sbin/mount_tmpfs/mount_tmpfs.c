@@ -34,7 +34,7 @@
 #include <sys/mount.h>
 #include <sys/stat.h>
 
-#include <vfs/tmpfs/tmpfs_args.h>
+#include <vfs/tmpfs/tmpfs_mount.h>
 
 #include <ctype.h>
 #include <err.h>
@@ -84,7 +84,7 @@ static void	usage(void) __dead2;
 
 void
 mount_tmpfs_parseargs(int argc, char *argv[],
-	struct tmpfs_args *args, int *mntflags,
+	struct tmpfs_mount_info *args, int *mntflags,
 	char *canon_dev, char *canon_dir)
 {
 	int gidset, modeset, uidset; /* Ought to be 'bool'. */
@@ -328,12 +328,13 @@ usage(void)
 int
 mount_tmpfs(int argc, char *argv[])
 {
-	struct tmpfs_args args;
+	struct tmpfs_mount_info args;
 	char canon_dev[MAXPATHLEN], canon_dir[MAXPATHLEN];
 	int mntflags;
 	struct vfsconf vfc;
 	int error;
-	fsnode_t copyroot = NULL, copyhlinks;
+	fsnode_t copyroot = NULL;
+	fsnode_t copyhlinks = NULL;
 
 	mount_tmpfs_parseargs(argc, argv, &args, &mntflags,
 	    canon_dev, canon_dir);

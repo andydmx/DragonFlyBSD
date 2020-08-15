@@ -1,7 +1,7 @@
 # $FreeBSD: src/usr.sbin/yppush/Makefile,v 1.9 2001/07/20 06:20:30 obrien Exp $
 
 RPCDIR=	${.CURDIR}/../../include/rpcsvc
-.PATH: ${RPCDIR} ${.CURDIR}/../../usr.sbin/ypserv \
+.PATH: ${RPCDIR} ${.CURDIR}/../ypserv \
        ${.CURDIR}/../../libexec/ypxfr
 
 PROG=	yppush
@@ -14,6 +14,7 @@ WARNS?=	3
 CFLAGS+= -I. -I${.CURDIR}/../../libexec/ypxfr
 
 RPCGEN= rpcgen -C
+NO_WCAST_FUNCTION_TYPE=
 
 CLEANFILES= ${GENSRCS}
 

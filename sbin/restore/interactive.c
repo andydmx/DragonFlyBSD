@@ -28,27 +28,23 @@
  *
  * @(#)interactive.c	8.5 (Berkeley) 5/1/95
  * $FreeBSD: src/sbin/restore/interactive.c,v 1.8.2.1 2001/01/03 14:36:08 iedowse Exp $
- * $DragonFly: src/sbin/restore/interactive.c,v 1.10 2005/11/06 12:49:25 swildner Exp $
  */
 
 #include <sys/param.h>
 #include <sys/stat.h>
 
-#include <dirent.h>
+#include <vfs/ufs/dinode.h>
+#include <vfs/ufs/dir.h>
+#include <protocols/dumprestore.h>
+
 #include <setjmp.h>
 #include <glob.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-#include <vfs/ufs/dinode.h>
-#include <vfs/ufs/dir.h>
-#include <protocols/dumprestore.h>
-
 #include "restore.h"
 #include "extern.h"
-
-#define round(a, b) (((a) + (b) - 1) / (b) * (b))
 
 /*
  * Things to handle interruptions.
@@ -77,11 +73,11 @@ struct arglist {
 static char	*copynext(char *, char *);
 static int	 fcmp(const void *, const void *);
 static void	 formatf(struct afile *, int);
-static void	 getcmd(char *, char *, char *, int, struct arglist *);
+static void	 getcmd(char *, char *, char *, size_t, struct arglist *);
 struct dirent	*glob_readdir(RST_DIR *dirp);
 static int	 glob_stat(const char *, struct stat *);
-static void	 mkentry(char *, struct direct *, struct afile *);
-static void	 printlist(char *, char *);
+static void	 mkentry(const char *, struct direct *, struct afile *);
+static void	 printlist(const char *, char *);
 
 /*
  * Read and execute commands from the terminal.
@@ -178,6 +174,7 @@ loop:
 	case 'h':
 		if (strncmp(cmd, "help", strlen(cmd)) != 0)
 			goto bad;
+		/* FALLTHROUGH */
 	case '?':
 		fprintf(stderr, "%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s",
 			"Available commands are:\n",
@@ -295,7 +292,7 @@ loop:
  * eliminate any embedded ".." components.
  */
 static void
-getcmd(char *curdir, char *cmd, char *name, int size, struct arglist *ap)
+getcmd(char *curdir, char *cmd, char *name, size_t size, struct arglist *ap)
 {
 	char *cp;
 	static char input[BUFSIZ];
@@ -429,7 +426,7 @@ copynext(char *input, char *output)
  * remove any embedded "." and ".." components.
  */
 void
-canon(char *rawname, char *canonname, int len)
+canon(const char *rawname, char *canonname, size_t len)
 {
 	char *cp, *np;
 
@@ -443,7 +440,7 @@ canon(char *rawname, char *canonname, int len)
 		fprintf(stderr, "canonname: not enough buffer space\n");
 		done(1);
 	}
-		
+
 	strcat(canonname, rawname);
 	/*
 	 * Eliminate multiple and trailing '/'s
@@ -483,7 +480,7 @@ canon(char *rawname, char *canonname, int len)
  * Do an "ls" style listing of a directory
  */
 static void
-printlist(char *name, char *basename)
+printlist(const char *name, char *basename)
 {
 	struct afile *fp, *list, *listp = NULL;
 	struct direct *dp;
@@ -494,14 +491,14 @@ printlist(char *name, char *basename)
 
 	dp = pathsearch(name);
 	if (dp == NULL || (!dflag && TSTINO(dp->d_ino, dumpmap) == 0) ||
-	    (!vflag && dp->d_ino == WINO))
+	    (!vflag && dp->d_ino == UFS_WINO))
 		return;
 	if ((dirp = rst_opendir(name)) == NULL) {
 		entries = 1;
 		list = &single;
 		mkentry(name, dp, list);
 		len = strlen(basename) + 1;
-		if (strlen(name) - len > single.len) {
+		if (strlen(name) - len > (unsigned short)single.len) {
 			freename(single.fname);
 			single.fname = savename(&name[len]);
 			single.len = strlen(single.fname);
@@ -529,7 +526,7 @@ printlist(char *name, char *basename)
 				break;
 			if (!dflag && TSTINO(dp->d_ino, dumpmap) == 0)
 				continue;
-			if (!vflag && (dp->d_ino == WINO ||
+			if (!vflag && (dp->d_ino == UFS_WINO ||
 			     strcmp(dp->d_name, ".") == 0 ||
 			     strcmp(dp->d_name, "..") == 0))
 				continue;
@@ -564,7 +561,7 @@ printlist(char *name, char *basename)
  * Read the contents of a directory.
  */
 static void
-mkentry(char *name, struct direct *dp, struct afile *fp)
+mkentry(const char *name, struct direct *dp, struct afile *fp)
 {
 	char *cp;
 	struct entry *np;
@@ -627,13 +624,14 @@ static void
 formatf(struct afile *list, int nentry)
 {
 	struct afile *fp, *endlist;
-	int width, bigino, haveprefix, havepostfix;
+	unsigned int bigino;
+	int width, haveprefix, havepostfix;
 	int i, j, w, precision = 0, columns, lines;
 
 	width = 0;
 	haveprefix = 0;
 	havepostfix = 0;
-	bigino = ROOTINO;
+	bigino = UFS_ROOTINO;
 	endlist = &list[nentry];
 	for (fp = &list[0]; fp < endlist; fp++) {
 		if (bigino < fp->fnum)
@@ -691,6 +689,8 @@ formatf(struct afile *list, int nentry)
  * First have to get definition of a dirent.
  */
 #undef DIRBLKSIZ
+#include <dirent.h>
+#undef d_ino
 
 struct dirent *
 glob_readdir(RST_DIR *dirp)
@@ -706,7 +706,7 @@ glob_readdir(RST_DIR *dirp)
 	struct dirent *adp;
 
 	while ((dp = rst_readdir(dirp)) != NULL) {
-		if (!vflag && dp->d_ino == WINO)
+		if (!vflag && dp->d_ino == UFS_WINO)
 			continue;
 		if (dflag || TSTINO(dp->d_ino, dumpmap))
 			break;
@@ -714,7 +714,7 @@ glob_readdir(RST_DIR *dirp)
 	if (dp == NULL)
 		return (NULL);
 	adp = (struct dirent *)&adirent;
-	adp->d_ino = dp->d_ino;
+	adp->d_fileno = dp->d_ino;
 	adp->d_namlen = dp->d_namlen;
 	strcpy(adp->d_name, dp->d_name);
 	return (adp);
@@ -730,7 +730,7 @@ glob_stat(const char *name, struct stat *stp)
 
 	dp = pathsearch(name);
 	if (dp == NULL || (!dflag && TSTINO(dp->d_ino, dumpmap) == 0) ||
-	    (!vflag && dp->d_ino == WINO))
+	    (!vflag && dp->d_ino == UFS_WINO))
 		return (-1);
 	if (inodetype(dp->d_ino) == NODE)
 		stp->st_mode = IFDIR;
@@ -745,15 +745,15 @@ glob_stat(const char *name, struct stat *stp)
 static int
 fcmp(const void *f1, const void *f2)
 {
-	return (strcmp(((struct afile *)f1)->fname,
-	    ((struct afile *)f2)->fname));
+	return (strcmp(((const struct afile *)f1)->fname,
+	    ((const struct afile *)f2)->fname));
 }
 
 /*
  * respond to interrupts
  */
 void
-onintr(int signo)
+onintr(int signo __unused)
 {
 	if (command == 'i' && runshell)
 		longjmp(reset, 1);

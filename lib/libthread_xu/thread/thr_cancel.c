@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2005, David Xu<davidxu@freebsd.org>
+ * Copyright (c) 2005, David Xu <davidxu@freebsd.org>
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -23,7 +23,6 @@
  * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
  * THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
- * $DragonFly: src/lib/libthread_xu/thread/thr_cancel.c,v 1.4 2006/04/06 13:03:09 davidxu Exp $
  */
 
 #include "namespace.h"
@@ -32,8 +31,6 @@
 #include "un-namespace.h"
 
 #include "thr_private.h"
-
-int _pthread_setcanceltype(int type, int *oldtype);
 
 int
 _pthread_cancel(pthread_t pthread)
@@ -82,7 +79,7 @@ int
 _pthread_setcancelstate(int state, int *oldstate)
 {
 	struct pthread *curthread = tls_get_curthread();
-	int oldval, ret;
+	int oldval;
 
 	oldval = curthread->cancelflags;
 	if (oldstate != NULL)
@@ -91,25 +88,23 @@ _pthread_setcancelstate(int state, int *oldstate)
 	switch (state) {
 	case PTHREAD_CANCEL_DISABLE:
 		atomic_set_int(&curthread->cancelflags, THR_CANCEL_DISABLE);
-		ret = 0;
 		break;
 	case PTHREAD_CANCEL_ENABLE:
 		atomic_clear_int(&curthread->cancelflags, THR_CANCEL_DISABLE);
 		testcancel(curthread);
-		ret = 0;
 		break;
 	default:
-		ret = EINVAL;
+		return (EINVAL);
 	}
 
-	return (ret);
+	return (0);
 }
 
 int
 _pthread_setcanceltype(int type, int *oldtype)
 {
 	struct pthread	*curthread = tls_get_curthread();
-	int oldval, ret;
+	int oldval;
 
 	oldval = curthread->cancelflags;
 	if (oldtype != NULL)
@@ -120,17 +115,15 @@ _pthread_setcanceltype(int type, int *oldtype)
 	case PTHREAD_CANCEL_ASYNCHRONOUS:
 		atomic_set_int(&curthread->cancelflags, THR_CANCEL_AT_POINT);
 		testcancel(curthread);
-		ret = 0;
 		break;
 	case PTHREAD_CANCEL_DEFERRED:
 		atomic_clear_int(&curthread->cancelflags, THR_CANCEL_AT_POINT);
-		ret = 0;
 		break;
 	default:
-		ret = EINVAL;
+		return (EINVAL);
 	}
 
-	return (ret);
+	return (0);
 }
 
 void
@@ -163,4 +156,3 @@ __strong_reference(_pthread_cancel, pthread_cancel);
 __strong_reference(_pthread_setcancelstate, pthread_setcancelstate);
 __strong_reference(_pthread_setcanceltype, pthread_setcanceltype);
 __strong_reference(_pthread_testcancel, pthread_testcancel);
-

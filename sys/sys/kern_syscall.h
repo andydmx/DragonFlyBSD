@@ -33,7 +33,9 @@
 #error "This file should not be included by userland programs."
 #endif
 
-#include <sys/uio.h>
+#include <sys/signal.h>
+#include <sys/wait.h>
+#include <sys/_uio.h>
 
 #define DUP_FIXED	0x1	/* Copy to specific fd even if in use */
 #define DUP_VARIABLE	0x2	/* Copy fd to an unused fd */
@@ -49,9 +51,7 @@ struct nchandle;
 struct nlookupdata;
 struct rlimit;
 struct rusage;
-struct sigaction;
-struct sigaltstack;
-struct __sigset;
+struct __wrusage;
 struct sf_hdtr;
 struct sockaddr;
 struct socket;
@@ -82,17 +82,17 @@ int kern_execve(struct nlookupdata *nd, struct image_args *args);
 /*
  * Prototypes for syscalls in kern/kern_exit.c
  */
-int kern_wait(pid_t pid, int *status, int options, struct rusage *rusage,
-	int *res);
+int kern_wait(idtype_t idtype, id_t id, int *status, int options,
+	struct __wrusage *wrusage, siginfo_t *info, int *res);
 
 /*
  * Prototypes for syscalls in kern/kern_sig.c
  */
 int kern_sigaction(int sig, struct sigaction *act, struct sigaction *oact);
-int kern_sigprocmask(int how, struct __sigset *set, struct __sigset *oset);
-int kern_sigpending(struct __sigset *set);
-int kern_sigsuspend(struct __sigset *mask);
-int kern_sigaltstack(struct sigaltstack *ss, struct sigaltstack *oss);
+int kern_sigprocmask(int how, sigset_t *set, sigset_t *oset);
+int kern_sigpending(sigset_t *set);
+int kern_sigsuspend(sigset_t *mask);
+int kern_sigaltstack(stack_t *ss, stack_t *oss);
 int kern_kill(int sig, pid_t pid, lwpid_t tid);
 
 /*
@@ -110,7 +110,8 @@ int kern_getrlimit(u_int which, struct rlimit *limp);
 /*
  * Prototypes for syscalls in kern/uipc_syscalls.c
  */
-int kern_accept(int s, int fflags, struct sockaddr **name, int *namelen, int *res);
+int kern_accept(int s, int fflags, struct sockaddr **name, int *namelen, int *res,
+	int sockflags /* SOCK_{NONBLOCK,CLOEXEC,KERN_NOINHERIT} */);
 int kern_bind(int s, struct sockaddr *sa);
 int kern_connect(int s, int fflags, struct sockaddr *sa);
 int kern_listen(int s, int backlog);
@@ -129,6 +130,11 @@ int kern_socket(int domain, int type, int protocol, int *res);
 int kern_socketpair(int domain, int type, int protocol, int *sockv);
 
 /*
+ * Prototypes for syscalls in kern/sys_pipe.c
+ */
+int kern_pipe(long *fds, int flags);
+
+/*
  * Prototypes for syscalls in kern/vfs_syscalls.c
  */
 int kern_access(struct nlookupdata *nd, int amode, int flags);
@@ -139,6 +145,7 @@ int kern_chroot(struct nchandle *nch);
 int kern_fstatfs(int fd, struct statfs *buf);
 int kern_fstatvfs(int fd, struct statvfs *buf);
 int kern_ftruncate(int fd, off_t length);
+int kern_futimens(int fd, struct timespec *ts);
 int kern_futimes(int fd, struct timeval *tptr);
 int kern_getdirentries(int fd, char *buf, u_int count, long *basep, int *res,
 		       enum uio_seg);
@@ -162,6 +169,7 @@ int kern_statvfs(struct nlookupdata *nd, struct statvfs *buf);
 int kern_symlink(struct nlookupdata *nd, char *path, int mode);
 int kern_truncate(struct nlookupdata *nd, off_t length);
 int kern_unlink(struct nlookupdata *nd);
+int kern_utimensat(struct nlookupdata *nd, const struct timespec *ts, int flag);
 int kern_utimes(struct nlookupdata *nd, struct timeval *tptr);
 struct uuid *kern_uuidgen(struct uuid *store, size_t count);
 

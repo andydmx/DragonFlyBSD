@@ -1,5 +1,5 @@
 #
-# $FreeBSD$
+# $FreeBSD: head/tools/tools/usbtest/Makefile 275407 2014-12-02 13:58:57Z hselasky $
 #
 # Copyright (c) 2013 Hans Petter Selasky. All rights reserved.
 #
@@ -31,10 +31,11 @@ SRCS+=	usb_msc_test.c
 SRCS+=	usb_modem_test.c
 SRCS+=	usb_control_ep_test.c
 
+DPADD+=	${LIBUSB}
 LDADD+=	-lusb
 
 WARNS=	3
 
-CFLAGS+= -I ${.CURDIR}/../../../sys/dev/usb/gadget
+CFLAGS+= -I ${.CURDIR}/../../../sys/bus/u4b/gadget
 
 .include <bsd.prog.mk>

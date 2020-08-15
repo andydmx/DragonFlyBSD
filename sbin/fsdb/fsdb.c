@@ -3,7 +3,7 @@
 /*
  *  Copyright (c) 1995 John T. Kohl
  *  All rights reserved.
- * 
+ *
  *  Redistribution and use in source and binary forms, with or without
  *  modification, are permitted provided that the following conditions
  *  are met:
@@ -14,7 +14,7 @@
  *     documentation and/or other materials provided with the distribution.
  *  3. The name of the author may not be used to endorse or promote products
  *     derived from this software without specific prior written permission.
- * 
+ *
  * THIS SOFTWARE IS PROVIDED BY THE AUTHOR `AS IS'' AND ANY EXPRESS OR
  * IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
  * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
@@ -28,7 +28,6 @@
  * POSSIBILITY OF SUCH DAMAGE.
  *
  * $FreeBSD: src/sbin/fsdb/fsdb.c,v 1.13.2.3 2002/03/20 13:39:02 joerg Exp $
- * $DragonFly: src/sbin/fsdb/fsdb.c,v 1.9 2006/04/03 01:58:49 dillon Exp $
  */
 
 #include <sys/param.h>
@@ -50,7 +49,7 @@
 static void usage(void);
 int cmdloop(void);
 
-static void 
+static void
 usage(void)
 {
 	fprintf(stderr, "usage: fsdb [-d] [-f] [-r] fsname\n");
@@ -58,7 +57,6 @@ usage(void)
 }
 
 int returntosingle = 0;
-char nflag = 0;
 
 /*
  * We suck in lots of fsck code, and just pick & choose the stuff we want.
@@ -185,7 +183,7 @@ helpfn(int argc, char **argv)
 
     printf("Commands are:\n%-10s %5s %5s   %s\n",
 	   "command", "min argc", "max argc", "what");
-    
+
     for (cmdtp = cmds; cmdtp->cmd; cmdtp++)
 	printf("%-10s %5u %5u   %s\n",
 	       cmdtp->cmd, cmdtp->minargc, cmdtp->maxargc, cmdtp->helptxt);
@@ -196,7 +194,8 @@ char *
 prompt(EditLine *el)
 {
     static char pstring[64];
-    snprintf(pstring, sizeof(pstring), "fsdb (inum: %d)> ", curinum);
+    snprintf(pstring, sizeof(pstring), "fsdb (inum: %ju)> ",
+	(uintmax_t)curinum);
     return pstring;
 }
 
@@ -214,8 +213,8 @@ cmdloop(void)
     HistEvent he;
     EditLine *elptr;
 
-    curinode = ginode(ROOTINO);
-    curinum = ROOTINO;
+    curinode = ginode(UFS_ROOTINO);
+    curinum = UFS_ROOTINO;
     printactive(0);
 
     hist = history_init();
@@ -276,9 +275,10 @@ struct ufs1_dinode *curinode;
 ino_t curinum, ocurrent;
 
 #define GETINUM(ac,inum)    inum = strtoul(argv[ac], &cp, 0); \
-    if (inum < ROOTINO || inum > maxino || cp == argv[ac] || *cp != '\0' ) { \
-	printf("inode %d out of range; range is [%d,%d]\n", \
-	       inum, ROOTINO, maxino); \
+    if (inum < UFS_ROOTINO || inum > maxino || \
+	cp == argv[ac] || *cp != '\0' ) {			       \
+	printf("inode %ju out of range; range is [%ju,%ju]\n", \
+	       (uintmax_t)inum, (uintmax_t)UFS_ROOTINO, (uintmax_t)maxino); \
 	return 1; \
     }
 
@@ -342,7 +342,8 @@ CMDFUNCSTART(uplink)
 {
     if (!checkactive())
 	return 1;
-    printf("inode %d link count now %d\n", curinum, ++curinode->di_nlink);
+    printf("inode %ju link count now %d\n", (uintmax_t)curinum,
+	++curinode->di_nlink);
     inodirty();
     return 0;
 }
@@ -351,7 +352,8 @@ CMDFUNCSTART(downlink)
 {
     if (!checkactive())
 	return 1;
-    printf("inode %d link count now %d\n", curinum, --curinode->di_nlink);
+    printf("inode %ju link count now %d\n", (uintmax_t)curinum,
+	--curinode->di_nlink);
     inodirty();
     return 0;
 }
@@ -373,7 +375,7 @@ const char *typename[] = {
     "unregistered #13",
     "whiteout",
 };
-    
+
 int slot;
 
 int
@@ -437,10 +439,10 @@ CMDFUNCSTART(focusname)
 	return 1;
 
     ocurrent = curinum;
-    
+
     if (argv[1][0] == '/') {
-	curinum = ROOTINO;
-	curinode = ginode(ROOTINO);
+	curinum = UFS_ROOTINO;
+	curinode = ginode(UFS_ROOTINO);
     } else {
 	if (!checkactivedir())
 	    return 1;
@@ -471,7 +473,7 @@ CMDFUNCSTART(ln)
 	return 1;
     rval = makeentry(curinum, inum, argv[2]);
     if (rval)
-	printf("Ino %d entered as `%s'\n", inum, argv[2]);
+	printf("Ino %ju entered as `%s'\n", (uintmax_t)inum, argv[2]);
     else
 	printf("could not enter name? weird.\n");
     curinode = ginode(curinum);
@@ -513,7 +515,7 @@ CMDFUNCSTART(chinum)
     char *cp;
     ino_t inum;
     struct inodesc idesc;
-    
+
     slotcount = 0;
     if (!checkactivedir())
 	return 1;
@@ -563,7 +565,7 @@ CMDFUNCSTART(chname)
     int rval;
     char *cp;
     struct inodesc idesc;
-    
+
     slotcount = 0;
     if (!checkactivedir())
 	return 1;
@@ -610,16 +612,14 @@ CMDFUNCSTART(newtype)
     if (!checkactive())
 	return 1;
     type = curinode->di_mode & IFMT;
-    for (tp = typenamemap;
-	 tp < &typenamemap[sizeof(typenamemap)/sizeof(*typenamemap)];
-	 tp++) {
+    for (tp = typenamemap; tp < &typenamemap[NELEM(typenamemap)]; tp++) {
 	if (!strcmp(argv[1], tp->typename)) {
 	    printf("setting type to %s\n", tp->typename);
 	    type = tp->typebits;
 	    break;
 	}
     }
-    if (tp == &typenamemap[sizeof(typenamemap)/sizeof(*typenamemap)]) {
+    if (tp == &typenamemap[NELEM(typenamemap)]) {
 	warnx("type `%s' not known", argv[1]);
 	warnx("try one of `file', `dir', `socket', `fifo'");
 	return 1;
@@ -641,11 +641,11 @@ CMDFUNCSTART(chlen)
 	return 1;
 
     len = strtol(argv[1], &cp, 0);
-    if (cp == argv[1] || *cp != '\0' || len < 0) { 
+    if (cp == argv[1] || *cp != '\0' || len < 0) {
 	warnx("bad length `%s'", argv[1]);
 	return 1;
     }
-    
+
     curinode->di_size = len;
     inodirty();
     printactive(0);
@@ -662,11 +662,11 @@ CMDFUNCSTART(chmode)
 	return 1;
 
     modebits = strtol(argv[1], &cp, 8);
-    if (cp == argv[1] || *cp != '\0' || (modebits & ~07777)) { 
+    if (cp == argv[1] || *cp != '\0' || (modebits & ~07777)) {
 	warnx("bad modebits `%s'", argv[1]);
 	return 1;
     }
-    
+
     curinode->di_mode &= ~07777;
     curinode->di_mode |= modebits;
     inodirty();
@@ -684,11 +684,11 @@ CMDFUNCSTART(chaflags)
 	return 1;
 
     flags = strtoul(argv[1], &cp, 0);
-    if (cp == argv[1] || *cp != '\0' ) { 
+    if (cp == argv[1] || *cp != '\0' ) {
 	warnx("bad flags `%s'", argv[1]);
 	return 1;
     }
-    
+
     if (flags > UINT_MAX) {
 	warnx("flags set beyond 32-bit range of field (%lx)\n", flags);
 	return(1);
@@ -709,11 +709,11 @@ CMDFUNCSTART(chgen)
 	return 1;
 
     gen = strtol(argv[1], &cp, 0);
-    if (cp == argv[1] || *cp != '\0' ) { 
+    if (cp == argv[1] || *cp != '\0' ) {
 	warnx("bad gen `%s'", argv[1]);
 	return 1;
     }
-    
+
     if (gen > INT_MAX || gen < INT_MIN) {
 	warnx("gen set beyond 32-bit range of field (%lx)\n", gen);
 	return(1);
@@ -734,7 +734,7 @@ CMDFUNCSTART(linkcount)
 	return 1;
 
     lcnt = strtol(argv[1], &cp, 0);
-    if (cp == argv[1] || *cp != '\0' ) { 
+    if (cp == argv[1] || *cp != '\0' ) {
 	warnx("bad link count `%s'", argv[1]);
 	return 1;
     }
@@ -742,7 +742,7 @@ CMDFUNCSTART(linkcount)
 	warnx("max link count is %d\n", USHRT_MAX);
 	return 1;
     }
-    
+
     curinode->di_nlink = lcnt;
     inodirty();
     printactive(0);
@@ -760,7 +760,7 @@ CMDFUNCSTART(chowner)
 	return 1;
 
     uid = strtoul(argv[1], &cp, 0);
-    if (cp == argv[1] || *cp != '\0' ) { 
+    if (cp == argv[1] || *cp != '\0' ) {
 	/* try looking up name */
 	if ((pwd = getpwnam(argv[1]))) {
 	    uid = pwd->pw_uid;
@@ -769,7 +769,7 @@ CMDFUNCSTART(chowner)
 	    return 1;
 	}
     }
-    
+
     curinode->di_uid = uid;
     inodirty();
     printactive(0);
@@ -787,7 +787,7 @@ CMDFUNCSTART(chgroup)
 	return 1;
 
     gid = strtoul(argv[1], &cp, 0);
-    if (cp == argv[1] || *cp != '\0' ) { 
+    if (cp == argv[1] || *cp != '\0' ) {
 	if ((grp = getgrnam(argv[1]))) {
 	    gid = grp->gr_gid;
 	} else {
@@ -795,7 +795,7 @@ CMDFUNCSTART(chgroup)
 	    return 1;
 	}
     }
-    
+
     curinode->di_gid = gid;
     inodirty();
     printactive(0);
@@ -828,7 +828,7 @@ badformat:
     for (p = name; *p; p++)
 	if (*p < '0' || *p > '9')
 	    goto badformat;
-    
+
     p = name;
 #define VAL() ((*p++) - '0')
     t.tm_year = VAL();

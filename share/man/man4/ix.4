@@ -1,6 +1,6 @@
 .\" Copyright (c) 2001-2008, Intel Corporation
 .\" All rights reserved.
-.\" 
+.\"
 .\" Redistribution and use in source and binary forms, with or without
 .\" modification, are permitted provided that the following conditions are met:
 .\"
@@ -31,7 +31,7 @@
 .\"
 .\" $FreeBSD: src/share/man/man4/ixgbe.4,v 1.2 2008/06/17 21:14:02 brueffer Exp $
 .\"
-.Dd May 11, 2014
+.Dd December 17, 2017
 .Dt IX 4
 .Os
 .Sh NAME
@@ -111,6 +111,30 @@ due to the number of MSI-X vectors is 64,
 at most 16 reception queues and 32 transmission queues will be enabled
 under MSI-X mode.
 .Pp
+The
+.Nm
+driver supports the following media types:
+.Bl -tag -width ".Cm autoselect"
+.It Cm autoselect
+Enables auto-negotiation for speed and duplex.
+.El
+.Pp
+The
+.Nm
+driver supports the following media options:
+.Bl -tag -width ".Cm forcepause"
+.It Cm rxpause
+Enable flow control PAUSE reception.
+.It Cm txpause
+Enable flow control PAUSE transmission.
+.It Cm forcepause
+Force flow control PAUSE operation as configured by
+.Cm rxpause
+and
+.Cm txpause
+media options.
+.El
+.Pp
 For more information on configuring this device, see
 .Xr ifconfig 8 .
 The
@@ -129,140 +153,126 @@ controller chips:
 .Pp
 .Bl -bullet -compact
 .It
-Intel 10 Gigabit AF DA Dual Port Server Adapter
-.It
 Intel 10 Gigabit AT Server Adapter
 .It
-Intel 10 Gigabit AT2 Server Adapter
+Intel 82598EB 10 Gigabit Ethernet Controller
 .It
-Intel 10 Gigabit CX4 Dual Port Server Adapter
+Intel 82599EB 10 Gigabit Ethernet Controller
 .It
-Intel 10 Gigabit XF LR Server Adapter
+Intel 82599EN 10 Gigabit Ethernet Controller
 .It
-Intel 10 Gigabit XF SR Dual Port Server Adapter
-.It
-Intel 10 Gigabit XF SR Server Adapter
-.It
-Intel 82598 10 Gigabit Ethernet Controller
-.It
-Intel 82599 10 Gigabit Ethernet Controller
+Intel 82599ES 10 Gigabit Ethernet Controller
 .It
 Intel Ethernet Controller X540-AT2
 .It
-Intel Ethernet Converged Network Adapter X520 Series
+Intel Ethernet Controller X550-AT
+.It
+Intel Ethernet Controller X550-AT2
+.It
+Intel Ethernet Controller X550-BT2
+.It
+Intel Ethernet Connection X557-AT
+.It
+Intel Ethernet Connection X557-AT2
+.It
+Intel Ethernet Connection X557-AT4
+.It
+Intel Ethernet Controller X710-AM2
+.It
+Intel Ethernet Converged Network Adapter X520-DA1
+.It
+Intel Ethernet Converged Network Adapter X520-DA2
+.It
+Intel Ethernet Converged Network Adapter X520-LR1
+.It
+Intel Ethernet Converged Network Adapter X520-QDA1
+.It
+Intel Ethernet Converged Network Adapter X520-SR1
+.It
+Intel Ethernet Converged Network Adapter X520-SR2
 .It
 Intel Ethernet Converged Network Adapter X540-T1
 .It
 Intel Ethernet Converged Network Adapter X540-T2
 .It
-Intel Ethernet Server Adapter X520 Series
+Intel Ethernet Converged Network Adapter X550-T1
 .It
-Intel Ethernet Server Adapter X520-DA2
+Intel Ethernet Converged Network Adapter X550-T2
 .It
-Intel Ethernet Server Adapter X520-LR1
+Intel Ethernet Converged Network Adapter X710-DA2
 .It
-Intel Ethernet Server Adapter X520-SR1
-.It
-Intel Ethernet Server Adapter X520-SR2
-.It
-Intel Ethernet Server Adapter X520-T2
+Intel Ethernet Converged Network Adapter X710-DA4
 .El
 .Sh TUNABLES
 Tunables can be set at the
 .Xr loader 8
 prompt before booting the kernel or stored in
 .Xr loader.conf 5 .
-.Em X
+.Em Y
 is the device unit number.
-.Bl -tag -width ".Va hw.ixX.unsupported_sfp"
-.It Va hw.ix.rxd Va hw.ixX.rxd
+.Bl -tag -width ".Va hw.ixY.unsupported_sfp"
+.It Va hw.ix.rxd Va hw.ixY.rxd
 Number of receive descriptors allocated by the driver.
 The default value is 2048.
 The minimum is 64,
 and the maximum is 4096.
-.It Va hw.ix.txd Va hw.ixX.txd
+.It Va hw.ix.txd Va hw.ixY.txd
 Number of transmit descriptors allocated by the driver.
 The default value is 2048.
 The minimum is 64,
 and the maximum is 4096.
-.It Va hw.ix.rxr Va hw.ixX.rxr
+.It Va hw.ix.rxr Va hw.ixY.rxr
 This tunable specifies the number of reception queues could be enabled.
 Maximum allowed value for these tunables is device specific
 and it must be power of 2 aligned.
 Setting these tunables to 0 allows the driver to make
 as many reception queues ready-for-use as allowed by the number of CPUs.
-.It Va hw.ix.txr Va hw.ixX.txr
+.It Va hw.ix.txr Va hw.ixY.txr
 This tunable specifies the number of transmission queues could be enabled.
 Maximum allowed value for these tunables is device specific
 and it must be power of 2 aligned.
 Setting these tunables to 0 allows the driver to make
 as many transmission queues ready-for-use as allowed by the number of CPUs.
-.It Va hw.ix.msix.enable Va hw.ixX.msix.enable
+.It Va hw.ix.msix.enable Va hw.ixY.msix.enable
 By default,
 the driver will use MSI-X if it is supported.
 This behaviour can be turned off by setting this tunable to 0.
-.It Va hw.ix.msix.agg_rxtx Va hw.ixX.msix.agg_rxtx
-If MSI-X is used,
-the driver aggregates transmission queue and reception queue processing
-by default.
-This behaviour could be turned off by setting this tunable to 0.
-If the number of MSI-X vectors is not enough to
-put transmission queue processing and reception queue processing
-onto independent MSI-X vector,
-then transmission queue and reception queue processing are always
-aggregated.
-.It Va hw.ixX.msix.off
-If MSI-X is used,
-and transmission queue and reception queue processing are aggregated,
-this tunable specifies the leading target CPU for
-transmission and reception queues processing.
-The value specificed must be aligned to the maximum of
-the number of reception queues
-and the number of transmission queues enabled,
-and must be less than the power of 2 number of CPUs.
-.It Va hw.ixX.msix.rxoff
-If MSI-X is used,
-and transmission queue and reception queue processing are not aggregated,
-this tunable specifies the leading target CPU for reception queues processing.
-The value specificed must be aligned to the number of reception queues enabled
-and must be less than the power of 2 number of CPUs.
-.It Va hw.ixX.msix.txoff
-If MSI-X is used,
-and transmission queue and reception queue processing are not aggregated,
-this tunable specifies the leading target CPU
-for transmission queues processing.
-The value specificed must be aligned to
-the number of transmission queues enabled
-and must be less than the power of 2 number of CPUs.
-.It Va hw.ix.msi.enable Va hw.ixX.msi.enable
+.It Va hw.ix.msi.enable Va hw.ixY.msi.enable
 If MSI-X is disabled and MSI is supported,
 the driver will use MSI.
 This behavior can be turned off by setting this tunable to 0.
-.It Va hw.ixX.msi.cpu
+.It Va hw.ixY.msi.cpu
 If MSI is used,
 it specifies the MSI's target CPU.
-.It Va hw.ixX.npoll.txoff
-This tunable specifies the leading target CPU for
-transmission queue
-.Xr polling 4
-processing.
-The value specificed must be aligned to the number of transmission queues
-enabled and must be less than the power of 2 number of CPUs.
-.It Va hw.ixX.npoll.rxoff
-This tunable specifies the leading target CPU for
-reception queue
-.Xr polling 4
-processing.
-The value specificed must be aligned to the number of reception queues
-enabled and must be less than the power of 2 number of CPUs.
 .It Va hw.ix.unsupported_sfp
 By default,
 this driver does not allow "unsupported" SFP modules.
 This behavior can be changed by setting this tunable to 1.
+.It Va hw.ix.flow_ctrl Va hw.ixY.flow_ctrl
+The default flow control settings.
+Supported values are:
+rxpause (only enable PAUSE reception),
+txpause (only enable PAUSE transmission),
+full (enable PAUSE reception and transmission),
+none (disable flow control PAUSE operation),
+force-rxpause (force PAUSE reception),
+force-txpause (force PAUSE transmission),
+force-full (forcefully enable PAUSE reception and transmission),
+force-none (forcefully disable flow control PAUSE operation).
+Default is none.
+.It Va hw.ix.direct_input
+By default,
+if the
+.Xr polling 4
+is enabled,
+the driver will handle input packets directly,
+instead of queuing input packets for further processing.
+The direct input packets handling improves performance and
+stablize latency.
 .El
 .Sh MIB Variables
 A number of per-interface variables are implemented in the
-.Va hw.ix Ns Em X
+.Va dev.ix. Ns Em Y
 branch of the
 .Xr sysctl 3
 MIB.
@@ -272,7 +282,7 @@ Number of reception queues could be enabled (read-only).
 Use the tunable
 .Va hw.ix.rxr
 or
-.Va hw.ixX.rxr
+.Va hw.ixY.rxr
 to configure it.
 .It Va rxr_inuse
 Number of reception queues being used (read-only).
@@ -281,7 +291,7 @@ Number of transmission queues could be enabled (read-only).
 Use the tunable
 .Va hw.ix.txr
 or
-.Va hw.ixX.txr
+.Va hw.ixY.txr
 to configure it.
 .It Va txr_inuse
 Number of transmission queues being used (read-only).
@@ -290,14 +300,14 @@ Number of descriptors per reception queue (read-only).
 Use the tunable
 .Va hw.ix.rxd
 or
-.Va hw.ixX.rxd
+.Va hw.ixY.rxd
 to configure it.
 .It Va txd
 Number of descriptors per transmission queue (read-only).
 Use the tunable
 .Va hw.ix.txd
 or
-.Va hw.ixX.txd
+.Va hw.ixY.txd
 to configure it.
 .It Va rxtx_intr_rate
 If MSI or legacy interrupt is used,
@@ -346,26 +356,11 @@ Setting this value too high will make device drop incoming packets.
 Setting this value too low will hurt overall reception performance
 due to the frequent hardware register writing.
 The default value is 32.
-.It Va npoll_rxoff
-See the tunable
-.Va hw.ixX.npoll.rxoff .
-The set value will take effect the next time
+.It Va direct_input
+See
+.Va hw.ix.direct_input .
 .Xr polling 4
-is enabled on the device.
-.It Va npoll_txoff
-See the tunable
-.Va hw.ixX.npoll.txoff .
-The set value will take effect the next time
-.Xr polling 4
-is enabled on the device.
-.It Va flowctrl
-Flow control setting.
-Set it to 0 to turn off flow control.
-Set it to 1 to enable only the reception of pause frames.
-Set it to 2 to enable only the generation of pause frames.
-Set it to 3 to enable both the reception of pause frames
-and generation of pause frames,
-i.e. full flow control.
+needs to be turned off and turned on again to make this variable take effect.
 .El
 .Sh SEE ALSO
 .Xr altq 4 ,

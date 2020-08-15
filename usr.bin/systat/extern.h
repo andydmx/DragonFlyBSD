@@ -10,11 +10,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -38,7 +34,6 @@
 
 extern struct	cmdtab *curcmd;
 extern struct	cmdtab cmdtab[];
-extern struct	text *xtext;
 extern WINDOW	*wnd;
 extern char	c, *namp, hostname[];
 extern double	avenrun[3];
@@ -62,6 +57,8 @@ extern int			num_devices;
 extern int			num_selected;
 extern int			num_selections;
 extern long			select_generation;
+extern struct statinfo		cur, last;
+extern struct kinfo_cputime	old_cp_time;
 
 int	 checkhost(struct inpcb *);
 int	 checkport(struct inpcb *);
@@ -89,9 +86,10 @@ int	 cmdkre(const char *, char *);
 int	 cmdnetstat(const char *, char *);
 int	 cmdnetbw(const char *, char *);
 int	 cmdpftop(const char *, char *);
+int	 cmdsensors(const char *, char *);
 struct	 cmdtab *lookup(const char *);
 void	 command(const char *);
-void	 die(int);
+void	 die(int) __dead2;
 void	 display(int);
 int	 dkinit(void);
 int	 dkcmd(char *, char *);
@@ -131,7 +129,7 @@ int	 initsensors(void);
 int	 initswap(void);
 int	 inittcp(void);
 int	 initvmm(void);
-int	 keyboard(void);
+int	 keyboard(void) __dead2;
 int	 kvm_ckread(void *, void *, int);
 void	 labelicmp(void);
 void	 labelicmp6(void);
@@ -153,7 +151,7 @@ void	 labeltcp(void);
 void	 labelvmm(void);
 void	 load(void);
 int	 netcmd(const char *, char *);
-void	 nlisterr(struct nlist []);
+void	 nlisterr(struct nlist []) __dead2;
 WINDOW	*openicmp(void);
 WINDOW	*openicmp6(void);
 WINDOW  *openifstat(void);

@@ -21,7 +21,6 @@
  * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
  * DEALINGS IN THE SOFTWARE.
  *
- * $FreeBSD: head/sys/dev/drm2/radeon/r600_blit_shaders.h 254885 2013-08-25 19:37:15Z dumbbell $
  */
 
 #ifndef R600_BLIT_SHADERS_H
@@ -36,5 +35,4 @@ extern const u32 r6xx_default_state[];
 extern const u32 r6xx_ps_size, r6xx_vs_size;
 extern const u32 r6xx_default_size, r7xx_default_size;
 
-__pure uint32_t int2float(uint32_t x);
 #endif

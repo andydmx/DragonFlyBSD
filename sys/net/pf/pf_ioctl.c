@@ -88,7 +88,6 @@
 
 #include <machine/limits.h>
 #include <net/pfil.h>
-#include <sys/mutex.h>
 
 u_int rt_numfibs = RT_NUMFIBS;
 
@@ -144,6 +143,8 @@ static MALLOC_DEFINE(M_PFRULEPL, "pfrulepl", "pf rule pool list");
 static MALLOC_DEFINE(M_PFALTQPL, "pfaltqpl", "pf altq pool list");
 static MALLOC_DEFINE(M_PFPOOLADDRPL, "pfpooladdrpl", "pf pool address pool list");
 static MALLOC_DEFINE(M_PFFRENTPL, "pffrent", "pf frent pool list");
+
+MALLOC_DEFINE(M_PF, 	  "pf", "pf general");
 
 
 /*
@@ -210,6 +211,25 @@ pfattach(void)
 	kmalloc_raise_limit(pf_frent_pl, 0);
 	kmalloc_create(&pf_cent_pl, "pf cent pool list");
 	kmalloc_raise_limit(pf_cent_pl, 0);
+
+	/*
+	 * Allocate pcpu array.
+	 *
+	 * NOTE: The state table also has a global element which we index
+	 *	 at [ncpus], so it needs one extra slot.
+	 */
+	tree_src_tracking = kmalloc(sizeof(*tree_src_tracking) * ncpus,
+				M_PF, M_WAITOK | M_ZERO);
+	tree_id = kmalloc(sizeof(*tree_id) * ncpus,
+				M_PF, M_WAITOK | M_ZERO);
+	state_list = kmalloc(sizeof(*state_list) * ncpus,
+				M_PF, M_WAITOK | M_ZERO);
+	pf_counters = kmalloc(sizeof(*pf_counters) * ncpus,
+				M_PF, M_WAITOK | M_ZERO);
+	pf_statetbl = kmalloc(sizeof(*pf_statetbl) * (ncpus + 1),
+				M_PF, M_WAITOK | M_ZERO);
+	purge_cur = kmalloc(sizeof(*purge_cur) * ncpus,
+				M_PF, M_WAITOK | M_ZERO);
 	
 	pfr_initialize();
 	pfi_initialize();
@@ -260,8 +280,8 @@ pfattach(void)
 	my_timeout[PFTM_OTHER_MULTIPLE] = 60;		/* Bidirectional */
 	my_timeout[PFTM_FRAG] = 30;			/* Fragment expire */
 	my_timeout[PFTM_INTERVAL] = 10;			/* Expire interval */
-	my_timeout[PFTM_SRC_NODE] = 0;		/* Source Tracking */
-	my_timeout[PFTM_TS_DIFF] = 30;		/* Allowed TS diff */
+	my_timeout[PFTM_SRC_NODE] = 0;			/* Source Tracking */
+	my_timeout[PFTM_TS_DIFF] = 30;			/* Allowed TS diff */
 	my_timeout[PFTM_ADAPTIVE_START] = PFSTATE_ADAPT_START;
 	my_timeout[PFTM_ADAPTIVE_END] = PFSTATE_ADAPT_END;
 	
@@ -660,8 +680,12 @@ pf_enable_altq(struct pf_altq *altq)
 	struct tb_profile	 tb;
 	int			 error = 0;
 
-	if ((ifp = ifunit(altq->ifname)) == NULL)
+	ifnet_lock();
+
+	if ((ifp = ifunit(altq->ifname)) == NULL) {
+		ifnet_unlock();
 		return (EINVAL);
+	}
 
 	if (ifp->if_snd.altq_type != ALTQT_NONE)
 		error = altq_enable(&ifp->if_snd);
@@ -675,6 +699,7 @@ pf_enable_altq(struct pf_altq *altq)
 		crit_exit();
 	}
 
+	ifnet_unlock();
 	return (error);
 }
 
@@ -685,15 +710,21 @@ pf_disable_altq(struct pf_altq *altq)
 	struct tb_profile	 tb;
 	int			 error;
 
-	if ((ifp = ifunit(altq->ifname)) == NULL)
+	ifnet_lock();
+
+	if ((ifp = ifunit(altq->ifname)) == NULL) {
+		ifnet_unlock();
 		return (EINVAL);
+	}
 
 	/*
 	 * when the discipline is no longer referenced, it was overridden
 	 * by a new one.  if so, just return.
 	 */
-	if (altq->altq_disc != ifp->if_snd.altq_disc)
+	if (altq->altq_disc != ifp->if_snd.altq_disc) {
+		ifnet_unlock();
 		return (0);
+	}
 
 	error = altq_disable(&ifp->if_snd);
 
@@ -705,6 +736,7 @@ pf_disable_altq(struct pf_altq *altq)
 		crit_exit();
 	}
 
+	ifnet_unlock();
 	return (error);
 }
 #endif /* ALTQ */
@@ -1736,8 +1768,27 @@ pfioctl(struct dev_ioctl_args *ap)
 	}
 
 	case DIOCGETSTATUS: {
+		/*
+		 * Retrieve pf_status, merge pcpu counters into pf_status
+		 * for user consumption.
+		 */
 		struct pf_status *s = (struct pf_status *)addr;
+		struct pf_counters *pfc;
+		int n;
+		int i;
+
 		bcopy(&pf_status, s, sizeof(struct pf_status));
+		for (n = 0; n < ncpus; ++n) {
+			pfc = &pf_counters[n];
+			for (i = 0; i < PFRES_MAX; ++i)
+				s->counters[i] += pfc->counters[i];
+			for (i = 0; i < LCNT_MAX; ++i)
+				s->lcounters[i] += pfc->lcounters[i];
+			for (i = 0; i < FCNT_MAX; ++i)
+				s->fcounters[i] += pfc->fcounters[i];
+			for (i = 0; i < SCNT_MAX; ++i)
+				s->scounters[i] += pfc->scounters[i];
+		}
 		pfi_update_status(s->ifname, s);
 		break;
 	}
@@ -1754,9 +1805,17 @@ pfioctl(struct dev_ioctl_args *ap)
 	}
 
 	case DIOCCLRSTATUS: {
+		int i;
+
 		bzero(pf_status.counters, sizeof(pf_status.counters));
 		bzero(pf_status.fcounters, sizeof(pf_status.fcounters));
 		bzero(pf_status.scounters, sizeof(pf_status.scounters));
+		for (i = 0; i < ncpus; ++i) {
+			bzero(pf_counters[i].counters, sizeof(pf_counters[0].counters));
+			bzero(pf_counters[i].fcounters, sizeof(pf_counters[0].fcounters));
+			bzero(pf_counters[i].scounters, sizeof(pf_counters[0].scounters));
+		}
+
 		pf_status.since = time_second;
 		if (*pf_status.ifname)
 			pfi_update_status(pf_status.ifname, NULL);
@@ -1904,11 +1963,13 @@ pfioctl(struct dev_ioctl_args *ap)
 		if (psp->ifname[0] != 0) {
 			/* Can we completely trust user-land? */
 			strlcpy(ps.ifname, psp->ifname, IFNAMSIZ);
+			ifnet_lock();
 			ifp = ifunit(ps.ifname);
 			if (ifp )
 				psp->baudrate = ifp->if_baudrate;
 			else
 				error = EINVAL;
+			ifnet_unlock();
 		} else
 			error = EINVAL;
 		break;
@@ -2997,7 +3058,6 @@ static void
 pf_clear_states(void)
 {
 	struct pf_state		*s, *nexts;
-	u_int			killed = 0;
 	globaldata_t save_gd = mycpu;
 	int nn;
 
@@ -3009,9 +3069,8 @@ pf_clear_states(void)
 			/* don't send out individual delete messages */
 			s->sync_flags = PFSTATE_NOSYNC;
 			pf_unlink_state(s);
-			killed++;
 		}
-                        
+
 	}
 	lwkt_setcpu_self(save_gd);
 
@@ -3130,8 +3189,9 @@ shutdown_pf(void)
 
 		/* status does not use malloced mem so no need to cleanup */
 		/* fingerprints and interfaces have their own cleanup code */
-	} while(0);
-        return (error);
+	} while (0);
+
+	return (error);
 }
 
 static int
@@ -3246,8 +3306,8 @@ hook_pf(void)
 		lwkt_reltoken(&pf_token);
 		return (ENODEV);
 	}
-	pfil_add_hook(pf_check_in, NULL, PFIL_IN | PFIL_MPSAFE, pfh_inet);
-	pfil_add_hook(pf_check_out, NULL, PFIL_OUT | PFIL_MPSAFE, pfh_inet);
+	pfil_add_hook(pf_check_in, NULL, PFIL_IN, pfh_inet);
+	pfil_add_hook(pf_check_out, NULL, PFIL_OUT, pfh_inet);
 #ifdef INET6
 	pfh_inet6 = pfil_head_get(PFIL_TYPE_AF, AF_INET6);
 	if (pfh_inet6 == NULL) {
@@ -3256,8 +3316,8 @@ hook_pf(void)
 		lwkt_reltoken(&pf_token);
 		return (ENODEV);
 	}
-	pfil_add_hook(pf_check6_in, NULL, PFIL_IN | PFIL_MPSAFE, pfh_inet6);
-	pfil_add_hook(pf_check6_out, NULL, PFIL_OUT | PFIL_MPSAFE, pfh_inet6);
+	pfil_add_hook(pf_check6_in, NULL, PFIL_IN, pfh_inet6);
+	pfil_add_hook(pf_check6_out, NULL, PFIL_OUT, pfh_inet6);
 #endif
 
 	pf_pfil_hooked = 1;
@@ -3307,7 +3367,7 @@ pf_load(void)
 {
 	lwkt_gettoken(&pf_token);
 
-	pf_dev = make_dev(&pf_ops, 0, 0, 0, 0600, PF_NAME);
+	pf_dev = make_dev(&pf_ops, 0, UID_ROOT, GID_WHEEL, 0600, PF_NAME);
 	pfattach();
 	lockinit(&pf_consistency_lock, "pfconslck", 0, LK_CANRECURSE);
 	lockinit(&pf_global_statetbl_lock, "pfglstlk", 0, 0);
@@ -3344,11 +3404,12 @@ pf_unload(void)
 		lwkt_reltoken(&pf_token);
 		return error;
 	}
-	shutdown_pf();
+	kprintf("PF shutdown\n");
 	pf_end_threads = 1;
+	shutdown_pf();
 	while (pf_end_threads < 2) {
 		wakeup_one(pf_purge_thread);
-		tsleep(pf_purge_thread, 0, "pftmo", hz);
+		tsleep(pf_purge_thread, 0, "pftmo", hz / 10);
 	}
 	pfi_cleanup();
 	pf_osfp_flush();
@@ -3356,6 +3417,7 @@ pf_unload(void)
 	lockuninit(&pf_consistency_lock);
 	lwkt_reltoken(&pf_token);
 
+	pf_normalize_unload();
 	if (pf_maskhead != NULL) {
 		pf_maskhead->rnh_walktree(pf_maskhead,
 			pf_mask_del, pf_maskhead);
@@ -3365,11 +3427,19 @@ pf_unload(void)
 	kmalloc_destroy(&pf_state_pl);
 	kmalloc_destroy(&pf_frent_pl);
 	kmalloc_destroy(&pf_cent_pl);
+
+	kfree(tree_src_tracking, M_PF);
+	kfree(tree_id, M_PF);
+	kfree(state_list, M_PF);
+	kfree(pf_counters, M_PF);
+	kfree(pf_statetbl, M_PF);
+	kfree(purge_cur, M_PF);
+
 	return 0;
 }
 
 static int
-pf_modevent(module_t mod, int type, void *data)
+pf_modevent(module_t mod, int type, void *data __unused)
 {
 	int error = 0;
 
@@ -3396,5 +3466,6 @@ static moduledata_t pf_mod = {
 	pf_modevent,
 	0
 };
+
 DECLARE_MODULE(pf, pf_mod, SI_SUB_PSEUDO, SI_ORDER_FIRST);
 MODULE_VERSION(pf, PF_MODVER);

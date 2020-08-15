@@ -248,6 +248,8 @@ acpi_video_attach(device_t dev)
 	acpi_sc = devclass_get_softc(devclass_find("acpi"), 0);
 	if (acpi_sc == NULL)
 		return (ENXIO);
+	ACPI_SERIAL_INIT(video);
+	ACPI_SERIAL_INIT(video_output);
 	ACPI_SERIAL_BEGIN(video);
 	if (acpi_video_sysctl_tree == NULL) {
 		acpi_video_sysctl_tree = SYSCTL_ADD_NODE(&acpi_video_sysctl_ctx,
@@ -394,8 +396,7 @@ acpi_video_notify_handler(ACPI_HANDLE handle, UINT32 notify, void *context)
 		ACPI_SERIAL_END(video);
 		break;
 	default:
-		device_printf(sc->device, "unknown notify event 0x%x\n",
-		    notify);
+		device_printf(sc->device, "unknown notify: %#x\n", notify);
 	}
 }
 
@@ -631,7 +632,11 @@ acpi_video_vo_destroy(struct acpi_video_output *vo)
 
 	switch (vo->adr & DOD_DEVID_MASK) {
 	case DOD_DEVID_MONITOR:
-		voqh = &crt_units;
+		if ((vo->adr & DOD_DEVID_MASK_FULL) == DOD_DEVID_LCD) {
+			voqh = &lcd_units;
+		} else {
+			voqh = &crt_units;
+		}
 		break;
 	case DOD_DEVID_TV:
 		voqh = &tv_units;
@@ -689,8 +694,8 @@ acpi_video_vo_notify_handler(ACPI_HANDLE handle, UINT32 notify, void *context)
 			goto out;
 		break;
 	default:
-		kprintf("unknown notify event 0x%x from %s\n",
-		    notify, acpi_name(handle));
+		kprintf("unknown notify: %#x from %s\n", notify,
+		    acpi_name(handle));
 		goto out;
 	}
 

@@ -78,8 +78,15 @@ ZLIB_1.2.8 {
     zlibVersion;
 };
 
-DF306.0 {
-    zopen;
+ZLIB_1.2.11 {
+    adler32_z;
+    crc32_z;
+    deflateGetDictionary;
+    gzfread;
+    gzfwrite;
+    inflateCodesUsed;
+    inflateValidate;
+    uncompress2;
 };
 
 ZLIBprivate_1.0 {

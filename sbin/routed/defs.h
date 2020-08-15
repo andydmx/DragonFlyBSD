@@ -10,11 +10,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgment:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -33,12 +29,7 @@
  *	@(#)defs.h	8.1 (Berkeley) 6/5/93
  *
  * $FreeBSD: src/sbin/routed/defs.h,v 1.13 1999/09/05 17:49:11 peter Exp $
- * $DragonFly: src/sbin/routed/defs.h,v 1.2 2003/06/17 04:27:34 dillon Exp $
  */
-
-#ifdef  sgi
-#ident "$FreeBSD: src/sbin/routed/defs.h,v 1.13 1999/09/05 17:49:11 peter Exp $"
-#endif
 
 /* Definitions for RIPv2 routing process.
  *
@@ -71,10 +62,6 @@
 #include <unistd.h>
 #include <errno.h>
 #include <string.h>
-#ifdef sgi
-#include <strings.h>
-#include <bstring.h>
-#endif
 #include <stdarg.h>
 #include <syslog.h>
 #include <time.h>
@@ -85,14 +72,7 @@
 #include <sys/ioctl.h>
 #include <sys/sysctl.h>
 #include <sys/socket.h>
-#ifdef sgi
-#define _USER_ROUTE_TREE
-#include <net/radix.h>
-#else
 #include "radix.h"
-#define UNUSED __attribute__((unused))
-#define PATTRIB(f,l) __attribute__((format (printf,f,l)))
-#endif
 #include <net/if.h>
 #include <net/route.h>
 #include <net/if_dl.h>
@@ -100,6 +80,7 @@
 #include <arpa/inet.h>
 #define RIPVERSION RIPv2
 #include <protocols/routed.h>
+#include <openssl/md5.h>
 
 
 /* Type of an IP address.
@@ -108,9 +89,7 @@
  * So define it here so it can be changed for the target system.
  * It should be defined somewhere netinet/in.h, but it is not.
  */
-#ifdef sgi
-#define naddr u_int32_t
-#elif defined (__NetBSD__)
+#if defined (__NetBSD__)
 #define naddr u_int32_t
 #define _HAVE_SA_LEN
 #define _HAVE_SIN_LEN
@@ -149,9 +128,7 @@
 
 
 /* Router Discovery parameters */
-#ifndef sgi
 #define INADDR_ALLROUTERS_GROUP		0xe0000002  /* 224.0.0.2 */
-#endif
 #define	MaxMaxAdvertiseInterval		1800
 #define	MinMaxAdvertiseInterval		4
 #define	DefMaxAdvertiseInterval		600
@@ -297,9 +274,6 @@ struct interface {
 		u_int	ierrors;
 		u_int	opackets;
 		u_int	oerrors;
-#ifdef sgi
-		u_int	odrops;
-#endif
 		time_t	ts;		/* timestamp on network stats */
 	} int_data;
 #	define MAX_AUTH_KEYS 5
@@ -505,11 +479,6 @@ extern char inittracename[MAXPATHLEN+1];
 extern struct radix_node_head *rhead;
 
 
-#ifdef sgi
-/* Fix conflicts */
-#define	dup2(x,y)		BSDdup2(x,y)
-#endif /* sgi */
-
 extern void fix_sock(int, const char *);
 extern void fix_select(void);
 extern void rip_off(void);
@@ -524,7 +493,7 @@ extern void rip_bcast(int);
 extern void supply(struct sockaddr_in *, struct interface *,
 		   enum output_type, int, int, int);
 
-extern void	msglog(const char *, ...) PATTRIB(1,2);
+extern void	msglog(const char *, ...) __printflike(1, 2);
 struct msg_limit {
     time_t	reuse;
     struct msg_sub {
@@ -534,9 +503,9 @@ struct msg_limit {
     } subs[MSG_SUBJECT_N];
 };
 extern void	msglim(struct msg_limit *, naddr,
-		       const char *, ...) PATTRIB(3,4);
+		       const char *, ...) __printflike(3, 4);
 #define	LOGERR(msg) msglog(msg ": %s", strerror(errno))
-extern void	logbad(int, const char *, ...) PATTRIB(2,3);
+extern void	logbad(int, const char *, ...) __dead2 __printflike(2, 3);
 #define	BADERR(dump,msg) logbad(dump,msg ": %s", strerror(errno))
 #ifdef DEBUG
 #define	DBGERR(dump,msg) BADERR(dump,msg)
@@ -560,12 +529,12 @@ extern void	lastlog(void);
 extern void	trace_close(int);
 extern void	set_tracefile(const char *, const char *, int);
 extern void	tracelevel_msg(const char *, int);
-extern void	trace_off(const char*, ...) PATTRIB(1,2);
+extern void	trace_off(const char*, ...) __printflike(1, 2);
 extern void	set_tracelevel(void);
 extern void	trace_flush(void);
-extern void	trace_misc(const char *, ...) PATTRIB(1,2);
-extern void	trace_act(const char *, ...) PATTRIB(1,2);
-extern void	trace_pkt(const char *, ...) PATTRIB(1,2);
+extern void	trace_misc(const char *, ...) __printflike(1, 2);
+extern void	trace_act(const char *, ...) __printflike(1, 2);
+extern void	trace_pkt(const char *, ...) __printflike(1, 2);
 extern void	trace_add_del(const char *, struct rt_entry *);
 extern void	trace_change(struct rt_entry *, u_int, struct rt_spare *,
 			     const char *);
@@ -645,13 +614,3 @@ extern struct interface *iflookup(naddr);
 
 extern struct auth *find_auth(struct interface *);
 extern void end_md5_auth(struct ws_buf *, struct auth *);
-
-#define MD5_DIGEST_LEN 16
-typedef struct {
-	u_int32_t state[4];		/* state (ABCD) */
-	u_int32_t count[2];		/* # of bits, modulo 2^64 (LSB 1st) */
-	unsigned char buffer[64];	/* input buffer */
-} MD5_CTX;
-extern void MD5Init(MD5_CTX*);
-extern void MD5Update(MD5_CTX*, u_char*, u_int);
-extern void MD5Final(u_char[MD5_DIGEST_LEN], MD5_CTX*);

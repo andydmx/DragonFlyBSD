@@ -25,14 +25,30 @@
 .\" OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
 .\" SUCH DAMAGE.
 .\"
-.\" $FreeBSD: src/share/man/man9/sysctl_add_oid.9,v 1.21 2006/04/28 10:45:27 rwatson Exp $
 .\"
-.Dd June 22, 2006
+.Dd December 2, 2019
 .Dt SYSCTL_ADD_OID 9
 .Os
 .Sh NAME
 .Nm sysctl_add_oid ,
-.Nm sysctl_remove_oid
+.Nm sysctl_remove_oid ,
+.Nm SYSCTL_CHILDREN ,
+.Nm SYSCTL_STATIC_CHILDREN ,
+.Nm SYSCTL_ADD_OID ,
+.Nm SYSCTL_ADD_NODE ,
+.Nm SYSCTL_ADD_STRING ,
+.Nm SYSCTL_ADD_BIT32 ,
+.Nm SYSCTL_ADD_BIT64 ,
+.Nm SYSCTL_ADD_INT ,
+.Nm SYSCTL_ADD_U32 ,
+.Nm SYSCTL_ADD_UINT ,
+.Nm SYSCTL_ADD_LONG ,
+.Nm SYSCTL_ADD_ULONG ,
+.Nm SYSCTL_ADD_QUAD ,
+.Nm SYSCTL_ADD_UQUAD ,
+.Nm SYSCTL_ADD_OPAQUE ,
+.Nm SYSCTL_ADD_STRUCT ,
+.Nm SYSCTL_ADD_PROC
 .Nd runtime sysctl tree manipulation
 .Sh SYNOPSIS
 .In sys/sysctl.h
@@ -87,6 +103,50 @@
 .Fa "const char *descr"
 .Fc
 .Ft struct sysctl_oid *
+.Fo SYSCTL_ADD_S8
+.Fa "struct sysctl_ctx_list *ctx"
+.Fa "struct sysctl_oid_list *parent"
+.Fa "int number"
+.Fa "const char *name"
+.Fa "int access"
+.Fa "int8_t *arg"
+.Fa "int len"
+.Fa "const char *descr"
+.Fc
+.Ft struct sysctl_oid *
+.Fo SYSCTL_ADD_S16
+.Fa "struct sysctl_ctx_list *ctx"
+.Fa "struct sysctl_oid_list *parent"
+.Fa "int number"
+.Fa "const char *name"
+.Fa "int access"
+.Fa "int16_t *arg"
+.Fa "int len"
+.Fa "const char *descr"
+.Fc
+.Ft struct sysctl_oid *
+.Fo SYSCTL_ADD_S32
+.Fa "struct sysctl_ctx_list *ctx"
+.Fa "struct sysctl_oid_list *parent"
+.Fa "int number"
+.Fa "const char *name"
+.Fa "int access"
+.Fa "int32_t *arg"
+.Fa "int len"
+.Fa "const char *descr"
+.Fc
+.Ft struct sysctl_oid *
+.Fo SYSCTL_ADD_S64
+.Fa "struct sysctl_ctx_list *ctx"
+.Fa "struct sysctl_oid_list *parent"
+.Fa "int number"
+.Fa "const char *name"
+.Fa "int access"
+.Fa "int64_t *arg"
+.Fa "int len"
+.Fa "const char *descr"
+.Fc
+.Ft struct sysctl_oid *
 .Fo SYSCTL_ADD_STRING
 .Fa "struct sysctl_ctx_list *ctx"
 .Fa "struct sysctl_oid_list *parent"
@@ -95,6 +155,30 @@
 .Fa "int access"
 .Fa "char *arg"
 .Fa "int len"
+.Fa "const char *descr"
+.Fc
+.Ft struct sysctl_oid *
+.Fo SYSCTL_ADD_BIT32
+.Fa "struct sysctl_ctx_list *ctx"
+.Fa "struct sysctl_oid_list *parent"
+.Fa "int number"
+.Fa "const char *name"
+.Fa "int access"
+.Fa "uint32_t *arg"
+.Fa "uint32_t val"
+.Fa "int bit"
+.Fa "const char *descr"
+.Fc
+.Ft struct sysctl_oid *
+.Fo SYSCTL_ADD_BIT64
+.Fa "struct sysctl_ctx_list *ctx"
+.Fa "struct sysctl_oid_list *parent"
+.Fa "int number"
+.Fa "const char *name"
+.Fa "int access"
+.Fa "uint64_t *arg"
+.Fa "uint32_t val"
+.Fa "int bit"
 .Fa "const char *descr"
 .Fc
 .Ft struct sysctl_oid *
@@ -109,6 +193,49 @@
 .Fa "const char *descr"
 .Fc
 .Ft struct sysctl_oid *
+.Fo SYSCTL_ADD_U8
+.Fa "struct sysctl_ctx_list *ctx"
+.Fa "struct sysctl_oid_list *parent"
+.Fa "int number"
+.Fa "const char *name"
+.Fa "int access"
+.Fa "uint8_t *arg"
+.Fa "int len"
+.Fa "const char *descr"
+.Fc
+.Ft struct sysctl_oid *
+.Fo SYSCTL_ADD_U16
+.Fa "struct sysctl_ctx_list *ctx"
+.Fa "struct sysctl_oid_list *parent"
+.Fa "int number"
+.Fa "const char *name"
+.Fa "int access"
+.Fa "uint16_t *arg"
+.Fa "int len"
+.Fa "const char *descr"
+.Fc
+.Ft struct sysctl_oid *
+.Fo SYSCTL_ADD_U32
+.Fa "struct sysctl_ctx_list *ctx"
+.Fa "struct sysctl_oid_list *parent"
+.Fa "int number"
+.Fa "const char *name"
+.Fa "int access"
+.Fa "uint32_t *arg"
+.Fa "const char *descr"
+.Fc
+.Ft struct sysctl_oid *
+.Fo SYSCTL_ADD_U64
+.Fa "struct sysctl_ctx_list *ctx"
+.Fa "struct sysctl_oid_list *parent"
+.Fa "int number"
+.Fa "const char *name"
+.Fa "int access"
+.Fa "uint64_t *arg"
+.Fa "int len"
+.Fa "const char *descr"
+.Fc
+.Ft struct sysctl_oid *
 .Fo SYSCTL_ADD_UINT
 .Fa "struct sysctl_ctx_list *ctx"
 .Fa "struct sysctl_oid_list *parent"
@@ -116,7 +243,7 @@
 .Fa "const char *name"
 .Fa "int access"
 .Fa "unsigned int *arg"
-.Fa "int len"
+.Fa "int val"
 .Fa "const char *descr"
 .Fc
 .Ft struct sysctl_oid *
@@ -147,7 +274,7 @@
 .Fa "const char *name"
 .Fa "int access"
 .Fa "quad_t *arg"
-.Fa "int len"
+.Fa "int val"
 .Fa "const char *descr"
 .Fc
 .Ft struct sysctl_oid *
@@ -158,7 +285,7 @@
 .Fa "const char *name"
 .Fa "int access"
 .Fa "u_quad_t *arg"
-.Fa "int len"
+.Fa "int val"
 .Fa "const char *descr"
 .Fc
 .Ft struct sysctl_oid *
@@ -338,6 +465,8 @@ for
 .Dq IU
 for
 .Li "unsigned int" ,
+.Dq IK
+for temperature in tenths of kelvins,
 .Dq L
 for
 .Li "long" ,
@@ -420,11 +549,51 @@ function.
 creates an oid of type
 .Dv CTLTYPE_NODE ,
 to which child oids may be added.
+.It Fn SYSCTL_ADD_S8
+creates an oid that handles an
+.Li int8_t
+variable.
+.It Fn SYSCTL_ADD_S16
+creates an oid that handles an
+.Li int16_t
+variable.
+.It Fn SYSCTL_ADD_S32
+creates an oid that handles an
+.Li int16_t
+variable.
+.It Fn SYSCTL_ADD_S64
+creates an oid that handles an
+.Li int64_t
+variable.
 .It Fn SYSCTL_ADD_STRING
 creates an oid that handles a zero-terminated character string.
+.It Fn SYSCTL_ADD_BIT32
+creates an oid that can flip individual bits of an
+.Li uint32_t
+variable.
+.It Fn SYSCTL_ADD_BIT64
+creates an oid that can flip individual bits of an
+.Li uint64_t
+variable.
 .It Fn SYSCTL_ADD_INT
 creates an oid that handles an
 .Li int
+variable.
+.It Fn SYSCTL_ADD_U8
+creates an oid that handles a
+.Li uint8_t
+variable.
+.It Fn SYSCTL_ADD_U16
+creates an oid that handles a
+.Li uint16_t
+variable.
+.It Fn SYSCTL_ADD_U32
+creates an oid that handles a
+.Li uint32_t
+variable.
+.It Fn SYSCTL_ADD_U64
+creates an oid that handles a
+.Li uint64_t
 variable.
 .It Fn SYSCTL_ADD_UINT
 creates an oid that handles an

@@ -1,5 +1,14 @@
 ARCHIVE_3.1.2 {
 };
 
-ARCHIVEprivate_1.0 {
+ARCHIVE_3.2.0 {
 } ARCHIVE_3.1.2;
+
+ARCHIVE_3.3.3 {
+} ARCHIVE_3.2.0;
+
+ARCHIVE_3.4.3 {
+} ARCHIVE_3.3.3;
+
+ARCHIVEprivate_1.0 {
+} ARCHIVE_3.4.3;

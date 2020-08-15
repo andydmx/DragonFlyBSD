@@ -154,8 +154,7 @@ static char err_prefix[] = "ip6_fw_ctl:";
 /*
  * Returns 1 if the port is matched by the vector, 0 otherwise
  */
-static
-__inline int
+static __inline int
 port_match6(u_short *portptr, int nports, u_short port, int range_flag)
 {
 	if (!nports)
@@ -179,7 +178,7 @@ static int
 tcp6flg_match(struct tcphdr *tcp6, struct ip6_fw *f)
 {
 	u_char		flg_set, flg_clr;
-	
+
 	/*
 	 * If an established connection is required, reject packets that
 	 * have only SYN of RST|ACK|SYN set.  Otherwise, fall through to
@@ -259,7 +258,7 @@ ip6opts_match(struct ip6_hdr **pip6, struct ip6_fw *f, struct mbuf **m,
 		if ((*m)->m_len < *off + sizeof(*ip6e))
 			goto opts_check;	/* XXX */
 
-		switch(*nxt) {
+		switch (*nxt) {
 		case IPPROTO_FRAGMENT:
 			if ((*m)->m_len >= *off + sizeof(struct ip6_frag)) {
 				struct ip6_frag *ip6f;
@@ -317,8 +316,7 @@ ip6opts_match(struct ip6_hdr **pip6, struct ip6_fw *f, struct mbuf **m,
 		return 0;
 }
 
-static
-__inline int
+static __inline int
 iface_match(struct ifnet *ifp, union ip6_fw_if *ifu, int byname)
 {
 	/* Check by name or by IP address */
@@ -407,7 +405,7 @@ ip6fw_report(struct ip6_fw *f, struct ip6_hdr *ip6,
 			ksnprintf(SNPARGS(action2, 0), "SkipTo %d",
 			    f->fw_skipto_rule);
 			break;
-		default:	
+		default:
 			action = "UNKNOWN";
 			break;
 		}
@@ -772,6 +770,7 @@ got_match:
 	    && !IN6_IS_ADDR_MULTICAST(&ip6->ip6_dst)) {
 		switch (rule->fw_reject_code) {
 		case IPV6_FW_REJECT_RST:
+#if 1	/* not tested */
 		  {
 			struct tcphdr *const tcp =
 				(struct tcphdr *) ((caddr_t)ip6 + off);
@@ -816,6 +815,7 @@ got_match:
 			*m = NULL;
 			break;
 		  }
+#endif
 		default:	/* Send an ICMP unreachable using code */
 			if (oif)
 				(*m)->m_pkthdr.rcvif = oif;
@@ -852,7 +852,7 @@ add_entry6(struct ip6_fw_head *chainptr, struct ip6_fw *frwl)
 	ftmp->fw_pcnt = 0L;
 	ftmp->fw_bcnt = 0L;
 	fwc->rule = ftmp;
-	
+
 	crit_enter();
 
 	if (!chainptr->lh_first) {
@@ -1100,11 +1100,11 @@ ip6_fw_ctl(int stage, struct mbuf **mm)
 
 	if (stage == IPV6_FW_GET) {
 		struct ip6_fw_chain *fcp = ip6_fw_chain.lh_first;
-		*mm = m = m_get(MB_WAIT, MT_DATA); /* XXX */
+		*mm = m = m_get(M_WAITOK, MT_DATA); /* XXX */
 		if (!m)
 			return(ENOBUFS);
 		if (sizeof *(fcp->rule) > MLEN) {
-			MCLGET(m, MB_WAIT);
+			MCLGET(m, M_WAITOK);
 			if ((m->m_flags & M_EXT) == 0) {
 				m_free(m);
 				return(ENOBUFS);
@@ -1113,14 +1113,14 @@ ip6_fw_ctl(int stage, struct mbuf **mm)
 		for (; fcp; fcp = fcp->chain.le_next) {
 			bcopy(fcp->rule, m->m_data, sizeof *(fcp->rule));
 			m->m_len = sizeof *(fcp->rule);
-			m->m_next = m_get(MB_WAIT, MT_DATA); /* XXX */
+			m->m_next = m_get(M_WAITOK, MT_DATA); /* XXX */
 			if (!m->m_next) {
 				m_freem(*mm);
 				return(ENOBUFS);
 			}
 			m = m->m_next;
 			if (sizeof *(fcp->rule) > MLEN) {
-				MCLGET(m, MB_WAIT);
+				MCLGET(m, M_WAITOK);
 				if ((m->m_flags & M_EXT) == 0) {
 					m_freem(*mm);
 					return(ENOBUFS);

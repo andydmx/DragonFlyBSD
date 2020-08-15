@@ -46,6 +46,8 @@
 #include <machine/tss.h>	/* struct x86_64tss */
 #include <machine/npx.h>
 
+struct pv_entry;
+
 /*
  * Note on interrupt control.  Pending interrupts not yet dispatched are
  * marked in gd_fpending or gd_spending.  Once dispatched the interrupt's
@@ -66,33 +68,33 @@ struct mdglobaldata {
 	struct user_segment_descriptor gd_common_tssd;
 	struct user_segment_descriptor *gd_tss_gdt;
 	struct thread   *gd_npxthread;
-	struct x86_64tss gd_common_tss;
 	union savefpu	gd_savefpu;	/* fast bcopy/zero temp fpu save area */
+	union savefpu	gd_zerofpu;	/* xrstor/fxrstor/frstor zero regs */
 	int		gd_fpu_lock;	/* fast bcopy/zero cpu lock */
-	int		unused005;
-	int		unused001;
+	int		gd_xinvaltlb;	/* reentrancy check invaltlb routine */
+	int		gd_unused001;
 	int		gd_spending;	/* software interrupt pending */
 	int		gd_sdelayed;	/* delayed software ints */
 	int		gd_currentldt;
 	int		gd_private_tss;
-	u_int		unused002;
-	u_int		unused003;
+	u_int		gd_unused002;
+	u_int		gd_unused003;
 	u_int		gd_ss_eflags;
-	pt_entry_t	*gd_cunused0;
-	pt_entry_t	*gd_cunused1;
-	pt_entry_t	*gd_cunused2;
-	pt_entry_t	*gd_cunused3;
+	long		gd_lunused0;
+	long		gd_lunused1;
+	long		gd_lunused2;
+	long		gd_lunusde3;
 	caddr_t		gd_aunused0;
 	caddr_t		gd_aunused1;
 	caddr_t		gd_aunused2;
-	pt_entry_t	*gd_aunused3;
+	struct pv_entry	*gd_newpv;
 	u_int		gd_acpi_id;
 	u_int		gd_apic_id;
-	register_t	gd_scratch_rsp;
-	register_t	unused004;
+	register_t	gd_unused004;
+	register_t	gd_unused005;
 	register_t	gd_user_fs;	/* current user fs in MSR */
 	register_t	gd_user_gs;	/* current user gs in MSR */
-	cpumask_t	gd_invltlb_ret;
+	cpumask_t	gd_unused006;
 	u_long		gd_ipending[3];
 };
 
@@ -107,23 +109,56 @@ struct mdglobaldata {
  * This is the upper (0xff800000) address space layout that is per-cpu.
  * It is setup in locore.s and pmap.c for the BSP and in mp_machdep.c for
  * each AP.  genassym helps export this to the assembler code.
+ *
+ * Most of the major elements in struct privatespace must be
+ * PAGE_SIZE aligned.
  */
 struct privatespace {
-	/* JG TODO: fix comments describing layout */
-	/* page 0 - data page */
+	/*
+	 * page 0 - data page
+	 */
 	struct mdglobaldata mdglobaldata;
 	char		__filler0[MDGLOBALDATA_PAD];
 
-	/* page 1..4 - CPAGE1,CPAGE2,CPAGE3,PPAGE1 (unused) */
-	char		unused1[PAGE_SIZE];
+	/*
+	 * page 1 - Unused (unmapped)
+	 */
 	char		unused2[PAGE_SIZE];
-	char		unused3[PAGE_SIZE];
-	char		unused4[PAGE_SIZE];
 
-	/* page 5..4+UPAGES - idle stack (UPAGES pages) */
+	/*
+	 * page 2 - Trampoline page.  Put the trampoline and common_tss
+	 *	    in the same page to make them easier to isolate
+	 *	    from the rest of the kernel map.  See x86_64/pmap.c
+	 *
+	 *	    rsp0 points into trampoline.  Interrupts are always
+	 *	    disabled for this case but leave reserved1[]
+	 *	    reserved just in case.
+	 */
+	char		reserved1[PAGE_SIZE -
+				  sizeof(struct trampframe) -
+				  sizeof(uint64_t) -
+				  sizeof(struct x86_64tss)];
+	struct trampframe trampoline;
+	uint64_t	reserved1b;	/* 16-byte-align trampoline */
+	struct x86_64tss common_tss;	/* (misaligned by 8 bytes) */
+
+	/*
+	 * page 3, 4 - NMI, Double fault stack
+	 * page 5, 6 - Debug fault stack
+	 */
+	char		dblstack[PAGE_SIZE * 2 -
+				 sizeof(struct trampframe)];
+	struct trampframe dbltramp;
+	char		dbgstack[PAGE_SIZE * 2 -
+				 sizeof(struct trampframe)];
+	struct trampframe dbgtramp;
+
+	/* page 7+   - idle stack (UPAGES pages) */
 	char		idlestack[UPAGES * PAGE_SIZE];
-};
+} __packed;
+
 #define mdcpu  		((struct mdglobaldata *)_get_mycpu())
+#define pscpu  		((struct privatespace *)_get_mycpu())
 
 #endif
 

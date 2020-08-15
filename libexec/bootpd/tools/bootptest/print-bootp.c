@@ -268,7 +268,7 @@ rfc1048_opts[] = {
 	/* DHCP extensions (RFC-1533, sect. 9) */
 #endif
 };
-#define	KNOWN_OPTIONS (sizeof(rfc1048_opts) / sizeof(rfc1048_opts[0]))
+#define	KNOWN_OPTIONS NELEM(rfc1048_opts)
 
 static void
 rfc1048_print(u_char *bp, int length)
@@ -305,7 +305,7 @@ rfc1048_print(u_char *bp, int length)
 		len = *bp++;
 		if (bp + len > ep) {
 			/* truncated option */
-			printf(" |(%d>%d)", len, ep - bp);
+			printf(" |(%d>%td)", len, ep - bp);
 			return;
 		}
 		/* Print the option value(s). */

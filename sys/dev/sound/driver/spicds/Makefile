@@ -1,9 +1,9 @@
-# $FreeBSD: src/sys/modules/sound/driver/spicds/Makefile,v 1.2.2.1 2007/05/13 21:03:46 ariff Exp $
+# $FreeBSD: head/sys/modules/sound/driver/spicds/Makefile 162892 2006-09-30 18:12:33Z netchild $
 
-.PATH: ${.CURDIR}/../../../../dev/sound/pci
+.PATH: ${.CURDIR}/../../pci
 
 KMOD=	snd_spicds
-SRCS=	device_if.h bus_if.h pci_if.h
+SRCS=	device_if.h bus_if.h
 SRCS+=	spicds.c
 
 .include <bsd.kmod.mk>

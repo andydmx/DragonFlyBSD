@@ -35,7 +35,7 @@
 /*
  * Each cpu in a system has its own self-contained light weight kernel
  * thread scheduler, which means that generally speaking we only need
- * to use a critical section to avoid problems.  Foreign thread 
+ * to use a critical section to avoid problems.  Foreign thread
  * scheduling is queued via (async) IPIs.
  */
 
@@ -45,6 +45,7 @@
 #include <sys/proc.h>
 #include <sys/rtprio.h>
 #include <sys/kinfo.h>
+#include <sys/malloc.h>
 #include <sys/queue.h>
 #include <sys/sysctl.h>
 #include <sys/kthread.h>
@@ -52,10 +53,11 @@
 #include <sys/lock.h>
 #include <sys/spinlock.h>
 #include <sys/ktr.h>
+#include <sys/indefinite.h>
 
 #include <sys/thread2.h>
 #include <sys/spinlock2.h>
-#include <sys/mplock2.h>
+#include <sys/indefinite2.h>
 
 #include <sys/dsched.h>
 
@@ -70,10 +72,9 @@
 
 #include <machine/stdarg.h>
 #include <machine/smp.h>
+#include <machine/clock.h>
 
-#ifdef _KERNEL_VIRTUAL
-#include <pthread.h>
-#endif
+#define LOOPMASK
 
 #if !defined(KTR_CTXSW)
 #define KTR_CTXSW KTR_ALL
@@ -89,21 +90,18 @@ static MALLOC_DEFINE(M_THREAD, "thread", "lwkt threads");
 #ifdef	INVARIANTS
 static int panic_on_cscount = 0;
 #endif
-static __int64_t switch_count = 0;
-static __int64_t preempt_hit = 0;
-static __int64_t preempt_miss = 0;
-static __int64_t preempt_weird = 0;
+#ifdef DEBUG_LWKT_THREAD
+static int64_t switch_count = 0;
+static int64_t preempt_hit = 0;
+static int64_t preempt_miss = 0;
+static int64_t preempt_weird = 0;
+#endif
 static int lwkt_use_spin_port;
-static struct objcache *thread_cache;
+__read_mostly static struct objcache *thread_cache;
 int cpu_mwait_spin = 0;
 
 static void lwkt_schedule_remote(void *arg, int arg2, struct intrframe *frame);
 static void lwkt_setcpu_remote(void *arg);
-
-extern void cpu_heavy_restore(void);
-extern void cpu_lwkt_restore(void);
-extern void cpu_kthread_restore(void);
-extern void cpu_idle_restore(void);
 
 /*
  * We can make all thread ports use the spin backend instead of the thread
@@ -115,47 +113,29 @@ TUNABLE_INT("lwkt.use_spin_port", &lwkt_use_spin_port);
 SYSCTL_INT(_lwkt, OID_AUTO, panic_on_cscount, CTLFLAG_RW, &panic_on_cscount, 0,
     "Panic if attempting to switch lwkt's while mastering cpusync");
 #endif
+#ifdef DEBUG_LWKT_THREAD
 SYSCTL_QUAD(_lwkt, OID_AUTO, switch_count, CTLFLAG_RW, &switch_count, 0,
     "Number of switched threads");
-SYSCTL_QUAD(_lwkt, OID_AUTO, preempt_hit, CTLFLAG_RW, &preempt_hit, 0, 
+SYSCTL_QUAD(_lwkt, OID_AUTO, preempt_hit, CTLFLAG_RW, &preempt_hit, 0,
     "Successful preemption events");
-SYSCTL_QUAD(_lwkt, OID_AUTO, preempt_miss, CTLFLAG_RW, &preempt_miss, 0, 
+SYSCTL_QUAD(_lwkt, OID_AUTO, preempt_miss, CTLFLAG_RW, &preempt_miss, 0,
     "Failed preemption events");
 SYSCTL_QUAD(_lwkt, OID_AUTO, preempt_weird, CTLFLAG_RW, &preempt_weird, 0,
     "Number of preempted threads.");
-static int fairq_enable = 0;
-SYSCTL_INT(_lwkt, OID_AUTO, fairq_enable, CTLFLAG_RW,
-	&fairq_enable, 0, "Turn on fairq priority accumulators");
-static int fairq_bypass = -1;
-SYSCTL_INT(_lwkt, OID_AUTO, fairq_bypass, CTLFLAG_RW,
-	&fairq_bypass, 0, "Allow fairq to bypass td on token failure");
+#endif
 extern int lwkt_sched_debug;
 int lwkt_sched_debug = 0;
 SYSCTL_INT(_lwkt, OID_AUTO, sched_debug, CTLFLAG_RW,
 	&lwkt_sched_debug, 0, "Scheduler debug");
-static int lwkt_spin_loops = 10;
-SYSCTL_INT(_lwkt, OID_AUTO, spin_loops, CTLFLAG_RW,
+__read_mostly static u_int lwkt_spin_loops = 10;
+SYSCTL_UINT(_lwkt, OID_AUTO, spin_loops, CTLFLAG_RW,
 	&lwkt_spin_loops, 0, "Scheduler spin loops until sorted decon");
-static int lwkt_spin_reseq = 0;
-SYSCTL_INT(_lwkt, OID_AUTO, spin_reseq, CTLFLAG_RW,
-	&lwkt_spin_reseq, 0, "Scheduler resequencer enable");
-static int lwkt_spin_monitor = 0;
-SYSCTL_INT(_lwkt, OID_AUTO, spin_monitor, CTLFLAG_RW,
-	&lwkt_spin_monitor, 0, "Scheduler uses monitor/mwait");
-static int lwkt_spin_fatal = 0;	/* disabled */
-SYSCTL_INT(_lwkt, OID_AUTO, spin_fatal, CTLFLAG_RW,
-	&lwkt_spin_fatal, 0, "LWKT scheduler spin loops till fatal panic");
-static int preempt_enable = 1;
+__read_mostly static int preempt_enable = 1;
 SYSCTL_INT(_lwkt, OID_AUTO, preempt_enable, CTLFLAG_RW,
 	&preempt_enable, 0, "Enable preemption");
 static int lwkt_cache_threads = 0;
 SYSCTL_INT(_lwkt, OID_AUTO, cache_threads, CTLFLAG_RD,
 	&lwkt_cache_threads, 0, "thread+kstack cache");
-
-#ifndef _KERNEL_VIRTUAL
-static __cachealign int lwkt_cseq_rindex;
-static __cachealign int lwkt_cseq_windex;
-#endif
 
 /*
  * These helper procedures handle the runq, they can only be called from
@@ -189,6 +169,9 @@ _lwkt_dequeue(thread_t td)
  * be many user processes in kernel mode exiting from a tsleep() which
  * become runnable.
  *
+ * We scan the queue in both directions to help deal with degenerate
+ * situations when hundreds or thousands (or more) threads are runnable.
+ *
  * NOTE: lwkt_schedulerclock() will force a round-robin based on td_pri and
  *	 will ignore user priority.  This is to ensure that user threads in
  *	 kernel mode get cpu at some point regardless of what the user
@@ -198,7 +181,8 @@ static __inline
 void
 _lwkt_enqueue(thread_t td)
 {
-    thread_t xtd;
+    thread_t xtd;	/* forward scan */
+    thread_t rtd;	/* reverse scan */
 
     if ((td->td_flags & (TDF_RUNQ|TDF_MIGRATING|TDF_BLOCKQ)) == 0) {
 	struct globaldata *gd = td->td_gd;
@@ -222,17 +206,34 @@ _lwkt_enqueue(thread_t td)
 	     *
 	     *	     If upri matches exactly place at end/round-robin.
 	     */
+	    rtd = TAILQ_LAST(&gd->gd_tdrunq, lwkt_queue);
+
 	    while (xtd &&
-		   (xtd->td_pri >= td->td_pri ||
+		   (xtd->td_pri > td->td_pri ||
 		    (xtd->td_pri == td->td_pri &&
 		     xtd->td_upri >= td->td_upri))) {
 		xtd = TAILQ_NEXT(xtd, td_threadq);
+
+		/*
+		 * Doing a reverse scan at the same time is an optimization
+		 * for the insert-closer-to-tail case that avoids having to
+		 * scan the entire list.  This situation can occur when
+		 * thousands of threads are woken up at the same time.
+		 */
+		if (rtd->td_pri > td->td_pri ||
+		    (rtd->td_pri == td->td_pri &&
+		    rtd->td_upri >= td->td_upri)) {
+			TAILQ_INSERT_AFTER(&gd->gd_tdrunq, rtd, td, td_threadq);
+			goto skip;
+		}
+		rtd = TAILQ_PREV(rtd, lwkt_queue, td_threadq);
 	    }
 	    if (xtd)
 		TAILQ_INSERT_BEFORE(xtd, td, td_threadq);
 	    else
 		TAILQ_INSERT_TAIL(&gd->gd_tdrunq, td, td_threadq);
 	}
+skip:
 	++gd->gd_tdrunqcount;
 
 	/*
@@ -243,7 +244,7 @@ _lwkt_enqueue(thread_t td)
     }
 }
 
-static __boolean_t
+static boolean_t
 _lwkt_thread_ctor(void *obj, void *privdata, int ocflags)
 {
 	struct thread *td = (struct thread *)obj;
@@ -276,7 +277,7 @@ _lwkt_thread_dtor(void *obj, void *privdata)
  * Nominally cache up to 32 thread + kstack structures.  Cache more on
  * systems with a lot of cpu cores.
  */
-void
+static void
 lwkt_init(void)
 {
     TUNABLE_INT("lwkt.cache_threads", &lwkt_cache_threads);
@@ -290,6 +291,7 @@ lwkt_init(void)
 				0, lwkt_cache_threads,
 				_lwkt_thread_ctor, _lwkt_thread_dtor, NULL);
 }
+SYSINIT(lwkt_init, SI_BOOT2_LWKT_INIT, SI_ORDER_FIRST, lwkt_init, NULL);
 
 /*
  * Schedule a thread to run.  As the current thread we can always safely
@@ -334,6 +336,7 @@ lwkt_gdinit(struct globaldata *gd)
 {
     TAILQ_INIT(&gd->gd_tdrunq);
     TAILQ_INIT(&gd->gd_tdallq);
+    lockinit(&gd->gd_sysctllock, "sysctl", 0, LK_CANRECURSE);
 }
 
 /*
@@ -385,13 +388,17 @@ lwkt_alloc_thread(struct thread *td, int stksize, int cpu, int flags)
 	}
     }
     if (stack == NULL) {
-	stack = (void *)kmem_alloc_stack(&kernel_map, stksize);
+	if (cpu < 0)
+		stack = (void *)kmem_alloc_stack(&kernel_map, stksize, 0);
+	else
+		stack = (void *)kmem_alloc_stack(&kernel_map, stksize,
+						 KM_CPU(cpu));
 	flags |= TDF_ALLOCATED_STACK;
     }
     if (cpu < 0) {
 	cpu = ++cpu_rotator;
 	cpu_ccfence();
-	cpu %= ncpus;
+	cpu = (uint32_t)cpu % (uint32_t)ncpus;
     }
     lwkt_init_thread(td, stack, stksize, flags, globaldata_find(cpu));
     return(td);
@@ -403,7 +410,7 @@ lwkt_alloc_thread(struct thread *td, int stksize, int cpu, int flags)
  *
  * All threads start out in a critical section at a priority of
  * TDPRI_KERN_DAEMON.  Higher level code will modify the priority as
- * appropriate.  This function may send an IPI message when the 
+ * appropriate.  This function may send an IPI message when the
  * requested cpu is not the current cpu and consequently gd_tdallq may
  * not be initialized synchronously from the point of view of the originating
  * cpu.
@@ -464,7 +471,7 @@ lwkt_init_thread(thread_t td, void *stack, int stksize, int flags,
     } else {
 	lwkt_send_ipiq(gd, lwkt_init_thread_remote, td);
     }
-    dsched_new_thread(td);
+    dsched_enter_thread(td);
 }
 
 void
@@ -518,7 +525,7 @@ lwkt_free_thread(thread_t td)
 
 
 /*
- * Switch to the next runnable lwkt.  If no LWKTs are runnable then 
+ * Switch to the next runnable lwkt.  If no LWKTs are runnable then
  * switch to the idlethread.  Switching must occur within a critical
  * section to avoid races with the scheduling queue.
  *
@@ -551,7 +558,11 @@ lwkt_switch(void)
     globaldata_t gd = mycpu;
     thread_t td = gd->gd_curthread;
     thread_t ntd;
-    int spinning = 0;
+    thread_t xtd;
+    int upri;
+#ifdef LOOPMASK
+    uint64_t tsc_base = rdtsc();
+#endif
 
     KKASSERT(gd->gd_processing_ipiq == 0);
     KKASSERT(td->td_flags & TDF_RUNNING);
@@ -613,7 +624,10 @@ lwkt_switch(void)
     }
 
     /*
-     * Release all tokens
+     * Release all tokens.  Once we do this we must remain in the critical
+     * section and cannot run IPIs or other interrupts until we switch away
+     * because they may implode if they try to get a token using our thread
+     * context.
      */
     crit_enter_gd(gd);
     if (TD_TOKS_HELD(td))
@@ -626,7 +640,6 @@ lwkt_switch(void)
     KASSERT(gd->gd_spinlocks == 0 || panicstr != NULL,
 	    ("lwkt_switch: still holding %d exclusive spinlocks!",
 	     gd->gd_spinlocks));
-
 
 #ifdef	INVARIANTS
     if (td->td_cscount) {
@@ -650,210 +663,104 @@ lwkt_switch(void)
     if ((ntd = td->td_preempted) != NULL) {
 	KKASSERT(ntd->td_flags & TDF_PREEMPT_LOCK);
 	ntd->td_flags |= TDF_PREEMPT_DONE;
+	ntd->td_contended = 0;		/* reset contended */
 
 	/*
 	 * The interrupt may have woken a thread up, we need to properly
 	 * set the reschedule flag if the originally interrupted thread is
 	 * at a lower priority.
 	 *
-	 * The interrupt may not have descheduled.
+	 * NOTE: The interrupt may not have descheduled ntd.
+	 *
+	 * NOTE: We do not reschedule if there are no threads on the runq.
+	 *	 (ntd could be the idlethread).
 	 */
-	if (TAILQ_FIRST(&gd->gd_tdrunq) != ntd)
+	xtd = TAILQ_FIRST(&gd->gd_tdrunq);
+	if (xtd && xtd != ntd)
 	    need_lwkt_resched();
 	goto havethread_preempted;
     }
 
     /*
-     * If we cannot obtain ownership of the tokens we cannot immediately
-     * schedule the target thread.
+     * Figure out switch target.  If we cannot switch to our desired target
+     * look for a thread that we can switch to.
      *
-     * Reminder: Again, we cannot afford to run any IPIs in this path if
-     * the current thread has been descheduled.
+     * NOTE! The limited spin loop and related parameters are extremely
+     *	     important for system performance, particularly for pipes and
+     *	     concurrent conflicting VM faults.
      */
-    for (;;) {
-	clear_lwkt_resched();
+    clear_lwkt_resched();
+    ntd = TAILQ_FIRST(&gd->gd_tdrunq);
 
-	/*
-	 * Hotpath - pull the head of the run queue and attempt to schedule
-	 * it.
-	 */
-	ntd = TAILQ_FIRST(&gd->gd_tdrunq);
-
-	if (ntd == NULL) {
-	    /*
-	     * Runq is empty, switch to idle to allow it to halt.
-	     */
-	    ntd = &gd->gd_idlethread;
-	    if (gd->gd_trap_nesting_level == 0 && panicstr == NULL)
-		ASSERT_NO_TOKENS_HELD(ntd);
-	    cpu_time.cp_msg[0] = 0;
-	    cpu_time.cp_stallpc = 0;
-	    goto haveidle;
-	}
-
-	/*
-	 * Hotpath - schedule ntd.
-	 *
-	 * NOTE: For UP there is no mplock and lwkt_getalltokens()
-	 *	     always succeeds.
-	 */
-	if (TD_TOKS_NOT_HELD(ntd) ||
-	    lwkt_getalltokens(ntd, (spinning >= lwkt_spin_loops)))
-	{
-	    goto havethread;
-	}
-
-	/*
-	 * Coldpath (SMP only since tokens always succeed on UP)
-	 *
-	 * We had some contention on the thread we wanted to schedule.
-	 * What we do now is try to find a thread that we can schedule
-	 * in its stead.
-	 *
-	 * The coldpath scan does NOT rearrange threads in the run list.
-	 * The lwkt_schedulerclock() will assert need_lwkt_resched() on
-	 * the next tick whenever the current head is not the current thread.
-	 */
-#ifdef	INVARIANTS
-	++ntd->td_contended;
-#endif
-	++gd->gd_cnt.v_lock_colls;
-
-	if (fairq_bypass > 0)
-		goto skip;
-
-	while ((ntd = TAILQ_NEXT(ntd, td_threadq)) != NULL) {
-#ifndef NO_LWKT_SPLIT_USERPRI
-		/*
-		 * Never schedule threads returning to userland or the
-		 * user thread scheduler helper thread when higher priority
-		 * threads are present.  The runq is sorted by priority
-		 * so we can give up traversing it when we find the first
-		 * low priority thread.
-		 */
-		if (ntd->td_pri < TDPRI_KERN_LPSCHED) {
-			ntd = NULL;
-			break;
-		}
-#endif
-
-		/*
-		 * Try this one.
-		 */
-		if (TD_TOKS_NOT_HELD(ntd) ||
-		    lwkt_getalltokens(ntd, (spinning >= lwkt_spin_loops))) {
-			goto havethread;
-		}
-#ifdef	INVARIANTS
-		++ntd->td_contended;
-#endif
-		++gd->gd_cnt.v_lock_colls;
-	}
-
-skip:
-	/*
-	 * We exhausted the run list, meaning that all runnable threads
-	 * are contested.
-	 */
-	cpu_pause();
-#ifdef _KERNEL_VIRTUAL
-	pthread_yield();
-#endif
-	ntd = &gd->gd_idlethread;
-	if (gd->gd_trap_nesting_level == 0 && panicstr == NULL)
-	    ASSERT_NO_TOKENS_HELD(ntd);
-	/* contention case, do not clear contention mask */
-
-	/*
-	 * We are going to have to retry but if the current thread is not
-	 * on the runq we instead switch through the idle thread to get away
-	 * from the current thread.  We have to flag for lwkt reschedule
-	 * to prevent the idle thread from halting.
-	 *
-	 * NOTE: A non-zero spinning is passed to lwkt_getalltokens() to
-	 *	 instruct it to deal with the potential for deadlocks by
-	 *	 ordering the tokens by address.
-	 */
-	if ((td->td_flags & TDF_RUNQ) == 0) {
-	    need_lwkt_resched();	/* prevent hlt */
-	    goto haveidle;
-	}
-#if defined(INVARIANTS) && defined(__x86_64__)
-	if ((read_rflags() & PSL_I) == 0) {
-		cpu_enable_intr();
-		panic("lwkt_switch() called with interrupts disabled");
-	}
-#endif
-
-	/*
-	 * Number iterations so far.  After a certain point we switch to
-	 * a sorted-address/monitor/mwait version of lwkt_getalltokens()
-	 */
-	if (spinning < 0x7FFFFFFF)
-	    ++spinning;
-
-#ifndef _KERNEL_VIRTUAL
-	/*
-	 * lwkt_getalltokens() failed in sorted token mode, we can use
-	 * monitor/mwait in this case.
-	 */
-	if (spinning >= lwkt_spin_loops &&
-	    (cpu_mi_feature & CPU_MI_MONITOR) &&
-	    lwkt_spin_monitor)
-	{
-	    cpu_mmw_pause_int(&gd->gd_reqflags,
-			      (gd->gd_reqflags | RQF_SPINNING) &
-			      ~RQF_IDLECHECK_WK_MASK,
-			      cpu_mwait_spin, 0);
-	}
-#endif
-
-	/*
-	 * We already checked that td is still scheduled so this should be
-	 * safe.
-	 */
-	splz_check();
-
-#ifndef _KERNEL_VIRTUAL
-	/*
-	 * This experimental resequencer is used as a fall-back to reduce
-	 * hw cache line contention by placing each core's scheduler into a
-	 * time-domain-multplexed slot.
-	 *
-	 * The resequencer is disabled by default.  It's functionality has
-	 * largely been superceeded by the token algorithm which limits races
-	 * to a subset of cores.
-	 *
-	 * The resequencer algorithm tends to break down when more than
-	 * 20 cores are contending.  What appears to happen is that new
-	 * tokens can be obtained out of address-sorted order by new cores
-	 * while existing cores languish in long delays between retries and
-	 * wind up being starved-out of the token acquisition.
-	 */
-	if (lwkt_spin_reseq && spinning >= lwkt_spin_reseq) {
-	    int cseq = atomic_fetchadd_int(&lwkt_cseq_windex, 1);
-	    int oseq;
-
-	    while ((oseq = lwkt_cseq_rindex) != cseq) {
-		cpu_ccfence();
-#if 1
-		if (cpu_mi_feature & CPU_MI_MONITOR) {
-		    cpu_mmw_pause_int(&lwkt_cseq_rindex, oseq,
-			cpu_mwait_spin, 0);
-		} else {
-#endif
-		    cpu_pause();
-		    cpu_lfence();
-#if 1
-		}
-#endif
+    if (ntd) {
+	do {
+	    if (TD_TOKS_NOT_HELD(ntd) ||
+		lwkt_getalltokens(ntd, (ntd->td_contended > lwkt_spin_loops)))
+	    {
+		goto havethread;
 	    }
-	    DELAY(1);
-	    atomic_add_int(&lwkt_cseq_rindex, 1);
-	}
+	    ++ntd->td_contended;	/* overflow ok */
+	    if (gd->gd_indefinite.type == 0)
+		indefinite_init(&gd->gd_indefinite, NULL, 0, 't');
+#ifdef LOOPMASK
+	    if (tsc_frequency && rdtsc() - tsc_base > tsc_frequency) {
+		    kprintf("lwkt_switch: excessive contended %d "
+			    "thread %p\n", ntd->td_contended, ntd);
+		    tsc_base = rdtsc();
+	    }
 #endif
-	/* highest level for(;;) loop */
+	} while (ntd->td_contended < (lwkt_spin_loops >> 1));
+	upri = ntd->td_upri;
+
+	/*
+	 * Bleh, the thread we wanted to switch to has a contended token.
+	 * See if we can switch to another thread.
+	 *
+	 * We generally don't want to do this because it represents a
+	 * priority inversion, but contending tokens on the same cpu can
+	 * cause real problems if we don't now that we have an exclusive
+	 * priority mechanism over shared for tokens.
+	 *
+	 * The solution is to allow threads with pending tokens to compete
+	 * for them (a lower priority thread will get less cpu once it
+	 * returns from the kernel anyway).  If a thread does not have
+	 * any contending tokens, we go by td_pri and upri.
+	 */
+	while ((ntd = TAILQ_NEXT(ntd, td_threadq)) != NULL) {
+	    if (TD_TOKS_NOT_HELD(ntd) &&
+		ntd->td_pri < TDPRI_KERN_LPSCHED && upri > ntd->td_upri) {
+		    continue;
+	    }
+	    if (upri < ntd->td_upri)
+		upri = ntd->td_upri;
+
+	    /*
+	     * Try this one.
+	     */
+	    if (TD_TOKS_NOT_HELD(ntd) ||
+		lwkt_getalltokens(ntd, (ntd->td_contended > lwkt_spin_loops))) {
+		    goto havethread;
+	    }
+	    ++ntd->td_contended;	/* overflow ok */
+	}
+
+	/*
+	 * Fall through, switch to idle thread to get us out of the current
+	 * context.  Since we were contended, prevent HLT by flagging a
+	 * LWKT reschedule.
+	 */
+	need_lwkt_resched();
     }
+
+    /*
+     * We either contended on ntd or the runq is empty.  We must switch
+     * through the idle thread to get out of the current context.
+     */
+    ntd = &gd->gd_idlethread;
+    if (gd->gd_trap_nesting_level == 0 && panicstr == NULL)
+	ASSERT_NO_TOKENS_HELD(ntd);
+    cpu_time.cp_msg[0] = 0;
+    goto haveidle;
 
 havethread:
     /*
@@ -861,8 +768,15 @@ havethread:
      * thread.
      */
     ntd->td_wmesg = NULL;
+    ntd->td_contended = 0;	/* reset once scheduled */
     ++gd->gd_cnt.v_swtch;
     gd->gd_idle_repeat = 0;
+
+    /*
+     * If we were busy waiting record final disposition
+     */
+    if (gd->gd_indefinite.type)
+	    indefinite_done(&gd->gd_indefinite);
 
 havethread_preempted:
     /*
@@ -885,7 +799,9 @@ haveidle:
 	 * We are responsible for marking ntd as TDF_RUNNING.
 	 */
 	KKASSERT((ntd->td_flags & TDF_RUNNING) == 0);
+#ifdef DEBUG_LWKT_THREAD
 	++switch_count;
+#endif
 	KTR_LOG(ctxsw_sw, gd->gd_cpuid, ntd);
 	ntd->td_flags |= TDF_RUNNING;
 	lwkt_switch_return(td->td_switch(ntd));
@@ -909,6 +825,13 @@ void
 lwkt_switch_return(thread_t otd)
 {
 	globaldata_t rgd;
+#ifdef LOOPMASK
+	uint64_t tsc_base = rdtsc();
+#endif
+	int exiting;
+
+	exiting = otd->td_flags & TDF_EXITING;
+	cpu_ccfence();
 
 	/*
 	 * Check if otd was migrating.  Now that we are on ntd we can finish
@@ -936,8 +859,13 @@ lwkt_switch_return(thread_t otd)
 	/*
 	 * Final exit validations (see lwp_wait()).  Note that otd becomes
 	 * invalid the *instant* we set TDF_MP_EXITSIG.
+	 *
+	 * Use the EXITING status loaded from before we clear TDF_RUNNING,
+	 * because if it is not set otd becomes invalid the instant we clear
+	 * TDF_RUNNING on it (otherwise, if the system is fast enough, we
+	 * might 'steal' TDF_EXITING from another switch-return!).
 	 */
-	while (otd->td_flags & TDF_EXITING) {
+	while (exiting) {
 		u_int mpflags;
 
 		mpflags = otd->td_mpflags;
@@ -956,15 +884,28 @@ lwkt_switch_return(thread_t otd)
 				break;
 			}
 		}
+
+#ifdef LOOPMASK
+		if (tsc_frequency && rdtsc() - tsc_base > tsc_frequency) {
+			kprintf("lwkt_switch_return: excessive TDF_EXITING "
+				"thread %p\n", otd);
+			tsc_base = rdtsc();
+		}
+#endif
 	}
 }
 
 /*
  * Request that the target thread preempt the current thread.  Preemption
- * can only occur if our only critical section is the one that we were called
- * with, the relative priority of the target thread is higher, and the target
- * thread holds no tokens.  This also only works if we are not holding any
- * spinlocks (obviously).
+ * can only occur only:
+ *
+ *	- If our critical section is the one that we were called with
+ *	- The relative priority of the target thread is higher
+ *	- The target is not excessively interrupt-nested via td_nest_count
+ *	- The target thread holds no tokens.
+ *	- The target thread is not already scheduled and belongs to the
+ *	  current cpu.
+ *	- The current thread is not holding any spin-locks.
  *
  * THE CALLER OF LWKT_PREEMPT() MUST BE IN A CRITICAL SECTION.  Typically
  * this is called via lwkt_schedule() through the td_preemptable callback.
@@ -1004,25 +945,42 @@ lwkt_preempt(thread_t ntd, int critcount)
 
     td = gd->gd_curthread;
     if (preempt_enable == 0) {
+#ifdef DEBUG_LWKT_THREAD
 	++preempt_miss;
+#endif
 	return;
     }
     if (ntd->td_pri <= td->td_pri) {
+#ifdef DEBUG_LWKT_THREAD
 	++preempt_miss;
+#endif
 	return;
     }
     if (td->td_critcount > critcount) {
+#ifdef DEBUG_LWKT_THREAD
 	++preempt_miss;
+#endif
+	return;
+    }
+    if (td->td_nest_count >= 2) {
+#ifdef DEBUG_LWKT_THREAD
+	++preempt_miss;
+#endif
 	return;
     }
     if (td->td_cscount) {
+#ifdef DEBUG_LWKT_THREAD
 	++preempt_miss;
+#endif
 	return;
     }
     if (ntd->td_gd != gd) {
+#ifdef DEBUG_LWKT_THREAD
 	++preempt_miss;
+#endif
 	return;
     }
+
     /*
      * We don't have to check spinlocks here as they will also bump
      * td_critcount.
@@ -1034,15 +992,21 @@ lwkt_preempt(thread_t ntd, int critcount)
     KKASSERT(gd->gd_spinlocks == 0);
 
     if (TD_TOKS_HELD(ntd)) {
+#ifdef DEBUG_LWKT_THREAD
 	++preempt_miss;
+#endif
 	return;
     }
     if (td == ntd || ((td->td_flags | ntd->td_flags) & TDF_PREEMPT_LOCK)) {
+#ifdef DEBUG_LWKT_THREAD
 	++preempt_weird;
+#endif
 	return;
     }
     if (ntd->td_preempted) {
+#ifdef DEBUG_LWKT_THREAD
 	++preempt_hit;
+#endif
 	return;
     }
     KKASSERT(gd->gd_processing_ipiq == 0);
@@ -1058,7 +1022,9 @@ lwkt_preempt(thread_t ntd, int critcount)
      * A preemption must switch back to the original thread, assert the
      * case.
      */
+#ifdef DEBUG_LWKT_THREAD
     ++preempt_hit;
+#endif
     ntd->td_preempted = td;
     td->td_flags |= TDF_PREEMPT_LOCK;
     KTR_LOG(ctxsw_pre, gd->gd_cpuid, ntd);
@@ -1147,10 +1113,8 @@ lwkt_passive_release(struct thread *td)
 {
     struct lwp *lp = td->td_lwp;
 
-#ifndef NO_LWKT_SPLIT_USERPRI
     td->td_release = NULL;
     lwkt_setpri_self(TDPRI_KERN_USER);
-#endif
 
     lp->lwp_proc->p_usched->release_curproc(lp);
 }
@@ -1172,10 +1136,25 @@ lwkt_yield(void)
     globaldata_t gd = mycpu;
     thread_t td = gd->gd_curthread;
 
+    /*
+     * Should never be called with spinlocks held but there is a path
+     * via ACPI where it might happen.
+     */
+    if (gd->gd_spinlocks)
+	return;
+
+    /*
+     * Safe to call splz if we are not too-heavily nested.
+     */
     if ((gd->gd_reqflags & RQF_IDLECHECK_MASK) && td->td_nest_count < 2)
 	splz();
+
+    /*
+     * Caller allows switching
+     */
     if (lwkt_resched_wanted()) {
-	lwkt_schedule_self(curthread);
+	atomic_set_int(&td->td_mpflags, TDF_MP_DIDYIELD);
+	lwkt_schedule_self(td);
 	lwkt_switch();
     }
 }
@@ -1201,6 +1180,7 @@ lwkt_yield_quick(void)
 	if (TAILQ_FIRST(&gd->gd_tdrunq) == td) {
 	    clear_lwkt_resched();
 	} else {
+	    atomic_set_int(&td->td_mpflags, TDF_MP_DIDYIELD);
 	    lwkt_schedule_self(curthread);
 	    lwkt_switch();
 	}
@@ -1223,6 +1203,13 @@ lwkt_user_yield(void)
 {
     globaldata_t gd = mycpu;
     thread_t td = gd->gd_curthread;
+
+    /*
+     * Should never be called with spinlocks held but there is a path
+     * via ACPI where it might happen.
+     */
+    if (gd->gd_spinlocks)
+	return;
 
     /*
      * Always run any pending interrupts in case we are in a critical
@@ -1378,12 +1365,14 @@ lwkt_acquire(thread_t td)
 {
     globaldata_t gd;
     globaldata_t mygd;
-    int retry = 10000000;
 
     KKASSERT(td->td_flags & TDF_MIGRATING);
     gd = td->td_gd;
     mygd = mycpu;
     if (gd != mycpu) {
+#ifdef LOOPMASK
+	uint64_t tsc_base = rdtsc();
+#endif
 	cpu_lfence();
 	KKASSERT((td->td_flags & TDF_RUNQ) == 0);
 	crit_enter_gd(mygd);
@@ -1391,13 +1380,15 @@ lwkt_acquire(thread_t td)
 	while (td->td_flags & (TDF_RUNNING|TDF_PREEMPT_LOCK)) {
 	    lwkt_process_ipiq();
 	    cpu_lfence();
-	    if (--retry == 0) {
-		kprintf("lwkt_acquire: stuck: td %p td->td_flags %08x\n",
-			td, td->td_flags);
-		retry = 10000000;
-	    }
 #ifdef _KERNEL_VIRTUAL
-	    pthread_yield();
+	    vkernel_yield();
+#endif
+#ifdef LOOPMASK
+	    if (tsc_frequency && rdtsc() - tsc_base > tsc_frequency) {
+		    kprintf("lwkt_acquire: stuck td %p td->td_flags %08x\n",
+			    td, td->td_flags);
+		    tsc_base = rdtsc();
+	    }
 #endif
 	}
 	DEBUG_POP_INFO();
@@ -1416,8 +1407,8 @@ lwkt_acquire(thread_t td)
 
 /*
  * Generic deschedule.  Descheduling threads other then your own should be
- * done only in carefully controlled circumstances.  Descheduling is 
- * asynchronous.  
+ * done only in carefully controlled circumstances.  Descheduling is
+ * asynchronous.
  *
  * This function may block if the cpu has run out of messages.
  */
@@ -1503,7 +1494,8 @@ lwkt_schedulerclock(thread_t td)
     globaldata_t gd = td->td_gd;
     thread_t xtd;
 
-    if (TAILQ_FIRST(&gd->gd_tdrunq) == td) {
+    xtd = TAILQ_FIRST(&gd->gd_tdrunq);
+    if (xtd == td) {
 	/*
 	 * If the current thread is at the head of the runq shift it to the
 	 * end of any equal-priority threads and request a LWKT reschedule
@@ -1524,17 +1516,18 @@ lwkt_schedulerclock(thread_t td)
 		TAILQ_INSERT_TAIL(&gd->gd_tdrunq, td, td_threadq);
 	    need_lwkt_resched();
 	}
-    } else {
+    } else if (xtd) {
 	/*
 	 * If we scheduled a thread other than the one at the head of the
 	 * queue always request a reschedule every tick.
 	 */
 	need_lwkt_resched();
     }
+    /* else curthread probably the idle thread, no need to reschedule */
 }
 
 /*
- * Migrate the current thread to the specified cpu. 
+ * Migrate the current thread to the specified cpu.
  *
  * This is accomplished by descheduling ourselves from the current cpu
  * and setting td_migrate_gd.  The lwkt_switch() code will detect that the
@@ -1683,8 +1676,6 @@ lwkt_exit(void)
     /*
      * Do any cleanup that might block here
      */
-    if (td->td_flags & TDF_VERBOSE)
-	kprintf("kthread %p %s has exited\n", td, td->td_comm);
     biosched_done(td);
     dsched_exit_thread(td);
 
@@ -1770,14 +1761,14 @@ crit_panic(void)
     int lcrit = td->td_critcount;
 
     td->td_critcount = 0;
+    cpu_ccfence();
     panic("td_critcount is/would-go negative! %p %d", td, lcrit);
     /* NOT REACHED */
 }
 
 /*
  * Called from debugger/panic on cpus which have been stopped.  We must still
- * process the IPIQ while stopped, even if we were stopped while in a critical
- * section (XXX).
+ * process the IPIQ while stopped.
  *
  * If we are dumping also try to process any pending interrupts.  This may
  * or may not work depending on the state of the cpu at the point it was
@@ -1788,12 +1779,13 @@ lwkt_smp_stopped(void)
 {
     globaldata_t gd = mycpu;
 
-    crit_enter_gd(gd);
     if (dumping) {
 	lwkt_process_ipiq();
+	--gd->gd_intr_nesting_level;
 	splz();
+	++gd->gd_intr_nesting_level;
     } else {
 	lwkt_process_ipiq();
     }
-    crit_exit_gd(gd);
+    cpu_smp_stopped();
 }

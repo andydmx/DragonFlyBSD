@@ -2,7 +2,6 @@
 #
 # $NetBSD: root,v 1.2 2000/05/13 08:45:09 lukem Exp $
 # $FreeBSD: src/etc/rc.d/root,v 1.5 2002/10/31 02:06:05 gordon Exp $
-# $DragonFly: src/etc/rc.d/root,v 1.4 2005/11/19 21:47:32 swildner Exp $
 #
 
 # PROVIDE: root
@@ -24,18 +23,13 @@ root_start()
 		;;
 	*)
 		if ! mount -u -o rw /; then
-			echo 'Mounting root filesystem rw failed, startup aborted'
-			exit 1
+			echo 'Mounting root filesystem rw failed; startup aborted'
+			stop_boot true
 		fi
 		;;
 	esac
 	umount -a >/dev/null 2>&1
-
-	# If we booted a special kernel remove the record
-	# so we will boot the default kernel next time.
-	if [ -e /boot/nextkernel ]; then
-		rm -f /boot/nextkernel
-	fi
+	return 0
 }
 
 load_rc_config $name

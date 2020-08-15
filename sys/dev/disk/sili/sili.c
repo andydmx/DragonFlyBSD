@@ -93,8 +93,8 @@ static void sili_ata_cmd_done(struct sili_ccb *ccb);
 int
 sili_init(struct sili_softc *sc)
 {
-	DPRINTF(SILI_D_VERBOSE, " GHC 0x%b",
-		sili_read(sc, SILI_REG_GHC), SILI_FMT_GHC);
+	DPRINTF(SILI_D_VERBOSE, " GHC 0x%pb%i",
+		SILI_FMT_GHC, sili_read(sc, SILI_REG_GHC));
 
 	/*
 	 * Reset the entire chip.  This also resets all ports.
@@ -560,7 +560,7 @@ sili_port_state_machine(struct sili_port *ap, int initial)
 			 * which have changed state.  This will adjust
 			 * at_probe and set ATA_PORT_F_RESCAN
 			 *
-			 * We want to wait at least 10 seconds before probing
+			 * We want to wait at least 5 seconds before probing
 			 * a newly inserted device.  If the check status
 			 * indicates a device is present and in need of a
 			 * hard reset, we make sure we have slept before
@@ -568,7 +568,7 @@ sili_port_state_machine(struct sili_port *ap, int initial)
 			 *
 			 * We also need to wait at least 1 second for the
 			 * PHY state to change after insertion, if we
-			 * haven't already waited the 10 seconds.
+			 * haven't already waited the 5 seconds.
 			 *
 			 * NOTE: When pm_check_good finds a good port it
 			 *	 typically starts us in probe state
@@ -582,8 +582,8 @@ sili_port_state_machine(struct sili_port *ap, int initial)
 				    at->at_probe <= ATA_PROBE_NEED_HARD_RESET
 				) {
 					didsleep = 1;
-					kprintf("%s: Waiting 10 seconds on insertion\n", PORTNAME(ap));
-					sili_os_sleep(10000);
+					kprintf("%s: Waiting 5 seconds on insertion\n", PORTNAME(ap));
+					sili_os_sleep(5000);
 				}
 			}
 
@@ -1089,7 +1089,7 @@ restart:
 		ccb = &ap->ap_ccbs[slot];
 		if (ccb->ccb_xa.flags & ATA_F_TIMEOUT_RUNNING) {
 			serial = ccb->ccb_xa.serial;
-			callout_stop_sync(&ccb->ccb_timeout);
+			callout_cancel(&ccb->ccb_timeout);
 			if (serial != ccb->ccb_xa.serial) {
 				kprintf("%s: Warning: timeout race ccb %p\n",
 					PORTNAME(ap), ccb);
@@ -1709,10 +1709,10 @@ sili_port_intr(struct sili_port *ap, int blockable)
 		active = ap->ap_active & ~ap->ap_expired;
 		error = sili_pread(ap, SILI_PREG_CERROR);
 		kprintf("%s.%d target error %d active=%08x hactive=%08x "
-			"SERR=%b\n",
+			"SERR=%pb%i\n",
 			PORTNAME(ap), target, error,
 			active, sili_pread(ap, SILI_PREG_SLOTST),
-			sili_pread(ap, SILI_PREG_SERR), SILI_PFMT_SERR);
+			SILI_PFMT_SERR, sili_pread(ap, SILI_PREG_SERR));
 
 		while (active) {
 			slot = ffs(active) - 1;
@@ -1829,11 +1829,11 @@ sili_port_intr(struct sili_port *ap, int blockable)
 		sili_pwrite(ap, SILI_PREG_INT_STATUS, is & fatal_mask);
 
 		serr = sili_pread(ap, SILI_PREG_SERR);
-		kprintf("%s: Unrecoverable errors (IS: %b, SERR: %b), "
+		kprintf("%s: Unrecoverable errors (IS: %pb%i, SERR: %pb%i), "
 			"disabling port.\n",
 			PORTNAME(ap),
-			is, SILI_PFMT_INT_STATUS,
-			serr, SILI_PFMT_SERR
+			SILI_PFMT_INT_STATUS, is,
+			SILI_PFMT_SERR, serr
 		);
 		is &= ~fatal_mask;
 		/* XXX try recovery first */
@@ -2356,9 +2356,9 @@ sili_ata_cmd(struct ata_xfer *xa)
 	if (ccb->ccb_port->ap_state == AP_S_FATAL_ERROR)
 		goto failcmd;
 #if 0
-	kprintf("%s: started std command %b ccb %d ccb_at %p %d\n",
+	kprintf("%s: started std command %pb%i ccb %d ccb_at %p %d\n",
 		ATANAME(ccb->ccb_port, ccb->ccb_xa.at),
-		sili_pread(ccb->ccb_port, SILI_PREG_CMD), SILI_PFMT_CMD,
+		SILI_PFMT_CMD, sili_pread(ccb->ccb_port, SILI_PREG_CMD),
 		ccb->ccb_slot,
 		ccb->ccb_xa.at,
 		ccb->ccb_xa.at ? ccb->ccb_xa.at->at_target : -1);
@@ -2401,7 +2401,7 @@ sili_ata_cmd_done(struct sili_ccb *ccb)
 	 */
 	if (xa->flags & ATA_F_TIMEOUT_RUNNING) {
 		serial = ccb->ccb_xa.serial;
-		callout_stop_sync(&ccb->ccb_timeout);
+		callout_cancel(&ccb->ccb_timeout);
 		if (serial != ccb->ccb_xa.serial) {
 			kprintf("%s: Warning: timeout race ccb %p\n",
 				PORTNAME(ccb->ccb_port), ccb);

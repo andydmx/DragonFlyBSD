@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2011-2014 The DragonFly Project.  All rights reserved.
+ * Copyright (c) 2011-2018 The DragonFly Project.  All rights reserved.
  *
  * This code is derived from software contributed to The DragonFly Project
  * by Matthew Dillon <dillon@dragonflybsd.org>
@@ -38,7 +38,6 @@
 #include <sys/fcntl.h>
 #include <sys/buf.h>
 #include <sys/proc.h>
-#include <sys/namei.h>
 #include <sys/mount.h>
 #include <sys/vnode.h>
 #include <sys/mountctl.h>
@@ -51,28 +50,22 @@ struct hammer2_fiterate {
 	hammer2_off_t	bpref;
 	hammer2_off_t	bnext;
 	int		loops;
+	int		relaxed;
 };
 
 typedef struct hammer2_fiterate hammer2_fiterate_t;
 
-static int hammer2_freemap_try_alloc(hammer2_trans_t *trans,
-			hammer2_chain_t **parentp, hammer2_blockref_t *bref,
-			int radix, hammer2_fiterate_t *iter);
-static void hammer2_freemap_init(hammer2_trans_t *trans, hammer2_mount_t *hmp,
+static int hammer2_freemap_try_alloc(hammer2_chain_t **parentp,
+			hammer2_blockref_t *bref, int radix,
+			hammer2_fiterate_t *iter, hammer2_tid_t mtid);
+static void hammer2_freemap_init(hammer2_dev_t *hmp,
 			hammer2_key_t key, hammer2_chain_t *chain);
-static int hammer2_bmap_alloc(hammer2_trans_t *trans, hammer2_mount_t *hmp,
+static int hammer2_bmap_alloc(hammer2_dev_t *hmp,
 			hammer2_bmap_data_t *bmap, uint16_t class,
-			int n, int radix, hammer2_key_t *basep);
-static int hammer2_freemap_iterate(hammer2_trans_t *trans,
-			hammer2_chain_t **parentp, hammer2_chain_t **chainp,
+			int n, int sub_key, int radix, hammer2_key_t *basep);
+static int hammer2_freemap_iterate(hammer2_chain_t **parentp,
+			hammer2_chain_t **chainp,
 			hammer2_fiterate_t *iter);
-
-static __inline
-int
-hammer2_freemapradix(int radix)
-{
-	return(radix);
-}
 
 /*
  * Calculate the device offset for the specified FREEMAP_NODE or FREEMAP_LEAF
@@ -84,70 +77,40 @@ hammer2_freemapradix(int radix)
  * good freemaps in case of a crash which we can use as a base for the fixup
  * scan at mount-time.
  */
-#define H2FMBASE(key, radix)	((key) & ~(((hammer2_off_t)1 << (radix)) - 1))
-#define H2FMSHIFT(radix)	((hammer2_off_t)1 << (radix))
-
 static
 int
-hammer2_freemap_reserve(hammer2_trans_t *trans, hammer2_chain_t *chain,
-			int radix)
+hammer2_freemap_reserve(hammer2_chain_t *chain, int radix)
 {
 	hammer2_blockref_t *bref = &chain->bref;
 	hammer2_off_t off;
 	int index;
+	int index_inc;
 	size_t bytes;
 
 	/*
-	 * Physical allocation size -> radix.  Typically either 256 for
-	 * a level 0 freemap leaf or 65536 for a level N freemap node.
-	 *
-	 * NOTE: A 256 byte bitmap represents 256 x 8 x 1024 = 2MB of storage.
-	 *	 Do not use hammer2_allocsize() here as it has a min cap.
+	 * Physical allocation size.
 	 */
-	bytes = 1 << radix;
+	bytes = (size_t)1 << radix;
 
 	/*
 	 * Calculate block selection index 0..7 of current block.  If this
 	 * is the first allocation of the block (verses a modification of an
 	 * existing block), we use index 0, otherwise we use the next rotating
 	 * index.
-	 *
-	 * NORMAL transactions use FREEMAP sections 0-5, while FREEBATCH
-	 * transactions use sections 6 and 7.  FREEBATCH transactions are
-	 * used by the batch freeing code to spool-off in-memory structures
-	 * used to track the batch free scan.
 	 */
-	if (trans->flags & HAMMER2_TRANS_FREEBATCH) {
-		if ((bref->data_off & ~HAMMER2_OFF_MASK_RADIX) == 0) {
-			index = (HAMMER2_ZONE_FREEMAP_06 -
-				 HAMMER2_ZONE_FREEMAP_00) / 4;
-		} else {
-			off = bref->data_off & ~HAMMER2_OFF_MASK_RADIX &
-			      (((hammer2_off_t)1 <<
-				HAMMER2_FREEMAP_LEVEL1_RADIX) - 1);
-			off = off / HAMMER2_PBUFSIZE;
-			KKASSERT(off >= HAMMER2_ZONE_FREEMAP_06 &&
-				 off < HAMMER2_ZONE_FREEMAP_08);
-			index = (int)(off - HAMMER2_ZONE_FREEMAP_00) / 4;
-			KKASSERT(index >= 6 && index < 8);
-			if (++index == 8)
-				index = 6;
-		}
+	if ((bref->data_off & ~HAMMER2_OFF_MASK_RADIX) == 0) {
+		index = 0;
 	} else {
-		if ((bref->data_off & ~HAMMER2_OFF_MASK_RADIX) == 0) {
+		off = bref->data_off & ~HAMMER2_OFF_MASK_RADIX &
+		      HAMMER2_SEGMASK;
+		off = off / HAMMER2_PBUFSIZE;
+		KKASSERT(off >= HAMMER2_ZONE_FREEMAP_00 &&
+			 off < HAMMER2_ZONE_FREEMAP_END);
+		index = (int)(off - HAMMER2_ZONE_FREEMAP_00) /
+			HAMMER2_ZONE_FREEMAP_INC;
+		KKASSERT(index >= 0 && index < HAMMER2_NFREEMAPS);
+		if (++index == HAMMER2_NFREEMAPS)
 			index = 0;
-		} else {
-			off = bref->data_off & ~HAMMER2_OFF_MASK_RADIX &
-			      (((hammer2_off_t)1 <<
-				HAMMER2_FREEMAP_LEVEL1_RADIX) - 1);
-			off = off / HAMMER2_PBUFSIZE;
-			KKASSERT(off >= HAMMER2_ZONE_FREEMAP_00 &&
-				 off < HAMMER2_ZONE_FREEMAP_06);
-			index = (int)(off - HAMMER2_ZONE_FREEMAP_00) / 4;
-			KKASSERT(index >= 0 && index < 6);
-			if (++index == 6)
-				index = 0;
-		}
 	}
 
 	/*
@@ -155,34 +118,43 @@ hammer2_freemap_reserve(hammer2_trans_t *trans, hammer2_chain_t *chain,
 	 * point into the 4MB reserved area at the base of the appropriate
 	 * 2GB zone, once added to the FREEMAP_x selection above.
 	 */
+	index_inc = index * HAMMER2_ZONE_FREEMAP_INC;
+
 	switch(bref->keybits) {
-	/* case HAMMER2_FREEMAP_LEVEL5_RADIX: not applicable */
-	case HAMMER2_FREEMAP_LEVEL4_RADIX:	/* 2EB */
+	/* case HAMMER2_FREEMAP_LEVEL6_RADIX: not applicable */
+	case HAMMER2_FREEMAP_LEVEL5_RADIX:	/* 4EB */
+		KKASSERT(bref->type == HAMMER2_BREF_TYPE_FREEMAP_NODE);
+		KKASSERT(bytes == HAMMER2_FREEMAP_LEVELN_PSIZE);
+		off = H2FMBASE(bref->key, HAMMER2_FREEMAP_LEVEL5_RADIX) +
+		      (index_inc + HAMMER2_ZONE_FREEMAP_00 +
+		       HAMMER2_ZONEFM_LEVEL5) * HAMMER2_PBUFSIZE;
+		break;
+	case HAMMER2_FREEMAP_LEVEL4_RADIX:	/* 16PB */
 		KKASSERT(bref->type == HAMMER2_BREF_TYPE_FREEMAP_NODE);
 		KKASSERT(bytes == HAMMER2_FREEMAP_LEVELN_PSIZE);
 		off = H2FMBASE(bref->key, HAMMER2_FREEMAP_LEVEL4_RADIX) +
-		      (index * 4 + HAMMER2_ZONE_FREEMAP_00 +
+		      (index_inc + HAMMER2_ZONE_FREEMAP_00 +
 		       HAMMER2_ZONEFM_LEVEL4) * HAMMER2_PBUFSIZE;
 		break;
-	case HAMMER2_FREEMAP_LEVEL3_RADIX:	/* 2PB */
+	case HAMMER2_FREEMAP_LEVEL3_RADIX:	/* 64TB */
 		KKASSERT(bref->type == HAMMER2_BREF_TYPE_FREEMAP_NODE);
 		KKASSERT(bytes == HAMMER2_FREEMAP_LEVELN_PSIZE);
 		off = H2FMBASE(bref->key, HAMMER2_FREEMAP_LEVEL3_RADIX) +
-		      (index * 4 + HAMMER2_ZONE_FREEMAP_00 +
+		      (index_inc + HAMMER2_ZONE_FREEMAP_00 +
 		       HAMMER2_ZONEFM_LEVEL3) * HAMMER2_PBUFSIZE;
 		break;
-	case HAMMER2_FREEMAP_LEVEL2_RADIX:	/* 2TB */
+	case HAMMER2_FREEMAP_LEVEL2_RADIX:	/* 256GB */
 		KKASSERT(bref->type == HAMMER2_BREF_TYPE_FREEMAP_NODE);
 		KKASSERT(bytes == HAMMER2_FREEMAP_LEVELN_PSIZE);
 		off = H2FMBASE(bref->key, HAMMER2_FREEMAP_LEVEL2_RADIX) +
-		      (index * 4 + HAMMER2_ZONE_FREEMAP_00 +
+		      (index_inc + HAMMER2_ZONE_FREEMAP_00 +
 		       HAMMER2_ZONEFM_LEVEL2) * HAMMER2_PBUFSIZE;
 		break;
-	case HAMMER2_FREEMAP_LEVEL1_RADIX:	/* 2GB */
+	case HAMMER2_FREEMAP_LEVEL1_RADIX:	/* 1GB */
 		KKASSERT(bref->type == HAMMER2_BREF_TYPE_FREEMAP_LEAF);
 		KKASSERT(bytes == HAMMER2_FREEMAP_LEVELN_PSIZE);
 		off = H2FMBASE(bref->key, HAMMER2_FREEMAP_LEVEL1_RADIX) +
-		      (index * 4 + HAMMER2_ZONE_FREEMAP_00 +
+		      (index_inc + HAMMER2_ZONE_FREEMAP_00 +
 		       HAMMER2_ZONEFM_LEVEL1) * HAMMER2_PBUFSIZE;
 		break;
 	default:
@@ -209,18 +181,32 @@ hammer2_freemap_reserve(hammer2_trans_t *trans, hammer2_chain_t *chain,
  *
  * ip and bpref are only used as a heuristic to determine locality of
  * reference.  bref->key may also be used heuristically.
+ *
+ * This function is a NOP if bytes is 0.
  */
 int
-hammer2_freemap_alloc(hammer2_trans_t *trans, hammer2_chain_t *chain,
-		      size_t bytes)
+hammer2_freemap_alloc(hammer2_chain_t *chain, size_t bytes)
 {
-	hammer2_mount_t *hmp = chain->hmp;
+	hammer2_dev_t *hmp = chain->hmp;
 	hammer2_blockref_t *bref = &chain->bref;
 	hammer2_chain_t *parent;
+	hammer2_tid_t mtid;
 	int radix;
 	int error;
 	unsigned int hindex;
 	hammer2_fiterate_t iter;
+
+	/*
+	 * If allocating or downsizing to zero we just get rid of whatever
+	 * data_off we had.
+	 */
+	if (bytes == 0) {
+		chain->bref.data_off = 0;
+		return 0;
+	}
+
+	KKASSERT(hmp->spmp);
+	mtid = hammer2_trans_sub(hmp->spmp);
 
 	/*
 	 * Validate the allocation size.  It must be a power of 2.
@@ -237,14 +223,12 @@ hammer2_freemap_alloc(hammer2_trans_t *trans, hammer2_chain_t *chain,
 		 * Freemap blocks themselves are assigned from the reserve
 		 * area, not allocated from the freemap.
 		 */
-		error = hammer2_freemap_reserve(trans, chain, radix);
+		error = hammer2_freemap_reserve(chain, radix);
+
 		return error;
 	}
 
 	KKASSERT(bytes >= HAMMER2_ALLOC_MIN && bytes <= HAMMER2_ALLOC_MAX);
-
-	if (trans->flags & (HAMMER2_TRANS_ISFLUSH | HAMMER2_TRANS_PREFLUSH))
-		++trans->sync_xid;
 
 	/*
 	 * Calculate the starting point for our allocation search.
@@ -279,9 +263,10 @@ hammer2_freemap_alloc(hammer2_trans_t *trans, hammer2_chain_t *chain,
 	KKASSERT(hindex < HAMMER2_FREEMAP_HEUR_NRADIX);
 	hindex += bref->type * HAMMER2_FREEMAP_HEUR_NRADIX;
 	hindex &= HAMMER2_FREEMAP_HEUR_TYPES * HAMMER2_FREEMAP_HEUR_NRADIX - 1;
-	KKASSERT(hindex < HAMMER2_FREEMAP_HEUR);
+	KKASSERT(hindex < HAMMER2_FREEMAP_HEUR_SIZE);
 
 	iter.bpref = hmp->heur_freemap[hindex];
+	iter.relaxed = hmp->freemap_relaxed;
 
 	/*
 	 * Make sure bpref is in-bounds.  It's ok if bpref covers a zone's
@@ -294,30 +279,30 @@ hammer2_freemap_alloc(hammer2_trans_t *trans, hammer2_chain_t *chain,
 	 * Iterate the freemap looking for free space before and after.
 	 */
 	parent = &hmp->fchain;
+	hammer2_chain_ref(parent);
 	hammer2_chain_lock(parent, HAMMER2_RESOLVE_ALWAYS);
-	error = EAGAIN;
+	error = HAMMER2_ERROR_EAGAIN;
 	iter.bnext = iter.bpref;
 	iter.loops = 0;
 
-	while (error == EAGAIN) {
-		error = hammer2_freemap_try_alloc(trans, &parent, bref,
-						  radix, &iter);
+	while (error == HAMMER2_ERROR_EAGAIN) {
+		error = hammer2_freemap_try_alloc(&parent, bref, radix,
+						  &iter, mtid);
 	}
+	hmp->freemap_relaxed |= iter.relaxed;	/* heuristical, SMP race ok */
 	hmp->heur_freemap[hindex] = iter.bnext;
 	hammer2_chain_unlock(parent);
-
-	if (trans->flags & (HAMMER2_TRANS_ISFLUSH | HAMMER2_TRANS_PREFLUSH))
-		--trans->sync_xid;
+	hammer2_chain_drop(parent);
 
 	return (error);
 }
 
 static int
-hammer2_freemap_try_alloc(hammer2_trans_t *trans, hammer2_chain_t **parentp,
+hammer2_freemap_try_alloc(hammer2_chain_t **parentp,
 			  hammer2_blockref_t *bref, int radix,
-			  hammer2_fiterate_t *iter)
+			  hammer2_fiterate_t *iter, hammer2_tid_t mtid)
 {
-	hammer2_mount_t *hmp = (*parentp)->hmp;
+	hammer2_dev_t *hmp = (*parentp)->hmp;
 	hammer2_off_t l0size;
 	hammer2_off_t l1size;
 	hammer2_off_t l1mask;
@@ -326,10 +311,7 @@ hammer2_freemap_try_alloc(hammer2_trans_t *trans, hammer2_chain_t **parentp,
 	hammer2_off_t key;
 	size_t bytes;
 	uint16_t class;
-	int error = 0;
-	int cache_index = -1;
-	int ddflag;
-
+	int error;
 
 	/*
 	 * Calculate the number of bytes being allocated, the number
@@ -348,14 +330,14 @@ hammer2_freemap_try_alloc(hammer2_trans_t *trans, hammer2_chain_t **parentp,
 	 * when necessary by hammer2_chain_create().
 	 */
 	key = H2FMBASE(iter->bnext, HAMMER2_FREEMAP_LEVEL1_RADIX);
-	l0size = H2FMSHIFT(HAMMER2_FREEMAP_LEVEL0_RADIX);
-	l1size = H2FMSHIFT(HAMMER2_FREEMAP_LEVEL1_RADIX);
+	l0size = HAMMER2_FREEMAP_LEVEL0_SIZE;
+	l1size = HAMMER2_FREEMAP_LEVEL1_SIZE;
 	l1mask = l1size - 1;
 
 	chain = hammer2_chain_lookup(parentp, &key_dummy, key, key + l1mask,
-				     &cache_index,
+				     &error,
 				     HAMMER2_LOOKUP_ALWAYS |
-				     HAMMER2_LOOKUP_MATCHIND, &ddflag);
+				     HAMMER2_LOOKUP_MATCHIND);
 
 	if (chain == NULL) {
 		/*
@@ -367,36 +349,46 @@ hammer2_freemap_try_alloc(hammer2_trans_t *trans, hammer2_chain_t **parentp,
 		kprintf("freemap create L1 @ %016jx bpref %016jx\n",
 			key, iter->bpref);
 #endif
-		error = hammer2_chain_create(trans, parentp, &chain, hmp->spmp,
+		error = hammer2_chain_create(parentp, &chain, NULL, hmp->spmp,
+				     HAMMER2_METH_DEFAULT,
 				     key, HAMMER2_FREEMAP_LEVEL1_RADIX,
 				     HAMMER2_BREF_TYPE_FREEMAP_LEAF,
 				     HAMMER2_FREEMAP_LEVELN_PSIZE,
-				     0);
+				     mtid, 0, 0);
 		KKASSERT(error == 0);
 		if (error == 0) {
-			hammer2_chain_modify(trans, chain, 0);
+			hammer2_chain_modify(chain, mtid, 0, 0);
 			bzero(&chain->data->bmdata[0],
 			      HAMMER2_FREEMAP_LEVELN_PSIZE);
 			chain->bref.check.freemap.bigmask = (uint32_t)-1;
 			chain->bref.check.freemap.avail = l1size;
 			/* bref.methods should already be inherited */
 
-			hammer2_freemap_init(trans, hmp, key, chain);
+			hammer2_freemap_init(hmp, key, chain);
 		}
-	} else if ((chain->bref.check.freemap.bigmask & (1 << radix)) == 0) {
+	} else if (chain->error) {
+		/*
+		 * Error during lookup.
+		 */
+		kprintf("hammer2_freemap_try_alloc: %016jx: error %s\n",
+			(intmax_t)bref->data_off,
+			hammer2_error_str(chain->error));
+		error = HAMMER2_ERROR_EIO;
+	} else if ((chain->bref.check.freemap.bigmask &
+		   ((size_t)1 << radix)) == 0) {
 		/*
 		 * Already flagged as not having enough space
 		 */
-		error = ENOSPC;
+		error = HAMMER2_ERROR_ENOSPC;
 	} else {
 		/*
 		 * Modify existing chain to setup for adjustment.
 		 */
-		hammer2_chain_modify(trans, chain, 0);
+		hammer2_chain_modify(chain, mtid, 0, 0);
 	}
 
 	/*
-	 * Scan 2MB entries.
+	 * Scan 4MB entries.
 	 */
 	if (error == 0) {
 		hammer2_bmap_data_t *bmap;
@@ -409,43 +401,109 @@ hammer2_freemap_try_alloc(hammer2_trans_t *trans, hammer2_chain_t **parentp,
 		start = (int)((iter->bnext - key) >>
 			      HAMMER2_FREEMAP_LEVEL0_RADIX);
 		KKASSERT(start >= 0 && start < HAMMER2_FREEMAP_COUNT);
-		hammer2_chain_modify(trans, chain, 0);
+		hammer2_chain_modify(chain, mtid, 0, 0);
 
-		error = ENOSPC;
+		error = HAMMER2_ERROR_ENOSPC;
 		for (count = 0; count < HAMMER2_FREEMAP_COUNT; ++count) {
+			int availchk;
+
 			if (start + count >= HAMMER2_FREEMAP_COUNT &&
 			    start - count < 0) {
 				break;
 			}
+
+			/*
+			 * Calculate bmap pointer from thart starting index
+			 * forwards.
+			 *
+			 * NOTE: bmap pointer is invalid if n >= FREEMAP_COUNT.
+			 */
 			n = start + count;
 			bmap = &chain->data->bmdata[n];
-			if (n < HAMMER2_FREEMAP_COUNT && bmap->avail &&
-			    (bmap->class == 0 || bmap->class == class)) {
+
+			if (n >= HAMMER2_FREEMAP_COUNT) {
+				availchk = 0;
+			} else if (bmap->avail) {
+				availchk = 1;
+			} else if (radix < HAMMER2_FREEMAP_BLOCK_RADIX &&
+			          (bmap->linear & HAMMER2_FREEMAP_BLOCK_MASK)) {
+				availchk = 1;
+			} else {
+				availchk = 0;
+			}
+
+			/*
+			 * Try to allocate from a matching freemap class
+			 * superblock.  If we are in relaxed mode we allocate
+			 * from any freemap class superblock.
+			 */
+			if (availchk &&
+			    (bmap->class == 0 || bmap->class == class ||
+			     iter->relaxed)) {
 				base_key = key + n * l0size;
-				error = hammer2_bmap_alloc(trans, hmp, bmap,
-							   class, n, radix,
+				error = hammer2_bmap_alloc(hmp, bmap,
+							   class, n,
+							   (int)bref->key,
+							   radix,
 							   &base_key);
-				if (error != ENOSPC) {
+				if (error != HAMMER2_ERROR_ENOSPC) {
 					key = base_key;
 					break;
 				}
 			}
+
+			/*
+			 * Calculate bmap pointer from thart starting index
+			 * backwards (locality).
+			 *
+			 * Must recalculate after potentially having called
+			 * hammer2_bmap_alloc() above in case chain was
+			 * reallocated.
+			 *
+			 * NOTE: bmap pointer is invalid if n < 0.
+			 */
 			n = start - count;
 			bmap = &chain->data->bmdata[n];
-			if (n >= 0 && bmap->avail &&
-			    (bmap->class == 0 || bmap->class == class)) {
+			if (n < 0) {
+				availchk = 0;
+			} else if (bmap->avail) {
+				availchk = 1;
+			} else if (radix < HAMMER2_FREEMAP_BLOCK_RADIX &&
+			          (bmap->linear & HAMMER2_FREEMAP_BLOCK_MASK)) {
+				availchk = 1;
+			} else {
+				availchk = 0;
+			}
+
+			/*
+			 * Try to allocate from a matching freemap class
+			 * superblock.  If we are in relaxed mode we allocate
+			 * from any freemap class superblock.
+			 */
+			if (availchk &&
+			    (bmap->class == 0 || bmap->class == class ||
+			    iter->relaxed)) {
 				base_key = key + n * l0size;
-				error = hammer2_bmap_alloc(trans, hmp, bmap,
-							   class, n, radix,
+				error = hammer2_bmap_alloc(hmp, bmap,
+							   class, n,
+							   (int)bref->key,
+							   radix,
 							   &base_key);
-				if (error != ENOSPC) {
+				if (error != HAMMER2_ERROR_ENOSPC) {
 					key = base_key;
 					break;
 				}
 			}
 		}
-		if (error == ENOSPC)
-			chain->bref.check.freemap.bigmask &= ~(1 << radix);
+
+		/*
+		 * We only know for sure that we can clear the bitmap bit
+		 * if we scanned the entire array (start == 0).
+		 */
+		if (error == HAMMER2_ERROR_ENOSPC && start == 0) {
+			chain->bref.check.freemap.bigmask &=
+				(uint32_t)~((size_t)1 << radix);
+		}
 		/* XXX also scan down from original count */
 	}
 
@@ -461,24 +519,37 @@ hammer2_freemap_try_alloc(hammer2_trans_t *trans, hammer2_chain_t **parentp,
 		KKASSERT((key & HAMMER2_ZONE_MASK64) >= HAMMER2_ZONE_SEG);
 		bref->data_off = key | radix;
 
+		/*
+		 * Record dedupability.  The dedup bits are cleared
+		 * when bulkfree transitions the freemap from 11->10,
+		 * and asserted to be clear on the 10->00 transition.
+		 *
+		 * We must record the bitmask with the chain locked
+		 * at the time we set the allocation bits to avoid
+		 * racing a bulkfree.
+		 */
+		if (bref->type == HAMMER2_BREF_TYPE_DATA)
+			hammer2_io_dedup_set(hmp, bref);
 #if 0
 		kprintf("alloc cp=%p %016jx %016jx using %016jx\n",
 			chain,
 			bref->key, bref->data_off, chain->bref.data_off);
 #endif
-	} else if (error == ENOSPC) {
+	} else if (error == HAMMER2_ERROR_ENOSPC) {
 		/*
 		 * Return EAGAIN with next iteration in iter->bnext, or
 		 * return ENOSPC if the allocation map has been exhausted.
 		 */
-		error = hammer2_freemap_iterate(trans, parentp, &chain, iter);
+		error = hammer2_freemap_iterate(parentp, &chain, iter);
 	}
 
 	/*
 	 * Cleanup
 	 */
-	if (chain)
+	if (chain) {
 		hammer2_chain_unlock(chain);
+		hammer2_chain_drop(chain);
+	}
 	return (error);
 }
 
@@ -486,26 +557,29 @@ hammer2_freemap_try_alloc(hammer2_trans_t *trans, hammer2_chain_t **parentp,
  * Allocate (1<<radix) bytes from the bmap whos base data offset is (*basep).
  *
  * If the linear iterator is mid-block we use it directly (the bitmap should
- * already be marked allocated), otherwise we search for a block in the bitmap
- * that fits the allocation request.
+ * already be marked allocated), otherwise we search for a block in the
+ * bitmap that fits the allocation request.
  *
  * A partial bitmap allocation sets the minimum bitmap granularity (16KB)
  * to fully allocated and adjusts the linear allocator to allow the
  * remaining space to be allocated.
+ *
+ * sub_key is the lower 32 bits of the chain->bref.key for the chain whos
+ * bref is being allocated.  If the radix represents an allocation >= 16KB
+ * (aka HAMMER2_FREEMAP_BLOCK_RADIX) we try to use this key to select the
+ * blocks directly out of the bmap.
  */
 static
 int
-hammer2_bmap_alloc(hammer2_trans_t *trans, hammer2_mount_t *hmp,
-		   hammer2_bmap_data_t *bmap,
-		   uint16_t class, int n, int radix, hammer2_key_t *basep)
+hammer2_bmap_alloc(hammer2_dev_t *hmp, hammer2_bmap_data_t *bmap,
+		   uint16_t class, int n, int sub_key,
+		   int radix, hammer2_key_t *basep)
 {
-	hammer2_io_t *dio;
 	size_t size;
-	size_t bsize;
+	size_t bgsize;
 	int bmradix;
-	uint32_t bmmask;
+	hammer2_bitmap_t bmmask;
 	int offset;
-	int error;
 	int i;
 	int j;
 
@@ -516,11 +590,10 @@ hammer2_bmap_alloc(hammer2_trans_t *trans, hammer2_mount_t *hmp,
 
 	if (radix <= HAMMER2_FREEMAP_BLOCK_RADIX) {
 		bmradix = 2;
-		bsize = HAMMER2_FREEMAP_BLOCK_SIZE;
 		/* (16K) 2 bits per allocation block */
 	} else {
-		bmradix = 2 << (radix - HAMMER2_FREEMAP_BLOCK_RADIX);
-		bsize = size;
+		bmradix = (hammer2_bitmap_t)2 <<
+			  (radix - HAMMER2_FREEMAP_BLOCK_RADIX);
 		/* (32K-256K) 4, 8, 16, 32 bits per allocation block */
 	}
 
@@ -532,11 +605,11 @@ hammer2_bmap_alloc(hammer2_trans_t *trans, hammer2_mount_t *hmp,
 	 * once we pack to the boundary.  We adjust it after a bitmap
 	 * allocation only for sub-16KB allocations (so the perfectly good
 	 * previous value can still be used for fragments when 16KB+
-	 * allocations are made).
+	 * allocations are made inbetween fragmentary allocations).
 	 *
-	 * Beware of hardware artifacts when bmradix == 32 (intermediate
+	 * Beware of hardware artifacts when bmradix == 64 (intermediate
 	 * result can wind up being '1' instead of '0' if hardware masks
-	 * bit-count & 31).
+	 * bit-count & 63).
 	 *
 	 * NOTE: j needs to be even in the j= calculation.  As an artifact
 	 *	 of the /2 division, our bitmask has to clear bit 0.
@@ -548,37 +621,104 @@ hammer2_bmap_alloc(hammer2_trans_t *trans, hammer2_mount_t *hmp,
 	    HAMMER2_FREEMAP_BLOCK_SIZE &&
 	    (bmap->linear & HAMMER2_FREEMAP_BLOCK_MASK) &&
 	    bmap->linear < HAMMER2_SEGSIZE) {
+		/*
+		 * Use linear iterator if it is not block-aligned to avoid
+		 * wasting space.
+		 *
+		 * Calculate the bitmapq[] index (i) and calculate the
+		 * shift count within the 64-bit bitmapq[] entry.
+		 *
+		 * The freemap block size is 16KB, but each bitmap
+		 * entry is two bits so use a little trick to get
+		 * a (j) shift of 0, 2, 4, ... 62 in 16KB chunks.
+		 */
 		KKASSERT(bmap->linear >= 0 &&
 			 bmap->linear + size <= HAMMER2_SEGSIZE &&
 			 (bmap->linear & (HAMMER2_ALLOC_MIN - 1)) == 0);
 		offset = bmap->linear;
-		i = offset / (HAMMER2_SEGSIZE / 8);
-		j = (offset / (HAMMER2_FREEMAP_BLOCK_SIZE / 2)) & 30;
-		bmmask = (bmradix == 32) ?
-			 0xFFFFFFFFU : (1 << bmradix) - 1;
+		i = offset / (HAMMER2_SEGSIZE / HAMMER2_BMAP_ELEMENTS);
+		j = (offset / (HAMMER2_FREEMAP_BLOCK_SIZE / 2)) & 62;
+		bmmask = (bmradix == HAMMER2_BMAP_BITS_PER_ELEMENT) ?
+			 HAMMER2_BMAP_ALLONES :
+			 ((hammer2_bitmap_t)1 << bmradix) - 1;
 		bmmask <<= j;
 		bmap->linear = offset + size;
 	} else {
-		for (i = 0; i < 8; ++i) {
-			bmmask = (bmradix == 32) ?
-				 0xFFFFFFFFU : (1 << bmradix) - 1;
-			for (j = 0; j < 32; j += bmradix) {
-				if ((bmap->bitmap[i] & bmmask) == 0)
+		/*
+		 * Try to index a starting point based on sub_key.  This
+		 * attempts to restore sequential block ordering on-disk
+		 * whenever possible, even if data is committed out of
+		 * order.
+		 *
+		 * i - Index bitmapq[], full data range represented is
+		 *     HAMMER2_BMAP_SIZE.
+		 *
+		 * j - Index within bitmapq[i], full data range represented is
+		 *     HAMMER2_BMAP_INDEX_SIZE.
+		 *
+		 * WARNING!
+		 */
+		i = -1;
+		j = -1;
+
+		switch(class >> 8) {
+		case HAMMER2_BREF_TYPE_DATA:
+			if (radix >= HAMMER2_FREEMAP_BLOCK_RADIX) {
+				i = (sub_key & HAMMER2_BMAP_MASK) /
+				    (HAMMER2_BMAP_SIZE / HAMMER2_BMAP_ELEMENTS);
+				j = (sub_key & HAMMER2_BMAP_INDEX_MASK) /
+				    (HAMMER2_BMAP_INDEX_SIZE /
+				     HAMMER2_BMAP_BLOCKS_PER_ELEMENT);
+				j = j * 2;
+			}
+			break;
+		case HAMMER2_BREF_TYPE_INODE:
+			break;
+		default:
+			break;
+		}
+		if (i >= 0) {
+			KKASSERT(i < HAMMER2_BMAP_ELEMENTS &&
+				 j < 2 * HAMMER2_BMAP_BLOCKS_PER_ELEMENT);
+			KKASSERT(j + bmradix <= HAMMER2_BMAP_BITS_PER_ELEMENT);
+			bmmask = (bmradix == HAMMER2_BMAP_BITS_PER_ELEMENT) ?
+				 HAMMER2_BMAP_ALLONES :
+				 ((hammer2_bitmap_t)1 << bmradix) - 1;
+			bmmask <<= j;
+
+			if ((bmap->bitmapq[i] & bmmask) == 0)
+				goto success;
+		}
+
+		/*
+		 * General element scan.
+		 *
+		 * WARNING: (j) is iterating a bit index (by 2's)
+		 */
+		for (i = 0; i < HAMMER2_BMAP_ELEMENTS; ++i) {
+			bmmask = (bmradix == HAMMER2_BMAP_BITS_PER_ELEMENT) ?
+				 HAMMER2_BMAP_ALLONES :
+				 ((hammer2_bitmap_t)1 << bmradix) - 1;
+			for (j = 0;
+			     j < HAMMER2_BMAP_BITS_PER_ELEMENT;
+			     j += bmradix) {
+				if ((bmap->bitmapq[i] & bmmask) == 0)
 					goto success;
 				bmmask <<= bmradix;
 			}
 		}
 		/*fragments might remain*/
 		/*KKASSERT(bmap->avail == 0);*/
-		return (ENOSPC);
+		return (HAMMER2_ERROR_ENOSPC);
 success:
-		offset = i * (HAMMER2_SEGSIZE / 8) +
+		offset = i * (HAMMER2_SEGSIZE / HAMMER2_BMAP_ELEMENTS) +
 			 (j * (HAMMER2_FREEMAP_BLOCK_SIZE / 2));
 		if (size & HAMMER2_FREEMAP_BLOCK_MASK)
 			bmap->linear = offset + size;
 	}
 
-	KKASSERT(i >= 0 && i < 8);	/* 8 x 16 -> 128 x 16K -> 2MB */
+	/* 8 x (64/2) -> 256 x 16K -> 4MB */
+	KKASSERT(i >= 0 && i < HAMMER2_BMAP_ELEMENTS);
 
 	/*
 	 * Optimize the buffer cache to avoid unnecessary read-before-write
@@ -588,31 +728,35 @@ success:
 	 * so the actual bitmap test is somewhat more involved.  We have
 	 * to use a compatible buffer size for this operation.
 	 */
-	if ((bmap->bitmap[i] & bmmask) == 0 &&
+	if ((bmap->bitmapq[i] & bmmask) == 0 &&
 	    hammer2_devblksize(size) != size) {
 		size_t psize = hammer2_devblksize(size);
 		hammer2_off_t pmask = (hammer2_off_t)psize - 1;
-		int pbmradix = 2 << (hammer2_devblkradix(radix) -
-				     HAMMER2_FREEMAP_BLOCK_RADIX);
-		uint32_t pbmmask;
+		int pbmradix = (hammer2_bitmap_t)2 <<
+					(hammer2_devblkradix(radix) -
+			       HAMMER2_FREEMAP_BLOCK_RADIX);
+		hammer2_bitmap_t pbmmask;
 		int pradix = hammer2_getradix(psize);
 
-		pbmmask = (pbmradix == 32) ? 0xFFFFFFFFU : (1 << pbmradix) - 1;
+		pbmmask = (pbmradix == HAMMER2_BMAP_BITS_PER_ELEMENT) ?
+			HAMMER2_BMAP_ALLONES :
+			((hammer2_bitmap_t)1 << pbmradix) - 1;
 		while ((pbmmask & bmmask) == 0)
 			pbmmask <<= pbmradix;
 
 #if 0
-		kprintf("%016jx mask %08x %08x %08x (%zd/%zd)\n",
-			*basep + offset, bmap->bitmap[i],
+		kprintf("%016jx mask %016jx %016jx %016jx (%zd/%zd)\n",
+			*basep + offset, bmap->bitmapq[i],
 			pbmmask, bmmask, size, psize);
 #endif
 
-		if ((bmap->bitmap[i] & pbmmask) == 0) {
-			error = hammer2_io_newq(hmp,
-						(*basep + (offset & ~pmask)) |
-						 pradix,
-						psize, &dio);
-			hammer2_io_bqrelse(&dio);
+		if ((bmap->bitmapq[i] & pbmmask) == 0) {
+			hammer2_io_t *dio;
+
+			hammer2_io_newnz(hmp, class >> 8,
+					(*basep + (offset & ~pmask)) |
+					pradix, psize, &dio);
+			hammer2_io_putblk(&dio);
 		}
 	}
 
@@ -635,29 +779,60 @@ success:
 		}
 	}
 #endif
+	/*
+	 * Calculate the bitmap-granular change in bgsize for the volume
+	 * header.  We cannot use the fine-grained change here because
+	 * the bulkfree code can't undo it.  If the bitmap element is already
+	 * marked allocated it has already been accounted for.
+	 */
+	if (radix < HAMMER2_FREEMAP_BLOCK_RADIX) {
+		if (bmap->bitmapq[i] & bmmask)
+			bgsize = 0;
+		else
+			bgsize = HAMMER2_FREEMAP_BLOCK_SIZE;
+	} else {
+		bgsize = size;
+	}
 
 	/*
-	 * Adjust the linear iterator, set the radix if necessary (might as
-	 * well just set it unconditionally), adjust *basep to return the
-	 * allocated data offset.
+	 * Adjust the bitmap, set the class (it might have been 0),
+	 * and available bytes, update the allocation offset (*basep)
+	 * from the L0 base to the actual offset.
+	 *
+	 * Do not override the class if doing a relaxed class allocation.
+	 *
+	 * avail must reflect the bitmap-granular availability.  The allocator
+	 * tests will also check the linear iterator.
 	 */
-	bmap->bitmap[i] |= bmmask;
-	bmap->class = class;
-	bmap->avail -= size;
+	bmap->bitmapq[i] |= bmmask;
+	if (bmap->class == 0)
+		bmap->class = class;
+	bmap->avail -= bgsize;
 	*basep += offset;
 
-	hammer2_voldata_lock(hmp);
-	hammer2_voldata_modify(hmp);
-	hmp->voldata.allocator_free -= size;  /* XXX */
-	hammer2_voldata_unlock(hmp);
+	/*
+	 * Adjust the volume header's allocator_free parameter.  This
+	 * parameter has to be fixed up by bulkfree which has no way to
+	 * figure out sub-16K chunking, so it must be adjusted by the
+	 * bitmap-granular size.
+	 */
+	if (bgsize) {
+		hammer2_voldata_lock(hmp);
+		hammer2_voldata_modify(hmp);
+		hmp->voldata.allocator_free -= bgsize;
+		hammer2_voldata_unlock(hmp);
+	}
 
 	return(0);
 }
 
+/*
+ * Initialize a freemap for the storage area (in bytes) that begins at (key).
+ */
 static
 void
-hammer2_freemap_init(hammer2_trans_t *trans, hammer2_mount_t *hmp,
-		     hammer2_key_t key, hammer2_chain_t *chain)
+hammer2_freemap_init(hammer2_dev_t *hmp, hammer2_key_t key,
+		     hammer2_chain_t *chain)
 {
 	hammer2_off_t l1size;
 	hammer2_off_t lokey;
@@ -665,56 +840,69 @@ hammer2_freemap_init(hammer2_trans_t *trans, hammer2_mount_t *hmp,
 	hammer2_bmap_data_t *bmap;
 	int count;
 
-	l1size = H2FMSHIFT(HAMMER2_FREEMAP_LEVEL1_RADIX);
+	/*
+	 * LEVEL1 is 1GB, there are two level1 1GB freemaps per 2GB zone.
+	 */
+	l1size = HAMMER2_FREEMAP_LEVEL1_SIZE;
 
 	/*
-	 * Calculate the portion of the 2GB map that should be initialized
+	 * Calculate the portion of the 1GB map that should be initialized
 	 * as free.  Portions below or after will be initialized as allocated.
 	 * SEGMASK-align the areas so we don't have to worry about sub-scans
 	 * or endianess when using memset.
 	 *
-	 * (1) Ensure that all statically allocated space from newfs_hammer2
-	 *     is marked allocated.
-	 *
-	 * (2) Ensure that the reserved area is marked allocated (typically
-	 *     the first 4MB of the 2GB area being represented).
-	 *
-	 * (3) Ensure that any trailing space at the end-of-volume is marked
-	 *     allocated.
-	 *
 	 * WARNING! It is possible for lokey to be larger than hikey if the
 	 *	    entire 2GB segment is within the static allocation.
 	 */
+	/*
+	 * (1) Ensure that all statically allocated space from newfs_hammer2
+	 *     is marked allocated, and take it up to the level1 base for
+	 *     this key.
+	 */
 	lokey = (hmp->voldata.allocator_beg + HAMMER2_SEGMASK64) &
 		~HAMMER2_SEGMASK64;
+	if (lokey < H2FMBASE(key, HAMMER2_FREEMAP_LEVEL1_RADIX))
+		lokey = H2FMBASE(key, HAMMER2_FREEMAP_LEVEL1_RADIX);
 
-	if (lokey < H2FMBASE(key, HAMMER2_FREEMAP_LEVEL1_RADIX) +
-		  HAMMER2_ZONE_SEG64) {
-		lokey = H2FMBASE(key, HAMMER2_FREEMAP_LEVEL1_RADIX) +
-			HAMMER2_ZONE_SEG64;
-	}
+	/*
+	 * (2) Ensure that the reserved area is marked allocated (typically
+	 *     the first 4MB of each 2GB area being represented).  Since
+	 *     each LEAF represents 1GB of storage and the zone is 2GB, we
+	 *     have to adjust lowkey upward every other LEAF sequentially.
+	 */
+	if (lokey < H2FMZONEBASE(key) + HAMMER2_ZONE_SEG64)
+		lokey = H2FMZONEBASE(key) + HAMMER2_ZONE_SEG64;
 
-	hikey = key + H2FMSHIFT(HAMMER2_FREEMAP_LEVEL1_RADIX);
+	/*
+	 * (3) Ensure that any trailing space at the end-of-volume is marked
+	 *     allocated.
+	 */
+	hikey = key + HAMMER2_FREEMAP_LEVEL1_SIZE;
 	if (hikey > hmp->voldata.volu_size) {
 		hikey = hmp->voldata.volu_size & ~HAMMER2_SEGMASK64;
 	}
 
-	chain->bref.check.freemap.avail =
-		H2FMSHIFT(HAMMER2_FREEMAP_LEVEL1_RADIX);
+	/*
+	 * Heuristic highest possible value
+	 */
+	chain->bref.check.freemap.avail = HAMMER2_FREEMAP_LEVEL1_SIZE;
 	bmap = &chain->data->bmdata[0];
 
+	/*
+	 * Initialize bitmap (bzero'd by caller)
+	 */
 	for (count = 0; count < HAMMER2_FREEMAP_COUNT; ++count) {
 		if (key < lokey || key >= hikey) {
-			memset(bmap->bitmap, -1,
-			       sizeof(bmap->bitmap));
+			memset(bmap->bitmapq, -1,
+			       sizeof(bmap->bitmapq));
 			bmap->avail = 0;
 			bmap->linear = HAMMER2_SEGSIZE;
 			chain->bref.check.freemap.avail -=
-				H2FMSHIFT(HAMMER2_FREEMAP_LEVEL0_RADIX);
+				HAMMER2_FREEMAP_LEVEL0_SIZE;
 		} else {
-			bmap->avail = H2FMSHIFT(HAMMER2_FREEMAP_LEVEL0_RADIX);
+			bmap->avail = HAMMER2_FREEMAP_LEVEL0_SIZE;
 		}
-		key += H2FMSHIFT(HAMMER2_FREEMAP_LEVEL0_RADIX);
+		key += HAMMER2_FREEMAP_LEVEL0_SIZE;
 		++bmap;
 	}
 }
@@ -723,23 +911,32 @@ hammer2_freemap_init(hammer2_trans_t *trans, hammer2_mount_t *hmp,
  * The current Level 1 freemap has been exhausted, iterate to the next
  * one, return ENOSPC if no freemaps remain.
  *
+ * At least two loops are required.  If we are not in relaxed mode and
+ * we run out of storage we enter relaxed mode and do a third loop.
+ * The relaxed mode is recorded back in the hmp so once we enter the mode
+ * we remain relaxed until stuff begins to get freed and only do 2 loops.
+ *
  * XXX this should rotate back to the beginning to handle freed-up space
  * XXX or use intermediate entries to locate free space. TODO
  */
 static int
-hammer2_freemap_iterate(hammer2_trans_t *trans, hammer2_chain_t **parentp,
-			hammer2_chain_t **chainp, hammer2_fiterate_t *iter)
+hammer2_freemap_iterate(hammer2_chain_t **parentp, hammer2_chain_t **chainp,
+			hammer2_fiterate_t *iter)
 {
-	hammer2_mount_t *hmp = (*parentp)->hmp;
+	hammer2_dev_t *hmp = (*parentp)->hmp;
 
-	iter->bnext &= ~(H2FMSHIFT(HAMMER2_FREEMAP_LEVEL1_RADIX) - 1);
-	iter->bnext += H2FMSHIFT(HAMMER2_FREEMAP_LEVEL1_RADIX);
+	iter->bnext &= ~HAMMER2_FREEMAP_LEVEL1_MASK;
+	iter->bnext += HAMMER2_FREEMAP_LEVEL1_SIZE;
 	if (iter->bnext >= hmp->voldata.volu_size) {
 		iter->bnext = 0;
-		if (++iter->loops == 2)
-			return (ENOSPC);
+		if (++iter->loops >= 2) {
+			if (iter->relaxed == 0)
+				iter->relaxed = 1;
+			else
+				return (HAMMER2_ERROR_ENOSPC);
+		}
 	}
-	return(EAGAIN);
+	return(HAMMER2_ERROR_EAGAIN);
 }
 
 /*
@@ -748,14 +945,16 @@ hammer2_freemap_iterate(hammer2_trans_t *trans, hammer2_chain_t **parentp,
  * as allocated) blocks whos freemap upates might not have been committed
  * in the last crash and is used by the bulk freemap scan to stage frees.
  *
+ * WARNING! Cannot be called with a empty-data bref (radix == 0).
+ *
  * XXX currently disabled when how == 0 (the normal real-time case).  At
  * the moment we depend on the bulk freescan to actually free blocks.  It
  * will still call this routine with a non-zero how to stage possible frees
  * and to do the actual free.
  */
 void
-hammer2_freemap_adjust(hammer2_trans_t *trans, hammer2_mount_t *hmp,
-		       hammer2_blockref_t *bref, int how)
+hammer2_freemap_adjust(hammer2_dev_t *hmp, hammer2_blockref_t *bref,
+		       int how)
 {
 	hammer2_off_t data_off = bref->data_off;
 	hammer2_chain_t *chain;
@@ -766,30 +965,39 @@ hammer2_freemap_adjust(hammer2_trans_t *trans, hammer2_mount_t *hmp,
 	hammer2_off_t l0size;
 	hammer2_off_t l1size;
 	hammer2_off_t l1mask;
-	uint32_t *bitmap;
-	const uint32_t bmmask00 = 0;
-	uint32_t bmmask01;
-	uint32_t bmmask10;
-	uint32_t bmmask11;
+	hammer2_tid_t mtid;
+	hammer2_bitmap_t *bitmap;
+	const hammer2_bitmap_t bmmask00 = 0;
+	hammer2_bitmap_t bmmask01;
+	hammer2_bitmap_t bmmask10;
+	hammer2_bitmap_t bmmask11;
 	size_t bytes;
 	uint16_t class;
 	int radix;
 	int start;
 	int count;
 	int modified = 0;
-	int cache_index = -1;
 	int error;
-	int ddflag;
+	size_t bgsize = 0;
+
+	KKASSERT(how == HAMMER2_FREEMAP_DORECOVER);
+
+	KKASSERT(hmp->spmp);
+	mtid = hammer2_trans_sub(hmp->spmp);
 
 	radix = (int)data_off & HAMMER2_OFF_MASK_RADIX;
+	KKASSERT(radix != 0);
 	data_off &= ~HAMMER2_OFF_MASK_RADIX;
 	KKASSERT(radix <= HAMMER2_RADIX_MAX);
 
-	bytes = (size_t)1 << radix;
+	if (radix)
+		bytes = (size_t)1 << radix;
+	else
+		bytes = 0;
 	class = (bref->type << 8) | hammer2_devblkradix(radix);
 
 	/*
-	 * We can't adjust thre freemap for data allocations made by
+	 * We can't adjust the freemap for data allocations made by
 	 * newfs_hammer2.
 	 */
 	if (data_off < hmp->voldata.allocator_beg)
@@ -801,17 +1009,18 @@ hammer2_freemap_adjust(hammer2_trans_t *trans, hammer2_mount_t *hmp,
 	 * Lookup the level1 freemap chain.  The chain must exist.
 	 */
 	key = H2FMBASE(data_off, HAMMER2_FREEMAP_LEVEL1_RADIX);
-	l0size = H2FMSHIFT(HAMMER2_FREEMAP_LEVEL0_RADIX);
-	l1size = H2FMSHIFT(HAMMER2_FREEMAP_LEVEL1_RADIX);
+	l0size = HAMMER2_FREEMAP_LEVEL0_SIZE;
+	l1size = HAMMER2_FREEMAP_LEVEL1_SIZE;
 	l1mask = l1size - 1;
 
 	parent = &hmp->fchain;
+	hammer2_chain_ref(parent);
 	hammer2_chain_lock(parent, HAMMER2_RESOLVE_ALWAYS);
 
 	chain = hammer2_chain_lookup(&parent, &key_dummy, key, key + l1mask,
-				     &cache_index,
+				     &error,
 				     HAMMER2_LOOKUP_ALWAYS |
-				     HAMMER2_LOOKUP_MATCHIND, &ddflag);
+				     HAMMER2_LOOKUP_MATCHIND);
 
 	/*
 	 * Stop early if we are trying to free something but no leaf exists.
@@ -819,6 +1028,15 @@ hammer2_freemap_adjust(hammer2_trans_t *trans, hammer2_mount_t *hmp,
 	if (chain == NULL && how != HAMMER2_FREEMAP_DORECOVER) {
 		kprintf("hammer2_freemap_adjust: %016jx: no chain\n",
 			(intmax_t)bref->data_off);
+		goto done;
+	}
+	if (chain->error) {
+		kprintf("hammer2_freemap_adjust: %016jx: error %s\n",
+			(intmax_t)bref->data_off,
+			hammer2_error_str(chain->error));
+		hammer2_chain_unlock(chain);
+		hammer2_chain_drop(chain);
+		chain = NULL;
 		goto done;
 	}
 
@@ -829,11 +1047,12 @@ hammer2_freemap_adjust(hammer2_trans_t *trans, hammer2_mount_t *hmp,
 	 * bref.check.freemap structure.
 	 */
 	if (chain == NULL && how == HAMMER2_FREEMAP_DORECOVER) {
-		error = hammer2_chain_create(trans, &parent, &chain, hmp->spmp,
+		error = hammer2_chain_create(&parent, &chain, NULL, hmp->spmp,
+				     HAMMER2_METH_DEFAULT,
 				     key, HAMMER2_FREEMAP_LEVEL1_RADIX,
 				     HAMMER2_BREF_TYPE_FREEMAP_LEAF,
 				     HAMMER2_FREEMAP_LEVELN_PSIZE,
-				     0);
+				     mtid, 0, 0);
 
 		if (hammer2_debug & 0x0040) {
 			kprintf("fixup create chain %p %016jx:%d\n",
@@ -841,14 +1060,15 @@ hammer2_freemap_adjust(hammer2_trans_t *trans, hammer2_mount_t *hmp,
 		}
 
 		if (error == 0) {
-			hammer2_chain_modify(trans, chain, 0);
+			error = hammer2_chain_modify(chain, mtid, 0, 0);
+			KKASSERT(error == 0);
 			bzero(&chain->data->bmdata[0],
 			      HAMMER2_FREEMAP_LEVELN_PSIZE);
 			chain->bref.check.freemap.bigmask = (uint32_t)-1;
 			chain->bref.check.freemap.avail = l1size;
 			/* bref.methods should already be inherited */
 
-			hammer2_freemap_init(trans, hmp, key, chain);
+			hammer2_freemap_init(hmp, key, chain);
 		}
 		/* XXX handle error */
 	}
@@ -863,9 +1083,9 @@ hammer2_freemap_adjust(hammer2_trans_t *trans, hammer2_mount_t *hmp,
 	 * Calculate the bitmask (runs in 2-bit pairs).
 	 */
 	start = ((int)(data_off >> HAMMER2_FREEMAP_BLOCK_RADIX) & 15) * 2;
-	bmmask01 = 1 << start;
-	bmmask10 = 2 << start;
-	bmmask11 = 3 << start;
+	bmmask01 = (hammer2_bitmap_t)1 << start;
+	bmmask10 = (hammer2_bitmap_t)2 << start;
+	bmmask11 = (hammer2_bitmap_t)3 << start;
 
 	/*
 	 * Fixup the bitmap.  Partial blocks cannot be fully freed unless
@@ -881,7 +1101,7 @@ hammer2_freemap_adjust(hammer2_trans_t *trans, hammer2_mount_t *hmp,
 
 	/*
 	 * [re]load the bmap and bitmap pointers.  Each bmap entry covers
-	 * a 2MB swath.  The bmap itself (LEVEL1) covers 2GB.
+	 * a 4MB swath.  The bmap itself (LEVEL1) covers 2GB.
 	 *
 	 * Be sure to reset the linear iterator to ensure that the adjustment
 	 * is not ignored.
@@ -889,7 +1109,7 @@ hammer2_freemap_adjust(hammer2_trans_t *trans, hammer2_mount_t *hmp,
 again:
 	bmap = &chain->data->bmdata[(int)(data_off >> HAMMER2_SEGRADIX) &
 				    (HAMMER2_FREEMAP_COUNT - 1)];
-	bitmap = &bmap->bitmap[(int)(data_off >> (HAMMER2_SEGRADIX - 3)) & 7];
+	bitmap = &bmap->bitmapq[(int)(data_off >> (HAMMER2_SEGRADIX - 3)) & 7];
 
 	if (modified)
 		bmap->linear = 0;
@@ -902,12 +1122,15 @@ again:
 			 */
 			if ((*bitmap & bmmask11) != bmmask11) {
 				if (modified == 0) {
-					hammer2_chain_modify(trans, chain, 0);
+					hammer2_chain_modify(chain, mtid, 0, 0);
 					modified = 1;
 					goto again;
 				}
-				if ((*bitmap & bmmask11) == bmmask00)
-					bmap->avail -= 1 << radix;
+				if ((*bitmap & bmmask11) == bmmask00) {
+					bmap->avail -=
+						HAMMER2_FREEMAP_BLOCK_SIZE;
+					bgsize += HAMMER2_FREEMAP_BLOCK_SIZE;
+				}
 				if (bmap->class == 0)
 					bmap->class = class;
 				*bitmap |= bmmask11;
@@ -924,13 +1147,19 @@ again:
 					bref->type, data_off, bytes);
 				*/
 			}
-		} else if ((*bitmap & bmmask11) == bmmask11) {
+		}
+#if 0
+		/*
+		 * XXX this stuff doesn't work, avail is miscalculated and
+		 * code 10 means something else now.
+		 */
+		else if ((*bitmap & bmmask11) == bmmask11) {
 			/*
 			 * Mayfree/Realfree request and bitmap is currently
 			 * marked as being fully allocated.
 			 */
 			if (!modified) {
-				hammer2_chain_modify(trans, chain, 0);
+				hammer2_chain_modify(chain, 0);
 				modified = 1;
 				goto again;
 			}
@@ -945,7 +1174,7 @@ again:
 			 */
 			if (how == HAMMER2_FREEMAP_DOREALFREE) {
 				if (!modified) {
-					hammer2_chain_modify(trans, chain, 0);
+					hammer2_chain_modify(chain, 0);
 					modified = 1;
 					goto again;
 				}
@@ -960,23 +1189,27 @@ again:
 			      "Illegal state %08x(%08x)",
 			      *bitmap, *bitmap & bmmask11);
 		}
+#endif
 		--count;
 		bmmask01 <<= 2;
 		bmmask10 <<= 2;
 		bmmask11 <<= 2;
 	}
+#if HAMMER2_BMAP_ELEMENTS != 8
+#error "hammer2_freemap.c: HAMMER2_BMAP_ELEMENTS expected to be 8"
+#endif
 	if (how == HAMMER2_FREEMAP_DOREALFREE && modified) {
 		bmap->avail += 1 << radix;
 		KKASSERT(bmap->avail <= HAMMER2_SEGSIZE);
 		if (bmap->avail == HAMMER2_SEGSIZE &&
-		    bmap->bitmap[0] == 0 &&
-		    bmap->bitmap[1] == 0 &&
-		    bmap->bitmap[2] == 0 &&
-		    bmap->bitmap[3] == 0 &&
-		    bmap->bitmap[4] == 0 &&
-		    bmap->bitmap[5] == 0 &&
-		    bmap->bitmap[6] == 0 &&
-		    bmap->bitmap[7] == 0) {
+		    bmap->bitmapq[0] == 0 &&
+		    bmap->bitmapq[1] == 0 &&
+		    bmap->bitmapq[2] == 0 &&
+		    bmap->bitmapq[3] == 0 &&
+		    bmap->bitmapq[4] == 0 &&
+		    bmap->bitmapq[5] == 0 &&
+		    bmap->bitmapq[6] == 0 &&
+		    bmap->bitmapq[7] == 0) {
 			key = H2FMBASE(data_off, HAMMER2_FREEMAP_LEVEL0_RADIX);
 			kprintf("Freeseg %016jx\n", (intmax_t)key);
 			bmap->class = 0;
@@ -990,13 +1223,27 @@ again:
 	 * be something allocatable.  We also set this in recovery... it
 	 * doesn't hurt and we might want to use the hint for other validation
 	 * operations later on.
+	 *
+	 * We could calculate the largest possible allocation and set the
+	 * radii that could fit, but its easier just to set bigmask to -1.
 	 */
-	if (modified)
-		chain->bref.check.freemap.bigmask |= 1 << radix;
+	if (modified) {
+		chain->bref.check.freemap.bigmask = -1;
+		hmp->freemap_relaxed = 0;	/* reset heuristic */
+	}
 
 	hammer2_chain_unlock(chain);
+	hammer2_chain_drop(chain);
 done:
 	hammer2_chain_unlock(parent);
+	hammer2_chain_drop(parent);
+
+	if (bgsize) {
+		hammer2_voldata_lock(hmp);
+		hammer2_voldata_modify(hmp);
+		hmp->voldata.allocator_free -= bgsize;
+		hammer2_voldata_unlock(hmp);
+	}
 }
 
 /*

@@ -9,11 +9,7 @@
 .\" 2. Redistributions in binary form must reproduce the above copyright
 .\"    notice, this list of conditions and the following disclaimer in the
 .\"    documentation and/or other materials provided with the distribution.
-.\" 3. All advertising materials mentioning features or use of this software
-.\"    must display the following acknowledgment:
-.\"	This product includes software developed by the University of
-.\"	California, Berkeley and its contributors.
-.\" 4. Neither the name of the University nor the names of its contributors
+.\" 3. Neither the name of the University nor the names of its contributors
 .\"    may be used to endorse or promote products derived from this software
 .\"    without specific prior written permission.
 .\"
@@ -31,9 +27,8 @@
 .\"
 .\"	@(#)clri.8	8.2 (Berkeley) 4/19/94
 .\" $FreeBSD: src/sbin/clri/clri.8,v 1.7.2.4 2003/01/24 03:45:38 trhodes Exp $
-.\" $DragonFly: src/sbin/clri/clri.8,v 1.2 2003/06/17 04:27:32 dillon Exp $
 .\"
-.Dd April 19, 1994
+.Dd September 29, 2016
 .Dt CLRI 8
 .Os
 .Sh NAME
@@ -75,6 +70,11 @@ will be able to clean up the resulting mess.
 .Sh SEE ALSO
 .Xr fsck 8 ,
 .Xr fsdb 8
+.Sh HISTORY
+The
+.Nm
+utility appeared in
+.At v6 .
 .Sh BUGS
 If the file is open, the work of
 .Nm

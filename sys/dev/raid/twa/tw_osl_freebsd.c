@@ -296,12 +296,11 @@ twa_attach(device_t dev)
 	TW_INT32		irq_flags;
 	TW_INT32		error;
 
-	tw_osli_dbg_dprintf(3, sc, "entered");
-
 	sc->ctlr_handle.osl_ctlr_ctxt = sc;
 
 	/* Initialize the softc structure. */
 	sc->bus_dev = dev;
+	tw_osli_dbg_dprintf(3, sc, "entered");
 	sc->device_id = pci_get_device(dev);
 
 	/* Initialize the mutexes right here. */
@@ -312,20 +311,8 @@ twa_attach(device_t dev)
 	sc->sim_lock = &(sc->sim_lock_handle);
 	lockinit(sc->sim_lock, "tw_osl_sim_lock", 0, LK_CANRECURSE);
 
-	sysctl_ctx_init(&sc->sysctl_ctxt);
-	sc->sysctl_tree = SYSCTL_ADD_NODE(&sc->sysctl_ctxt,
-		SYSCTL_STATIC_CHILDREN(_hw), OID_AUTO,
-		device_get_nameunit(dev), CTLFLAG_RD, 0, "");
-	if (sc->sysctl_tree == NULL) {
-		tw_osli_printf(sc, "error = %d",
-			TW_CL_SEVERITY_ERROR_STRING,
-			TW_CL_MESSAGE_SOURCE_FREEBSD_DRIVER,
-			0x2000,
-			"Cannot add sysctl tree node",
-			ENXIO);
-		return(ENXIO);
-	}
-	SYSCTL_ADD_STRING(&sc->sysctl_ctxt, SYSCTL_CHILDREN(sc->sysctl_tree),
+	SYSCTL_ADD_STRING(device_get_sysctl_ctx(dev),
+		SYSCTL_CHILDREN(device_get_sysctl_tree(dev)),
 		OID_AUTO, "driver_version", CTLFLAG_RD,
 		TW_OSL_DRIVER_VERSION_STRING, 0, "TWA driver version");
 
@@ -794,11 +781,6 @@ tw_osli_free_resources(struct twa_softc *sc)
 	if (sc->ctrl_dev != NULL)
 		destroy_dev(sc->ctrl_dev);
 	dev_ops_remove_minor(&twa_ops, device_get_unit(sc->bus_dev));
-
-	if ((error = sysctl_ctx_free(&sc->sysctl_ctxt)))
-		tw_osli_dbg_dprintf(1, sc,
-			"sysctl_ctx_free returned %d", error);
-
 }
 
 
@@ -868,8 +850,8 @@ twa_shutdown(device_t dev)
 	error = twa_teardown_intr(sc);
 
 	/* Stop watchdog task. */
-	callout_stop_sync(&(sc->watchdog_callout[0]));
-	callout_stop_sync(&(sc->watchdog_callout[1]));
+	callout_cancel(&(sc->watchdog_callout[0]));
+	callout_cancel(&(sc->watchdog_callout[1]));
 
 	/* Disconnect from the controller. */
 	if ((error = tw_cl_shutdown_ctlr(&(sc->ctlr_handle), 0))) {
@@ -946,9 +928,8 @@ tw_osli_fw_passthru(struct twa_softc *sc, TW_INT8 *buf)
 	 * Make sure that the data buffer sent to firmware is a
 	 * 512 byte multiple in size.
 	 */
-	data_buf_size_adjusted =
-		(user_buf->driver_pkt.buffer_length +
-		(sc->sg_size_factor - 1)) & ~(sc->sg_size_factor - 1);
+	data_buf_size_adjusted = roundup2(user_buf->driver_pkt.buffer_length,
+	    sc->sg_size_factor);
 	if ((req->length = data_buf_size_adjusted)) {
 		req->data = kmalloc(data_buf_size_adjusted,
 		    TW_OSLI_MALLOC_CLASS, M_WAITOK);
@@ -1367,9 +1348,7 @@ tw_osli_map_request(struct tw_osli_req_context *req)
 			/* Save original data pointer and length. */
 			req->real_data = req->data;
 			req->real_length = req->length;
-			req->length = (req->length +
-				(sc->sg_size_factor - 1)) &
-				~(sc->sg_size_factor - 1);
+			req->length = roundup2(req->length, sc->sg_size_factor);
 			req->data = kmalloc(req->length, TW_OSLI_MALLOC_CLASS,
 					M_NOWAIT);
 			if (req->data == NULL) {

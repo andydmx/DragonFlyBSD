@@ -92,7 +92,7 @@ SetSockOpt(int fd, int level, int option, int yesno)
     return setsockopt(fd, level, option,
 				(char *)&yesno, sizeof yesno);
 }
-
+
 /*
  * The following are routines used to print out debugging information.
  */
@@ -620,7 +620,7 @@ printsub(char direction, unsigned char *pointer, int length)
 		}
 		{
 		    char tbuf[64];
-		    sprintf(tbuf, "%s%s%s%s%s",
+		    snprintf(tbuf, sizeof(tbuf), "%s%s%s%s%s",
 			pointer[2]&MODE_EDIT ? "|EDIT" : "",
 			pointer[2]&MODE_TRAPSIG ? "|TRAPSIG" : "",
 			pointer[2]&MODE_SOFT_TAB ? "|SOFT_TAB" : "",

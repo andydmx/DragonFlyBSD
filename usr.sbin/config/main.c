@@ -33,11 +33,11 @@
 
 #include <sys/types.h>
 #include <sys/stat.h>
-#include <sys/file.h>
 #include <sys/mman.h>
 #include <sys/param.h>
 #include <ctype.h>
 #include <err.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <dirent.h>
 #include <sysexits.h>
@@ -55,13 +55,20 @@
 
 #define	CDIR	"../compile/"
 
+char *	platformname;
+char *	machinename;
+char *	machinearchname;
+
+struct cputype	*cputype;
+struct opt	*opt, *mkopt;
+struct opt_list	*otab;
+
 char *	PREFIX;
 char 	destdir[MAXPATHLEN];
-char 	srcdir[MAXPATHLEN];
+char 	srcdir[MAXPATHLEN - 32];
 
 static int no_config_clobber = TRUE;
 int	debugging;
-int	profiling;
 
 extern int yyparse(void);
 static void configfile(void);
@@ -77,12 +84,15 @@ main(int argc, char *argv[])
 {
 	struct stat buf;
 	int ch, len;
-	unsigned int i;
 	char *p;
-	char linksrc[64], linkdest[MAXPATHLEN];
+	char linkdest[MAXPATHLEN];
+#if 0
+	unsigned int i;
+	char linksrc[64];
 	static const char *emus[] = { "linux" };
+#endif
 
-	while ((ch = getopt(argc, argv, "d:gpr")) != -1)
+	while ((ch = getopt(argc, argv, "d:gr")) != -1)
 		switch (ch) {
 		case 'd':
 			if (*destdir == '\0')
@@ -92,9 +102,6 @@ main(int argc, char *argv[])
 			break;
 		case 'g':
 			debugging++;
-			break;
-		case 'p':
-			profiling++;
 			break;
 		case 'r':
 			no_config_clobber = FALSE;
@@ -149,15 +156,15 @@ main(int argc, char *argv[])
 	if (yyparse())
 		exit(3);
 	if (platformname == NULL) {
-		printf("Specify platform architecture, e.g. 'platform pc32'\n");
+		printf("Specify platform architecture, e.g. 'platform pc64'\n");
 		exit(1);
 	}
 	if (machinename == NULL) {
-		printf("Specify machine architecture, e.g. 'machine i386'\n");
+		printf("Specify machine architecture, e.g. 'machine x86_64'\n");
 		exit(1);
 	}
 	if (machinearchname == NULL) {
-		printf("Specify cpu architecture, e.g. 'machine_arch i386'\n");
+		printf("Specify cpu architecture, e.g. 'machine_arch x86_64'\n");
 		exit(1);
 	}
 	newbus_ioconf();
@@ -210,7 +217,8 @@ main(int argc, char *argv[])
 	 * XXX check directory structure for architecture subdirectories and
 	 * create the symlinks automatically XXX
 	 */
-	for (i = 0; i < sizeof(emus) / sizeof(emus[0]); ++i) {
+#if 0
+	for (i = 0; i < NELEM(emus); ++i) {
 		if (*srcdir == 0)  {
 			snprintf(linkdest, sizeof(linkdest),
 			    "../../emulation/%s/%s",
@@ -223,6 +231,7 @@ main(int argc, char *argv[])
 		snprintf(linksrc, sizeof(linksrc), "arch_%s", emus[i]);
 		symlink(linkdest, path(linksrc));
 	}
+#endif
 
 	options();			/* make options .h files */
 	makefile();			/* build Makefile */

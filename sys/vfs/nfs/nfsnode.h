@@ -13,11 +13,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -155,7 +151,7 @@ struct nfsnode {
 #define	NFLUSHINPROG	0x0002	/* Avoid multiple calls to vinvalbuf() */
 #define	NLMODIFIED	0x0004	/* Client has pending modifications */
 #define	NWRITEERR	0x0008	/* Flag write errors so close will know */
-#define	NUNUSED020	0x0020
+#define	NREMOVED	0x0020	/* Flag possible removal of file */
 #define	NUNUSED040	0x0040
 #define	NQNFSEVICTED	0x0080	/* Has been evicted */
 #define	NACC		0x0100	/* Special file accessed */

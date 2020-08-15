@@ -10,11 +10,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -151,6 +147,9 @@ struct	ip_stats {
 	u_long	ips_badaddr;		/* invalid address on header */
 	u_long	ips_pad[3];		/* pad to cache line size (64B) */
 };
+#ifdef _KERNEL
+CTASSERT((sizeof(struct ip_stats) & __VM_CACHELINE_MASK) == 0);
+#endif
 
 #ifdef _KERNEL
 
@@ -165,10 +164,6 @@ extern struct ip_stats	ipstats_percpu[MAXCPU];
 #define	IP_ALLOWBROADCAST	SO_BROADCAST	/* can send broadcast packets */
 #define	IP_DEBUGROUTE		0x10000		/* debug route */
 
-/* direction passed to ip_hashfn as last parameter */
-#define IP_MPORT_IN		0 /* Find lwkt port for incoming packets */
-#define IP_MPORT_OUT		1 /* Find lwkt port for outgoing packets */
-
 struct ip;
 struct inpcb;
 struct route;
@@ -180,6 +175,7 @@ union netmsg;
 extern u_short	ip_id;				/* ip packet ctr, for ids */
 extern int	ip_defttl;			/* default IP ttl */
 extern int	ipforwarding;			/* ip forwarding */
+extern int	ip_porthash_trycount;
 extern u_char	ip_protox[];
 extern struct socket *ip_rsvpd;		/* reservation protocol daemon */
 extern struct socket *ip_mrouter;	/* multicast routing daemon */
@@ -199,9 +195,11 @@ void	 ip_init(void);
 extern int	 (*ip_mforward)(struct ip *, struct ifnet *, struct mbuf *,
 			  struct ip_moptions *);
 
-void	ip_hashfn(struct mbuf **, int, int);
-void	ip_hashfn_in(struct mbuf **, int);
-void	ip_hashcheck(struct mbuf *, const struct pktinfo *);
+void	 ip_hashfn(struct mbuf **, int);
+void	 ip_hashcheck(struct mbuf *, const struct pktinfo *);
+struct mbuf *
+	 ip_rehashm(struct mbuf *, int);
+void	 ip_transport_redispatch(struct lwkt_port *, struct mbuf *, int);
 
 boolean_t
 	 ip_lengthcheck(struct mbuf **, int);
@@ -212,13 +210,11 @@ struct in_ifaddr *
 	 ip_rtaddr(struct in_addr, struct route *);
 void	 ip_savecontrol(struct inpcb *, struct mbuf **, struct ip *,
 		struct mbuf *);
-void	 ip_slowtimo(void);
 struct mbuf *
 	 ip_srcroute(struct mbuf *);
 void	 ip_stripoptions(struct mbuf *);
 u_int16_t ip_randomid(void);
 void	rip_ctloutput(union netmsg *);
-void	rip_ctlinput(union netmsg *);
 void	rip_init(void);
 int	rip_input(struct mbuf **, int *, int);
 int	rip_output(struct mbuf *, struct socket *, ...);

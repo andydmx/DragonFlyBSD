@@ -33,22 +33,26 @@
  * SUCH DAMAGE.
  */
 
+#ifndef HAMMER2_HAMMER2_H_
+#define HAMMER2_HAMMER2_H_
+
 /*
  * Rollup headers for hammer2 utility
  */
 #include <sys/types.h>
-#include <sys/uio.h>
 #include <sys/queue.h>
 #include <sys/mount.h>
 #include <sys/file.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <sys/wait.h>
-#include <sys/tty.h>
+#include <sys/stat.h>
+#include <sys/ttycom.h>
 #include <sys/endian.h>
 #include <sys/sysctl.h>
 #include <sys/udev.h>
 #include <sys/diskslice.h>
+#include <sys/dtype.h>
 #include <dmsg.h>
 #include <dirent.h>
 
@@ -61,6 +65,7 @@
 #include <vfs/hammer2/hammer2_disk.h>
 #include <vfs/hammer2/hammer2_mount.h>
 #include <vfs/hammer2/hammer2_ioctl.h>
+#include <vfs/hammer2/hammer2_xxhash.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -80,12 +85,15 @@
 
 #include <libutil.h>
 
+#include "hammer2_subs.h"
+
 #define HAMMER2_DEFAULT_DIR	"/etc/hammer2"
 #define HAMMER2_PATH_REMOTE	HAMMER2_DEFAULT_DIR "/remote"
 #ifndef UDEV_DEVICE_PATH
 #define UDEV_DEVICE_PATH	"/dev/udev"
 #endif
 
+#if 0
 struct hammer2_idmap {
 	struct hammer2_idmap *next;
 	uint32_t ran_beg;	/* inclusive */
@@ -104,18 +112,19 @@ struct hammer2_udppkt {
 };
 
 typedef struct hammer2_udppkt hammer2_udppkt_t;
+#endif
 
 extern int DebugOpt;
-extern int ForceOpt;
-extern int RecurseOpt;
 extern int VerboseOpt;
 extern int QuietOpt;
+extern int ForceOpt;
+extern int RecurseOpt;
 extern int NormalExit;
+extern size_t MemOpt;
 
 /*
  * Hammer2 command APIs
  */
-int hammer2_ioctl_handle(const char *sel_path);
 void hammer2_demon(void *(*func)(void *), void *arg);
 
 int cmd_remote_connect(const char *sel_path, const char *url);
@@ -123,39 +132,40 @@ int cmd_remote_disconnect(const char *sel_path, const char *url);
 int cmd_remote_status(const char *sel_path, int all_opt);
 
 int cmd_pfs_getid(const char *sel_path, const char *name, int privateid);
-int cmd_pfs_list(const char *sel_path);
+int cmd_pfs_list(int ac, char **av);
 int cmd_pfs_create(const char *sel_path, const char *name,
 			uint8_t pfs_type, const char *uuid_str);
-int cmd_pfs_delete(const char *sel_path, const char *name);
-int cmd_pfs_snapshot(const char *sel_path, const char *name, const char *label);
+int cmd_pfs_delete(const char *sel_path, char **av, int ac);
+int cmd_pfs_snapshot(const char *sel_path, const char *name, const char *label,
+			uint32_t pfs_flags);
 
 int cmd_service(void);
 int cmd_hash(int ac, const char **av);
+int cmd_dhash(int ac, const char **av);
+int cmd_info(int ac, const char **av);
+int cmd_mountall(int ac, const char **av);
 int cmd_stat(int ac, const char **av);
 int cmd_leaf(const char *sel_path);
 int cmd_shell(const char *hostname);
 int cmd_debugspan(const char *hostname);
-int cmd_chaindump(const char *path);
-int cmd_show(const char *devpath, int dofreemap);
+int cmd_destroy_path(int ac, const char **av);
+int cmd_destroy_inum(const char *sel_path, int ac, const char **av);
+int cmd_dumpchain(const char *path, u_int flags);
+int cmd_emergency_mode(const char *sel_path, int enable,
+			int ac, const char **av);
+int cmd_show(const char *devpath, int which);
 int cmd_rsainit(const char *dir_path);
 int cmd_rsaenc(const char **keys, int nkeys);
 int cmd_rsadec(const char **keys, int nkeys);
 int cmd_setcomp(const char *comp_str, char **paths);
 int cmd_setcheck(const char *comp_str, char **paths);
-
-/*
- * Misc functions
- */
-const char *hammer2_time64_to_str(uint64_t htime64, char **strp);
-const char *hammer2_uuid_to_str(uuid_t *uuid, char **strp);
-const char *hammer2_iptype_to_str(uint8_t type);
-const char *hammer2_pfstype_to_str(uint8_t type);
-const char *sizetostr(hammer2_off_t size);
-const char *counttostr(hammer2_off_t size);
-hammer2_key_t dirhash(const unsigned char *name, size_t len);
-
-uint32_t hammer2_icrc32(const void *buf, size_t size);
-uint32_t hammer2_icrc32c(const void *buf, size_t size, uint32_t crc);
+int cmd_bulkfree(const char *dir_path);
+int cmd_cleanup(const char *dir_path);
+#if 0
+int cmd_bulkfree_async(const char *dir_path);
+#endif
 
 void hammer2_shell_parse(dmsg_msg_t *msg, int unmanaged);
-void print_inode(char* inode_string);
+void print_inode(const char *path);
+
+#endif /* !HAMMER2_HAMMER2_H_ */

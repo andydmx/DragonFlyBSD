@@ -55,7 +55,7 @@
 #include <net/if.h>
 #include <net/if_types.h>
 #include <net/ifq_var.h>
-#include <net/netisr.h>
+#include <net/netisr2.h>
 #include <net/route.h>
 #include <net/bpf.h>
 #include <net/if_clone.h>
@@ -90,18 +90,19 @@
 static MALLOC_DEFINE(M_GIF, "gif", "Generic Tunnel Interface");
 LIST_HEAD(, gif_softc) gif_softc_list;
 
-int	gif_clone_create (struct if_clone *, int, caddr_t);
-int	gif_clone_destroy (struct ifnet *);
+int	gif_clone_create(struct if_clone *, int, caddr_t, caddr_t);
+int	gif_clone_destroy(struct ifnet *);
 
 struct if_clone gif_cloner = IF_CLONE_INITIALIZER("gif", gif_clone_create,
     gif_clone_destroy, 0, IF_MAXUNIT);
 
-static int gifmodevent (module_t, int, void *);
+static int gifmodevent(module_t, int, void *);
 static void gif_clear_cache(struct gif_softc *sc);
 
 SYSCTL_DECL(_net_link);
 SYSCTL_NODE(_net_link, IFT_GIF, gif, CTLFLAG_RW, 0,
     "Generic Tunnel Interface");
+
 #ifndef MAX_GIF_NEST
 /*
  * This macro controls the default upper limitation on nesting of gif tunnels.
@@ -130,8 +131,10 @@ static int parallel_tunnels = 0;
 SYSCTL_INT(_net_link_gif, OID_AUTO, parallel_tunnels, CTLFLAG_RW,
     &parallel_tunnels, 0, "Allow parallel tunnels?");
 
+
 int
-gif_clone_create(struct if_clone *ifc, int unit, caddr_t params)
+gif_clone_create(struct if_clone *ifc, int unit,
+		 caddr_t params __unused, caddr_t data __unused)
 {
 	struct gif_softc *sc;
 	
@@ -201,33 +204,27 @@ static void
 gif_clear_cache(struct gif_softc *sc)
 {
 	struct rtentry *rt;
-	int origcpu;
 	int n;
 
-	for (n = 0; n < ncpus; ++n) {
+	for (n = 0; n < netisr_ncpus; ++n) {
 		rt = sc->gif_ro[n].ro_rt;
-		/*
-		 * Routes need to be cleaned up in their CPU so migrate
-		 * to it and return to the original CPU after completion.
-		 */
-		origcpu = mycpuid;
-		if (rt && rt->rt_cpuid != mycpuid)
-			lwkt_migratecpu(rt->rt_cpuid);
-		else
-			origcpu = -1;
-
-		if (sc->gif_ro[n].ro_rt) {
-			RTFREE(sc->gif_ro[n].ro_rt);
+		if (rt != NULL) {
+			KASSERT(rt->rt_cpuid == n,
+			    ("inet rt for cpu%d installed on cpu%d slot",
+			     rt->rt_cpuid, n));
+			rtfree_async(rt);
 			sc->gif_ro[n].ro_rt = NULL;
 		}
 #ifdef INET6
-		if (sc->gif_ro6[n].ro_rt) {
-			RTFREE(sc->gif_ro6[n].ro_rt);
+		rt = sc->gif_ro6[n].ro_rt;
+		if (rt != NULL) {
+			KASSERT(rt->rt_cpuid == n,
+			    ("inet6 rt for cpu%d installed on cpu%d slot",
+			     rt->rt_cpuid, n));
+			rtfree_async(rt);
 			sc->gif_ro6[n].ro_rt = NULL;
 		}
 #endif
-		if (origcpu >= 0)
-			lwkt_migratecpu(origcpu);
 	}
 }
 
@@ -412,6 +409,8 @@ gif_output(struct ifnet *ifp, struct mbuf *m, struct sockaddr *dst,
 {
 	struct ifaltq_subque *ifsq = ifq_get_subq_default(&ifp->if_snd);
 	int error;
+
+	ASSERT_NETISR_NCPUS(mycpuid);
 
 	ifsq_serialize_hw(ifsq);
 	error = gif_output_serialized(ifp, m, dst, rt);

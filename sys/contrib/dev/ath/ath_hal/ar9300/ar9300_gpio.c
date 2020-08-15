@@ -162,7 +162,6 @@ ar9300_gpio_cfg_output(
 
     HALASSERT(gpio < AH_PRIVATE(ah)->ah_caps.halNumGpioPins);
     if ((gpio == AR9382_GPIO_PIN_8_RESERVED)  ||
-        (gpio == AR9382_GPIO_PIN_11_RESERVED) ||
         (gpio == AR9382_GPIO_9_INPUT_ONLY))
     {
         return AH_FALSE;
@@ -243,7 +242,6 @@ ar9300_gpio_cfg_output_led_off(
     u_int32_t gpio,
     HAL_GPIO_MUX_TYPE halSignalType)
 {
-#define N(a)    (sizeof(a) / sizeof(a[0]))
     u_int32_t    ah_signal_type;
     u_int32_t    gpio_shift;
     u_int8_t    smart_ant = 0;
@@ -335,7 +333,6 @@ ar9300_gpio_cfg_output_led_off(
                (AR_GPIO_OE_OUT_DRV << gpio_shift));
 
     return AH_TRUE;
-#undef N
 }
 
 /*
@@ -348,7 +345,6 @@ ar9300_gpio_cfg_input(struct ath_hal *ah, u_int32_t gpio)
 
     HALASSERT(gpio < AH_PRIVATE(ah)->ah_caps.halNumGpioPins);
     if ((gpio == AR9382_GPIO_PIN_8_RESERVED)  ||
-        (gpio == AR9382_GPIO_PIN_11_RESERVED) ||
         (gpio > AR9382_MAX_GPIO_INPUT_PIN_NUM))
     {
         return AH_FALSE;
@@ -378,7 +374,6 @@ ar9300_gpio_set(struct ath_hal *ah, u_int32_t gpio, u_int32_t val)
 {
     HALASSERT(gpio < AH_PRIVATE(ah)->ah_caps.halNumGpioPins);
     if ((gpio == AR9382_GPIO_PIN_8_RESERVED)  ||
-        (gpio == AR9382_GPIO_PIN_11_RESERVED) ||
         (gpio == AR9382_GPIO_9_INPUT_ONLY))
     {
         return AH_FALSE;
@@ -397,8 +392,7 @@ ar9300_gpio_get(struct ath_hal *ah, u_int32_t gpio)
 {
     u_int32_t gpio_in;
     HALASSERT(gpio < AH_PRIVATE(ah)->ah_caps.halNumGpioPins);
-    if ((gpio == AR9382_GPIO_PIN_8_RESERVED) ||
-        (gpio == AR9382_GPIO_PIN_11_RESERVED))
+    if (gpio == AR9382_GPIO_PIN_8_RESERVED)
     {
         return 0xffffffff;
     }
@@ -453,7 +447,6 @@ ar9300_gpio_set_intr(struct ath_hal *ah, u_int gpio, u_int32_t ilevel)
     HALASSERT(gpio < AH_PRIVATE(ah)->ah_caps.halNumGpioPins);
 
     if ((gpio == AR9382_GPIO_PIN_8_RESERVED) ||
-        (gpio == AR9382_GPIO_PIN_11_RESERVED) ||
         (gpio > AR9382_MAX_GPIO_INPUT_PIN_NUM))
     {
         return;
@@ -549,8 +542,7 @@ ar9300_gpio_get_mask(struct ath_hal *ah)
 
     if (AH_PRIVATE(ah)->ah_devid == AR9300_DEVID_AR9380_PCIE) {
         mask = (1 << AR9382_MAX_GPIO_PIN_NUM) - 1;
-        mask &= ~(1 << AR9382_GPIO_PIN_8_RESERVED |
-                  1 << AR9382_GPIO_PIN_11_RESERVED);
+        mask &= ~(1 << AR9382_GPIO_PIN_8_RESERVED);
     }
     return mask;
 }
@@ -562,8 +554,7 @@ ar9300_gpio_set_mask(struct ath_hal *ah, u_int32_t mask, u_int32_t pol_map)
 
     if (AH_PRIVATE(ah)->ah_devid == AR9300_DEVID_AR9380_PCIE) {
         invalid = ~((1 << AR9382_MAX_GPIO_PIN_NUM) - 1);
-        invalid |= 1 << AR9382_GPIO_PIN_8_RESERVED |
-                   1 << AR9382_GPIO_PIN_11_RESERVED;
+        invalid |= 1 << AR9382_GPIO_PIN_8_RESERVED;
     }
     if (mask & invalid) {
         ath_hal_printf(ah, "%s: invalid GPIO mask 0x%x\n", __func__, mask);

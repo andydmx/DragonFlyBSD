@@ -1,4 +1,4 @@
-# $Id: bsd.after-import.mk,v 1.11 2012/12/29 19:32:25 sjg Exp $
+# $Id: bsd.after-import.mk,v 1.15 2018/12/30 17:14:24 sjg Exp $
 
 # This makefile is for use when integrating bmake into a BSD build
 # system.  Use this makefile after importing bmake.
@@ -41,15 +41,13 @@ SRCTOP := ${srctop}
 HOST_OS!= uname
 .endif
 
-# .../share/mk will find ${SRCTOP}/share/mk
-# if we are within ${SRCTOP}
-DEFAULT_SYS_PATH= .../share/mk:/usr/share/mk
-
 BOOTSTRAP_ARGS = \
-	--with-default-sys-path='${DEFAULT_SYS_PATH}' \
 	--prefix /usr \
 	--share /usr/share
 
+.if !empty(DEFAULT_SYS_PATH)
+BOOTSTRAP_ARGS += --with-default-sys-path='${DEFAULT_SYS_PATH}'
+.endif
 
 # run boot-strap with minimal influence
 bootstrap:	${BMAKE_SRC}/boot-strap ${MAKEFILE}
@@ -58,13 +56,14 @@ bootstrap:	${BMAKE_SRC}/boot-strap ${MAKEFILE}
 
 # Makefiles need a little more tweaking than say config.h
 MAKEFILE_SED = 	sed -e '/^MACHINE/d' \
+	-e '/include.*VERSION/d' \
 	-e '/^PROG/ { s,=,?=,;s,bmake,$${.CURDIR:T},; }' \
 	-e 's,^.-include,.sinclude,' \
 	-e '/^\..*include  *</ { s,<,<bsd.,;/autoconf/d; }' \
 	-e 's,${SRCTOP},$${SRCTOP},g'
 
 # These are the simple files we want to capture
-configured_files= config.h Makefile.config unit-tests/Makefile
+configured_files= config.h Makefile.config unit-tests/Makefile.config
 
 after-import: bootstrap ${MAKEFILE}
 .for f in ${configured_files:M*.[ch]}
@@ -88,7 +87,6 @@ _makefile:	bootstrap ${MAKEFILE}
 	@(echo '# This is a generated file, do NOT edit!'; \
 	echo '# See ${_this:S,${SRCTOP}/,,}'; \
 	echo '#'; echo '# $$${HOST_OS}$$'; \
-	echo; echo '.sinclude "Makefile.inc"'; \
 	echo; echo 'SRCTOP?= $${.CURDIR:${.CURDIR:S,${SRCTOP}/,,:C,[^/]+,H,g:S,/,:,g}}'; \
 	echo; echo '# look here first for config.h'; \
 	echo 'CFLAGS+= -I$${.CURDIR}'; echo; \

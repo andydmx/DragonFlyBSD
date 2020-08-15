@@ -46,7 +46,7 @@
 #include <sys/param.h>
 #include <sys/kernel.h>
 #include <sys/systm.h>
-#include <sys/sysproto.h>
+#include <sys/sysmsg.h>
 #include <sys/filedesc.h>
 #include <sys/kern_syscall.h>
 #include <sys/proc.h>
@@ -76,42 +76,12 @@
 
 #include <sys/file2.h>
 #include <sys/thread.h>
-#include <sys/thread2.h>
 #include <vm/vm_page2.h>
 
-static int max_proc_mmap;
+static int max_proc_mmap = 1000000;
 SYSCTL_INT(_vm, OID_AUTO, max_proc_mmap, CTLFLAG_RW, &max_proc_mmap, 0, "");
 int vkernel_enable;
 SYSCTL_INT(_vm, OID_AUTO, vkernel_enable, CTLFLAG_RW, &vkernel_enable, 0, "");
-
-/*
- * Set the maximum number of vm_map_entry structures per process.  Roughly
- * speaking vm_map_entry structures are tiny, so allowing them to eat 1/100
- * of our KVM malloc space still results in generous limits.  We want a 
- * default that is good enough to prevent the kernel running out of resources
- * if attacked from compromised user account but generous enough such that
- * multi-threaded processes are not unduly inconvenienced.
- */
-
-static void vmmapentry_rsrc_init (void *);
-SYSINIT(vmmersrc, SI_BOOT1_POST, SI_ORDER_ANY, vmmapentry_rsrc_init, NULL)
-
-static void
-vmmapentry_rsrc_init(void *dummy)
-{
-    max_proc_mmap = KvaSize / sizeof(struct vm_map_entry);
-    max_proc_mmap /= 100;
-}
-
-/*
- * MPSAFE
- */
-int
-sys_sbrk(struct sbrk_args *uap)
-{
-	/* Not yet implemented */
-	return (EOPNOTSUPP);
-}
 
 /*
  * sstk_args(int incr)
@@ -119,7 +89,7 @@ sys_sbrk(struct sbrk_args *uap)
  * MPSAFE
  */
 int
-sys_sstk(struct sstk_args *uap)
+sys_sstk(struct sysmsg *sysmsg, const struct sstk_args *uap)
 {
 	/* Not yet implemented */
 	return (EOPNOTSUPP);
@@ -184,8 +154,9 @@ kern_mmap(struct vmspace *vms, caddr_t uaddr, size_t ulen,
 		return (EINVAL);
 
 	if (flags & MAP_STACK) {
-		if ((fd != -1) ||
-		    ((prot & (PROT_READ | PROT_WRITE)) != (PROT_READ | PROT_WRITE)))
+		if (fd != -1)
+			return (EINVAL);
+		if ((prot & (PROT_READ|PROT_WRITE)) != (PROT_READ|PROT_WRITE))
 			return (EINVAL);
 		flags |= MAP_ANON;
 		pos = 0;
@@ -264,7 +235,7 @@ kern_mmap(struct vmspace *vms, caddr_t uaddr, size_t ulen,
 		 * Mapping file, get fp for validation. Obtain vnode and make
 		 * sure it is of appropriate type.
 		 */
-		fp = holdfp(p->p_fd, fd, -1);
+		fp = holdfp(td, fd, -1);
 		if (fp == NULL)
 			return (EBADF);
 		if (fp->f_type != DTYPE_VNODE) {
@@ -342,7 +313,7 @@ kern_mmap(struct vmspace *vms, caddr_t uaddr, size_t ulen,
 			 * credentials do we use for determination? What if
 			 * proc does a setuid?
 			 */
-			maxprot = VM_PROT_EXECUTE;	/* ??? */
+			maxprot = VM_PROT_EXECUTE;
 			if (fp->f_flag & FREAD) {
 				maxprot |= VM_PROT_READ;
 			} else if (prot & PROT_READ) {
@@ -357,6 +328,8 @@ kern_mmap(struct vmspace *vms, caddr_t uaddr, size_t ulen,
 			 * for it, bail out.  Check for superuser, only if
 			 * we're at securelevel < 1, to allow the XIG X server
 			 * to continue to work.
+			 *
+			 * PROT_WRITE + MAP_SHARED
 			 */
 			if ((flags & MAP_SHARED) != 0 || vp->v_type == VCHR) {
 				if ((fp->f_flag & FWRITE) != 0) {
@@ -367,6 +340,18 @@ kern_mmap(struct vmspace *vms, caddr_t uaddr, size_t ulen,
 					if ((va.va_flags &
 					    (IMMUTABLE|APPEND)) == 0) {
 						maxprot |= VM_PROT_WRITE;
+
+						/*
+						 * SHARED+RW regular file mmap()
+						 * updates v_lastwrite_ts.
+						 */
+						if ((prot & PROT_WRITE) &&
+						    vp->v_type == VREG &&
+						    vn_lock(vp, LK_EXCLUSIVE | LK_RETRY) == 0) {
+							vfs_timestamp(&vp->v_lastwrite_ts);
+							vsetflags(vp, VLASTWRITETS);
+							vn_unlock(vp);
+						}
 					} else if (prot & PROT_WRITE) {
 						error = EPERM;
 						goto done;
@@ -386,11 +371,9 @@ kern_mmap(struct vmspace *vms, caddr_t uaddr, size_t ulen,
 
 	/*
 	 * Do not allow more then a certain number of vm_map_entry structures
-	 * per process.  Scale with the number of rforks sharing the map
-	 * to make the limit reasonable for threads.
+	 * per process.  0 to disable.
 	 */
-	if (max_proc_mmap && 
-	    vms->vm_map.nentries >= max_proc_mmap * vmspace_getrefs(vms)) {
+	if (max_proc_mmap && vms->vm_map.nentries >= max_proc_mmap) {
 		error = ENOMEM;
 		lwkt_reltoken(&vms->vm_map.token);
 		goto done;
@@ -404,7 +387,7 @@ kern_mmap(struct vmspace *vms, caddr_t uaddr, size_t ulen,
 	lwkt_reltoken(&vms->vm_map.token);
 done:
 	if (fp)
-		fdrop(fp);
+		dropfp(td, fd, fp);
 
 	return (error);
 }
@@ -415,13 +398,40 @@ done:
  * No requirements.
  */
 int
-sys_mmap(struct mmap_args *uap)
+sys_mmap(struct sysmsg *sysmsg, const struct mmap_args *uap)
 {
 	int error;
+	int flags = uap->flags;
+	off_t upos = uap->pos;
+
+	/*
+	 * Work around fairly serious problems with trying to have an
+	 * auto-grow stack segment related to other unrelated calls to
+	 * mmap() potentially getting addresses within such segments.
+	 *
+	 * Our attempt to use TRYFIXED to mediate the problem basically
+	 * failed.  For example, rtld-elf uses it to try to optimize
+	 * shlib placement, but could run afoul of this issue.
+	 *
+	 * The only remaining true MAP_STACK we allow is the user stack as
+	 * created by the exec code.  All userland MAP_STACK's are converted
+	 * to normal mmap()s right here.
+	 */
+	if (flags & MAP_STACK) {
+		if (uap->fd != -1)
+			return (EINVAL);
+		if ((uap->prot & (PROT_READ|PROT_WRITE)) !=
+		    (PROT_READ|PROT_WRITE)) {
+			return (EINVAL);
+		}
+		flags &= ~MAP_STACK;
+		flags |= MAP_ANON;
+		upos = 0;
+	}
 
 	error = kern_mmap(curproc->p_vmspace, uap->addr, uap->len,
-			  uap->prot, uap->flags,
-			  uap->fd, uap->pos, &uap->sysmsg_resultp);
+			  uap->prot, flags,
+			  uap->fd, upos, &sysmsg->sysmsg_resultp);
 
 	return (error);
 }
@@ -434,7 +444,7 @@ sys_mmap(struct mmap_args *uap)
  * No requirements
  */
 int
-sys_msync(struct msync_args *uap)
+sys_msync(struct sysmsg *sysmsg, const struct msync_args *uap)
 {
 	struct proc *p = curproc;
 	vm_offset_t addr;
@@ -488,8 +498,8 @@ sys_msync(struct msync_args *uap)
 			rv = KERN_INVALID_ADDRESS;
 			goto done;
 		}
-		addr = entry->start;
-		size = entry->end - entry->start;
+		addr = entry->ba.start;
+		size = entry->ba.end - entry->ba.start;
 		vm_map_unlock_read(map);
 	}
 
@@ -523,7 +533,7 @@ done:
  * No requirements
  */
 int
-sys_munmap(struct munmap_args *uap)
+sys_munmap(struct sysmsg *sysmsg, const struct munmap_args *uap)
 {
 	struct proc *p = curproc;
 	vm_offset_t addr;
@@ -581,7 +591,7 @@ sys_munmap(struct munmap_args *uap)
  * No requirements.
  */
 int
-sys_mprotect(struct mprotect_args *uap)
+sys_mprotect(struct sysmsg *sysmsg, const struct mprotect_args *uap)
 {
 	struct proc *p = curproc;
 	vm_offset_t addr;
@@ -593,10 +603,6 @@ sys_mprotect(struct mprotect_args *uap)
 	addr = (vm_offset_t) uap->addr;
 	size = uap->len;
 	prot = uap->prot & VM_PROT_ALL;
-#if defined(VM_PROT_READ_IS_EXEC)
-	if (prot & VM_PROT_READ)
-		prot |= VM_PROT_EXECUTE;
-#endif
 
 	pageoff = (addr & PAGE_MASK);
 	addr -= pageoff;
@@ -631,7 +637,7 @@ sys_mprotect(struct mprotect_args *uap)
  * No requirements.
  */
 int
-sys_minherit(struct minherit_args *uap)
+sys_minherit(struct sysmsg *sysmsg, const struct minherit_args *uap)
 {
 	struct proc *p = curproc;
 	vm_offset_t addr;
@@ -677,7 +683,7 @@ sys_minherit(struct minherit_args *uap)
  * No requirements.
  */
 int
-sys_madvise(struct madvise_args *uap)
+sys_madvise(struct sysmsg *sysmsg, const struct madvise_args *uap)
 {
 	struct proc *p = curproc;
 	vm_offset_t start, end;
@@ -720,7 +726,7 @@ sys_madvise(struct madvise_args *uap)
  * No requirements
  */
 int
-sys_mcontrol(struct mcontrol_args *uap)
+sys_mcontrol(struct sysmsg *sysmsg, const struct mcontrol_args *uap)
 {
 	struct proc *p = curproc;
 	vm_offset_t start, end;
@@ -764,7 +770,7 @@ sys_mcontrol(struct mcontrol_args *uap)
  * No requirements
  */
 int
-sys_mincore(struct mincore_args *uap)
+sys_mincore(struct sysmsg *sysmsg, const struct mincore_args *uap)
 {
 	struct proc *p = curproc;
 	vm_offset_t addr, first_addr;
@@ -804,7 +810,7 @@ RestartScan:
 	timestamp = map->timestamp;
 
 	if (!vm_map_lookup_entry(map, addr, &entry))
-		entry = entry->next;
+		entry = RB_MIN(vm_map_rb_tree, &map->rb_root);
 
 	/*
 	 * Do this on a map entry basis so that if the pages are not
@@ -812,10 +818,9 @@ RestartScan:
 	 * up the pages elsewhere.
 	 */
 	lastvecindex = -1;
-	for(current = entry;
-		(current != &map->header) && (current->start < end);
-		current = current->next) {
-
+	for (current = entry;
+	     current && current->ba.start < end;
+	     current = vm_map_rb_tree_RB_NEXT(current)) {
 		/*
 		 * ignore submaps (for now) or null objects
 		 */
@@ -823,16 +828,16 @@ RestartScan:
 		    current->maptype != VM_MAPTYPE_VPAGETABLE) {
 			continue;
 		}
-		if (current->object.vm_object == NULL)
+		if (current->ba.object == NULL)
 			continue;
 		
 		/*
 		 * limit this scan to the current map entry and the
 		 * limits for the mincore call
 		 */
-		if (addr < current->start)
-			addr = current->start;
-		cend = current->end;
+		if (addr < current->ba.start)
+			addr = current->ba.start;
+		cend = current->ba.end;
 		if (cend > end)
 			cend = end;
 
@@ -859,27 +864,26 @@ RestartScan:
 				/*
 				 * calculate the page index into the object
 				 */
-				offset = current->offset + (addr - current->start);
+				offset = current->ba.offset +
+					 (addr - current->ba.start);
 				pindex = OFF_TO_IDX(offset);
 
 				/*
-				 * if the page is resident, then gather 
+				 * if the page is resident, then gather
 				 * information about it.  spl protection is
-				 * required to maintain the object 
+				 * required to maintain the object
 				 * association.  And XXX what if the page is
 				 * busy?  What's the deal with that?
 				 *
 				 * XXX vm_token - legacy for pmap_ts_referenced
-				 *     in i386 and vkernel pmap code.
+				 *     in x86 and vkernel pmap code.
 				 */
 				lwkt_gettoken(&vm_token);
-				vm_object_hold(current->object.vm_object);
-				m = vm_page_lookup(current->object.vm_object,
-						    pindex);
+				vm_object_hold(current->ba.object);
+				m = vm_page_lookup(current->ba.object, pindex);
 				if (m && m->valid) {
 					mincoreinfo = MINCORE_INCORE;
-					if (m->dirty ||
-						pmap_is_modified(m))
+					if (m->dirty || pmap_is_modified(m))
 						mincoreinfo |= MINCORE_MODIFIED_OTHER;
 					if ((m->flags & PG_REFERENCED) ||
 						pmap_ts_referenced(m)) {
@@ -887,7 +891,7 @@ RestartScan:
 						mincoreinfo |= MINCORE_REFERENCED_OTHER;
 					}
 				}
-				vm_object_drop(current->object.vm_object);
+				vm_object_drop(current->ba.object);
 				lwkt_reltoken(&vm_token);
 			}
 
@@ -918,15 +922,15 @@ RestartScan:
 			/*
 			 * Pass the page information to the user
 			 */
-			error = subyte( vec + vecindex, mincoreinfo);
+			error = subyte(vec + vecindex, mincoreinfo);
 			if (error) {
 				error = EFAULT;
 				goto done;
 			}
 
 			/*
-			 * If the map has changed, due to the subyte, the previous
-			 * output may be invalid.
+			 * If the map has changed, due to the subyte,
+			 * the previous output may be invalid.
 			 */
 			vm_map_lock_read(map);
 			if (timestamp != map->timestamp)
@@ -979,7 +983,7 @@ done:
  * No requirements
  */
 int
-sys_mlock(struct mlock_args *uap)
+sys_mlock(struct sysmsg *sysmsg, const struct mlock_args *uap)
 {
 	vm_offset_t addr;
 	vm_offset_t tmpaddr;
@@ -996,7 +1000,9 @@ sys_mlock(struct mlock_args *uap)
 	size += pageoff;
 	size = (vm_size_t) round_page(size);
 	if (size < uap->len)		/* wrap */
-		return(EINVAL);
+		return (EINVAL);
+	if (size == 0)			/* silently allow 0 size */
+		return (0);
 	tmpaddr = addr + size;		/* workaround gcc4 opt */
 	if (tmpaddr < addr)		/* wrap */
 		return (EINVAL);
@@ -1029,9 +1035,8 @@ sys_mlock(struct mlock_args *uap)
  * No requirements
  */
 int
-sys_mlockall(struct mlockall_args *uap)
+sys_mlockall(struct sysmsg *sysmsg, const struct mlockall_args *uap)
 {
-#ifdef _P1003_1B_VISIBLE
 	struct thread *td = curthread;
 	struct proc *p = td->td_proc;
 	vm_map_t map = &p->p_vmspace->vm_map;
@@ -1049,23 +1054,18 @@ sys_mlockall(struct mlockall_args *uap)
 	vm_map_lock(map);
 	do {
 		if (how & MCL_CURRENT) {
-			for(entry = map->header.next;
-			    entry != &map->header;
-			    entry = entry->next);
-
+			RB_FOREACH(entry, vm_map_rb_tree, &map->rb_root) {
+				; /* NOT IMPLEMENTED YET */
+			}
 			rc = ENOSYS;
 			break;
 		}
-	
 		if (how & MCL_FUTURE)
 			map->flags |= MAP_WIREFUTURE;
 	} while(0);
 	vm_map_unlock(map);
 
 	return (rc);
-#else /* !_P1003_1B_VISIBLE */
-	return (ENOSYS);
-#endif /* _P1003_1B_VISIBLE */
 }
 
 /*
@@ -1076,7 +1076,7 @@ sys_mlockall(struct mlockall_args *uap)
  * No requirements
  */
 int
-sys_munlockall(struct munlockall_args *uap)
+sys_munlockall(struct sysmsg *sysmsg, const struct munlockall_args *uap)
 {
 	struct thread *td = curthread;
 	struct proc *p = td->td_proc;
@@ -1090,9 +1090,7 @@ sys_munlockall(struct munlockall_args *uap)
 	map->flags &= ~MAP_WIREFUTURE;
 
 retry:
-	for (entry = map->header.next;
-	     entry != &map->header;
-	     entry = entry->next) {
+	RB_FOREACH(entry, vm_map_rb_tree, &map->rb_root) {
 		if ((entry->eflags & MAP_ENTRY_USER_WIRED) == 0)
 			continue;
 
@@ -1113,7 +1111,7 @@ retry:
 			entry->eflags |= MAP_ENTRY_NEEDS_WAKEUP;
 			++mycpu->gd_cnt.v_intrans_coll;
 			++mycpu->gd_cnt.v_intrans_wait;
-			vm_map_transition_wait(map);
+			vm_map_transition_wait(map, 1);
 			goto retry;
 		}
 
@@ -1127,7 +1125,6 @@ retry:
 			vm_fault_unwire(map, entry);
 	}
 
-	map->timestamp++;
 	vm_map_unlock(map);
 
 	return (rc);
@@ -1141,7 +1138,7 @@ retry:
  * No requirements
  */
 int
-sys_munlock(struct munlock_args *uap)
+sys_munlock(struct sysmsg *sysmsg, const struct munlock_args *uap)
 {
 	struct thread *td = curthread;
 	struct proc *p = td->td_proc;
@@ -1161,6 +1158,8 @@ sys_munlock(struct munlock_args *uap)
 	tmpaddr = addr + size;
 	if (tmpaddr < addr)		/* wrap */
 		return (EINVAL);
+	if (size == 0)			/* silently allow 0 size */
+		return (0);
 
 #ifndef pmap_wired_count
 	error = priv_check(td, PRIV_ROOT);
@@ -1188,7 +1187,7 @@ vm_mmap(vm_map_t map, vm_offset_t *addr, vm_size_t size, vm_prot_t prot,
 	vm_offset_t eaddr;
 	vm_size_t   esize;
 	vm_size_t   align;
-	int (*uksmap)(cdev_t dev, vm_page_t fake);
+	int (*uksmap)(vm_map_backing_t ba, int op, cdev_t dev, vm_page_t fake);
 	struct vnode *vp;
 	struct thread *td = curthread;
 	struct proc *p;
@@ -1327,6 +1326,9 @@ vm_mmap(vm_map_t map, vm_offset_t *addr, vm_size_t size, vm_prot_t prot,
 			 * sharing permanently allocated kernel memory or
 			 * process-context-specific (per-process) data.
 			 *
+			 * The object offset for uksmap represents the
+			 * lwp_tid that did the mapping.
+			 *
 			 * Force them to be shared.
 			 */
 			uksmap = vp->v_rdev->si_ops->d_uksmap;
@@ -1400,14 +1402,6 @@ vm_mmap(vm_map_t map, vm_offset_t *addr, vm_size_t size, vm_prot_t prot,
 	if (flags & MAP_NOCORE)
 		docow |= MAP_DISABLE_COREDUMP;
 
-#if defined(VM_PROT_READ_IS_EXEC)
-	if (prot & VM_PROT_READ)
-		prot |= VM_PROT_EXECUTE;
-
-	if (maxprot & VM_PROT_READ)
-		maxprot |= VM_PROT_EXECUTE;
-#endif
-
 	/*
 	 * This may place the area in its own page directory if (size) is
 	 * large enough, otherwise it typically returns its argument.
@@ -1427,23 +1421,23 @@ vm_mmap(vm_map_t map, vm_offset_t *addr, vm_size_t size, vm_prot_t prot,
 	if (uksmap) {
 		rv = vm_map_find(map, uksmap, vp->v_rdev,
 				 foff, addr, size,
-				 align,
-				 fitit, VM_MAPTYPE_UKSMAP,
+				 align, fitit,
+				 VM_MAPTYPE_UKSMAP, VM_SUBSYS_MMAP,
 				 prot, maxprot, docow);
 	} else if (flags & MAP_STACK) {
-		rv = vm_map_stack(map, *addr, size, flags,
+		rv = vm_map_stack(map, addr, size, flags,
 				  prot, maxprot, docow);
 	} else if (flags & MAP_VPAGETABLE) {
 		rv = vm_map_find(map, object, NULL,
 				 foff, addr, size,
-				 align,
-				 fitit, VM_MAPTYPE_VPAGETABLE,
+				 align, fitit,
+				 VM_MAPTYPE_VPAGETABLE, VM_SUBSYS_MMAP,
 				 prot, maxprot, docow);
 	} else {
 		rv = vm_map_find(map, object, NULL,
 				 foff, addr, size,
-				 align,
-				 fitit, VM_MAPTYPE_NORMAL,
+				 align, fitit,
+				 VM_MAPTYPE_NORMAL, VM_SUBSYS_MMAP,
 				 prot, maxprot, docow);
 	}
 

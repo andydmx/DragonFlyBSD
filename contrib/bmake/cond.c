@@ -1,4 +1,4 @@
-/*	$NetBSD: cond.c,v 1.67 2012/11/03 13:59:27 christos Exp $	*/
+/*	$NetBSD: cond.c,v 1.79 2020/07/09 22:34:08 sjg Exp $	*/
 
 /*
  * Copyright (c) 1988, 1989, 1990 The Regents of the University of California.
@@ -70,14 +70,14 @@
  */
 
 #ifndef MAKE_NATIVE
-static char rcsid[] = "$NetBSD: cond.c,v 1.67 2012/11/03 13:59:27 christos Exp $";
+static char rcsid[] = "$NetBSD: cond.c,v 1.79 2020/07/09 22:34:08 sjg Exp $";
 #else
 #include <sys/cdefs.h>
 #ifndef lint
 #if 0
 static char sccsid[] = "@(#)cond.c	8.2 (Berkeley) 1/2/94";
 #else
-__RCSID("$NetBSD: cond.c,v 1.67 2012/11/03 13:59:27 christos Exp $");
+__RCSID("$NetBSD: cond.c,v 1.79 2020/07/09 22:34:08 sjg Exp $");
 #endif
 #endif /* not lint */
 #endif
@@ -91,6 +91,7 @@ __RCSID("$NetBSD: cond.c,v 1.67 2012/11/03 13:59:27 christos Exp $");
  *
  */
 
+#include    <assert.h>
 #include    <ctype.h>
 #include    <errno.h>    /* For strtoul() error checking */
 
@@ -145,7 +146,7 @@ typedef enum {
  * last two fields are stored in condInvert and condDefProc, respectively.
  */
 static void CondPushBack(Token);
-static int CondGetArg(char **, char **, const char *);
+static int CondGetArg(Boolean, char **, char **, const char *);
 static Boolean CondDoDefined(int, const char *);
 static int CondStrMatch(const void *, const void *);
 static Boolean CondDoMake(int, const char *);
@@ -181,6 +182,15 @@ static Token	  condPushBack=TOK_NONE;	/* Single push-back token used in
 static unsigned int	cond_depth = 0;  	/* current .if nesting level */
 static unsigned int	cond_min_depth = 0;  	/* depth at makefile open */
 
+/*
+ * Indicate when we should be strict about lhs of comparisons.
+ * TRUE when Cond_EvalExpression is called from Cond_Eval (.if etc)
+ * FALSE when Cond_EvalExpression is called from var.c:ApplyModifiers
+ * since lhs is already expanded and we cannot tell if
+ * it was a variable reference or not.
+ */
+static Boolean lhsStrict;
+
 static int
 istoken(const char *str, const char *tok, size_t len)
 {
@@ -215,9 +225,6 @@ CondPushBack(Token t)
  * CondGetArg --
  *	Find the argument of a built-in function.
  *
- * Input:
- *	parens		TRUE if arg should be bounded by parens
- *
  * Results:
  *	The length of the argument and the address of the argument.
  *
@@ -228,7 +235,7 @@ CondPushBack(Token t)
  *-----------------------------------------------------------------------
  */
 static int
-CondGetArg(char **linePtr, char **argPtr, const char *func)
+CondGetArg(Boolean doEval, char **linePtr, char **argPtr, const char *func)
 {
     char	  *cp;
     int	    	  argLen;
@@ -249,7 +256,7 @@ CondGetArg(char **linePtr, char **argPtr, const char *func)
 	 * the word 'make' or 'defined' at the beginning of a symbol...
 	 */
 	*argPtr = NULL;
-	return (0);
+	return 0;
     }
 
     while (*cp == ' ' || *cp == '\t') {
@@ -280,10 +287,11 @@ CondGetArg(char **linePtr, char **argPtr, const char *func)
 	    int		len;
 	    void	*freeIt;
 
-	    cp2 = Var_Parse(cp, VAR_CMD, TRUE, &len, &freeIt);
+	    cp2 = Var_Parse(cp, VAR_CMD, VARF_UNDEFERR|
+			    (doEval ? VARF_WANTRES : 0),
+			    &len, &freeIt);
 	    Buf_AddBytes(&buf, strlen(cp2), cp2);
-	    if (freeIt)
-		free(freeIt);
+	    free(freeIt);
 	    cp += len;
 	    continue;
 	}
@@ -306,11 +314,11 @@ CondGetArg(char **linePtr, char **argPtr, const char *func)
     if (func != NULL && *cp++ != ')') {
 	Parse_Error(PARSE_WARNING, "Missing closing parenthesis for %s()",
 		     func);
-	return (0);
+	return 0;
     }
 
     *linePtr = cp;
-    return (argLen);
+    return argLen;
 }
 
 /*-
@@ -337,9 +345,9 @@ CondDoDefined(int argLen MAKE_ATTR_UNUSED, const char *arg)
     } else {
 	result = FALSE;
     }
-    if (p1)
-	free(p1);
-    return (result);
+
+    free(p1);
+    return result;
 }
 
 /*-
@@ -359,7 +367,7 @@ CondDoDefined(int argLen MAKE_ATTR_UNUSED, const char *arg)
 static int
 CondStrMatch(const void *string, const void *pattern)
 {
-    return(!Str_Match(string, pattern));
+    return !Str_Match(string, pattern);
 }
 
 /*-
@@ -404,14 +412,14 @@ CondDoExists(int argLen MAKE_ATTR_UNUSED, const char *arg)
     if (DEBUG(COND)) {
 	fprintf(debug_file, "exists(%s) result is \"%s\"\n",
 	       arg, path ? path : "");
-    }    
+    }
     if (path != NULL) {
 	result = TRUE;
 	free(path);
     } else {
 	result = FALSE;
     }
-    return (result);
+    return result;
 }
 
 /*-
@@ -433,7 +441,7 @@ CondDoTarget(int argLen MAKE_ATTR_UNUSED, const char *arg)
     GNode   *gn;
 
     gn = Targ_FindNode(arg, TARG_NOCREATE);
-    return (gn != NULL) && !OP_NOP(gn->type);
+    return gn != NULL && !OP_NOP(gn->type);
 }
 
 /*-
@@ -457,7 +465,7 @@ CondDoCommands(int argLen MAKE_ATTR_UNUSED, const char *arg)
     GNode   *gn;
 
     gn = Targ_FindNode(arg, TARG_NOCREATE);
-    return (gn != NULL) && !OP_NOP(gn->type) && !Lst_IsEmpty(gn->commands);
+    return gn != NULL && !OP_NOP(gn->type) && !Lst_IsEmpty(gn->commands);
 }
 
 /*-
@@ -481,6 +489,10 @@ CondCvtArg(char *str, double *value)
     double d_val;
 
     errno = 0;
+    if (!*str) {
+	*value = (double)0;
+	return TRUE;
+    }
     l_val = strtoul(str, &eptr, str[1] == 'x' ? 16 : 10);
     ech = *eptr;
     if (ech == 0 && errno != ERANGE) {
@@ -517,7 +529,7 @@ CondCvtArg(char *str, double *value)
  */
 /* coverity:[+alloc : arg-*2] */
 static char *
-CondGetString(Boolean doEval, Boolean *quoted, void **freeIt)
+CondGetString(Boolean doEval, Boolean *quoted, void **freeIt, Boolean strictLHS)
 {
     Buffer buf;
     char *cp;
@@ -561,8 +573,9 @@ CondGetString(Boolean doEval, Boolean *quoted, void **freeIt)
 	    break;
 	case '$':
 	    /* if we are in quotes, then an undefined variable is ok */
-	    str = Var_Parse(condExpr, VAR_CMD, (qt ? 0 : doEval),
-			    &len, freeIt);
+	    str = Var_Parse(condExpr, VAR_CMD,
+			    ((!qt && doEval) ? VARF_UNDEFERR : 0) |
+			    (doEval ? VARF_WANTRES : 0), &len, freeIt);
 	    if (str == var_Error) {
 		if (*freeIt) {
 		    free(*freeIt);
@@ -601,6 +614,16 @@ CondGetString(Boolean doEval, Boolean *quoted, void **freeIt)
 	    condExpr--;			/* don't skip over next char */
 	    break;
 	default:
+	    if (strictLHS && !qt && *start != '$' &&
+		!isdigit((unsigned char) *start)) {
+		/* lhs must be quoted, a variable reference or number */
+		if (*freeIt) {
+		    free(*freeIt);
+		    *freeIt = NULL;
+		}
+		str = NULL;
+		goto cleanup;
+	    }
 	    Buf_AddByte(&buf, *condExpr);
 	    break;
 	}
@@ -643,12 +666,12 @@ compare_expression(Boolean doEval)
     rhs = NULL;
     lhsFree = rhsFree = FALSE;
     lhsQuoted = rhsQuoted = FALSE;
-    
+
     /*
      * Parse the variable spec and skip over it, saving its
      * value in lhs.
      */
-    lhs = CondGetString(doEval, &lhsQuoted, &lhsFree);
+    lhs = CondGetString(doEval, &lhsQuoted, &lhsFree, lhsStrict);
     if (!lhs)
 	goto done;
 
@@ -686,7 +709,7 @@ compare_expression(Boolean doEval)
 		goto done;
 	    }
 	    /* For .ifxxx <number> compare against zero */
-	    if (CondCvtArg(lhs, &left)) { 
+	    if (CondCvtArg(lhs, &left)) {
 		t = left != 0.0;
 		goto done;
 	    }
@@ -709,9 +732,14 @@ compare_expression(Boolean doEval)
 	goto done;
     }
 
-    rhs = CondGetString(doEval, &rhsQuoted, &rhsFree);
+    rhs = CondGetString(doEval, &rhsQuoted, &rhsFree, FALSE);
     if (!rhs)
 	goto done;
+
+    if (!doEval) {
+	t = TOK_FALSE;
+	goto done;
+    }
 
     if (rhsQuoted || lhsQuoted) {
 do_string_compare:
@@ -739,7 +767,7 @@ do_string_compare:
 	 * rhs is either a float or an integer. Convert both the
 	 * lhs and the rhs to a double and compare the two.
 	 */
-    
+
 	if (!CondCvtArg(lhs, &left) || !CondCvtArg(rhs, &right))
 	    goto do_string_compare;
 
@@ -782,15 +810,13 @@ do_string_compare:
     }
 
 done:
-    if (lhsFree)
-	free(lhsFree);
-    if (rhsFree)
-	free(rhsFree);
+    free(lhsFree);
+    free(rhsFree);
     return t;
 }
 
 static int
-get_mpt_arg(char **linePtr, char **argPtr, const char *func MAKE_ATTR_UNUSED)
+get_mpt_arg(Boolean doEval, char **linePtr, char **argPtr, const char *func MAKE_ATTR_UNUSED)
 {
     /*
      * Use Var_Parse to parse the spec in parens and return
@@ -804,7 +830,7 @@ get_mpt_arg(char **linePtr, char **argPtr, const char *func MAKE_ATTR_UNUSED)
     /* We do all the work here and return the result as the length */
     *argPtr = NULL;
 
-    val = Var_Parse(cp - 1, VAR_CMD, FALSE, &length, &freeIt);
+    val = Var_Parse(cp - 1, VAR_CMD, doEval ? VARF_WANTRES : 0, &length, &freeIt);
     /*
      * Advance *linePtr to beyond the closing ). Note that
      * we subtract one because 'length' is calculated from 'cp - 1'.
@@ -825,8 +851,7 @@ get_mpt_arg(char **linePtr, char **argPtr, const char *func MAKE_ATTR_UNUSED)
      * true/false here.
      */
     length = *val ? 2 : 1;
-    if (freeIt)
-	free(freeIt);
+    free(freeIt);
     return length;
 }
 
@@ -842,7 +867,7 @@ compare_function(Boolean doEval)
     static const struct fn_def {
 	const char  *fn_name;
 	int         fn_name_len;
-        int         (*fn_getarg)(char **, char **, const char *);
+        int         (*fn_getarg)(Boolean, char **, char **, const char *);
 	Boolean     (*fn_proc)(int, const char *);
     } fn_defs[] = {
 	{ "defined",   7, CondGetArg, CondDoDefined },
@@ -870,15 +895,14 @@ compare_function(Boolean doEval)
 	if (*cp != '(')
 	    break;
 
-	arglen = fn_def->fn_getarg(&cp, &arg, fn_def->fn_name);
+	arglen = fn_def->fn_getarg(doEval, &cp, &arg, fn_def->fn_name);
 	if (arglen <= 0) {
 	    condExpr = cp;
 	    return arglen < 0 ? TOK_ERROR : TOK_FALSE;
 	}
 	/* Evaluate the argument using the required function. */
 	t = !doEval || fn_def->fn_proc(arglen, arg);
-	if (arg)
-	    free(arg);
+	free(arg);
 	condExpr = cp;
 	return t;
     }
@@ -896,7 +920,7 @@ compare_function(Boolean doEval)
      * would be invalid if we did "defined(a)" - so instead treat as an
      * expression.
      */
-    arglen = CondGetArg(&cp, &arg, NULL);
+    arglen = CondGetArg(doEval, &cp, &arg, NULL);
     for (cp1 = cp; isspace(*(unsigned char *)cp1); cp1++)
 	continue;
     if (*cp1 == '=' || *cp1 == '!')
@@ -910,8 +934,7 @@ compare_function(Boolean doEval)
      * be empty - even if it contained a variable expansion.
      */
     t = !doEval || if_info->defProc(arglen, arg) != if_info->doNot;
-    if (arg)
-	free(arg);
+    free(arg);
     return t;
 }
 
@@ -1020,7 +1043,7 @@ CondT(Boolean doEval)
 	    t = TOK_TRUE;
 	}
     }
-    return (t);
+    return t;
 }
 
 /*-
@@ -1066,7 +1089,7 @@ CondF(Boolean doEval)
 	    CondPushBack(o);
 	}
     }
-    return (l);
+    return l;
 }
 
 /*-
@@ -1113,7 +1136,7 @@ CondE(Boolean doEval)
 	    CondPushBack(o);
 	}
     }
-    return (l);
+    return l;
 }
 
 /*-
@@ -1135,13 +1158,15 @@ CondE(Boolean doEval)
  *-----------------------------------------------------------------------
  */
 int
-Cond_EvalExpression(const struct If *info, char *line, Boolean *value, int eprint)
+Cond_EvalExpression(const struct If *info, char *line, Boolean *value, int eprint, Boolean strictLHS)
 {
     static const struct If *dflt_info;
     const struct If *sv_if_info = if_info;
     char *sv_condExpr = condExpr;
     Token sv_condPushBack = condPushBack;
     int rval;
+
+    lhsStrict = strictLHS;
 
     while (*line == ' ' || *line == '\t')
 	line++;
@@ -1153,8 +1178,9 @@ Cond_EvalExpression(const struct If *info, char *line, Boolean *value, int eprin
 		break;
 	dflt_info = info;
     }
+    assert(info != NULL);
 
-    if_info = info != NULL ? info : ifs + 4;
+    if_info = info;
     condExpr = line;
     condPushBack = TOK_NONE;
 
@@ -1359,7 +1385,7 @@ Cond_Eval(char *line)
     }
 
     /* And evaluate the conditional expresssion */
-    if (Cond_EvalExpression(ifp, line, &value, 1) == COND_INVALID) {
+    if (Cond_EvalExpression(ifp, line, &value, 1, TRUE) == COND_INVALID) {
 	/* Syntax error in conditional, error message already output. */
 	/* Skip everything to matching .endif */
 	cond_state[cond_depth] = SKIP_TO_ELSE;

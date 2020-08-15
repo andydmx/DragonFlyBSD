@@ -31,12 +31,13 @@
  * OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
  *
- * $DragonFly: src/lib/libc/stdio/fcookie.c,v 1.1 2005/07/23 20:23:05 joerg Exp $
  */
 
 #include <stdio.h>
 
 #include "priv_stdio.h"
+
+void *_fcookie(FILE *);
 
 void *
 _fcookie(FILE *fp)

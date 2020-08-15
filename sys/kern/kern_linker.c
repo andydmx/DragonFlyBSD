@@ -32,7 +32,7 @@
 #include <sys/kernel.h>
 #include <sys/systm.h>
 #include <sys/malloc.h>
-#include <sys/sysproto.h>
+#include <sys/sysmsg.h>
 #include <sys/sysent.h>
 #include <sys/proc.h>
 #include <sys/priv.h>
@@ -47,8 +47,6 @@
 #include <sys/sysctl.h>
 
 #include <vm/vm_zone.h>
-
-#include <sys/mplock2.h>
 
 #ifdef _KERNEL_VIRTUAL
 #include <dlfcn.h>
@@ -65,7 +63,8 @@ MALLOC_DEFINE(M_LINKER, "kld", "kernel linker");
 linker_file_t linker_current_file;
 linker_file_t linker_kernel_file;
 
-static struct lock lock;	/* lock for the file list */
+static struct lock llf_lock;	/* lock for the file list */
+static struct lock kld_lock;
 static linker_class_list_t classes;
 static linker_file_list_t linker_files;
 static int next_file_id = 1;
@@ -99,7 +98,8 @@ linker_strdup(const char *str)
 static void
 linker_init(void* arg)
 {
-    lockinit(&lock, "klink", 0, 0);
+    lockinit(&llf_lock, "klink", 0, 0);
+    lockinit(&kld_lock, "kldlk", 0, LK_CANRECURSE);
     TAILQ_INIT(&classes);
     TAILQ_INIT(&linker_files);
 }
@@ -382,14 +382,14 @@ linker_find_file_by_name(const char* filename)
     koname = kmalloc(strlen(filename) + 4, M_LINKER, M_WAITOK);
     ksprintf(koname, "%s.ko", filename);
 
-    lockmgr(&lock, LK_SHARED);
+    lockmgr(&llf_lock, LK_SHARED);
     TAILQ_FOREACH(lf, &linker_files, link) {
 	if (!strcmp(lf->filename, koname))
 	    break;
 	if (!strcmp(lf->filename, filename))
 	    break;
     }
-    lockmgr(&lock, LK_RELEASE);
+    lockmgr(&llf_lock, LK_RELEASE);
 
     if (koname)
 	kfree(koname, M_LINKER);
@@ -401,11 +401,12 @@ linker_find_file_by_id(int fileid)
 {
     linker_file_t lf = NULL;
 
-    lockmgr(&lock, LK_SHARED);
-    TAILQ_FOREACH(lf, &linker_files, link)
+    lockmgr(&llf_lock, LK_SHARED);
+    TAILQ_FOREACH(lf, &linker_files, link) {
 	if (lf->id == fileid)
 	    break;
-    lockmgr(&lock, LK_RELEASE);
+    }
+    lockmgr(&llf_lock, LK_RELEASE);
 
     return lf;
 }
@@ -416,13 +417,14 @@ linker_file_foreach(linker_predicate_t *predicate, void *context)
     linker_file_t lf;
     int retval = 0;
 
-    lockmgr(&lock, LK_SHARED);
+    lockmgr(&llf_lock, LK_SHARED);
     TAILQ_FOREACH(lf, &linker_files, link) {
 	retval = predicate(lf, context);
 	if (retval != 0)
 	    break;
     }
-    lockmgr(&lock, LK_RELEASE);
+    lockmgr(&llf_lock, LK_RELEASE);
+
     return (retval);
 }
 
@@ -439,7 +441,7 @@ linker_make_file(const char* pathname, void* priv, struct linker_file_ops* ops)
 	filename = pathname;
 
     KLD_DPF(FILE, ("linker_make_file: new file, filename=%s\n", filename));
-    lockmgr(&lock, LK_EXCLUSIVE);
+    lockmgr(&llf_lock, LK_EXCLUSIVE);
     lf = kmalloc(sizeof(struct linker_file), M_LINKER, M_WAITOK | M_ZERO);
     lf->refs = 1;
     lf->userrefs = 0;
@@ -455,7 +457,8 @@ linker_make_file(const char* pathname, void* priv, struct linker_file_ops* ops)
     lf->ops = ops;
     TAILQ_INSERT_TAIL(&linker_files, lf, link);
 
-    lockmgr(&lock, LK_RELEASE);
+    lockmgr(&llf_lock, LK_RELEASE);
+
     return lf;
 }
 
@@ -474,12 +477,12 @@ linker_file_unload(linker_file_t file)
 
     KLD_DPF(FILE, ("linker_file_unload: lf->refs=%d\n", file->refs));
 
-    lockmgr(&lock, LK_EXCLUSIVE);
+    lockmgr(&llf_lock, LK_EXCLUSIVE);
 
     /* Easy case of just dropping a reference. */
     if (file->refs > 1) {
 	    file->refs--;
-	    lockmgr(&lock, LK_RELEASE);
+	    lockmgr(&llf_lock, LK_RELEASE);
 	    return (0);
     }
 
@@ -500,7 +503,7 @@ linker_file_unload(linker_file_t file)
 	if ((error = module_unload(mod)) != 0) {
 	    KLD_DPF(FILE, ("linker_file_unload: module %p vetoes unload\n",
 			   mod));
-	    lockmgr(&lock, LK_RELEASE);
+	    lockmgr(&llf_lock, LK_RELEASE);
 	    file->refs--;
 	    goto out;
 	}
@@ -517,19 +520,19 @@ linker_file_unload(linker_file_t file)
     /* Don't try to run SYSUNINITs if we are unloaded due to a link error */
     if (file->flags & LINKER_FILE_LINKED) {
 	file->flags &= ~LINKER_FILE_LINKED;
-	lockmgr(&lock, LK_RELEASE);
+	lockmgr(&llf_lock, LK_RELEASE);
 	linker_file_sysuninit(file);
 	linker_file_unregister_sysctls(file);
-	lockmgr(&lock, LK_EXCLUSIVE);
+	lockmgr(&llf_lock, LK_EXCLUSIVE);
     }
 
     TAILQ_REMOVE(&linker_files, file, link);
 
     if (file->deps) {
-	lockmgr(&lock, LK_RELEASE);
+	lockmgr(&llf_lock, LK_RELEASE);
 	for (i = 0; i < file->ndeps; i++)
 	    linker_file_unload(file->deps[i]);
-	lockmgr(&lock, LK_EXCLUSIVE);
+	lockmgr(&llf_lock, LK_EXCLUSIVE);
 	kfree(file->deps, M_LINKER);
 	file->deps = NULL;
     }
@@ -548,7 +551,7 @@ linker_file_unload(linker_file_t file)
 
     kfree(file, M_LINKER);
 
-    lockmgr(&lock, LK_RELEASE);
+    lockmgr(&llf_lock, LK_RELEASE);
 
 out:
     return error;
@@ -761,7 +764,7 @@ linker_ddb_symbol_values(c_linker_sym_t sym, linker_symval_t *symval)
  * MPALMOSTSAFE
  */
 int
-sys_kldload(struct kldload_args *uap)
+sys_kldload(struct sysmsg *sysmsg, const struct kldload_args *uap)
 {
     struct thread *td = curthread;
     char *file;
@@ -769,7 +772,7 @@ sys_kldload(struct kldload_args *uap)
     linker_file_t lf;
     int error = 0;
 
-    uap->sysmsg_result = -1;
+    sysmsg->sysmsg_result = -1;
 
     if (securelevel > 0 || kernel_mem_readonly)	/* redundant, but that's OK */
 	return EPERM;
@@ -794,14 +797,14 @@ sys_kldload(struct kldload_args *uap)
 	modname = file;
     }
 
-    get_mplock();
+    lockmgr(&kld_lock, LK_EXCLUSIVE);
     error = linker_load_module(kldname, modname, NULL, NULL, &lf);
-    rel_mplock();
+    lockmgr(&kld_lock, LK_RELEASE);
     if (error)
 	goto out;
 
     lf->userrefs++;
-    uap->sysmsg_result = lf->id;
+    sysmsg->sysmsg_result = lf->id;
 
 out:
     if (file)
@@ -813,7 +816,7 @@ out:
  * MPALMOSTSAFE
  */
 int
-sys_kldunload(struct kldunload_args *uap)
+sys_kldunload(struct sysmsg *sysmsg, const struct kldunload_args *uap)
 {
     struct thread *td = curthread;
     linker_file_t lf;
@@ -825,7 +828,7 @@ sys_kldunload(struct kldunload_args *uap)
     if ((error = priv_check(td, PRIV_KLD_UNLOAD)) != 0)
 	return error;
 
-    get_mplock();
+    lockmgr(&kld_lock, LK_EXCLUSIVE);
     lf = linker_find_file_by_id(uap->fileid);
     if (lf) {
 	KLD_DPF(FILE, ("kldunload: lf->userrefs=%d\n", lf->userrefs));
@@ -842,7 +845,8 @@ sys_kldunload(struct kldunload_args *uap)
 	error = ENOENT;
     }
 out:
-    rel_mplock();
+    lockmgr(&kld_lock, LK_RELEASE);
+
     return error;
 }
 
@@ -850,13 +854,13 @@ out:
  * MPALMOSTSAFE
  */
 int
-sys_kldfind(struct kldfind_args *uap)
+sys_kldfind(struct sysmsg *sysmsg, const struct kldfind_args *uap)
 {
     char *filename = NULL, *modulename;
     linker_file_t lf;
     int error;
 
-    uap->sysmsg_result = -1;
+    sysmsg->sysmsg_result = -1;
 
     filename = kmalloc(MAXPATHLEN, M_TEMP, M_WAITOK);
     if ((error = copyinstr(uap->file, filename, MAXPATHLEN, NULL)) != 0)
@@ -866,13 +870,13 @@ sys_kldfind(struct kldfind_args *uap)
     if (modulename == NULL)
 	modulename = filename;
 
-    get_mplock();
+    lockmgr(&kld_lock, LK_EXCLUSIVE);
     lf = linker_find_file_by_name(modulename);
     if (lf)
-	uap->sysmsg_result = lf->id;
+	sysmsg->sysmsg_result = lf->id;
     else
 	error = ENOENT;
-    rel_mplock();
+    lockmgr(&kld_lock, LK_RELEASE);
 
 out:
     if (filename)
@@ -884,12 +888,12 @@ out:
  * MPALMOSTSAFE
  */
 int
-sys_kldnext(struct kldnext_args *uap)
+sys_kldnext(struct sysmsg *sysmsg, const struct kldnext_args *uap)
 {
     linker_file_t lf;
     int error = 0;
 
-    get_mplock();
+    lockmgr(&kld_lock, LK_EXCLUSIVE);
     if (uap->fileid == 0) {
 	    lf = TAILQ_FIRST(&linker_files);
     } else {
@@ -907,12 +911,13 @@ sys_kldnext(struct kldnext_args *uap)
     }
 
     if (lf)
-	uap->sysmsg_result = lf->id;
+	sysmsg->sysmsg_result = lf->id;
     else
-	uap->sysmsg_result = 0;
+	sysmsg->sysmsg_result = 0;
 
 out:
-    rel_mplock();
+    lockmgr(&kld_lock, LK_RELEASE);
+
     return error;
 }
 
@@ -920,7 +925,7 @@ out:
  * MPALMOSTSAFE
  */
 int
-sys_kldstat(struct kldstat_args *uap)
+sys_kldstat(struct sysmsg *sysmsg, const struct kldstat_args *uap)
 {
     linker_file_t lf;
     int error = 0;
@@ -928,7 +933,7 @@ sys_kldstat(struct kldstat_args *uap)
     struct kld_file_stat* stat;
     int namelen;
 
-    get_mplock();
+    lockmgr(&kld_lock, LK_EXCLUSIVE);
     lf = linker_find_file_by_id(uap->fileid);
     if (!lf) {
 	error = ENOENT;
@@ -961,10 +966,11 @@ sys_kldstat(struct kldstat_args *uap)
     if ((error = copyout(&lf->size, &stat->size, sizeof(size_t))) != 0)
 	goto out;
 
-    uap->sysmsg_result = 0;
+    sysmsg->sysmsg_result = 0;
 
 out:
-    rel_mplock();
+    lockmgr(&kld_lock, LK_RELEASE);
+
     return error;
 }
 
@@ -972,22 +978,22 @@ out:
  * MPALMOSTSAFE
  */
 int
-sys_kldfirstmod(struct kldfirstmod_args *uap)
+sys_kldfirstmod(struct sysmsg *sysmsg, const struct kldfirstmod_args *uap)
 {
     linker_file_t lf;
     int error = 0;
 
-    get_mplock();
+    lockmgr(&kld_lock, LK_EXCLUSIVE);
     lf = linker_find_file_by_id(uap->fileid);
     if (lf) {
 	if (TAILQ_FIRST(&lf->modules))
-	    uap->sysmsg_result = module_getid(TAILQ_FIRST(&lf->modules));
+	    sysmsg->sysmsg_result = module_getid(TAILQ_FIRST(&lf->modules));
 	else
-	    uap->sysmsg_result = 0;
+	    sysmsg->sysmsg_result = 0;
     } else {
 	error = ENOENT;
     }
-    rel_mplock();
+    lockmgr(&kld_lock, LK_RELEASE);
 
     return error;
 }
@@ -996,7 +1002,7 @@ sys_kldfirstmod(struct kldfirstmod_args *uap)
  * MPALMOSTSAFE
  */
 int
-sys_kldsym(struct kldsym_args *uap)
+sys_kldsym(struct sysmsg *sysmsg, const struct kldsym_args *uap)
 {
     char *symstr = NULL;
     c_linker_sym_t sym;
@@ -1005,7 +1011,7 @@ sys_kldsym(struct kldsym_args *uap)
     struct kld_sym_lookup lookup;
     int error = 0;
 
-    get_mplock();
+    lockmgr(&kld_lock, LK_EXCLUSIVE);
     if ((error = copyin(uap->data, &lookup, sizeof(lookup))) != 0)
 	goto out;
     if (lookup.version != sizeof(lookup) || uap->cmd != KLDSYM_LOOKUP) {
@@ -1044,9 +1050,10 @@ sys_kldsym(struct kldsym_args *uap)
 	    error = ENOENT;
     }
 out:
-    rel_mplock();
+    lockmgr(&kld_lock, LK_RELEASE);
     if (symstr)
 	kfree(symstr, M_TEMP);
+
     return error;
 }
 
@@ -1096,18 +1103,19 @@ linker_reference_module(const char *modname, struct mod_depend *verinfo,
     modlist_t mod;
     int error;
 
-    lockmgr(&lock, LK_SHARED);
+    lockmgr(&llf_lock, LK_SHARED);
     if ((mod = modlist_lookup2(modname, verinfo)) != NULL) {
         *result = mod->container;
         (*result)->refs++;
-        lockmgr(&lock, LK_RELEASE);
+        lockmgr(&llf_lock, LK_RELEASE);
         return (0);
     }
 
-    lockmgr(&lock, LK_RELEASE);
-    get_mplock();
+    lockmgr(&llf_lock, LK_RELEASE);
+    /*lockmgr(&kld_lock, LK_EXCLUSIVE);*/
     error = linker_load_module(NULL, modname, NULL, verinfo, result);
-    rel_mplock();
+    /*lockmgr(&kld_lock, LK_RELEASE);*/
+
     return (error);
 }
 
@@ -1118,23 +1126,24 @@ linker_release_module(const char *modname, struct mod_depend *verinfo,
     modlist_t mod;
     int error;
 
-    lockmgr(&lock, LK_SHARED);
+    lockmgr(&llf_lock, LK_SHARED);
     if (lf == NULL) {
         KASSERT(modname != NULL,
             ("linker_release_module: no file or name"));
         mod = modlist_lookup2(modname, verinfo);
         if (mod == NULL) {
-            lockmgr(&lock, LK_RELEASE);
+            lockmgr(&llf_lock, LK_RELEASE);
             return (ESRCH);
         }
         lf = mod->container;
     } else
         KASSERT(modname == NULL && verinfo == NULL,
             ("linker_release_module: both file and name"));
-    lockmgr(&lock, LK_RELEASE);
-    get_mplock();
+    lockmgr(&llf_lock, LK_RELEASE);
+    /*lockmgr(&kld_lock, LK_EXCLUSIVE);*/
     error = linker_file_unload(lf);
-    rel_mplock();
+    /*lockmgr(&kld_lock, LK_RELEASE);*/
+
     return (error);
 }
 

@@ -23,7 +23,8 @@
 .\" SUCH DAMAGE.
 .\"
 .\" $FreeBSD: src/sys/boot/forth/loader.conf.5,v 1.18 2002/08/27 01:02:56 trhodes Exp $
-.Dd October 6, 2010
+.\"
+.Dd August 14, 2015
 .Dt LOADER.CONF 5
 .Os
 .Sh NAME
@@ -111,6 +112,11 @@ If no
 is defined (see below), the
 module's name is taken to be
 .Aq Ar module .
+Only modules necessary for mounting the root file system should be loaded from
+.Nm
+due to memory limitations in the early boot phase.
+Other modules can be loaded later via similar entries in
+.Xr rc.conf 5 .
 .It Ao Ar module Ac Ns Ar _name
 Defines the name of the module.
 .It Ao Ar module Ac Ns Ar _type
@@ -199,6 +205,16 @@ above and also add
 to cause the kernel to use the serial port without also forcing the
 boot loader to use the serial port.
 .Pp
+In contrast to the above, if you wish to place your serial console
+on a late-configuring serial port (such as one from a PCIe card),
+that serial port will not be available to the loader or for half
+the boot and it is probably best to leave
+.Va boot_serial unset .
+In
+this situation, syscons may have already taken the console, so
+you need to override it using (for example)
+.Va sio4.flags=0x30 instead of 0x10.
+.Pp
 The boot1/boot2 code uses BIOS calls to read and write the screen but also
 mirrors output to and monitors COM1 @ 9600.
 In an IPMI environment you do not usually have to adjust the boot code
@@ -217,33 +233,42 @@ then install the bootcode to the partition via
 .Pp
 Note that in comconsole mode the kernel will pick up the baud rate
 from the boot loader, so no kernel recompile is needed.
-.It Va fred_disable
-.Pq Dq NO
-Shows a monochrome version of Fred, the official
-.Dx
-mascot, when the
-boot menu appears.
-To make his life a bit more colorful, consider setting
-.Pa loader_color
-to
-.Dq YES .
-.It Va fred_on_left
-.Pq Dq NO
-Shows Fred on the left side of the menu rather than the right side.
 .It Va kernel
 .Pq Dq kernel .
-.It Va loader_color
+.It Va loader_plain
+.Pq Dq NO
+Unlike in the past, the loader defaults to displaying Fred, the official
+.Dx
+mascot, in color when the boot menu appears, unless
+.Pa console
+is set to
+.Dq comconsole
+in
+.Pa loader.conf
+or in the environment. If set to
+.Dq YES ,
+Fred will always be displayed in monochrome.
+.It Va fred_is_red
+.Pq Dq NO
+Under color mode, Fred is depicted as a blue dragonfly with cyan wings
+by default.  If set to
+.Dq YES ,
+Fred will be shown as a red dragonfly with red wings instead.
+.It Va fred_disable
+.Pq Dq NO
+Fred is displayed with the menu by default.  If set to
+.Dq YES ,
+Fred will not be shown.  The area will simply be blank.
+.It Va fred_on_left
 .Pq Dq NO
 If set to
 .Dq YES ,
-you'll meet Fred, the official
-.Dx
-mascot, in technicolor when the
-boot menu appears (remember to set
-.Pa fred_disable
-to
-.Dq NO
-for this to work.)
+Fred will be displayed on the left side of the menu rather than the right side.
+.It Va fred_separated
+.Pq Dq NO
+If set to
+.Dq YES ,
+a line will be drawn between Fred and the menu block.
 .It Va splash_bmp_load
 .Pq Dq NO
 If set to
@@ -256,17 +281,6 @@ If set to
 .Dq YES ,
 will load the splash screen module, making it possible to display a pcx image
 on the screen while booting.
-.It Va userconfig_script_load
-.Pq Dq NO
-If set to
-.Dq YES ,
-will load the userconfig data.
-.It Va vesa_load
-.Pq Dq NO
-If set to
-.Dq YES ,
-the vesa module will be loaded, enabling bitmaps above VGA resolution to
-be displayed.
 .El
 .Sh IPMI
 Generally speaking machines with IPMI capabilities are capable of

@@ -34,7 +34,7 @@
  * The implementation is designed to avoid looping when compatible operations
  * are executed.
  *
- * To acquire a spinlock we first increment counta.  Then we check if counta
+ * To acquire a spinlock we first increment lock.  Then we check if lock
  * meets our requirements.  For an exclusive spinlock it must be 1, of a
  * shared spinlock it must either be 1 or the SHARED_SPINLOCK bit must be set.
  *
@@ -44,7 +44,7 @@
  *
  * Exclusive spinlock failure case: While maintaining the count, clear the
  * SHARED_SPINLOCK flag unconditionally.  Then use an atomic add to transfer
- * the count from the low bits to the high bits of counta.  Then loop until
+ * the count from the low bits to the high bits of lock.  Then loop until
  * all low bits are 0.  Once the low bits drop to 0 we can transfer the
  * count back with an atomic_cmpset_int(), atomically, and return.
  */
@@ -62,21 +62,12 @@
 #include <machine/cpufunc.h>
 #include <machine/specialreg.h>
 #include <machine/clock.h>
+#include <sys/indefinite2.h>
 #include <sys/spinlock.h>
 #include <sys/spinlock2.h>
 #include <sys/ktr.h>
 
-#ifdef _KERNEL_VIRTUAL
-#include <pthread.h>
-#endif
-
 struct spinlock pmap_spin = SPINLOCK_INITIALIZER(pmap_spin, "pmap_spin");
-
-struct indefinite_info {
-	sysclock_t	base;
-	int		secs;
-	const char	*ident;
-};
 
 /*
  * Kernal Trace
@@ -102,188 +93,205 @@ static int spin_lock_test_mode;
 
 #ifdef DEBUG_LOCKS_LATENCY
 
-static long spinlocks_add_latency;
+__read_frequently static long spinlocks_add_latency;
 SYSCTL_LONG(_debug, OID_AUTO, spinlocks_add_latency, CTLFLAG_RW,
     &spinlocks_add_latency, 0,
     "Add spinlock latency");
 
 #endif
 
+__read_frequently static long spin_backoff_max = 4096;
+SYSCTL_LONG(_debug, OID_AUTO, spin_backoff_max, CTLFLAG_RW,
+    &spin_backoff_max, 0,
+    "Spinlock exponential backoff limit");
 
-/*
- * We need a fairly large pool to avoid contention on large SMP systems,
- * particularly multi-chip systems.
- */
-/*#define SPINLOCK_NUM_POOL	8101*/
-#define SPINLOCK_NUM_POOL	8192
-#define SPINLOCK_NUM_POOL_MASK	(SPINLOCK_NUM_POOL - 1)
+/* 1 << n clock cycles, approx */
+__read_frequently static long spin_window_shift = 8;
+SYSCTL_LONG(_debug, OID_AUTO, spin_window_shift, CTLFLAG_RW,
+    &spin_window_shift, 0,
+    "Spinlock TSC windowing");
 
-static __cachealign struct {
-	struct spinlock	spin;
-	char filler[32 - sizeof(struct spinlock)];
-} pool_spinlocks[SPINLOCK_NUM_POOL];
-
-static int spin_indefinite_check(struct spinlock *spin,
-				  struct indefinite_info *info);
+__read_frequently int indefinite_uses_rdtsc = 1;
+SYSCTL_INT(_debug, OID_AUTO, indefinite_uses_rdtsc, CTLFLAG_RW,
+    &indefinite_uses_rdtsc, 0,
+    "Indefinite code uses RDTSC");
 
 /*
  * We contested due to another exclusive lock holder.  We lose.
  *
  * We have to unwind the attempt and may acquire the spinlock
- * anyway while doing so.  countb was incremented on our behalf.
+ * anyway while doing so.
  */
 int
 spin_trylock_contested(struct spinlock *spin)
 {
 	globaldata_t gd = mycpu;
 
-	/*atomic_add_int(&spin->counta, -1);*/
+	/*
+	 * Handle degenerate case, else fail.
+	 */
+	if (atomic_cmpset_int(&spin->lock, SPINLOCK_SHARED|0, 1))
+		return TRUE;
+	/*atomic_add_int(&spin->lock, -1);*/
 	--gd->gd_spinlocks;
-	--gd->gd_curthread->td_critcount;
+	crit_exit_quick(gd->gd_curthread);
+
 	return (FALSE);
 }
 
 /*
- * The spin_lock() inline was unable to acquire the lock.
+ * The spin_lock() inline was unable to acquire the lock and calls this
+ * function with spin->lock already incremented, passing (spin->lock - 1)
+ * to the function (the result of the inline's fetchadd).
  *
- * atomic_swap_int() is the absolute fastest spinlock instruction, at
- * least on multi-socket systems.  All instructions seem to be about
- * the same on single-socket multi-core systems.  However, atomic_swap_int()
- * does not result in an even distribution of successful acquisitions.
+ * Note that we implement both exclusive and shared spinlocks, so we cannot
+ * use atomic_swap_int().  Instead, we try to use atomic_fetchadd_int()
+ * to put most of the burden on the cpu.  Atomic_cmpset_int() (cmpxchg)
+ * can cause a lot of unnecessary looping in situations where it is just
+ * trying to increment the count.
  *
- * UNFORTUNATELY we cannot really use atomic_swap_int() when also implementing
- * shared spin locks, so as we do a better job removing contention we've
- * moved to atomic_cmpset_int() to be able handle multiple states.
+ * Similarly, we leave the SHARED flag intact and incur slightly more
+ * overhead when switching from shared to exclusive.  This allows us to
+ * use atomic_fetchadd_int() for both spinlock types in the critical
+ * path.
  *
- * Another problem we have is that (at least on the 48-core opteron we test
- * with) having all 48 cores contesting the same spin lock reduces
- * performance to around 600,000 ops/sec, verses millions when fewer cores
- * are going after the same lock.
+ * The exponential (n^1.5) backoff algorithm is designed to both reduce
+ * cache bus contention between cpu cores and sockets, and to allow some
+ * bursting of exclusive locks in heavily contended situations to improve
+ * performance.
  *
- * Backoff algorithms can create even worse starvation problems, and don't
- * really improve performance when a lot of cores are contending.
- *
- * Our solution is to allow the data cache to lazy-update by reading it
- * non-atomically and only attempting to acquire the lock if the lazy read
- * looks good.  This effectively limits cache bus bandwidth.  A cpu_pause()
- * (for intel/amd anyhow) is not strictly needed as cache bus resource use
- * is governed by the lazy update.
- *
- * WARNING!!!!  Performance matters here, by a huge margin.
- *
- *	48-core test with pre-read / -j 48 no-modules kernel compile
- *	with fanned-out inactive and active queues came in at 55 seconds.
- *
- *	48-core test with pre-read / -j 48 no-modules kernel compile
- *	came in at 75 seconds.  Without pre-read it came in at 170 seconds.
- *
- *	4-core test with pre-read / -j 48 no-modules kernel compile
- *	came in at 83 seconds.  Without pre-read it came in at 83 seconds
- *	as well (no difference).
+ * The exclusive lock priority mechanism prevents even heavily contended
+ * exclusive locks from being starved by shared locks
  */
 void
-_spin_lock_contested(struct spinlock *spin, const char *ident)
+_spin_lock_contested(struct spinlock *spin, const char *ident, int value)
 {
-	struct indefinite_info info = { 0, 0, ident };
-	int i;
+	indefinite_info_t info;
+	uint32_t ovalue;
+	long expbackoff;
+	long loop;
 
 	/*
-	 * Transfer our count to the high bits, then loop until we can
-	 * acquire the low counter (== 1).  No new shared lock can be
-	 * acquired while we hold the EXCLWAIT bits.
+	 * WARNING! Caller has already incremented the lock.  We must
+	 *	    increment the count value (from the inline's fetch-add)
+	 *	    to match.
 	 *
-	 * Force any existing shared locks to exclusive.  The shared unlock
-	 * understands that this may occur.
+	 * Handle the degenerate case where the spinlock is flagged SHARED
+	 * with only our reference.  We can convert it to EXCLUSIVE.
 	 */
-	atomic_add_int(&spin->counta, SPINLOCK_EXCLWAIT - 1);
-	atomic_clear_int(&spin->counta, SPINLOCK_SHARED);
-
-#ifdef DEBUG_LOCKS_LATENCY
-	long j;
-	for (j = spinlocks_add_latency; j > 0; --j)
-		cpu_ccfence();
-#endif
-#if defined(INVARIANTS)
-	if (spin_lock_test_mode > 10 &&
-	    spin->countb > spin_lock_test_mode &&
-	    (spin_lock_test_mode & 0xFF) == mycpu->gd_cpuid) {
-		spin->countb = 0;
-		print_backtrace(-1);
+	if (value == (SPINLOCK_SHARED | 1) - 1) {
+		if (atomic_cmpset_int(&spin->lock, SPINLOCK_SHARED | 1, 1))
+			return;
 	}
-	++spin->countb;
-#endif
-	i = 0;
+	/* ++value; value not used after this */
+	info.type = 0;		/* avoid improper gcc warning */
+	info.ident = NULL;	/* avoid improper gcc warning */
+	info.secs = 0;		/* avoid improper gcc warning */
+	info.base = 0;		/* avoid improper gcc warning */
+	expbackoff = 0;
 
-	/*logspin(beg, spin, 'w');*/
+	/*
+	 * Transfer our exclusive request to the high bits and clear the
+	 * SPINLOCK_SHARED bit if it was set.  This makes the spinlock
+	 * appear exclusive, preventing any NEW shared or exclusive
+	 * spinlocks from being obtained while we wait for existing
+	 * shared or exclusive holders to unlock.
+	 *
+	 * Don't tread on earlier exclusive waiters by stealing the lock
+	 * away early if the low bits happen to now be 1.
+	 *
+	 * The shared unlock understands that this may occur.
+	 */
+	ovalue = atomic_fetchadd_int(&spin->lock, SPINLOCK_EXCLWAIT - 1);
+	ovalue += SPINLOCK_EXCLWAIT - 1;
+	if (ovalue & SPINLOCK_SHARED) {
+		atomic_clear_int(&spin->lock, SPINLOCK_SHARED);
+		ovalue &= ~SPINLOCK_SHARED;
+	}
+
 	for (;;) {
+		expbackoff = (expbackoff + 1) * 3 / 2;
+		if (expbackoff == 6)		/* 1, 3, 6, 10, ... */
+			indefinite_init(&info, ident, 0, 'S');
+		if (indefinite_uses_rdtsc) {
+			if ((rdtsc() >> spin_window_shift) % ncpus != mycpuid)  {
+				for (loop = expbackoff; loop; --loop)
+					cpu_pause();
+			}
+		}
+		/*cpu_lfence();*/
+
 		/*
 		 * If the low bits are zero, try to acquire the exclusive lock
-		 * by transfering our high bit counter to the low bits.
+		 * by transfering our high bit reservation to the low bits.
 		 *
-		 * NOTE: Reading spin->counta prior to the swap is extremely
-		 *	 important on multi-chip/many-core boxes.  On 48-core
-		 *	 this one change improves fully concurrent all-cores
-		 *	 compiles by 100% or better.
+		 * NOTE: Avoid unconditional atomic op by testing ovalue,
+		 *	 otherwise we get cache bus armageddon.
 		 *
-		 *	 I can't emphasize enough how important the pre-read
-		 *	 is in preventing hw cache bus armageddon on
-		 *	 multi-chip systems.  And on single-chip/multi-core
-		 *	 systems it just doesn't hurt.
+		 * NOTE: We must also ensure that the SHARED bit is cleared.
+		 *	 It is possible for it to wind up being set on a
+		 *	 shared lock override of the EXCLWAIT bits.
 		 */
-		uint32_t ovalue = spin->counta;
+		ovalue = spin->lock;
 		cpu_ccfence();
-		if ((ovalue & (SPINLOCK_EXCLWAIT - 1)) == 0 &&
-		    atomic_cmpset_int(&spin->counta, ovalue,
-				      (ovalue - SPINLOCK_EXCLWAIT) | 1)) {
-			break;
+		if ((ovalue & (SPINLOCK_EXCLWAIT - 1)) == 0) {
+			uint32_t nvalue;
+
+			nvalue= ((ovalue - SPINLOCK_EXCLWAIT) | 1) &
+				~SPINLOCK_SHARED;
+			if (atomic_fcmpset_int(&spin->lock, &ovalue, nvalue))
+				break;
+			continue;
 		}
-		if ((++i & 0x7F) == 0x7F) {
-			mycpu->gd_cnt.v_lock_name[0] = 'X';
-			strncpy(mycpu->gd_cnt.v_lock_name + 1,
-				ident,
-				sizeof(mycpu->gd_cnt.v_lock_name) - 2);
-			++mycpu->gd_cnt.v_lock_colls;
-#if defined(INVARIANTS)
-			++spin->countb;
-#endif
-			if (spin_indefinite_check(spin, &info))
+		if (expbackoff > 6 + spin_backoff_max)
+			expbackoff = 6 + spin_backoff_max;
+		if (expbackoff >= 6) {
+			if (indefinite_check(&info))
 				break;
 		}
-#ifdef _KERNEL_VIRTUAL
-		pthread_yield();
-#endif
 	}
-	/*logspin(end, spin, 'w');*/
+	if (expbackoff >= 6)
+		indefinite_done(&info);
 }
 
 /*
- * Shared spinlock attempt was contested.
+ * The spin_lock_shared() inline was unable to acquire the lock and calls
+ * this function with spin->lock already incremented.
  *
- * The caller has not modified counta.
+ * This is not in the critical path unless there is contention between
+ * shared and exclusive holders.
+ *
+ * Exclusive locks have priority over shared locks.  However, this can
+ * cause shared locks to be starved when large numbers of threads are
+ * competing for exclusive locks so the shared lock code uses TSC-windowing
+ * to selectively ignore the exclusive priority mechanism.  This has the
+ * effect of allowing a limited number of shared locks to compete against
+ * exclusive waiters at any given moment.
+ *
+ * Note that shared locks do not implement exponential backoff.  Instead,
+ * the shared lock simply polls the lock value.  One cpu_pause() is built
+ * into indefinite_check().
  */
 void
 _spin_lock_shared_contested(struct spinlock *spin, const char *ident)
 {
-	struct indefinite_info info = { 0, 0, ident };
-	int i;
+	indefinite_info_t info;
+	uint32_t ovalue;
+
+	/*
+	 * Undo the inline's increment.
+	 */
+	ovalue = atomic_fetchadd_int(&spin->lock, -1) - 1;
+
+	indefinite_init(&info, ident, 0, 's');
+	cpu_pause();
 
 #ifdef DEBUG_LOCKS_LATENCY
 	long j;
 	for (j = spinlocks_add_latency; j > 0; --j)
 		cpu_ccfence();
 #endif
-#if defined(INVARIANTS)
-	if (spin_lock_test_mode > 10 &&
-	    spin->countb > spin_lock_test_mode &&
-	    (spin_lock_test_mode & 0xFF) == mycpu->gd_cpuid) {
-		spin->countb = 0;
-		print_backtrace(-1);
-	}
-	++spin->countb;
-#endif
-	i = 0;
 
-	/*logspin(beg, spin, 'w');*/
 	for (;;) {
 		/*
 		 * Loop until we can acquire the shared spinlock.  Note that
@@ -292,7 +300,7 @@ _spin_lock_shared_contested(struct spinlock *spin, const char *ident)
 		 * priority (otherwise shared users on multiple cpus can hog
 		 * the spinlnock).
 		 *
-		 * NOTE: Reading spin->counta prior to the swap is extremely
+		 * NOTE: Reading spin->lock prior to the swap is extremely
 		 *	 important on multi-chip/many-core boxes.  On 48-core
 		 *	 this one change improves fully concurrent all-cores
 		 *	 compiles by 100% or better.
@@ -302,104 +310,69 @@ _spin_lock_shared_contested(struct spinlock *spin, const char *ident)
 		 *	 multi-chip systems.  And on single-chip/multi-core
 		 *	 systems it just doesn't hurt.
 		 */
-		uint32_t ovalue = spin->counta;
-
 		cpu_ccfence();
+
+		/*
+		 * Ignore the EXCLWAIT bits if we are inside our window.
+		 */
+		if (indefinite_uses_rdtsc &&
+		    (ovalue & (SPINLOCK_EXCLWAIT - 1)) == 0 &&
+		    (rdtsc() >> spin_window_shift) % ncpus == mycpuid)  {
+			if (atomic_fcmpset_int(&spin->lock, &ovalue,
+					       ovalue | SPINLOCK_SHARED | 1)) {
+				break;
+			}
+			continue;
+		}
+
+		/*
+		 * Check ovalue tightly (no exponential backoff for shared
+		 * locks, that would result in horrible performance.  Instead,
+		 * shared locks depend on the exclusive priority mechanism
+		 * to avoid starving exclusive locks).
+		 */
 		if (ovalue == 0) {
-			if (atomic_cmpset_int(&spin->counta, 0,
-					      SPINLOCK_SHARED | 1))
+			if (atomic_fcmpset_int(&spin->lock, &ovalue,
+					      SPINLOCK_SHARED | 1)) {
 				break;
-		} else if (ovalue & SPINLOCK_SHARED) {
-			if (atomic_cmpset_int(&spin->counta, ovalue,
-					      ovalue + 1))
-				break;
+			}
+			continue;
 		}
-		if ((++i & 0x7F) == 0x7F) {
-			mycpu->gd_cnt.v_lock_name[0] = 'S';
-			strncpy(mycpu->gd_cnt.v_lock_name + 1,
-				ident,
-				sizeof(mycpu->gd_cnt.v_lock_name) - 2);
-			++mycpu->gd_cnt.v_lock_colls;
-#if defined(INVARIANTS)
-			++spin->countb;
-#endif
-			if (spin_indefinite_check(spin, &info))
+
+		/*
+		 * If SHARED is already set, go for the increment, improving
+		 * the exclusive to multiple-readers transition.
+		 */
+		if (ovalue & SPINLOCK_SHARED) {
+			ovalue = atomic_fetchadd_int(&spin->lock, 1);
+			/* ovalue += 1; NOT NEEDED */
+			if (ovalue & SPINLOCK_SHARED)
 				break;
+			ovalue = atomic_fetchadd_int(&spin->lock, -1);
+			ovalue += -1;
+			continue;
 		}
-#ifdef _KERNEL_VIRTUAL
-		pthread_yield();
-#endif
+		if (indefinite_check(&info))
+			break;
+		/*
+		 * ovalue was wrong anyway, just reload
+		 */
+		ovalue = spin->lock;
 	}
-	/*logspin(end, spin, 'w');*/
+	indefinite_done(&info);
 }
 
 /*
- * Pool functions (SHARED SPINLOCKS NOT SUPPORTED)
+ * Automatically avoid use of rdtsc when running in a VM
  */
-static __inline int
-_spin_pool_hash(void *ptr)
+static void
+spinlock_sysinit(void *dummy __unused)
 {
-	int i;
-
-	i = ((int)(uintptr_t) ptr >> 5) ^ ((int)(uintptr_t)ptr >> 12);
-	i &= SPINLOCK_NUM_POOL_MASK;
-	return (i);
+	if (vmm_guest)
+		indefinite_uses_rdtsc = 0;
 }
+SYSINIT(spinsysinit, SI_BOOT2_PROC0, SI_ORDER_FIRST, spinlock_sysinit, NULL);
 
-void
-_spin_pool_lock(void *chan, const char *ident)
-{
-	struct spinlock *sp;
-
-	sp = &pool_spinlocks[_spin_pool_hash(chan)].spin;
-	_spin_lock(sp, ident);
-}
-
-void
-_spin_pool_unlock(void *chan)
-{
-	struct spinlock *sp;
-
-	sp = &pool_spinlocks[_spin_pool_hash(chan)].spin;
-	spin_unlock(sp);
-}
-
-
-static
-int
-spin_indefinite_check(struct spinlock *spin, struct indefinite_info *info)
-{
-	sysclock_t count;
-
-	cpu_spinlock_contested();
-
-	count = sys_cputimer->count();
-	if (info->secs == 0) {
-		info->base = count;
-		++info->secs;
-	} else if (count - info->base > sys_cputimer->freq) {
-		kprintf("spin_lock: %s(%p), indefinite wait (%d secs)!\n",
-			info->ident, spin, info->secs);
-		info->base = count;
-		++info->secs;
-		if (panicstr)
-			return (TRUE);
-#if defined(INVARIANTS)
-		if (spin_lock_test_mode) {
-			print_backtrace(-1);
-			return (TRUE);
-		}
-#endif
-#if defined(INVARIANTS)
-		if (info->secs == 11)
-			print_backtrace(-1);
-#endif
-		if (info->secs == 60)
-			panic("spin_lock: %s(%p), indefinite wait!",
-			      info->ident, spin);
-	}
-	return (FALSE);
-}
 
 /*
  * If INVARIANTS is enabled various spinlock timing tests can be run

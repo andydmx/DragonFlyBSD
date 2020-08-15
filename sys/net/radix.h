@@ -10,11 +10,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -168,8 +164,11 @@ struct radix_node_head {
 		     struct radix_node_head *head, struct radix_node nodes[]);
 	struct	radix_node *(*rnh_delpkt)	/* remove based on packet hdr */
 		    (void *v, char *mask, struct radix_node_head *head);
-	struct	radix_node *(*rnh_matchpkt)	/* locate based on packet hdr */
-		    (void *v, struct radix_node_head *head);
+
+	/* traverse tree starting from a */
+	int	(*rnh_walktree_at)
+		    (struct radix_node_head *head, const char *a, const char *m,
+		     walktree_f_t *f, void *w);
 
 	struct radix_node_head *rnh_maskhead;
 };

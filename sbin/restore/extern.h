@@ -10,11 +10,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -32,25 +28,24 @@
  *
  *	@(#)extern.h	8.2 (Berkeley) 1/7/94
  * $FreeBSD: src/sbin/restore/extern.h,v 1.5 1999/08/28 00:14:05 peter Exp $
- * $DragonFly: src/sbin/restore/extern.h,v 1.4 2005/08/28 04:35:14 dillon Exp $
  */
 
-struct entry	*addentry(char *, ufs1_ino_t, int);
+struct entry	*addentry(const char *, ufs1_ino_t, int);
 long		 addfile(char *, ufs1_ino_t, int);
 int		 addwhiteout(char *);
-void		 badentry(struct entry *, char *);
-void	 	 canon(char *, char *, int);
+void		 badentry(struct entry *, const char *);
+void	 	 canon(const char *, char *, size_t);
 void		 checkrestore(void);
 void		 closemt(void);
 void		 createfiles(void);
-void		 createleaves(char *);
+void		 createleaves(const char *);
 void		 createlinks(void);
 long		 deletefile(char *, ufs1_ino_t, int);
 void		 deleteino(ufs1_ino_t);
 void		 delwhiteout(struct entry *);
 ufs1_ino_t	 dirlookup(const char *);
 void 	 	 done(int) __dead2;
-void		 dumpsymtable(char *, long);
+void		 dumpsymtable(const char *, long);
 void	 	 extractdirs(int);
 int		 extractfile(char *);
 void		 findunreflinks(void);
@@ -59,17 +54,17 @@ void		 freeentry(struct entry *);
 void		 freename(char *);
 int	 	 genliteraldir(char *, ufs1_ino_t);
 char		*gentempname(struct entry *);
-void		 getfile(void (*)(char *, long), void (*)(char *, long));
+void		 getfile(void (*)(char *, size_t), void (*)(char *, size_t));
 void		 getvol(long);
-void		 initsymtable(char *);
+void		 initsymtable(const char *);
 int	 	 inodetype(ufs1_ino_t);
 int		 linkit(char *, char *, int);
 struct entry	*lookupino(ufs1_ino_t);
-struct entry	*lookupname(char *);
+struct entry	*lookupname(const char *);
 long		 listfile(char *, ufs1_ino_t, int);
 ufs1_ino_t	 lowerbnd(ufs1_ino_t);
 void		 mktempname(struct entry *);
-void		 moveentry(struct entry *, char *);
+void		 moveentry(struct entry *, const char *);
 void		 msg(const char *, ...) __printflike(1, 2);
 char		*myname(struct entry *);
 void		 newnode(struct entry *);
@@ -84,24 +79,24 @@ void		 removeleaf(struct entry *);
 void		 removenode(struct entry *);
 void		 removeoldleaves(void);
 void		 removeoldnodes(void);
-void		 renameit(char *, char *);
-int		 reply(char *);
+void		 renameit(const char *, const char *);
+int		 reply(const char *);
 RST_DIR		*rst_opendir(const char *);
 struct direct	*rst_readdir(RST_DIR *);
 void		 rst_closedir(RST_DIR *dirp);
 void	 	 runcmdshell(void);
-char		*savename(char *);
+char		*savename(const char *);
 void	 	 setdirmodes(int);
 void		 setinput(char *);
 void		 setup(void);
 void	 	 skipdirs(void);
 void		 skipfile(void);
 void		 skipmaps(void);
-void		 swabst(u_char *, u_char *);
+void		 swabst(const char *, u_char *);
 void	 	 treescan(char *, ufs1_ino_t, long (*)(char *, ufs1_ino_t, int));
 ufs1_ino_t	 upperbnd(ufs1_ino_t);
 long		 verifyfile(char *, ufs1_ino_t, int);
-void		 xtrnull(char *, long);
+void		 xtrnull(char *, size_t);
 
 /* From ../dump/dumprmt.c */
 void		rmtclose(void);

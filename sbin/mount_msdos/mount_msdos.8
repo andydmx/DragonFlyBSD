@@ -30,7 +30,7 @@
 .\"
 .\" $FreeBSD: src/sbin/mount_msdos/mount_msdos.8,v 1.19.2.1 2000/12/08 14:03:59 ru Exp $
 .\"
-.Dd September 12, 2009
+.Dd October 2, 2019
 .Dt MOUNT_MSDOS 8
 .Os
 .Sh NAME
@@ -43,6 +43,7 @@
 .Op Fl g Ar gid
 .Op Fl L Ar locale
 .Op Fl m Ar mask
+.Op Fl M Ar mask
 .Op Fl o Ar options
 .Op Fl u Ar uid
 .\".Op Fl G
@@ -104,10 +105,24 @@ for more information about octal file modes.)
 Only the nine low-order bits of
 .Ar mask
 are used.
+The value of
+.Ar -M
+is used if it is supplied and
+.Ar -m
+is omitted.
 The default
 .Ar mask
 is taken from the
 directory on which the file system is being mounted.
+.It Fl M Ar mask
+Specify the maximum file permissions for directories
+in the file system.
+The value of
+.Ar -m
+is used if it is supplied and
+.Ar -M
+is omitted.
+See the previous option's description for details.
 .It Fl s
 Force behaviour to
 ignore and not generate Win'95 long filenames.
@@ -121,15 +136,8 @@ If neither
 nor
 .Fl l
 are given,
-.Nm
-searches the root directory of the filesystem to
-be mounted for any existing Win'95 long filenames.
-If no such entries are found, but short DOS filenames are found,
-.Fl s
-is the default.
-Otherwise
 .Fl l
-is assumed.
+is the default.
 .It Fl 9
 Ignore the special Win'95 directory entries even
 if deleting or renaming a file.
@@ -154,17 +162,24 @@ file name conversions for DOS names.
 .Xr fstab 5 ,
 .Xr mount 8
 .Sh HISTORY
-The
+The predecessor to
 .Nm
-utility first appeared in
-.Fx 2.0 .
-Its predecessor, the
+utility named
 .Nm mount_pcfs
-utility appeared in
-.Fx 1.0 ,
-and was abandoned in favor
-of the more aptly-named
-.Nm .
+appeared in
+.Bx 386 .
+It was rewritten in
+.Nx 1.0
+and first appeared in
+.Fx 2.0 .
+.Sh AUTHORS
+Initial implementation as
+.Nm mount_pcfs
+was written by
+.An -nosplit
+.An Paul Popelka Aq Mt paulp@uts.amdahl.com .
+It was rewritten by
+.An Christopher G. Demetriou Aq Mt cgd@NetBSD.org .
 .Sh CAVEATS
 The use of the
 .Fl 9

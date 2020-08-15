@@ -25,31 +25,37 @@
 # SUCH DAMAGE.
 #
 # $FreeBSD: src/tools/make_libdeps.sh,v 1.2.2.1 2002/07/23 12:12:30 ru Exp $
-# $DragonFly: src/tools/make_libdeps.sh,v 1.4 2005/05/07 17:38:34 swildner Exp $
 
-export PATH=/usr/bin
+export PATH=/sbin:/usr/bin
 
+set -e
+
+LC_ALL=C			# make sort deterministic
 FS=': '				# internal field separator
 LIBDEPENDS=./_libdeps		# intermediate output file
 USRSRC=${1:-/usr/src}		# source root
 LIBS="
 	lib
 	gnu/lib
-	gnu/usr.bin/perl/libperl
-	kerberos5/lib
-	secure/lib
-	usr.bin/lex/lib
+	usr.bin/flex/lib
 "				# where to scan for libraries
 
 # This sed(1) filter is used to convert -lfoo to path/to/libfoo.
 #
 SED_FILTER="
 sed -E
+    -e's;-Wl,[^ ]+[ ]?;;g'
+    -e's;-lprivate_crypto;-lrecrypto;g'
+    -e's;-lprivate_ncurses;-lncurses;g'
+    -e's;-lprivate_ssh;-lssh;g'
+    -e's;-lprivate_ssl;-lressl;g'
+    -e's;-pthread;-lthread_xu;g'
+    -e's;/[^ ]+/libpthread\.so;-lpthread;g'
+    -e's;/[^ ]+/libelf_pic.a;-lelf;g'
+    -e's;\.\./components/[^ ]+/lib[a-z0-9]+_pic\.a[ ]?;;g'
+    -e's;[ ]$;;g'
     -e's; ;! ;g'
     -e's;$;!;'
-    -e's;-lm!;lib/msun;g'
-    -e's;-l(asn1|gssapi|krb5|roken)!;kerberos5/lib/lib\1;g'
-    -e's;-l(crypto|ssh)!;secure/lib/lib\1;g'
     -e's;-l([^!]+)!;lib/lib\1;g'
 "
 
@@ -59,13 +65,13 @@ genlibdepends()
 {
 	(
 		cd ${USRSRC}
-		find ${LIBS} -mindepth 1 -name Makefile |
+		find ${LIBS} -mindepth 1 -name Makefile | sort |
 		xargs grep -l 'bsd\.lib\.mk' |
 		while read makefile; do
 			libdir=$(dirname ${makefile})
 			deps=$(
 				cd ${libdir}
-				make -V LDADD
+				make -m ${USRSRC}/share/mk -V LDADD
 			)
 			if [ "${deps}" ]; then
 				echo ${libdir}"${FS}"$(
@@ -84,12 +90,12 @@ main()
 	fi
 
 	prebuild_libs=$(
-		awk -F"${FS}" '{ print $2 }' ${LIBDEPENDS} |rs 0 1 |sort -u
+		awk -F"${FS}" '{ print $2 }' ${LIBDEPENDS} | tr ' ' '\n' |
+		    sort -u
 	)
 	echo "Libraries with dependents:"
 	echo
-	echo ${prebuild_libs} |
-	rs 0 1
+	echo ${prebuild_libs} | tr ' ' '\n'
 	echo
 
 	echo "List of interdependencies:"

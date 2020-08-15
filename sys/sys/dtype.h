@@ -10,11 +10,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -106,8 +102,14 @@ static const char *dktypenames[] = {
 #define FS_HAMMER	22
 #define FS_HAMMER2	23
 #define FS_UDF		24
+#define FS_RESERVED25	25
 #define FS_EFS		26
 #define FS_ZFS		27
+#define FS_RESERVED28	28
+#define FS_RESERVED29	29
+#define FS_NANDFS	30
+#define FS_ENCRYPTED	31		/* generic encrypted */
+#define FS_UNSPECIFIED	32		/* generic unspecified */
 
 #ifdef	DKTYPENAMES
 
@@ -140,6 +142,11 @@ static const char *fstypenames[] = {
 	"?",			/* 25	*/
 	"EFS",			/* 26	*/
 	"ZFS",			/* 27	*/
+	"?",			/* 28	*/
+	"?",			/* 29	*/
+	"nandfs",		/* 30	*/
+	"encrypted",		/* 31 - encrypted (generic) */
+	"unspecified",		/* 32 - unspecified */
 	NULL
 };
 
@@ -170,8 +177,13 @@ static const char *fstype_to_vfsname[] = {
 	"hammer2",		/* 23	*/
 	"udf",			/* 24	*/
 	NULL,			/* 25	*/
-	NULL,			/* 26	*/
-	NULL,			/* 27	*/
+	"efs",			/* 26	*/
+	"zfs",			/* 27	*/
+	NULL,			/* 28	*/
+	NULL,			/* 29	*/
+	"nandfs",		/* 30	*/
+	"encrypted",		/* 31	*/
+	"unspec",		/* 32	*/
 	NULL
 };
 

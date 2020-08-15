@@ -539,6 +539,7 @@ static devclass_t acpi_asus_devclass;
 
 DRIVER_MODULE(acpi_asus, acpi, acpi_asus_driver, acpi_asus_devclass, NULL, NULL);
 MODULE_DEPEND(acpi_asus, acpi, 1, 1, 1);
+MODULE_DEPEND(acpi_asus, led, 1, 1, 1);
 
 static int
 acpi_asus_probe(device_t dev)
@@ -1248,6 +1249,9 @@ acpi_asus_lcdd_notify(ACPI_HANDLE h, UINT32 notify, void *context)
 	case 0x86:
 		acpi_asus_sysctl_set(sc, ACPI_ASUS_METHOD_BRN, sc->s_brn+1);
 		ACPI_VPRINT(sc->dev, acpi_sc, "Brightness increased\n");
+		break;
+	default:
+		device_printf(sc->dev, "unknown notify: %#x\n", notify);
 		break;
 	}
 	ACPI_SERIAL_END(asus);

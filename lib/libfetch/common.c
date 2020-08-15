@@ -1,5 +1,7 @@
 /*-
- * Copyright (c) 1998-2014 Dag-Erling Smørgrav
+ * SPDX-License-Identifier: BSD-3-Clause
+ *
+ * Copyright (c) 1998-2016 Dag-Erling Smørgrav
  * Copyright (c) 2013 Michael Gmelin <freebsd@grem.de>
  * All rights reserved.
  *
@@ -25,10 +27,12 @@
  * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
  * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
  * THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- * $FreeBSD: head/lib/libfetch/common.c 266291 2014-05-17 03:39:56Z des $
+ *
+ * $FreeBSD: head/lib/libfetch/common.c 358227 2020-02-21 18:21:57Z kevans
  */
 
 #include <sys/cdefs.h>
+
 #include <sys/param.h>
 #include <sys/socket.h>
 #include <sys/time.h>
@@ -39,6 +43,7 @@
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <inttypes.h>
 #include <netdb.h>
 #include <poll.h>
 #include <pwd.h>
@@ -69,6 +74,64 @@ static struct fetcherr netdb_errlist[] = {
 	{ EAI_FAIL,	FETCH_RESOLV,	"Non-recoverable resolver failure" },
 	{ EAI_NONAME,	FETCH_RESOLV,	"No address record" },
 	{ -1,		FETCH_UNKNOWN,	"Unknown resolver error" }
+};
+
+/*
+ * SOCKS5 error enumerations
+ */
+enum SOCKS5_ERR {
+/* Protocol errors */
+	SOCKS5_ERR_SELECTION,
+	SOCKS5_ERR_READ_METHOD,
+	SOCKS5_ERR_VER5_ONLY,
+	SOCKS5_ERR_NOMETHODS,
+	SOCKS5_ERR_NOTIMPLEMENTED,
+	SOCKS5_ERR_HOSTNAME_SIZE,
+	SOCKS5_ERR_REQUEST,
+	SOCKS5_ERR_REPLY,
+	SOCKS5_ERR_NON_VER5_RESP,
+	SOCKS5_ERR_GENERAL,
+	SOCKS5_ERR_NOT_ALLOWED,
+	SOCKS5_ERR_NET_UNREACHABLE,
+	SOCKS5_ERR_HOST_UNREACHABLE,
+	SOCKS5_ERR_CONN_REFUSED,
+	SOCKS5_ERR_TTL_EXPIRED,
+	SOCKS5_ERR_COM_UNSUPPORTED,
+	SOCKS5_ERR_ADDR_UNSUPPORTED,
+	SOCKS5_ERR_UNSPECIFIED,
+/* Configuration errors */
+	SOCKS5_ERR_BAD_HOST,
+	SOCKS5_ERR_BAD_PROXY_FORMAT,
+	SOCKS5_ERR_BAD_PORT
+};
+
+/*
+ * Error messages for SOCKS5 errors
+ */
+static struct fetcherr socks5_errlist[] = {
+/* SOCKS5 protocol errors */
+	{ SOCKS5_ERR_SELECTION,		FETCH_ABORT,	"SOCKS5: Failed to send selection method" },
+	{ SOCKS5_ERR_READ_METHOD,	FETCH_ABORT,	"SOCKS5: Failed to read method" },
+	{ SOCKS5_ERR_VER5_ONLY,		FETCH_PROTO,	"SOCKS5: Only version 5 is implemented" },
+	{ SOCKS5_ERR_NOMETHODS,		FETCH_PROTO,	"SOCKS5: No acceptable methods" },
+	{ SOCKS5_ERR_NOTIMPLEMENTED,	FETCH_PROTO,	"SOCKS5: Method currently not implemented" },
+	{ SOCKS5_ERR_HOSTNAME_SIZE,	FETCH_PROTO,	"SOCKS5: Hostname size is above 256 bytes" },
+	{ SOCKS5_ERR_REQUEST,		FETCH_PROTO,	"SOCKS5: Failed to request" },
+	{ SOCKS5_ERR_REPLY,		FETCH_PROTO,	"SOCKS5: Failed to receive reply" },
+	{ SOCKS5_ERR_NON_VER5_RESP,	FETCH_PROTO,	"SOCKS5: Server responded with a non-version 5 response" },
+	{ SOCKS5_ERR_GENERAL,		FETCH_ABORT,	"SOCKS5: General server failure" },
+	{ SOCKS5_ERR_NOT_ALLOWED,	FETCH_AUTH,	"SOCKS5: Connection not allowed by ruleset" },
+	{ SOCKS5_ERR_NET_UNREACHABLE,	FETCH_NETWORK,	"SOCKS5: Network unreachable" },
+	{ SOCKS5_ERR_HOST_UNREACHABLE,	FETCH_ABORT,	"SOCKS5: Host unreachable" },
+	{ SOCKS5_ERR_CONN_REFUSED,	FETCH_ABORT,	"SOCKS5: Connection refused" },
+	{ SOCKS5_ERR_TTL_EXPIRED,	FETCH_TIMEOUT,	"SOCKS5: TTL expired" },
+	{ SOCKS5_ERR_COM_UNSUPPORTED,	FETCH_PROTO,	"SOCKS5: Command not supported" },
+	{ SOCKS5_ERR_ADDR_UNSUPPORTED,	FETCH_ABORT,	"SOCKS5: Address type not supported" },
+	{ SOCKS5_ERR_UNSPECIFIED,	FETCH_UNKNOWN,	"SOCKS5: Unspecified error" },
+/* Configuration error */
+	{ SOCKS5_ERR_BAD_HOST,		FETCH_ABORT,	"SOCKS5: Bad proxy host" },
+	{ SOCKS5_ERR_BAD_PROXY_FORMAT,	FETCH_ABORT,	"SOCKS5: Bad proxy format" },
+	{ SOCKS5_ERR_BAD_PORT,		FETCH_ABORT,	"SOCKS5: Bad port" }
 };
 
 /* End-of-Line */
@@ -152,7 +215,7 @@ fetch_syserr(void)
 	case EHOSTDOWN:
 		fetchLastErrCode = FETCH_DOWN;
 		break;
-default:
+	default:
 		fetchLastErrCode = FETCH_UNKNOWN;
 	}
 	snprintf(fetchLastErrString, MAXERRSTRING, "%s", strerror(errno));
@@ -186,9 +249,9 @@ fetch_default_port(const char *scheme)
 
 	if ((se = getservbyname(scheme, "tcp")) != NULL)
 		return (ntohs(se->s_port));
-	if (strcasecmp(scheme, SCHEME_FTP) == 0)
+	if (strcmp(scheme, SCHEME_FTP) == 0)
 		return (FTP_DEFAULT_PORT);
-	if (strcasecmp(scheme, SCHEME_HTTP) == 0)
+	if (strcmp(scheme, SCHEME_HTTP) == 0)
 		return (HTTP_DEFAULT_PORT);
 	return (0);
 }
@@ -199,9 +262,9 @@ fetch_default_port(const char *scheme)
 int
 fetch_default_proxy_port(const char *scheme)
 {
-	if (strcasecmp(scheme, SCHEME_FTP) == 0)
+	if (strcmp(scheme, SCHEME_FTP) == 0)
 		return (FTP_DEFAULT_PROXY_PORT);
-	if (strcasecmp(scheme, SCHEME_HTTP) == 0)
+	if (strcmp(scheme, SCHEME_HTTP) == 0)
 		return (HTTP_DEFAULT_PROXY_PORT);
 	return (0);
 }
@@ -240,24 +303,281 @@ fetch_ref(conn_t *conn)
 
 
 /*
+ * Resolve an address
+ */
+struct addrinfo *
+fetch_resolve(const char *addr, int port, int af)
+{
+	char hbuf[256], sbuf[8];
+	struct addrinfo hints, *res;
+	const char *hb, *he, *sep;
+	const char *host, *service;
+	int err, len;
+
+	/* first, check for a bracketed IPv6 address */
+	if (*addr == '[') {
+		hb = addr + 1;
+		if ((sep = strchr(hb, ']')) == NULL) {
+			errno = EINVAL;
+			goto syserr;
+		}
+		he = sep++;
+	} else {
+		hb = addr;
+		sep = strchrnul(hb, ':');
+		he = sep;
+	}
+
+	/* see if we need to copy the host name */
+	if (*he != '\0') {
+		len = snprintf(hbuf, sizeof(hbuf),
+		    "%.*s", (int)(he - hb), hb);
+		if (len < 0)
+			goto syserr;
+		if (len >= (int)sizeof(hbuf)) {
+			errno = ENAMETOOLONG;
+			goto syserr;
+		}
+		host = hbuf;
+	} else {
+		host = hb;
+	}
+
+	/* was it followed by a service name? */
+	if (*sep == '\0' && port != 0) {
+		if (port < 1 || port > 65535) {
+			errno = EINVAL;
+			goto syserr;
+		}
+		if (snprintf(sbuf, sizeof(sbuf), "%d", port) < 0)
+			goto syserr;
+		service = sbuf;
+	} else if (*sep != '\0') {
+		service = sep + 1;
+	} else {
+		service = NULL;
+	}
+
+	/* resolve */
+	memset(&hints, 0, sizeof(hints));
+	hints.ai_family = af;
+	hints.ai_socktype = SOCK_STREAM;
+	hints.ai_flags = AI_ADDRCONFIG;
+	if ((err = getaddrinfo(host, service, &hints, &res)) != 0) {
+		netdb_seterr(err);
+		return (NULL);
+	}
+	return (res);
+syserr:
+	fetch_syserr();
+	return (NULL);
+}
+
+
+/*
  * Bind a socket to a specific local address
  */
 int
 fetch_bind(int sd, int af, const char *addr)
 {
-	struct addrinfo hints, *res, *res0;
+	struct addrinfo *cliai, *ai;
 	int err;
 
-	memset(&hints, 0, sizeof(hints));
-	hints.ai_family = af;
-	hints.ai_socktype = SOCK_STREAM;
-	hints.ai_protocol = 0;
-	if ((err = getaddrinfo(addr, NULL, &hints, &res0)) != 0)
+	if ((cliai = fetch_resolve(addr, 0, af)) == NULL)
 		return (-1);
-	for (res = res0; res; res = res->ai_next)
-		if (bind(sd, res->ai_addr, res->ai_addrlen) == 0)
+	for (ai = cliai; ai != NULL; ai = ai->ai_next)
+		if ((err = bind(sd, ai->ai_addr, ai->ai_addrlen)) == 0)
+			break;
+	if (err != 0)
+		fetch_syserr();
+	freeaddrinfo(cliai);
+	return (err == 0 ? 0 : -1);
+}
+
+
+/*
+ * SOCKS5 connection initiation, based on RFC 1928
+ * Default DNS resolution over SOCKS5
+ */
+int
+fetch_socks5_init(conn_t *conn, const char *host, int port, int verbose)
+{
+	/*
+	 * Size is based on largest packet prefix (4 bytes) +
+	 * Largest FQDN (256) + one byte size (1) +
+	 * Port (2)
+	 */
+	unsigned char buf[BUFF_SIZE];
+	unsigned char *ptr;
+	int ret = 1;
+
+	if (verbose)
+		fetch_info("Initializing SOCKS5 connection: %s:%d", host, port);
+
+	/* Connection initialization */
+	ptr = buf;
+	*ptr++ = SOCKS_VERSION_5;
+	*ptr++ = SOCKS_CONNECTION;
+	*ptr++ = SOCKS_RSV;
+
+	if (fetch_write(conn, buf, 3) != 3) {
+		ret = SOCKS5_ERR_SELECTION;
+		goto fail;
+	}
+
+	/* Verify response from SOCKS5 server */
+	if (fetch_read(conn, buf, 2) != 2) {
+		ret = SOCKS5_ERR_READ_METHOD;
+		goto fail;
+	}
+
+	ptr = buf;
+	if (ptr[0] != SOCKS_VERSION_5) {
+		ret = SOCKS5_ERR_VER5_ONLY;
+		goto fail;
+	}
+	if (ptr[1] == SOCKS_NOMETHODS) {
+		ret = SOCKS5_ERR_NOMETHODS;
+		goto fail;
+	}
+	else if (ptr[1] != SOCKS5_NOTIMPLEMENTED) {
+		ret = SOCKS5_ERR_NOTIMPLEMENTED;
+		goto fail;
+	}
+
+	/* Send Request */
+	*ptr++ = SOCKS_VERSION_5;
+	*ptr++ = SOCKS_CONNECTION;
+	*ptr++ = SOCKS_RSV;
+	/* Encode all targets as a hostname to avoid DNS leaks */
+	*ptr++ = SOCKS_ATYP_DOMAINNAME;
+	if (strlen(host) > FQDN_SIZE) {
+		ret = SOCKS5_ERR_HOSTNAME_SIZE;
+		goto fail;
+	}
+	*ptr++ = strlen(host);
+	strncpy(ptr, host, strlen(host));
+	ptr = ptr + strlen(host);
+
+	port = htons(port);
+	*ptr++ = port & 0x00ff;
+	*ptr++ = (port & 0xff00) >> 8;
+
+	if (fetch_write(conn, buf, ptr - buf) != ptr - buf) {
+		ret = SOCKS5_ERR_REQUEST;
+		goto fail;
+	}
+
+	/* BND.ADDR is variable length, read the largest on non-blocking socket */
+	if (!fetch_read(conn, buf, BUFF_SIZE)) {
+		ret = SOCKS5_ERR_REPLY;
+		goto fail;
+	}
+
+	ptr = buf;
+	if (*ptr++ != SOCKS_VERSION_5) {
+		ret = SOCKS5_ERR_NON_VER5_RESP;
+		goto fail;
+	}
+
+	switch(*ptr++) {
+	case SOCKS_SUCCESS:
+		break;
+	case SOCKS_GENERAL_FAILURE:
+		ret = SOCKS5_ERR_GENERAL;
+		goto fail;
+	case SOCKS_CONNECTION_NOT_ALLOWED:
+		ret = SOCKS5_ERR_NOT_ALLOWED;
+		goto fail;
+	case SOCKS_NETWORK_UNREACHABLE:
+		ret = SOCKS5_ERR_NET_UNREACHABLE;
+		goto fail;
+	case SOCKS_HOST_UNREACHABLE:
+		ret = SOCKS5_ERR_HOST_UNREACHABLE;
+		goto fail;
+	case SOCKS_CONNECTION_REFUSED:
+		ret = SOCKS5_ERR_CONN_REFUSED;
+		goto fail;
+	case SOCKS_TTL_EXPIRED:
+		ret = SOCKS5_ERR_TTL_EXPIRED;
+		goto fail;
+	case SOCKS_COMMAND_NOT_SUPPORTED:
+		ret = SOCKS5_ERR_COM_UNSUPPORTED;
+		goto fail;
+	case SOCKS_ADDRESS_NOT_SUPPORTED:
+		ret = SOCKS5_ERR_ADDR_UNSUPPORTED;
+		goto fail;
+	default:
+		ret = SOCKS5_ERR_UNSPECIFIED;
+		goto fail;
+	}
+
+	return (ret);
+
+fail:
+	socks5_seterr(ret);
+	return (0);
+}
+
+/*
+ * Perform SOCKS5 initialization
+ */
+int
+fetch_socks5_getenv(char **host, int *port)
+{
+	char *socks5env, *endptr, *ext;
+	const char *portDelim;
+	size_t slen;
+
+	portDelim = ":";
+	if ((socks5env = getenv("SOCKS5_PROXY")) == NULL || *socks5env == '\0') {
+		*host = NULL;
+		*port = -1;
+		return (-1);
+	}
+
+	/*
+	 * IPv6 addresses begin and end in brackets.  Set the port delimiter
+	 * accordingly and search for it so we can do appropriate validation.
+	 */
+	if (socks5env[0] == '[')
+		portDelim = "]:";
+
+	slen = strlen(socks5env);
+	ext = strstr(socks5env, portDelim);
+	if (socks5env[0] == '[') {
+		if (socks5env[slen - 1] == ']') {
+			*host = strndup(socks5env, slen);
+		} else if (ext != NULL) {
+			*host = strndup(socks5env, ext - socks5env + 1);
+		} else {
+			socks5_seterr(SOCKS5_ERR_BAD_PROXY_FORMAT);
 			return (0);
-	return (-1);
+		}
+	} else {
+		*host = strndup(socks5env, ext - socks5env);
+	}
+
+	if (*host == NULL) {
+		fprintf(stderr, "Failure to allocate memory, exiting.\n");
+		return (-1);
+	}
+	if (ext == NULL) {
+		*port = 1080; /* Default port as defined in RFC1928 */
+	} else {
+		ext += strlen(portDelim);
+		errno = 0;
+		*port = strtoimax(ext, (char **)&endptr, 10);
+		if (*endptr != '\0' || errno != 0 || *port < 0 ||
+		    *port > 65535) {
+			free(*host);
+			*host = NULL;
+			socks5_seterr(SOCKS5_ERR_BAD_PORT);
+			return (0);
+		}
+	}
+
+	return (2);
 }
 
 
@@ -267,59 +587,117 @@ fetch_bind(int sd, int af, const char *addr)
 conn_t *
 fetch_connect(const char *host, int port, int af, int verbose)
 {
-	conn_t *conn;
-	char pbuf[10];
+	struct addrinfo *cais = NULL, *sais = NULL, *cai, *sai;
 	const char *bindaddr;
-	struct addrinfo hints, *res, *res0;
-	int sd, err;
+	conn_t *conn = NULL;
+	int err = 0, sd = -1;
+	char *sockshost;
+	int socksport;
 
-	DEBUG(fprintf(stderr, "---> %s:%d\n", host, port));
+	DEBUGF("---> %s:%d\n", host, port);
 
-	if (verbose)
-		fetch_info("looking up %s", host);
+	/*
+	 * Check if SOCKS5_PROXY env variable is set.  fetch_socks5_getenv
+	 * will either set sockshost = NULL or allocate memory in all cases.
+	 */
+	sockshost = NULL;
+	if (!fetch_socks5_getenv(&sockshost, &socksport))
+		goto fail;
 
-	/* look up host name and set up socket address structure */
-	snprintf(pbuf, sizeof(pbuf), "%d", port);
-	memset(&hints, 0, sizeof(hints));
-	hints.ai_family = af;
-	hints.ai_socktype = SOCK_STREAM;
-	hints.ai_protocol = 0;
-	if ((err = getaddrinfo(host, pbuf, &hints, &res0)) != 0) {
-		netdb_seterr(err);
-		return (NULL);
-	}
-	bindaddr = getenv("FETCH_BIND_ADDRESS");
+	/* Not using SOCKS5 proxy */
+	if (sockshost == NULL) {
+		/* resolve server address */
+		if (verbose)
+			fetch_info("resolving server address: %s:%d", host,
+			    port);
+		if ((sais = fetch_resolve(host, port, af)) == NULL)
+			goto fail;
 
-	if (verbose)
-		fetch_info("connecting to %s:%d", host, port);
-
-	/* try to connect */
-	for (sd = -1, res = res0; res; sd = -1, res = res->ai_next) {
-		if ((sd = socket(res->ai_family, res->ai_socktype,
-			 res->ai_protocol)) == -1)
-			continue;
-		if (bindaddr != NULL && *bindaddr != '\0' &&
-		    fetch_bind(sd, res->ai_family, bindaddr) != 0) {
-			fetch_info("failed to bind to '%s'", bindaddr);
-			close(sd);
-			continue;
+		/* resolve client address */
+		bindaddr = getenv("FETCH_BIND_ADDRESS");
+		if (bindaddr != NULL && *bindaddr != '\0') {
+			if (verbose)
+				fetch_info("resolving client address: %s",
+				    bindaddr);
+			if ((cais = fetch_resolve(bindaddr, 0, af)) == NULL)
+				goto fail;
 		}
-		if (connect(sd, res->ai_addr, res->ai_addrlen) == 0 &&
-		    fcntl(sd, F_SETFL, O_NONBLOCK) == 0)
-			break;
-		close(sd);
-	}
-	freeaddrinfo(res0);
-	if (sd == -1) {
-		fetch_syserr();
-		return (NULL);
+	} else {
+		/* resolve socks5 proxy address */
+		if (verbose)
+			fetch_info("resolving SOCKS5 server address: %s:%d",
+			    sockshost, socksport);
+		if ((sais = fetch_resolve(sockshost, socksport, af)) == NULL) {
+			socks5_seterr(SOCKS5_ERR_BAD_HOST);
+			goto fail;
+		}
 	}
 
-	if ((conn = fetch_reopen(sd)) == NULL) {
-		fetch_syserr();
+	/* try each server address in turn */
+	for (err = 0, sai = sais; sai != NULL; sai = sai->ai_next) {
+		/* open socket */
+		if ((sd = socket(sai->ai_family, SOCK_STREAM, 0)) < 0)
+			goto syserr;
+		/* attempt to bind to client address */
+		for (err = 0, cai = cais; cai != NULL; cai = cai->ai_next) {
+			if (cai->ai_family != sai->ai_family)
+				continue;
+			if ((err = bind(sd, cai->ai_addr, cai->ai_addrlen)) == 0)
+				break;
+		}
+		if (err != 0) {
+			if (verbose)
+				fetch_info("failed to bind to %s", bindaddr);
+			goto syserr;
+		}
+		/* attempt to connect to server address */
+		if ((err = connect(sd, sai->ai_addr, sai->ai_addrlen)) == 0)
+			break;
+		/* clean up before next attempt */
 		close(sd);
+		sd = -1;
 	}
+	if (err != 0) {
+		if (verbose && sockshost == NULL) {
+			fetch_info("failed to connect to %s:%d", host, port);
+			goto syserr;
+		} else if (sockshost != NULL) {
+			if (verbose)
+				fetch_info(
+				    "failed to connect to SOCKS5 server %s:%d",
+				    sockshost, socksport);
+			socks5_seterr(SOCKS5_ERR_CONN_REFUSED);
+			goto fail;
+		}
+		goto syserr;
+	}
+
+	if ((conn = fetch_reopen(sd)) == NULL)
+		goto syserr;
+
+	if (sockshost)
+		if (!fetch_socks5_init(conn, host, port, verbose))
+			goto fail;
+	free(sockshost);
+	if (cais != NULL)
+		freeaddrinfo(cais);
+	if (sais != NULL)
+		freeaddrinfo(sais);
 	return (conn);
+syserr:
+	fetch_syserr();
+fail:
+	free(sockshost);
+	/* Fully close if it was opened; otherwise just don't leak the fd. */
+	if (conn != NULL)
+		fetch_close(conn);
+	else if (sd >= 0)
+		close(sd);
+	if (cais != NULL)
+		freeaddrinfo(cais);
+	if (sais != NULL)
+		freeaddrinfo(sais);
+	return (NULL);
 }
 
 #ifdef WITH_SSL
@@ -470,7 +848,7 @@ fetch_ssl_hname_match(const char *h, size_t hlen, const char *m,
 	if (!fetch_ssl_hname_equal(hdot - delta, delta,
 	    mdot1 - delta, delta))
 		return (0);
-	/* all tests succeded, it's a match */
+	/* all tests succeeded, it's a match */
 	return (1);
 }
 
@@ -494,7 +872,8 @@ fetch_ssl_get_numeric_addrinfo(const char *hostname, size_t len)
 	hints.ai_protocol = 0;
 	hints.ai_flags = AI_NUMERICHOST;
 	/* port is not relevant for this purpose */
-	getaddrinfo(host, "443", &hints, &res);
+	if (getaddrinfo(host, "443", &hints, &res) != 0)
+		res = NULL;
 	free(host);
 	return res;
 }
@@ -581,7 +960,11 @@ fetch_ssl_verify_altname(STACK_OF(GENERAL_NAME) *altnames,
 #else
 		name = sk_GENERAL_NAME_value(altnames, i);
 #endif
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
 		ns = (const char *)ASN1_STRING_data(name->d.ia5);
+#else
+		ns = (const char *)ASN1_STRING_get0_data(name->d.ia5);
+#endif
 		nslen = (size_t)ASN1_STRING_length(name->d.ia5);
 
 		if (name->type == GEN_DNS && ip == NULL &&
@@ -671,13 +1054,15 @@ fetch_ssl_setup_transport_layer(SSL_CTX *ctx, int verbose)
 {
 	long ssl_ctx_options;
 
-	ssl_ctx_options = SSL_OP_ALL | SSL_OP_NO_TICKET;
-	if (getenv("SSL_ALLOW_SSL2") == NULL)
-		ssl_ctx_options |= SSL_OP_NO_SSLv2;
-	if (getenv("SSL_NO_SSL3") != NULL)
+	ssl_ctx_options = SSL_OP_ALL | SSL_OP_NO_SSLv2 | SSL_OP_NO_TICKET;
+	if (getenv("SSL_ALLOW_SSL3") == NULL)
 		ssl_ctx_options |= SSL_OP_NO_SSLv3;
 	if (getenv("SSL_NO_TLS1") != NULL)
 		ssl_ctx_options |= SSL_OP_NO_TLSv1;
+	if (getenv("SSL_NO_TLS1_1") != NULL)
+		ssl_ctx_options |= SSL_OP_NO_TLSv1_1;
+	if (getenv("SSL_NO_TLS1_2") != NULL)
+		ssl_ctx_options |= SSL_OP_NO_TLSv1_2;
 	if (verbose)
 		fetch_info("SSL options: %lx", ssl_ctx_options);
 	SSL_CTX_set_options(ctx, ssl_ctx_options);
@@ -688,7 +1073,7 @@ fetch_ssl_setup_transport_layer(SSL_CTX *ctx, int verbose)
  * Configure peer verification based on environment.
  */
 #define LOCAL_CERT_FILE	"/usr/local/etc/ssl/cert.pem"
-#define BASE_CERT_FILE  "/etc/ssl/cert.pem"
+#define BASE_CERT_FILE	"/etc/ssl/cert.pem"
 static int
 fetch_ssl_setup_peer_verification(SSL_CTX *ctx, int verbose)
 {
@@ -701,7 +1086,8 @@ fetch_ssl_setup_peer_verification(SSL_CTX *ctx, int verbose)
 		if (ca_cert_file == NULL &&
 		    access(LOCAL_CERT_FILE, R_OK) == 0)
 			ca_cert_file = LOCAL_CERT_FILE;
-		if (ca_cert_file == NULL)
+		if (ca_cert_file == NULL &&
+		    access(BASE_CERT_FILE, R_OK) == 0)
 			ca_cert_file = BASE_CERT_FILE;
 		ca_cert_path = getenv("SSL_CA_CERT_PATH");
 		if (verbose) {
@@ -712,11 +1098,17 @@ fetch_ssl_setup_peer_verification(SSL_CTX *ctx, int verbose)
 			if (ca_cert_path != NULL)
 				fetch_info("Using CA cert path: %s",
 				    ca_cert_path);
+			if (ca_cert_file == NULL && ca_cert_path == NULL)
+				fetch_info("Using OpenSSL default "
+				    "CA cert file and path");
 		}
 		SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER,
 		    fetch_ssl_cb_verify_crt);
-		SSL_CTX_load_verify_locations(ctx, ca_cert_file,
-		    ca_cert_path);
+		if (ca_cert_file != NULL || ca_cert_path != NULL)
+			SSL_CTX_load_verify_locations(ctx, ca_cert_file,
+			    ca_cert_path);
+		else
+			SSL_CTX_set_default_verify_paths(ctx);
 		if ((crl_file = getenv("SSL_CRL_FILE")) != NULL) {
 			if (verbose)
 				fetch_info("Using CRL file: %s", crl_file);
@@ -872,8 +1264,8 @@ fetch_ssl(conn_t *conn, const struct url *URL, int verbose)
 	}
 
 	if (verbose) {
-		fetch_info("SSL connection established using %s",
-		    SSL_get_cipher(conn->ssl));
+		fetch_info("%s connection established using %s",
+		    SSL_get_version(conn->ssl), SSL_get_cipher(conn->ssl));
 		name = X509_get_subject_name(conn->ssl_cert);
 		str = X509_NAME_oneline(name, 0, 0);
 		fetch_info("Certificate subject: %s", str);
@@ -888,6 +1280,7 @@ fetch_ssl(conn_t *conn, const struct url *URL, int verbose)
 #else
 	(void)conn;
 	(void)verbose;
+	(void)URL;
 	fprintf(stderr, "SSL support disabled\n");
 	return (-1);
 #endif
@@ -1056,7 +1449,7 @@ fetch_getln(conn_t *conn)
 	} while (c != '\n');
 
 	conn->buf[conn->buflen] = '\0';
-	DEBUG(fprintf(stderr, "<<< %s", conn->buf));
+	DEBUGF("<<< %s", conn->buf);
 	return (0);
 }
 
@@ -1109,6 +1502,9 @@ fetch_writev(conn_t *conn, struct iovec *iov, int iovcnt)
 			errno = 0;
 			pfd.revents = 0;
 			if (poll(&pfd, 1, deltams) < 0) {
+				/* POSIX compliance */
+				if (errno == EAGAIN)
+					continue;
 				if (errno == EINTR && fetchRestartCalls)
 					continue;
 				return (-1);
@@ -1158,7 +1554,7 @@ fetch_putln(conn_t *conn, const char *str, size_t len)
 	struct iovec iov[2];
 	int ret;
 
-	DEBUG(fprintf(stderr, ">>> %s\n", str));
+	DEBUGF(">>> %s\n", str);
 	iov[0].iov_base = __DECONST(char *, str);
 	iov[0].iov_len = len;
 	iov[1].iov_base = __DECONST(char *, ENDL);
@@ -1220,7 +1616,7 @@ fetch_add_entry(struct url_ent **p, int *size, int *len,
 	}
 
 	if (*len >= *size - 1) {
-		tmp = realloc(*p, (*size * 2 + 1) * sizeof(**p));
+		tmp = reallocarray(*p, *size * 2 + 1, sizeof(**p));
 		if (tmp == NULL) {
 			errno = ENOMEM;
 			fetch_syserr();
@@ -1253,27 +1649,23 @@ fetch_read_word(FILE *f)
 	return (word);
 }
 
-/*
- * Get authentication data for a URL from .netrc
- */
-int
-fetch_netrc_auth(struct url *url)
+static int
+fetch_netrc_open(void)
 {
+	struct passwd *pwd;
 	char fn[PATH_MAX];
-	const char *word;
-	char *p;
-	FILE *f;
+	const char *p;
+	int fd, serrno;
 
 	if ((p = getenv("NETRC")) != NULL) {
+		DEBUGF("NETRC=%s\n", p);
 		if (snprintf(fn, sizeof(fn), "%s", p) >= (int)sizeof(fn)) {
 			fetch_info("$NETRC specifies a file name "
 			    "longer than PATH_MAX");
 			return (-1);
 		}
 	} else {
-		if ((p = getenv("HOME")) != NULL) {
-			struct passwd *pwd;
-
+		if ((p = getenv("HOME")) == NULL) {
 			if ((pwd = getpwuid(getuid())) == NULL ||
 			    (p = pwd->pw_dir) == NULL)
 				return (-1);
@@ -1282,17 +1674,47 @@ fetch_netrc_auth(struct url *url)
 			return (-1);
 	}
 
-	if ((f = fopen(fn, "r")) == NULL)
+	if ((fd = open(fn, O_RDONLY)) < 0) {
+		serrno = errno;
+		DEBUGF("%s: %s\n", fn, strerror(serrno));
+		errno = serrno;
+	}
+	return (fd);
+}
+
+/*
+ * Get authentication data for a URL from .netrc
+ */
+int
+fetch_netrc_auth(struct url *url)
+{
+	const char *word;
+	int serrno;
+	FILE *f;
+
+	if (url->netrcfd < 0)
+		url->netrcfd = fetch_netrc_open();
+	if (url->netrcfd < 0)
 		return (-1);
+	if ((f = fdopen(url->netrcfd, "r")) == NULL) {
+		serrno = errno;
+		DEBUGF("fdopen(netrcfd): %s", strerror(errno));
+		close(url->netrcfd);
+		url->netrcfd = -1;
+		errno = serrno;
+		return (-1);
+	}
+	rewind(f);
+	DEBUGF("searching netrc for %s\n", url->host);
 	while ((word = fetch_read_word(f)) != NULL) {
 		if (strcmp(word, "default") == 0) {
-			DEBUG(fetch_info("Using default .netrc settings"));
+			DEBUGF("using default netrc settings\n");
 			break;
 		}
 		if (strcmp(word, "machine") == 0 &&
 		    (word = fetch_read_word(f)) != NULL &&
 		    strcasecmp(word, url->host) == 0) {
-			DEBUG(fetch_info("Using .netrc settings for %s", word));
+			DEBUGF("using netrc settings for %s\n", word);
 			break;
 		}
 	}
@@ -1324,9 +1746,13 @@ fetch_netrc_auth(struct url *url)
 		}
 	}
 	fclose(f);
+	url->netrcfd = -1;
 	return (0);
- ferr:
+ferr:
+	serrno = errno;
 	fclose(f);
+	url->netrcfd = -1;
+	errno = serrno;
 	return (-1);
 }
 
@@ -1335,7 +1761,7 @@ fetch_netrc_auth(struct url *url)
  * which the proxy should not be consulted; the contents is a comma-,
  * or space-separated list of domain names.  A single asterisk will
  * override all proxy variables and no transactions will be proxied
- * (for compatability with lynx and curl, see the discussion at
+ * (for compatibility with lynx and curl, see the discussion at
  * <http://curl.haxx.se/mail/archive_pre_oct_99/0009.html>).
  */
 int

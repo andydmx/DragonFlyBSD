@@ -1,4 +1,9 @@
 /*
+ * @(#)res_comp.c	8.1 (Berkeley) 6/4/93
+ * $Id: res_comp.c,v 1.5 2005/07/28 06:51:50 marka Exp $
+ */
+
+/*
  * Copyright (c) 1985, 1993
  *    The Regents of the University of California.  All rights reserved.
  * 
@@ -10,11 +15,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- * 	This product includes software developed by the University of
- * 	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  * 
@@ -67,11 +68,6 @@
  * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT
  * OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
-
-#if defined(LIBC_SCCS) && !defined(lint)
-static const char sccsid[] = "@(#)res_comp.c	8.1 (Berkeley) 6/4/93";
-static const char rcsid[] = "$Id: res_comp.c,v 1.5 2005/07/28 06:51:50 marka Exp $";
-#endif /* LIBC_SCCS and not lint */
 
 #include "port_before.h"
 #include <sys/types.h>
@@ -141,6 +137,7 @@ dn_skipname(const u_char *ptr, const u_char *eom) {
  */
 #define PERIOD 0x2e
 #define	hyphenchar(c) ((c) == 0x2d)
+#define	underscorechar(c) ((c) == 0x5f)
 #define bslashchar(c) ((c) == 0x5c)
 #define periodchar(c) ((c) == PERIOD)
 #define asterchar(c) ((c) == 0x2a)
@@ -149,7 +146,7 @@ dn_skipname(const u_char *ptr, const u_char *eom) {
 #define digitchar(c) ((c) >= 0x30 && (c) <= 0x39)
 
 #define borderchar(c) (alphachar(c) || digitchar(c))
-#define middlechar(c) (borderchar(c) || hyphenchar(c))
+#define middlechar(c) (borderchar(c) || hyphenchar(c) || underscorechar(c))
 #define	domainchar(c) ((c) > 0x20 && (c) < 0x7f)
 
 int

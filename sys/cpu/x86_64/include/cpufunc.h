@@ -12,11 +12,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -46,11 +42,13 @@
 
 #include <sys/cdefs.h>
 #include <sys/thread.h>
+#include <machine/clock.h>
 #include <machine/psl.h>
 #include <machine/smp.h>
 
 struct thread;
 struct region_descriptor;
+struct pmap;
 
 __BEGIN_DECLS
 #define readb(va)	(*(volatile u_int8_t *) (va))
@@ -66,6 +64,8 @@ __BEGIN_DECLS
 #ifdef	__GNUC__
 
 #include <machine/lock.h>		/* XXX */
+
+struct trapframe;
 
 static __inline void
 breakpoint(void)
@@ -263,18 +263,7 @@ cpu_amdcpubug_dfly01(void)
 static __inline int
 ffs(int mask)
 {
-#if 0
-	/*
-	 * Note that gcc-2's builtin ffs would be used if we didn't declare
-	 * this inline or turn off the builtin.  The builtin is faster but
-	 * broken in gcc-2.4.5 and slower but working in gcc-2.5 and later
-	 * versions.
-	 */
-	return (mask == 0 ? mask : (int)bsfl((u_int)mask) + 1);
-#else
-	/* Actually, the above is way out of date.  The builtins use cmov etc */
 	return (__builtin_ffs(mask));
-#endif
 }
 
 #define	HAVE_INLINE_FFSL
@@ -282,7 +271,7 @@ ffs(int mask)
 static __inline int
 ffsl(long mask)
 {
-	return (mask == 0 ? mask : (int)bsfq((u_long)mask) + 1);
+	return (__builtin_ffsl(mask));
 }
 
 #define	HAVE_INLINE_FLS
@@ -299,6 +288,14 @@ static __inline int
 flsl(long mask)
 {
 	return (mask == 0 ? mask : (int)bsrq((u_long)mask) + 1);
+}
+
+#define	HAVE_INLINE_FLSLL
+
+static __inline int
+flsll(long long mask)
+{
+	return (flsl((long)mask));
 }
 
 #endif /* _KERNEL */
@@ -411,9 +408,6 @@ invd(void)
 
 #if defined(_KERNEL)
 
-void smp_invltlb(void);
-void smp_invltlb_intr(void);
-
 #ifndef _CPU_INVLPG_DEFINED
 
 /*
@@ -428,26 +422,6 @@ cpu_invlpg(void *addr)
 	__asm __volatile("invlpg %0" : : "m" (*(char *)addr) : "memory");
 }
 
-#endif
-
-#if defined(_KERNEL)
-struct smp_invlpg_range_cpusync_arg {
-	vm_offset_t sva;
-	vm_offset_t eva;
-};
-
-void
-smp_invlpg_range_cpusync(void *arg);
-
-static __inline void
-smp_invlpg_range(cpumask_t mask, vm_offset_t sva, vm_offset_t eva)
-{
-	struct smp_invlpg_range_cpusync_arg arg;
-
-	arg.sva = sva;
-	arg.eva = eva;
-	lwkt_cpusync_simple(mask, smp_invlpg_range_cpusync, &arg);
-}
 #endif
 
 static __inline void
@@ -567,14 +541,29 @@ rdpmc(u_int pmc)
 
 #define _RDTSC_SUPPORTED_
 
-static __inline u_int64_t
+static __inline tsc_uclock_t
 rdtsc(void)
 {
 	u_int32_t low, high;
 
 	__asm __volatile("rdtsc" : "=a" (low), "=d" (high));
-	return (low | ((u_int64_t)high << 32));
+	return (low | ((tsc_uclock_t)high << 32));
 }
+
+#ifdef _KERNEL
+#include <machine/cputypes.h>
+#include <machine/md_var.h>
+
+static __inline tsc_uclock_t
+rdtsc_ordered(void)
+{
+	if (cpu_vendor_id == CPU_VENDOR_INTEL)
+		cpu_lfence();
+	else
+		cpu_mfence();
+	return rdtsc();
+}
+#endif
 
 static __inline void
 wbinvd(void)
@@ -687,6 +676,11 @@ cpu_invltlb(void)
 }
 
 #endif
+
+void smp_invltlb(void);
+void smp_sniff(void);
+void cpu_sniff(int);
+void hard_sniff(struct trapframe *);
 
 static __inline u_short
 rfs(void)
@@ -952,7 +946,7 @@ u_short	rfs(void);
 u_short	rgs(void);
 u_int64_t rdmsr(u_int msr);
 u_int64_t rdpmc(u_int pmc);
-u_int64_t rdtsc(void);
+tsc_uclock_t rdtsc(void);
 u_int	read_rflags(void);
 void	wbinvd(void);
 void	write_rflags(u_int rf);
@@ -981,6 +975,8 @@ void	intr_restore(register_t rf);
 int	rdmsr_safe(u_int msr, uint64_t *val);
 int wrmsr_safe(u_int msr, uint64_t newval);
 void	reset_dbregs(void);
+void	smap_open(void);
+void	smap_close(void);
 
 __END_DECLS
 

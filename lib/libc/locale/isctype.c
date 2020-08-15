@@ -18,7 +18,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -52,7 +52,7 @@ digittoint(int c)
 int
 isalnum(int c)
 {
-	return (__sbistype(c, _CTYPE_A|_CTYPE_D));
+	return (__sbistype(c, _CTYPE_A|_CTYPE_N));
 }
 
 #undef isalpha
@@ -122,7 +122,7 @@ islower(int c)
 int
 isnumber(int c)
 {
-	return (__sbistype(c, _CTYPE_D));
+	return (__sbistype(c, _CTYPE_N));
 }
 
 #undef isphonogram	

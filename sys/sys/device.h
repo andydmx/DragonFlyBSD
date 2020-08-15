@@ -35,6 +35,7 @@
 #ifndef _SYS_DEVICE_H_
 #define _SYS_DEVICE_H_
 
+#ifdef _KERNEL
 #ifndef _SYS_TYPES_H_
 #include <sys/types.h>
 #endif
@@ -49,6 +50,8 @@ struct cdev;
 struct ucred;
 struct devfs_bitmap;
 struct vm_page;
+struct vm_map_backing;
+struct vnode;
 
 /*
  * This structure is at the base of every device args structure
@@ -122,7 +125,7 @@ struct dev_mmap_args {
 	struct dev_generic_args a_head;
 	vm_offset_t	a_offset;
 	int		a_nprot;
-	int		a_result;	/* page number */
+	int64_t		a_result;	/* page number */
 	struct file	*a_fp;
 };
 
@@ -248,9 +251,11 @@ struct dev_ops {
 	d_kqfilter_t	*d_kqfilter;
 	d_clone_t	*d_clone;	/* clone from base dev_ops */
 	d_revoke_t	*d_revoke;
-	int (*d_uksmap)(struct cdev *dev, struct vm_page *fake);
+	int (*d_uksmap)(struct vm_map_backing *ba, int op,
+				struct cdev *dev, struct vm_page *fake);
 #define dev_ops_last_field	d_uksmap
 };
+#endif /* _KERNEL */
 
 /*
  * Types for d_flags.
@@ -265,18 +270,26 @@ struct dev_ops {
 
 /*
  * Flags for d_flags.
+ *
+ * D_NOEMERGPGR		Indicates complex layering, the emergency pager
+ *			should skip buffers related to such devices.
  */
+#ifdef _KERNEL
 #define D_MEMDISK	0x00010000	/* memory type disk */
-#define D_NAGGED	0x00020000	/* nagged about missing make_dev() */
+#define D_UNUSED17	0x00020000	/* was: nagged about missing make_dev() */
 #define D_CANFREE	0x00040000	/* can free blocks */
 #define D_TRACKCLOSE	0x00080000	/* track all closes */
 #define D_MASTER	0x00100000	/* used by pty/tty code */
-#define D_UNUSED200000	0x00200000
+#define D_NOEMERGPGR	0x00200000	/* too complex for emergency pager */
 #define D_MPSAFE	0x00400000	/* all dev_d*() calls are MPSAFE */
+#define D_KVABIO	0x00800000	/* device support KVABIO API */
+#define D_QUICK		0x01000000	/* no fancy open/close support needed*/
+#endif
 
 /*
  * A union of all possible argument structures.
  */
+#if 0
 union dev_args_union {
 	struct dev_generic_args	du_head;
 	struct dev_open_args	du_open;
@@ -291,7 +304,9 @@ union dev_args_union {
 	struct dev_kqfilter_args du_kqfilter;
 	struct dev_clone_args	du_clone;
 };
+#endif
 
+#ifdef _KERNEL
 /*
  * Linking structure for mask/match registration
  */
@@ -310,6 +325,7 @@ struct dev_ops_maj {
 
 RB_HEAD(dev_ops_rb_tree, dev_ops_maj);
 RB_PROTOTYPE2(dev_ops_rb_tree, dev_ops_maj, rbnode, rb_dev_ops_compare, int);
+#endif /* _KERNEL */
 
 #ifdef _KERNEL
 
@@ -318,7 +334,8 @@ extern struct dev_ops dead_dev_ops;
 struct disk;
 struct sysmsg;
 
-int dev_dopen(cdev_t dev, int oflags, int devtype, struct ucred *cred, struct file *fp);
+int dev_dopen(cdev_t dev, int oflags, int devtype, struct ucred *cred,
+    struct file *fp, struct vnode *vp);
 int dev_dclose(cdev_t dev, int fflag, int devtype, struct file *fp);
 void dev_dstrategy(cdev_t dev, struct bio *bio);
 void dev_dstrategy_chain(cdev_t dev, struct bio *bio);
@@ -330,7 +347,7 @@ int64_t dev_dpsize(cdev_t dev);
 int dev_dread(cdev_t dev, struct uio *uio, int ioflag, struct file *fp);
 int dev_dwrite(cdev_t dev, struct uio *uio, int ioflag, struct file *fp);
 int dev_dkqfilter(cdev_t dev, struct knote *kn, struct file *fp);
-int dev_dmmap(cdev_t dev, vm_offset_t offset, int nprot, struct file *fp);
+int64_t dev_dmmap(cdev_t dev, vm_offset_t offset, int nprot, struct file *fp);
 int dev_dmmap_single(cdev_t dev, vm_ooffset_t *offset, vm_size_t size,
 			struct vm_object **object, int nprot, struct file *fp);
 int dev_dclone(cdev_t dev);
@@ -342,21 +359,6 @@ int dev_dmaj(cdev_t dev);
 int dev_dflags(cdev_t dev);
 int dev_doperate(struct dev_generic_args *ap);
 int dev_doperate_ops(struct dev_ops *, struct dev_generic_args *ap);
-
-d_default_t	nodefault;
-d_open_t	noopen;
-d_close_t	noclose;
-d_read_t	noread;
-d_write_t	nowrite;
-d_ioctl_t	noioctl;
-d_mmap_t	nommap;
-d_mmap_single_t	nommap_single;
-d_strategy_t	nostrategy;
-d_dump_t	nodump;
-d_psize_t	nopsize;
-d_kqfilter_t	nokqfilter;
-d_clone_t	noclone;
-d_revoke_t	norevoke;
 
 d_open_t	nullopen;
 d_close_t	nullclose;
@@ -381,6 +383,8 @@ int dev_ops_remove_minor(struct dev_ops *ops, int minor);
 struct dev_ops *dev_ops_intercept(cdev_t, struct dev_ops *);
 void dev_ops_restore(cdev_t, struct dev_ops *);
 
+#define MAKEDEV_MINNBUF	14
+char  *makedev_unit_b32(char *nbuf, uintmax_t num);
 cdev_t make_dev(struct dev_ops *ops, int minor, uid_t uid, gid_t gid,
 		int perms, const char *fmt, ...) __printflike(6, 7);
 cdev_t make_dev_covering(struct dev_ops *ops,  struct dev_ops *bops, int minor,

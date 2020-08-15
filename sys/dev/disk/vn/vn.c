@@ -15,11 +15,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -59,6 +55,7 @@
 #include "use_vn.h"
 #include <sys/param.h>
 #include <sys/systm.h>
+#include <sys/uio.h>
 #include <sys/kernel.h>
 #include <sys/proc.h>
 #include <sys/priv.h>
@@ -93,7 +90,7 @@ static	d_strategy_t	vnstrategy;
 static	d_clone_t	vnclone;
 
 MALLOC_DEFINE(M_VN, "vn_softc", "vn driver structures");
-DEVFS_DECLARE_CLONE_BITMAP(vn);
+DEVFS_DEFINE_CLONE_BITMAP(vn);
 
 #if NVN <= 1
 #define VN_PREALLOCATED_UNITS	4
@@ -105,12 +102,13 @@ DEVFS_DECLARE_CLONE_BITMAP(vn);
 
 /*
  * dev_ops
- *	D_DISK		we want to look like a disk
+ *	D_DISK		We want to look like a disk
  *	D_CANFREE	We support BUF_CMD_FREEBLKS
+ *	D_NOEMERGPGR	Too complex for emergency pager
  */
 
 static struct dev_ops vn_ops = {
-	{ "vn", 0, D_DISK | D_CANFREE },
+	{ "vn", 0, D_DISK | D_CANFREE | D_NOEMERGPGR },
 	.d_open =	vnopen,
 	.d_close =	vnclose,
 	.d_read =	physread,
@@ -155,7 +153,7 @@ static int	vnget (cdev_t dev, struct vn_softc *vn , struct vn_user *vnu);
 static int	vn_modevent (module_t, int, void *);
 static int 	vniocattach_file (struct vn_softc *, struct vn_ioctl *, cdev_t dev, int flag, struct ucred *cred);
 static int 	vniocattach_swap (struct vn_softc *, struct vn_ioctl *, cdev_t dev, int flag, struct ucred *cred);
-static cdev_t	vn_create(int unit, struct devfs_bitmap *bitmap, int clone);
+static cdev_t	vn_create(int unit, int clone);
 
 static int
 vnclone(struct dev_clone_args *ap)
@@ -163,7 +161,7 @@ vnclone(struct dev_clone_args *ap)
 	int unit;
 
 	unit = devfs_clone_bitmap_get(&DEVFS_CLONE_BITMAP(vn), 0);
-	ap->a_dev = vn_create(unit, &DEVFS_CLONE_BITMAP(vn), 1);
+	ap->a_dev = vn_create(unit, 1);
 
 	return 0;
 }
@@ -229,7 +227,7 @@ vnopen(struct dev_open_args *ap)
 	KKASSERT(vn != NULL);
 
 	/*
-	 * Update si_bsize fields for device.  This data will be overriden by
+	 * Update si_bsize fields for device.  This data will be overridden by
 	 * the slice/parition code for vn accesses through partitions, and
 	 * used directly if you open the 'whole disk' device.
 	 *
@@ -589,7 +587,7 @@ vniocattach_file(struct vn_softc *vn, struct vn_ioctl *vio, cdev_t dev,
 	info.d_ncylinders = vn->sc_size / info.d_secpercyl;
 	disk_setdiskinfo_sync(&vn->sc_disk, &info);
 
-	error = dev_dopen(dev, flag, S_IFCHR, cred, NULL);
+	error = dev_dopen(dev, flag, S_IFCHR, cred, NULL, NULL);
 	if (error)
 		vnclear(vn);
 
@@ -638,6 +636,7 @@ vniocattach_swap(struct vn_softc *vn, struct vn_ioctl *vio, cdev_t dev,
 	vn->sc_object = swap_pager_alloc(NULL,
 					 vn->sc_secsize * (off_t)vio->vn_size,
 					 VM_PROT_DEFAULT, 0);
+	vm_object_set_flag(vn->sc_object, OBJ_NOPAGEIN);
 	IFOPT(vn, VN_RESERVE) {
 		if (swap_pager_reserve(vn->sc_object, 0, vn->sc_size) < 0) {
 			vm_pager_deallocate(vn->sc_object);
@@ -666,7 +665,7 @@ vniocattach_swap(struct vn_softc *vn, struct vn_ioctl *vio, cdev_t dev,
 		info.d_ncylinders = vn->sc_size / info.d_secpercyl;
 		disk_setdiskinfo_sync(&vn->sc_disk, &info);
 
-		error = dev_dopen(dev, flag, S_IFCHR, cred, NULL);
+		error = dev_dopen(dev, flag, S_IFCHR, cred, NULL, NULL);
 	}
 	if (error == 0) {
 		IFOPT(vn, VN_FOLLOW) {
@@ -685,7 +684,7 @@ vniocattach_swap(struct vn_softc *vn, struct vn_ioctl *vio, cdev_t dev,
  * to this "disk" is essentially as root.  Note that credentials may change
  * if some other uid can write directly to the mapped file (NFS).
  */
-int
+static int
 vnsetcred(struct vn_softc *vn, struct ucred *cred)
 {
 	char *tmpbuf;
@@ -726,7 +725,7 @@ vnsetcred(struct vn_softc *vn, struct ucred *cred)
 	return (error);
 }
 
-void
+static void
 vnclear(struct vn_softc *vn)
 {
 	IFOPT(vn, VN_FOLLOW)
@@ -844,8 +843,11 @@ vnsize(struct dev_psize_args *ap)
 	return(0);
 }
 
+/*
+ * Returns NULL only if the specified unit cannot be allocated.
+ */
 static cdev_t
-vn_create(int unit, struct devfs_bitmap *bitmap, int clone)
+vn_create(int unit, int clone)
 {
 	struct vn_softc *vn;
 	struct disk_info info;
@@ -874,9 +876,6 @@ vn_create(int unit, struct devfs_bitmap *bitmap, int clone)
 	info.d_ncylinders = 0;
 	disk_setdiskinfo_sync(&vn->sc_disk, &info);
 
-	if (bitmap != NULL)
-		devfs_clone_bitmap_set(bitmap, unit);
-
 	return ret_dev;
 }
 
@@ -889,11 +888,12 @@ vn_modevent(module_t mod, int type, void *data)
 
 	switch (type) {
 	case MOD_LOAD:
-		dev = make_autoclone_dev(&vn_ops, &DEVFS_CLONE_BITMAP(vn), vnclone, UID_ROOT,
-		    GID_OPERATOR, 0640, "vn");
-
+		dev = make_autoclone_dev(&vn_ops, &DEVFS_CLONE_BITMAP(vn),
+					 vnclone, UID_ROOT, GID_OPERATOR,
+					 0640, "vn");
 		for (i = 0; i < VN_PREALLOCATED_UNITS; i++) {
-			vn_create(i, &DEVFS_CLONE_BITMAP(vn), 0);
+			devfs_clone_bitmap_set(&DEVFS_CLONE_BITMAP(vn), i);
+			vn_create(i, 0);
 		}
 		break;
 

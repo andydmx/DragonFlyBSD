@@ -1,4 +1,6 @@
-/*
+/*-
+ * SPDX-License-Identifier: BSD-3-Clause
+ *
  * Copyright (c) 1993
  *	The Regents of the University of California.  All rights reserved.
  *
@@ -10,11 +12,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -31,34 +29,31 @@
  * SUCH DAMAGE.
  *
  *	from: @(#)extern.h	8.1 (Berkeley) 6/4/93
- * $FreeBSD: src/libexec/getty/extern.h,v 1.7 2000/01/28 07:12:02 bde Exp $
- * $DragonFly: src/libexec/getty/extern.h,v 1.3 2003/11/14 03:54:30 dillon Exp $
+ * $FreeBSD: head/libexec/getty/extern.h 328858 2018-02-04 19:05:13Z trasz $
  */
 
 struct delayval;
 struct termios;
-struct gettyflags;
-struct gettynums;
-struct gettystrs;
 
+extern	char **environ;
+extern	char editedhost[];
 extern	char hostname[];
-extern	int hopcount;
 extern	struct termios tmode, omode;
 extern	struct gettyflags gettyflags[];
 extern	struct gettynums gettynums[];
 extern	struct gettystrs gettystrs[];
 
-int	 adelay (int, struct delayval *);
-const char *autobaud (void);
-int	 delaybits (void);
-void	 edithost (const char *);
-void	 gendefaults (void);
-void	 gettable (const char *, char *);
-void	 makeenv (char *[]);
-const char *portselector (void);
-void	 set_ttydefaults (int);
-void	 setchars (void);
-void	 setdefaults (void);
-void	 set_flags (int);
-int	 speed (int);
-int	 getty_chat (char *, int, int);
+int	 adelay(int, struct delayval *);
+const char *autobaud(void);
+int	 delaybits(void);
+void	 edithost(const char *);
+void	 gendefaults(void);
+void	 gettable(const char *, char *);
+void	 makeenv(char *[]);
+const char *portselector(void);
+void	 set_ttydefaults(int);
+void	 setchars(void);
+void	 setdefaults(void);
+void	 set_flags(int);
+int	 speed(int);
+int	 getty_chat(char *, int, int);

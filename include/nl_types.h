@@ -35,9 +35,10 @@
 #define _NL_TYPES_H_
 
 #include <sys/cdefs.h>
-#include <sys/types.h>
 
 #ifdef _NLS_PRIVATE
+#include <machine/stdint.h>
+
 /*
  * MESSAGE CATALOG FILE FORMAT.
  *
@@ -54,23 +55,23 @@
 #define _NLS_MAGIC	0xff88ff89
 
 struct _nls_cat_hdr {
-	int32_t __magic;
-	int32_t __nsets;
-	int32_t __mem;
-	int32_t __msg_hdr_offset;
-	int32_t __msg_txt_offset;
+	__int32_t __magic;
+	__int32_t __nsets;
+	__int32_t __mem;
+	__int32_t __msg_hdr_offset;
+	__int32_t __msg_txt_offset;
 } ;
 
 struct _nls_set_hdr {
-	int32_t __setno;	/* set number: 0 < x <= NL_SETMAX */
-	int32_t __nmsgs;	/* number of messages in the set  */
-	int32_t __index;	/* index of first msg_hdr in msg_hdr table */
+	__int32_t __setno;	/* set number: 0 < x <= NL_SETMAX */
+	__int32_t __nmsgs;	/* number of messages in the set  */
+	__int32_t __index;	/* index of first msg_hdr in msg_hdr table */
 } ;
 
 struct _nls_msg_hdr {
-	int32_t __msgno;	/* msg number: 0 < x <= NL_MSGMAX */
-	int32_t __msglen;
-	int32_t __offset;
+	__int32_t __msgno;	/* msg number: 0 < x <= NL_MSGMAX */
+	__int32_t __msglen;
+	__int32_t __offset;
 } ;
 
 #endif	/* _NLS_PRIVATE */
@@ -84,14 +85,16 @@ typedef struct __nl_cat_d {
 } *nl_catd;
 
 #ifndef _NL_ITEM_DECLARED
-typedef	__nl_item	nl_item;
+typedef	int	nl_item;
 #define	_NL_ITEM_DECLARED
 #endif
 
 __BEGIN_DECLS
+#if __POSIX_VISIBLE >= 200809 || __XSI_VISIBLE
 nl_catd  catopen(const char *, int);
 char    *catgets(nl_catd, int, int, const char *) __format_arg(4);
 int	 catclose(nl_catd);
+#endif
 __END_DECLS
 
 #endif	/* _NL_TYPES_H_ */

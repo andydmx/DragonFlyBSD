@@ -12,7 +12,7 @@
 .\" 2. Redistributions in binary form must reproduce the above copyright
 .\"    notice, this list of conditions and the following disclaimer in the
 .\"    documentation and/or other materials provided with the distribution.
-.\" 4. Neither the name of the University nor the names of its contributors
+.\" 3. Neither the name of the University nor the names of its contributors
 .\"    may be used to endorse or promote products derived from this software
 .\"    without specific prior written permission.
 .\"
@@ -57,7 +57,7 @@ The
 .Fn setlocale
 function recognizes several categories of routines.
 These are the categories and the sets of routines they select:
-.Bl -tag -width LC_MONETARY
+.Bl -tag -width ".Dv LC_MONETARY"
 .It Dv LC_ALL
 Set the entire locale generically.
 .It Dv LC_COLLATE
@@ -150,8 +150,7 @@ and the category
 .Sh ERRORS
 No errors are defined.
 .Sh SEE ALSO
-.Xr colldef 1 ,
-.Xr mklocale 1 ,
+.Xr localedef 1 ,
 .Xr catopen 3 ,
 .Xr ctype 3 ,
 .Xr localeconv 3 ,

@@ -43,6 +43,7 @@
 #include <sys/diskmbr.h>
 #include <sys/dtype.h>
 #include <machine/bootinfo.h>
+#include <machine/psl.h>
 
 #include <stdarg.h>
 
@@ -124,12 +125,6 @@ static int	bd_open(struct open_file *f, ...);
 static int	bd_close(struct open_file *f);
 static void	bd_print(int verbose);
 
-/*
- * Max number of sectors to bounce-buffer if the request crosses a 64k boundary
- */
-#define BOUNCEBUF_SIZE	8192
-#define BOUNCEBUF_SECTS	(BOUNCEBUF_SIZE / BIOSDISK_SECSIZE)
-
 struct devsw biosdisk = {
     "disk", 
     DEVT_DISK, 
@@ -148,7 +143,8 @@ static int	bd_bestslice(struct open_disk *od);
 static void	bd_chainextended(struct open_disk *od, u_int32_t base,
 					u_int32_t offset);
 
-static caddr_t	bounce_base;
+char	bounce_base[BOUNCEBUF_SIZE];	/* also used by CD code */
+
 
 /*
  * Translate between BIOS device numbers and our private unit numbers.
@@ -182,9 +178,6 @@ static int
 bd_init(void) 
 {
     int	base, unit, nfd = 0;
-
-    if (bounce_base == NULL)
-	bounce_base = malloc(BOUNCEBUF_SIZE * 2);
 
     /* sequence 0, 0x80 */
     for (base = 0; base <= 0x80; base += 0x80) {
@@ -223,7 +216,7 @@ bd_int13probe(struct bdinfo *bd)
     v86.edx = bd->bd_unit;
     v86int();
     
-    if (!(v86.efl & 0x1) &&				/* carry clear */
+    if (!(v86.efl & PSL_C) &&				/* carry clear */
 	((v86.edx & 0xff) > ((unsigned)bd->bd_unit & 0x7f))) {	/* unit # OK */
 
 	/*
@@ -243,7 +236,7 @@ bd_int13probe(struct bdinfo *bd)
 	v86.edx = bd->bd_unit;
 	v86.ebx = 0x55aa;
 	v86int();
-	if (!(v86.efl & 0x1) &&				/* carry clear */
+	if (!(v86.efl & PSL_C) &&			/* carry clear */
 	    ((v86.ebx & 0xffff) == 0xaa55) &&		/* signature */
 	    (v86.ecx & 0x1)) {				/* packets mode ok */
 	    bd->bd_flags |= BD_MODEEDD1;
@@ -284,8 +277,9 @@ bd_print(int verbose)
 		dptr = &od->od_slicetab[0];
 
 		/* Check for a "dedicated" disk */
-		if (((dptr[3].dp_typ == DOSPTYP_386BSD) ||
-			(dptr[3].dp_typ == DOSPTYP_NETBSD)) &&
+		if ((dptr[3].dp_typ == DOSPTYP_386BSD ||
+		     dptr[3].dp_typ == DOSPTYP_NETBSD ||
+		     dptr[3].dp_typ == DOSPTYP_DFLYBSD) &&
 		    (dptr[3].dp_start == 0) &&
 		    (dptr[3].dp_size == 50000)) {
 		    sprintf(line, "      disk%d", i);
@@ -313,6 +307,7 @@ bd_printslice(struct open_disk *od, struct dos_partition *dp, char *prefix,
 	char line[80];
 
 	switch (dp->dp_typ) {
+	case DOSPTYP_DFLYBSD:
 	case DOSPTYP_386BSD:
 	case DOSPTYP_NETBSD:
 	/* XXX: possibly add types 0 and 1, as in subr_disk, for gpt magic */
@@ -644,7 +639,8 @@ bd_opendisk(struct open_disk **odp, struct i386_devdesc *dev)
     /*
      * Check for the historically bogus MBR found on true dedicated disks
      */
-    if ((dptr[3].dp_typ == DOSPTYP_386BSD) &&
+    if ((dptr[3].dp_typ == DOSPTYP_386BSD ||
+	 dptr[3].dp_typ == DOSPTYP_DFLYBSD) &&
       (dptr[3].dp_start == 0) &&
       (dptr[3].dp_size == 50000)) {
         sector = 0;
@@ -671,10 +667,14 @@ bd_opendisk(struct open_disk **odp, struct i386_devdesc *dev)
     DEBUG("slice entry %d at %d, %d sectors", dev->d_kind.biosdisk.slice - 1, sector, dptr->dp_size);
 
     /*
-     * If we are looking at a BSD slice, and the partition is < 0, assume the 'a' partition
+     * If we are looking at a BSD slice, and the partition is < 0,
+     * assume the 'a' partition
      */
-    if ((dptr->dp_typ == DOSPTYP_386BSD) && (dev->d_kind.biosdisk.partition < 0))
+    if ((dptr->dp_typ == DOSPTYP_386BSD ||
+	 dptr->dp_typ == DOSPTYP_DFLYBSD) &&
+        dev->d_kind.biosdisk.partition < 0) {
 	dev->d_kind.biosdisk.partition = 0;
+    }
 
 unsliced:
     /* 
@@ -885,7 +885,8 @@ bd_bestslice(struct open_disk *od)
 	dp = &od->od_slicetab[0];
 	for (i = 0; i < od->od_nslices; i++, dp++) {
 		switch (dp->dp_typ) {
-		case DOSPTYP_386BSD:		/* FreeBSD */
+		case DOSPTYP_DFLYBSD:		/* DragonFlyBSD */
+		case DOSPTYP_386BSD:		/* FreeBSD and old DFlyBSD */
 			pref = dp->dp_flag & 0x80 ? PREF_FBSD_ACT : PREF_FBSD;
 			break;
 
@@ -1107,7 +1108,7 @@ bd_read(struct open_disk *od, daddr_t dblk, int blks, caddr_t dest)
 		v86.ds = VTOPSEG(packet);
 		v86.esi = VTOPOFF(packet);
 		v86int();
-		result = (v86.efl & 0x1);
+		result = (v86.efl & PSL_C);
 		if (result == 0)
 		    break;
 	    } else if (cyl < 1024) {
@@ -1120,7 +1121,7 @@ bd_read(struct open_disk *od, daddr_t dblk, int blks, caddr_t dest)
 		v86.es = VTOPSEG(xp);
 		v86.ebx = VTOPOFF(xp);
 		v86int();
-		result = (v86.efl & 0x1);
+		result = (v86.efl & PSL_C);
 		if (result == 0)
 		    break;
 	    } else {
@@ -1258,7 +1259,7 @@ bd_write(struct open_disk *od, daddr_t dblk, int blks, caddr_t dest)
 		v86.ds = VTOPSEG(packet);
 		v86.esi = VTOPOFF(packet);
 		v86int();
-		result = (v86.efl & 0x1);
+		result = (v86.efl & PSL_C);
 		if (result == 0)
 		    break;
 	    } else if (cyl < 1024) {
@@ -1271,7 +1272,7 @@ bd_write(struct open_disk *od, daddr_t dblk, int blks, caddr_t dest)
 		v86.es = VTOPSEG(xp);
 		v86.ebx = VTOPOFF(xp);
 		v86int();
-		result = (v86.efl & 0x1);
+		result = (v86.efl & PSL_C);
 		if (result == 0)
 		    break;
 	    } else {
@@ -1301,7 +1302,7 @@ bd_getgeom(struct open_disk *od)
     v86.edx = od->od_unit;
     v86int();
 
-    if ((v86.efl & 0x1) ||				/* carry set */
+    if ((v86.efl & PSL_C) ||				/* carry set */
 	((v86.edx & 0xff) <= (unsigned)(od->od_unit & 0x7f)))	/* unit # bad */
 	return(1);
     
@@ -1338,7 +1339,7 @@ bd_getbigeom(int bunit)
     v86.eax = 0x800;
     v86.edx = 0x80 + bunit;
     v86int();
-    if (v86.efl & 0x1)
+    if (v86.efl & PSL_C)
 	return 0x4f010f;
     return ((v86.ecx & 0xc0) << 18) | ((v86.ecx & 0xff00) << 8) |
 	   (v86.edx & 0xff00) | (v86.ecx & 0x3f);
@@ -1404,10 +1405,7 @@ bd_getdev(struct i386_devdesc *dev)
 	    unit = i;
     }
 
-    rootdev = MAKEBOOTDEV(major,
-			  (dev->d_kind.biosdisk.slice + 1) >> 4, 	/* XXX slices may be wrong here */
-			  (dev->d_kind.biosdisk.slice + 1) & 0xf, 
-			  unit,
+    rootdev = MAKEBOOTDEV(major, dev->d_kind.biosdisk.slice + 1, unit,
 			  dev->d_kind.biosdisk.partition);
     DEBUG("dev is 0x%x\n", rootdev);
     return(rootdev);

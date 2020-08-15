@@ -1,4 +1,4 @@
-/* $FreeBSD: head/lib/libusb/libusb.h 260315 2014-01-05 10:41:43Z hselasky $ */
+/* $FreeBSD: head/lib/libusb/libusb.h 277245 2015-01-16 12:11:01Z hselasky $ */
 /*-
  * Copyright (c) 2009 Sylvestre Gallon. All rights reserved.
  *
@@ -33,6 +33,8 @@
 #include <sys/types.h>
 #endif
 
+#define	LIBUSB_CALL
+
 #ifdef __cplusplus
 extern	"C" {
 #endif
@@ -49,10 +51,18 @@ enum libusb_class_code {
 	LIBUSB_CLASS_COMM = 2,
 	LIBUSB_CLASS_HID = 3,
 	LIBUSB_CLASS_PTP = 6,
+	LIBUSB_CLASS_IMAGE = 6,
 	LIBUSB_CLASS_PRINTER = 7,
 	LIBUSB_CLASS_MASS_STORAGE = 8,
 	LIBUSB_CLASS_HUB = 9,
 	LIBUSB_CLASS_DATA = 10,
+	LIBUSB_CLASS_SMART_CARD = 11,
+	LIBUSB_CLASS_CONTENT_SECURITY = 13,
+	LIBUSB_CLASS_VIDEO = 14,
+	LIBUSB_CLASS_PERSONAL_HEALTHCARE = 15,
+	LIBUSB_CLASS_DIAGNOSTIC_DEVICE = 0xdc,
+	LIBUSB_CLASS_WIRELESS = 0xe0,
+	LIBUSB_CLASS_APPLICATION = 0xfe,
 	LIBUSB_CLASS_VENDOR_SPEC = 0xff,
 };
 
@@ -118,6 +128,8 @@ enum libusb_standard_request {
 	LIBUSB_REQUEST_GET_INTERFACE = 0x0A,
 	LIBUSB_REQUEST_SET_INTERFACE = 0x0B,
 	LIBUSB_REQUEST_SYNCH_FRAME = 0x0C,
+	LIBUSB_REQUEST_SET_SEL = 0x30,
+	LIBUSB_REQUEST_SET_ISOCH_DELAY = 0x31,
 };
 
 enum libusb_request_type {
@@ -197,7 +209,7 @@ enum libusb_log_level {
 	LIBUSB_LOG_LEVEL_ERROR,
 	LIBUSB_LOG_LEVEL_WARNING,
 	LIBUSB_LOG_LEVEL_INFO,
-  	LIBUSB_LOG_LEVEL_DEBUG
+	LIBUSB_LOG_LEVEL_DEBUG
 };
 
 /* 
@@ -212,12 +224,25 @@ enum libusb_debug_level {
 	LIBUSB_DEBUG_TRANSFER=2,
 };
 
+#define	LIBUSB_HOTPLUG_MATCH_ANY -1
+
+typedef enum {
+	LIBUSB_HOTPLUG_NO_FLAGS = 0,
+	LIBUSB_HOTPLUG_ENUMERATE = 1 << 0,
+} libusb_hotplug_flag;
+
+typedef enum {
+	LIBUSB_HOTPLUG_EVENT_DEVICE_ARRIVED = 1,
+	LIBUSB_HOTPLUG_EVENT_DEVICE_LEFT = 2,
+} libusb_hotplug_event;
+
 /* libusb structures */
 
 struct libusb_context;
 struct libusb_device;
 struct libusb_transfer;
 struct libusb_device_handle;
+struct libusb_hotplug_callback_handle_struct;
 
 struct libusb_pollfd {
 	int	fd;
@@ -230,6 +255,7 @@ typedef struct libusb_device_handle libusb_device_handle;
 typedef struct libusb_pollfd libusb_pollfd;
 typedef void (*libusb_pollfd_added_cb) (int fd, short events, void *user_data);
 typedef void (*libusb_pollfd_removed_cb) (int fd, void *user_data);
+typedef struct libusb_hotplug_callback_handle_struct *libusb_hotplug_callback_handle;
 
 typedef struct libusb_device_descriptor {
 	uint8_t	bLength;
@@ -471,6 +497,14 @@ int	libusb_interrupt_transfer(libusb_device_handle * devh, uint8_t endpoint, uin
 
 uint16_t libusb_cpu_to_le16(uint16_t x);
 uint16_t libusb_le16_to_cpu(uint16_t x);
+
+/* Hotplug support */
+
+typedef int (*libusb_hotplug_callback_fn)(libusb_context *ctx,
+    libusb_device *device, libusb_hotplug_event event, void *user_data);
+
+int	libusb_hotplug_register_callback(libusb_context *ctx, libusb_hotplug_event events, libusb_hotplug_flag flags, int vendor_id, int product_id, int dev_class, libusb_hotplug_callback_fn cb_fn, void *user_data, libusb_hotplug_callback_handle *handle);
+void	libusb_hotplug_deregister_callback(libusb_context *ctx, libusb_hotplug_callback_handle handle);
 
 #if 0
 {					/* indent fix */

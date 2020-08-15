@@ -2,6 +2,7 @@
  * Copyright (c) 2010 Isilon Systems, Inc.
  * Copyright (c) 2010 iX Systems, Inc.
  * Copyright (c) 2010 Panasas, Inc.
+ * Copyright (c) 2015-2020 François Tigeot <ftigeot@wolfpond.org>
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -28,17 +29,19 @@
 #ifndef	_LINUX_BITOPS_H_
 #define	_LINUX_BITOPS_H_
 
-#include <sys/types.h>
-#include <sys/systm.h>
+#include <asm/types.h>
 
-#ifdef __LP64__
-#define	BITS_PER_LONG		64
-#else
-#define	BITS_PER_LONG		32
-#endif
+#define BIT(nr)			(1UL << (nr))
+#define BIT_ULL(nb)		(1ULL << (nb))
 #define	BIT_MASK(n)		(~0UL >> (BITS_PER_LONG - (n)))
 #define	BITS_TO_LONGS(n)	howmany((n), BITS_PER_LONG)
 #define BIT_WORD(nr)		((nr) / BITS_PER_LONG)
+#define BITS_PER_BYTE		8
+
+#include <asm/bitops.h>
+
+#include <sys/types.h>
+#include <sys/systm.h>
 
 static inline int
 __ffs(int mask)
@@ -64,6 +67,17 @@ __flsl(long mask)
 	return (flsl(mask) - 1);
 }
 
+/*
+ * fls64 - find leftmost set bit in a 64-bit word
+ *
+ * Returns 0 if no bit is set or the bit
+ * position counted from 1 to 64 otherwise
+ */
+static inline int
+fls64(__u64 x)
+{
+	return flsl(x);
+}
 
 #define	ffz(mask)	__ffs(~(mask))
 
@@ -289,14 +303,14 @@ bitmap_empty(unsigned long *addr, int size)
 #define	NBLONG	(NBBY * sizeof(long))
 
 #define	set_bit(i, a)							\
-    atomic_set_long(&((volatile long *)(a))[(i)/NBLONG], 1 << (i) % NBLONG)
+    atomic_set_long(&((volatile long *)(a))[(i)/NBLONG], 1LU << ((i) % NBLONG))
 
 #define	clear_bit(i, a)							\
-    atomic_clear_long(&((volatile long *)(a))[(i)/NBLONG], 1 << (i) % NBLONG)
+    atomic_clear_long(&((volatile long *)(a))[(i)/NBLONG], 1LU << ((i) % NBLONG))
 
 #define	test_bit(i, a)							\
     !!(atomic_load_acq_long(&((volatile long *)(a))[(i)/NBLONG]) &	\
-    1 << ((i) % NBLONG))
+			    (1LU << ((i) % NBLONG)))
 
 static inline long
 test_and_clear_bit(long bit, long *var)
@@ -305,12 +319,26 @@ test_and_clear_bit(long bit, long *var)
 
 	var += bit / (sizeof(long) * NBBY);
 	bit %= sizeof(long) * NBBY;
-	bit = 1 << bit;
+	bit = 1L << bit;
 	do {
 		val = *(volatile long *)var;
 	} while (atomic_cmpset_long(var, val, val & ~bit) == 0);
 
 	return !!(val & bit);
+}
+
+static inline unsigned long
+__test_and_clear_bit(unsigned int bit, volatile unsigned long *ptr)
+{
+	const unsigned int units = (sizeof(*ptr) * NBBY);
+	volatile unsigned long *const p = &ptr[bit / units];
+	const unsigned long mask = (1UL << (bit % units));
+	unsigned long v;
+
+	v = *p;
+	*p &= ~mask;
+
+	return ((v & mask) != 0);
 }
 
 static inline long
@@ -320,7 +348,7 @@ test_and_set_bit(long bit, volatile unsigned long *var)
 
 	var += bit / (sizeof(long) * NBBY);
 	bit %= sizeof(long) * NBBY;
-	bit = 1 << bit;
+	bit = 1L << bit;
 	do {
 		val = *(volatile long *)var;
 	} while (atomic_cmpset_long(var, val, val | bit) == 0);
@@ -482,6 +510,31 @@ bitmap_release_region(unsigned long *bitmap, int pos, int order)
         __reg_op(bitmap, pos, order, REG_OP_RELEASE);
 }
 
+/* Returns a contiguous bitmask from bits h to l */
+#define GENMASK(h, l)	\
+	(((~0UL) >> (BITS_PER_LONG - (h) - 1)) & ((~0UL) << (l)))
+
+#define GENMASK_ULL(h, l) \
+	(((~0ULL) >> (BITS_PER_LONG_LONG - 1 - (h))) & ((~0ULL) << (l)))
+
 #include <asm/bitops/non-atomic.h>
+#include <asm/bitops/const_hweight.h>
+
+#define for_each_set_bit(bit, addr, size) \
+	for ((bit) = find_first_bit((addr), (size));		\
+	     (bit) < (size);					\
+	     (bit) = find_next_bit((addr), (size), (bit) + 1))
+
+#define for_each_clear_bit(bit, addr, size) \
+	for ((bit) = find_first_zero_bit((addr), (size));	\
+	     (bit) < (size);						\
+	     (bit) = find_next_zero_bit((addr), (size), (bit) + 1))
+
+static inline int64_t
+sign_extend64(uint64_t value, int index)
+{
+	uint8_t shift = 63 - index;
+	return (int64_t)(value << shift) >> shift;
+}
 
 #endif	/* _LINUX_BITOPS_H_ */

@@ -1,4 +1,6 @@
 /*-
+ * SPDX-License-Identifier: BSD-3-Clause
+ *
  * Copyright (c) 1990, 1993
  *	The Regents of the University of California.  All rights reserved.
  *
@@ -33,9 +35,12 @@
 
 #include <stdio.h>
 
+#include "yyerror.h"
+
 int
-yyerror(char *msg)
+yyerror(const char *msg)
 {
-	(void)fprintf(stderr, "%s\n", msg);
+
+	fprintf(stderr, "%s\n", msg);
 	return(0);
 }

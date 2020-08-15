@@ -24,7 +24,6 @@
  * THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  * $FreeBSD: src/sys/dev/kbd/kbdreg.h,v 1.9.2.2 2001/07/30 16:46:44 yokota Exp $
- * $DragonFly: src/sys/dev/misc/kbd/kbdreg.h,v 1.6 2007/06/06 18:49:27 dillon Exp $
  */
 
 #ifndef _DEV_KBD_KBDREG_H_
@@ -128,6 +127,8 @@ struct keyboard {
 #define KBD_ACTIVATE(k)		(++(k)->kb_active)
 #define KBD_DEACTIVATE(k)	(--(k)->kb_active)
 #define KBD_LED_VAL(k)		((k)->kb_led)
+
+#define KBD_MAXKEYBOARDS	16
 
 /* Locking functions */
 
@@ -237,10 +238,10 @@ typedef struct keyboard_driver {
 	static struct keyboard_driver name##_kbd_driver = { \
 		{ NULL }, #name, &sw, config		\
 	};						\
-	DATA_SET(kbddriver_set, name##_kbd_driver);
+	DATA_SET(kbddriver_set, name##_kbd_driver)
 
 /* global variables */
-extern keyboard_switch_t **kbdsw;
+extern keyboard_switch_t *kbdsw[KBD_MAXKEYBOARDS];
 
 /* functions for the keyboard driver */
 int			kbd_add_driver(keyboard_driver_t *driver);

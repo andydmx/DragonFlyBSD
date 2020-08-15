@@ -8,6 +8,7 @@ MAN=	aac.4 \
 	acpi_fujitsu.4 \
 	acpi_hp.4 \
 	acpi_panasonic.4 \
+	acpi_pvpanic.4 \
 	acpi_sony.4 \
 	acpi_thermal.4 \
 	acpi_thinkpad.4 \
@@ -20,11 +21,8 @@ MAN=	aac.4 \
 	aesni.4 \
 	age.4 \
 	agp.4 \
-	ahc.4 \
 	ahci.4 \
-	ahd.4 \
 	aibs.4 \
-	aic.4 \
 	alc.4 \
 	ale.4 \
 	alpm.4 \
@@ -33,9 +31,10 @@ MAN=	aac.4 \
 	amdpm.4 \
 	amdsbwd.4 \
 	amdsmb.4 \
+	amdsmn.4 \
+	amdtemp.4 \
 	amr.4 \
-	an.4 \
-	apm.4 \
+	aperf.4 \
 	aps.4 \
 	arcmsr.4 \
 	arp.4 \
@@ -62,10 +61,12 @@ MAN=	aac.4 \
 	carp.4 \
 	ccd.4 \
 	cd.4 \
+	cdce.4 \
 	ch.4 \
 	ciss.4 \
 	clockmod.4 \
 	cmx.4 \
+	corepower.4 \
 	coretemp.4 \
 	cpuctl.4 \
 	crypto.4 \
@@ -83,19 +84,18 @@ MAN=	aac.4 \
 	dm.4 \
 	dm_target_striped.4 \
 	dm_target_crypt.4 \
+	dm_target_delay.4 \
+	dm_target_flakey.4 \
 	dpt.4 \
 	drm.4 \
-	dsched.4 \
-	dsched_bfq.4 \
 	dummynet.4 \
 	ecc.4 \
+	efidev.4 \
 	ehci.4 \
 	em.4 \
-	est.4 \
+	ena.4 \
 	et.4 \
 	exca.4 \
-	faith.4 \
-	fast_ipsec.4 \
 	fd.4 \
 	fdc.4 \
 	firewire.4 \
@@ -104,19 +104,21 @@ MAN=	aac.4 \
 	fxp.4 \
 	gdb.4 \
 	gif.4 \
+	gpio_acpi.4 \
+	gpio_intel.4 \
 	gre.4 \
 	hifn.4 \
 	hpt27xx.4 \
 	hptiop.4 \
 	hptmv.4 \
 	hptrr.4 \
+	i915.4 \
 	ichiic.4 \
 	ichsmb.4 \
 	ichwd.4 \
 	icmp.4 \
 	icmp6.4 \
 	ida.4 \
-	ieee80211.4 \
 	ifmedia.4 \
 	ifmib.4 \
 	igb.4 \
@@ -129,12 +131,13 @@ MAN=	aac.4 \
 	inet6.4 \
 	intpm.4 \
 	intro.4 \
+	io.4 \
 	ip.4 \
 	ip6.4 \
 	ipfirewall.4 \
 	ipheth.4 \
+	ipmi.4 \
 	ips.4 \
-	ipsec.4 \
 	isa.4 \
 	iscsi_initiator.4 \
 	isp.4 \
@@ -142,6 +145,8 @@ MAN=	aac.4 \
 	it.4 \
 	iwi.4 \
 	iwifw.4 \
+	iwm.4 \
+	iwmfw.4 \
 	iwn.4 \
 	iwnfw.4 \
 	ix.4 \
@@ -158,12 +163,14 @@ MAN=	aac.4 \
 	led.4 \
 	lge.4 \
 	lm.4 \
+	lnc.4 \
 	lo.4 \
 	lp.4 \
 	lpbb.4 \
 	lpt.4 \
 	md.4 \
 	mem.4 \
+	memtemp.4 \
 	mfi.4 \
 	miibus.4 \
 	mlx.4 \
@@ -172,8 +179,8 @@ MAN=	aac.4 \
 	mmcsd.4 \
 	mn.4 \
 	mos.4 \
-	moscom.4 \
 	mouse.4 \
+	mpr.4 \
 	mps.4 \
 	mpt.4 \
 	mrsas.4 \
@@ -186,7 +193,6 @@ MAN=	aac.4 \
 	natapicam.4 \
 	nataraid.4 \
 	ncr.4 \
-	ncv.4 \
 	ndis.4 \
 	netgraph.4 \
 	netintro.4 \
@@ -219,8 +225,8 @@ MAN=	aac.4 \
 	ng_vjc.4 \
 	nmdm.4 \
 	nsclpcsio.4 \
-	nsp.4 \
 	null.4 \
+	nvme.4 \
 	oce.4 \
 	ohci.4 \
 	orm.4 \
@@ -241,12 +247,11 @@ MAN=	aac.4 \
 	ppbus.4 \
 	ppc.4 \
 	ppi.4 \
-	ppp.4 \
 	psm.4 \
 	pt.4 \
 	pty.4 \
 	puc.4 \
-	puffs.4 \
+	radeon.4 \
 	ral.4 \
 	random.4 \
 	rdrand.4 \
@@ -255,7 +260,6 @@ MAN=	aac.4 \
 	rl.4 \
 	rndtest.4 \
 	route.4 \
-	rp.4 \
 	rum.4 \
 	run.4 \
 	runfw.4 \
@@ -269,7 +273,6 @@ MAN=	aac.4 \
 	sdhci.4 \
 	ses.4 \
 	sf.4 \
-	si.4 \
 	sili.4 \
 	sio.4 \
 	sis.4 \
@@ -277,6 +280,7 @@ MAN=	aac.4 \
 	sl.4 \
 	sln.4 \
 	smb.4 \
+	smbacpi.4 \
 	smbus.4 \
 	smp.4 \
 	sn.4 \
@@ -284,16 +288,15 @@ MAN=	aac.4 \
 	snd_atiixp.4 \
 	snd_cmi.4 \
 	snd_cs4281.4 \
-	snd_csa.4 \
-	snd_ds1.4 \
 	snd_emu10k1.4 \
+	snd_emu10kx.4 \
 	snd_envy24.4 \
 	snd_envy24ht.4 \
 	snd_es137x.4 \
 	snd_fm801.4 \
 	snd_hda.4 \
+	snd_hdspe.4 \
 	snd_ich.4 \
-	snd_maestro3.4 \
 	snd_maestro.4 \
 	snd_neomagic.4 \
 	snd_solo.4 \
@@ -309,7 +312,6 @@ MAN=	aac.4 \
 	st.4 \
 	ste.4 \
 	stf.4 \
-	stg.4 \
 	stge.4 \
 	sym.4 \
 	syncer.4 \
@@ -328,6 +330,7 @@ MAN=	aac.4 \
 	twa.4 \
 	twe.4 \
 	tws.4 \
+	tx.4 \
 	txp.4 \
 	uark.4 \
 	ubsa.4 \
@@ -367,19 +370,24 @@ MAN=	aac.4 \
 	usb.4 \
 	usb_quirk.4 \
 	usb_template.4 \
-	uscanner.4 \
 	usfs.4 \
 	uslcom.4 \
 	u3g.4 \
-	uticom.4 \
 	uvisor.4 \
 	uvscom.4 \
 	vga.4 \
+	vga_switcheroo.4 \
 	vge.4 \
+	viapm.4 \
 	vinum.4 \
 	virtio.4 \
+	virtio_balloon.4 \
 	virtio_blk.4 \
+	virtio_random.4 \
+	virtio_scsi.4 \
 	vlan.4 \
+	vmbus.4 \
+	vmx.4 \
 	vn.4 \
 	vpo.4 \
 	vr.4 \
@@ -396,6 +404,7 @@ MAN=	aac.4 \
 	wlan_wep.4 \
 	wlan_xauth.4 \
 	wpi.4 \
+	wsp.4 \
 	xe.4 \
 	xhci.4 \
 	xl.4 \
@@ -405,20 +414,12 @@ MAN=	aac.4 \
 # XXX re-add when pfsync(4) has been fixed
 #	pfsync.4 \
 
-# XXX re-add when adjusted to the new 802.11 framework
-#	acx.4 \
-#	bwi.4 \
-#	iwl.4 \
-#	rtw.4 \
-
 MLINKS=	acpi_thermal.4 acpi_tz.4
-#MLINKS+=acx.4 if_acx.4
 MLINKS+=ae.4 if_ae.4
 MLINKS+=age.4 if_age.4
 MLINKS+=agp.4 agpgart.4
 MLINKS+=alc.4 if_alc.4
 MLINKS+=ale.4 if_ale.4
-MLINKS+=an.4 if_an.4
 MLINKS+=ath.4 if_ath.4
 MLINKS+=aue.4 if_aue.4
 MLINKS+=axe.4 if_axe.4
@@ -429,22 +430,19 @@ MLINKS+=bge.4 if_bge.4
 MLINKS+=bktr.4 brooktree.4
 MLINKS+=bnx.4 if_bnx.4
 MLINKS+=bridge.4 if_bridge.4
-#MLINKS+=bwi.4 if_bwi.4
 MLINKS+=bwn.4 if_bwn.4
+MLINKS+=cdce.4 if_cdce.4
 MLINKS+=crypto.4 cryptodev.4
 MLINKS+=cue.4 if_cue.4
 MLINKS+=dc.4 if_dc.4
 MLINKS+=disc.4 if_disc.4
 MLINKS+=dm.4 dm_target_linear.4
-MLINKS+=drm.4 i915kms.4 \
-	drm.4 radeondrm.4 \
-	drm.4 radeon.4
-MLINKS+=dsched.4 dsched_fq.4
+MLINKS+=efidev.4 efirtc.4
 MLINKS+=em.4 emx.4 \
 	em.4 if_em.4 \
 	em.4 if_emx.4
+MLINKS+=ena.4 if_ena.4
 MLINKS+=et.4 if_et.4
-MLINKS+=faith.4 if_faith.4
 MLINKS+=fd.4 stderr.4 \
 	fd.4 stdin.4 \
 	fd.4 stdout.4
@@ -461,7 +459,7 @@ MLINKS+=ipfirewall.4 ipaccounting.4 \
 	ipfirewall.4 ipfw.4
 MLINKS+=ipheth.4 if_ipheth.4
 MLINKS+=iwi.4 if_iwi.4
-#MLINKS+=iwl.4 if_iwl.4
+MLINKS+=iwm.4 if_iwm.4
 MLINKS+=iwn.4 if_iwn.4
 MLINKS+=ix.4 if_ix.4 \
 	ix.4 ixgbe.4 \
@@ -469,7 +467,11 @@ MLINKS+=ix.4 if_ix.4 \
 MLINKS+=jme.4 if_jme.4
 MLINKS+=kue.4 if_kue.4
 MLINKS+=lagg.4 if_lagg.4
+MLINKS+=led.4 led_create.9 \
+	led.4 led_create_state.9 \
+	led.4 led_destroy.9
 MLINKS+=lge.4 if_lge.4
+MLINKS+=lnc.4 if_lnc.4
 MLINKS+=lo.4 loop.4
 MLINKS+=lp.4 plip.4
 MLINKS+=mem.4 kmem.4
@@ -489,13 +491,10 @@ MLINKS+=oce.4 if_oce.4
 MLINKS+=pccbb.4 cbb.4
 MLINKS+=pcm.4 sound.4
 MLINKS+=pcn.4 if_pcn.4
-MLINKS+=ppp.4 if_ppp.4
 MLINKS+=ral.4 if_ral.4
 MLINKS+=random.4 urandom.4
 MLINKS+=re.4 if_re.4
 MLINKS+=rl.4 if_rl.4
-#MLINKS+=rtw.4 if_rtw.4
-#MLINKS+=rue.4 if_rue.4
 MLINKS+=rum.4 if_rum.4
 MLINKS+=run.4 if_run.4
 MLINKS+=sbsh.4 if_sbsh.4
@@ -513,17 +512,16 @@ MLINKS+=snd_als4000.4 als4000.4
 MLINKS+=snd_atiixp.4 atiixp.4
 MLINKS+=snd_cmi.4 cmi.4
 MLINKS+=snd_cs4281.4 cs4281.4
-MLINKS+=snd_csa.4 csa.4
-MLINKS+=snd_ds1.4 ds1.4
 MLINKS+=snd_emu10k1.4 emu10k1.4
+MLINKS+=snd_emu10kx.4 emu10kx.4
 MLINKS+=snd_envy24.4 envy24.4
 MLINKS+=snd_envy24ht.4 envy24ht.4
 MLINKS+=snd_es137x.4 es137x.4
 MLINKS+=snd_fm801.4 fm801.4
 MLINKS+=snd_hda.4 hda.4
+MLINKS+=snd_hdspe.4 hdspe.4
 MLINKS+=snd_ich.4 ich.4
 MLINKS+=snd_maestro.4 maestro.4
-MLINKS+=snd_maestro3.4 maestro3.4
 MLINKS+=snd_neomagic.4 neomagic.4
 MLINKS+=snd_solo.4 solo.4
 MLINKS+=snd_spicds.4 spicds.4
@@ -541,15 +539,16 @@ MLINKS+=tap.4 if_tap.4
 MLINKS+=ti.4 if_ti.4
 MLINKS+=tl.4 if_tl.4
 MLINKS+=tun.4 if_tun.4
+MLINKS+=tx.4 if_tx.4
 MLINKS+=txp.4 if_txp.4
 MLINKS+=udav.4 if_udav.4
 MLINKS+=upmap.4 kpmap.4
-#MLINKS+=ural.4 if_ural.4
 MLINKS+=urndis.4 if_urndis.4
 MLINKS+=urtwn.4 if_urtwn.4
-MLINKS+=vga.4 vesa.4
+MLINKS+=vga_switcheroo.4 apple_gmux.4
 MLINKS+=vge.4 if_vge.4
 MLINKS+=vlan.4 if_vlan.4
+MLINKS+=vmx.4 if_vmx.4
 MLINKS+=vpo.4 imm.4
 MLINKS+=vr.4 if_vr.4
 MLINKS+=vtnet.4 if_vtnet.4
@@ -558,9 +557,5 @@ MLINKS+=wi.4 if_wi.4
 MLINKS+=wpi.4 if_wpi.4
 MLINKS+=xe.4 if_xe.4
 MLINKS+=xl.4 if_xl.4
-
-.if ${MACHINE_ARCH} == "i386"
-SUBDIR=	 man4.${MACHINE_ARCH}
-.endif
 
 .include <bsd.prog.mk>

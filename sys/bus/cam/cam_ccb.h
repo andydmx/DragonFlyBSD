@@ -80,7 +80,7 @@ typedef enum {
 	CAM_DIS_DISCONNECT	= 0x00020000,/* Disable disconnect	      */
 	CAM_SG_LIST_PHYS	= 0x00040000,/* SG list has physical addrs.   */
 	CAM_POLLED		= 0x00080000,/* Requested that polling be used*/
-	CAM_UNUSED100000	= 0x00100000,
+	CAM_QUIET		= 0x00100000,/* Quiet error reporting	      */
 	CAM_DATA_PHYS		= 0x00200000,/* SG/Buffer data ptrs are phys. */
 	CAM_CDB_PHYS		= 0x00400000,/* CDB poiner is physical	      */
 	CAM_ENG_SGLIST		= 0x00800000,/* SG list is for the HBA engine */
@@ -257,6 +257,9 @@ typedef union {
 	u_int8_t	bytes[CCB_SIM_PRIV_SIZE * sizeof(ccb_priv_entry)];
 } ccb_spriv_area;
 
+/*
+ * WARNING!  Fields are specifically copied in cam_periph.c's restore_ccb()
+ */
 struct ccb_hdr {
 	cam_pinfo	pinfo;		/* Info for priority scheduling */
 	camq_entry	xpt_links;	/* For chaining in the XPT layer */	
@@ -275,8 +278,8 @@ struct ccb_hdr {
 	ccb_ppriv_area	periph_priv;
 	ccb_spriv_area	sim_priv;
 	u_int32_t	timeout;	/* Timeout value */
-	struct		callout timeout_ch;
-					/* Callout handle used for timeouts */
+	struct	callout *timeout_ch;	/* Callout handle used for timeouts */
+	char		pad[48];	/* user/kernel structure compat */
 };
 
 /* Get Device Information CCB */

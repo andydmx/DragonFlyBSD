@@ -1,12 +1,9 @@
-DF306.0 {
-	/* PSEUDO syscalls */
-	_exit;
-
-	.mcount;
+DF404.0 {
 	_setjmp;
 	_longjmp;
+	.mcount;
+	getcontext;
 	fabs;
-	__flt_rounds;
 	fpgetmask;
 	fpgetprec;
 	fpgetround;
@@ -14,18 +11,15 @@ DF306.0 {
 	fpsetmask;
 	fpsetprec;
 	fpsetround;
-	__infinity;
-	__nan;
 	makecontext;
+	makecontext_quick;
+	setcontext_quick;
+	swapcontext_quick;
 	rfork_thread;
 	setjmp;
 	longjmp;
 	sigsetjmp;
 	siglongjmp;
-	htonl;
-	htons;
-	ntohl;
-	ntohs;
 	amd64_get_fsbase;
 	amd64_get_gsbase;
 	amd64_set_fsbase;
@@ -36,12 +30,25 @@ DF306.0 {
 };
 
 DFprivate_1.0 {
-	/* PSEUDO syscalls */
-	_getlogin;
 	___longjmp;
+	__flt_rounds;
+	__infinity;
+	__isfinitel;
+	__isnanl;
+	__isnormall;
 	__longjmp;
+	__nan;
 	__siglongjmp;
-	.curbrk;
-	.cerror;
+	__signbitl;
+	_DYNAMIC;
 	_brk;
+	_end;
+	_getcontext;
+	_makecontext;
+	_makecontext_quick;
+	_setcontext_quick;
+	_swapcontext_quick;
+	.curbrk;
+	.minbrk;
+	.cerror;
 };

@@ -35,12 +35,11 @@
  * $FreeBSD: src/sys/kern/kern_exit.c,v 1.92.2.11 2003/01/13 22:51:16 dillon Exp $
  */
 
-#include "opt_compat.h"
 #include "opt_ktrace.h"
 
 #include <sys/param.h>
 #include <sys/systm.h>
-#include <sys/sysproto.h>
+#include <sys/sysmsg.h>
 #include <sys/kernel.h>
 #include <sys/malloc.h>
 #include <sys/proc.h>
@@ -69,12 +68,9 @@
 #include <vm/pmap.h>
 #include <vm/vm_map.h>
 #include <vm/vm_extern.h>
-#include <sys/user.h>
 
 #include <sys/refcount.h>
-#include <sys/thread2.h>
-#include <sys/sysref2.h>
-#include <sys/mplock2.h>
+#include <sys/spinlock2.h>
 
 #include <machine/vmm.h>
 
@@ -102,6 +98,9 @@ static struct task *deadlwp_task[MAXCPU];
 static struct lwplist deadlwp_list[MAXCPU];
 static struct lwkt_token deadlwp_token[MAXCPU];
 
+void (*linux_task_drop_callback)(thread_t td);
+void (*linux_proc_drop_callback)(struct proc *p);
+
 /*
  * exit --
  *	Death of process.
@@ -109,7 +108,7 @@ static struct lwkt_token deadlwp_token[MAXCPU];
  * SYS_EXIT_ARGS(int rval)
  */
 int
-sys_exit(struct exit_args *uap)
+sys_exit(struct sysmsg *sysmsg, const struct exit_args *uap)
 {
 	exit1(W_EXITCODE(uap->rval, 0));
 	/* NOTREACHED */
@@ -120,7 +119,7 @@ sys_exit(struct exit_args *uap)
  *	Death of a lwp or process with optional bells and whistles.
  */
 int
-sys_extexit(struct extexit_args *uap)
+sys_extexit(struct sysmsg *sysmsg, const struct extexit_args *uap)
 {
 	struct proc *p = curproc;
 	int action, who;
@@ -184,22 +183,38 @@ sys_extexit(struct extexit_args *uap)
  *
  * If forexec is non-zero the current thread and process flags are
  * cleaned up so they can be reused.
- *
- * Caller must hold curproc->p_token
  */
 int
 killalllwps(int forexec)
 {
 	struct lwp *lp = curthread->td_lwp;
 	struct proc *p = lp->lwp_proc;
+	int fakestop;
 
 	/*
 	 * Interlock against P_WEXIT.  Only one of the process's thread
 	 * is allowed to do the master exit.
 	 */
-	if (p->p_flags & P_WEXIT)
+	lwkt_gettoken(&p->p_token);
+	if (p->p_flags & P_WEXIT) {
+		lwkt_reltoken(&p->p_token);
 		return (EALREADY);
+	}
 	p->p_flags |= P_WEXIT;
+	lwkt_gettoken(&lp->lwp_token);
+
+	/*
+	 * Set temporary stopped state in case we are racing a coredump.
+	 * Otherwise the coredump may hang forever.
+	 */
+	if (lp->lwp_mpflags & LWP_MP_WSTOP) {
+		fakestop = 0;
+	} else {
+		atomic_set_int(&lp->lwp_mpflags, LWP_MP_WSTOP);
+		++p->p_nstopped;
+		fakestop = 1;
+		wakeup(&p->p_nstopped);
+	}
 
 	/*
 	 * Interlock with LWP_MP_WEXIT and kill any remaining LWPs
@@ -207,6 +222,14 @@ killalllwps(int forexec)
 	atomic_set_int(&lp->lwp_mpflags, LWP_MP_WEXIT);
 	if (p->p_nthreads > 1)
 		killlwps(lp);
+
+	/*
+	 * Undo temporary stopped state
+	 */
+	if (fakestop && (lp->lwp_mpflags & LWP_MP_WSTOP)) {
+		atomic_clear_int(&lp->lwp_mpflags, LWP_MP_WSTOP);
+		--p->p_nstopped;
+	}
 
 	/*
 	 * If doing this for an exec, clean up the remaining thread
@@ -217,6 +240,9 @@ killalllwps(int forexec)
 		atomic_clear_int(&lp->lwp_mpflags, LWP_MP_WEXIT);
 		p->p_flags &= ~P_WEXIT;
 	}
+	lwkt_reltoken(&lp->lwp_token);
+	lwkt_reltoken(&p->p_token);
+
 	return(0);
 }
 
@@ -241,16 +267,18 @@ killlwps(struct lwp *lp)
 		LWPHOLD(tlp);
 		lwkt_gettoken(&tlp->lwp_token);
 		if ((tlp->lwp_mpflags & LWP_MP_WEXIT) == 0) {
-			lwpsignal(p, tlp, SIGKILL);
 			atomic_set_int(&tlp->lwp_mpflags, LWP_MP_WEXIT);
+			lwpsignal(p, tlp, SIGKILL);
 		}
 		lwkt_reltoken(&tlp->lwp_token);
 		LWPRELE(tlp);
 	}
 
 	/*
-	 * Wait for everything to clear out.
+	 * Wait for everything to clear out.  Also make sure any tstop()s
+	 * are signalled (we are holding p_token for the interlock).
 	 */
+	wakeup(p);
 	while (p->p_nthreads > 1)
 		tsleep(&p->p_nthreads, 0, "killlwps", 0);
 }
@@ -298,16 +326,17 @@ exit1(int rv)
 
 	/* are we a task leader? */
 	if (p == p->p_leader) {
-        	struct kill_args killArgs;
-		killArgs.signum = SIGKILL;
+		struct sysmsg sysmsg;
+
+		sysmsg.extargs.kill.signum = SIGKILL;
 		q = p->p_peers;
 		while(q) {
-			killArgs.pid = q->p_pid;
+			sysmsg.extargs.kill.pid = q->p_pid;
 			/*
 		         * The interface for kill is better
 			 * than the internal signal
 			 */
-			sys_kill(&killArgs);
+			sys_kill(&sysmsg, &sysmsg.extargs.kill);
 			q = q->p_peers;
 		}
 		while (p->p_peers) 
@@ -326,7 +355,6 @@ exit1(int rv)
 	 * XXX what if one of these generates an error?
 	 */
 	p->p_xstat = rv;
-	EVENTHANDLER_INVOKE(process_exit, p);
 
 	/*
 	 * XXX: imho, the eventhandler stuff is much cleaner than this.
@@ -341,7 +369,7 @@ exit1(int rv)
 	SIGEMPTYSET(p->p_siglist);
 	SIGEMPTYSET(lp->lwp_siglist);
 	if (timevalisset(&p->p_realtimer.it_value))
-		callout_stop_sync(&p->p_ithandle);
+		callout_terminate(&p->p_ithandle);
 
 	/*
 	 * Reset any sigio structures pointing to us as a result of
@@ -367,8 +395,6 @@ exit1(int rv)
 	 * XXX Shutdown SYSV semaphores
 	 */
 	semexit(p);
-
-	KKASSERT(p->p_numposixlocks == 0);
 
 	/* The next two chunks should probably be moved to vmspace_exit. */
 	vm = p->p_vmspace;
@@ -399,8 +425,15 @@ exit1(int rv)
 	 * the environment as it can, and the last process cleaned up
 	 * by vmspace_exit() (which decrements exitingcnt) cleans up the
 	 * remainder.
+	 *
+	 * NOTE: Releasing p_token around this call is helpful if the
+	 *	 vmspace had a huge RSS.  Otherwise some other process
+	 *	 trying to do an allproc or other scan (like 'ps') may
+	 *	 stall for a long time.
 	 */
+	lwkt_reltoken(&p->p_token);
 	vmspace_relexit(vm);
+	lwkt_gettoken(&p->p_token);
 
 	if (SESS_LEADER(p)) {
 		struct session *sp = p->p_session;
@@ -469,7 +502,7 @@ exit1(int rv)
 	 */
 	if (p->p_flags & P_PPWAIT) {
 		if (p->p_pptr && p->p_pptr->p_upmap)
-			p->p_pptr->p_upmap->invfork = 0;
+			atomic_add_int(&p->p_pptr->p_upmap->invfork, -1);
 		atomic_clear_int(&p->p_flags, P_PPWAIT);
 		wakeup(p->p_pptr);
 	}
@@ -522,6 +555,7 @@ exit1(int rv)
 			LIST_REMOVE(q, p_sibling);
 			LIST_INSERT_HEAD(&reproc->p_children, q, p_sibling);
 			q->p_pptr = reproc;
+			q->p_ppid = reproc->p_pid;
 			q->p_sigparent = SIGCHLD;
 
 			/*
@@ -540,11 +574,12 @@ exit1(int rv)
 	}
 
 	/*
-	 * Save exit status and final rusage info, adding in child rusage
-	 * info and self times.
+	 * Save exit status and final rusage info.  We no longer add
+	 * child rusage info into self times, wait4() and kern_wait()
+	 * handles it in order to properly support wait6().
 	 */
 	calcru_proc(p, &p->p_ru);
-	ruadd(&p->p_ru, &p->p_cru);
+	/*ruadd(&p->p_ru, &p->p_cru); REMOVED */
 
 	/*
 	 * notify interested parties of our demise.
@@ -593,7 +628,13 @@ exit1(int rv)
 	 *
 	 * Other substructures are freed from wait().
 	 */
-	plimit_free(p);
+	if (p->p_limit) {
+		struct plimit *rlimit;
+
+		rlimit = p->p_limit;
+		p->p_limit = NULL;
+		plimit_free(rlimit);
+	}
 
 	/*
 	 * Finally, call machine-dependent code to release as many of the
@@ -627,6 +668,12 @@ lwp_exit(int masterexit, void *waddr)
 	p->p_usched->release_curproc(lp);
 
 	/*
+	 * Destroy the per-thread shared page and remove from any pmaps
+	 * it resides in.
+	 */
+	lwp_userunmap(lp);
+
+	/*
 	 * lwp_exit() may be called without setting LWP_MP_WEXIT, so
 	 * make sure it is set here.
 	 */
@@ -647,13 +694,31 @@ lwp_exit(int masterexit, void *waddr)
 	 */
 	kqueue_terminate(&lp->lwp_kqueue);
 
+	if (td->td_linux_task)
+		linux_task_drop_callback(td);
+	if (masterexit && p->p_linux_mm)
+		linux_proc_drop_callback(p);
+
 	/*
-	 * Clean up any syscall-cached ucred
+	 * Clean up any syscall-cached ucred or rlimit.
 	 */
 	if (td->td_ucred) {
 		crfree(td->td_ucred);
 		td->td_ucred = NULL;
 	}
+	if (td->td_limit) {
+		struct plimit *rlimit;
+
+		rlimit = td->td_limit;
+		td->td_limit = NULL;
+		plimit_free(rlimit);
+        }
+
+	/*
+	 * Cleanup any cached descriptors for this thread
+	 */
+	if (p->p_fd)
+		fexitcache(td);
 
 	/*
 	 * Nobody actually wakes us when the lock
@@ -816,6 +881,7 @@ lwp_dispose(struct lwp *lp)
 	struct thread *td = lp->lwp_thread;
 
 	KKASSERT(lwkt_preempted_proc() != lp);
+	KKASSERT(lp->lwp_lock == 0);
 	KKASSERT(td->td_refs == 0);
 	KKASSERT((td->td_flags & (TDF_RUNNING |
 				  TDF_RUNQ |
@@ -834,43 +900,116 @@ lwp_dispose(struct lwp *lp)
 }
 
 int
-sys_wait4(struct wait_args *uap)
+sys_wait4(struct sysmsg *sysmsg, const struct wait_args *uap)
 {
-	struct rusage rusage;
-	int error, status;
+	struct __wrusage wrusage;
+	int error;
+	int status;
+	int options;
+	id_t id;
+	idtype_t idtype;
 
-	error = kern_wait(uap->pid, (uap->status ? &status : NULL),
-			  uap->options, (uap->rusage ? &rusage : NULL),
-			  &uap->sysmsg_result);
+	options = uap->options | WEXITED | WTRAPPED;
+	id = uap->pid;
+
+	if (id == WAIT_ANY) {
+		idtype = P_ALL;
+	} else if (id == WAIT_MYPGRP) {
+		idtype = P_PGID;
+		id = curproc->p_pgid;
+	} else if (id < 0) {
+		idtype = P_PGID;
+		id = -id;
+	} else {
+		idtype = P_PID;
+	}
+
+	error = kern_wait(idtype, id, &status, options, &wrusage,
+			  NULL, &sysmsg->sysmsg_result);
 
 	if (error == 0 && uap->status)
 		error = copyout(&status, uap->status, sizeof(*uap->status));
-	if (error == 0 && uap->rusage)
-		error = copyout(&rusage, uap->rusage, sizeof(*uap->rusage));
+	if (error == 0 && uap->rusage) {
+		ruadd(&wrusage.wru_self, &wrusage.wru_children);
+		error = copyout(&wrusage.wru_self, uap->rusage, sizeof(*uap->rusage));
+	}
+	return (error);
+}
+
+int
+sys_wait6(struct sysmsg *sysmsg, const struct wait6_args *uap)
+{
+	struct __wrusage wrusage;
+	siginfo_t info;
+	siginfo_t *infop;
+	int error;
+	int status;
+	int options;
+	id_t id;
+	idtype_t idtype;
+
+	/*
+	 * NOTE: wait6() requires WEXITED and WTRAPPED to be specified if
+	 *	 desired.
+	 */
+	options = uap->options;
+	idtype = uap->idtype;
+	id = uap->id;
+	infop = uap->info ? &info : NULL;
+
+	switch(idtype) {
+	case P_PID:
+	case P_PGID:
+		if (id == WAIT_MYPGRP) {
+			idtype = P_PGID;
+			id = curproc->p_pgid;
+		}
+		break;
+	default:
+		/* let kern_wait deal with the remainder */
+		break;
+	}
+
+	error = kern_wait(idtype, id, &status, options,
+			  &wrusage, infop, &sysmsg->sysmsg_result);
+
+	if (error == 0 && uap->status)
+		error = copyout(&status, uap->status, sizeof(*uap->status));
+	if (error == 0 && uap->wrusage)
+		error = copyout(&wrusage, uap->wrusage, sizeof(*uap->wrusage));
+	if (error == 0 && uap->info)
+		error = copyout(&info, uap->info, sizeof(*uap->info));
 	return (error);
 }
 
 /*
- * wait1()
- *
- * wait_args(int pid, int *status, int options, struct rusage *rusage)
+ * kernel wait*() system call support
  */
 int
-kern_wait(pid_t pid, int *status, int options, struct rusage *rusage, int *res)
+kern_wait(idtype_t idtype, id_t id, int *status, int options,
+	  struct __wrusage *wrusage, siginfo_t *info, int *res)
 {
 	struct thread *td = curthread;
 	struct lwp *lp;
 	struct proc *q = td->td_proc;
 	struct proc *p, *t;
+	struct ucred *cr;
 	struct pargs *pa;
 	struct sigacts *ps;
 	int nfound, error;
 	long waitgen;
 
-	if (pid == 0)
-		pid = -q->p_pgid;
-	if (options &~ (WUNTRACED|WNOHANG|WCONTINUED|WLINUXCLONE))
+	/*
+	 * Must not have extraneous options.  Must have at least one
+	 * matchable option.
+	 */
+	if (options &~ (WUNTRACED|WNOHANG|WCONTINUED|WLINUXCLONE|WSTOPPED|
+			WEXITED|WTRAPPED|WNOWAIT)) {
 		return (EINVAL);
+	}
+	if ((options & (WEXITED | WUNTRACED | WCONTINUED | WTRAPPED)) == 0) {
+		return (EINVAL);
+	}
 
 	/*
 	 * Protect the q->p_children list
@@ -892,8 +1031,10 @@ loop:
 	 * was handled within tsleep(), and the parent would only see
 	 * the CONT when both are stopped and continued together.  This little
 	 * two-line hack restores this effect.
+	 *
+	 * No locks are held so we can safely block the process here.
 	 */
-	while (q->p_stat == SSTOP)
+	if (STOPLWP(q, td->td_lwp))
             tstop();
 
 	nfound = 0;
@@ -907,10 +1048,66 @@ loop:
 	 */
 	waitgen = atomic_fetchadd_long(&q->p_waitgen, 0x80000000);
 	LIST_FOREACH(p, &q->p_children, p_sibling) {
-		if (pid != WAIT_ANY &&
-		    p->p_pid != pid && p->p_pgid != -pid) {
+		/*
+		 * Skip children that another thread is already uninterruptably
+		 * reaping.
+		 */
+		if (PWAITRES_PENDING(p))
+			continue;
+
+		/*
+		 * Filter, (p) will be held on fall-through.  Try to optimize
+		 * this to avoid the atomic op until we are pretty sure we
+		 * want this process.
+		 */
+		switch(idtype) {
+		case P_ALL:
+			PHOLD(p);
+			break;
+		case P_PID:
+			if (p->p_pid != (pid_t)id)
+				continue;
+			PHOLD(p);
+			break;
+		case P_PGID:
+			if (p->p_pgid != (pid_t)id)
+				continue;
+			PHOLD(p);
+			break;
+		case P_SID:
+			PHOLD(p);
+			if (p->p_session && p->p_session->s_sid != (pid_t)id) {
+				PRELE(p);
+				continue;
+			}
+			break;
+		case P_UID:
+			PHOLD(p);
+			if (p->p_ucred->cr_uid != (uid_t)id) {
+				PRELE(p);
+				continue;
+			}
+			break;
+		case P_GID:
+			PHOLD(p);
+			if (p->p_ucred->cr_gid != (gid_t)id) {
+				PRELE(p);
+				continue;
+			}
+			break;
+		case P_JAILID:
+			PHOLD(p);
+			if (p->p_ucred->cr_prison &&
+			    p->p_ucred->cr_prison->pr_id != (int)id) {
+				PRELE(p);
+				continue;
+			}
+			break;
+		default:
+			/* unsupported filter */
 			continue;
 		}
+		/* (p) is held at this point */
 
 		/*
 		 * This special case handles a kthread spawned by linux_clone
@@ -922,11 +1119,12 @@ loop:
 		 */
 		if ((p->p_sigparent != SIGCHLD) ^ 
 		    ((options & WLINUXCLONE) != 0)) {
+			PRELE(p);
 			continue;
 		}
 
 		nfound++;
-		if (p->p_stat == SZOMB) {
+		if (p->p_stat == SZOMB && (options & WEXITED)) {
 			/*
 			 * We may go into SZOMB with threads still present.
 			 * We must wait for them to exit before we can reap
@@ -934,22 +1132,31 @@ loop:
 			 * non-master threads.
 			 *
 			 * Only this routine can remove a process from
-			 * the zombie list and destroy it, use PACQUIREZOMB()
-			 * to serialize us and loop if it blocks (interlocked
-			 * by the parent's q->p_token).
+			 * the zombie list and destroy it.
 			 *
-			 * WARNING!  (p) can be invalid when PHOLDZOMB(p)
-			 *	     returns non-zero.  Be sure not to
-			 *	     mess with it.
+			 * This function will fail after sleeping if another
+			 * thread owns the zombie lock.  This function will
+			 * fail immediately or after sleeping if another
+			 * thread owns or obtains ownership of the reap via
+			 * WAITRES.
 			 */
-			if (PHOLDZOMB(p))
+			if (PHOLDZOMB(p)) {
+				PRELE(p);
 				goto loop;
+			}
 			lwkt_gettoken(&p->p_token);
 			if (p->p_pptr != q) {
 				lwkt_reltoken(&p->p_token);
+				PRELE(p);
 				PRELEZOMB(p);
 				goto loop;
 			}
+
+			/*
+			 * We are the reaper, from this point on the reap
+			 * cannot be aborted.
+			 */
+			PWAITRES_SET(p);
 			while (p->p_nthreads > 0) {
 				tsleep(&p->p_nthreads, 0, "lwpzomb", hz);
 			}
@@ -964,6 +1171,14 @@ loop:
 			 * be zero.
 			 */
 			while ((lp = RB_ROOT(&p->p_lwp_tree)) != NULL) {
+				/*
+				 * Make sure no one is using this lwp, before
+				 * it is removed from the tree.  If we didn't
+				 * wait it here, lwp tree iteration with
+				 * blocking operation would be broken.
+				 */
+				while (lp->lwp_lock > 0)
+					tsleep(lp, 0, "zomblwp", 1);
 				lwp_rb_tree_RB_REMOVE(&p->p_lwp_tree, lp);
 				reaplwp(lp);
 			}
@@ -980,31 +1195,56 @@ loop:
 			 * put a hold on the process for short periods of
 			 * time.
 			 */
-			PRELE(p);
-			PSTALL(p, "reap3", 0);
+			PRELE(p);		/* from top of loop */
+			PSTALL(p, "reap3", 1);	/* 1 ref (for PZOMBHOLD) */
 
 			/* Take care of our return values. */
 			*res = p->p_pid;
 
-			if (status)
-				*status = p->p_xstat;
-			if (rusage)
-				*rusage = p->p_ru;
+			*status = p->p_xstat;
+			wrusage->wru_self = p->p_ru;
+			wrusage->wru_children = p->p_cru;
+
+			if (info) {
+				bzero(info, sizeof(*info));
+				info->si_errno = 0;
+				info->si_signo = SIGCHLD;
+				if (WIFEXITED(p->p_xstat)) {
+					info->si_code = CLD_EXITED;
+					info->si_status =
+						WEXITSTATUS(p->p_xstat);
+				} else {
+					info->si_code = CLD_KILLED;
+					info->si_status = WTERMSIG(p->p_xstat);
+				}
+				info->si_pid = p->p_pid;
+				info->si_uid = p->p_ucred->cr_uid;
+			}
+
+			/*
+			 * WNOWAIT shortcuts to done here, leaving the
+			 * child on the zombie list.
+			 */
+			if (options & WNOWAIT) {
+				lwkt_reltoken(&p->p_token);
+				PRELEZOMB(p);
+				error = 0;
+				goto done;
+			}
 
 			/*
 			 * If we got the child via a ptrace 'attach',
 			 * we need to give it back to the old parent.
 			 */
 			if (p->p_oppid && (t = pfind(p->p_oppid)) != NULL) {
-				PHOLD(p);
 				p->p_oppid = 0;
 				proc_reparent(p, t);
 				ksignal(t, SIGCHLD);
 				wakeup((caddr_t)t);
-				error = 0;
 				PRELE(t);
 				lwkt_reltoken(&p->p_token);
 				PRELEZOMB(p);
+				error = 0;
 				goto done;
 			}
 
@@ -1021,6 +1261,7 @@ loop:
 
 			p->p_xstat = 0;
 			ruadd(&q->p_cru, &p->p_ru);
+			ruadd(&q->p_cru, &p->p_cru);
 
 			/*
 			 * Decrement the count of procs running with this uid.
@@ -1028,10 +1269,14 @@ loop:
 			chgproccnt(p->p_ucred->cr_ruidinfo, -1, 0);
 
 			/*
-			 * Free up credentials.
+			 * Free up credentials.  p_spin is required to
+			 * avoid races against allproc scans.
 			 */
-			crfree(p->p_ucred);
+			spin_lock(&p->p_spin);
+			cr = p->p_ucred;
 			p->p_ucred = NULL;
+			spin_unlock(&p->p_spin);
+			crfree(cr);
 
 			/*
 			 * Remove unused arguments
@@ -1057,33 +1302,46 @@ loop:
 			 * to safely destroy its vmspace.  Wait for any current
 			 * holders to go away (so the vmspace remains stable),
 			 * then scrap it.
+			 *
+			 * NOTE: Releasing the parent process (q) p_token
+			 *	 across the vmspace_exitfree() call is
+			 *	 important here to reduce stalls on
+			 *	 interactions with (q) (such as
+			 *	 fork/exec/wait or 'ps').
 			 */
-			PSTALL(p, "reap4", 0);
+			PSTALL(p, "reap4", 1);
+			lwkt_reltoken(&q->p_token);
 			vmspace_exitfree(p);
-			PSTALL(p, "reap5", 0);
+			lwkt_gettoken(&q->p_token);
+			PSTALL(p, "reap5", 1);
 
 			/*
 			 * NOTE: We have to officially release ZOMB in order
 			 *	 to ensure that a racing thread in kern_wait()
 			 *	 which blocked on ZOMB is woken up.
 			 */
-			PHOLD(p);
 			PRELEZOMB(p);
+			kfree(p->p_uidpcpu, M_SUBPROC);
 			kfree(p, M_PROC);
 			atomic_add_int(&nprocs, -1);
 			error = 0;
 			goto done;
 		}
-		if (p->p_stat == SSTOP && (p->p_flags & P_WAITED) == 0 &&
-		    ((p->p_flags & P_TRACED) || (options & WUNTRACED))) {
-			PHOLD(p);
+
+		/*
+		 * Process has not yet exited
+		 */
+		if ((p->p_stat == SSTOP || p->p_stat == SCORE) &&
+		    (p->p_flags & P_WAITED) == 0 &&
+		    (((p->p_flags & P_TRACED) && (options & WTRAPPED)) ||
+		     (options & WSTOPPED))) {
 			lwkt_gettoken(&p->p_token);
 			if (p->p_pptr != q) {
 				lwkt_reltoken(&p->p_token);
 				PRELE(p);
 				goto loop;
 			}
-			if (p->p_stat != SSTOP ||
+			if ((p->p_stat != SSTOP && p->p_stat != SCORE) ||
 			    (p->p_flags & P_WAITED) != 0 ||
 			    ((p->p_flags & P_TRACED) == 0 &&
 			     (options & WUNTRACED) == 0)) {
@@ -1092,21 +1350,31 @@ loop:
 				goto loop;
 			}
 
-			p->p_flags |= P_WAITED;
+			/*
+			 * Don't set P_WAITED if WNOWAIT specified, leaving
+			 * the process in a waitable state.
+			 */
+			if ((options & WNOWAIT) == 0)
+				p->p_flags |= P_WAITED;
 
 			*res = p->p_pid;
-			if (status)
-				*status = W_STOPCODE(p->p_xstat);
+			*status = W_STOPCODE(p->p_xstat);
 			/* Zero rusage so we get something consistent. */
-			if (rusage)
-				bzero(rusage, sizeof(*rusage));
+			bzero(wrusage, sizeof(*wrusage));
 			error = 0;
+			if (info) {
+				bzero(info, sizeof(*info));
+				if (p->p_flags & P_TRACED)
+					info->si_code = CLD_TRAPPED;
+				else
+					info->si_code = CLD_STOPPED;
+				info->si_status = WSTOPSIG(p->p_xstat);
+			}
 			lwkt_reltoken(&p->p_token);
 			PRELE(p);
 			goto done;
 		}
 		if ((options & WCONTINUED) && (p->p_flags & P_CONTINUED)) {
-			PHOLD(p);
 			lwkt_gettoken(&p->p_token);
 			if (p->p_pptr != q) {
 				lwkt_reltoken(&p->p_token);
@@ -1120,15 +1388,26 @@ loop:
 			}
 
 			*res = p->p_pid;
-			p->p_flags &= ~P_CONTINUED;
 
-			if (status)
-				*status = SIGCONT;
+			/*
+			 * Don't set P_WAITED if WNOWAIT specified, leaving
+			 * the process in a waitable state.
+			 */
+			if ((options & WNOWAIT) == 0)
+				p->p_flags &= ~P_CONTINUED;
+
+			*status = SIGCONT;
 			error = 0;
+			if (info) {
+				bzero(info, sizeof(*info));
+				info->si_code = CLD_CONTINUED;
+				info->si_status = WSTOPSIG(p->p_xstat);
+			}
 			lwkt_reltoken(&p->p_token);
 			PRELE(p);
 			goto done;
 		}
+		PRELE(p);
 	}
 	if (nfound == 0) {
 		error = ECHILD;
@@ -1195,6 +1474,7 @@ proc_reparent(struct proc *child, struct proc *parent)
 		LIST_REMOVE(child, p_sibling);
 		LIST_INSERT_HEAD(&parent->p_children, child, p_sibling);
 		child->p_pptr = parent;
+		child->p_ppid = parent->p_pid;
 		lwkt_reltoken(&parent->p_token);
 		lwkt_reltoken(&child->p_token);
 		lwkt_reltoken(&opp->p_token);

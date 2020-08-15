@@ -43,6 +43,10 @@
 #define	LIBSTAND	1
 #endif
 
+#ifndef DEBUG
+#define	DEBUG		0
+#endif
+
 #ifdef BOOT2
 #include "boot2.h"
 #else
@@ -326,7 +330,7 @@ hammer_directory_namekey(const void *name __unused, int len __unused)
  * Misc
  */
 static u_int32_t
-hammer_to_unix_xid(uuid_t *uuid)
+hammer_to_unix_xid(hammer_uuid_t *uuid)
 {
 	return(*(u_int32_t *)&uuid->node[2]);
 }
@@ -647,7 +651,7 @@ hresolve(struct hfs *hfs, ino_t dirino, const char *name)
 			return (ed->entry.obj_id);
 	}
 
-#if BOOT2
+#ifdef BOOT2
 	if (ls == 2)
 		printf("\n");
 #endif
@@ -870,7 +874,7 @@ hinit(struct hfs *hfs)
 		       volhead->vol_signature != HAMMER_FSBUF_VOLUME ?
 				"in" :
 				"");
-		printf("name: %s\n", volhead->vol_name);
+		printf("name: %s\n", volhead->vol_label);
 	}
 #endif
 
@@ -929,7 +933,7 @@ hammer_open(const char *path, struct open_file *f)
 	}
 
 #if DEBUG
-	printf("hammer_open %s %p %ld\n", path, f);
+	printf("hammer_open %s %p\n", path, f);
 #endif
 
 	hf->ino = hlookup(&hf->hfs, path);

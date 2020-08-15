@@ -38,7 +38,6 @@
 #include <sys/systm.h>
 #include <sys/proc.h>
 #include <sys/mount.h>
-#include <sys/namei.h>
 #include <sys/vnode.h>
 #include <sys/malloc.h>
 #include <sys/kernel.h>
@@ -53,11 +52,12 @@
 
 static MALLOC_DEFINE(M_NFSNODE, "NFS node", "NFS node");
 
-static struct objcache *nfsnode_objcache;
-static LIST_HEAD(nfsnodehashhead, nfsnode) *nfsnodehashtbl;
-static u_long nfsnodehash;
-static lwkt_token nfsnhash_token = LWKT_TOKEN_INITIALIZER(nfsnhash_token);
+static struct lwkt_token nfsnhash_token =
+			LWKT_TOKEN_INITIALIZER(nfsnhash_token);
 static struct lock nfsnhash_lock;
+__read_mostly static struct objcache *nfsnode_objcache;
+__read_mostly static LIST_HEAD(nfsnodehashhead, nfsnode) *nfsnodehashtbl;
+__read_mostly static u_long nfsnodehash;
 
 #define TRUE	1
 #define	FALSE	0
@@ -71,9 +71,19 @@ static struct lock nfsnhash_lock;
 void
 nfs_nhinit(void)
 {
-	nfsnode_objcache = objcache_create_simple(M_NFSNODE, sizeof(struct nfsnode));
-	nfsnodehashtbl = hashinit(desiredvnodes, M_NFSHASH, &nfsnodehash);
+	int hsize = vfs_inodehashsize();
+
+	nfsnode_objcache = objcache_create_simple(M_NFSNODE,
+						  sizeof(struct nfsnode));
+	nfsnodehashtbl = hashinit(hsize, M_NFSHASH, &nfsnodehash);
 	lockinit(&nfsnhash_lock, "nfsnht", 0, 0);
+}
+
+void
+nfs_nhdestroy(void)
+{
+	hashdestroy(nfsnodehashtbl, M_NFSHASH, nfsnodehash);
+	objcache_destroy(nfsnode_objcache);
 }
 
 /*
@@ -208,6 +218,7 @@ loop:
 	*npp = np;
 	lockmgr(&nfsnhash_lock, LK_RELEASE);
 	lwkt_reltoken(&nfsnhash_token);
+	vx_downgrade(vp);
 
 	return (0);
 }
@@ -358,6 +369,7 @@ loop:
 	*npp = np;
 	error = 0;
 	lockmgr(&nfsnhash_lock, LK_RELEASE);
+	vx_downgrade(vp);
 fail:
 	lwkt_reltoken(&nfsnhash_token);
 	return (error);
@@ -406,6 +418,8 @@ nfs_inactive(struct vop_inactive_args *ap)
 	}
 
 	np->n_flag &= ~(NWRITEERR | NACC | NUPD | NCHG | NLOCKED | NWANTED);
+	if (np->n_flag & NREMOVED)
+		vrecycle(ap->a_vp);
 	lwkt_reltoken(&nmp->nm_token);
 
 	return (0);

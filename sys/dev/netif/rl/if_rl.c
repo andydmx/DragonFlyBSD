@@ -97,7 +97,6 @@
 #include <sys/serialize.h>
 #include <sys/bus.h>
 #include <sys/rman.h>
-#include <sys/thread2.h>
 #include <sys/interrupt.h>
 
 #include <net/if.h>
@@ -1066,7 +1065,7 @@ rl_rxeof(struct rl_softc *sc)
 			 * the data.
 			 */
 			m = m_devget(rxbufpos - RL_ETHER_ALIGN,
-			    wrap + RL_ETHER_ALIGN, 0, ifp, NULL);
+				     wrap + RL_ETHER_ALIGN, 0, ifp);
 			if (m == NULL) {
 				IFNET_STAT_INC(ifp, ierrors, 1);
 			} else {
@@ -1077,7 +1076,7 @@ rl_rxeof(struct rl_softc *sc)
 			cur_rx = (total_len - wrap + ETHER_CRC_LEN);
 		} else {
 			m = m_devget(rxbufpos - RL_ETHER_ALIGN,
-			    total_len + RL_ETHER_ALIGN, 0, ifp, NULL);
+				     total_len + RL_ETHER_ALIGN, 0, ifp);
 			if (m == NULL) {
 				IFNET_STAT_INC(ifp, ierrors, 1);
 			} else
@@ -1300,7 +1299,7 @@ rl_encap(struct rl_softc *sc, struct mbuf *m_head)
 	 * TX buffers, plus we can only have one fragment buffer
 	 * per packet.  We have to copy pretty much all the time.
 	 */
-	m_new = m_defrag(m_head, MB_DONTWAIT);
+	m_new = m_defrag(m_head, M_NOWAIT);
 	if (m_new == NULL) {
 		m_freem(m_head);
 		return ENOBUFS;

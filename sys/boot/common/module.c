@@ -24,7 +24,6 @@
  * SUCH DAMAGE.
  *
  * $FreeBSD: src/sys/boot/common/module.c,v 1.25 2003/08/25 23:30:41 obrien Exp $
- * $DragonFly: src/sys/boot/common/module.c,v 1.6 2008/09/02 17:21:12 dillon Exp $
  */
 
 /*
@@ -37,6 +36,9 @@
 #include <sys/linker.h>
 #include <sys/module.h>
 #include <sys/queue.h>
+#ifndef EFI
+#include "libi386/libi386.h"
+#endif
 
 #include "bootstrap.h"
 
@@ -67,6 +69,7 @@ static void			moduledir_rebuild(void);
 static vm_offset_t	loadaddr = 0;
 
 static const char	*default_searchpath ="modules;KERNEL";
+static const char	*local_module_path = "../modules.local";
 
 static STAILQ_HEAD(, moduledir) moduledir_list = STAILQ_HEAD_INITIALIZER(moduledir_list);
 
@@ -119,7 +122,7 @@ command_load(int argc, char *argv[])
 {
     char	*typestr;
     int		dofile, dokld, ch, error;
-    
+
     dokld = dofile = 0;
     optind = 1;
     optreset = 1;
@@ -161,16 +164,20 @@ command_load(int argc, char *argv[])
      */
     if (dokld || file_havepath(argv[1])) {
 	error = mod_loadkld(argv[1], argc - 2, argv + 2);
-	if (error == EEXIST)
-	    sprintf(command_errbuf, "warning: KLD '%s' already loaded", argv[1]);
+	if (error == EEXIST) {
+	    snprintf(command_errbuf, sizeof(command_errbuf),
+		"warning: KLD '%s' already loaded", argv[1]);
+	}
 	return (error == 0 ? CMD_OK : CMD_ERROR);
     }
     /*
      * Looks like a request for a module.
      */
     error = mod_load(argv[1], NULL, argc - 2, argv + 2);
-    if (error == EEXIST)
-	sprintf(command_errbuf, "warning: module '%s' already loaded", argv[1]);
+    if (error == EEXIST) {
+	snprintf(command_errbuf, sizeof(command_errbuf),
+	    "warning: module '%s' already loaded", argv[1]);
+    }
     return (error == 0 ? CMD_OK : CMD_ERROR);
 }
 
@@ -180,7 +187,7 @@ static int
 command_unload(int argc, char *argv[])
 {
     struct preloaded_file	*fp;
-    
+
     while (preloaded_files != NULL) {
 	fp = preloaded_files;
 	preloaded_files = preloaded_files->f_next;
@@ -219,16 +226,16 @@ command_crc(int argc, char *argv[])
 	    /* locate the file on the load path */
 	    cp = file_search(argv[i], NULL);
 	    if (cp == NULL) {
-		sprintf(command_errbuf, "can't find '%s'", argv[i]);
+		snprintf(command_errbuf, sizeof(command_errbuf),
+		    "can't find '%s'", argv[i]);
 		error = CMD_ERROR;
 		break;
 	    }
 	    name = cp;
 
 	    if ((fd = rel_open(name, NULL, O_RDONLY)) < 0) {
-		sprintf(command_errbuf,
-			"can't open '%s': %s",
-			name, strerror(errno));
+		snprintf(command_errbuf, sizeof(command_errbuf),
+		    "can't open '%s': %s", name, strerror(errno));
 		free(name);
 		error = CMD_ERROR;
 		break;
@@ -244,7 +251,7 @@ command_crc(int argc, char *argv[])
 				name, strerror(errno));
 			break;
 		}
-		if (got == 0)
+		if (crc == 0)
 			crc = iscsi_crc32(buf, got);
 		else
 			crc = iscsi_crc32_ext(buf, got, crc);
@@ -288,7 +295,7 @@ command_lsmod(int argc, char *argv[])
 
     pager_open();
     for (fp = preloaded_files; fp; fp = fp->f_next) {
-	sprintf(lbuf, " %p: %s (%s, 0x%lx)\n", 
+	sprintf(lbuf, " %p: %s (%s, 0x%lx)\n",
 		(void *) fp->f_addr, fp->f_name, fp->f_type, (long) fp->f_size);
 	pager_output(lbuf);
 	if (fp->f_args != NULL) {
@@ -337,8 +344,8 @@ file_load(char *filename, vm_offset_t dest, struct preloaded_file **result)
 	if (error == EFTYPE)
 	    continue;		/* Unknown to this handler? */
 	if (error) {
-	    sprintf(command_errbuf, "can't load file '%s': %s",
-		filename, strerror(error));
+	    snprintf(command_errbuf, sizeof(command_errbuf),
+		"can't load file '%s': %s", filename, strerror(error));
 	    break;
 	}
     }
@@ -346,7 +353,8 @@ file_load(char *filename, vm_offset_t dest, struct preloaded_file **result)
 }
 
 static int
-file_load_dependencies(struct preloaded_file *base_file) {
+file_load_dependencies(struct preloaded_file *base_file)
+{
     struct file_metadata *md;
     struct preloaded_file *fp;
     struct mod_depend *verinfo;
@@ -373,8 +381,8 @@ file_load_dependencies(struct preloaded_file *base_file) {
 	     */
 	    mp = file_findmodule(NULL, dmodname, verinfo);
 	    if (mp == NULL) {
-		sprintf(command_errbuf, "module '%s' exists but with wrong version",
-		    dmodname);
+		snprintf(command_errbuf, sizeof(command_errbuf),
+		    "module '%s' exists but with wrong version", dmodname);
 		error = ENOENT;
 		break;
 	    }
@@ -391,6 +399,7 @@ file_load_dependencies(struct preloaded_file *base_file) {
     }
     return (error);
 }
+
 /*
  * We've been asked to load (name) as (type), so just suck it in,
  * no arguments or anything.
@@ -412,13 +421,15 @@ file_loadraw(char *type, char *name)
     /* locate the file on the load path */
     cp = file_search(name, NULL);
     if (cp == NULL) {
-	sprintf(command_errbuf, "can't find '%s'", name);
+	snprintf(command_errbuf, sizeof(command_errbuf),
+	    "can't find '%s'", name);
 	return(CMD_ERROR);
     }
     name = cp;
-    
+
     if ((fd = rel_open(name, NULL, O_RDONLY)) < 0) {
-	sprintf(command_errbuf, "can't open '%s': %s", name, strerror(errno));
+	snprintf(command_errbuf, sizeof(command_errbuf),
+	    "can't open '%s': %s", name, strerror(errno));
 	free(name);
 	return(CMD_ERROR);
     }
@@ -426,18 +437,28 @@ file_loadraw(char *type, char *name)
     laddr = loadaddr;
     for (;;) {
 	/* read in 4k chunks; size is not really important */
+#ifndef EFI
+	if (laddr + 4096 > heapbase) {
+	    snprintf(command_errbuf, sizeof(command_errbuf),
+		"error reading '%s': out of load memory", name);
+	    free(name);
+	    close(fd);
+	    return(CMD_ERROR);
+	}
+#endif
 	got = archsw.arch_readin(fd, laddr, 4096);
 	if (got == 0)				/* end of file */
 	    break;
 	if (got < 0) {				/* error */
-	    sprintf(command_errbuf, "error reading '%s': %s", name, strerror(errno));
+	    snprintf(command_errbuf, sizeof(command_errbuf),
+		"error reading '%s': %s", name, strerror(errno));
 	    free(name);
 	    close(fd);
 	    return(CMD_ERROR);
 	}
 	laddr += got;
     }
-    
+
     /* Looks OK so far; create & populate control structure */
     fp = file_alloc();
     fp->f_name = name;
@@ -481,13 +502,15 @@ mod_load(char *modname, struct mod_depend *verinfo, int argc, char *argv[])
 	    free(mp->m_args);
 	mp->m_args = unargv(argc, argv);
 #endif
-	sprintf(command_errbuf, "warning: module '%s' already loaded", mp->m_name);
+	snprintf(command_errbuf, sizeof(command_errbuf),
+	    "warning: module '%s' already loaded", mp->m_name);
 	return (0);
     }
     /* locate file with the module on the search path */
     filename = mod_searchmodule(modname, verinfo);
     if (filename == NULL) {
-	sprintf(command_errbuf, "can't find '%s'", modname);
+	snprintf(command_errbuf, sizeof(command_errbuf),
+	    "can't find '%s'", modname);
 	return (ENOENT);
     }
     err = mod_loadkld(filename, argc, argv);
@@ -510,19 +533,21 @@ mod_loadkld(const char *kldname, int argc, char *argv[])
      */
     filename = file_search(kldname, kld_ext_list);
     if (filename == NULL) {
-	sprintf(command_errbuf, "can't find '%s'", kldname);
+	snprintf(command_errbuf, sizeof(command_errbuf),
+	    "can't find '%s'", kldname);
 	return (ENOENT);
     }
-    /* 
+    /*
      * Check if KLD already loaded
      */
     fp = file_findfile(filename, NULL);
     if (fp) {
-	sprintf(command_errbuf, "warning: KLD '%s' already loaded", filename);
+	snprintf(command_errbuf, sizeof(command_errbuf),
+	    "warning: KLD '%s' already loaded", filename);
 	free(filename);
 	return (0);
     }
-    for (last_file = preloaded_files; 
+    for (last_file = preloaded_files;
 	 last_file != NULL && last_file->f_next != NULL;
 	 last_file = last_file->f_next)
 	;
@@ -543,7 +568,8 @@ mod_loadkld(const char *kldname, int argc, char *argv[])
 	}
     } while(0);
     if (err == EFTYPE)
-	sprintf(command_errbuf, "don't know how to load module '%s'", filename);
+	snprintf(command_errbuf, sizeof(command_errbuf),
+	    "don't know how to load module '%s'", filename);
     if (err && fp)
 	file_discard(fp);
     free(filename);
@@ -581,7 +607,7 @@ file_findmodule(struct preloaded_file *fp, char *modname,
     if (fp == NULL) {
 	for (fp = preloaded_files; fp; fp = fp->f_next) {
 	    mp = file_findmodule(fp, modname, verinfo);
-    	    if (mp)
+	    if (mp)
 		return (mp);
 	}
 	return (NULL);
@@ -595,7 +621,7 @@ file_findmodule(struct preloaded_file *fp, char *modname,
 	    mver = mp->m_version;
 	    if (mver == verinfo->md_ver_preferred)
 		return (mp);
-	    if (mver >= verinfo->md_ver_minimum && 
+	    if (mver >= verinfo->md_ver_minimum &&
 		mver <= verinfo->md_ver_maximum &&
 		mver > bestver) {
 		best = mp;
@@ -657,17 +683,14 @@ file_lookup(const char *path, const char *name, int namelen, char **extlist)
 {
     struct stat	st;
     char	*result, *cp, **cpp;
-    int		pathlen, extlen, len;
+    size_t	pathlen, extlen;
 
     pathlen = strlen(path);
     extlen = 0;
     if (extlist == NULL)
 	extlist = emptyextlist;
-    for (cpp = extlist; *cpp; cpp++) {
-	len = strlen(*cpp);
-	if (len > extlen)
-	    extlen = len;
-    }
+    for (cpp = extlist; *cpp; cpp++)
+	extlen = MAX(extlen, strlen(*cpp));
     result = malloc(pathlen + namelen + extlen + 2 + 7 + 1);
     if (result == NULL)
 	return (NULL);
@@ -759,8 +782,8 @@ file_search(const char *name, char **extlist)
     return(result);
 }
 
-#define	INT_ALIGN(base, ptr)	ptr = \
-	(base) + (((ptr) - (base) + sizeof(int) - 1) & ~(sizeof(int) - 1))
+#define	INT_ALIGN(base, ptr) \
+	ptr = (base) + roundup2((ptr) - (base), sizeof(int))
 
 static char *
 mod_search_hints(struct moduledir *mdp, const char *modname,
@@ -800,7 +823,7 @@ mod_search_hints(struct moduledir *mdp, const char *modname,
 		found = 1;
 		break;
 	    }
-	    if (ival >= verinfo->md_ver_minimum && 
+	    if (ival >= verinfo->md_ver_minimum &&
 		ival <= verinfo->md_ver_maximum &&
 		ival > bestver) {
 		bestver = ival;
@@ -902,7 +925,7 @@ file_discard(struct preloaded_file *fp)
 	mp1 = mp;
 	mp = mp->m_next;
 	free(mp1);
-    }	
+    }
     if (fp->f_name != NULL)
 	free(fp->f_name);
     if (fp->f_type != NULL)
@@ -920,7 +943,7 @@ struct preloaded_file *
 file_alloc(void)
 {
     struct preloaded_file	*fp;
-    
+
     if ((fp = malloc(sizeof(struct preloaded_file))) != NULL) {
 	bzero(fp, sizeof(struct preloaded_file));
     }
@@ -934,7 +957,7 @@ static void
 file_insert_tail(struct preloaded_file *fp)
 {
     struct preloaded_file	*cm;
-    
+
     /* Append to list of loaded file */
     fp->f_next = NULL;
     if (preloaded_files == NULL) {
@@ -973,7 +996,8 @@ moduledir_readhints(struct moduledir *mdp)
     if (mdp->d_hints != NULL || (mdp->d_flags & MDIR_NOHINTS))
 	return;
     path = moduledir_fullpath(mdp, "linker.hints");
-    if (rel_stat(path, &st) != 0 || st.st_size < (sizeof(version) + sizeof(int)) ||
+    if (rel_stat(path, &st) != 0 ||
+	st.st_size < (ssize_t)(sizeof(version) + sizeof(int)) ||
 	st.st_size > 100 * 1024 || (fd = rel_open(path, NULL, O_RDONLY)) < 0) {
 	free(path);
 	mdp->d_flags |= MDIR_NOHINTS;
@@ -999,7 +1023,6 @@ bad:
 	mdp->d_hints = NULL;
     }
     mdp->d_flags |= MDIR_NOHINTS;
-    return;
 }
 
 /*
@@ -1009,8 +1032,8 @@ static void
 moduledir_rebuild(void)
 {
     struct	moduledir *mdp, *mtmp;
-    const char	*path, *cp, *ep;
-    int		cplen;
+    const char	*path, *cp, *ep, *modlocal;
+    size_t	cplen;
 
     path = getenv("module_path");
     if (path == NULL)
@@ -1031,7 +1054,7 @@ moduledir_rebuild(void)
 	for (cplen = ep - cp; cplen > 1 && cp[cplen - 1] == '/'; cplen--)
 	    ;
 	STAILQ_FOREACH(mdp, &moduledir_list, d_link) {
-	    if (strlen(mdp->d_path) != cplen ||	bcmp(cp, mdp->d_path, cplen) != 0)
+	    if (strlen(mdp->d_path) != cplen || bcmp(cp, mdp->d_path, cplen) != 0)
 		continue;
 	    mdp->d_flags &= ~MDIR_REMOVED;
 	    break;
@@ -1051,6 +1074,31 @@ moduledir_rebuild(void)
 	    break;
     }
     /*
+     * Include modules.local if requested
+     */
+    modlocal = getenv("local_modules");
+    if (modlocal != NULL && strcmp(modlocal, "YES") == 0) {
+	cp = local_module_path;
+	cplen = strlen(local_module_path);
+	STAILQ_FOREACH(mdp, &moduledir_list, d_link) {
+	    if (strlen(mdp->d_path) != cplen || bcmp(cp, mdp->d_path, cplen) != 0)
+		continue;
+	    mdp->d_flags &= ~MDIR_REMOVED;
+	    break;
+	}
+	if (mdp == NULL) {
+	    mdp = malloc(sizeof(*mdp) + cplen + 1);
+	    if (mdp == NULL)
+		return;
+	    mdp->d_path = (char*)(mdp + 1);
+	    bcopy(local_module_path, mdp->d_path, cplen);
+	    mdp->d_path[cplen] = 0;
+	    mdp->d_hints = NULL;
+	    mdp->d_flags = 0;
+	    STAILQ_INSERT_TAIL(&moduledir_list, mdp, d_link);
+	}
+    }
+    /*
      * Delete unused directories if any
      */
     mdp = STAILQ_FIRST(&moduledir_list);
@@ -1066,5 +1114,4 @@ moduledir_rebuild(void)
 	    free(mtmp);
 	}
     }
-    return;
 }

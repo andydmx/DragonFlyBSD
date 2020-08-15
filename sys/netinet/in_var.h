@@ -10,11 +10,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -32,7 +28,6 @@
  *
  *	@(#)in_var.h	8.2 (Berkeley) 1/9/95
  * $FreeBSD: src/sys/netinet/in_var.h,v 1.33.2.3 2001/12/14 20:09:34 jlemon Exp $
- * $DragonFly: src/sys/netinet/in_var.h,v 1.16 2008/10/26 07:11:28 sephe Exp $
  */
 
 #ifndef _NETINET_IN_VAR_H_
@@ -40,9 +35,6 @@
 
 #ifndef _SYS_QUEUE_H_
 #include <sys/queue.h>
-#endif
-#ifndef _SYS_FNV_HASH_H_
-#include <sys/fnv_hash.h>
 #endif
 #ifndef _NET_IF_VAR_H_
 #include <net/if_var.h>
@@ -87,13 +79,17 @@ struct	in_aliasreq {
  * return a pointer to the addr as a sockaddr_in.
  */
 #define IA_SIN(ia)    (&(((struct in_ifaddr *)(ia))->ia_addr))
+#if 0
 #define IA_DSTSIN(ia) (&(((struct in_ifaddr *)(ia))->ia_dstaddr))
 
 #define IN_LNAOF(in, ifa) \
 	((ntohl((in).s_addr) & ~((struct in_ifaddr *)(ifa)->ia_subnetmask))
+#endif
 
 
-#ifdef	_KERNEL
+#ifdef _KERNEL
+#include <sys/fnv_hash.h>
+
 struct in_ifaddr_container;
 
 extern	struct	in_addr zeroin_addr;
@@ -146,6 +142,7 @@ IFP_TO_IA(const struct ifnet *_ifp)
 
 #endif	/* _KERNEL */
 
+#ifdef _KERNEL
 /*
  * This information should be part of the ifnet structure but we don't wish
  * to change that - as it might break a number of things
@@ -175,6 +172,7 @@ struct in_multi {
 	u_int	inm_state;		/*  state of the membership */
 	struct	router_info *inm_rti;	/* router info*/
 };
+#endif	/* _KERNEL */
 
 #ifdef _KERNEL
 
@@ -249,10 +247,10 @@ struct  lwkt_serialize;
 union	netmsg;
 
 void	in_ifdetach(struct ifnet *ifp);
+void	in_if_down(struct ifnet *ifp);
 struct	in_multi *in_addmulti (struct in_addr *, struct ifnet *);
 void	in_delmulti (struct in_multi *);
-int	in_control (struct socket *, u_long, caddr_t, struct ifnet *,
-			struct thread *);
+int	in_control (u_long, caddr_t, struct ifnet *, struct thread *);
 void	in_control_dispatch(union netmsg *);
 void	in_rtqdrain (void);
 void	ip_input (struct mbuf *);

@@ -17,7 +17,7 @@ set disk = "ad6"
 
 # For safety this only runs on a CD- or PXE-booted machine
 #
-df / | egrep -q '^(*.cd|.+:)'
+df / | egrep -q '^(.*cd|.+:)'
 if ( $status > 0 ) then
     echo "This program formats your disk and you didn't run it from"
     echo "a CD or NFS boot!"
@@ -53,7 +53,7 @@ set echo
 #
 dd if=/dev/zero of=/dev/${disk} bs=32k count=16
 fdisk -IB ${disk}
-disklabel64 -r -w ${disk}s1 auto
+disklabel64 -r -w ${disk}s1
 disklabel64 -B ${disk}s1
 disklabel64 ${disk}s1 > /tmp/label
 
@@ -66,7 +66,7 @@ disklabel64 -R ${disk}s1 /tmp/label
 
 # Create file systems
 newfs /dev/${disk}s1a
-newfs_hammer -L ROOT /dev/${disk}s1d
+newfs_hammer -f -L ROOT /dev/${disk}s1d
 
 # Mount it
 #
@@ -203,6 +203,11 @@ if ( ! -f /mnt/etc/ssh/ssh_host_dsa_key ) then
     cd /mnt/etc/ssh
     ssh-keygen -t dsa -f ssh_host_dsa_key -N ""
 endif
+
+# Misc cleanups
+#
+rm -R /mnt/README* /mnt/autorun* /mnt/index.html /mnt/dflybsd.ico
+rm /mnt/boot.catalog
 
 # take CD out and reboot
 # 

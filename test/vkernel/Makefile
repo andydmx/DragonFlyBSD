@@ -5,13 +5,13 @@
 SRCDIR ?= ${.CURDIR}/../..
 PHYSMEM ?= 256m
 NCPUS ?= 2
-FSTYPE ?=
+FSTYPE ?= ufs
+EXTRAOPTS ?=
+MAKE_JOBS?=     $$(sysctl -n hw.ncpu)
 
 all: help
 
-.if ${MACHINE_ARCH} == "i386"
-USEKERNEL=VKERNEL
-.else
+.if ${MACHINE_ARCH} == "x86_64"
 USEKERNEL=VKERNEL64
 .endif
 
@@ -32,7 +32,8 @@ help:
 	@echo ""
 	@echo "    setenv ROOTSIZE size (optional)"
 	@echo "    setenv VKDIR target_dir"
-	@echo "    setenv FSTYPE fstype (optional. values:hammer, 4.2BSD)"
+	@echo "    setenv FSTYPE fstype (optional. values: hammer, hammer2, ufs)"
+	@echo "    setenv MAKE_JOBS njobs (optional)"
 	@echo ""
 	@echo "Meta target components:"
 	@echo ""
@@ -45,6 +46,7 @@ help:
 	@echo "    run      - run vkernel with VKDIR/root.img"
 	@echo "    mount    - mount VKDIR/root.img at VKDIR/root"
 	@echo "    umount   - unmount"
+	@echo "    fsck	    - fsck VKDIR/root.img"
 	@echo ""
 	@echo "Individual target components:"
 	@echo ""
@@ -71,22 +73,22 @@ clean: check
 #
 #
 world: checkq
-	cd ${SRCDIR} && make -j 4 buildworld
+	cd ${SRCDIR} && make -j ${MAKE_JOBS} buildworld
 
 kernel: checkq
-	cd ${SRCDIR} && make -j 4 KERNCONF=${USEKERNEL} buildkernel
+	cd ${SRCDIR} && make -j ${MAKE_JOBS} KERNCONF=${USEKERNEL} buildkernel
 
 nativekernel: checkq
-	cd ${SRCDIR} && make -j 4 KERNCONF=${USEKERNEL} nativekernel
+	cd ${SRCDIR} && make -j ${MAKE_JOBS} KERNCONF=${USEKERNEL} nativekernel
 
 # Quick build - just rebuild the kernel quickly
 #
 #
 quickworld: checkq
-	cd ${SRCDIR} && make -j 4 quickworld
+	cd ${SRCDIR} && make -j ${MAKE_JOBS} quickworld
 
 quickkernel: checkq
-	cd ${SRCDIR} && make -j 4 KERNCONF=${USEKERNEL} quickkernel
+	cd ${SRCDIR} && make -j ${MAKE_JOBS} KERNCONF=${USEKERNEL} quickkernel
 
 # Build and mount an empty filesystem for the emulated root disk
 #
@@ -94,13 +96,16 @@ quickkernel: checkq
 #       have a dependency on mount.
 #
 root:	check
-	vnconfig -c -T -S ${ROOTSIZE} -s labels \
-	    `cat ${VKDIR}/vn.which` ${VKDIR}/root.img
+	vnconfig -c -T -S ${ROOTSIZE} `cat ${VKDIR}/vn.which` ${VKDIR}/root.img
 	dd if=/dev/zero of=/dev/`cat ${VKDIR}/vn.which` bs=32k count=4
 	fdisk -IB `cat ${VKDIR}/vn.which`
 	disklabel -r -w `cat ${VKDIR}/vn.which`s1 auto
 	disklabel `cat ${VKDIR}/vn.which`s1 > ${VKDIR}/label.tmp
+.if ${FSTYPE} == "ufs"
+	echo 'a: * 0 4.2BSD' >> ${VKDIR}/label.tmp
+.else
 	echo 'a: * 0 ${FSTYPE}' >> ${VKDIR}/label.tmp
+.endif
 	disklabel -R `cat ${VKDIR}/vn.which`s1 ${VKDIR}/label.tmp
 	disklabel -B `cat ${VKDIR}/vn.which`s1
 	${NEWFS_CMD} ${NEWFS_ARGS} /dev/`cat ${VKDIR}/vn.which`s1a
@@ -108,8 +113,8 @@ root:	check
 	vnconfig -u `cat ${VKDIR}/vn.which` > /dev/null 2>&1
 
 mount: check
-	vnconfig -c -s labels `cat ${VKDIR}/vn.which` ${VKDIR}/root.img
-.	if ${FSTYPE} == "4.2BSD"
+	vnconfig -c `cat ${VKDIR}/vn.which` ${VKDIR}/root.img
+.	if ${FSTYPE} == "ufs"
 		fsck -p /dev/`cat ${VKDIR}/vn.which`s1a
 .	endif
 	${MOUNT_CMD} /dev/`cat ${VKDIR}/vn.which`s1a ${VKDIR}/root
@@ -117,16 +122,25 @@ mount: check
 
 umount: check
 
+fsck: check
+	vnconfig -c `cat ${VKDIR}/vn.which` ${VKDIR}/root.img
+	fsck -y /dev/`cat ${VKDIR}/vn.which`s1a
+	make umount
+
 # Install a fresh world & distribution, and kernel
 #
 install: mount
 	cd ${SRCDIR} && \
-	    make -j 4 DESTDIR=${VKDIR}/root installworld
+	    make -j 4 DESTDIR=${VKDIR}/root NO_BACKUP=TRUE installworld
 	cd ${SRCDIR}/etc && \
 	    make -j 4 DESTDIR=${VKDIR}/root distribution
+.if ${FSTYPE} == "ufs"
 	echo '/dev/vkd0s1a	/	ufs	rw	1 1' > ${VKDIR}/root/etc/fstab
+.else
+	echo '/dev/vkd0s1a	/	${FSTYPE}	rw	0 0' > ${VKDIR}/root/etc/fstab
+.endif
 	echo 'proc		/proc	procfs	rw	0 0' >> ${VKDIR}/root/etc/fstab
-	echo 'vfs.root.mountfrom="ufs:vkd0s1a"' > ${VKDIR}/root/boot/loader.conf
+	echo "vfs.root.mountfrom=\"${FSTYPE}:vkd0s1a\"" > ${VKDIR}/root/boot/loader.conf
 	#(egrep -v '^console' ${VKDIR}/root/etc/ttys; echo 'console "/usr/libexec/getty Pc"	cons25	on	secure') > ${VKDIR}/root/etc/ttys.new
 	#mv -f ${VKDIR}/root/etc/ttys.new ${VKDIR}/root/etc/ttys
 	cd ${SRCDIR} && \
@@ -149,7 +163,8 @@ leaf: mount
 #
 #
 reinstall: mount
-	cd ${SRCDIR} && make -j 4 DESTDIR=${VKDIR}/root installworld
+	cd ${SRCDIR} && \
+	    make -j 4 DESTDIR=${VKDIR}/root NO_BACKUP=TRUE installworld
 
 reinstallkernel: mount
 	cd ${SRCDIR} && \
@@ -170,7 +185,7 @@ run: check
 	sysctl vm.vkernel_enable=1
 	cd ${VKDIR} && ./vkernel -m ${PHYSMEM} -n ${NCPUS} \
 			-r root.img -U -v \
-			-I /var/run/vknet
+			-I /var/run/vknet ${EXTRAOPTS} ${MNTOPTS}
 
 # When running w/ a NFS root
 #
@@ -204,12 +219,22 @@ NEWFS_CMD = newfs_${FSTYPE}
 NEWFS_ARGS = -L VKROOT -f
 MOUNT_CMD = mount_${FSTYPE}
 ROOTSIZE ?= 5G
-.else
-FSTYPE = 4.2BSD
+MNTOPTS += -e vfs.root.mountfrom=\'${FSTYPE}:vkd0s1a\'
+.elif ${FSTYPE} == "hammer2"
+NEWFS_CMD = newfs_${FSTYPE}
+NEWFS_ARGS = -f
+MOUNT_CMD = mount_${FSTYPE}
+ROOTSIZE ?= 5G
+MNTOPTS += -e vfs.root.mountfrom=\'${FSTYPE}:vkd0s1a\'
+.elif ${FSTYPE} == "ufs"
 NEWFS_CMD = newfs
 NEWFS_ARGS =
 MOUNT_CMD = mount
 ROOTSIZE ?= 2G
+.else
+	@(echo "\"${FSTYPE}\" is not a valid filesystem"; /usr/bin/false)
+.endif
+.if ${FSTYPE} == "hammer" || ${FSTYPE} == "hammer2"
 .endif
 
 

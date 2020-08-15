@@ -30,24 +30,20 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
-#include <sys/types.h>
-#include <sys/param.h>
-
 #include <sys/disk.h>
 #include <sys/fcntl.h>
 #include <sys/malloc.h>
-#include <sys/namei.h>
-#include <sys/vnode.h>
 #include <sys/nlookup.h>
+#include <sys/proc.h>
 
 #include <dev/disk/dm/dm.h>
 
-SLIST_HEAD(dm_pdevs, dm_pdev) dm_pdev_list;
+static TAILQ_HEAD(, dm_pdev) dm_pdev_list;
 
-struct lock dm_pdev_mutex;
+static struct lock dm_pdev_mutex;
 
 static dm_pdev_t *dm_pdev_alloc(const char *);
-static int dm_pdev_rem(dm_pdev_t *);
+static int dm_pdev_free(dm_pdev_t *);
 static dm_pdev_t *dm_pdev_lookup_name(const char *);
 
 /*
@@ -57,13 +53,13 @@ static dm_pdev_t *dm_pdev_lookup_name(const char *);
 static dm_pdev_t *
 dm_pdev_lookup_name(const char *dm_pdev_name)
 {
-	dm_pdev_t *dm_pdev;
+	dm_pdev_t *dmp;
 
 	KKASSERT(dm_pdev_name != NULL);
 
-	SLIST_FOREACH(dm_pdev, &dm_pdev_list, next_pdev) {
-		if (strcmp(dm_pdev_name, dm_pdev->name) == 0)
-			return dm_pdev;
+	TAILQ_FOREACH(dmp, &dm_pdev_list, next_pdev) {
+		if (strcmp(dm_pdev_name, dmp->name) == 0)
+			return dmp;
 	}
 
 	return NULL;
@@ -117,13 +113,14 @@ dm_pdev_correct_dump_offset(dm_pdev_t *pdev, off_t offset)
 
 /*
  * Create entry for device with name dev_name and open vnode for it.
- * If entry already exists in global SLIST I will only increment
+ * If entry already exists in global TAILQ I will only increment
  * reference counter.
  */
 dm_pdev_t *
 dm_pdev_insert(const char *dev_name)
 {
 	dm_pdev_t *dmp;
+	struct vattr va;
 	int error;
 
 	KKASSERT(dev_name != NULL);
@@ -133,23 +130,35 @@ dm_pdev_insert(const char *dev_name)
 
 	if (dmp != NULL) {
 		dmp->ref_cnt++;
-		aprint_debug("dmp_pdev_insert pdev %s already in tree\n", dev_name);
+		dmdebug("pdev %s already in tree\n", dev_name);
 		lockmgr(&dm_pdev_mutex, LK_RELEASE);
 		return dmp;
 	}
-	lockmgr(&dm_pdev_mutex, LK_RELEASE);
 
-	if ((dmp = dm_pdev_alloc(dev_name)) == NULL)
+	if ((dmp = dm_pdev_alloc(dev_name)) == NULL) {
+		lockmgr(&dm_pdev_mutex, LK_RELEASE);
 		return NULL;
+	}
 
 	error = dm_dk_lookup(dev_name, &dmp->pdev_vnode);
 	if (error) {
-		aprint_debug("dk_lookup on device: %s failed with error %d!\n",
+		dmdebug("Lookup on %s failed with error %d!\n",
 		    dev_name, error);
-		kfree(dmp, M_DM);
+		dm_pdev_free(dmp);
+		lockmgr(&dm_pdev_mutex, LK_RELEASE);
 		return NULL;
 	}
 	dmp->ref_cnt = 1;
+
+	if (dm_pdev_get_vattr(dmp, &va) == -1) {
+		dmdebug("getattr on %s failed\n", dev_name);
+		dm_pdev_free(dmp);
+		lockmgr(&dm_pdev_mutex, LK_RELEASE);
+		return NULL;
+	}
+	ksnprintf(dmp->udev_name, sizeof(dmp->udev_name),
+		"%d:%d", va.va_rmajor, va.va_rminor);
+	dmp->udev = dm_pdev_get_udev(dmp);
 
 	/*
 	 * Get us the partinfo from the underlying device, it's needed for
@@ -158,10 +167,22 @@ dm_pdev_insert(const char *dev_name)
 	bzero(&dmp->pdev_pinfo, sizeof(dmp->pdev_pinfo));
 	error = dev_dioctl(dmp->pdev_vnode->v_rdev, DIOCGPART,
 	    (void *)&dmp->pdev_pinfo, 0, proc0.p_ucred, NULL, NULL);
+	if (!error) {
+		struct partinfo *dpart = &dmp->pdev_pinfo;
+		dmdebug("DIOCGPART offset=%ju size=%ju blocks=%ju blksize=%d\n",
+			dpart->media_offset,
+			dpart->media_size,
+			dpart->media_blocks,
+			dpart->media_blksize);
+	} else {
+		kprintf("dmp_pdev_insert DIOCGPART failed %d\n", error);
+	}
 
-	lockmgr(&dm_pdev_mutex, LK_EXCLUSIVE);
-	SLIST_INSERT_HEAD(&dm_pdev_list, dmp, next_pdev);
+	TAILQ_INSERT_TAIL(&dm_pdev_list, dmp, next_pdev);
 	lockmgr(&dm_pdev_mutex, LK_RELEASE);
+
+	dmdebug("pdev %s %s 0x%016jx\n",
+		dmp->name, dmp->udev_name, (uintmax_t)dmp->udev);
 
 	return dmp;
 }
@@ -175,21 +196,21 @@ dm_pdev_alloc(const char *name)
 {
 	dm_pdev_t *dmp;
 
-	if ((dmp = kmalloc(sizeof(dm_pdev_t), M_DM, M_WAITOK | M_ZERO)) == NULL)
+	dmp = kmalloc(sizeof(*dmp), M_DM, M_WAITOK | M_ZERO);
+	if (dmp == NULL)
 		return NULL;
 
-	strlcpy(dmp->name, name, MAX_DEV_NAME);
-
-	dmp->ref_cnt = 0;
-	dmp->pdev_vnode = NULL;
+	if (name)
+		strlcpy(dmp->name, name, DM_MAX_DEV_NAME);
 
 	return dmp;
 }
+
 /*
  * Destroy allocated dm_pdev.
  */
 static int
-dm_pdev_rem(dm_pdev_t * dmp)
+dm_pdev_free(dm_pdev_t *dmp)
 {
 	int err;
 
@@ -197,28 +218,28 @@ dm_pdev_rem(dm_pdev_t * dmp)
 
 	if (dmp->pdev_vnode != NULL) {
 		err = vn_close(dmp->pdev_vnode, FREAD | FWRITE, NULL);
-		if (err != 0)
+		if (err != 0) {
+			kfree(dmp, M_DM);
 			return err;
+		}
 	}
 	kfree(dmp, M_DM);
-	dmp = NULL;
 
 	return 0;
 }
 
 /*
- * This funcion is called from dm_dev_remove_ioctl.
+ * This funcion is called from targets' destroy() handler.
  * When I'm removing device from list, I have to decrement
  * reference counter. If reference counter is 0 I will remove
  * dmp from global list and from device list to. And I will CLOSE
  * dmp vnode too.
  */
-
 /*
  * Decrement pdev reference counter if 0 remove it.
  */
 int
-dm_pdev_decr(dm_pdev_t * dmp)
+dm_pdev_decr(dm_pdev_t *dmp)
 {
 	KKASSERT(dmp != NULL);
 	/*
@@ -228,12 +249,46 @@ dm_pdev_decr(dm_pdev_t * dmp)
 	lockmgr(&dm_pdev_mutex, LK_EXCLUSIVE);
 
 	if (--dmp->ref_cnt == 0) {
-		SLIST_REMOVE(&dm_pdev_list, dmp, dm_pdev, next_pdev);
+		TAILQ_REMOVE(&dm_pdev_list, dmp, next_pdev);
 		lockmgr(&dm_pdev_mutex, LK_RELEASE);
-		dm_pdev_rem(dmp);
+		dm_pdev_free(dmp);
 		return 0;
 	}
 	lockmgr(&dm_pdev_mutex, LK_RELEASE);
+	return 0;
+}
+
+uint64_t
+dm_pdev_get_udev(dm_pdev_t *dmp)
+{
+	struct vattr va;
+	int ret;
+
+	if (dmp->pdev_vnode == NULL)
+		return (uint64_t)-1;
+
+	ret = dm_pdev_get_vattr(dmp, &va);
+	if (ret)
+		return (uint64_t)-1;
+
+	ret = makeudev(va.va_rmajor, va.va_rminor);
+
+	return ret;
+}
+
+int
+dm_pdev_get_vattr(dm_pdev_t *dmp, struct vattr *vap)
+{
+	int ret;
+
+	if (dmp->pdev_vnode == NULL)
+		return -1;
+
+	KKASSERT(vap);
+	ret = VOP_GETATTR(dmp->pdev_vnode, vap);
+	if (ret)
+		return -1;
+
 	return 0;
 }
 
@@ -243,7 +298,7 @@ dm_pdev_decr(dm_pdev_t * dmp)
 int
 dm_pdev_init(void)
 {
-	SLIST_INIT(&dm_pdev_list);	/* initialize global pdev list */
+	TAILQ_INIT(&dm_pdev_list);	/* initialize global pdev list */
 	lockinit(&dm_pdev_mutex, "dmpdev", 0, LK_CANRECURSE);
 
 	return 0;
@@ -255,17 +310,16 @@ dm_pdev_init(void)
 int
 dm_pdev_uninit(void)
 {
-	dm_pdev_t *dm_pdev;
+	dm_pdev_t *dmp;
 
 	lockmgr(&dm_pdev_mutex, LK_EXCLUSIVE);
-	while (!SLIST_EMPTY(&dm_pdev_list)) {	/* List Deletion. */
 
-		dm_pdev = SLIST_FIRST(&dm_pdev_list);
-
-		SLIST_REMOVE_HEAD(&dm_pdev_list, next_pdev);
-
-		dm_pdev_rem(dm_pdev);
+	while ((dmp = TAILQ_FIRST(&dm_pdev_list)) != NULL) {
+		TAILQ_REMOVE(&dm_pdev_list, dmp, next_pdev);
+		dm_pdev_free(dmp);
 	}
+	KKASSERT(TAILQ_EMPTY(&dm_pdev_list));
+
 	lockmgr(&dm_pdev_mutex, LK_RELEASE);
 
 	lockuninit(&dm_pdev_mutex);

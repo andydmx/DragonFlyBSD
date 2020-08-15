@@ -41,8 +41,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <libgen.h>
 
-#define CRUNCH_VERSION	"0.2"
+#define CRUNCH_VERSION	"0.3"
 
 #define MAXLINELEN	16384
 #define MAXFIELDS 	 2048
@@ -67,54 +68,59 @@ typedef struct prog {
 	char *realsrcdir;
 	char *objdir;
 	char *objvar;		/* Makefile variable to replace OBJS */
-	strlst_t *objs, *objpaths;
+	strlst_t *objs;
+	strlst_t *objpaths;
 	strlst_t *buildopts;
 	strlst_t *keeplist;
 	strlst_t *links;
 	strlst_t *libs;
-	strlst_t *libs_so;
+	strlst_t *libs_int;	/* internal libraries */
 	int goterror;
 } prog_t;
 
 
 /* global state */
 
-strlst_t *buildopts = NULL;
-strlst_t *srcdirs   = NULL;
-strlst_t *libs      = NULL;
-strlst_t *libs_so   = NULL;
-prog_t   *progs     = NULL;
+static strlst_t *buildopts = NULL;
+static strlst_t *linkopts  = NULL;
+static strlst_t *srcdirs   = NULL;
+static strlst_t *libs      = NULL;
+static strlst_t *libs_so   = NULL;
+static strlst_t *libs_int  = NULL;
+static prog_t   *progs     = NULL;
 
-char confname[MAXPATHLEN], infilename[MAXPATHLEN];
-char outmkname[MAXPATHLEN], outcfname[MAXPATHLEN], execfname[MAXPATHLEN];
-char tempfname[MAXPATHLEN], cachename[MAXPATHLEN], curfilename[MAXPATHLEN];
-char outhdrname[MAXPATHLEN] ;	/* user-supplied header for *.mk */
-char *objprefix;		/* where are the objects ? */
-char *path_make;
-int linenum = -1;
-int goterror = 0;
+static char confname[MAXPATHLEN - 32], infilename[MAXPATHLEN];
+static char outmkname[MAXPATHLEN], outcfname[MAXPATHLEN], execfname[MAXPATHLEN];
+static char tempfname[MAXPATHLEN], cachename[MAXPATHLEN], curfilename[MAXPATHLEN];
+static char outhdrname[MAXPATHLEN]; /* user-supplied header for *.mk */
+static char *objprefix;		/* where are the objects ? */
+static char *path_make;
+static int linenum = -1;
+static int goterror = 0;
 
-int verbose, readcache;		/* options */
-int reading_cache;
-int makeobj = 0;		/* add 'make obj' rules to the makefile */
+static int verbose, readcache;	/* options */
+static int reading_cache;
+static int makeobj = 0;		/* add 'make obj' rules to the makefile */
 
-int list_mode;
+static int list_mode;
 
-/* general library routines */
+/* general routines */
 
-void status(const char *str);
-void out_of_memory(void);
-void add_string(strlst_t **listp, char *str);
-int is_dir(const char *pathname);
-int is_nonempty_file(const char *pathname);
-int subtract_strlst(strlst_t **lista, strlst_t **listb);
-int in_list(strlst_t **listp, char *str);
+static void status(const char *str);
+static void out_of_memory(void) __dead2;
+static void add_string(strlst_t **listp, char *str, int nodup);
+static int is_dir(const char *pathname);
+static int is_nonempty_file(const char *pathname);
+static int subtract_strlst(strlst_t **lista, strlst_t **listb);
+static int in_list(strlst_t **listp, char *str);
+static void free_list(strlst_t *head);
+static int iseq(const char *a, const char *b);
 
 /* helper routines for main() */
 
-void usage(void);
-void parse_conf_file(void);
-void gen_outputs(void);
+static void usage(void) __dead2;
+static void parse_conf_file(void);
+static void gen_outputs(void);
 
 extern char *crunched_skel[];
 
@@ -136,12 +142,11 @@ main(int argc, char **argv)
 	p = getenv("MAKEOBJDIRPREFIX");
 	if (p == NULL || *p == '\0')
 		objprefix = "/usr/obj"; /* default */
-	else
-		if ((objprefix = strdup(p)) == NULL)
-			out_of_memory();
+	else if ((objprefix = strdup(p)) == NULL)
+		out_of_memory();
 
-	while((optc = getopt(argc, argv, "lh:m:c:e:p:foq")) != -1) {
-		switch(optc) {
+	while ((optc = getopt(argc, argv, "lh:m:c:e:p:foq")) != -1) {
+		switch (optc) {
 		case 'f':
 			readcache = 0;
 			break;
@@ -195,12 +200,12 @@ main(int argc, char **argv)
 
 	/* confname = `basename infilename .conf` */
 
-	if ((p=strrchr(infilename, '/')) != NULL)
+	if ((p = strrchr(infilename, '/')) != NULL)
 		strlcpy(confname, p + 1, sizeof(confname));
 	else
 		strlcpy(confname, infilename, sizeof(confname));
 
-	if ((p=strrchr(confname, '.')) != NULL && !strcmp(p, ".conf"))
+	if ((p = strrchr(confname, '.')) != NULL && iseq(p, ".conf"))
 		*p = '\0';
 
 	if (!*outmkname)
@@ -212,7 +217,7 @@ main(int argc, char **argv)
 
 	snprintf(cachename, sizeof(cachename), "%s.cache", confname);
 	snprintf(tempfname, sizeof(tempfname), "%s/crunchgen_%sXXXXXX",
-	getenv("TMPDIR") ? getenv("TMPDIR") : _PATH_TMP, confname);
+		 getenv("TMPDIR") ? getenv("TMPDIR") : _PATH_TMP, confname);
 
 	parse_conf_file();
 	if (list_mode)
@@ -224,7 +229,7 @@ main(int argc, char **argv)
 }
 
 
-void
+static void
 usage(void)
 {
 	fprintf(stderr, "%s%s\n\t%s%s\n", "usage: crunchgen [-foq] ",
@@ -243,21 +248,23 @@ usage(void)
 
 /* helper routines for parse_conf_file */
 
-void parse_one_file(char *filename);
-void parse_line(char *pline, int *fc, char **fv, int nf);
-void add_srcdirs(int argc, char **argv);
-void add_progs(int argc, char **argv);
-void add_link(int argc, char **argv);
-void add_libs(int argc, char **argv);
-void add_libs_so(int argc, char **argv);
-void add_buildopts(int argc, char **argv);
-void add_special(int argc, char **argv);
+static void parse_one_file(char *filename);
+static void parse_line(char *pline, int *fc, char **fv, int nf);
+static void add_srcdirs(int argc, char **argv);
+static void add_progs(int argc, char **argv);
+static void add_link(int argc, char **argv);
+static void add_libs(int argc, char **argv);
+static void add_libs_so(int argc, char **argv);
+static void add_libs_int(int argc, char **argv);
+static void add_buildopts(int argc, char **argv);
+static void add_linkopts(int argc, char **argv);
+static void add_special(int argc, char **argv);
 
-prog_t *find_prog(char *str);
-void add_prog(char *progname);
+static prog_t *find_prog(char *str);
+static void add_prog(char *progname);
 
 
-void
+static void
 parse_conf_file(void)
 {
 	if (!is_nonempty_file(infilename))
@@ -271,7 +278,7 @@ parse_conf_file(void)
 }
 
 
-void
+static void
 parse_one_file(char *filename)
 {
 	char *fieldv[MAXFIELDS];
@@ -295,34 +302,37 @@ parse_one_file(char *filename)
 		linenum++;
 		parse_line(line, &fieldc, fieldv, MAXFIELDS);
 
-		if (fieldc < 1)
+		if (fieldc == 0) {
 			continue;
-
-		if (!strcmp(fieldv[0], "srcdirs"))
-			f = add_srcdirs;
-		else if(!strcmp(fieldv[0], "progs"))
-			f = add_progs;
-		else if(!strcmp(fieldv[0], "ln"))
-			f = add_link;
-		else if(!strcmp(fieldv[0], "libs"))
-			f = add_libs;
-		else if(!strcmp(fieldv[0], "libs_so"))
-			f = add_libs_so;
-		else if(!strcmp(fieldv[0], "buildopts"))
-			f = add_buildopts;
-		else if(!strcmp(fieldv[0], "special"))
-			f = add_special;
-		else {
-			warnx("%s:%d: skipping unknown command `%s'",
-			    curfilename, linenum, fieldv[0]);
+		} else if (fieldc == 1) {
+			warnx("%s:%d: %s %s",
+			    curfilename, linenum, fieldv[0],
+			    "command needs at least 1 argument, skipping");
 			goterror = 1;
 			continue;
 		}
 
-		if (fieldc < 2) {
-			warnx("%s:%d: %s %s",
-			    curfilename, linenum, fieldv[0],
-			    "command needs at least 1 argument, skipping");
+		if (iseq(fieldv[0], "srcdirs"))
+			f = add_srcdirs;
+		else if (iseq(fieldv[0], "progs"))
+			f = add_progs;
+		else if (iseq(fieldv[0], "ln"))
+			f = add_link;
+		else if (iseq(fieldv[0], "libs"))
+			f = add_libs;
+		else if (iseq(fieldv[0], "libs_so"))
+			f = add_libs_so;
+		else if (iseq(fieldv[0], "libs_int"))
+			f = add_libs_int;
+		else if (iseq(fieldv[0], "buildopts"))
+			f = add_buildopts;
+		else if (iseq(fieldv[0], "linkopts"))
+			f = add_linkopts;
+		else if (iseq(fieldv[0], "special"))
+			f = add_special;
+		else {
+			warnx("%s:%d: skipping unknown command `%s'",
+			    curfilename, linenum, fieldv[0]);
 			goterror = 1;
 			continue;
 		}
@@ -338,7 +348,7 @@ parse_one_file(char *filename)
 }
 
 
-void
+static void
 parse_line(char *pline, int *fc, char **fv, int nf)
 {
 	char *p;
@@ -346,7 +356,7 @@ parse_line(char *pline, int *fc, char **fv, int nf)
 	p = pline;
 	*fc = 0;
 
-	while (1) {
+	for (;;) {
 		while (isspace((unsigned char)*p))
 			p++;
 
@@ -370,15 +380,15 @@ parse_line(char *pline, int *fc, char **fv, int nf)
 }
 
 
-void
+static void
 add_srcdirs(int argc, char **argv)
 {
 	int i;
 
 	for (i = 1; i < argc; i++) {
-		if (is_dir(argv[i]))
-			add_string(&srcdirs, argv[i]);
-		else {
+		if (is_dir(argv[i])) {
+			add_string(&srcdirs, argv[i], 1);
+		} else {
 			warnx("%s:%d: `%s' is not a directory, skipping it",
 			    curfilename, linenum, argv[i]);
 			goterror = 1;
@@ -387,7 +397,7 @@ add_srcdirs(int argc, char **argv)
 }
 
 
-void
+static void
 add_progs(int argc, char **argv)
 {
 	int i;
@@ -397,7 +407,7 @@ add_progs(int argc, char **argv)
 }
 
 
-void
+static void
 add_prog(char *progname)
 {
 	prog_t *p1, *p2;
@@ -405,11 +415,11 @@ add_prog(char *progname)
 	/* add to end, but be smart about dups */
 
 	for (p1 = NULL, p2 = progs; p2 != NULL; p1 = p2, p2 = p2->next)
-		if (!strcmp(p2->name, progname))
+		if (iseq(p2->name, progname))
 			return;
 
 	p2 = malloc(sizeof(prog_t));
-	if(p2) {
+	if (p2) {
 		memset(p2, 0, sizeof(prog_t));
 		p2->name = strdup(progname);
 	}
@@ -428,18 +438,17 @@ add_prog(char *progname)
 	p2->objdir = NULL;
 	p2->links = NULL;
 	p2->libs = NULL;
-	p2->libs_so = NULL;
 	p2->objs = NULL;
 	p2->keeplist = NULL;
 	p2->buildopts = NULL;
 	p2->goterror = 0;
 
 	if (list_mode)
-		printf("%s\n",progname);
+		printf("%s\n", progname);
 }
 
 
-void
+static void
 add_link(int argc, char **argv)
 {
 	int i;
@@ -456,19 +465,19 @@ add_link(int argc, char **argv)
 		if (list_mode)
 			printf("%s\n",argv[i]);
 
-		add_string(&p->links, argv[i]);
+		add_string(&p->links, argv[i], 1);
 	}
 }
 
 
-void
+static void
 add_libs(int argc, char **argv)
 {
 	int i;
 
-	for(i = 1; i < argc; i++) {
-		add_string(&libs, argv[i]);
-		if ( in_list(&libs_so, argv[i]) )
+	for (i = 1; i < argc; i++) {
+		add_string(&libs, argv[i], 1);
+		if (in_list(&libs_so, argv[i]))
 			warnx("%s:%d: "
 				"library `%s' specified as dynamic earlier",
 				curfilename, linenum, argv[i]);
@@ -476,14 +485,14 @@ add_libs(int argc, char **argv)
 }
 
 
-void
+static void
 add_libs_so(int argc, char **argv)
 {
 	int i;
 
-	for(i = 1; i < argc; i++) {
-		add_string(&libs_so, argv[i]);
-		if ( in_list(&libs, argv[i]) )
+	for (i = 1; i < argc; i++) {
+		add_string(&libs_so, argv[i], 1);
+		if (in_list(&libs, argv[i]))
 			warnx("%s:%d: "
 				"library `%s' specified as static earlier",
 				curfilename, linenum, argv[i]);
@@ -491,17 +500,38 @@ add_libs_so(int argc, char **argv)
 }
 
 
-void
+static void
+add_libs_int(int argc, char **argv)
+{
+	int i;
+
+	for (i = 1; i < argc; i++) {
+		add_string(&libs_int, argv[i], 1);
+	}
+}
+
+
+static void
 add_buildopts(int argc, char **argv)
 {
 	int i;
 
 	for (i = 1; i < argc; i++)
-		add_string(&buildopts, argv[i]);
+		add_string(&buildopts, argv[i], 0);  /* allow duplicates */
 }
 
 
-void
+static void
+add_linkopts(int argc, char **argv)
+{
+	int i;
+
+	for (i = 1; i < argc; i++)
+		add_string(&linkopts, argv[i], 0);  /* allow duplicates */
+}
+
+
+static void
 add_special(int argc, char **argv)
 {
 	int i;
@@ -517,45 +547,48 @@ add_special(int argc, char **argv)
 		return;
 	}
 
-	if (!strcmp(argv[2], "ident")) {
+	if (iseq(argv[2], "ident")) {
 		if (argc != 4)
 			goto argcount;
 		if ((p->ident = strdup(argv[3])) == NULL)
 			out_of_memory();
-	} else if (!strcmp(argv[2], "srcdir")) {
+	} else if (iseq(argv[2], "srcdir")) {
 		if (argc != 4)
 			goto argcount;
 		if ((p->srcdir = strdup(argv[3])) == NULL)
 			out_of_memory();
-	} else if (!strcmp(argv[2], "objdir")) {
-		if(argc != 4)
+	} else if (iseq(argv[2], "objdir")) {
+		if (argc != 4)
 			goto argcount;
-		if((p->objdir = strdup(argv[3])) == NULL)
+		if ((p->objdir = strdup(argv[3])) == NULL)
 			out_of_memory();
-	} else if (!strcmp(argv[2], "objs")) {
+	} else if (iseq(argv[2], "objs")) {
 		p->objs = NULL;
 		for (i = 3; i < argc; i++)
-			add_string(&p->objs, argv[i]);
-	} else if (!strcmp(argv[2], "objpaths")) {
+			add_string(&p->objs, argv[i], 1);
+	} else if (iseq(argv[2], "objpaths")) {
 		p->objpaths = NULL;
 		for (i = 3; i < argc; i++)
-			add_string(&p->objpaths, argv[i]);
-	} else if (!strcmp(argv[2], "keep")) {
+			add_string(&p->objpaths, argv[i], 1);
+	} else if (iseq(argv[2], "keep")) {
 		p->keeplist = NULL;
-		for(i = 3; i < argc; i++)
-			add_string(&p->keeplist, argv[i]);
-	} else if (!strcmp(argv[2], "objvar")) {
-		if(argc != 4)
+		for (i = 3; i < argc; i++)
+			add_string(&p->keeplist, argv[i], 1);
+	} else if (iseq(argv[2], "objvar")) {
+		if (argc != 4)
 			goto argcount;
 		if ((p->objvar = strdup(argv[3])) == NULL)
 			out_of_memory();
-	} else if (!strcmp(argv[2], "buildopts")) {
+	} else if (iseq(argv[2], "buildopts")) {
 		p->buildopts = NULL;
 		for (i = 3; i < argc; i++)
-			add_string(&p->buildopts, argv[i]);
-	} else if (!strcmp(argv[2], "lib")) {
+			add_string(&p->buildopts, argv[i], 0);
+	} else if (iseq(argv[2], "lib")) {
 		for (i = 3; i < argc; i++)
-			add_string(&p->libs, argv[i]);
+			add_string(&p->libs, argv[i], 1);
+	} else if (iseq(argv[2], "lib_int")) {
+		for (i = 3; i < argc; i++)
+			add_string(&p->libs_int, argv[i], 1);
 	} else {
 		warnx("%s:%d: bad parameter name `%s', skipping line",
 		    curfilename, linenum, argv[2]);
@@ -563,19 +596,19 @@ add_special(int argc, char **argv)
 	}
 	return;
 
- argcount:
+argcount:
 	warnx("%s:%d: too %s arguments, expected \"special %s %s <string>\"",
-	    curfilename, linenum, argc < 4? "few" : "many", argv[1], argv[2]);
+	    curfilename, linenum, argc < 4 ? "few" : "many", argv[1], argv[2]);
 	goterror = 1;
 }
 
 
-prog_t *find_prog(char *str)
+static prog_t *find_prog(char *str)
 {
 	prog_t *p;
 
 	for (p = progs; p != NULL; p = p->next)
-		if (!strcmp(p->name, str))
+		if (iseq(p->name, str))
 			return p;
 
 	return NULL;
@@ -590,21 +623,23 @@ prog_t *find_prog(char *str)
 
 /* helper subroutines */
 
-void remove_error_progs(void);
-void fillin_program(prog_t *p);
-void gen_specials_cache(void);
-void gen_output_makefile(void);
-void gen_output_cfile(void);
+static void remove_error_progs(void);
+static void fillin_program(prog_t *p);
+static void gen_specials_cache(void);
+static void gen_output_makefile(void);
+static void gen_output_cfile(void);
 
-void fillin_program_objs(prog_t *p, char *path);
-void top_makefile_rules(FILE *outmk);
-void prog_makefile_rules(FILE *outmk, prog_t *p);
-void output_strlst(FILE *outf, strlst_t *lst);
-char *genident(char *str);
-char *dir_search(char *progname);
+static void fillin_program_objs(prog_t *p, char *path);
+static void top_makefile_rules(FILE *outmk);
+static void prog_makefile_rules(FILE *outmk, prog_t *p);
+static void intlib_makefile_rules(FILE *outmk, char *path);
+static void output_strlst(FILE *outf, strlst_t *lst);
+static char *genident(char *str);
+static char *dir_search(char *progname);
+static void collect_internal_libs(strlst_t **listp);
 
 
-void
+static void
 gen_outputs(void)
 {
 	prog_t *p;
@@ -616,6 +651,7 @@ gen_outputs(void)
 	gen_specials_cache();
 	gen_output_cfile();
 	gen_output_makefile();
+
 	status("");
 	fprintf(stderr,
 	    "Run \"%s -f %s\" to build crunched binary.\n",
@@ -625,12 +661,11 @@ gen_outputs(void)
 /*
  * run the makefile for the program to find which objects are necessary
  */
-void
+static void
 fillin_program(prog_t *p)
 {
 	char path[MAXPATHLEN];
 	char line[MAXLINELEN];
-	FILE *f;
 
 	snprintf(line, MAXLINELEN, "filling in parms for %s", p->name);
 	status(line);
@@ -643,22 +678,10 @@ fillin_program(prog_t *p)
 		p->srcdir = dir_search(p->name);
 	}
 
-	/* Determine the actual srcdir (maybe symlinked). */
+	/* Determine the real srcdir (maybe symlinked). */
 	if (p->srcdir) {
-		snprintf(line, MAXLINELEN, "cd %s && echo -n `/bin/pwd`",
-		    p->srcdir);
-		f = popen(line,"r");
-		if (!f)
-			errx(1, "Can't execute: %s\n", line);
-
-		path[0] = '\0';
-		fgets(path, sizeof path, f);
-		if (pclose(f))
-			errx(1, "Can't execute: %s\n", line);
-
-		if (!*path)
-			errx(1, "Can't perform pwd on: %s\n", p->srcdir);
-
+		if ((realpath(p->srcdir, path)) == NULL)
+			errx(1, "Can't get realpath on: %s\n", p->srcdir);
 		p->realsrcdir = strdup(path);
 	}
 
@@ -670,9 +693,10 @@ fillin_program(prog_t *p)
 		snprintf(line, sizeof line, "%s/%s", objprefix, p->realsrcdir);
 		if (is_dir(line)) {
 			if ((p->objdir = strdup(line)) == NULL)
-			out_of_memory();
-		} else
+				out_of_memory();
+		} else {
 			p->objdir = p->realsrcdir;
+		}
 	}
 
 	/*
@@ -683,9 +707,10 @@ fillin_program(prog_t *p)
 	if (is_nonempty_file(path)) {
 		snprintf(line, MAXLINELEN, "Using %s for %s", path, p->name);
 		status(line);
-	} else
-		if (p->srcdir)
-			snprintf(path, sizeof(path), "%s/Makefile", p->srcdir);
+	} else if (p->srcdir) {
+		snprintf(path, sizeof(path), "%s/Makefile", p->srcdir);
+	}
+
 	if (!p->objs && p->srcdir && is_nonempty_file(path))
 		fillin_program_objs(p, path);
 
@@ -701,13 +726,13 @@ fillin_program(prog_t *p)
 		p->goterror = 1;
 }
 
-void
+static void
 fillin_program_objs(prog_t *p, char *path)
 {
 	char *obj, *cp;
 	int fd, rc;
 	FILE *f;
-	char *objvar="OBJS";
+	char *objvar = "OBJS";
 	strlst_t *s;
 	char line[MAXLINELEN];
 
@@ -731,18 +756,17 @@ fillin_program_objs(prog_t *p, char *path)
 	if (outhdrname[0] != '\0')
 		fprintf(f, ".include \"%s\"\n", outhdrname);
 	fprintf(f, ".include \"%s\"\n", path);
-	fprintf(f, ".POSIX:\n");
 	if (buildopts) {
 		fprintf(f, "BUILDOPTS+=");
 		output_strlst(f, buildopts);
 	}
 	fprintf(f, ".if defined(PROG)\n");
-	fprintf(f, "%s?=${PROG}.o\n", objvar);
+	fprintf(f, "%s?= ${PROG}.o\n", objvar);
 	fprintf(f, ".endif\n");
 	fprintf(f, "loop:\n\t@echo 'OBJS= '${%s}\n", objvar);
 
 	fprintf(f, "crunchgen_objs:\n"
-	    "\t@cd %s && %s -f %s $(BUILDOPTS) $(%s_OPTS)",
+	    "\t@cd %s && %s -f %s ${BUILDOPTS} ${%s_OPTS}",
 	    p->srcdir, path_make, tempfname, p->ident);
 	for (s = p->buildopts; s != NULL; s = s->next)
 		fprintf(f, " %s", s->str);
@@ -755,10 +779,11 @@ fillin_program_objs(prog_t *p, char *path)
 	if ((f = popen(line, "r")) == NULL) {
 		warn("submake pipe");
 		goterror = 1;
+		unlink(tempfname);
 		return;
 	}
 
-	while(fgets(line, MAXLINELEN, f)) {
+	while (fgets(line, MAXLINELEN, f)) {
 		if (strncmp(line, "OBJS= ", 6)) {
 			warnx("make error: %s", line);
 			goterror = 1;
@@ -769,19 +794,19 @@ fillin_program_objs(prog_t *p, char *path)
 		while (isspace((unsigned char)*cp))
 			cp++;
 
-		while(*cp) {
+		while (*cp) {
 			obj = cp;
 			while (*cp && !isspace((unsigned char)*cp))
 				cp++;
 			if (*cp)
 				*cp++ = '\0';
-			add_string(&p->objs, obj);
+			add_string(&p->objs, obj, 1);
 			while (isspace((unsigned char)*cp))
 				cp++;
 		}
 	}
 
-	if ((rc=pclose(f)) != 0) {
+	if ((rc = pclose(f)) != 0) {
 		warnx("make error: make returned %d", rc);
 		goterror = 1;
 	}
@@ -789,16 +814,16 @@ fillin_program_objs(prog_t *p, char *path)
 	unlink(tempfname);
 }
 
-void
+static void
 remove_error_progs(void)
 {
 	prog_t *p1, *p2;
 
 	p1 = NULL; p2 = progs;
 	while (p2 != NULL) {
-		if (!p2->goterror)
+		if (!p2->goterror) {
 			p1 = p2, p2 = p2->next;
-		else {
+		} else {
 			/* delete it from linked list */
 			warnx("%s: %s: ignoring program because of errors",
 			    infilename, p2->name);
@@ -811,7 +836,7 @@ remove_error_progs(void)
 	}
 }
 
-void
+static void
 gen_specials_cache(void)
 {
 	FILE *cachef;
@@ -827,8 +852,8 @@ gen_specials_cache(void)
 		return;
 	}
 
-	fprintf(cachef, "# %s - parm cache generated from %s by crunchgen "
-	    " %s\n\n",
+	fprintf(cachef,
+	    "# %s - parm cache generated from %s by crunchgen %s\n\n",
 	    cachename, infilename, CRUNCH_VERSION);
 
 	for (p = progs; p != NULL; p = p->next) {
@@ -852,10 +877,11 @@ gen_specials_cache(void)
 }
 
 
-void
+static void
 gen_output_makefile(void)
 {
 	prog_t *p;
+	strlst_t *intlibs, *l;
 	FILE *outmk;
 	char line[MAXLINELEN];
 
@@ -875,6 +901,13 @@ gen_output_makefile(void)
 		fprintf(outmk, ".include \"%s\"\n", outhdrname);
 
 	top_makefile_rules(outmk);
+
+	intlibs = NULL;
+	collect_internal_libs(&intlibs);
+	for (l = intlibs; l != NULL; l = l->next)
+		intlib_makefile_rules(outmk, l->str);
+	free_list(intlibs);
+
 	for (p = progs; p != NULL; p = p->next)
 		prog_makefile_rules(outmk, p);
 
@@ -883,7 +916,7 @@ gen_output_makefile(void)
 }
 
 
-void
+static void
 gen_output_cfile(void)
 {
 	char **cp;
@@ -912,7 +945,7 @@ gen_output_cfile(void)
 	for (p = progs; p != NULL; p = p->next)
 		fprintf(outcf, "extern int _crunched_%s_stub();\n", p->ident);
 
-	fprintf(outcf, "\nstruct stub entry_points[] = {\n");
+	fprintf(outcf, "\nstatic const struct stub entry_points[] = {\n");
 	for (p = progs; p != NULL; p = p->next) {
 		fprintf(outcf, "\t{ \"%s\", _crunched_%s_stub },\n",
 		    p->name, p->ident);
@@ -927,7 +960,7 @@ gen_output_cfile(void)
 }
 
 
-char *genident(char *str)
+static char *genident(char *str)
 {
 	char *n, *s, *d;
 
@@ -951,7 +984,7 @@ char *genident(char *str)
 }
 
 
-char *dir_search(char *progname)
+static char *dir_search(char *progname)
 {
 	char path[MAXPATHLEN];
 	strlst_t *dir;
@@ -971,13 +1004,30 @@ char *dir_search(char *progname)
 }
 
 
-void
+static void
+collect_internal_libs(strlst_t **listp)
+{
+	strlst_t *l;
+	prog_t *p;
+
+	for (l = libs_int; l != NULL; l = l->next)
+		add_string(listp, l->str, 1);
+	for (p = progs; p != NULL; p = p->next) {
+		if (p->libs_int) {
+			for (l = p->libs_int; l != NULL; l = l->next)
+				add_string(listp, l->str, 1);
+		}
+	}
+}
+
+
+static void
 top_makefile_rules(FILE *outmk)
 {
 	prog_t *p;
+	strlst_t *intlibs, *l;
 
-	fprintf(outmk, "LD?= ld\n");
-	if ( subtract_strlst(&libs, &libs_so) )
+	if (subtract_strlst(&libs, &libs_so))
 		fprintf(outmk, "# NOTE: Some LIBS declarations below overridden by LIBS_SO\n");
 
 	fprintf(outmk, "LIBS+=");
@@ -986,17 +1036,24 @@ top_makefile_rules(FILE *outmk)
 	fprintf(outmk, "LIBS_SO+=");
 	output_strlst(outmk, libs_so);
 
+	fprintf(outmk, "LIBS_INT+=");
+	output_strlst(outmk, libs_int);
+
 	if (makeobj) {
 		fprintf(outmk, "MAKEOBJDIRPREFIX?=%s\n", objprefix);
-		fprintf(outmk, "MAKEENV=env MAKEOBJDIRPREFIX=$(MAKEOBJDIRPREFIX)\n");
-		fprintf(outmk, "CRUNCHMAKE=$(MAKEENV) $(MAKE)\n");
+		fprintf(outmk, "MAKEENV=env MAKEOBJDIRPREFIX=${MAKEOBJDIRPREFIX}\n");
+		fprintf(outmk, "CRUNCHMAKE=${MAKEENV} ${MAKE}\n");
 	} else {
-		fprintf(outmk, "CRUNCHMAKE=$(MAKE)\n");
+		fprintf(outmk, "CRUNCHMAKE=${MAKE}\n");
 	}
 
 	if (buildopts) {
 		fprintf(outmk, "BUILDOPTS+=");
 		output_strlst(outmk, buildopts);
+	}
+	if (linkopts) {
+		fprintf(outmk, "LINKOPTS+=");
+		output_strlst(outmk, linkopts);
 	}
 
 	fprintf(outmk, "CRUNCHED_OBJS=");
@@ -1010,28 +1067,43 @@ top_makefile_rules(FILE *outmk)
 	fprintf(outmk, "\nSUBCLEAN_TARGETS=");
 	for (p = progs; p != NULL; p = p->next)
 		fprintf(outmk, " %s_clean", p->ident);
-	fprintf(outmk, "\n\n");
+	fprintf(outmk, "\n");
 
-	fprintf(outmk, "all: objs exe\nobjs: $(SUBMAKE_TARGETS)\n");
+	/* internal libraries */
+	intlibs = NULL;
+	collect_internal_libs(&intlibs);
+	fprintf(outmk, "SUBMAKE_TARGETS+=");
+	for (l = intlibs; l != NULL; l = l->next)
+		fprintf(outmk, " %s_make", basename(l->str));
+	fprintf(outmk, "\nSUBCLEAN_TARGETS+=");
+	for (l = intlibs; l != NULL; l = l->next)
+		fprintf(outmk, " %s_clean", basename(l->str));
+	fprintf(outmk, "\n\n");
+	free_list(intlibs);
+
+	fprintf(outmk, "all: objs exe\nobjs: ${SUBMAKE_TARGETS}\n");
 	fprintf(outmk, "exe: %s\n", execfname);
-	fprintf(outmk, "%s: %s.o $(CRUNCHED_OBJS) $(SUBMAKE_TARGETS)\n", execfname, execfname);
+	fprintf(outmk, "%s: %s.o ${CRUNCHED_OBJS} ${SUBMAKE_TARGETS}\n",
+	    execfname, execfname);
 	fprintf(outmk, ".if defined(LIBS_SO) && !empty(LIBS_SO)\n");
-	fprintf(outmk, "\t$(CC) -o %s %s.o $(CRUNCHED_OBJS) \\\n",
+	fprintf(outmk, "\t${CC} ${LINKOPTS} -o %s %s.o \\\n",
 	    execfname, execfname);
-	fprintf(outmk, "\t\t-Xlinker -Bstatic $(LIBS) \\\n");
-	fprintf(outmk, "\t\t-Xlinker -Bdynamic $(LIBS_SO)\n");
+	fprintf(outmk, "\t\t${CRUNCHED_OBJS} ${LIBS_INT} \\\n");
+	fprintf(outmk, "\t\t-Xlinker -Bstatic ${LIBS} \\\n");
+	fprintf(outmk, "\t\t-Xlinker -Bdynamic ${LIBS_SO}\n");
 	fprintf(outmk, ".else\n");
-	fprintf(outmk, "\t$(CC) -static -o %s %s.o $(CRUNCHED_OBJS) $(LIBS)\n",
+	fprintf(outmk, "\t${CC} ${LINKOPTS} -static -o %s %s.o \\\n",
 	    execfname, execfname);
+	fprintf(outmk, "\t\t${CRUNCHED_OBJS} ${LIBS_INT} ${LIBS}\n");
 	fprintf(outmk, ".endif\n");
 	fprintf(outmk, "\tstrip %s\n", execfname);
 	fprintf(outmk, "realclean: clean subclean\n");
 	fprintf(outmk, "clean:\n\trm -f %s *.lo *.o *_stub.c\n", execfname);
-	fprintf(outmk, "subclean: $(SUBCLEAN_TARGETS)\n");
+	fprintf(outmk, "subclean: ${SUBCLEAN_TARGETS}\n");
 }
 
 
-void
+static void
 prog_makefile_rules(FILE *outmk, prog_t *p)
 {
 	strlst_t *lst;
@@ -1042,7 +1114,7 @@ prog_makefile_rules(FILE *outmk, prog_t *p)
 	if (p->objdir)
 		fprintf(outmk, "%s", p->objdir);
 	else
-		fprintf(outmk, "$(MAKEOBJDIRPREFIX)/$(%s_REALSRCDIR)\n",
+		fprintf(outmk, "${MAKEOBJDIRPREFIX}/${%s_REALSRCDIR}\n",
 		    p->ident);
 	fprintf(outmk, "\n");
 
@@ -1050,11 +1122,11 @@ prog_makefile_rules(FILE *outmk, prog_t *p)
 	if (p->objpaths)
 		output_strlst(outmk, p->objpaths);
 	else {
-		for (lst = p->objs; lst != NULL; lst = lst->next) {
-			fprintf(outmk, " $(%s_OBJDIR)/%s", p->ident, lst->str);
-		}
+		for (lst = p->objs; lst != NULL; lst = lst->next)
+			fprintf(outmk, " ${%s_OBJDIR}/%s", p->ident, lst->str);
 		fprintf(outmk, "\n");
 	}
+	fprintf(outmk, "${%s_OBJPATHS}: .NOMETA\n", p->ident);
 
 	if (p->srcdir && p->objs) {
 		fprintf(outmk, "%s_SRCDIR=%s\n", p->ident, p->srcdir);
@@ -1066,23 +1138,20 @@ prog_makefile_rules(FILE *outmk, prog_t *p)
 			fprintf(outmk, "%s_OPTS+=", p->ident);
 			output_strlst(outmk, p->buildopts);
 		}
-#if 0
-		fprintf(outmk, "$(%s_OBJPATHS): %s_make\n\n", p->ident, p->ident);
-#endif
 		fprintf(outmk, "%s_make:\n", p->ident);
-		fprintf(outmk, "\t(cd $(%s_SRCDIR) && ", p->ident);
+		fprintf(outmk, "\t(cd ${%s_SRCDIR} && ", p->ident);
 		if (makeobj)
-			fprintf(outmk, "$(CRUNCHMAKE) obj && ");
+			fprintf(outmk, "${CRUNCHMAKE} obj && ");
 		fprintf(outmk, "\\\n");
-		fprintf(outmk, "\t\t$(CRUNCHMAKE) $(BUILDOPTS) $(%s_OPTS) depend &&",
+		fprintf(outmk, "\t\t${CRUNCHMAKE} ${BUILDOPTS} ${%s_OPTS} depend && ",
 		    p->ident);
 		fprintf(outmk, "\\\n");
-		fprintf(outmk, "\t\t$(CRUNCHMAKE) $(BUILDOPTS) $(%s_OPTS) "
-		    "$(%s_OBJS))",
+		fprintf(outmk, "\t\t${CRUNCHMAKE} ${BUILDOPTS} ${%s_OPTS} "
+		    "${%s_OBJS})",
 		    p->ident, p->ident);
 		fprintf(outmk, "\n");
 		fprintf(outmk, "%s_clean:\n", p->ident);
-		fprintf(outmk, "\t(cd $(%s_SRCDIR) && $(CRUNCHMAKE) $(BUILDOPTS) clean cleandepend)\n\n",
+		fprintf(outmk, "\t(cd ${%s_SRCDIR} && ${CRUNCHMAKE} ${BUILDOPTS} clean cleandepend)\n\n",
 		    p->ident);
 	} else {
 		fprintf(outmk, "%s_make:\n", p->ident);
@@ -1090,6 +1159,12 @@ prog_makefile_rules(FILE *outmk, prog_t *p)
 		    p->name);
 	}
 
+	if (p->libs_int) {
+		fprintf(outmk, "%s_LIBS_INT=", p->ident);
+		for (lst = p->libs_int; lst != NULL; lst = lst->next)
+			fprintf(outmk, " ${%s_LIB}", basename(lst->str));
+		fprintf(outmk, "\n");
+	}
 	if (p->libs) {
 		fprintf(outmk, "%s_LIBS=", p->ident);
 		output_strlst(outmk, p->libs);
@@ -1097,19 +1172,30 @@ prog_makefile_rules(FILE *outmk, prog_t *p)
 
 	fprintf(outmk, "%s_stub.c:\n", p->name);
 	fprintf(outmk, "\techo \""
+	    "extern int main(int, char **, char **); "
 	    "int _crunched_%s_stub(int argc, char **argv, char **envp)"
 	    "{return main(argc,argv,envp);}\" >%s_stub.c\n",
 	    p->ident, p->name);
-	fprintf(outmk, "%s.lo: %s_stub.o $(%s_OBJPATHS)",
+	fprintf(outmk, "%s_stub.o: %s_stub.c\n",
+	    p->name, p->name);
+	fprintf(outmk, "\t${CC} ${CFLAGS:N-flto*} -c %s_stub.c -o %s_stub.o",
+	    p->name, p->name);
+	fprintf(outmk, "\n");
+	fprintf(outmk, "%s.lo: %s_stub.o ${%s_OBJPATHS}",
 	    p->name, p->name, p->ident);
+	if (p->libs_int)
+		fprintf(outmk, " ${%s_LIBS_INT}", p->ident);
 	if (p->libs)
-		fprintf(outmk, " $(%s_LIBS)", p->ident);
+		fprintf(outmk, " ${%s_LIBS}", p->ident);
 
 	fprintf(outmk, "\n");
-	fprintf(outmk, "\t$(LD) -dc -r -o %s.lo %s_stub.o $(%s_OBJPATHS)",
+	fprintf(outmk, "\t${CC} -nostdlib -Wl,-dc -r "
+	    "-o %s.lo %s_stub.o ${%s_OBJPATHS}",
 	    p->name, p->name, p->ident);
 	if (p->libs)
-		fprintf(outmk, " $(%s_LIBS)", p->ident);
+		fprintf(outmk, " ${%s_LIBS}", p->ident);
+	if (p->libs_int)
+		fprintf(outmk, " ${%s_LIBS_INT}", p->ident);
 	fprintf(outmk, "\n");
 	fprintf(outmk, "\tcrunchide -k _crunched_%s_stub ", p->ident);
 	for (lst = p->keeplist; lst != NULL; lst = lst->next)
@@ -1117,7 +1203,51 @@ prog_makefile_rules(FILE *outmk, prog_t *p)
 	fprintf(outmk, "%s.lo\n", p->name);
 }
 
-void
+
+static void
+intlib_makefile_rules(FILE *outmk, char *path)
+{
+	char *pathcopy, *libname, *srcdir, *objdir;
+	char realsrcdir[MAXPATHLEN], line[MAXPATHLEN];
+
+	libname = basename(path);
+	if ((pathcopy = strdup(path)) == NULL)
+		out_of_memory();
+	srcdir = dirname(pathcopy);
+	if ((realpath(srcdir, realsrcdir)) == NULL)
+		errx(1, "Can't get realpath on: %s\n", srcdir);
+
+	fprintf(outmk, "\n# -------- %s\n\n", libname);
+	fprintf(outmk, "%s_SRCDIR=%s\n", libname, srcdir);
+	fprintf(outmk, "%s_REALSRCDIR=%s\n", libname, realsrcdir);
+
+	snprintf(line, sizeof line, "%s/%s", objprefix, realsrcdir);
+	if (is_dir(line)) {
+		if ((objdir = strdup(line)) == NULL)
+			out_of_memory();
+	} else {
+		objdir = realsrcdir;
+	}
+	fprintf(outmk, "%s_OBJDIR=%s\n", libname, objdir);
+	fprintf(outmk, "%s_LIB=${%s_OBJDIR}/%s\n", libname, libname, libname);
+
+	fprintf(outmk, "%s_make:\n", libname);
+	fprintf(outmk, "\t(cd ${%s_SRCDIR} && ", libname);
+	if (makeobj)
+		fprintf(outmk, "${CRUNCHMAKE} obj && ");
+	fprintf(outmk, "\\\n");
+	fprintf(outmk, "\t\t${CRUNCHMAKE} ${BUILDOPTS} ${%s_OPTS} depend && ",
+	    libname);
+	fprintf(outmk, "\\\n");
+	fprintf(outmk, "\t\t${CRUNCHMAKE} ${BUILDOPTS} ${%s_OPTS} %s)\n",
+	    libname, libname);
+	fprintf(outmk, "%s_clean:\n", libname);
+	fprintf(outmk, "\t(cd ${%s_SRCDIR} && ${CRUNCHMAKE} ${BUILDOPTS} clean cleandepend)\n",
+	    libname);
+}
+
+
+static void
 output_strlst(FILE *outf, strlst_t *lst)
 {
 	for (; lst != NULL; lst = lst->next)
@@ -1133,7 +1263,7 @@ output_strlst(FILE *outf, strlst_t *lst)
  *
  */
 
-void
+static void
 status(const char *str)
 {
 	static int lastlen = 0;
@@ -1153,22 +1283,22 @@ status(const char *str)
 }
 
 
-void
+static void
 out_of_memory(void)
 {
 	err(1, "%s: %d: out of memory, stopping", infilename, linenum);
 }
 
 
-void
-add_string(strlst_t **listp, char *str)
+static void
+add_string(strlst_t **listp, char *str, int nodup)
 {
 	strlst_t *p1, *p2;
 
-	/* add to end, but be smart about dups */
+	/* add to end, and avoid duplicate if nodup != 0 */
 
 	for (p1 = NULL, p2 = *listp; p2 != NULL; p1 = p2, p2 = p2->next)
-		if (!strcmp(p2->str, str))
+		if (nodup && iseq(p2->str, str))
 			return;
 
 	p2 = malloc(sizeof(strlst_t));
@@ -1185,31 +1315,47 @@ add_string(strlst_t **listp, char *str)
 		p1->next = p2;
 }
 
-int
+static int
 subtract_strlst(strlst_t **lista, strlst_t **listb)
 {
 	int subtract_count = 0;
 	strlst_t *p1;
+
 	for (p1 = *listb; p1 != NULL; p1 = p1->next)
-		if ( in_list(lista, p1->str) ) {
+		if (in_list(lista, p1->str)) {
 			warnx("Will compile library `%s' dynamically", p1->str);
 			strcat(p1->str, "");
 			subtract_count++;
 		}
+
 	return subtract_count;
 }
 
-int
+static int
 in_list(strlst_t **listp, char *str)
 {
 	strlst_t *p1;
+
 	for (p1 = *listp; p1 != NULL; p1 = p1->next)
-		if (!strcmp(p1->str, str))
+		if (iseq(p1->str, str))
 			return 1;
 	return 0;
 }
 
-int
+static void
+free_list(strlst_t *head)
+{
+	strlst_t *tmp;
+
+	while (head != NULL) {
+		tmp = head;
+		head = head->next;
+		free(tmp->str);
+		free(tmp);
+	}
+}
+
+static int
 is_dir(const char *pathname)
 {
 	struct stat buf;
@@ -1220,7 +1366,7 @@ is_dir(const char *pathname)
 	return S_ISDIR(buf.st_mode);
 }
 
-int
+static int
 is_nonempty_file(const char *pathname)
 {
 	struct stat buf;
@@ -1229,4 +1375,10 @@ is_nonempty_file(const char *pathname)
 		return 0;
 
 	return S_ISREG(buf.st_mode) && buf.st_size > 0;
+}
+
+static int
+iseq(const char *a, const char *b)
+{
+	return (strcmp(a, b) == 0);
 }

@@ -10,11 +10,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -42,16 +38,15 @@
 #endif
 
 struct lwp;
+struct sysmsg;
 
-typedef	int	sy_call_t (void *);
+typedef	int	sy_call_t (struct sysmsg *sysmsg, const void *);
 
 struct sysent {		/* system call table */
 	int	sy_narg;	/* number of arguments */
 	sy_call_t *sy_call;	/* start function */
 	sy_call_t *sy_abort;	/* abort function (only if start was async) */
 };
-
-#define SYF_ARGMASK	0x0000FFFF
 
 #define SCARG(p,k)	((p)->k)	/* get arg from args pointer */
   /* placeholder till we integrate rest of lite2 syscallargs changes XXX */
@@ -64,7 +59,6 @@ struct vnode;
 struct sysentvec {
 	int		sv_size;	/* number of entries */
 	struct sysent	*sv_table;	/* pointer to sysent */
-	u_int		sv_mask;	/* optional mask to index, else -1 */
 	int		sv_sigsize;	/* size of signal translation table */
 	int		*sv_sigtbl;	/* signal translation table */
 	int		sv_errsize;	/* size of errno translation table */
@@ -79,8 +73,6 @@ struct sysentvec {
 	char 		*sv_sigcode;	/* start of sigtramp code */
 	int 		*sv_szsigcode;	/* size of sigtramp code */
 					/* prep syscall (must be MPSAFE) */
-	void		(*sv_prepsyscall) (struct trapframe *, int *,
-					       u_int *, caddr_t *);
 	char		*sv_name;	/* name of binary type */
 	int		(*sv_coredump) (struct lwp *, int, struct vnode *,
 					    off_t);

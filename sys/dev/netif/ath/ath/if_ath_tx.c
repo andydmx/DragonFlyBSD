@@ -29,6 +29,7 @@
  */
 
 #include <sys/cdefs.h>
+__FBSDID("$FreeBSD$");
 
 /*
  * Driver for the Atheros Wireless LAN controller.
@@ -47,7 +48,6 @@
 #include <sys/mbuf.h>
 #include <sys/malloc.h>
 #include <sys/lock.h>
-#include <sys/mutex.h>
 #include <sys/kernel.h>
 #include <sys/socket.h>
 #include <sys/sockio.h>
@@ -59,6 +59,12 @@
 #include <sys/taskqueue.h>
 #include <sys/priv.h>
 #include <sys/ktr.h>
+
+#if defined(__DragonFly__)
+/* empty */
+#else
+#include <machine/bus.h>
+#endif
 
 #include <net/if.h>
 #include <net/if_var.h>
@@ -104,7 +110,9 @@
 #include <dev/netif/ath/ath/if_ath_alq.h>
 #endif
 
+#if defined(__DragonFly__)
 extern  const char* ath_hal_ether_sprintf(const uint8_t *mac);
+#endif
 
 /*
  * How many retries to perform in software
@@ -240,14 +248,11 @@ void
 ath_txfrag_cleanup(struct ath_softc *sc,
 	ath_bufhead *frags, struct ieee80211_node *ni)
 {
-	struct ath_buf *bf;
-	struct ath_buf *next;
+	struct ath_buf *bf, *next;
 
 	ATH_TXBUF_LOCK_ASSERT(sc);
 
-	next = TAILQ_FIRST(frags);
-	while ((bf = next) != NULL) {
-		next = TAILQ_NEXT(bf, bf_list);
+	TAILQ_FOREACH_SAFE(bf, frags, bf_list, next) {
 		/* NB: bf assumed clean */
 		TAILQ_REMOVE(frags, bf, bf_list);
 		ath_returnbuf_head(sc, bf);
@@ -285,46 +290,70 @@ ath_txfrag_setup(struct ath_softc *sc, ath_bufhead *frags,
 	return !TAILQ_EMPTY(frags);
 }
 
-/*
- * Reclaim mbuf resources.  For fragmented frames we
- * need to claim each frag chained with m_nextpkt.
- */
-void
-ath_freetx(struct mbuf *m)
-{
-	struct mbuf *next;
-
-	do {
-		next = m->m_nextpkt;
-		m->m_nextpkt = NULL;
-		m_freem(m);
-	} while ((m = next) != NULL);
-}
-
 static int
 ath_tx_dmasetup(struct ath_softc *sc, struct ath_buf *bf, struct mbuf *m0)
 {
+#if defined(__DragonFly__)
+#else
+	struct mbuf *m;
+#endif
 	int error;
 
 	/*
 	 * Load the DMA map so any coalescing is done.  This
 	 * also calculates the number of descriptors we need.
 	 */
-	error = bus_dmamap_load_mbuf_defrag(sc->sc_dmat, bf->bf_dmamap, &m0,
-				     bf->bf_segs, ATH_TXDESC, &bf->bf_nseg,
+#if defined(__DragonFly__)
+	error = bus_dmamap_load_mbuf_segment(sc->sc_dmat, bf->bf_dmamap, m0,
+				     bf->bf_segs, 1, &bf->bf_nseg,
 				     BUS_DMA_NOWAIT);
-	if (error != 0) {
+#else
+	error = bus_dmamap_load_mbuf_sg(sc->sc_dmat, bf->bf_dmamap, m0,
+				     bf->bf_segs, &bf->bf_nseg,
+				     BUS_DMA_NOWAIT);
+#endif
+	if (error == EFBIG) {
+		/* XXX packet requires too many descriptors */
+		bf->bf_nseg = ATH_MAX_SCATTER + 1;
+	} else if (error != 0) {
 		sc->sc_stats.ast_tx_busdma++;
-		ath_freetx(m0);
+		ieee80211_free_mbuf(m0);
 		return error;
 	}
-
 	/*
-	 * Discard null packets.
+	 * Discard null packets and check for packets that
+	 * require too many TX descriptors.  We try to convert
+	 * the latter to a cluster.
 	 */
-	if (bf->bf_nseg == 0) {
+	if (bf->bf_nseg > ATH_MAX_SCATTER) {		/* too many desc's, linearize */
+		sc->sc_stats.ast_tx_linear++;
+#if defined(__DragonFly__)
+		error = bus_dmamap_load_mbuf_defrag(sc->sc_dmat,
+					     bf->bf_dmamap, &m0,
+					     bf->bf_segs, ATH_TXDESC,
+					     &bf->bf_nseg, BUS_DMA_NOWAIT);
+#else
+		m = m_collapse(m0, M_NOWAIT, ATH_MAX_SCATTER);
+		if (m == NULL) {
+			ieee80211_free_mbuf(m0);
+			sc->sc_stats.ast_tx_nombuf++;
+			return ENOMEM;
+		}
+		m0 = m;
+		error = bus_dmamap_load_mbuf_sg(sc->sc_dmat, bf->bf_dmamap, m0,
+					     bf->bf_segs, &bf->bf_nseg,
+					     BUS_DMA_NOWAIT);
+#endif
+		if (error != 0) {
+			sc->sc_stats.ast_tx_busdma++;
+			ieee80211_free_mbuf(m0);
+			return error;
+		}
+		KASSERT(bf->bf_nseg <= ATH_MAX_SCATTER,
+		    ("too many segments after defrag; nseg %u", bf->bf_nseg));
+	} else if (bf->bf_nseg == 0) {		/* null packet, discard */
 		sc->sc_stats.ast_tx_nodata++;
-		ath_freetx(m0);
+		ieee80211_free_mbuf(m0);
 		return EIO;
 	}
 	DPRINTF(sc, ATH_DEBUG_XMIT, "%s: m %p len %u\n",
@@ -1029,8 +1058,7 @@ ath_tx_calc_protection(struct ath_softc *sc, struct ath_buf *bf)
 	uint16_t flags;
 	int shortPreamble;
 	const HAL_RATE_TABLE *rt = sc->sc_currates;
-	struct ifnet *ifp = sc->sc_ifp;
-	struct ieee80211com *ic = ifp->if_l2com;
+	struct ieee80211com *ic = &sc->sc_ic;
 
 	flags = bf->bf_state.bfs_txflags;
 	rix = bf->bf_state.bfs_rc[0].rix;
@@ -1321,7 +1349,7 @@ ath_tx_setds(struct ath_softc *sc, struct ath_buf *bf)
 	);
 
 	/*
-	 * This will be overriden when the descriptor chain is written.
+	 * This will be overridden when the descriptor chain is written.
 	 */
 	bf->bf_lastds = ds;
 	bf->bf_last = bf;
@@ -1441,11 +1469,18 @@ ath_tx_should_swq_frame(struct ath_softc *sc, struct ath_node *an,
 		 * Other control/mgmt frame; bypass software queuing
 		 * for now!
 		 */
+#if defined(__DragonFly__)
 		DPRINTF(sc, ATH_DEBUG_XMIT, 
 		    "%s: %s: Node is asleep; sending mgmt "
 		    "(type=%d, subtype=%d)\n",
 		    __func__, ath_hal_ether_sprintf(ni->ni_macaddr),
 		    type, subtype);
+#else
+		DPRINTF(sc, ATH_DEBUG_XMIT,
+		    "%s: %6D: Node is asleep; sending mgmt "
+		    "(type=%d, subtype=%d)\n",
+		    __func__, ni->ni_macaddr, ":", type, subtype);
+#endif
 		return (0);
 	} else {
 		return (1);
@@ -1524,8 +1559,7 @@ ath_tx_normal_setup(struct ath_softc *sc, struct ieee80211_node *ni,
 {
 	struct ieee80211vap *vap = ni->ni_vap;
 	struct ath_hal *ah = sc->sc_ah;
-	struct ifnet *ifp = sc->sc_ifp;
-	struct ieee80211com *ic = ifp->if_l2com;
+	struct ieee80211com *ic = &sc->sc_ic;
 	const struct chanAccParams *cap = &ic->ic_wme.wme_chanParams;
 	int error, iswep, ismcast, isfrag, ismrr;
 	int keyix, hdrlen, pktlen, try0 = 0;
@@ -1549,7 +1583,7 @@ ath_tx_normal_setup(struct ath_softc *sc, struct ieee80211_node *ni,
 	ATH_TX_LOCK_ASSERT(sc);
 
 	wh = mtod(m0, struct ieee80211_frame *);
-	iswep = wh->i_fc[1] & IEEE80211_FC1_WEP;
+	iswep = wh->i_fc[1] & IEEE80211_FC1_PROTECTED;
 	ismcast = IEEE80211_IS_MULTICAST(wh->i_addr1);
 	isfrag = m0->m_flags & M_FRAG;
 	hdrlen = ieee80211_anyhdrsize(wh);
@@ -1562,7 +1596,7 @@ ath_tx_normal_setup(struct ath_softc *sc, struct ieee80211_node *ni,
 	/* Handle encryption twiddling if needed */
 	if (! ath_tx_tag_crypto(sc, ni, m0, iswep, isfrag, &hdrlen,
 	    &pktlen, &keyix)) {
-		ath_freetx(m0);
+		ieee80211_free_mbuf(m0);
 		return EIO;
 	}
 
@@ -1670,11 +1704,11 @@ ath_tx_normal_setup(struct ath_softc *sc, struct ieee80211_node *ni,
 			flags |= HAL_TXDESC_NOACK;
 		break;
 	default:
-		if_printf(ifp, "bogus frame type 0x%x (%s)\n",
+		device_printf(sc->sc_dev, "bogus frame type 0x%x (%s)\n",
 			wh->i_fc[0] & IEEE80211_FC0_TYPE_MASK, __func__);
 		/* XXX statistic */
 		/* XXX free tx dmamap */
-		ath_freetx(m0);
+		ieee80211_free_mbuf(m0);
 		return EIO;
 	}
 
@@ -1730,7 +1764,7 @@ ath_tx_normal_setup(struct ath_softc *sc, struct ieee80211_node *ni,
 		    "%s: discard frame, ACK required w/ TDMA\n", __func__);
 		sc->sc_stats.ast_tdma_ack++;
 		/* XXX free tx dmamap */
-		ath_freetx(m0);
+		ieee80211_free_mbuf(m0);
 		return EIO;
 	}
 #endif
@@ -2053,8 +2087,7 @@ ath_tx_raw_start(struct ath_softc *sc, struct ieee80211_node *ni,
 	struct ath_buf *bf, struct mbuf *m0,
 	const struct ieee80211_bpf_params *params)
 {
-	struct ifnet *ifp = sc->sc_ifp;
-	struct ieee80211com *ic = ifp->if_l2com;
+	struct ieee80211com *ic = &sc->sc_ic;
 	struct ath_hal *ah = sc->sc_ah;
 	struct ieee80211vap *vap = ni->ni_vap;
 	int error, ismcast, ismrr;
@@ -2115,7 +2148,7 @@ ath_tx_raw_start(struct ath_softc *sc, struct ieee80211_node *ni,
 	if (! ath_tx_tag_crypto(sc, ni,
 	    m0, params->ibp_flags & IEEE80211_BPF_CRYPTO, 0,
 	    &hdrlen, &pktlen, &keyix)) {
-		ath_freetx(m0);
+		ieee80211_free_mbuf(m0);
 		return EIO;
 	}
 	/* packet header may have moved, reset our local pointer */
@@ -2194,7 +2227,7 @@ ath_tx_raw_start(struct ath_softc *sc, struct ieee80211_node *ni,
 
 		sc->sc_tx_th.wt_tsf = htole64(tsf);
 		sc->sc_tx_th.wt_flags = sc->sc_hwmap[rix].txflags;
-		if (wh->i_fc[1] & IEEE80211_FC1_WEP)
+		if (wh->i_fc[1] & IEEE80211_FC1_PROTECTED)
 			sc->sc_tx_th.wt_flags |= IEEE80211_RADIOTAP_F_WEP;
 		if (m0->m_flags & M_FRAG)
 			sc->sc_tx_th.wt_flags |= IEEE80211_RADIOTAP_F_FRAG;
@@ -2319,8 +2352,7 @@ ath_raw_xmit(struct ieee80211_node *ni, struct mbuf *m,
 	const struct ieee80211_bpf_params *params)
 {
 	struct ieee80211com *ic = ni->ni_ic;
-	struct ifnet *ifp = ic->ic_ifp;
-	struct ath_softc *sc = ifp->if_softc;
+	struct ath_softc *sc = ic->ic_softc;
 	struct ath_buf *bf;
 	struct ieee80211_frame *wh = mtod(m, struct ieee80211_frame *);
 	int error = 0;
@@ -2337,14 +2369,15 @@ ath_raw_xmit(struct ieee80211_node *ni, struct mbuf *m,
 	ATH_PCU_UNLOCK(sc);
 
 	/* Wake the hardware up already */
+	ATH_LOCK(sc);
 	ath_power_set_power_state(sc, HAL_PM_AWAKE);
+	ATH_UNLOCK(sc);
 
 	ATH_TX_LOCK(sc);
 
-	if ((ifp->if_flags & IFF_RUNNING) == 0 || sc->sc_invalid) {
-		DPRINTF(sc, ATH_DEBUG_XMIT, "%s: discard frame, %s", __func__,
-		    (ifp->if_flags & IFF_RUNNING) == 0 ?
-			"!running" : "invalid");
+	if (!sc->sc_running || sc->sc_invalid) {
+		DPRINTF(sc, ATH_DEBUG_XMIT, "%s: discard frame, r/i: %d/%d",
+		    __func__, sc->sc_running, sc->sc_invalid);
 		m_freem(m);
 		error = ENETDOWN;
 		goto bad;
@@ -2401,7 +2434,6 @@ ath_raw_xmit(struct ieee80211_node *ni, struct mbuf *m,
 		}
 	}
 	sc->sc_wd_timer = 5;
-	ifp->if_opackets++;
 	sc->sc_stats.ast_tx_raw++;
 
 	/*
@@ -2419,7 +2451,9 @@ ath_raw_xmit(struct ieee80211_node *ni, struct mbuf *m,
 
 
 	/* Put the hardware back to sleep if required */
+	ATH_LOCK(sc);
 	ath_power_restore_power_state(sc);
+	ATH_UNLOCK(sc);
 
 	return 0;
 
@@ -2441,14 +2475,14 @@ bad:
 	ATH_PCU_UNLOCK(sc);
 
 	/* Put the hardware back to sleep if required */
+	ATH_LOCK(sc);
 	ath_power_restore_power_state(sc);
+	ATH_UNLOCK(sc);
 
 badbad:
 	ATH_KTR(sc, ATH_KTR_TX, 2, "ath_raw_xmit: bad0: m=%p, params=%p",
 	    m, params);
-	ifp->if_oerrors++;
 	sc->sc_stats.ast_tx_raw_fail++;
-	ieee80211_free_node(ni);
 
 	return error;
 }
@@ -2763,6 +2797,7 @@ ath_tx_leak_count_update(struct ath_softc *sc, struct ath_tid *tid,
 		else
 			wh->i_fc[1] &= ~IEEE80211_FC1_MORE_DATA;
 
+#if defined(__DragonFly__)
 		DPRINTF(sc, ATH_DEBUG_NODE_PWRSAVE,
 		    "%s: %s: leak count = %d, psq=%d, swq=%d, MORE=%d\n",
 		    __func__,
@@ -2771,6 +2806,17 @@ ath_tx_leak_count_update(struct ath_softc *sc, struct ath_tid *tid,
 		    tid->an->an_stack_psq,
 		    tid->an->an_swq_depth,
 		    !! (wh->i_fc[1] & IEEE80211_FC1_MORE_DATA));
+#else
+		DPRINTF(sc, ATH_DEBUG_NODE_PWRSAVE,
+		    "%s: %6D: leak count = %d, psq=%d, swq=%d, MORE=%d\n",
+		    __func__,
+		    tid->an->an_node.ni_macaddr,
+		    ":",
+		    tid->an->an_leak_count,
+		    tid->an->an_stack_psq,
+		    tid->an->an_swq_depth,
+		    !! (wh->i_fc[1] & IEEE80211_FC1_MORE_DATA));
+#endif
 
 		/*
 		 * Re-sync the underlying buffer.
@@ -3121,7 +3167,7 @@ ath_tx_swq(struct ath_softc *sc, struct ieee80211_node *ni,
 	 * If we're not doing A-MPDU, be prepared to direct dispatch
 	 * up to both limits if possible.  This particular corner
 	 * case may end up with packet starvation between aggregate
-	 * traffic and non-aggregate traffic: we wnat to ensure
+	 * traffic and non-aggregate traffic: we want to ensure
 	 * that non-aggregate stations get a few frames queued to the
 	 * hardware before the aggregate station(s) get their chance.
 	 *
@@ -3232,11 +3278,19 @@ ath_tx_tid_pause(struct ath_softc *sc, struct ath_tid *tid)
 
 	ATH_TX_LOCK_ASSERT(sc);
 	tid->paused++;
+#if defined(__DragonFly__)
 	DPRINTF(sc, ATH_DEBUG_SW_TX_CTRL, "%s: [%s]: tid=%d, paused = %d\n",
 	    __func__,
 	    ath_hal_ether_sprintf(tid->an->an_node.ni_macaddr),
 	    tid->tid,
 	    tid->paused);
+#else
+	DPRINTF(sc, ATH_DEBUG_SW_TX_CTRL, "%s: [%6D]: tid=%d, paused = %d\n",
+	    __func__,
+	    tid->an->an_node.ni_macaddr, ":",
+	    tid->tid,
+	    tid->paused);
+#endif
 }
 
 /*
@@ -3253,22 +3307,38 @@ ath_tx_tid_resume(struct ath_softc *sc, struct ath_tid *tid)
 	 * until it's actually resolved.
 	 */
 	if (tid->paused == 0) {
+#if defined(__DragonFly__)
 		device_printf(sc->sc_dev,
-			      "%s: [%s]: tid=%d, paused=0?\n",
-			      __func__,
-			      ath_hal_ether_sprintf(
-						tid->an->an_node.ni_macaddr),
-			      tid->tid);
+		    "%s: [%s]: tid=%d, paused=0?\n",
+		    __func__,
+		    ath_hal_ether_sprintf(tid->an->an_node.ni_macaddr),
+		    tid->tid);
+#else
+		device_printf(sc->sc_dev,
+		    "%s: [%6D]: tid=%d, paused=0?\n",
+		    __func__,
+		    tid->an->an_node.ni_macaddr, ":",
+		    tid->tid);
+#endif
 	} else {
 		tid->paused--;
 	}
 
+#if defined(__DragonFly__)
 	DPRINTF(sc, ATH_DEBUG_SW_TX_CTRL,
 	    "%s: [%s]: tid=%d, unpaused = %d\n",
 	    __func__,
 	    ath_hal_ether_sprintf(tid->an->an_node.ni_macaddr),
 	    tid->tid,
 	    tid->paused);
+#else
+	DPRINTF(sc, ATH_DEBUG_SW_TX_CTRL,
+	    "%s: [%6D]: tid=%d, unpaused = %d\n",
+	    __func__,
+	    tid->an->an_node.ni_macaddr, ":",
+	    tid->tid,
+	    tid->paused);
+#endif
 
 	if (tid->paused)
 		return;
@@ -3544,18 +3614,34 @@ ath_tx_tid_bar_unsuspend(struct ath_softc *sc, struct ath_tid *tid)
 
 	ATH_TX_LOCK_ASSERT(sc);
 
+#if defined(__DragonFly__)
 	DPRINTF(sc, ATH_DEBUG_SW_TX_BAR,
 	    "%s: %s: TID=%d, called\n",
 	    __func__,
 	    ath_hal_ether_sprintf(tid->an->an_node.ni_macaddr),
 	    tid->tid);
+#else
+	DPRINTF(sc, ATH_DEBUG_SW_TX_BAR,
+	    "%s: %6D: TID=%d, called\n",
+	    __func__,
+	    tid->an->an_node.ni_macaddr,
+	    ":",
+	    tid->tid);
+#endif
 
 	if (tid->bar_tx == 0 || tid->bar_wait == 0) {
+#if defined(__DragonFly__)
 		DPRINTF(sc, ATH_DEBUG_SW_TX_BAR,
 		    "%s: %s: TID=%d, bar_tx=%d, bar_wait=%d: ?\n",
 		    __func__,
 		    ath_hal_ether_sprintf(tid->an->an_node.ni_macaddr),
 		    tid->tid, tid->bar_tx, tid->bar_wait);
+#else
+		DPRINTF(sc, ATH_DEBUG_SW_TX_BAR,
+		    "%s: %6D: TID=%d, bar_tx=%d, bar_wait=%d: ?\n",
+		    __func__, tid->an->an_node.ni_macaddr, ":",
+		    tid->tid, tid->bar_tx, tid->bar_wait);
+#endif
 	}
 
 	tid->bar_tx = tid->bar_wait = 0;
@@ -3576,11 +3662,20 @@ ath_tx_tid_bar_tx_ready(struct ath_softc *sc, struct ath_tid *tid)
 	if (tid->bar_wait == 0 || tid->hwq_depth > 0)
 		return (0);
 
+#if defined(__DragonFly__)
 	DPRINTF(sc, ATH_DEBUG_SW_TX_BAR,
 	    "%s: %s: TID=%d, bar ready\n",
 	    __func__,
 	    ath_hal_ether_sprintf(tid->an->an_node.ni_macaddr),
 	    tid->tid);
+#else
+	DPRINTF(sc, ATH_DEBUG_SW_TX_BAR,
+	    "%s: %6D: TID=%d, bar ready\n",
+	    __func__,
+	    tid->an->an_node.ni_macaddr,
+	    ":",
+	    tid->tid);
+#endif
 
 	return (1);
 }
@@ -3604,11 +3699,20 @@ ath_tx_tid_bar_tx(struct ath_softc *sc, struct ath_tid *tid)
 
 	ATH_TX_LOCK_ASSERT(sc);
 
+#if defined(__DragonFly__)
 	DPRINTF(sc, ATH_DEBUG_SW_TX_BAR,
 	    "%s: %s: TID=%d, called\n",
 	    __func__,
 	    ath_hal_ether_sprintf(tid->an->an_node.ni_macaddr),
 	    tid->tid);
+#else
+	DPRINTF(sc, ATH_DEBUG_SW_TX_BAR,
+	    "%s: %6D: TID=%d, called\n",
+	    __func__,
+	    tid->an->an_node.ni_macaddr,
+	    ":",
+	    tid->tid);
+#endif
 
 	tap = ath_tx_get_tx_tid(tid->an, tid->tid);
 
@@ -3616,22 +3720,39 @@ ath_tx_tid_bar_tx(struct ath_softc *sc, struct ath_tid *tid)
 	 * This is an error condition!
 	 */
 	if (tid->bar_wait == 0 || tid->bar_tx == 1) {
+#if defined(__DragonFly__)
 		DPRINTF(sc, ATH_DEBUG_SW_TX_BAR,
 		    "%s: %s: TID=%d, bar_tx=%d, bar_wait=%d: ?\n",
 		    __func__,
 		    ath_hal_ether_sprintf(tid->an->an_node.ni_macaddr),
 		    tid->tid, tid->bar_tx, tid->bar_wait);
+#else
+		DPRINTF(sc, ATH_DEBUG_SW_TX_BAR,
+		    "%s: %6D: TID=%d, bar_tx=%d, bar_wait=%d: ?\n",
+		    __func__, tid->an->an_node.ni_macaddr, ":",
+		    tid->tid, tid->bar_tx, tid->bar_wait);
+#endif
 		return;
 	}
 
 	/* Don't do anything if we still have pending frames */
 	if (tid->hwq_depth > 0) {
+#if defined(__DragonFly__)
 		DPRINTF(sc, ATH_DEBUG_SW_TX_BAR,
 		    "%s: %s: TID=%d, hwq_depth=%d, waiting\n",
 		    __func__,
 		    ath_hal_ether_sprintf(tid->an->an_node.ni_macaddr),
 		    tid->tid,
 		    tid->hwq_depth);
+#else
+		DPRINTF(sc, ATH_DEBUG_SW_TX_BAR,
+		    "%s: %6D: TID=%d, hwq_depth=%d, waiting\n",
+		    __func__,
+		    tid->an->an_node.ni_macaddr,
+		    ":",
+		    tid->tid,
+		    tid->hwq_depth);
+#endif
 		return;
 	}
 
@@ -3650,12 +3771,22 @@ ath_tx_tid_bar_tx(struct ath_softc *sc, struct ath_tid *tid)
 	 *
 	 * XXX verify this is _actually_ the valid value to begin at!
 	 */
+#if defined(__DragonFly__)
 	DPRINTF(sc, ATH_DEBUG_SW_TX_BAR,
 	    "%s: %s: TID=%d, new BAW left edge=%d\n",
 	    __func__,
 	    ath_hal_ether_sprintf(tid->an->an_node.ni_macaddr),
 	    tid->tid,
 	    tap->txa_start);
+#else
+	DPRINTF(sc, ATH_DEBUG_SW_TX_BAR,
+	    "%s: %6D: TID=%d, new BAW left edge=%d\n",
+	    __func__,
+	    tid->an->an_node.ni_macaddr,
+	    ":",
+	    tid->tid,
+	    tap->txa_start);
+#endif
 
 	/* Try sending the BAR frame */
 	/* We can't hold the lock here! */
@@ -3669,10 +3800,18 @@ ath_tx_tid_bar_tx(struct ath_softc *sc, struct ath_tid *tid)
 
 	/* Failure? For now, warn loudly and continue */
 	ATH_TX_LOCK(sc);
+#if defined(__DragonFly__)
 	DPRINTF(sc, ATH_DEBUG_SW_TX_BAR,
 	    "%s: %s: TID=%d, failed to TX BAR, continue!\n",
-	    __func__, ath_hal_ether_sprintf(tid->an->an_node.ni_macaddr),
+	    __func__,
+	    ath_hal_ether_sprintf(tid->an->an_node.ni_macaddr),
 	    tid->tid);
+#else
+	DPRINTF(sc, ATH_DEBUG_SW_TX_BAR,
+	    "%s: %6D: TID=%d, failed to TX BAR, continue!\n",
+	    __func__, tid->an->an_node.ni_macaddr, ":",
+	    tid->tid);
+#endif
 	ath_tx_tid_bar_unsuspend(sc, tid);
 }
 
@@ -3727,6 +3866,7 @@ ath_tx_tid_drain_print(struct ath_softc *sc, struct ath_node *an,
 	txq = sc->sc_ac2q[tid->ac];
 	tap = ath_tx_get_tx_tid(an, tid->tid);
 
+#if defined(__DragonFly__)
 	DPRINTF(sc, ATH_DEBUG_SW_TX | ATH_DEBUG_RESET,
 	    "%s: %s: %s: bf=%p: addbaw=%d, dobaw=%d, "
 	    "seqno=%d, retry=%d\n",
@@ -3738,6 +3878,21 @@ ath_tx_tid_drain_print(struct ath_softc *sc, struct ath_node *an,
 	    bf->bf_state.bfs_dobaw,
 	    SEQNO(bf->bf_state.bfs_seqno),
 	    bf->bf_state.bfs_retries);
+#else
+	DPRINTF(sc, ATH_DEBUG_SW_TX | ATH_DEBUG_RESET,
+	    "%s: %s: %6D: bf=%p: addbaw=%d, dobaw=%d, "
+	    "seqno=%d, retry=%d\n",
+	    __func__,
+	    pfx,
+	    ni->ni_macaddr,
+	    ":",
+	    bf,
+	    bf->bf_state.bfs_addedbaw,
+	    bf->bf_state.bfs_dobaw,
+	    SEQNO(bf->bf_state.bfs_seqno),
+	    bf->bf_state.bfs_retries);
+#endif
+#if defined(__DragonFly__)
 	DPRINTF(sc, ATH_DEBUG_SW_TX | ATH_DEBUG_RESET,
 	    "%s: %s: %s: bf=%p: txq[%d] axq_depth=%d, axq_aggr_depth=%d\n",
 	    __func__,
@@ -3747,6 +3902,19 @@ ath_tx_tid_drain_print(struct ath_softc *sc, struct ath_node *an,
 	    txq->axq_qnum,
 	    txq->axq_depth,
 	    txq->axq_aggr_depth);
+#else
+	DPRINTF(sc, ATH_DEBUG_SW_TX | ATH_DEBUG_RESET,
+	    "%s: %s: %6D: bf=%p: txq[%d] axq_depth=%d, axq_aggr_depth=%d\n",
+	    __func__,
+	    pfx,
+	    ni->ni_macaddr,
+	    ":",
+	    bf,
+	    txq->axq_qnum,
+	    txq->axq_depth,
+	    txq->axq_aggr_depth);
+#endif
+#if defined(__DragonFly__)
 	DPRINTF(sc, ATH_DEBUG_SW_TX | ATH_DEBUG_RESET,
 	    "%s: %s: %s: bf=%p: tid txq_depth=%d hwq_depth=%d, bar_wait=%d, "
 	      "isfiltered=%d\n",
@@ -3758,6 +3926,21 @@ ath_tx_tid_drain_print(struct ath_softc *sc, struct ath_node *an,
 	    tid->hwq_depth,
 	    tid->bar_wait,
 	    tid->isfiltered);
+#else
+	DPRINTF(sc, ATH_DEBUG_SW_TX | ATH_DEBUG_RESET,
+	    "%s: %s: %6D: bf=%p: tid txq_depth=%d hwq_depth=%d, bar_wait=%d, "
+	      "isfiltered=%d\n",
+	    __func__,
+	    pfx,
+	    ni->ni_macaddr,
+	    ":",
+	    bf,
+	    tid->axq_depth,
+	    tid->hwq_depth,
+	    tid->bar_wait,
+	    tid->isfiltered);
+#endif
+#if defined(__DragonFly__)
 	DPRINTF(sc, ATH_DEBUG_SW_TX | ATH_DEBUG_RESET,
 	    "%s: %s: %s: tid %d: "
 	    "sched=%d, paused=%d, "
@@ -3771,7 +3954,22 @@ ath_tx_tid_drain_print(struct ath_softc *sc, struct ath_node *an,
 	     tid->incomp, tid->baw_head,
 	     tid->baw_tail, tap == NULL ? -1 : tap->txa_start,
 	     ni->ni_txseqs[tid->tid]);
-
+#else
+	DPRINTF(sc, ATH_DEBUG_SW_TX | ATH_DEBUG_RESET,
+	    "%s: %s: %6D: tid %d: "
+	    "sched=%d, paused=%d, "
+	    "incomp=%d, baw_head=%d, "
+	    "baw_tail=%d txa_start=%d, ni_txseqs=%d\n",
+	     __func__,
+	     pfx,
+	     ni->ni_macaddr,
+	     ":",
+	     tid->tid,
+	     tid->sched, tid->paused,
+	     tid->incomp, tid->baw_head,
+	     tid->baw_tail, tap == NULL ? -1 : tap->txa_start,
+	     ni->ni_txseqs[tid->tid]);
+#endif
 	/* XXX Dump the frame, see what it is? */
 	if (IFF_DUMPPKTS(sc, ATH_DEBUG_XMIT))
 		ieee80211_dump_pkt(ni->ni_ic,
@@ -3865,6 +4063,7 @@ ath_tx_tid_drain(struct ath_softc *sc, struct ath_node *an,
 	/* But don't do it for non-QoS TIDs */
 	if (tap) {
 #if 1
+#if defined(__DragonFly__)
 		DPRINTF(sc, ATH_DEBUG_SW_TX_CTRL,
 		    "%s: %s: node %p: TID %d: sliding BAW left edge to %d\n",
 		    __func__,
@@ -3872,6 +4071,16 @@ ath_tx_tid_drain(struct ath_softc *sc, struct ath_node *an,
 		    an,
 		    tid->tid,
 		    tap->txa_start);
+#else
+		DPRINTF(sc, ATH_DEBUG_SW_TX_CTRL,
+		    "%s: %6D: node %p: TID %d: sliding BAW left edge to %d\n",
+		    __func__,
+		    ni->ni_macaddr,
+		    ":",
+		    an,
+		    tid->tid,
+		    tap->txa_start);
+#endif
 #endif
 		ni->ni_txseqs[tid->tid] = tap->txa_start;
 		tid->baw_tail = tid->baw_head;
@@ -3938,7 +4147,7 @@ ath_tx_tid_reset(struct ath_softc *sc, struct ath_tid *tid)
 	 * XXX TODO: it may just be enough to walk the HWQs and mark
 	 * frames for that node as non-aggregate; or mark the ath_node
 	 * with something that indicates that aggregation is no longer
-	 * occuring.  Then we can just toss the BAW complaints and
+	 * occurring.  Then we can just toss the BAW complaints and
 	 * do a complete hard reset of state here - no pause, no
 	 * complete counter, etc.
 	 */
@@ -3965,6 +4174,7 @@ ath_tx_node_flush(struct ath_softc *sc, struct ath_node *an)
 	    &an->an_node);
 
 	ATH_TX_LOCK(sc);
+#if defined(__DragonFly__)
 	DPRINTF(sc, ATH_DEBUG_NODE,
 	    "%s: %s: flush; is_powersave=%d, stack_psq=%d, tim=%d, "
 	    "swq_depth=%d, clrdmask=%d, leak_count=%d\n",
@@ -3976,6 +4186,20 @@ ath_tx_node_flush(struct ath_softc *sc, struct ath_node *an)
 	    an->an_swq_depth,
 	    an->clrdmask,
 	    an->an_leak_count);
+#else
+	DPRINTF(sc, ATH_DEBUG_NODE,
+	    "%s: %6D: flush; is_powersave=%d, stack_psq=%d, tim=%d, "
+	    "swq_depth=%d, clrdmask=%d, leak_count=%d\n",
+	    __func__,
+	    an->an_node.ni_macaddr,
+	    ":",
+	    an->an_is_powersave,
+	    an->an_stack_psq,
+	    an->an_tim_set,
+	    an->an_swq_depth,
+	    an->clrdmask,
+	    an->an_leak_count);
+#endif
 
 	for (tid = 0; tid < IEEE80211_TID_SIZE; tid++) {
 		struct ath_tid *atid = &an->an_tid[tid];
@@ -4768,7 +4992,7 @@ ath_tx_aggr_comp_aggr(struct ath_softc *sc, struct ath_buf *bf_first,
 		ath_tx_tid_filt_comp_aggr(sc, atid, bf_first, &bf_cq);
 
 		/* Remove from BAW */
-		TAILQ_FOREACH(bf, &bf_cq, bf_list) {
+		TAILQ_FOREACH_SAFE(bf, &bf_cq, bf_list, bf_next) {
 			if (bf->bf_state.bfs_addedbaw)
 				drops++;
 			if (bf->bf_state.bfs_dobaw) {
@@ -4864,7 +5088,7 @@ ath_tx_aggr_comp_aggr(struct ath_softc *sc, struct ath_buf *bf_first,
 
 	/* AR5416 BA bug; this requires an interface reset */
 	if (isaggr && tx_ok && (! hasba)) {
-		DPRINTF(sc, ATH_DEBUG_SW_TX_AGGR,
+		device_printf(sc->sc_dev,
 		    "%s: AR5416 bug: hasba=%d; txok=%d, isaggr=%d, "
 		    "seq_st=%d\n",
 		    __func__, hasba, tx_ok, isaggr, seq_st);
@@ -5546,7 +5770,7 @@ ath_tx_tid_hw_queue_norm(struct ath_softc *sc, struct ath_node *an,
 void
 ath_txq_sched(struct ath_softc *sc, struct ath_txq *txq)
 {
-	struct ath_tid *tid, *last;
+	struct ath_tid *tid, *next, *last;
 
 	ATH_TX_LOCK_ASSERT(sc);
 
@@ -5570,7 +5794,7 @@ ath_txq_sched(struct ath_softc *sc, struct ath_txq *txq)
 
 	last = TAILQ_LAST(&txq->axq_tidq, axq_t_s);
 
-	while ((tid = TAILQ_FIRST(&txq->axq_tidq)) != NULL) {
+	TAILQ_FOREACH_SAFE(tid, &txq->axq_tidq, axq_qelem, next) {
 		/*
 		 * Suspend paused queues here; they'll be resumed
 		 * once the addba completes or times out.
@@ -5583,9 +5807,7 @@ ath_txq_sched(struct ath_softc *sc, struct ath_txq *txq)
 		 * a frame; be careful.
 		 */
 		if (! ath_tx_tid_can_tx_or_sched(sc, tid)) {
-			if (tid == last)
-				break;
-			continue;
+			goto loop_done;
 		}
 		if (ath_tx_ampdu_running(sc, tid->an, tid->tid))
 			ath_tx_tid_hw_queue_aggr(sc, tid->an, tid);
@@ -5608,7 +5830,7 @@ ath_txq_sched(struct ath_softc *sc, struct ath_txq *txq)
 		if (txq->axq_depth >= sc->sc_hwq_limit_nonaggr) {
 			break;
 		}
-
+loop_done:
 		/*
 		 * If this was the last entry on the original list, stop.
 		 * Otherwise nodes that have been rescheduled onto the end
@@ -5697,8 +5919,8 @@ int
 ath_addba_request(struct ieee80211_node *ni, struct ieee80211_tx_ampdu *tap,
     int dialogtoken, int baparamset, int batimeout)
 {
-	struct ath_softc *sc = ni->ni_ic->ic_ifp->if_softc;
-	int tid = tap->txa_ac;
+	struct ath_softc *sc = ni->ni_ic->ic_softc;
+	int tid = tap->txa_tid;
 	struct ath_node *an = ATH_NODE(ni);
 	struct ath_tid *atid = &an->an_tid[tid];
 
@@ -5737,11 +5959,20 @@ ath_addba_request(struct ieee80211_node *ni, struct ieee80211_tx_ampdu *tap,
 	}
 	ATH_TX_UNLOCK(sc);
 
+#if defined(__DragonFly__)
 	DPRINTF(sc, ATH_DEBUG_SW_TX_CTRL,
 	    "%s: %s: called; dialogtoken=%d, baparamset=%d, batimeout=%d\n",
 	    __func__,
 	    ath_hal_ether_sprintf(ni->ni_macaddr),
 	    dialogtoken, baparamset, batimeout);
+#else
+	DPRINTF(sc, ATH_DEBUG_SW_TX_CTRL,
+	    "%s: %6D: called; dialogtoken=%d, baparamset=%d, batimeout=%d\n",
+	    __func__,
+	    ni->ni_macaddr,
+	    ":",
+	    dialogtoken, baparamset, batimeout);
+#endif
 	DPRINTF(sc, ATH_DEBUG_SW_TX_CTRL,
 	    "%s: txa_start=%d, ni_txseqs=%d\n",
 	    __func__, tap->txa_start, ni->ni_txseqs[tid]);
@@ -5774,16 +6005,24 @@ int
 ath_addba_response(struct ieee80211_node *ni, struct ieee80211_tx_ampdu *tap,
     int status, int code, int batimeout)
 {
-	struct ath_softc *sc = ni->ni_ic->ic_ifp->if_softc;
-	int tid = tap->txa_ac;
+	struct ath_softc *sc = ni->ni_ic->ic_softc;
+	int tid = tap->txa_tid;
 	struct ath_node *an = ATH_NODE(ni);
 	struct ath_tid *atid = &an->an_tid[tid];
 	int r;
 
+#if defined(__DragonFly__)
 	DPRINTF(sc, ATH_DEBUG_SW_TX_CTRL,
 	    "%s: %s: called; status=%d, code=%d, batimeout=%d\n", __func__,
 	    ath_hal_ether_sprintf(ni->ni_macaddr),
 	    status, code, batimeout);
+#else
+	DPRINTF(sc, ATH_DEBUG_SW_TX_CTRL,
+	    "%s: %6D: called; status=%d, code=%d, batimeout=%d\n", __func__,
+	    ni->ni_macaddr,
+	    ":",
+	    status, code, batimeout);
+#endif
 
 	DPRINTF(sc, ATH_DEBUG_SW_TX_CTRL,
 	    "%s: txa_start=%d, ni_txseqs=%d\n",
@@ -5820,16 +6059,23 @@ ath_addba_response(struct ieee80211_node *ni, struct ieee80211_tx_ampdu *tap,
 void
 ath_addba_stop(struct ieee80211_node *ni, struct ieee80211_tx_ampdu *tap)
 {
-	struct ath_softc *sc = ni->ni_ic->ic_ifp->if_softc;
-	int tid = tap->txa_ac;
+	struct ath_softc *sc = ni->ni_ic->ic_softc;
+	int tid = tap->txa_tid;
 	struct ath_node *an = ATH_NODE(ni);
 	struct ath_tid *atid = &an->an_tid[tid];
 	ath_bufhead bf_cq;
 	struct ath_buf *bf;
 
+#if defined(__DragonFly__)
 	DPRINTF(sc, ATH_DEBUG_SW_TX_CTRL, "%s: %s: called\n",
 	    __func__,
 	    ath_hal_ether_sprintf(ni->ni_macaddr));
+#else
+	DPRINTF(sc, ATH_DEBUG_SW_TX_CTRL, "%s: %6D: called\n",
+	    __func__,
+	    ni->ni_macaddr,
+	    ":");
+#endif
 
 	/*
 	 * Pause TID traffic early, so there aren't any races
@@ -5911,11 +6157,20 @@ ath_tx_node_reassoc(struct ath_softc *sc, struct ath_node *an)
 		tid = &an->an_tid[i];
 		if (tid->hwq_depth == 0)
 			continue;
+#if defined(__DragonFly__)
 		DPRINTF(sc, ATH_DEBUG_NODE,
 		    "%s: %s: TID %d: cleaning up TID\n",
 		    __func__,
 		    ath_hal_ether_sprintf(an->an_node.ni_macaddr),
 		    i);
+#else
+		DPRINTF(sc, ATH_DEBUG_NODE,
+		    "%s: %6D: TID %d: cleaning up TID\n",
+		    __func__,
+		    an->an_node.ni_macaddr,
+		    ":",
+		    i);
+#endif
 		/*
 		 * In case there's a followup call to this, only call it
 		 * if we don't have a cleanup in progress.
@@ -5953,24 +6208,37 @@ void
 ath_bar_response(struct ieee80211_node *ni, struct ieee80211_tx_ampdu *tap,
     int status)
 {
-	struct ath_softc *sc = ni->ni_ic->ic_ifp->if_softc;
-	int tid = tap->txa_ac;
+	struct ath_softc *sc = ni->ni_ic->ic_softc;
+	int tid = tap->txa_tid;
 	struct ath_node *an = ATH_NODE(ni);
 	struct ath_tid *atid = &an->an_tid[tid];
 	int attempts = tap->txa_attempts;
 	int old_txa_start;
 
+#if defined(__DragonFly__)
 	DPRINTF(sc, ATH_DEBUG_SW_TX_BAR,
-	    "%s: %s: called; txa_tid=%d, atid->tid=%d, status=%d, attempts=%d"
-	    ",  txa_start=%d, txa_seqpending=%d\n",
+	    "%s: %s: called; txa_tid=%d, atid->tid=%d, status=%d, attempts=%d, txa_start=%d, txa_seqpending=%d\n",
 	    __func__,
 	    ath_hal_ether_sprintf(ni->ni_macaddr),
-	    tap->txa_ac,
+	    tap->txa_tid,
 	    atid->tid,
 	    status,
 	    attempts,
 	    tap->txa_start,
 	    tap->txa_seqpending);
+#else
+	DPRINTF(sc, ATH_DEBUG_SW_TX_BAR,
+	    "%s: %6D: called; txa_tid=%d, atid->tid=%d, status=%d, attempts=%d, txa_start=%d, txa_seqpending=%d\n",
+	    __func__,
+	    ni->ni_macaddr,
+	    ":",
+	    tap->txa_tid,
+	    atid->tid,
+	    status,
+	    attempts,
+	    tap->txa_start,
+	    tap->txa_seqpending);
+#endif
 
 	/* Note: This may update the BAW details */
 	/*
@@ -5983,17 +6251,18 @@ ath_bar_response(struct ieee80211_node *ni, struct ieee80211_tx_ampdu *tap,
 	 * XXX and just correct it afterwards? The below condition should
 	 * XXX never happen and if it does I need to fix all kinds of things.
 	 */
+	ATH_TX_LOCK(sc);
 	old_txa_start = tap->txa_start;
 	sc->sc_bar_response(ni, tap, status);
 	if (tap->txa_start != old_txa_start) {
-		device_printf(sc->sc_dev,
-			      "%s: tid=%d; txa_start=%d, old=%d, adjusting\n",
-			      __func__,
-			      tid,
-			      tap->txa_start,
-			      old_txa_start);
+		device_printf(sc->sc_dev, "%s: tid=%d; txa_start=%d, old=%d, adjusting\n",
+		    __func__,
+		    tid,
+		    tap->txa_start,
+		    old_txa_start);
 	}
 	tap->txa_start = old_txa_start;
+	ATH_TX_UNLOCK(sc);
 
 	/* Unpause the TID */
 	/*
@@ -6025,16 +6294,25 @@ void
 ath_addba_response_timeout(struct ieee80211_node *ni,
     struct ieee80211_tx_ampdu *tap)
 {
-	struct ath_softc *sc = ni->ni_ic->ic_ifp->if_softc;
-	int tid = tap->txa_ac;
+	struct ath_softc *sc = ni->ni_ic->ic_softc;
+	int tid = tap->txa_tid;
 	struct ath_node *an = ATH_NODE(ni);
 	struct ath_tid *atid = &an->an_tid[tid];
 
+#if defined(__DragonFly__)
 	DPRINTF(sc, ATH_DEBUG_SW_TX_CTRL,
 	    "%s: %s: TID=%d, called; resuming\n",
 	    __func__,
 	    ath_hal_ether_sprintf(ni->ni_macaddr),
 	    tid);
+#else
+	DPRINTF(sc, ATH_DEBUG_SW_TX_CTRL,
+	    "%s: %6D: TID=%d, called; resuming\n",
+	    __func__,
+	    ni->ni_macaddr,
+	    ":",
+	    tid);
+#endif
 
 	ATH_TX_LOCK(sc);
 	atid->addba_tx_pending = 0;
@@ -6092,9 +6370,15 @@ ath_tx_node_sleep(struct ath_softc *sc, struct ath_node *an)
 	ATH_TX_LOCK(sc);
 
 	if (an->an_is_powersave) {
+#if defined(__DragonFly__)
 		DPRINTF(sc, ATH_DEBUG_XMIT,
 		    "%s: %s: node was already asleep!\n",
 		    __func__, ath_hal_ether_sprintf(an->an_node.ni_macaddr));
+#else
+		DPRINTF(sc, ATH_DEBUG_XMIT,
+		"%s: %6D: node was already asleep!\n",
+		__func__, an->an_node.ni_macaddr, ":");
+#endif
 		ATH_TX_UNLOCK(sc);
 		return;
 	}

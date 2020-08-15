@@ -21,7 +21,6 @@
 #define DRILL_AFROMFILE 3
 #define DRILL_QTOFILE 	4
 #define DRILL_NSEC	5
-#define DRILL_REVERSE	6
 #define DRILL_SECTRACE 	7
 
 #define DRILL_ON(VAR, BIT) \
@@ -30,10 +29,9 @@
 (VAR) = (VAR) & ~(BIT)
 
 extern ldns_rr_list *global_dns_root;
-extern bool qds;
 extern int verbosity;
 
-ldns_pkt *do_trace(ldns_resolver *res,
+void do_trace(ldns_resolver *res,
 			    ldns_rdf *name,
 			    ldns_rr_type type, 
 			    ldns_rr_class c);
@@ -44,8 +42,7 @@ ldns_status do_chase(ldns_resolver *res,
 				 ldns_rr_list *trusted_keys, 
 				 ldns_pkt *pkt_o,
 				 uint16_t qflags,
-				 ldns_rr_list *prev_key_list,
-				 int verbosity);
+				 ldns_rr_list *prev_key_list);
 int do_secure_trace(ldns_resolver *res,
 				ldns_rdf *name,
 				ldns_rr_type type, 

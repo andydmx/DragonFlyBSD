@@ -8,8 +8,11 @@ LEAPFILE=	-L leapseconds
 LEAPFILE=
 .endif
 
+ZIC_UG_FLAGS=	-u ${BINOWN} -g ${BINGRP}
+
 TZFILES=	africa antarctica asia australasia etcetera europe \
-		northamerica southamerica systemv
+		northamerica southamerica
+TZFILES+=	dragonfly
 POSIXRULES=	America/New_York
 
 .if defined(OLDTIMEZONES)
@@ -36,7 +39,6 @@ yearistype: yearistype.sh
 beforeinstall:
 	umask 022; cd ${.CURDIR}; \
 	zic -D -d ${DESTDIR}/usr/share/zoneinfo -p ${POSIXRULES} \
-	    -u ${BINOWN} -g ${BINGRP} \
-	    ${LEAPFILE} -y ${YEARISTYPE} ${TZFILES}
+	    ${ZIC_UG_FLAGS} ${LEAPFILE} -y ${YEARISTYPE} ${TZFILES}
 
 .include <bsd.prog.mk>

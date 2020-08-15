@@ -42,11 +42,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -309,6 +305,10 @@ struct nd_opt_hdr {		/* Neighbor discovery option header */
 #define ND_OPT_MTU			5
 
 #define ND_OPT_ROUTE_INFO		200	/* draft-ietf-ipngwg-router-preference, not officially assigned yet */
+#define ND_OPT_RDNSS			25	/* RFC 6106 */
+#define ND_OPT_DNSSL			31	/* RFC 6106 */
+#define ND_OPT_MAX			31
+
 
 struct nd_opt_prefix_info {	/* prefix information */
 	u_int8_t	nd_opt_pi_type;
@@ -346,6 +346,22 @@ struct nd_opt_route_info {	/* route info */
 	u_int8_t	nd_opt_rti_flags;
 	u_int32_t	nd_opt_rti_lifetime;
 	/* prefix follows */
+} __attribute__((__packed__));
+
+struct nd_opt_rdnss {		/* RDNSS option (RFC 6106) */
+	u_int8_t	nd_opt_rdnss_type;
+	u_int8_t	nd_opt_rdnss_len;
+	u_int16_t	nd_opt_rdnss_reserved;
+	u_int32_t	nd_opt_rdnss_lifetime;
+	/* followed by list of recursive DNS servers */
+} __attribute__((__packed__));
+
+struct nd_opt_dnssl {		/* DNSSL option (RFC 6106) */
+	u_int8_t	nd_opt_dnssl_type;
+	u_int8_t	nd_opt_dnssl_len;
+	u_int16_t	nd_opt_dnssl_reserved;
+	u_int32_t	nd_opt_dnssl_lifetime;
+	/* followed by list of DNS search domains */
 } __attribute__((__packed__));
 
 /*
@@ -679,7 +695,6 @@ void	icmp6_init (void);
 void	icmp6_paramerror (struct mbuf *, int);
 void	icmp6_error (struct mbuf *, int, int, int);
 int	icmp6_input (struct mbuf **, int *, int);
-void	icmp6_fasttimo (void);
 void	icmp6_reflect (struct mbuf *, size_t);
 void	icmp6_prepare (struct mbuf *);
 void	icmp6_redirect_input (struct mbuf *, int);

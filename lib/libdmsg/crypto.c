@@ -100,29 +100,28 @@ dmsg_crypto_gcm_init(dmsg_ioq_t *ioq, char *key, int klen,
 
 	if (klen < DMSG_CRYPTO_GCM_KEY_SIZE ||
 	    ivlen < DMSG_CRYPTO_GCM_IV_FIXED_SIZE) {
-		if (DMsgDebugOpt)
-			fprintf(stderr, "Not enough key or iv material\n");
+		dm_printf(1, "%s\n", "Not enough key or iv material");
 		return -1;
 	}
 
-	printf("%s key: ", enc ? "Encryption" : "Decryption");
+	dm_printf(6, "%s key: ", enc ? "Encryption" : "Decryption");
 	for (i = 0; i < DMSG_CRYPTO_GCM_KEY_SIZE; ++i)
-		printf("%02x", (unsigned char)key[i]);
-	printf("\n");
+		dmx_printf(6, "%02x", (unsigned char)key[i]);
+	dmx_printf(6, "%s\n", "");
 
-	printf("%s iv:  ", enc ? "Encryption" : "Decryption");
+	dm_printf(6, "%s iv:  ", enc ? "Encryption" : "Decryption");
 	for (i = 0; i < DMSG_CRYPTO_GCM_IV_FIXED_SIZE; ++i)
-		printf("%02x", (unsigned char)iv_fixed[i]);
-	printf(" (fixed part only)\n");
+		dmx_printf(6, "%02x", (unsigned char)iv_fixed[i]);
+	dmx_printf(6, "%s\n", " (fixed part only)");
 
 	EVP_CIPHER_CTX_init(&ioq->ctx);
 
 	if (enc)
 		ok = EVP_EncryptInit_ex(&ioq->ctx, EVP_aes_256_gcm(), NULL,
-					key, NULL);
+					(unsigned char*)key, NULL);
 	else
 		ok = EVP_DecryptInit_ex(&ioq->ctx, EVP_aes_256_gcm(), NULL,
-					key, NULL);
+					(unsigned char*)key, NULL);
 	if (!ok)
 		goto fail;
 
@@ -165,8 +164,7 @@ dmsg_crypto_gcm_init(dmsg_ioq_t *ioq, char *key, int klen,
 	return 0;
 
 fail:
-	if (DMsgDebugOpt)
-		fprintf(stderr, "Error during _gcm_init\n");
+	dm_printf(1, "%s\n", "Error during _gcm_init");
 	return -1;
 }
 
@@ -205,15 +203,19 @@ dmsg_crypto_gcm_encrypt_chunk(dmsg_ioq_t *ioq, char *ct, char *pt,
 	*out_size = 0;
 
 	/* Re-initialize with new IV (but without redoing the key schedule) */
-	ok = EVP_EncryptInit_ex(&ioq->ctx, NULL, NULL, NULL, ioq->iv);
+	ok = EVP_EncryptInit_ex(&ioq->ctx, NULL, NULL, NULL,
+		(unsigned char*)ioq->iv);
 	if (!ok)
 		goto fail;
 
-	ok = EVP_EncryptUpdate(&ioq->ctx, ct, &u_len, pt, in_size);
+	u_len = 0;	/* safety */
+	ok = EVP_EncryptUpdate(&ioq->ctx, (unsigned char*)ct, &u_len,
+		(unsigned char*)pt, in_size);
 	if (!ok)
 		goto fail;
 
-	ok = EVP_EncryptFinal(&ioq->ctx, ct + u_len, &f_len);
+	f_len = 0;	/* safety */
+	ok = EVP_EncryptFinal_ex(&ioq->ctx, (unsigned char*)ct + u_len, &f_len);
 	if (!ok)
 		goto fail;
 
@@ -231,14 +233,15 @@ dmsg_crypto_gcm_encrypt_chunk(dmsg_ioq_t *ioq, char *ct, char *pt,
 	}
 
 	*out_size = u_len + f_len + DMSG_CRYPTO_GCM_TAG_SIZE;
+	EVP_CIPHER_CTX_reset(&ioq->ctx);
 
 	return 0;
 
 fail:
 	ioq->error = DMSG_IOQ_ERROR_ALGO;
 fail_out:
-	if (DMsgDebugOpt)
-		fprintf(stderr, "error during encrypt_chunk\n");
+	EVP_CIPHER_CTX_reset(&ioq->ctx);
+	dm_printf(1, "%s\n", "error during encrypt_chunk");
 	return -1;
 }
 
@@ -253,7 +256,8 @@ dmsg_crypto_gcm_decrypt_chunk(dmsg_ioq_t *ioq, char *ct, char *pt,
 	*consume_size = 0;
 
 	/* Re-initialize with new IV (but without redoing the key schedule) */
-	ok = EVP_DecryptInit_ex(&ioq->ctx, NULL, NULL, NULL, ioq->iv);
+	ok = EVP_DecryptInit_ex(&ioq->ctx, NULL, NULL, NULL,
+		(unsigned char*)ioq->iv);
 	if (!ok) {
 		ioq->error = DMSG_IOQ_ERROR_ALGO;
 		goto fail_out;
@@ -267,11 +271,12 @@ dmsg_crypto_gcm_decrypt_chunk(dmsg_ioq_t *ioq, char *ct, char *pt,
 		goto fail_out;
 	}
 
-	ok = EVP_DecryptUpdate(&ioq->ctx, pt, &u_len, ct, out_size);
+	ok = EVP_DecryptUpdate(&ioq->ctx, (unsigned char*)pt, &u_len,
+		(unsigned char*)ct, out_size);
 	if (!ok)
 		goto fail;
 
-	ok = EVP_DecryptFinal(&ioq->ctx, pt + u_len, &f_len);
+	ok = EVP_DecryptFinal_ex(&ioq->ctx, (unsigned char*)pt + u_len, &f_len);
 	if (!ok)
 		goto fail;
 
@@ -282,14 +287,17 @@ dmsg_crypto_gcm_decrypt_chunk(dmsg_ioq_t *ioq, char *ct, char *pt,
 	}
 
 	*consume_size = u_len + f_len + DMSG_CRYPTO_GCM_TAG_SIZE;
+	EVP_CIPHER_CTX_reset(&ioq->ctx);
 
 	return 0;
 
 fail:
 	ioq->error = DMSG_IOQ_ERROR_MACFAIL;
 fail_out:
-	if (DMsgDebugOpt)
-		fprintf(stderr, "error during decrypt_chunk (likely authentication error)\n");
+	EVP_CIPHER_CTX_reset(&ioq->ctx);
+	dm_printf(1, "%s\n",
+		  "error during decrypt_chunk "
+		  "(likely authentication error)");
 	return -1;
 }
 
@@ -366,25 +374,23 @@ dmsg_crypto_negotiate(dmsg_iocom_t *iocom)
 	if (getpeername(iocom->sock_fd, &sa.sa, &salen) < 0) {
 		iocom->ioq_rx.error = DMSG_IOQ_ERROR_NOPEER;
 		atomic_set_int(&iocom->flags, DMSG_IOCOMF_EOF);
-		if (DMsgDebugOpt)
-			fprintf(stderr, "accept: getpeername() failed\n");
+		dm_printf(1, "%s\n", "accept: getpeername() failed");
 		goto done;
 	}
 	if (getnameinfo(&sa.sa, salen, peername, sizeof(peername),
 			NULL, 0, NI_NUMERICHOST) < 0) {
 		iocom->ioq_rx.error = DMSG_IOQ_ERROR_NOPEER;
 		atomic_set_int(&iocom->flags, DMSG_IOCOMF_EOF);
-		if (DMsgDebugOpt)
-			fprintf(stderr, "accept: cannot decode sockaddr\n");
+		dm_printf(1, "%s\n", "accept: cannot decode sockaddr");
 		goto done;
 	}
 	if (DMsgDebugOpt) {
 		if (realhostname_sa(realname, sizeof(realname),
 				    &sa.sa, salen) == HOSTNAME_FOUND) {
-			fprintf(stderr, "accept from %s (%s)\n",
-				peername, realname);
+			dm_printf(1, "accept from %s (%s)\n",
+				  peername, realname);
 		} else {
-			fprintf(stderr, "accept from %s\n", peername);
+			dm_printf(1, "accept from %s\n", peername);
 		}
 	}
 
@@ -402,12 +408,10 @@ dmsg_crypto_negotiate(dmsg_iocom_t *iocom)
 		if (stat(path, &st) < 0) {
 			iocom->ioq_rx.error = DMSG_IOQ_ERROR_NORKEY;
 			atomic_set_int(&iocom->flags, DMSG_IOCOMF_EOF);
-			if (DMsgDebugOpt)
-				fprintf(stderr, "auth failure: unknown host\n");
+			dm_printf(1, "%s\n", "auth failure: unknown host");
 			goto done;
 		}
-		if (DMsgDebugOpt)
-			fprintf(stderr, "auth succeeded, unencrypted link\n");
+		dm_printf(1, "%s\n", "auth succeeded, unencrypted link");
 		goto done;
 	}
 	if (fp) {
@@ -416,9 +420,7 @@ dmsg_crypto_negotiate(dmsg_iocom_t *iocom)
 		if (keys[0] == NULL) {
 			iocom->ioq_rx.error = DMSG_IOQ_ERROR_KEYFMT;
 			atomic_set_int(&iocom->flags, DMSG_IOCOMF_EOF);
-			if (DMsgDebugOpt)
-				fprintf(stderr,
-					"auth failure: bad key format\n");
+			dm_printf(1, "%s\n", "auth failure: bad key format");
 			goto done;
 		}
 	}
@@ -438,8 +440,7 @@ dmsg_crypto_negotiate(dmsg_iocom_t *iocom)
 	if (keys[1] == NULL) {
 		iocom->ioq_rx.error = DMSG_IOQ_ERROR_KEYFMT;
 		atomic_set_int(&iocom->flags, DMSG_IOCOMF_EOF);
-		if (DMsgDebugOpt)
-			fprintf(stderr, "auth failure: bad host key format\n");
+		dm_printf(1, "%s\n", "auth failure: bad host key format");
 		goto done;
 	}
 
@@ -448,8 +449,7 @@ dmsg_crypto_negotiate(dmsg_iocom_t *iocom)
 	if ((fp = fopen(path, "r")) == NULL) {
 		iocom->ioq_rx.error = DMSG_IOQ_ERROR_NOLKEY;
 		atomic_set_int(&iocom->flags, DMSG_IOCOMF_EOF);
-		if (DMsgDebugOpt)
-			fprintf(stderr, "auth failure: bad host key format\n");
+		dm_printf(1, "%s\n", "auth failure: bad host key format");
 		goto done;
 	}
 	keys[2] = PEM_read_RSAPrivateKey(fp, NULL, NULL, NULL);
@@ -457,8 +457,7 @@ dmsg_crypto_negotiate(dmsg_iocom_t *iocom)
 	if (keys[2] == NULL) {
 		iocom->ioq_rx.error = DMSG_IOQ_ERROR_KEYFMT;
 		atomic_set_int(&iocom->flags, DMSG_IOCOMF_EOF);
-		if (DMsgDebugOpt)
-			fprintf(stderr, "auth failure: bad host key format\n");
+		dm_printf(1, "%s\n", "auth failure: bad host key format");
 		goto done;
 	}
 	free(path);
@@ -474,9 +473,8 @@ dmsg_crypto_negotiate(dmsg_iocom_t *iocom)
 		    sizeof(handtx) % blksize != 0) {
 			iocom->ioq_rx.error = DMSG_IOQ_ERROR_KEYFMT;
 			atomic_set_int(&iocom->flags, DMSG_IOCOMF_EOF);
-			if (DMsgDebugOpt)
-				fprintf(stderr, "auth failure: "
-						"key size mismatch\n");
+			dm_printf(1, "%s\n",
+				  "auth failure: key size mismatch");
 			goto done;
 		}
 	} else {
@@ -501,8 +499,7 @@ urandfail:
 			close(fd);
 		iocom->ioq_rx.error = DMSG_IOQ_ERROR_BADURANDOM;
 		atomic_set_int(&iocom->flags, DMSG_IOCOMF_EOF);
-		if (DMsgDebugOpt)
-			fprintf(stderr, "auth failure: bad rng\n");
+		dm_printf(1, "%s\n", "auth failure: bad rng");
 		goto done;
 	}
 	if (bcmp(&handrx, &handtx, sizeof(handtx)) == 0)
@@ -550,28 +547,32 @@ urandfail:
 			 */
 			do {
 				++*(int *)(ptr + 4);
-				if (RSA_private_encrypt(blksize, ptr, buf1,
+				if (RSA_private_encrypt(blksize,
+					    (unsigned char*)ptr,
+					    (unsigned char*)buf1,
 					    keys[2], RSA_NO_PADDING) < 0) {
 					iocom->ioq_rx.error =
 						DMSG_IOQ_ERROR_KEYXCHGFAIL;
 				}
 			} while (buf1[0] & 0xC0);
 
-			if (RSA_public_encrypt(blksize, buf1, buf2,
+			if (RSA_public_encrypt(blksize,
+					    (unsigned char*)buf1,
+					    (unsigned char*)buf2,
 					    keys[0], RSA_NO_PADDING) < 0) {
 				iocom->ioq_rx.error =
 					DMSG_IOQ_ERROR_KEYXCHGFAIL;
 			}
 		}
 		if (write(iocom->sock_fd, buf2, blksize) != (ssize_t)blksize) {
-			fprintf(stderr, "WRITE ERROR\n");
+			dmio_printf(iocom, 1, "%s\n", "WRITE ERROR");
 		}
 	}
 	if (iocom->ioq_rx.error) {
 		atomic_set_int(&iocom->flags, DMSG_IOCOMF_EOF);
-		if (DMsgDebugOpt)
-			fprintf(stderr, "auth failure: key exchange failure "
-					"during encryption\n");
+		dmio_printf(iocom, 1, "%s\n",
+			    "auth failure: key exchange failure "
+			    "during encryption");
 		goto done;
 	}
 
@@ -587,11 +588,15 @@ urandfail:
 		ptr -= (i & blkmask);
 		i += n;
 		if (keys[0] && (i & blkmask) == 0) {
-			if (RSA_private_decrypt(blksize, ptr, buf1,
+			if (RSA_private_decrypt(blksize,
+					   (unsigned char*)ptr,
+					   (unsigned char*)buf1,
 					   keys[2], RSA_NO_PADDING) < 0)
 				iocom->ioq_rx.error =
 						DMSG_IOQ_ERROR_KEYXCHGFAIL;
-			if (RSA_public_decrypt(blksize, buf1, ptr,
+			if (RSA_public_decrypt(blksize,
+					   (unsigned char*)buf1,
+					   (unsigned char*)ptr,
 					   keys[0], RSA_NO_PADDING) < 0)
 				iocom->ioq_rx.error =
 						DMSG_IOQ_ERROR_KEYXCHGFAIL;
@@ -599,9 +604,9 @@ urandfail:
 	}
 	if (iocom->ioq_rx.error) {
 		atomic_set_int(&iocom->flags, DMSG_IOCOMF_EOF);
-		if (DMsgDebugOpt)
-			fprintf(stderr, "auth failure: key exchange failure "
-					"during decryption\n");
+		dmio_printf(iocom, 1, "%s\n",
+			    "auth failure: key exchange failure "
+			    "during decryption");
 		goto done;
 	}
 
@@ -613,8 +618,8 @@ urandfail:
 keyxchgfail:
 		iocom->ioq_rx.error = DMSG_IOQ_ERROR_KEYXCHGFAIL;
 		atomic_set_int(&iocom->flags, DMSG_IOCOMF_EOF);
-		if (DMsgDebugOpt)
-			fprintf(stderr, "auth failure: key exchange failure\n");
+		dmio_printf(iocom, 1, "%s\n",
+			    "auth failure: key exchange failure");
 		goto done;
 	}
 
@@ -636,17 +641,19 @@ keyxchgfail:
 	 * Use separate session keys and session fixed IVs for receive and
 	 * transmit.
 	 */
-	error = crypto_algos[DMSG_CRYPTO_ALGO].init(&iocom->ioq_rx, handrx.sess,
+	error = crypto_algos[DMSG_CRYPTO_ALGO].init(&iocom->ioq_rx,
+	    (char*)handrx.sess,
 	    crypto_algos[DMSG_CRYPTO_ALGO].keylen,
-	    handrx.sess + crypto_algos[DMSG_CRYPTO_ALGO].keylen,
+	    (char*)handrx.sess + crypto_algos[DMSG_CRYPTO_ALGO].keylen,
 	    sizeof(handrx.sess) - crypto_algos[DMSG_CRYPTO_ALGO].keylen,
 	    0 /* decryption */);
 	if (error)
 		goto keyxchgfail;
 
-	error = crypto_algos[DMSG_CRYPTO_ALGO].init(&iocom->ioq_tx, handtx.sess,
+	error = crypto_algos[DMSG_CRYPTO_ALGO].init(&iocom->ioq_tx,
+	    (char*)handtx.sess,
 	    crypto_algos[DMSG_CRYPTO_ALGO].keylen,
-	    handtx.sess + crypto_algos[DMSG_CRYPTO_ALGO].keylen,
+	    (char*)handtx.sess + crypto_algos[DMSG_CRYPTO_ALGO].keylen,
 	    sizeof(handtx.sess) - crypto_algos[DMSG_CRYPTO_ALGO].keylen,
 	    1 /* encryption */);
 	if (error)
@@ -654,8 +661,7 @@ keyxchgfail:
 
 	atomic_set_int(&iocom->flags, DMSG_IOCOMF_CRYPTED);
 
-	if (DMsgDebugOpt)
-		fprintf(stderr, "auth success: %s\n", handrx.quickmsg);
+	dmio_printf(iocom, 1, "auth success: %s\n", handrx.quickmsg);
 done:
 	if (path)
 		free(path);
@@ -663,7 +669,7 @@ done:
 		RSA_free(keys[0]);
 	if (keys[1])
 		RSA_free(keys[1]);
-	if (keys[1])
+	if (keys[2])
 		RSA_free(keys[2]);
 }
 
@@ -698,15 +704,20 @@ dmsg_crypto_decrypt(dmsg_iocom_t *iocom __unused, dmsg_ioq_t *ioq)
 		    DMSG_CRYPTO_CHUNK_SIZE,
 		    &used);
 #ifdef CRYPTO_DEBUG
-		printf("dec: p_len: %d, used: %d, fifo_cdn: %ju, fifo_cdx: %ju\n",
-		       p_len, used, ioq->fifo_cdn, ioq->fifo_cdx);
+		dmio_printf(iocom, 5,
+			    "dec: p_len: %d, used: %d, "
+			    "fifo_cdn: %ju, fifo_cdx: %ju\n",
+			     p_len, used,
+			     ioq->fifo_cdn, ioq->fifo_cdx);
 #endif
 		p_len -= used;
 		ioq->fifo_cdn += used;
 		ioq->fifo_cdx += DMSG_CRYPTO_CHUNK_SIZE;
 #ifdef CRYPTO_DEBUG
-		printf("dec: p_len: %d, used: %d, fifo_cdn: %ju, fifo_cdx: %ju\n",
-		       p_len, used, ioq->fifo_cdn, ioq->fifo_cdx);
+		dmio_printf(iocom, 5,
+			    "dec: p_len: %d, used: %d, "
+			    "fifo_cdn: %ju, fifo_cdx: %ju\n",
+			    p_len, used, ioq->fifo_cdn, ioq->fifo_cdx);
 #endif
 	}
 }
@@ -741,21 +752,30 @@ dmsg_crypto_encrypt(dmsg_iocom_t *iocom __unused, dmsg_ioq_t *ioq,
 			    (char *)iov[i].iov_base + used,
 			    DMSG_CRYPTO_CHUNK_SIZE, &ct_used);
 #ifdef CRYPTO_DEBUG
-			printf("nactp: %ju, p_len: %d, ct_used: %d, used: %d, nmax: %ju\n",
-			       *nactp, p_len, ct_used, used, nmax);
+			dmio_printf(iocom, 5,
+				    "nactp: %ju, p_len: %d, "
+				    "ct_used: %d, used: %d, nmax: %ju\n",
+				    *nactp, p_len, ct_used, used, nmax);
 #endif
 
 			*nactp += (size_t)DMSG_CRYPTO_CHUNK_SIZE;	/* plaintext count */
 			used += DMSG_CRYPTO_CHUNK_SIZE;
 			p_len -= DMSG_CRYPTO_CHUNK_SIZE;
 
-			ioq->fifo_cdx += (size_t)ct_used;	/* crypted count */
-			ioq->fifo_cdn += (size_t)ct_used;	/* crypted count */
+			/*
+			 * NOTE: crypted count will eventually differ from
+			 *	 nmax, but for now we have not yet introduced
+			 *	 random armor.
+			 */
+			ioq->fifo_cdx += (size_t)ct_used;
+			ioq->fifo_cdn += (size_t)ct_used;
 			ioq->fifo_end += (size_t)ct_used;
 			nmax -= (size_t)ct_used;
 #ifdef CRYPTO_DEBUG
-			printf("nactp: %ju, p_len: %d, ct_used: %d, used: %d, nmax: %ju\n",
-			       *nactp, p_len, ct_used, used, nmax);
+			dmio_printf(iocom, 5,
+				    "nactp: %ju, p_len: %d, "
+				    "ct_used: %d, used: %d, nmax: %ju\n",
+				    *nactp, p_len, ct_used, used, nmax);
 #endif
 		}
 	}

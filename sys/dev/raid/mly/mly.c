@@ -553,7 +553,7 @@ mly_intr(void *arg)
     debug_called(2);
 
     mly_done(sc);
-};
+}
 
 /********************************************************************************
  ********************************************************************************
@@ -1660,8 +1660,10 @@ mly_alloc_command(struct mly_softc *sc, struct mly_command **mcp)
 
     debug_called(3);
 
-    if ((mc = mly_dequeue_free(sc)) == NULL)
+    if ((mc = mly_dequeue_free(sc)) == NULL) {
+	*mcp = NULL;	/* avoid gcc warning */
 	return(ENOMEM);
+    }
 
     *mcp = mc;
     return(0);
@@ -2010,7 +2012,7 @@ mly_cam_rescan_btl(struct mly_softc *sc, int bus, int target)
     if (xpt_create_path(&ccb->ccb_h.path, xpt_periph,
 			cam_sim_path(sc->mly_cam_sim[bus]), target, 0) != CAM_REQ_CMP) {
 	mly_printf(sc, "rescan failed (can't create path)\n");
-	xpt_free_ccb(ccb);
+	xpt_free_ccb(&ccb->ccb_h);
 	return;
     }
 
@@ -2025,7 +2027,7 @@ mly_cam_rescan_btl(struct mly_softc *sc, int bus, int target)
 static void
 mly_cam_rescan_callback(struct cam_periph *periph, union ccb *ccb)
 {
-    xpt_free_ccb(ccb);
+    xpt_free_ccb(&ccb->ccb_h);
 }
 
 /********************************************************************************
@@ -2605,7 +2607,9 @@ mly_print_command(struct mly_command *mc)
     if (mc->mc_packet != NULL)
 	mly_print_packet(mc);
     mly_printf(sc, "  data      %p/%d\n", mc->mc_data, mc->mc_length);
-    mly_printf(sc, "  flags     %b\n", mc->mc_flags, "\20\1busy\2complete\3slotted\4mapped\5datain\6dataout\n");
+    mly_printf(sc, "  flags     %pb%i\n",
+	       "\20\1busy\2complete\3slotted\4mapped\5datain\6dataout\n",
+	       mc->mc_flags);
     mly_printf(sc, "  complete  %p\n", mc->mc_complete);
     mly_printf(sc, "  private   %p\n", mc->mc_private);
 }

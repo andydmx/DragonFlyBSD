@@ -40,6 +40,7 @@
 #include <kvm.h>
 #include <limits.h>
 #include <nlist.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -107,8 +108,6 @@ struct reg_save_area {
 	uint64_t rdi, rsi, rdx, rcx, r8, r9;
 	/* XMM registers follow, but we don't use them */
 };
-#elif __i386__
-typedef void *machine_va_list;
 #endif
 
 static int cflag;
@@ -433,14 +432,14 @@ print_header(FILE *fo, int row)
 			fprintf(fo, "%-16s ", "timestamp");
 		if (xflag) {
 			if (nflag)
-			    fprintf(fo, "%-10s %-10s", "caller2", "caller1");
+			    fprintf(fo, "%-18s %-18s ", "caller2", "caller1");
 			else
-			    fprintf(fo, "%-20s %-20s", "caller2", "caller1");
+			    fprintf(fo, "%-25s %-25s ", "caller2", "caller1");
 		}
 		if (iflag)
 			fprintf(fo, "%-20s ", "ID");
 		if (fflag)
-			fprintf(fo, "%10s%-30s ", "", "file and line");
+			fprintf(fo, "%10s%-30s", "", "file and line");
 		if (pflag)
 			fprintf(fo, "%s", "trace");
 		fprintf(fo, "\n");
@@ -471,12 +470,12 @@ print_entry(FILE *fo, int n, int row, struct ktr_entry *entry,
 	}
 	if (xflag) {
 		if (nflag) {
-		    fprintf(fo, "%p %p ", 
+		    fprintf(fo, "%p %p ",
 			    entry->ktr_caller2, entry->ktr_caller1);
 		} else {
-		    fprintf(fo, "%-25s ", 
+		    fprintf(fo, "%-25s ",
 			    address_to_symbol(entry->ktr_caller2, &symctx));
-		    fprintf(fo, "%-25s ", 
+		    fprintf(fo, "%-25s ",
 			    address_to_symbol(entry->ktr_caller1, &symctx));
 		}
 	}
@@ -568,6 +567,14 @@ mangle_string_ptrs(const char *fmt, uint8_t *fmtdata, int dofree)
 			;
 		intsz = 0;
 		switch (p[0]) {
+		case 'h':
+			if (p[1] == 'h') {
+				++p;
+				intsz = sizeof(char);
+			} else {
+				intsz = sizeof(short);
+			}
+			break;
 		case 'l':
 			if (p[1] == 'l') {
 				++p;
@@ -621,7 +628,7 @@ mangle_string_ptrs(const char *fmt, uint8_t *fmtdata, int dofree)
 			  char *t = strdup(kvm_string(((char **)fmtdata)[0],
 							  &strctx));
 			  ((const char **)fmtdata)[0] = t;
-					
+
 				skipsize = sizeof(char *);
 			}
 			++ret;
@@ -684,7 +691,7 @@ kvm_ktrinfo(void *kptr, struct save_ctx *ctx)
 		return(NULL);
 	if (ctx->save_kptr != kptr) {
 		if (kvm_read(kd, (uintptr_t)kptr, ki, sizeof(*ki)) == -1) {
-			bzero(&ki, sizeof(*ki));
+			bzero(ki, sizeof(*ki));
 		} else {
 			ctx->save_kptr = kptr;
 		}
@@ -756,7 +763,7 @@ read_symbols(const char *file)
 	char cmd[256];
 	size_t buflen = sizeof(buf);
 	FILE *fp;
-	struct symdata *sym;
+	struct symdata *sym = NULL;
 	char *s1;
 	char *s2;
 	char *s3;
@@ -765,7 +772,7 @@ read_symbols(const char *file)
 
 	if (file == NULL) {
 		if (sysctlbyname("kern.bootfile", buf, &buflen, NULL, 0) < 0)
-			file = "/boot/kernel";
+			file = "/boot/kernel/kernel";
 		else
 			file = buf;
 	}
@@ -782,12 +789,18 @@ read_symbols(const char *file)
 			sym->symname = strdup(s3);
 			if (strcmp(s3, "kernbase") == 0)
 				symbegin = sym->symaddr;
-			if (strcmp(s3, "end") == 0)
+			if (strcmp(s3, "end") == 0 || strcmp(s3, "_end") == 0)
 				symend = sym->symaddr;
 			TAILQ_INSERT_TAIL(&symlist, sym, link);
 		    }
 		}
 		pclose(fp);
+	}
+	if (symend == NULL) {
+		if (sym != NULL)
+			symend = sym->symaddr;
+		else
+			symend = (char *)-1;
 	}
 	symcache = TAILQ_FIRST(&symlist);
 }
@@ -1029,6 +1042,7 @@ kvmfprintf(FILE *fp, const char *ctl, va_list va)
 					is_long = 1;
 					/* fall through */
 				case 'd':
+				case 'i':
 				case 'u':
 				case 'x':
 				case 'o':
@@ -1080,10 +1094,14 @@ kvmfprintf(FILE *fp, const char *ctl, va_list va)
 					++n;
 					break;
 				case 'j':
+				case 't':
 					is_long = 2;
 					break;
 				case 'z':
 					is_long = 3;
+					break;
+				case 'h':
+					is_long = 0;
 					break;
 				case 'l':
 					if (is_long)
@@ -1091,6 +1109,7 @@ kvmfprintf(FILE *fp, const char *ctl, va_list va)
 					else
 						is_long = 1;
 					break;
+				case '#':
 				case '.':
 				case '-':
 				case '+':
@@ -1233,8 +1252,8 @@ conversion_size(const char *fmt, enum argument_class *argclass)
 			convsize = sizeof(double);
 		else
 			convsize = sizeof(float);
-		break;
 		*argclass = ARGCLASS_FP;
+		break;
 	case 's':
 		convsize = sizeof(char *);
 		*argclass = ARGCLASS_INTEGER;
@@ -1355,7 +1374,7 @@ va_list_from_blob(machine_va_list *_valist, const char *fmt, char *blob, size_t 
 	}
 	if (blobsize) {
 		fprintf(stderr, "Couldn't consume all data for format %s "
-			"(%zd bytes left over)\n", fmt, blobsize);
+			"(%zu bytes left over)\n", fmt, blobsize);
 		goto free_areas;
 	}
 	va_list_rewind(valist);
@@ -1369,67 +1388,6 @@ free_areas:
 free_valist:
 	free(valist);
 	*_valist = NULL;
-	return -1;
-}
-#elif __i386__
-
-static void
-va_list_cleanup(machine_va_list *valist)
-{
-	if (*valist)
-		free(*valist);
-}
-
-static int
-va_list_from_blob(machine_va_list *valist, const char *fmt, char *blob, size_t blobsize)
-{
-	const char *f;
-	char *n;
-	size_t bytes, sz;
-	enum argument_class argclass;
-
-	n = NULL;
-	bytes = 0;
-	for (f = fmt; *f != '\0'; ++f) {
-		if (*f != '%')
-			continue;
-		sz = conversion_size(f, &argclass);
-		if (blobsize < sz) {
-			fprintf(stderr, "not enough data available "
-				"for format: %s\n", fmt);
-			goto free_va;
-		}
-		if ((argclass == ARGCLASS_INTEGER) && (sz < 4)) {
-			int i = -1;	/* do C integer promotion */
-			if (sz == 1)
-				i = *(char *)blob;
-			else
-				i = *(short *)blob;
-			if (!(n = realloc(n, bytes + 4)))
-				goto free_va;
-			memcpy(n + bytes, &i, sizeof(i));
-			bytes += 4;
-		} else {
-			if (!(n = realloc(n, bytes + sz)))
-				goto free_va;
-			memcpy(n + bytes, blob, sz);
-			bytes += sz;
-		}
-		blob += sz;
-		blobsize -= sz;
-
-	}
-	if (blobsize) {
-		fprintf(stderr, "Couldn't consume all data for format %s "
-			"(%zd bytes left over)\n", fmt, blobsize);
-		goto free_va;
-	}
-	*valist = n;
-	return 0;
-free_va:
-	if (n)
-		free(n);
-	*valist = NULL;
 	return -1;
 }
 

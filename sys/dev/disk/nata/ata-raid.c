@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2000 - 2006 Søren Schmidt <sos@FreeBSD.org>
+ * Copyright (c) 2000 - 2008 Søren Schmidt <sos@FreeBSD.org>
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -40,9 +40,9 @@
 #include <sys/endian.h>
 #include <sys/libkern.h>
 #include <sys/malloc.h>
+#include <sys/lock.h>
 #include <sys/module.h>
 #include <sys/nata.h>
-#include <sys/spinlock2.h>
 #include <sys/systm.h>
 
 #include <vm/pmap.h>
@@ -57,6 +57,16 @@
 #include "ata-pci.h"
 #include "ata_if.h"
 
+/* local implementation, to trigger a warning */
+static inline void
+biofinish(struct bio *bp, struct bio *x __unused, int error)
+{
+	struct buf *bbp = bp->bio_buf;
+
+	bbp->b_flags |= B_ERROR;
+	bbp->b_error = error;
+	biodone(bp);
+}
 
 /* device structure */
 static	d_strategy_t	ata_raid_strategy;
@@ -74,7 +84,7 @@ static struct dev_ops ar_ops = {
 /* prototypes */
 static void ata_raid_done(struct ata_request *request);
 static void ata_raid_config_changed(struct ar_softc *rdp, int writeback);
-static int ata_raid_status(struct ata_ioc_raid_config *config);
+static int ata_raid_status(struct ata_ioc_raid_status *status);
 static int ata_raid_create(struct ata_ioc_raid_config *config);
 static int ata_raid_delete(int array);
 static int ata_raid_addspare(struct ata_ioc_raid_config *config);
@@ -124,7 +134,7 @@ static void ata_raid_sii_print_meta(struct sii_raid_conf *meta);
 static void ata_raid_sis_print_meta(struct sis_raid_conf *meta);
 static void ata_raid_via_print_meta(struct via_raid_conf *meta);
 
-/* internal vars */   
+/* internal vars */
 static struct ar_softc *ata_raid_arrays[MAX_ARRAYS];
 static MALLOC_DEFINE(M_AR, "ar_driver", "ATA PseudoRAID driver");
 static devclass_t ata_raid_sub_devclass;
@@ -138,14 +148,14 @@ ata_raid_attach(struct ar_softc *rdp, int writeback)
     char buffer[32];
     int disk;
 
-    spin_init(&rdp->lock, "ataraidattach");
+    lockinit(&rdp->lock, "ataraidattach", 0, 0);
     ata_raid_config_changed(rdp, writeback);
 
     /* sanitize arrays total_size % (width * interleave) == 0 */
     if (rdp->type == AR_T_RAID0 || rdp->type == AR_T_RAID01 ||
 	rdp->type == AR_T_RAID5) {
-	rdp->total_sectors = (rdp->total_sectors/(rdp->interleave*rdp->width))*
-			     (rdp->interleave * rdp->width);
+	rdp->total_sectors = rounddown(rdp->total_sectors,
+	    rdp->interleave * rdp->width);
 	ksprintf(buffer, " (stripe %d KB)",
 		(rdp->interleave * DEV_BSIZE) / 1024);
     }
@@ -230,13 +240,14 @@ ata_raid_attach(struct ar_softc *rdp, int writeback)
 static int
 ata_raid_ioctl(u_long cmd, caddr_t data)
 {
+    struct ata_ioc_raid_status *status = (struct ata_ioc_raid_status *)data;
     struct ata_ioc_raid_config *config = (struct ata_ioc_raid_config *)data;
     int *lun = (int *)data;
     int error = EOPNOTSUPP;
 
     switch (cmd) {
     case IOCATARAIDSTATUS:
-	error = ata_raid_status(config);
+	error = ata_raid_status(status);
 	break;
 			
     case IOCATARAIDCREATE:
@@ -281,7 +292,7 @@ ata_raid_flush(struct ar_softc *rdp, struct bio *bp)
 	request->u.ata.lba = 0;
 	request->u.ata.count = 0;
 	request->u.ata.feature = 0;
-	request->timeout = 1;
+	request->timeout = 1;	/* ATA_DEFAULT_TIMEOUT */
 	request->retries = 0;
 	request->flags |= ATA_R_ORDERED | ATA_R_DIRECT;
 	ata_queue_request(request);
@@ -308,19 +319,14 @@ ata_raid_strategy(struct dev_strategy_args *ap)
 	int error;
 
 	error = ata_raid_flush(rdp, bp);
-	if (error != 0) {
-		bbp->b_flags |= B_ERROR;
-		bbp->b_error = error;
-		biodone(bp);
-	}
+	if (error != 0)
+		biofinish(bp, NULL, error);
 	return(0);
     }
 
     if (!(rdp->status & AR_S_READY) ||
 	(bbp->b_cmd != BUF_CMD_READ && bbp->b_cmd != BUF_CMD_WRITE)) {
-	bbp->b_flags |= B_ERROR;
-	bbp->b_error = EIO;
-	biodone(bp);
+	biofinish(bp, NULL, EIO);
 	return(0);
     }
 
@@ -369,9 +375,7 @@ ata_raid_strategy(struct dev_strategy_args *ap)
 
 	default:
 	    kprintf("ar%d: unknown array type in ata_raid_strategy\n", rdp->lun);
-	    bbp->b_flags |= B_ERROR;
-	    bbp->b_error = EIO;
-	    biodone(bp);
+	    biofinish(bp, NULL, EIO);
 	    return(0);
 	}
 	 
@@ -380,9 +384,7 @@ ata_raid_strategy(struct dev_strategy_args *ap)
 	    lba += rdp->offset_sectors;
 
 	if (!(request = ata_raid_init_request(rdp, bp))) {
-	    bbp->b_flags |= B_ERROR;
-	    bbp->b_error = EIO;
-	    biodone(bp);
+	    biofinish(bp, NULL, EIO);
 	    return(0);
 	}
 	request->data = data;
@@ -400,9 +402,7 @@ ata_raid_strategy(struct dev_strategy_args *ap)
 		rdp->disks[drv].flags &= ~AR_DF_ONLINE;
 		ata_raid_config_changed(rdp, 1);
 		ata_free_request(request);
-		bbp->b_flags |= B_ERROR;
-		bbp->b_error = EIO;
-		biodone(bp);
+		biofinish(bp, NULL, EIO);
 		return(0);
 	    }
 	    request->this = drv;
@@ -428,9 +428,7 @@ ata_raid_strategy(struct dev_strategy_args *ap)
 		ata_raid_config_changed(rdp, 1);
 	    if (!(rdp->status & AR_S_READY)) {
 		ata_free_request(request);
-		bbp->b_flags |= B_ERROR;
-		bbp->b_error = EIO;
-		biodone(bp);
+		biofinish(bp, NULL, EIO);
 		return(0);
 	    }
 
@@ -498,7 +496,7 @@ ata_raid_strategy(struct dev_strategy_args *ap)
 				rebuild->dev = rdp->disks[this].dev;
 				rebuild->flags &= ~ATA_R_READ;
 				rebuild->flags |= ATA_R_WRITE;
-				spin_init(&composite->lock, "ardfspare");
+				lockinit(&composite->lock, "ardfspare", 0, 0);
 				composite->residual = request->bytecount;
 				composite->rd_needed |= (1 << drv);
 				composite->wr_depend |= (1 << drv);
@@ -557,7 +555,7 @@ ata_raid_strategy(struct dev_strategy_args *ap)
 				      sizeof(struct ata_request));
 				mirror->this = this;
 				mirror->dev = rdp->disks[this].dev;
-				spin_init(&composite->lock, "ardfonline");
+				lockinit(&composite->lock, "ardfonline", 0, 0);
 				composite->residual = request->bytecount;
 				composite->wr_needed |= (1 << drv);
 				composite->wr_needed |= (1 << this);
@@ -605,9 +603,7 @@ ata_raid_strategy(struct dev_strategy_args *ap)
 		ata_raid_config_changed(rdp, 1);
 	    if (!(rdp->status & AR_S_READY)) {
 		ata_free_request(request);
-		bbp->b_flags |= B_ERROR;
-		bbp->b_error = EIO;
-		biodone(bp);
+		biofinish(bp, NULL, EIO);
 		return(0);
 	    }
 	    if (rdp->status & AR_S_DEGRADED) {
@@ -619,16 +615,15 @@ ata_raid_strategy(struct dev_strategy_args *ap)
 		if (bbp->b_cmd == BUF_CMD_READ) {
 		    ata_raid_send_request(request);
 		}
-		if (bbp->b_cmd == BUF_CMD_WRITE) { 
+		if (bbp->b_cmd == BUF_CMD_WRITE) {
 		    ata_raid_send_request(request);
-		    /* XXX TGEN no, I don't speak Danish either */
 		    /*
-		     * sikre at læs-modify-skriv til hver disk er atomarisk.
-		     * par kopi af request
-		     * læse orgdata fra drv
-		     * skriv nydata til drv
-		     * læse parorgdata fra par
-		     * skriv orgdata xor parorgdata xor nydata til par
+		     * ensure that read-modify-write to each disk is atomic.
+		     * couple of copies of request
+		     * read old data data from drv
+		     * write new data to drv
+		     * read smth-smth data from pairs
+		     * write old data xor smth-smth data xor data to pairs
 		     */
 		}
 	    }
@@ -704,7 +699,7 @@ ata_raid_done(struct ata_request *request)
 
 		/* is this a rebuild composite */
 		if ((composite = request->composite)) {
-		    spin_lock(&composite->lock);
+		    lockmgr(&composite->lock, LK_EXCLUSIVE);
 		
 		    /* handle the read part of a rebuild composite */
 		    if (request->flags & ATA_R_READ) {
@@ -740,7 +735,7 @@ ata_raid_done(struct ata_request *request)
 				finished = 1;
 			}
 		    }
-		    spin_unlock(&composite->lock);
+		    lockmgr(&composite->lock, LK_RELEASE);
 		}
 
 		/* if read failed retry on the mirror */
@@ -761,7 +756,7 @@ ata_raid_done(struct ata_request *request)
 	    else if (bbp->b_cmd == BUF_CMD_WRITE) {
 		/* do we have a mirror or rebuild to deal with ? */
 		if ((composite = request->composite)) {
-		    spin_lock(&composite->lock);
+		    lockmgr(&composite->lock, LK_EXCLUSIVE);
 		    if (composite->wr_done & (1 << mirror)) {
 			if (request->result) {
 			    if (composite->request[mirror]->result) {
@@ -784,7 +779,7 @@ ata_raid_done(struct ata_request *request)
 			if (!composite->residual)
 			    finished = 1;
 		    }
-		    spin_unlock(&composite->lock);
+		    lockmgr(&composite->lock, LK_RELEASE);
 		}
 		/* no mirror we are done */
 		else {
@@ -863,7 +858,7 @@ ata_raid_done(struct ata_request *request)
 		    ata_free_request(composite->request[i]);
 		}
 	    }
-	    spin_uninit(&composite->lock);
+	    lockuninit(&composite->lock);
 	    ata_free_composite(composite);
 	}
     }
@@ -918,7 +913,8 @@ ata_raid_config_changed(struct ar_softc *rdp, int writeback)
 {
     int disk, count, status;
 
-    spin_lock(&rdp->lock);
+    lockmgr(&rdp->lock, LK_EXCLUSIVE);
+
     /* set default all working mode */
     status = rdp->status;
     rdp->status &= ~AR_S_DEGRADED;
@@ -979,10 +975,14 @@ ata_raid_config_changed(struct ar_softc *rdp, int writeback)
      * those of the missing or failed drives (in all cases).
      */
     if (rdp->status != status) {
+
+	/* raid status has changed, update metadata */
+	writeback = 1;
+
+	/* announce we have trouble ahead */
 	if (!(rdp->status & AR_S_READY)) {
 	    kprintf("ar%d: FAILURE - %s array broken\n",
 		   rdp->lun, ata_raid_type(rdp));
-	    writeback = 1;
 	}
 	else if (rdp->status & AR_S_DEGRADED) {
 	    if (rdp->type & (AR_T_RAID1 | AR_T_RAID01))
@@ -991,35 +991,41 @@ ata_raid_config_changed(struct ar_softc *rdp, int writeback)
 		kprintf("ar%d: WARNING - parity", rdp->lun);
 	    kprintf(" protection lost. %s array in DEGRADED mode\n",
 		   ata_raid_type(rdp));
-	    writeback = 1;
 	}
     }
-    spin_unlock(&rdp->lock);
+    lockmgr(&rdp->lock, LK_RELEASE);
     if (writeback)
 	ata_raid_write_metadata(rdp);
 
 }
 
 static int
-ata_raid_status(struct ata_ioc_raid_config *config)
+ata_raid_status(struct ata_ioc_raid_status *status)
 {
     struct ar_softc *rdp;
     int i;
 	
-    if (!(rdp = ata_raid_arrays[config->lun]))
+    if (!(rdp = ata_raid_arrays[status->lun]))
 	return ENXIO;
 	
-    config->type = rdp->type;
-    config->total_disks = rdp->total_disks;
+    status->type = rdp->type;
+    status->total_disks = rdp->total_disks;
     for (i = 0; i < rdp->total_disks; i++ ) {
-	if ((rdp->disks[i].flags & AR_DF_PRESENT) && rdp->disks[i].dev)  
-	    config->disks[i] = device_get_unit(rdp->disks[i].dev);
-	else
-	    config->disks[i] = -1;
+	status->disks[i].state = 0;
+	if ((rdp->disks[i].flags & AR_DF_PRESENT) && rdp->disks[i].dev) {
+	    status->disks[i].lun = device_get_unit(rdp->disks[i].dev);
+	    if (rdp->disks[i].flags & AR_DF_PRESENT)
+		status->disks[i].state |= AR_DISK_PRESENT;
+	    if (rdp->disks[i].flags & AR_DF_ONLINE)
+		status->disks[i].state |= AR_DISK_ONLINE;
+	    if (rdp->disks[i].flags & AR_DF_SPARE)
+		status->disks[i].state |= AR_DISK_SPARE;
+	} else
+	    status->disks[i].lun = -1;
     }
-    config->interleave = rdp->interleave;
-    config->status = rdp->status;
-    config->progress = 100 * rdp->rebuild_lba / rdp->total_sectors;
+    status->interleave = rdp->interleave;
+    status->status = rdp->status;
+    status->progress = 100 * rdp->rebuild_lba / rdp->total_sectors;
     return 0;
 }
 
@@ -1031,7 +1037,6 @@ ata_raid_create(struct ata_ioc_raid_config *config)
     int array, disk;
     int ctlr = 0, total_disks = 0;
     u_int disk_size = 0;
-    device_t gpdev;
 
     for (array = 0; array < MAX_ARRAYS; array++) {
 	if (!ata_raid_arrays[array])
@@ -1056,9 +1061,7 @@ ata_raid_create(struct ata_ioc_raid_config *config)
 	    }
 	    rdp->disks[disk].dev = device_get_parent(subdisk);
 
-	    gpdev = GRANDPARENT(rdp->disks[disk].dev);
-
-	    switch (pci_get_vendor(gpdev)) {
+	    switch (pci_get_vendor(GRANDPARENT(rdp->disks[disk].dev))) {
 	    case ATA_HIGHPOINT_ID:
 		/* 
 		 * we need some way to decide if it should be v2 or v3
@@ -1404,17 +1407,12 @@ static int
 ata_raid_read_metadata(device_t subdisk)
 {
     devclass_t pci_devclass = devclass_find("pci");
+    devclass_t atapci_devclass = devclass_find("atapci");
     devclass_t devclass=device_get_devclass(GRANDPARENT(GRANDPARENT(subdisk)));
-    device_t gpdev;
-    uint16_t vendor;
 
     /* prioritize vendor native metadata layout if possible */
-    if (devclass == pci_devclass) {
-	gpdev = device_get_parent(subdisk);
-	gpdev = GRANDPARENT(gpdev);
-	vendor = pci_get_vendor(gpdev);
-
-	switch (vendor) {
+    if (devclass == pci_devclass || devclass == atapci_devclass) {
+	switch (pci_get_vendor(GRANDPARENT(device_get_parent(subdisk)))) {
 	case ATA_HIGHPOINT_ID: 
 	    if (ata_raid_hptv3_read_meta(subdisk, ata_raid_arrays))
 		return 0;
@@ -1725,8 +1723,8 @@ ata_raid_adaptec_read_meta(device_t dev, struct ar_softc **raidp)
 	if (be32toh(meta->generation) >= raid->generation) {
 	    struct ata_device *atadev = device_get_softc(parent);
 	    struct ata_channel *ch = device_get_softc(GRANDPARENT(dev));
-	    int disk_number = (ch->unit << !(ch->flags & ATA_NO_SLAVE)) +
-			      ATA_DEV(atadev->unit);
+	    int disk_number =
+		(ch->unit << !(ch->flags & ATA_NO_SLAVE)) + atadev->unit;
 
 	    raid->disks[disk_number].dev = parent;
 	    raid->disks[disk_number].sectors = 
@@ -2267,8 +2265,15 @@ ata_raid_intel_read_meta(device_t dev, struct ar_softc **raidp)
 	if (meta->generation >= raid->generation) {
 	    for (disk = 0; disk < raid->total_disks; disk++) {
 		struct ata_device *atadev = device_get_softc(parent);
+		int len;
 
-		if (!strncmp(raid->disks[disk].serial, atadev->param.serial,
+		for (len = 0; len < sizeof(atadev->param.serial); len++) {
+		    if (atadev->param.serial[len] < 0x20)
+			break;
+		}
+		len = (len > sizeof(raid->disks[disk].serial)) ?
+		    len - sizeof(raid->disks[disk].serial) : 0;
+		if (!strncmp(raid->disks[disk].serial, atadev->param.serial + len,
 		    sizeof(raid->disks[disk].serial))) {
 		    raid->disks[disk].dev = parent;
 		    raid->disks[disk].flags |= (AR_DF_PRESENT | AR_DF_ONLINE);
@@ -2336,11 +2341,18 @@ ata_raid_intel_write_meta(struct ar_softc *rdp)
 		device_get_softc(device_get_parent(rdp->disks[disk].dev));
 	    struct ata_device *atadev =
 		device_get_softc(rdp->disks[disk].dev);
+	    int len;
 
-	    bcopy(atadev->param.serial, meta->disk[disk].serial,
+	    for (len = 0; len < sizeof(atadev->param.serial); len++) {
+		if (atadev->param.serial[len] < 0x20)
+		    break;
+	    }
+	    len = (len > sizeof(rdp->disks[disk].serial)) ?
+	        len - sizeof(rdp->disks[disk].serial) : 0;
+	    bcopy(atadev->param.serial + len, meta->disk[disk].serial,
 		  sizeof(rdp->disks[disk].serial));
 	    meta->disk[disk].sectors = rdp->disks[disk].sectors;
-	    meta->disk[disk].id = (ch->unit << 16) | ATA_DEV(atadev->unit);
+	    meta->disk[disk].id = (ch->unit << 16) | atadev->unit;
 	}
 	else
 	    meta->disk[disk].sectors = rdp->total_sectors / rdp->width;
@@ -2717,7 +2729,7 @@ ata_raid_jmicron_write_meta(struct ar_softc *rdp)
     strncpy(meta->name, rdp->name, sizeof(meta->name));
     meta->stripe_shift = ffs(rdp->interleave) - 2;
 
-    for (disk = 0; disk < rdp->total_disks; disk++) {
+    for (disk = 0; disk < rdp->total_disks && disk < JM_MAX_DISKS; disk++) {
 	if (rdp->disks[disk].serial[0])
 	    bcopy(rdp->disks[disk].serial,&meta->disks[disk],sizeof(u_int32_t));
 	else
@@ -3329,7 +3341,7 @@ ata_raid_promise_write_meta(struct ar_softc *rdp)
 		device_get_softc(device_get_parent(rdp->disks[disk].dev));
 
 	    meta->raid.channel = ch->unit;
-	    meta->raid.device = ATA_DEV(atadev->unit);
+	    meta->raid.device = atadev->unit;
 	    meta->raid.disk_sectors = rdp->disks[disk].sectors;
 	    meta->raid.disk_offset = rdp->offset_sectors;
 	}
@@ -3417,7 +3429,7 @@ ata_raid_promise_write_meta(struct ar_softc *rdp)
 		    device_get_softc(rdp->disks[drive].dev);
 
 		meta->raid.disk[drive].channel = ch->unit;
-		meta->raid.disk[drive].device = ATA_DEV(atadev->unit);
+		meta->raid.disk[drive].device = atadev->unit;
 	    }
 	    meta->raid.disk[drive].magic_0 =
 		PR_MAGIC0(meta->raid.disk[drive]) | timestamp.tv_sec;
@@ -3730,7 +3742,7 @@ ata_raid_sis_write_meta(struct ar_softc *rdp)
 	    struct ata_channel *ch = 
 		device_get_softc(device_get_parent(rdp->disks[disk].dev));
 	    struct ata_device *atadev = device_get_softc(rdp->disks[disk].dev);
-	    int disk_number = 1 + ATA_DEV(atadev->unit) + (ch->unit << 1);
+	    int disk_number = 1 + atadev->unit + (ch->unit << 1);
 
 	    meta->disks |= disk_number << ((1 - disk) << 2);
 	}
@@ -3768,7 +3780,7 @@ ata_raid_sis_write_meta(struct ar_softc *rdp)
 	    bcopy(atadev->param.model, meta->model, sizeof(meta->model));
 
 	    /* XXX SOS if total_disks > 2 this may not float */
-	    meta->disk_number = 1 + ATA_DEV(atadev->unit) + (ch->unit << 1);
+	    meta->disk_number = 1 + atadev->unit + (ch->unit << 1);
 
 	    if (testing || bootverbose)
 		ata_raid_sis_print_meta(meta);
@@ -4030,11 +4042,6 @@ ata_raid_init_request(struct ar_softc *rdp, struct bio *bio)
     default:
 	kprintf("ar%d: FAILURE - unknown BUF operation\n", rdp->lun);
 	ata_free_request(request);
-#if 0
-	bio->bio_buf->b_flags |= B_ERROR;
-	bio->bio_buf->b_error = EIO;
-	biodone(bio);
-#endif /* 0 */
 	return(NULL);
     }
     return request;
@@ -4095,7 +4102,7 @@ ata_raid_rw(device_t dev, u_int64_t lba, void *data, u_int bcount, int flags)
 
     /* setup request */
     request->dev = dev;
-    request->timeout = 10;
+    request->timeout = ATA_DEFAULT_TIMEOUT;
     request->retries = 0;
     request->data = data;
     request->bytecount = bcount;
@@ -4166,7 +4173,10 @@ ata_raid_subdisk_detach(device_t dev)
 	    ars->raid[volume]->disks[ars->disk_number[volume]].flags &= 
 		~(AR_DF_PRESENT | AR_DF_ONLINE);
 	    ars->raid[volume]->disks[ars->disk_number[volume]].dev = NULL;
-	    ata_raid_config_changed(ars->raid[volume], 1);
+#if 0
+	    if (mtx_initialized(&ars->raid[volume]->lock))
+#endif
+		ata_raid_config_changed(ars->raid[volume], 1);
 	    ars->raid[volume] = NULL;
 	    ars->disk_number[volume] = -1;
 	}
@@ -4224,6 +4234,10 @@ ata_raid_module_event_handler(module_t mod, int what, void *arg)
 
 	    if (!rdp || !rdp->status)
 		continue;
+#if 0
+	    if (mtx_initialized(&rdp->lock))
+		lockuninit(&rdp->lock);
+#endif
 	    disk_destroy(&rdp->disk);
 	}
 	if (testing || bootverbose)
@@ -4306,8 +4320,8 @@ ata_raid_print_meta(struct ar_softc *raid)
     kprintf("=================================================\n");
     kprintf("format              %s\n", ata_raid_format(raid));
     kprintf("type                %s\n", ata_raid_type(raid));
-    kprintf("flags               0x%02x %b\n", raid->status, raid->status,
-	   "\20\3REBUILDING\2DEGRADED\1READY\n");
+    kprintf("flags               0x%02x %pb%i\n", raid->status,
+	   "\20\3REBUILDING\2DEGRADED\1READY\n", raid->status);
     kprintf("magic_0             0x%016jx\n", raid->magic_0);
     kprintf("magic_1             0x%016jx\n",raid->magic_1);
     kprintf("generation          %u\n", raid->generation);
@@ -4320,8 +4334,8 @@ ata_raid_print_meta(struct ar_softc *raid)
     kprintf("interleave          %u\n", raid->interleave);
     kprintf("total_disks         %u\n", raid->total_disks);
     for (i = 0; i < raid->total_disks; i++) {
-	kprintf("    disk %d:      flags = 0x%02x %b\n", i, raid->disks[i].flags,
-	       raid->disks[i].flags, "\20\4ONLINE\3SPARE\2ASSIGNED\1PRESENT\n");
+	kprintf("    disk %d:      flags = 0x%02x %pb%i\n", i, raid->disks[i].flags,
+	       "\20\4ONLINE\3SPARE\2ASSIGNED\1PRESENT\n", raid->disks[i].flags);
 	if (raid->disks[i].dev) {
 	    kprintf("        ");
 	    device_printf(raid->disks[i].dev, " sectors %jd\n",
@@ -4506,8 +4520,8 @@ ata_raid_hptv3_print_meta(struct hptv3_raid_conf *meta)
 	kprintf("    total_disks         %u\n", meta->configs[i].total_disks);
 	kprintf("    disk_number         %u\n", meta->configs[i].disk_number);
 	kprintf("    stripe_shift        %u\n", meta->configs[i].stripe_shift);
-	kprintf("    status              %b\n", meta->configs[i].status,
-	       "\20\2RAID5\1NEED_REBUILD\n");
+	kprintf("    status              %pb%i\n",
+	       "\20\2RAID5\1NEED_REBUILD\n", meta->configs[i].status);
 	kprintf("    critical_disks      %u\n", meta->configs[i].critical_disks);
 	kprintf("    rebuild_lba         %ju\n",
 	       meta->configs_high[0].rebuild_lba +
@@ -4520,8 +4534,8 @@ ata_raid_hptv3_print_meta(struct hptv3_raid_conf *meta)
     kprintf("checksum_1          0x%02x\n", meta->checksum_1);
     kprintf("dummy_0             0x%02x\n", meta->dummy_0);
     kprintf("dummy_1             0x%02x\n", meta->dummy_1);
-    kprintf("flags               %b\n", meta->flags,
-	   "\20\4RCACHE\3WCACHE\2NCQ\1TCQ\n");
+    kprintf("flags               %pb%i\n",
+	   "\20\4RCACHE\3WCACHE\2NCQ\1TCQ\n", meta->flags);
     kprintf("=================================================\n");
 }
 
@@ -4850,12 +4864,12 @@ ata_raid_promise_print_meta(struct promise_raid_conf *meta)
     kprintf("magic_0             0x%016jx\n", meta->magic_0);
     kprintf("magic_1             0x%04x\n", meta->magic_1);
     kprintf("magic_2             0x%08x\n", meta->magic_2);
-    kprintf("integrity           0x%08x %b\n", meta->raid.integrity,
-		meta->raid.integrity, "\20\10VALID\n" );
-    kprintf("flags               0x%02x %b\n",
-	   meta->raid.flags, meta->raid.flags,
+    kprintf("integrity           0x%08x %pb%i\n", meta->raid.integrity,
+	   "\20\10VALID\n", meta->raid.integrity);
+    kprintf("flags               0x%02x %pb%i\n",
+	   meta->raid.flags,
 	   "\20\10READY\7DOWN\6REDIR\5DUPLICATE\4SPARE"
-	   "\3ASSIGNED\2ONLINE\1VALID\n");
+	   "\3ASSIGNED\2ONLINE\1VALID\n", meta->raid.flags);
     kprintf("disk_number         %d\n", meta->raid.disk_number);
     kprintf("channel             0x%02x\n", meta->raid.channel);
     kprintf("device              0x%02x\n", meta->raid.device);
@@ -4864,9 +4878,10 @@ ata_raid_promise_print_meta(struct promise_raid_conf *meta)
     kprintf("disk_sectors        %u\n", meta->raid.disk_sectors);
     kprintf("rebuild_lba         0x%08x\n", meta->raid.rebuild_lba);
     kprintf("generation          0x%04x\n", meta->raid.generation);
-    kprintf("status              0x%02x %b\n",
-	    meta->raid.status, meta->raid.status,
-	   "\20\6MARKED\5DEGRADED\4READY\3INITED\2ONLINE\1VALID\n");
+    kprintf("status              0x%02x %pb%i\n",
+	    meta->raid.status,
+	   "\20\6MARKED\5DEGRADED\4READY\3INITED\2ONLINE\1VALID\n",
+	    meta->raid.status);
     kprintf("type                %s\n", ata_raid_promise_type(meta->raid.type));
     kprintf("total_disks         %u\n", meta->raid.total_disks);
     kprintf("stripe_shift        %u\n", meta->raid.stripe_shift);
@@ -4879,10 +4894,10 @@ ata_raid_promise_print_meta(struct promise_raid_conf *meta)
     kprintf("magic_1             0x%016jx\n", meta->raid.magic_1);
     kprintf("DISK#   flags dummy_0 channel device  magic_0\n");
     for (i = 0; i < 8; i++) {
-	kprintf("  %d    %b    0x%02x  0x%02x  0x%02x  ",
-	       i, meta->raid.disk[i].flags,
+	kprintf("  %d    %pb%i    0x%02x  0x%02x  0x%02x  ", i,
 	       "\20\10READY\7DOWN\6REDIR\5DUPLICATE\4SPARE"
-	       "\3ASSIGNED\2ONLINE\1VALID\n", meta->raid.disk[i].dummy_0,
+	       "\3ASSIGNED\2ONLINE\1VALID\n",
+	       meta->raid.disk[i].flags, meta->raid.disk[i].dummy_0,
 	       meta->raid.disk[i].channel, meta->raid.disk[i].device);
 	kprintf("0x%016jx\n", meta->raid.disk[i].magic_0);
     }
@@ -4928,9 +4943,8 @@ ata_raid_sii_print_meta(struct sii_raid_conf *meta)
     kprintf("raid1_ident         %u\n", meta->raid1_ident);
     kprintf("rebuild_lba         %ju\n", meta->rebuild_lba);
     kprintf("generation          0x%08x\n", meta->generation);
-    kprintf("status              0x%02x %b\n",
-	    meta->status, meta->status,
-	   "\20\1READY\n");
+    kprintf("status              0x%02x %pb%i\n",
+	    meta->status, "\20\1READY\n", meta->status);
     kprintf("base_raid1_position %02x\n", meta->base_raid1_position);
     kprintf("base_raid0_position %02x\n", meta->base_raid0_position);
     kprintf("position            %02x\n", meta->position);

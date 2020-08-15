@@ -1,11 +1,11 @@
 /*
  * include.h - includes all important files for Phantasia
- *
- * $DragonFly: src/games/phantasia/include.h,v 1.3 2005/05/31 00:06:26 swildner Exp $
  */
 
 #include <ctype.h>
+#ifndef COMPILING_SETUP
 #include <curses.h>
+#endif
 #include <math.h>
 #include <setjmp.h>
 #include <signal.h>
@@ -15,6 +15,15 @@
 #include <fcntl.h>
 #include <string.h>
 #include <unistd.h>
+
+#ifdef COMPILING_SETUP
+/* XXX this used to be provided by curses.h */
+#include <stdio.h>	/* for FILE */
+#include <stdbool.h>	/* for bool */
+#ifndef TRUE
+#define	TRUE	true
+#endif
+#endif
 
 #include "macros.h"
 #include "phantdefs.h"

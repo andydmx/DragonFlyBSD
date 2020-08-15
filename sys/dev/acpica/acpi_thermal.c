@@ -41,8 +41,6 @@
 #include <sys/power.h>
 #include <sys/sensors.h>
 
-#include <sys/mplock2.h>
-
 #include "acpi.h"
 #include "accommon.h"
 
@@ -109,6 +107,7 @@ struct acpi_tz_softc {
     eventhandler_tag		tz_event;
 
     struct acpi_tz_zone 	tz_zone;	/*Thermal zone parameters*/
+    time_t			tz_error_time;	/*Lookup error timestamp*/
     int				tz_validchecks;
     int				tz_insane_tmp_notified;
 
@@ -124,6 +123,11 @@ struct acpi_tz_softc {
     struct ksensor		sensor;
 };
 
+/* silence errors after X seconds, try again after Y seconds */
+#define TZ_SILENCE_ERROR						\
+    ((acpi_tz_polling_rate <= 0 ? TZ_POLLRATE : acpi_tz_polling_rate) * 2 + 1)
+#define TZ_RETRY_ERROR		7200
+
 #define	TZ_ACTIVE_LEVEL(act)	((act) >= 0 ? (act) : TZ_NUMLEVELS)
 
 #define CPUFREQ_MAX_LEVELS	64 /* XXX cpufreq should export this */
@@ -137,6 +141,7 @@ static void	acpi_tz_switch_cooler_on(ACPI_OBJECT *obj, void *arg);
 static void	acpi_tz_getparam(struct acpi_tz_softc *sc, char *node,
 				 int *data);
 static void	acpi_tz_sanity(struct acpi_tz_softc *sc, int *val, char *what);
+static int	acpi_tz_polling_sysctl(SYSCTL_HANDLER_ARGS);
 static int	acpi_tz_active_sysctl(SYSCTL_HANDLER_ARGS);
 static int	acpi_tz_cooling_sysctl(SYSCTL_HANDLER_ARGS);
 static int	acpi_tz_temp_sysctl(SYSCTL_HANDLER_ARGS);
@@ -162,6 +167,7 @@ static driver_t acpi_tz_driver = {
     "acpi_tz",
     acpi_tz_methods,
     sizeof(struct acpi_tz_softc),
+    .gpri = KOBJ_GPRI_ACPI
 };
 
 static char *acpi_tz_tmp_name = "_TMP";
@@ -206,6 +212,10 @@ acpi_tz_attach(device_t dev)
     char			oidname[8];
 
     ACPI_FUNCTION_TRACE((char *)(uintptr_t)__func__);
+    if (device_get_unit(dev) == 0)
+	ACPI_LOCK_INIT(thermal, "acpitz");
+
+    ACPI_LOCK(thermal);
 
     sc = device_get_softc(dev);
     sc->tz_dev = dev;
@@ -224,8 +234,10 @@ acpi_tz_attach(device_t dev)
      * structures.  We don't need to worry about interference with the
      * control thread since we haven't fully attached this device yet.
      */
-    if ((error = acpi_tz_establish(sc)) != 0)
+    if ((error = acpi_tz_establish(sc)) != 0) {
+	ACPI_UNLOCK(thermal);
 	return (error);
+    }
 
     /*
      * Register for any Notify events sent to this zone.
@@ -249,10 +261,11 @@ acpi_tz_attach(device_t dev)
 		       OID_AUTO, "min_runtime", CTLFLAG_RW,
 		       &acpi_tz_min_runtime, 0,
 		       "minimum cooling run time in sec");
-	SYSCTL_ADD_INT(&acpi_tz_sysctl_ctx,
+	SYSCTL_ADD_PROC(&acpi_tz_sysctl_ctx,
 		       SYSCTL_CHILDREN(acpi_tz_sysctl_tree),
-		       OID_AUTO, "polling_rate", CTLFLAG_RW,
-		       &acpi_tz_polling_rate, 0, "monitor polling interval in seconds");
+		       OID_AUTO, "polling_rate", CTLTYPE_INT | CTLFLAG_RW,
+		       &acpi_tz_polling_rate, 0, acpi_tz_polling_sysctl,
+		       "I", "monitor polling interval in seconds");
 	SYSCTL_ADD_INT(&acpi_tz_sysctl_ctx,
 		       SYSCTL_CHILDREN(acpi_tz_sysctl_tree), OID_AUTO,
 		       "user_override", CTLFLAG_RW, &acpi_tz_override, 0,
@@ -317,7 +330,7 @@ acpi_tz_attach(device_t dev)
      * our power profile event handler.
      */
     sc->tz_event = EVENTHANDLER_REGISTER(power_profile_change,
-	acpi_tz_power_profile, sc, 0);
+					 acpi_tz_power_profile, sc, 0);
     if (acpi_tz_td == NULL) {
 	error = kthread_create(acpi_tz_thread, NULL, &acpi_tz_td,
 	    "acpi_thermal");
@@ -372,6 +385,8 @@ out:
 	    acpi_tz_notify_handler);
 	sysctl_ctx_free(&sc->tz_sysctl_ctx);
     }
+    ACPI_UNLOCK(thermal);
+
     return_VALUE (error);
 }
 
@@ -473,22 +488,38 @@ acpi_tz_get_temperature(struct acpi_tz_softc *sc)
 
     ACPI_FUNCTION_NAME ("acpi_tz_get_temperature");
 
+    /*
+     * Silence lookup errors after 10 seconds, then retry every two hours.
+     */
+    if (sc->tz_error_time &&
+	time_uptime - sc->tz_error_time > TZ_SILENCE_ERROR) {
+	    if (time_uptime - sc->tz_error_time < TZ_RETRY_ERROR)
+		return (FALSE);
+	sc->tz_error_time = time_uptime - TZ_SILENCE_ERROR;
+    }
+
     /* Evaluate the thermal zone's _TMP method. */
     status = acpi_GetInteger(sc->tz_handle, acpi_tz_tmp_name, &temp);
     if (ACPI_FAILURE(status)) {
 	ACPI_VPRINT(sc->tz_dev, acpi_device_get_parent_softc(sc->tz_dev),
 	    "error fetching current temperature -- %s\n",
 	     AcpiFormatException(status));
+	if (sc->tz_error_time == 0)
+	    sc->tz_error_time = time_uptime;
 	return (FALSE);
     }
 
     /* Check it for validity. */
     acpi_tz_sanity(sc, &temp, acpi_tz_tmp_name);
-    if (temp == -1)
+    if (temp == -1) {
+	if (sc->tz_error_time == 0)
+	    sc->tz_error_time = time_uptime;
 	return (FALSE);
+    }
 
     ACPI_DEBUG_PRINT((ACPI_DB_VALUES, "got %d.%dC\n", TZ_KELVTOC(temp)));
     sc->tz_temperature = temp;
+    sc->tz_error_time = 0;
     /* Update sensor */
     if(sc->tz_temperature == -1)
         sc->sensor.flags &= ~SENSOR_FINVALID;
@@ -539,7 +570,7 @@ acpi_tz_monitor(void *Context)
 	(newactive == TZ_ACTIVE_NONE || newactive > sc->tz_active)) {
 
 	getnanotime(&curtime);
-	timespecsub(&curtime, &sc->tz_cooling_started);
+	timespecsub(&curtime, &sc->tz_cooling_started, &curtime);
 	if (curtime.tv_sec < acpi_tz_min_runtime)
 	    newactive = sc->tz_active;
     }
@@ -706,6 +737,28 @@ acpi_tz_getparam(struct acpi_tz_softc *sc, char *node, int *data)
 }
 
 /*
+ * Handle sysctl for reading and changing the thermal-zone polling rate.
+ */
+static int
+acpi_tz_polling_sysctl(SYSCTL_HANDLER_ARGS)
+{
+    int val, error;
+
+    val = acpi_tz_polling_rate;
+    error = sysctl_handle_int(oidp, &val, 0, req);
+
+    /* Error or no new value */
+    if (error != 0 || req->newptr == NULL)
+	return (error);
+    if (val < 0 || val > 3600)
+	return (EINVAL);
+
+    acpi_tz_polling_rate = val;
+    wakeup(&acpi_tz_td);
+    return (error);
+}
+
+/*
  * Sanity-check a temperature value.  Assume that setpoints
  * should be between 0C and 200C.
  */
@@ -863,8 +916,7 @@ acpi_tz_notify_handler(ACPI_HANDLE h, UINT32 notify, void *context)
 	acpi_tz_signal(sc, TZ_FLAG_GETSETTINGS);
 	break;
     default:
-	ACPI_VPRINT(sc->tz_dev, acpi_device_get_parent_softc(sc->tz_dev),
-		    "unknown Notify event 0x%x\n", notify);
+	device_printf(sc->tz_dev, "unknown notify: %#x\n", notify);
 	break;
     }
 
@@ -968,8 +1020,11 @@ acpi_tz_thread(void *arg)
     devs = NULL;
     devcount = 0;
     sc = NULL;
-    get_mplock();
 
+    ACPI_LOCK(acpi);		/* wait for ACPI to finish nominal attach */
+    ACPI_UNLOCK(acpi);
+
+    lwkt_gettoken(&acpi_token);
     for (;;) {
 	/* If the number of devices has changed, re-evaluate. */
 	if (devclass_get_count(acpi_tz_devclass) != devcount) {
@@ -1006,12 +1061,13 @@ acpi_tz_thread(void *arg)
 	if (i == devcount) {
 	    tsleep_interlock(&acpi_tz_td, 0);
 	    ACPI_UNLOCK(thermal);
-	    tsleep(&acpi_tz_td, 0, "tzpoll", hz * acpi_tz_polling_rate);
+	    tsleep(&acpi_tz_td, PINTERLOCKED, "tzpoll",
+		(acpi_tz_polling_rate <= 0 ? 0 : hz * acpi_tz_polling_rate));
 	} else {
 	    ACPI_UNLOCK(thermal);
 	}
     }
-    rel_mplock();
+    lwkt_reltoken(&acpi_token);
 }
 
 #ifdef __FreeBSD__
@@ -1152,8 +1208,11 @@ acpi_tz_cooling_thread(void *arg)
 
     ACPI_FUNCTION_TRACE((char *)(uintptr_t)__func__);
 
+    ACPI_LOCK(acpi);		/* wait for ACPI to finish nominal attach */
+    ACPI_UNLOCK(acpi);
+
     sc = (struct acpi_tz_softc *)arg;
-    get_mplock();
+    lwkt_gettoken(&acpi_token);
 
     prev_temp = sc->tz_temperature;
     while (sc->tz_cooling_enabled) {
@@ -1197,7 +1256,8 @@ acpi_tz_cooling_thread(void *arg)
     ACPI_LOCK(thermal);
     sc->tz_cooling_proc_running = FALSE;
     ACPI_UNLOCK(thermal);
-    rel_mplock();
+
+    lwkt_reltoken(&acpi_token);
 }
 
 /*

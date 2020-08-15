@@ -27,8 +27,8 @@
  * Including this file is mandatory for all USB related c-files in the kernel.
  */
 
-#ifndef _USB_FREEBSD_H_
-#define	_USB_FREEBSD_H_
+#ifndef _USB_DRAGONFLY_H_
+#define	_USB_DRAGONFLY_H_
 
 /* Default USB configuration */
 #define	USB_HAVE_UGEN 1
@@ -40,6 +40,7 @@
 #define	USB_HAVE_TT_SUPPORT 1
 #define	USB_HAVE_POWERD 1
 #define	USB_HAVE_MSCTEST 1
+#define	USB_HAVE_MSCTEST_DETACH 1
 #define	USB_HAVE_PF 1
 #define	USB_HAVE_ROOT_MOUNT_HOLD 0
 #define	USB_HAVE_ID_SECTION 1
@@ -48,6 +49,10 @@
 #define	USB_HAVE_FIXED_IFACE 0
 #define	USB_HAVE_FIXED_CONFIG 0
 #define	USB_HAVE_FIXED_PORT 0
+#define	USB_HAVE_DISABLE_ENUM 1
+
+/* define zero ticks callout value */
+#define USB_CALLOUT_ZERO_TICKS 1
 
 #define	USB_TD_GET_PROC(td) (td)->td_proc
 #define	USB_PROC_GET_GID(td) (td)->p_pgid
@@ -55,11 +60,7 @@
 #if (!defined(USB_HOST_ALIGN)) || (USB_HOST_ALIGN <= 0)
 /* Use default value. */
 #undef USB_HOST_ALIGN
-#if defined(__arm__) || defined(__mips__) || defined(__powerpc__)
-#define USB_HOST_ALIGN	32		/* Arm and MIPS need at least this much, if not more */
-#else
 #define	USB_HOST_ALIGN    8		/* bytes, must be power of two */
-#endif
 #endif
 /* Sanity check for USB_HOST_ALIGN: Verify power of two. */
 #if ((-USB_HOST_ALIGN) & USB_HOST_ALIGN) != USB_HOST_ALIGN
@@ -92,4 +93,4 @@ typedef uint32_t usb_ticks_t;		/* system defined */
 typedef uint16_t usb_power_mask_t;	/* see "USB_HW_POWER_XXX" */
 typedef uint16_t usb_stream_t;		/* stream ID */
 
-#endif	/* _USB_FREEBSD_H_ */
+#endif	/* _USB_DRAGONFLY_H_ */

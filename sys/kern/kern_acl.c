@@ -34,7 +34,7 @@
 
 #include <sys/param.h>
 #include <sys/systm.h>
-#include <sys/sysproto.h>
+#include <sys/sysmsg.h>
 #include <sys/kernel.h>
 #include <sys/malloc.h>
 #include <sys/vnode.h>
@@ -46,8 +46,6 @@
 #include <sys/errno.h>
 #include <sys/stat.h>
 #include <sys/acl.h>
-
-#include <sys/mplock2.h>
 
 static int vacl_set_acl(struct vnode *vp, acl_type_t type, struct acl *aclp);
 static int vacl_get_acl(struct vnode *vp, acl_type_t type, struct acl *aclp);
@@ -148,7 +146,8 @@ vacl_aclcheck(struct vnode *vp, acl_type_t type, struct acl *aclp)
  * Given a file path, get an ACL for it
  */
 int
-sys___acl_get_file(struct __acl_get_file_args *uap)
+sys___acl_get_file(struct sysmsg *sysmsg,
+		   const struct __acl_get_file_args *uap)
 {
 	struct nlookupdata nd;
 	struct vnode *vp;
@@ -172,7 +171,8 @@ sys___acl_get_file(struct __acl_get_file_args *uap)
  * Given a file path, set an ACL for it
  */
 int
-sys___acl_set_file(struct __acl_set_file_args *uap)
+sys___acl_set_file(struct sysmsg *sysmsg,
+		   const struct __acl_set_file_args *uap)
 {
 	struct nlookupdata nd;
 	struct vnode *vp;
@@ -196,14 +196,14 @@ sys___acl_set_file(struct __acl_set_file_args *uap)
  * Given a file descriptor, get an ACL for it
  */
 int
-sys___acl_get_fd(struct __acl_get_fd_args *uap)
+sys___acl_get_fd(struct sysmsg *sysmsg,
+		 const struct __acl_get_fd_args *uap)
 {
 	struct thread *td = curthread;
 	struct file *fp;
 	int error;
 
-	KKASSERT(td->td_proc);
-	if ((error = holdvnode(td->td_proc->p_fd, uap->filedes, &fp)) != 0)
+	if ((error = holdvnode(td, uap->filedes, &fp)) != 0)
 		return(error);
 	error = vacl_get_acl((struct vnode *)fp->f_data, uap->type, uap->aclp);
 	fdrop(fp);
@@ -215,14 +215,14 @@ sys___acl_get_fd(struct __acl_get_fd_args *uap)
  * Given a file descriptor, set an ACL for it
  */
 int
-sys___acl_set_fd(struct __acl_set_fd_args *uap)
+sys___acl_set_fd(struct sysmsg *sysmsg,
+		 const struct __acl_set_fd_args *uap)
 {
 	struct thread *td = curthread;
 	struct file *fp;
 	int error;
 
-	KKASSERT(td->td_proc);
-	if ((error = holdvnode(td->td_proc->p_fd, uap->filedes, &fp)) != 0)
+	if ((error = holdvnode(td, uap->filedes, &fp)) != 0)
 		return(error);
 	error = vacl_set_acl((struct vnode *)fp->f_data, uap->type, uap->aclp);
 	fdrop(fp);
@@ -233,7 +233,8 @@ sys___acl_set_fd(struct __acl_set_fd_args *uap)
  * Given a file path, delete an ACL from it.
  */
 int
-sys___acl_delete_file(struct __acl_delete_file_args *uap)
+sys___acl_delete_file(struct sysmsg *sysmsg,
+		      const struct __acl_delete_file_args *uap)
 {
 	struct nlookupdata nd;
 	struct vnode *vp;
@@ -258,14 +259,15 @@ sys___acl_delete_file(struct __acl_delete_file_args *uap)
  * Given a file path, delete an ACL from it.
  */
 int
-sys___acl_delete_fd(struct __acl_delete_fd_args *uap)
+sys___acl_delete_fd(struct sysmsg *sysmsg,
+		    const struct __acl_delete_fd_args *uap)
 {
 	struct thread *td = curthread;
 	struct file *fp;
 	int error;
 
 	KKASSERT(td->td_proc);
-	if ((error = holdvnode(td->td_proc->p_fd, uap->filedes, &fp)) != 0)
+	if ((error = holdvnode(td, uap->filedes, &fp)) != 0)
 		return(error);
 	error = vacl_delete((struct vnode *)fp->f_data, uap->type);
 	fdrop(fp);
@@ -276,7 +278,8 @@ sys___acl_delete_fd(struct __acl_delete_fd_args *uap)
  * Given a file path, check an ACL for it
  */
 int
-sys___acl_aclcheck_file(struct __acl_aclcheck_file_args *uap)
+sys___acl_aclcheck_file(struct sysmsg *sysmsg,
+			const struct __acl_aclcheck_file_args *uap)
 {
 	struct nlookupdata nd;
 	struct vnode *vp;
@@ -301,14 +304,15 @@ sys___acl_aclcheck_file(struct __acl_aclcheck_file_args *uap)
  * Given a file descriptor, check an ACL for it
  */
 int
-sys___acl_aclcheck_fd(struct __acl_aclcheck_fd_args *uap)
+sys___acl_aclcheck_fd(struct sysmsg *sysmsg,
+		      const struct __acl_aclcheck_fd_args *uap)
 {
 	struct thread *td = curthread;
 	struct file *fp;
 	int error;
 
 	KKASSERT(td->td_proc);
-	if ((error = holdvnode(td->td_proc->p_fd, uap->filedes, &fp)) != 0)
+	if ((error = holdvnode(td, uap->filedes, &fp)) != 0)
 		return(error);
 	error = vacl_aclcheck((struct vnode *)fp->f_data, uap->type, uap->aclp);
 	fdrop(fp);

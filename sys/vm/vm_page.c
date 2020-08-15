@@ -1,11 +1,13 @@
 /*
- * (MPSAFE)
- *
+ * Copyright (c) 2003-2019 The DragonFly Project.  All rights reserved.
  * Copyright (c) 1991 Regents of the University of California.
  * All rights reserved.
  *
  * This code is derived from software contributed to Berkeley by
  * The Mach Operating System project at Carnegie-Mellon University.
+ *
+ * This code is derived from software contributed to The DragonFly Project
+ * by Matthew Dillon <dillon@backplane.com>
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -75,6 +77,7 @@
 #include <sys/kernel.h>
 #include <sys/alist.h>
 #include <sys/sysctl.h>
+#include <sys/cpu_topology.h>
 
 #include <vm/vm.h>
 #include <vm/vm_param.h>
@@ -92,31 +95,56 @@
 #include <machine/inttypes.h>
 #include <machine/md_var.h>
 #include <machine/specialreg.h>
+#include <machine/bus_dma.h>
 
 #include <vm/vm_page2.h>
 #include <sys/spinlock2.h>
 
-#define VMACTION_HSIZE	256
-#define VMACTION_HMASK	(VMACTION_HSIZE - 1)
+/*
+ * Cache necessary elements in the hash table itself to avoid indirecting
+ * through random vm_page's when doing a lookup.  The hash table is
+ * heuristical and it is ok for races to mess up any or all fields.
+ */
+struct vm_page_hash_elm {
+	vm_page_t	m;
+	vm_object_t	object;	/* heuristical */
+	vm_pindex_t	pindex;	/* heuristical */
+	int		ticks;
+	int		unused;
+};
+
+#define VM_PAGE_HASH_SET	4		    /* power of 2, set-assoc */
+#define VM_PAGE_HASH_MAX	(8 * 1024 * 1024)   /* power of 2, max size */
+
+/*
+ * SET - Minimum required set associative size, must be a power of 2.  We
+ *	 want this to match or exceed the set-associativeness of the cpu,
+ *	 up to a reasonable limit (we will use 16).
+ */
+__read_mostly static int set_assoc_mask = 16 - 1;
 
 static void vm_page_queue_init(void);
 static void vm_page_free_wakeup(void);
 static vm_page_t vm_page_select_cache(u_short pg_color);
-static vm_page_t _vm_page_list_find2(int basequeue, int index);
+static vm_page_t _vm_page_list_find_wide(int basequeue, int index, int *lastp);
+static vm_page_t _vm_page_list_find2_wide(int bq1, int bq2, int index,
+			int *lastp1, int *lastp);
 static void _vm_page_deactivate_locked(vm_page_t m, int athead);
+static void vm_numa_add_topology_mem(cpu_node_t *cpup, int physid, long bytes);
 
 /*
  * Array of tailq lists
  */
-__cachealign struct vpgqueues vm_page_queues[PQ_COUNT];
+struct vpgqueues vm_page_queues[PQ_COUNT];
 
-LIST_HEAD(vm_page_action_list, vm_page_action);
-struct vm_page_action_list	action_list[VMACTION_HSIZE];
 static volatile int vm_pages_waiting;
-
 static struct alist vm_contig_alist;
 static struct almeta vm_contig_ameta[ALIST_RECORDS_65536];
 static struct spinlock vm_contig_spin = SPINLOCK_INITIALIZER(&vm_contig_spin, "vm_contig_spin");
+
+__read_mostly static int vm_page_hash_vnode_only;
+__read_mostly static int vm_page_hash_size;
+__read_mostly static struct vm_page_hash_elm *vm_page_hash;
 
 static u_long vm_dma_reserved = 0;
 TUNABLE_ULONG("vm.dma_reserved", &vm_dma_reserved);
@@ -124,6 +152,14 @@ SYSCTL_ULONG(_vm, OID_AUTO, dma_reserved, CTLFLAG_RD, &vm_dma_reserved, 0,
 	    "Memory reserved for DMA");
 SYSCTL_UINT(_vm, OID_AUTO, dma_free_pages, CTLFLAG_RD,
 	    &vm_contig_alist.bl_free, 0, "Memory reserved for DMA");
+
+SYSCTL_INT(_vm, OID_AUTO, page_hash_vnode_only, CTLFLAG_RW,
+	    &vm_page_hash_vnode_only, 0, "Only hash vnode pages");
+#if 0
+static int vm_page_hash_debug;
+SYSCTL_INT(_vm, OID_AUTO, page_hash_debug, CTLFLAG_RW,
+	    &vm_page_hash_debug, 0, "Only hash vnode pages");
+#endif
 
 static int vm_contig_verbose = 0;
 TUNABLE_INT("vm.contig_verbose", &vm_contig_verbose);
@@ -137,32 +173,34 @@ vm_page_queue_init(void)
 	int i;
 
 	for (i = 0; i < PQ_L2_SIZE; i++)
-		vm_page_queues[PQ_FREE+i].cnt = &vmstats.v_free_count;
+		vm_page_queues[PQ_FREE+i].cnt_offset =
+			offsetof(struct vmstats, v_free_count);
 	for (i = 0; i < PQ_L2_SIZE; i++)
-		vm_page_queues[PQ_CACHE+i].cnt = &vmstats.v_cache_count;
+		vm_page_queues[PQ_CACHE+i].cnt_offset =
+			offsetof(struct vmstats, v_cache_count);
 	for (i = 0; i < PQ_L2_SIZE; i++)
-		vm_page_queues[PQ_INACTIVE+i].cnt = &vmstats.v_inactive_count;
+		vm_page_queues[PQ_INACTIVE+i].cnt_offset =
+			offsetof(struct vmstats, v_inactive_count);
 	for (i = 0; i < PQ_L2_SIZE; i++)
-		vm_page_queues[PQ_ACTIVE+i].cnt = &vmstats.v_active_count;
+		vm_page_queues[PQ_ACTIVE+i].cnt_offset =
+			offsetof(struct vmstats, v_active_count);
 	for (i = 0; i < PQ_L2_SIZE; i++)
-		vm_page_queues[PQ_HOLD+i].cnt = &vmstats.v_active_count;
+		vm_page_queues[PQ_HOLD+i].cnt_offset =
+			offsetof(struct vmstats, v_active_count);
 	/* PQ_NONE has no queue */
 
 	for (i = 0; i < PQ_COUNT; i++) {
+		vm_page_queues[i].lastq = -1;
 		TAILQ_INIT(&vm_page_queues[i].pl);
 		spin_init(&vm_page_queues[i].spin, "vm_page_queue_init");
 	}
-
-	for (i = 0; i < VMACTION_HSIZE; i++)
-		LIST_INIT(&action_list[i]);
 }
 
 /*
  * note: place in initialized data section?  Is this necessary?
  */
-long first_page = 0;
-int vm_page_array_size = 0;
-int vm_page_zero_count = 0;
+vm_pindex_t first_page = 0;
+vm_pindex_t vm_page_array_size = 0;
 vm_page_t vm_page_array = NULL;
 vm_paddr_t vm_low_phys_reserved;
 
@@ -195,32 +233,61 @@ vm_set_page_size(void)
  * Must be called in a critical section.
  */
 static void
-vm_add_new_page(vm_paddr_t pa)
+vm_add_new_page(vm_paddr_t pa, int *badcountp)
 {
 	struct vpgqueues *vpq;
 	vm_page_t m;
 
 	m = PHYS_TO_VM_PAGE(pa);
+
+	/*
+	 * Make sure it isn't a duplicate (due to BIOS page range overlaps,
+	 * which we consider bugs... but don't crash).  Note that m->phys_addr
+	 * is pre-initialized, so use m->queue as a check.
+	 */
+	if (m->queue) {
+		if (*badcountp < 10) {
+			kprintf("vm_add_new_page: duplicate pa %016jx\n",
+				(intmax_t)pa);
+			++*badcountp;
+		} else if (*badcountp == 10) {
+			kprintf("vm_add_new_page: duplicate pa (many more)\n");
+			++*badcountp;
+		}
+		return;
+	}
+
 	m->phys_addr = pa;
 	m->flags = 0;
-	m->pc = (pa >> PAGE_SHIFT) & PQ_L2_MASK;
 	m->pat_mode = PAT_WRITE_BACK;
+	m->pc = (pa >> PAGE_SHIFT);
+
 	/*
 	 * Twist for cpu localization in addition to page coloring, so
 	 * different cpus selecting by m->queue get different page colors.
 	 */
-	m->pc ^= ((pa >> PAGE_SHIFT) / PQ_L2_SIZE) & PQ_L2_MASK;
-	m->pc ^= ((pa >> PAGE_SHIFT) / (PQ_L2_SIZE * PQ_L2_SIZE)) & PQ_L2_MASK;
+	m->pc ^= ((pa >> PAGE_SHIFT) / PQ_L2_SIZE);
+	m->pc ^= ((pa >> PAGE_SHIFT) / (PQ_L2_SIZE * PQ_L2_SIZE));
+	m->pc &= PQ_L2_MASK;
+
 	/*
 	 * Reserve a certain number of contiguous low memory pages for
 	 * contigmalloc() to use.
+	 *
+	 * Even though these pages represent real ram and can be
+	 * reverse-mapped, we set PG_FICTITIOUS and PG_UNQUEUED
+	 * because their use is special-cased.
+	 *
+	 * WARNING! Once PG_FICTITIOUS is set, vm_page_wire*()
+	 *	    and vm_page_unwire*() calls have no effect.
 	 */
 	if (pa < vm_low_phys_reserved) {
-		atomic_add_int(&vmstats.v_page_count, 1);
-		atomic_add_int(&vmstats.v_dma_pages, 1);
+		atomic_add_long(&vmstats.v_page_count, 1);
+		atomic_add_long(&vmstats.v_dma_pages, 1);
+		m->flags |= PG_FICTITIOUS | PG_UNQUEUED;
 		m->queue = PQ_NONE;
 		m->wire_count = 1;
-		atomic_add_int(&vmstats.v_wire_count, 1);
+		atomic_add_long(&vmstats.v_wire_count, 1);
 		alist_free(&vm_contig_alist, pa >> PAGE_SHIFT, 1);
 		return;
 	}
@@ -231,18 +298,10 @@ vm_add_new_page(vm_paddr_t pa)
 	m->queue = m->pc + PQ_FREE;
 	KKASSERT(m->dirty == 0);
 
-	atomic_add_int(&vmstats.v_page_count, 1);
-	atomic_add_int(&vmstats.v_free_count, 1);
+	atomic_add_long(&vmstats.v_page_count, 1);
+	atomic_add_long(&vmstats.v_free_count, 1);
 	vpq = &vm_page_queues[m->queue];
-	if ((vpq->flipflop & 15) == 0) {
-		pmap_zero_page(VM_PAGE_TO_PHYS(m));
-		m->flags |= PG_ZERO;
-		TAILQ_INSERT_TAIL(&vpq->pl, m, pageq);
-		atomic_add_int(&vm_page_zero_count, 1);
-	} else {
-		TAILQ_INSERT_HEAD(&vpq->pl, m, pageq);
-	}
-	++vpq->flipflop;
+	TAILQ_INSERT_HEAD(&vpq->pl, m, pageq);
 	++vpq->lcnt;
 }
 
@@ -266,40 +325,50 @@ vm_page_startup(void)
 {
 	vm_offset_t vaddr = virtual2_start ? virtual2_start : virtual_start;
 	vm_offset_t mapped;
-	vm_size_t npages;
+	vm_pindex_t npages;
 	vm_paddr_t page_range;
 	vm_paddr_t new_end;
 	int i;
 	vm_paddr_t pa;
-	int nblocks;
 	vm_paddr_t last_pa;
 	vm_paddr_t end;
 	vm_paddr_t biggestone, biggestsize;
 	vm_paddr_t total;
+	vm_page_t m;
+	int badcount;
 
 	total = 0;
+	badcount = 0;
 	biggestsize = 0;
 	biggestone = 0;
-	nblocks = 0;
 	vaddr = round_page(vaddr);
 
-	for (i = 0; phys_avail[i + 1]; i += 2) {
-		phys_avail[i] = round_page64(phys_avail[i]);
-		phys_avail[i + 1] = trunc_page64(phys_avail[i + 1]);
+	/*
+	 * Make sure ranges are page-aligned.
+	 */
+	for (i = 0; phys_avail[i].phys_end; ++i) {
+		phys_avail[i].phys_beg = round_page64(phys_avail[i].phys_beg);
+		phys_avail[i].phys_end = trunc_page64(phys_avail[i].phys_end);
+		if (phys_avail[i].phys_end < phys_avail[i].phys_beg)
+			phys_avail[i].phys_end = phys_avail[i].phys_beg;
 	}
 
-	for (i = 0; phys_avail[i + 1]; i += 2) {
-		vm_paddr_t size = phys_avail[i + 1] - phys_avail[i];
+	/*
+	 * Locate largest block
+	 */
+	for (i = 0; phys_avail[i].phys_end; ++i) {
+		vm_paddr_t size = phys_avail[i].phys_end -
+				  phys_avail[i].phys_beg;
 
 		if (size > biggestsize) {
 			biggestone = i;
 			biggestsize = size;
 		}
-		++nblocks;
 		total += size;
 	}
+	--i;	/* adjust to last entry for use down below */
 
-	end = phys_avail[biggestone+1];
+	end = phys_avail[biggestone].phys_end;
 	end = trunc_page(end);
 
 	/*
@@ -319,15 +388,15 @@ vm_page_startup(void)
 	 * The amd64 port needs this to indicate which direct map pages
 	 * need to be dumped, via calls to dump_add_page()/dump_drop_page().
 	 *
-	 * However, i386 still needs this workspace internally within the
-	 * minidump code.  In theory, they are not needed on i386, but are
+	 * However, x86 still needs this workspace internally within the
+	 * minidump code.  In theory, they are not needed on x86, but are
 	 * included should the sf_buf code decide to use them.
 	 */
-	page_range = phys_avail[(nblocks - 1) * 2 + 1] / PAGE_SIZE;
+	page_range = phys_avail[i].phys_end / PAGE_SIZE;
 	vm_page_dump_size = round_page(roundup2(page_range, NBBY) / NBBY);
 	end -= vm_page_dump_size;
 	vm_page_dump = (void *)pmap_map(&vaddr, end, end + vm_page_dump_size,
-	    VM_PROT_READ | VM_PROT_WRITE);
+					VM_PROT_READ | VM_PROT_WRITE);
 	bzero((void *)vm_page_dump, vm_page_dump_size);
 #endif
 	/*
@@ -335,27 +404,27 @@ vm_page_startup(void)
 	 * use (taking into account the overhead of a page structure per
 	 * page).
 	 */
-	first_page = phys_avail[0] / PAGE_SIZE;
-	page_range = phys_avail[(nblocks - 1) * 2 + 1] / PAGE_SIZE - first_page;
+	first_page = phys_avail[0].phys_beg / PAGE_SIZE;
+	page_range = phys_avail[i].phys_end / PAGE_SIZE - first_page;
 	npages = (total - (page_range * sizeof(struct vm_page))) / PAGE_SIZE;
 
 #ifndef _KERNEL_VIRTUAL
 	/*
 	 * (only applies to real kernels)
 	 *
-	 * Initialize the contiguous reserve map.  We initially reserve up
-	 * to 1/4 available physical memory or 65536 pages (~256MB), whichever
-	 * is lower.
+	 * Reserve a large amount of low memory for potential 32-bit DMA
+	 * space allocations.  Once device initialization is complete we
+	 * release most of it, but keep (vm_dma_reserved) memory reserved
+	 * for later use.  Typically for X / graphics.  Through trial and
+	 * error we find that GPUs usually requires ~60-100MB or so.
 	 *
-	 * Once device initialization is complete we return most of the
-	 * reserved memory back to the normal page queues but leave some
-	 * in reserve for things like usb attachments.
+	 * By default, 128M is left in reserve on machines with 2G+ of ram.
 	 */
 	vm_low_phys_reserved = (vm_paddr_t)65536 << PAGE_SHIFT;
 	if (vm_low_phys_reserved > total / 4)
 		vm_low_phys_reserved = total / 4;
 	if (vm_dma_reserved == 0) {
-		vm_dma_reserved = 16 * 1024 * 1024;	/* 16MB */
+		vm_dma_reserved = 128 * 1024 * 1024;	/* 128MB */
 		if (vm_dma_reserved > total / 16)
 			vm_dma_reserved = total / 16;
 	}
@@ -367,6 +436,8 @@ vm_page_startup(void)
 	 * Initialize the mem entry structures now, and put them in the free
 	 * queue.
 	 */
+	if (bootverbose && ctob(physmem) >= 400LL*1024*1024*1024)
+		kprintf("initializing vm_page_array ");
 	new_end = trunc_page(end - page_range * sizeof(struct vm_page));
 	mapped = pmap_map(&vaddr, new_end, end, VM_PROT_READ | VM_PROT_WRITE);
 	vm_page_array = (vm_page_t)mapped;
@@ -377,32 +448,48 @@ vm_page_startup(void)
 	 * we have to manually add these pages to the minidump tracking so
 	 * that they can be dumped, including the vm_page_array.
 	 */
-	for (pa = new_end; pa < phys_avail[biggestone + 1]; pa += PAGE_SIZE)
+	for (pa = new_end;
+	     pa < phys_avail[biggestone].phys_end;
+	     pa += PAGE_SIZE) {
 		dump_add_page(pa);
+	}
 #endif
 
 	/*
-	 * Clear all of the page structures
+	 * Clear all of the page structures, run basic initialization so
+	 * PHYS_TO_VM_PAGE() operates properly even on pages not in the
+	 * map.
 	 */
 	bzero((caddr_t) vm_page_array, page_range * sizeof(struct vm_page));
 	vm_page_array_size = page_range;
+	if (bootverbose && ctob(physmem) >= 400LL*1024*1024*1024)
+		kprintf("size = 0x%zx\n", vm_page_array_size);
+
+	m = &vm_page_array[0];
+	pa = ptoa(first_page);
+	for (i = 0; i < page_range; ++i) {
+		spin_init(&m->spin, "vm_page");
+		m->phys_addr = pa;
+		pa += PAGE_SIZE;
+		++m;
+	}
 
 	/*
 	 * Construct the free queue(s) in ascending order (by physical
 	 * address) so that the first 16MB of physical memory is allocated
 	 * last rather than first.  On large-memory machines, this avoids
-	 * the exhaustion of low physical memory before isa_dmainit has run.
+	 * the exhaustion of low physical memory before isa_dma_init has run.
 	 */
 	vmstats.v_page_count = 0;
 	vmstats.v_free_count = 0;
-	for (i = 0; phys_avail[i + 1] && npages > 0; i += 2) {
-		pa = phys_avail[i];
+	for (i = 0; phys_avail[i].phys_end && npages > 0; ++i) {
+		pa = phys_avail[i].phys_beg;
 		if (i == biggestone)
 			last_pa = new_end;
 		else
-			last_pa = phys_avail[i + 1];
+			last_pa = phys_avail[i].phys_end;
 		while (pa < last_pa && npages-- > 0) {
-			vm_add_new_page(pa);
+			vm_add_new_page(pa, &badcount);
 			pa += PAGE_SIZE;
 		}
 	}
@@ -410,6 +497,238 @@ vm_page_startup(void)
 		virtual2_start = vaddr;
 	else
 		virtual_start = vaddr;
+	mycpu->gd_vmstats = vmstats;
+}
+
+/*
+ * (called from early boot only)
+ *
+ * Reorganize VM pages based on numa data.  May be called as many times as
+ * necessary.  Will reorganize the vm_page_t page color and related queue(s)
+ * to allow vm_page_alloc() to choose pages based on socket affinity.
+ *
+ * NOTE: This function is only called while we are still in UP mode, so
+ *	 we only need a critical section to protect the queues (which
+ *	 saves a lot of time, there are likely a ton of pages).
+ */
+void
+vm_numa_organize(vm_paddr_t ran_beg, vm_paddr_t bytes, int physid)
+{
+	vm_paddr_t scan_beg;
+	vm_paddr_t scan_end;
+	vm_paddr_t ran_end;
+	struct vpgqueues *vpq;
+	vm_page_t m;
+	vm_page_t mend;
+	int socket_mod;
+	int socket_value;
+	int i;
+
+	/*
+	 * Check if no physical information, or there was only one socket
+	 * (so don't waste time doing nothing!).
+	 */
+	if (cpu_topology_phys_ids <= 1 ||
+	    cpu_topology_core_ids == 0) {
+		return;
+	}
+
+	/*
+	 * Setup for our iteration.  Note that ACPI may iterate CPU
+	 * sockets starting at 0 or 1 or some other number.  The
+	 * cpu_topology code mod's it against the socket count.
+	 */
+	ran_end = ran_beg + bytes;
+
+	socket_mod = PQ_L2_SIZE / cpu_topology_phys_ids;
+	socket_value = (physid % cpu_topology_phys_ids) * socket_mod;
+	mend = &vm_page_array[vm_page_array_size];
+
+	crit_enter();
+
+	/*
+	 * Adjust cpu_topology's phys_mem parameter
+	 */
+	if (root_cpu_node)
+		vm_numa_add_topology_mem(root_cpu_node, physid, (long)bytes);
+
+	/*
+	 * Adjust vm_page->pc and requeue all affected pages.  The
+	 * allocator will then be able to localize memory allocations
+	 * to some degree.
+	 */
+	for (i = 0; phys_avail[i].phys_end; ++i) {
+		scan_beg = phys_avail[i].phys_beg;
+		scan_end = phys_avail[i].phys_end;
+		if (scan_end <= ran_beg)
+			continue;
+		if (scan_beg >= ran_end)
+			continue;
+		if (scan_beg < ran_beg)
+			scan_beg = ran_beg;
+		if (scan_end > ran_end)
+			scan_end = ran_end;
+		if (atop(scan_end) > first_page + vm_page_array_size)
+			scan_end = ptoa(first_page + vm_page_array_size);
+
+		m = PHYS_TO_VM_PAGE(scan_beg);
+		while (scan_beg < scan_end) {
+			KKASSERT(m < mend);
+			if (m->queue != PQ_NONE) {
+				vpq = &vm_page_queues[m->queue];
+				TAILQ_REMOVE(&vpq->pl, m, pageq);
+				--vpq->lcnt;
+				/* queue doesn't change, no need to adj cnt */
+				m->queue -= m->pc;
+				m->pc %= socket_mod;
+				m->pc += socket_value;
+				m->pc &= PQ_L2_MASK;
+				m->queue += m->pc;
+				vpq = &vm_page_queues[m->queue];
+				TAILQ_INSERT_HEAD(&vpq->pl, m, pageq);
+				++vpq->lcnt;
+				/* queue doesn't change, no need to adj cnt */
+			} else {
+				m->pc %= socket_mod;
+				m->pc += socket_value;
+				m->pc &= PQ_L2_MASK;
+			}
+			scan_beg += PAGE_SIZE;
+			++m;
+		}
+	}
+
+	crit_exit();
+}
+
+/*
+ * (called from early boot only)
+ *
+ * Don't allow the NUMA organization to leave vm_page_queues[] nodes
+ * completely empty for a logical cpu.  Doing so would force allocations
+ * on that cpu to always borrow from a nearby cpu, create unnecessary
+ * contention, and cause vm_page_alloc() to iterate more queues and run more
+ * slowly.
+ *
+ * This situation can occur when memory sticks are not entirely populated,
+ * populated at different densities, or in naturally assymetric systems
+ * such as the 2990WX.  There could very well be many vm_page_queues[]
+ * entries with *NO* pages assigned to them.
+ *
+ * Fixing this up ensures that each logical CPU has roughly the same
+ * sized memory pool, and more importantly ensures that logical CPUs
+ * do not wind up with an empty memory pool.
+ *
+ * At them moment we just iterate the other queues and borrow pages,
+ * moving them into the queues for cpus with severe deficits even though
+ * the memory might not be local to those cpus.  I am not doing this in
+ * a 'smart' way, its effectively UMA style (sorta, since its page-by-page
+ * whereas real UMA typically exchanges address bits 8-10 with high address
+ * bits).  But it works extremely well and gives us fairly good deterministic
+ * results on the cpu cores associated with these secondary nodes.
+ */
+void
+vm_numa_organize_finalize(void)
+{
+	struct vpgqueues *vpq;
+	vm_page_t m;
+	long lcnt_lo;
+	long lcnt_hi;
+	int iter;
+	int i;
+	int scale_lim;
+
+	crit_enter();
+
+	/*
+	 * Machines might not use an exact power of 2 for phys_ids,
+	 * core_ids, ht_ids, etc.  This can slightly reduce the actual
+	 * range of indices in vm_page_queues[] that are nominally used.
+	 */
+	if (cpu_topology_ht_ids) {
+		scale_lim = PQ_L2_SIZE / cpu_topology_phys_ids;
+		scale_lim = scale_lim / cpu_topology_core_ids;
+		scale_lim = scale_lim / cpu_topology_ht_ids;
+		scale_lim = scale_lim * cpu_topology_ht_ids;
+		scale_lim = scale_lim * cpu_topology_core_ids;
+		scale_lim = scale_lim * cpu_topology_phys_ids;
+	} else {
+		scale_lim = PQ_L2_SIZE;
+	}
+
+	/*
+	 * Calculate an average, set hysteresis for balancing from
+	 * 10% below the average to the average.
+	 */
+	lcnt_hi = 0;
+	for (i = 0; i < scale_lim; ++i) {
+		lcnt_hi += vm_page_queues[i].lcnt;
+	}
+	lcnt_hi /= scale_lim;
+	lcnt_lo = lcnt_hi - lcnt_hi / 10;
+
+	kprintf("vm_page: avg %ld pages per queue, %d queues\n",
+		lcnt_hi, scale_lim);
+
+	iter = 0;
+	for (i = 0; i < scale_lim; ++i) {
+		vpq = &vm_page_queues[PQ_FREE + i];
+		while (vpq->lcnt < lcnt_lo) {
+			struct vpgqueues *vptmp;
+
+			iter = (iter + 1) & PQ_L2_MASK;
+			vptmp = &vm_page_queues[PQ_FREE + iter];
+			if (vptmp->lcnt < lcnt_hi)
+				continue;
+			m = TAILQ_FIRST(&vptmp->pl);
+			KKASSERT(m->queue == PQ_FREE + iter);
+			TAILQ_REMOVE(&vptmp->pl, m, pageq);
+			--vptmp->lcnt;
+			/* queue doesn't change, no need to adj cnt */
+			m->queue -= m->pc;
+			m->pc = i;
+			m->queue += m->pc;
+			TAILQ_INSERT_HEAD(&vpq->pl, m, pageq);
+			++vpq->lcnt;
+		}
+	}
+	crit_exit();
+}
+
+static
+void
+vm_numa_add_topology_mem(cpu_node_t *cpup, int physid, long bytes)
+{
+	int cpuid;
+	int i;
+
+	switch(cpup->type) {
+	case PACKAGE_LEVEL:
+		cpup->phys_mem += bytes;
+		break;
+	case CHIP_LEVEL:
+		/*
+		 * All members should have the same chipid, so we only need
+		 * to pull out one member.
+		 */
+		if (CPUMASK_TESTNZERO(cpup->members)) {
+			cpuid = BSFCPUMASK(cpup->members);
+			if (physid ==
+			    get_chip_ID_from_APICID(CPUID_TO_APICID(cpuid))) {
+				cpup->phys_mem += bytes;
+			}
+		}
+		break;
+	case CORE_LEVEL:
+	case THREAD_LEVEL:
+		/*
+		 * Just inherit from the parent node
+		 */
+		cpup->phys_mem = cpup->parent_node->phys_mem;
+		break;
+	}
+	for (i = 0; i < MAXCPU && cpup->child_node[i]; ++i)
+		vm_numa_add_topology_mem(cpup->child_node[i], physid, bytes);
 }
 
 /*
@@ -429,7 +748,31 @@ vm_page_startup_finish(void *dummy __unused)
 	alist_blk_t xcount;
 	alist_blk_t bfree;
 	vm_page_t m;
+	struct vm_page_hash_elm *mp;
+	int mask;
 
+	/*
+	 * Set the set_assoc_mask based on the fitted number of CPUs.
+	 * This is a mask, so we subject 1.
+	 *
+	 * w/PQ_L2_SIZE = 1024, Don't let the associativity drop below 8.
+	 * So if we have 256 CPUs, two hyper-threads will wind up sharing.
+	 *
+	 * The maximum is PQ_L2_SIZE.  However, we limit the starting
+	 * maximum to 16 (mask = 15) in order to improve the cache locality
+	 * of related kernel data structures.
+	 */
+	mask = PQ_L2_SIZE / ncpus_fit - 1;
+	if (mask < 7)		/* minimum is 8-way w/256 CPU threads */
+		mask = 7;
+	if (mask < 15)
+		mask = 15;
+	cpu_ccfence();
+	set_assoc_mask = mask;
+
+	/*
+	 * Return part of the initial reserve back to the system
+	 */
 	spin_lock(&vm_contig_spin);
 	for (;;) {
 		bfree = alist_free_info(&vm_contig_alist, &blk, &count);
@@ -473,12 +816,13 @@ vm_page_startup_finish(void *dummy __unused)
 				blk, count, rblk);
 			break;
 		}
-		atomic_add_int(&vmstats.v_dma_pages, -count);
+		atomic_add_long(&vmstats.v_dma_pages, -(long)count);
 		spin_unlock(&vm_contig_spin);
 
 		m = PHYS_TO_VM_PAGE((vm_paddr_t)blk << PAGE_SHIFT);
 		vm_low_phys_reserved = VM_PAGE_TO_PHYS(m);
 		while (count) {
+			vm_page_flag_clear(m, PG_FICTITIOUS | PG_UNQUEUED);
 			vm_page_busy_wait(m, FALSE, "cpgfr");
 			vm_page_unwire(m, 0);
 			vm_page_free(m);
@@ -497,9 +841,29 @@ vm_page_startup_finish(void *dummy __unused)
 		(intmax_t)(vmstats.v_dma_pages - vm_contig_alist.bl_free) *
 		(PAGE_SIZE / 1024),
 		(intmax_t)vm_contig_alist.bl_free * (PAGE_SIZE / 1024));
+
+	/*
+	 * Power of 2
+	 */
+	vm_page_hash_size = 4096;
+	while (vm_page_hash_size < (vm_page_array_size / 16))
+		vm_page_hash_size <<= 1;
+	if (vm_page_hash_size > VM_PAGE_HASH_MAX)
+		vm_page_hash_size = VM_PAGE_HASH_MAX;
+
+	/*
+	 * hash table for vm_page_lookup_quick()
+	 */
+	mp = (void *)kmem_alloc3(&kernel_map,
+				 (vm_page_hash_size + VM_PAGE_HASH_SET) *
+				  sizeof(*vm_page_hash),
+				 VM_SUBSYS_VMPGHASH, KM_CPU(0));
+	bzero(mp, (vm_page_hash_size + VM_PAGE_HASH_SET) * sizeof(*mp));
+	cpu_sfence();
+	vm_page_hash = mp;
 }
 SYSINIT(vm_pgend, SI_SUB_PROC0_POST, SI_ORDER_ANY,
-	vm_page_startup_finish, NULL)
+	vm_page_startup_finish, NULL);
 
 
 /*
@@ -655,54 +1019,101 @@ _vm_page_rem_queue_spinlocked(vm_page_t m)
 {
 	struct vpgqueues *pq;
 	u_short queue;
+	u_short oqueue;
+	long *cnt_adj;
+	long *cnt_gd;
 
 	queue = m->queue;
 	if (queue != PQ_NONE) {
 		pq = &vm_page_queues[queue];
 		TAILQ_REMOVE(&pq->pl, m, pageq);
-		atomic_add_int(pq->cnt, -1);
+
+		/*
+		 * Primarily adjust our pcpu stats for rollup, which is
+		 * (mycpu->gd_vmstats_adj + offset).  This is normally
+		 * synchronized on every hardclock().
+		 *
+		 * However, in order for the nominal low-memory algorithms
+		 * to work properly if the unsynchronized adjustment gets
+		 * too negative and might trigger the pageout daemon, we
+		 * immediately synchronize with the global structure.
+		 *
+		 * The idea here is to reduce unnecessary SMP cache mastership
+		 * changes in the global vmstats, which can be particularly
+		 * bad in multi-socket systems.
+		 *
+		 * WARNING! In systems with low amounts of memory the
+		 *	    vm_paging_needed(-1024 * ncpus) test could
+		 *	    wind up testing a value above the paging target,
+		 *	    meaning it would almost always return TRUE.  In
+		 *	    that situation we synchronize every time the
+		 *	    cumulative adjustment falls below -1024.
+		 */
+		cnt_adj = (long *)((char *)&mycpu->gd_vmstats_adj +
+				   pq->cnt_offset);
+		cnt_gd = (long *)((char *)&mycpu->gd_vmstats +
+				   pq->cnt_offset);
+		atomic_add_long(cnt_adj, -1);
+		atomic_add_long(cnt_gd, -1);
+
+		if (*cnt_adj < -1024 && vm_paging_needed(-1024 * ncpus)) {
+			u_long copy = atomic_swap_long(cnt_adj, 0);
+			cnt_adj = (long *)((char *)&vmstats + pq->cnt_offset);
+			atomic_add_long(cnt_adj, copy);
+		}
 		pq->lcnt--;
 		m->queue = PQ_NONE;
-		vm_page_queues_spin_unlock(queue);
-		if ((queue - m->pc) == PQ_FREE && (m->flags & PG_ZERO))
-			atomic_subtract_int(&vm_page_zero_count, 1);
-		if ((queue - m->pc) == PQ_CACHE || (queue - m->pc) == PQ_FREE)
-			return (queue - m->pc);
+		oqueue = queue;
+		queue -= m->pc;
+		vm_page_queues_spin_unlock(oqueue);	/* intended */
 	}
 	return queue;
 }
 
 /*
- * Helper function places the vm_page on the specified queue.
+ * Helper function places the vm_page on the specified queue.  Generally
+ * speaking only PQ_FREE pages are placed at the head, to allow them to
+ * be allocated sooner rather than later on the assumption that they
+ * are cache-hot.
  *
  * The vm_page must be spinlocked.
+ * The vm_page must NOT be FICTITIOUS (that would be a disaster)
  * This function will return with both the page and the queue locked.
  */
 static __inline void
 _vm_page_add_queue_spinlocked(vm_page_t m, u_short queue, int athead)
 {
 	struct vpgqueues *pq;
+	u_long *cnt_adj;
+	u_long *cnt_gd;
 
-	KKASSERT(m->queue == PQ_NONE);
+	KKASSERT(m->queue == PQ_NONE &&
+		 (m->flags & (PG_FICTITIOUS | PG_UNQUEUED)) == 0);
 
 	if (queue != PQ_NONE) {
 		vm_page_queues_spin_lock(queue);
 		pq = &vm_page_queues[queue];
 		++pq->lcnt;
-		atomic_add_int(pq->cnt, 1);
-		m->queue = queue;
 
 		/*
-		 * Put zero'd pages on the end ( where we look for zero'd pages
-		 * first ) and non-zerod pages at the head.
+		 * Adjust our pcpu stats.  If a system entity really needs
+		 * to incorporate the count it will call vmstats_rollup()
+		 * to roll it all up into the global vmstats strufture.
 		 */
+		cnt_adj = (long *)((char *)&mycpu->gd_vmstats_adj +
+				   pq->cnt_offset);
+		cnt_gd = (long *)((char *)&mycpu->gd_vmstats +
+				   pq->cnt_offset);
+		atomic_add_long(cnt_adj, 1);
+		atomic_add_long(cnt_gd, 1);
+
+		/*
+		 * PQ_FREE is always handled LIFO style to try to provide
+		 * cache-hot pages to programs.
+		 */
+		m->queue = queue;
 		if (queue - m->pc == PQ_FREE) {
-			if (m->flags & PG_ZERO) {
-				TAILQ_INSERT_TAIL(&pq->pl, m, pageq);
-				atomic_add_int(&vm_page_zero_count, 1);
-			} else {
-				TAILQ_INSERT_HEAD(&pq->pl, m, pageq);
-			}
+			TAILQ_INSERT_HEAD(&pq->pl, m, pageq);
 		} else if (athead) {
 			TAILQ_INSERT_HEAD(&pq->pl, m, pageq);
 		} else {
@@ -713,9 +1124,11 @@ _vm_page_add_queue_spinlocked(vm_page_t m, u_short queue, int athead)
 }
 
 /*
- * Wait until page is no longer PG_BUSY or (if also_m_busy is TRUE)
- * m->busy is zero.  Returns TRUE if it had to sleep, FALSE if we
- * did not.  Only one sleep call will be made before returning.
+ * Wait until page is no longer BUSY.  If also_m_busy is TRUE we wait
+ * until the page is no longer BUSY or SBUSY (busy_count field is 0).
+ *
+ * Returns TRUE if it had to sleep, FALSE if we did not.  Only one sleep
+ * call will be made before returning.
  *
  * This function does NOT busy the page and on return the page is not
  * guaranteed to be available.
@@ -723,19 +1136,20 @@ _vm_page_add_queue_spinlocked(vm_page_t m, u_short queue, int athead)
 void
 vm_page_sleep_busy(vm_page_t m, int also_m_busy, const char *msg)
 {
-	u_int32_t flags;
+	u_int32_t busy_count;
 
 	for (;;) {
-		flags = m->flags;
+		busy_count = m->busy_count;
 		cpu_ccfence();
 
-		if ((flags & PG_BUSY) == 0 &&
-		    (also_m_busy == 0 || (flags & PG_SBUSY) == 0)) {
+		if ((busy_count & PBUSY_LOCKED) == 0 &&
+		    (also_m_busy == 0 || (busy_count & PBUSY_MASK) == 0)) {
 			break;
 		}
 		tsleep_interlock(m, 0);
-		if (atomic_cmpset_int(&m->flags, flags,
-				      flags | PG_WANTED | PG_REFERENCED)) {
+		if (atomic_cmpset_int(&m->busy_count, busy_count,
+				      busy_count | PBUSY_WANTED)) {
+			atomic_set_int(&m->flags, PG_REFERENCED);
 			tsleep(m, PINTERLOCKED, msg, 0);
 			break;
 		}
@@ -743,34 +1157,140 @@ vm_page_sleep_busy(vm_page_t m, int also_m_busy, const char *msg)
 }
 
 /*
- * Wait until PG_BUSY can be set, then set it.  If also_m_busy is TRUE we
- * also wait for m->busy to become 0 before setting PG_BUSY.
+ * This calculates and returns a page color given an optional VM object and
+ * either a pindex or an iterator.  We attempt to return a cpu-localized
+ * pg_color that is still roughly 16-way set-associative.  The CPU topology
+ * is used if it was probed.
+ *
+ * The caller may use the returned value to index into e.g. PQ_FREE when
+ * allocating a page in order to nominally obtain pages that are hopefully
+ * already localized to the requesting cpu.  This function is not able to
+ * provide any sort of guarantee of this, but does its best to improve
+ * hardware cache management performance.
+ *
+ * WARNING! The caller must mask the returned value with PQ_L2_MASK.
+ */
+u_short
+vm_get_pg_color(int cpuid, vm_object_t object, vm_pindex_t pindex)
+{
+	u_short pg_color;
+	int object_pg_color;
+
+	/*
+	 * WARNING! cpu_topology_core_ids might not be a power of two.
+	 *	    We also shouldn't make assumptions about
+	 *	    cpu_topology_phys_ids either.
+	 *
+	 * WARNING! ncpus might not be known at this time (during early
+	 *	    boot), and might be set to 1.
+	 *
+	 * General format: [phys_id][core_id][cpuid][set-associativity]
+	 * (but uses modulo, so not necessarily precise bit masks)
+	 */
+	object_pg_color = object ? object->pg_color : 0;
+
+	if (cpu_topology_ht_ids) {
+		int phys_id;
+		int core_id;
+		int ht_id;
+		int physcale;
+		int grpscale;
+		int cpuscale;
+
+		/*
+		 * Translate cpuid to socket, core, and hyperthread id.
+		 */
+		phys_id = get_cpu_phys_id(cpuid);
+		core_id = get_cpu_core_id(cpuid);
+		ht_id = get_cpu_ht_id(cpuid);
+
+		/*
+		 * Calculate pg_color for our array index.
+		 *
+		 * physcale - socket multiplier.
+		 * grpscale - core multiplier (cores per socket)
+		 * cpu*	    - cpus per core
+		 *
+		 * WARNING! In early boot, ncpus has not yet been
+		 *	    initialized and may be set to (1).
+		 *
+		 * WARNING! physcale must match the organization that
+		 *	    vm_numa_organize() creates to ensure that
+		 *	    we properly localize allocations to the
+		 *	    requested cpuid.
+		 */
+		physcale = PQ_L2_SIZE / cpu_topology_phys_ids;
+		grpscale = physcale / cpu_topology_core_ids;
+		cpuscale = grpscale / cpu_topology_ht_ids;
+
+		pg_color = phys_id * physcale;
+		pg_color += core_id * grpscale;
+		pg_color += ht_id * cpuscale;
+		pg_color += (pindex + object_pg_color) % cpuscale;
+
+#if 0
+		if (grpsize >= 8) {
+			pg_color += (pindex + object_pg_color) % grpsize;
+		} else {
+			if (grpsize <= 2) {
+				grpsize = 8;
+			} else {
+				/* 3->9, 4->8, 5->10, 6->12, 7->14 */
+				grpsize += grpsize;
+				if (grpsize < 8)
+					grpsize += grpsize;
+			}
+			pg_color += (pindex + object_pg_color) % grpsize;
+		}
+#endif
+	} else {
+		/*
+		 * Unknown topology, distribute things evenly.
+		 *
+		 * WARNING! In early boot, ncpus has not yet been
+		 *	    initialized and may be set to (1).
+		 */
+		int cpuscale;
+
+		cpuscale = PQ_L2_SIZE / ncpus;
+
+		pg_color = cpuid * cpuscale;
+		pg_color += (pindex + object_pg_color) % cpuscale;
+	}
+	return (pg_color & PQ_L2_MASK);
+}
+
+/*
+ * Wait until BUSY can be set, then set it.  If also_m_busy is TRUE we
+ * also wait for m->busy_count to become 0 before setting PBUSY_LOCKED.
  */
 void
 VM_PAGE_DEBUG_EXT(vm_page_busy_wait)(vm_page_t m,
 				     int also_m_busy, const char *msg
 				     VM_PAGE_DEBUG_ARGS)
 {
-	u_int32_t flags;
+	u_int32_t busy_count;
 
 	for (;;) {
-		flags = m->flags;
+		busy_count = m->busy_count;
 		cpu_ccfence();
-		if (flags & PG_BUSY) {
+		if (busy_count & PBUSY_LOCKED) {
 			tsleep_interlock(m, 0);
-			if (atomic_cmpset_int(&m->flags, flags,
-					  flags | PG_WANTED | PG_REFERENCED)) {
+			if (atomic_cmpset_int(&m->busy_count, busy_count,
+					  busy_count | PBUSY_WANTED)) {
+				atomic_set_int(&m->flags, PG_REFERENCED);
 				tsleep(m, PINTERLOCKED, msg, 0);
 			}
-		} else if (also_m_busy && (flags & PG_SBUSY)) {
+		} else if (also_m_busy && busy_count) {
 			tsleep_interlock(m, 0);
-			if (atomic_cmpset_int(&m->flags, flags,
-					  flags | PG_WANTED | PG_REFERENCED)) {
+			if (atomic_cmpset_int(&m->busy_count, busy_count,
+					  busy_count | PBUSY_WANTED)) {
+				atomic_set_int(&m->flags, PG_REFERENCED);
 				tsleep(m, PINTERLOCKED, msg, 0);
 			}
 		} else {
-			if (atomic_cmpset_int(&m->flags, flags,
-					      flags | PG_BUSY)) {
+			if (atomic_cmpset_int(&m->busy_count, busy_count,
+					      busy_count | PBUSY_LOCKED)) {
 #ifdef VM_PAGE_DEBUG
 				m->busy_func = func;
 				m->busy_line = lineno;
@@ -782,8 +1302,8 @@ VM_PAGE_DEBUG_EXT(vm_page_busy_wait)(vm_page_t m,
 }
 
 /*
- * Attempt to set PG_BUSY.  If also_m_busy is TRUE we only succeed if m->busy
- * is also 0.
+ * Attempt to set BUSY.  If also_m_busy is TRUE we only succeed if
+ * m->busy_count is also 0.
  *
  * Returns non-zero on failure.
  */
@@ -791,16 +1311,17 @@ int
 VM_PAGE_DEBUG_EXT(vm_page_busy_try)(vm_page_t m, int also_m_busy
 				    VM_PAGE_DEBUG_ARGS)
 {
-	u_int32_t flags;
+	u_int32_t busy_count;
 
 	for (;;) {
-		flags = m->flags;
+		busy_count = m->busy_count;
 		cpu_ccfence();
-		if (flags & PG_BUSY)
+		if (busy_count & PBUSY_LOCKED)
 			return TRUE;
-		if (also_m_busy && (flags & PG_SBUSY))
+		if (also_m_busy && (busy_count & PBUSY_MASK) != 0)
 			return TRUE;
-		if (atomic_cmpset_int(&m->flags, flags, flags | PG_BUSY)) {
+		if (atomic_cmpset_int(&m->busy_count, busy_count,
+				      busy_count | PBUSY_LOCKED)) {
 #ifdef VM_PAGE_DEBUG
 				m->busy_func = func;
 				m->busy_line = lineno;
@@ -811,11 +1332,8 @@ VM_PAGE_DEBUG_EXT(vm_page_busy_try)(vm_page_t m, int also_m_busy
 }
 
 /*
- * Clear the PG_BUSY flag and return non-zero to indicate to the caller
+ * Clear the BUSY flag and return non-zero to indicate to the caller
  * that a wakeup() should be performed.
- *
- * The vm_page must be spinlocked and will remain spinlocked on return.
- * The related queue must NOT be spinlocked (which could deadlock us).
  *
  * (inline version)
  */
@@ -823,113 +1341,115 @@ static __inline
 int
 _vm_page_wakeup(vm_page_t m)
 {
-	u_int32_t flags;
+	u_int32_t busy_count;
 
+	busy_count = m->busy_count;
+	cpu_ccfence();
 	for (;;) {
-		flags = m->flags;
-		cpu_ccfence();
-		if (atomic_cmpset_int(&m->flags, flags,
-				      flags & ~(PG_BUSY | PG_WANTED))) {
-			break;
+		if (atomic_fcmpset_int(&m->busy_count, &busy_count,
+				      busy_count &
+				      ~(PBUSY_LOCKED | PBUSY_WANTED))) {
+			return((int)(busy_count & PBUSY_WANTED));
 		}
 	}
-	return(flags & PG_WANTED);
+	/* not reached */
 }
 
 /*
- * Clear the PG_BUSY flag and wakeup anyone waiting for the page.  This
+ * Clear the BUSY flag and wakeup anyone waiting for the page.  This
  * is typically the last call you make on a page before moving onto
  * other things.
  */
 void
 vm_page_wakeup(vm_page_t m)
 {
-        KASSERT(m->flags & PG_BUSY, ("vm_page_wakeup: page not busy!!!"));
-	vm_page_spin_lock(m);
-	if (_vm_page_wakeup(m)) {
-		vm_page_spin_unlock(m);
+        KASSERT(m->busy_count & PBUSY_LOCKED,
+		("vm_page_wakeup: page not busy!!!"));
+	if (_vm_page_wakeup(m))
 		wakeup(m);
-	} else {
-		vm_page_spin_unlock(m);
-	}
 }
 
 /*
- * Holding a page keeps it from being reused.  Other parts of the system
- * can still disassociate the page from its current object and free it, or
- * perform read or write I/O on it and/or otherwise manipulate the page,
- * but if the page is held the VM system will leave the page and its data
- * intact and not reuse the page for other purposes until the last hold
- * reference is released.  (see vm_page_wire() if you want to prevent the
- * page from being disassociated from its object too).
+ * Hold a page, preventing reuse.  This is typically only called on pages
+ * in a known state (either held busy, special, or interlocked in some
+ * manner).  Holding a page does not ensure that it remains valid, it only
+ * prevents reuse.  The page must not already be on the FREE queue or in
+ * any danger of being moved to the FREE queue concurrent with this call.
  *
- * The caller must still validate the contents of the page and, if necessary,
- * wait for any pending I/O (e.g. vm_page_sleep_busy() loop) to complete
- * before manipulating the page.
+ * Other parts of the system can still disassociate the page from its object
+ * and attempt to free it, or perform read or write I/O on it and/or otherwise
+ * manipulate the page, but if the page is held the VM system will leave the
+ * page and its data intact and not cycle it through the FREE queue until
+ * the last hold has been released.
  *
- * XXX get vm_page_spin_lock() here and move FREE->HOLD if necessary
+ * (see vm_page_wire() if you want to prevent the page from being
+ *  disassociated from its object too).
  */
 void
 vm_page_hold(vm_page_t m)
 {
-	vm_page_spin_lock(m);
 	atomic_add_int(&m->hold_count, 1);
-	if (m->queue - m->pc == PQ_FREE) {
-		_vm_page_queue_spin_lock(m);
-		_vm_page_rem_queue_spinlocked(m);
-		_vm_page_add_queue_spinlocked(m, PQ_HOLD + m->pc, 0);
-		_vm_page_queue_spin_unlock(m);
-	}
-	vm_page_spin_unlock(m);
+	KKASSERT(m->queue - m->pc != PQ_FREE);
 }
 
 /*
  * The opposite of vm_page_hold().  If the page is on the HOLD queue
  * it was freed while held and must be moved back to the FREE queue.
+ *
+ * To avoid racing against vm_page_free*() we must re-test conditions
+ * after obtaining the spin-lock.  The initial test can also race a
+ * vm_page_free*() that is in the middle of moving a page to PQ_HOLD,
+ * leaving the page on PQ_HOLD with hold_count == 0.  Rather than
+ * throw a spin-lock in the critical path, we rely on the pageout
+ * daemon to clean-up these loose ends.
+ *
+ * More critically, the 'easy movement' between queues without busying
+ * a vm_page is only allowed for PQ_FREE<->PQ_HOLD.
  */
 void
 vm_page_unhold(vm_page_t m)
 {
 	KASSERT(m->hold_count > 0 && m->queue - m->pc != PQ_FREE,
-		("vm_page_unhold: pg %p illegal hold_count (%d) or on FREE queue (%d)",
+		("vm_page_unhold: pg %p illegal hold_count (%d) or "
+		 "on FREE queue (%d)",
 		 m, m->hold_count, m->queue - m->pc));
-	vm_page_spin_lock(m);
-	atomic_add_int(&m->hold_count, -1);
-	if (m->hold_count == 0 && m->queue - m->pc == PQ_HOLD) {
-		_vm_page_queue_spin_lock(m);
-		_vm_page_rem_queue_spinlocked(m);
-		_vm_page_add_queue_spinlocked(m, PQ_FREE + m->pc, 0);
-		_vm_page_queue_spin_unlock(m);
+
+	if (atomic_fetchadd_int(&m->hold_count, -1) == 1 &&
+	    m->queue - m->pc == PQ_HOLD) {
+		vm_page_spin_lock(m);
+		if (m->hold_count == 0 && m->queue - m->pc == PQ_HOLD) {
+			_vm_page_queue_spin_lock(m);
+			_vm_page_rem_queue_spinlocked(m);
+			_vm_page_add_queue_spinlocked(m, PQ_FREE + m->pc, 1);
+			_vm_page_queue_spin_unlock(m);
+		}
+		vm_page_spin_unlock(m);
 	}
-	vm_page_spin_unlock(m);
 }
 
 /*
- *	vm_page_getfake:
- *
- *	Create a fictitious page with the specified physical address and
- *	memory attribute.  The memory attribute is the only the machine-
- *	dependent aspect of a fictitious page that must be initialized.
+ * Create a fictitious page with the specified physical address and
+ * memory attribute.  The memory attribute is the only the machine-
+ * dependent aspect of a fictitious page that must be initialized.
  */
-
 void
 vm_page_initfake(vm_page_t m, vm_paddr_t paddr, vm_memattr_t memattr)
 {
-
-	if ((m->flags & PG_FICTITIOUS) != 0) {
-		/*
-		 * The page's memattr might have changed since the
-		 * previous initialization.  Update the pmap to the
-		 * new memattr.
-		 */
+	/*
+	 * The page's memattr might have changed since the
+	 * previous initialization.  Update the pmap to the
+	 * new memattr.
+	 */
+	if ((m->flags & PG_FICTITIOUS) != 0)
 		goto memattr;
-	}
 	m->phys_addr = paddr;
 	m->queue = PQ_NONE;
 	/* Fictitious pages don't use "segind". */
 	/* Fictitious pages don't use "order" or "pool". */
-	m->flags = PG_FICTITIOUS | PG_UNMANAGED | PG_BUSY;
+	m->flags = PG_FICTITIOUS | PG_UNQUEUED;
+	m->busy_count = PBUSY_LOCKED;
 	m->wire_count = 1;
+	spin_init(&m->spin, "fake_page");
 	pmap_page_init(m);
 memattr:
 	pmap_page_set_memattr(m, memattr);
@@ -957,13 +1477,13 @@ vm_page_insert(vm_page_t m, vm_object_t object, vm_pindex_t pindex)
 	if (m->object != NULL)
 		panic("vm_page_insert: already inserted");
 
-	object->generation++;
+	atomic_add_int(&object->generation, 1);
 
 	/*
-	 * Record the object/offset pair in this page and add the
-	 * pv_list_count of the page to the object.
+	 * Associate the VM page with an (object, offset).
 	 *
 	 * The vm_page spin lock is required for interactions with the pmap.
+	 * XXX vm_page_spin_lock() might not be needed for this any more.
 	 */
 	vm_page_spin_lock(m);
 	m->object = object;
@@ -976,7 +1496,6 @@ vm_page_insert(vm_page_t m, vm_object_t object, vm_pindex_t pindex)
 	}
 	++object->resident_page_count;
 	++mycpu->gd_vmtotal.t_rm;
-	/* atomic_add_int(&object->agg_pv_list_count, m->md.pv_list_count); */
 	vm_page_spin_unlock(m);
 
 	/*
@@ -997,14 +1516,19 @@ vm_page_insert(vm_page_t m, vm_object_t object, vm_pindex_t pindex)
 /*
  * Removes the given vm_page_t from the (object,index) table
  *
- * The underlying pmap entry (if any) is NOT removed here.
- * This routine may not block.
- *
  * The page must be BUSY and will remain BUSY on return.
  * No other requirements.
  *
  * NOTE: FreeBSD side effect was to unbusy the page on return.  We leave
  *	 it busy.
+ *
+ * NOTE: Caller is responsible for any pmap disposition prior to the
+ *	 rename (as the pmap code will not be able to find the entries
+ *	 once the object has been disassociated).  The caller may choose
+ *	 to leave the pmap association intact if this routine is being
+ *	 called as part of a rename between shadowed objects.
+ *
+ * This routine may not block.
  */
 void
 vm_page_remove(vm_page_t m)
@@ -1015,7 +1539,7 @@ vm_page_remove(vm_page_t m)
 		return;
 	}
 
-	if ((m->flags & PG_BUSY) == 0)
+	if ((m->busy_count & PBUSY_LOCKED) == 0)
 		panic("vm_page_remove: page not busy");
 
 	object = m->object;
@@ -1026,18 +1550,173 @@ vm_page_remove(vm_page_t m)
 	 * Remove the page from the object and update the object.
 	 *
 	 * The vm_page spin lock is required for interactions with the pmap.
+	 * XXX vm_page_spin_lock() might not be needed for this any more.
 	 */
 	vm_page_spin_lock(m);
 	vm_page_rb_tree_RB_REMOVE(&object->rb_memq, m);
 	--object->resident_page_count;
 	--mycpu->gd_vmtotal.t_rm;
-	/* atomic_add_int(&object->agg_pv_list_count, -m->md.pv_list_count); */
 	m->object = NULL;
+	atomic_add_int(&object->generation, 1);
 	vm_page_spin_unlock(m);
 
-	object->generation++;
-
 	vm_object_drop(object);
+}
+
+/*
+ * Calculate the hash position for the vm_page hash heuristic.  Generally
+ * speaking we want to localize sequential lookups to reduce memory stalls.
+ *
+ * Mask by ~3 to offer 4-way set-assoc
+ */
+static __inline
+struct vm_page_hash_elm *
+vm_page_hash_hash(vm_object_t object, vm_pindex_t pindex)
+{
+	size_t hi;
+
+	hi = iscsi_crc32(&object, sizeof(object)) << 2;
+	hi ^= hi >> (23 - 2);
+	hi += pindex * VM_PAGE_HASH_SET;
+#if 0
+	/* mix it up */
+	hi = (intptr_t)object ^ object->pg_color ^ pindex;
+	hi += object->pg_color * pindex;
+	hi = hi ^ (hi >> 20);
+#endif
+	hi &= vm_page_hash_size - 1;		/* bounds */
+
+	return (&vm_page_hash[hi]);
+}
+
+/*
+ * Heuristical page lookup that does not require any locks.  Returns
+ * a soft-busied page on success, NULL on failure.
+ *
+ * Caller must lookup the page the slow way if NULL is returned.
+ */
+vm_page_t
+vm_page_hash_get(vm_object_t object, vm_pindex_t pindex)
+{
+	struct vm_page_hash_elm *mp;
+	vm_page_t m;
+	int i;
+
+	if (__predict_false(vm_page_hash == NULL))
+		return NULL;
+	mp = vm_page_hash_hash(object, pindex);
+	for (i = 0; i < VM_PAGE_HASH_SET; ++i, ++mp) {
+		if (mp->object != object ||
+		    mp->pindex != pindex) {
+			continue;
+		}
+		m = mp->m;
+		cpu_ccfence();
+		if (m == NULL)
+			continue;
+		if (m->object != object || m->pindex != pindex)
+			continue;
+		if (vm_page_sbusy_try(m))
+			continue;
+		if (m->object == object && m->pindex == pindex) {
+			/*
+			 * On-match optimization - do not update ticks
+			 * unless we have to (reduce cache coherency traffic)
+			 */
+			if (mp->ticks != ticks)
+				mp->ticks = ticks;
+			return m;
+		}
+		vm_page_sbusy_drop(m);
+	}
+	return NULL;
+}
+
+/*
+ * Enter page onto vm_page_hash[].  This is a heuristic, SMP collisions
+ * are allowed.
+ */
+static __inline
+void
+vm_page_hash_enter(vm_page_t m)
+{
+	struct vm_page_hash_elm *mp;
+	struct vm_page_hash_elm *best;
+	vm_object_t object;
+	vm_pindex_t pindex;
+	int best_delta;
+	int delta;
+	int i;
+
+	/*
+	 * Only enter type-stable vm_pages with well-shared objects.
+	 */
+	if ((m->flags & PG_MAPPEDMULTI) == 0)
+		return;
+	if (__predict_false(vm_page_hash == NULL ||
+			    m < &vm_page_array[0] ||
+			    m >= &vm_page_array[vm_page_array_size])) {
+		return;
+	}
+	if (__predict_false(m->object == NULL))
+		return;
+#if 0
+	/*
+	 * Disabled at the moment, there are some degenerate conditions
+	 * with often-exec'd programs that get ignored.  In particular,
+	 * the kernel's elf loader does a vn_rdwr() on the first page of
+	 * a binary.
+	 */
+	if (m->object->ref_count <= 2 || (m->object->flags & OBJ_ONEMAPPING))
+		return;
+#endif
+	if (vm_page_hash_vnode_only && m->object->type != OBJT_VNODE)
+		return;
+
+	/*
+	 * Find best entry
+	 */
+	object = m->object;
+	pindex = m->pindex;
+
+	mp = vm_page_hash_hash(object, pindex);
+	best = mp;
+	best_delta = ticks - best->ticks;
+
+	for (i = 0; i < VM_PAGE_HASH_SET; ++i, ++mp) {
+		if (mp->m == m &&
+		    mp->object == object &&
+		    mp->pindex == pindex) {
+			/*
+			 * On-match optimization - do not update ticks
+			 * unless we have to (reduce cache coherency traffic)
+			 */
+			if (mp->ticks != ticks)
+				mp->ticks = ticks;
+			return;
+		}
+
+		/*
+		 * The best choice is the oldest entry.
+		 *
+		 * Also check for a field overflow, using -1 instead of 0
+		 * to deal with SMP races on accessing the 'ticks' global.
+		 */
+		delta = ticks - mp->ticks;
+		if (delta < -1)
+			best = mp;
+		if (best_delta < delta)
+			best = mp;
+	}
+
+	/*
+	 * Load the entry.  Copy a few elements to the hash entry itself
+	 * to reduce memory stalls due to memory indirects on lookups.
+	 */
+	best->m = m;
+	best->object = object;
+	best->pindex = pindex;
+	best->ticks = ticks;
 }
 
 /*
@@ -1056,7 +1735,10 @@ vm_page_lookup(vm_object_t object, vm_pindex_t pindex)
 	 */
 	ASSERT_LWKT_TOKEN_HELD(vm_object_token(object));
 	m = vm_page_rb_tree_RB_LOOKUP(&object->rb_memq, pindex);
-	KKASSERT(m == NULL || (m->object == object && m->pindex == pindex));
+	if (m) {
+		KKASSERT(m->object == object && m->pindex == pindex);
+		vm_page_hash_enter(m);
+	}
 	return(m);
 }
 
@@ -1066,37 +1748,40 @@ VM_PAGE_DEBUG_EXT(vm_page_lookup_busy_wait)(struct vm_object *object,
 					    int also_m_busy, const char *msg
 					    VM_PAGE_DEBUG_ARGS)
 {
-	u_int32_t flags;
+	u_int32_t busy_count;
 	vm_page_t m;
 
 	ASSERT_LWKT_TOKEN_HELD(vm_object_token(object));
 	m = vm_page_rb_tree_RB_LOOKUP(&object->rb_memq, pindex);
 	while (m) {
 		KKASSERT(m->object == object && m->pindex == pindex);
-		flags = m->flags;
+		busy_count = m->busy_count;
 		cpu_ccfence();
-		if (flags & PG_BUSY) {
+		if (busy_count & PBUSY_LOCKED) {
 			tsleep_interlock(m, 0);
-			if (atomic_cmpset_int(&m->flags, flags,
-					  flags | PG_WANTED | PG_REFERENCED)) {
+			if (atomic_cmpset_int(&m->busy_count, busy_count,
+					  busy_count | PBUSY_WANTED)) {
+				atomic_set_int(&m->flags, PG_REFERENCED);
 				tsleep(m, PINTERLOCKED, msg, 0);
 				m = vm_page_rb_tree_RB_LOOKUP(&object->rb_memq,
 							      pindex);
 			}
-		} else if (also_m_busy && (flags & PG_SBUSY)) {
+		} else if (also_m_busy && busy_count) {
 			tsleep_interlock(m, 0);
-			if (atomic_cmpset_int(&m->flags, flags,
-					  flags | PG_WANTED | PG_REFERENCED)) {
+			if (atomic_cmpset_int(&m->busy_count, busy_count,
+					  busy_count | PBUSY_WANTED)) {
+				atomic_set_int(&m->flags, PG_REFERENCED);
 				tsleep(m, PINTERLOCKED, msg, 0);
 				m = vm_page_rb_tree_RB_LOOKUP(&object->rb_memq,
 							      pindex);
 			}
-		} else if (atomic_cmpset_int(&m->flags, flags,
-					     flags | PG_BUSY)) {
+		} else if (atomic_cmpset_int(&m->busy_count, busy_count,
+					     busy_count | PBUSY_LOCKED)) {
 #ifdef VM_PAGE_DEBUG
 			m->busy_func = func;
 			m->busy_line = lineno;
 #endif
+			vm_page_hash_enter(m);
 			break;
 		}
 	}
@@ -1119,7 +1804,7 @@ VM_PAGE_DEBUG_EXT(vm_page_lookup_busy_try)(struct vm_object *object,
 					   int also_m_busy, int *errorp
 					   VM_PAGE_DEBUG_ARGS)
 {
-	u_int32_t flags;
+	u_int32_t busy_count;
 	vm_page_t m;
 
 	ASSERT_LWKT_TOKEN_HELD(vm_object_token(object));
@@ -1127,22 +1812,59 @@ VM_PAGE_DEBUG_EXT(vm_page_lookup_busy_try)(struct vm_object *object,
 	*errorp = FALSE;
 	while (m) {
 		KKASSERT(m->object == object && m->pindex == pindex);
-		flags = m->flags;
+		busy_count = m->busy_count;
 		cpu_ccfence();
-		if (flags & PG_BUSY) {
+		if (busy_count & PBUSY_LOCKED) {
 			*errorp = TRUE;
 			break;
 		}
-		if (also_m_busy && (flags & PG_SBUSY)) {
+		if (also_m_busy && busy_count) {
 			*errorp = TRUE;
 			break;
 		}
-		if (atomic_cmpset_int(&m->flags, flags, flags | PG_BUSY)) {
+		if (atomic_cmpset_int(&m->busy_count, busy_count,
+				      busy_count | PBUSY_LOCKED)) {
 #ifdef VM_PAGE_DEBUG
 			m->busy_func = func;
 			m->busy_line = lineno;
 #endif
+			vm_page_hash_enter(m);
 			break;
+		}
+	}
+	return m;
+}
+
+/*
+ * Returns a page that is only soft-busied for use by the caller in
+ * a read-only fashion.  Returns NULL if the page could not be found,
+ * the soft busy could not be obtained, or the page data is invalid.
+ *
+ * XXX Doesn't handle PG_FICTITIOUS pages at the moment, but there is
+ *     no reason why we couldn't.
+ */
+vm_page_t
+vm_page_lookup_sbusy_try(struct vm_object *object, vm_pindex_t pindex,
+			 int pgoff, int pgbytes)
+{
+	vm_page_t m;
+
+	ASSERT_LWKT_TOKEN_HELD(vm_object_token(object));
+	m = vm_page_rb_tree_RB_LOOKUP(&object->rb_memq, pindex);
+	if (m) {
+		if ((m->valid != VM_PAGE_BITS_ALL &&
+		     !vm_page_is_valid(m, pgoff, pgbytes)) ||
+		    (m->flags & PG_FICTITIOUS)) {
+			m = NULL;
+		} else if (vm_page_sbusy_try(m)) {
+			m = NULL;
+		} else if ((m->valid != VM_PAGE_BITS_ALL &&
+			    !vm_page_is_valid(m, pgoff, pgbytes)) ||
+			   (m->flags & PG_FICTITIOUS)) {
+			vm_page_sbusy_drop(m);
+			m = NULL;
+		} else {
+			vm_page_hash_enter(m);
 		}
 	}
 	return m;
@@ -1183,11 +1905,18 @@ vm_page_next(vm_page_t m)
  *	 swap.  If the page is on the cache, we have to deactivate it
  *	 or vm_page_dirty() will panic.  Dirty pages are not allowed
  *	 on the cache.
+ *
+ * NOTE: Caller is responsible for any pmap disposition prior to the
+ *	 rename (as the pmap code will not be able to find the entries
+ *	 once the object has been disassociated or changed).  Nominally
+ *	 the caller is moving a page between shadowed objects and so the
+ *	 pmap association is retained without having to remove the page
+ *	 from it.
  */
 void
 vm_page_rename(vm_page_t m, vm_object_t new_object, vm_pindex_t new_pindex)
 {
-	KKASSERT(m->flags & PG_BUSY);
+	KKASSERT(m->busy_count & PBUSY_LOCKED);
 	ASSERT_LWKT_TOKEN_HELD_EXCL(vm_object_token(new_object));
 	if (m->object) {
 		ASSERT_LWKT_TOKEN_HELD_EXCL(vm_object_token(m->object));
@@ -1247,12 +1976,15 @@ vm_page_unqueue(vm_page_t m)
  * caches.  We need this optimization because cpu caches tend to be
  * physical caches, while object spaces tend to be virtual.
  *
- * On MP systems each PQ_FREE and PQ_CACHE color queue has its own spinlock
- * and the algorithm is adjusted to localize allocations on a per-core basis.
+ * The page coloring optimization also, very importantly, tries to localize
+ * memory to cpus and physical sockets.
+ *
+ * Each PQ_FREE and PQ_CACHE color queue has its own spinlock and the
+ * algorithm is adjusted to localize allocations on a per-core basis.
  * This is done by 'twisting' the colors.
  *
  * The page is returned spinlocked and removed from its queue (it will
- * be on PQ_NONE), or NULL. The page is not PG_BUSY'd.  The caller
+ * be on PQ_NONE), or NULL. The page is not BUSY'd.  The caller
  * is responsible for dealing with the busy-page case (usually by
  * deactivating the page and looping).
  *
@@ -1266,71 +1998,279 @@ vm_page_unqueue(vm_page_t m)
  */
 static __inline
 vm_page_t
-_vm_page_list_find(int basequeue, int index, boolean_t prefer_zero)
+_vm_page_list_find(int basequeue, int index)
 {
+	struct vpgqueues *pq;
 	vm_page_t m;
 
-	for (;;) {
-		if (prefer_zero)
-			m = TAILQ_LAST(&vm_page_queues[basequeue+index].pl, pglist);
-		else
-			m = TAILQ_FIRST(&vm_page_queues[basequeue+index].pl);
-		if (m == NULL) {
-			m = _vm_page_list_find2(basequeue, index);
+	index &= PQ_L2_MASK;
+	pq = &vm_page_queues[basequeue + index];
+
+	/*
+	 * Try this cpu's colored queue first.  Test for a page unlocked,
+	 * then lock the queue and locate a page.  Note that the lock order
+	 * is reversed, but we do not want to dwadle on the page spinlock
+	 * anyway as it is held significantly longer than the queue spinlock.
+	 */
+	if (TAILQ_FIRST(&pq->pl)) {
+		spin_lock(&pq->spin);
+		TAILQ_FOREACH(m, &pq->pl, pageq) {
+			if (spin_trylock(&m->spin) == 0)
+				continue;
+			KKASSERT(m->queue == basequeue + index);
+			pq->lastq = -1;
 			return(m);
 		}
-		vm_page_and_queue_spin_lock(m);
-		if (m->queue == basequeue + index) {
-			_vm_page_rem_queue_spinlocked(m);
-			/* vm_page_t spin held, no queue spin */
-			break;
-		}
-		vm_page_and_queue_spin_unlock(m);
+		spin_unlock(&pq->spin);
 	}
+
+	m = _vm_page_list_find_wide(basequeue, index, &pq->lastq);
+
 	return(m);
 }
 
+/*
+ * If we could not find the page in the desired queue try to find it in
+ * a nearby (NUMA-aware) queue, spreading out as we go.
+ */
 static vm_page_t
-_vm_page_list_find2(int basequeue, int index)
+_vm_page_list_find_wide(int basequeue, int index, int *lastp)
 {
-	int i;
-	vm_page_t m = NULL;
 	struct vpgqueues *pq;
-
-	pq = &vm_page_queues[basequeue];
+	vm_page_t m = NULL;
+	int pqmask = set_assoc_mask >> 1;
+	int pqi;
+	int range;
+	int skip_start;
+	int skip_next;
+	int count;
 
 	/*
-	 * Note that for the first loop, index+i and index-i wind up at the
-	 * same place.  Even though this is not totally optimal, we've already
-	 * blown it by missing the cache case so we do not care.
+	 * Avoid re-searching empty queues over and over again skip to
+	 * pq->last if appropriate.
 	 */
-	for (i = PQ_L2_SIZE / 2; i > 0; --i) {
-		for (;;) {
-			m = TAILQ_FIRST(&pq[(index + i) & PQ_L2_MASK].pl);
-			if (m) {
-				_vm_page_and_queue_spin_lock(m);
-				if (m->queue ==
-				    basequeue + ((index + i) & PQ_L2_MASK)) {
-					_vm_page_rem_queue_spinlocked(m);
+	if (*lastp >= 0)
+		index = *lastp;
+
+	index &= PQ_L2_MASK;
+	pq = &vm_page_queues[basequeue];
+	count = 0;
+	skip_start = -1;
+	skip_next = -1;
+
+	/*
+	 * Run local sets of 16, 32, 64, 128, up to the entire queue if all
+	 * else fails (PQ_L2_MASK).
+	 *
+	 * pqmask is a mask, 15, 31, 63, etc.
+	 *
+	 * Test each queue unlocked first, then lock the queue and locate
+	 * a page.  Note that the lock order is reversed, but we do not want
+	 * to dwadle on the page spinlock anyway as it is held significantly
+	 * longer than the queue spinlock.
+	 */
+	do {
+		pqmask = (pqmask << 1) | 1;
+
+		pqi = index;
+		range = pqmask + 1;
+
+		while (range > 0) {
+			if (pqi >= skip_start && pqi < skip_next) {
+				range -= skip_next - pqi;
+				pqi = (pqi & ~pqmask) | (skip_next & pqmask);
+			}
+			if (range > 0 && TAILQ_FIRST(&pq[pqi].pl)) {
+				spin_lock(&pq[pqi].spin);
+				TAILQ_FOREACH(m, &pq[pqi].pl, pageq) {
+					if (spin_trylock(&m->spin) == 0)
+						continue;
+					KKASSERT(m->queue == basequeue + pqi);
+
+					/*
+					 * If we had to wander too far, set
+					 * *lastp to skip past empty queues.
+					 */
+					if (count >= 8)
+						*lastp = pqi & PQ_L2_MASK;
 					return(m);
 				}
-				_vm_page_and_queue_spin_unlock(m);
-				continue;
+				spin_unlock(&pq[pqi].spin);
 			}
-			m = TAILQ_FIRST(&pq[(index - i) & PQ_L2_MASK].pl);
-			if (m) {
-				_vm_page_and_queue_spin_lock(m);
-				if (m->queue ==
-				    basequeue + ((index - i) & PQ_L2_MASK)) {
-					_vm_page_rem_queue_spinlocked(m);
-					return(m);
-				}
-				_vm_page_and_queue_spin_unlock(m);
-				continue;
-			}
-			break;	/* next i */
+			--range;
+			++count;
+			pqi = (pqi & ~pqmask) | ((pqi + 1) & pqmask);
 		}
+		skip_start = pqi & ~pqmask;
+		skip_next = (pqi | pqmask) + 1;
+	} while (pqmask != PQ_L2_MASK);
+
+	return(m);
+}
+
+static __inline
+vm_page_t
+_vm_page_list_find2(int bq1, int bq2, int index)
+{
+	struct vpgqueues *pq1;
+	struct vpgqueues *pq2;
+	vm_page_t m;
+
+	index &= PQ_L2_MASK;
+	pq1 = &vm_page_queues[bq1 + index];
+	pq2 = &vm_page_queues[bq2 + index];
+
+	/*
+	 * Try this cpu's colored queue first.  Test for a page unlocked,
+	 * then lock the queue and locate a page.  Note that the lock order
+	 * is reversed, but we do not want to dwadle on the page spinlock
+	 * anyway as it is held significantly longer than the queue spinlock.
+	 */
+	if (TAILQ_FIRST(&pq1->pl)) {
+		spin_lock(&pq1->spin);
+		TAILQ_FOREACH(m, &pq1->pl, pageq) {
+			if (spin_trylock(&m->spin) == 0)
+				continue;
+			KKASSERT(m->queue == bq1 + index);
+			pq1->lastq = -1;
+			pq2->lastq = -1;
+			return(m);
+		}
+		spin_unlock(&pq1->spin);
 	}
+
+	m = _vm_page_list_find2_wide(bq1, bq2, index, &pq1->lastq, &pq2->lastq);
+
+	return(m);
+}
+
+
+/*
+ * This version checks two queues at the same time, widening its search
+ * as we progress.  prefering basequeue1
+ * and starting on basequeue2 after exhausting the first set.  The idea
+ * is to try to stay localized to the cpu.
+ */
+static vm_page_t
+_vm_page_list_find2_wide(int basequeue1, int basequeue2, int index,
+			 int *lastp1, int *lastp2)
+{
+	struct vpgqueues *pq1;
+	struct vpgqueues *pq2;
+	vm_page_t m = NULL;
+	int pqmask1, pqmask2;
+	int pqi;
+	int range;
+	int skip_start1, skip_start2;
+	int skip_next1, skip_next2;
+	int count1, count2;
+
+	/*
+	 * Avoid re-searching empty queues over and over again skip to
+	 * pq->last if appropriate.
+	 */
+	if (*lastp1 >= 0)
+		index = *lastp1;
+
+	index &= PQ_L2_MASK;
+
+	pqmask1 = set_assoc_mask >> 1;
+	pq1 = &vm_page_queues[basequeue1];
+	count1 = 0;
+	skip_start1 = -1;
+	skip_next1 = -1;
+
+	pqmask2 = set_assoc_mask >> 1;
+	pq2 = &vm_page_queues[basequeue2];
+	count2 = 0;
+	skip_start2 = -1;
+	skip_next2 = -1;
+
+	/*
+	 * Run local sets of 16, 32, 64, 128, up to the entire queue if all
+	 * else fails (PQ_L2_MASK).
+	 *
+	 * pqmask is a mask, 15, 31, 63, etc.
+	 *
+	 * Test each queue unlocked first, then lock the queue and locate
+	 * a page.  Note that the lock order is reversed, but we do not want
+	 * to dwadle on the page spinlock anyway as it is held significantly
+	 * longer than the queue spinlock.
+	 */
+	do {
+		if (pqmask1 == PQ_L2_MASK)
+			goto skip2;
+
+		pqmask1 = (pqmask1 << 1) | 1;
+		pqi = index;
+		range = pqmask1 + 1;
+
+		while (range > 0) {
+			if (pqi >= skip_start1 && pqi < skip_next1) {
+				range -= skip_next1 - pqi;
+				pqi = (pqi & ~pqmask1) | (skip_next1 & pqmask1);
+			}
+			if (range > 0 && TAILQ_FIRST(&pq1[pqi].pl)) {
+				spin_lock(&pq1[pqi].spin);
+				TAILQ_FOREACH(m, &pq1[pqi].pl, pageq) {
+					if (spin_trylock(&m->spin) == 0)
+						continue;
+					KKASSERT(m->queue == basequeue1 + pqi);
+
+					/*
+					 * If we had to wander too far, set
+					 * *lastp to skip past empty queues.
+					 */
+					if (count1 >= 8)
+						*lastp1 = pqi & PQ_L2_MASK;
+					return(m);
+				}
+				spin_unlock(&pq1[pqi].spin);
+			}
+			--range;
+			++count1;
+			pqi = (pqi & ~pqmask1) | ((pqi + 1) & pqmask1);
+		}
+		skip_start1 = pqi & ~pqmask1;
+		skip_next1 = (pqi | pqmask1) + 1;
+skip2:
+		if (pqmask1 < ((set_assoc_mask << 1) | 1))
+			continue;
+
+		pqmask2 = (pqmask2 << 1) | 1;
+		pqi = index;
+		range = pqmask2 + 1;
+
+		while (range > 0) {
+			if (pqi >= skip_start2 && pqi < skip_next2) {
+				range -= skip_next2 - pqi;
+				pqi = (pqi & ~pqmask2) | (skip_next2 & pqmask2);
+			}
+			if (range > 0 && TAILQ_FIRST(&pq2[pqi].pl)) {
+				spin_lock(&pq2[pqi].spin);
+				TAILQ_FOREACH(m, &pq2[pqi].pl, pageq) {
+					if (spin_trylock(&m->spin) == 0)
+						continue;
+					KKASSERT(m->queue == basequeue2 + pqi);
+
+					/*
+					 * If we had to wander too far, set
+					 * *lastp to skip past empty queues.
+					 */
+					if (count2 >= 8)
+						*lastp2 = pqi & PQ_L2_MASK;
+					return(m);
+				}
+				spin_unlock(&pq2[pqi].spin);
+			}
+			--range;
+			++count2;
+			pqi = (pqi & ~pqmask2) | ((pqi + 1) & pqmask2);
+		}
+		skip_start2 = pqi & ~pqmask2;
+		skip_next2 = (pqi | pqmask2) + 1;
+	} while (pqmask1 != PQ_L2_MASK && pqmask2 != PQ_L2_MASK);
+
 	return(m);
 }
 
@@ -1340,11 +2280,18 @@ _vm_page_list_find2(int basequeue, int index)
  * deactivate it if it cannot be busied!)
  *
  * Returns a spinlocked vm_page that has been removed from its queue.
+ * (note that _vm_page_list_find() does not remove the page from its
+ *  queue).
  */
 vm_page_t
-vm_page_list_find(int basequeue, int index, boolean_t prefer_zero)
+vm_page_list_find(int basequeue, int index)
 {
-	return(_vm_page_list_find(basequeue, index, prefer_zero));
+	vm_page_t m;
+
+	m = _vm_page_list_find(basequeue, index);
+	if (m)
+		_vm_page_rem_queue_spinlocked(m);
+	return m;
 }
 
 /*
@@ -1363,12 +2310,13 @@ vm_page_select_cache(u_short pg_color)
 	vm_page_t m;
 
 	for (;;) {
-		m = _vm_page_list_find(PQ_CACHE, pg_color & PQ_L2_MASK, FALSE);
+		m = _vm_page_list_find(PQ_CACHE, pg_color);
 		if (m == NULL)
 			break;
 		/*
-		 * (m) has been removed from its queue and spinlocked
+		 * (m) has been spinlocked
 		 */
+		_vm_page_rem_queue_spinlocked(m);
 		if (vm_page_busy_try(m, TRUE)) {
 			_vm_page_deactivate_locked(m, 0);
 			vm_page_spin_unlock(m);
@@ -1376,11 +2324,12 @@ vm_page_select_cache(u_short pg_color)
 			/*
 			 * We successfully busied the page
 			 */
-			if ((m->flags & (PG_UNMANAGED | PG_NEED_COMMIT)) == 0 &&
+			if ((m->flags & PG_NEED_COMMIT) == 0 &&
 			    m->hold_count == 0 &&
 			    m->wire_count == 0 &&
 			    (m->dirty & m->valid) == 0) {
 				vm_page_spin_unlock(m);
+				KKASSERT((m->flags & PG_UNQUEUED) == 0);
 				pagedaemon_wakeup();
 				return(m);
 			}
@@ -1401,22 +2350,22 @@ vm_page_select_cache(u_short pg_color)
 }
 
 /*
- * Find a free or zero page, with specified preference.  We attempt to
- * inline the nominal case and fall back to _vm_page_select_free() 
- * otherwise.  A busied page is removed from the queue and returned.
+ * Find a free page.  We attempt to inline the nominal case and fall back
+ * to _vm_page_select_free() otherwise.  A busied page is removed from
+ * the queue and returned.
  *
  * This routine may not block.
  */
 static __inline vm_page_t
-vm_page_select_free(u_short pg_color, boolean_t prefer_zero)
+vm_page_select_free(u_short pg_color)
 {
 	vm_page_t m;
 
 	for (;;) {
-		m = _vm_page_list_find(PQ_FREE, pg_color & PQ_L2_MASK,
-				       prefer_zero);
+		m = _vm_page_list_find(PQ_FREE, pg_color);
 		if (m == NULL)
 			break;
+		_vm_page_rem_queue_spinlocked(m);
 		if (vm_page_busy_try(m, TRUE)) {
 			/*
 			 * Various mechanisms such as a pmap_collect can
@@ -1441,14 +2390,20 @@ vm_page_select_free(u_short pg_color, boolean_t prefer_zero)
 			/*
 			 * Theoretically if we are able to busy the page
 			 * atomic with the queue removal (using the vm_page
-			 * lock) nobody else should be able to mess with the
-			 * page before us.
+			 * lock) nobody else should have been able to mess
+			 * with the page before us.
+			 *
+			 * Assert the page state.  Note that even though
+			 * wiring doesn't adjust queues, a page on the free
+			 * queue should never be wired at this point.
 			 */
-			KKASSERT((m->flags & (PG_UNMANAGED |
+			KKASSERT((m->flags & (PG_UNQUEUED |
 					      PG_NEED_COMMIT)) == 0);
-			KASSERT(m->hold_count == 0, ("m->hold_count is not zero "
-						     "pg %p q=%d flags=%08x hold=%d wire=%d",
-						     m, m->queue, m->flags, m->hold_count, m->wire_count));
+			KASSERT(m->hold_count == 0,
+				("m->hold_count is not zero "
+				 "pg %p q=%d flags=%08x hold=%d wire=%d",
+				 m, m->queue, m->flags,
+				 m->hold_count, m->wire_count));
 			KKASSERT(m->wire_count == 0);
 			vm_page_spin_unlock(m);
 			pagedaemon_wakeup();
@@ -1460,43 +2415,67 @@ vm_page_select_free(u_short pg_color, boolean_t prefer_zero)
 	return(m);
 }
 
-/*
- * This implements a per-cpu cache of free, zero'd, ready-to-go pages.
- * The idea is to populate this cache prior to acquiring any locks so
- * we don't wind up potentially zeroing VM pages (under heavy loads) while
- * holding potentialy contending locks.
- *
- * Note that we allocate the page uninserted into anything and use a pindex
- * of 0, the vm_page_alloc() will effectively add gd_cpuid so these
- * allocations should wind up being uncontended.  However, we still want
- * to rove across PQ_L2_SIZE.
- */
-void
-vm_page_pcpu_cache(void)
+static __inline vm_page_t
+vm_page_select_free_or_cache(u_short pg_color, int *fromcachep)
 {
-#if 0
-	globaldata_t gd = mycpu;
 	vm_page_t m;
 
-	if (gd->gd_vmpg_count < GD_MINVMPG) {
-		crit_enter_gd(gd);
-		while (gd->gd_vmpg_count < GD_MAXVMPG) {
-			m = vm_page_alloc(NULL, ticks & ~ncpus2_mask,
-					  VM_ALLOC_NULL_OK | VM_ALLOC_NORMAL |
-					  VM_ALLOC_NULL_OK | VM_ALLOC_ZERO);
-			if (gd->gd_vmpg_count < GD_MAXVMPG) {
-				if ((m->flags & PG_ZERO) == 0) {
-					pmap_zero_page(VM_PAGE_TO_PHYS(m));
-					vm_page_flag_set(m, PG_ZERO);
-				}
-				gd->gd_vmpg_array[gd->gd_vmpg_count++] = m;
+	*fromcachep = 0;
+	for (;;) {
+		m = _vm_page_list_find2(PQ_FREE, PQ_CACHE, pg_color);
+		if (m == NULL)
+			break;
+		if (vm_page_busy_try(m, TRUE)) {
+			_vm_page_rem_queue_spinlocked(m);
+			_vm_page_deactivate_locked(m, 0);
+			vm_page_spin_unlock(m);
+		} else if (m->queue - m->pc == PQ_FREE) {
+			/*
+			 * We successfully busied the page, PQ_FREE case
+			 */
+			_vm_page_rem_queue_spinlocked(m);
+			KKASSERT((m->flags & (PG_UNQUEUED |
+					      PG_NEED_COMMIT)) == 0);
+			KASSERT(m->hold_count == 0,
+				("m->hold_count is not zero "
+				 "pg %p q=%d flags=%08x hold=%d wire=%d",
+				 m, m->queue, m->flags,
+				 m->hold_count, m->wire_count));
+			KKASSERT(m->wire_count == 0);
+			vm_page_spin_unlock(m);
+			pagedaemon_wakeup();
+
+			/* return busied and removed page */
+			return(m);
+		} else {
+			/*
+			 * We successfully busied the page, PQ_CACHE case
+			 */
+			_vm_page_rem_queue_spinlocked(m);
+			if ((m->flags & PG_NEED_COMMIT) == 0 &&
+			    m->hold_count == 0 &&
+			    m->wire_count == 0 &&
+			    (m->dirty & m->valid) == 0) {
+				vm_page_spin_unlock(m);
+				KKASSERT((m->flags & PG_UNQUEUED) == 0);
+				pagedaemon_wakeup();
+				*fromcachep = 1;
+				return(m);
+			}
+
+			/*
+			 * The page cannot be recycled, deactivate it.
+			 */
+			_vm_page_deactivate_locked(m, 0);
+			if (_vm_page_wakeup(m)) {
+				vm_page_spin_unlock(m);
+				wakeup(m);
 			} else {
-				vm_page_free(m);
+				vm_page_spin_unlock(m);
 			}
 		}
-		crit_exit_gd(gd);
 	}
-#endif
+	return(m);
 }
 
 /*
@@ -1519,6 +2498,8 @@ vm_page_pcpu_cache(void)
  *				(see vm_page_grab())
  *	VM_ALLOC_USE_GD		ok to use per-gd cache
  *
+ *	VM_ALLOC_CPU(n)		allocate using specified cpu localization
+ *
  * The object must be held if not NULL
  * This routine may not block
  *
@@ -1529,10 +2510,12 @@ vm_page_pcpu_cache(void)
 vm_page_t
 vm_page_alloc(vm_object_t object, vm_pindex_t pindex, int page_req)
 {
-	globaldata_t gd = mycpu;
+	globaldata_t gd;
 	vm_object_t obj;
 	vm_page_t m;
 	u_short pg_color;
+	int cpuid_local;
+	int fromcache;
 
 #if 0
 	/*
@@ -1552,14 +2535,26 @@ vm_page_alloc(vm_object_t object, vm_pindex_t pindex, int page_req)
 	m = NULL;
 
 	/*
-	 * Cpu twist - cpu localization algorithm
+	 * CPU LOCALIZATION
+	 *
+	 * CPU localization algorithm.  Break the page queues up by physical
+	 * id and core id (note that two cpu threads will have the same core
+	 * id, and core_id != gd_cpuid).
+	 *
+	 * This is nowhere near perfect, for example the last pindex in a
+	 * subgroup will overflow into the next cpu or package.  But this
+	 * should get us good page reuse locality in heavy mixed loads.
+	 *
+	 * (may be executed before the APs are started, so other GDs might
+	 *  not exist!)
 	 */
-	if (object) {
-		pg_color = gd->gd_cpuid + (pindex & ~ncpus_fit_mask) +
-			   (object->pg_color & ~ncpus_fit_mask);
-	} else {
-		pg_color = gd->gd_cpuid + (pindex & ~ncpus_fit_mask);
-	}
+	if (page_req & VM_ALLOC_CPU_SPEC)
+		cpuid_local = VM_ALLOC_GETCPU(page_req);
+	else
+		cpuid_local = mycpu->gd_cpuid;
+
+	pg_color = vm_get_pg_color(cpuid_local, object, pindex);
+
 	KKASSERT(page_req & 
 		(VM_ALLOC_NORMAL|VM_ALLOC_QUICK|
 		 VM_ALLOC_INTERRUPT|VM_ALLOC_SYSTEM));
@@ -1571,19 +2566,36 @@ vm_page_alloc(vm_object_t object, vm_pindex_t pindex, int page_req)
 	if (curthread->td_flags & TDF_SYSTHREAD)
 		page_req |= VM_ALLOC_SYSTEM;
 
+	/*
+	 * Impose various limitations.  Note that the v_free_reserved test
+	 * must match the opposite of vm_page_count_target() to avoid
+	 * livelocks, be careful.
+	 */
 loop:
-	if (vmstats.v_free_count > vmstats.v_free_reserved ||
-	    ((page_req & VM_ALLOC_INTERRUPT) && vmstats.v_free_count > 0) ||
-	    ((page_req & VM_ALLOC_SYSTEM) && vmstats.v_cache_count == 0 &&
-		vmstats.v_free_count > vmstats.v_interrupt_free_min)
+	gd = mycpu;
+	if (gd->gd_vmstats.v_free_count >= gd->gd_vmstats.v_free_reserved ||
+	    ((page_req & VM_ALLOC_INTERRUPT) &&
+	     gd->gd_vmstats.v_free_count > 0) ||
+	    ((page_req & VM_ALLOC_SYSTEM) &&
+	     gd->gd_vmstats.v_cache_count == 0 &&
+	     gd->gd_vmstats.v_free_count >
+	     gd->gd_vmstats.v_interrupt_free_min)
 	) {
 		/*
 		 * The free queue has sufficient free pages to take one out.
+		 *
+		 * However, if the free queue is strained the scan may widen
+		 * to the entire queue and cause a great deal of SMP
+		 * contention, so we use a double-queue-scan if we can
+		 * to avoid this.
 		 */
-		if (page_req & (VM_ALLOC_ZERO | VM_ALLOC_FORCE_ZERO))
-			m = vm_page_select_free(pg_color, TRUE);
-		else
-			m = vm_page_select_free(pg_color, FALSE);
+		if (page_req & VM_ALLOC_NORMAL) {
+			m = vm_page_select_free_or_cache(pg_color, &fromcache);
+			if (m && fromcache)
+				goto found_cache;
+		} else {
+			m = vm_page_select_free(pg_color);
+		}
 	} else if (page_req & VM_ALLOC_NORMAL) {
 		/*
 		 * Allocatable from the cache (non-interrupt only).  On
@@ -1610,11 +2622,13 @@ loop:
 		 * deadlock.
 		 */
 		if (m != NULL) {
+found_cache:
 			KASSERT(m->dirty == 0,
 				("Found dirty cache page %p", m));
 			if ((obj = m->object) != NULL) {
 				if (vm_object_hold_try(obj)) {
-					vm_page_protect(m, VM_PROT_NONE);
+					if (__predict_false((m->flags & (PG_MAPPED|PG_WRITEABLE)) != 0))
+						vm_page_protect(m, VM_PROT_NONE);
 					vm_page_free(m);
 					/* m->object NULL here */
 					vm_object_drop(obj);
@@ -1623,7 +2637,8 @@ loop:
 					vm_page_wakeup(m);
 				}
 			} else {
-				vm_page_protect(m, VM_PROT_NONE);
+				if (__predict_false((m->flags & (PG_MAPPED|PG_WRITEABLE)) != 0))
+					vm_page_protect(m, VM_PROT_NONE);
 				vm_page_free(m);
 			}
 			goto loop;
@@ -1632,18 +2647,14 @@ loop:
 		/*
 		 * On failure return NULL
 		 */
-#if defined(DIAGNOSTIC)
-		if (vmstats.v_cache_count > 0)
-			kprintf("vm_page_alloc(NORMAL): missing pages on cache queue: %d\n", vmstats.v_cache_count);
-#endif
-		vm_pageout_deficit++;
+		atomic_add_int(&vm_pageout_deficit, 1);
 		pagedaemon_wakeup();
 		return (NULL);
 	} else {
 		/*
 		 * No pages available, wakeup the pageout daemon and give up.
 		 */
-		vm_pageout_deficit++;
+		atomic_add_int(&vm_pageout_deficit, 1);
 		pagedaemon_wakeup();
 		return (NULL);
 	}
@@ -1652,8 +2663,10 @@ loop:
 	 * v_free_count can race so loop if we don't find the expected
 	 * page.
 	 */
-	if (m == NULL)
+	if (m == NULL) {
+		vmstats_rollup();
 		goto loop;
+	}
 
 	/*
 	 * Good page found.  The page has already been busied for us and
@@ -1670,9 +2683,10 @@ done:
 	 * Initialize the structure, inheriting some flags but clearing
 	 * all the rest.  The page has already been busied for us.
 	 */
-	vm_page_flag_clear(m, ~(PG_ZERO | PG_BUSY | PG_SBUSY));
+	vm_page_flag_clear(m, ~PG_KEEP_NEWPAGE_MASK);
+
 	KKASSERT(m->wire_count == 0);
-	KKASSERT(m->busy == 0);
+	KKASSERT((m->busy_count & PBUSY_MASK) == 0);
 	m->act_count = 0;
 	m->valid = 0;
 
@@ -1705,7 +2719,7 @@ done:
 	pagedaemon_wakeup();
 
 	/*
-	 * A PG_BUSY page is returned.
+	 * A BUSY page is returned.
 	 */
 	return (m);
 }
@@ -1738,7 +2752,10 @@ vm_page_alloc_contig(vm_paddr_t low, vm_paddr_t high,
 {
 	alist_blk_t blk;
 	vm_page_t m;
-	int i;
+	vm_pindex_t i;
+#if 0
+	static vm_pindex_t contig_rover;
+#endif
 
 	alignment >>= PAGE_SHIFT;
 	if (alignment == 0)
@@ -1748,38 +2765,72 @@ vm_page_alloc_contig(vm_paddr_t low, vm_paddr_t high,
 		boundary = 1;
 	size = (size + PAGE_MASK) >> PAGE_SHIFT;
 
-	spin_lock(&vm_contig_spin);
-	blk = alist_alloc(&vm_contig_alist, 0, size);
-	if (blk == ALIST_BLOCK_NONE) {
-		spin_unlock(&vm_contig_spin);
-		if (bootverbose) {
-			kprintf("vm_page_alloc_contig: %ldk nospace\n",
-				(size + PAGE_MASK) * (PAGE_SIZE / 1024));
+#if 0
+	/*
+	 * Disabled temporarily until we find a solution for DRM (a flag
+	 * to always use the free space reserve, for performance).
+	 */
+	if (high == BUS_SPACE_MAXADDR && alignment <= PAGE_SIZE &&
+	    boundary <= PAGE_SIZE && size == 1 &&
+	    memattr == VM_MEMATTR_DEFAULT) {
+		/*
+		 * Any page will work, use vm_page_alloc()
+		 * (e.g. when used from kmem_alloc_attr())
+		 */
+		m = vm_page_alloc(NULL, (contig_rover++) & 0x7FFFFFFF,
+				  VM_ALLOC_NORMAL | VM_ALLOC_SYSTEM |
+				  VM_ALLOC_INTERRUPT);
+		m->valid = VM_PAGE_BITS_ALL;
+		vm_page_wire(m);
+		vm_page_wakeup(m);
+	} else
+#endif
+	{
+		/*
+		 * Use the low-memory dma reserve
+		 */
+		spin_lock(&vm_contig_spin);
+		blk = alist_alloc(&vm_contig_alist, 0, size);
+		if (blk == ALIST_BLOCK_NONE) {
+			spin_unlock(&vm_contig_spin);
+			if (bootverbose) {
+				kprintf("vm_page_alloc_contig: %ldk nospace\n",
+					(size << PAGE_SHIFT) / 1024);
+				print_backtrace(5);
+			}
+			return(NULL);
 		}
-		return(NULL);
-	}
-	if (high && ((vm_paddr_t)(blk + size) << PAGE_SHIFT) > high) {
-		alist_free(&vm_contig_alist, blk, size);
-		spin_unlock(&vm_contig_spin);
-		if (bootverbose) {
-			kprintf("vm_page_alloc_contig: %ldk high "
-				"%016jx failed\n",
-				(size + PAGE_MASK) * (PAGE_SIZE / 1024),
-				(intmax_t)high);
+		if (high && ((vm_paddr_t)(blk + size) << PAGE_SHIFT) > high) {
+			alist_free(&vm_contig_alist, blk, size);
+			spin_unlock(&vm_contig_spin);
+			if (bootverbose) {
+				kprintf("vm_page_alloc_contig: %ldk high "
+					"%016jx failed\n",
+					(size << PAGE_SHIFT) / 1024,
+					(intmax_t)high);
+			}
+			return(NULL);
 		}
-		return(NULL);
-	}
-	spin_unlock(&vm_contig_spin);
-	if (vm_contig_verbose) {
-		kprintf("vm_page_alloc_contig: %016jx/%ldk\n",
-			(intmax_t)(vm_paddr_t)blk << PAGE_SHIFT,
-			(size + PAGE_MASK) * (PAGE_SIZE / 1024));
-	}
+		spin_unlock(&vm_contig_spin);
 
-	m = PHYS_TO_VM_PAGE((vm_paddr_t)blk << PAGE_SHIFT);
-	if (memattr != VM_MEMATTR_DEFAULT)
-		for (i = 0;i < size;i++)
+		/*
+		 * Base vm_page_t of range
+		 */
+		m = PHYS_TO_VM_PAGE((vm_paddr_t)blk << PAGE_SHIFT);
+	}
+	if (vm_contig_verbose) {
+		kprintf("vm_page_alloc_contig: %016jx/%ldk "
+			"(%016jx-%016jx al=%lu bo=%lu pgs=%lu attr=%d\n",
+			(intmax_t)m->phys_addr,
+			(size << PAGE_SHIFT) / 1024,
+			low, high, alignment, boundary, size, memattr);
+	}
+	if (memattr != VM_MEMATTR_DEFAULT) {
+		for (i = 0; i < size; ++i) {
+			KKASSERT(m[i].flags & PG_FICTITIOUS);
 			pmap_page_set_memattr(&m[i], memattr);
+		}
+	}
 	return m;
 }
 
@@ -1799,12 +2850,19 @@ vm_page_free_contig(vm_page_t m, unsigned long size)
 			(intmax_t)pa, size / 1024);
 	}
 	if (pa < vm_low_phys_reserved) {
+		/*
+		 * Just assert check the first page for convenience.
+		 */
+		KKASSERT(m->wire_count == 1);
+		KKASSERT(m->flags & PG_FICTITIOUS);
 		KKASSERT(pa + size <= vm_low_phys_reserved);
 		spin_lock(&vm_contig_spin);
 		alist_free(&vm_contig_alist, start, pages);
 		spin_unlock(&vm_contig_spin);
 	} else {
 		while (pages) {
+			/* XXX FUTURE, maybe (pair with vm_pg_contig_alloc()) */
+			/*vm_page_flag_clear(m, PG_FICTITIOUS | PG_UNQUEUED);*/
 			vm_page_busy_wait(m, FALSE, "cpgfr");
 			vm_page_unwire(m, 0);
 			vm_page_free(m);
@@ -1858,7 +2916,8 @@ vm_wait(int timo)
 		timo = hz;
 	lwkt_gettoken(&vm_token);
 
-	if (curthread == pagethread) {
+	if (curthread == pagethread ||
+	    curthread == emergpager) {
 		/*
 		 * The pageout daemon itself needs pages, this is bad.
 		 */
@@ -1877,8 +2936,8 @@ vm_wait(int timo)
 		 * allocation priority.
 		 */
 		if (vm_page_count_target()) {
-			if (vm_pages_needed == 0) {
-				vm_pages_needed = 1;
+			if (vm_pages_needed <= 1) {
+				++vm_pages_needed;
 				wakeup(&vm_pages_needed);
 			}
 			++vm_pages_waiting;	/* SMP race ok */
@@ -1910,12 +2969,22 @@ vm_wait_pfault(void)
 		lwkt_gettoken(&vm_token);
 		while (vm_page_count_severe()) {
 			if (vm_page_count_target()) {
-				if (vm_pages_needed == 0) {
-					vm_pages_needed = 1;
+				thread_t td;
+
+				if (vm_pages_needed <= 1) {
+					++vm_pages_needed;
 					wakeup(&vm_pages_needed);
 				}
 				++vm_pages_waiting;	/* SMP race ok */
 				tsleep(&vmstats.v_free_count, 0, "pfault", hz);
+
+				/*
+				 * Do not stay stuck in the loop if the system is trying
+				 * to kill the process.
+				 */
+				td = curthread;
+				if (td->td_proc && (td->td_proc->p_flags & P_LOWMEMKILL))
+					break;
 			}
 		}
 		lwkt_reltoken(&vm_token);
@@ -1928,25 +2997,38 @@ vm_wait_pfault(void)
  *
  * The caller should be holding the page busied ? XXX
  * This routine may not block.
+ *
+ * It is ok if the page is wired (so buffer cache operations don't have
+ * to mess with the page queues).
  */
 void
 vm_page_activate(vm_page_t m)
 {
 	u_short oqueue;
 
+	/*
+	 * If already active or inappropriate, just set act_count and
+	 * return.  We don't have to spin-lock the page.
+	 */
+	if (m->queue - m->pc == PQ_ACTIVE ||
+	    (m->flags & (PG_FICTITIOUS | PG_UNQUEUED))) {
+		if (m->act_count < ACT_INIT)
+			m->act_count = ACT_INIT;
+		return;
+	}
+
 	vm_page_spin_lock(m);
-	if (m->queue - m->pc != PQ_ACTIVE) {
+	if (m->queue - m->pc != PQ_ACTIVE &&
+	    (m->flags & (PG_FICTITIOUS | PG_UNQUEUED)) == 0) {
 		_vm_page_queue_spin_lock(m);
 		oqueue = _vm_page_rem_queue_spinlocked(m);
 		/* page is left spinlocked, queue is unlocked */
 
 		if (oqueue == PQ_CACHE)
 			mycpu->gd_cnt.v_reactivated++;
-		if (m->wire_count == 0 && (m->flags & PG_UNMANAGED) == 0) {
-			if (m->act_count < ACT_INIT)
-				m->act_count = ACT_INIT;
-			_vm_page_add_queue_spinlocked(m, PQ_ACTIVE + m->pc, 0);
-		}
+		if (m->act_count < ACT_INIT)
+			m->act_count = ACT_INIT;
+		_vm_page_add_queue_spinlocked(m, PQ_ACTIVE + m->pc, 0);
 		_vm_page_and_queue_spin_unlock(m);
 		if (oqueue == PQ_CACHE || oqueue == PQ_FREE)
 			pagedaemon_wakeup();
@@ -1954,6 +3036,18 @@ vm_page_activate(vm_page_t m)
 		if (m->act_count < ACT_INIT)
 			m->act_count = ACT_INIT;
 		vm_page_spin_unlock(m);
+	}
+}
+
+void
+vm_page_soft_activate(vm_page_t m)
+{
+	if (m->queue - m->pc == PQ_ACTIVE ||
+	    (m->flags & (PG_FICTITIOUS | PG_UNQUEUED))) {
+		if (m->act_count < ACT_INIT)
+			m->act_count = ACT_INIT;
+	} else {
+		vm_page_activate(m);
 	}
 }
 
@@ -1967,13 +3061,15 @@ vm_page_activate(vm_page_t m)
 static __inline void
 vm_page_free_wakeup(void)
 {
+	globaldata_t gd = mycpu;
+
 	/*
 	 * If the pageout daemon itself needs pages, then tell it that
 	 * there are some free.
 	 */
 	if (vm_pageout_pages_needed &&
-	    vmstats.v_cache_count + vmstats.v_free_count >= 
-	    vmstats.v_pageout_free_min
+	    gd->gd_vmstats.v_cache_count + gd->gd_vmstats.v_free_count >=
+	    gd->gd_vmstats.v_pageout_free_min
 	) {
 		vm_pageout_pages_needed = 0;
 		wakeup(&vm_pageout_pages_needed);
@@ -2023,21 +3119,26 @@ vm_page_free_wakeup(void)
  * Returns the given page to the PQ_FREE or PQ_HOLD list and disassociates
  * it from its VM object.
  *
- * The vm_page must be PG_BUSY on entry.  PG_BUSY will be released on
+ * The vm_page must be BUSY on entry.  BUSY will be released on
  * return (the page will have been freed).
  */
 void
 vm_page_free_toq(vm_page_t m)
 {
+	/*
+	 * The page must not be mapped when freed, but we may have to call
+	 * pmap_mapped_sync() to validate this.
+	 */
 	mycpu->gd_cnt.v_tfree++;
+	if (m->flags & (PG_MAPPED | PG_WRITEABLE))
+		pmap_mapped_sync(m);
 	KKASSERT((m->flags & PG_MAPPED) == 0);
-	KKASSERT(m->flags & PG_BUSY);
+	KKASSERT(m->busy_count & PBUSY_LOCKED);
 
-	if (m->busy || ((m->queue - m->pc) == PQ_FREE)) {
-		kprintf("vm_page_free: pindex(%lu), busy(%d), "
-			"PG_BUSY(%d), hold(%d)\n",
-			(u_long)m->pindex, m->busy,
-			((m->flags & PG_BUSY) ? 1 : 0), m->hold_count);
+	if ((m->busy_count & PBUSY_MASK) || ((m->queue - m->pc) == PQ_FREE)) {
+		kprintf("vm_page_free: pindex(%lu), busy %08x, "
+			"hold(%d)\n",
+			(u_long)m->pindex, m->busy_count, m->hold_count);
 		if ((m->queue - m->pc) == PQ_FREE)
 			panic("vm_page_free: freeing free page");
 		else
@@ -2051,18 +3152,18 @@ vm_page_free_toq(vm_page_t m)
 	 * queue).
 	 */
 	vm_page_remove(m);
-	vm_page_and_queue_spin_lock(m);
-	_vm_page_rem_queue_spinlocked(m);
 
 	/*
 	 * No further management of fictitious pages occurs beyond object
 	 * and queue removal.
 	 */
 	if ((m->flags & PG_FICTITIOUS) != 0) {
-		vm_page_spin_unlock(m);
+		KKASSERT(m->queue == PQ_NONE);
 		vm_page_wakeup(m);
 		return;
 	}
+	vm_page_and_queue_spin_lock(m);
+	_vm_page_rem_queue_spinlocked(m);
 
 	m->valid = 0;
 	vm_page_undirty(m);
@@ -2076,24 +3177,24 @@ vm_page_free_toq(vm_page_t m)
 		panic("vm_page_free: freeing wired page");
 	}
 
+	if (!MD_PAGE_FREEABLE(m))
+		panic("vm_page_free: page %p is still mapped!", m);
+
 	/*
-	 * Clear the UNMANAGED flag when freeing an unmanaged page.
-	 * Clear the NEED_COMMIT flag
+	 * Clear the PG_NEED_COMMIT and the PG_UNQUEUED flags.  The
+	 * page returns to normal operation and will be placed in
+	 * the PQ_HOLD or PQ_FREE queue.
 	 */
-	if (m->flags & PG_UNMANAGED)
-		vm_page_flag_clear(m, PG_UNMANAGED);
-	if (m->flags & PG_NEED_COMMIT)
-		vm_page_flag_clear(m, PG_NEED_COMMIT);
+	vm_page_flag_clear(m, PG_NEED_COMMIT | PG_UNQUEUED);
 
 	if (m->hold_count != 0) {
-		vm_page_flag_clear(m, PG_ZERO);
 		_vm_page_add_queue_spinlocked(m, PQ_HOLD + m->pc, 0);
 	} else {
-		_vm_page_add_queue_spinlocked(m, PQ_FREE + m->pc, 0);
+		_vm_page_add_queue_spinlocked(m, PQ_FREE + m->pc, 1);
 	}
 
 	/*
-	 * This sequence allows us to clear PG_BUSY while still holding
+	 * This sequence allows us to clear BUSY while still holding
 	 * its spin lock, which reduces contention vs allocators.  We
 	 * must not leave the queue locked or _vm_page_wakeup() may
 	 * deadlock.
@@ -2109,113 +3210,20 @@ vm_page_free_toq(vm_page_t m)
 }
 
 /*
- * vm_page_free_fromq_fast()
+ * Mark this page as wired down by yet another map.  We do not adjust the
+ * queue the page is on, it will be checked for wiring as-needed.
  *
- * Remove a non-zero page from one of the free queues; the page is removed for
- * zeroing, so do not issue a wakeup.
- */
-vm_page_t
-vm_page_free_fromq_fast(void)
-{
-	static int qi;
-	vm_page_t m;
-	int i;
-
-	for (i = 0; i < PQ_L2_SIZE; ++i) {
-		m = vm_page_list_find(PQ_FREE, qi, FALSE);
-		/* page is returned spinlocked and removed from its queue */
-		if (m) {
-			if (vm_page_busy_try(m, TRUE)) {
-				/*
-				 * We were unable to busy the page, deactivate
-				 * it and loop.
-				 */
-				_vm_page_deactivate_locked(m, 0);
-				vm_page_spin_unlock(m);
-			} else if (m->flags & PG_ZERO) {
-				/*
-				 * The page is already PG_ZERO, requeue it and loop
-				 */
-				_vm_page_add_queue_spinlocked(m,
-							      PQ_FREE + m->pc,
-							      0);
-				vm_page_queue_spin_unlock(m);
-				if (_vm_page_wakeup(m)) {
-					vm_page_spin_unlock(m);
-					wakeup(m);
-				} else {
-					vm_page_spin_unlock(m);
-				}
-			} else {
-				/*
-				 * The page is not PG_ZERO'd so return it.
-				 */
-				KKASSERT((m->flags & (PG_UNMANAGED |
-						      PG_NEED_COMMIT)) == 0);
-				KKASSERT(m->hold_count == 0);
-				KKASSERT(m->wire_count == 0);
-				vm_page_spin_unlock(m);
-				break;
-			}
-			m = NULL;
-		}
-		qi = (qi + PQ_PRIME2) & PQ_L2_MASK;
-	}
-	return (m);
-}
-
-/*
- * vm_page_unmanage()
- *
- * Prevent PV management from being done on the page.  The page is
- * removed from the paging queues as if it were wired, and as a 
- * consequence of no longer being managed the pageout daemon will not
- * touch it (since there is no way to locate the pte mappings for the
- * page).  madvise() calls that mess with the pmap will also no longer
- * operate on the page.
- *
- * Beyond that the page is still reasonably 'normal'.  Freeing the page
- * will clear the flag.
- *
- * This routine is used by OBJT_PHYS objects - objects using unswappable
- * physical memory as backing store rather then swap-backed memory and
- * will eventually be extended to support 4MB unmanaged physical 
- * mappings.
- *
- * Caller must be holding the page busy.
- */
-void
-vm_page_unmanage(vm_page_t m)
-{
-	KKASSERT(m->flags & PG_BUSY);
-	if ((m->flags & PG_UNMANAGED) == 0) {
-		if (m->wire_count == 0)
-			vm_page_unqueue(m);
-	}
-	vm_page_flag_set(m, PG_UNMANAGED);
-}
-
-/*
- * Mark this page as wired down by yet another map, removing it from
- * paging queues as necessary.
+ * This function has no effect on fictitious pages.
  *
  * Caller must be holding the page busy.
  */
 void
 vm_page_wire(vm_page_t m)
 {
-	/*
-	 * Only bump the wire statistics if the page is not already wired,
-	 * and only unqueue the page if it is on some queue (if it is unmanaged
-	 * it is already off the queues).  Don't do anything with fictitious
-	 * pages because they are always wired.
-	 */
-	KKASSERT(m->flags & PG_BUSY);
+	KKASSERT(m->busy_count & PBUSY_LOCKED);
 	if ((m->flags & PG_FICTITIOUS) == 0) {
 		if (atomic_fetchadd_int(&m->wire_count, 1) == 0) {
-			if ((m->flags & PG_UNMANAGED) == 0)
-				vm_page_unqueue(m);
-			atomic_add_int(&vmstats.v_wire_count, 1);
+			atomic_add_long(&mycpu->gd_vmstats_adj.v_wire_count, 1);
 		}
 		KASSERT(m->wire_count != 0,
 			("vm_page_wire: wire_count overflow m=%p", m));
@@ -2224,6 +3232,10 @@ vm_page_wire(vm_page_t m)
 
 /*
  * Release one wiring of this page, potentially enabling it to be paged again.
+ *
+ * Note that wired pages are no longer unconditionally removed from the
+ * paging queues, so the page may already be on a queue.  Move the page
+ * to the desired queue if necessary.
  *
  * Many pages placed on the inactive queue should actually go
  * into the cache, but it is difficult to figure out which.  What
@@ -2248,48 +3260,47 @@ vm_page_wire(vm_page_t m)
  * be placed in the cache - for example, just after dirtying a page.
  * dirty pages in the cache are not allowed.
  *
+ * PG_FICTITIOUS or PG_UNQUEUED pages are never moved to any queue, and
+ * the wire_count will not be adjusted in any way for a PG_FICTITIOUS
+ * page.
+ *
  * This routine may not block.
  */
 void
 vm_page_unwire(vm_page_t m, int activate)
 {
-	KKASSERT(m->flags & PG_BUSY);
+	KKASSERT(m->busy_count & PBUSY_LOCKED);
 	if (m->flags & PG_FICTITIOUS) {
 		/* do nothing */
-	} else if (m->wire_count <= 0) {
+	} else if ((int)m->wire_count <= 0) {
 		panic("vm_page_unwire: invalid wire count: %d", m->wire_count);
 	} else {
 		if (atomic_fetchadd_int(&m->wire_count, -1) == 1) {
-			atomic_add_int(&vmstats.v_wire_count, -1);
-			if (m->flags & PG_UNMANAGED) {
+			atomic_add_long(&mycpu->gd_vmstats_adj.v_wire_count,-1);
+			if (m->flags & PG_UNQUEUED) {
 				;
 			} else if (activate || (m->flags & PG_NEED_COMMIT)) {
-				vm_page_spin_lock(m);
-				_vm_page_add_queue_spinlocked(m,
-							PQ_ACTIVE + m->pc, 0);
-				_vm_page_and_queue_spin_unlock(m);
+				vm_page_activate(m);
 			} else {
-				vm_page_spin_lock(m);
-				vm_page_flag_clear(m, PG_WINATCFLS);
-				_vm_page_add_queue_spinlocked(m,
-							PQ_INACTIVE + m->pc, 0);
-				++vm_swapcache_inactive_heuristic;
-				_vm_page_and_queue_spin_unlock(m);
+				vm_page_deactivate(m);
 			}
 		}
 	}
 }
 
 /*
- * Move the specified page to the inactive queue.  If the page has
- * any associated swap, the swap is deallocated.
+ * Move the specified page to the inactive queue.
  *
  * Normally athead is 0 resulting in LRU operation.  athead is set
  * to 1 if we want this page to be 'as if it were placed in the cache',
  * except without unmapping it from the process address space.
  *
  * vm_page's spinlock must be held on entry and will remain held on return.
- * This routine may not block.
+ * This routine may not block.  The caller does not have to hold the page
+ * busied but should have some sort of interlock on its validity.
+ *
+ * It is ok if the page is wired (so buffer cache operations don't have
+ * to mess with the page queues).
  */
 static void
 _vm_page_deactivate_locked(vm_page_t m, int athead)
@@ -2299,18 +3310,23 @@ _vm_page_deactivate_locked(vm_page_t m, int athead)
 	/*
 	 * Ignore if already inactive.
 	 */
-	if (m->queue - m->pc == PQ_INACTIVE)
+	if (m->queue - m->pc == PQ_INACTIVE ||
+	    (m->flags & (PG_FICTITIOUS | PG_UNQUEUED))) {
 		return;
+	}
+
 	_vm_page_queue_spin_lock(m);
 	oqueue = _vm_page_rem_queue_spinlocked(m);
 
-	if (m->wire_count == 0 && (m->flags & PG_UNMANAGED) == 0) {
+	if ((m->flags & (PG_FICTITIOUS | PG_UNQUEUED)) == 0) {
 		if (oqueue == PQ_CACHE)
 			mycpu->gd_cnt.v_reactivated++;
 		vm_page_flag_clear(m, PG_WINATCFLS);
 		_vm_page_add_queue_spinlocked(m, PQ_INACTIVE + m->pc, athead);
-		if (athead == 0)
-			++vm_swapcache_inactive_heuristic;
+		if (athead == 0) {
+			atomic_add_long(
+				&vm_page_queues[PQ_INACTIVE + m->pc].adds, 1);
+		}
 	}
 	/* NOTE: PQ_NONE if condition not taken */
 	_vm_page_queue_spin_unlock(m);
@@ -2320,14 +3336,20 @@ _vm_page_deactivate_locked(vm_page_t m, int athead)
 /*
  * Attempt to deactivate a page.
  *
- * No requirements.
+ * No requirements.  We can pre-filter before getting the spinlock.
+ *
+ * It is ok if the page is wired (so buffer cache operations don't have
+ * to mess with the page queues).
  */
 void
 vm_page_deactivate(vm_page_t m)
 {
-	vm_page_spin_lock(m);
-	_vm_page_deactivate_locked(m, 0);
-	vm_page_spin_unlock(m);
+	if (m->queue - m->pc != PQ_INACTIVE &&
+	    (m->flags & (PG_FICTITIOUS | PG_UNQUEUED)) == 0) {
+		vm_page_spin_lock(m);
+		_vm_page_deactivate_locked(m, 0);
+		vm_page_spin_unlock(m);
+	}
 }
 
 void
@@ -2337,39 +3359,39 @@ vm_page_deactivate_locked(vm_page_t m)
 }
 
 /*
- * Attempt to move a page to PQ_CACHE.
+ * Attempt to move a busied page to PQ_CACHE, then unconditionally unbusy it.
  *
- * Returns 0 on failure, 1 on success
+ * This function returns non-zero if it successfully moved the page to
+ * PQ_CACHE.
  *
- * The page should NOT be busied by the caller.  This function will validate
- * whether the page can be safely moved to the cache.
+ * This function unconditionally unbusies the page on return.
  */
 int
 vm_page_try_to_cache(vm_page_t m)
 {
-	vm_page_spin_lock(m);
-	if (vm_page_busy_try(m, TRUE)) {
-		vm_page_spin_unlock(m);
-		return(0);
-	}
+	/*
+	 * Shortcut if we obviously cannot move the page, or if the
+	 * page is already on the cache queue, or it is ficitious.
+	 *
+	 * Never allow a wired page into the cache.
+	 */
 	if (m->dirty || m->hold_count || m->wire_count ||
-	    (m->flags & (PG_UNMANAGED | PG_NEED_COMMIT))) {
-		if (_vm_page_wakeup(m)) {
-			vm_page_spin_unlock(m);
-			wakeup(m);
-		} else {
-			vm_page_spin_unlock(m);
-		}
+	    m->queue - m->pc == PQ_CACHE ||
+	    (m->flags & (PG_UNQUEUED | PG_NEED_COMMIT | PG_FICTITIOUS))) {
+		vm_page_wakeup(m);
 		return(0);
 	}
-	vm_page_spin_unlock(m);
 
 	/*
 	 * Page busied by us and no longer spinlocked.  Dirty pages cannot
-	 * be moved to the cache.
+	 * be moved to the cache, but can be deactivated.  However, users
+	 * of this function want to move pages closer to the cache so we
+	 * only deactivate it if it is in PQ_ACTIVE.  We do not re-deactivate.
 	 */
 	vm_page_test_dirty(m);
 	if (m->dirty || (m->flags & PG_NEED_COMMIT)) {
+		if (m->queue - m->pc == PQ_ACTIVE)
+			vm_page_deactivate(m);
 		vm_page_wakeup(m);
 		return(0);
 	}
@@ -2381,37 +3403,30 @@ vm_page_try_to_cache(vm_page_t m)
  * Attempt to free the page.  If we cannot free it, we do nothing.
  * 1 is returned on success, 0 on failure.
  *
+ * The page can be in any state, including already being on the free
+ * queue.  Check to see if it really can be freed.  Note that we disallow
+ * this ad-hoc operation if the page is flagged PG_UNQUEUED.
+ *
+ * Caller provides an unlocked/non-busied page.
  * No requirements.
  */
 int
 vm_page_try_to_free(vm_page_t m)
 {
-	vm_page_spin_lock(m);
-	if (vm_page_busy_try(m, TRUE)) {
-		vm_page_spin_unlock(m);
+	if (vm_page_busy_try(m, TRUE))
 		return(0);
-	}
 
-	/*
-	 * The page can be in any state, including already being on the free
-	 * queue.  Check to see if it really can be freed.
-	 */
 	if (m->dirty ||				/* can't free if it is dirty */
 	    m->hold_count ||			/* or held (XXX may be wrong) */
 	    m->wire_count ||			/* or wired */
-	    (m->flags & (PG_UNMANAGED |		/* or unmanaged */
-			 PG_NEED_COMMIT)) ||	/* or needs a commit */
+	    (m->flags & (PG_UNQUEUED |		/* or unqueued */
+			 PG_NEED_COMMIT |	/* or needs a commit */
+			 PG_FICTITIOUS)) ||	/* or is fictitious */
 	    m->queue - m->pc == PQ_FREE ||	/* already on PQ_FREE */
 	    m->queue - m->pc == PQ_HOLD) {	/* already on PQ_HOLD */
-		if (_vm_page_wakeup(m)) {
-			vm_page_spin_unlock(m);
-			wakeup(m);
-		} else {
-			vm_page_spin_unlock(m);
-		}
+		vm_page_wakeup(m);
 		return(0);
 	}
-	vm_page_spin_unlock(m);
 
 	/*
 	 * We can probably free the page.
@@ -2445,9 +3460,12 @@ vm_page_try_to_free(vm_page_t m)
 void
 vm_page_cache(vm_page_t m)
 {
-	if ((m->flags & (PG_UNMANAGED | PG_NEED_COMMIT)) ||
-	    m->busy || m->wire_count || m->hold_count) {
-		kprintf("vm_page_cache: attempting to cache busy/held page\n");
+	/*
+	 * Not suitable for the cache
+	 */
+	if ((m->flags & (PG_UNQUEUED | PG_NEED_COMMIT | PG_FICTITIOUS)) ||
+	    (m->busy_count & PBUSY_MASK) ||
+	    m->wire_count || m->hold_count) {
 		vm_page_wakeup(m);
 		return;
 	}
@@ -2461,7 +3479,11 @@ vm_page_cache(vm_page_t m)
 		return;
 	}
 
+#if 0
 	/*
+	 * REMOVED - it is possible for dirty to get set at any time as
+	 *	     long as the page is still mapped and writeable.
+	 *
 	 * Caller is required to test m->dirty, but note that the act of
 	 * removing the page from its maps can cause it to become dirty
 	 * on an SMP system due to another cpu running in usermode.
@@ -2470,6 +3492,7 @@ vm_page_cache(vm_page_t m)
 		panic("vm_page_cache: caching a dirty page, pindex: %ld",
 			(long)m->pindex);
 	}
+#endif
 
 	/*
 	 * Remove all pmaps and indicate that the page is not
@@ -2477,9 +3500,13 @@ vm_page_cache(vm_page_t m)
 	 * have blocked (especially w/ VM_PROT_NONE), so recheck
 	 * everything.
 	 */
-	vm_page_protect(m, VM_PROT_NONE);
-	if ((m->flags & (PG_UNMANAGED | PG_MAPPED)) ||
-	    m->busy || m->wire_count || m->hold_count) {
+	if (m->flags & (PG_MAPPED | PG_WRITEABLE)) {
+		vm_page_protect(m, VM_PROT_NONE);
+		pmap_mapped_sync(m);
+	}
+	if ((m->flags & (PG_UNQUEUED | PG_MAPPED)) ||
+	    (m->busy_count & PBUSY_MASK) ||
+	    m->wire_count || m->hold_count) {
 		vm_page_wakeup(m);
 	} else if (m->dirty || (m->flags & PG_NEED_COMMIT)) {
 		vm_page_deactivate(m);
@@ -2488,13 +3515,8 @@ vm_page_cache(vm_page_t m)
 		_vm_page_and_queue_spin_lock(m);
 		_vm_page_rem_queue_spinlocked(m);
 		_vm_page_add_queue_spinlocked(m, PQ_CACHE + m->pc, 0);
-		_vm_page_queue_spin_unlock(m);
-		if (_vm_page_wakeup(m)) {
-			vm_page_spin_unlock(m);
-			wakeup(m);
-		} else {
-			vm_page_spin_unlock(m);
-		}
+		_vm_page_and_queue_spin_unlock(m);
+		vm_page_wakeup(m);
 		vm_page_free_wakeup();
 	}
 }
@@ -2575,29 +3597,74 @@ vm_page_dontneed(vm_page_t m)
 
 /*
  * These routines manipulate the 'soft busy' count for a page.  A soft busy
- * is almost like PG_BUSY except that it allows certain compatible operations
- * to occur on the page while it is busy.  For example, a page undergoing a
- * write can still be mapped read-only.
+ * is almost like a hard BUSY except that it allows certain compatible
+ * operations to occur on the page while it is busy.  For example, a page
+ * undergoing a write can still be mapped read-only.
  *
- * Because vm_pages can overlap buffers m->busy can be > 1.  m->busy is only
- * adjusted while the vm_page is PG_BUSY so the flash will occur when the
- * busy bit is cleared.
+ * We also use soft-busy to quickly pmap_enter shared read-only pages
+ * without having to hold the page locked.
+ *
+ * The soft-busy count can be > 1 in situations where multiple threads
+ * are pmap_enter()ing the same page simultaneously, or when two buffer
+ * cache buffers overlap the same page.
+ *
+ * The caller must hold the page BUSY when making these two calls.
  */
 void
 vm_page_io_start(vm_page_t m)
 {
-        KASSERT(m->flags & PG_BUSY, ("vm_page_io_start: page not busy!!!"));
-        atomic_add_char(&m->busy, 1);
-	vm_page_flag_set(m, PG_SBUSY);
+	uint32_t ocount;
+
+	ocount = atomic_fetchadd_int(&m->busy_count, 1);
+	KKASSERT(ocount & PBUSY_LOCKED);
 }
 
 void
 vm_page_io_finish(vm_page_t m)
 {
-        KASSERT(m->flags & PG_BUSY, ("vm_page_io_finish: page not busy!!!"));
-        atomic_subtract_char(&m->busy, 1);
-	if (m->busy == 0)
-		vm_page_flag_clear(m, PG_SBUSY);
+	uint32_t ocount;
+
+	ocount = atomic_fetchadd_int(&m->busy_count, -1);
+	KKASSERT(ocount & PBUSY_MASK);
+#if 0
+	if (((ocount - 1) & (PBUSY_LOCKED | PBUSY_MASK)) == 0)
+		wakeup(m);
+#endif
+}
+
+/*
+ * Attempt to soft-busy a page.  The page must not be PBUSY_LOCKED.
+ *
+ * We can't use fetchadd here because we might race a hard-busy and the
+ * page freeing code asserts on a non-zero soft-busy count (even if only
+ * temporary).
+ *
+ * Returns 0 on success, non-zero on failure.
+ */
+int
+vm_page_sbusy_try(vm_page_t m)
+{
+	uint32_t ocount;
+
+	for (;;) {
+		ocount = m->busy_count;
+		cpu_ccfence();
+		if (ocount & PBUSY_LOCKED)
+			return 1;
+		if (atomic_cmpset_int(&m->busy_count, ocount, ocount + 1))
+			break;
+	}
+	return 0;
+#if 0
+	if (m->busy_count & PBUSY_LOCKED)
+		return 1;
+	ocount = atomic_fetchadd_int(&m->busy_count, 1);
+	if (ocount & PBUSY_LOCKED) {
+		vm_page_sbusy_drop(m);
+		return 1;
+	}
+	return 0;
+#endif
 }
 
 /*
@@ -2637,8 +3704,6 @@ vm_page_clear_commit(vm_page_t m)
  * always returned if we had blocked.  
  *
  * This routine may not be called from an interrupt.
- *
- * PG_ZERO is *ALWAYS* cleared by this routine.
  *
  * No other requirements.
  */
@@ -2686,18 +3751,26 @@ vm_page_grab(vm_object_t object, vm_pindex_t pindex, int allocflags)
 	 *
 	 * If VM_ALLOC_FORCE_ZERO the page is unconditionally zero'd and set
 	 * valid even if already valid.
+	 *
+	 * NOTE!  We have removed all of the PG_ZERO optimizations and also
+	 *	  removed the idle zeroing code.  These optimizations actually
+	 *	  slow things down on modern cpus because the zerod area is
+	 *	  likely uncached, placing a memory-access burden on the
+	 *	  accesors taking the fault.
+	 *
+	 *	  By always zeroing the page in-line with the fault, no
+	 *	  dynamic ram reads are needed and the caches are hot, ready
+	 *	  for userland to access the memory.
 	 */
 	if (m->valid == 0) {
 		if (allocflags & (VM_ALLOC_ZERO | VM_ALLOC_FORCE_ZERO)) {
-			if ((m->flags & PG_ZERO) == 0)
-				pmap_zero_page(VM_PAGE_TO_PHYS(m));
+			pmap_zero_page(VM_PAGE_TO_PHYS(m));
 			m->valid = VM_PAGE_BITS_ALL;
 		}
 	} else if (allocflags & VM_ALLOC_FORCE_ZERO) {
 		pmap_zero_page(VM_PAGE_TO_PHYS(m));
 		m->valid = VM_PAGE_BITS_ALL;
 	}
-	vm_page_flag_clear(m, PG_ZERO);
 failed:
 	vm_object_drop(object);
 	return(m);
@@ -2762,7 +3835,7 @@ _vm_page_zero_valid(vm_page_t m, int base, int size)
 	 * first block.
 	 */
 
-	if ((frag = base & ~(DEV_BSIZE - 1)) != base &&
+	if ((frag = rounddown2(base, DEV_BSIZE)) != base &&
 	    (m->valid & (1 << (base >> DEV_BSHIFT))) == 0
 	) {
 		pmap_zero_page_area(
@@ -2780,7 +3853,7 @@ _vm_page_zero_valid(vm_page_t m, int base, int size)
 
 	endoff = base + size;
 
-	if ((frag = endoff & ~(DEV_BSIZE - 1)) != endoff &&
+	if ((frag = rounddown2(endoff, DEV_BSIZE)) != endoff &&
 	    (m->valid & (1 << (endoff >> DEV_BSHIFT))) == 0
 	) {
 		pmap_zero_page_area(
@@ -2816,13 +3889,11 @@ vm_page_set_valid(vm_page_t m, int base, int size)
 /*
  * Set valid bits and clear dirty bits.
  *
+ * Page must be busied by caller.
+ *
  * NOTE: This function does not clear the pmap modified bit.
  *	 Also note that e.g. NFS may use a byte-granular base
  *	 and size.
- *
- * WARNING: Page must be busied?  But vfs_clean_one_page() will call
- *	    this without necessarily busying the page (via bdwrite()).
- *	    So for now vm_token must also be held.
  *
  * No other requirements.
  */
@@ -2844,11 +3915,7 @@ vm_page_set_validclean(vm_page_t m, int base, int size)
 /*
  * Set valid & dirty.  Used by buwrite()
  *
- * WARNING: Page must be busied?  But vfs_dirty_one_page() will
- *	    call this function in buwrite() so for now vm_token must
- *	    be held.
- *
- * No other requirements.
+ * Page must be busied by caller.
  */
 void
 vm_page_set_validdirty(vm_page_t m, int base, int size)
@@ -2922,7 +3989,7 @@ vm_page_set_invalid(vm_page_t m, int base, int size)
 	bits = vm_page_bits(base, size);
 	m->valid &= ~bits;
 	m->dirty &= ~bits;
-	m->object->generation++;
+	atomic_add_int(&m->object->generation, 1);
 }
 
 /*
@@ -2993,141 +4060,64 @@ vm_page_is_valid(vm_page_t m, int base, int size)
 }
 
 /*
- * update dirty bits from pmap/mmu.  May not block.
+ * Update dirty bits from pmap/mmu.  May not block.
  *
  * Caller must hold the page busy
+ *
+ * WARNING! Unless the page has been unmapped, this function only
+ *	    provides a likely dirty status.
  */
 void
 vm_page_test_dirty(vm_page_t m)
 {
-	if ((m->dirty != VM_PAGE_BITS_ALL) && pmap_is_modified(m)) {
+	if (m->dirty != VM_PAGE_BITS_ALL && pmap_is_modified(m)) {
 		vm_page_dirty(m);
 	}
 }
 
-/*
- * Register an action, associating it with its vm_page
- */
-void
-vm_page_register_action(vm_page_action_t action, vm_page_event_t event)
-{
-	struct vm_page_action_list *list;
-	int hv;
-
-	hv = (int)((intptr_t)action->m >> 8) & VMACTION_HMASK;
-	list = &action_list[hv];
-
-	lwkt_gettoken(&vm_token);
-	vm_page_flag_set(action->m, PG_ACTIONLIST);
-	action->event = event;
-	LIST_INSERT_HEAD(list, action, entry);
-	lwkt_reltoken(&vm_token);
-}
-
-/*
- * Unregister an action, disassociating it from its related vm_page
- */
-void
-vm_page_unregister_action(vm_page_action_t action)
-{
-	struct vm_page_action_list *list;
-	int hv;
-
-	lwkt_gettoken(&vm_token);
-	if (action->event != VMEVENT_NONE) {
-		action->event = VMEVENT_NONE;
-		LIST_REMOVE(action, entry);
-
-		hv = (int)((intptr_t)action->m >> 8) & VMACTION_HMASK;
-		list = &action_list[hv];
-		if (LIST_EMPTY(list))
-			vm_page_flag_clear(action->m, PG_ACTIONLIST);
-	}
-	lwkt_reltoken(&vm_token);
-}
-
-/*
- * Issue an event on a VM page.  Corresponding action structures are
- * removed from the page's list and called.
- *
- * If the vm_page has no more pending action events we clear its
- * PG_ACTIONLIST flag.
- */
-void
-vm_page_event_internal(vm_page_t m, vm_page_event_t event)
-{
-	struct vm_page_action_list *list;
-	struct vm_page_action *scan;
-	struct vm_page_action *next;
-	int hv;
-	int all;
-
-	hv = (int)((intptr_t)m >> 8) & VMACTION_HMASK;
-	list = &action_list[hv];
-	all = 1;
-
-	lwkt_gettoken(&vm_token);
-	LIST_FOREACH_MUTABLE(scan, list, entry, next) {
-		if (scan->m == m) {
-			if (scan->event == event) {
-				scan->event = VMEVENT_NONE;
-				LIST_REMOVE(scan, entry);
-				scan->func(m, scan);
-				/* XXX */
-			} else {
-				all = 0;
-			}
-		}
-	}
-	if (all)
-		vm_page_flag_clear(m, PG_ACTIONLIST);
-	lwkt_reltoken(&vm_token);
-}
-
 #include "opt_ddb.h"
 #ifdef DDB
-#include <sys/kernel.h>
-
 #include <ddb/ddb.h>
 
 DB_SHOW_COMMAND(page, vm_page_print_page_info)
 {
-	db_printf("vmstats.v_free_count: %d\n", vmstats.v_free_count);
-	db_printf("vmstats.v_cache_count: %d\n", vmstats.v_cache_count);
-	db_printf("vmstats.v_inactive_count: %d\n", vmstats.v_inactive_count);
-	db_printf("vmstats.v_active_count: %d\n", vmstats.v_active_count);
-	db_printf("vmstats.v_wire_count: %d\n", vmstats.v_wire_count);
-	db_printf("vmstats.v_free_reserved: %d\n", vmstats.v_free_reserved);
-	db_printf("vmstats.v_free_min: %d\n", vmstats.v_free_min);
-	db_printf("vmstats.v_free_target: %d\n", vmstats.v_free_target);
-	db_printf("vmstats.v_cache_min: %d\n", vmstats.v_cache_min);
-	db_printf("vmstats.v_inactive_target: %d\n", vmstats.v_inactive_target);
+	db_printf("vmstats.v_free_count: %ld\n", vmstats.v_free_count);
+	db_printf("vmstats.v_cache_count: %ld\n", vmstats.v_cache_count);
+	db_printf("vmstats.v_inactive_count: %ld\n", vmstats.v_inactive_count);
+	db_printf("vmstats.v_active_count: %ld\n", vmstats.v_active_count);
+	db_printf("vmstats.v_wire_count: %ld\n", vmstats.v_wire_count);
+	db_printf("vmstats.v_free_reserved: %ld\n", vmstats.v_free_reserved);
+	db_printf("vmstats.v_free_min: %ld\n", vmstats.v_free_min);
+	db_printf("vmstats.v_free_target: %ld\n", vmstats.v_free_target);
+	db_printf("vmstats.v_cache_min: %ld\n", vmstats.v_cache_min);
+	db_printf("vmstats.v_inactive_target: %ld\n",
+		  vmstats.v_inactive_target);
 }
 
 DB_SHOW_COMMAND(pageq, vm_page_print_pageq_info)
 {
 	int i;
 	db_printf("PQ_FREE:");
-	for(i=0;i<PQ_L2_SIZE;i++) {
-		db_printf(" %d", vm_page_queues[PQ_FREE + i].lcnt);
+	for (i = 0; i < PQ_L2_SIZE; i++) {
+		db_printf(" %ld", vm_page_queues[PQ_FREE + i].lcnt);
 	}
 	db_printf("\n");
 		
 	db_printf("PQ_CACHE:");
-	for(i=0;i<PQ_L2_SIZE;i++) {
-		db_printf(" %d", vm_page_queues[PQ_CACHE + i].lcnt);
+	for(i = 0; i < PQ_L2_SIZE; i++) {
+		db_printf(" %ld", vm_page_queues[PQ_CACHE + i].lcnt);
 	}
 	db_printf("\n");
 
 	db_printf("PQ_ACTIVE:");
-	for(i=0;i<PQ_L2_SIZE;i++) {
-		db_printf(" %d", vm_page_queues[PQ_ACTIVE + i].lcnt);
+	for(i = 0; i < PQ_L2_SIZE; i++) {
+		db_printf(" %ld", vm_page_queues[PQ_ACTIVE + i].lcnt);
 	}
 	db_printf("\n");
 
 	db_printf("PQ_INACTIVE:");
-	for(i=0;i<PQ_L2_SIZE;i++) {
-		db_printf(" %d", vm_page_queues[PQ_INACTIVE + i].lcnt);
+	for(i = 0; i < PQ_L2_SIZE; i++) {
+		db_printf(" %ld", vm_page_queues[PQ_INACTIVE + i].lcnt);
 	}
 	db_printf("\n");
 }

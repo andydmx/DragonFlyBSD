@@ -528,7 +528,7 @@ ng_pptpgre_xmit(node_p node, struct mbuf *m, meta_p meta)
 	/* Prepend GRE header to outgoing frame */
 	grelen = sizeof(*gre) + sizeof(u_int32_t) * (gre->hasSeq + gre->hasAck);
 	if (m == NULL) {
-		MGETHDR(m, MB_DONTWAIT, MT_DATA);
+		MGETHDR(m, M_NOWAIT, MT_DATA);
 		if (m == NULL) {
 			priv->stats.memoryFailures++;
 			NG_FREE_META(meta);
@@ -537,7 +537,7 @@ ng_pptpgre_xmit(node_p node, struct mbuf *m, meta_p meta)
 		m->m_len = m->m_pkthdr.len = grelen;
 		m->m_pkthdr.rcvif = NULL;
 	} else {
-		M_PREPEND(m, grelen, MB_DONTWAIT);
+		M_PREPEND(m, grelen, M_NOWAIT);
 		if (m == NULL || (m->m_len < grelen
 		    && (m = m_pullup(m, grelen)) == NULL)) {
 			priv->stats.memoryFailures++;
@@ -665,8 +665,8 @@ bad:
 			a->ato = PPTP_MIN_TIMEOUT;
 
 		/* Shift packet transmit times in our transmit window */
-		ovbcopy(a->timeSent + index + 1, a->timeSent,
-		    sizeof(*a->timeSent) * (PPTP_XMIT_WIN - (index + 1)));
+		bcopy(a->timeSent + index + 1, a->timeSent,
+		      sizeof(*a->timeSent) * (PPTP_XMIT_WIN - (index + 1)));
 
 		/* If we sent an entire window, increase window size by one */
 		if (PPTP_SEQ_DIFF(ack, a->winAck) >= 0

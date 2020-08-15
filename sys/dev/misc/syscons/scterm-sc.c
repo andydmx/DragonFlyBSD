@@ -564,10 +564,21 @@ scterm_scan_esc(scr_stat *scp, term_stat *tcp, u_char c)
 				else
 					sc->flags &= ~SC_CHAR_CURSOR;
 			} else if (tcp->num_param == 2) {
-				sc->cursor_base = scp->font_size 
+				sc->cursor_base = scp->font_height 
 						- (tcp->param[1] & 0x1F) - 1;
 				sc->cursor_height = (tcp->param[1] & 0x1F) 
 						- (tcp->param[0] & 0x1F) + 1;
+				if (sc->cursor_base < 0)
+					sc->cursor_base = 0;
+
+				if (sc->cursor_height < 1) {
+					sc->cursor_height = 1;
+				} else if (sc->cursor_height >
+					   scp->font_height -
+					   scp->cursor_base) {
+					sc->cursor_height = scp->font_height -
+							    scp->cursor_base;
+				}
 			}
 			/* 
 			 * The cursor shape is global property; 
@@ -636,7 +647,7 @@ scterm_puts(scr_stat *scp, u_char *buf, int len)
 
 	tcp = scp->ts;
 outloop:
-	scp->sc->write_in_progress++;
+	atomic_add_char(&scp->sc->write_in_progress, 1);
 
 	if (tcp->esc) {
 		scterm_scan_esc(scp, tcp, *buf);
@@ -658,7 +669,7 @@ outloop:
 
 	sc_term_gen_scroll(scp, scp->sc->scr_map[0x20], tcp->cur_attr);
 
-	scp->sc->write_in_progress--;
+	atomic_add_char(&scp->sc->write_in_progress, -1);
 	if (len)
 		goto outloop;
 }

@@ -97,7 +97,6 @@
 #include <sys/msgport2.h>
 #include <net/netmsg2.h>
 #include <net/netisr2.h>
-#include <sys/mplock2.h>
 
 #ifdef CARP
 #include <netinet/ip_carp.h>
@@ -105,6 +104,8 @@
 
 #define SIN(s) ((struct sockaddr_in *)s)
 #define SDL(s) ((struct sockaddr_dl *)s)
+
+MALLOC_DEFINE(M_ARP, "arp", "ARP");
 
 SYSCTL_DECL(_net_link_ether);
 SYSCTL_NODE(_net_link_ether, PF_INET, inet, CTLFLAG_RW, 0, "");
@@ -131,13 +132,12 @@ struct llinfo_arp {
 	u_short	la_asked;	/* #times we QUERIED following expiration */
 };
 
-static	LIST_HEAD(, llinfo_arp) llinfo_arp_list[MAXCPU];
-
 static int	arp_maxtries = 5;
 static int	useloopback = 1; /* use loopback interface for local traffic */
 static int	arp_proxyall = 0;
 static int	arp_refresh = 60; /* refresh arp cache ~60 (not impl yet) */
 static int	arp_restricted_match = 0;
+static int	arp_ignore_probes = 1;
 
 SYSCTL_INT(_net_link_ether_inet, OID_AUTO, maxtries, CTLFLAG_RW,
 	   &arp_maxtries, 0, "ARP resolution attempts before returning error");
@@ -149,6 +149,8 @@ SYSCTL_INT(_net_link_ether_inet, OID_AUTO, restricted_match, CTLFLAG_RW,
 	   &arp_restricted_match, 0, "Only match against the sender");
 SYSCTL_INT(_net_link_ether_inet, OID_AUTO, refresh, CTLFLAG_RW,
 	   &arp_refresh, 0, "Preemptively refresh the ARP");
+SYSCTL_INT(_net_link_ether_inet, OID_AUTO, ignore_probes, CTLFLAG_RW,
+	   &arp_ignore_probes, 0, "Ignore ARP probes");
 
 static void	arp_rtrequest(int, struct rtentry *);
 static void	arprequest(struct ifnet *, const struct in_addr *,
@@ -159,7 +161,7 @@ static void	arpintr(netmsg_t msg);
 static void	arptfree(struct llinfo_arp *);
 static void	arptimer(void *);
 static struct llinfo_arp *
-		arplookup(in_addr_t, boolean_t, boolean_t, boolean_t);
+		arplookup(in_addr_t, boolean_t, boolean_t);
 #ifdef INET
 static void	in_arpinput(struct mbuf *);
 static void	in_arpreply(struct mbuf *m, in_addr_t, in_addr_t);
@@ -167,13 +169,13 @@ static void	arp_update_msghandler(netmsg_t);
 static void	arp_reply_msghandler(netmsg_t);
 #endif
 
-struct arptimer_ctx {
+struct arp_pcpu_data {
+	LIST_HEAD(, llinfo_arp) llinfo_list;
 	struct callout		timer_ch;
 	struct netmsg_base	timer_nmsg;
-	int			timer_inited;
-} __cachealign;
+};
 
-static struct arptimer_ctx	arptimer_context[MAXCPU];
+static struct arp_pcpu_data	*arp_data[MAXCPU];
 
 /*
  * Timeout routine.  Age arp_tab entries periodically.
@@ -181,31 +183,33 @@ static struct arptimer_ctx	arptimer_context[MAXCPU];
 static void
 arptimer_dispatch(netmsg_t nmsg)
 {
+	struct arp_pcpu_data *ad = nmsg->lmsg.u.ms_resultp;
 	struct llinfo_arp *la, *nla;
-	int cpuid = mycpuid;
+
+	ASSERT_NETISR_NCPUS(mycpuid);
 
 	/* Reply ASAP */
 	crit_enter();
-	lwkt_replymsg(&nmsg->lmsg, 0);
+	netisr_replymsg(&nmsg->base, 0);
 	crit_exit();
 
-	LIST_FOREACH_MUTABLE(la, &llinfo_arp_list[cpuid], la_le, nla) {
+	LIST_FOREACH_MUTABLE(la, &ad->llinfo_list, la_le, nla) {
 		if (la->la_rt->rt_expire && la->la_rt->rt_expire <= time_uptime)
 			arptfree(la);
 	}
-	callout_reset(&arptimer_context[cpuid].timer_ch, arpt_prune * hz,
-	    arptimer, NULL);
+	callout_reset(&ad->timer_ch, arpt_prune * hz, arptimer, &ad->timer_nmsg);
 }
 
 static void
-arptimer(void *arg __unused)
+arptimer(void *xnm)
 {
-	int cpuid = mycpuid;
-	struct lwkt_msg *lmsg = &arptimer_context[cpuid].timer_nmsg.lmsg;
+	struct netmsg_base *nm = xnm;
+
+	KKASSERT(mycpuid < netisr_ncpus);
 
 	crit_enter();
-	if (lmsg->ms_flags & MSGF_DONE)
-		lwkt_sendmsg_oncpu(netisr_cpuport(cpuid), lmsg);
+	if (nm->lmsg.ms_flags & MSGF_DONE)
+		netisr_sendmsg_oncpu(nm);
 	crit_exit();
 }
 
@@ -223,15 +227,6 @@ arp_rtrequest(int req, struct rtentry *rt)
 
 	struct sockaddr_dl null_sdl = { sizeof null_sdl, AF_LINK };
 
-	if (__predict_false(!arptimer_context[mycpuid].timer_inited)) {
-		struct arptimer_ctx *ctx = &arptimer_context[mycpuid];
-
-		ctx->timer_inited = TRUE;
-		netmsg_init(&ctx->timer_nmsg, NULL, &netisr_adone_rport,
-		    MSGF_PRIORITY, arptimer_dispatch);
-		callout_init_mp(&ctx->timer_ch);
-		callout_reset(&ctx->timer_ch, hz, arptimer, NULL);
-	}
 	if (rt->rt_flags & RTF_GATEWAY)
 		return;
 
@@ -250,17 +245,19 @@ arp_rtrequest(int req, struct rtentry *rt)
 			 * Case 1: This route should come from a route to iface.
 			 */
 			rt_setgate(rt, rt_key(rt),
-				   (struct sockaddr *)&null_sdl,
-				   RTL_DONTREPORT);
+				   (struct sockaddr *)&null_sdl);
 			gate = rt->rt_gateway;
 			SDL(gate)->sdl_type = rt->rt_ifp->if_type;
 			SDL(gate)->sdl_index = rt->rt_ifp->if_index;
 			rt->rt_expire = time_uptime;
 			break;
 		}
-		/* Announce a new entry if requested. */
-		if (rt->rt_flags & RTF_ANNOUNCE) {
-			arprequest_async(rt->rt_ifp,
+		/*
+		 * Announce a new entry if requested, and only announce it
+		 * once on cpu0.
+		 */
+		if ((rt->rt_flags & RTF_ANNOUNCE) && mycpuid == 0) {
+			arprequest(rt->rt_ifp,
 			    &SIN(rt_key(rt))->sin_addr,
 			    &SIN(rt_key(rt))->sin_addr,
 			    LLADDR(SDL(gate)));
@@ -289,7 +286,7 @@ arp_rtrequest(int req, struct rtentry *rt)
 		bzero(la, sizeof *la);
 		la->la_rt = rt;
 		rt->rt_flags |= RTF_LLINFO;
-		LIST_INSERT_HEAD(&llinfo_arp_list[mycpuid], la, la_le);
+		LIST_INSERT_HEAD(&arp_data[mycpuid]->llinfo_list, la, la_le);
 
 #ifdef INET
 		/*
@@ -358,7 +355,7 @@ arpreq_alloc(struct ifnet *ifp, const struct in_addr *sip,
 	struct arphdr *ah;
 	u_short ar_hrd;
 
-	if ((m = m_gethdr(MB_DONTWAIT, MT_DATA)) == NULL)
+	if ((m = m_gethdr(M_NOWAIT, MT_DATA)) == NULL)
 		return NULL;
 	m->m_pkthdr.rcvif = NULL;
 
@@ -397,6 +394,8 @@ arpreq_send(struct ifnet *ifp, struct mbuf *m)
 {
 	struct sockaddr sa;
 	struct ether_header *eh;
+
+	ASSERT_NETISR_NCPUS(mycpuid);
 
 	switch (ifp->if_type) {
 	case IFT_ETHER:
@@ -441,6 +440,8 @@ arprequest(struct ifnet *ifp, const struct in_addr *sip,
 {
 	struct mbuf *m;
 
+	ASSERT_NETISR_NCPUS(mycpuid);
+
 	if (enaddr == NULL) {
 		if (ifp->if_bridge) {
 			enaddr = IF_LLADDR(ether_bridge_interface(ifp));
@@ -466,6 +467,7 @@ arprequest_async(struct ifnet *ifp, const struct in_addr *sip,
 {
 	struct mbuf *m;
 	struct netmsg_packet *pmsg;
+	int cpu;
 
 	if (enaddr == NULL) {
 		if (ifp->if_bridge) {
@@ -484,7 +486,11 @@ arprequest_async(struct ifnet *ifp, const struct in_addr *sip,
 	pmsg->nm_packet = m;
 	pmsg->base.lmsg.u.ms_resultp = ifp;
 
-	lwkt_sendmsg_oncpu(netisr_cpuport(mycpuid), &pmsg->base.lmsg);
+	if (mycpuid < netisr_ncpus)
+		cpu = mycpuid;
+	else
+		cpu = 0;
+	lwkt_sendmsg(netisr_cpuport(cpu), &pmsg->base.lmsg);
 }
 
 /*
@@ -504,40 +510,44 @@ arpresolve(struct ifnet *ifp, struct rtentry *rt0, struct mbuf *m,
 	struct rtentry *rt = NULL;
 	struct llinfo_arp *la = NULL;
 	struct sockaddr_dl *sdl;
+	int error;
 
 	if (m->m_flags & M_BCAST) {	/* broadcast */
 		memcpy(desten, ifp->if_broadcastaddr, ifp->if_addrlen);
-		return (1);
+		return 0;
 	}
 	if (m->m_flags & M_MCAST) {/* multicast */
 		ETHER_MAP_IP_MULTICAST(&SIN(dst)->sin_addr, desten);
-		return (1);
+		return 0;
 	}
 	if (rt0 != NULL) {
-		if (rt_llroute(dst, rt0, &rt) != 0) {
+		error = rt_llroute(dst, rt0, &rt);
+		if (error != 0) {
 			m_freem(m);
-			return 0;
+			return error;
 		}
 		la = rt->rt_llinfo;
 	}
 	if (la == NULL) {
-		la = arplookup(SIN(dst)->sin_addr.s_addr,
-			       TRUE, RTL_REPORTMSG, FALSE);
+		la = arplookup(SIN(dst)->sin_addr.s_addr, TRUE, FALSE);
 		if (la != NULL)
 			rt = la->la_rt;
 	}
 	if (la == NULL || rt == NULL) {
+		char addr[INET_ADDRSTRLEN];
+
 		log(LOG_DEBUG, "arpresolve: can't allocate llinfo for %s%s%s\n",
-		    inet_ntoa(SIN(dst)->sin_addr), la ? "la" : " ",
+		    kinet_ntoa(SIN(dst)->sin_addr, addr), la ? "la" : " ",
 		    rt ? "rt" : "");
 		m_freem(m);
-		return (0);
+		return ENOBUFS;
 	}
-	sdl = SDL(rt->rt_gateway);
+
 	/*
 	 * Check the address family and length is valid, the address
 	 * is resolved; otherwise, try to resolve.
 	 */
+	sdl = SDL(rt->rt_gateway);
 	if ((rt->rt_expire == 0 || rt->rt_expire > time_uptime) &&
 	    sdl->sdl_family == AF_LINK && sdl->sdl_alen != 0) {
 		/*
@@ -555,8 +565,9 @@ arpresolve(struct ifnet *ifp, struct rtentry *rt0, struct mbuf *m,
 		}
 
 		bcopy(LLADDR(sdl), desten, sdl->sdl_alen);
-		return 1;
+		return 0;
 	}
+
 	/*
 	 * If ARP is disabled or static on this interface, stop.
 	 * XXX
@@ -565,8 +576,9 @@ arpresolve(struct ifnet *ifp, struct rtentry *rt0, struct mbuf *m,
 	 */
 	if (ifp->if_flags & (IFF_NOARP | IFF_STATICARP)) {
 		m_freem(m);
-		return (0);
+		return ifp->if_flags & IFF_NOARP ? ENOTSUP : EINVAL;
 	}
+
 	/*
 	 * There is an arptab entry, but no ethernet address
 	 * response yet.  Replace the held mbuf with this
@@ -575,24 +587,35 @@ arpresolve(struct ifnet *ifp, struct rtentry *rt0, struct mbuf *m,
 	if (la->la_hold != NULL)
 		m_freem(la->la_hold);
 	la->la_hold = m;
+
+	/*
+	 * Return EWOULDBLOCK if we have tried less than arp_maxtries. It
+	 * will be masked by ether_output(). Return EHOSTDOWN/EHOSTUNREACH
+	 * if we have already sent arp_maxtries ARP requests. Retransmit the
+	 * ARP request, but not faster than one request per second.
+	 */
+	if (la->la_asked < arp_maxtries)
+		error = EWOULDBLOCK;
+	else
+		error = (rt != NULL && rt->rt_flags & RTF_GATEWAY) ?
+		    EHOSTUNREACH : EHOSTDOWN;
+
 	if (rt->rt_expire || ((rt->rt_flags & RTF_STATIC) && !sdl->sdl_alen)) {
 		rt->rt_flags &= ~RTF_REJECT;
 		if (la->la_asked == 0 || rt->rt_expire != time_uptime) {
 			rt->rt_expire = time_uptime;
-			if (la->la_asked++ < arp_maxtries) {
-				arprequest(ifp,
-					   &SIN(rt->rt_ifa->ifa_addr)->sin_addr,
-					   &SIN(dst)->sin_addr,
-					   NULL);
-			} else {
-				rt->rt_flags |= RTF_REJECT;
+			arprequest(ifp,
+				   &SIN(rt->rt_ifa->ifa_addr)->sin_addr,
+				   &SIN(dst)->sin_addr,
+				   NULL);
+			if (la->la_asked++ >= arp_maxtries) {
 				rt->rt_expire += arpt_down;
-				la->la_asked = 0;
 				la->la_preempt = arp_maxtries;
+				rt_rtmsg(RTM_MISS, rt, rt->rt_ifp, 0);
 			}
 		}
 	}
-	return (0);
+	return error;
 }
 
 /*
@@ -661,6 +684,7 @@ arpintr(netmsg_t msg)
 static int	log_arp_wrong_iface = 1;
 static int	log_arp_movements = 1;
 static int	log_arp_permanent_modify = 1;
+static int	log_arp_creation_failure = 1;
 
 SYSCTL_INT(_net_link_ether_inet, OID_AUTO, log_arp_wrong_iface, CTLFLAG_RW,
 	   &log_arp_wrong_iface, 0,
@@ -672,10 +696,15 @@ SYSCTL_INT(_net_link_ether_inet, OID_AUTO, log_arp_permanent_modify, CTLFLAG_RW,
 	   &log_arp_permanent_modify, 0,
 	   "Log arp replies from MACs different than the one "
 	   "in the permanent arp entry");
+SYSCTL_INT(_net_link_ether_inet, OID_AUTO, log_arp_creation_failure, CTLFLAG_RW,
+	   &log_arp_creation_failure, 0, "Log arp creation failure");
 
-static void
+/*
+ * Returns non-zero if the routine updated anything.
+ */
+static int
 arp_update_oncpu(struct mbuf *m, in_addr_t saddr, boolean_t create,
-		 boolean_t generate_report, boolean_t dologging)
+		 boolean_t dologging)
 {
 	struct arphdr *ah = mtod(m, struct arphdr *);
 	struct ifnet *ifp = m->m_pkthdr.rcvif;
@@ -683,13 +712,17 @@ arp_update_oncpu(struct mbuf *m, in_addr_t saddr, boolean_t create,
 	struct sockaddr_dl *sdl;
 	struct rtentry *rt;
 	char hexstr[2][64];
+	char sbuf[INET_ADDRSTRLEN];
+	int changed = create;
 
 	KASSERT(curthread->td_type == TD_TYPE_NETISR,
 	    ("arp update not in netisr"));
 
-	la = arplookup(saddr, create, generate_report, FALSE);
+	la = arplookup(saddr, create, FALSE);
 	if (la && (rt = la->la_rt) && (sdl = SDL(rt->rt_gateway))) {
 		struct in_addr isaddr = { saddr };
+		int rt_cmd = sdl->sdl_alen == 0 ? RTM_ADD : RTM_CHANGE;
+		bool do_rtmsg = false;
 
 		/*
 		 * Normally arps coming in on the wrong interface are ignored,
@@ -727,23 +760,32 @@ arp_update_oncpu(struct mbuf *m, in_addr_t saddr, boolean_t create,
 				log(LOG_ERR,
 				    "arp: %s is on %s "
 				    "but got reply from %s on %s\n",
-				    inet_ntoa(isaddr),
+				    kinet_ntoa(isaddr, sbuf),
 				    rt->rt_ifp->if_xname, hexstr[0],
 				    ifp->if_xname);
 			}
 			if (nifp == NULL)
-				return;
+				return 0;
 
 			/*
 			 * nifp is our man!  Replace rt_ifp and adjust
 			 * the sdl.
 			 */
 			ifp = rt->rt_ifp = nifp;
-			sdl->sdl_type = ifp->if_type;
-			sdl->sdl_index = ifp->if_index;
+			if (sdl->sdl_type != ifp->if_type) {
+				sdl->sdl_type = ifp->if_type;
+				changed = 1;
+				do_rtmsg = true;
+			}
+			if (sdl->sdl_index != ifp->if_index) {
+				sdl->sdl_index = ifp->if_index;
+				changed = 1;
+				do_rtmsg = true;
+			}
 		}
 		if (sdl->sdl_alen &&
 		    bcmp(ar_sha(ah), LLADDR(sdl), sdl->sdl_alen)) {
+			changed = 1;
 			if (rt->rt_expire != 0) {
 				if (dologging && log_arp_movements) {
 					hexncpy((u_char *)LLADDR(sdl), ifp->if_addrlen,
@@ -752,7 +794,7 @@ arp_update_oncpu(struct mbuf *m, in_addr_t saddr, boolean_t create,
 					    hexstr[1], HEX_NCPYLEN(ifp->if_addrlen), ":");
 			    		log(LOG_INFO,
 					    "arp: %s moved from %s to %s on %s\n",
-					    inet_ntoa(isaddr), hexstr[0], hexstr[1],
+					    kinet_ntoa(isaddr, sbuf), hexstr[0], hexstr[1],
 					    ifp->if_xname);
 				}
 			} else {
@@ -762,10 +804,11 @@ arp_update_oncpu(struct mbuf *m, in_addr_t saddr, boolean_t create,
 					log(LOG_ERR,
 					"arp: %s attempts to modify "
 					"permanent entry for %s on %s\n",
-					hexstr[0], inet_ntoa(isaddr), ifp->if_xname);
+					hexstr[0], kinet_ntoa(isaddr, sbuf), ifp->if_xname);
 				}
-				return;
+				return changed;
 			}
+			do_rtmsg = true;
 		}
 		/*
 		 * sanity check for the address length.
@@ -788,15 +831,30 @@ arp_update_oncpu(struct mbuf *m, in_addr_t saddr, boolean_t create,
 				"(ignored)", hexstr[0],
 				ah->ar_hln, ifp->if_addrlen);
 			}
-			return;
+			return changed;
 		}
+		if (sdl->sdl_alen == 0)
+			do_rtmsg = true;
 		memcpy(LLADDR(sdl), ar_sha(ah), sdl->sdl_alen = ah->ar_hln);
 		if (rt->rt_expire != 0) {
-			rt->rt_expire = time_uptime + arpt_keep;
+			if (rt->rt_expire != time_uptime + arpt_keep &&
+			    rt->rt_expire != time_uptime + arpt_keep - 1) {
+				rt->rt_expire = time_uptime + arpt_keep;
+				changed = 1;
+			}
 		}
-		rt->rt_flags &= ~RTF_REJECT;
-		la->la_asked = 0;
-		la->la_preempt = arp_maxtries;
+		if (rt->rt_flags & RTF_REJECT) {
+			rt->rt_flags &= ~RTF_REJECT;
+			changed = 1;
+		}
+		if (la->la_asked != 0) {
+			la->la_asked = 0;
+			changed = 1;
+		}
+		if (la->la_preempt != arp_maxtries) {
+			la->la_preempt = arp_maxtries;
+			changed = 1;
+		}
 
 		/*
 		 * This particular cpu might have been holding an mbuf
@@ -808,8 +866,13 @@ arp_update_oncpu(struct mbuf *m, in_addr_t saddr, boolean_t create,
 			la->la_hold = NULL;
 			m_adj(m, sizeof(struct ether_header));
 			ifp->if_output(ifp, m, rt_key(rt), rt);
+			changed = 1;
 		}
+
+		if (do_rtmsg && mycpuid == 0)
+			rt_rtmsg(rt_cmd, rt, rt->rt_ifp, 0);
 	}
+	return changed;
 }
 
 /*
@@ -826,7 +889,8 @@ in_arpinput(struct mbuf *m)
 	struct in_addr isaddr, itaddr, myaddr;
 	uint8_t *enaddr = NULL;
 	int req_len;
-	char hexstr[64];
+	int changed;
+	char hexstr[64], sbuf[INET_ADDRSTRLEN];
 
 	req_len = arphdr_len2(ifp->if_addrlen, sizeof(struct in_addr));
 	if (m->m_len < req_len && (m = m_pullup(m, req_len)) == NULL) {
@@ -981,7 +1045,7 @@ match:
 	if (!bcmp(ar_sha(ah), ifp->if_broadcastaddr, ifp->if_addrlen)) {
 		log(LOG_ERR,
 		    "arp: link address is broadcast for IP address %s!\n",
-		    inet_ntoa(isaddr));
+		    kinet_ntoa(isaddr, sbuf));
 		m_freem(m);
 		return;
 	}
@@ -990,7 +1054,7 @@ match:
 		    hexstr, HEX_NCPYLEN(ifp->if_addrlen), ":");
 		log(LOG_ERR,
 		   "arp: %s is using my IP address %s!\n",
-		    hexstr, inet_ntoa(isaddr));
+		    hexstr, kinet_ntoa(isaddr, sbuf));
 		itaddr = myaddr;
 		goto reply;
 	}
@@ -1012,16 +1076,16 @@ match:
 	 *
 	 * However, we only need to generate rtmsg on CPU0.
 	 */
-	KASSERT(&curthread->td_msgport == netisr_cpuport(0),
-	    ("arp input not in netisr0, but on cpu%d", mycpuid));
-	arp_update_oncpu(m, isaddr.s_addr, itaddr.s_addr == myaddr.s_addr,
-	    RTL_REPORTMSG, TRUE);
+	ASSERT_NETISR0;
+	changed = arp_update_oncpu(m, isaddr.s_addr,
+				   itaddr.s_addr == myaddr.s_addr,
+				   TRUE);
 
-	if (ncpus > 1) {
+	if (netisr_ncpus > 1 && changed) {
 		struct netmsg_inarp *msg = &m->m_hdr.mh_arpmsg;
 
 		netmsg_init(&msg->base, NULL, &netisr_apanic_rport,
-		    0, arp_update_msghandler);
+			    0, arp_update_msghandler);
 		msg->m = m;
 		msg->saddr = isaddr.s_addr;
 		msg->taddr = itaddr.s_addr;
@@ -1056,16 +1120,19 @@ arp_update_msghandler(netmsg_t msg)
 	struct netmsg_inarp *rmsg = (struct netmsg_inarp *)msg;
 	int nextcpu;
 
+	ASSERT_NETISR_NCPUS(mycpuid);
+
 	/*
 	 * This message handler will be called on all of the APs;
 	 * no need to generate rtmsg on them.
 	 */
 	KASSERT(mycpuid > 0, ("arp update msg on cpu%d", mycpuid));
-	arp_update_oncpu(rmsg->m, rmsg->saddr, rmsg->taddr == rmsg->myaddr,
-	    RTL_DONTREPORT, FALSE);
+	arp_update_oncpu(rmsg->m, rmsg->saddr,
+			 rmsg->taddr == rmsg->myaddr,
+			 FALSE);
 
 	nextcpu = mycpuid + 1;
-	if (nextcpu < ncpus) {
+	if (nextcpu < netisr_ncpus) {
 		lwkt_forwardmsg(netisr_cpuport(nextcpu), &rmsg->base.lmsg);
 	} else {
 		struct mbuf *m = rmsg->m;
@@ -1088,6 +1155,9 @@ arp_update_msghandler(netmsg_t msg)
 	}
 }
 
+/*
+ * Reply to an arp request
+ */
 static void
 in_arpreply(struct mbuf *m, in_addr_t taddr, in_addr_t myaddr)
 {
@@ -1096,6 +1166,8 @@ in_arpreply(struct mbuf *m, in_addr_t taddr, in_addr_t myaddr)
 	struct arphdr *ah;
 	struct sockaddr sa;
 	struct ether_header *eh;
+
+	ASSERT_NETISR0;
 
 	ah = mtod(m, struct arphdr *);
 	if (ntohs(ah->ar_op) != ARPOP_REQUEST) {
@@ -1112,9 +1184,12 @@ in_arpreply(struct mbuf *m, in_addr_t taddr, in_addr_t myaddr)
 		struct llinfo_arp *la;
 		struct rtentry *rt;
 
-		la = arplookup(taddr, FALSE, RTL_DONTREPORT, SIN_PROXY);
+		la = arplookup(taddr, FALSE, SIN_PROXY);
 		if (la == NULL) {
 			struct sockaddr_in sin;
+#ifdef DEBUG_PROXY
+			char tbuf[INET_ADDRSTRLEN];
+#endif
 
 			if (!arp_proxyall) {
 				m_freem(m);
@@ -1132,19 +1207,25 @@ in_arpreply(struct mbuf *m, in_addr_t taddr, in_addr_t myaddr)
 				return;
 			}
 			--rt->rt_refcnt;
+
 			/*
 			 * Don't send proxies for nodes on the same interface
 			 * as this one came out of, or we'll get into a fight
 			 * over who claims what Ether address.
+			 *
+			 * If the rt entry is associated with a bridge, we
+			 * count it as the 'same' interface if ifp is
+			 * associated with the bridge.
 			 */
-			if (rt->rt_ifp == ifp) {
+			if (rt->rt_ifp == ifp || rt->rt_ifp == ifp->if_bridge) {
 				m_freem(m);
 				return;
 			}
 			memcpy(ar_tha(ah), ar_sha(ah), ah->ar_hln);
 			memcpy(ar_sha(ah), enaddr, ah->ar_hln);
 #ifdef DEBUG_PROXY
-			kprintf("arp: proxying for %s\n", inet_ntoa(itaddr));
+			kprintf("arp: proxying for %s\n",
+			    kinet_ntoa(itaddr, tbuf));
 #endif
 		} else {
 			struct sockaddr_dl *sdl;
@@ -1204,6 +1285,13 @@ arptfree(struct llinfo_arp *la)
 		rt->rt_flags &= ~RTF_REJECT;
 		return;
 	}
+
+	/*
+	 * ARP expiry happens under one big timer.
+	 * To avoid overflowing the route socket, don't report this.
+	 * Now that RTM_MISS is reported when an address is unresolvable
+	 * the benefit of reporting this deletion is questionable.
+	 */
 	rtrequest(RTM_DELETE, rt_key(rt), NULL, rt_mask(rt), 0, NULL);
 }
 
@@ -1211,18 +1299,21 @@ arptfree(struct llinfo_arp *la)
  * Lookup or enter a new address in arptab.
  */
 static struct llinfo_arp *
-arplookup(in_addr_t addr, boolean_t create, boolean_t generate_report,
+arplookup(in_addr_t addr, boolean_t create,
 	  boolean_t proxy)
 {
 	struct rtentry *rt;
 	struct sockaddr_inarp sin = { sizeof sin, AF_INET };
 	const char *why = NULL;
 
+	/* Check ARP probes, e.g. from Cisco switches. */
+	if (addr == INADDR_ANY && arp_ignore_probes)
+		return (NULL);
+
 	sin.sin_addr.s_addr = addr;
 	sin.sin_other = proxy ? SIN_PROXY : 0;
 	if (create) {
-		rt = _rtlookup((struct sockaddr *)&sin,
-			       generate_report, RTL_DOCLONE);
+		rt = rtlookup((struct sockaddr *)&sin);
 	} else {
 		rt = rtpurelookup((struct sockaddr *)&sin);
 	}
@@ -1238,9 +1329,11 @@ arplookup(in_addr_t addr, boolean_t create, boolean_t generate_report,
 		why = "gateway route is not ours";
 
 	if (why) {
-		if (create) {
+		if (create && log_arp_creation_failure) {
+			char abuf[INET_ADDRSTRLEN];
+
 			log(LOG_DEBUG, "arplookup %s failed: %s\n",
-			    inet_ntoa(sin.sin_addr), why);
+			    kinet_ntoa(sin.sin_addr, abuf), why);
 		}
 		if (rt->rt_refcnt <= 0 && (rt->rt_flags & RTF_WASCLONED)) {
 			/* No references to this route.  Purge it. */
@@ -1263,8 +1356,13 @@ void
 arp_gratuitous(struct ifnet *ifp, struct ifaddr *ifa)
 {
 	if (IA_SIN(ifa)->sin_addr.s_addr != INADDR_ANY) {
-		arprequest_async(ifp, &IA_SIN(ifa)->sin_addr,
-				 &IA_SIN(ifa)->sin_addr, NULL);
+		if (IN_NETISR_NCPUS(mycpuid)) {
+			arprequest(ifp, &IA_SIN(ifa)->sin_addr,
+			    &IA_SIN(ifa)->sin_addr, NULL);
+		} else {
+			arprequest_async(ifp, &IA_SIN(ifa)->sin_addr,
+			    &IA_SIN(ifa)->sin_addr, NULL);
+		}
 	}
 }
 
@@ -1293,17 +1391,38 @@ arp_ifaddr(void *arg __unused, struct ifnet *ifp,
 }
 
 static void
+arp_init_dispatch(netmsg_t nm)
+{
+	struct arp_pcpu_data *ad;
+
+	ASSERT_NETISR_NCPUS(mycpuid);
+
+	ad = kmalloc(sizeof(*ad), M_ARP, M_WAITOK | M_ZERO);
+
+	LIST_INIT(&ad->llinfo_list);
+	callout_init_mp(&ad->timer_ch);
+	netmsg_init(&ad->timer_nmsg, NULL, &netisr_adone_rport,
+	    MSGF_PRIORITY, arptimer_dispatch);
+	ad->timer_nmsg.lmsg.u.ms_resultp = ad;
+
+	arp_data[mycpuid] = ad;
+
+	callout_reset(&ad->timer_ch, hz, arptimer, &ad->timer_nmsg);
+
+	netisr_forwardmsg(&nm->base, mycpuid + 1);
+}
+
+static void
 arp_init(void)
 {
-	int cpu;
+	struct netmsg_base nm;
 
-	for (cpu = 0; cpu < ncpus2; cpu++)
-		LIST_INIT(&llinfo_arp_list[cpu]);
+	netmsg_init(&nm, NULL, &curthread->td_msgport, 0, arp_init_dispatch);
+	netisr_domsg_global(&nm);
 
 	netisr_register(NETISR_ARP, arpintr, NULL);
 
 	EVENTHANDLER_REGISTER(ifaddr_event, arp_ifaddr, NULL,
 	    EVENTHANDLER_PRI_LAST);
 }
-
 SYSINIT(arp, SI_SUB_PROTO_DOMAIN, SI_ORDER_ANY, arp_init, 0);

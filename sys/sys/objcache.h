@@ -33,13 +33,14 @@
 #ifndef _SYS_OBJCACHE_H_
 #define _SYS_OBJCACHE_H_
 
-#if defined(_KERNEL) || defined(_KERNEL_STRUCTURES)
-
 #ifndef _SYS_TYPES_H_
 #include <sys/types.h>
 #endif
-#ifndef _SYS_MALLOC_H_
-#include <sys/malloc.h>
+
+#if defined(_KERNEL) || defined(_KERNEL_STRUCTURES)
+
+#ifndef _SYS__MALLOC_H_
+#include <sys/_malloc.h>
 #endif
 
 #define OC_MFLAGS	0x0000ffff	/* same as malloc flags */
@@ -70,6 +71,7 @@ struct objcache
 			  int cluster_limit, int nom_cache,
 			  objcache_ctor_fn *ctor, objcache_dtor_fn *dtor,
 			  void *privdata);
+void	objcache_set_cluster_limit(struct objcache *oc, int cluster_limit);
 void	*objcache_get(struct objcache *oc, int ocflags);
 void	 objcache_put(struct objcache *oc, void *obj);
 void	 objcache_dtor(struct objcache *oc, void *obj);
@@ -78,7 +80,7 @@ void	 objcache_populate_linear(struct objcache *oc, void *elts, int nelts,
 __boolean_t objcache_reclaimlist(struct objcache *oc[], int nlist, int ocflags);
 void	 objcache_destroy(struct objcache *oc);
 
-#endif
+#endif	/* _KERNEL */
 
 /*
  * Common underlying allocators.
@@ -90,7 +92,9 @@ struct objcache_malloc_args {
 
 #ifdef	_KERNEL
 
-void	*objcache_malloc_alloc(void *allocator_args, int ocflags);
+void	*objcache_malloc_alloc(void *allocator_args, int ocflags) __malloclike;
+void	*objcache_malloc_alloc_zero(void *allocator_args, int ocflags)
+	    __malloclike;
 void	 objcache_malloc_free(void *obj, void *allocator_args);
 
 void	*objcache_nop_alloc(void *allocator_args, int ocflags);
@@ -99,4 +103,25 @@ void	 objcache_nop_free(void *obj, void *allocator_args);
 #endif	/* _KERNEL */
 
 #endif	/* _KERNEL || _KERNEL_STRUCTURES */
+
+#define OBJCACHE_UNLIMITED	0x40000000
+#define OBJCACHE_NAMELEN	32
+
+struct objcache_stats {
+	char		oc_name[OBJCACHE_NAMELEN];	/* \0 term. */
+
+	/*
+	 * >= OBJCACHE_UNLIMITED, if unlimited.
+	 */
+	u_long		oc_limit;
+
+	u_long		oc_requested;
+	u_long		oc_used;
+	u_long		oc_cached;
+	u_long		oc_exhausted;
+	u_long		oc_failed;
+	u_long		oc_allocated;
+	u_long		oc_reserved[5];			/* reserved 0. */
+};
+
 #endif	/* !_SYS_OBJCACHE_H_ */

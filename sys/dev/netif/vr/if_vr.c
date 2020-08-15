@@ -71,7 +71,6 @@
 #include <sys/serialize.h>
 #include <sys/bus.h>
 #include <sys/rman.h>
-#include <sys/thread2.h>
 #include <sys/interrupt.h>
 
 #include <net/if.h>
@@ -930,7 +929,7 @@ vr_newbuf(struct vr_softc *sc, struct vr_chain_onefrag *c, struct mbuf *m)
 	struct mbuf *m_new = NULL;
 
 	if (m == NULL) {
-		m_new = m_getcl(MB_DONTWAIT, MT_DATA, M_PKTHDR);
+		m_new = m_getcl(M_NOWAIT, MT_DATA, M_PKTHDR);
 		if (m_new == NULL)
 			return (ENOBUFS);
 		m_new->m_len = m_new->m_pkthdr.len = MCLBYTES;
@@ -1014,7 +1013,7 @@ vr_rxeof(struct vr_softc *sc)
 		total_len -= ETHER_CRC_LEN;
 
 		m0 = m_devget(mtod(m, char *) - ETHER_ALIGN,
-		    total_len + ETHER_ALIGN, 0, ifp, NULL);
+			      total_len + ETHER_ALIGN, 0, ifp);
 		vr_newbuf(sc, cur_rx, m);
 		if (m0 == NULL) {
 			IFNET_STAT_INC(ifp, ierrors, 1);

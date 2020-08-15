@@ -1,4 +1,4 @@
-/*	$NetBSD: suff.c,v 1.70 2013/05/18 13:13:34 sjg Exp $	*/
+/*	$NetBSD: suff.c,v 1.88 2020/07/03 08:02:55 rillig Exp $	*/
 
 /*
  * Copyright (c) 1988, 1989, 1990, 1993
@@ -69,14 +69,14 @@
  */
 
 #ifndef MAKE_NATIVE
-static char rcsid[] = "$NetBSD: suff.c,v 1.70 2013/05/18 13:13:34 sjg Exp $";
+static char rcsid[] = "$NetBSD: suff.c,v 1.88 2020/07/03 08:02:55 rillig Exp $";
 #else
 #include <sys/cdefs.h>
 #ifndef lint
 #if 0
 static char sccsid[] = "@(#)suff.c	8.4 (Berkeley) 3/21/94";
 #else
-__RCSID("$NetBSD: suff.c,v 1.70 2013/05/18 13:13:34 sjg Exp $");
+__RCSID("$NetBSD: suff.c,v 1.88 2020/07/03 08:02:55 rillig Exp $");
 #endif
 #endif /* not lint */
 #endif
@@ -135,6 +135,7 @@ __RCSID("$NetBSD: suff.c,v 1.70 2013/05/18 13:13:34 sjg Exp $");
  *				order to find the node.
  */
 
+#include    	  <assert.h>
 #include    	  <stdio.h>
 #include	  "make.h"
 #include	  "hash.h"
@@ -265,7 +266,7 @@ SuffStrIsPrefix(const char *pref, const char *str)
 	str++;
     }
 
-    return (*pref ? NULL : str);
+    return *pref ? NULL : str;
 }
 
 /*-
@@ -303,7 +304,7 @@ SuffSuffIsSuffix(const Suff *s, const SuffixCmpData *sd)
 	p2--;
     }
 
-    return (p1 == s->name - 1 ? p2 : NULL);
+    return p1 == s->name - 1 ? p2 : NULL;
 }
 
 /*-
@@ -323,7 +324,7 @@ SuffSuffIsSuffix(const Suff *s, const SuffixCmpData *sd)
 static int
 SuffSuffIsSuffixP(const void *s, const void *sd)
 {
-    return(!SuffSuffIsSuffix(s, sd));
+    return !SuffSuffIsSuffix(s, sd);
 }
 
 /*-
@@ -346,7 +347,7 @@ SuffSuffIsSuffixP(const void *s, const void *sd)
 static int
 SuffSuffHasNameP(const void *s, const void *sname)
 {
-    return (strcmp(sname, ((const Suff *)s)->name));
+    return strcmp(sname, ((const Suff *)s)->name);
 }
 
 /*-
@@ -393,7 +394,7 @@ SuffSuffIsPrefix(const void *s, const void *str)
 static int
 SuffGNHasNameP(const void *gn, const void *name)
 {
-    return (strcmp(name, ((const GNode *)gn)->name));
+    return strcmp(name, ((const GNode *)gn)->name);
 }
 
  	    /*********** Maintenance Functions ************/
@@ -553,7 +554,20 @@ Suff_ClearSuffixes(void)
 #endif
     sufflist = Lst_Init(FALSE);
     sNum = 0;
-    suffNull = emptySuff;
+    if (suffNull)
+	SuffFree(suffNull);
+    emptySuff = suffNull = bmake_malloc(sizeof(Suff));
+
+    suffNull->name =   	    bmake_strdup("");
+    suffNull->nameLen =     0;
+    suffNull->searchPath =  Lst_Init(FALSE);
+    Dir_Concat(suffNull->searchPath, dirSearchPath);
+    suffNull->children =    Lst_Init(FALSE);
+    suffNull->parents =	    Lst_Init(FALSE);
+    suffNull->ref =	    Lst_Init(FALSE);
+    suffNull->sNum =   	    sNum++;
+    suffNull->flags =  	    SUFF_NULL;
+    suffNull->refCount =    1;
 }
 
 /*-
@@ -618,9 +632,9 @@ SuffParseTransform(char *str, Suff **srcPtr, Suff **targPtr)
 		 */
 		*srcPtr = single;
 		*targPtr = suffNull;
-		return(TRUE);
+		return TRUE;
 	    }
-	    return (FALSE);
+	    return FALSE;
 	}
 	src = (Suff *)Lst_Datum(srcLn);
 	str2 = str + src->nameLen;
@@ -632,7 +646,7 @@ SuffParseTransform(char *str, Suff **srcPtr, Suff **targPtr)
 	    if (targLn != NULL) {
 		*srcPtr = src;
 		*targPtr = (Suff *)Lst_Datum(targLn);
-		return (TRUE);
+		return TRUE;
 	    }
 	}
     }
@@ -660,7 +674,7 @@ Suff_IsTransform(char *str)
 {
     Suff    	  *src, *targ;
 
-    return (SuffParseTransform(str, &src, &targ));
+    return SuffParseTransform(str, &src, &targ);
 }
 
 /*-
@@ -724,7 +738,7 @@ Suff_AddTransform(char *line)
     SuffInsert(t->children, s);
     SuffInsert(s->parents, t);
 
-    return (gn);
+    return gn;
 }
 
 /*-
@@ -749,7 +763,7 @@ Suff_AddTransform(char *line)
  *-----------------------------------------------------------------------
  */
 int
-Suff_EndTransform(void *gnp, void *dummy)
+Suff_EndTransform(void *gnp, void *dummy MAKE_ATTR_UNUSED)
 {
     GNode *gn = (GNode *)gnp;
 
@@ -796,7 +810,7 @@ Suff_EndTransform(void *gnp, void *dummy)
 	fprintf(debug_file, "transformation %s complete\n", gn->name);
     }
 
-    return(dummy ? 0 : 0);
+    return 0;
 }
 
 /*-
@@ -846,7 +860,7 @@ SuffRebuildGraph(void *transformp, void *sp)
 	    s2 = (Suff *)Lst_Datum(ln);
 	    SuffInsert(s2->children, s);
 	    SuffInsert(s->parents, s2);
-	    return(0);
+	    return 0;
 	}
     }
 
@@ -875,7 +889,7 @@ SuffRebuildGraph(void *transformp, void *sp)
 	    SuffInsert(s2->parents, s);
 	}
     }
-    return(0);
+    return 0;
 }
 
 /*-
@@ -1021,7 +1035,7 @@ Suff_GetPath(char *sname)
 	return NULL;
     } else {
 	s = (Suff *)Lst_Datum(ln);
-	return (s->searchPath);
+	return s->searchPath;
     }
 }
 
@@ -1079,9 +1093,9 @@ Suff_DoPaths(void)
 	}
     }
 
-    Var_Set(".INCLUDES", ptr = Dir_MakeFlags("-I", inIncludes), VAR_GLOBAL, 0);
+    Var_Set(".INCLUDES", ptr = Dir_MakeFlags("-I", inIncludes), VAR_GLOBAL);
     free(ptr);
-    Var_Set(".LIBS", ptr = Dir_MakeFlags("-L", inLibs), VAR_GLOBAL, 0);
+    Var_Set(".LIBS", ptr = Dir_MakeFlags("-L", inLibs), VAR_GLOBAL);
     free(ptr);
 
     Lst_Destroy(inIncludes, Dir_Destroy);
@@ -1202,7 +1216,7 @@ SuffAddSrc(void *sp, void *lsp)
 #ifdef DEBUG_SRC
 	s2->cp = Lst_Init(FALSE);
 	Lst_AtEnd(targ->cp, s2);
-	fprintf(debug_file, "1 add %x %x to %x:", targ, s2, ls->l);
+	fprintf(debug_file, "1 add %p %p to %p:", targ, s2, ls->l);
 	Lst_ForEach(ls->l, PrintAddr, NULL);
 	fprintf(debug_file, "\n");
 #endif
@@ -1220,12 +1234,12 @@ SuffAddSrc(void *sp, void *lsp)
 #ifdef DEBUG_SRC
     s2->cp = Lst_Init(FALSE);
     Lst_AtEnd(targ->cp, s2);
-    fprintf(debug_file, "2 add %x %x to %x:", targ, s2, ls->l);
+    fprintf(debug_file, "2 add %p %p to %p:", targ, s2, ls->l);
     Lst_ForEach(ls->l, PrintAddr, NULL);
     fprintf(debug_file, "\n");
 #endif
 
-    return(0);
+    return 0;
 }
 
 /*-
@@ -1292,14 +1306,14 @@ SuffRemoveSrc(Lst l)
 		free(s->pref);
 	    else {
 #ifdef DEBUG_SRC
-		LstNode ln = Lst_Member(s->parent->cp, s);
-		if (ln != NULL)
-		    Lst_Remove(s->parent->cp, ln);
+		LstNode ln2 = Lst_Member(s->parent->cp, s);
+		if (ln2 != NULL)
+		    Lst_Remove(s->parent->cp, ln2);
 #endif
 		--s->parent->children;
 	    }
 #ifdef DEBUG_SRC
-	    fprintf(debug_file, "free: [l=%x] p=%x %d\n", l, s, s->children);
+	    fprintf(debug_file, "free: [l=%p] p=%p %d\n", l, s, s->children);
 	    Lst_Destroy(s->cp, NULL);
 #endif
 	    Lst_Remove(l, ln);
@@ -1310,7 +1324,7 @@ SuffRemoveSrc(Lst l)
 	}
 #ifdef DEBUG_SRC
 	else {
-	    fprintf(debug_file, "keep: [l=%x] p=%x %d: ", l, s, s->children);
+	    fprintf(debug_file, "keep: [l=%p] p=%p %d: ", l, s, s->children);
 	    Lst_ForEach(s->cp, PrintAddr, NULL);
 	    fprintf(debug_file, "\n");
 	}
@@ -1359,7 +1373,7 @@ SuffFindThem(Lst srcs, Lst slst)
 	 */
 	if (Targ_FindNode(s->file, TARG_NOCREATE) != NULL) {
 #ifdef DEBUG_SRC
-	    fprintf(debug_file, "remove %x from %x\n", s, srcs);
+	    fprintf(debug_file, "remove %p from %p\n", s, srcs);
 #endif
 	    rs = s;
 	    break;
@@ -1368,7 +1382,7 @@ SuffFindThem(Lst srcs, Lst slst)
 	if ((ptr = Dir_FindFile(s->file, s->suff->searchPath)) != NULL) {
 	    rs = s;
 #ifdef DEBUG_SRC
-	    fprintf(debug_file, "remove %x from %x\n", s, srcs);
+	    fprintf(debug_file, "remove %p from %p\n", s, srcs);
 #endif
 	    free(ptr);
 	    break;
@@ -1385,7 +1399,7 @@ SuffFindThem(Lst srcs, Lst slst)
     if (DEBUG(SUFF) && rs) {
 	fprintf(debug_file, "got it\n");
     }
-    return (rs);
+    return rs;
 }
 
 /*-
@@ -1484,14 +1498,14 @@ SuffFindCmds(Src *targ, Lst slst)
     targ->children += 1;
 #ifdef DEBUG_SRC
     ret->cp = Lst_Init(FALSE);
-    fprintf(debug_file, "3 add %x %x\n", targ, ret);
+    fprintf(debug_file, "3 add %p %p\n", targ, ret);
     Lst_AtEnd(targ->cp, ret);
 #endif
     Lst_AtEnd(slst, ret);
     if (DEBUG(SUFF)) {
 	fprintf(debug_file, "\tusing existing source %s\n", s->name);
     }
-    return (ret);
+    return ret;
 }
 
 /*-
@@ -1543,7 +1557,7 @@ SuffExpandChildren(LstNode cln, GNode *pgn)
     if (DEBUG(SUFF)) {
 	fprintf(debug_file, "Expanding \"%s\"...", cgn->name);
     }
-    cp = Var_Subst(NULL, cgn->name, pgn, TRUE);
+    cp = Var_Subst(NULL, cgn->name, pgn, VARF_UNDEFERR|VARF_WANTRES);
 
     if (cp != NULL) {
 	Lst	    members = Lst_Init(FALSE);
@@ -1596,14 +1610,14 @@ SuffExpandChildren(LstNode cln, GNode *pgn)
 		    int 	len;
 		    void	*freeIt;
 
-		    junk = Var_Parse(cp, pgn, TRUE, &len, &freeIt);
+		    junk = Var_Parse(cp, pgn, VARF_UNDEFERR|VARF_WANTRES,
+			&len, &freeIt);
 		    if (junk != var_Error) {
 			cp += len - 1;
 		    }
 
-		    if (freeIt)
-			free(freeIt);
-		} else if (*cp == '\\' && *cp != '\0') {
+		    free(freeIt);
+		} else if (*cp == '\\' && cp[1] != '\0') {
 		    /*
 		     * Escaped something -- skip over it
 		     */
@@ -1817,7 +1831,7 @@ SuffApplyTransform(GNode *tGn, GNode *sGn, Suff *t, Suff *s)
 	 * called to link an OP_MEMBER and OP_ARCHV node), so return
 	 * FALSE.
 	 */
-	return(FALSE);
+	return FALSE;
     }
 
     gn = (GNode *)Lst_Datum(ln);
@@ -1850,7 +1864,7 @@ SuffApplyTransform(GNode *tGn, GNode *sGn, Suff *t, Suff *s)
      */
     (void)Lst_AtEnd(sGn->iParents, tGn);
 
-    return(TRUE);
+    return TRUE;
 }
 
 
@@ -1881,6 +1895,7 @@ SuffFindArchiveDeps(GNode *gn, Lst slst)
 	TARGET,	    	    /* Must be first */
 	PREFIX,	    	    /* Must be second */
     };
+    LstNode 	ln, nln;    /* Next suffix node to check */
     int	    	i;  	    /* Index into copy and vals */
     Suff    	*ms;	    /* Suffix descriptor for member */
     char    	*name;	    /* Start of member's name */
@@ -1891,6 +1906,13 @@ SuffFindArchiveDeps(GNode *gn, Lst slst)
      */
     eoarch = strchr(gn->name, '(');
     eoname = strchr(eoarch, ')');
+
+    /*
+     * Caller guarantees the format `libname(member)', via
+     * Arch_ParseArchive.
+     */
+    assert(eoarch != NULL);
+    assert(eoname != NULL);
 
     *eoname = '\0';	  /* Nuke parentheses during suffix search */
     *eoarch = '\0';	  /* So a suffix can be found */
@@ -1919,9 +1941,8 @@ SuffFindArchiveDeps(GNode *gn, Lst slst)
      */
     for (i = (sizeof(copy)/sizeof(copy[0]))-1; i >= 0; i--) {
 	char *p1;
-	Var_Set(copy[i], Var_Value(copy[i], mem, &p1), gn, 0);
-	if (p1)
-	    free(p1);
+	Var_Set(copy[i], Var_Value(copy[i], mem, &p1), gn);
+	free(p1);
 
     }
 
@@ -1940,8 +1961,22 @@ SuffFindArchiveDeps(GNode *gn, Lst slst)
     /*
      * Set the other two local variables required for this target.
      */
-    Var_Set(MEMBER, name, gn, 0);
-    Var_Set(ARCHIVE, gn->name, gn, 0);
+    Var_Set(MEMBER, name, gn);
+    Var_Set(ARCHIVE, gn->name, gn);
+
+    /*
+     * Set $@ for compatibility with other makes
+     */
+    Var_Set(TARGET, gn->name, gn);
+
+    /*
+     * Now we've got the important local variables set, expand any sources
+     * that still contain variables or wildcards in their names.
+     */
+    for (ln = Lst_First(gn->children); ln != NULL; ln = nln) {
+	nln = Lst_Succ(ln);
+	SuffExpandChildren(ln, gn);
+    }
 
     if (ms != NULL) {
 	/*
@@ -1950,7 +1985,6 @@ SuffFindArchiveDeps(GNode *gn, Lst slst)
 	 * through the entire list, we just look at suffixes to which the
 	 * member's suffix may be transformed...
 	 */
-	LstNode		ln;
 	SuffixCmpData	sd;		/* Search string data */
 
 	/*
@@ -1990,9 +2024,10 @@ SuffFindArchiveDeps(GNode *gn, Lst slst)
 
     /*
      * Flag the member as such so we remember to look in the archive for
-     * its modification time.
+     * its modification time. The OP_JOIN | OP_MADE is needed because this
+     * target should never get made.
      */
-    mem->type |= OP_MEMBER;
+    mem->type |= OP_MEMBER | OP_JOIN | OP_MADE;
 }
 
 /*-
@@ -2178,10 +2213,10 @@ SuffFindNormalDeps(GNode *gn, Lst slst)
 	}
     }
 
-    Var_Set(TARGET, gn->path ? gn->path : gn->name, gn, 0);
+    Var_Set(TARGET, gn->path ? gn->path : gn->name, gn);
 
     pref = (targ != NULL) ? targ->pref : gn->name;
-    Var_Set(PREFIX, pref, gn, 0);
+    Var_Set(PREFIX, pref, gn);
 
     /*
      * Now we've got the important local variables set, expand any sources
@@ -2211,7 +2246,7 @@ sfnd_abort:
 				     targ->suff->searchPath));
 	    if (gn->path != NULL) {
 		char *ptr;
-		Var_Set(TARGET, gn->path, gn, 0);
+		Var_Set(TARGET, gn->path, gn);
 
 		if (targ != NULL) {
 		    /*
@@ -2234,7 +2269,7 @@ sfnd_abort:
 		    else
 			ptr = gn->path;
 
-		    Var_Set(PREFIX, ptr, gn, 0);
+		    Var_Set(PREFIX, ptr, gn);
 
 		    gn->path[savep] = savec;
 		} else {
@@ -2251,7 +2286,7 @@ sfnd_abort:
 		    else
 			ptr = gn->path;
 
-		    Var_Set(PREFIX, ptr, gn, 0);
+		    Var_Set(PREFIX, ptr, gn);
 		}
 	    }
 	}
@@ -2338,9 +2373,9 @@ sfnd_abort:
 	     */
 	    targ->node->type |= OP_DEPS_FOUND;
 
-	    Var_Set(PREFIX, targ->pref, targ->node, 0);
+	    Var_Set(PREFIX, targ->pref, targ->node);
 
-	    Var_Set(TARGET, targ->node->name, targ->node, 0);
+	    Var_Set(TARGET, targ->node->name, targ->node);
 	}
     }
 
@@ -2423,8 +2458,8 @@ SuffFindDeps(GNode *gn, Lst slst)
     /*
      * Make sure we have these set, may get revised below.
      */
-    Var_Set(TARGET, gn->path ? gn->path : gn->name, gn, 0);
-    Var_Set(PREFIX, gn->name, gn, 0);
+    Var_Set(TARGET, gn->path ? gn->path : gn->name, gn);
+    Var_Set(PREFIX, gn->name, gn);
 
     if (DEBUG(SUFF)) {
 	fprintf(debug_file, "SuffFindDeps (%s)\n", gn->name);
@@ -2453,14 +2488,14 @@ SuffFindDeps(GNode *gn, Lst slst)
 	    Arch_FindLib(gn, s->searchPath);
 	} else {
 	    gn->suffix = NULL;
-	    Var_Set(TARGET, gn->name, gn, 0);
+	    Var_Set(TARGET, gn->name, gn);
 	}
 	/*
 	 * Because a library (-lfoo) target doesn't follow the standard
 	 * filesystem conventions, we don't set the regular variables for
 	 * the thing. .PREFIX is simply made empty...
 	 */
-	Var_Set(PREFIX, "", gn, 0);
+	Var_Set(PREFIX, "", gn);
     } else {
 	SuffFindNormalDeps(gn, slst);
     }
@@ -2524,32 +2559,18 @@ Suff_SetNull(char *name)
 void
 Suff_Init(void)
 {
-    sufflist = Lst_Init(FALSE);
 #ifdef CLEANUP
     suffClean = Lst_Init(FALSE);
 #endif
     srclist = Lst_Init(FALSE);
     transforms = Lst_Init(FALSE);
 
-    sNum = 0;
     /*
      * Create null suffix for single-suffix rules (POSIX). The thing doesn't
      * actually go on the suffix list or everyone will think that's its
      * suffix.
      */
-    emptySuff = suffNull = bmake_malloc(sizeof(Suff));
-
-    suffNull->name =   	    bmake_strdup("");
-    suffNull->nameLen =     0;
-    suffNull->searchPath =  Lst_Init(FALSE);
-    Dir_Concat(suffNull->searchPath, dirSearchPath);
-    suffNull->children =    Lst_Init(FALSE);
-    suffNull->parents =	    Lst_Init(FALSE);
-    suffNull->ref =	    Lst_Init(FALSE);
-    suffNull->sNum =   	    sNum++;
-    suffNull->flags =  	    SUFF_NULL;
-    suffNull->refCount =    1;
-
+    Suff_ClearSuffixes();
 }
 
 
@@ -2582,14 +2603,15 @@ Suff_End(void)
 
 /********************* DEBUGGING FUNCTIONS **********************/
 
-static int SuffPrintName(void *s, void *dummy)
+static int SuffPrintName(void *s, void *dummy MAKE_ATTR_UNUSED)
 {
+
     fprintf(debug_file, "%s ", ((Suff *)s)->name);
-    return (dummy ? 0 : 0);
+    return 0;
 }
 
 static int
-SuffPrintSuff(void *sp, void *dummy)
+SuffPrintSuff(void *sp, void *dummy MAKE_ATTR_UNUSED)
 {
     Suff    *s = (Suff *)sp;
     int	    flags;
@@ -2627,11 +2649,11 @@ SuffPrintSuff(void *sp, void *dummy)
     fprintf(debug_file, "#\tSearch Path: ");
     Dir_PrintPath(s->searchPath);
     fputc('\n', debug_file);
-    return (dummy ? 0 : 0);
+    return 0;
 }
 
 static int
-SuffPrintTrans(void *tp, void *dummy)
+SuffPrintTrans(void *tp, void *dummy MAKE_ATTR_UNUSED)
 {
     GNode   *t = (GNode *)tp;
 
@@ -2640,7 +2662,7 @@ SuffPrintTrans(void *tp, void *dummy)
     fputc('\n', debug_file);
     Lst_ForEach(t->commands, Targ_PrintCmd, NULL);
     fputc('\n', debug_file);
-    return(dummy ? 0 : 0);
+    return 0;
 }
 
 void

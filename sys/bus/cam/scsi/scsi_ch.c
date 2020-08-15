@@ -80,7 +80,6 @@
 #include <sys/chio.h>
 #include <sys/errno.h>
 #include <sys/devicestat.h>
-#include <sys/thread2.h>
 
 #include "../cam.h"
 #include "../cam_ccb.h"
@@ -119,6 +118,7 @@ typedef enum {
 } ch_state;
 
 typedef enum {
+	CH_CCB_POLLED,
 	CH_CCB_PROBE,
 	CH_CCB_WAITING
 } ch_ccb_types;
@@ -523,6 +523,10 @@ chdone(struct cam_periph *periph, union ccb *done_ccb)
 	csio = &done_ccb->csio;
 
 	switch(done_ccb->ccb_h.ccb_state) {
+	case CH_CCB_POLLED:
+		/* Caller releases ccb */
+		wakeup(&done_ccb->ccb_h.cbfcnp);
+		return;
 	case CH_CCB_PROBE:
 	{
 		struct scsi_mode_header_6 *mode_header;
@@ -810,6 +814,7 @@ chmove(struct cam_periph *periph, struct changer_move *cm)
 	toelem = softc->sc_firsts[cm->cm_totype] + cm->cm_tounit;
 
 	ccb = cam_periph_getccb(periph, /*priority*/ 1);
+	ccb->ccb_h.ccb_state = CH_CCB_POLLED;
 
 	scsi_move_medium(&ccb->csio,
 			 /* retries */ 1,
@@ -869,6 +874,7 @@ chexchange(struct cam_periph *periph, struct changer_exchange *ce)
 	dst2 = softc->sc_firsts[ce->ce_sdsttype] + ce->ce_sdstunit;
 
 	ccb = cam_periph_getccb(periph, /*priority*/ 1);
+	ccb->ccb_h.ccb_state = CH_CCB_POLLED;
 
 	scsi_exchange_medium(&ccb->csio,
 			     /* retries */ 1,
@@ -919,6 +925,7 @@ chposition(struct cam_periph *periph, struct changer_position *cp)
 	dst = softc->sc_firsts[cp->cp_type] + cp->cp_unit;
 
 	ccb = cam_periph_getccb(periph, /*priority*/ 1);
+	ccb->ccb_h.ccb_state = CH_CCB_POLLED;
 
 	scsi_position_to_element(&ccb->csio,
 				 /* retries */ 1,
@@ -1076,6 +1083,7 @@ chgetelemstatus(struct cam_periph *periph,
 
 	cam_periph_lock(periph);
 	ccb = cam_periph_getccb(periph, /*priority*/ 1);
+	ccb->ccb_h.ccb_state = CH_CCB_POLLED;
 
 	scsi_read_element_status(&ccb->csio,
 				 /* retries */ 1,
@@ -1202,6 +1210,7 @@ chielem(struct cam_periph *periph,
 	softc = (struct ch_softc *)periph->softc;
 
 	ccb = cam_periph_getccb(periph, /*priority*/ 1);
+	ccb->ccb_h.ccb_state = CH_CCB_POLLED;
 
 	scsi_initialize_element_status(&ccb->csio,
 				      /* retries */ 1,
@@ -1286,6 +1295,7 @@ chsetvoltag(struct cam_periph *periph,
 	scsi_ulto2b(csvr->csvr_voltag.cv_serial, ssvtp.minvsn);
 
 	ccb = cam_periph_getccb(periph, /*priority*/ 1);
+	ccb->ccb_h.ccb_state = CH_CCB_POLLED;
 
 	scsi_send_volume_tag(&ccb->csio,
 			     /* retries */ 1,
@@ -1324,6 +1334,7 @@ chgetparams(struct cam_periph *periph)
 	softc = (struct ch_softc *)periph->softc;
 
 	ccb = cam_periph_getccb(periph, /*priority*/ 1);
+	ccb->ccb_h.ccb_state = CH_CCB_POLLED;
 
 	/*
 	 * The scsi_mode_sense_data structure is just a convenience

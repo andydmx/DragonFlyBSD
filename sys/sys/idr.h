@@ -39,8 +39,7 @@
  * IDR is a small Integer ID management library that provides an interface to
  * map integers with some pointer that can later be retrieved.
  *
- * NOTE: Pointer mapped by integer can't be NULL.
- *
+ * NOTE: Maintains compatibility with linux, allowing NULL pointers.
  */
 
 
@@ -50,11 +49,6 @@
 #ifdef _KERNEL
 
 #include <sys/thread.h>
-
-#ifndef GFP_KERNEL
-#include <sys/malloc.h>
-#define GFP_KERNEL	M_WAITOK
-#endif
 
 struct idr_node {
 	void	*data;
@@ -73,7 +67,7 @@ struct idr {
 
 void	*idr_find(struct idr *idp, int id);
 void	*idr_replace(struct idr *idp, void *ptr, int id);
-void	 idr_remove(struct idr *idp, int id);
+void	*idr_remove(struct idr *idp, int id);
 void	 idr_remove_all(struct idr *idp);
 void	 idr_destroy(struct idr *idp);
 int	 idr_for_each(struct idr *idp, int (*fn)(int id, void *p, void *data), void *data);
@@ -83,6 +77,17 @@ int	 idr_pre_get(struct idr *idp, unsigned gfp_mask);
 
 void	 idr_init(struct idr *idp);
 
+int idr_alloc(struct idr *idp, void *ptr, int start, int end, unsigned gfp_mask);
+
+static inline void idr_preload(unsigned gfp_mask)
+{
+	/* Linux disables preemption and allocates a per-cpu buffer here */
+}
+
+static inline void idr_preload_end(void)
+{
+	/* Linux re-enables preemption here */
+}
 
 #endif /* _KERNEL */
 

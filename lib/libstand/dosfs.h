@@ -25,8 +25,8 @@
  * IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-#ifndef DOSIO_H
-#define DOSIO_H
+#ifndef _STAND_DOSFS_H_
+#define	_STAND_DOSFS_H_
 
 /*
  * DOS file attributes
@@ -108,6 +108,7 @@ typedef struct {
     u_int lsndta;               /* start of data area */
     u_int fatsz;                /* FAT entry size */
     u_int xclus;                /* maximum cluster number */
+    DOS_DE root;
 } DOS_FS;
 
 typedef struct {
@@ -117,4 +118,4 @@ typedef struct {
     u_int c;                    /* last cluster read */
 } DOS_FILE;
 
-#endif  /* !DOSIO_H */
+#endif  /* !_STAND_DOSFS_H_ */

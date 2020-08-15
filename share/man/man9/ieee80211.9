@@ -23,20 +23,20 @@
 .\" OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
 .\" SUCH DAMAGE.
 .\"
-.\" $FreeBSD: src/share/man/man9/ieee80211.9,v 1.7 2010/03/29 17:39:38 trasz Exp $
+.\" $FreeBSD: head/share/man/man9/ieee80211.9 233648 2012-03-29 05:02:12Z eadler $
 .\"
-.Dd May 10, 2011
+.Dd May 26, 2016
 .Dt IEEE80211 9
 .Os
 .Sh NAME
-.Nm net80211
+.Nm ieee80211
 .Nd 802.11 network layer
 .Sh SYNOPSIS
 .In net/if.h
 .In net/if_media.h
 .In netproto/802_11/ieee80211_var.h
 .Ft void
-.Fn ieee80211_ifattach "struct ieee80211com *ic" "const uint8_t macaddr[IEEE80211_ADDR_LEN]"
+.Fn ieee80211_ifattach "struct ieee80211com *ic"
 .Ft void
 .Fn ieee80211_ifdetach "struct ieee80211com *ic"
 .Sh DESCRIPTION
@@ -174,7 +174,7 @@ On return from
 .Fn ieee80211_ifattach
 the driver is expected to override default callback functions in the
 .Vt ieee80211com
-structure to register it's private routines.
+structure to register its private routines.
 Methods marked with a
 .Dq *
 must be provided by the driver.
@@ -207,11 +207,11 @@ method.
 Transmit a raw 802.11 frame.
 The default method drops the frame and generates a message on the console.
 .It Dv ic_updateslot
-Update hardware state after an 802.11 IFS slot time change,
+Update hardware state after an 802.11 IFS slot time change.
 There is no default method; the pointer may be NULL in which case
 it will not be used.
 .It Dv ic_update_mcast
-Update hardware for a change in the multicast packet filter,
+Update hardware for a change in the multicast packet filter.
 The default method prints a console message.
 .It Dv ic_update_promisc
 Update hardware for a change in the promiscuous mode setting.
@@ -235,13 +235,13 @@ Memory allocated by the driver must be tagged with
 to balance the memory allocation statistics.
 .It Dv ic_node_free
 Reclaim storage of a node allocated by
-.Dv ic_node_alloc  .
+.Dv ic_node_alloc .
 Drivers are expected to
 .Em interpose
 their own method to cleanup private state but must call through
 this method to allow
 .Nm
-to reclaim it's private state.
+to reclaim its private state.
 .It Dv ic_node_cleanup
 Cleanup state in a
 .Vt ieee80211_node
@@ -263,13 +263,13 @@ The default method ages frames on the power-save queue (in AP mode)
 and pending frames in the receive reorder queues (for stations using A-MPDU).
 .It Dv ic_node_drain
 Reclaim all optional resources associated with a node.
-This call is used to free up resources when they are in short supply,
+This call is used to free up resources when they are in short supply.
 .It Dv ic_node_getrssi
 Return the Receive Signal Strength Indication (RSSI) in .5 dBm units for
 the specified node.
 This interface returns a subset of the information
 returned by
-.Dv ic_node_getsignal ,
+.Dv ic_node_getsignal .
 The default method calculates a filtered average over the last ten
 samples passed in to
 .Xr ieee80211_input 9
@@ -343,7 +343,7 @@ Drivers may interpose this method if they need to setup private state
 for handling transmit A-MPDU.
 .It Dv ic_addb_response
 Process a received ADDBA Response Action frame and setup resources as
-needed for doing transmit A-MPDU,
+needed for doing transmit A-MPDU.
 .It Dv ic_addb_stop
 Shutdown an A-MPDU transmit stream for the specified station and AC.
 The default method reclaims local state after sending a DelBA Action frame.

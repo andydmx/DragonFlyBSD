@@ -10,11 +10,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgment:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -30,29 +26,15 @@
  * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
  *
+ * @(#)main.c	8.1 (Berkeley) 6/5/93
  * $FreeBSD: src/sbin/routed/main.c,v 1.11.2.1 2000/08/14 17:00:03 sheldonh Exp $
  */
 
 #include "defs.h"
 #include "pathnames.h"
-#ifdef sgi
-#include "math.h"
-#endif
 #include <signal.h>
 #include <fcntl.h>
 #include <sys/file.h>
-
-#if !defined(sgi) && !defined(__NetBSD__)
-char copyright[] =
-"@(#) Copyright (c) 1983, 1988, 1993\n\
-	The Regents of the University of California.  All rights reserved.\n";
-static char sccsid[] __attribute__((unused)) = "@(#)main.c	8.1 (Berkeley) 6/5/93";
-#elif defined(__NetBSD__)
-__RCSID("$NetBSD$");
-__COPYRIGHT("@(#) Copyright (c) 1983, 1988, 1993\n\
-	The Regents of the University of California.  All rights reserved.\n");
-#endif
-
 
 pid_t	mypid;
 
@@ -120,7 +102,7 @@ main(int argc,
 	 */
 	signal(SIGHUP, SIG_IGN);
 
-	openlog("routed", LOG_PID | LOG_ODELAY, LOG_DAEMON);
+	openlog("routed", LOG_PID, LOG_DAEMON);
 	ftrace = stdout;
 
 	gettimeofday(&clk, 0);
@@ -286,14 +268,8 @@ usage:
 	signal(SIGUSR2, sigtrace_off);
 
 	/* get into the background */
-#ifdef sgi
-	if (0 > _daemonize(background ? 0 : (_DF_NOCHDIR|_DF_NOFORK),
-			   STDIN_FILENO, STDOUT_FILENO, STDERR_FILENO))
-		BADERR(0, "_daemonize()");
-#else
 	if (background && daemon(0, 1) < 0)
 		BADERR(0,"daemon()");
-#endif
 
 	mypid = getpid();
 	srandom((int)(clk.tv_sec ^ clk.tv_usec ^ mypid));
@@ -538,7 +514,7 @@ usage:
 
 /* ARGSUSED */
 void
-sigalrm(int s UNUSED)
+sigalrm(__unused int s)
 {
 	/* Historically, SIGALRM would cause the daemon to check for
 	 * new and broken interfaces.

@@ -32,69 +32,17 @@
 /*
  * This file implements initial version of device-mapper error target.
  */
-#include <sys/types.h>
-#include <sys/param.h>
-
-#include <sys/buf.h>
-
 #include <dev/disk/dm/dm.h>
-
-/* Init function called from dm_table_load_ioctl. */
-static int
-dm_target_error_init(dm_dev_t * dmv, void **target_config, char *argv)
-{
-
-	kprintf("Error target init function called!!\n");
-
-	*target_config = NULL;
-
-	dmv->dev_type = DM_ERROR_DEV;
-
-	return 0;
-}
-
-/* Status routine called to get params string. */
-static char *
-dm_target_error_status(void *target_config)
-{
-	return NULL;
-}
 
 /* Strategy routine called from dm_strategy. */
 static int
-dm_target_error_strategy(dm_table_entry_t * table_en, struct buf * bp)
+dm_target_error_strategy(dm_table_entry_t *table_en, struct buf *bp)
 {
-
-	kprintf("Error target read function called!!\n");
-
 	bp->b_error = EIO;
 	bp->b_resid = 0;
 
 	biodone(&bp->b_bio1);
 
-	return 0;
-}
-
-/* Doesn't do anything here. */
-static int
-dm_target_error_destroy(dm_table_entry_t * table_en)
-{
-	table_en->target_config = NULL;
-
-	return 0;
-}
-
-/* Doesn't not need to do anything here. */
-static int
-dm_target_error_deps(dm_table_entry_t * table_en, prop_array_t prop_array)
-{
-	return 0;
-}
-
-/* Unsupported for this target. */
-static int
-dm_target_error_upcall(dm_table_entry_t * table_en, struct buf * bp)
-{
 	return 0;
 }
 
@@ -114,14 +62,7 @@ dmte_mod_handler(module_t mod, int type, void *unused)
 		dmt->version[0] = 1;
 		dmt->version[1] = 0;
 		dmt->version[2] = 0;
-		strlcpy(dmt->name, "error", DM_MAX_TYPE_NAME);
-		dmt->init = &dm_target_error_init;
-		dmt->status = &dm_target_error_status;
 		dmt->strategy = &dm_target_error_strategy;
-		dmt->deps = &dm_target_error_deps;
-		dmt->destroy = &dm_target_error_destroy;
-		dmt->upcall = &dm_target_error_upcall;
-		dmt->dump = NULL;
 
 		err = dm_target_insert(dmt);
 		if (err == 0)
@@ -129,12 +70,9 @@ dmte_mod_handler(module_t mod, int type, void *unused)
 		break;
 
 	case MOD_UNLOAD:
-		err = dm_target_rem("error");
+		err = dm_target_remove("error");
 		if (err == 0)
 			kprintf("dm_target_error: unloaded\n");
-		break;
-
-	default:
 		break;
 	}
 

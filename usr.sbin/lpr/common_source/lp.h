@@ -10,11 +10,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -267,11 +263,11 @@ void	 delay(int _millisec);
 void	 displayq(struct printer *_pp, int _format);
 void	 dump(const char *_nfile, const char *_datafile, int _copies);
 void	 fatal(const struct printer *_pp, const char *_msg, ...)
-	    __printflike(2, 3);
+	    __dead2 __printflike(2, 3);
 int	 firstprinter(struct printer *_pp, int *_error);
 void	 free_printer(struct printer *_pp);
 void	 free_request(struct request *_rp);
-int	 getline(FILE *_cfp);
+int	 get_line(FILE *_cfp);
 int	 getport(const struct printer *_pp, const char *_rhost, int _rport);
 int	 getprintcap(const char *_printer, struct printer *_pp);
 int	 getq(const struct printer *_pp, struct jobqueue *(*_namelist[]));
@@ -292,7 +288,7 @@ const
 char	*pcaperr(int _error);
 void	 prank(int _n);
 void	 process(const struct printer *_pp, char *_file);
-void	 rmjob(const char *_printer);
+void	 rmjob(const char *_printer) __dead2;
 void	 rmremote(const struct printer *_pp);
 void	 setprintcap(char *_newfile);
 int	 set_qstate(int _action, const char *_lfname);

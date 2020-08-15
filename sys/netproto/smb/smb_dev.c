@@ -66,7 +66,7 @@ static d_read_t	 nsmb_dev_read;
 static d_write_t nsmb_dev_write;
 static d_ioctl_t nsmb_dev_ioctl;
 static d_clone_t nsmbclone;
-DEVFS_DECLARE_CLONE_BITMAP(nsmb);
+DEVFS_DEFINE_CLONE_BITMAP(nsmb);
 
 MODULE_VERSION(netsmb, NSMB_VERSION);
 
@@ -388,7 +388,7 @@ smb_dev2share(int fd, int mode, struct smb_cred *scred,
 
 	KKASSERT(scred->scr_td->td_proc);
 
-	fp = holdfp(scred->scr_td->td_proc->p_fd, fd, FREAD|FWRITE);
+	fp = holdfp_fdp(scred->scr_td->td_proc->p_fd, fd, FREAD|FWRITE);
 	if (fp == NULL)
 		return EBADF;
 

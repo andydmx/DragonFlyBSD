@@ -39,8 +39,8 @@
 #include <string.h>
 #include <unistd.h>
 
-void pigout (char *, int);
-void usage (void);
+static void pigout(char *, int);
+static void usage(void) __dead2;
 
 int
 main(int argc, char **argv)
@@ -61,7 +61,7 @@ main(int argc, char **argv)
 	for (len = 0; (ch = getchar()) != EOF;) {
 		if (isalpha(ch)) {
 			if (len >= (int)sizeof(buf)) {
-				(void)fprintf(stderr, "pig: ate too much!\n");
+				fprintf(stderr, "pig: ate too much!\n");
 				exit(1);
 			}
 			buf[len++] = ch;
@@ -71,12 +71,12 @@ main(int argc, char **argv)
 			pigout(buf, len);
 			len = 0;
 		}
-		(void)putchar(ch);
+		putchar(ch);
 	}
 	exit(0);
 }
 
-void
+static void
 pigout(char *buf, int len)
 {
 	int ch, start;
@@ -87,7 +87,7 @@ pigout(char *buf, int len)
 	 * as a vowel if it appears first.
 	 */
 	if (index("aeiouAEIOU", buf[0]) != NULL) {
-		(void)printf("%.*sway", len, buf);
+		printf("%.*sway", len, buf);
 		return;
 	}
 
@@ -102,12 +102,12 @@ pigout(char *buf, int len)
 		    (buf[start] == 'u' || buf[start] == 'U'))
 			buf[len++] = buf[start++];
 	}
-	(void)printf("%.*say", olen, buf + start);
+	printf("%.*say", olen, buf + start);
 }
 
-void
+static void
 usage(void)
 {
-	(void)fprintf(stderr, "usage: pig\n");
+	fprintf(stderr, "usage: pig\n");
 	exit(1);
 }

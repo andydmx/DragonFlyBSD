@@ -5,19 +5,16 @@
 # $FreeBSD: src/sys/modules/hptmv/Makefile,v 1.5 2010/08/23 06:13:29 imp Exp $
 
 KMOD= hptmv
-SRCS= opt_scsi.h opt_cam.h
+SRCS= opt_cam.h
 SRCS+= bus_if.h device_if.h pci_if.h
 SRCS+= mv.c entry.c ioctl.c hptproc.c gui_lib.c
-OBJS+= hptmvraid.o
+OBJS+= hptmvraid.bo
 
-.if $(MACHINE_ARCH) == "x86_64"
-HPTMV_RAID_O = x86_64-elf.raid.o.uu
-.else
-HPTMV_RAID_O = i386-elf.raid.o.uu
-.endif
+hptmvraid.bo:	$(MACHINE_ARCH)-elf.raid.o.uu
+	uudecode -o ${.TARGET} < ${.ALLSRC}
+	elfedit --output-osabi none ${.TARGET}
 
-hptmvraid.o:	${.CURDIR}/$(HPTMV_RAID_O)
-	uudecode -p < ${.CURDIR}/$(HPTMV_RAID_O) > ${.TARGET}
+CLEANFILES+= hptmvraid.bo
 
 #
 # Debug Options:
@@ -44,6 +41,6 @@ DEBUGOPT += -DDEBUG_LEVEL=1
 DEBUGOPT += -DFOR_DEMO
 .endif
 
-CFLAGS = ${DEBUGOPT}
+KCFLAGS = ${DEBUGOPT}
 
 .include <bsd.kmod.mk>

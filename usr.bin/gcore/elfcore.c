@@ -46,6 +46,9 @@
 
 #include "extern.h"
 
+extern ssize_t gcore_seg_limit;
+extern int gcore_verbose;
+
 /*
  * Code for generating ELF core dumps.
  */
@@ -125,15 +128,15 @@ elf_coredump(int fd, pid_t pid)
 
 	php = (Elf_Phdr *)((char *)hdr + sizeof(Elf_Ehdr)) + 1;
 	for (i = 0;  i < seginfo.count;  i++) {
-		int nleft = php->p_filesz;
+		long nleft = php->p_filesz;
 
 		lseek(memfd, (off_t)php->p_vaddr, SEEK_SET);
 		while (nleft > 0) {
-			char buf[8*1024];
-			int nwant;
-			int ngot;
+			char buf[65536];
+			ssize_t nwant;
+			ssize_t ngot;
 
-			nwant = nleft;
+			nwant = (ssize_t)nleft;
 			if (nwant > sizeof buf)
 				nwant = sizeof buf;
 			ngot = read(memfd, buf, nwant);
@@ -141,7 +144,7 @@ elf_coredump(int fd, pid_t pid)
 				err(1, "read from %s", memname);
 			if (ngot < nwant)
 				errx(1, "short read from %s:"
-				    " wanted %d, got %d\n", memname,
+				    " wanted %zd, got %zd\n", memname,
 				    nwant, ngot);
 			ngot = write(fd, buf, nwant);
 			if (ngot == -1)
@@ -171,9 +174,9 @@ cb_put_phdr(vm_map_entry_t entry, void *closure)
 
 	phdr->p_type = PT_LOAD;
 	phdr->p_offset = phc->offset;
-	phdr->p_vaddr = entry->start;
+	phdr->p_vaddr = entry->ba.start;
 	phdr->p_paddr = 0;
-	phdr->p_filesz = phdr->p_memsz = entry->end - entry->start;
+	phdr->p_filesz = phdr->p_memsz = entry->ba.end - entry->ba.start;
 	phdr->p_align = PAGE_SIZE;
 	phdr->p_flags = 0;
 	if (entry->protection & VM_PROT_READ)
@@ -197,7 +200,7 @@ cb_size_segment(vm_map_entry_t entry, void *closure)
 	struct sseg_closure *ssc = (struct sseg_closure *)closure;
 
 	ssc->count++;
-	ssc->size += entry->end - entry->start;
+	ssc->size += entry->ba.end - entry->ba.start;
 }
 
 /*
@@ -210,7 +213,7 @@ each_writable_segment(vm_map_entry_t map, segment_callback func, void *closure)
 {
 	vm_map_entry_t entry;
 
-	for (entry = map;  entry != NULL;  entry = entry->next)
+	for (entry = map; entry; entry = entry->rb_entry.rbe_parent)
 		(*func)(entry, closure);
 }
 
@@ -356,7 +359,7 @@ static void
 freemap(vm_map_entry_t map)
 {
 	while (map != NULL) {
-		vm_map_entry_t next = map->next;
+		vm_map_entry_t next = map->rb_entry.rbe_parent;
 		free(map);
 		map = next;
 	}
@@ -452,14 +455,15 @@ readmap(pid_t pid)
 	 * be read with a single read() call.  Start with a reasonbly sized
 	 * buffer, and double it until it is big enough.
 	 */
-	bufsize = 8 * 1024;
+	bufsize = 65536;
 	mapbuf = NULL;
 	for ( ; ; ) {
 		if ((mapbuf = realloc(mapbuf, bufsize + 1)) == NULL)
 			errx(1, "out of memory");
 		mapsize = read(mapfd, mapbuf, bufsize);
-		if (mapsize != -1 || errno != EFBIG)
+		if ((mapsize != -1 || errno != EFBIG) && mapsize != bufsize) {
 			break;
+		}
 		bufsize *= 2;
 		/* This lseek shouldn't be necessary, but it is. */
 		lseek(mapfd, (off_t)0, SEEK_SET);
@@ -482,32 +486,52 @@ readmap(pid_t pid)
 		char type[16];
 		int n;
 		int len;
+		int skipme = 0;
 
 		len = 0;
 		n = sscanf(mapbuf + pos, "%lx %lx %*d %*d %*x %3[-rwx]"
-		    " %*d %*d %*x %*s %*s %16s %*s%*[\n]%n",
+		    " %*d %*d %*x %*s %*s %15s %*s%*[\n]%n",
 		    &start, &end, prot, type, &len);
 		if (n != 4)
-			errx(1, "ill-formed line in %s", mapname);
+			errx(1, "ill-formed line in %s: '%s'",
+			    mapname, mapbuf);
 		pos += len;
 
 		/* Ignore segments of the wrong kind, and unwritable ones */
+		if (gcore_seg_limit >= 0 && end - start > gcore_seg_limit) {
+			skipme = 1;
+		}
 		if (strncmp(prot, "rw", 2) != 0 ||
 		    (strcmp(type, "default") != 0 &&
 		    strcmp(type, "vnode") != 0 &&
-		    strcmp(type, "swap") != 0))
+		    strcmp(type, "swap") != 0)) {
+			skipme = 2;
+		}
+		if (gcore_verbose || skipme == 1)
+			printf("%016lx-%016lx (%ldM) %s,%s",
+			       start, end,
+				(end - start) / (1024 * 1024),
+				prot, type);
+		if (skipme) {
+			if (skipme == 1)
+				printf(" (ignored - seglimit)\n");
+			else if (gcore_verbose)
+				printf(" (ignored)\n");
 			continue;
+		}
+		if (gcore_verbose)
+			printf("\n");
 
 		if ((ent = (vm_map_entry_t)calloc(1, sizeof *ent)) == NULL)
 			errx(1, "out of memory");
-		ent->start = start;
-		ent->end = end;
+		ent->ba.start = start;
+		ent->ba.end = end;
 		ent->protection = VM_PROT_READ | VM_PROT_WRITE;
 		if (prot[2] == 'x')
 		    ent->protection |= VM_PROT_EXECUTE;
 
 		*linkp = ent;
-		linkp = &ent->next;
+		linkp = &ent->rb_entry.rbe_parent;
 	}
 	free(mapbuf);
 	return map;

@@ -26,18 +26,13 @@
  * OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
  *
- * $FreeBSD: src/usr.bin/getconf/getconf.h,v 1.4.2.1 2002/10/27 04:18:40 wollman Exp $
- * $DragonFly: src/usr.bin/getconf/getconf.h,v 1.4 2003/11/04 20:25:45 dillon Exp $
+ * $FreeBSD: head/usr.bin/getconf/getconf.h 106017 2002-10-27 04:14:08Z wollman $
  */
 
 #include <inttypes.h>
 
-#define	GC_PRIdMAX	"lld"
-
-typedef long long	gc_intmax_t;
-
 int	find_confstr(const char *name, int *key);
-int	find_limit(const char *name, gc_intmax_t *value);
+int	find_limit(const char *name, intmax_t *value);
 int	find_pathconf(const char *name, int *key);
 int	find_progenv(const char *name, const char **alt_path);
 int	find_sysconf(const char *name, int *key);

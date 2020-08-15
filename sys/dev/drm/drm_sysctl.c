@@ -33,12 +33,20 @@
 #include <sys/types.h>
 
 #include <drm/drmP.h>
+#include "drm_legacy.h"
+
+SYSCTL_NODE(_hw, OID_AUTO, dri, CTLFLAG_RD, 0, "DRI Graphics");
+SYSCTL_INT(_hw_dri, OID_AUTO, debug, CTLFLAG_RW, &drm_debug, 0,
+	    "Enable debugging output");
+SYSCTL_INT(_hw_dri, OID_AUTO, vblank_offdelay, CTLFLAG_RW,
+	    &drm_vblank_offdelay, 0, "Delay until vblank irq auto-disable");
+SYSCTL_INT(_hw_dri, OID_AUTO, timestamp_precision, CTLFLAG_RW,
+	    &drm_timestamp_precision, 0, "Max. error on timestamps");
 
 static int	   drm_name_info DRM_SYSCTL_HANDLER_ARGS;
 static int	   drm_vm_info DRM_SYSCTL_HANDLER_ARGS;
 static int	   drm_clients_info DRM_SYSCTL_HANDLER_ARGS;
 static int	   drm_bufs_info DRM_SYSCTL_HANDLER_ARGS;
-static int	   drm_vblank_info DRM_SYSCTL_HANDLER_ARGS;
 
 struct drm_sysctl_list {
 	const char *name;
@@ -48,47 +56,29 @@ struct drm_sysctl_list {
 	{"vm",	    drm_vm_info},
 	{"clients", drm_clients_info},
 	{"bufs",    drm_bufs_info},
-	{"vblank",    drm_vblank_info},
 };
 #define DRM_SYSCTL_ENTRIES NELEM(drm_sysctl_list)
-
-struct drm_sysctl_info {
-	struct sysctl_ctx_list ctx;
-	char		       name[2];
-};
 
 int drm_sysctl_init(struct drm_device *dev)
 {
 	struct drm_sysctl_info *info;
 	struct sysctl_oid *oid;
-	struct sysctl_oid *top, *drioid;
-	int		  i;
+	struct sysctl_oid *top;
+	int i, unit;
 
-	info = kmalloc(sizeof *info, M_DRM, M_WAITOK | M_ZERO);
+	info = kzalloc(sizeof *info, GFP_KERNEL);
 	if ( !info )
 		return 1;
 	dev->sysctl = info;
 
-	/* Add the sysctl node for DRI if it doesn't already exist */
-	drioid = SYSCTL_ADD_NODE(&info->ctx, &sysctl__hw_children, OID_AUTO,
-	    "dri", CTLFLAG_RW, NULL, "DRI Graphics");
-	if (!drioid)
+	unit = device_get_unit(dev->dev->bsddev);
+	if (unit > 9)
 		return 1;
 
-	/* Find the next free slot under hw.dri */
-	i = 0;
-	SLIST_FOREACH(oid, SYSCTL_CHILDREN(drioid), oid_link) {
-		if (i <= oid->oid_arg2)
-			i = oid->oid_arg2 + 1;
-	}
-	if (i>9)
-		return 1;
-	
-	dev->sysctl_node_idx = i;
 	/* Add the hw.dri.x for our device */
-	info->name[0] = '0' + i;
+	info->name[0] = '0' + unit;
 	info->name[1] = 0;
-	top = SYSCTL_ADD_NODE(&info->ctx, SYSCTL_CHILDREN(drioid),
+	top = SYSCTL_ADD_NODE(&info->ctx, &SYSCTL_NODE_CHILDREN(_hw, dri),
 	    OID_AUTO, info->name, CTLFLAG_RW, NULL, NULL);
 	if (!top)
 		return 1;
@@ -107,24 +97,8 @@ int drm_sysctl_init(struct drm_device *dev)
 		if (!oid)
 			return 1;
 	}
-	SYSCTL_ADD_INT(&info->ctx, SYSCTL_CHILDREN(drioid), OID_AUTO, "debug",
-	    CTLFLAG_RW, &drm_debug, sizeof(drm_debug),
-	    "Enable debugging output");
-	SYSCTL_ADD_INT(&info->ctx, SYSCTL_CHILDREN(drioid), OID_AUTO, "notyet",
-	    CTLFLAG_RW, &drm_notyet_flag, sizeof(drm_debug),
-	    "Enable notyet reminders");
-
 	if (dev->driver->sysctl_init != NULL)
 		dev->driver->sysctl_init(dev, &info->ctx, top);
-
-	SYSCTL_ADD_INT(&info->ctx, SYSCTL_CHILDREN(drioid), OID_AUTO,
-	    "vblank_offdelay", CTLFLAG_RW, &drm_vblank_offdelay,
-	    sizeof(drm_vblank_offdelay),
-	    "");
-	SYSCTL_ADD_INT(&info->ctx, SYSCTL_CHILDREN(drioid), OID_AUTO,
-	    "timestamp_precision", CTLFLAG_RW, &drm_timestamp_precision,
-	    sizeof(drm_timestamp_precision),
-	    "");
 
 	return (0);
 }
@@ -134,7 +108,7 @@ int drm_sysctl_cleanup(struct drm_device *dev)
 	int error;
 
 	error = sysctl_ctx_free(&dev->sysctl->ctx);
-	drm_free(dev->sysctl, M_DRM);
+	kfree(dev->sysctl);
 	dev->sysctl = NULL;
 	if (dev->driver->sysctl_cleanup != NULL)
 		dev->driver->sysctl_cleanup(dev);
@@ -157,7 +131,8 @@ static int drm_name_info DRM_SYSCTL_HANDLER_ARGS
 	int retcode;
 	int hasunique = 0;
 
-	DRM_SYSCTL_PRINT("%s 0x%x", dev->driver->name, dev2udev(dev->devnode));
+	DRM_SYSCTL_PRINT("%s 0x%x", dev->driver->name,
+	    devid_from_dev(dev->devnode));
 	
 	DRM_LOCK(dev);
 	if (dev->unique) {
@@ -230,8 +205,8 @@ done:
 static int drm_bufs_info DRM_SYSCTL_HANDLER_ARGS
 {
 	struct drm_device	 *dev = arg1;
-	drm_device_dma_t *dma = dev->dma;
-	drm_device_dma_t tempdma;
+	struct drm_device_dma *dma = dev->dma;
+	struct drm_device_dma tempdma;
 	int *templists;
 	int i;
 	char buf[128];
@@ -245,25 +220,21 @@ static int drm_bufs_info DRM_SYSCTL_HANDLER_ARGS
 		DRM_UNLOCK(dev);
 		return 0;
 	}
-	spin_lock(&dev->dma_lock);
 	tempdma = *dma;
 	templists = kmalloc(sizeof(int) * dma->buf_count, M_DRM,
-	    M_NOWAIT);
+			    M_WAITOK | M_NULLOK);
 	for (i = 0; i < dma->buf_count; i++)
 		templists[i] = dma->buflist[i]->list;
 	dma = &tempdma;
-	spin_unlock(&dev->dma_lock);
 	DRM_UNLOCK(dev);
 
 	DRM_SYSCTL_PRINT("\n o     size count  free	 segs pages    kB\n");
 	for (i = 0; i <= DRM_MAX_ORDER; i++) {
 		if (dma->bufs[i].buf_count)
-			DRM_SYSCTL_PRINT("%2d %8d %5d %5d %5d %5d %5d\n",
+			DRM_SYSCTL_PRINT("%2d %8d %5d %5d %5d %5d\n",
 				       i,
 				       dma->bufs[i].buf_size,
 				       dma->bufs[i].buf_count,
-				       atomic_read(&dma->bufs[i]
-						   .freelist.count),
 				       dma->bufs[i].seg_count,
 				       dma->bufs[i].seg_count
 				       *(1 << dma->bufs[i].page_order),
@@ -280,7 +251,7 @@ static int drm_bufs_info DRM_SYSCTL_HANDLER_ARGS
 
 	SYSCTL_OUT(req, "", 1);
 done:
-	drm_free(templists, M_DRM);
+	kfree(templists);
 	return retcode;
 }
 
@@ -299,7 +270,7 @@ static int drm_clients_info DRM_SYSCTL_HANDLER_ARGS
 		privcount++;
 
 	tempprivs = kmalloc(sizeof(struct drm_file) * privcount, M_DRM,
-	    M_NOWAIT);
+			    M_WAITOK | M_NULLOK);
 	if (tempprivs == NULL) {
 		DRM_UNLOCK(dev);
 		return ENOMEM;
@@ -311,46 +282,19 @@ static int drm_clients_info DRM_SYSCTL_HANDLER_ARGS
 	DRM_UNLOCK(dev);
 
 	DRM_SYSCTL_PRINT(
-	    "\na dev            pid   uid      magic     ioctls\n");
+	    "\na dev            pid      magic     ioctls\n");
 	for (i = 0; i < privcount; i++) {
 		priv = &tempprivs[i];
-		DRM_SYSCTL_PRINT("%c %-12s %5d %5d %10u %10lu\n",
+		DRM_SYSCTL_PRINT("%c %-12s %5d %10u %10lu\n",
 			       priv->authenticated ? 'y' : 'n',
 			       devtoname(priv->dev->devnode),
 			       priv->pid,
-			       priv->uid,
 			       priv->magic,
-			       priv->ioctl_count);
+			       0UL);
 	}
 
 	SYSCTL_OUT(req, "", 1);
 done:
-	drm_free(tempprivs, M_DRM);
-	return retcode;
-}
-
-static int drm_vblank_info DRM_SYSCTL_HANDLER_ARGS
-{
-	struct drm_device *dev = arg1;
-	char buf[128];
-	int retcode;
-	int i;
-
-	DRM_SYSCTL_PRINT("\ncrtc ref count    last     enabled inmodeset\n");
-	DRM_LOCK(dev);
-	if (dev->_vblank_count == NULL)
-		goto done;
-	for (i = 0 ; i < dev->num_crtcs ; i++) {
-		DRM_SYSCTL_PRINT("  %02d  %02d %08d %08d %02d      %02d\n",
-		    i, dev->vblank_refcount[i].counter,
-		    dev->_vblank_count[i].counter,
-		    dev->last_vblank[i],
-		    dev->vblank_enabled[i],
-		    dev->vblank_inmodeset[i]);
-	}
-done:
-	DRM_UNLOCK(dev);
-
-	SYSCTL_OUT(req, "", -1);
+	kfree(tempprivs);
 	return retcode;
 }

@@ -31,9 +31,16 @@
 #include <link.h>
 #include <stddef.h>
 #include <string.h>
+#include "libc_private.h"
+
+struct dl_phdr_info build_phdr_info(void) __dso_hidden;
+void _rtld_thread_childfork(void);
+void _rtld_thread_init(void *);
+void _rtld_thread_postfork(void);
+void _rtld_thread_prefork(void);
+void _rtld_setthreaded(void);
 
 extern char **environ;
-void	_rtld_error(const char *, ...);
 
 static char sorry[] = "Service unavailable";
 
@@ -109,6 +116,13 @@ dlvsym(void *handle __unused,const char *name __unused,
 	return NULL;
 }
 
+#pragma weak _rtld_thread_init
+void
+_rtld_thread_init(void * li __unused)
+{
+	_rtld_error(sorry);
+}
+
 #pragma weak dlinfo
 int
 dlinfo(void *handle __unused, int request __unused, void *p __unused)
@@ -117,7 +131,7 @@ dlinfo(void *handle __unused, int request __unused, void *p __unused)
 	return 0;
 }
 
-__dso_hidden struct dl_phdr_info
+struct dl_phdr_info
 build_phdr_info(void)
 {
 	struct dl_phdr_info phdr_info;
@@ -135,15 +149,12 @@ build_phdr_info(void)
 		case AT_BASE:
 			phdr_info.dlpi_addr = (Elf_Addr) auxp->a_un.a_ptr;
 			break;
-
 		case AT_EXECPATH:
 			phdr_info.dlpi_name = (const char *) auxp->a_un.a_ptr;
 			break;
-
 		case AT_PHDR:
 			phdr_info.dlpi_phdr = (const Elf_Phdr *) auxp->a_un.a_ptr;
 			break;
-
 		case AT_PHNUM:
 			phdr_info.dlpi_phnum = (Elf_Half) auxp->a_un.a_val;
 			break;
@@ -154,7 +165,7 @@ build_phdr_info(void)
 	    if (phdr_info.dlpi_phdr[i].p_type == PT_TLS) {
 		phdr_info.dlpi_tls_modid = 1;
 		phdr_info.dlpi_tls_data =
-		  (void*) phdr_info.dlpi_phdr[i].p_vaddr;
+		  (void*)phdr_info.dlpi_phdr[i].p_vaddr;
 	    }
 
 	return (phdr_info);
@@ -179,8 +190,8 @@ dl_iterate_phdr(int (*callback)(struct dl_phdr_info *, size_t, void *),
 void *
 fdlopen(int fd __unused, int mode __unused)
 {
-        _rtld_error(sorry);
-        return NULL;
+	_rtld_error(sorry);
+	return NULL;
 }
 
 #pragma weak _rtld_addr_phdr
@@ -197,4 +208,28 @@ int
 _rtld_get_stack_prot(void)
 {
 	return (PROT_EXEC | PROT_READ | PROT_WRITE);
+}
+
+#pragma weak _rtld_thread_prefork
+void
+_rtld_thread_prefork(void)
+{
+}
+
+#pragma weak _rtld_thread_postfork
+void
+_rtld_thread_postfork(void)
+{
+}
+
+#pragma weak _rtld_thread_childfork
+void
+_rtld_thread_childfork(void)
+{
+}
+
+#pragma weak _rtld_setthreaded
+void
+_rtld_setthreaded(void)
+{
 }

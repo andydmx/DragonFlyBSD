@@ -69,6 +69,7 @@ static int	ffs_mount (struct mount *, char *, caddr_t, struct ucred *);
 static int	ffs_init (struct vfsconf *);
 
 static struct vfsops ufs_vfsops = {
+	.vfs_flags =		0,
 	.vfs_mount =    	ffs_mount,
 	.vfs_unmount =    	ffs_unmount,
 	.vfs_root =    		ufs_root,
@@ -264,7 +265,7 @@ ffs_mount(struct mount *mp,		/* mount struct pointer */
 			mp->mnt_flag &= ~MNT_ASYNC;
 		}
 		/* if not updating name...*/
-		if (args.fspec == 0) {
+		if (args.fspec == NULL) {
 			/*
 			 * Process export requests.  Jumping to "success"
 			 * will return the vfs_export() error code.
@@ -449,7 +450,6 @@ ffs_reload(struct mount *mp, struct ucred *cred)
 	void *space;
 	struct buf *bp;
 	struct fs *fs, *newfs;
-	struct partinfo dpart;
 	int i, blks, size, error;
 	struct scaninfo scaninfo;
 	int32_t *lp;
@@ -476,12 +476,6 @@ ffs_reload(struct mount *mp, struct ucred *cred)
 	/*
 	 * Step 2: re-read superblock from disk.
 	 */
-	if (VOP_IOCTL(devvp, DIOCGPART, (caddr_t)&dpart, FREAD,
-	    cred, NULL) != 0) {
-		size = DEV_BSIZE;
-	} else {
-		size = dpart.media_blksize;
-	}
 	if ((error = bread(devvp, SBOFF, SBSIZE, &bp)) != 0) {
 		brelse(bp);
 		return (error);
@@ -593,11 +587,11 @@ ffs_reload_scan2(struct mount *mp, struct vnode *vp, void *data)
 int
 ffs_mountfs(struct vnode *devvp, struct mount *mp, struct malloc_type *mtype)
 {
+	struct mount *mptmp;
 	struct ufsmount *ump;
 	struct buf *bp;
 	struct fs *fs;
 	cdev_t dev;
-	struct partinfo dpart;
 	void *space;
 	int error, i, blks, size, ronly;
 	int32_t *lp;
@@ -644,13 +638,6 @@ ffs_mountfs(struct vnode *devvp, struct mount *mp, struct malloc_type *mtype)
 	 */
 	if (devvp->v_object == NULL)
 		panic("ffs_reload: devvp has no VM object!");
-
-	if (VOP_IOCTL(devvp, DIOCGPART, (caddr_t)&dpart, FREAD,
-		      proc0.p_ucred, NULL) != 0) {
-		size = DEV_BSIZE;
-	} else {
-		size = dpart.media_blksize;
-	}
 
 	bp = NULL;
 	ump = NULL;
@@ -733,9 +720,12 @@ ffs_mountfs(struct vnode *devvp, struct mount *mp, struct malloc_type *mtype)
 	mp->mnt_data = (qaddr_t)ump;
 	mp->mnt_stat.f_fsid.val[0] = fs->fs_id[0];
 	mp->mnt_stat.f_fsid.val[1] = fs->fs_id[1];
-	if (fs->fs_id[0] == 0 || fs->fs_id[1] == 0 || 
-	    vfs_getvfs(&mp->mnt_stat.f_fsid)) 
+	if (fs->fs_id[0] == 0 || fs->fs_id[1] == 0) {
 		vfs_getnewfsid(mp);
+	} else if ((mptmp = vfs_getvfs(&mp->mnt_stat.f_fsid)) != NULL) {
+		vfs_getnewfsid(mp);
+		mount_drop(mptmp);
+	}
 	mp->mnt_maxsymlinklen = fs->fs_maxsymlinklen;
 	mp->mnt_flag |= MNT_LOCAL;
 	ump->um_mountp = mp;
@@ -819,8 +809,8 @@ ffs_oldfscompat(struct fs *fs)
 		int i;						/* XXX */
 		uint64_t sizepb = fs->fs_bsize;		/* XXX */
 								/* XXX */
-		fs->fs_maxfilesize = fs->fs_bsize * NDADDR - 1;	/* XXX */
-		for (i = 0; i < NIADDR; i++) {			/* XXX */
+		fs->fs_maxfilesize = fs->fs_bsize * UFS_NDADDR - 1; /* XXX */
+		for (i = 0; i < UFS_NIADDR; i++) {		/* XXX */
 			sizepb *= NINDIR(fs);			/* XXX */
 			fs->fs_maxfilesize += sizepb;		/* XXX */
 		}						/* XXX */
@@ -944,7 +934,7 @@ ffs_statfs(struct mount *mp, struct statfs *sbp, struct ucred *cred)
 	sbp->f_bfree = fs->fs_cstotal.cs_nbfree * fs->fs_frag +
 		fs->fs_cstotal.cs_nffree;
 	sbp->f_bavail = freespace(fs, fs->fs_minfree);
-	sbp->f_files =  fs->fs_ncg * fs->fs_ipg - ROOTINO;
+	sbp->f_files =  fs->fs_ncg * fs->fs_ipg - UFS_ROOTINO;
 	sbp->f_ffree = fs->fs_cstotal.cs_nifree;
 	if (sbp != &mp->mnt_stat) {
 		sbp->f_type = mp->mnt_vfc->vfc_typenum;
@@ -1202,7 +1192,9 @@ retry:
 	 * return a VX locked and refd vnode (VX == same as normal vget()
 	 * vnode so we are ok)
 	 */
+	vx_downgrade(vp);
 	*vpp = vp;
+
 	return (0);
 }
 
@@ -1225,7 +1217,7 @@ ffs_fhtovp(struct mount *mp, struct vnode *rootvp,
 
 	ufhp = (struct ufid *)fhp;
 	fs = VFSTOUFS(mp)->um_fs;
-	if (ufhp->ufid_ino < ROOTINO ||
+	if (ufhp->ufid_ino < UFS_ROOTINO ||
 	    ufhp->ufid_ino >= fs->fs_ncg * fs->fs_ipg)
 		return (ESTALE);
 	return (ufs_fhtovp(mp, rootvp, ufhp, vpp));

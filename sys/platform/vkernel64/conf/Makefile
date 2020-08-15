@@ -14,7 +14,15 @@ S=	../..
 
 # Override the normal kernel link and link as a normal user program
 #
-SYSTEM_LD= @${CC} ${DEBUG} ${PROF} -export-dynamic -o ${.TARGET} ${SYSTEM_OBJS} vers.o -pthread
+# Note that the vkernel requires .hash section to be present as the kernel
+# linker uses it to resolve its symbols.
+#
+# Additionally, the max-page-size is set to 0x200000 regardless of the ld
+# default setting.
+#
+SYSTEM_LD= @${CC} ${DEBUG} -Wl,--export-dynamic -o ${.TARGET} ${SYSTEM_OBJS} vers.o -pthread
+SYSTEM_LD+= -Wl,--hash-style=sysv
+SYSTEM_LD+= -Wl,-z,max-page-size=0x200000
 
 %BEFORE_DEPEND
 

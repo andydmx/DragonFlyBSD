@@ -53,6 +53,7 @@
 #include <sys/kernel.h>
 #include <sys/sysctl.h>
 #include <sys/unistd.h>
+#include <sys/lwp.h>
 
 #include <machine/clock.h>
 #include <machine/cpu.h>
@@ -78,6 +79,8 @@
 char machine[] = MACHINE;
 SYSCTL_STRING(_hw, HW_MACHINE, machine, CTLFLAG_RD,
 	      machine, 0, "Machine class");
+
+u_int cpu_vendor_id = 0;		/* XXX */
 
 /*
  * Finish a fork operation, with lwp lp2 nearly set up.
@@ -170,7 +173,7 @@ cpu_fork(struct lwp *lp1, struct lwp *lp2, int flags)
         /* Copy the LDT, if necessary. */
         if (pcb2->pcb_ldt != NULL) {
 		if (flags & RFMEM) {
-			pcb2->pcb_ldt->ldt_refcnt++;
+			atomic_add_int(&pcb2->pcb_ldt->ldt_refcnt, 1);
 		} else {
 			pcb2->pcb_ldt = user_ldt_alloc(pcb2,
 				pcb2->pcb_ldt->ldt_len);
@@ -199,10 +202,10 @@ cpu_prepare_lwp(struct lwp *lp, struct lwp_params *params)
 	void *bad_return = NULL;
 	int error;
 
-	regs->tf_rip = (long)params->func;
-	regs->tf_rsp = (long)params->stack;
+	regs->tf_rip = (long)params->lwp_func;
+	regs->tf_rsp = (long)params->lwp_stack;
 	/* Set up argument for function call */
-	regs->tf_rdi = (long)params->arg; /* JG Can this be in userspace addresses? */
+	regs->tf_rdi = (long)params->lwp_arg; /* JG Can this be in userspace addresses? */
 	/*
 	 * Set up fake return address.  As the lwp function may never return,
 	 * we simply copy out a NULL pointer and force the lwp to receive
@@ -256,7 +259,7 @@ cpu_lwp_exit(void)
 
 	pcb = td->td_pcb;
 
-	/* Some i386 functionality was dropped */
+	/* Some x86 functionality was dropped */
 	KKASSERT(pcb->pcb_ext == NULL);
 
 	/*
@@ -295,18 +298,6 @@ cpu_thread_exit(void)
 	panic("cpu_thread_exit: lwkt_switch() unexpectedly returned");
 }
 
-int
-grow_stack(struct proc *p, u_long sp)
-{
-	int rv;
-
-	rv = vm_map_growstack (p, sp);
-	if (rv != KERN_SUCCESS)
-		return (0);
-
-	return (1);
-}
-
 /*
  * Used by /dev/kmem to determine if we can safely read or write
  * the requested KVA range.  Some portions of kernel memory are
@@ -320,14 +311,16 @@ kvm_access_check(vm_offset_t saddr, vm_offset_t eaddr, int prot)
 {
 	vm_offset_t addr;
 
-	if (saddr >= trunc_page((vm_offset_t)&_start) && eaddr <= round_page((vm_offset_t)&_end))
+	if (saddr >= trunc_page((vm_offset_t)&_start) &&
+	    eaddr <= round_page((vm_offset_t)&_end)) {
 		return 0;
+	}
 	if (saddr < KvaStart)
 		return EFAULT;
 	if (eaddr >= KvaEnd)
 		return EFAULT;
 	for (addr = saddr; addr < eaddr; addr += PAGE_SIZE)  {
-		if (pmap_extract(&kernel_pmap, addr) == 0)
+		if (pmap_kextract(addr) == 0)
 			return EFAULT;
 	}
 	if (!kernacc((caddr_t)saddr, eaddr - saddr, prot))

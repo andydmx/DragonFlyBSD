@@ -53,7 +53,7 @@
 #include <sys/vnode.h>
 #include <sys/sysent.h>
 #include <sys/reboot.h>
-#include <sys/sysproto.h>
+#include <sys/sysmsg.h>
 #include <sys/vmmeter.h>
 #include <sys/unistd.h>
 #include <sys/malloc.h>
@@ -62,9 +62,7 @@
 #include <sys/refcount.h>
 #include <sys/file2.h>
 #include <sys/thread2.h>
-#include <sys/sysref2.h>
 #include <sys/spinlock2.h>
-#include <sys/mplock2.h>
 
 #include <machine/cpu.h>
 
@@ -74,7 +72,6 @@
 #include <vm/pmap.h>
 #include <vm/vm_map.h>
 #include <vm/vm_extern.h>
-#include <sys/user.h>
 #include <sys/copyright.h>
 
 int vfs_mountroot_devfs(void);
@@ -101,15 +98,16 @@ extern	struct user *proc0paddr;
 int	boothowto = 0;		/* initialized so that it can be patched */
 SYSCTL_INT(_debug, OID_AUTO, boothowto, CTLFLAG_RD, &boothowto, 0,
     "Reboot flags, from console subsystem");
-SYSCTL_ULONG(_kern, OID_AUTO, usched_global_cpumask, CTLFLAG_RW,
-    &usched_global_cpumask, 0, "global user scheduler cpumask");
+SYSCTL_OPAQUE(_kern, OID_AUTO, usched_global_cpumask, CTLFLAG_RW,
+    &usched_global_cpumask, sizeof(usched_global_cpumask), "LU",
+    "global user scheduler cpumask");
 
 /*
  * This ensures that there is at least one entry so that the sysinit_set
  * symbol is not undefined.  A subsystem ID of SI_SPECIAL_DUMMY is never
  * executed.
  */
-SYSINIT(placeholder, SI_SPECIAL_DUMMY, SI_ORDER_ANY, NULL, NULL)
+SYSINIT(placeholder, SI_SPECIAL_DUMMY, SI_ORDER_ANY, NULL, NULL);
 
 /*
  * The sysinit table itself.  Items are checked off as the are run.
@@ -168,13 +166,15 @@ mi_proc0init(struct globaldata *gd, struct user *proc0paddr)
 	RB_INIT(&proc0.p_lwp_tree);
 	spin_init(&proc0.p_spin, "iproc_proc0");
 	lwkt_token_init(&proc0.p_token, "iproc");
-	proc0.p_lasttid = 0;	/* +1 = next TID */
+	lwp0.lwp_tid = 1;
+	proc0.p_lasttid = lwp0.lwp_tid;	/* +1 = next TID */
 	lwp_rb_tree_RB_INSERT(&proc0.p_lwp_tree, &lwp0);
 	lwp0.lwp_thread = &thread0;
 	lwp0.lwp_proc = &proc0;
 	proc0.p_usched = usched_init();
 	CPUMASK_ASSALLONES(lwp0.lwp_cpumask);
 	lwkt_token_init(&lwp0.lwp_token, "lwp_token");
+	TAILQ_INIT(&lwp0.lwp_lpmap_backing_list);
 	spin_init(&lwp0.lwp_spin, "iproc_lwp0");
 	varsymset_init(&proc0.p_varsymset, NULL);
 	thread0.td_flags |= TDF_RUNNING;
@@ -295,7 +295,7 @@ print_caddr_t(void *data)
 {
 	kprintf("%s", (char *)data);
 }
-SYSINIT(announce, SI_BOOT1_COPYRIGHT, SI_ORDER_FIRST, print_caddr_t, copyright)
+SYSINIT(announce, SI_BOOT1_COPYRIGHT, SI_ORDER_FIRST, print_caddr_t, copyright);
 
 /*
  * Leave the critical section that protected us from spurious interrupts
@@ -313,7 +313,7 @@ leavecrit(void *dummy __unused)
 	if (bootverbose)
 		kprintf("Leaving critical section, allowing interrupts\n");
 }
-SYSINIT(leavecrit, SI_BOOT2_LEAVE_CRIT, SI_ORDER_ANY, leavecrit, NULL)
+SYSINIT(leavecrit, SI_BOOT2_LEAVE_CRIT, SI_ORDER_ANY, leavecrit, NULL);
 
 /*
  * This is called after the threading system is up and running,
@@ -324,7 +324,7 @@ tsleepworks(void *dummy __unused)
 {
 	tsleep_now_works = 1;
 }
-SYSINIT(tsleepworks, SI_BOOT2_FINISH_SMP, SI_ORDER_SECOND, tsleepworks, NULL)
+SYSINIT(tsleepworks, SI_BOOT2_FINISH_SMP, SI_ORDER_SECOND, tsleepworks, NULL);
 
 /*
  * This is called after devices have configured.  Tell the kernel we are
@@ -335,7 +335,7 @@ endofcoldboot(void *dummy __unused)
 {
 	cold = 0;
 }
-SYSINIT(endofcoldboot, SI_SUB_ISWARM, SI_ORDER_ANY, endofcoldboot, NULL)
+SYSINIT(endofcoldboot, SI_SUB_ISWARM, SI_ORDER_ANY, endofcoldboot, NULL);
 
 /*
  ***************************************************************************
@@ -356,6 +356,7 @@ proc0_init(void *dummy __unused)
 {
 	struct proc *p;
 	struct lwp *lp;
+	struct uidinfo *uip;
 
 	p = &proc0;
 	lp = &lwp0;
@@ -411,10 +412,12 @@ proc0_init(void *dummy __unused)
 	bcopy("swapper", thread0.td_comm, sizeof ("swapper"));
 
 	/* Create credentials. */
+	uip = uicreate(0);	/* for cr_ruidinfo */
+	uihold(uip);		/* for cr_uidinfo */
 	p->p_ucred = crget();
-	p->p_ucred->cr_ruidinfo = uifind(0);
+	p->p_ucred->cr_ruidinfo = uip;
+	p->p_ucred->cr_uidinfo = uip;
 	p->p_ucred->cr_ngroups = 1;	/* group 0 */
-	p->p_ucred->cr_uidinfo = uifind(0);
 	thread0.td_ucred = crhold(p->p_ucred);	/* bootstrap fork1() */
 
 	/* Don't jail it */
@@ -452,7 +455,7 @@ proc0_init(void *dummy __unused)
 	(void)chgproccnt(p->p_ucred->cr_uidinfo, 1, 0);
 	vm_init_limits(p);
 }
-SYSINIT(p0init, SI_BOOT2_PROC0, SI_ORDER_FIRST, proc0_init, NULL)
+SYSINIT(p0init, SI_BOOT2_PROC0, SI_ORDER_FIRST, proc0_init, NULL);
 
 static int proc0_post_callback(struct proc *p, void *data __unused);
 
@@ -466,7 +469,7 @@ proc0_post(void *dummy __unused)
 	 * Now we can look at the time, having had a chance to verify the
 	 * time from the file system.  Pretend that proc0 started now.
 	 */
-	allproc_scan(proc0_post_callback, NULL);
+	allproc_scan(proc0_post_callback, NULL, 0);
 
 	/*
 	 * Give the ``random'' number generator a thump.
@@ -483,7 +486,7 @@ proc0_post_callback(struct proc *p, void *data __unused)
 	return(0);
 }
 
-SYSINIT(p0post, SI_SUB_PROC0_POST, SI_ORDER_FIRST, proc0_post, NULL)
+SYSINIT(p0post, SI_SUB_PROC0_POST, SI_ORDER_FIRST, proc0_post, NULL);
 
 /*
  ***************************************************************************
@@ -535,6 +538,7 @@ static void
 start_init(void *dummy, struct trapframe *frame)
 {
 	vm_offset_t addr;
+	struct sysmsg sysmsg;
 	struct execve_args args;
 	int options, error;
 	char *var, *path, *next, *s;
@@ -552,11 +556,6 @@ start_init(void *dummy, struct trapframe *frame)
 	if (env != NULL)
 		strlcpy(kernelname, env, sizeof(kernelname));
 
-	/*
-	 * The MP lock is not held on entry.  We release it before
-	 * returning to userland.
-	 */
-	get_mplock();
 	p = curproc;
 
 	lp = ONLY_LWP_IN_PROC(p);
@@ -587,13 +586,13 @@ start_init(void *dummy, struct trapframe *frame)
 	addr = trunc_page(USRSTACK - PAGE_SIZE);
 	error = vm_map_find(&p->p_vmspace->vm_map, NULL, NULL,
 			    0, &addr, PAGE_SIZE,
-			    PAGE_SIZE,
-			    FALSE, VM_MAPTYPE_NORMAL,
+			    PAGE_SIZE, FALSE,
+			    VM_MAPTYPE_NORMAL, VM_SUBSYS_INIT,
 			    VM_PROT_ALL, VM_PROT_ALL, 0);
 	if (error)
 		panic("init: couldn't allocate argument space");
 	p->p_vmspace->vm_maxsaddr = (caddr_t)addr;
-	p->p_vmspace->vm_ssize = 1;
+	p->p_vmspace->vm_ssize = PAGE_SIZE;
 
 	if ((var = kgetenv("init_path")) != NULL) {
 		strncpy(init_path, var, sizeof init_path);
@@ -648,14 +647,18 @@ start_init(void *dummy, struct trapframe *frame)
 		/*
 		 * Move out the arg pointers.
 		 */
-		uap = (char **)((intptr_t)ucp & ~(sizeof(intptr_t)-1));
-		(void)suword((caddr_t)--uap, (long)0);	/* terminator */
-		(void)suword((caddr_t)--uap, (long)(intptr_t)arg1);
-		(void)suword((caddr_t)--uap, (long)(intptr_t)arg0);
+		uap = (char **)(rounddown2((intptr_t)ucp, sizeof(intptr_t)));
+
+		/* terminator */
+		suword64((uint64_t *)(caddr_t)--uap, (uint64_t)0);
+
+		suword64((uint64_t *)(caddr_t)--uap, (uint64_t)(intptr_t)arg1);
+		suword64((uint64_t *)(caddr_t)--uap, (uint64_t)(intptr_t)arg0);
 
 		/*
 		 * Point at the arguments.
 		 */
+		bzero(&sysmsg, sizeof(sysmsg));
 		args.fname = arg0;
 		args.argv = uap;
 		args.envv = NULL;
@@ -672,8 +675,7 @@ start_init(void *dummy, struct trapframe *frame)
 		 * MP lock will migrate with us though so we still have to
 		 * release it.
 		 */
-		if ((error = sys_execve(&args)) == 0) {
-			rel_mplock();
+		if ((error = sys_execve(&sysmsg, &args)) == 0) {
 			lp->lwp_proc->p_usched->acquire_curproc(lp);
 			return;
 		}
@@ -708,7 +710,7 @@ create_init(const void *udata __unused)
 	cpu_set_fork_handler(lp, start_init, NULL);
 	crit_exit();
 }
-SYSINIT(init, SI_SUB_CREATE_INIT, SI_ORDER_FIRST, create_init, NULL)
+SYSINIT(init, SI_SUB_CREATE_INIT, SI_ORDER_FIRST, create_init, NULL);
 
 /*
  * Make it runnable now.
@@ -718,7 +720,7 @@ kick_init(const void *udata __unused)
 {
 	start_forked_proc(&lwp0, initproc);
 }
-SYSINIT(kickinit, SI_SUB_KTHREAD_INIT, SI_ORDER_FIRST, kick_init, NULL)
+SYSINIT(kickinit, SI_SUB_KTHREAD_INIT, SI_ORDER_FIRST, kick_init, NULL);
 
 static void
 kpmap_init(const void *udata __unused)
@@ -738,9 +740,11 @@ kpmap_init(const void *udata __unused)
 	kpmap->header[4].offset = offsetof(struct sys_kpmap, tsc_freq);
 	kpmap->header[5].type = KPTYPE_TICK_FREQ;
 	kpmap->header[5].offset = offsetof(struct sys_kpmap, tick_freq);
+	kpmap->header[6].type = KPTYPE_FAST_GTOD;
+	kpmap->header[6].offset = offsetof(struct sys_kpmap, fast_gtod);
 	kpmap->version = KPMAP_VERSION;
 }
-SYSINIT(kpmapinit, SI_BOOT1_POST, SI_ORDER_FIRST, kpmap_init, NULL)
+SYSINIT(kpmapinit, SI_BOOT1_POST, SI_ORDER_FIRST, kpmap_init, NULL);
 
 /*
  * Machine independant globaldata initialization
@@ -754,9 +758,16 @@ mi_gdinit(struct globaldata *gd, int cpuid)
 	gd->gd_sysid_alloc = cpuid;	/* prime low bits for cpu lookup */
 	gd->gd_cpuid = cpuid;
 	CPUMASK_ASSBIT(gd->gd_cpumask, cpuid);
+	gd->gd_cpumask_simple = CPUMASK_SIMPLE(cpuid);
+	gd->gd_cpumask_offset = (uintptr_t)CPUMASK_ADDR(*(cpumask_t *)0, cpuid);
 	lwkt_gdinit(gd);
 	vm_map_entry_reserve_cpu_init(gd);
-	sleep_gdinit(gd);
+	if (gd->gd_cpuid == 0)
+		sleep_early_gdinit(gd);
+	else
+		sleep_gdinit(gd);
+	slab_gdinit(gd);
 	ATOMIC_CPUMASK_ORBIT(usched_global_cpumask, cpuid);
+	gd->gd_vmstats = vmstats;
 }
 

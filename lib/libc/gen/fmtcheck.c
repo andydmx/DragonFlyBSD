@@ -34,14 +34,13 @@
  *
  * $NetBSD: fmtcheck.c,v 1.2 2000/11/01 01:17:20 briggs Exp $
  * $FreeBSD: src/lib/libc/gen/fmtcheck.c,v 1.9 2008/08/02 06:02:42 das Exp $
- * $DragonFly: src/lib/libc/gen/fmtcheck.c,v 1.3 2003/08/22 19:31:21 asmodai Exp $
  */
 
 #include <stdio.h>
 #include <string.h>
 #include <ctype.h>
 
-__weak_reference(__fmtcheck, fmtcheck);
+const char *__fmtcheck(const char *, const char *);
 
 enum __e_fmtcheck_types {
 	FMTCHECK_START,
@@ -329,3 +328,5 @@ __fmtcheck(const char *f1, const char *f2)
 	}
 	return f1;
 }
+
+__weak_reference(__fmtcheck, fmtcheck);

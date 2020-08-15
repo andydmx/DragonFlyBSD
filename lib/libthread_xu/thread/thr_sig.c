@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 1995-1998 John Birrell <jb@cimlogic.com.au>
+ * Copyright (c) 2005, David Xu <davidxu@freebsd.org>
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -10,33 +10,23 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by John Birrell.
- * 4. Neither the name of the author nor the names of any co-contributors
- *    may be used to endorse or promote products derived from this software
- *    without specific prior written permission.
  *
- * THIS SOFTWARE IS PROVIDED BY JOHN BIRRELL AND CONTRIBUTORS ``AS IS'' AND
- * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
- * ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE
- * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
- * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
- * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
- * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
- * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
- * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
- * SUCH DAMAGE.
+ * THIS SOFTWARE IS PROVIDED BY THE AUTHOR ``AS IS'' AND ANY EXPRESS OR
+ * IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+ * OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+ * IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY DIRECT, INDIRECT,
+ * INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT
+ * NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+ * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+ * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
+ * THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
- * $DragonFly: src/lib/libthread_xu/thread/thr_sig.c,v 1.7 2006/04/06 13:03:09 davidxu Exp $
  */
 
 #include "namespace.h"
 #include <sys/signalvar.h>
-
 #include <machine/tls.h>
-
 #include <signal.h>
 #include <errno.h>
 #include <string.h>
@@ -44,6 +34,11 @@
 #include "un-namespace.h"
 
 #include "thr_private.h"
+
+#if defined(_PTHREADS_DEBUGGING) || defined(_PTHREADS_DEBUGGING2)
+#include <sys/file.h>
+#include <stdio.h>
+#endif
 
 /* #define DEBUG_SIGNAL */
 #ifdef DEBUG_SIGNAL
@@ -56,6 +51,10 @@ int	__sigwait(const sigset_t *set, int *sig);
 int	__sigwaitinfo(const sigset_t *set, siginfo_t *info);
 int	__sigtimedwait(const sigset_t *set, siginfo_t *info,
 		const struct timespec * timeout);
+
+#if defined(_PTHREADS_DEBUGGING) || defined(_PTHREADS_DEBUGGING2)
+static void _thr_debug_sig(int signo);
+#endif
 
 static void
 sigcancel_handler(int sig __unused, siginfo_t *info __unused,
@@ -102,7 +101,7 @@ _thr_suspend_check(struct pthread *curthread)
 		cycle = curthread->cycle;
 
 		/* Wake the thread suspending us. */
-		_thr_umtx_wake(&curthread->cycle, INT_MAX);
+		_thr_umtx_wake(&curthread->cycle, 0);
 
 		/*
 		 * if we are from pthread_exit, we don't want to
@@ -132,6 +131,17 @@ _thr_signal_init(void)
 	act.sa_flags = SA_SIGINFO | SA_RESTART;
 	act.sa_sigaction = (__siginfohandler_t *)&sigcancel_handler;
 	__sys_sigaction(SIGCANCEL, &act, NULL);
+
+#if defined(_PTHREADS_DEBUGGING) || defined(_PTHREADS_DEBUGGING2)
+	/*
+	 * If enabled, rwlock, mutex, and condition variable operations
+	 * are recorded in a text buffer and signal 63 dumps the buffer
+	 * to /tmp/cond${pid}.log.
+	 */
+	act.sa_flags = SA_RESTART;
+	act.sa_handler = _thr_debug_sig;
+	__sys_sigaction(63, &act, NULL);
+#endif
 }
 
 void
@@ -270,3 +280,74 @@ __sigwait(const sigset_t *set, int *sig)
 
 __strong_reference(__sigwait, sigwait);
 
+#if defined(_PTHREADS_DEBUGGING) || defined(_PTHREADS_DEBUGGING2)
+
+#define LOGBUF_SIZE	(4 * 1024 * 1024)
+#define LOGBUF_MASK	(LOGBUF_SIZE - 1)
+
+char LogBuf[LOGBUF_SIZE];
+unsigned long LogWIndex;
+
+void
+_thr_log(const char *buf, size_t bytes)
+{
+	struct pthread *curthread;
+	unsigned long i;
+	char prefix[32];
+	size_t plen;
+
+	curthread = tls_get_curthread();
+	if (curthread) {
+		plen = snprintf(prefix, sizeof(prefix), "%d.%d: ",
+				(int)__sys_getpid(),
+				curthread->tid);
+	} else {
+		plen = snprintf(prefix, sizeof(prefix), "unknown: ");
+	}
+
+	if (bytes == 0)
+		bytes = strlen(buf);
+	i = atomic_fetchadd_long(&LogWIndex, plen + bytes);
+	i = i & LOGBUF_MASK;
+	if (plen <= (size_t)(LOGBUF_SIZE - i)) {
+		bcopy(prefix, LogBuf + i, plen);
+	} else {
+		bcopy(prefix, LogBuf + i, LOGBUF_SIZE - i);
+		plen -= LOGBUF_SIZE - i;
+		bcopy(prefix, LogBuf, plen);
+	}
+
+	i += plen;
+	i = i & LOGBUF_MASK;
+	if (bytes <= (size_t)(LOGBUF_SIZE - i)) {
+		bcopy(buf, LogBuf + i, bytes);
+	} else {
+		bcopy(buf, LogBuf + i, LOGBUF_SIZE - i);
+		bytes -= LOGBUF_SIZE - i;
+		bcopy(buf, LogBuf, bytes);
+	}
+}
+
+static void
+_thr_debug_sig(int signo __unused)
+{
+        char buf[256];
+	int fd;
+	unsigned long i;
+
+	snprintf(buf, sizeof(buf), "/tmp/cond%d.log", (int)__sys_getpid());
+	fd = open(buf, O_RDWR|O_CREAT|O_TRUNC|O_CLOEXEC, 0666);
+	if (fd >= 0) {
+		i = LogWIndex;
+		if (i < LOGBUF_SIZE) {
+			write(fd, LogBuf, i);
+		} else {
+			i &= LOGBUF_MASK;
+			write(fd, LogBuf + i, LOGBUF_SIZE - i);
+			write(fd, LogBuf, i);
+		}
+		close(fd);
+	}
+}
+
+#endif

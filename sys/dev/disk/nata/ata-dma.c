@@ -24,7 +24,6 @@
  * THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  * $FreeBSD: src/sys/dev/ata/ata-dma.c,v 1.147 2007/04/08 21:53:52 sos Exp $
- * $DragonFly: src/sys/dev/disk/nata/ata-dma.c,v 1.5 2007/07/23 19:26:09 dillon Exp $
  */
 
 #include "opt_ata.h"
@@ -40,7 +39,6 @@
 #include <machine/bus_dma.h>
 
 #include "ata-all.h"
-#include "ata-pci.h"
 #include "ata_if.h"
 
 /* prototypes */
@@ -74,8 +72,8 @@ ata_dmainit(device_t dev)
     ch->dma->load = ata_dmaload;
     ch->dma->unload = ata_dmaunload;
     ch->dma->alignment = 2;
-    ch->dma->boundary = 128 * DEV_BSIZE;
-    ch->dma->segsize = 128 * DEV_BSIZE;
+    ch->dma->boundary = 256 * 256;
+    ch->dma->segsize = 256 * 256;
     ch->dma->max_iosize = 128 * DEV_BSIZE;
     ch->dma->max_address = BUS_SPACE_MAXADDR_32BIT;
 }
@@ -213,6 +211,7 @@ ata_dmasetprd(void *xsc, bus_dma_segment_t *segs, int nsegs, int error)
 	prd[i].count = htole32(segs[i].ds_len);
     }
     prd[i - 1].count |= htole32(ATA_DMA_EOT);
+    KASSERT(nsegs <= ATA_DMA_ENTRIES, ("too many DMA segment entries\n"));
     args->nsegs = nsegs;
 }
 
@@ -266,7 +265,7 @@ ata_dmaload(device_t dev, caddr_t data, int32_t count, int dir,
     return 0;
 }
 
-int
+static int
 ata_dmaunload(device_t dev)
 {
     struct ata_channel *ch = device_get_softc(dev);

@@ -28,14 +28,13 @@
  */
 
 /*
- * 6.5 : Interrupt handling
+ * Interrupt Handling
  */
 
 #include <sys/param.h>
 #include <sys/kernel.h>
 #include <sys/bus.h>
 #include <sys/rman.h>
-#include <sys/thread2.h>
 #include <sys/machintr.h>
  
 #include "acpi.h"
@@ -101,7 +100,7 @@ AcpiOsInstallInterruptHandler(UINT32 InterruptNumber,
 	device_printf(sc->acpi_dev, "could not allocate interrupt\n");
 	goto error;
     }
-    if (bus_setup_intr(sc->acpi_dev, sc->acpi_irq, 0,
+    if (bus_setup_intr(sc->acpi_dev, sc->acpi_irq, INTR_MPSAFE,
 		    InterruptWrapper, Context, &sc->acpi_irq_handle, NULL)) {
 	device_printf(sc->acpi_dev, "could not set up interrupt\n");
 	goto error;
@@ -132,9 +131,7 @@ AcpiOsRemoveInterruptHandler(UINT32 InterruptNumber, ACPI_OSD_HANDLER ServiceRou
     if (!acpi_sci_enabled())
 	return_ACPI_STATUS (AE_OK);
 
-    if (InterruptNumber < 0 || InterruptNumber > 255)
-	return_ACPI_STATUS (AE_BAD_PARAMETER);
-    if (ServiceRoutine == NULL)
+    if (InterruptNumber > 255 || ServiceRoutine == NULL)
 	return_ACPI_STATUS (AE_BAD_PARAMETER);
 
     if ((sc = devclass_get_softc(devclass_find("acpi"), 0)) == NULL)
@@ -156,7 +153,7 @@ AcpiOsRemoveInterruptHandler(UINT32 InterruptNumber, ACPI_OSD_HANDLER ServiceRou
 static void
 InterruptWrapper(void *arg)
 {
-    crit_enter();
+    lwkt_gettoken(&acpi_token);
     InterruptHandler(arg);
-    crit_exit();
+    lwkt_reltoken(&acpi_token);
 }

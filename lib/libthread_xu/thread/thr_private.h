@@ -1,5 +1,8 @@
 /*
+ * Copyright (C) 2005 Daniel M. Eischen <deischen@freebsd.org>
+ * Copyright (c) 2005 David Xu <davidxu@freebsd.org>
  * Copyright (c) 1995-1998 John Birrell <jb@cimlogic.com.au>.
+ *
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -10,28 +13,23 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by John Birrell.
- * 4. Neither the name of the author nor the names of any co-contributors
- *    may be used to endorse or promote products derived from this software
- *    without specific prior written permission.
  *
- * THIS SOFTWARE IS PROVIDED BY JOHN BIRRELL AND CONTRIBUTORS ``AS IS'' AND
- * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
- * ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE
- * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
- * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
- * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
- * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
- * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
- * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
- * SUCH DAMAGE.
- *
- * Private thread definitions for the uthread kernel.
+ * THIS SOFTWARE IS PROVIDED BY THE AUTHOR ``AS IS'' AND ANY EXPRESS OR
+ * IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+ * OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+ * IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY DIRECT, INDIRECT,
+ * INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT
+ * NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+ * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+ * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
+ * THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  * $FreeBSD: head/lib/libthr/thread/thr_private.h 217706 2010-08-23 $
+ */
+
+/*
+ * Private thread definitions for the uthread kernel.
  */
 
 #ifndef _THR_PRIVATE_H
@@ -45,15 +43,21 @@
 #include <sys/cdefs.h>
 #include <sys/queue.h>
 #include <sys/rtprio.h>
+#include <sys/mman.h>
 #include <machine/atomic.h>
 #include <errno.h>
 #include <limits.h>
 #include <signal.h>
-#include <stdio.h>
+#include <sys/cpumask.h>
 #include <sys/sched.h>
+#include <stdarg.h>
 #include <unistd.h>
 #include <pthread.h>
 #include <pthread_np.h>
+
+#if defined(_PTHREADS_DEBUGGING) || defined(_PTHREADS_DEBUGGING2)
+void	_thr_log(const char *buf, size_t bytes);
+#endif
 
 #include "pthread_md.h"
 #include "thr_umtx.h"
@@ -65,7 +69,7 @@
 /*
  * Kernel fatal error handler macro.
  */
-#define PANIC(string)		_thread_exit(__FILE__,__LINE__,string)
+#define PANIC(args...)		_thread_exitf(__FILE__, __LINE__, ##args)
 
 /* Output debug messages like this: */
 #define stdout_debug(args...)	_thread_printf(STDOUT_FILENO, ##args)
@@ -81,39 +85,22 @@
 #endif
 
 #ifdef PIC
-#define	STATIC_LIB_REQUIRE(name)
+#define STATIC_LIB_REQUIRE(name)
 #else
 #define STATIC_LIB_REQUIRE(name)	__asm(".globl " #name)
 #endif
 
-TAILQ_HEAD(thread_head, pthread)	thread_head;
-TAILQ_HEAD(atfork_head, pthread_atfork)	atfork_head;
-
-#define	TIMESPEC_ADD(dst, src, val)				\
-	do { 							\
-		(dst)->tv_sec = (src)->tv_sec + (val)->tv_sec;	\
-		(dst)->tv_nsec = (src)->tv_nsec + (val)->tv_nsec; \
-		if ((dst)->tv_nsec >= 1000000000) {		\
-			(dst)->tv_sec++;			\
-			(dst)->tv_nsec -= 1000000000;		\
-		}						\
-	} while (0)
-
-#define	TIMESPEC_SUB(dst, src, val)				\
-	do { 							\
-		(dst)->tv_sec = (src)->tv_sec - (val)->tv_sec;	\
-		(dst)->tv_nsec = (src)->tv_nsec - (val)->tv_nsec; \
-		if ((dst)->tv_nsec < 0) {			\
-			(dst)->tv_sec--;			\
-			(dst)->tv_nsec += 1000000000;		\
-		}						\
-	} while (0)
+typedef TAILQ_HEAD(thread_head, pthread)	thread_head;
+typedef TAILQ_HEAD(atfork_head, pthread_atfork)	atfork_head;
 
 struct pthread_mutex {
 	/*
 	 * Lock for accesses to this structure.
 	 */
 	volatile umtx_t			m_lock;
+#ifdef _PTHREADS_DEBUGGING2
+	int				m_lastop[32];
+#endif
 	enum pthread_mutextype		m_type;
 	int				m_protocol;
 	TAILQ_HEAD(mutex_head, pthread)	m_queue;
@@ -123,15 +110,15 @@ struct pthread_mutex {
 	int				m_refcount;
 
 	/*
-	 * Used for priority inheritence and protection.
+	 * Used for priority inheritance and protection.
 	 *
-	 *   m_prio       - For priority inheritence, the highest active
-	 *                  priority (threads locking the mutex inherit
-	 *                  this priority).  For priority protection, the
-	 *                  ceiling priority of this mutex.
+	 *   m_prio       - For priority inheritance, the highest active
+	 *		    priority (threads locking the mutex inherit
+	 *		    this priority).  For priority protection, the
+	 *		    ceiling priority of this mutex.
 	 *   m_saved_prio - mutex owners inherited priority before
-	 *                  taking the mutex, restored when the owner
-	 *                  unlocks the mutex.
+	 *		    taking the mutex, restored when the owner
+	 *		    unlocks the mutex.
 	 */
 	int				m_prio;
 	int				m_saved_prio;
@@ -144,11 +131,15 @@ struct pthread_mutex {
 
 #define TAILQ_INITIALIZER	{ NULL, NULL }
 
-#define PTHREAD_MUTEX_STATIC_INITIALIZER   \
-	{0, PTHREAD_MUTEX_DEFAULT, PTHREAD_PRIO_NONE, TAILQ_INITIALIZER, \
-	NULL, { NULL }, MUTEX_FLAGS_PRIVATE, 0, 0, 0, TAILQ_INITIALIZER }
+#define PTHREAD_MUTEX_STATIC_INITIALIZER   		\
+	{	.m_lock = 0,				\
+		.m_type = PTHREAD_MUTEX_DEFAULT,	\
+		.m_protocol = PTHREAD_PRIO_NONE,	\
+		.m_queue = TAILQ_INITIALIZER,		\
+		.m_flags = MUTEX_FLAGS_PRIVATE		\
+	}
 /*
- * Flags for mutexes. 
+ * Flags for mutexes.
  */
 #define MUTEX_FLAGS_PRIVATE	0x01
 #define MUTEX_FLAGS_INITED	0x02
@@ -163,16 +154,17 @@ struct pthread_mutex_attr {
 #define PTHREAD_MUTEXATTR_STATIC_INITIALIZER \
 	{ PTHREAD_MUTEX_DEFAULT, PTHREAD_PRIO_NONE, 0, MUTEX_FLAGS_PRIVATE }
 
+struct cond_cancel_info;
+
 struct pthread_cond {
 	/*
 	 * Lock for accesses to this structure.
 	 */
 	volatile umtx_t	c_lock;
-	volatile umtx_t	c_seqno;
-	volatile int	c_waiters;
-	volatile int	c_broadcast;
+	volatile int	c_unused01;
 	int		c_pshared;
 	int		c_clockid;
+	TAILQ_HEAD(, cond_cancel_info)	c_waitlist;
 };
 
 struct pthread_cond_attr {
@@ -239,10 +231,12 @@ struct pthread_attr {
 	int	prio;
 	int	suspend;
 #define	THR_STACK_USER		0x100	/* 0xFF reserved for <pthread.h> */
+#define THR_CPUMASK		0x200	/* cpumask is valid */
 	int	flags;
 	void	*stackaddr_attr;
 	size_t	stacksize_attr;
 	size_t	guardsize_attr;
+	cpumask_t cpumask;
 };
 
 /*
@@ -314,7 +308,7 @@ struct pthread_key {
 	volatile int	allocated;
 	volatile int	count;
 	int		seqno;
-	void            (*destructor)(void *);
+	void		(*destructor)(void *);
 };
 
 /*
@@ -376,8 +370,8 @@ struct pthread {
 	void			*arg;
 	struct pthread_attr	attr;
 
- 	/*
-	 * Cancelability flags 
+	/*
+	 * Cancelability flags
 	 */
 #define	THR_CANCEL_DISABLE		0x0001
 #define	THR_CANCEL_EXITING		0x0002
@@ -439,7 +433,7 @@ struct pthread {
 
 	/*
 	 * Inherited priority is the priority a thread inherits by
-	 * taking a priority inheritence or protection mutex.  It
+	 * taking a priority inheritance or protection mutex.  It
 	 * is not affected by base priority changes.  Inherited
 	 * priority defaults to and remains 0 until a mutex is taken
 	 * that is being waited on by any other thread whose priority
@@ -476,14 +470,14 @@ struct pthread {
 	struct tls_tcb		*tcb;
 
 	/* Cleanup handlers Link List */
-	struct pthread_cleanup *cleanup;
+	struct pthread_cleanup	*cleanup;
 
 	/* Enable event reporting */
 	int			report_events;
-	
+
 	/* Event mask */
 	td_thr_events_t		event_mask;
-	
+
 	/* Event */
 	td_event_msg_t		event_buf;
 };
@@ -492,22 +486,45 @@ struct pthread {
 	(((thrd)->locklevel > 0) ||			\
 	((thrd)->critical_count > 0))
 
+/*
+ * Internal temporary locks without suspend check
+ */
 #define THR_UMTX_TRYLOCK(thrd, lck)			\
-	_thr_umtx_trylock((lck), (thrd)->tid)
+	_thr_umtx_trylock((lck), (thrd)->tid, 1)
 
 #define	THR_UMTX_LOCK(thrd, lck)			\
-	_thr_umtx_lock((lck), (thrd)->tid)
+	_thr_umtx_lock((lck), (thrd)->tid, 1)
 
 #define	THR_UMTX_TIMEDLOCK(thrd, lck, timo)		\
-	_thr_umtx_timedlock((lck), (thrd)->tid, (timo))
+	_thr_umtx_timedlock((lck), (thrd)->tid, (timo), 1)
 
 #define	THR_UMTX_UNLOCK(thrd, lck)			\
-	_thr_umtx_unlock((lck), (thrd)->tid)
+	_thr_umtx_unlock((lck), (thrd)->tid, 1)
 
+/*
+ * Interal locks without suspend check, used when the lock
+ * state needs to persist (i.e. to help implement things
+ * like pthread_mutex_lock()).  Non-temporary.
+ */
+#define THR_UMTX_TRYLOCK_PERSIST(thrd, lck)		\
+	_thr_umtx_trylock((lck), (thrd)->tid, 0)
+
+#define	THR_UMTX_LOCK_PERSIST(thrd, lck)		\
+	_thr_umtx_lock((lck), (thrd)->tid, 0)
+
+#define	THR_UMTX_TIMEDLOCK_PERSIST(thrd, lck, timo)	\
+	_thr_umtx_timedlock((lck), (thrd)->tid, (timo), 0)
+
+#define	THR_UMTX_UNLOCK_PERSIST(thrd, lck)		\
+	_thr_umtx_unlock((lck), (thrd)->tid, 0)
+
+/*
+ * Internal temporary locks with suspend check
+ */
 #define	THR_LOCK_ACQUIRE(thrd, lck)			\
 do {							\
 	(thrd)->locklevel++;				\
-	_thr_umtx_lock((lck), (thrd)->tid);		\
+	_thr_umtx_lock((lck), (thrd)->tid, 1);		\
 } while (0)
 
 #ifdef	_PTHREADS_INVARIANTS
@@ -523,7 +540,7 @@ do {							\
 #define	THR_LOCK_RELEASE(thrd, lck)			\
 do {							\
 	THR_ASSERT_LOCKLEVEL(thrd);			\
-	_thr_umtx_unlock((lck), (thrd)->tid);		\
+	_thr_umtx_unlock((lck), (thrd)->tid, 1);	\
 	(thrd)->locklevel--;				\
 	_thr_ast(thrd);					\
 } while (0)
@@ -581,17 +598,19 @@ do {								\
 #define	THR_IN_SYNCQ(thrd)	(((thrd)->sflags & THR_FLAGS_IN_SYNCQ) != 0)
 
 #define SHOULD_REPORT_EVENT(curthr, e)			\
-	(curthr->report_events && 			\
+	(curthr->report_events &&			\
 	 (((curthr)->event_mask | _thread_event_mask ) & e) != 0)
 
+#ifndef __LIBC_ISTHREADED_DECLARED
+#define __LIBC_ISTHREADED_DECLARED
 extern int __isthreaded;
+#endif
 
 /*
  * Global variables for the pthread library.
  */
 extern char		*_usrstack;
 extern struct pthread	*_thr_initial;
-extern int		_thread_scope_system;
 
 /* For debugger */
 extern int		_libthread_xu_debug;
@@ -607,6 +626,7 @@ extern struct thread_head	_thread_gc_list;
 extern int	_thread_active_threads;
 
 extern struct	atfork_head	_thr_atfork_list;
+extern struct	atfork_head	_thr_atfork_kern_list;
 extern umtx_t	_thr_atfork_lock;
 
 /* Default thread attributes */
@@ -640,27 +660,41 @@ int	_thr_setthreaded(int);
 int	_mutex_cv_lock(pthread_mutex_t *, int count);
 int	_mutex_cv_unlock(pthread_mutex_t *, int *count);
 void	_mutex_notify_priochange(struct pthread *, struct pthread *, int);
-int	_mutex_reinit(pthread_mutex_t *);
-void	_mutex_fork(struct pthread *curthread);
+void	_mutex_fork(struct pthread *curthread, lwpid_t tid);
 void	_mutex_unlock_private(struct pthread *);
+
+#if 0
+int	_mutex_reinit(pthread_mutex_t *);
+void	_cond_reinit(pthread_cond_t pcond);
+void	_rwlock_reinit(pthread_rwlock_t prwlock);
+#endif
+
 void	_libpthread_init(struct pthread *);
 struct pthread *_thr_alloc(struct pthread *);
 void	_thread_exit(const char *, int, const char *) __dead2;
+void	_thread_exitf(const char *, int, const char *, ...) __dead2
+	    __printflike(3, 4);
 void	_thr_exit_cleanup(void);
+void	_thr_atfork_kern(void (*prepare)(void), void (*parent)(void),
+			void (*child)(void));
 int	_thr_ref_add(struct pthread *, struct pthread *, int);
 void	_thr_ref_delete(struct pthread *, struct pthread *);
 void	_thr_ref_delete_unlocked(struct pthread *, struct pthread *);
 int	_thr_find_thread(struct pthread *, struct pthread *, int);
+void	_thr_malloc_init(void);
+void	_rtld_setthreaded(int);
 void	_thr_rtld_init(void);
 void	_thr_rtld_fini(void);
 int	_thr_stack_alloc(struct pthread_attr *);
 void	_thr_stack_free(struct pthread_attr *);
 void	_thr_stack_cleanup(void);
+void	_thr_sem_init(void);
 void	_thr_free(struct pthread *, struct pthread *);
 void	_thr_gc(struct pthread *);
-void    _thread_cleanupspecific(void);
-void    _thread_dump_info(void);
-void	_thread_printf(int, const char *, ...);
+void	_thread_cleanupspecific(void);
+void	_thread_dump_info(void);
+void	_thread_printf(int, const char *, ...) __printflike(2, 3);
+void	_thread_vprintf(int, const char *, va_list);
 void	_thr_spinlock_init(void);
 int	_thr_cancel_enter(struct pthread *);
 void	_thr_cancel_leave(struct pthread *, int);
@@ -691,13 +725,8 @@ int	_rtp_to_schedparam(const struct rtprio *rtp, int *policy,
 	    struct sched_param *param);
 int	_schedparam_to_rtp(int policy, const struct sched_param *param,
 	    struct rtprio *rtp);
-int 	_umtx_sleep_err(volatile const int *, int, int);
-int 	_umtx_wakeup_err(volatile const int *, int);
-
-/* #include <sys/aio.h> */
-#ifdef _SYS_AIO_H_
-int	__sys_aio_suspend(const struct aiocb * const[], int, const struct timespec *);
-#endif
+int	_umtx_sleep_err(volatile const int *, int, int);
+int	_umtx_wakeup_err(volatile const int *, int);
 
 /* #include <fcntl.h> */
 #ifdef  _SYS_FCNTL_H_
@@ -711,7 +740,7 @@ int     __sys_openat(int, const char *, int, ...);
 int	__sys_ioctl(int, unsigned long, ...);
 #endif
 
-/* #inclde <sched.h> */
+/* #include <sched.h> */
 #ifdef	_SCHED_H_
 int	__sys_sched_yield(void);
 #endif
@@ -724,26 +753,7 @@ int     __sys_sigpending(sigset_t *);
 int     __sys_sigprocmask(int, const sigset_t *, sigset_t *);
 int     __sys_sigsuspend(const sigset_t *);
 int     __sys_sigreturn(ucontext_t *);
-int     __sys_sigaltstack(const struct sigaltstack *, struct sigaltstack *);
-#endif
-
-/* #include <sys/socket.h> */
-#ifdef _SYS_SOCKET_H_
-int	__sys_accept(int, struct sockaddr *, socklen_t *);
-int	__sys_connect(int, const struct sockaddr *, socklen_t);
-ssize_t __sys_recv(int, void *, size_t, int);
-ssize_t __sys_recvfrom(int, void *, size_t, int, struct sockaddr *, socklen_t *);
-ssize_t __sys_recvmsg(int, struct msghdr *, int);
-int	__sys_sendfile(int, int, off_t, size_t, struct sf_hdtr *,
-	    off_t *, int);
-ssize_t __sys_sendmsg(int, const struct msghdr *, int);
-ssize_t __sys_sendto(int, const void *,size_t, int, const struct sockaddr *, socklen_t);
-#endif
-
-/* #include <sys/uio.h> */
-#ifdef  _SYS_UIO_H_
-ssize_t __sys_readv(int, const struct iovec *, int);
-ssize_t __sys_writev(int, const struct iovec *, int);
+int     __sys_sigaltstack(const stack_t *, stack_t *);
 #endif
 
 /* #include <time.h> */
@@ -753,11 +763,9 @@ int	__sys_nanosleep(const struct timespec *, struct timespec *);
 
 /* #include <unistd.h> */
 #ifdef  _UNISTD_H_
-int     __sys_close(int);
-int     __sys_execve(const char *, char * const *, char * const *);
-int	__sys_fsync(int);
+int	__sys_close(int);
+int	__sys_execve(const char *, char * const *, char * const *);
 pid_t	__sys_getpid(void);
-int     __sys_select(int, fd_set *, fd_set *, fd_set *, struct timeval *);
 ssize_t __sys_read(int, void *, size_t);
 ssize_t __sys_write(int, const void *, size_t);
 void	__sys_exit(int);
@@ -765,16 +773,6 @@ int	__sys_sigwait(const sigset_t *, int *);
 int	__sys_sigtimedwait(const sigset_t *, siginfo_t *,
 		const struct timespec *);
 int	__sys_sigwaitinfo(const sigset_t *set, siginfo_t *info);
-#endif
-
-/* #include <poll.h> */
-#ifdef _SYS_POLL_H_
-int 	__sys_poll(struct pollfd *, unsigned, int);
-#endif
-
-/* #include <sys/mman.h> */
-#ifdef _SYS_MMAN_H_
-int	__sys_msync(void *, size_t, int);
 #endif
 
 static inline int
@@ -793,11 +791,19 @@ static inline void
 _thr_check_init(void)
 {
 	if (_thr_initial == NULL)
-		_libpthread_init(0);
+		_libpthread_init(NULL);
 }
 
 struct dl_phdr_info;
 void __pthread_cxa_finalize(struct dl_phdr_info *phdr_info);
+
+/*
+ * Used in low-level init to directly call libc's malloc implementation
+ * instead of a potentially third-party malloc implementation.  Required
+ * for bootstrapping pthreads.
+ */
+void *__malloc(size_t bytes);
+void __free(void *ptr);
 
 __END_DECLS
 

@@ -12,7 +12,7 @@
 
 #include <sys/param.h>
 #include <sys/systm.h>
-#include <sys/sysproto.h>
+#include <sys/sysmsg.h>
 #include <sys/kernel.h>
 #include <sys/proc.h>
 #include <sys/sem.h>
@@ -21,8 +21,6 @@
 #include <sys/malloc.h>
 #include <sys/jail.h>
 #include <sys/thread.h>
-
-#include <sys/thread2.h>
 
 static MALLOC_DEFINE(M_SEM, "sem", "SVID compatible semaphores");
 
@@ -97,7 +95,7 @@ struct sem_undo {
  * SEMUSZ is properly aligned.
  */
 
-#define SEM_ALIGN(bytes) (((bytes) + (sizeof(long) - 1)) & ~(sizeof(long) - 1))
+#define SEM_ALIGN(bytes) roundup2(bytes, sizeof(long))
 
 /* actual size of an undo structure */
 #define SEMUSZ(nent)	SEM_ALIGN(offsetof(struct sem_undo, un_ent[nent]))
@@ -180,7 +178,7 @@ seminit(void *dummy)
 		semaptr->ds.sem_perm.mode = 0;
 	}
 }
-SYSINIT(sysv_sem, SI_SUB_SYSV_SEM, SI_ORDER_FIRST, seminit, NULL)
+SYSINIT(sysv_sem, SI_SUB_SYSV_SEM, SI_ORDER_FIRST, seminit, NULL);
 
 /*
  * Allocate a new sem_undo structure for a process
@@ -286,7 +284,7 @@ semundo_clear(int semid, int semnum)
 	sunext = TAILQ_FIRST(&semu_list);
 	while ((suptr = sunext) != NULL) {
 		if ((p = suptr->un_proc) == NULL) {
-			suptr = TAILQ_NEXT(suptr, un_entry);
+			sunext = TAILQ_NEXT(suptr, un_entry);
 			continue;
 		}
 		++suptr->un_refs;
@@ -339,9 +337,10 @@ semundo_clear(int semid, int semnum)
  * MPALMOSTSAFE
  */
 int
-sys___semctl(struct __semctl_args *uap)
+sys___semctl(struct sysmsg *sysmsg, const struct __semctl_args *uap)
 {
 	struct thread *td = curthread;
+	struct prison *pr = td->td_proc->p_ucred->cr_prison;
 	int semid = uap->semid;
 	int semnum = uap->semnum;
 	int cmd = uap->cmd;
@@ -351,43 +350,15 @@ sys___semctl(struct __semctl_args *uap)
 	int i, rval, eval;
 	struct semid_ds sbuf;
 	struct semid_pool *semaptr;
-	struct semid_pool *semakptr;
 	struct sem *semptr;
 
 #ifdef SEM_DEBUG
 	kprintf("call to semctl(%d, %d, %d, 0x%x)\n", semid, semnum, cmd, arg);
 #endif
 
-	if (!jail_sysvipc_allowed && cred->cr_prison != NULL)
+	if (pr && !PRISON_CAP_ISSET(pr->pr_caps, PRISON_CAP_SYS_SYSVIPC))
 		return (ENOSYS);
 
-	switch (cmd) {
-	case SEM_STAT:
-		/*
-		 * For this command we assume semid is an array index
-		 * rather than an IPC id.
-		 */
-		if (semid < 0 || semid >= seminfo.semmni) {
-			eval = EINVAL;
-			break;
-		}
-		semakptr = &sema[semid];
-		lockmgr(&semakptr->lk, LK_EXCLUSIVE);
-		if ((semakptr->ds.sem_perm.mode & SEM_ALLOC) == 0) {
-			eval = EINVAL;
-			lockmgr(&semakptr->lk, LK_RELEASE);
-			break;
-		}
-		if ((eval = ipcperm(td->td_proc, &semakptr->ds.sem_perm, IPC_R))) {
-			lockmgr(&semakptr->lk, LK_RELEASE);
-			break;
-		}
-		bcopy(&semakptr->ds, arg->buf, sizeof(struct semid_ds));
-		rval = IXSEQ_TO_IPCID(semid, semakptr->ds.sem_perm);
-		lockmgr(&semakptr->lk, LK_RELEASE);
-		break;
-	}
-	
 	semid = IPCID_TO_IX(semid);
 	if (semid < 0 || semid >= seminfo.semmni) {
 		return(EINVAL);
@@ -452,6 +423,26 @@ sys___semctl(struct __semctl_args *uap)
 			break;
 		eval = copyout(&semaptr->ds, real_arg.buf,
 			       sizeof(struct semid_ds));
+		break;
+	case SEM_STAT:
+		/*
+		 * For this command we assume semid is an array index
+		 * rather than an IPC id.  However, the conversion is
+		 * just a mask so just validate that the passed-in semid
+		 * matches the masked semid.
+		 */
+		if (uap->semid != semid) {
+			eval = EINVAL;
+			break;
+		}
+		eval = ipcperm(td->td_proc, &semaptr->ds.sem_perm, IPC_R);
+		if (eval)
+			break;
+		if ((eval = copyin(arg, &real_arg, sizeof(real_arg))) != 0)
+			break;
+		eval = copyout(&semaptr->ds, real_arg.buf,
+			       sizeof(struct semid_ds));
+		rval = IXSEQ_TO_IPCID(semid, semaptr->ds.sem_perm);
 		break;
 
 	case GETNCNT:
@@ -565,7 +556,7 @@ sys___semctl(struct __semctl_args *uap)
 	lockmgr(&semaptr->lk, LK_RELEASE);
 
 	if (eval == 0)
-		uap->sysmsg_result = rval;
+		sysmsg->sysmsg_result = rval;
 	return(eval);
 }
 
@@ -573,9 +564,10 @@ sys___semctl(struct __semctl_args *uap)
  * MPALMOSTSAFE
  */
 int
-sys_semget(struct semget_args *uap)
+sys_semget(struct sysmsg *sysmsg, const struct semget_args *uap)
 {
 	struct thread *td = curthread;
+	struct prison *pr = td->td_proc->p_ucred->cr_prison;
 	int semid, eval;
 	int key = uap->key;
 	int nsems = uap->nsems;
@@ -586,7 +578,7 @@ sys_semget(struct semget_args *uap)
 	kprintf("semget(0x%x, %d, 0%o)\n", key, nsems, semflg);
 #endif
 
-	if (!jail_sysvipc_allowed && cred->cr_prison != NULL)
+	if (pr && !PRISON_CAP_ISSET(pr->pr_caps, PRISON_CAP_SYS_SYSVIPC))
 		return (ENOSYS);
 
 	eval = 0;
@@ -716,7 +708,7 @@ sys_semget(struct semget_args *uap)
 
 done:
 	if (eval == 0) {
-		uap->sysmsg_result =
+		sysmsg->sysmsg_result =
 			IXSEQ_TO_IPCID(semid, sema[semid].ds.sem_perm);
 	}
 	return(eval);
@@ -726,9 +718,10 @@ done:
  * MPSAFE
  */
 int
-sys_semop(struct semop_args *uap)
+sys_semop(struct sysmsg *sysmsg, const struct semop_args *uap)
 {
 	struct thread *td = curthread;
+	struct prison *pr = td->td_proc->p_ucred->cr_prison;
 	int semid = uap->semid;
 	u_int nsops = uap->nsops;
 	struct sembuf sops[MAX_SOPS];
@@ -742,7 +735,7 @@ sys_semop(struct semop_args *uap)
 #ifdef SEM_DEBUG
 	kprintf("call to semop(%d, 0x%x, %u)\n", semid, sops, nsops);
 #endif
-	if (!jail_sysvipc_allowed && td->td_ucred->cr_prison != NULL)
+	if (pr && !PRISON_CAP_ISSET(pr->pr_caps, PRISON_CAP_SYS_SYSVIPC))
 		return (ENOSYS);
 
 	semid = IPCID_TO_IX(semid);	/* Convert back to zero origin */
@@ -1040,7 +1033,7 @@ donex:
 #ifdef SEM_DEBUG
 	kprintf("semop:  done\n");
 #endif
-	uap->sysmsg_result = 0;
+	sysmsg->sysmsg_result = 0;
 	eval = 0;
 done:
 	lockmgr(&semaptr->lk, LK_RELEASE);

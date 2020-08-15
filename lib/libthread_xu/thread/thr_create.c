@@ -1,7 +1,6 @@
 /*
  * Copyright (c) 2005 David Xu <davidxu@freebsd.org>
  * Copyright (c) 2003 Daniel M. Eischen <deischen@gdeb.com>
- * Copyright (c) 1995-1998 John Birrell <jb@cimlogic.com.au>
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -12,27 +11,19 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by John Birrell.
- * 4. Neither the name of the author nor the names of any co-contributors
- *    may be used to endorse or promote products derived from this software
- *    without specific prior written permission.
  *
- * THIS SOFTWARE IS PROVIDED BY JOHN BIRRELL AND CONTRIBUTORS ``AS IS'' AND
- * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
- * ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE
- * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
- * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
- * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
- * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
- * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
- * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
- * SUCH DAMAGE.
+ * THIS SOFTWARE IS PROVIDED BY THE AUTHOR ``AS IS'' AND ANY EXPRESS OR
+ * IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+ * OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+ * IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY DIRECT, INDIRECT,
+ * INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT
+ * NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+ * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+ * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
+ * THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  * $FreeBSD: src/lib/libpthread/thread/thr_create.c,v 1.58 2004/10/23 23:28:36 davidxu Exp $
- * $DragonFly: src/lib/libthread_xu/thread/thr_create.c,v 1.12 2008/05/09 11:24:08 corecode Exp $
  */
 
 #include "namespace.h"
@@ -45,25 +36,27 @@
 #include <sys/time.h>
 #include <machine/reg.h>
 #include <machine/tls.h>
-
 #include <pthread.h>
 #include <sys/signalvar.h>
+#include <sys/lwp.h>
 #include "un-namespace.h"
 
-#include "thr_private.h"
 #include "libc_private.h"
+#include "thr_private.h"
 
 static int  create_stack(struct pthread_attr *pattr);
 static void thread_start(void *);
 
 int
-_pthread_create(pthread_t * thread, const pthread_attr_t * attr,
-       void *(*start_routine) (void *), void *arg)
+_pthread_create(pthread_t * __restrict thread,
+    const pthread_attr_t * __restrict attr, void *(*start_routine) (void *),
+    void * __restrict arg)
 {
 	struct lwp_params create_params;
 	void *stack;
 	sigset_t sigmask, oldsigmask;
 	struct pthread *curthread, *new_thread;
+	const cpu_set_t *cpumask = NULL;
 	int ret = 0, locked;
 
 	_thr_check_init();
@@ -78,11 +71,12 @@ _pthread_create(pthread_t * thread, const pthread_attr_t * attr,
 	if ((new_thread = _thr_alloc(curthread)) == NULL)
 		return (EAGAIN);
 
-	if (attr == NULL || *attr == NULL)
+	if (attr == NULL || *attr == NULL) {
 		/* Use the default thread attributes: */
 		new_thread->attr = _pthread_attr_default;
-	else
+	} else {
 		new_thread->attr = *(*attr);
+	}
 	if (new_thread->attr.sched_inherit == PTHREAD_INHERIT_SCHED) {
 		/* inherit scheduling contention scope */
 		if (curthread->attr.flags & PTHREAD_SCOPE_SYSTEM)
@@ -94,11 +88,8 @@ _pthread_create(pthread_t * thread, const pthread_attr_t * attr,
 		 * inherited in following code.
 		 */
 	}
-
-	if (_thread_scope_system > 0)
-		new_thread->attr.flags |= PTHREAD_SCOPE_SYSTEM;
-	else if (_thread_scope_system < 0)
-		new_thread->attr.flags &= ~PTHREAD_SCOPE_SYSTEM;
+	if (new_thread->attr.flags & THR_CPUMASK)
+		cpumask = &new_thread->attr.cpumask;
 
 	if (create_stack(&new_thread->attr) != 0) {
 		/* Insufficient memory to create a stack: */
@@ -163,12 +154,12 @@ _pthread_create(pthread_t * thread, const pthread_attr_t * attr,
 		locked = 0;
 	/* Schedule the new thread. */
 	stack = (char *)new_thread->attr.stackaddr_attr +
-		        new_thread->attr.stacksize_attr;
+			new_thread->attr.stacksize_attr;
 	bzero(&create_params, sizeof(create_params));
-	create_params.func = thread_start;
-	create_params.arg = new_thread;
-	create_params.stack = stack;
-	create_params.tid1 = &new_thread->tid;
+	create_params.lwp_func = thread_start;
+	create_params.lwp_arg = new_thread;
+	create_params.lwp_stack = stack;
+	create_params.lwp_tid1 = &new_thread->tid;
 	/*
 	 * Thread created by thr_create() inherits currrent thread
 	 * sigmask, however, before new thread setup itself correctly,
@@ -179,7 +170,7 @@ _pthread_create(pthread_t * thread, const pthread_attr_t * attr,
 	SIGFILLSET(sigmask);
 	__sys_sigprocmask(SIG_SETMASK, &sigmask, &oldsigmask);
 	new_thread->sigmask = oldsigmask;
-	ret = lwp_create(&create_params);
+	ret = lwp_create2(&create_params, cpumask);
 	__sys_sigprocmask(SIG_SETMASK, &oldsigmask, NULL);
 	if (ret != 0) {
 		if (!locked)
@@ -188,7 +179,7 @@ _pthread_create(pthread_t * thread, const pthread_attr_t * attr,
 		new_thread->terminated = 1;
 		if (new_thread->flags & THR_FLAGS_NEED_SUSPEND) {
 			new_thread->cycle++;
-			_thr_umtx_wake(&new_thread->cycle, INT_MAX);
+			_thr_umtx_wake(&new_thread->cycle, 0);
 		}
 		THR_THREAD_UNLOCK(curthread, new_thread);
 		THREAD_LIST_LOCK(curthread);
@@ -236,7 +227,7 @@ thread_start(void *arg)
 
 	if (curthread->flags & THR_FLAGS_NEED_SUSPEND)
 		_thr_suspend_check(curthread);
-	_nmalloc_thr_init();
+	_libc_thr_init();
 
 	/* Run the current thread's start routine with argument: */
 	_pthread_exit(curthread->start_routine(curthread->arg));

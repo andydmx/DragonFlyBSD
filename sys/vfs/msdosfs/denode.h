@@ -1,8 +1,9 @@
-/* $FreeBSD: src/sys/msdosfs/denode.h,v 1.20 1999/12/29 04:54:52 peter Exp $ */
-/* $DragonFly: src/sys/vfs/msdosfs/denode.h,v 1.12 2006/09/10 01:26:41 dillon Exp $ */
+/* $FreeBSD$ */
 /*	$NetBSD: denode.h,v 1.25 1997/11/17 15:36:28 ws Exp $	*/
 
 /*-
+ * SPDX-License-Identifier: BSD-4-Clause
+ *
  * Copyright (C) 1994, 1995, 1997 Wolfgang Solfrank.
  * Copyright (C) 1994, 1995, 1997 TooLs GmbH.
  * All rights reserved.
@@ -33,7 +34,7 @@
  * OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF
  * ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
-/*
+/*-
  * Written by Paul Popelka (paulp@uts.amdahl.com)
  *
  * You can do anything you want with this software, just don't say you wrote
@@ -48,6 +49,8 @@
  *
  * October 1992
  */
+#ifndef _FS_MSDOSFS_DENODE_H_
+#define	_FS_MSDOSFS_DENODE_H_
 
 /*
  * This is the pc filesystem specific portion of the vnode structure.
@@ -99,7 +102,7 @@
 #define	MSDOSFSROOT_OFS	0x1fffffff
 
 /*
- * The fat cache structure. fc_fsrcn is the filesystem relative cluster
+ * The FAT cache structure. fc_fsrcn is the filesystem relative cluster
  * number that corresponds to the file relative cluster number in this
  * structure (fc_frcn).
  */
@@ -109,27 +112,29 @@ struct fatcache {
 };
 
 /*
- * The fat entry cache as it stands helps make extending files a "quick"
- * operation by avoiding having to scan the fat to discover the last
+ * The FAT entry cache as it stands helps make extending files a "quick"
+ * operation by avoiding having to scan the FAT to discover the last
  * cluster of the file. The cache also helps sequential reads by
  * remembering the last cluster read from the file.  This also prevents us
- * from having to rescan the fat to find the next cluster to read.  This
+ * from having to rescan the FAT to find the next cluster to read.  This
  * cache is probably pretty worthless if a file is opened by multiple
  * processes.
  */
-#define	FC_SIZE		2	/* number of entries in the cache */
+#define	FC_SIZE		3	/* number of entries in the cache */
 #define	FC_LASTMAP	0	/* entry the last call to pcbmap() resolved
 				 * to */
 #define	FC_LASTFC	1	/* entry for the last cluster in the file */
+#define	FC_NEXTTOLASTFC	2	/* entry for a close to the last cluster in
+				 * the file */
 
 #define	FCE_EMPTY	0xffffffff	/* doesn't represent an actual cluster # */
 
 /*
- * Set a slot in the fat cache.
+ * Set a slot in the FAT cache.
  */
 #define	fc_setcache(dep, slot, frcn, fsrcn) \
-	(dep)->de_fc[slot].fc_frcn = frcn; \
-	(dep)->de_fc[slot].fc_fsrcn = fsrcn;
+	(dep)->de_fc[(slot)].fc_frcn = (frcn); \
+	(dep)->de_fc[(slot)].fc_fsrcn = (fsrcn);
 
 /*
  * This is the in memory variant of a dos directory entry.  It is usually
@@ -158,7 +163,7 @@ struct denode {
 	u_short de_MDate;	/* modification date */
 	u_long de_StartCluster; /* starting cluster of file */
 	u_long de_FileSize;	/* size of file in bytes */
-	struct fatcache de_fc[FC_SIZE];	/* fat cache */
+	struct fatcache de_fc[FC_SIZE];	/* FAT cache */
 	u_quad_t de_modrev;	/* Revision level for lease. */
 };
 
@@ -171,6 +176,8 @@ struct denode {
 #define	DE_MODIFIED	0x0020	/* Denode has been modified */
 #define	DE_RENAME	0x0040	/* Denode is in the process of being renamed */
 
+/* Maximum size of a file on a FAT filesystem */
+#define MSDOSFS_FILESIZE_MAX	0xFFFFFFFFLL
 
 /*
  * Transfer directory entries between internal and external form.
@@ -180,7 +187,7 @@ struct denode {
 #define DE_INTERNALIZE32(dep, dp)			\
 	 ((dep)->de_StartCluster |= getushort((dp)->deHighClust) << 16)
 #define DE_INTERNALIZE(dep, dp)				\
-	(bcopy((dp)->deName, (dep)->de_Name, 11),	\
+	(memcpy((dep)->de_Name, (dp)->deName, 11),	\
 	 (dep)->de_Attributes = (dp)->deAttributes,	\
 	 (dep)->de_LowerCase = (dp)->deLowerCase,	\
 	 (dep)->de_CHun = (dp)->deCHundredth,		\
@@ -194,7 +201,7 @@ struct denode {
 	 (FAT32((dep)->de_pmp) ? DE_INTERNALIZE32((dep), (dp)) : 0))
 
 #define DE_EXTERNALIZE(dp, dep)				\
-	(bcopy((dep)->de_Name, (dp)->deName, 11),	\
+	(memcpy((dp)->deName, (dep)->de_Name, 11),	\
 	 (dp)->deAttributes = (dep)->de_Attributes,	\
 	 (dp)->deLowerCase = (dep)->de_LowerCase,	\
 	 (dp)->deCHundredth = (dep)->de_CHun,		\
@@ -205,11 +212,9 @@ struct denode {
 	 putushort((dp)->deMDate, (dep)->de_MDate),	\
 	 putushort((dp)->deStartCluster, (dep)->de_StartCluster), \
 	 putulong((dp)->deFileSize,			\
-	     ((dep)->de_Attributes & ATTR_DIRECTORY) ? 0 : (dep)->de_FileSize), \
+	     ((dep)->de_Attributes & ATTR_DIRECTORY) ?	\
+	     0 : (dep)->de_FileSize), \
 	 putushort((dp)->deHighClust, (dep)->de_StartCluster >> 16))
-
-#define	de_forw		de_chain[0]
-#define	de_back		de_chain[1]
 
 #ifdef _KERNEL
 
@@ -217,32 +222,32 @@ struct denode {
 #define	DETOV(de)	((de)->de_vnode)
 
 #define	DETIMES(dep, acc, mod, cre) do {				\
-	if ((dep)->de_flag & DE_UPDATE) { 				\
+	if ((dep)->de_flag & DE_UPDATE) {				\
 		(dep)->de_flag |= DE_MODIFIED;				\
-		unix2dostime((mod), &(dep)->de_MDate, &(dep)->de_MTime,	\
-		    NULL);						\
-		(dep)->de_Attributes |= ATTR_ARCHIVE; 			\
+		timespec2fattime((mod), 0, &(dep)->de_MDate,		\
+		    &(dep)->de_MTime, NULL);				\
+		(dep)->de_Attributes |= ATTR_ARCHIVE;			\
 	}								\
 	if ((dep)->de_pmp->pm_flags & MSDOSFSMNT_NOWIN95) {		\
 		(dep)->de_flag &= ~(DE_UPDATE | DE_CREATE | DE_ACCESS);	\
 		break;							\
 	}								\
 	if ((dep)->de_flag & DE_ACCESS) {				\
-	    	u_int16_t adate;					\
+		uint16_t adate;						\
 									\
-		unix2dostime((acc), &adate, NULL, NULL);		\
+		timespec2fattime((acc), 0, &adate, NULL, NULL);		\
 		if (adate != (dep)->de_ADate) {				\
 			(dep)->de_flag |= DE_MODIFIED;			\
 			(dep)->de_ADate = adate;			\
 		}							\
 	}								\
 	if ((dep)->de_flag & DE_CREATE) {				\
-		unix2dostime((cre), &(dep)->de_CDate, &(dep)->de_CTime,	\
-		    &(dep)->de_CHun);					\
-		    (dep)->de_flag |= DE_MODIFIED;			\
+		timespec2fattime((cre), 0, &(dep)->de_CDate,		\
+		    &(dep)->de_CTime, &(dep)->de_CHun);			\
+		(dep)->de_flag |= DE_MODIFIED;				\
 	}								\
 	(dep)->de_flag &= ~(DE_UPDATE | DE_CREATE | DE_ACCESS);		\
-} while (0);
+} while (0)
 
 /*
  * This overlays the fid structure (see mount.h)
@@ -251,33 +256,40 @@ struct defid {
 	u_short defid_len;	/* length of structure */
 	u_short defid_pad;	/* force long alignment */
 
-	u_long defid_dirclust;	/* cluster this dir entry came from */
-	u_long defid_dirofs;	/* offset of entry within the cluster */
+	uint32_t defid_dirclust; /* cluster this dir entry came from */
+	uint32_t defid_dirofs;	/* offset of entry within the cluster */
 #if 0
-	u_long	defid_gen;	/* generation number */
+	uint32_t defid_gen;	/* generation number */
 #endif
 };
 
-int msdosfs_lookup (struct vop_old_lookup_args *);
-int msdosfs_inactive (struct vop_inactive_args *);
-int msdosfs_reclaim (struct vop_reclaim_args *);
+int msdosfs_init(struct vfsconf *vfsp);
+int msdosfs_uninit(struct vfsconf *vfsp);
+
+int msdosfs_lookup(struct vop_old_lookup_args *);
+int msdosfs_inactive(struct vop_inactive_args *);
+int msdosfs_reclaim(struct vop_reclaim_args *);
 
 /*
  * Internal service routine prototypes.
  */
-int deget (struct msdosfsmount *, u_long, u_long, struct denode **);
-int uniqdosname (struct denode *, struct componentname *, u_char *);
-int findwin95 (struct denode *);
+int deget(struct msdosfsmount *, u_long, u_long, struct denode **);
+int uniqdosname(struct denode *, struct componentname *, u_char *);
 
-int readep (struct msdosfsmount *pmp, u_long dirclu, u_long dirofs,  struct buf **bpp, struct direntry **epp);
-int readde (struct denode *dep, struct buf **bpp, struct direntry **epp);
-int deextend (struct denode *dep, u_long length);
-int fillinusemap (struct msdosfsmount *pmp);
-void msdosfs_reinsert(struct denode *ip, u_long new_dirclust, u_long new_diroffset);
-int dosdirempty (struct denode *dep);
-int createde (struct denode *dep, struct denode *ddep, struct denode **depp, struct componentname *cnp);
-int deupdat (struct denode *dep, int waitfor);
-int removede (struct denode *pdep, struct denode *dep);
-int detrunc (struct denode *dep, u_long length, int flags);
-int doscheckpath ( struct denode *source, struct denode *target);
+int readep(struct msdosfsmount *pmp, u_long dirclu, u_long dirofs,
+    struct buf **bpp, struct direntry **epp);
+int readde(struct denode *dep, struct buf **bpp, struct direntry **epp);
+int deextend(struct denode *dep, u_long length);
+int fillinusemap(struct msdosfsmount *pmp);
+void msdosfs_reinsert(struct denode *ip, u_long new_dirclust,
+    u_long new_diroffset);
+int dosdirempty(struct denode *dep);
+int createde(struct denode *dep, struct denode *ddep, struct denode **depp,
+    struct componentname *cnp);
+int deupdat(struct denode *dep, int waitfor);
+int removede(struct denode *pdep, struct denode *dep);
+int detrunc(struct denode *dep, u_long length, int flags);
+int doscheckpath( struct denode *source, struct denode *target);
 #endif	/* _KERNEL */
+
+#endif	/* !_FS_MSDOSFS_DENODE_H_ */

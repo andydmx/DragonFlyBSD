@@ -36,23 +36,21 @@
 
 #include <sys/param.h>
 #include <sys/bus.h>
+#include <sys/cpuhelper.h>
 #include <sys/kernel.h>
 #include <sys/malloc.h>
 #include <sys/queue.h>
 #include <sys/rman.h>
 #include <sys/sysctl.h>
 #include <sys/msgport2.h>
-
-#include <net/netisr2.h>
-#include <net/netmsg2.h>
-#include <net/if_var.h>
+#include <sys/cpu_topology.h>
 
 #include "acpi.h"
 #include "acpivar.h"
 #include "acpi_cpu.h"
 #include "acpi_cpu_pstate.h"
 
-#define ACPI_NPSTATE_MAX	16
+#define ACPI_NPSTATE_MAX	32
 
 #define ACPI_PSS_PX_NENTRY	6
 
@@ -67,10 +65,10 @@
 struct acpi_pst_softc;
 LIST_HEAD(acpi_pst_list, acpi_pst_softc);
 
-struct netmsg_acpi_pst {
-	struct netmsg_base base;
-	const struct acpi_pst_res *ctrl;
-	const struct acpi_pst_res *status;
+struct acpi_pst_chmsg {
+	struct cpuhelper_msg	ch_msg;
+	const struct acpi_pst_res *ch_ctrl;
+	const struct acpi_pst_res *ch_status;
 };
 
 struct acpi_pst_domain {
@@ -81,8 +79,9 @@ struct acpi_pst_domain {
 
 	uint32_t		pd_flags;
 
+	struct lwkt_serialize	pd_serialize;
+
 	int			pd_state;
-	int			pd_sstart;
 	struct acpi_pst_list	pd_pstlist;
 
 	struct sysctl_ctx_list	pd_sysctl_ctx;
@@ -102,16 +101,21 @@ struct acpi_pst_softc {
 	struct acpi_pst_res	pst_sreg;
 
 	int			pst_state;
-	int			pst_sstart;
 	int			pst_cpuid;
+
+	uint32_t		pst_flags;
 
 	ACPI_HANDLE		pst_handle;
 
 	LIST_ENTRY(acpi_pst_softc) pst_link;
 };
 
+#define ACPI_PST_FLAG_PPC	0x1
+#define ACPI_PST_FLAG_PDL	0x2
+
 static int	acpi_pst_probe(device_t dev);
 static int	acpi_pst_attach(device_t dev);
+static void	acpi_pst_notify(device_t dev);
 
 static void	acpi_pst_postattach(void *);
 static struct acpi_pst_domain *
@@ -122,8 +126,13 @@ static struct acpi_pst_domain *
 		acpi_pst_domain_find(uint32_t);
 static struct acpi_pst_domain *
 		acpi_pst_domain_alloc(uint32_t, uint32_t, uint32_t);
-static int	acpi_pst_domain_set_pstate(struct acpi_pst_domain *, int);
-static int	acpi_pst_global_set_pstate(int);
+static void	acpi_pst_domain_set_pstate_locked(struct acpi_pst_domain *,
+		    int, int *);
+static void	acpi_pst_domain_set_pstate(struct acpi_pst_domain *, int,
+		    int *);
+static void	acpi_pst_domain_check_nproc(device_t, struct acpi_pst_domain *);
+static void	acpi_pst_global_set_pstate(int);
+static void	acpi_pst_global_fixup_pstate(void);
 
 static int	acpi_pst_check_csr(struct acpi_pst_softc *);
 static int	acpi_pst_check_pstates(struct acpi_pst_softc *);
@@ -134,14 +143,18 @@ static const struct acpi_pstate *
 		acpi_pst_get_pstate(struct acpi_pst_softc *);
 static int	acpi_pst_alloc_resource(device_t, ACPI_OBJECT *, int,
 		    struct acpi_pst_res *);
+static int	acpi_pst_eval_ppc(struct acpi_pst_softc *, int *);
+static int	acpi_pst_eval_pdl(struct acpi_pst_softc *, int *);
 
-static void	acpi_pst_check_csr_handler(netmsg_t);
-static void	acpi_pst_check_pstates_handler(netmsg_t);
-static void	acpi_pst_init_handler(netmsg_t);
-static void	acpi_pst_set_pstate_handler(netmsg_t);
-static void	acpi_pst_get_pstate_handler(netmsg_t);
+static void	acpi_pst_check_csr_handler(struct cpuhelper_msg *);
+static void	acpi_pst_check_pstates_handler(struct cpuhelper_msg *);
+static void	acpi_pst_init_handler(struct cpuhelper_msg *);
+static void	acpi_pst_set_pstate_handler(struct cpuhelper_msg *);
+static void	acpi_pst_get_pstate_handler(struct cpuhelper_msg *);
 
 static int	acpi_pst_sysctl_freqs(SYSCTL_HANDLER_ARGS);
+static int	acpi_pst_sysctl_freqs_bin(SYSCTL_HANDLER_ARGS);
+static int	acpi_pst_sysctl_power(SYSCTL_HANDLER_ARGS);
 static int	acpi_pst_sysctl_members(SYSCTL_HANDLER_ARGS);
 static int	acpi_pst_sysctl_select(SYSCTL_HANDLER_ARGS);
 static int	acpi_pst_sysctl_global(SYSCTL_HANDLER_ARGS);
@@ -152,10 +165,33 @@ static int			acpi_pst_domain_id;
 
 static int			acpi_pst_global_state;
 
+static int			acpi_pstate_start = -1;
+static int			acpi_pstate_count;
 static int			acpi_npstates;
 static struct acpi_pstate	*acpi_pstates;
 
 static const struct acpi_pst_md	*acpi_pst_md;
+
+static int			acpi_pst_pdl = -1;
+TUNABLE_INT("hw.acpi.cpu.pst.pdl", &acpi_pst_pdl);
+
+static int			acpi_pst_ht_reuse_domain = 1;
+TUNABLE_INT("hw.acpi.cpu.pst.ht_reuse_domain", &acpi_pst_ht_reuse_domain);
+
+static int			acpi_pst_force_pkg_domain = 0;
+TUNABLE_INT("hw.acpi.cpu.pst.force_pkg_domain", &acpi_pst_force_pkg_domain);
+
+static int			acpi_pst_handle_notify = 1;
+TUNABLE_INT("hw.acpi.cpu.pst.handle_notify", &acpi_pst_handle_notify);
+
+/*
+ * Force CPU package power domain for Intel CPUs.
+ *
+ * As of this write (14 July 2015), all Intel CPUs only have CPU package
+ * power domain.
+ */
+static int			acpi_pst_intel_pkg_domain = 1;
+TUNABLE_INT("hw.acpi.cpu.pst.intel_pkg_domain", &acpi_pst_intel_pkg_domain);
 
 static device_method_t acpi_pst_methods[] = {
 	/* Device interface */
@@ -188,7 +224,8 @@ static device_method_t acpi_pst_methods[] = {
 static driver_t acpi_pst_driver = {
 	"cpu_pst",
 	acpi_pst_methods,
-	sizeof(struct acpi_pst_softc)
+	sizeof(struct acpi_pst_softc),
+	.gpri = KOBJ_GPRI_ACPI+2
 };
 
 static devclass_t acpi_pst_devclass;
@@ -223,6 +260,24 @@ acpi_pst_probe(device_t dev)
 		acpi_pst_md = acpi_pst_md_probe();
 
 	handle = acpi_get_handle(dev);
+
+	/*
+	 * Check _PSD package
+	 *
+	 * NOTE:
+	 * Some BIOSes do not expose _PCT for the second thread of
+	 * CPU cores.  In this case, _PSD should be enough to get the
+	 * P-state of the second thread working, since it must have
+	 * the same _PCT and _PSS as the first thread in the same
+	 * core.
+	 */
+	buf.Pointer = NULL;
+	buf.Length = ACPI_ALLOCATE_BUFFER;
+	status = AcpiEvaluateObject(handle, "_PSD", NULL, &buf);
+	if (!ACPI_FAILURE(status)) {
+		AcpiOsFree((ACPI_OBJECT *)buf.Pointer);
+		goto done;
+	}
 
 	/*
 	 * Check _PCT package
@@ -266,6 +321,7 @@ acpi_pst_probe(device_t dev)
 	}
 	AcpiOsFree(obj);
 
+done:
 	device_set_desc(dev, "ACPI CPU P-State");
 	return 0;
 }
@@ -273,13 +329,13 @@ acpi_pst_probe(device_t dev)
 static int
 acpi_pst_attach(device_t dev)
 {
-	struct acpi_pst_softc *sc = device_get_softc(dev), *pst;
+	struct acpi_pst_softc *sc = device_get_softc(dev);
 	struct acpi_pst_domain *dom = NULL;
 	ACPI_BUFFER buf;
 	ACPI_STATUS status;
 	ACPI_OBJECT *obj;
 	struct acpi_pstate *pstate, *p;
-	int i, npstate, error;
+	int i, npstate, error, sstart, scount;
 
 	sc->pst_dev = dev;
 	sc->pst_parent = device_get_softc(device_get_parent(dev));
@@ -350,24 +406,7 @@ acpi_pst_attach(device_t dev)
 	}
 
 	/* Make sure that adding us will not overflow our domain */
-	i = 0;
-	LIST_FOREACH(pst, &dom->pd_pstlist, pst_link)
-		++i;
-	if (i == dom->pd_nproc) {
-		device_printf(dev, "Domain%u already contains %d P-States, "
-			      "invalid _PSD package\n",
-			      dom->pd_dom, dom->pd_nproc);
-#if 0
-		/*
-		 * Some stupid BIOSes will set wrong "# of processors",
-		 * e.g. 1 for CPU w/ hyperthreading; Be lenient here.
-		 */
-		return ENXIO;
-#else
-		dom->pd_nproc++;
-#endif
-	}
-	KKASSERT(i < dom->pd_nproc);
+	acpi_pst_domain_check_nproc(dev, dom);
 
 	/*
 	 * Get control/status registers from _PCT
@@ -376,6 +415,72 @@ acpi_pst_attach(device_t dev)
 	buf.Length = ACPI_ALLOCATE_BUFFER;
 	status = AcpiEvaluateObject(sc->pst_handle, "_PCT", NULL, &buf);
 	if (ACPI_FAILURE(status)) {
+		struct acpi_pst_softc *pst;
+
+		/*
+		 * No _PCT.  See the comment in acpi_pst_probe() near
+		 * _PSD check.
+		 *
+		 * Use control/status registers of another CPU in the
+		 * same domain, or in the same core, if the type of
+		 * these registers are "Fixed Hardware", e.g. on most
+		 * of the model Intel CPUs.
+		 */
+		pst = LIST_FIRST(&dom->pd_pstlist);
+		if (pst == NULL) {
+			cpumask_t mask;
+
+			mask = get_cpumask_from_level(sc->pst_cpuid,
+			    CORE_LEVEL);
+			if (CPUMASK_TESTNZERO(mask)) {
+				struct acpi_pst_domain *dom1;
+
+				LIST_FOREACH(dom1, &acpi_pst_domains, pd_link) {
+					LIST_FOREACH(pst, &dom1->pd_pstlist,
+					    pst_link) {
+						if (CPUMASK_TESTBIT(mask,
+						    pst->pst_cpuid))
+							break;
+					}
+					if (pst != NULL)
+						break;
+				}
+				if (pst != NULL && acpi_pst_ht_reuse_domain) {
+					/*
+					 * Use the same domain for CPUs in the
+					 * same core.
+					 */
+					device_printf(dev, "Destroy domain%u, "
+					    "reuse domain%u\n",
+					    dom->pd_dom, dom1->pd_dom);
+					LIST_REMOVE(dom, pd_link);
+					kfree(dom, M_DEVBUF);
+					dom = dom1;
+					/*
+					 * Make sure that adding us will not
+					 * overflow the domain containing
+					 * siblings in the same core.
+					 */
+					acpi_pst_domain_check_nproc(dev, dom);
+				}
+			}
+		}
+		if (pst != NULL &&
+		    pst->pst_creg.pr_res == NULL &&
+		    pst->pst_creg.pr_rid == 0 &&
+		    pst->pst_creg.pr_gas.SpaceId ==
+		    ACPI_ADR_SPACE_FIXED_HARDWARE &&
+		    pst->pst_sreg.pr_res == NULL &&
+		    pst->pst_sreg.pr_rid == 0 &&
+		    pst->pst_sreg.pr_gas.SpaceId ==
+		    ACPI_ADR_SPACE_FIXED_HARDWARE) {
+			sc->pst_creg = pst->pst_creg;
+			sc->pst_sreg = pst->pst_sreg;
+			device_printf(dev,
+			    "No _PCT; reuse %s control/status regs\n",
+			    device_get_nameunit(pst->pst_dev));
+			goto fetch_pss;
+		}
 		device_printf(dev, "Can't get _PCT package - %s\n",
 			      AcpiFormatException(status));
 		return ENXIO;
@@ -415,6 +520,7 @@ acpi_pst_attach(device_t dev)
 	/* Free _PCT */
 	AcpiOsFree(obj);
 
+fetch_pss:
 	/*
 	 * Create P-State table according to _PSS
 	 */
@@ -422,6 +528,17 @@ acpi_pst_attach(device_t dev)
 	buf.Length = ACPI_ALLOCATE_BUFFER;
 	status = AcpiEvaluateObject(sc->pst_handle, "_PSS", NULL, &buf);
 	if (ACPI_FAILURE(status)) {
+		/*
+		 * No _PSS.  See the comment in acpi_pst_probe() near
+		 * _PSD check.
+		 *
+		 * Assume _PSS are same across all CPUs; well, they
+		 * should/have to be so.
+		 */
+		if (acpi_npstates > 0 && acpi_pstates != NULL) {
+			device_printf(dev, "No _PSS\n");
+			goto fetch_ppc;
+		}
 		device_printf(dev, "Can't get _PSS package - %s\n",
 			      AcpiFormatException(status));
 		return ENXIO;
@@ -482,6 +599,13 @@ acpi_pst_attach(device_t dev)
 				return ENXIO;
 			}
 		}
+		if (p->st_freq & 0x80000000) {
+			device_printf(dev, "Invalid _PSS P%d freq: 0x%08x\n",
+			    i, p->st_freq);
+			AcpiOsFree(obj);
+			kfree(pstate, M_TEMP);
+			return ENXIO;
+		}
 	}
 
 	/* Free _PSS */
@@ -518,46 +642,138 @@ acpi_pst_attach(device_t dev)
 			   sizeof(*pstate) * npstate) != 0) {
 			device_printf(dev, "Inconsistent _PSS "
 				      "cross Processor objects\n");
+#if 0
+			/*
+			 * Some BIOSes create different P-State tables;
+			 * just trust the one from the BSP and move on.
+			 */
 			kfree(pstate, M_TEMP);
 			return ENXIO;
+#endif
 		}
 		kfree(pstate, M_TEMP);
 	}
 
+fetch_ppc:
 	/* By default, we start from P-State table's first entry */
-	sc->pst_sstart = 0;
+	sstart = 0;
 
 	/*
 	 * Adjust the usable first entry of P-State table,
 	 * if there is _PPC object.
 	 */
-	buf.Pointer = NULL;
-	buf.Length = ACPI_ALLOCATE_BUFFER;
-	status = AcpiEvaluateObject(sc->pst_handle, "_PPC", NULL, &buf);
-	if (!ACPI_FAILURE(status)) {
-		obj = (ACPI_OBJECT *)buf.Pointer;
-		if (obj->Type == ACPI_TYPE_INTEGER) {
-			if (obj->Integer.Value >= acpi_npstates) {
-				device_printf(dev, "Invalid _PPC value\n");
-				AcpiOsFree(obj);
-				return ENXIO;
-			}
-			sc->pst_sstart = obj->Integer.Value;
-			if (bootverbose)
-				device_printf(dev, "_PPC %d\n", sc->pst_sstart);
-
-			/* TODO: Install notifiy handler */
-		} else {
-			device_printf(dev, "Invalid _PPC object\n");
-			AcpiOsFree(obj);
-			return ENXIO;
+	error = acpi_pst_eval_ppc(sc, &sstart);
+	if (error && error != ENOENT)
+		return error;
+	else if (!error)
+		sc->pst_flags |= ACPI_PST_FLAG_PPC;
+	if (acpi_pstate_start < 0) {
+		acpi_pstate_start = sstart;
+	} else if (acpi_pstate_start != sstart) {
+		device_printf(dev, "_PPC mismatch, was %d, now %d\n",
+		    acpi_pstate_start, sstart);
+		if (acpi_pstate_start < sstart) {
+			device_printf(dev, "_PPC %d -> %d\n",
+			    acpi_pstate_start, sstart);
+			acpi_pstate_start = sstart;
 		}
-
-		/* Free _PPC */
-		AcpiOsFree(obj);
 	}
 
-	sc->pst_state = sc->pst_sstart;
+	/*
+	 * By default, we assume number of usable P-States is same as
+	 * number of P-States.
+	 */
+	scount = acpi_npstates;
+
+	/*
+	 * Allow users to override or set _PDL
+	 */
+	if (acpi_pst_pdl >= 0) {
+		if (acpi_pst_pdl < acpi_npstates) {
+			if (bootverbose) {
+				device_printf(dev, "_PDL override %d\n",
+				    acpi_pst_pdl);
+			}
+			scount = acpi_pst_pdl + 1;
+			goto proc_pdl;
+		} else {
+			device_printf(dev, "Invalid _PDL override %d, "
+			    "must be less than %d\n", acpi_pst_pdl,
+			    acpi_npstates);
+		}
+	}
+
+	/*
+	 * Adjust the number of usable entries in P-State table,
+	 * if there is _PDL object.
+	 */
+	error = acpi_pst_eval_pdl(sc, &scount);
+	if (error && error != ENOENT)
+		return error;
+	else if (!error)
+		sc->pst_flags |= ACPI_PST_FLAG_PDL;
+proc_pdl:
+	if (acpi_pstate_count == 0) {
+		acpi_pstate_count = scount;
+	} else if (acpi_pstate_count != scount) {
+		device_printf(dev, "_PDL mismatch, was %d, now %d\n",
+		    acpi_pstate_count, scount);
+		if (acpi_pstate_count > scount) {
+			device_printf(dev, "_PDL %d -> %d\n",
+			    acpi_pstate_count, scount);
+			acpi_pstate_count = scount;
+		}
+	}
+
+	/*
+	 * Some CPUs only have package P-states, but some BIOSes put each
+	 * hyperthread to its own P-state domain; allow user to override.
+	 */
+	if (LIST_EMPTY(&dom->pd_pstlist) &&
+	    (acpi_pst_force_pkg_domain ||
+	     (cpu_vendor_id == CPU_VENDOR_INTEL &&
+	      acpi_pst_intel_pkg_domain))) {
+		cpumask_t mask;
+
+		mask = get_cpumask_from_level(sc->pst_cpuid, CHIP_LEVEL);
+		if (CPUMASK_TESTNZERO(mask)) {
+			struct acpi_pst_softc *pst = NULL;
+			struct acpi_pst_domain *dom1;
+
+			LIST_FOREACH(dom1, &acpi_pst_domains, pd_link) {
+				LIST_FOREACH(pst, &dom1->pd_pstlist,
+				    pst_link) {
+					if (CPUMASK_TESTBIT(mask,
+					    pst->pst_cpuid))
+						break;
+				}
+				if (pst != NULL)
+					break;
+			}
+			if (pst != NULL &&
+			    memcmp(&pst->pst_creg, &sc->pst_creg,
+			        sizeof(sc->pst_creg)) == 0 &&
+			    memcmp(&pst->pst_sreg, &sc->pst_sreg,
+			        sizeof(sc->pst_sreg)) == 0) {
+				/*
+				 * Use the same domain for CPUs in the
+				 * same package.
+				 */
+				device_printf(dev, "Destroy domain%u, "
+				    "force pkg domain%u\n",
+				    dom->pd_dom, dom1->pd_dom);
+				LIST_REMOVE(dom, pd_link);
+				kfree(dom, M_DEVBUF);
+				dom = dom1;
+				/*
+				 * Make sure that adding us will not
+				 * overflow the domain containing
+				 * siblings in the same package.
+				 */
+				acpi_pst_domain_check_nproc(dev, dom);
+			}
+		}
+	}
 
 	/* Link us with the domain */
 	sc->pst_domain = dom;
@@ -565,6 +781,9 @@ acpi_pst_attach(device_t dev)
 
 	if (device_get_unit(dev) == 0)
 		AcpiOsExecute(OSL_NOTIFY_HANDLER, acpi_pst_postattach, NULL);
+
+	if (sc->pst_flags & (ACPI_PST_FLAG_PPC | ACPI_PST_FLAG_PDL))
+		sc->pst_parent->cpu_pst_notify = acpi_pst_notify;
 
 	return 0;
 }
@@ -705,21 +924,22 @@ acpi_pst_domain_alloc(uint32_t domain, uint32_t coord, uint32_t nproc)
 	dom->pd_dom = domain;
 	dom->pd_coord = coord;
 	dom->pd_nproc = nproc;
-	dom->pd_state = 0; /* XXX */
-	dom->pd_sstart = 0; /* XXX */
 	LIST_INIT(&dom->pd_pstlist);
+	lwkt_serialize_init(&dom->pd_serialize);
 
 	LIST_INSERT_HEAD(&acpi_pst_domains, dom, pd_link);
 
 	return dom;
 }
 
-static int
-acpi_pst_domain_set_pstate(struct acpi_pst_domain *dom, int i)
+static void
+acpi_pst_domain_set_pstate_locked(struct acpi_pst_domain *dom, int i, int *global)
 {
 	const struct acpi_pstate *pstate;
 	struct acpi_pst_softc *sc;
 	int done, error;
+
+	ASSERT_SERIALIZED(&dom->pd_serialize);
 
 	KKASSERT(i >= 0 && i < acpi_npstates);
 	pstate = &acpi_pstates[i];
@@ -740,23 +960,68 @@ acpi_pst_domain_set_pstate(struct acpi_pst_domain *dom, int i)
 	}
 	dom->pd_state = i;
 
-	return 0;
+	if (global != NULL)
+		*global = i;
 }
 
-static int
+static void
+acpi_pst_domain_set_pstate(struct acpi_pst_domain *dom, int i, int *global)
+{
+	lwkt_serialize_enter(&dom->pd_serialize);
+	acpi_pst_domain_set_pstate_locked(dom, i, global);
+	lwkt_serialize_exit(&dom->pd_serialize);
+}
+
+static void
 acpi_pst_global_set_pstate(int i)
 {
 	struct acpi_pst_domain *dom;
+	int *global = &acpi_pst_global_state;
 
 	LIST_FOREACH(dom, &acpi_pst_domains, pd_link) {
 		/* Skip dead domain */
 		if (dom->pd_flags & ACPI_PSTDOM_FLAG_DEAD)
 			continue;
-		acpi_pst_domain_set_pstate(dom, i);
+		acpi_pst_domain_set_pstate(dom, i, global);
+		global = NULL;
 	}
-	acpi_pst_global_state = i;
+}
 
-	return 0;
+static void
+acpi_pst_global_fixup_pstate(void)
+{
+	struct acpi_pst_domain *dom;
+	int *global = &acpi_pst_global_state;
+	int sstart, scount;
+
+	sstart = acpi_pstate_start;
+	scount = acpi_pstate_count;
+
+	LIST_FOREACH(dom, &acpi_pst_domains, pd_link) {
+		int i = -1;
+
+		/* Skip dead domain */
+		if (dom->pd_flags & ACPI_PSTDOM_FLAG_DEAD)
+			continue;
+
+		lwkt_serialize_enter(&dom->pd_serialize);
+
+		if (global != NULL) {
+			if (*global < sstart)
+				*global = sstart;
+			else if (*global >= scount)
+				*global = scount - 1;
+			global = NULL;
+		}
+		if (dom->pd_state < sstart)
+			i = sstart;
+		else if (dom->pd_state >= scount)
+			i = scount - 1;
+		if (i >= 0)
+			acpi_pst_domain_set_pstate_locked(dom, i, NULL);
+
+		lwkt_serialize_exit(&dom->pd_serialize);
+	}
 }
 
 static void
@@ -765,7 +1030,7 @@ acpi_pst_postattach(void *arg __unused)
 	struct acpi_pst_domain *dom;
 	struct acpi_cpu_softc *cpu;
 	device_t *devices;
-	int i, ndevices, error, has_domain, sstate;
+	int i, ndevices, error, has_domain;
 
 	devices = NULL;
 	ndevices = 0;
@@ -788,19 +1053,22 @@ acpi_pst_postattach(void *arg __unused)
 	if (acpi_pst_md == NULL)
 		kprintf("ACPI: no P-State CPU driver\n");
 
-	sstate = 0x7fffffff;
 	has_domain = 0;
 	LIST_FOREACH(dom, &acpi_pst_domains, pd_link) {
 		struct acpi_pst_softc *sc;
 		char buf[32];
+
+		dom->pd_state = acpi_pstate_start;
 
 		/*
 		 * Make sure that all processors belonging to this
 		 * domain are located.
 		 */
 		i = 0;
-		LIST_FOREACH(sc, &dom->pd_pstlist, pst_link)
+		LIST_FOREACH(sc, &dom->pd_pstlist, pst_link) {
+			sc->pst_state = acpi_pstate_start;
 			++i;
+		}
 		if (i != dom->pd_nproc) {
 			KKASSERT(i < dom->pd_nproc);
 
@@ -875,9 +1143,23 @@ acpi_pst_postattach(void *arg __unused)
 		SYSCTL_ADD_PROC(&dom->pd_sysctl_ctx,
 				SYSCTL_CHILDREN(dom->pd_sysctl_tree),
 				OID_AUTO, "available",
-				CTLTYPE_STRING | CTLFLAG_RD,
+				CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_SKIP,
 				dom, 0, acpi_pst_sysctl_freqs, "A",
 				"available frequencies");
+
+		SYSCTL_ADD_PROC(&dom->pd_sysctl_ctx,
+				SYSCTL_CHILDREN(dom->pd_sysctl_tree),
+				OID_AUTO, "avail",
+				CTLTYPE_OPAQUE | CTLFLAG_RD,
+				dom, 0, acpi_pst_sysctl_freqs_bin, "IU",
+				"available frequencies");
+
+		SYSCTL_ADD_PROC(&dom->pd_sysctl_ctx,
+				SYSCTL_CHILDREN(dom->pd_sysctl_tree),
+				OID_AUTO, "power",
+				CTLTYPE_OPAQUE | CTLFLAG_RD,
+				dom, 0, acpi_pst_sysctl_power, "IU",
+				"power of available frequencies");
 
 		SYSCTL_ADD_PROC(&dom->pd_sysctl_ctx,
 				SYSCTL_CHILDREN(dom->pd_sysctl_tree),
@@ -895,9 +1177,6 @@ acpi_pst_postattach(void *arg __unused)
 					dom, 0, acpi_pst_sysctl_select,
 					"IU", "select freq");
 		}
-
-		if (dom->pd_state < sstate)
-			sstate = dom->pd_state;
 	}
 
 	if (has_domain && acpi_pst_md != NULL &&
@@ -908,18 +1187,24 @@ acpi_pst_postattach(void *arg __unused)
 				CTLTYPE_UINT | CTLFLAG_RW,
 				NULL, 0, acpi_pst_sysctl_global,
 				"IU", "select freq for all domains");
+		SYSCTL_ADD_INT(&cpu->glob_sysctl_ctx,
+			       SYSCTL_CHILDREN(cpu->glob_sysctl_tree),
+			       OID_AUTO, "px_handle_notify", CTLFLAG_RW,
+			       &acpi_pst_handle_notify, 0,
+			       "handle type 0x80 notify");
 
-		acpi_pst_global_set_pstate(sstate);
+		acpi_pst_global_set_pstate(acpi_pstate_start);
 	}
 }
 
 static int
 acpi_pst_sysctl_freqs(SYSCTL_HANDLER_ARGS)
 {
-	struct acpi_pst_domain *dom = arg1;
-	int i, error;
+	int i, error, sstart, scount;
 
 	error = 0;
+	sstart = acpi_pstate_start;
+	scount = acpi_pstate_count;
 	for (i = 0; i < acpi_npstates; ++i) {
 		if (error == 0 && i)
 			error = SYSCTL_OUT(req, " ", 1);
@@ -927,7 +1212,7 @@ acpi_pst_sysctl_freqs(SYSCTL_HANDLER_ARGS)
 			const char *pat;
 			char buf[32];
 
-			if (i < dom->pd_sstart)
+			if (i < sstart || i >= scount)
 				pat = "(%u)";
 			else
 				pat = "%u";
@@ -938,6 +1223,38 @@ acpi_pst_sysctl_freqs(SYSCTL_HANDLER_ARGS)
 		}
 	}
 	return error;
+}
+
+static int
+acpi_pst_sysctl_freqs_bin(SYSCTL_HANDLER_ARGS)
+{
+	uint32_t freqs[ACPI_NPSTATE_MAX];
+	int cnt, i, sstart, scount;
+
+	sstart = acpi_pstate_start;
+	scount = acpi_pstate_count;
+
+	cnt = scount - sstart;
+	for (i = 0; i < cnt; ++i)
+		freqs[i] = acpi_pstates[sstart + i].st_freq;
+
+	return sysctl_handle_opaque(oidp, freqs, cnt * sizeof(freqs[0]), req);
+}
+
+static int
+acpi_pst_sysctl_power(SYSCTL_HANDLER_ARGS)
+{
+	uint32_t power[ACPI_NPSTATE_MAX];
+	int cnt, i, sstart, scount;
+
+	sstart = acpi_pstate_start;
+	scount = acpi_pstate_count;
+
+	cnt = scount - sstart;
+	for (i = 0; i < cnt; ++i)
+		power[i] = acpi_pstates[sstart + i].st_power;
+
+	return sysctl_handle_opaque(oidp, power, cnt * sizeof(power[0]), req);
 }
 
 static int
@@ -995,7 +1312,7 @@ acpi_pst_sysctl_select(SYSCTL_HANDLER_ARGS)
 	if (i < 0)
 		return EINVAL;
 
-	acpi_pst_domain_set_pstate(dom, i);
+	acpi_pst_domain_set_pstate(dom, i, NULL);
 	return 0;
 }
 
@@ -1023,133 +1340,132 @@ acpi_pst_sysctl_global(SYSCTL_HANDLER_ARGS)
 }
 
 static void
-acpi_pst_check_csr_handler(netmsg_t msg)
+acpi_pst_check_csr_handler(struct cpuhelper_msg *msg)
 {
-	struct netmsg_acpi_pst *rmsg = (struct netmsg_acpi_pst *)msg;
+	struct acpi_pst_chmsg *pmsg = (struct acpi_pst_chmsg *)msg;
 	int error;
 
-	error = acpi_pst_md->pmd_check_csr(rmsg->ctrl, rmsg->status);
-	lwkt_replymsg(&rmsg->base.lmsg, error);
+	error = acpi_pst_md->pmd_check_csr(pmsg->ch_ctrl, pmsg->ch_status);
+	cpuhelper_replymsg(msg, error);
 }
 
 static int
 acpi_pst_check_csr(struct acpi_pst_softc *sc)
 {
-	struct netmsg_acpi_pst msg;
+	struct acpi_pst_chmsg msg;
 
 	if (acpi_pst_md == NULL)
 		return 0;
 
-	netmsg_init(&msg.base, NULL, &curthread->td_msgport,
-		    MSGF_PRIORITY, acpi_pst_check_csr_handler);
-	msg.ctrl = &sc->pst_creg;
-	msg.status = &sc->pst_sreg;
+	cpuhelper_initmsg(&msg.ch_msg, &curthread->td_msgport,
+	    acpi_pst_check_csr_handler, NULL, MSGF_PRIORITY);
+	msg.ch_ctrl = &sc->pst_creg;
+	msg.ch_status = &sc->pst_sreg;
 
-	return lwkt_domsg(netisr_cpuport(sc->pst_cpuid), &msg.base.lmsg, 0);
+	return (cpuhelper_domsg(&msg.ch_msg, sc->pst_cpuid));
 }
 
 static void
-acpi_pst_check_pstates_handler(netmsg_t msg)
+acpi_pst_check_pstates_handler(struct cpuhelper_msg *msg)
 {
 	int error;
 
 	error = acpi_pst_md->pmd_check_pstates(acpi_pstates, acpi_npstates);
-	lwkt_replymsg(&msg->lmsg, error);
+	cpuhelper_replymsg(msg, error);
 }
 
 static int
 acpi_pst_check_pstates(struct acpi_pst_softc *sc)
 {
-	struct netmsg_base msg;
+	struct cpuhelper_msg msg;
 
 	if (acpi_pst_md == NULL)
 		return 0;
 
-	netmsg_init(&msg, NULL, &curthread->td_msgport,
-		    MSGF_PRIORITY, acpi_pst_check_pstates_handler);
-
-	return lwkt_domsg(netisr_cpuport(sc->pst_cpuid), &msg.lmsg, 0);
+	cpuhelper_initmsg(&msg, &curthread->td_msgport,
+	    acpi_pst_check_pstates_handler, NULL, MSGF_PRIORITY);
+	return (cpuhelper_domsg(&msg, sc->pst_cpuid));
 }
 
 static void
-acpi_pst_init_handler(netmsg_t msg)
+acpi_pst_init_handler(struct cpuhelper_msg *msg)
 {
-	struct netmsg_acpi_pst *rmsg = (struct netmsg_acpi_pst *)msg;
+	struct acpi_pst_chmsg *pmsg = (struct acpi_pst_chmsg *)msg;
 	int error;
 
-	error = acpi_pst_md->pmd_init(rmsg->ctrl, rmsg->status);
-	lwkt_replymsg(&rmsg->base.lmsg, error);
+	error = acpi_pst_md->pmd_init(pmsg->ch_ctrl, pmsg->ch_status);
+	cpuhelper_replymsg(msg, error);
 }
 
 static int
 acpi_pst_init(struct acpi_pst_softc *sc)
 {
-	struct netmsg_acpi_pst msg;
+	struct acpi_pst_chmsg msg;
 
 	if (acpi_pst_md == NULL)
 		return 0;
 
-	netmsg_init(&msg.base, NULL, &curthread->td_msgport,
-		    MSGF_PRIORITY, acpi_pst_init_handler);
-	msg.ctrl = &sc->pst_creg;
-	msg.status = &sc->pst_sreg;
+	cpuhelper_initmsg(&msg.ch_msg, &curthread->td_msgport,
+	    acpi_pst_init_handler, NULL, MSGF_PRIORITY);
+	msg.ch_ctrl = &sc->pst_creg;
+	msg.ch_status = &sc->pst_sreg;
 
-	return lwkt_domsg(netisr_cpuport(sc->pst_cpuid), &msg.base.lmsg, 0);
+	return (cpuhelper_domsg(&msg.ch_msg, sc->pst_cpuid));
 }
 
 static void
-acpi_pst_set_pstate_handler(netmsg_t msg)
+acpi_pst_set_pstate_handler(struct cpuhelper_msg *msg)
 {
-	struct netmsg_acpi_pst *rmsg = (struct netmsg_acpi_pst *)msg;
+	struct acpi_pst_chmsg *pmsg = (struct acpi_pst_chmsg *)msg;
 	int error;
 
-	error = acpi_pst_md->pmd_set_pstate(rmsg->ctrl, rmsg->status,
-					    rmsg->base.lmsg.u.ms_resultp);
-	lwkt_replymsg(&rmsg->base.lmsg, error);
+	error = acpi_pst_md->pmd_set_pstate(pmsg->ch_ctrl, pmsg->ch_status,
+	    msg->ch_cbarg);
+	cpuhelper_replymsg(msg, error);
 }
 
 static int
 acpi_pst_set_pstate(struct acpi_pst_softc *sc, const struct acpi_pstate *pstate)
 {
-	struct netmsg_acpi_pst msg;
+	struct acpi_pst_chmsg msg;
 
 	KKASSERT(acpi_pst_md != NULL);
 
-	netmsg_init(&msg.base, NULL, &curthread->td_msgport,
-		    MSGF_PRIORITY, acpi_pst_set_pstate_handler);
-	msg.base.lmsg.u.ms_resultp = __DECONST(void *, pstate);
-	msg.ctrl = &sc->pst_creg;
-	msg.status = &sc->pst_sreg;
+	cpuhelper_initmsg(&msg.ch_msg, &curthread->td_msgport,
+	    acpi_pst_set_pstate_handler, __DECONST(void *, pstate),
+	    MSGF_PRIORITY);
+	msg.ch_ctrl = &sc->pst_creg;
+	msg.ch_status = &sc->pst_sreg;
 
-	return lwkt_domsg(netisr_cpuport(sc->pst_cpuid), &msg.base.lmsg, 0);
+	return (cpuhelper_domsg(&msg.ch_msg, sc->pst_cpuid));
 }
 
 static void
-acpi_pst_get_pstate_handler(netmsg_t msg)
+acpi_pst_get_pstate_handler(struct cpuhelper_msg *msg)
 {
-	struct netmsg_acpi_pst *rmsg = (struct netmsg_acpi_pst *)msg;
+	struct acpi_pst_chmsg *pmsg = (struct acpi_pst_chmsg *)msg;
 	const struct acpi_pstate *pstate;
 
-	pstate = acpi_pst_md->pmd_get_pstate(rmsg->status, acpi_pstates,
-					     acpi_npstates);
-	rmsg->base.lmsg.u.ms_resultp = __DECONST(void *, pstate);
-	lwkt_replymsg(&rmsg->base.lmsg, 0);
+	pstate = acpi_pst_md->pmd_get_pstate(pmsg->ch_status, acpi_pstates,
+	    acpi_npstates);
+	msg->ch_cbarg = __DECONST(void *, pstate);
+	cpuhelper_replymsg(msg, 0);
 }
 
 static const struct acpi_pstate *
 acpi_pst_get_pstate(struct acpi_pst_softc *sc)
 {
-	struct netmsg_acpi_pst msg;
+	struct acpi_pst_chmsg msg;
 
 	if (acpi_pst_md == NULL)
 		return 0;
 
-	netmsg_init(&msg.base, NULL, &curthread->td_msgport,
-		    MSGF_PRIORITY, acpi_pst_get_pstate_handler);
-	msg.status = &sc->pst_sreg;
+	cpuhelper_initmsg(&msg.ch_msg, &curthread->td_msgport,
+	    acpi_pst_get_pstate_handler, NULL, MSGF_PRIORITY);
+	msg.ch_status = &sc->pst_sreg;
 
-	lwkt_domsg(netisr_cpuport(sc->pst_cpuid), &msg.base.lmsg, 0);
-	return msg.base.lmsg.u.ms_resultp;
+	cpuhelper_domsg(&msg.ch_msg, sc->pst_cpuid);
+	return (msg.ch_msg.ch_cbarg);
 }
 
 static int
@@ -1175,4 +1491,176 @@ acpi_pst_alloc_resource(device_t dev, ACPI_OBJECT *obj, int idx,
 		res->pr_rid = 0;
 	}
 	return 0;
+}
+
+static void
+acpi_pst_domain_check_nproc(device_t dev, struct acpi_pst_domain *dom)
+{
+	struct acpi_pst_softc *pst;
+	int i;
+
+	i = 0;
+	LIST_FOREACH(pst, &dom->pd_pstlist, pst_link)
+		++i;
+	if (i == dom->pd_nproc) {
+		/*
+		 * Some stupid BIOSes will set wrong "# of processors",
+		 * e.g. 1 for CPU w/ hyperthreading; Be lenient here.
+		 */
+		if (bootverbose) {
+			device_printf(dev, "domain%u already contains %d "
+			    "P-States\n", dom->pd_dom, dom->pd_nproc);
+		}
+		dom->pd_nproc++;
+	}
+	KKASSERT(i < dom->pd_nproc);
+}
+
+static int
+acpi_pst_eval_ppc(struct acpi_pst_softc *sc, int *sstart)
+{
+	ACPI_BUFFER buf;
+	ACPI_STATUS status;
+	ACPI_OBJECT *obj;
+
+	buf.Pointer = NULL;
+	buf.Length = ACPI_ALLOCATE_BUFFER;
+	status = AcpiEvaluateObject(sc->pst_handle, "_PPC", NULL, &buf);
+	if (!ACPI_FAILURE(status)) {
+		ACPI_OBJECT_LIST arglist;
+		ACPI_OBJECT arg[2];
+
+		obj = (ACPI_OBJECT *)buf.Pointer;
+		if (obj->Type == ACPI_TYPE_INTEGER) {
+			if (obj->Integer.Value >= acpi_npstates) {
+				/*
+				 * Some broken BIOSes can set this
+				 * to any values; let's simply start
+				 * from the first P-state, which
+				 * should be the highest frequency
+				 * available.
+				 */
+				if (bootverbose) {
+					device_printf(sc->pst_dev,
+					    "Invalid _PPC value %ju, "
+					    "npstates %d\n",
+					    (uintmax_t)obj->Integer.Value,
+					    acpi_npstates);
+				}
+				*sstart = 0;
+			} else {
+				*sstart = obj->Integer.Value;
+				if (bootverbose) {
+					device_printf(sc->pst_dev, "_PPC %d\n",
+					    *sstart);
+				}
+			}
+		} else {
+			device_printf(sc->pst_dev, "Invalid _PPC object\n");
+			AcpiOsFree(obj);
+			return ENXIO;
+		}
+
+		/* Free _PPC */
+		AcpiOsFree(obj);
+
+		/* _PPC has been successfully processed */
+		arglist.Pointer = arg;
+		arglist.Count = 2;
+		arg[0].Type = ACPI_TYPE_INTEGER;
+		arg[0].Integer.Value = 0x80;
+		arg[1].Type = ACPI_TYPE_INTEGER;
+		arg[1].Integer.Value = 0;
+		AcpiEvaluateObject(sc->pst_handle, "_OST", &arglist, NULL);
+
+		return 0;
+	}
+	return ENOENT;
+}
+
+static int
+acpi_pst_eval_pdl(struct acpi_pst_softc *sc, int *scount)
+{
+	ACPI_BUFFER buf;
+	ACPI_STATUS status;
+	ACPI_OBJECT *obj;
+
+	buf.Pointer = NULL;
+	buf.Length = ACPI_ALLOCATE_BUFFER;
+	status = AcpiEvaluateObject(sc->pst_handle, "_PDL", NULL, &buf);
+	if (!ACPI_FAILURE(status)) {
+		obj = (ACPI_OBJECT *)buf.Pointer;
+		if (obj->Type == ACPI_TYPE_INTEGER) {
+			if (obj->Integer.Value >= acpi_npstates) {
+				device_printf(sc->pst_dev,
+				    "Invalid _PDL value\n");
+				AcpiOsFree(obj);
+				return ENXIO;
+			}
+			if (obj->Integer.Value >= acpi_pstate_start) {
+				*scount = obj->Integer.Value + 1;
+				if (bootverbose) {
+					device_printf(sc->pst_dev, "_PDL %d\n",
+					    *scount);
+				}
+			} else {
+				/* Prefer _PPC as stated in ACPI 5.1 8.4.4.6 */
+				device_printf(sc->pst_dev, "conflict _PDL %ju "
+				    "and _PPC %d, ignore\n",
+				    (uintmax_t)obj->Integer.Value,
+				    acpi_pstate_start);
+			}
+		} else {
+			device_printf(sc->pst_dev, "Invalid _PDL object\n");
+			AcpiOsFree(obj);
+			return ENXIO;
+		}
+
+		/* Free _PDL */
+		AcpiOsFree(obj);
+
+		return 0;
+	}
+	return ENOENT;
+}
+
+/*
+ * Notify is serialized by acpi task thread.
+ */
+static void
+acpi_pst_notify(device_t dev)
+{
+	struct acpi_pst_softc *sc = device_get_softc(dev);
+	boolean_t fixup = FALSE;
+
+	if (!acpi_pst_handle_notify)
+		return;
+
+	/*
+	 * NOTE:
+	 * _PPC and _PDL evaluation order is critical.  _PDL
+	 * evaluation depends on _PPC evaluation.
+	 */
+	if (sc->pst_flags & ACPI_PST_FLAG_PPC) {
+		int sstart = acpi_pstate_start;
+
+		acpi_pst_eval_ppc(sc, &sstart);
+		if (acpi_pstate_start != sstart && sc->pst_cpuid == 0) {
+			acpi_pstate_start = sstart;
+			fixup = TRUE;
+		}
+	}
+	if (sc->pst_flags & ACPI_PST_FLAG_PDL) {
+		int scount = acpi_pstate_count;
+
+		acpi_pst_eval_pdl(sc, &scount);
+		if (acpi_pstate_count != scount && sc->pst_cpuid == 0) {
+			acpi_pstate_count = scount;
+			fixup = TRUE;
+		}
+	}
+
+	if (fixup && acpi_pst_md != NULL &&
+	    acpi_pst_md->pmd_set_pstate != NULL)
+		acpi_pst_global_fixup_pstate();
 }

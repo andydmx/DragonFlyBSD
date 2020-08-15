@@ -27,7 +27,6 @@
  * Currently, the argument is ignored.
  */
 #include <sys/param.h>
-#include <sys/file.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/time.h>
@@ -46,6 +45,7 @@
 
 #include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <ifaddrs.h>
 #include <netdb.h>
 #include <stdarg.h>
@@ -381,7 +381,7 @@ rarp_open(char *device)
 		BPF_STMT(BPF_RET|BPF_K, 0),
 	};
 	static struct bpf_program filter = {
-		sizeof insns / sizeof(insns[0]),
+		NELEM(insns),
 		insns
 	};
 

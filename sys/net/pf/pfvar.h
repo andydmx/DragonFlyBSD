@@ -65,19 +65,17 @@ struct pf_state;
 extern struct lwkt_token pf_token;
 extern struct lwkt_token pf_gtoken;
 
-#define	PF_TCPS_PROXY_SRC	((TCP_NSTATES)+0)
-#define	PF_TCPS_PROXY_DST	((TCP_NSTATES)+1)
+#define PF_TCPS_PROXY_SRC	((TCP_NSTATES)+0)
+#define PF_TCPS_PROXY_DST	((TCP_NSTATES)+1)
 
 
-#define RTLABEL_LEN 32
-#define	IFG_ALL		"all"		/* group contains all interfaces */
+#define RTLABEL_LEN		32
 #define BPF_DIRECTION_OUT	(1<<1)
-#define	PWAIT 0
-#define RT_NUMFIBS 1
-#define	ALTQ_IS_ENABLED(ifq)		((ifq)->altq_flags & ALTQF_ENABLED)
+#define PWAIT			0
+#define RT_NUMFIBS		1
+#define ALTQ_IS_ENABLED(ifq)	((ifq)->altq_flags & ALTQF_ENABLED)
 
-
-#define	PF_MD5_DIGEST_LENGTH	16
+#define PF_MD5_DIGEST_LENGTH	16
 #ifdef MD5_DIGEST_LENGTH
 #if PF_MD5_DIGEST_LENGTH != MD5_DIGEST_LENGTH
 #error
@@ -115,8 +113,8 @@ enum	{ PFTM_TCP_FIRST_PACKET, PFTM_TCP_OPENING, PFTM_TCP_ESTABLISHED,
 /* PFTM default values */
 #define PFTM_TCP_FIRST_PACKET_VAL	120	/* First TCP packet */
 #define PFTM_TCP_OPENING_VAL		30	/* No response yet */
-#define PFTM_TCP_ESTABLISHED_VAL	24*60*60/* Established */
-#define PFTM_TCP_CLOSING_VAL		15 * 60	/* Half closed */
+#define PFTM_TCP_ESTABLISHED_VAL	(24*60*60)/* Established */
+#define PFTM_TCP_CLOSING_VAL		(15 * 60) /* Half closed */
 #define PFTM_TCP_FIN_WAIT_VAL		45	/* Got both FINs */
 #define PFTM_TCP_CLOSED_VAL		90	/* Got a RST */
 #define PFTM_UDP_FIRST_PACKET_VAL	60	/* First UDP packet */
@@ -143,12 +141,12 @@ enum	{ PF_ADDR_ADDRMASK, PF_ADDR_NOROUTE, PF_ADDR_DYNIFTL,
 	  PF_ADDR_RANGE };
 #define PF_POOL_TYPEMASK	0x0f
 #define PF_POOL_STICKYADDR	0x20
-#define	PF_WSCALE_FLAG		0x80
-#define	PF_WSCALE_MASK		0x0f
+#define PF_WSCALE_FLAG		0x80
+#define PF_WSCALE_MASK		0x0f
 
-#define	PF_LOG			0x01
-#define	PF_LOG_ALL		0x02
-#define	PF_LOG_SOCKET_LOOKUP	0x04
+#define PF_LOG			0x01
+#define PF_LOG_ALL		0x02
+#define PF_LOG_SOCKET_LOOKUP	0x04
 
 #define PR_WAITOK	0x0001 /* M_WAITOK */
 #define PR_NOWAIT	0x0002 /* M_NOWAIT */
@@ -171,7 +169,7 @@ struct pf_addr {
 #define addr32	pfa.addr32
 };
 
-#define	PF_TABLE_NAME_SIZE	 32
+#define PF_TABLE_NAME_SIZE	 32
 
 #define PFI_AFLAG_NETWORK	0x01
 #define PFI_AFLAG_BROADCAST	0x02
@@ -202,6 +200,10 @@ struct pf_addr_wrap {
 
 #ifdef _KERNEL
 
+#ifdef MALLOC_DECLARE
+MALLOC_DECLARE(M_PF);
+#endif
+
 struct pfi_dynaddr {
 	TAILQ_ENTRY(pfi_dynaddr)	 entry;
 	struct pf_addr			 pfid_addr4;
@@ -223,7 +225,7 @@ struct pfi_dynaddr {
  */
 
 #define	NTOHS(x)	(x) = ntohs((__uint16_t)(x))
-#define HTONS(x)	(x) = htons((__uint16_t)(x))
+#define	HTONS(x)	(x) = htons((__uint16_t)(x))
 
 #define	PF_NAME		"pf"
 
@@ -698,9 +700,9 @@ struct pf_rule {
 #define PFRULE_IFBOUND		0x00010000	/* if-bound */
 #define PFRULE_STATESLOPPY	0x00020000	/* sloppy state tracking */
 
-#define PFSTATE_HIWAT		10000	/* default state table size */
-#define PFSTATE_ADAPT_START	6000	/* default adaptive timeout start */
-#define PFSTATE_ADAPT_END	12000	/* default adaptive timeout end */
+#define PFSTATE_HIWAT		50000	/* default state table size */
+#define PFSTATE_ADAPT_START	30000	/* default adaptive timeout start */
+#define PFSTATE_ADAPT_END	60000	/* default adaptive timeout end */
 
 
 struct pf_threshold {
@@ -1161,39 +1163,24 @@ TAILQ_HEAD(pfi_grouphead, pfi_kif);
 TAILQ_HEAD(pfi_statehead, pfi_kif);
 RB_HEAD(pfi_ifhead, pfi_kif);
 
-/* state tables */
-extern struct pf_state_tree	 pf_statetbl[MAXCPU+1];
-
 /* keep synced with pfi_kif, used in RB_FIND */
 struct pfi_kif_cmp {
-	char				 pfik_ifname[IFNAMSIZ];
+	char				 pfik_name[IFNAMSIZ];
 };
 
 struct pfi_kif {
-	struct pfi_if			 pfik_if;
+	char				 pfik_name[IFNAMSIZ];
 	RB_ENTRY(pfi_kif)		 pfik_tree;
 	u_int64_t			 pfik_packets[2][2][2];
 	u_int64_t			 pfik_bytes[2][2][2];
 	u_int32_t			 pfik_tzero;
 	int				 pfik_flags;
-	struct hook_desc_head		*pfik_ah_head;
-	void				*pfik_ah_cookie;
-	struct pfi_kif			*pfik_parent;
 	struct ifnet			*pfik_ifp;
 	struct ifg_group		*pfik_group;
 	int				 pfik_states;
 	int				 pfik_rules;
 	TAILQ_HEAD(, pfi_dynaddr)	 pfik_dynaddrs;
 };
-#define pfik_name	pfik_if.pfif_name
-#define pfik_packets	pfik_if.pfif_packets
-#define pfik_bytes	pfik_if.pfif_bytes
-#define pfik_tzero	pfik_if.pfif_tzero
-#define pfik_flags	pfik_if.pfif_flags
-#define pfik_addcnt	pfik_if.pfif_addcnt
-#define pfik_delcnt	pfik_if.pfif_delcnt
-#define pfik_states	pfik_if.pfif_states
-#define pfik_rules	pfik_if.pfif_rules
 
 enum pfi_kif_refs {
 	PFI_KIF_REF_NONE,
@@ -1357,14 +1344,26 @@ struct pf_pdesc {
 			*(a) = (x); \
 	} while (0)
 
-#define REASON_SET(a, x) \
-	do { \
+#define PF_INC_COUNTER(x)	pf_counters[mycpu->gd_cpuid].counters[(x)]++
+#define PF_INC_LCOUNTER(x)	pf_counters[mycpu->gd_cpuid].lcounters[(x)]++
+#define PF_INC_FCOUNTER(x)	pf_counters[mycpu->gd_cpuid].fcounters[(x)]++
+#define PF_INC_SCOUNTER(x)	pf_counters[mycpu->gd_cpuid].scounters[(x)]++
+
+#define REASON_SET(a, x)			\
+	do {					\
 		u_short *r = (a); /* keep -Waddress happy */ \
-		if (r != NULL) \
-			*r = (x); \
-		if ((x) < PFRES_MAX) \
-			pf_status.counters[(x)]++; \
+		if (r != NULL)			\
+			*r = (x);		\
+		if ((x) < PFRES_MAX)		\
+			PF_INC_COUNTER(x);	\
 	} while (0)
+
+struct pf_counters {
+	u_int64_t	counters[PFRES_MAX];
+	u_int64_t	lcounters[LCNT_MAX];	/* limit counters */
+	u_int64_t	fcounters[FCNT_MAX];
+	u_int64_t	scounters[SCNT_MAX];
+} __cachealign;
 
 struct pf_status {
 	u_int64_t	counters[PFRES_MAX];
@@ -1755,13 +1754,17 @@ struct pf_ifspeed {
 #ifdef _KERNEL
 RB_HEAD(pf_src_tree, pf_src_node);
 RB_PROTOTYPE(pf_src_tree, pf_src_node, entry, pf_src_compare);
-extern struct pf_src_tree tree_src_tracking[MAXCPU];
 
 RB_HEAD(pf_state_tree_id, pf_state);
 RB_PROTOTYPE(pf_state_tree_id, pf_state,
     entry_id, pf_state_compare_id);
-extern struct pf_state_tree_id tree_id[MAXCPU];
-extern struct pf_state_queue state_list[MAXCPU];
+
+extern struct pf_src_tree *tree_src_tracking;	/* ncpus */
+extern struct pf_state_tree_id *tree_id;	/* ncpus */
+extern struct pf_state_queue *state_list;	/* ncpus */
+extern struct pf_counters *pf_counters;		/* ncpus */
+extern struct pf_state **purge_cur;		/* ncpus */
+extern struct pf_state_tree *pf_statetbl;	/* ncpus + 1 */
 
 TAILQ_HEAD(pf_poolqueue, pf_pool);
 extern struct pf_poolqueue		  pf_pools[2];
@@ -1847,6 +1850,7 @@ int	pf_match_uid(u_int8_t, uid_t, uid_t, uid_t);
 int	pf_match_gid(u_int8_t, gid_t, gid_t, gid_t);
 
 void	pf_normalize_init(void);
+void	pf_normalize_unload(void);
 int	pf_normalize_ip(struct mbuf **, int, struct pfi_kif *, u_short *,
 	    struct pf_pdesc *);
 int	pf_normalize_ip6(struct mbuf **, int, struct pfi_kif *, u_short *,
@@ -1912,6 +1916,7 @@ void		 pfi_cleanup(void);
 void		 pfi_attach_clone(struct if_clone *);
 void		 pfi_kif_ref(struct pfi_kif *, enum pfi_kif_refs);
 void		 pfi_kif_unref(struct pfi_kif *, enum pfi_kif_refs);
+struct pfi_kif	*pfi_kif_find(const char *);
 int		 pfi_kif_match(struct pfi_kif *, struct pfi_kif *);
 void		 pfi_attach_ifnet(struct ifnet *);
 void		 pfi_detach_ifnet(struct ifnet *);

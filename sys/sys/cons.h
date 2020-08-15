@@ -15,11 +15,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -37,11 +33,10 @@
  *
  *	from: @(#)cons.h	7.2 (Berkeley) 5/9/91
  * $FreeBSD: src/sys/sys/cons.h,v 1.24 2000/01/11 14:54:01 yokota Exp $
- * $DragonFly: src/sys/sys/cons.h,v 1.7 2007/05/07 05:21:42 dillon Exp $
  */
 
-#ifndef _MACHINE_CONS_H_
-#define	_MACHINE_CONS_H_
+#ifndef _SYS_CONS_H_
+#define _SYS_CONS_H_
 
 #ifndef _SYS_TYPES_H_
 #include <sys/types.h>
@@ -57,6 +52,7 @@ typedef	int	cn_getc_t (void *);
 typedef	int	cn_checkc_t (void *);
 typedef	void	cn_putc_t (void *, int);
 typedef	void	cn_dbctl_t (void *, int);
+typedef void	cn_poll_t (void *, int);
 
 struct consdev {
 	cn_probe_t	*cn_probe;	/* probe hardware */
@@ -67,6 +63,7 @@ struct consdev {
 	cn_checkc_t	*cn_checkc;	/* kernel test char ready */
 	cn_putc_t	*cn_putc;	/* kernel putchar interface */
 	cn_dbctl_t	*cn_dbctl;	/* debugger control interface */
+	cn_poll_t	*cn_poll;	/* polling mode control */
 	struct	tty *cn_tp;	/* tty structure for console device */
 	cdev_t	cn_dev;		/* device after cn_init_fini tie-in */
 	short	cn_pri;		/* pecking order; the higher the better */
@@ -96,9 +93,10 @@ extern	int sysbeep_enable;		/* enable audio system beep */
 extern	struct consdev *cn_tab;	/* console device */
 extern  struct consdev *gdb_tab;/* gdb debugger device */
 
-#define CONS_DRIVER(name, probe, init, initfini, term, getc, checkc, putc, dbctl)	\
+#define CONS_DRIVER(name, probe, init, initfini, term, getc, checkc, putc, dbctl, poller)	\
 	static struct consdev name##_consdev = {			\
-		probe, init, initfini, term, getc, checkc, putc, dbctl	\
+		probe, init, initfini, term, getc, checkc, putc, dbctl,	\
+		poller							\
 	};								\
 	DATA_SET(cons_set, name##_consdev)
 
@@ -109,7 +107,8 @@ void	cninit (void);
 void	cninit_finish (void);
 void	cndbctl (int);
 void	cnputc (int);
+void	cnpoll (int);
 
 #endif /* _KERNEL */
 
-#endif /* !_MACHINE_CONS_H_ */
+#endif /* !_SYS_CONS_H_ */

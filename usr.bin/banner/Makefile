@@ -1,8 +1,7 @@
-#	@(#)Makefile	8.1 (Berkeley) 6/6/93
-# $FreeBSD: src/usr.bin/banner/Makefile,v 1.3.6.2 2001/08/02 00:56:44 obrien Exp $
-# $DragonFly: src/usr.bin/banner/Makefile,v 1.4 2007/08/27 16:50:51 pavalos Exp $
+#	$OpenBSD: Makefile,v 1.5 2017/05/27 07:55:44 tedu Exp $
 
 PROG=	banner
-MAN=	banner.6
+
+SRCS=	banner.c chset.c
 
 .include <bsd.prog.mk>

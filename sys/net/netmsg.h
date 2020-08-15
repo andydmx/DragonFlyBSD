@@ -71,6 +71,8 @@ typedef struct netmsg_base *netmsg_base_t;
  * - netmsg_packet is embedded in mbufs.
  * - netmsg_pru_send is embedded in mbufs.
  * - netmsg_inarp is embedded in mbufs.
+ * - netmsg_ctlinput is embedded in mbufs.
+ * - netmsg_genpkt is embedded in mbufs.
  */
 TAILQ_HEAD(notifymsglist, netmsg_so_notify);
 
@@ -86,6 +88,21 @@ struct netmsg_inarp {
 	in_addr_t		saddr;
 	in_addr_t		taddr;
 	in_addr_t		myaddr;
+};
+
+struct netmsg_ctlinput {
+	struct netmsg_base	base;
+	struct mbuf		*m;
+	int			cmd;
+	int			hlen;
+	int			proto;
+};
+
+struct netmsg_genpkt {
+	struct netmsg_base	base;
+	struct mbuf		*m;
+	void			*arg1;
+	u_long			arg2;
 };
 
 struct netmsg_pr_timeout {
@@ -133,7 +150,10 @@ struct netmsg_pru_bind {
 	struct netmsg_base	base;
 	struct sockaddr		*nm_nam;
 	struct thread		*nm_td;
+	int			nm_flags;	/* PRUB_ */
 };
+
+#define PRUB_RELINK		0x0001
 
 struct netmsg_pru_connect {
 	struct netmsg_base	base;
@@ -145,9 +165,7 @@ struct netmsg_pru_connect {
 };
 
 #define PRUC_RECONNECT		0x0001		/* thread port change */
-#define PRUC_NAMALLOC		0x0002		/* nm_nam allocated */
 #define PRUC_PUSH		0x0004		/* call tcp_output */
-#define PRUC_FALLBACK		0x0008		/* fallback to ipv4 */
 #define PRUC_ASYNC		0x0010
 #define PRUC_HELDTD		0x0020
 #define PRUC_HASLADDR		0x0040
@@ -257,12 +275,16 @@ struct netmsg_pru_soreceive {
 
 struct netmsg_pr_ctloutput {
 	struct netmsg_base	base;
+	int			nm_flags;	/* PRCO_xx */
 	struct sockopt		*nm_sopt;
 };
 
-struct netmsg_pru_ctlinput {
+#define PRCO_HELDTD		0x1
+
+struct netmsg_pr_ctlinput {
 	struct netmsg_base	base;
 	int			nm_cmd;
+	int			nm_direct;
 	struct sockaddr		*nm_arg;
 	void			*nm_extra;
 };
@@ -282,6 +304,7 @@ union netmsg {
 	struct netmsg_so_notify_abort	notify_abort;
 
 	struct netmsg_pr_ctloutput	ctloutput;
+	struct netmsg_pr_ctlinput	ctlinput;
 
 	struct netmsg_pru_abort		abort;
 	struct netmsg_pru_accept	accept;		/* synchronous */
@@ -302,7 +325,6 @@ union netmsg {
 	struct netmsg_pru_sockaddr	sockaddr;
 	struct netmsg_pru_sosend	sosend;		/* synchronous */
 	struct netmsg_pru_soreceive	soreceive;	/* synchronous */
-	struct netmsg_pru_ctlinput	ctlinput;
 };
 
 #endif	/* _KERNEL || _KERNEL_STRUCTURES */

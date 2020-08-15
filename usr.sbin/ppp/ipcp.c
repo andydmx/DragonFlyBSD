@@ -26,7 +26,6 @@
  * SUCH DAMAGE.
  *
  * $FreeBSD: src/usr.sbin/ppp/ipcp.c,v 1.90.2.12 2002/09/28 10:16:25 brian Exp $
- * $DragonFly: src/usr.sbin/ppp/ipcp.c,v 1.2 2003/06/17 04:30:00 dillon Exp $
  */
 
 #include <sys/param.h>
@@ -151,7 +150,7 @@ protoname(int proto)
   };
   unsigned f;
 
-  for (f = 0; f < sizeof cftypes / sizeof *cftypes; f++)
+  for (f = 0; f < NELEM(cftypes); f++)
     if (cftypes[f].id == proto)
       return cftypes[f].txt;
 
@@ -612,6 +611,8 @@ ipcp_proxyarp(struct ipcp *ipcp,
   struct bundle *bundle = ipcp->fsm.bundle;
   struct in_addr peer, mask, ip;
   int n, ret;
+
+  mask.s_addr = 0;	/* avoid gcc warnings */
 
   if (!ncpaddr_getip4(&addr->peer, &peer)) {
     log_Printf(LogERROR, "Oops, ipcp_proxyarp() called with unexpected addr\n");

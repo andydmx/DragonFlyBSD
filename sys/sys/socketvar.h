@@ -10,11 +10,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -76,6 +72,7 @@ struct accept_filter;
 struct signalsockbuf {
 	struct sockbuf sb;
 	struct kqinfo ssb_kq;	/* process selecting read/write */
+	struct notifymsglist ssb_mlist;	/* list of pending predicate messages */
 	uint32_t ssb_flags;	/* flags, see below (use atomic ops) */
 	u_int	ssb_timeo;	/* timeout for read/write */
 	long	ssb_lowat;	/* low water mark */
@@ -142,6 +139,7 @@ struct socket {
 	 */
 	short	so_timeo;		/* connection timeout */
 	u_short	so_error;		/* error affecting connection */
+	u_short	so_rerror;		/* error affecting receiving */
 	struct  sigio *so_sigio;	/* information for async I/O or
 					   out of band data (SIGURG) */
 	u_long	so_oobmark;		/* chars to oob mark */
@@ -155,6 +153,7 @@ struct socket {
 	/* NB: generation count must not be first; easiest to make it last. */
 	void	*so_emuldata;		/* private data for emulators */
 	int	so_refs;		/* shutdown refs */
+	int	so_reserved01;
 	struct	so_accf { 
 		struct	accept_filter *so_accept_filter;
 		void	*so_accept_filter_arg;	/* saved filter args */
@@ -166,6 +165,10 @@ struct socket {
 
 	struct spinlock so_rcvd_spin;
 	struct netmsg_pru_rcvd so_rcvd_msg;
+
+	lwkt_port_t so_orig_port;
+
+	long	so_inum;
 };
 
 #endif
@@ -186,14 +189,15 @@ struct socket {
 #define	SS_CANTRCVMORE		0x0020	/* can't receive more data from peer */
 #define	SS_RCVATMARK		0x0040	/* at mark on input */
 
+#define	SS_ISCLOSING		0x0080	/* in process of closing */
 #define	SS_ASSERTINPROG		0x0100	/* sonewconn race debugging */
 #define	SS_ASYNC		0x0200	/* async i/o notify */
 #define	SS_ISCONFIRMING		0x0400	/* deciding to accept connection req */
-#define	SS_ISCLOSING		0x0800	/* in process of closing */
 
 #define	SS_INCOMP		0x0800	/* unaccepted, incomplete connection */
 #define	SS_COMP			0x1000	/* unaccepted, complete connection */
 #define	SS_ISDISCONNECTED	0x2000	/* socket disconnected from peer */
+#define	SS_ACCEPTMECH		0x4000	/* allow bind override vs accepted */
 
 /*
  * Externalized form of struct socket used by the sysctl(3) interface.
@@ -325,16 +329,16 @@ ssb_preallocstream(struct signalsockbuf *ssb, struct mbuf *m)
 #define ssb_appendcontrol(ssb, m, control)				\
 	((ssb_space(ssb) <= 0) ? 0 : sbappendcontrol(&(ssb)->sb, m, control))
 
-#define ssb_insert_knote(ssb, kn) {					\
+#define ssb_insert_knote(ssb, kn) do {					\
 	knote_insert(&(ssb)->ssb_kq.ki_note, kn);			\
 	atomic_set_int(&(ssb)->ssb_flags, SSB_KNOTE);			\
-}
+} while(0)
 
-#define ssb_remove_knote(ssb, kn) {					\
+#define ssb_remove_knote(ssb, kn) do {					\
 	knote_remove(&(ssb)->ssb_kq.ki_note, kn);			\
 	if (SLIST_EMPTY(&(ssb)->ssb_kq.ki_note))			\
 		atomic_clear_int(&(ssb)->ssb_flags, SSB_KNOTE);		\
-}
+} while(0)
 
 #define	sorwakeup(so)	sowakeup((so), &(so)->so_rcv)
 #define	sowwakeup(so)	sowakeup((so), &(so)->so_snd)
@@ -414,15 +418,15 @@ void	ssbtoxsockbuf (struct signalsockbuf *sb, struct xsockbuf *xsb);
 int	ssb_wait (struct signalsockbuf *sb);
 int	_ssb_lock (struct signalsockbuf *sb);
 
-void	soabort (struct socket *so);
-void	soabort_async (struct socket *so);
-void	soabort_oncpu (struct socket *so);
+void	soabort_async (struct socket *so, boolean_t clr_head);
+void	soabort_direct (struct socket *so);
 int	soaccept (struct socket *so, struct sockaddr **nam);
 void	soaccept_generic (struct socket *so);
 struct	socket *soalloc (int waitok, struct protosw *);
 int	sobind (struct socket *so, struct sockaddr *nam, struct thread *td);
 void	socantrcvmore (struct socket *so);
 void	socantsendmore (struct socket *so);
+void	soroverflow(struct socket *so);
 int	socket_wait (struct socket *so, struct timespec *ts, int *res);
 int	soclose (struct socket *so, int fflags);
 int	soconnect (struct socket *so, struct sockaddr *nam, struct thread *td,
@@ -445,7 +449,7 @@ void	sosetport (struct socket *so, struct lwkt_port *port);
 int	solisten (struct socket *so, int backlog, struct thread *td);
 struct socket *sonewconn (struct socket *head, int connstatus);
 struct socket *sonewconn_faddr (struct socket *head, int connstatus,
-	    const struct sockaddr *faddr);
+	    const struct sockaddr *faddr, boolean_t keep_ref);
 void	soinherit(struct socket *so, struct socket *so_inh);
 int	sooptcopyin (struct sockopt *sopt, void *buf, size_t len,
 			 size_t minlen);

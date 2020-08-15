@@ -108,8 +108,6 @@ static int
 ahci_attach (device_t dev)
 {
 	struct ahci_softc *sc = device_get_softc(dev);
-	char name[16];
-	int error;
 
 	sc->sc_ad = ahci_lookup_device(dev);
 	if (sc->sc_ad == NULL)
@@ -132,19 +130,7 @@ ahci_attach (device_t dev)
 	if (kgetenv("hint.ahci.forcefbss"))
 		sc->sc_flags |= AHCI_F_FORCE_FBSS;
 
-	sysctl_ctx_init(&sc->sysctl_ctx);
-	ksnprintf(name, sizeof(name), "%s%d",
-		device_get_name(dev), device_get_unit(dev));
-	sc->sysctl_tree = SYSCTL_ADD_NODE(&sc->sysctl_ctx,
-				SYSCTL_STATIC_CHILDREN(_hw),
-				OID_AUTO, name, CTLFLAG_RD, 0, "");
-
-	error = sc->sc_ad->ad_attach(dev);
-	if (error) {
-		sysctl_ctx_free(&sc->sysctl_ctx);
-		sc->sysctl_tree = NULL;
-	}
-	return (error);
+	return (sc->sc_ad->ad_attach(dev));
 }
 
 static int
@@ -153,10 +139,6 @@ ahci_detach (device_t dev)
 	struct ahci_softc *sc = device_get_softc(dev);
 	int error = 0;
 
-	if (sc->sysctl_tree) {
-		sysctl_ctx_free(&sc->sysctl_ctx);
-		sc->sysctl_tree = NULL;
-	}
 	if (sc->sc_ad) {
 		error = sc->sc_ad->ad_detach(dev);
 		sc->sc_ad = NULL;
@@ -183,7 +165,8 @@ static int
 ahci_sysctl_link_pwr_state (SYSCTL_HANDLER_ARGS)
 {
 	struct ahci_port *ap = arg1;
-	const char *state_names[] = {"unknown", "active", "partial", "slumber"};
+	const char *state_names[] =
+	    {"unknown", "active", "partial", "slumber", "devsleep"};
 	char buf[16];
 	int state;
 
@@ -257,6 +240,7 @@ ahci_os_hardsleep(int us)
 void
 ahci_os_start_port(struct ahci_port *ap)
 {
+	struct sysctl_oid *soid;
 	char name[16];
 
 	atomic_set_int(&ap->ap_signal, AP_SIGF_INIT | AP_SIGF_THREAD_SYNC);
@@ -265,8 +249,9 @@ ahci_os_start_port(struct ahci_port *ap)
 	lockinit(&ap->ap_sig_lock, "ahport", 0, 0);
 	sysctl_ctx_init(&ap->sysctl_ctx);
 	ksnprintf(name, sizeof(name), "%d", ap->ap_num);
+	soid = device_get_sysctl_tree(ap->ap_sc->sc_dev);
 	ap->sysctl_tree = SYSCTL_ADD_NODE(&ap->sysctl_ctx,
-				SYSCTL_CHILDREN(ap->ap_sc->sysctl_tree),
+				SYSCTL_CHILDREN(soid),
 				OID_AUTO, name, CTLFLAG_RD, 0, "");
 
 	if ((ap->ap_sc->sc_cap & AHCI_REG_CAP_SALP) &&
@@ -390,9 +375,20 @@ ahci_port_thread(void *arg)
 	atomic_clear_int(&ap->ap_signal, AP_SIGF_THREAD_SYNC);
 	wakeup(&ap->ap_signal);
 	ahci_port_state_machine(ap, 1);
-	ahci_os_unlock_port(ap);
 	atomic_clear_int(&ap->ap_signal, AP_SIGF_INIT);
-	wakeup(&ap->ap_signal);
+
+	/*
+	 * If attaching synchronous wakeup the frontend (device attach code),
+	 * otherwise attach asynchronously.  We haven't probed anything yet
+	 * so the ahci_cam_attach() won't try to probe.
+	 */
+	if (ahci_synchronous_boot) {
+		wakeup(&ap->ap_signal);
+	} else {
+		if (ahci_cam_attach(ap) == 0)
+			ahci_cam_changed(ap, NULL, -1);
+	}
+	ahci_os_unlock_port(ap);
 
 	/*
 	 * Then loop on the helper core.
@@ -403,7 +399,7 @@ ahci_port_thread(void *arg)
 		lockmgr(&ap->ap_sig_lock, LK_EXCLUSIVE);
 		if (ap->ap_signal == 0) {
 			lksleep(&ap->ap_thread, &ap->ap_sig_lock, 0,
-				"ahport", 0);
+				"ahport", 10 * hz);
 		}
 		mask = ap->ap_signal;
 		atomic_clear_int(&ap->ap_signal, mask);

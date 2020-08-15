@@ -28,11 +28,11 @@
  *
  *	@(#)raw_usrreq.c	8.1 (Berkeley) 6/10/93
  * $FreeBSD: src/sys/net/raw_usrreq.c,v 1.18 1999/08/28 00:48:28 peter Exp $
- * $DragonFly: src/sys/net/raw_usrreq.c,v 1.14 2007/06/24 20:00:00 dillon Exp $
  */
 
 #include <sys/param.h>
 #include <sys/systm.h>
+#include <sys/malloc.h>
 #include <sys/mbuf.h>
 #include <sys/proc.h>
 #include <sys/priv.h>
@@ -44,9 +44,12 @@
 #include <sys/msgport2.h>
 
 #include <net/raw_cb.h>
+#include <net/netisr2.h>
 
-
-static struct lwkt_token raw_token = LWKT_TOKEN_INITIALIZER(raw_token);
+/*
+ * Except from the raw_init(), rest of interfaces must be called
+ * from netisr0.
+ */
 
 /*
  * Initialize raw connection block q.
@@ -78,9 +81,10 @@ raw_input(struct mbuf *m0, const struct sockproto *proto,
 	struct mbuf *m = m0;
 	struct socket *last;
 
-	lwkt_gettoken(&raw_token);
+	ASSERT_NETISR0;
 
 	last = NULL;
+
 	LIST_FOREACH(rp, &rawcb_list, list) {
 		if (rp == skip)
 			continue;
@@ -101,16 +105,19 @@ raw_input(struct mbuf *m0, const struct sockproto *proto,
 			continue;
 		if (rp->rcb_faddr && !sa_equal(rp->rcb_faddr, src))
 			continue;
+		/* Run any filtering that may have been installed. */
+		if (rp->rcb_filter != NULL && rp->rcb_filter(m, proto, rp) != 0)
+			continue;
 		if (last) {
 			struct mbuf *n;
 
-			n = m_copypacket(m, MB_DONTWAIT);
+			n = m_copypacket(m, M_NOWAIT);
 			if (n != NULL) {
 				lwkt_gettoken(&last->so_rcv.ssb_token);
 				if (ssb_appendaddr(&last->so_rcv, src, n,
 						 NULL) == 0) {
-					/* should notify about lost packet */
 					m_freem(n);
+					soroverflow(last);
 				} else {
 					sorwakeup(last);
 				}
@@ -121,15 +128,15 @@ raw_input(struct mbuf *m0, const struct sockproto *proto,
 	}
 	if (last) {
 		lwkt_gettoken(&last->so_rcv.ssb_token);
-		if (ssb_appendaddr(&last->so_rcv, src, m, NULL) == 0)
+		if (ssb_appendaddr(&last->so_rcv, src, m, NULL) == 0) {
 			m_freem(m);
-		else
+			soroverflow(last);
+		} else
 			sorwakeup(last);
 		lwkt_reltoken(&last->so_rcv.ssb_token);
 	} else {
 		m_freem(m);
 	}
-	lwkt_reltoken(&raw_token);
 }
 
 /*
@@ -140,8 +147,11 @@ raw_ctlinput(netmsg_t msg)
 {
 	int error = 0;
 
-	if (msg->ctlinput.nm_cmd < 0 || msg->ctlinput.nm_cmd > PRC_NCMDS)
-		;
+	ASSERT_NETISR0;
+
+	if (msg->ctlinput.nm_cmd < 0 || msg->ctlinput.nm_cmd > PRC_NCMDS) {
+		; /* no-op */
+	}
 	lwkt_replymsg(&msg->lmsg, error);
 }
 
@@ -154,6 +164,8 @@ raw_uabort(netmsg_t msg)
 {
 	struct rawcb *rp = sotorawcb(msg->base.nm_so);
 	int error;
+
+	ASSERT_NETISR0;
 
 	if (rp) {
 		raw_disconnect(rp);
@@ -176,6 +188,8 @@ raw_uattach(netmsg_t msg)
 	struct rawcb *rp;
 	int error;
 
+	ASSERT_NETISR0;
+
 	rp = sotorawcb(so);
 	if (rp) {
 		error = priv_check_cred(ai->p_ucred, PRIV_ROOT, NULL_CRED_OKAY);
@@ -190,12 +204,14 @@ raw_uattach(netmsg_t msg)
 static void
 raw_ubind(netmsg_t msg)
 {
+	ASSERT_NETISR0;
 	lwkt_replymsg(&msg->lmsg, EINVAL);
 }
 
 static void
 raw_uconnect(netmsg_t msg)
 {
+	ASSERT_NETISR0;
 	lwkt_replymsg(&msg->lmsg, EINVAL);
 }
 
@@ -207,6 +223,8 @@ raw_udetach(netmsg_t msg)
 {
 	struct rawcb *rp = sotorawcb(msg->base.nm_so);
 	int error;
+
+	ASSERT_NETISR0;
 
 	if (rp) {
 		raw_detach(rp);
@@ -223,6 +241,8 @@ raw_udisconnect(netmsg_t msg)
 	struct socket *so = msg->base.nm_so;
 	struct rawcb *rp;
 	int error;
+
+	ASSERT_NETISR0;
 
 	rp = sotorawcb(so);
 	if (rp == NULL) {
@@ -246,6 +266,8 @@ raw_upeeraddr(netmsg_t msg)
 {
 	struct rawcb *rp = sotorawcb(msg->base.nm_so);
 	int error;
+
+	ASSERT_NETISR0;
 
 	if (rp == NULL) {
 		error = EINVAL;
@@ -271,6 +293,8 @@ raw_usend(netmsg_t msg)
 	struct pr_output_info oi;
 	int flags = msg->send.nm_flags;
 	int error;
+
+	ASSERT_NETISR0;
 
 	if (rp == NULL) {
 		error = EINVAL;
@@ -315,6 +339,8 @@ raw_ushutdown(netmsg_t msg)
 	struct rawcb *rp = sotorawcb(msg->base.nm_so);
 	int error;
 
+	ASSERT_NETISR0;
+
 	if (rp) {
 		socantsendmore(msg->base.nm_so);
 		error = 0;
@@ -329,6 +355,8 @@ raw_usockaddr(netmsg_t msg)
 {
 	struct rawcb *rp = sotorawcb(msg->base.nm_so);
 	int error;
+
+	ASSERT_NETISR0;
 
 	if (rp == NULL) {
 		error = EINVAL;
@@ -349,7 +377,7 @@ struct pr_usrreqs raw_usrreqs = {
 	.pru_connect = raw_uconnect,
 	.pru_connect2 = pr_generic_notsupp,
 	.pru_control = pr_generic_notsupp,
-	.pru_detach = raw_udetach, 
+	.pru_detach = raw_udetach,
 	.pru_disconnect = raw_udisconnect,
 	.pru_listen = pr_generic_notsupp,
 	.pru_peeraddr = raw_upeeraddr,

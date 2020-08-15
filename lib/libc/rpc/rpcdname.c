@@ -38,7 +38,10 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <string.h>
+#include <rpc/rpc.h>
 #include "un-namespace.h"
+
+#include "rpc_com.h"
 
 static char *default_domain = NULL;
 
@@ -62,7 +65,7 @@ get_default_domain(void)
 }
 
 /*
- * This is a wrapper for the system call getdomainname which returns a
+ * This is a wrapper for the getdomainname function which returns a
  * ypclnt.h error code in the failure case.  It also checks to see that
  * the domain name is non-null, knowing that the null string is going to
  * get rejected elsewhere in the NIS client package.

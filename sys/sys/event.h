@@ -24,7 +24,6 @@
  * SUCH DAMAGE.
  *
  *	$FreeBSD: src/sys/sys/event.h,v 1.5.2.6 2003/02/09 15:28:13 nectar Exp $
- *	$DragonFly: src/sys/sys/event.h,v 1.7 2007/01/15 01:26:56 dillon Exp $
  */
 
 #ifndef _SYS_EVENT_H_
@@ -32,9 +31,6 @@
 
 #ifndef _SYS_TYPES_H_
 #include <sys/types.h>
-#endif
-#ifndef _NET_NETISR_H_
-#include <net/netisr.h>			/* struct notifymsglist */
 #endif
 #if defined(_KERNEL) || defined(_KERNEL_STRUCTURES)
 #include <sys/queue.h>
@@ -49,10 +45,11 @@
 #define EVFILT_TIMER		(-7)	/* timers */
 #define EVFILT_EXCEPT		(-8)	/* exceptional conditions */
 #define EVFILT_USER		(-9)	/* user events */
+#define EVFILT_FS		(-10)	/* filesystem events */
 
 #define EVFILT_MARKER		0xF	/* placemarker for tailq */
 
-#define EVFILT_SYSCOUNT		9
+#define EVFILT_SYSCOUNT		10
 
 #define EV_SET(kevp_, a, b, c, d, e, f) do {	\
 	struct kevent *kevp = (kevp_);		\
@@ -82,11 +79,14 @@ struct kevent {
 /* flags */
 #define EV_ONESHOT	0x0010		/* only report one occurrence */
 #define EV_CLEAR	0x0020		/* clear event state after reporting */
+#define EV_RECEIPT	0x0040		/* force EV_ERROR on success, data=0 */
+#define EV_DISPATCH	0x0080		/* disable event after reporting */
 
-#define EV_SYSFLAGS	0xF000		/* reserved by system */
+#define EV_SYSFLAGS	0xF800		/* reserved by system */
 #define EV_FLAG1	0x2000		/* filter-specific flag */
 
 /* returned values */
+#define EV_HUP		0x0800		/* complete peer disconnect */
 #define EV_EOF		0x8000		/* EOF detected */
 #define EV_ERROR	0x4000		/* error, data contains errno */
 #define EV_NODATA	0x1000		/* EOF and no more data */
@@ -159,23 +159,13 @@ SLIST_HEAD(klist, knote);
  */
 struct kqinfo {
 	struct	klist ki_note;		/* kernel note list */
-	struct	notifymsglist ki_mlist;	/* list of pending predicate messages */
 };
 
 #endif
 
 #ifdef _KERNEL
 
-/*
- * Global token for kqueue subsystem
- */
-extern struct lwkt_token kq_token;
-
-#ifdef MALLOC_DECLARE
-MALLOC_DECLARE(M_KQUEUE);
-#endif
-
-#define KNOTE(list, hint)	if ((list) != NULL) knote(list, hint)
+#define KNOTE(list, hint)	if (!SLIST_EMPTY((list))) knote(list, hint)
 
 /*
  * Flag indicating hint is a signal.  Used by EVFILT_SIGNAL, and also
@@ -205,7 +195,7 @@ struct knote {
 	SLIST_ENTRY(knote)	kn_link;	/* for fd */
 	TAILQ_ENTRY(knote)	kn_kqlink;	/* for kq_knlist */
 	SLIST_ENTRY(knote)	kn_next;	/* for struct kqinfo */
-	TAILQ_ENTRY(knote)	kn_tqe;		/* for kq_head */
+	TAILQ_ENTRY(knote)	kn_tqe;		/* for kq_knpend */
 	struct			kqueue *kn_kq;	/* which queue we are on */
 	struct 			kevent kn_kevent;
 	int			kn_status;
@@ -241,24 +231,31 @@ struct thread;
 struct filedesc;
 struct kevent_args;
 
+#define KEVENT_TIMEOUT_PRECISE	0x01
+
+#define KEVENT_SCAN_KEEP_MARKER		0
+#define KEVENT_SCAN_RELOAD_MARKER	1
+#define KEVENT_SCAN_INSERT_MARKER	2
+
 typedef int	(*k_copyout_fn)(void *arg, struct kevent *kevp, int count,
     int *res);
 typedef int	(*k_copyin_fn)(void *arg, struct kevent *kevp, int max,
     int *events);
 int kern_kevent(struct kqueue *kq, int nevents, int *res, void *uap,
     k_copyin_fn kevent_copyin, k_copyout_fn kevent_copyout,
-    struct timespec *tsp);
+    struct timespec *tsp, int flags);
 
-extern void	knote(struct klist *list, long hint);
-extern void	knote_insert(struct klist *klist, struct knote *kn);
-extern void	knote_remove(struct klist *klist, struct knote *kn);
-/*extern void	knote_empty(struct klist *list);*/
-extern void	knote_assume_knotes(struct kqinfo *, struct kqinfo *,
-		    struct filterops *, void *);
-extern void	knote_fdclose(struct file *fp, struct filedesc *fdp, int fd);
-extern void	kqueue_init(struct kqueue *kq, struct filedesc *fdp);
-extern void	kqueue_terminate(struct kqueue *kq);
-extern int 	kqueue_register(struct kqueue *kq, struct kevent *kev);
+void	knote(struct klist *, long);
+void	knote_insert(struct klist *, struct knote *);
+void	knote_remove(struct klist *, struct knote *);
+void	knote_assume_knotes(struct kqinfo *, struct kqinfo *,
+	    struct filterops *, void *);
+void	knote_fdclose(struct file *, struct filedesc *, int);
+void	kqueue_init(struct kqueue *, struct filedesc *);
+void	kqueue_terminate(struct kqueue *);
+int 	kqueue_register(struct kqueue *, struct kevent *, int *);
+
+extern struct klist fs_klist;	/* EVFILT_FS */
 
 #endif 	/* _KERNEL */
 

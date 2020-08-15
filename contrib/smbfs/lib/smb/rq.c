@@ -40,7 +40,6 @@
 #include <stdio.h>
 #include <unistd.h>
 #include <string.h>
-#include <strings.h>
 #include <stdlib.h>
 #include <sysexits.h>
 
@@ -86,7 +85,7 @@ smb_rq_wend(struct smb_rq *rqp)
 }
 
 int
-smb_rq_dmem(struct mbdata *mbp, const char *src, size_t size)
+smb_rq_dmem(struct mbdata *mbp, char *src, size_t size)
 {
 	struct mbuf *m;
 	char * dst;
@@ -118,7 +117,7 @@ smb_rq_dmem(struct mbdata *mbp, const char *src, size_t size)
 }
 
 int
-smb_rq_dstring(struct mbdata *mbp, const char *s)
+smb_rq_dstring(struct mbdata *mbp, char *s)
 {
 	return smb_rq_dmem(mbp, s, strlen(s) + 1);
 }

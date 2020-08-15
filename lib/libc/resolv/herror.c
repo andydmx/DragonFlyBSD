@@ -1,4 +1,9 @@
 /*
+ * @(#)herror.c	8.1 (Berkeley) 6/4/93
+ * $Id: herror.c,v 1.4 2005/04/27 04:56:41 sra Exp $
+ */
+
+/*
  * Copyright (c) 1987, 1993
  *    The Regents of the University of California.  All rights reserved.
  * 
@@ -10,11 +15,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- * 	This product includes software developed by the University of
- * 	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  * 
@@ -48,11 +49,6 @@
  * OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
-#if defined(LIBC_SCCS) && !defined(lint)
-static const char sccsid[] = "@(#)herror.c	8.1 (Berkeley) 6/4/93";
-static const char rcsid[] = "$Id: herror.c,v 1.4 2005/04/27 04:56:41 sra Exp $";
-#endif /* LIBC_SCCS and not lint */
-
 #include "port_before.h"
 
 #ifdef _LIBC
@@ -85,7 +81,7 @@ const char *h_errlist[] = {
 	"Unknown server error",			/*%< 3 NO_RECOVERY */
 	"No address associated with name",	/*%< 4 NO_ADDRESS */
 };
-int	h_nerr = { sizeof h_errlist / sizeof h_errlist[0] };
+int	h_nerr = { NELEM(h_errlist) };
 
 #if !(__GLIBC__ > 2 || __GLIBC__ == 2 &&  __GLIBC_MINOR__ >= 3)
 #undef	h_errno

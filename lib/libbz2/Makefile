@@ -11,10 +11,7 @@ INCS=		bzlib.h
 CFLAGS+=	-I${BZ2DIR}
 WARNS?=		3
 
-.if defined(RELEASE36)
-SHLIB_MAJOR=	3
 VERSION_DEF=	${.CURDIR}/Versions.def
 SYMBOL_MAPS=	${.CURDIR}/Symbol.map
-.endif
 
 .include <bsd.lib.mk>

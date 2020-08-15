@@ -23,8 +23,7 @@ ${_fwd}: ${_h}
 # mimic a standard user include topology.  Only the virtual kernel
 # build uses these.  e.g. in order for #include <fcntl.h> to work.
 #
-_lhdrs= aio.h errno.h fcntl.h linker_set.h poll.h syslog.h \
-	termios.h ucontext.h
+_lhdrs= aio.h errno.h fcntl.h linker_set.h poll.h syslog.h ucontext.h
 _LHDRS=
 .for _h in ${_lhdrs}
 _fwd:=	${_MACHINE_FWD}/include/${_h}
@@ -51,7 +50,8 @@ ${_FWDHDRS}:
 	echo "#define _MACHINE_${.TARGET:T:S/./_/g:tu}_" ; \
 	echo "#include <cpu/${.TARGET:T}>" ; \
 	echo "#endif" ; \
-	echo) > ${.TARGET}
+	echo) > ${.TARGET}.${.MAKE.PID}
+	@mv -f ${.TARGET}.${.MAKE.PID} ${.TARGET}
 
 ${_LHDRS}:
 	@(echo "creating sys/ forwarding header ${.TARGET}" 1>&2; \
@@ -63,4 +63,5 @@ ${_LHDRS}:
 	echo "#define _${.TARGET:T:S/./_/g:tu}_" ; \
 	echo "#include <sys/${.TARGET:T}>" ; \
 	echo "#endif" ; \
-	echo) > ${.TARGET}
+	echo) > ${.TARGET}.${.MAKE.PID}
+	@mv -f ${.TARGET}.${.MAKE.PID} ${.TARGET}

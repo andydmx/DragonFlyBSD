@@ -31,7 +31,7 @@
 .\"     @(#)rc.8	8.2 (Berkeley) 12/11/93
 .\" $FreeBSD: src/share/man/man8/rc.8,v 1.22 2002/12/12 17:25:58 ru Exp $
 .\"
-.Dd October 29, 2014
+.Dd July 20, 2018
 .Dt RC 8
 .Os
 .Sh NAME
@@ -113,6 +113,13 @@ speedup will not occur when
 .Nm
 is started up after exiting the single-user shell.
 .It
+If the file
+.Pa /firstboot
+does not exist, add
+.Dq Li firstboot
+to the list of KEYWORDS to skip in
+.Xr rcorder 8 .
+.It
 Invoke
 .Xr rcorder 8
 to order the files in
@@ -137,6 +144,10 @@ and sources the script in a subshell.
 If the script has a
 .Pa .sh
 suffix then it is sourced directly into the current shell.
+.It
+If the file
+.Pa /firstboot
+exists, delete it.
 .El
 .Ss Operation of Nm rc.shutdown
 .Bl -enum
@@ -188,7 +199,7 @@ In order of startup, these are:
 .It Pa NETWORKING
 Ensure basic network services are running, including general
 network configuration
-.Pq Pa netif , routing , network_ipv6 , ppp-user .
+.Pq Pa netif , routing , network_ipv6 , ppp .
 .It Pa SERVERS
 Ensure basic services (such as
 .Pa NETWORKING
@@ -220,7 +231,7 @@ have a
 .Pa .sh
 suffix.
 Extreme care must be taken in using this, as the startup sequence will
-terminate if the script does.
+terminate if the script terminates.
 .It Pa bar
 Scripts that are sourced in a subshell.
 These can stop the boot if necessary with the following shell
@@ -462,8 +473,7 @@ Most daemons, including network related daemons, have their own script in
 which can be used to start, stop, and check the status of the service.
 .Pp
 Any architecture specific scripts, such as
-.Pa /etc/rc.d/apm
-for example, specifically check that they are on that architecture
+specifically check that they are on that architecture
 before starting the daemon.
 .Pp
 Following tradition, all startup files reside in

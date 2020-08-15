@@ -31,7 +31,6 @@
  * THE POSSIBILITY OF SUCH DAMAGE.
  *
  * $FreeBSD: src/sys/dev/bge/if_bgereg.h,v 1.1.2.16 2004/09/23 20:11:18 ps Exp $
- * $DragonFly: src/sys/dev/netif/bge/if_bgereg.h,v 1.25 2008/10/22 14:24:24 sephe Exp $
  */
 
 #ifndef _IF_BNXVAR_H_
@@ -175,7 +174,7 @@ struct bnx_rx_std_ring {
 	int			bnx_rx_std_refill __cachealign;
 	int			bnx_rx_std_used;
 	u_int			bnx_rx_std_running;
-	struct thread		bnx_rx_std_ithread;
+	struct thread		*bnx_rx_std_ithread;
 
 	struct bnx_rx_buf	bnx_rx_std_buf[BGE_STD_RX_RING_CNT];
 
@@ -300,6 +299,9 @@ struct bnx_intr_data {
 #define BNX_TX_RING_MAX		4
 #define BNX_INTR_MAX		5
 
+#define BNX_RDRTABLE_SIZE	(BGE_RSS_INDIR_TBLENT_CNT * \
+				 BGE_RSS_INDIR_TBL_CNT)
+
 struct bnx_softc {
 	struct arpcom		arpcom;		/* interface info */
 	device_t		bnx_dev;
@@ -323,7 +325,6 @@ struct bnx_softc {
 #define BNX_FLAG_TSO		0x00000200
 #define BNX_FLAG_NO_EEPROM	0x10000000
 #define BNX_FLAG_RXTX_BUNDLE	0x20000000
-#define BNX_FLAG_STD_THREAD	0x40000000
 #define BNX_FLAG_STATUS_HASTAG	0x80000000
 
 	uint32_t		bnx_mfw_flags;	/* Management F/W flags */
@@ -374,8 +375,8 @@ struct bnx_softc {
 	int			bnx_tick_cpuid;
 	struct callout		bnx_tick_timer;
 
-	int			bnx_npoll_rxoff;
-	int			bnx_npoll_txoff;
+	struct if_ringmap	*bnx_tx_rmap;
+	struct if_ringmap	*bnx_rx_rmap;
 
 	int			bnx_msix_mem_rid;
 	struct resource		*bnx_msix_mem_res;
@@ -383,8 +384,7 @@ struct bnx_softc {
 	int			bnx_intr_cnt;
 	struct bnx_intr_data	bnx_intr_data[BNX_INTR_MAX];
 
-	struct sysctl_ctx_list	bnx_sysctl_ctx;
-	struct sysctl_oid	*bnx_sysctl_tree;
+	int			bnx_rdr_table[BNX_RDRTABLE_SIZE];
 
 	int			bnx_phyno;
 	uint32_t		bnx_coal_chg;

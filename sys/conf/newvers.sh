@@ -11,11 +11,7 @@
 # 2. Redistributions in binary form must reproduce the above copyright
 #    notice, this list of conditions and the following disclaimer in the
 #    documentation and/or other materials provided with the distribution.
-# 3. All advertising materials mentioning features or use of this software
-#    must display the following acknowledgement:
-#	This product includes software developed by the University of
-#	California, Berkeley and its contributors.
-# 4. Neither the name of the University nor the names of its contributors
+# 3. Neither the name of the University nor the names of its contributors
 #    may be used to endorse or promote products derived from this software
 #    without specific prior written permission.
 #
@@ -43,11 +39,11 @@ fi
 
 # Set the branch
 #
-BRANCH="DEVELOPMENT_4_1"
+BRANCH="DEVELOPMENT_5_9"
 
 TYPE="DragonFly"
 
-# Figure out the revision and subversion, if any.  If the tag is in 
+# Figure out the revision and subversion, if any.  If the tag is in
 # the form NAME_X_Y the revision is extracted from X and Y and the branch
 # tag is truncated to just NAME.  Otherwise we are on the HEAD branch and
 # we are either HEAD or PREVIEW and the programmed revision is used.
@@ -105,7 +101,11 @@ then
 fi
 
 touch version
-v=`cat version` u=${USER-root} d=`pwd` h=`hostname` t=`date`
+v=`cat version`
+u=${USER:-root}
+d=`pwd`
+h=${HOSTNAME:-`hostname`}
+t=`date`
 if [ "$v" = "" ]; then
     v=1
 fi

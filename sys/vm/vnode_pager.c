@@ -51,6 +51,7 @@
 
 #include <sys/param.h>
 #include <sys/systm.h>
+#include <sys/uio.h>
 #include <sys/kernel.h>
 #include <sys/proc.h>
 #include <sys/vnode.h>
@@ -70,19 +71,18 @@
 #include <vm/swap_pager.h>
 #include <vm/vm_extern.h>
 
-#include <sys/thread2.h>
 #include <vm/vm_page2.h>
 
-static void vnode_pager_dealloc (vm_object_t);
-static int vnode_pager_getpage (vm_object_t, vm_page_t *, int);
-static void vnode_pager_putpages (vm_object_t, vm_page_t *, int, int, int *);
-static boolean_t vnode_pager_haspage (vm_object_t, vm_pindex_t);
+static	pgo_dealloc_t		vnode_pager_dealloc;
+static	pgo_getpage_t		vnode_pager_getpage;
+static	pgo_putpages_t		vnode_pager_putpages;
+static	pgo_haspage_t		vnode_pager_haspage;
 
 struct pagerops vnodepagerops = {
-	vnode_pager_dealloc,
-	vnode_pager_getpage,
-	vnode_pager_putpages,
-	vnode_pager_haspage
+	.pgo_dealloc =		vnode_pager_dealloc,
+	.pgo_getpage =		vnode_pager_getpage,
+	.pgo_putpages =		vnode_pager_putpages,
+	.pgo_haspage =		vnode_pager_haspage
 };
 
 static struct krate vbadrate = { 1 };
@@ -117,7 +117,7 @@ vnode_pager_alloc(void *handle, off_t length, vm_prot_t prot, off_t offset,
 	 * XXX hack - This initialization should be put somewhere else.
 	 */
 	if (vnode_pbuf_freecnt < 0) {
-	    vnode_pbuf_freecnt = nswbuf / 2 + 1;
+	    vnode_pbuf_freecnt = nswbuf_kva / 2 + 1;
 	}
 
 	/*
@@ -228,9 +228,7 @@ vnode_pager_dealloc(vm_object_t object)
 }
 
 /*
- * Return whether the vnode pager has the requested page.  Return the
- * number of disk-contiguous pages before and after the requested page,
- * not including the requested page.
+ * Return whether the vnode pager has the requested page.
  */
 static boolean_t
 vnode_pager_haspage(vm_object_t object, vm_pindex_t pindex)
@@ -262,7 +260,7 @@ vnode_pager_haspage(vm_object_t object, vm_pindex_t pindex)
 	voff = loffset % bsize;
 
 	/*
-	 * XXX
+	 * XXX (obsolete - before and after pointers are now NULL)
 	 *
 	 * BMAP returns byte counts before and after, where after
 	 * is inclusive of the base page.  haspage must return page
@@ -417,7 +415,9 @@ vnode_pager_setsize(struct vnode *vp, vm_ooffset_t nsize)
 void
 vnode_pager_freepage(vm_page_t m)
 {
-	if (m->busy || m->wire_count || (m->flags & PG_NEED_COMMIT)) {
+	if ((m->busy_count & PBUSY_MASK) ||
+	    m->wire_count ||
+	    (m->flags & PG_NEED_COMMIT)) {
 		vm_page_activate(m);
 		vm_page_wakeup(m);
 	} else {
@@ -466,6 +466,7 @@ vnode_pager_generic_getpages(struct vnode *vp, vm_page_t *mpp, int bytecount,
 	int count;
 	int i;
 	int ioflags;
+	int obytecount;
 
 	/*
 	 * Do not do anything if the vnode is bad.
@@ -531,6 +532,7 @@ vnode_pager_generic_getpages(struct vnode *vp, vm_page_t *mpp, int bytecount,
 		KASSERT(secmask < PAGE_SIZE, ("vnode_pager_generic_getpages: sector size %d too large", secmask + 1));
 		bytecount = (bytecount + secmask) & ~secmask;
 	}
+	obytecount = bytecount;
 
 	/*
 	 * Severe hack to avoid deadlocks with the buffer cache
@@ -573,7 +575,7 @@ vnode_pager_generic_getpages(struct vnode *vp, vm_page_t *mpp, int bytecount,
 
 	/*
 	 * Calculate the actual number of bytes read and clean up the
-	 * page list.  
+	 * page list.
 	 */
 	bytecount -= auio.uio_resid;
 
@@ -595,6 +597,10 @@ vnode_pager_generic_getpages(struct vnode *vp, vm_page_t *mpp, int bytecount,
 				kprintf("page failed but no I/O error page "
 					"%p object %p pindex %d\n",
 					mt, mt->object, (int) mt->pindex);
+				kprintf("i=%d foff=%016lx bytecount=%d/%d "
+					"uioresid=%zd\n",
+					i, foff, obytecount, bytecount,
+					auio.uio_resid);
 				/* whoops, something happened */
 				error = EINVAL;
 			}
@@ -624,7 +630,7 @@ vnode_pager_generic_getpages(struct vnode *vp, vm_page_t *mpp, int bytecount,
  */
 static void
 vnode_pager_putpages(vm_object_t object, vm_page_t *m, int count,
-		     int sync, int *rtvals)
+		     int flags, int *rtvals)
 {
 	int rtval;
 	struct vnode *vp;
@@ -633,7 +639,7 @@ vnode_pager_putpages(vm_object_t object, vm_page_t *m, int count,
 	/*
 	 * Force synchronous operation if we are extremely low on memory
 	 * to prevent a low-memory deadlock.  VOP operations often need to
-	 * allocate more memory to initiate the I/O ( i.e. do a BMAP 
+	 * allocate more memory to initiate the I/O ( i.e. do a BMAP
 	 * operation ).  The swapper handles the case by limiting the amount
 	 * of asynchronous I/O, but that sort of solution doesn't scale well
 	 * for the vnode pager without a lot of work.
@@ -644,17 +650,17 @@ vnode_pager_putpages(vm_object_t object, vm_page_t *m, int count,
 
 	if ((vmstats.v_free_count + vmstats.v_cache_count) <
 	    vmstats.v_pageout_free_min) {
-		sync |= OBJPC_SYNC;
+		flags |= OBJPC_SYNC;
 	}
 
 	/*
 	 * Call device-specific putpages function
 	 */
 	vp = object->handle;
-	rtval = VOP_PUTPAGES(vp, m, bytes, sync, rtvals, 0);
+	rtval = VOP_PUTPAGES(vp, m, bytes, flags, rtvals, 0);
 	if (rtval == EOPNOTSUPP) {
 	    kprintf("vnode_pager: *** WARNING *** stale FS putpages\n");
-	    rtval = vnode_pager_generic_putpages( vp, m, bytes, sync, rtvals);
+	    rtval = vnode_pager_generic_putpages( vp, m, bytes, flags, rtvals);
 	}
 }
 
@@ -737,11 +743,11 @@ vnode_pager_generic_putpages(struct vnode *vp, vm_page_t *m, int bytecount,
 	 * the system decides how to cluster.
 	 */
 	ioflags = IO_VMIO;
-	if (flags & (VM_PAGER_PUT_SYNC | VM_PAGER_PUT_INVAL))
+	if (flags & (OBJPC_SYNC | OBJPC_INVAL))
 		ioflags |= IO_SYNC;
-	else if ((flags & VM_PAGER_CLUSTER_OK) == 0)
+	else if ((flags & OBJPC_CLUSTER_OK) == 0)
 		ioflags |= IO_ASYNC;
-	ioflags |= (flags & VM_PAGER_PUT_INVAL) ? IO_INVAL: 0;
+	ioflags |= (flags & OBJPC_INVAL) ? IO_INVAL: 0;
 	ioflags |= IO_SEQMAX << IO_SEQSHIFT;
 
 	aiov.iov_base = (caddr_t) 0;
@@ -778,38 +784,27 @@ vnode_pager_generic_putpages(struct vnode *vp, vm_page_t *m, int bytecount,
 /*
  * Run the chain and if the bottom-most object is a vnode-type lock the
  * underlying vnode.  A locked vnode or NULL is returned.
+ *
+ * Caller must hold the first object.
  */
 struct vnode *
-vnode_pager_lock(vm_object_t object)
+vnode_pager_lock(vm_map_backing_t ba)
 {
-	struct vnode *vp = NULL;
+	vm_map_backing_t lba;
+	struct vnode *vp;
 	vm_object_t lobject;
-	vm_object_t tobject;
 	int error;
 
-	if (object == NULL)
-		return(NULL);
+	if (ba == NULL)
+		return NULL;
+	lba = ba;
+	while (lba->backing_ba)
+		lba = lba->backing_ba;
+	if ((lobject = lba->object) == NULL)
+		return NULL;
+	if (lba != ba)
+		vm_object_hold_shared(lobject);
 
-	ASSERT_LWKT_TOKEN_HELD(vm_object_token(object));
-	lobject = object;
-
-	while (lobject->type != OBJT_VNODE) {
-		if (lobject->flags & OBJ_DEAD)
-			break;
-		tobject = lobject->backing_object;
-		if (tobject == NULL)
-			break;
-		vm_object_hold_shared(tobject);
-		if (tobject == lobject->backing_object) {
-			if (lobject != object) {
-				vm_object_lock_swap();
-				vm_object_drop(lobject);
-			}
-			lobject = tobject;
-		} else {
-			vm_object_drop(tobject);
-		}
-	}
 	while (lobject->type == OBJT_VNODE &&
 	       (lobject->flags & OBJ_DEAD) == 0) {
 		/*
@@ -826,11 +821,11 @@ vnode_pager_lock(vm_object_t object)
 				"lockstatus %d, retrying\n",
 				vp, error,
 				lockstatus(&vp->v_lock, curthread));
-			tsleep(object->handle, 0, "vnpgrl", hz);
+			tsleep(lobject->handle, 0, "vnpgrl", hz);
 		}
 		vp = NULL;
 	}
-	if (lobject != object)
+	if (lba != ba)
 		vm_object_drop(lobject);
 	return (vp);
 }

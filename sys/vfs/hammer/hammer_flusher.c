@@ -1,13 +1,13 @@
 /*
  * Copyright (c) 2008 The DragonFly Project.  All rights reserved.
- * 
+ *
  * This code is derived from software contributed to The DragonFly Project
  * by Matthew Dillon <dillon@backplane.com>
- * 
+ *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
  * are met:
- * 
+ *
  * 1. Redistributions of source code must retain the above copyright
  *    notice, this list of conditions and the following disclaimer.
  * 2. Redistributions in binary form must reproduce the above copyright
@@ -17,7 +17,7 @@
  * 3. Neither the name of The DragonFly Project nor the names of its
  *    contributors may be used to endorse or promote products derived
  *    from this software without specific, prior written permission.
- * 
+ *
  * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
  * ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
  * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
@@ -30,7 +30,7 @@
  * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT
  * OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
- * 
+ *
  * $DragonFly: src/sys/vfs/hammer/hammer_flusher.c,v 1.45 2008/07/31 04:42:04 dillon Exp $
  */
 /*
@@ -53,17 +53,14 @@ RB_GENERATE(hammer_fls_rb_tree, hammer_inode, rb_flsnode,
 /*
  * Support structures for the flusher threads.
  */
-struct hammer_flusher_info {
+typedef struct hammer_flusher_info {
 	TAILQ_ENTRY(hammer_flusher_info) entry;
-	struct hammer_mount *hmp;
+	hammer_mount_t	hmp;
 	thread_t	td;
 	int		runstate;
-	int		count;
 	hammer_flush_group_t flg;
 	struct hammer_transaction trans;        /* per-slave transaction */
-};
-
-typedef struct hammer_flusher_info *hammer_flusher_info_t;
+} *hammer_flusher_info_t;
 
 /*
  * Sync all inodes pending on the flusher.
@@ -166,7 +163,7 @@ hammer_flusher_async_one(hammer_mount_t hmp)
 void
 hammer_flusher_wait(hammer_mount_t hmp, int seq)
 {
-	while ((int)(seq - hmp->flusher.done) > 0)
+	while (seq - hmp->flusher.done > 0)
 		tsleep(&hmp->flusher.done, 0, "hmrfls", 0);
 }
 
@@ -179,7 +176,7 @@ int
 hammer_flusher_running(hammer_mount_t hmp)
 {
 	int seq = hmp->flusher.next - 1;
-	if ((int)(seq - hmp->flusher.done) > 0)
+	if (seq - hmp->flusher.done > 0)
 		return(1);
 	return (0);
 }
@@ -351,7 +348,12 @@ hammer_flusher_flush(hammer_mount_t hmp, int *nomorep)
 			return (hmp->flusher.done);
 		}
 	} else {
-		KKASSERT((int)(flg->seq - seq) > 0);
+		/*
+		 * Sequence number problems can only happen if a critical
+		 * filesystem error occurred which forced the filesystem into
+		 * read-only mode.
+		 */
+		KKASSERT(flg->seq - seq > 0 || hmp->ronly >= 2);
 		flg = NULL;
 	}
 
@@ -365,7 +367,7 @@ hammer_flusher_flush(hammer_mount_t hmp, int *nomorep)
 	while (flg && flg->running) {
 		++count;
 		if (hammer_debug_general & 0x0001) {
-			kprintf("hammer_flush %d ttl=%d recs=%d\n",
+			hdkprintf("%d ttl=%d recs=%d\n",
 				flg->seq, flg->total_count, flg->refs);
 		}
 		if (hmp->flags & HAMMER_MOUNT_CRITICAL_ERROR)
@@ -437,13 +439,13 @@ hammer_flusher_flush(hammer_mount_t hmp, int *nomorep)
 	}
 
 	/*
-	 * Clean up any freed big-blocks (typically zone-2). 
+	 * Clean up any freed big-blocks (typically zone-2).
 	 * resv->flush_group is typically set several flush groups ahead
 	 * of the free to ensure that the freed block is not reused until
 	 * it can no longer be reused.
 	 */
 	while ((resv = TAILQ_FIRST(&hmp->delay_list)) != NULL) {
-		if ((int)(resv->flush_group - seq) > 0)
+		if (resv->flg_no - seq > 0)
 			break;
 		hammer_reserve_clrdelay(hmp, resv);
 	}
@@ -476,7 +478,6 @@ hammer_flusher_slave_thread(void *arg)
 		RB_SCAN(hammer_fls_rb_tree, &flg->flush_tree, NULL,
 			hammer_flusher_flush_inode, info);
 
-		info->count = 0;
 		info->runstate = 0;
 		info->flg = NULL;
 		TAILQ_REMOVE(&hmp->flusher.run_list, info, entry);
@@ -560,13 +561,13 @@ hammer_flusher_flush_inode(hammer_inode_t ip, void *data)
 		if (error == EWOULDBLOCK)
 			error = 0;
 	}
-	hammer_flush_inode_done(ip, error);
+	hammer_sync_inode_done(ip, error);
 	/* ip invalid */
 
 	while (hmp->flusher.finalize_want)
 		tsleep(&hmp->flusher.finalize_want, 0, "hmrsxx", 0);
 	if (hammer_flusher_undo_exhausted(trans, 1)) {
-		kprintf("HAMMER: Warning: UNDO area too small!\n");
+		hkprintf("Warning: UNDO area too small!\n");
 		hammer_flusher_finalize(trans, 1);
 	} else if (hammer_flusher_meta_limit(trans->hmp)) {
 		hammer_flusher_finalize(trans, 0);
@@ -658,10 +659,10 @@ hammer_flusher_finalize(hammer_transaction_t trans, int final)
 			break;
 		hammer_ref(&io->lock);
 		hammer_io_write_interlock(io);
-		KKASSERT(io->type != HAMMER_STRUCTURE_VOLUME);
+		KKASSERT(io->type != HAMMER_IOTYPE_VOLUME);
 		hammer_io_flush(io, 0);
 		hammer_io_done_interlock(io);
-		hammer_rel_buffer((hammer_buffer_t)io, 0);
+		hammer_rel_buffer(HAMMER_ITOB(io), 0);
 		hammer_io_limit_backlog(hmp);
 		++count;
 	}
@@ -683,8 +684,10 @@ hammer_flusher_finalize(hammer_transaction_t trans, int final)
 		if (root_volume->io.modified) {
 			hammer_modify_volume(trans, root_volume,
 					     dundomap, sizeof(hmp->blockmap));
-			for (i = 0; i < HAMMER_MAX_ZONES; ++i)
-				hammer_crc_set_blockmap(&cundomap[i]);
+			for (i = 0; i < HAMMER_MAX_ZONES; ++i) {
+				hammer_crc_set_blockmap(hmp->version,
+							&cundomap[i]);
+			}
 			bcopy(cundomap, dundomap, sizeof(hmp->blockmap));
 			hammer_modify_volume_done(root_volume);
 		}
@@ -737,10 +740,10 @@ hammer_flusher_finalize(hammer_transaction_t trans, int final)
 
 	if (dundomap->first_offset != cundomap->first_offset ||
 		   dundomap->next_offset != save_undo_next_offset) {
-		hammer_modify_volume(NULL, root_volume, NULL, 0);
+		hammer_modify_volume_noundo(NULL, root_volume);
 		dundomap->first_offset = cundomap->first_offset;
 		dundomap->next_offset = save_undo_next_offset;
-		hammer_crc_set_blockmap(dundomap);
+		hammer_crc_set_blockmap(hmp->version, dundomap);
 		hammer_modify_volume_done(root_volume);
 	}
 
@@ -757,10 +760,10 @@ hammer_flusher_finalize(hammer_transaction_t trans, int final)
 	 * mandatory.
 	 */
 	if (root_volume->io.modified) {
-		hammer_modify_volume(NULL, root_volume, NULL, 0);
+		hammer_modify_volume_noundo(NULL, root_volume);
 		if (root_volume->ondisk->vol0_next_tid < trans->tid)
 			root_volume->ondisk->vol0_next_tid = trans->tid;
-		hammer_crc_set_volume(root_volume->ondisk);
+		hammer_crc_set_volume(hmp->version, root_volume->ondisk);
 		hammer_modify_volume_done(root_volume);
 		hammer_io_write_interlock(&root_volume->io);
 		hammer_io_flush(&root_volume->io, 0);
@@ -802,9 +805,9 @@ hammer_flusher_finalize(hammer_transaction_t trans, int final)
 			break;
 		KKASSERT(io->modify_refs == 0);
 		hammer_ref(&io->lock);
-		KKASSERT(io->type != HAMMER_STRUCTURE_VOLUME);
+		KKASSERT(io->type != HAMMER_IOTYPE_VOLUME);
 		hammer_io_flush(io, 0);
-		hammer_rel_buffer((hammer_buffer_t)io, 0);
+		hammer_rel_buffer(HAMMER_ITOB(io), 0);
 		hammer_io_limit_backlog(hmp);
 		++count;
 	}
@@ -866,9 +869,9 @@ failed:
 	hammer_sync_unlock(trans);
 
 	if (hmp->flags & HAMMER_MOUNT_CRITICAL_ERROR) {
-		kprintf("HAMMER(%s): Critical write error during flush, "
-			"refusing to sync UNDO FIFO\n",
-			root_volume->ondisk->vol_name);
+		hvkprintf(root_volume,
+			"Critical write error during flush, "
+			"refusing to sync UNDO FIFO\n");
 	}
 
 done:
@@ -893,11 +896,11 @@ hammer_flusher_flush_undos(hammer_mount_t hmp, int mode)
 		if (io->ioerror)
 			break;
 		hammer_ref(&io->lock);
-		KKASSERT(io->type != HAMMER_STRUCTURE_VOLUME);
+		KKASSERT(io->type != HAMMER_IOTYPE_VOLUME);
 		hammer_io_write_interlock(io);
 		hammer_io_flush(io, hammer_undo_reclaim(io));
 		hammer_io_done_interlock(io);
-		hammer_rel_buffer((hammer_buffer_t)io, 0);
+		hammer_rel_buffer(HAMMER_ITOB(io), 0);
 		hammer_io_limit_backlog(hmp);
 		++count;
 	}
@@ -957,10 +960,37 @@ hammer_flusher_haswork(hammer_mount_t hmp)
 	    RB_ROOT(&hmp->undo_root) ||
 	    RB_ROOT(&hmp->data_root) ||
 	    RB_ROOT(&hmp->meta_root) ||
-	    (hmp->hflags & HMNT_UNDO_DIRTY)		/* UNDO FIFO sync */
-	) {
+	    (hmp->hflags & HMNT_UNDO_DIRTY)) {		/* UNDO FIFO sync */
 		return(1);
 	}
 	return(0);
 }
 
+int
+hammer_flush_dirty(hammer_mount_t hmp, int max_count)
+{
+	int count = 0;
+	int dummy;
+
+	while (hammer_flusher_haswork(hmp)) {
+		hammer_flusher_sync(hmp);
+		++count;
+		if (count >= 5) {
+			if (count == 5)
+				hkprintf("flushing.");
+			else
+				kprintf(".");
+			tsleep(&dummy, 0, "hmrufl", hz);
+		}
+		if (max_count != -1 && count == max_count) {
+			kprintf("giving up");
+			break;
+		}
+	}
+	if (count >= 5)
+		kprintf("\n");
+
+	if (count >= max_count)
+		return(-1);
+	return(0);
+}

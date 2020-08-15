@@ -1,3 +1,4 @@
+/* $FreeBSD: head/sys/dev/usb/usb_hid.c 246122 2013-01-30 15:26:04Z hselasky $ */
 /*	$NetBSD: hid.c,v 1.17 2001/11/13 06:24:53 lukem Exp $	*/
 
 
@@ -40,7 +41,6 @@
 #include <sys/bus.h>
 #include <sys/module.h>
 #include <sys/lock.h>
-#include <sys/mutex.h>
 #include <sys/condvar.h>
 #include <sys/sysctl.h>
 #include <sys/unistd.h>
@@ -659,7 +659,7 @@ hid_get_data_sub(const uint8_t *buf, usb_size_t len, struct hid_location *loc,
 	if (hsize > 32)
 		hsize = 32;
 
-	/* Get data in a safe way */	
+	/* Get data in a safe way */
 	data = 0;
 	rpos = (hpos / 8);
 	n = (hsize + 7) / 8;
@@ -719,7 +719,7 @@ hid_put_data_unsigned(uint8_t *buf, usb_size_t len,
 	if (hsize > 32)
 		hsize = 32;
 
-	/* Put data in a safe way */	
+	/* Put data in a safe way */
 	rpos = (hpos / 8);
 	n = (hsize + 7) / 8;
 	data = ((uint64_t)value) << (hpos % 8);

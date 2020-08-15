@@ -38,6 +38,7 @@
 
 #include <sys/param.h>
 #include <sys/systm.h>
+#include <sys/uio.h>
 #include <sys/malloc.h>
 #include <sys/proc.h>
 #include <sys/priv.h>
@@ -84,7 +85,7 @@ procfs_dostatus(struct proc *curp, struct lwp *lp, struct pfsnode *pfs,
 	sess = p->p_pgrp->pg_session;
 	sid = sess->s_leader ? sess->s_leader->p_pid : 0;
 
-/* comm pid ppid pgid sid maj,min ctty,sldr start ut st wmsg 
+/* comm pid ppid pgid sid maj,min ctty,sldr start ut st wmsg
                                 euid ruid rgid,egid,groups[1 .. NGROUPS]
 */
 	KASSERT(sizeof(psbuf) > MAXCOMLEN,
@@ -122,10 +123,7 @@ procfs_dostatus(struct proc *curp, struct lwp *lp, struct pfsnode *pfs,
 		DOCHECK();
 	}
 
-	if (p->p_flags & P_SWAPPEDOUT) {
-		ps += ksnprintf(ps, psbuf + sizeof(psbuf) - ps,
-		    " -1,-1 -1,-1 -1,-1");
-	} else {
+	{
 		struct rusage ru;
 
 		calcru_proc(p, &ru);
@@ -144,13 +142,13 @@ procfs_dostatus(struct proc *curp, struct lwp *lp, struct pfsnode *pfs,
 
 	cr = p->p_ucred;
 
-	ps += ksnprintf(ps, psbuf + sizeof(psbuf) - ps, " %lu %lu %lu", 
+	ps += ksnprintf(ps, psbuf + sizeof(psbuf) - ps, " %lu %lu %lu",
 		(u_long)cr->cr_uid,
 		(u_long)p->p_ucred->cr_ruid,
 		(u_long)p->p_ucred->cr_rgid);
 	DOCHECK();
 
-	/* egid (p->p_ucred->cr_svgid) is equal to cr_ngroups[0] 
+	/* egid (p->p_ucred->cr_svgid) is equal to cr_ngroups[0]
 	   see also getegid(2) in /sys/kern/kern_prot.c */
 
 	for (i = 0; i < cr->cr_ngroups; i++) {
@@ -191,7 +189,7 @@ procfs_docmdline(struct proc *curp, struct lwp *lp, struct pfsnode *pfs,
 
 	if (uio->uio_rw != UIO_READ)
 		return (EOPNOTSUPP);
-	
+
 	/*
 	 * If we are using the ps/cmdline caching, use that.  Otherwise
 	 * revert back to the old way which only implements full cmdline
@@ -201,13 +199,31 @@ procfs_docmdline(struct proc *curp, struct lwp *lp, struct pfsnode *pfs,
 	 * don't fall back on p->p_comm or return an error: the authentic
 	 * Linux behaviour is to return zero-length in this case.
 	 */
-	if (p->p_upmap != NULL && p->p_upmap->proc_title[0] &&
+	if (lp->lwp_lpmap != NULL && lp->lwp_lpmap->thread_title[0] &&
 	    (ps_argsopen || (CHECKIO(curp, p) &&
 			     (p->p_flags & P_INEXEC) == 0 &&
 			     !p_trespass(curp->p_ucred, p->p_ucred))
 	    )) {
 		/*
+		 * Args set via writable thread mmap.
+		 *
+		 * We must calculate the string length manually
+		 * because the user data can change at any time.
+		 */
+		bp = lp->lwp_lpmap->thread_title;
+		for (buflen = 0; buflen < UPMAP_MAXPROCTITLE - 1; ++buflen) {
+			if (bp[buflen] == 0)
+				break;
+		}
+		buf = NULL;
+	} else if (p->p_upmap != NULL && p->p_upmap->proc_title[0] &&
+		   (ps_argsopen || (CHECKIO(curp, p) &&
+			     (p->p_flags & P_INEXEC) == 0 &&
+			     !p_trespass(curp->p_ucred, p->p_ucred))
+	    )) {
+		/*
 		 * Args set via writable user process mmap.
+		 *
 		 * We must calculate the string length manually
 		 * because the user data can change at any time.
 		 */

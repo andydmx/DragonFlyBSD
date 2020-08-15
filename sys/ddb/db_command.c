@@ -46,8 +46,7 @@
 #include <ddb/db_output.h>
 
 #include <machine/md_var.h>	/* needed for db_reset() */
-
-#include <setjmp.h>
+#include <machine/setjmp.h>
 
 /*
  * Exported global variables
@@ -72,55 +71,56 @@ static db_cmdfcn_t	db_reset;
 
 static struct command db_show_all_cmds[] = {
 #if 0
-	{ "threads",	db_show_all_threads,	0,	0 },
+	{ "threads",	db_show_all_threads,	0,	NULL },
 #endif
-	{ "procs",	db_ps,			0,	0 },
+	{ "procs",	db_ps,			0,	NULL },
 	{ NULL }
 };
 
 static struct command db_show_cmds[] = {
 	{ "all",	0,			0,	db_show_all_cmds },
-	{ "registers",	db_show_regs,		0,	0 },
-	{ "breaks",	db_listbreak_cmd, 	0,	0 },
+	{ "registers",	db_show_regs,		0,	NULL },
+	{ "breaks",	db_listbreak_cmd, 	0,	NULL },
 #if 0
-	{ "thread",	db_show_one_thread,	0,	0 },
+	{ "thread",	db_show_one_thread,	0,	NULL },
 #endif
 #if 0
-	{ "port",	ipc_port_print,		0,	0 },
+	{ "port",	ipc_port_print,		0,	NULL },
 #endif
 	{ NULL, }
 };
 
 static struct command db_command_table[] = {
-	{ "print",	db_print_cmd,		0,	0 },
-	{ "p",		db_print_cmd,		0,	0 },
-	{ "examine",	db_examine_cmd,		CS_SET_DOT, 0 },
-	{ "x",		db_examine_cmd,		CS_SET_DOT, 0 },
-	{ "search",	db_search_cmd,		CS_OWN|CS_SET_DOT, 0 },
-	{ "set",	db_set_cmd,		CS_OWN,	0 },
-	{ "write",	db_write_cmd,		CS_MORE|CS_SET_DOT, 0 },
-	{ "w",		db_write_cmd,		CS_MORE|CS_SET_DOT, 0 },
-	{ "delete",	db_delete_cmd,		0,	0 },
-	{ "d",		db_delete_cmd,		0,	0 },
-	{ "break",	db_breakpoint_cmd,	0,	0 },
-	{ "dwatch",	db_deletewatch_cmd,	0,	0 },
-	{ "watch",	db_watchpoint_cmd,	CS_MORE,0 },
-	{ "dhwatch",	db_deletehwatch_cmd,	0,      0 },
-	{ "hwatch",	db_hwatchpoint_cmd,	0,      0 },
-	{ "step",	db_single_step_cmd,	0,	0 },
-	{ "s",		db_single_step_cmd,	0,	0 },
-	{ "continue",	db_continue_cmd,	0,	0 },
-	{ "c",		db_continue_cmd,	0,	0 },
-	{ "until",	db_trace_until_call_cmd,0,	0 },
-	{ "next",	db_trace_until_matching_cmd,0,	0 },
-	{ "match",	db_trace_until_matching_cmd,0,	0 },
-	{ "trace",	db_stack_trace_cmd,	0,	0 },
-	{ "where",	db_stack_trace_cmd, 0,	0 },
-	{ "call",	db_fncall,		CS_OWN,	0 },
+	{ "print",	db_print_cmd,		0,	NULL },
+	{ "p",		db_print_cmd,		0,	NULL },
+	{ "examine",	db_examine_cmd,		CS_SET_DOT, NULL },
+	{ "x",		db_examine_cmd,		CS_SET_DOT, NULL },
+	{ "search",	db_search_cmd,		CS_OWN|CS_SET_DOT, NULL },
+	{ "set",	db_set_cmd,		CS_OWN,	NULL },
+	{ "write",	db_write_cmd,		CS_MORE|CS_SET_DOT, NULL },
+	{ "w",		db_write_cmd,		CS_MORE|CS_SET_DOT, NULL },
+	{ "delete",	db_delete_cmd,		0,	NULL },
+	{ "d",		db_delete_cmd,		0,	NULL },
+	{ "break",	db_breakpoint_cmd,	0,	NULL },
+	{ "dwatch",	db_deletewatch_cmd,	0,	NULL },
+	{ "watch",	db_watchpoint_cmd,	CS_MORE,NULL },
+	{ "dhwatch",	db_deletehwatch_cmd,	0,      NULL },
+	{ "hwatch",	db_hwatchpoint_cmd,	0,      NULL },
+	{ "step",	db_single_step_cmd,	0,	NULL },
+	{ "s",		db_single_step_cmd,	0,	NULL },
+	{ "continue",	db_continue_cmd,	0,	NULL },
+	{ "c",		db_continue_cmd,	0,	NULL },
+	{ "i",		db_invltlb_cmd,		0,	NULL },
+	{ "until",	db_trace_until_call_cmd,0,	NULL },
+	{ "next",	db_trace_until_matching_cmd,0,	NULL },
+	{ "match",	db_trace_until_matching_cmd,0,	NULL },
+	{ "trace",	db_stack_trace_cmd,	0,	NULL },
+	{ "where",	db_stack_trace_cmd, 0,	NULL },
+	{ "call",	db_fncall,		CS_OWN,	NULL },
 	{ "show",	0,			0,	db_show_cmds },
-	{ "ps",		db_ps,			0,	0 },
-	{ "gdb",	db_gdb,			0,	0 },
-	{ "reset",	db_reset,		0,	0 },
+	{ "ps",		db_ps,			0,	NULL },
+	{ "gdb",	db_gdb,			0,	NULL },
+	{ "reset",	db_reset,		0,	NULL },
 	{ NULL, }
 };
 
@@ -451,10 +451,11 @@ db_command_loop(void)
 	/*
 	 * Initialize 'prev' and 'next' to dot.
 	 */
+	cnpoll(TRUE);
 	db_prev = db_dot;
 	db_next = db_dot;
 
-	db_cmd_loop_done = 0;
+	db_cmd_loop_done = FALSE;
 	while (!db_cmd_loop_done) {
 
 	    setjmp(db_jmpbuf);
@@ -467,6 +468,7 @@ db_command_loop(void)
 	    db_command(&db_last_command, db_command_table,
 		    SET_BEGIN(db_cmd_set), SET_LIMIT(db_cmd_set));
 	}
+	cnpoll(FALSE);
 }
 
 void
@@ -483,6 +485,26 @@ db_error(char *s)
  * Call random function:
  * !expr(arg,arg,arg)
  */
+typedef union {
+	db_expr_t	(*a0)(void);
+	db_expr_t	(*a1)(db_expr_t);
+	db_expr_t	(*a2)(db_expr_t, db_expr_t);
+	db_expr_t	(*a3)(db_expr_t, db_expr_t, db_expr_t);
+	db_expr_t	(*a4)(db_expr_t, db_expr_t, db_expr_t, db_expr_t);
+	db_expr_t	(*a5)(db_expr_t, db_expr_t, db_expr_t, db_expr_t, db_expr_t);
+	db_expr_t	(*a6)(db_expr_t, db_expr_t, db_expr_t, db_expr_t, db_expr_t,
+			   db_expr_t);
+	db_expr_t	(*a7)(db_expr_t, db_expr_t, db_expr_t, db_expr_t, db_expr_t,
+			   db_expr_t, db_expr_t);
+	db_expr_t	(*a8)(db_expr_t, db_expr_t, db_expr_t, db_expr_t, db_expr_t,
+			   db_expr_t, db_expr_t, db_expr_t);
+	db_expr_t	(*a9)(db_expr_t, db_expr_t, db_expr_t, db_expr_t, db_expr_t,
+			   db_expr_t, db_expr_t, db_expr_t, db_expr_t);
+	db_expr_t	(*a10)(db_expr_t, db_expr_t, db_expr_t, db_expr_t, db_expr_t,
+			   db_expr_t, db_expr_t, db_expr_t, db_expr_t, db_expr_t);
+} fcn_multiargs_t;
+
+
 static void
 db_fncall(db_expr_t dummy1, boolean_t dummy2, db_expr_t dummy3, char *dummy4)
 {
@@ -491,11 +513,7 @@ db_fncall(db_expr_t dummy1, boolean_t dummy2, db_expr_t dummy3, char *dummy4)
 	db_expr_t	args[MAXARGS];
 	int		nargs = 0;
 	db_expr_t	retval;
-	typedef db_expr_t fcn_10args_t (db_expr_t, db_expr_t, db_expr_t,
-					    db_expr_t, db_expr_t, db_expr_t,
-					    db_expr_t, db_expr_t, db_expr_t,
-					    db_expr_t);
-	fcn_10args_t	*func;
+	fcn_multiargs_t	func;
 	int		t;
 
 	if (!db_expression(&fn_addr)) {
@@ -503,7 +521,7 @@ db_fncall(db_expr_t dummy1, boolean_t dummy2, db_expr_t dummy3, char *dummy4)
 	    db_flush_lex();
 	    return;
 	}
-	func = (fcn_10args_t *)fn_addr;	/* XXX */
+	func.a0 = (void *)fn_addr;
 
 	t = db_read_token();
 	if (t == tLPAREN) {
@@ -532,13 +550,55 @@ db_fncall(db_expr_t dummy1, boolean_t dummy2, db_expr_t dummy3, char *dummy4)
 	}
 	db_skip_to_eol();
 
-	while (nargs < MAXARGS) {
-	    args[nargs++] = 0;
+	/*
+	 * This is mainly so kgdb doesn't get confused if ddb> call is
+	 * in its backtrace.
+	 */
+	switch(nargs) {
+	case 0:
+		retval = (*func.a0)();
+		break;
+	case 1:
+		retval = (*func.a1)(args[0]);
+		break;
+	case 2:
+		retval = (*func.a2)(args[0], args[1]);
+		break;
+	case 3:
+		retval = (*func.a3)(args[0], args[1], args[2]);
+		break;
+	case 4:
+		retval = (*func.a4)(args[0], args[1], args[2], args[3]);
+		break;
+	case 5:
+		retval = (*func.a5)(args[0], args[1], args[2], args[3], args[4]);
+		break;
+	case 6:
+		retval = (*func.a6)(args[0], args[1], args[2], args[3], args[4],
+				    args[5]);
+		break;
+	case 7:
+		retval = (*func.a7)(args[0], args[1], args[2], args[3], args[4],
+				    args[5], args[6]);
+		break;
+	case 8:
+		retval = (*func.a8)(args[0], args[1], args[2], args[3], args[4],
+				    args[5], args[6], args[7]);
+		break;
+	case 9:
+		retval = (*func.a9)(args[0], args[1], args[2], args[3], args[4],
+				    args[5], args[6], args[7], args[8]);
+		break;
+	case 10:
+		retval = (*func.a10)(args[0], args[1], args[2], args[3], args[4],
+				     args[5], args[6], args[7], args[8], args[9]);
+		break;
+	default:
+		db_printf("too many arguments\n");
+		retval = 0;
+		break;
 	}
-
-	retval = (*func)(args[0], args[1], args[2], args[3], args[4],
-			 args[5], args[6], args[7], args[8], args[9] );
-	db_printf("%#lr\n", (long)retval);
+	db_printf("%s\n", db_num_to_str(retval));
 }
 
 /* Enter GDB remote protocol debugger on the next trap. */

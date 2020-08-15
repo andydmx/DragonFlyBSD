@@ -45,7 +45,6 @@
 #include <sys/sysctl.h>
 #include <sys/queue.h>
 #include <sys/spinlock2.h>
-#include <sys/sysref2.h>
 #include <sys/ktr.h>
 
 #include <string.h>
@@ -103,7 +102,7 @@ dirfs_mount(struct mount *mp, char *path, caddr_t data, struct ucred *cred)
 	size_t done, nlen;
 	int error;
 
-	debug_called();
+	dbg(1, "called\n");
 
 	if (mp->mnt_flag & MNT_UPDATE) {
 		dmp = VFS_TO_DIRFS(mp);
@@ -182,7 +181,7 @@ dirfs_unmount(struct mount *mp, int mntflags)
 	int cnt;
 	int error;
 
-	debug_called();
+	dbg(1, "called\n");
 	cnt = 0;
 	dmp = VFS_TO_DIRFS(mp);
 
@@ -227,7 +226,7 @@ dirfs_root(struct mount *mp, struct vnode **vpp)
 	int fd;
 	int error;
 
-	debug_called();
+	dbg(1, "called\n");
 
 	dmp = VFS_TO_DIRFS(mp);
 	KKASSERT(dmp != NULL);
@@ -258,7 +257,7 @@ dirfs_root(struct mount *mp, struct vnode **vpp)
 		 */
 		fd = open(dmp->dm_path, O_DIRECTORY);
 		if (fd == -1) {
-			dbg(5, "failed to open ROOT node\n");
+			dbg(9, "failed to open ROOT node\n");
 			dirfs_free_vp(dmp, dnp);
 			dirfs_node_free(dmp, dnp);
 			return errno;
@@ -282,7 +281,7 @@ dirfs_root(struct mount *mp, struct vnode **vpp)
 static int
 dirfs_fhtovp(struct mount *mp, struct vnode *rootvp, struct fid *fhp, struct vnode **vpp)
 {
-	debug_called();
+	dbg(1, "called\n");
 
 	return EOPNOTSUPP;
 }
@@ -293,7 +292,7 @@ dirfs_statfs(struct mount *mp, struct statfs *sbp, struct ucred *cred)
 	dirfs_mount_t dmp = VFS_TO_DIRFS(mp);
 	struct statfs st;
 
-	debug_called();
+	dbg(1, "called\n");
 
 	if((statfs(dmp->dm_path, &st)) == -1)
 		return errno;
@@ -312,7 +311,7 @@ dirfs_statvfs(struct mount *mp, struct statvfs *sbp, struct ucred *cred)
 	dirfs_mount_t dmp = VFS_TO_DIRFS(mp);
 	struct statvfs st;
 
-	debug_called();
+	dbg(1, "called\n");
 
 	if ((statvfs(dmp->dm_path, &st)) == -1)
 		return errno;
@@ -329,7 +328,7 @@ dirfs_vptofh(struct vnode *vp, struct fid *fhp)
 
 	dnp = VP_TO_NODE(vp);
 	debug_node2(dnp);
-	debug_called();
+	dbg(1, "called\n");
 
 	return EOPNOTSUPP;
 }
@@ -338,12 +337,13 @@ static int
 dirfs_checkexp(struct mount *mp, struct sockaddr *nam, int *exflagsp,
 	       struct ucred **credanonp)
 {
-	debug_called();
+	dbg(1, "called\n");
 
 	return EOPNOTSUPP;
 }
 
 static struct vfsops dirfs_vfsops = {
+	.vfs_flags =			0,
 	.vfs_mount =			dirfs_mount,
 	.vfs_unmount =			dirfs_unmount,
 	.vfs_root =			dirfs_root,
@@ -352,7 +352,6 @@ static struct vfsops dirfs_vfsops = {
 	.vfs_statvfs =			dirfs_statvfs,
 	.vfs_fhtovp =			dirfs_fhtovp,
 	.vfs_vptofh =			dirfs_vptofh,
-	.vfs_sync =			vfs_stdsync,
 	.vfs_checkexp =			dirfs_checkexp
 };
 

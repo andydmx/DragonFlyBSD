@@ -32,8 +32,6 @@
 #include <sys/types.h>
 #include <machine/atomic.h>
 
-#define	CACHE_LINE_SIZE		64
-
 struct Struct_Obj_Entry;
 
 /* Return the address of the .dynamic section in the dynamic linker. */
@@ -62,13 +60,10 @@ reloc_jmpslot(Elf_Addr *where, Elf_Addr target,
 
 #define call_init_pointer(obj, target) \
 	(((InitArrFunc)(target))(main_argc, main_argv, environ))
-
-#define round(size, align) \
-	(((size) + (align) - 1) & ~((align) - 1))
 #define calculate_first_tls_offset(size, align) \
-	round(size, align)
+	roundup2(size, align)
 #define calculate_tls_offset(prev_offset, prev_size, size, align) \
-	round((prev_offset) + (size), align)
+	roundup2((prev_offset) + (size), align)
 #define calculate_tls_end(off, size) 	(off)
 
 typedef struct {

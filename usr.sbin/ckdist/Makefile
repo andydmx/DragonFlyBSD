@@ -1,13 +1,15 @@
-# $FreeBSD: src/usr.sbin/ckdist/Makefile,v 1.2 1999/08/28 01:15:46 peter Exp $
-# $DragonFly: src/usr.sbin/ckdist/Makefile,v 1.2 2003/06/17 04:29:52 dillon Exp $
+# $FreeBSD: head/usr.sbin/ckdist/Makefile 314659 2017-03-04 11:38:03Z ngie $
 
 .PATH: ${.CURDIR}/../../usr.bin/cksum
 
 PROG=	ckdist
 SRCS=   ckdist.c crc.c
-WARNS?=	3
 
-DPADD=	${LIBMD}
-LDADD=	-lmd
+
+CFLAGS+=	${PRIVATELIB_CFLAGS}
+DPADD=		${LIBCRYPTO}
+LDADD=		-lprivate_crypto
+LDFLAGS+=	${PRIVATELIB_LDFLAGS}
+
 
 .include <bsd.prog.mk>

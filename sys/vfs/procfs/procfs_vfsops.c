@@ -77,6 +77,7 @@ procfs_mount(struct mount *mp, char *path, caddr_t data, struct ucred *cred)
 
 	mp->mnt_flag |= MNT_LOCAL;
 	mp->mnt_kern_flag |= MNTK_NOSTKMNT;
+	mp->mnt_kern_flag |= MNTK_QUICKHALT;   /* no teardown needed on halt */
 	mp->mnt_data = NULL;
 	vfs_getnewfsid(mp);
 
@@ -144,12 +145,12 @@ procfs_statfs(struct mount *mp, struct statfs *sbp, struct ucred *cred)
 }
 
 static struct vfsops procfs_vfsops = {
+	.vfs_flags =		0,
 	.vfs_mount =    	procfs_mount,
 	.vfs_unmount =    	procfs_unmount,
 	.vfs_root =    		procfs_root,
 	.vfs_statfs =    	procfs_statfs,
-	.vfs_sync =    		vfs_stdsync
 };
 
-VFS_SET(procfs_vfsops, procfs, VFCF_SYNTHETIC);
+VFS_SET(procfs_vfsops, procfs, VFCF_SYNTHETIC | VFCF_MPSAFE);
 MODULE_VERSION(procfs, 1);

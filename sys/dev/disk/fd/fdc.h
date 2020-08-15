@@ -10,11 +10,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -32,7 +28,6 @@
  *
  *	from:	@(#)fd.c	7.4 (Berkeley) 5/25/91
  * $FreeBSD: src/sys/isa/fdc.h,v 1.20.2.3 2002/02/03 14:08:46 nyan Exp $
- * $DragonFly: src/sys/dev/disk/fd/fdc.h,v 1.7 2007/05/21 04:22:23 dillon Exp $
  *
  */
 
@@ -76,7 +71,7 @@ struct fdc_data
 	bus_space_tag_t ctlt;
 	bus_space_handle_t ctlh;
 	void	*fdc_intr;
-	struct	device *fdc_dev;
+	device_t fdc_dev;
 	struct	callout pseudointr_ch;
 	void	(*fdctl_wr)(struct fdc_data *fdc, u_int8_t v);
 };

@@ -188,7 +188,7 @@ hpt_delete_array(_VBUS_ARG DEVICEID id, DWORD options)
 /* just to prevent driver from sending more commands */
 static void HPTLIBAPI nothing(_VBUS_ARG void *notused){}
 
-void
+static void
 lock_driver_idle(IAL_ADAPTER_T *pAdapter)
 {
 	_VBUS_INST(&pAdapter->VBus)
@@ -237,8 +237,8 @@ int Kernel_DeviceIoControl(_VBUS_ARG
 		if(!mIsArray(pArray))
 			return -1;
 
-			_vbus_p=pArray->pVBus;
-			pAdapter = (IAL_ADAPTER_T *)_vbus_p->OsExt;
+		_vbus_p=pArray->pVBus;
+		pAdapter = (IAL_ADAPTER_T *)_vbus_p->OsExt;
 
 	        for(i = 0; i < MAX_VDEVICE_PER_VBUS; i++) {
 				if(pArray == _vbus_p->pVDevice[i])
@@ -616,7 +616,7 @@ hpt_set_array_state(DEVICEID idArray, DWORD state)
 	return 0;
 }
 
-int HPTLIBAPI
+static int HPTLIBAPI
 R1ControlSgl(_VBUS_ARG PCommand pCmd, FPSCAT_GATH pSgTable, int logical)
 {
 	ULONG bufferSize = SECTOR_TO_BYTE(pCmd->uCmd.R1Control.nSectors);
@@ -680,7 +680,7 @@ R1ControlSgl(_VBUS_ARG PCommand pCmd, FPSCAT_GATH pSgTable, int logical)
 }
 
 static int End_Job=0;
-void HPTLIBAPI
+static void HPTLIBAPI
 thread_io_done(_VBUS_ARG PCommand pCmd)
 {
 	End_Job = 1;

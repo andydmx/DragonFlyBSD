@@ -2,21 +2,21 @@
  * SYS/MSGPORT2.H
  *
  *	Implements Inlines for LWKT messages and ports.
- * 
- * $DragonFly: src/sys/sys/msgport2.h,v 1.17 2008/11/09 09:20:09 sephe Exp $
  */
 
 #ifndef _SYS_MSGPORT2_H_
 #define _SYS_MSGPORT2_H_
 
 #ifndef _KERNEL
-
 #error "This file should not be included by userland programs."
+#endif
 
-#else
+#ifndef _SYS_SYSTM_H_
+#include <sys/systm.h>
+#endif
 
-#ifndef _SYS_THREAD2_H_
-#include <sys/thread2.h>
+#ifdef MALLOC_DECLARE
+MALLOC_DECLARE(M_LWKTMSG);
 #endif
 
 /*
@@ -48,7 +48,7 @@ lwkt_initmsg_abortable(lwkt_msg_t msg, lwkt_port_t rport, int flags,
 static __inline
 void
 lwkt_replymsg(lwkt_msg_t msg, int error)
-{   
+{
     lwkt_port_t port;
 
     msg->ms_error = error;
@@ -60,7 +60,7 @@ lwkt_replymsg(lwkt_msg_t msg, int error)
  * Retrieve the next message from the port's message queue, return NULL
  * if no messages are pending.  The retrieved message will either be a
  * request or a reply based on the MSGF_REPLY bit.
- * 
+ *
  * If the backend port is a thread port, the the calling thread MUST
  * own the port.
  */
@@ -115,5 +115,4 @@ lwkt_setmsg_receipt(lwkt_msg_t msg, void (*receiptfn)(lwkt_msg_t, lwkt_port_t))
 	msg->ms_receiptfn = receiptfn;
 }
 
-#endif	/* _KERNEL */
 #endif	/* _SYS_MSGPORT2_H_ */

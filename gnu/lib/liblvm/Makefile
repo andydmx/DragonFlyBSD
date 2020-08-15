@@ -7,7 +7,6 @@ SHLIB_MAJOR?=	0
 
 LVM2_DISTDIR=	${LVM2_DIR}/dist
 
-CFLAGS+=	-D_XOPEN_SOURCE=600
 CFLAGS+=	-I${LVM2_DISTDIR}/include
 
 SRCS+=		activate.c lvmcache.c toolcontext.c config.c btree.c \
@@ -20,7 +19,7 @@ SRCS+=		activate.c lvmcache.c toolcontext.c config.c btree.c \
 		file_locking.c locking.c no_locking.c log.c lv_manip.c \
 		merge.c metadata.c mirror.c pv_manip.c pv_map.c segtype.c \
 		snapshot_manip.c crc.c lvm-exec.c lvm-file.c lvm-string.c \
-		lvm-wrappers.c timestamp.c util.c memlock.c report.c \
+		lvm-wrappers.c timestamp.c memlock.c report.c \
 		striped.c unknown.c uuid.c zero.c disk-rep.c format1.c \
 		import-export.c \
 		import-extents.c layout.c lvm1-label.c vg_number.c \
@@ -28,8 +27,8 @@ SRCS+=		activate.c lvmcache.c toolcontext.c config.c btree.c \
 		filter_dragonfly.c snapshot.c mirrored.c dev_manager.c fs.c \
 		lvm-globals.c dev.c
 
-CSTD?=		gnu89
-WARNS?=		1
+# empty source ("empty for now")
+#SRCS+=	util.c
 
 .PATH:	${LVM2_DISTDIR}/lib/
 .PATH:	${LVM2_DISTDIR}/lib/activate

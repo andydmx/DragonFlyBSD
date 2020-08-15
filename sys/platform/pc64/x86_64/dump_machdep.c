@@ -34,12 +34,13 @@
 #include <sys/device.h>
 #include <sys/kernel.h>
 #include <sys/kerneldump.h>
+#include <sys/kbio.h>
 #include <vm/vm.h>
 #include <vm/pmap.h>
 #include <machine/elf.h>
 #include <machine/md_var.h>
 #include <machine/thread.h>
-#include <sys/thread2.h>
+#include <machine/vmparam.h>
 
 CTASSERT(sizeof(struct kerneldumpheader) == 512);
 
@@ -55,7 +56,7 @@ SYSCTL_INT(_debug, OID_AUTO, minidump, CTLFLAG_RW, &do_minidump, 0,
 #define	SIZEOF_METADATA		(64*1024)
 
 #define	MD_ALIGN(x)	(((off_t)(x) + PAGE_MASK) & ~PAGE_MASK)
-#define	DEV_ALIGN(x)	(((off_t)(x) + (DEV_BSIZE-1)) & ~(DEV_BSIZE-1))
+#define	DEV_ALIGN(x)	roundup2((off_t)(x), DEV_BSIZE)
 
 struct md_pa {
 	vm_paddr_t md_start;
@@ -71,21 +72,20 @@ static off_t dumplo, fileofs;
 static char buffer[DEV_BSIZE];
 static size_t fragsz;
 
-/* 20 phys_avail entry pairs correspond to 10 md_pa's */
-static struct md_pa dump_map[10];
+static struct md_pa dump_map[VM_PHYSSEG_MAX+1];
 
 static void
 md_pa_init(void)
 {
-	int n, idx;
+	int n;
 
 	bzero(dump_map, sizeof(dump_map));
 	for (n = 0; n < NELEM(dump_map); n++) {
-		idx = n * 2;
-		if (dump_avail[idx] == 0 && dump_avail[idx + 1] == 0)
+		if (dump_avail[n].phys_beg == 0 && dump_avail[n].phys_end == 0)
 			break;
-		dump_map[n].md_start = dump_avail[idx];
-		dump_map[n].md_size = dump_avail[idx + 1] - dump_avail[idx];
+		dump_map[n].md_start = dump_avail[n].phys_beg;
+		dump_map[n].md_size = dump_avail[n].phys_end -
+				      dump_avail[n].phys_beg;
 	}
 }
 
@@ -169,6 +169,7 @@ cb_dumpdata(struct md_pa *mdp, int seqnr, void *arg)
 
 	kprintf("  chunk %d: %ldMB (%ld pages)", seqnr, PG2MB(pgs), pgs);
 
+	cnpoll(TRUE);
 	while (pgs) {
 		chunk = pgs;
 		if (chunk > (max_iosize/PAGE_SIZE))
@@ -193,12 +194,16 @@ cb_dumpdata(struct md_pa *mdp, int seqnr, void *arg)
 
 		/* Check for user abort. */
 		c = cncheckc();
-		if (c == 0x03)
-			return (ECANCELED);
-		if (c != -1)
+		if (c == 0x03) {
+			error = ECANCELED;
+			goto done;
+		}
+		if (c != -1 && c != NOKEY)
 			kprintf(" (CTRL-C to abort) ");
 	}
 	kprintf(" ... %s\n", (error) ? "fail" : "ok");
+done:
+	cnpoll(FALSE);
 	return (error);
 }
 
@@ -261,8 +266,13 @@ md_dumpsys(struct dumperinfo *di)
 	size_t hdrsz;
 	int error;
 
-	savectx(&dumppcb);
-	dumpthread = curthread;
+	/*
+	 * Save context if dump called without panic.
+	 */
+	if (dumpthread == NULL) {
+		savectx(&dumppcb);
+		dumpthread = curthread;
+	}
 
 	if (do_minidump) {
 		minidumpsys(di);

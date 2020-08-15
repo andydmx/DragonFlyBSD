@@ -34,11 +34,7 @@
  * I want to say thank you to all people who helped me with this project.
  */
 
-#include <sys/types.h>
-#include <sys/param.h>
 #include <sys/ctype.h>
-
-#include <sys/buf.h>
 #include <sys/conf.h>
 #include <sys/device.h>
 #include <sys/disk.h>
@@ -48,8 +44,7 @@
 #include <sys/module.h>
 #include <sys/sysctl.h>
 #include <dev/disk/dm/dm.h>
-
-#include "netbsd-dm.h"
+#include <dev/disk/dm/netbsd-dm.h>
 
 static	d_ioctl_t	dmioctl;
 static	d_open_t	dmopen;
@@ -58,8 +53,7 @@ static	d_psize_t	dmsize;
 static	d_strategy_t	dmstrategy;
 static	d_dump_t	dmdump;
 
-/* attach and detach routines */
-void dmattach(int);
+/* New module handle and destroy routines */
 static int dm_modcmd(module_t mod, int cmd, void *unused);
 static int dmdestroy(void);
 
@@ -67,12 +61,14 @@ static void dm_doinit(void);
 
 static int dm_cmd_to_fun(prop_dictionary_t);
 static int disk_ioctl_switch(cdev_t, u_long, void *);
-static int dm_ioctl_switch(u_long);
-#if 0
-static void dmminphys(struct buf *);
-#endif
 
-/* ***Variable-definitions*** */
+static struct dev_ops dmctl_ops = {
+	{ "dm", 0, D_MPSAFE },
+	.d_open		= dmopen,
+	.d_close	= dmclose,
+	.d_ioctl	= dmioctl,
+};
+
 struct dev_ops dm_ops = {
 	{ "dm", 0, D_DISK | D_MPSAFE },
 	.d_open		= dmopen,
@@ -83,7 +79,6 @@ struct dev_ops dm_ops = {
 	.d_strategy	= dmstrategy,
 	.d_psize	= dmsize,
 	.d_dump		= dmdump,
-/* D_DISK */
 };
 
 MALLOC_DEFINE(M_DM, "dm", "Device Mapper allocations");
@@ -103,36 +98,45 @@ DECLARE_MODULE(dm, dm_mod, SI_SUB_RAID, SI_ORDER_ANY);
 MODULE_VERSION(dm, 1);
 
 /*
+ * This structure is used to translate command sent to kernel driver in
+ * <key>command</key>
+ * <value></value>
+ * to function
+ */
+/*
  * This array is used to translate cmd to function pointer.
  *
  * Interface between libdevmapper and lvm2tools uses different
  * names for one IOCTL call because libdevmapper do another thing
  * then. When I run "info" or "mknodes" libdevmapper will send same
  * ioctl to kernel but will do another things in userspace.
- *
  */
-static struct cmd_function cmd_fn[] = {
-		{ .cmd = "version", .fn = dm_get_version_ioctl},
-		{ .cmd = "targets", .fn = dm_list_versions_ioctl},
-		{ .cmd = "create",  .fn = dm_dev_create_ioctl},
-		{ .cmd = "info",    .fn = dm_dev_status_ioctl},
-		{ .cmd = "mknodes", .fn = dm_dev_status_ioctl},
-		{ .cmd = "names",   .fn = dm_dev_list_ioctl},
-		{ .cmd = "suspend", .fn = dm_dev_suspend_ioctl},
-		{ .cmd = "remove",  .fn = dm_dev_remove_ioctl},
-		{ .cmd = "remove_all", .fn = dm_dev_remove_all_ioctl},
-		{ .cmd = "rename",  .fn = dm_dev_rename_ioctl},
-		{ .cmd = "resume",  .fn = dm_dev_resume_ioctl},
-		{ .cmd = "clear",   .fn = dm_table_clear_ioctl},
-		{ .cmd = "deps",    .fn = dm_table_deps_ioctl},
-		{ .cmd = "reload",  .fn = dm_table_load_ioctl},
-		{ .cmd = "status",  .fn = dm_table_status_ioctl},
-		{ .cmd = "table",   .fn = dm_table_status_ioctl},
-		{ .cmd = "message", .fn = dm_message_ioctl},
-		{NULL, NULL}
+static struct cmd_function {
+	const char *cmd;
+	int (*fn)(prop_dictionary_t);
+} cmd_fn[] = {
+	{.cmd = "version",    .fn = NULL},
+	{.cmd = "targets",    .fn = dm_list_versions_ioctl},
+	{.cmd = "create",     .fn = dm_dev_create_ioctl},
+	{.cmd = "info",       .fn = dm_dev_status_ioctl},
+	{.cmd = "mknodes",    .fn = dm_dev_status_ioctl},
+	{.cmd = "names",      .fn = dm_dev_list_ioctl},
+	{.cmd = "suspend",    .fn = dm_dev_suspend_ioctl},
+	{.cmd = "remove",     .fn = dm_dev_remove_ioctl},
+	{.cmd = "remove_all", .fn = dm_dev_remove_all_ioctl},
+	{.cmd = "rename",     .fn = dm_dev_rename_ioctl},
+	{.cmd = "resume",     .fn = dm_dev_resume_ioctl},
+	{.cmd = "clear",      .fn = dm_table_clear_ioctl},
+	{.cmd = "deps",       .fn = dm_table_deps_ioctl},
+	{.cmd = "reload",     .fn = dm_table_load_ioctl},
+	{.cmd = "status",     .fn = dm_table_status_ioctl},
+	{.cmd = "table",      .fn = dm_table_status_ioctl},
+	{.cmd = "message",    .fn = dm_message_ioctl},
 };
 
-/* New module handle routine */
+/*
+ * New module handle routine
+ */
 static int
 dm_modcmd(module_t mod, int cmd, void *unused)
 {
@@ -156,14 +160,12 @@ dm_modcmd(module_t mod, int cmd, void *unused)
 		 */
 		if (dm_dev_counter > 0)
 			return EBUSY;
+		/* race window here */
 
 		error = dmdestroy();
 		if (error)
 			break;
 		kprintf("Device Mapper unloaded\n");
-		break;
-
-	default:
 		break;
 	}
 
@@ -176,10 +178,12 @@ dm_doinit(void)
 	dm_target_init();
 	dm_dev_init();
 	dm_pdev_init();
-	dmcdev = make_dev(&dm_ops, 0, UID_ROOT, GID_OPERATOR, 0640, "mapper/control");
+	dmcdev = make_dev(&dmctl_ops, 0, UID_ROOT, GID_OPERATOR, 0640, "mapper/control");
 }
 
-/* Destroy routine */
+/*
+ * Destroy routine
+ */
 static int
 dmdestroy(void)
 {
@@ -208,8 +212,7 @@ dmopen(struct dev_open_args *ap)
 	dmv->is_open = 1;
 	dm_dev_unbusy(dmv);
 
-	aprint_debug("dm open routine called %" PRIu32 "\n",
-	    minor(ap->a_head.a_dev));
+	dmdebug("minor=%" PRIu32 "\n", minor(ap->a_head.a_dev));
 	return 0;
 }
 
@@ -229,8 +232,7 @@ dmclose(struct dev_close_args *ap)
 	dmv->is_open = 0;
 	dm_dev_unbusy(dmv);
 
-	aprint_debug("dm close routine called %" PRIu32 "\n",
-	    minor(ap->a_head.a_dev));
+	dmdebug("minor=%" PRIu32 "\n", minor(ap->a_head.a_dev));
 	return 0;
 }
 
@@ -241,96 +243,79 @@ dmioctl(struct dev_ioctl_args *ap)
 	cdev_t dev = ap->a_head.a_dev;
 	u_long cmd = ap->a_cmd;
 	void *data = ap->a_data;
+	struct plistref *pref;
 
 	int r, err;
 	prop_dictionary_t dm_dict_in;
 
 	err = r = 0;
-
-	aprint_debug("dmioctl called\n");
-
 	KKASSERT(data != NULL);
 
-	if (( r = disk_ioctl_switch(dev, cmd, data)) == ENOTTY) {
-		struct plistref *pref = (struct plistref *) data;
+	if ((r = disk_ioctl_switch(dev, cmd, data)) != ENOTTY)
+		return r;  /* Handled disk ioctl */
 
-		/* Check if we were called with NETBSD_DM_IOCTL ioctl
-		   otherwise quit. */
-		if ((r = dm_ioctl_switch(cmd)) != 0)
-			return r;
-
-		if((r = prop_dictionary_copyin_ioctl(pref, cmd, &dm_dict_in)) != 0)
-			return r;
-
-		if ((r = dm_check_version(dm_dict_in)) != 0)
-			goto cleanup_exit;
-
-		/* run ioctl routine */
-		if ((err = dm_cmd_to_fun(dm_dict_in)) != 0)
-			goto cleanup_exit;
-
-cleanup_exit:
-		r = prop_dictionary_copyout_ioctl(pref, cmd, dm_dict_in);
-		prop_object_release(dm_dict_in);
+	switch(cmd) {
+	case NETBSD_DM_IOCTL:
+		dmdebug("NETBSD_DM_IOCTL called\n");
+		break;
+	default:
+		dmdebug("Unknown ioctl %lu called\n", cmd);
+		return ENOTTY;
 	}
 
-	/*
-	 * Return the error of the actual command if one one has
-	 * happened. Otherwise return 'r' which indicates errors
-	 * that occurred during helper operations.
-	 */
-	return (err != 0)?err:r;
+	pref = (struct plistref *)data;  /* data is for libprop */
+	if ((r = prop_dictionary_copyin_ioctl(pref, cmd, &dm_dict_in)) != 0)
+		return r;
+
+	if ((r = dm_check_version(dm_dict_in)) == 0)
+		err = dm_cmd_to_fun(dm_dict_in);
+
+	r = prop_dictionary_copyout_ioctl(pref, cmd, dm_dict_in);
+	prop_object_release(dm_dict_in);
+
+	/* Return the dm ioctl error if any. */
+	if (err)
+		return err;
+	return r;
 }
 
 /*
  * Translate command sent from libdevmapper to func.
  */
 static int
-dm_cmd_to_fun(prop_dictionary_t dm_dict){
-	int i, r;
+dm_cmd_to_fun(prop_dictionary_t dm_dict)
+{
+	int i, size;
 	prop_string_t command;
+	struct cmd_function *p = NULL;
 
-	r = 0;
+	size = sizeof(cmd_fn) / sizeof(cmd_fn[0]);
 
 	if ((command = prop_dictionary_get(dm_dict, DM_IOCTL_COMMAND)) == NULL)
 		return EINVAL;
 
-	for(i = 0; cmd_fn[i].cmd != NULL; i++)
-		if (prop_string_equals_cstring(command, cmd_fn[i].cmd))
+	for (i = 0; i < size; i++) {
+		p = &cmd_fn[i];
+		if (prop_string_equals_cstring(command, p->cmd))
 			break;
-
-	if (cmd_fn[i].cmd == NULL)
-		return EINVAL;
-
-	aprint_debug("ioctl %s called\n", cmd_fn[i].cmd);
-	r = cmd_fn[i].fn(dm_dict);
-
-	return r;
-}
-
-/* Call apropriate ioctl handler function. */
-static int
-dm_ioctl_switch(u_long cmd)
-{
-
-	switch(cmd) {
-
-	case NETBSD_DM_IOCTL:
-		aprint_debug("dm NetBSD_DM_IOCTL called\n");
-		break;
-	default:
-		 aprint_debug("dm unknown ioctl called\n");
-		 return ENOTTY;
-		 break; /* NOT REACHED */
 	}
 
-	 return 0;
+	KKASSERT(p);
+	if (i == size) {
+		dmdebug("Unknown ioctl\n");
+		return EINVAL;
+	}
+
+	dmdebug("ioctl %s called %p\n", p->cmd, p->fn);
+	if (p->fn == NULL)
+		return 0;  /* No handler required */
+
+	return p->fn(dm_dict);
 }
 
- /*
-  * Check for disk specific ioctls.
-  */
-
+/*
+ * Check for disk specific ioctls.
+ */
 static int
 disk_ioctl_switch(cdev_t dev, u_long cmd, void *data)
 {
@@ -342,17 +327,15 @@ disk_ioctl_switch(cdev_t dev, u_long cmd, void *data)
 
 	switch(cmd) {
 	case DIOCGPART:
-	{
-		struct partinfo *dpart;
-		u_int64_t size;
-		dpart = data;
-		bzero(dpart, sizeof(*dpart));
-
 		if ((dmv = dev->si_drv1) == NULL)
 			return ENODEV;
 		if (dmv->diskp->d_info.d_media_blksize == 0) {
 			return ENOTSUP;
 		} else {
+			u_int64_t size;
+			struct partinfo *dpart = data;
+			bzero(dpart, sizeof(*dpart));
+
 			size = dm_table_size(&dmv->table_head);
 			dpart->media_offset  = 0;
 			dpart->media_size    = size * DEV_BSIZE;
@@ -360,11 +343,11 @@ disk_ioctl_switch(cdev_t dev, u_long cmd, void *data)
 			dpart->media_blksize = DEV_BSIZE;
 			dpart->fstype = FS_BSDFFS;
 		}
+		dmdebug("DIOCGPART called\n");
 		break;
-	}
 
 	default:
-		aprint_debug("unknown disk_ioctl called\n");
+		dmdebug("Unknown disk ioctl %lu called\n", cmd);
 		return ENOTTY;
 		break; /* NOT REACHED */
 	}
@@ -379,28 +362,22 @@ static int
 dmstrategy(struct dev_strategy_args *ap)
 {
 	cdev_t dev = ap->a_head.a_dev;
+	dm_dev_t *dmv = dev->si_drv1;
+	dm_table_t *tbl;
+	dm_table_entry_t *table_en;
+
 	struct bio *bio = ap->a_bio;
 	struct buf *bp = bio->bio_buf;
-	int bypass;
-
-	dm_dev_t *dmv;
-	dm_table_t  *tbl;
-	dm_table_entry_t *table_en;
 	struct buf *nestbuf;
 
 	uint64_t buf_start, buf_len, issued_len;
 	uint64_t table_start, table_end;
 	uint64_t start, end;
+	int bypass;
 
 	buf_start = bio->bio_offset;
 	buf_len = bp->b_bcount;
-
-	tbl = NULL;
-
-	table_end = 0;
 	issued_len = 0;
-
-	dmv = dev->si_drv1;
 
 	switch(bp->b_cmd) {
 	case BUF_CMD_READ:
@@ -436,12 +413,12 @@ dmstrategy(struct dev_strategy_args *ap)
 	/*
 	 * Find out what tables I want to select.
 	 */
-	SLIST_FOREACH(table_en, tbl, next) {
+	TAILQ_FOREACH(table_en, tbl, next) {
 		/*
 		 * I need need number of bytes not blocks.
 		 */
 		table_start = table_en->start * DEV_BSIZE;
-		table_end = table_start + (table_en->length) * DEV_BSIZE;
+		table_end = table_start + table_en->length * DEV_BSIZE;
 
 		/*
 		 * Calculate the start and end
@@ -449,16 +426,17 @@ dmstrategy(struct dev_strategy_args *ap)
 		start = MAX(table_start, buf_start);
 		end = MIN(table_end, buf_start + buf_len);
 
-		aprint_debug("----------------------------------------\n");
-		aprint_debug("table_start %010" PRIu64", table_end %010"
-		    PRIu64 "\n", table_start, table_end);
-		aprint_debug("buf_start %010" PRIu64", buf_len %010"
-		    PRIu64"\n", buf_start, buf_len);
-		aprint_debug("start-buf_start %010"PRIu64", end %010"
-		    PRIu64"\n", start - buf_start, end);
-		aprint_debug("start %010" PRIu64" , end %010"
-                    PRIu64"\n", start, end);
-		aprint_debug("\n----------------------------------------\n");
+		if (dm_debug_level) {
+			kprintf("----------------------------------------\n");
+			kprintf("table_start %010" PRIu64", table_end %010"
+			    PRIu64 "\n", table_start, table_end);
+			kprintf("buf_start %010" PRIu64", buf_len %010"
+			    PRIu64"\n", buf_start, buf_len);
+			kprintf("start-buf_start %010"PRIu64", end %010"
+			    PRIu64"\n", start - buf_start, end);
+			kprintf("start %010" PRIu64", end %010"
+			    PRIu64"\n", start, end);
+		}
 
 		if (bypass) {
 			nestbuf = getpbuf(NULL);
@@ -472,11 +450,11 @@ dmstrategy(struct dev_strategy_args *ap)
 			nestbuf->b_flags |= bio->bio_buf->b_flags & B_HASBOGUS;
 
 			nestiobuf_add(bio, nestbuf,
-				      start - buf_start, (end - start),
+				      start - buf_start, end - start,
 				      &dmv->stats);
 			issued_len += end - start;
 
-			nestbuf->b_bio1.bio_offset = (start - table_start);
+			nestbuf->b_bio1.bio_offset = start - table_start;
 			table_en->target->strategy(table_en, nestbuf);
 		}
 	}
@@ -493,39 +471,31 @@ static int
 dmdump(struct dev_dump_args *ap)
 {
 	cdev_t dev = ap->a_head.a_dev;
-	dm_dev_t *dmv;
-	dm_table_t  *tbl;
+	dm_dev_t *dmv = dev->si_drv1;
+	dm_table_t *tbl;
 	dm_table_entry_t *table_en;
+
 	uint64_t buf_start, buf_len, issued_len;
 	uint64_t table_start, table_end;
-	uint64_t start, end, data_offset;
-	off_t offset;
-	size_t length;
+	uint64_t start, end;
 	int error = 0;
 
 	buf_start = ap->a_offset;
 	buf_len = ap->a_length;
-
-	tbl = NULL;
-
-	table_end = 0;
 	issued_len = 0;
-
-	dmv = dev->si_drv1;
 
 	/* Select active table */
 	tbl = dm_table_get_entry(&dmv->table_head, DM_TABLE_ACTIVE);
 
-
 	/*
 	 * Find out what tables I want to select.
 	 */
-	SLIST_FOREACH(table_en, tbl, next) {
+	TAILQ_FOREACH(table_en, tbl, next) {
 		/*
 		 * I need need number of bytes not blocks.
 		 */
 		table_start = table_en->start * DEV_BSIZE;
-		table_end = table_start + (table_en->length) * DEV_BSIZE;
+		table_end = table_start + table_en->length * DEV_BSIZE;
 
 		/*
 		 * Calculate the start and end
@@ -541,18 +511,14 @@ dmdump(struct dev_dump_args *ap)
 
 			table_en->target->dump(table_en, NULL, 0, 0);
 		} else if (start < end) {
-			data_offset = start - buf_start;
-			offset = start - table_start;
-			length = end - start;
-
 			if (table_en->target->dump == NULL) {
 				error = ENXIO;
 				goto out;
 			}
 
 			table_en->target->dump(table_en,
-			    (char *)ap->a_virtual + data_offset,
-			    length, offset);
+			    (char *)ap->a_virtual + start - buf_start,
+			    end - start, start - table_start);
 
 			issued_len += end - start;
 		}
@@ -572,27 +538,14 @@ dmsize(struct dev_psize_args *ap)
 {
 	cdev_t dev = ap->a_head.a_dev;
 	dm_dev_t *dmv;
-	uint64_t size;
-
-	size = 0;
 
 	if ((dmv = dev->si_drv1) == NULL)
 		return ENXIO;
 
-	size = dm_table_size(&dmv->table_head);
-	ap->a_result = (int64_t)size;
+	ap->a_result = (int64_t)dm_table_size(&dmv->table_head);
 
 	return 0;
 }
-
-#if 0
-static void
-dmminphys(struct buf *bp)
-{
-
-	bp->b_bcount = MIN(bp->b_bcount, MAXPHYS);
-}
-#endif
 
 void
 dmsetdiskinfo(struct disk *disk, dm_table_head_t *head)
@@ -616,7 +569,12 @@ dmsetdiskinfo(struct disk *disk, dm_table_head_t *head)
 	info.d_secpercyl = info.d_secpertrack * info.d_nheads;
 	info.d_ncylinders = dmp_size / info.d_secpercyl;
 
+	/*
+	 * The probe is asynchronous so call disk_config() to
+	 * wait for it to complete.
+	 */
 	disk_setdiskinfo(disk, &info);
+	disk_config(NULL);
 }
 
 /*
@@ -637,6 +595,14 @@ atoi64(const char *s)
 	}
 
 	return n;
+}
+
+char *
+dm_alloc_string(int len)
+{
+	if (len <= 0)
+		len = DM_MAX_PARAMS_SIZE;
+	return kmalloc(len, M_DM, M_WAITOK | M_ZERO);
 }
 
 void
@@ -660,4 +626,3 @@ dm_builtin_uninit(void *arg)
 TUNABLE_INT("debug.dm_debug", &dm_debug_level);
 SYSCTL_INT(_debug, OID_AUTO, dm_debug, CTLFLAG_RW, &dm_debug_level,
 	       0, "Enable device mapper debugging");
-

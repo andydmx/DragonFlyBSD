@@ -33,11 +33,12 @@
 .Nm psm
 .Nd PS/2 mouse style pointing device driver
 .Sh SYNOPSIS
+.Cd "device psm0 at atkbdc? irq 12"
+.Pp
 .Cd "options KBD_RESETDELAY=N"
 .Cd "options KBD_MAXWAIT=N"
 .Cd "options PSM_DEBUG=N"
 .Cd "options KBDIO_DEBUG=N"
-.Cd "device psm0 at atkbdc? irq 12"
 .Sh DESCRIPTION
 The
 .Nm
@@ -172,30 +173,11 @@ The driver has an internal variable which governs the effect of
 the acceleration.
 Its value can be modified via the driver flag
 or via an ioctl call.
-.Ss Device Number
-The minor device number of the
-.Nm
-is made up of:
-.Bd -literal -offset indent
-minor = (`unit' << 1) | `non-blocking'
-.Ed
-.Pp
-where `unit' is the device number (usually 0) and the `non-blocking' bit
-is set to indicate ``don't block waiting for mouse input,
-return immediately''.
-The `non-blocking' bit should be set for \fIXFree86\fP,
-therefore the minor device number usually used for \fIXFree86\fP is 1.
-See
-.Sx FILES
-for device node names.
 .Sh DRIVER CONFIGURATION
 .Ss Kernel Configuration Options
-There are following kernel configuration options to control the
+The following kernel configuration options can be used to control the
 .Nm
 driver.
-They may be set in the kernel configuration file
-(see
-.Xr config 8 ) .
 .Bl -tag -width MOUSE
 .It Em KBD_RESETDELAY=X , KBD_MAXWAIT=Y
 The
@@ -229,12 +211,7 @@ for debug logging.
 .Ss Driver Flags
 The
 .Nm
-driver accepts the following driver flags.
-Set them in the
-kernel configuration file or in the User Configuration Menu at
-the boot time
-(see
-.Xr boot 8 ) .
+driver accepts the following driver flags in the kernel configuration file.
 .Bl -tag -width MOUSE
 .It bit 0..3 RESOLUTION
 This flag specifies the resolution of the pointing device.
@@ -396,7 +373,7 @@ typedef struct mousehw {
 .Ed
 .Pp
 The
-.Dv buttons
+.Fa buttons
 field holds the number of buttons on the device.
 The
 .Nm
@@ -408,12 +385,12 @@ However, it will not affect the operation of
 the driver.
 .Pp
 The
-.Dv iftype
+.Fa iftype
 is always
 .Dv MOUSE_IF_PS2 .
 .Pp
 The
-.Dv type
+.Fa type
 tells the device type:
 .Dv MOUSE_MOUSE ,
 .Dv MOUSE_TRACKBALL ,
@@ -426,7 +403,7 @@ driver may not always, in fact it is very rarely able to, identify
 the device type.
 .Pp
 The
-.Dv model
+.Fa model
 is always
 .Dv MOUSE_MODEL_GENERIC
 at the operation level 0.
@@ -440,7 +417,7 @@ Again the
 driver may or may not set an appropriate value in this field.
 .Pp
 The
-.Dv hwid
+.Fa hwid
 is the ID value returned by the device.
 Known IDs include:
 .Pp
@@ -499,7 +476,7 @@ typedef struct mousemode {
 .Ed
 .Pp
 The
-.Dv protocol
+.Fa protocol
 is
 .Dv MOUSE_PROTO_PS2
 at the operation level zero and two.
@@ -507,14 +484,14 @@ at the operation level zero and two.
 at the operation level one.
 .Pp
 The
-.Dv rate
+.Fa rate
 is the status report rate (reports/sec) at which the device will send
 movement report to the host computer.
 Typical supported values are 10, 20, 40, 60, 80, 100 and 200.
 Some mice may accept other arbitrary values too.
 .Pp
 The
-.Dv resolution
+.Fa resolution
 of the pointing device must be one of
 .Dv MOUSE_RES_XXX
 constants or a positive value.
@@ -537,14 +514,14 @@ Typical resolutions are:
 .El
 .Pp
 The
-.Dv accelfactor
+.Fa accelfactor
 field holds a value to control acceleration feature
 (see
 .Sx Acceleration ) .
 It must be zero or greater.  If it is zero, acceleration is disabled.
 .Pp
 The
-.Dv packetsize
+.Fa packetsize
 field specifies the length of the data packet.
 It depends on the
 operation level and the model of the pointing device.
@@ -559,13 +536,13 @@ Depends on the model of the device
 .El
 .Pp
 The array
-.Dv syncmask
+.Fa syncmask
 holds a bit mask and pattern to detect the first byte of the
 data packet.
-.Dv syncmask[0]
+.Fa syncmask Ns Bq 0
 is the bit mask to be ANDed with a byte.
 If the result is equal to
-.Dv syncmask[1] ,
+.Fa syncmask Ns Bq 1 ,
 the byte is likely to be the first byte of the data packet.
 Note that this detection method is not 100% reliable,
 thus, should be taken only as an advisory measure.
@@ -575,11 +552,11 @@ The command changes the current operation parameters of the mouse driver
 as specified in
 .Ar mode .
 Only
-.Dv rate ,
-.Dv resolution ,
-.Dv level
+.Fa rate ,
+.Fa resolution ,
+.Fa level
 and
-.Dv accelfactor
+.Fa accelfactor
 may be modifiable.
 Setting values in the other field does not generate
 error and has no effect.
@@ -587,9 +564,9 @@ error and has no effect.
 If you do not want to change the current setting of a field, put -1
 there.
 You may also put zero in
-.Dv resolution
+.Fa resolution
 and
-.Dv rate ,
+.Fa rate ,
 and the default value for the fields will be selected.
 .\" .Pp
 .\" .It Dv MOUSE_GETVARS Ar mousevar_t *vars
@@ -609,14 +586,14 @@ and the default value for the fields will be selected.
 .\" .Pp
 .\" Upon returning to the user program, the driver will place the number
 .\" of valid data bytes in the buffer in the
-.\" .Dv len
+.\" .Fa len
 .\" field.
 .\" .Pp
 .It Dv MOUSE_READSTATE Ar mousedata_t *state
 .\" The command reads the hardware settings from the device.
 .\" Upon returning to the user program, the driver will place the number
 .\" of valid data bytes in the buffer in the
-.\" .Dv len
+.\" .Fa len
 .\" field. It is usually 3 bytes.
 .\" The buffer is formatted as follows:
 .\" .Pp
@@ -671,9 +648,7 @@ movement counts as described in
 .Sh FILES
 .Bl -tag -width /dev/npsm0 -compact
 .It Pa /dev/psm0
-`non-blocking' device node
-.It Pa /dev/bpsm0
-`blocking' device node
+device node
 .El
 .Sh EXAMPLES
 .Dl "device psm0 at atkbdc? irq 12 flags 0x2000"
@@ -849,8 +824,3 @@ to name the few.
 .Pp
 This manual page was written by
 .An Kazutaka Yokota Aq Mt yokota@FreeBSD.org .
-.Sh BUGS
-The ioctl command
-.Dv MOUSEIOCREAD
-has been removed.
-It was never functional anyway.

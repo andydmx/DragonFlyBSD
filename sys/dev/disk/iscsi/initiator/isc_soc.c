@@ -50,13 +50,9 @@
 #include <sys/kthread.h>
 #include <sys/syslog.h>
 #include <sys/mbuf.h>
-#include <sys/user.h>
-#include <signal.h>
 #include <sys/eventhandler.h>
 #include <sys/socketops.h>
 
-#include <sys/thread2.h>
-#include <sys/mutex2.h>
 #include <sys/mplock2.h>
 
 #include <bus/cam/cam.h>
@@ -112,7 +108,7 @@ isc_sendPDU(isc_session_t *sp, pduq_t *pq)
      /*
       | mbuf for the iSCSI header
       */
-     MGETHDR(mh, MB_TRYWAIT, MT_DATA);
+     MGETHDR(mh, M_WAITOK, MT_DATA);
      mh->m_len = mh->m_pkthdr.len = sizeof(union ipdu_u);
      mh->m_pkthdr.rcvif = NULL;
      MH_ALIGN(mh, sizeof(union ipdu_u));
@@ -154,7 +150,7 @@ isc_sendPDU(isc_session_t *sp, pduq_t *pq)
           while(len > 0) {
                 int       l;
 
-	       MGET(md, MB_TRYWAIT, MT_DATA);
+	       MGET(md, M_WAITOK, MT_DATA);
 	       pq->refcnt++;
 
                 l = min(MCLBYTES, len);
@@ -180,7 +176,7 @@ isc_sendPDU(isc_session_t *sp, pduq_t *pq)
 
 	  pp->ds_dig = sp->dataDigest(pp->ds, pp->ds_len, 0);
 
-	  MGET(me, MB_TRYWAIT, MT_DATA);
+	  MGET(me, M_WAITOK, MT_DATA);
           me->m_len = sizeof(int);
           MH_ALIGN(mh, sizeof(int));
           bcopy(&pp->ds_dig, me->m_data, sizeof(int));

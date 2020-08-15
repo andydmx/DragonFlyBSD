@@ -23,11 +23,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -48,6 +44,7 @@
 
 #include <sys/param.h>
 #include <sys/systm.h>
+#include <sys/uio.h>
 #include <sys/namei.h>
 #include <sys/buf.h>
 #include <sys/mount.h>
@@ -58,7 +55,7 @@
 #include "quota.h"
 #include "inode.h"
 #include "dir.h"
-#include "ext2mount.h"
+#include "ext2_mount.h"
 #include "ext2_extern.h"
 #include "ext2_fs.h"
 #include "ext2_fs_sb.h"
@@ -548,7 +545,7 @@ found:
 	 * in the cache as to where the entry was found.
 	 */
 	if (nameiop == NAMEI_LOOKUP)
-		dp->i_diroff = dp->i_offset &~ (DIRBLKSIZ - 1);
+		dp->i_diroff = rounddown2(dp->i_offset, DIRBLKSIZ);
 
 	/*
 	 * If deleting, and at end of pathname, return
@@ -702,7 +699,7 @@ ext2_dirbadentry(struct vnode *dp, struct ext2_dir_entry_2 *de,
 {
 	int	DIRBLKSIZ = VTOI(dp)->i_e2fs->s_blocksize;
 
-        char * error_msg = NULL;
+        char *error_msg = NULL;
 
         if (de->rec_len < EXT2_DIR_REC_LEN(1))
                 error_msg = "rec_len is smaller than minimal";
@@ -1004,7 +1001,7 @@ ext2_checkpath(struct inode *source, struct inode *target, struct ucred *cred)
 		error = EEXIST;
 		goto out;
 	}
-	rootino = ROOTINO;
+	rootino = EXT2_ROOTINO;
 	error = 0;
 	if (target->i_number == rootino)
 		goto out;

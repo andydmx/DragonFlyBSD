@@ -118,7 +118,7 @@ __hash_open(const char *file, int flags, mode_t mode,
 	hashp->flags = flags;
 
 	if (file) {
-		if ((hashp->fp = _open(file, flags, mode)) == -1)
+		if ((hashp->fp = _open(file, flags | O_CLOEXEC, mode)) == -1)
 			RETURN_ERROR(errno, error0);
 		_fcntl(hashp->fp, F_SETFD, 1);
 		new_table = _fstat(hashp->fp, &statbuf) == 0 &&
@@ -289,7 +289,7 @@ init_hash(HTAB *hashp, const char *file, const HASHINFO *info)
 	if (file != NULL) {
 		if (stat(file, &statbuf))
 			return (NULL);
-		hashp->BSIZE = statbuf.st_blksize;
+		hashp->BSIZE = NOM_BSIZE;
 		if (hashp->BSIZE > MAX_BSIZE)
 			hashp->BSIZE = MAX_BSIZE;
 		hashp->BSHIFT = __log2(hashp->BSIZE);
@@ -383,13 +383,13 @@ hdestroy(HTAB *hashp)
 	save_errno = 0;
 
 #ifdef HASH_STATISTICS
-	fprintf(stderr, "hdestroy: accesses %ld collisions %ld\n",
+	fprintf(stderr, "hdestroy: accesses %d collisions %d\n",
 	    hash_accesses, hash_collisions);
-	fprintf(stderr, "hdestroy: expansions %ld\n",
+	fprintf(stderr, "hdestroy: expansions %d\n",
 	    hash_expansions);
-	fprintf(stderr, "hdestroy: overflows %ld\n",
+	fprintf(stderr, "hdestroy: overflows %d\n",
 	    hash_overflows);
-	fprintf(stderr, "keys %ld maxp %d segmentcount %d\n",
+	fprintf(stderr, "keys %d maxp %d segmentcount %d\n",
 	    hashp->NKEYS, hashp->MAX_BUCKET, hashp->nsegs);
 
 	for (i = 0; i < NCACHED; i++)

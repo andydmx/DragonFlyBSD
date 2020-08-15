@@ -28,7 +28,7 @@
 .\"
 .\" $FreeBSD: src/share/man/man9/ifnet.9,v 1.9.2.10 2003/06/15 02:22:30 hmp Exp $
 .\"
-.Dd June 29, 2014
+.Dd June 20, 2018
 .Dt IFNET 9
 .Os
 .Sh NAME
@@ -94,7 +94,7 @@
 .Fa "const struct pktinfo *pi" "int cpuid"
 .Fc
 .Ft void
-.Fn (*if_start) "struct ifnet *ifp"
+.Fn (*if_start) "struct ifnet *ifp" "struct ifaltq_subque *ifsq"
 .Ft int
 .Fo (*if_ioctl)
 .Fa "struct ifnet *ifp" "u_long command" "caddr_t data" "struct ucred *cr"
@@ -755,7 +755,7 @@ A pointer to the link-layer multicast address, if any, to which the
 network-layer multicast address in
 .Va ifma_addr
 is mapped, else a null pointer.
-If this element is non-nil, this
+If this element is non-NULL, this
 membership also holds an invisible reference to another membership for
 that link-layer address.
 .It Va ifma_refcount
@@ -838,9 +838,8 @@ further interpretation.
 The following commands are handled by
 .Fn ifioctl :
 .Pp
-.Bl -tag -width ".Dv OSIOCGIFNETMASK" -offset indent -compact
+.Bl -tag -width ".Dv SIOCSIFDSTADDR" -offset indent -compact
 .It Dv SIOCGIFCONF
-.It Dv OSIOCGIFCONF
 Get interface configuration.
 (No call-down to driver.)
 .Pp
@@ -900,18 +899,6 @@ function is called to perform the operation; qq.v.
 .It Dv SIOCSIFNETMASK
 The socket's protocol control routine is called to implement the
 requested action.
-.Pp
-.It Dv OSIOCGIFADDR
-.It Dv OSIOCGIFDSTADDR
-.It Dv OSIOCGIFBRDADDR
-.It Dv OSIOCGIFNETMASK
-The socket's protocol control routine is called to implement the
-requested action.
-On return,
-.Vt sockaddr
-structures are converted into old-style (no
-.Va sa_len
-member).
 .El
 .El
 .Pp
@@ -1039,7 +1026,6 @@ if one is found, else it returns a null pointer.
 .Xr ifmib 4 ,
 .Xr lo 4 ,
 .Xr netintro 4 ,
-.Xr config 8 ,
 .Xr ppp 8 ,
 .\" .Xr mbuf 9 ,
 .Xr rtentry 9

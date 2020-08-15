@@ -33,7 +33,6 @@
 
 #include "opt_inet.h"
 #include "opt_ipdivert.h"
-#include "opt_ipsec.h"
 
 #ifndef INET
 #error "IPDIVERT requires INET."
@@ -60,8 +59,6 @@
 
 #include <net/netmsg2.h>
 #include <net/netisr2.h>
-#include <sys/thread2.h>
-#include <sys/mplock2.h>
 
 #include <netinet/in.h>
 #include <netinet/in_systm.h>
@@ -126,14 +123,14 @@ void
 div_init(void)
 {
 	in_pcbinfo_init(&divcbinfo, 0, FALSE);
-	in_pcbportinfo_init(&divcbportinfo, 1, FALSE, 0);
+	in_pcbportinfo_init(&divcbportinfo, 1, 0);
 	/*
 	 * XXX We don't use the hash list for divert IP, but it's easier
 	 * to allocate a one entry hash list than it is to check all
 	 * over the place for hashbase == NULL.
 	 */
 	divcbinfo.hashbase = hashinit(1, M_PCB, &divcbinfo.hashmask);
-	divcbinfo.portinfo = &divcbportinfo;
+	in_pcbportinfo_set(&divcbinfo, &divcbportinfo, 1);
 	divcbinfo.wildcardhashbase = hashinit(1, M_PCB,
 					      &divcbinfo.wildcardhashmask);
 	divcbinfo.ipi_size = sizeof(struct inpcb);
@@ -170,8 +167,7 @@ div_packet(struct mbuf *m, int incoming, int port)
 	struct divert_info *divinfo;
 	u_int16_t nport;
 
-	KASSERT(&curthread->td_msgport == netisr_cpuport(0),
-	    ("not in netisr0"));
+	ASSERT_NETISR0;
 
 	/* Locate the divert info */
 	mtag = m_tag_find(m, PACKET_TAG_IPFW_DIVERT, NULL);
@@ -242,9 +238,10 @@ div_packet(struct mbuf *m, int incoming, int port)
 	}
 	if (sa) {
 		lwkt_gettoken(&sa->so_rcv.ssb_token);
-		if (ssb_appendaddr(&sa->so_rcv, (struct sockaddr *)&divsrc, m, NULL) == 0)
+		if (ssb_appendaddr(&sa->so_rcv, (struct sockaddr *)&divsrc, m, NULL) == 0) {
 			m_freem(m);
-		else
+			soroverflow(sa);
+		} else
 			sorwakeup(sa);
 		lwkt_reltoken(&sa->so_rcv.ssb_token);
 	} else {
@@ -325,8 +322,7 @@ div_output(struct socket *so, struct mbuf *m,
 	struct m_tag *mtag;
 	struct divert_info *divinfo;
 
-	KASSERT(&curthread->td_msgport == netisr_cpuport(0),
-	    ("not in netisr0"));
+	ASSERT_NETISR0;
 
 	if (control)
 		m_freem(control);		/* XXX */
@@ -336,7 +332,7 @@ div_output(struct socket *so, struct mbuf *m,
 	 * with a 0 tag in mh_data is effectively untagged,
 	 * so we could optimize that case.
 	 */
-	mtag = m_tag_get(PACKET_TAG_IPFW_DIVERT, sizeof(*divinfo), MB_DONTWAIT);
+	mtag = m_tag_get(PACKET_TAG_IPFW_DIVERT, sizeof(*divinfo), M_NOWAIT);
 	if (mtag == NULL) {
 		error = ENOBUFS;
 		goto cantsend;
@@ -389,8 +385,7 @@ div_attach(netmsg_t msg)
 	struct inpcb *inp;
 	int error;
 
-	KASSERT(&curthread->td_msgport == netisr_cpuport(0),
-	    ("not in netisr0"));
+	ASSERT_NETISR0;
 
 	inp  = so->so_pcb;
 	if (inp)
@@ -407,7 +402,6 @@ div_attach(netmsg_t msg)
 		goto out;
 	inp = (struct inpcb *)so->so_pcb;
 	inp->inp_ip_p = proto;
-	inp->inp_vflag |= INP_IPV4;
 	inp->inp_flags |= INP_HDRINCL;
 	/*
 	 * The socket is always "connected" because
@@ -425,8 +419,7 @@ div_detach(netmsg_t msg)
 	struct socket *so = msg->detach.base.nm_so;
 	struct inpcb *inp;
 
-	KASSERT(&curthread->td_msgport == netisr_cpuport(0),
-	    ("not in netisr0"));
+	ASSERT_NETISR0;
 
 	inp = so->so_pcb;
 	if (inp == NULL)
@@ -451,8 +444,7 @@ div_disconnect(netmsg_t msg)
 	struct socket *so = msg->disconnect.base.nm_so;
 	int error;
 
-	KASSERT(&curthread->td_msgport == netisr_cpuport(0),
-	    ("not in netisr0"));
+	ASSERT_NETISR0;
 
 	if (so->so_state & SS_ISCONNECTED) {
 		soisdisconnected(so);
@@ -470,8 +462,7 @@ div_bind(netmsg_t msg)
 	struct sockaddr *nam = msg->bind.nm_nam;
 	int error;
 
-	KASSERT(&curthread->td_msgport == netisr_cpuport(0),
-	    ("not in netisr0"));
+	ASSERT_NETISR0;
 
 	/*
 	 * in_pcbbind assumes that nam is a sockaddr_in
@@ -495,8 +486,7 @@ div_shutdown(netmsg_t msg)
 {
 	struct socket *so = msg->shutdown.base.nm_so;
 
-	KASSERT(&curthread->td_msgport == netisr_cpuport(0),
-	    ("not in netisr0"));
+	ASSERT_NETISR0;
 
 	socantsendmore(so);
 
@@ -522,7 +512,7 @@ div_send(netmsg_t msg)
 
 SYSCTL_DECL(_net_inet_divert);
 SYSCTL_PROC(_net_inet_divert, OID_AUTO, pcblist, CTLFLAG_RD, &divcbinfo, 1,
-	    in_pcblist_global, "S,xinpcb", "List of active divert sockets");
+	    in_pcblist_range, "S,xinpcb", "List of active divert sockets");
 
 struct pr_usrreqs div_usrreqs = {
 	.pru_abort = div_abort,
@@ -554,7 +544,7 @@ ip_divert_out(struct mbuf *m, int tee)
 
 	/* Clone packet if we're doing a 'tee' */
 	if (tee)
-		clone = m_dup(m, MB_DONTWAIT);
+		clone = m_dup(m, M_NOWAIT);
 
 	/*
 	 * XXX
@@ -653,7 +643,7 @@ ip_divert_in(struct mbuf *m, int tee)
 
 	/* Clone packet if we're doing a 'tee' */
 	if (tee)
-		clone = m_dup(m, MB_DONTWAIT);
+		clone = m_dup(m, M_NOWAIT);
 
 	/*
 	 * Restore packet header fields to original

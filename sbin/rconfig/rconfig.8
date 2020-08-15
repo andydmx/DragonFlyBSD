@@ -1,4 +1,3 @@
-.\" $DragonFly: src/sbin/rconfig/rconfig.8,v 1.7 2008/09/07 08:18:54 swildner Exp $
 .\"
 .\" Copyright (c) 2003,2004 The DragonFly Project.  All rights reserved.
 .\"
@@ -32,7 +31,7 @@
 .\" OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
 .\" SUCH DAMAGE.
 .\"
-.Dd June 17, 2004
+.Dd June 16, 2019
 .Dt RCONFIG 8
 .Os
 .Sh NAME
@@ -40,14 +39,17 @@
 .Nd Remote Configuration Client/Server
 .Sh SYNOPSIS
 .Nm
-.Bk -words
 .Op Fl a
-.Op Fl W Ar workdir
-.Op Fl T Ar tagdir
-.Op Fl C Ar configfiles
-.Op Fl s
 .Op Fl v
-.Ek
+.Op Fl W Ar workdir
+.Op Ar host[:tag] Ar ...
+.Nm
+.Fl s
+.Op Fl a
+.Op Fl C Ar configfiles
+.Op Fl T Ar tagdir
+.Op Fl v
+.Op Ar bind_address Ar ...
 .Sh DESCRIPTION
 The
 .Nm
@@ -87,6 +89,10 @@ option should not be used in that case.
 .Pp
 The following command line options are available when operating in server mode:
 .Bl -tag -width Fl
+.It Fl s
+This option is required to operate
+.Nm
+as a server.
 .It Fl a
 .Nm
 will bind to and listen on all available interfaces.  If this option is not
@@ -97,12 +103,11 @@ Specify the directory containing the tag scripts.  The default is
 .Pa /usr/local/etc/rconfig .
 Tag scripts are in the form:
 .Pa tagname.sh .
+The tag name can only consist of alphabets (lower and upper letters),
+digits (zero to nine), underscore (_), dot (.),
+minus (-) and plus (+) symbols.
 .It Fl C Ar configfiles
 Specify server configuration files (currently unused).
-.It Fl s
-This option is required to operate
-.Nm
-as a server.
 .It Fl v
 Verbose mode prints additional information during program execution.
 .It bind_address

@@ -61,7 +61,6 @@
 
 #include <vfs/ufs/quota.h>
 #include <vfs/ufs/inode.h>
-#include <vfs/dirfs/dirfs.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -73,15 +72,14 @@
 
 struct nlist Nl[] = {
     { "_mountlist" },
-    { "_vnode_inactive_list" },
-    { "_vnode_active_list" },
+    { "_vnode_list_hash" },
+    { "_ncpus" },
     { NULL }
 };
 
 static void kkread(kvm_t *kd, u_long addr, void *buf, size_t nbytes);
 static struct mount *dumpmount(kvm_t *kd, struct mount *mp);
 static struct vnode *dumpvp(kvm_t *kd, struct vnode *vp, int whichlist, char *vfc_name);
-static void dump_dirfs_node(kvm_t *kd, void *arg);
 static void dumpbufs(kvm_t *kd, void *bufp, const char *id);
 static void dumplocks(kvm_t *kd, struct lockf *lockf);
 static void dumplockinfo(kvm_t *kd, struct lockf_range *item);
@@ -92,7 +90,6 @@ static const struct dump_private_data {
 	char vfc_name[MFSNAMELEN];
 	void (*dumpfn)(kvm_t *, void *);
 } dumplist[] = {
-	{ "dirfs", dump_dirfs_node },
 	{ "", NULL }
 };
 
@@ -105,10 +102,11 @@ int
 main(int ac, char **av)
 {
     struct mount *mp;
-    struct vnode *vp;
+    struct vnode_index *vib;
+    struct vnode_index vni;
     kvm_t *kd;
-    int i;
     int ch;
+    int ncpus = 0;
     const char *corefile = NULL;
     const char *sysfile = NULL;
 
@@ -152,18 +150,44 @@ main(int ac, char **av)
 	perror("kvm_nlist");
 	exit(1);
     }
+
+    /* Mount points and their private data */
     kkread(kd, Nl[0].n_value, &mp, sizeof(mp));
     while (mp)
 	mp = dumpmount(kd, mp);
+
+    /*
+     * Get ncpus for the vnode lists, we could get it with a sysctl
+     * but since we're reading kernel memory, take advantage of it.
+     * Also read the base address of vnode_list_hash.
+     */
+    kkread(kd, Nl[1].n_value, &vib, sizeof(vib));
+    kkread(kd, Nl[2].n_value, &ncpus, sizeof(ncpus));
+
+    /* Per-CPU list of inactive vnodes */
     printf("INACTIVELIST {\n");
-    kkread(kd, Nl[1].n_value, &vp, sizeof(vp));
-    while (vp)
-	    vp = dumpvp(kd, vp, 0, NULL);
+
+    for (int i = 0; i < ncpus; i++) {
+	    struct vnode *vp;
+
+	    kkread(kd, (u_long)(vib + i), &vni, sizeof(vni));
+	    vp = vni.inactive_list.tqh_first;
+	    for (; vp != NULL;)
+		    vp = dumpvp(kd, vp, 0, NULL);
+    }
     printf("}\n");
+
+    /* Per-CPU list of active vnodes */
     printf("ACTIVELIST {\n");
-    kkread(kd, Nl[2].n_value, &vp, sizeof(vp));
-    while (vp)
-	    vp = dumpvp(kd, vp, 0, NULL);
+    for (int i = 0; i < ncpus; i++) {
+	    struct vnode *vp;
+
+	    kkread(kd, (u_long)(vib + i), &vni, sizeof(vni));
+	    vp = vni.active_list.tqh_first;
+	    for (; vp;)
+		    vp = dumpvp(kd, vp, 0,
+			NULL);
+    }
     printf("}\n");
     return(0);
 }
@@ -178,7 +202,7 @@ dumpmount(kvm_t *kd, struct mount *mp)
     kkread(kd, (u_long)mp, &mnt, sizeof(mnt));
     printf("MOUNTPOINT %s on %s {\n",
 	mnt.mnt_stat.f_mntfromname, mnt.mnt_stat.f_mntonname);
-    printf("    lk_flags %08x count %08x holder = %p\n",
+    printf("    lk_flags %08x count %016jx holder = %p\n",
 	mnt.mnt_lock.lk_flags, mnt.mnt_lock.lk_count,
 	mnt.mnt_lock.lk_lockholder);
     printf("    mnt_flag %08x mnt_kern_flag %08x\n",
@@ -227,50 +251,6 @@ vtype(enum vtype type)
     }
     snprintf(buf, sizeof(buf), "%d", (int)type);
     return(buf);
-}
-
-static
-void dump_dirfs_node(kvm_t *kd, void *arg)
-{
-	dirfs_node_t dnp = (dirfs_node_t)arg;
-	struct dirfs_node dn;
-	char *name = NULL;
-	char strfd[16] = {0};
-
-	/* No garbage allowed */
-	bzero(&dn, sizeof(dn));
-
-	/*
-	 * Attempt to read in the address of the dnp and also
-	 * its name if there is any.
-	 */
-	kkread(kd, (u_long)dnp, &dn, sizeof(dn));
-	if (dn.dn_name != NULL) {
-		name = dn.dn_name;
-		dn.dn_name = calloc(1, MAXPATHLEN);
-		kkread(kd, (u_long)name, dn.dn_name, dn.dn_namelen);
-	}
-	printf("\tDIRFS\n");
-	printf("\t\tdn_name=%s mode=%u flags=%08x refs=%d ",
-	    (dn.dn_name ? dn.dn_name : "NULL"), dn.dn_mode, dn.dn_flags,
-	    dn.dn_refcnt);
-
-	printf("state=");
-	if (dn.dn_state & DIRFS_ROOT)
-		printf("DIRFS_ROOT ");
-
-	if (dn.dn_fd == -1)
-		sprintf(strfd, "%s", "NOFD");
-	else
-		sprintf(strfd, "%d", dn.dn_fd);
-
-	printf("\n\t\tuid=%u gid=%u objtype=%s nlinks=%d dn_fd=%s\n", dn.dn_uid,
-	    dn.dn_gid, vtype(dn.dn_type), dn.dn_links, strfd);
-	printf("\t\tsize=%jd ctime=%ju atime=%ju mtime=%ju\n\n", dn.dn_size,
-	    dn.dn_ctime, dn.dn_atime, dn.dn_mtime);
-
-	if (dn.dn_name)
-		free(dn.dn_name);
 }
 
 static struct vnode *
@@ -347,8 +327,8 @@ dumpvp(kvm_t *kd, struct vnode *vp, int whichlist, char *vfc_name)
 
     printf("\n");
 
-    if (vn.v_lock.lk_count || vn.v_lock.lk_lockholder != LK_NOTHREAD) {
-	printf("\tlk_flags %08x count %08x holder = %p\n",
+    if (vn.v_lock.lk_count || vn.v_lock.lk_lockholder != NULL) {
+	printf("\tlk_flags %08x count %016jx holder = %p\n",
 	    vn.v_lock.lk_flags, vn.v_lock.lk_count,
 	    vn.v_lock.lk_lockholder);
     }
@@ -417,12 +397,12 @@ dumpbufs(kvm_t *kd, void *bufp, const char *id)
 	struct buf buf;
 
 	kkread(kd, (u_long)bufp, &buf, sizeof(buf));
-	printf("\t    %-8s %p loffset %012llx/%05x foffset %08llx",
+	printf("\t    %-8s %p loffset %012lx/%05x foffset %08lx",
 		id, bufp,
 		buf.b_bio1.bio_offset,
 		buf.b_bufsize,
 		buf.b_bio2.bio_offset);
-	printf(" q=%d count=%08x flags=%08x refs=%08x dep=%p",
+	printf(" q=%d count=%016jx flags=%08x refs=%08x dep=%p",
 		buf.b_qindex, buf.b_lock.lk_count,
 		buf.b_flags, buf.b_refs, buf.b_dep.lh_first);
 	printf("\n");
@@ -470,7 +450,7 @@ dumplockinfo(kvm_t *kd, struct lockf_range *item)
 		ownerpid = -1;
 	}
 
-	printf("\t    ty=%d flgs=%04x %lld-%lld owner=%d\n",
+	printf("\t    ty=%d flgs=%04x %ld-%ld owner=%d\n",
 		item->lf_type, item->lf_flags,
 		item->lf_start, item->lf_end,
 		ownerpid

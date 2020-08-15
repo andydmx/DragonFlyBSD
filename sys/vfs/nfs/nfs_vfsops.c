@@ -55,6 +55,7 @@
 #include <vm/vm_extern.h>
 
 #include <net/if.h>
+#include <net/if_var.h>
 #include <net/route.h>
 #include <netinet/in.h>
 
@@ -126,6 +127,7 @@ static int	nfs_sync ( struct mount *mp, int waitfor);
  * nfs vfs operations.
  */
 static struct vfsops nfs_vfsops = {
+	.vfs_flags =		0,
 	.vfs_mount =    	nfs_mount,
 	.vfs_unmount =  	nfs_unmount,
 	.vfs_root =     	nfs_root,
@@ -135,7 +137,7 @@ static struct vfsops nfs_vfsops = {
 	.vfs_init =     	nfs_init,
 	.vfs_uninit =    	nfs_uninit
 };
-VFS_SET(nfs_vfsops, nfs, VFCF_NETWORK);
+VFS_SET(nfs_vfsops, nfs, VFCF_NETWORK | VFCF_MPSAFE);
 MODULE_VERSION(nfs, 1);
 
 /*
@@ -499,30 +501,27 @@ nfs_fsinfo(struct nfsmount *nmp, struct vnode *vp, struct thread *td)
 		NULLOUT(fsp = nfsm_dissect(&info, NFSX_V3FSINFO));
 		pref = fxdr_unsigned(u_int32_t, fsp->fs_wtpref);
 		if (pref < nmp->nm_wsize && pref >= NFS_FABLKSIZE)
-			nmp->nm_wsize = (pref + NFS_FABLKSIZE - 1) &
-				~(NFS_FABLKSIZE - 1);
+			nmp->nm_wsize = roundup2(pref, NFS_FABLKSIZE);
 		max = fxdr_unsigned(u_int32_t, fsp->fs_wtmax);
 		if (max < nmp->nm_wsize && max > 0) {
-			nmp->nm_wsize = max & ~(NFS_FABLKSIZE - 1);
+			nmp->nm_wsize = rounddown2(max, NFS_FABLKSIZE);
 			if (nmp->nm_wsize == 0)
 				nmp->nm_wsize = max;
 		}
 		pref = fxdr_unsigned(u_int32_t, fsp->fs_rtpref);
 		if (pref < nmp->nm_rsize && pref >= NFS_FABLKSIZE)
-			nmp->nm_rsize = (pref + NFS_FABLKSIZE - 1) &
-				~(NFS_FABLKSIZE - 1);
+			nmp->nm_rsize = roundup2(pref, NFS_FABLKSIZE);
 		max = fxdr_unsigned(u_int32_t, fsp->fs_rtmax);
 		if (max < nmp->nm_rsize && max > 0) {
-			nmp->nm_rsize = max & ~(NFS_FABLKSIZE - 1);
+			nmp->nm_rsize = rounddown2(max, NFS_FABLKSIZE);
 			if (nmp->nm_rsize == 0)
 				nmp->nm_rsize = max;
 		}
 		pref = fxdr_unsigned(u_int32_t, fsp->fs_dtpref);
 		if (pref < nmp->nm_readdirsize && pref >= NFS_DIRBLKSIZ)
-			nmp->nm_readdirsize = (pref + NFS_DIRBLKSIZ - 1) &
-				~(NFS_DIRBLKSIZ - 1);
+			nmp->nm_readdirsize = roundup2(pref, NFS_DIRBLKSIZ);
 		if (max < nmp->nm_readdirsize && max > 0) {
-			nmp->nm_readdirsize = max & ~(NFS_DIRBLKSIZ - 1);
+			nmp->nm_readdirsize = rounddown2(max, NFS_DIRBLKSIZ);
 			if (nmp->nm_readdirsize == 0)
 				nmp->nm_readdirsize = max;
 		}
@@ -566,7 +565,7 @@ nfs_mountroot(struct mount *mp)
 	struct thread *td = curthread;		/* XXX */
 	int error, i;
 	u_long l;
-	char buf[128];
+	char buf[128], addr[INET_ADDRSTRLEN];
 
 #if defined(BOOTP_NFSROOT) && defined(BOOTP)
 	bootpc_init();		/* use bootp to get nfs_diskless filled in */
@@ -595,11 +594,11 @@ nfs_mountroot(struct mount *mp)
 #define SINP(sockaddr)	((struct sockaddr_in *)(sockaddr))
 	kprintf("nfs_mountroot: interface %s ip %s",
 		nd->myif.ifra_name,
-		inet_ntoa(SINP(&nd->myif.ifra_addr)->sin_addr));
+		kinet_ntoa(SINP(&nd->myif.ifra_addr)->sin_addr, addr));
 	kprintf(" bcast %s",
-		inet_ntoa(SINP(&nd->myif.ifra_broadaddr)->sin_addr));
+		kinet_ntoa(SINP(&nd->myif.ifra_broadaddr)->sin_addr, addr));
 	kprintf(" mask %s\n",
-		inet_ntoa(SINP(&nd->myif.ifra_mask)->sin_addr));
+		kinet_ntoa(SINP(&nd->myif.ifra_mask)->sin_addr, addr));
 #undef SINP
 
 	/*
@@ -638,7 +637,7 @@ nfs_mountroot(struct mount *mp)
 		sin.sin_family = AF_INET;
 		sin.sin_len = sizeof(sin);
 		kprintf("nfs_mountroot: gateway %s\n",
-			inet_ntoa(nd->mygateway.sin_addr));
+			kinet_ntoa(nd->mygateway.sin_addr, addr));
 		error = rtrequest_global(RTM_ADD, (struct sockaddr *)&sin,
 					(struct sockaddr *)&nd->mygateway,
 					(struct sockaddr *)&mask,
@@ -682,6 +681,7 @@ nfs_mountroot(struct mount *mp)
 			(l >> 24) & 0xff, (l >> 16) & 0xff,
 			(l >>  8) & 0xff, (l >>  0) & 0xff,nd->swap_hostnam);
 		kprintf("NFS SWAP: %s\n",buf);
+		vp = NULL;	/* avoid gcc warnings */
 		error = nfs_mountdiskless(buf, "/swap", 0, &nd->swap_saddr,
 					  &nd->swap_args, td, &vp, &swap_mp);
 		if (error) {
@@ -1033,8 +1033,8 @@ mountnfs(struct nfs_args *argp, struct mount *mp, struct sockaddr *nam,
 	} else {
 		nmp = objcache_get(nfsmount_objcache, M_WAITOK);
 		bzero((caddr_t)nmp, sizeof (struct nfsmount));
-		mtx_init(&nmp->nm_rxlock);
-		mtx_init(&nmp->nm_txlock);
+		mtx_init_flags(&nmp->nm_rxlock, "nfsrx", MTXF_NOCOLLSTATS);
+		mtx_init_flags(&nmp->nm_txlock, "nfstx", MTXF_NOCOLLSTATS);
 		TAILQ_INIT(&nmp->nm_uidlruhead);
 		TAILQ_INIT(&nmp->nm_bioq);
 		TAILQ_INIT(&nmp->nm_reqq);
@@ -1113,7 +1113,7 @@ mountnfs(struct nfs_args *argp, struct mount *mp, struct sockaddr *nam,
 	 * traversals of the mount point (i.e. "..") will not work if
 	 * the nfsnode gets flushed out of the cache. Ufs does not have
 	 * this problem, because one can identify root inodes by their
-	 * number == ROOTINO (2).
+	 * number == UFS_ROOTINO (2).
 	 */
 	error = nfs_nget(mp, (nfsfh_t *)nmp->nm_fh, nmp->nm_fhsize, &np, NULL);
 	if (error)

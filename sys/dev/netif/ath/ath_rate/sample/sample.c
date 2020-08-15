@@ -36,6 +36,7 @@
  */
 
 #include <sys/cdefs.h>
+__FBSDID("$FreeBSD$");
 
 /*
  * John Bicket's SampleRate control algorithm.
@@ -51,9 +52,16 @@
 #include <sys/kernel.h>
 #include <sys/lock.h>
 #include <sys/malloc.h>
-#include <sys/mutex.h>
 #include <sys/errno.h>
+
+#if defined(__DragonFly__)
+/* empty */
+#else
+#include <machine/bus.h>
+#include <machine/resource.h>
+#endif
 #include <sys/bus.h>
+
 #include <sys/socket.h>
  
 #include <net/if.h>
@@ -76,7 +84,9 @@
 #include <dev/netif/ath/ath_hal/ah_desc.h>
 #include <dev/netif/ath/ath_rate/sample/tx_schedules.h>
 
-extern  const char* ath_hal_ether_sprintf(const uint8_t *mac);
+#if defined(__DragonFly__)
+extern const char* ath_hal_ether_sprintf(const uint8_t *mac);
+#endif
 
 /*
  * This file is an implementation of the SampleRate algorithm
@@ -485,8 +495,7 @@ ath_rate_findrate(struct ath_softc *sc, struct ath_node *an,
 #define	RATE(ix)	(DOT11RATE(ix) / 2)
 	struct sample_node *sn = ATH_NODE_SAMPLE(an);
 	struct sample_softc *ssc = ATH_SOFTC_SAMPLE(sc);
-	struct ifnet *ifp = sc->sc_ifp;
-	struct ieee80211com *ic = ifp->if_l2com;
+	struct ieee80211com *ic = &sc->sc_ic;
 	const HAL_RATE_TABLE *rt = sc->sc_currates;
 	const int size_bin = size_to_bin(frameLen);
 	int rix, mrr, best_rix, change_rates;
@@ -840,9 +849,11 @@ update_stats(struct ath_softc *sc, struct ath_node *an,
 }
 
 static void
-badrate(struct ifnet *ifp, int series, int hwrate, int tries, int status)
+badrate(struct ath_softc *sc, int series, int hwrate, int tries, int status)
 {
-	if_printf(ifp, "bad series%d hwrate 0x%x, tries %u ts_status 0x%x\n",
+
+	device_printf(sc->sc_dev,
+	    "bad series%d hwrate 0x%x, tries %u ts_status 0x%x\n",
 	    series, hwrate, tries, status);
 }
 
@@ -851,8 +862,7 @@ ath_rate_tx_complete(struct ath_softc *sc, struct ath_node *an,
 	const struct ath_rc_series *rc, const struct ath_tx_status *ts,
 	int frame_size, int nframes, int nbad)
 {
-	struct ifnet *ifp = sc->sc_ifp;
-	struct ieee80211com *ic = ifp->if_l2com;
+	struct ieee80211com *ic = &sc->sc_ic;
 	struct sample_node *sn = ATH_NODE_SAMPLE(an);
 	int final_rix, short_tries, long_tries;
 	const HAL_RATE_TABLE *rt = sc->sc_currates;
@@ -888,9 +898,10 @@ ath_rate_tx_complete(struct ath_softc *sc, struct ath_node *an,
 
 	if (!mrr || ts->ts_finaltsi == 0) {
 		if (!IS_RATE_DEFINED(sn, final_rix)) {
-			device_printf(sc->sc_dev, "%s: ts_rate=%d ts_finaltsi=%d\n",
-			    __func__, ts->ts_rate, ts->ts_finaltsi);
-			badrate(ifp, 0, ts->ts_rate, long_tries, status);
+			device_printf(sc->sc_dev,
+			    "%s: ts_rate=%d ts_finaltsi=%d, final_rix=%d\n",
+			    __func__, ts->ts_rate, ts->ts_finaltsi, final_rix);
+			badrate(sc, 0, ts->ts_rate, long_tries, status);
 			return;
 		}
 		/*
@@ -942,7 +953,7 @@ ath_rate_tx_complete(struct ath_softc *sc, struct ath_node *an,
 
 		for (i = 0; i < 4; i++) {
 			if (rc[i].tries && !IS_RATE_DEFINED(sn, rc[i].rix))
-				badrate(ifp, 0, rc[i].ratecode, rc[i].tries,
+				badrate(sc, 0, rc[i].ratecode, rc[i].tries,
 				    status);
 		}
 
@@ -1089,8 +1100,13 @@ ath_rate_ctl_reset(struct ath_softc *sc, struct ieee80211_node *ni)
 	if (ieee80211_msg(ni->ni_vap, IEEE80211_MSG_RATECTL)) {
 		uint64_t mask;
 
+#if defined(__DragonFly__)
 		ieee80211_note(ni->ni_vap, "[%s] %s: size 1600 rate/tt",
 		    ath_hal_ether_sprintf(ni->ni_macaddr), __func__);
+#else
+		ieee80211_note(ni->ni_vap, "[%6D] %s: size 1600 rate/tt",
+		    ni->ni_macaddr, ":", __func__);
+#endif
 		for (mask = sn->ratemask, rix = 0; mask != 0; mask >>= 1, rix++) {
 			if ((mask & 1) == 0)
 				continue;
@@ -1193,8 +1209,13 @@ ath_rate_fetch_node_stats(struct ath_softc *sc, struct ath_node *an,
 	 * Take a temporary copy of the sample node state so we can
 	 * modify it before we copy it.
 	 */
+#if defined(__DragonFly__)
 	tv = kmalloc(sizeof(struct ath_rateioctl_rt), M_TEMP,
-		     M_INTWAIT | M_ZERO);
+		M_INTWAIT | M_ZERO);
+#else
+	tv = malloc(sizeof(struct ath_rateioctl_rt), M_TEMP,
+		M_NOWAIT | M_ZERO);
+#endif
 	if (tv == NULL) {
 		return (ENOMEM);
 	}
@@ -1249,8 +1270,7 @@ sample_stats(void *arg, struct ieee80211_node *ni)
 	int rix, y;
 
 	kprintf("\n[%s] refcnt %d static_rix (%d %s) ratemask 0x%jx\n",
-	    ath_hal_ether_sprintf(ni->ni_macaddr),
-	    ieee80211_node_refcnt(ni),
+	    ether_sprintf(ni->ni_macaddr), ieee80211_node_refcnt(ni),
 	    dot11rate(rt, sn->static_rix),
 	    dot11rate_label(rt, sn->static_rix),
 	    (uintmax_t)sn->ratemask);
@@ -1298,8 +1318,7 @@ static int
 ath_rate_sysctl_stats(SYSCTL_HANDLER_ARGS)
 {
 	struct ath_softc *sc = arg1;
-	struct ifnet *ifp = sc->sc_ifp;
-	struct ieee80211com *ic = ifp->if_l2com;
+	struct ieee80211com *ic = &sc->sc_ic;
 	int error, v;
 
 	v = 0;
@@ -1346,8 +1365,8 @@ ath_rate_sysctl_sample_rate(SYSCTL_HANDLER_ARGS)
 static void
 ath_rate_sysctlattach(struct ath_softc *sc, struct sample_softc *ssc)
 {
-	struct sysctl_ctx_list *ctx = &sc->sc_sysctl_ctx;
-	struct sysctl_oid *tree = sc->sc_sysctl_tree;
+	struct sysctl_ctx_list *ctx = device_get_sysctl_ctx(sc->sc_dev);
+	struct sysctl_oid *tree = device_get_sysctl_tree(sc->sc_dev);
 
 	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
 	    "smoothing_rate", CTLTYPE_INT | CTLFLAG_RW, ssc, 0,
@@ -1368,7 +1387,11 @@ ath_rate_attach(struct ath_softc *sc)
 {
 	struct sample_softc *ssc;
 	
+#if defined(__DragonFly__)
 	ssc = kmalloc(sizeof(struct sample_softc), M_DEVBUF, M_INTWAIT|M_ZERO);
+#else
+	ssc = malloc(sizeof(struct sample_softc), M_DEVBUF, M_NOWAIT|M_ZERO);
+#endif
 	if (ssc == NULL)
 		return NULL;
 	ssc->arc.arc_space = sizeof(struct sample_node);
@@ -1390,34 +1413,36 @@ ath_rate_detach(struct ath_ratectrl *arc)
 	kfree(ssc, M_DEVBUF);
 }
 
+#if defined(__DragonFly__)
+
 /*
  * Module glue.
  */
 static int
 sample_modevent(module_t mod, int type, void *unused)
 {
-        int error;
+	int error;
 
-        wlan_serialize_enter();
+	wlan_serialize_enter();
 
-        switch (type) {
-        case MOD_LOAD:
-                if (bootverbose) {
-                        kprintf("ath_rate: <SampleRate bit-rate "
-                                "selection algorithm>\n");
-                }
-                error = 0;
-                break;
-        case MOD_UNLOAD:
-                error = 0;
-                break;
-        default:
-                error = EINVAL;
-                break;
-        }
-        wlan_serialize_exit();
+	switch (type) {
+	case MOD_LOAD:
+		if (bootverbose) {
+			kprintf("ath_rate: <SampleRate bit-rate "
+				"selection algorithm>\n");
+		}
+		error = 0;
+		break;
+	case MOD_UNLOAD:
+		error = 0;
+		break;
+	default:
+		error = EINVAL;
+		break;
+	}
+	wlan_serialize_exit();
 
-        return error;
+	return error;
 }
 
 static moduledata_t sample_mod = {
@@ -1430,3 +1455,5 @@ DECLARE_MODULE(ath_rate, sample_mod, SI_SUB_DRIVERS, SI_ORDER_FIRST);
 MODULE_VERSION(ath_rate, 1);
 MODULE_DEPEND(ath_rate, ath_hal, 1, 1, 1);
 MODULE_DEPEND(ath_rate, wlan, 1, 1, 1);
+
+#endif

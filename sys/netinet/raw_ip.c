@@ -31,7 +31,6 @@
  */
 
 #include "opt_inet6.h"
-#include "opt_ipsec.h"
 #include "opt_carp.h"
 
 #include <sys/param.h>
@@ -47,7 +46,6 @@
 #include <sys/socketvar.h>
 #include <sys/sysctl.h>
 
-#include <sys/thread2.h>
 #include <sys/socketvar2.h>
 #include <sys/msgport2.h>
 
@@ -69,22 +67,12 @@
 
 #include <net/ip_mroute/ip_mroute.h>
 #include <net/ipfw/ip_fw.h>
+#include <net/ipfw3/ip_fw.h>
 #include <net/dummynet/ip_dummynet.h>
-
-#ifdef FAST_IPSEC
-#include <netproto/ipsec/ipsec.h>
-#endif /*FAST_IPSEC*/
-
-#ifdef IPSEC
-#include <netinet6/ipsec.h>
-#endif /*IPSEC*/
+#include <net/dummynet3/ip_dummynet3.h>
 
 struct	inpcbinfo ripcbinfo;
 struct	inpcbportinfo ripcbportinfo;
-
-/* control hooks for ipfw and dummynet */
-ip_fw_ctl_t *ip_fw_ctl_ptr;
-ip_dn_ctl_t *ip_dn_ctl_ptr;
 
 /*
  * hooks for multicast routing. They all default to NULL,
@@ -100,7 +88,7 @@ int (*ip_mrouter_get)(struct socket *, struct sockopt *);
 int (*ip_mrouter_done)(void);
 int (*ip_mforward)(struct ip *, struct ifnet *, struct mbuf *,
 		struct ip_moptions *);
-int (*mrt_ioctl)(int, caddr_t);
+int (*mrt_ioctl)(u_long, caddr_t);
 int (*legal_vif_num)(int);
 u_long (*ip_mcast_src)(int);
 
@@ -125,14 +113,14 @@ void
 rip_init(void)
 {
 	in_pcbinfo_init(&ripcbinfo, 0, FALSE);
-	in_pcbportinfo_init(&ripcbportinfo, 1, FALSE, 0);
+	in_pcbportinfo_init(&ripcbportinfo, 1, 0);
 	/*
 	 * XXX We don't use the hash list for raw IP, but it's easier
 	 * to allocate a one entry hash list than it is to check all
 	 * over the place for hashbase == NULL.
 	 */
 	ripcbinfo.hashbase = hashinit(1, M_PCB, &ripcbinfo.hashmask);
-	ripcbinfo.portinfo = &ripcbportinfo;
+	in_pcbportinfo_set(&ripcbinfo, &ripcbportinfo, 1);
 	ripcbinfo.wildcardhashbase = hashinit(1, M_PCB,
 					      &ripcbinfo.wildcardhashmask);
 	ripcbinfo.ipi_size = sizeof(struct inpcb);
@@ -153,8 +141,7 @@ rip_input(struct mbuf **mp, int *offp, int proto)
 	struct inpcb *last = NULL;
 	struct mbuf *opts = NULL;
 
-	KASSERT(&curthread->td_msgport == netisr_cpuport(0),
-	    ("not in netisr0"));
+	ASSERT_NETISR0;
 
 	*mp = NULL;
 
@@ -163,7 +150,7 @@ rip_input(struct mbuf **mp, int *offp, int proto)
 		if (inp->inp_flags & INP_PLACEMARKER)
 			continue;
 #ifdef INET6
-		if ((inp->inp_vflag & INP_IPV4) == 0)
+		if (!INP_ISIPV4(inp))
 			continue;
 #endif
 		if (inp->inp_ip_p && inp->inp_ip_p != proto)
@@ -175,23 +162,8 @@ rip_input(struct mbuf **mp, int *offp, int proto)
 		    inp->inp_faddr.s_addr != ip->ip_src.s_addr)
 			continue;
 		if (last) {
-			struct mbuf *n = m_copypacket(m, MB_DONTWAIT);
+			struct mbuf *n = m_copypacket(m, M_NOWAIT);
 
-#ifdef IPSEC
-			/* check AH/ESP integrity. */
-			if (n && ipsec4_in_reject_so(n, last->inp_socket)) {
-				m_freem(n);
-				ipsecstat.in_polvio++;
-				/* do not inject data to pcb */
-			} else
-#endif /*IPSEC*/
-#ifdef FAST_IPSEC
-			/* check AH/ESP integrity. */
-			if (ipsec4_in_reject(n, last)) {
-				m_freem(n);
-				/* do not inject data to pcb */
-			} else
-#endif /*FAST_IPSEC*/
 			if (n) {
 				lwkt_gettoken(&last->inp_socket->so_rcv.ssb_token);
 				if (last->inp_flags & INP_CONTROLOPTS ||
@@ -200,10 +172,10 @@ rip_input(struct mbuf **mp, int *offp, int proto)
 				if (ssb_appendaddr(&last->inp_socket->so_rcv,
 					    (struct sockaddr *)&ripsrc, n,
 					    opts) == 0) {
-					/* should notify about lost packet */
 					m_freem(n);
 					if (opts)
 					    m_freem(opts);
+					soroverflow(last->inp_socket);
 				} else {
 					sorwakeup(last->inp_socket);
 				}
@@ -213,23 +185,6 @@ rip_input(struct mbuf **mp, int *offp, int proto)
 		}
 		last = inp;
 	}
-#ifdef IPSEC
-	/* check AH/ESP integrity. */
-	if (last && ipsec4_in_reject_so(m, last->inp_socket)) {
-		m_freem(m);
-		ipsecstat.in_polvio++;
-		ipstat.ips_delivered--;
-		/* do not inject data to pcb */
-	} else
-#endif /*IPSEC*/
-#ifdef FAST_IPSEC
-	/* check AH/ESP integrity. */
-	if (last && ipsec4_in_reject(m, last)) {
-		m_freem(m);
-		ipstat.ips_delivered--;
-		/* do not inject data to pcb */
-	} else
-#endif /*FAST_IPSEC*/
 	/* Check the minimum TTL for socket. */
 	if (last && ip->ip_ttl < last->inp_ip_minttl) {
 		m_freem(opts);
@@ -244,6 +199,7 @@ rip_input(struct mbuf **mp, int *offp, int proto)
 			m_freem(m);
 			if (opts)
 			    m_freem(opts);
+			soroverflow(last->inp_socket);
 		} else {
 			sorwakeup(last->inp_socket);
 		}
@@ -269,8 +225,7 @@ rip_output(struct mbuf *m, struct socket *so, ...)
 	int flags = (so->so_options & SO_DONTROUTE) | IP_ALLOWBROADCAST;
 	u_long dst;
 
-	KASSERT(&curthread->td_msgport == netisr_cpuport(0),
-	    ("not in netisr0"));
+	ASSERT_NETISR0;
 
 	__va_start(ap, so);
 	dst = __va_arg(ap, u_long);
@@ -285,7 +240,7 @@ rip_output(struct mbuf *m, struct socket *so, ...)
 			m_freem(m);
 			return(EMSGSIZE);
 		}
-		M_PREPEND(m, sizeof(struct ip), MB_WAIT);
+		M_PREPEND(m, sizeof(struct ip), M_WAITOK);
 		if (m == NULL)
 			return(ENOBUFS);
 		ip = mtod(m, struct ip *);
@@ -349,8 +304,7 @@ rip_ctloutput(netmsg_t msg)
 	struct	inpcb *inp = so->so_pcb;
 	int	error, optval;
 
-	KASSERT(&curthread->td_msgport == netisr_cpuport(0),
-	    ("not in netisr0"));
+	ASSERT_NETISR0;
 
 	error = 0;
 
@@ -376,12 +330,15 @@ rip_ctloutput(netmsg_t msg)
 			soopt_from_kbuf(sopt, &optval, sizeof optval);
 			break;
 
+		case IP_FW_X:
+			error = ip_fw3_sockopt(sopt);
+			break;
+
 		case IP_FW_ADD: /* ADD actually returns the body... */
 		case IP_FW_GET:
-			if (IPFW_LOADED)
-				error = ip_fw_sockopt(sopt);
-			else
-				error = ENOPROTOOPT;
+		case IP_FW_TBL_GET:
+		case IP_FW_TBL_EXPIRE: /* returns # of expired addresses */
+			error = ip_fw_sockopt(sopt);
 			break;
 
 		case IP_DUMMYNET_GET:
@@ -424,22 +381,30 @@ rip_ctloutput(netmsg_t msg)
 				inp->inp_flags &= ~INP_HDRINCL;
 			break;
 
+		case IP_FW_X:
+			error = ip_fw3_sockopt(sopt);
+			break;
+
 		case IP_FW_ADD:
 		case IP_FW_DEL:
 		case IP_FW_FLUSH:
 		case IP_FW_ZERO:
 		case IP_FW_RESETLOG:
-			if (IPFW_LOADED)
-				error = ip_fw_ctl_ptr(sopt);
-			else
-				error = ENOPROTOOPT;
+		case IP_FW_TBL_CREATE:
+		case IP_FW_TBL_DESTROY:
+		case IP_FW_TBL_ADD:
+		case IP_FW_TBL_DEL:
+		case IP_FW_TBL_FLUSH:
+		case IP_FW_TBL_ZERO:
+		case IP_FW_TBL_EXPIRE:
+			error = ip_fw_sockopt(sopt);
 			break;
 
 		case IP_DUMMYNET_CONFIGURE:
 		case IP_DUMMYNET_DEL:
 		case IP_DUMMYNET_FLUSH:
 			error = ip_dn_sockopt(sopt);
-			break ;
+			break;
 
 		case IP_RSVP_ON:
 			error = ip_rsvp_init(so);
@@ -482,86 +447,6 @@ done:
 	lwkt_replymsg(&msg->lmsg, error);
 }
 
-/*
- * This function exists solely to receive the PRC_IFDOWN messages which
- * are sent by if_down().  It looks for an ifaddr whose ifa_addr is sa,
- * and calls in_ifadown() to remove all routes corresponding to that address.
- * It also receives the PRC_IFUP messages from if_up() and reinstalls the
- * interface routes.
- */
-void
-rip_ctlinput(netmsg_t msg)
-{
-	int cmd = msg->ctlinput.nm_cmd;
-	struct sockaddr *sa = msg->ctlinput.nm_arg;
-	struct in_ifaddr *ia;
-	struct in_ifaddr_container *iac;
-	struct ifnet *ifp;
-	int err;
-	int flags;
-
-	KASSERT(&curthread->td_msgport == netisr_cpuport(0),
-	    ("not in netisr0"));
-
-	switch (cmd) {
-	case PRC_IFDOWN:
-		TAILQ_FOREACH(iac, &in_ifaddrheads[mycpuid], ia_link) {
-			ia = iac->ia;
-
-			if (ia->ia_ifa.ifa_addr == sa &&
-			    (ia->ia_flags & IFA_ROUTE)) {
-				/*
-				 * in_ifscrub kills the interface route.
-				 */
-				in_ifscrub(ia->ia_ifp, ia);
-				/*
-				 * in_ifadown gets rid of all the rest of
-				 * the routes.  This is not quite the right
-				 * thing to do, but at least if we are running
-				 * a routing process they will come back.
-				 */
-				in_ifadown(&ia->ia_ifa, 0);
-				break;
-			}
-		}
-		break;
-
-	case PRC_IFUP:
-		ia = NULL;
-		TAILQ_FOREACH(iac, &in_ifaddrheads[mycpuid], ia_link) {
-			if (iac->ia->ia_ifa.ifa_addr == sa) {
-				ia = iac->ia;
-				break;
-			}
-		}
-		if (ia == NULL || (ia->ia_flags & IFA_ROUTE))
-			goto done;
-		flags = RTF_UP;
-		ifp = ia->ia_ifa.ifa_ifp;
-
-#ifdef CARP
-		/*
-		 * Don't add prefix routes for CARP interfaces.
-		 * Prefix routes creation is handled by CARP
-		 * interfaces themselves.
-		 */
-		if (ifp->if_type == IFT_CARP)
-			goto done;
-#endif
-
-		if ((ifp->if_flags & IFF_LOOPBACK) ||
-		    (ifp->if_flags & IFF_POINTOPOINT))
-			flags |= RTF_HOST;
-
-		err = rtinit(&ia->ia_ifa, RTM_ADD, flags);
-		if (err == 0)
-			ia->ia_flags |= IFA_ROUTE;
-		break;
-	}
-done:
-	lwkt_replymsg(&msg->lmsg, 0);
-}
-
 u_long	rip_sendspace = RIPSNDQ;
 u_long	rip_recvspace = RIPRCVQ;
 
@@ -579,8 +464,7 @@ rip_attach(netmsg_t msg)
 	struct inpcb *inp;
 	int error;
 
-	KASSERT(&curthread->td_msgport == netisr_cpuport(0),
-	    ("not in netisr0"));
+	ASSERT_NETISR0;
 
 	inp = so->so_pcb;
 	if (inp)
@@ -596,11 +480,9 @@ rip_attach(netmsg_t msg)
 	error = in_pcballoc(so, &ripcbinfo);
 	if (error == 0) {
 		inp = (struct inpcb *)so->so_pcb;
-		inp->inp_vflag |= INP_IPV4;
 		inp->inp_ip_p = proto;
 		inp->inp_ip_ttl = ip_defttl;
 	}
-	error = 0;
 done:
 	lwkt_replymsg(&msg->lmsg, error);
 }
@@ -611,8 +493,7 @@ rip_detach(netmsg_t msg)
 	struct socket *so = msg->base.nm_so;
 	struct inpcb *inp;
 
-	KASSERT(&curthread->td_msgport == netisr_cpuport(0),
-	    ("not in netisr0"));
+	ASSERT_NETISR0;
 
 	inp = so->so_pcb;
 	if (inp == NULL)
@@ -643,8 +524,7 @@ rip_disconnect(netmsg_t msg)
 	struct socket *so = msg->base.nm_so;
 	int error;
 
-	KASSERT(&curthread->td_msgport == netisr_cpuport(0),
-	    ("not in netisr0"));
+	ASSERT_NETISR0;
 
 	if (so->so_state & SS_ISCONNECTED) {
 		soisdisconnected(so);
@@ -664,11 +544,10 @@ rip_bind(netmsg_t msg)
 	struct sockaddr_in *addr = (struct sockaddr_in *)nam;
 	int error;
 
-	KASSERT(&curthread->td_msgport == netisr_cpuport(0),
-	    ("not in netisr0"));
+	ASSERT_NETISR0;
 
 	if (nam->sa_len == sizeof(*addr)) {
-		if (TAILQ_EMPTY(&ifnet) ||
+		if (ifnet_array_isempty() ||
 		    ((addr->sin_family != AF_INET) &&
 		     (addr->sin_family != AF_IMPLINK)) ||
 		    (addr->sin_addr.s_addr != INADDR_ANY &&
@@ -693,12 +572,11 @@ rip_connect(netmsg_t msg)
 	struct sockaddr_in *addr = (struct sockaddr_in *)nam;
 	int error;
 
-	KASSERT(&curthread->td_msgport == netisr_cpuport(0),
-	    ("not in netisr0"));
+	ASSERT_NETISR0;
 
 	if (nam->sa_len != sizeof(*addr)) {
 		error = EINVAL;
-	} else if (TAILQ_EMPTY(&ifnet)) {
+	} else if (ifnet_array_isempty()) {
 		error = EADDRNOTAVAIL;
 	} else {
 		if ((addr->sin_family != AF_INET) &&
@@ -716,8 +594,7 @@ rip_connect(netmsg_t msg)
 static void
 rip_shutdown(netmsg_t msg)
 {
-	KASSERT(&curthread->td_msgport == netisr_cpuport(0),
-	    ("not in netisr0"));
+	ASSERT_NETISR0;
 
 	socantsendmore(msg->base.nm_so);
 	lwkt_replymsg(&msg->lmsg, 0);
@@ -735,8 +612,7 @@ rip_send(netmsg_t msg)
 	u_long dst;
 	int error;
 
-	KASSERT(&curthread->td_msgport == netisr_cpuport(0),
-	    ("not in netisr0"));
+	ASSERT_NETISR0;
 
 	if (so->so_state & SS_ISCONNECTED) {
 		if (nam) {
@@ -759,7 +635,7 @@ rip_send(netmsg_t msg)
 }
 
 SYSCTL_PROC(_net_inet_raw, OID_AUTO/*XXX*/, pcblist, CTLFLAG_RD, &ripcbinfo, 1,
-	    in_pcblist_global, "S,xinpcb", "List of active raw IP sockets");
+	    in_pcblist_range, "S,xinpcb", "List of active raw IP sockets");
 
 struct pr_usrreqs rip_usrreqs = {
 	.pru_abort = rip_abort,

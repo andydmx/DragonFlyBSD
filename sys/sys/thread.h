@@ -1,19 +1,13 @@
 /*
  * SYS/THREAD.H
  *
- *	Implements the architecture independant portion of the LWKT 
+ *	Implements the architecture independant portion of the LWKT
  *	subsystem.
- *
- * Types which must already be defined when this header is included by
- * userland:	struct md_thread
  */
 
 #ifndef _SYS_THREAD_H_
-#define _SYS_THREAD_H_
+#define	_SYS_THREAD_H_
 
-#ifndef _SYS_STDINT_H_
-#include <sys/stdint.h>		/* __int types */
-#endif
 #ifndef _SYS_PARAM_H_
 #include <sys/param.h>		/* MAXCOMLEN */
 #endif
@@ -35,7 +29,8 @@
 #ifndef _SYS_IOSCHED_H_
 #include <sys/iosched.h>
 #endif
-#include <machine/thread.h>
+#include <machine/thread.h>	/* md_thread */
+#include <machine/stdint.h>
 
 struct globaldata;
 struct lwp;
@@ -45,16 +40,21 @@ struct lwkt_queue;
 struct lwkt_token;
 struct lwkt_tokref;
 struct lwkt_ipiq;
+#if 0
 struct lwkt_cpu_msg;
 struct lwkt_cpu_port;
+#endif
 struct lwkt_cpusync;
+struct fdnode;
 union sysunion;
 
 typedef struct lwkt_queue	*lwkt_queue_t;
 typedef struct lwkt_token	*lwkt_token_t;
 typedef struct lwkt_tokref	*lwkt_tokref_t;
+#if 0
 typedef struct lwkt_cpu_msg	*lwkt_cpu_msg_t;
 typedef struct lwkt_cpu_port	*lwkt_cpu_port_t;
+#endif
 typedef struct lwkt_ipiq	*lwkt_ipiq_t;
 typedef struct lwkt_cpusync	*lwkt_cpusync_t;
 typedef struct thread 		*thread_t;
@@ -69,10 +69,10 @@ typedef TAILQ_HEAD(lwkt_queue, thread) lwkt_queue;
  * kernel nor the user version.
  */
 #if defined(_KERNEL) || defined(_KERNEL_STRUCTURES)
-#ifndef _MACHINE_THREAD_H_
-#include <machine/thread.h>		/* md_thread */
+#ifndef _SYS_CPUMASK_H_
+#include <sys/cpumask.h>	/* cpumask_t */
 #endif
-#ifndef _MACHINE_FRAME_H_
+#ifndef _CPU_FRAME_H_
 #include <machine/frame.h>
 #endif
 #else
@@ -85,6 +85,10 @@ struct intrframe;
  * running.  If the thread blocks, other threads can run holding the same
  * token(s).  The tokens are reacquired when the original thread resumes.
  *
+ * Tokens guarantee that no deadlock can happen regardless of type or
+ * ordering.  However, obtaining the same token first shared, then
+ * stacking exclusive, is not allowed and will panic.
+ *
  * A thread can depend on its serialization remaining intact through a
  * preemption.  An interrupt which attempts to use the same token as the
  * thread being preempted will reschedule itself for non-preemptive
@@ -96,25 +100,35 @@ struct intrframe;
  * thread has a stack of tokref's to keep track of acquired tokens.  Multiple
  * tokref's may reference the same token.
  *
- * Tokens can be held shared or exclusive.   An exclusive holder is able
- * to set the TOK_EXCLUSIVE bit in t_count as long as no bit in the count
- * mask is set.  If unable to accomplish this TOK_EXCLREQ can be set instead
- * which prevents any new shared acquisitions while the exclusive requestor
- * spins in the scheduler.  A shared holder can bump t_count by the increment
- * value as long as neither TOK_EXCLUSIVE or TOK_EXCLREQ is set, else spin
- * in the scheduler.
+ * EXCLUSIVE TOKENS
+ *	Acquiring an exclusive token requires acquiring the EXCLUSIVE bit
+ *	with count == 0.  If the exclusive bit cannot be acquired, EXCLREQ
+ *	is set.  Once acquired, EXCLREQ is cleared (but could get set by
+ *	another thread also trying for an exclusive lock at any time).
+ *
+ * SHARED TOKENS
+ *	Acquiring a shared token requires waiting for the EXCLUSIVE bit
+ *	to be cleared and then acquiring a count.  A shared lock request
+ *	can temporarily acquire a count and then back it out if it is
+ *	unable to obtain the EXCLUSIVE bit, allowing fetchadd to be used.
+ *
+ *	A thread attempting to get a single shared token will defer to
+ *	pending exclusive requesters.  However, a thread already holding
+ *	one or more tokens and trying to get an additional shared token
+ *	cannot defer to exclusive requesters because doing so can lead
+ *	to a deadlock.
  *
  * Multiple exclusive tokens are handled by treating the additional tokens
  * as a special case of the shared token, incrementing the count value.  This
  * reduces the complexity of the token release code.
  */
 
-typedef struct lwkt_token {
+struct lwkt_token {
     long		t_count;	/* Shared/exclreq/exclusive access */
     struct lwkt_tokref	*t_ref;		/* Exclusive ref */
     long		t_collisions;	/* Collision counter */
     const char		*t_desc;	/* Descriptive name */
-} lwkt_token;
+};
 
 #define TOK_EXCLUSIVE	0x00000001	/* Exclusive lock held */
 #define TOK_EXCLREQ	0x00000002	/* Exclusive request pending */
@@ -147,44 +161,17 @@ typedef struct lwkt_token {
 #define ASSERT_NO_TOKENS_HELD(td)	\
 	KKASSERT((td)->td_toks_stop == &td->td_toks_array[0])
 
-/*
- * Assert that a particular token is held and we are in a hard
- * code execution section (interrupt, ipi, or hard code section).
- * Hard code sections are not allowed to block or potentially block.
- * e.g. lwkt_gettoken() would only be ok if the token were already
- * held.
- */
-#define ASSERT_LWKT_TOKEN_HARD(tok)					\
-	do {								\
-		globaldata_t zgd __debugvar = mycpu;			\
-		KKASSERT((tok)->t_ref &&				\
-			 (tok)->t_ref->tr_owner == zgd->gd_curthread &&	\
-			 zgd->gd_intr_nesting_level > 0);		\
-	} while(0)
-
-/*
- * Assert that a particular token is held and we are in a normal
- * critical section.  Critical sections will not be preempted but
- * can explicitly block (tsleep, lwkt_gettoken, etc).
- */
-#define ASSERT_LWKT_TOKEN_CRIT(tok)					\
-	do {								\
-		globaldata_t zgd __debugvar = mycpu;			\
-		KKASSERT((tok)->t_ref &&				\
-			 (tok)->t_ref->tr_owner == zgd->gd_curthread &&	\
-			 zgd->gd_curthread->td_critcount > 0);		\
-	} while(0)
-
 struct lwkt_tokref {
     lwkt_token_t	tr_tok;		/* token in question */
     long		tr_count;	/* TOK_EXCLUSIVE|TOK_EXCLREQ or 0 */
     struct thread	*tr_owner;	/* me */
 };
 
-#define MAXCPUFIFO      32	/* power of 2 */
+#define MAXCPUFIFO      256	/* power of 2 */
 #define MAXCPUFIFO_MASK	(MAXCPUFIFO - 1)
 #define LWKT_MAXTOKENS	32	/* max tokens beneficially held by thread */
 
+#if defined(_KERNEL) || defined(_KERNEL_STRUCTURES)
 /*
  * Always cast to ipifunc_t when registering an ipi.  The actual ipi function
  * is called with both the data and an interrupt frame, but the ipi function
@@ -198,6 +185,7 @@ struct lwkt_ipiq {
     int		ip_rindex;      /* only written by target cpu */
     int		ip_xindex;      /* written by target, indicates completion */
     int		ip_windex;      /* only written by source cpu */
+    int		ip_drain;	/* drain source limit */
     struct {
 	ipifunc3_t	func;
 	void		*arg1;
@@ -207,8 +195,8 @@ struct lwkt_ipiq {
 };
 
 /*
- * CPU Synchronization structure.  See lwkt_cpusync_start() and
- * lwkt_cpusync_finish() for more information.
+ * CPU Synchronization structure.  See lwkt_cpusync_init() and
+ * lwkt_cpusync_interlock() for more information.
  */
 typedef void (*cpusync_func_t)(void *arg);
 
@@ -218,6 +206,7 @@ struct lwkt_cpusync {
     cpusync_func_t cs_func;		/* function to execute */
     void	*cs_data;		/* function data */
 };
+#endif /* _KERNEL || _KERNEL_STRUCTURES */
 
 /*
  * The standard message and queue structure used for communications between
@@ -225,12 +214,27 @@ struct lwkt_cpusync {
  * FIFO matrix allowing any cpu to send a message to any other cpu without
  * blocking.
  */
+#if 0
 typedef struct lwkt_cpu_msg {
     void	(*cm_func)(lwkt_cpu_msg_t msg);	/* primary dispatch function */
     int		cm_code;		/* request code if applicable */
     int		cm_cpu;			/* reply to cpu */
     thread_t	cm_originator;		/* originating thread for wakeup */
 } lwkt_cpu_msg;
+#endif
+
+/*
+ * per-thread file descriptor cache
+ */
+struct fdcache {
+	int     fd;			/* descriptor being cached */
+	int     locked;
+	struct file *fp;		/* cached referenced fp */
+	int	lru;
+	int	unused[3];
+} __cachealign;
+
+#define NFDCACHE	4		/* max fd's cached by a thread */
 
 /*
  * Thread structure.  Note that ownership of a thread structure is special
@@ -271,22 +275,23 @@ struct thread {
     __uint64_t	td_sticks;      /* Statclock hits in system mode (uS) */
     __uint64_t	td_iticks;	/* Statclock hits processing intr (uS) */
     int		td_locks;	/* lockmgr lock debugging */
-    void	*td_dsched_priv1;	/* priv data for I/O schedulers */
+    struct plimit *td_limit;	/* synchronized from proc->p_limit */
     int		td_refs;	/* hold position in gd_tdallq / hold free */
     int		td_nest_count;	/* prevent splz nesting */
-    int		td_contended;	/* token contention count */
+    u_int	td_contended;	/* token contention count */
     u_int	td_mpflags;	/* flags can be set by foreign cpus */
     int		td_cscount;	/* cpu synchronization master */
     int		td_wakefromcpu;	/* who woke me up? */
     int		td_upri;	/* user priority (sub-priority under td_pri) */
     int		td_type;	/* thread type, TD_TYPE_ */
-    int		td_unused02[1];	/* for future fields */
-    int		td_unused03[4];	/* for future fields */
+    int		td_tracker;	/* misc use (base value 0), recursion count */
+    int		td_fdcache_lru;
+    int		td_unused03[3];	/* for future fields */
     struct iosched_data td_iosdata;	/* Dynamic I/O scheduling data */
     struct timeval td_start;	/* start time for a thread/process */
     char	td_comm[MAXCOMLEN+1]; /* typ 16+1 bytes */
     struct thread *td_preempted; /* we preempted this thread */
-    struct ucred *td_ucred;		/* synchronized from p_ucred */
+    struct ucred *td_ucred;	/* synchronized from proc->p_ucred */
     void	 *td_vmm;	/* vmm private data */
     lwkt_tokref_t td_toks_have;		/* tokens we own */
     lwkt_tokref_t td_toks_stop;		/* tokens we want */
@@ -294,12 +299,14 @@ struct thread {
     int		td_fairq_load;		/* fairq */
     int		td_fairq_count;		/* fairq */
     struct globaldata *td_migrate_gd;	/* target gd for thread migration */
+    struct fdcache    td_fdcache[NFDCACHE];
+    void	*td_linux_task;		/* drm/linux support */
 #ifdef DEBUG_CRIT_SECTIONS
 #define CRIT_DEBUG_ARRAY_SIZE   32
 #define CRIT_DEBUG_ARRAY_MASK   (CRIT_DEBUG_ARRAY_SIZE - 1)
     const char	*td_crit_debug_array[CRIT_DEBUG_ARRAY_SIZE];
     int		td_crit_debug_index;
-    int		td_in_crit_report;	
+    int		td_in_crit_report;
 #endif
     struct md_thread td_mach;
 #ifdef DEBUG_LOCKS
@@ -352,7 +359,7 @@ struct thread {
 #define TDF_SYSTHREAD		0x00000100	/* reserve memory may be used */
 #define TDF_ALLOCATED_THREAD	0x00000200	/* objcache allocated thread */
 #define TDF_ALLOCATED_STACK	0x00000400	/* objcache allocated stack */
-#define TDF_VERBOSE		0x00000800	/* verbose on exit */
+#define TDF_FPU_HEUR		0x00000800	/* active restore on switch */
 #define TDF_DEADLKTREAT		0x00001000	/* special lockmgr treatment */
 #define TDF_MARKER		0x00002000	/* tdallq list scan marker */
 #define TDF_TIMEOUT_RUNNING	0x00004000	/* tsleep timeout race */
@@ -370,6 +377,7 @@ struct thread {
 #define TDF_FIXEDCPU		0x04000000	/* running cpu is fixed */
 #define TDF_USERMODE		0x08000000	/* in or entering user mode */
 #define TDF_NOFAULT		0x10000000	/* force onfault on fault */
+#define TDF_CLKTHREAD		0x20000000	/* detect INTTHREAD clock */
 
 #define TDF_MP_STOPREQ		0x00000001	/* suspend_kproc */
 #define TDF_MP_WAKEREQ		0x00000002	/* resume_kproc */
@@ -397,12 +405,12 @@ struct thread {
 #define TDPRI_USER_IDLE		4	/* user scheduler idle */
 #define TDPRI_USER_NORM		6	/* user scheduler normal */
 #define TDPRI_USER_REAL		8	/* user scheduler real time */
-#define TDPRI_KERN_LPSCHED	9	/* scheduler helper for userland sch */
+#define TDPRI_KERN_LPSCHED	9	/* (comparison point only) */
 #define TDPRI_KERN_USER		10	/* kernel / block in syscall */
 #define TDPRI_KERN_DAEMON	12	/* kernel daemon (pageout, etc) */
 #define TDPRI_SOFT_NORM		14	/* kernel / normal */
 #define TDPRI_SOFT_TIMER	16	/* kernel / timer */
-#define TDPRI_EXITING		19	/* exiting thread */
+#define TDPRI_UNUSED19		19
 #define TDPRI_INT_SUPPORT	20	/* kernel / high priority support */
 #define TDPRI_INT_LOW		27	/* low priority interrupt */
 #define TDPRI_INT_MED		28	/* medium priority interrupt */
@@ -414,6 +422,9 @@ struct thread {
 #define IN_CRITICAL_SECT(td)	((td)->td_critcount)
 
 #ifdef _KERNEL
+
+extern void (*linux_task_drop_callback)(struct thread *);
+extern void (*linux_proc_drop_callback)(struct proc *);
 
 /*
  * Global tokens
@@ -427,93 +438,86 @@ extern struct lwkt_token kvm_token;
 extern struct lwkt_token sigio_token;
 extern struct lwkt_token tty_token;
 extern struct lwkt_token vnode_token;
-extern struct lwkt_token ifnet_token;
+extern struct lwkt_token revoke_token;
+extern struct lwkt_token kbd_token;
+extern struct lwkt_token vga_token;
 
 /*
  * Procedures
  */
-extern void lwkt_init(void);
-extern struct thread *lwkt_alloc_thread(struct thread *, int, int, int);
-extern void lwkt_init_thread(struct thread *, void *, int, int,
-			     struct globaldata *);
-extern void lwkt_set_interrupt_support_thread(void);
-extern void lwkt_set_comm(thread_t, const char *, ...) __printflike(2, 3);
-extern void lwkt_free_thread(struct thread *);
-extern void lwkt_gdinit(struct globaldata *);
-extern void lwkt_switch(void);
-extern void lwkt_switch_return(struct thread *);
-extern void lwkt_preempt(thread_t, int);
-extern void lwkt_schedule(thread_t);
-extern void lwkt_schedule_noresched(thread_t);
-extern void lwkt_schedule_self(thread_t);
-extern void lwkt_deschedule(thread_t);
-extern void lwkt_deschedule_self(thread_t);
-extern void lwkt_yield(void);
-extern void lwkt_yield_quick(void);
-extern void lwkt_user_yield(void);
-extern void lwkt_hold(thread_t);
-extern void lwkt_rele(thread_t);
-extern void lwkt_passive_release(thread_t);
-extern void lwkt_maybe_splz(thread_t);
+struct thread *lwkt_alloc_thread(struct thread *, int, int, int);
+void lwkt_init_thread(struct thread *, void *, int, int, struct globaldata *);
+void lwkt_set_interrupt_support_thread(void);
+void lwkt_set_comm(thread_t, const char *, ...) __printflike(2, 3);
+void lwkt_free_thread(struct thread *);
+void lwkt_gdinit(struct globaldata *);
+void lwkt_switch(void);
+void lwkt_switch_return(struct thread *);
+void lwkt_preempt(thread_t, int);
+void lwkt_schedule(thread_t);
+void lwkt_schedule_noresched(thread_t);
+void lwkt_schedule_self(thread_t);
+void lwkt_deschedule(thread_t);
+void lwkt_deschedule_self(thread_t);
+void lwkt_yield(void);
+void lwkt_yield_quick(void);
+void lwkt_user_yield(void);
+void lwkt_hold(thread_t);
+void lwkt_rele(thread_t);
+void lwkt_passive_release(thread_t);
+void lwkt_maybe_splz(thread_t);
 
-extern void lwkt_gettoken(lwkt_token_t);
-extern void lwkt_gettoken_shared(lwkt_token_t);
-extern void lwkt_gettoken_hard(lwkt_token_t);
-extern int  lwkt_trytoken(lwkt_token_t);
-extern void lwkt_reltoken(lwkt_token_t);
-extern void lwkt_reltoken_hard(lwkt_token_t);
-extern int  lwkt_cnttoken(lwkt_token_t, thread_t);
-extern int  lwkt_getalltokens(thread_t, int);
-extern void lwkt_relalltokens(thread_t);
-extern void lwkt_token_init(lwkt_token_t, const char *);
-extern void lwkt_token_uninit(lwkt_token_t);
+void lwkt_gettoken(lwkt_token_t);
+void lwkt_gettoken_shared(lwkt_token_t);
+int  lwkt_trytoken(lwkt_token_t);
+void lwkt_reltoken(lwkt_token_t);
+int  lwkt_cnttoken(lwkt_token_t, thread_t);
+int  lwkt_getalltokens(thread_t, int);
+void lwkt_relalltokens(thread_t);
+void lwkt_token_init(lwkt_token_t, const char *);
+void lwkt_token_uninit(lwkt_token_t);
 
-extern void lwkt_token_pool_init(void);
-extern lwkt_token_t lwkt_token_pool_lookup(void *);
-extern lwkt_token_t lwkt_getpooltoken(void *);
-extern void lwkt_relpooltoken(void *);
+void lwkt_token_pool_init(void);
+lwkt_token_t lwkt_token_pool_lookup(void *);
+lwkt_token_t lwkt_getpooltoken(void *);
+void lwkt_relpooltoken(void *);
 
-extern void lwkt_token_swap(void);
+void lwkt_token_swap(void);
 
-extern void lwkt_setpri(thread_t, int);
-extern void lwkt_setpri_initial(thread_t, int);
-extern void lwkt_setpri_self(int);
-extern void lwkt_schedulerclock(thread_t td);
-extern void lwkt_setcpu_self(struct globaldata *);
-extern void lwkt_migratecpu(int);
+void lwkt_setpri(thread_t, int);
+void lwkt_setpri_initial(thread_t, int);
+void lwkt_setpri_self(int);
+void lwkt_schedulerclock(thread_t td);
+void lwkt_setcpu_self(struct globaldata *);
+void lwkt_migratecpu(int);
 
-extern void lwkt_giveaway(struct thread *);
-extern void lwkt_acquire(struct thread *);
-extern int  lwkt_send_ipiq3(struct globaldata *, ipifunc3_t, void *, int);
-extern int  lwkt_send_ipiq3_passive(struct globaldata *, ipifunc3_t,
-				    void *, int);
-extern int  lwkt_send_ipiq3_nowait(struct globaldata *, ipifunc3_t,
-				   void *, int);
-extern int  lwkt_send_ipiq3_bycpu(int, ipifunc3_t, void *, int);
-extern int  lwkt_send_ipiq3_mask(cpumask_t, ipifunc3_t, void *, int);
-extern void lwkt_wait_ipiq(struct globaldata *, int);
-extern int  lwkt_seq_ipiq(struct globaldata *);
-extern void lwkt_process_ipiq(void);
-extern void lwkt_process_ipiq_frame(struct intrframe *);
-extern void lwkt_smp_stopped(void);
-extern void lwkt_synchronize_ipiqs(const char *);
+void lwkt_giveaway(struct thread *);
+void lwkt_acquire(struct thread *);
+int  lwkt_send_ipiq3(struct globaldata *, ipifunc3_t, void *, int);
+int  lwkt_send_ipiq3_passive(struct globaldata *, ipifunc3_t, void *, int);
+int  lwkt_send_ipiq3_bycpu(int, ipifunc3_t, void *, int);
+int  lwkt_send_ipiq3_mask(cpumask_t, ipifunc3_t, void *, int);
+void lwkt_wait_ipiq(struct globaldata *, int);
+void lwkt_process_ipiq(void);
+void lwkt_process_ipiq_frame(struct intrframe *);
+void lwkt_smp_stopped(void);
+void lwkt_synchronize_ipiqs(const char *);
 
 /* lwkt_cpusync_init() - inline function in sys/thread2.h */
-extern void lwkt_cpusync_simple(cpumask_t, cpusync_func_t, void *);
-extern void lwkt_cpusync_interlock(lwkt_cpusync_t);
-extern void lwkt_cpusync_deinterlock(lwkt_cpusync_t);
-extern void lwkt_cpusync_quick(lwkt_cpusync_t);
+void lwkt_cpusync_simple(cpumask_t, cpusync_func_t, void *);
+void lwkt_cpusync_interlock(lwkt_cpusync_t);
+void lwkt_cpusync_deinterlock(lwkt_cpusync_t);
+void lwkt_cpusync_quick(lwkt_cpusync_t);
 
-extern void crit_panic(void) __dead2;
-extern struct lwp *lwkt_preempted_proc(void);
+void crit_panic(void) __dead2;
+struct lwp *lwkt_preempted_proc(void);
 
-extern int  lwkt_create (void (*func)(void *), void *, struct thread **,
-		struct thread *, int, int,
-		const char *, ...) __printflike(7, 8);
-extern void lwkt_exit (void) __dead2;
-extern void lwkt_remove_tdallq (struct thread *);
+int  lwkt_create(void (*)(void *), void *, struct thread **, struct thread *,
+	int, int, const char *, ...) __printflike(7, 8);
+void lwkt_exit(void) __dead2;
+void lwkt_remove_tdallq(struct thread *);
 
-#endif
+#endif /* _KERNEL */
 
-#endif
+#endif /* !_SYS_THREAD_H_ */
 

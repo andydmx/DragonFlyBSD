@@ -1,4 +1,4 @@
-/*	$OpenBSD: addrmatch.c,v 1.6 2012/06/21 00:16:07 dtucker Exp $ */
+/*	$OpenBSD: addrmatch.c,v 1.14 2018/07/31 03:07:24 djm Exp $ */
 
 /*
  * Copyright (c) 2004-2008 Damien Miller <djm@mindrot.org>
@@ -31,7 +31,6 @@
 
 #include "match.h"
 #include "log.h"
-#include "xmalloc.h"
 
 struct xaddr {
 	sa_family_t	af;
@@ -88,13 +87,13 @@ addr_sa_to_xaddr(struct sockaddr *sa, socklen_t slen, struct xaddr *xa)
 
 	switch (sa->sa_family) {
 	case AF_INET:
-		if (slen < sizeof(*in4))
+		if (slen < (socklen_t)sizeof(*in4))
 			return -1;
 		xa->af = AF_INET;
 		memcpy(&xa->v4, &in4->sin_addr, sizeof(xa->v4));
 		break;
 	case AF_INET6:
-		if (slen < sizeof(*in6))
+		if (slen < (socklen_t)sizeof(*in6))
 			return -1;
 		xa->af = AF_INET6;
 		memcpy(&xa->v6, &in6->sin6_addr, sizeof(xa->v6));
@@ -206,25 +205,24 @@ addr_cmp(const struct xaddr *a, const struct xaddr *b)
 static int
 addr_pton(const char *p, struct xaddr *n)
 {
-	struct addrinfo hints, *ai;
+	struct addrinfo hints, *ai = NULL;
+	int ret = -1;
 
 	memset(&hints, '\0', sizeof(hints));
 	hints.ai_flags = AI_NUMERICHOST;
 
 	if (p == NULL || getaddrinfo(p, NULL, &hints, &ai) != 0)
-		return -1;
-
+		goto out;
 	if (ai == NULL || ai->ai_addr == NULL)
-		return -1;
-
-	if (n != NULL &&
-	    addr_sa_to_xaddr(ai->ai_addr, ai->ai_addrlen, n) == -1) {
+		goto out;
+	if (n != NULL && addr_sa_to_xaddr(ai->ai_addr, ai->ai_addrlen, n) == -1)
+		goto out;
+	/* success */
+	ret = 0;
+ out:
+	if (ai != NULL)
 		freeaddrinfo(ai);
-		return -1;
-	}
-
-	freeaddrinfo(ai);
-	return 0;
+	return ret;
 }
 
 /*
@@ -399,8 +397,8 @@ addr_match_list(const char *addr, const char *_list)
 		/* Prefer CIDR address matching */
 		r = addr_pton_cidr(cp, &match_addr, &masklen);
 		if (r == -2) {
-			error("Inconsistent mask length for "
-			    "network \"%.100s\"", cp);
+			debug2("%s: inconsistent mask length for "
+			    "match network \"%.100s\"", __func__, cp);
 			ret = -2;
 			break;
 		} else if (r == 0) {
@@ -420,7 +418,7 @@ addr_match_list(const char *addr, const char *_list)
 				goto foundit;
 		}
 	}
-	xfree(o);
+	free(o);
 
 	return ret;
 }
@@ -494,7 +492,7 @@ addr_match_cidr_list(const char *addr, const char *_list)
 			continue;
 		}
 	}
-	xfree(o);
+	free(o);
 
 	return ret;
 }

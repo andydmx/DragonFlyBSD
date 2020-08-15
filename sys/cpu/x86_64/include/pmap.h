@@ -16,7 +16,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -44,6 +44,20 @@
 
 #ifndef _CPU_PMAP_H_
 #define _CPU_PMAP_H_
+
+#ifndef LOCORE
+
+#include <machine/stdint.h>
+
+/*
+ * MMU page tables, keep public for VM_MAX_USER_ADDRESS/PS_STRINGS.
+ */
+typedef	__uint64_t	pml4_entry_t;
+typedef	__uint64_t	pdp_entry_t;
+typedef	__uint64_t	pd_entry_t;
+typedef	__uint64_t	pt_entry_t;
+
+#endif /* !LOCORE */
 
 /*
  * Page-directory and page-table entries follow this format, with a few

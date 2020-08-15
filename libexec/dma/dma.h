@@ -1,8 +1,9 @@
 /*
+ * Copyright (c) 2008-2014, Simon Schubert <2@0x2c.org>.
  * Copyright (c) 2008 The DragonFly Project.  All rights reserved.
  *
  * This code is derived from software contributed to The DragonFly Project
- * by Simon 'corecode' Schubert <corecode@fs.ei.tum.de> and
+ * by Simon Schubert <2@0x2c.org> and
  * Matthias Schmidt <matthias@dragonflybsd.org>.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -43,12 +44,14 @@
 #include <arpa/inet.h>
 #include <openssl/ssl.h>
 #include <netdb.h>
+#include <sysexits.h>
 
 #define VERSION	"DragonFly Mail Agent " DMA_VERSION
 
 #define BUF_SIZE	2048
-#define ERRMSG_SIZE	200
+#define ERRMSG_SIZE	1024
 #define USERNAME_SIZE	50
+#define EHLO_RESPONSE_SIZE BUF_SIZE
 #define MIN_RETRY	300		/* 5 minutes */
 #define MAX_RETRY	(3*60*60)	/* retry at least every 3 hours */
 #define MAX_TIMEOUT	(5*24*60*60)	/* give up after 5 days */
@@ -60,7 +63,7 @@
 #define CON_TIMEOUT	(5*60)		/* Connection timeout per RFC5321 */
 
 #define STARTTLS	0x002		/* StartTLS support */
-#define SECURETRANS	0x004		/* SSL/TLS in general */
+#define SECURETRANSFER	0x004		/* SSL/TLS in general */
 #define NOSSL		0x008		/* Do not use SSL */
 #define DEFER		0x010		/* Defer mails */
 #define INSECURE	0x020		/* Allow plain login w/o encryption */
@@ -135,6 +138,7 @@ struct config {
 	const char *mailname;
 	const char *masquerade_host;
 	const char *masquerade_user;
+	const unsigned char *fingerprint;
 
 	/* XXX does not belong into config */
 	SSL *ssl;
@@ -158,6 +162,15 @@ struct mx_hostentry {
 	struct sockaddr_storage	sa;
 };
 
+struct smtp_auth_mechanisms {
+	int cram_md5;
+	int login;
+};
+
+struct smtp_features {
+	struct smtp_auth_mechanisms auth;
+	int starttls;
+};
 
 /* global variables */
 extern struct aliases aliases;
@@ -171,9 +184,6 @@ extern const char *logident_base;
 extern char neterr[ERRMSG_SIZE];
 extern char errmsg[ERRMSG_SIZE];
 
-/* aliases_parse.y */
-extern FILE *yyin;
-
 /* conf.c */
 void trim_line(char *);
 void parse_conf(const char *);
@@ -182,7 +192,8 @@ void parse_authfile(const char *);
 /* crypto.c */
 void hmac_md5(unsigned char *, int, unsigned char *, int, unsigned char *);
 int smtp_auth_md5(int, char *, char *);
-int smtp_init_crypto(int, int);
+int smtp_init_crypto(int, int, struct smtp_features*);
+int verify_server_fingerprint(const X509 *cert);
 
 /* dns.c */
 int dns_get_mx_list(const char *, int, struct mx_hostentry **, int);
@@ -191,6 +202,7 @@ int dns_get_mx_list(const char *, int, struct mx_hostentry **, int);
 char *ssl_errstr(void);
 int read_remote(int, int, char *);
 ssize_t send_remote_command(int, const char*, ...)  __attribute__((__nonnull__(2), __format__ (__printf__, 2, 3)));
+int perform_server_greeting(int, struct smtp_features*);
 int deliver_remote(struct qitem *);
 
 /* base64.c */
@@ -217,14 +229,14 @@ int flushqueue_signal(void);
 int deliver_local(struct qitem *);
 
 /* mail.c */
-void bounce(struct qitem *, const char *);
+void bounce(struct qitem *, const char *) __attribute__((__noreturn__));
 int readmail(struct queue *, int, int);
 
 /* util.c */
 const char *hostname(void);
 void setlogident(const char *, ...) __attribute__((__format__ (__printf__, 1, 2)));
-void errlog(int, const char *, ...) __attribute__((__format__ (__printf__, 2, 3)));
-void errlogx(int, const char *, ...) __attribute__((__format__ (__printf__, 2, 3)));
+void errlog(int, const char *, ...) __attribute__((__format__ (__printf__, 2, 3))) __attribute__((__noreturn__));
+void errlogx(int, const char *, ...) __attribute__((__format__ (__printf__, 2, 3))) __attribute__((__noreturn__));
 void set_username(void);
 void deltmp(void);
 int do_timeout(int, int);

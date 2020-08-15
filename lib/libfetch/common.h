@@ -1,4 +1,6 @@
 /*-
+ * SPDX-License-Identifier: BSD-3-Clause
+ *
  * Copyright (c) 1998-2014 Dag-Erling Smørgrav
  * All rights reserved.
  *
@@ -25,7 +27,7 @@
  * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
  * THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
- * $FreeBSD: head/lib/libfetch/common.h 261284 2014-01-30 08:37:23Z des $
+ * $FreeBSD: head/lib/libfetch/common.h 357968 2020-02-15 18:03:16Z kevans $
  */
 
 #ifndef _COMMON_H_INCLUDED
@@ -68,14 +70,50 @@ struct fetcherr {
 	const char	*string;
 };
 
+/* For SOCKS header size */
+#define HEAD_SIZE	4
+#define FQDN_SIZE	256
+#define PACK_SIZE	1
+#define PORT_SIZE	2
+#define BUFF_SIZE	HEAD_SIZE + FQDN_SIZE + PACK_SIZE + PORT_SIZE
+
+/* SOCKS5 Request Header */
+#define SOCKS_VERSION_5		0x05
+/* SOCKS5 CMD */
+#define SOCKS_CONNECTION	0x01
+#define SOCKS_BIND		0x02
+#define SOCKS_UDP		0x03
+#define SOCKS_NOMETHODS		0xFF
+#define SOCKS5_NOTIMPLEMENTED	0x00
+/* SOCKS5 Reserved */
+#define SOCKS_RSV		0x00
+/* SOCKS5 Address Type */
+#define SOCKS_ATYP_IPV4		0x01
+#define SOCKS_ATYP_DOMAINNAME	0x03
+#define SOCKS_ATYP_IPV6		0x04
+/* SOCKS5 Reply Field */
+#define SOCKS_SUCCESS			0x00
+#define SOCKS_GENERAL_FAILURE		0x01
+#define SOCKS_CONNECTION_NOT_ALLOWED	0x02
+#define SOCKS_NETWORK_UNREACHABLE	0x03
+#define SOCKS_HOST_UNREACHABLE		0x04
+#define SOCKS_CONNECTION_REFUSED	0x05
+#define SOCKS_TTL_EXPIRED		0x06
+#define SOCKS_COMMAND_NOT_SUPPORTED	0x07
+#define SOCKS_ADDRESS_NOT_SUPPORTED	0x08
+
 /* for fetch_writev */
 struct iovec;
 
 void		 fetch_seterr(struct fetcherr *, int);
 void		 fetch_syserr(void);
 void		 fetch_info(const char *, ...) __printflike(1, 2);
+int		 fetch_socks5_getenv(char **host, int *port);
+int		 fetch_socks5_init(conn_t *conn, const char *host,
+		     int port, int verbose);
 int		 fetch_default_port(const char *);
 int		 fetch_default_proxy_port(const char *);
+struct addrinfo *fetch_resolve(const char *, int, int);
 int		 fetch_bind(int, int, const char *);
 conn_t		*fetch_connect(const char *, int, int, int);
 conn_t		*fetch_reopen(int);
@@ -99,11 +137,19 @@ int		 fetch_no_proxy_match(const char *);
 #define http_seterr(n)	 fetch_seterr(http_errlist, n)
 #define netdb_seterr(n)	 fetch_seterr(netdb_errlist, n)
 #define url_seterr(n)	 fetch_seterr(url_errlist, n)
+#define socks5_seterr(n) fetch_seterr(socks5_errlist, n)
 
 #ifndef NDEBUG
-#define DEBUG(x) do { if (fetchDebug) { x; } } while (0)
+#define DEBUGF(...)							\
+	do {								\
+		if (fetchDebug)						\
+			fprintf(stderr, __VA_ARGS__);			\
+	} while (0)
 #else
-#define DEBUG(x) do { } while (0)
+#define DEBUGF(...)							\
+	do {								\
+		/* nothing */						\
+	} while (0)
 #endif
 
 /*
@@ -117,6 +163,9 @@ int		 fetch_no_proxy_match(const char *);
  */
 FILE		*http_request(struct url *, const char *,
 		     struct url_stat *, struct url *, const char *);
+FILE		*http_request_body(struct url *, const char *,
+		     struct url_stat *, struct url *, const char *,
+		     const char *, const char *);
 FILE		*ftp_request(struct url *, const char *,
 		     struct url_stat *, struct url *, const char *);
 

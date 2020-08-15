@@ -10,11 +10,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -31,7 +27,6 @@
  * SUCH DAMAGE.
  *
  * $FreeBSD: src/lib/libc/gen/telldir.c,v 1.4.12.1 2001/03/05 09:39:59 obrien Exp $
- * $DragonFly: src/lib/libc/gen/telldir.c,v 1.7 2008/05/03 22:07:37 dillon Exp $
  *
  * @(#)telldir.c	8.1 (Berkeley) 6/4/93
  */
@@ -45,6 +40,7 @@
 #include "un-namespace.h"
 
 #include "libc_private.h"
+#include "gen_private.h"
 
 /*
  * One of these structures is malloced to describe the current directory
@@ -77,7 +73,7 @@ telldir(DIR *dirp)
 	struct ddloc *lp;
 
 	if (__isthreaded) {
-		_pthread_mutex_lock((pthread_mutex_t *)&dirp->dd_lock);
+		_pthread_mutex_lock(&dirp->dd_lock);
 		_pthread_mutex_lock(&dd_hash_lock);
 	}
 
@@ -109,7 +105,7 @@ telldir(DIR *dirp)
 done:
 	if (__isthreaded) {
 		_pthread_mutex_unlock(&dd_hash_lock);
-		_pthread_mutex_unlock((pthread_mutex_t *)&dirp->dd_lock);
+		_pthread_mutex_unlock(&dirp->dd_lock);
 	}
 	return (index);
 }

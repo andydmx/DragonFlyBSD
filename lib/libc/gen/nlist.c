@@ -10,11 +10,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -31,7 +27,6 @@
  * SUCH DAMAGE.
  *
  *	$FreeBSD: src/lib/libc/gen/nlist.c,v 1.12.2.1 2001/07/11 23:59:09 obrien Exp $
- *	$DragonFly: src/lib/libc/gen/nlist.c,v 1.6 2005/04/26 08:21:34 joerg Exp $
  *
  * @(#)nlist.c	8.1 (Berkeley) 6/4/93
  */
@@ -40,10 +35,10 @@
 #include <sys/param.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
-#include <sys/file.h>
 
 #include <errno.h>
 #include <a.out.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
@@ -66,7 +61,7 @@ nlist(const char *name, struct nlist *list)
 {
 	int fd, n;
 
-	fd = _open(name, O_RDONLY, 0);
+	fd = _open(name, O_RDONLY | O_CLOEXEC, 0);
 	if (fd < 0)
 		return (-1);
 	n = __fdnlist(fd, list);
@@ -91,7 +86,7 @@ __fdnlist(int fd, struct nlist *list)
 	int n = -1;
 	size_t i;
 
-	for (i = 0; i < sizeof(nlist_fn) / sizeof(nlist_fn[0]); i++) {
+	for (i = 0; i < NELEM(nlist_fn); i++) {
 		n = (nlist_fn[i].fn)(fd, list);
 		if (n != -1)
 			break;

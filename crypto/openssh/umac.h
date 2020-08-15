@@ -1,4 +1,4 @@
-/* $OpenBSD: umac.h,v 1.1 2007/06/07 19:37:34 pvalchev Exp $ */
+/* $OpenBSD: umac.h,v 1.4 2019/06/07 14:18:48 dtucker Exp $ */
 /* -----------------------------------------------------------------------
  * 
  * umac.h -- C Implementation UMAC Message Authentication
@@ -39,7 +39,7 @@
   * at http://www.esat.kuleuven.ac.be/~rijmen/rijndael/ (search for
   * "Barreto"). The only two files needed are rijndael-alg-fst.c and
   * rijndael-alg-fst.h.
-  * Brian Gladman's version is distributed with GNU Public lisence
+  * Brian Gladman's version is distributed with GNU Public license
   * and can be found at http://fp.gladman.plus.com/AES/index.htm. It
   * includes a fast IA-32 assembly version.
   *
@@ -52,7 +52,7 @@
     extern "C" {
 #endif
 
-struct umac_ctx *umac_new(u_char key[]);
+struct umac_ctx *umac_new(const u_char key[]);
 /* Dynamically allocate a umac_ctx struct, initialize variables, 
  * generate subkeys from key.
  */
@@ -62,10 +62,10 @@ int umac_reset(struct umac_ctx *ctx);
 /* Reset a umac_ctx to begin authenicating a new message */
 #endif
 
-int umac_update(struct umac_ctx *ctx, u_char *input, long len);
+int umac_update(struct umac_ctx *ctx, const u_char *input, long len);
 /* Incorporate len bytes pointed to by input into context ctx */
 
-int umac_final(struct umac_ctx *ctx, u_char tag[], u_char nonce[8]);
+int umac_final(struct umac_ctx *ctx, u_char tag[], const u_char nonce[8]);
 /* Incorporate any pending data and the ctr value, and return tag. 
  * This function returns error code if ctr < 0. 
  */
@@ -107,7 +107,7 @@ int uhash_update(uhash_ctx_t ctx,
                long        len);
 
 int uhash_final(uhash_ctx_t ctx,
-              u_char        ouput[]);
+              u_char        output[]);
 
 int uhash(uhash_ctx_t ctx,
         u_char       *input,
@@ -115,6 +115,12 @@ int uhash(uhash_ctx_t ctx,
         u_char        output[]);
 
 #endif
+
+/* matching umac-128 API, we reuse umac_ctx, since it's opaque */
+struct umac_ctx *umac128_new(const u_char key[]);
+int umac128_update(struct umac_ctx *ctx, const u_char *input, long len);
+int umac128_final(struct umac_ctx *ctx, u_char tag[], const u_char nonce[8]);
+int umac128_delete(struct umac_ctx *ctx);
 
 #ifdef __cplusplus
     }

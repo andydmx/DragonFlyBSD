@@ -211,14 +211,15 @@ int
 include(const char *filename)
 {
     struct includeline	*script, *se, *sp;
-    char		input[256];			/* big enough? */
+    char		input[1024];			/* big enough? */
     int			argc,res;
     char		**argv, *cp;
     int			fd, flags, line;
 
     if (((fd = rel_open(filename, NULL, O_RDONLY)) == -1)) {
 	command_errmsg = command_errbuf;
-	snprintf(command_errbuf, 256, "cannot find \"%s\"", filename);
+	snprintf(command_errbuf, sizeof(command_errbuf),
+	    "cannot find \"%s\"", filename);
 	return(CMD_ERROR);
     }
 

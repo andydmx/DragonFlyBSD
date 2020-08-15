@@ -1,15 +1,15 @@
 /*
  * KERN_SLABALLOC.H	- Kernel SLAB memory allocator
- * 
+ *
  * Copyright (c) 2003,2004 The DragonFly Project.  All rights reserved.
- * 
+ *
  * This code is derived from software contributed to The DragonFly Project
  * by Matthew Dillon <dillon@backplane.com>
- * 
+ *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
  * are met:
- * 
+ *
  * 1. Redistributions of source code must retain the above copyright
  *    notice, this list of conditions and the following disclaimer.
  * 2. Redistributions in binary form must reproduce the above copyright
@@ -19,7 +19,7 @@
  * 3. Neither the name of The DragonFly Project nor the names of its
  *    contributors may be used to endorse or promote products derived
  *    from this software without specific, prior written permission.
- * 
+ *
  * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
  * ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
  * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
@@ -32,8 +32,6 @@
  * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT
  * OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
- * 
- * $DragonFly: src/sys/sys/slaballoc.h,v 1.8 2005/06/20 20:49:12 dillon Exp $
  */
 
 #ifndef _SYS_SLABALLOC_H_
@@ -41,12 +39,10 @@
 
 #if defined(_KERNEL) || defined(_KERNEL_STRUCTURES)
 
-#ifndef _SYS_STDINT_H_
-#include <sys/stdint.h>
+#ifndef _SYS__MALLOC_H_
+#include <sys/_malloc.h>
 #endif
-#ifndef _SYS_MALLOC_H_
-#include <sys/malloc.h>
-#endif
+#include <machine/stdint.h>
 
 /*
  * Note that any allocations which are exact multiples of PAGE_SIZE, or
@@ -97,8 +93,8 @@ typedef struct SLZone {
     __int32_t	z_Magic;	/* magic number for sanity check */
     int		z_Cpu;		/* which cpu owns this zone? */
     struct globaldata *z_CpuGd;	/* which cpu owns this zone? */
-    LIST_ENTRY(SLZone) z_Entry;	/* ZoneAry[] if z_NFree!=0, else Free*Zones */
-    struct SLZone *z_Next;	/* ZoneAry[] link if z_NFree non-zero */
+    TAILQ_ENTRY(SLZone) z_Entry;/* ZoneAry[] if z_NFree!=0, else Free*Zones */
+    void	*z_UNused01;
     int		z_NFree;	/* total free chunks / ualloc space in zone */
     int		z_NMax;		/* maximum free chunks */
     char	*z_BasePtr;	/* pointer to start of chunk array */
@@ -124,7 +120,7 @@ typedef struct SLZone {
 
 #define SLZF_UNOTZEROD		0x0001
 
-LIST_HEAD(SLZoneList, SLZone);		/* NOTE: Assumes NULL initialization */
+TAILQ_HEAD(SLZoneList, SLZone);
 typedef struct SLZoneList SLZoneList;
 
 typedef struct SLGlobalData {

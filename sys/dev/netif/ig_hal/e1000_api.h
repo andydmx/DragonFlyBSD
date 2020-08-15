@@ -1,6 +1,6 @@
 /******************************************************************************
 
-  Copyright (c) 2001-2012, Intel Corporation 
+  Copyright (c) 2001-2016, Intel Corporation
   All rights reserved.
   
   Redistribution and use in source and binary forms, with or without 
@@ -30,16 +30,14 @@
   POSSIBILITY OF SUCH DAMAGE.
 
 ******************************************************************************/
-/*$FreeBSD:$*/
+/*$FreeBSD$*/
 
 #ifndef _E1000_API_H_
 #define _E1000_API_H_
 
 #include "e1000_hw.h"
 
-#ifndef NO_82542_SUPPORT
 extern void e1000_init_function_pointers_82542(struct e1000_hw *hw);
-#endif
 extern void e1000_init_function_pointers_82543(struct e1000_hw *hw);
 extern void e1000_init_function_pointers_82540(struct e1000_hw *hw);
 extern void e1000_init_function_pointers_82571(struct e1000_hw *hw);
@@ -71,7 +69,7 @@ s32 e1000_setup_link(struct e1000_hw *hw);
 s32 e1000_get_speed_and_duplex(struct e1000_hw *hw, u16 *speed, u16 *duplex);
 s32 e1000_disable_pcie_master(struct e1000_hw *hw);
 void e1000_config_collision_dist(struct e1000_hw *hw);
-void e1000_rar_set(struct e1000_hw *hw, u8 *addr, u32 index);
+int e1000_rar_set(struct e1000_hw *hw, u8 *addr, u32 index);
 u32 e1000_hash_mc_addr(struct e1000_hw *hw, u8 *mc_addr);
 void e1000_update_mc_addr_list(struct e1000_hw *hw, u8 *mc_addr_list,
 			       u32 mc_addr_count);
@@ -99,7 +97,6 @@ s32 e1000_phy_commit(struct e1000_hw *hw);
 void e1000_power_up_phy(struct e1000_hw *hw);
 void e1000_power_down_phy(struct e1000_hw *hw);
 s32 e1000_read_mac_addr(struct e1000_hw *hw);
-s32 e1000_read_pba_num(struct e1000_hw *hw, u32 *part_num);
 s32 e1000_read_pba_string(struct e1000_hw *hw, u8 *pba_num, u32 pba_num_size);
 s32 e1000_read_pba_length(struct e1000_hw *hw, u32 *pba_num_size);
 void e1000_reload_nvm(struct e1000_hw *hw);
@@ -119,9 +116,7 @@ s32 e1000_mng_host_if_write(struct e1000_hw *hw, u8 *buffer, u16 length,
 s32 e1000_mng_write_cmd_header(struct e1000_hw *hw,
 			       struct e1000_host_mng_command_header *hdr);
 s32 e1000_mng_write_dhcp_info(struct e1000_hw *hw, u8 *buffer, u16 length);
-#ifndef NO_82542_SUPPORT
 u32  e1000_translate_register_82542(u32 reg);
-#endif
 
 
 
@@ -129,14 +124,14 @@ u32  e1000_translate_register_82542(u32 reg);
  * TBI_ACCEPT macro definition:
  *
  * This macro requires:
- *      adapter = a pointer to struct e1000_hw
+ *      a = a pointer to struct e1000_hw
  *      status = the 8 bit status field of the Rx descriptor with EOP set
- *      error = the 8 bit error field of the Rx descriptor with EOP set
+ *      errors = the 8 bit error field of the Rx descriptor with EOP set
  *      length = the sum of all the length fields of the Rx descriptors that
  *               make up the current frame
  *      last_byte = the last byte of the frame DMAed by the hardware
- *      max_frame_length = the maximum frame length we want to accept.
- *      min_frame_length = the minimum frame length we want to accept.
+ *      min_frame_size = the minimum frame length we want to accept.
+ *      max_frame_size = the maximum frame length we want to accept.
  *
  * This macro is a conditional that should be used in the interrupt
  * handler's Rx processing routine when RxErrors have been detected.
@@ -162,10 +157,10 @@ u32  e1000_translate_register_82542(u32 reg);
 	 (((errors) & E1000_RXD_ERR_FRAME_ERR_MASK) == E1000_RXD_ERR_CE) && \
 	 ((last_byte) == CARRIER_EXTENSION) && \
 	 (((status) & E1000_RXD_STAT_VP) ? \
-	  (((length) > (min_frame_size - VLAN_TAG_SIZE)) && \
-	  ((length) <= (max_frame_size + 1))) : \
-	  (((length) > min_frame_size) && \
-	  ((length) <= (max_frame_size + VLAN_TAG_SIZE + 1)))))
+	  (((length) > ((min_frame_size) - VLAN_TAG_SIZE)) && \
+	  ((length) <= ((max_frame_size) + 1))) : \
+	  (((length) > (min_frame_size)) && \
+	  ((length) <= ((max_frame_size) + VLAN_TAG_SIZE + 1)))))
 
 #define E1000_MAX(a, b) ((a) > (b) ? (a) : (b))
 #define E1000_DIVIDE_ROUND_UP(a, b)	(((a) + (b) - 1) / (b)) /* ceil(a/b) */

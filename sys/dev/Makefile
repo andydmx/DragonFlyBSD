@@ -11,11 +11,13 @@ SUBDIR=	\
 	pccard \
 	powermng \
 	raid \
-	serial \
 	sound \
 	smbus \
 	video \
 	virtual
+
+# empty to allow concurrent building
+SUBDIR_ORDERED=
 
 .for dir in ${SUBDIR}
 .if empty(DEV_SUPPORT:M${dir}) && empty(DEV_SUPPORT:M${dir}/*)

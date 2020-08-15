@@ -181,7 +181,7 @@ static driver_t acpi_toshiba_driver = {
 
 static devclass_t acpi_toshiba_devclass;
 DRIVER_MODULE(acpi_toshiba, acpi, acpi_toshiba_driver, acpi_toshiba_devclass,
-    0, 0);
+    NULL, NULL);
 MODULE_DEPEND(acpi_toshiba, acpi, 1, 1, 1);
 
 static device_method_t acpi_toshiba_video_methods[] = {
@@ -199,7 +199,7 @@ static driver_t acpi_toshiba_video_driver = {
 
 static devclass_t acpi_toshiba_video_devclass;
 DRIVER_MODULE(acpi_toshiba_video, acpi, acpi_toshiba_video_driver,
-    acpi_toshiba_video_devclass, 0, 0);
+    acpi_toshiba_video_devclass, NULL, NULL);
 MODULE_DEPEND(acpi_toshiba_video, acpi, 1, 1, 1);
 
 static int	enable_fn_keys = 1;
@@ -239,6 +239,7 @@ acpi_toshiba_attach(device_t dev)
 	sc = device_get_softc(dev);
 	sc->dev = dev;
 	sc->handle = acpi_get_handle(dev);
+	ACPI_SERIAL_INIT(toshiba);
 
 	acpi_sc = acpi_device_get_parent_softc(dev);
 	sysctl_ctx_init(&sc->sysctl_ctx);
@@ -526,8 +527,9 @@ acpi_toshiba_notify(ACPI_HANDLE h, UINT32 notify, void *context)
 			acpi_UserNotify("TOSHIBA", h, (uint8_t)key);
 		}
 		ACPI_SERIAL_END(toshiba);
-	} else
-		device_printf(sc->dev, "unknown notify: 0x%x\n", notify);
+	} else {
+		device_printf(sc->dev, "unknown notify: %#x\n", notify);
+	}
 }
 
 /*

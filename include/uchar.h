@@ -30,16 +30,12 @@
 #define	_UCHAR_H_
 
 #include <sys/cdefs.h>
-#include <sys/types.h>
+#include <machine/stdint.h>
+#include <machine/wchar.h>	/* for __mbstate_t */
 
-#ifndef _CHAR16_T_DECLARED
-typedef	__char16_t	char16_t;
-#define	_CHAR16_T_DECLARED
-#endif
-
-#ifndef _CHAR32_T_DECLARED
-typedef	__char32_t	char32_t;
-#define	_CHAR32_T_DECLARED
+#if !defined(__cplusplus) || __cplusplus < 201103
+typedef	__uint_least16_t	char16_t;
+typedef	__uint_least32_t	char32_t;
 #endif
 
 #ifndef _MBSTATE_T_DECLARED

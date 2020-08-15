@@ -618,7 +618,7 @@ ng_internalize(struct mbuf *control, struct thread *td)
 		vn = (struct vnode *) fp->f_data;
 		if (vn && (vn->v_type == VCHR)) {
 			/* for a VCHR, actually reference the FILE */
-			fp->f_count++;
+			fhold(fp);
 			/* XXX then what :) */
 			/* how to pass on to other modules? */
 		} else {
@@ -732,7 +732,7 @@ ship_msg(struct ngpcb *pcbp, struct ng_mesg *msg, struct sockaddr_ng *addr)
 
 	/* Copy the message itself into an mbuf chain */
 	msglen = sizeof(struct ng_mesg) + msg->header.arglen;
-	mdata = m_devget((caddr_t) msg, msglen, 0, NULL, NULL);
+	mdata = m_devget((caddr_t) msg, msglen, 0, NULL);
 
 	/* Here we free the message, as we are the end of the line.
 	 * We need to do that regardless of whether we got mbufs. */
@@ -747,6 +747,7 @@ ship_msg(struct ngpcb *pcbp, struct ng_mesg *msg, struct sockaddr_ng *addr)
 	lwkt_gettoken(&so->so_rcv.ssb_token);
 	if (ssb_appendaddr(&so->so_rcv,
 	    (struct sockaddr *) addr, mdata, NULL) == 0) {
+		soroverflow(so);
 		lwkt_reltoken(&so->so_rcv.ssb_token);
 		TRAP_ERROR;
 		m_freem(mdata);
@@ -868,6 +869,7 @@ ngs_rcvdata(hook_p hook, struct mbuf *m, meta_p meta)
 	/* Try to tell the socket which hook it came in on */
 	lwkt_gettoken(&so->so_rcv.ssb_token);
 	if (ssb_appendaddr(&so->so_rcv, (struct sockaddr *) addr, m, NULL) == 0) {
+		soroverflow(so);
 		lwkt_reltoken(&so->so_rcv.ssb_token);
 		m_freem(m);
 		TRAP_ERROR;

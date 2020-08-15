@@ -15,11 +15,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -37,18 +33,22 @@
  *
  *	@(#)pwd.h	8.2 (Berkeley) 1/21/94
  * $FreeBSD: src/include/pwd.h,v 1.17 2009/03/14 19:13:01 das Exp $
- * $DragonFly: src/include/pwd.h,v 1.2 2003/11/14 01:01:43 dillon Exp $
  */
 
 #ifndef _PWD_H_
 #define	_PWD_H_
 
 #include <sys/cdefs.h>
-#include <sys/types.h>
+#include <machine/stdint.h>
 
 #ifndef _GID_T_DECLARED
 typedef	__uint32_t	gid_t;
 #define	_GID_T_DECLARED
+#endif
+
+#ifndef _SIZE_T_DECLARED
+typedef	__size_t	size_t;
+#define	_SIZE_T_DECLARED
 #endif
 
 #ifndef _TIME_T_DECLARED
@@ -61,12 +61,7 @@ typedef	__uint32_t	uid_t;
 #define	_UID_T_DECLARED
 #endif
 
-#ifndef _SIZE_T_DECLARED
-typedef __size_t	size_t;
-#define _SIZE_T_DECLARED
-#endif
-
-#define _PATH_PWD		"/etc"
+#define	_PATH_PWD		"/etc"
 #define	_PATH_PASSWD		"/etc/passwd"
 #define	_PASSWD			"passwd"
 #define	_PATH_MASTERPASSWD	"/etc/master.passwd"
@@ -94,21 +89,21 @@ typedef __size_t	size_t;
  * tag, and that is what the _PW_VERSIONED macro is about.
  */
 
-#define _PW_VERSION_MASK	'\xF0'
-#define _PW_VERSIONED(x, v)	((unsigned char)(((x) & 0xCF) | ((v)<<4)))
+#define	_PW_VERSION_MASK	'\xF0'
+#define	_PW_VERSIONED(x, v)	((unsigned char)(((x) & 0xCF) | ((v)<<4)))
 
 #define	_PW_KEYBYNAME		'\x31'	/* stored by name */
 #define	_PW_KEYBYNUM		'\x32'	/* stored by entry in the "file" */
 #define	_PW_KEYBYUID		'\x33'	/* stored by uid */
-#define _PW_KEYYPENABLED	'\x34'	/* YP is enabled */
+#define	_PW_KEYYPENABLED	'\x34'	/* YP is enabled */
 #define	_PW_KEYYPBYNUM		'\x35'	/* special +@netgroup entries */
 
 /* The database also contains a key to indicate the format version of
  * the entries therein.  There may be other, older versioned entries
  * as well.
  */
-#define _PWD_VERSION_KEY	"\xFF" "VERSION"
-#define _PWD_CURRENT_VERSION	'\x04'
+#define	_PWD_VERSION_KEY	"\xFF" "VERSION"
+#define	_PWD_CURRENT_VERSION	'\x04'
 
 #define	_PASSWORD_EFMT1		'_'	/* extended encryption format */
 
@@ -129,25 +124,25 @@ struct passwd {
 };
 
 /* Mapping from fields to bits for pw_fields. */
-#define _PWF(x)		(1 << x)
-#define _PWF_NAME	_PWF(0)
-#define _PWF_PASSWD	_PWF(1)
-#define _PWF_UID	_PWF(2)
-#define _PWF_GID	_PWF(3)
-#define _PWF_CHANGE	_PWF(4)
-#define _PWF_CLASS	_PWF(5)
-#define _PWF_GECOS	_PWF(6)
-#define _PWF_DIR	_PWF(7)
-#define _PWF_SHELL	_PWF(8)
-#define _PWF_EXPIRE	_PWF(9)
+#define	_PWF(x)		(1 << x)
+#define	_PWF_NAME	_PWF(0)
+#define	_PWF_PASSWD	_PWF(1)
+#define	_PWF_UID	_PWF(2)
+#define	_PWF_GID	_PWF(3)
+#define	_PWF_CHANGE	_PWF(4)
+#define	_PWF_CLASS	_PWF(5)
+#define	_PWF_GECOS	_PWF(6)
+#define	_PWF_DIR	_PWF(7)
+#define	_PWF_SHELL	_PWF(8)
+#define	_PWF_EXPIRE	_PWF(9)
 
 /* XXX These flags are bogus.  With nsswitch, there are many
  * possible sources and they cannot be represented in a small integer.
  */
-#define _PWF_SOURCE	0x3000
-#define _PWF_FILES	0x1000
-#define _PWF_NIS	0x2000
-#define _PWF_HESIOD	0x3000
+#define	_PWF_SOURCE	0x3000
+#define	_PWF_FILES	0x1000
+#define	_PWF_NIS	0x2000
+#define	_PWF_HESIOD	0x3000
 
 __BEGIN_DECLS
 struct passwd	*getpwnam(const char *);
@@ -170,6 +165,10 @@ int		 getpwuid_r(uid_t, struct passwd *, char *, size_t,
 int		 getpwent_r(struct passwd *, char *, size_t, struct passwd **);
 int		 setpassent(int);
 const char	*user_from_uid(uid_t, int);
+int		 uid_from_user(const char *, uid_t *);
+int		 pwcache_userdb(int (*)(int), void (*)(void),
+		    struct passwd * (*)(const char *),
+		    struct passwd * (*)(uid_t));
 #endif
 __END_DECLS
 

@@ -10,11 +10,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -32,7 +28,6 @@
  *
  *	@(#)ktrace.h	8.1 (Berkeley) 6/2/93
  * $FreeBSD: src/sys/sys/ktrace.h,v 1.19.2.3 2001/01/06 09:58:23 alfred Exp $
- * $DragonFly: src/sys/sys/ktrace.h,v 1.10 2008/04/14 12:01:53 dillon Exp $
  */
 
 #ifndef _SYS_KTRACE_H_
@@ -43,9 +38,6 @@
 #endif
 #ifndef _SYS_TIME_H_
 #include <sys/time.h>
-#endif
-#ifndef _SYS_UIO_H_
-#include <sys/uio.h>
 #endif
 #ifndef _SYS_SIGNAL_H_
 #include <sys/signal.h>
@@ -95,10 +87,18 @@ struct ktr_header {
 /*
  * Test for kernel trace point (MP SAFE)
  */
-#define KTRPOINT(td, type)	\
-	((td)->td_proc && ((td)->td_proc->p_traceflag & (1<<(type))) && \
-	(((td)->td_proc->p_traceflag | (td)->td_lwp->lwp_traceflag) & \
-	  KTRFAC_ACTIVE) == 0)
+#define KTRPOINT(td, type)						\
+			((td)->td_proc &&				\
+			 ((td)->td_proc->p_traceflag & (1<<(type))) &&	\
+			(((td)->td_proc->p_traceflag |			\
+			  (td)->td_lwp->lwp_traceflag) &		\
+		         KTRFAC_ACTIVE) == 0)
+
+#define KTRPOINTP(p, td, type)						\
+	__predict_false((((p)->p_traceflag & (1<<(type))) &&		\
+			((p->p_traceflag |				\
+			  (td)->td_lwp->lwp_traceflag) &		\
+		         KTRFAC_ACTIVE) == 0))
 
 
 /*
@@ -139,6 +139,8 @@ struct ktr_sysret {
  * KTR_GENIO - trace generic process i/o
  */
 #define KTR_GENIO	4
+#if defined(_KERNEL) || defined(_KERNEL_STRUCTURES)
+#include <sys/_uio.h>		/* enum uio_rw, struct uio */
 struct ktr_genio {
 	int	ktr_fd;
 	enum	uio_rw ktr_rw;
@@ -146,6 +148,7 @@ struct ktr_genio {
 	 * followed by data successfully read/written
 	 */
 };
+#endif
 
 /*
  * KTR_PSIG - trace processed signal
@@ -196,7 +199,7 @@ void	ktrnamei (struct lwp *,char *);
 void	ktrcsw (struct lwp *,int,int);
 void	ktrpsig (struct lwp *, int, sig_t, sigset_t *, int);
 void	ktrgenio (struct lwp *, int, enum uio_rw, struct uio *, int);
-void	ktrsyscall (struct lwp *, int, int narg, register_t args[]);
+void	ktrsyscall (struct lwp *, int, int narg, union sysunion *args);
 void	ktrsysret (struct lwp *, int, int, register_t);
 void	ktrdestroy (struct ktrace_node **);
 struct ktrace_node *ktrinherit (struct ktrace_node *);

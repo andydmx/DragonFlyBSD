@@ -26,6 +26,7 @@
  * $FreeBSD: src/lib/libc/gen/_pthread_stubs.c,v 1.5 2001/06/11 23:18:22 iedowse Exp $
  */
 
+#include <sys/cdefs.h>
 #include <stdlib.h>
 #include <pthread.h>
 
@@ -39,13 +40,17 @@
  * latter can't be allowed to exit/terminate).
  */
 
+#define WRlc(f, n)			\
+    __weak_reference_asm(f, _ ## n);
 #define WR(f, n)			\
-    __weak_reference(f, _ ## n);	\
-    __weak_reference(f, n)
+    __weak_reference_asm(f, _ ## n);	\
+    __weak_reference_asm(f, n)
 
+/* XXX this needs something more clever, should not some of these return errors? */
 WR(__atfork, pthread_atfork);
 WR(stub_zero, pthread_attr_destroy);
 WR(stub_zero, pthread_attr_get_np);
+WR(stub_zero, pthread_attr_getaffinity_np);
 WR(stub_zero, pthread_attr_getdetachstate);
 WR(stub_zero, pthread_attr_getguardsize);
 WR(stub_zero, pthread_attr_getinheritsched);
@@ -56,6 +61,7 @@ WR(stub_zero, pthread_attr_getstack);
 WR(stub_zero, pthread_attr_getstackaddr);
 WR(stub_zero, pthread_attr_getstacksize);
 WR(stub_zero, pthread_attr_init);
+WR(stub_zero, pthread_attr_setaffinity_np);
 WR(stub_zero, pthread_attr_setcreatesuspend_np);
 WR(stub_zero, pthread_attr_setdetachstate);
 WR(stub_zero, pthread_attr_setguardsize);
@@ -73,7 +79,7 @@ WR(stub_zero, pthread_barrierattr_destroy);
 WR(stub_zero, pthread_barrierattr_getpshared);
 WR(stub_zero, pthread_barrierattr_init);
 WR(stub_zero, pthread_barrierattr_setpshared);
-WR(stub_zero, pthread_cancel);
+WRlc(stub_zero, pthread_cancel);
 WR(stub_zero, pthread_cleanup_pop);
 WR(stub_zero, pthread_cleanup_push);
 WR(stub_zero, pthread_cond_broadcast);
@@ -89,12 +95,15 @@ WR(stub_zero, pthread_condattr_init);
 WR(stub_zero, pthread_condattr_setclock);
 WR(stub_zero, pthread_condattr_setpshared);
 WR(stub_zero, pthread_detach);
-WR(stub_true, pthread_equal);
+WR(stub_equal, pthread_equal);
 WR(stub_exit, pthread_exit);
+WR(stub_zero, pthread_getaffinity_np);
 WR(stub_zero, pthread_getconcurrency);
+WR(stub_zero, pthread_getcpuclockid);
 WR(stub_zero, pthread_getprio);
 WR(stub_zero, pthread_getschedparam);
 WR(stub_null, pthread_getspecific);
+WR(stub_zero, pthread_getthreadid_np);
 WR(stub_empty, pthread_init_early);
 WR(stub_zero, pthread_join);
 WR(stub_zero, pthread_key_create);
@@ -139,7 +148,9 @@ WR(stub_zero, pthread_rwlockattr_getpshared);
 WR(stub_zero, pthread_rwlockattr_init);
 WR(stub_zero, pthread_rwlockattr_setpshared);
 WR(stub_self, pthread_self);
+WR(stub_pthread_get_name_np, pthread_get_name_np);
 WR(stub_zero, pthread_set_name_np);
+WR(stub_zero, pthread_setaffinity_np);
 WR(stub_zero, pthread_setcancelstate);
 WR(stub_zero, pthread_setcanceltype);
 WR(stub_zero, pthread_setconcurrency);
@@ -160,7 +171,6 @@ WR(stub_zero, pthread_switch_delete_np);
 WR(stub_zero, pthread_testcancel);
 WR(stub_zero, pthread_timedjoin_np);
 WR(stub_zero, pthread_yield);
-WR(stub_zero, sched_yield);
 WR(stub_zero, sem_close);
 WR(stub_zero, sem_destroy);
 WR(stub_zero, sem_getvalue);
@@ -211,9 +221,9 @@ stub_main(void)
 }
 
 static int __used
-stub_true(void)
+stub_equal(pthread_t a, pthread_t b)
 {
-	return (1);
+	return (a == b);
 }
 
 static void __used
@@ -225,6 +235,13 @@ static void __used
 stub_exit(void)
 {
 	exit(0);
+}
+
+static void __used
+stub_pthread_get_name_np(pthread_t a, char *name, size_t len)
+{
+	if (len)
+		name[0] = 0;
 }
 
 /*

@@ -1,7 +1,9 @@
 KMOD=	pktgen
 SRCS=	pktgen.c
 
-CFLAGS+= -g
-CFLAGS+= -DINVARIANTS 
+KCFLAGS+= -g
+.if !defined(NOINVAR)
+KCFLAGS+= -DINVARIANTS
+.endif
 
 .include <bsd.kmod.mk>

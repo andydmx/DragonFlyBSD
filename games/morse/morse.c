@@ -29,11 +29,12 @@
  * @(#) Copyright (c) 1988, 1993 The Regents of the University of California.  All rights reserved.
  * @(#)morse.c	8.1 (Berkeley) 5/31/93
  * $FreeBSD: src/games/morse/morse.c,v 1.12.2.2 2002/03/12 17:45:15 phantom Exp $
+ * $OpenBSD: morse.c,v 1.22 2016/03/07 12:07:56 mestre Exp $
  */
 
 /*
  * Taught to send *real* morse by Lyndon Nerenberg (VE7TCP/VE6BBM)
- * <lyndon@orthanc.com>
+ * <lyndon@orthanc.ca>
  */
 
 #include <sys/time.h>
@@ -51,6 +52,92 @@
 #include <string.h>
 #include <termios.h>
 #include <unistd.h>
+
+static const char *digit[] = {
+	"-----",
+	".----",
+	"..---",
+	"...--",
+	"....-",
+	".....",
+	"-....",
+	"--...",
+	"---..",
+	"----.",
+};
+
+static const char *alph[] = {
+	".-",
+	"-...",
+	"-.-.",
+	"-..",
+	".",
+	"..-.",
+	"--.",
+	"....",
+	"..",
+	".---",
+	"-.-",
+	".-..",
+	"--",
+	"-.",
+	"---",
+	".--.",
+	"--.-",
+	".-.",
+	"...",
+	"-",
+	"..-",
+	"...-",
+	".--",
+	"-..-",
+	"-.--",
+	"--..",
+};
+
+struct punc {
+	char c;
+	const char *morse;
+};
+
+static const struct punc other[] = {
+	{ 'e', "..-.." },	/* accented e - only decodes */
+	{ ',', "--..--" },
+	{ '.', ".-.-.-" },
+	{ '?', "..--.." },
+	{ '/', "-..-." },
+	{ '-', "-....-" },
+	{ ':', "---..." },
+	{ ';', "-.-.-." },
+	{ '(', "-.--." },	/* KN */
+	{ ')', "-.--.-" },
+	{ '"', ".-..-." },
+	{ '`', ".-..-." },
+	{ '\'', ".----." },
+	{ '+', ".-.-." },	/* AR \n\n\n */
+	{ '=', "-...-" },	/* BT \n\n */
+	{ '@', ".--.-." },
+	{ '\n', ".-.-" },	/* AA (will only decode) */
+	{ '\0', NULL }
+};
+
+struct prosign {
+	const char *c;
+	const char *morse;
+};
+
+static const struct prosign ps[] = {
+	{ "<AS>", ".-..." },	/* wait */
+	{ "<CL>", "-.-..-.." },
+	{ "<CT>", "-.-.-" },	/* start */
+	{ "<EE5>", "......" },	/* error */
+	{ "<EE5>", "......." },
+	{ "<EE5>", "........" },
+	{ "<SK>", "...-.-" },
+	{ "<SN>", "...-." },	/* understood */
+	{ "<SOS>", "...---..." },
+	{ NULL, NULL }
+};
 
 struct morsetab {
 	char            inchar;
@@ -151,7 +238,7 @@ static const struct morsetab koi8rtab[] = {
 	{'Ç', "--."},	/* ge */
 	{'Ä', "-.."},	/* de */
 	{'Å', "."},		/* ye */
-	{'£', "."},         	/* yo, the same as ye */
+	{'£', "."},		/* yo, the same as ye */
 	{'Ö', "...-"},	/* she */
 	{'Ú', "--.."},	/* ze */
 	{'É', ".."},		/* i */
@@ -186,18 +273,19 @@ struct tone_data {
 	size_t	len;
 };
 
-void		alloc_soundbuf(struct tone_data *, double, int);
-void		morse(char, int);
-void            show(const char *, int);
-void		play(const char *, int);
-void		ttyout(const char *, int);
-void		sighandler(int);
+static void		alloc_soundbuf(struct tone_data *, double, int);
+static void		morse(char, int);
+static void		decode(const char *);
+static void		show(const char *, int);
+static void		play(const char *, int);
+static void		ttyout(const char *, int);
+static void		sighandler(int);
 
-#define GETOPTOPTS "d:ef:lopP:sw:W:"
+#define GETOPTOPTS "d:ef:lopP:rsw:W:"
 #define USAGE \
-"usage: morse [-els] [-p | -o] [-P device] [-d device] [-w speed] [-W speed] [-f frequency] [string ...]\n"
+"usage: morse [-r] [-els] [-p | -o] [-P device] [-d device] [-w speed] [-W speed] [-f frequency] [string ...]\n"
 
-static int      lflag, oflag, pflag, sflag, eflag;
+static int      lflag, oflag, pflag, rflag, sflag, eflag;
 static int      wpm = 20;	/* words per minute */
 static int	farnsworth = -1;
 #define FREQUENCY 600
@@ -219,7 +307,7 @@ int		olflags;
 static const struct morsetab *hightab;
 
 int
-main(int argc, char **argv)
+main(int argc, char *argv[])
 {
 	int    ch, lflags;
 	int    prosign;
@@ -248,6 +336,9 @@ main(int argc, char **argv)
 			break;
 		case 'P':
 			snddev = optarg;
+			break;
+		case 'r':
+			rflag = 1;
 			break;
 		case 's':
 			sflag = 1;
@@ -346,10 +437,10 @@ main(int argc, char **argv)
 		lflags &= ~TIOCM_RTS;
 		olflags = lflags;
 		ioctl(line, TIOCMSET, &lflags);
-		(void)signal(SIGHUP, sighandler);
-		(void)signal(SIGINT, sighandler);
-		(void)signal(SIGQUIT, sighandler);
-		(void)signal(SIGTERM, sighandler);
+		signal(SIGHUP, sighandler);
+		signal(SIGINT, sighandler);
+		signal(SIGQUIT, sighandler);
+		signal(SIGTERM, sighandler);
 	}
 
 	argc -= optind;
@@ -362,6 +453,49 @@ main(int argc, char **argv)
 		else if (strcmp(codeset, "ISO8859-1") == 0 ||
 			 strcmp(codeset, "ISO8859-15") == 0)
 			hightab = iso8859tab;
+	}
+
+	if (rflag) {
+		if (*argv) {
+			do {
+				decode(*argv);
+			} while (*++argv);
+		} else {
+			char foo[10];	/* All morse chars shorter than this */
+			int blank, i;
+
+			i = 0;
+			blank = 0;
+			while ((ch = getchar()) != EOF) {
+				if (ch == '-' || ch == '.') {
+					foo[i++] = ch;
+					if (i == 10) {
+						/* overrun means gibberish--print 'x' and
+						 * advance */
+						i = 0;
+						putchar('x');
+						while ((ch = getchar()) != EOF &&
+						    (ch == '.' || ch == '-'))
+							;
+						blank = 1;
+					}
+				} else if (i) {
+					foo[i] = '\0';
+					decode(foo);
+					i = 0;
+					blank = 0;
+				} else if (isspace(ch)) {
+					if (blank) {
+						/* print whitespace for each double blank */
+						putchar(' ');
+						blank = 0;
+					} else
+						blank = 1;
+				}
+			}
+		}
+		putchar('\n');
+		exit(0);
 	}
 
 	if (lflag)
@@ -410,7 +544,7 @@ main(int argc, char **argv)
 	exit(0);
 }
 
-void
+static void
 alloc_soundbuf(struct tone_data *tone, double len, int on)
 {
 	int samples, i;
@@ -462,7 +596,7 @@ alloc_soundbuf(struct tone_data *tone, double len, int on)
 	}
 }
 
-void
+static void
 morse(char c, int prosign)
 {
 	const struct morsetab *m;
@@ -499,7 +633,43 @@ morse(char c, int prosign)
 	}
 }
 
-void
+static void
+decode(const char *s)
+{
+	int i;
+
+	for (i = 0; i < 10; i++)
+		if (strcmp(digit[i], s) == 0) {
+			putchar('0' + i);
+			return;
+		}
+
+	for (i = 0; i < 26; i++)
+		if (strcmp(alph[i], s) == 0) {
+			putchar('A' + i);
+			return;
+		}
+	i = 0;
+	while (other[i].c) {
+		if (strcmp(other[i].morse, s) == 0) {
+			putchar(other[i].c);
+			return;
+		}
+		i++;
+	}
+	i = 0;
+	while (ps[i].c) {
+		/* put whitespace around prosigns */
+		if (strcmp(ps[i].morse, s) == 0) {
+			printf(" %s ", ps[i].c);
+			return;
+		}
+		i++;
+	}
+	putchar('x');	/* line noise */
+}
+
+static void
 show(const char *s, int prosign)
 {
 	if (lflag) {
@@ -514,7 +684,7 @@ show(const char *s, int prosign)
 		printf("\n");
 }
 
-void
+static void
 play(const char *s, int prosign)
 {
 	const char *c;
@@ -558,7 +728,7 @@ play(const char *s, int prosign)
 		ioctl(spkr, SNDCTL_DSP_SYNC, NULL);
 }
 
-void
+static void
 ttyout(const char *s, int prosign)
 {
 	const char *c;
@@ -604,7 +774,7 @@ ttyout(const char *s, int prosign)
 	}
 }
 
-void
+static void
 sighandler(int signo)
 {
 
@@ -612,5 +782,5 @@ sighandler(int signo)
 	tcsetattr(line, TCSANOW, &otty);
 
 	signal(signo, SIG_DFL);
-	(void)kill(getpid(), signo);
+	kill(getpid(), signo);
 }

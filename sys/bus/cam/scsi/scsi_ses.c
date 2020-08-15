@@ -36,7 +36,6 @@
 #include <sys/buf.h>
 #include <sys/errno.h>
 #include <sys/devicestat.h>
-#include <sys/thread2.h>
 #include <machine/stdarg.h>
 
 #include "../cam.h"
@@ -1213,6 +1212,7 @@ ses_getputstat(ses_softc_t *ssc, int objid, SesComStat *sp, int slp, int in)
 	int err, amt, bufsiz, tidx, oidx;
 	char cdb[6], *sdata;
 
+	bzero(sp, sizeof(*sp));
 	cc = ssc->ses_private;
 	if (cc == NULL) {
 		return (ENXIO);

@@ -130,6 +130,7 @@
 #include <bus/cam/cam_ccb.h>
 #include <bus/cam/cam_sim.h>
 #include <bus/cam/cam_xpt_sim.h>
+#include <bus/cam/cam_xpt_periph.h>
 
 #include <bus/cam/scsi/scsi_all.h>
 #include <bus/cam/scsi/scsi_message.h>
@@ -137,14 +138,6 @@
 #include <vm/vm.h>
 #include <vm/pmap.h>
 
-#if defined(__i386__)
-#include "opt_asr.h"
-#include <machine/cputypes.h>
-
-#if defined(ASR_COMPAT)
-#define ASR_IOCTL_COMPAT
-#endif /* ASR_COMPAT */
-#endif
 #include <machine/vmparam.h>
 
 #include <bus/pci/pcivar.h>
@@ -297,17 +290,9 @@ typedef struct {
 } target2lun_t;
 
 /*
- *	To ensure that we only allocate and use the worst case ccb here, lets
- *	make our own local ccb union. If asr_alloc_ccb is utilized for another
- *	ccb type, ensure that you add the additional structures into our local
- *	ccb union. To ensure strict type checking, we will utilize the local
- *	ccb definition wherever possible.
+ * Don't play games with the ccb any more, use the CAM ccb
  */
-union asr_ccb {
-	struct ccb_hdr	    ccb_h;  /* For convenience */
-	struct ccb_scsiio   csio;
-	struct ccb_setasync csa;
-};
+#define asr_ccb ccb
 
 struct Asr_status_mem {
 	I2O_EXEC_STATUS_GET_REPLY	status;
@@ -686,19 +671,18 @@ asr_alloc_ccb(Asr_softc_t *sc)
 {
 	union asr_ccb *new_ccb;
 
-	if ((new_ccb = (union asr_ccb *)kmalloc(sizeof(*new_ccb),
-	  M_DEVBUF, M_WAITOK | M_ZERO)) != NULL) {
-		new_ccb->ccb_h.pinfo.priority = 1;
-		new_ccb->ccb_h.pinfo.index = CAM_UNQUEUED_INDEX;
-		new_ccb->ccb_h.spriv_ptr0 = sc;
-	}
+	new_ccb = xpt_alloc_ccb();
+	new_ccb->ccb_h.pinfo.priority = 1;
+	new_ccb->ccb_h.pinfo.index = CAM_UNQUEUED_INDEX;
+	new_ccb->ccb_h.spriv_ptr0 = sc;
+
 	return (new_ccb);
 } /* asr_alloc_ccb */
 
 static __inline void
 asr_free_ccb(union asr_ccb *free_ccb)
 {
-	kfree(free_ccb, M_DEVBUF);
+	xpt_free_ccb(&free_ccb->ccb_h);
 } /* asr_free_ccb */
 
 /*
@@ -788,8 +772,9 @@ ASR_ccbAdd(Asr_softc_t *sc, union asr_ccb *ccb)
 			 */
 			ccb->ccb_h.timeout = 6 * 60 * 1000;
 		}
-		callout_reset(&ccb->ccb_h.timeout_ch,
-		    (ccb->ccb_h.timeout * hz) / 1000, asr_timeout, ccb);
+		callout_reset(ccb->ccb_h.timeout_ch,
+			      (ccb->ccb_h.timeout * hz) / 1000,
+			      asr_timeout, ccb);
 	}
 	crit_exit();
 } /* ASR_ccbAdd */
@@ -801,7 +786,7 @@ static __inline void
 ASR_ccbRemove(Asr_softc_t *sc, union asr_ccb *ccb)
 {
 	crit_enter();
-	callout_stop(&ccb->ccb_h.timeout_ch);
+	callout_stop(ccb->ccb_h.timeout_ch);
 	LIST_REMOVE(&(ccb->ccb_h), sim_links.le);
 	crit_exit();
 } /* ASR_ccbRemove */
@@ -931,7 +916,7 @@ ASR_getTidAddress(Asr_softc_t *sc, int bus, int target, int lun, int new_entry)
 	 *	fragmentation effects on the allocations.
 	 */
 #define BUS_CHUNK 8
-	new_size = ((target + BUS_CHUNK - 1) & ~(BUS_CHUNK - 1));
+	new_size = roundup2(target, BUS_CHUNK);
 	if ((bus_ptr = sc->ha_targets[bus]) == NULL) {
 		/*
 		 *	Allocate a new structure?
@@ -982,7 +967,7 @@ ASR_getTidAddress(Asr_softc_t *sc, int bus, int target, int lun, int new_entry)
 	 */
 #define TARGET_CHUNK 8
 	if ((new_size = lun) != 0) {
-		new_size = ((lun + TARGET_CHUNK - 1) & ~(TARGET_CHUNK - 1));
+		new_size = roundup2(lun, TARGET_CHUNK);
 	}
 	if ((target_ptr = bus_ptr->LUN[target]) == NULL) {
 		/*
@@ -1177,15 +1162,18 @@ ASR_rescan(Asr_softc_t *sc)
 							  AC_LOST_DEVICE,
 							  path, NULL);
 						} else if (LastTID == (tid_t)-1) {
-							struct ccb_getdev ccb;
+							struct ccb_getdev *ccb;
+
+							ccb = &xpt_alloc_ccb()->cgd;
 
 							xpt_setup_ccb(
-							  &(ccb.ccb_h),
+							  &ccb->ccb_h,
 							  path, /*priority*/5);
 							xpt_async(
 							  AC_FOUND_DEVICE,
 							  path,
-							  &ccb);
+							  ccb);
+							xpt_free_ccb(&ccb->ccb_h);
 						} else {
 							xpt_async(
 							  AC_INQ_CHANGED,
@@ -1308,8 +1296,9 @@ asr_timeout(void *arg)
 		  cam_sim_unit(xpt_path_sim(ccb->ccb_h.path)), s);
 		if (ASR_reset (sc) == ENXIO) {
 			/* Try again later */
-			callout_reset(&ccb->ccb_h.timeout_ch,
-			    (ccb->ccb_h.timeout * hz) / 1000, asr_timeout, ccb);
+			callout_reset(ccb->ccb_h.timeout_ch,
+				      (ccb->ccb_h.timeout * hz) / 1000,
+				      asr_timeout, ccb);
 		}
 		return;
 	}
@@ -1323,8 +1312,9 @@ asr_timeout(void *arg)
 	if ((ccb->ccb_h.status & CAM_STATUS_MASK) == CAM_CMD_TIMEOUT) {
 		debug_asr_printf (" AGAIN\nreinitializing adapter\n");
 		if (ASR_reset (sc) == ENXIO) {
-			callout_reset(&ccb->ccb_h.timeout_ch,
-			    (ccb->ccb_h.timeout * hz) / 1000, asr_timeout, ccb);
+			callout_reset(ccb->ccb_h.timeout_ch,
+				      (ccb->ccb_h.timeout * hz) / 1000,
+				      asr_timeout, ccb);
 		}
 		crit_exit();
 		return;
@@ -1333,7 +1323,8 @@ asr_timeout(void *arg)
 	/* If the BUS reset does not take, then an adapter reset is next! */
 	ccb->ccb_h.status &= ~CAM_STATUS_MASK;
 	ccb->ccb_h.status |= CAM_CMD_TIMEOUT;
-	callout_reset(&ccb->ccb_h.timeout_ch, (ccb->ccb_h.timeout * hz) / 1000,
+	callout_reset(ccb->ccb_h.timeout_ch,
+		      (ccb->ccb_h.timeout * hz) / 1000,
 		      asr_timeout, ccb);
 	ASR_resetBus (sc, cam_sim_bus(xpt_path_sim(ccb->ccb_h.path)));
 	xpt_async (AC_BUS_RESET, ccb->ccb_h.path, NULL);
@@ -2401,8 +2392,9 @@ asr_attach(device_t dev)
 	 */
 	LIST_INIT(&(sc->ha_ccb));
 	/* Link us into the HA list */
-	for (ha = &Asr_softc_list; *ha; ha = &((*ha)->ha_next));
-		*(ha) = sc;
+	for (ha = &Asr_softc_list; *ha; ha = &((*ha)->ha_next))
+		;
+	*(ha) = sc;
 
 	/*
 	 *	This is the real McCoy!
@@ -3710,19 +3702,6 @@ asr_ioctl(struct dev_ioctl_args *ap)
 #endif /* ASR_IOCTL_COMPAT */
 
 		Info.processorFamily = ASR_sig.dsProcessorFamily;
-#if defined(__i386__)
-		switch (cpu) {
-		case CPU_386SX: case CPU_386:
-			Info.processorType = PROC_386; break;
-		case CPU_486SX: case CPU_486:
-			Info.processorType = PROC_486; break;
-		case CPU_586:
-			Info.processorType = PROC_PENTIUM; break;
-		case CPU_686:
-			Info.processorType = PROC_SEXIUM; break;
-		}
-#endif
-
 		Info.osType = OS_BSDI_UNIX;
 		Info.osMajorVersion = osrelease[0] - '0';
 		Info.osMinorVersion = osrelease[2] - '0';

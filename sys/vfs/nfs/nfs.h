@@ -13,11 +13,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -35,7 +31,6 @@
  *
  *	@(#)nfs.h	8.4 (Berkeley) 5/1/95
  * $FreeBSD: src/sys/nfs/nfs.h,v 1.53.2.5 2002/02/20 01:35:34 iedowse Exp $
- * $DragonFly: src/sys/vfs/nfs/nfs.h,v 1.21 2008/09/17 21:44:24 dillon Exp $
  */
 
 #ifndef _NFS_NFS_H_
@@ -176,6 +171,7 @@ struct nfs_args {
 #define	NFSMNT_ACREGMAX		0x00080000
 #define	NFSMNT_ACDIRMIN		0x00100000
 #define	NFSMNT_ACDIRMAX		0x00200000
+#define	NFSMNT_RETRYCNT		0x00400000  /* Set retry count */
 
 #define NFSSTA_HASWRITEVERF	0x00040000  /* Has write verifier for V3 */
 #define NFSSTA_GOTPATHCONF	0x00080000  /* Got the V3 pathconf info */
@@ -350,7 +346,7 @@ struct nfsm_info;
 struct nfsreq {
 	TAILQ_ENTRY(nfsreq) r_chain;
 	struct nfsm_info *r_info;
-	struct mtx_link r_link;
+	mtx_link_t	r_link;
 	struct mbuf	*r_mreq;
 	struct mbuf	*r_mrep;
 	struct mbuf	*r_md;
@@ -456,7 +452,6 @@ struct nfsuid {
 /* Bits for nu_flag */
 #define	NU_INETADDR	0x1
 #define NU_NAM		0x2
-#define NU_NETFAM(u)	(((u)->nu_flag & NU_INETADDR) ? AF_INET : AF_ISO)
 
 struct nfsrv_rec {
 	STAILQ_ENTRY(nfsrv_rec) nr_link;
@@ -657,6 +652,8 @@ extern struct lwkt_token nfs_token;
 u_quad_t nfs_curusec (void);
 int	nfs_init (struct vfsconf *vfsp);
 int	nfs_uninit (struct vfsconf *vfsp);
+struct ucred *nfs_crhold(struct ucred *cred);
+int	nfs_crsame(struct ucred *cr1, struct ucred *cr2);
 int	nfs_reply (struct nfsmount *nmp, struct nfsreq *);
 int	nfs_getreq (struct nfsrv_descript *,struct nfsd *,int);
 int	nfs_send (struct socket *, struct sockaddr *, struct mbuf *, 
@@ -694,6 +691,7 @@ int	nfs_namei (struct nlookupdata *, struct ucred *, int,
 		    struct nfssvc_sock *, struct sockaddr *, struct mbuf **,
 		    caddr_t *, struct vnode **, struct thread *, int, int);
 void	nfsrv_initcache (void);
+void	nfsrv_destroycache (void);
 int	nfs_getauth (struct nfsmount *, struct nfsreq *, struct ucred *, 
 			 char **, int *, char *, int *, NFSKERBKEY_T);
 int	nfs_getnickauth (struct nfsmount *, struct ucred *, char **, 
@@ -703,6 +701,7 @@ int	nfs_savenickauth (struct nfsmount *, struct ucred *, int,
 			      struct mbuf *);
 int	nfs_adv (struct mbuf **, caddr_t *, int, int);
 void	nfs_nhinit (void);
+void	nfs_nhdestroy (void);
 int	nfs_nmcancelreqs (struct nfsmount *);
 void	nfs_timer_callout (void*);
 int	nfsrv_dorec (struct nfssvc_sock *, struct nfsd *, 
@@ -792,7 +791,7 @@ void	nfsrv_rcv_upcall (struct socket *so, void *arg, int waitflag);
 void	nfsrv_slpderef (struct nfssvc_sock *slp);
 void	nfsrv_slpref (struct nfssvc_sock *slp);
 int	nfs_meta_setsize (struct vnode *vp, struct thread *td,
-			off_t nbase, int trivial);
+			off_t nbase, int nvextflags);
 int	nfs_clientd(struct nfsmount *nmp, struct ucred *cred,
 			struct nfsd_cargs *ncd, int flag, caddr_t argp,
 			struct thread *td);

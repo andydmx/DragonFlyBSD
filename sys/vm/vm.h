@@ -1,6 +1,7 @@
 /*
  * Copyright (c) 1991, 1993
  *	The Regents of the University of California.  All rights reserved.
+ * Copyright (c) 2003-2019 The DragonFly Project.  All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -10,11 +11,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -104,15 +101,8 @@ typedef u_char vm_maptype_t;	/* type of vm_map_entry */
 #define VM_MAPTYPE_SUBMAP	3
 #define VM_MAPTYPE_UKSMAP	4	/* user-kernel shared memory */
 
-union vm_map_object;
-typedef union vm_map_object vm_map_object_t;
-
 struct vm_map_entry;
-typedef struct vm_map_entry *vm_map_entry_t;
-
 struct vm_map;
-typedef struct vm_map *vm_map_t;
-
 struct vm_object;
 typedef struct vm_object *vm_object_t;
 

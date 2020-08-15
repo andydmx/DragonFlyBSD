@@ -1645,19 +1645,22 @@ twe_describe_controller(struct twe_softc *sc)
     TWE_Param		*p[6];
     u_int8_t		ports;
     u_int32_t		size;
-    int			i;
+    int			i, error;
 
     debug_called(2);
 
     TWE_IO_LOCK(sc);
 
+    ports = 0;
+    size = 0;
     /* get the port count */
-    twe_get_param_1(sc, TWE_PARAM_CONTROLLER, TWE_PARAM_CONTROLLER_PortCount, &ports);
+    error = twe_get_param_1(sc, TWE_PARAM_CONTROLLER,
+	TWE_PARAM_CONTROLLER_PortCount, &ports);
 
     /* get version strings */
     p[0] = twe_get_param(sc, TWE_PARAM_VERSION, TWE_PARAM_VERSION_FW,   16, NULL);
     p[1] = twe_get_param(sc, TWE_PARAM_VERSION, TWE_PARAM_VERSION_BIOS, 16, NULL);
-    if (p[0] && p[1])
+    if (error == 0 && p[0] && p[1])
 	 twe_printf(sc, "%d ports, Firmware %.16s, BIOS %.16s\n", ports, p[0]->data, p[1]->data);
 
     if (bootverbose) {
@@ -1689,9 +1692,10 @@ twe_describe_controller(struct twe_softc *sc)
 	for (i = 0; i < ports; i++) {
 	    if (p[0]->data[i] != TWE_PARAM_DRIVESTATUS_Present)
 		continue;
-	    twe_get_param_4(sc, TWE_PARAM_DRIVEINFO + i, TWE_PARAM_DRIVEINFO_Size, &size);
+	    error = twe_get_param_4(sc, TWE_PARAM_DRIVEINFO + i,
+		TWE_PARAM_DRIVEINFO_Size, &size);
 	    p[1] = twe_get_param(sc, TWE_PARAM_DRIVEINFO + i, TWE_PARAM_DRIVEINFO_Model, 40, NULL);
-	    if (p[1] != NULL) {
+	    if (error == 0 && p[1] != NULL) {
 		twe_printf(sc, "port %d: %.40s %dMB\n", i, p[1]->data, size / 2048);
 		kfree(p[1], M_DEVBUF);
 	    } else {
@@ -1735,16 +1739,18 @@ twe_check_bits(struct twe_softc *sc, u_int32_t status_reg)
      * TWE_DEBUG is not set, which will call us again as part of the soft reset.
      */
     if ((status_reg & TWE_STATUS_PANIC_BITS) != 0) {
-	twe_printf(sc, "FATAL STATUS BIT(S) %b\n", status_reg & TWE_STATUS_PANIC_BITS,
-		   TWE_STATUS_BITS_DESCRIPTION);
+	twe_printf(sc, "FATAL STATUS BIT(S) %pb%i\n",
+		   TWE_STATUS_BITS_DESCRIPTION,
+		   status_reg & TWE_STATUS_PANIC_BITS);
 	twe_panic(sc, "fatal status bits");
     }
 
     result = 0;
     if ((status_reg & TWE_STATUS_EXPECTED_BITS) != TWE_STATUS_EXPECTED_BITS) {
 	if (time_uptime > (lastwarn[0] + 5)) {
-	    twe_printf(sc, "missing expected status bit(s) %b\n", ~status_reg & TWE_STATUS_EXPECTED_BITS, 
-		       TWE_STATUS_BITS_DESCRIPTION);
+	    twe_printf(sc, "missing expected status bit(s) %pb%i\n",
+		       TWE_STATUS_BITS_DESCRIPTION,
+		       ~status_reg & TWE_STATUS_EXPECTED_BITS);
 	    lastwarn[0] = time_uptime;
 	}
 	result = 1;
@@ -1752,8 +1758,9 @@ twe_check_bits(struct twe_softc *sc, u_int32_t status_reg)
 
     if ((status_reg & TWE_STATUS_UNEXPECTED_BITS) != 0) {
 	if (time_uptime > (lastwarn[1] + 5)) {
-	    twe_printf(sc, "unexpected status bit(s) %b\n", status_reg & TWE_STATUS_UNEXPECTED_BITS, 
-		       TWE_STATUS_BITS_DESCRIPTION);
+	    twe_printf(sc, "unexpected status bit(s) %pb%i\n",
+		       TWE_STATUS_BITS_DESCRIPTION,
+		       status_reg & TWE_STATUS_UNEXPECTED_BITS);
 	    lastwarn[1] = time_uptime;
 	}
 	result = 1;
@@ -1896,7 +1903,7 @@ twe_print_controller(struct twe_softc *sc)
     u_int32_t		status_reg;
 
     status_reg = TWE_STATUS(sc);
-    twe_printf(sc, "status   %b\n", status_reg, TWE_STATUS_BITS_DESCRIPTION);
+    twe_printf(sc, "status   %pb%i\n", TWE_STATUS_BITS_DESCRIPTION, status_reg);
     twe_printf(sc, "          current  max    min\n");
     twe_printf(sc, "free      %04d     %04d   %04d\n",
 	sc->twe_qstat[TWEQ_FREE].q_length, sc->twe_qstat[TWEQ_FREE].q_max, sc->twe_qstat[TWEQ_FREE].q_min);

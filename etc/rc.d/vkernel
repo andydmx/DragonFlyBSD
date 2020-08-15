@@ -8,6 +8,7 @@
 
 name="vkernel"
 rcvar=`set_rcvar`
+
 start_cmd="vkernel_start"
 stop_cmd="vkernel_stop"
 
@@ -16,15 +17,31 @@ vkernel_start()
 	echo -n 'Starting virtual kernels:'
 	for _vkernel in ${vkernel_list}
 	do
+		# Start with a clean set of variables
+		unset pidfile bin memsize rootimgs ifaces logfile flags
+		unset vkuser vkgroup memimg
+
+		# Configure user to run vkernel
+		eval vkuser=\"\${vkernel_${_vkernel}_user}\"
+		if [ -z "${vkuser}" ]; then
+		    vkuser="root"
+		    vkgroup="wheel"
+		else
+		    vkgroup=$(id -ng ${vkuser})
+		fi
+
 		# Check if already running
 		eval pidfile="/var/run/vkernel.${_vkernel}.pid"
 		if [ -f "${pidfile}" ]; then
 			eval pid=`cat ${pidfile}`
 			if [ ! -z "${pid}" -a ! -z "`ps axwwp ${pid} | grep -wE "^[ ]*${pid}" | grep -v grep | awk '{print $1}'`" ]; then
 				echo
-				warn "Vkernel ${_vkernel} already running? (check ${pidfile})"
+				warn "vkernel ${_vkernel} already running? (check ${pidfile})"
 				continue
 			fi
+		else
+			# Regular users do not have write access in /var/run
+			install -c -o ${vkuser} -g ${vkgroup} /dev/null ${pidfile}
 		fi
 
 		# Configure vkernel binary
@@ -47,6 +64,35 @@ vkernel_start()
 			continue
 		else
 			memsize="-m ${_memsize}"
+		fi
+
+		# Configure vkernel memory image file
+		eval _memimg=\"\${vkernel_${_vkernel}_memimg}\"
+		if [ -z "${_memimg}" ]; then
+			mkdir -m 1777 -p /var/vkernel
+
+			for n in $(seq 0 999999)
+			do
+				eval _memf=$(printf "/var/vkernel/memimg.%06s" ${n})
+				if [ ! -f "${_memf}" ]
+				then
+					memimg=" -i ${_memf}"
+					break
+				else
+					if lockf -kst 0 ${_memf} echo >/dev/null
+					then
+						# Test if memimg is writable by vkuser
+						su - ${vkuser} -c "test -w ${_memf}"
+						if [ $? -eq 0 ]
+						then
+							memimg="-i ${_memf}"
+							break
+						fi
+					fi
+				fi
+			done
+		else
+			memimg="-i ${_memimg}"
 		fi
 
 		# Configure vkernel root image(s)
@@ -77,7 +123,9 @@ vkernel_start()
 		# Configure optional flags
 		eval flags=\"\${vkernel_${_vkernel}_flags}\"
 
-		eval "daemon ${bin} ${memsize} ${rootimgs} ${ifaces} ${flags} -p ${pidfile} >>${logfile} 2>&1 </dev/null"
+		eval "daemon -u ${vkuser} ${bin} ${memsize} ${rootimgs} " \
+		     "${memimg} ${ifaces} ${flags} -p ${pidfile}" \
+		     ">>${logfile} 2>&1 </dev/null"
 		echo -n " ${_vkernel}"
 	done
 	echo '.'

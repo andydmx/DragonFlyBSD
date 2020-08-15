@@ -13,13 +13,17 @@ MAN=	acpiexec.8
 
 SRCS=	\
 	aeexec.c \
+	aeexception.c \
 	aehandlers.c \
 	aeinitfile.c \
+	aeinstall.c \
 	aemain.c \
 	aeregion.c \
-	aetables.c
+	aetables.c \
+	aetests.c
 
 SRCS+=	\
+	acfileio.c \
 	acgetline.c \
 	ahids.c \
 	ahuuids.c \
@@ -33,6 +37,7 @@ SRCS+=	\
 	dbinput.c \
 	dbmethod.c \
 	dbnames.c \
+	dbobject.c \
 	dbstats.c \
 	dbtest.c \
 	dbutils.c \
@@ -41,7 +46,6 @@ SRCS+=	\
 	dmcstyle.c \
 	dmdeferred.c \
 	dmnames.c \
-	dmobject.c \
 	dmopcode.c \
 	dmresrc.c \
 	dmresrcl.c \
@@ -51,12 +55,14 @@ SRCS+=	\
 	dmwalk.c \
 	dsargs.c \
 	dscontrol.c \
+	dsdebug.c \
 	dsfield.c \
 	dsinit.c \
 	dsmethod.c \
 	dsmthdat.c \
 	dsobject.c \
 	dsopcode.c \
+	dspkginit.c \
 	dsutils.c \
 	dswexec.c \
 	dswload.c \
@@ -78,6 +84,7 @@ SRCS+=	\
 	evxfevnt.c \
 	evxfgpe.c \
 	evxfregn.c \
+	exconcat.c \
 	exconfig.c \
 	exconvrt.c \
 	excreate.c \
@@ -97,10 +104,12 @@ SRCS+=	\
 	exresnte.c \
 	exresolv.c \
 	exresop.c \
+	exserial.c \
 	exstore.c \
 	exstoren.c \
 	exstorob.c \
 	exsystem.c \
+	extrace.c \
 	exutils.c \
 	getopt.c \
 	hwacpi.c \
@@ -109,6 +118,7 @@ SRCS+=	\
 	hwpci.c \
 	hwregs.c \
 	hwsleep.c \
+	hwtimer.c \
 	hwvalid.c \
 	hwxface.c \
 	hwxfsleep.c \
@@ -133,7 +143,7 @@ SRCS+=	\
 	nsxfeval.c \
 	nsxfname.c \
 	nsxfobj.c \
-	oslibcfs.c \
+	osgendbg.c \
 	osunixxf.c \
 	psargs.c \
 	psloop.c \
@@ -170,6 +180,7 @@ SRCS+=	\
 	tbxfload.c \
 	tbxfroot.c \
 	utaddress.c \
+	utascii.c \
 	utalloc.c \
 	utbuffer.c \
 	utcache.c \
@@ -180,7 +191,6 @@ SRCS+=	\
 	uterror.c \
 	uteval.c \
 	utexcep.c \
-	utfileio.o \
 	utglobal.c \
 	uthex.c \
 	utids.c \
@@ -189,14 +199,17 @@ SRCS+=	\
 	utmath.c \
 	utmisc.c \
 	utmutex.c \
+	utnonansi.c \
 	utobject.c \
 	utosi.c \
 	utownerid.c \
 	utpredef.c \
-	utprint.c \
+	utresdecode.c \
 	utresrc.c \
 	utstate.c \
 	utstring.c \
+	utstrsuppt.c \
+	utstrtoul64.c \
 	uttrack.c \
 	utuuid.c \
 	utxface.c \
@@ -215,5 +228,8 @@ CFLAGS+= \
 
 LDADD+=	-lpthread
 DPADD+=	${LIBPTHREAD}
+
+# XXX issue with ACPI_OSD_EXEC_CALLBACK
+NO_WCAST_FUNCTION_TYPE=
 
 .include <bsd.prog.mk>

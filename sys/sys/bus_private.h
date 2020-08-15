@@ -24,7 +24,6 @@
  * SUCH DAMAGE.
  *
  * $FreeBSD: src/sys/sys/bus_private.h,v 1.11.2.2 2000/08/03 00:25:22 peter Exp $
- * $DragonFly: src/sys/sys/bus_private.h,v 1.10 2008/09/30 12:20:29 hasso Exp $
  */
 
 #ifndef _SYS_BUS_PRIVATE_H_
@@ -33,10 +32,8 @@
 #include <sys/sysctl.h>
 
 #if !defined(_KERNEL) && !defined(_KERNEL_STRUCTURES)
-
 #error "This file should not be included by userland programs."
-
-#else
+#endif
 
 #ifndef _SYS_BUS_H_
 #include <sys/bus.h>
@@ -56,7 +53,7 @@ struct driverlink {
  */
 typedef TAILQ_HEAD(devclass_list, devclass) devclass_list_t;
 typedef TAILQ_HEAD(driver_list, driverlink) driver_list_t;
-typedef TAILQ_HEAD(device_list, device) device_list_t;
+typedef TAILQ_HEAD(device_list, bsd_device) device_list_t;
 
 struct devclass {
 	TAILQ_ENTRY(devclass) link;
@@ -97,7 +94,7 @@ struct config_device {
 /*
  * Implementation of device.
  */
-struct device {
+struct bsd_device {
 	/*
 	 * A device is a kernel object. The first field must be the
 	 * current ops table for the object.
@@ -107,8 +104,8 @@ struct device {
 	/*
 	 * Device hierarchy.
 	 */
-	TAILQ_ENTRY(device)	link;		/* list of devices in parent */
-	TAILQ_ENTRY(device)	devlink;	/* global device list membership */
+	TAILQ_ENTRY(bsd_device)	link;		/* list of devices in parent */
+	TAILQ_ENTRY(bsd_device)	devlink;	/* global device list membership */
 	device_t		parent;
 	device_list_t		children;	/* list of subordinate devices */
 
@@ -148,5 +145,4 @@ struct device_op_desc {
 	const char*	name;		/* unique name (for registration) */
 };
 
-#endif	/* _KERNEL || _KERNEL_STRUCTURES */
 #endif	/* !_SYS_BUS_PRIVATE_H_ */

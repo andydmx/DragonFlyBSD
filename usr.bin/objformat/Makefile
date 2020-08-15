@@ -26,8 +26,9 @@ LINKS+=	${BINDIR}/objformat ${BINDIR}/as
 LINKS+=	${BINDIR}/objformat ${BINDIR}/c++filt
 LINKS+=	${BINDIR}/objformat ${BINDIR}/elfedit
 LINKS+=	${BINDIR}/objformat ${BINDIR}/gprof
-LINKS+=	${BINDIR}/objformat ${BINDIR}/incremental-dump
 LINKS+=	${BINDIR}/objformat ${BINDIR}/ld
+LINKS+=	${BINDIR}/objformat ${BINDIR}/ld.bfd
+LINKS+=	${BINDIR}/objformat ${BINDIR}/ld.gold
 LINKS+=	${BINDIR}/objformat ${BINDIR}/nm
 LINKS+=	${BINDIR}/objformat ${BINDIR}/objcopy
 LINKS+=	${BINDIR}/objformat ${BINDIR}/objdump
@@ -37,7 +38,7 @@ LINKS+=	${BINDIR}/objformat ${BINDIR}/size
 LINKS+=	${BINDIR}/objformat ${BINDIR}/strings
 LINKS+=	${BINDIR}/objformat ${BINDIR}/strip
 
-# These will exec /usr/bin/${CCVER}/<name>
+# These will exec /usr/libexec/${CCVER}/<name>
 #
 LINKS+=	${BINDIR}/objformat ${BINDIR}/CC
 LINKS+=	${BINDIR}/objformat ${BINDIR}/cpp

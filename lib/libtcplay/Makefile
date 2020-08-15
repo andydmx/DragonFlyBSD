@@ -1,9 +1,8 @@
 LIB=		tcplay
-MAJ_VER=	2
-MIN_VER=	0
+MAJ_VER=	3
+MIN_VER=	3
 SHLIB_MAJOR?=	${MAJ_VER}
 SHLIB_MINOR?=	${MIN_VER}
-WARNS?=		6
 MAN=		tcplay.3
 
 MLINKS+=	tcplay.3	tc_api_init.3
@@ -20,6 +19,7 @@ MLINKS+=	tcplay.3	tc_api_task_get_error.3
 
 CFLAGS+=	-DMAJ_VER=${MAJ_VER} -DMIN_VER=${MIN_VER}
 CFLAGS+=	-D_FILE_OFFSET_BITS=64
+CFLAGS+=	-I${.CURDIR}/../../crypto/libressl/include
 
 SRCS+=		tcplay.c crc32.c safe_mem.c io.c hdr.c humanize.c
 SRCS+=		crypto.c generic_xts.c

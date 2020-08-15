@@ -30,6 +30,7 @@
 
 #include "os.h"
 #include <err.h>
+#include <fcntl.h>
 #include <kvm.h>
 #include <stdio.h>
 #include <unistd.h>
@@ -37,13 +38,13 @@
 #include <pwd.h>
 #include <sys/errno.h>
 #include <sys/sysctl.h>
-#include <sys/file.h>
 #include <sys/vmmeter.h>
 #include <sys/resource.h>
 #include <sys/rtprio.h>
 
 /* Swap */
 #include <stdlib.h>
+#include <string.h>
 #include <sys/conf.h>
 
 #include <osreldate.h>		/* for changes in kernel structures */
@@ -61,13 +62,14 @@ static int namelength;
 static int cmdlength;
 static int show_fullcmd;
 
-int n_cpus = 0;
+int n_cpus, enable_ncpus;
 
 /* get_process_info passes back a handle.  This is what it looks like: */
 
 struct handle {
 	struct kinfo_proc **next_proc;	/* points to next valid proc pointer */
 	int remaining;		/* number of pointers remaining */
+	int show_threads;
 };
 
 /* declarations for load_avg */
@@ -85,10 +87,10 @@ struct handle {
  */
 
 static char smp_header[] =
-"   PID %-*.*s NICE  SIZE    RES    STATE CPU  TIME   CTIME    CPU COMMAND";
+"   PID %-*.*s NICE  SIZE    RES    STATE   C   TIME   CTIME    CPU COMMAND";
 
 #define smp_Proc_format \
-	"%6d %-*.*s %3d%7s %6s %8.8s %2d %6s %7s %5.2f%% %.*s"
+	"%6d %-*.*s %3d%7s %6s %8.8s %3d %6s %7s %5.2f%% %.*s"
 
 /* process state names for the "STATE" column of the display */
 /*
@@ -153,6 +155,12 @@ static int onproc = -1;
 static int pref_len;
 static struct kinfo_proc *pbase;
 static struct kinfo_proc **pref;
+
+static uint64_t prev_pbase_time;	/* unit: us */
+static struct kinfo_proc *prev_pbase;
+static int prev_pbase_alloc;
+static int prev_nproc;
+static int fscale;
 
 /* these are for getting the memory statistics */
 
@@ -232,7 +240,7 @@ int
 machine_init(struct statics *statics)
 {
 	int pagesize;
-	size_t modelen;
+	size_t modelen, prmlen;
 	struct passwd *pw;
 	struct timeval boottime;
 
@@ -246,6 +254,10 @@ machine_init(struct statics *statics)
 		/* we have no boottime to report */
 		boottime.tv_sec = -1;
 	}
+
+	prmlen = sizeof(fscale);
+	if (sysctlbyname("kern.fscale", &fscale, &prmlen, NULL, 0) == -1)
+		err(1, "sysctl kern.fscale failed");
 
 	while ((pw = getpwent()) != NULL) {
 		if ((int)strlen(pw->pw_name) > namelength)
@@ -263,6 +275,10 @@ machine_init(struct statics *statics)
 	pref = NULL;
 	nproc = 0;
 	onproc = -1;
+	prev_pbase = NULL;
+	prev_pbase_alloc = 0;
+	prev_pbase_time = 0;
+	prev_nproc = 0;
 	/*
 	 * get the page size with "getpagesize" and calculate pageshift from
 	 * it
@@ -286,6 +302,7 @@ machine_init(struct statics *statics)
 	statics->order_names = ordernames;
 	/* we need kvm descriptor in order to show full commands */
 	statics->flags.fullcmds = kd != NULL;
+	statics->flags.threads = 1;
 
 	/* all done! */
 	return (0);
@@ -440,10 +457,55 @@ get_system_info(struct system_info *si)
 
 static struct handle handle;
 
+static void
+fixup_pctcpu(struct kinfo_proc *fixit, uint64_t d)
+{
+	struct kinfo_proc *pp;
+	uint64_t ticks;
+	int i;
+
+	if (prev_nproc == 0 || d == 0)
+		return;
+
+	if (LP(fixit, pid) == -1) {
+		/* Skip kernel "idle" threads */
+		if (PP(fixit, stat) == SIDL)
+			return;
+		for (pp = prev_pbase, i = 0; i < prev_nproc; pp++, i++) {
+			if (LP(pp, pid) == -1 &&
+			    PP(pp, ktaddr) == PP(fixit, ktaddr))
+				break;
+		}
+	} else {
+		for (pp = prev_pbase, i = 0; i < prev_nproc; pp++, i++) {
+			if (LP(pp, pid) == LP(fixit, pid) &&
+			    LP(pp, tid) == LP(fixit, tid)) {
+				if (PP(pp, paddr) != PP(fixit, paddr)) {
+					/* pid/tid are reused */
+					pp = NULL;
+				}
+				break;
+			}
+		}
+	}
+	if (i == prev_nproc || pp == NULL)
+		return;
+
+	ticks = LP(fixit, iticks) - LP(pp, iticks);
+	ticks += LP(fixit, sticks) - LP(pp, sticks);
+	ticks += LP(fixit, uticks) - LP(pp, uticks);
+	if (ticks > d * 1000)
+		ticks = d * 1000;
+	LP(fixit, pctcpu) = (ticks * (uint64_t)fscale) / d;
+}
+
 caddr_t 
 get_process_info(struct system_info *si, struct process_select *sel,
     int compare_index)
 {
+	struct timespec tv;
+	uint64_t t, d = 0;
+
 	int i;
 	int total_procs;
 	int active_procs;
@@ -455,9 +517,9 @@ get_process_info(struct system_info *si, struct process_select *sel,
 	int show_system;
 	int show_uid;
 	int show_threads;
+	char *match_command;
 
 	show_threads = sel->threads;
-
 
 	pbase = kvm_getprocs(kd,
 	    KERN_PROC_ALL | (show_threads ? KERN_PROC_FLAG_LWP : 0), 0, &nproc);
@@ -468,6 +530,12 @@ get_process_info(struct system_info *si, struct process_select *sel,
 		(void)fprintf(stderr, "top: Out of memory.\n");
 		quit(23);
 	}
+
+	clock_gettime(CLOCK_MONOTONIC_PRECISE, &tv);
+	t = (tv.tv_sec * 1000000ULL) + (tv.tv_nsec / 1000ULL);
+	if (prev_pbase_time > 0 && t > prev_pbase_time)
+		d = t - prev_pbase_time;
+
 	/* get a pointer to the states summary array */
 	si->procstates = process_states;
 
@@ -476,6 +544,7 @@ get_process_info(struct system_info *si, struct process_select *sel,
 	show_system = sel->system;
 	show_uid = sel->uid != -1;
 	show_fullcmd = sel->fullcmd;
+	match_command = sel->command;
 
 	/* count up process states and get pointers to interesting procs */
 	total_procs = 0;
@@ -499,15 +568,52 @@ get_process_info(struct system_info *si, struct process_select *sel,
 				process_states[0]++;
 			if (pstate >= 0 && pstate < MAXPSTATES - 1)
 				process_states[pstate]++;
-			if ((show_system && (LP(pp, pid) == -1)) ||
-			    (show_idle || (LP(pp, pctcpu) != 0) ||
-			    (lpstate == LSRUN)) &&
-			    (!show_uid || PP(pp, ruid) == (uid_t) sel->uid)) {
-				*prefp++ = pp;
-				active_procs++;
+
+			if (match_command != NULL &&
+			    strstr(PP(pp, comm), match_command) == NULL) {
+				/* Command does not match */
+				continue;
 			}
+
+			if (show_uid && PP(pp, ruid) != (uid_t)sel->uid) {
+				/* UID does not match */
+				continue;
+			}
+
+			if (!show_system && LP(pp, pid) == -1) {
+				/* Don't show system processes */
+				continue;
+			}
+
+			/* Fix up pctcpu before show_idle test */
+			fixup_pctcpu(pp, d);
+
+			if (!show_idle && LP(pp, pctcpu) == 0 &&
+			    lpstate != LSRUN) {
+				/* Don't show idle processes */
+				continue;
+			}
+
+			*prefp++ = pp;
+			active_procs++;
 		}
 	}
+
+	/*
+	 * Save kinfo_procs for later pctcpu fixup.
+	 */
+	if (prev_pbase_alloc < nproc) {
+		prev_pbase_alloc = nproc;
+		prev_pbase = realloc(prev_pbase,
+		    prev_pbase_alloc * sizeof(struct kinfo_proc));
+		if (prev_pbase == NULL) {
+			fprintf(stderr, "top: Out of memory.\n");
+			quit(23);
+		}
+	}
+	prev_nproc = nproc;
+	prev_pbase_time = t;
+	memcpy(prev_pbase, pbase, nproc * sizeof(struct kinfo_proc));
 
 	qsort((char *)pref, active_procs, sizeof(struct kinfo_proc *),
 	    (int (*)(const void *, const void *))proc_compares[compare_index]);
@@ -519,6 +625,7 @@ get_process_info(struct system_info *si, struct process_select *sel,
 	/* pass back a handle */
 	handle.next_proc = pref;
 	handle.remaining = active_procs;
+	handle.show_threads = show_threads;
 	return ((caddr_t) & handle);
 }
 
@@ -535,8 +642,6 @@ format_next_process(caddr_t xhandle, char *(*get_userid) (int))
 	char status[16];
 	int state;
 	int xnice;
-	int prefer_fullcmd;
-	char **comm_full;
 	char *comm;
 	char cputime_fmt[10], ccputime_fmt[10];
 
@@ -546,21 +651,41 @@ format_next_process(caddr_t xhandle, char *(*get_userid) (int))
 	hp->remaining--;
 
 	/* get the process's command name */
-	prefer_fullcmd = show_fullcmd;
 	if (show_fullcmd) {
-		if ((comm_full = kvm_getargv(kd, pp, 0)) == NULL) {
-			prefer_fullcmd = 0;
+		char **comm_full = kvm_getargv(kd, pp, 0);
+		if (comm_full != NULL)
+			comm = *comm_full;
+		else
 			comm = PP(pp, comm);
-		}
 	}
 	else {
 		comm = PP(pp, comm);
+	}
+
+	/* the actual field to display */
+	char cmdfield[MAX_COLS];
+
+	if (PP(pp, flags) & P_SYSTEM) {
+		/* system process */
+		snprintf(cmdfield, sizeof cmdfield, "[%s]", comm);
+	} else if (hp->show_threads && PP(pp, nthreads) > 1) {
+		/* display it as a thread */
+		if (strcmp(PP(pp, comm), LP(pp, comm)) == 0) {
+			snprintf(cmdfield, sizeof cmdfield, "%s{%d}", comm,
+			    LP(pp, tid));
+		} else {
+			/* show thread name in addition to tid */
+			snprintf(cmdfield, sizeof cmdfield, "%s{%d/%s}", comm,
+			    LP(pp, tid), LP(pp, comm));
+		}
+	} else {
+		snprintf(cmdfield, sizeof cmdfield, "%s", comm);
 	}
 	
 	/*
 	 * Convert the process's runtime from microseconds to seconds.  This
 	 * time includes the interrupt time to be in compliance with ps output.
-	*/
+	 */
 	cputime = (LP(pp, uticks) + LP(pp, sticks) + LP(pp, iticks)) / 1000000;
 	ccputime = cputime + PP(pp, cru).ru_stime.tv_sec + PP(pp, cru).ru_utime.tv_sec;
 	format_time(cputime, cputime_fmt, sizeof(cputime_fmt));
@@ -585,8 +710,7 @@ format_next_process(caddr_t xhandle, char *(*get_userid) (int))
 		/* fall through */
 	default:
 
-		if (state >= 0 &&
-		    (unsigned)state < sizeof(state_abbrev) / sizeof(*state_abbrev))
+		if (state >= 0 && (unsigned)state < NELEM(state_abbrev))
 			sprintf(status, "%.6s", state_abbrev[(unsigned char)state]);
 		else
 			sprintf(status, "?%5d", state);
@@ -631,7 +755,7 @@ format_next_process(caddr_t xhandle, char *(*get_userid) (int))
 	    ccputime_fmt,
 	    100.0 * pct,
 	    cmdlength,
-	    prefer_fullcmd ? *comm_full : comm);
+	    cmdfield);
 
 	/* return the result */
 	return (fmt);
@@ -704,6 +828,25 @@ static unsigned char sorted_state[] =
 #define ORDERKEY_PRSSIZE \
   if((result = VP(p2, prssize) - VP(p1, prssize)) == 0)
 
+static __inline int
+orderkey_kernidle(const struct kinfo_proc *p1, const struct kinfo_proc *p2)
+{
+	int p1_kidle = 0, p2_kidle = 0;
+
+	if (LP(p1, pid) == -1 && PP(p1, stat) == SIDL)
+		p1_kidle = 1;
+	if (LP(p2, pid) == -1 && PP(p2, stat) == SIDL)
+		p2_kidle = 1;
+
+	if (!p2_kidle && p1_kidle)
+		return 1;
+	if (p2_kidle && !p1_kidle)
+		return -1;
+	return 0;
+}
+
+#define ORDERKEY_KIDLE	if ((result = orderkey_kernidle(p1, p2)) == 0)
+
 /* compare_cpu - the comparison function for sorting by cpu percentage */
 
 int
@@ -718,6 +861,7 @@ proc_compare(struct kinfo_proc **pp1, struct kinfo_proc **pp2)
 	p1 = *(struct kinfo_proc **) pp1;
 	p2 = *(struct kinfo_proc **) pp2;
 
+	ORDERKEY_KIDLE
 	ORDERKEY_PCTCPU
 	ORDERKEY_CPTICKS
 	ORDERKEY_STATE
@@ -745,6 +889,7 @@ compare_size(struct kinfo_proc **pp1, struct kinfo_proc **pp2)
 
 	ORDERKEY_MEM
 	ORDERKEY_RSSIZE
+	ORDERKEY_KIDLE
 	ORDERKEY_PCTCPU
 	ORDERKEY_CPTICKS
 	ORDERKEY_STATE
@@ -770,6 +915,7 @@ compare_res(struct kinfo_proc **pp1, struct kinfo_proc **pp2)
 
 	ORDERKEY_RSSIZE
 	ORDERKEY_MEM
+	ORDERKEY_KIDLE
 	ORDERKEY_PCTCPU
 	ORDERKEY_CPTICKS
 	ORDERKEY_STATE
@@ -796,6 +942,7 @@ compare_pres(struct kinfo_proc **pp1, struct kinfo_proc **pp2)
 	ORDERKEY_PRSSIZE
 	ORDERKEY_RSSIZE
 	ORDERKEY_MEM
+	ORDERKEY_KIDLE
 	ORDERKEY_PCTCPU
 	ORDERKEY_CPTICKS
 	ORDERKEY_STATE
@@ -819,6 +966,7 @@ compare_time(struct kinfo_proc **pp1, struct kinfo_proc **pp2)
 	p1 = *(struct kinfo_proc **) pp1;
 	p2 = *(struct kinfo_proc **) pp2;
 
+	ORDERKEY_KIDLE
 	ORDERKEY_CPTICKS
 	ORDERKEY_PCTCPU
 	ORDERKEY_KTHREADS
@@ -843,7 +991,8 @@ compare_ctime(struct kinfo_proc **pp1, struct kinfo_proc **pp2)
 	/* remove one level of indirection */
 	p1 = *(struct kinfo_proc **) pp1;
 	p2 = *(struct kinfo_proc **) pp2;
-	
+
+	ORDERKEY_KIDLE
 	ORDERKEY_CTIME
 	ORDERKEY_PCTCPU
 	ORDERKEY_KTHREADS
@@ -874,6 +1023,7 @@ compare_prio(struct kinfo_proc **pp1, struct kinfo_proc **pp2)
 	ORDERKEY_KTHREADS
 	ORDERKEY_KTHREADS_PRIO
 	ORDERKEY_PRIO
+	ORDERKEY_KIDLE
 	ORDERKEY_CPTICKS
 	ORDERKEY_PCTCPU
 	ORDERKEY_STATE
@@ -898,6 +1048,7 @@ compare_thr(struct kinfo_proc **pp1, struct kinfo_proc **pp2)
 
 	ORDERKEY_KTHREADS
 	ORDERKEY_KTHREADS_PRIO
+	ORDERKEY_KIDLE
 	ORDERKEY_CPTICKS
 	ORDERKEY_PCTCPU
 	ORDERKEY_STATE

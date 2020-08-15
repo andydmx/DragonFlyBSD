@@ -44,14 +44,7 @@
 #include <sys/sysctl.h>
 #include <vm/vm_page2.h>
 
-#include "opt_directio.h"
-
-#define VN_KNOTE(vp, b) \
-	KNOTE((struct klist *)&vp->v_pollinfo.vpi_kqinfo.ki_note, (b))
-
-#ifdef DIRECTIO
-extern int ffs_rawread(struct vnode *vp, struct uio *uio, int *workdone);
-#endif
+#define VN_KNOTE(vp, b) KNOTE(&vp->v_pollinfo.vpi_kqinfo.ki_note, (b))
 
 SYSCTL_DECL(_vfs_ffs);
 
@@ -77,20 +70,10 @@ ffs_read(struct vop_read_args *ap)
 	int ioflag;
 
 	vp = ap->a_vp;
-	seqcount = ap->a_ioflag >> 16;
+	seqcount = ap->a_ioflag >> IO_SEQSHIFT;
 	ip = VTOI(vp);
 	uio = ap->a_uio;
 	ioflag = ap->a_ioflag;
-#ifdef DIRECTIO
-	if ((ioflag & IO_DIRECT) != 0) {
-		int workdone;
-
-		error = ffs_rawread(vp, uio, &workdone);
-		if (error || workdone)
-			return error;
-	}
-#endif
-
 #ifdef DIAGNOSTIC
 	if (uio->uio_rw != UIO_READ)
 		panic("ffs_read: mode");
@@ -238,7 +221,7 @@ ffs_write(struct vop_write_args *ap)
 	struct thread *td;
 
 	extended = 0;
-	seqcount = ap->a_ioflag >> 16;
+	seqcount = ap->a_ioflag >> IO_SEQSHIFT;
 	ioflag = ap->a_ioflag;
 	uio = ap->a_uio;
 	vp = ap->a_vp;
@@ -298,6 +281,11 @@ ffs_write(struct vop_write_args *ap)
 		flags = seqcount << B_SEQSHIFT;
 	if ((ioflag & IO_SYNC) && !DOINGASYNC(vp))
 		flags |= B_SYNC;
+
+	if (uio->uio_segflg == UIO_NOCOPY)
+		ip->i_flag |= IN_NOCOPYWRITE;
+	else
+		vclrflags(vp, VLASTWRITETS);
 
 	for (error = 0; uio->uio_resid > 0;) {
 		lbn = lblkno(fs, uio->uio_offset);
@@ -422,7 +410,11 @@ ffs_write(struct vop_write_args *ap)
 		}
 	} else if (resid > uio->uio_resid && (ioflag & IO_SYNC)) {
 		error = ffs_update(vp, 1);
+	} else {
+		ufs_itimes(vp);
 	}
+	if (uio->uio_segflg == UIO_NOCOPY)
+		ip->i_flag &= ~IN_NOCOPYWRITE;
 
 	return (error);
 }

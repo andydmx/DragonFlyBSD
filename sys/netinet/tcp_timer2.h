@@ -10,11 +10,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -71,6 +67,18 @@ tcp_callout_stop(struct tcpcb *_tp, struct tcp_callout *_tc)
 
 	crit_enter();
 	callout_stop(&_tc->tc_callout);
+	_tp->tt_msg->tt_tasks &= ~_tc->tc_task;
+	_tp->tt_msg->tt_running_tasks &= ~_tc->tc_task;
+	crit_exit();
+}
+
+static __inline void
+tcp_callout_terminate(struct tcpcb *_tp, struct tcp_callout *_tc)
+{
+	KKASSERT(_tp->tt_msg->tt_cpuid == mycpuid);
+
+	crit_enter();
+	callout_terminate(&_tc->tc_callout);
 	_tp->tt_msg->tt_tasks &= ~_tc->tc_task;
 	_tp->tt_msg->tt_running_tasks &= ~_tc->tc_task;
 	crit_exit();

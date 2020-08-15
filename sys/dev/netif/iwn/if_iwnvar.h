@@ -1,4 +1,4 @@
-/*	$FreeBSD: head/sys/dev/iwn/if_iwnvar.h 258035 2013-11-12 05:58:23Z adrian $	*/
+/*	$FreeBSD$	*/
 /*	$OpenBSD: if_iwnvar.h,v 1.18 2010/04/30 16:06:46 damien Exp $	*/
 
 /*-
@@ -20,9 +20,6 @@
  * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
-
-#include <netproto/802_11/ieee80211_amrr.h>
-
 enum iwn_rxon_ctx_id {
 		IWN_RXON_BSS_CTX,
 		IWN_RXON_PAN_CTX,
@@ -118,15 +115,6 @@ struct iwn_tx_ring {
 	int			read;
 };
 
-struct iwn_amrr {
-	struct			ieee80211_node ni;      /* must be the first */
-	int			txcnt;
-	int			retrycnt;
-	int			success;
-	int			success_threshold;
-	int			recovery;
-};
-
 struct iwn_softc;
 
 struct iwn_rx_data {
@@ -153,7 +141,6 @@ struct iwn_node {
 		int			startidx;
 		int			nframes;
 	} agg[IEEE80211_TID_SIZE];
-	struct  ieee80211_amrr_node     amn;
 };
 
 struct iwn_calib_state {
@@ -239,22 +226,22 @@ struct iwn_vap {
 
 	int			(*iv_newstate)(struct ieee80211vap *,
 				    enum ieee80211_state, int);
-	struct  ieee80211_amrr_node     iv_amrr;
 	int			ctx;
 	int			beacon_int;
-	uint8_t		macaddr[IEEE80211_ADDR_LEN];
 
 };
 #define	IWN_VAP(_vap)	((struct iwn_vap *)(_vap))
 
 struct iwn_softc {
-	struct arpcom		arpcom;
 	device_t		sc_dev;
-
-	struct ifnet		*sc_ifp;
 	int			sc_debug;
-
+	struct cdev		*sc_cdev;
+#if defined(__DragonFly__)
+	struct lock		sc_lk;
+#else
 	struct mtx		sc_mtx;
+#endif
+	struct ieee80211com	sc_ic;
 
 	u_int			sc_flags;
 #define IWN_FLAG_HAS_OTPROM	(1 << 1)
@@ -266,6 +253,7 @@ struct iwn_softc {
 #define IWN_FLAG_ADV_BTCOEX	(1 << 8)
 #define IWN_FLAG_PAN_SUPPORT	(1 << 9)
 #define IWN_FLAG_BTCOEX		(1 << 10)
+#define	IWN_FLAG_RUNNING	(1 << 11)
 
 	uint8_t 		hw_type;
 	/* subdevice_id used to adjust configuration */
@@ -315,16 +303,15 @@ struct iwn_softc {
 	bus_space_tag_t		sc_st;
 	bus_space_handle_t	sc_sh;
 	struct resource		*irq;
-	bus_dma_tag_t		sc_dmat;
 	void 			*sc_ih;
 	bus_size_t		sc_sz;
 	int			sc_cap_off;	/* PCIe Capabilities. */
 
 	/* Tasks used by the driver */
-	struct task		sc_reinit_task;
 	struct task		sc_radioon_task;
 	struct task		sc_radiooff_task;
 	struct task		sc_panic_task;
+	struct task		sc_xmit_task;
 
 	/* Taskqueue */
 	struct taskqueue	*sc_tq;
@@ -335,7 +322,6 @@ struct iwn_softc {
 	struct iwn_calib_state	calib;
 	int			last_calib_ticks;
 	struct callout		watchdog_to;
-	struct callout		ct_kill_exit_to;
 	struct iwn_fw_info	fw;
 	struct iwn_calib_info	calibcmd[IWN5000_PHY_CALIB_MAX_RESULT];
 	uint32_t		errptr;
@@ -401,6 +387,9 @@ struct iwn_softc {
 	/* Are we doing a scan? */
 	int			sc_is_scanning;
 
+	/* Are we waiting for a beacon before xmit? */
+	int			sc_beacon_wait;
+
 	struct ieee80211_tx_ampdu *qid2tap[IWN5000_NTXQUEUES];
 
 	int			(*sc_ampdu_rx_start)(struct ieee80211_node *,
@@ -430,6 +419,31 @@ struct iwn_softc {
 
 	/* For specific params */
 	const struct iwn_base_params *base_params;
-	struct sysctl_ctx_list  sc_sysctl_ctx;
-	struct sysctl_oid       *sc_sysctl_tree;
+
+#define	IWN_UCODE_API(ver)	(((ver) & 0x0000FF00) >> 8)
+	uint32_t		ucode_rev;
+
+	/*
+	 * Global queue for queuing xmit frames
+	 * when we can't yet transmit (eg raw
+	 * frames whilst waiting for beacons.)
+	 */
+	struct mbufq		sc_xmit_queue;
 };
+
+#if defined(__DragonFly__)
+#define IWN_LOCK_INIT(_sc) \
+	lockinit(&(_sc)->sc_lk, device_get_nameunit((_sc)->sc_dev), 0, 0)
+#define IWN_LOCK(_sc)			lockmgr(&(_sc)->sc_lk, LK_EXCLUSIVE)
+#define IWN_LOCK_ASSERT(_sc)		KKASSERT(lockstatus(&(_sc)->sc_lk, curthread) == LK_EXCLUSIVE);
+#define IWN_UNLOCK(_sc)			lockmgr(&(_sc)->sc_lk, LK_RELEASE)
+#define IWN_LOCK_DESTROY(_sc)		lockuninit(&(_sc)->sc_lk)
+#else
+#define IWN_LOCK_INIT(_sc) \
+	mtx_init(&(_sc)->sc_mtx, device_get_nameunit((_sc)->sc_dev), \
+	    MTX_NETWORK_LOCK, MTX_DEF)
+#define IWN_LOCK(_sc)			mtx_lock(&(_sc)->sc_mtx)
+#define IWN_LOCK_ASSERT(_sc)		mtx_assert(&(_sc)->sc_mtx, MA_OWNED)
+#define IWN_UNLOCK(_sc)			mtx_unlock(&(_sc)->sc_mtx)
+#define IWN_LOCK_DESTROY(_sc)		mtx_destroy(&(_sc)->sc_mtx)
+#endif

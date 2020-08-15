@@ -62,9 +62,10 @@ struct intr_info {
 	intrec_t	i_reclist;
 	struct thread	*i_thread;	/* don't embed struct thread */
 	struct random_softc i_random;
-	int		i_running;
 	long		i_count;	/* interrupts dispatched */
-	int		i_mplock_required;
+	int		i_running;
+	short		i_mplock_required;
+	short		i_flags;
 	int		i_fast;
 	int		i_slow;
 	int		i_state;
@@ -74,10 +75,17 @@ struct intr_info {
 	int		i_intr;
 };
 
-static struct intr_info intr_info_ary[MAXCPU][MAX_INTS];
+struct intr_info_block {
+	struct intr_info ary[MAXCPU][MAX_INTS];
+};
+
+static struct intr_info_block *intr_block;
 static struct intr_info *swi_info_ary[MAX_SOFTINTS];
 
 static int max_installed_hard_intr[MAXCPU];
+
+MALLOC_DEFINE(M_INTRMNG, "intrmng", "interrupt management");
+
 
 #define EMERGENCY_INTR_POLLING_FREQ_MAX 20000
 
@@ -128,17 +136,21 @@ static void int_moveto_origcpu(int, int);
 static void sched_ithd_intern(struct intr_info *info);
 
 static struct systimer emergency_intr_timer[MAXCPU];
-static struct thread emergency_intr_thread[MAXCPU];
+static struct thread *emergency_intr_thread[MAXCPU];
 
 #define ISTATE_NOTHREAD		0
 #define ISTATE_NORMAL		1
 #define ISTATE_LIVELOCKED	2
 
 static int livelock_limit = 40000;
+static int livelock_limit_hi = 120000;
 static int livelock_lowater = 20000;
 static int livelock_debug = -1;
 SYSCTL_INT(_kern, OID_AUTO, livelock_limit,
         CTLFLAG_RW, &livelock_limit, 0, "Livelock interrupt rate limit");
+SYSCTL_INT(_kern, OID_AUTO, livelock_limit_hi,
+        CTLFLAG_RW, &livelock_limit_hi, 0,
+	"Livelock interrupt rate limit (high frequency)");
 SYSCTL_INT(_kern, OID_AUTO, livelock_lowater,
         CTLFLAG_RW, &livelock_lowater, 0, "Livelock low-water mark restore");
 SYSCTL_INT(_kern, OID_AUTO, livelock_debug,
@@ -160,7 +172,7 @@ SYSCTL_PROC(_kern, OID_AUTO, emergency_intr_freq, CTLTYPE_INT | CTLFLAG_RW,
 static int
 sysctl_emergency_enable(SYSCTL_HANDLER_ARGS)
 {
-	int error, enabled, cpuid, freq;
+	int error, enabled, cpuid, freq, origcpu;
 
 	enabled = emergency_intr_enable;
 	error = sysctl_handle_int(oidp, &enabled, 0, req);
@@ -172,15 +184,19 @@ sysctl_emergency_enable(SYSCTL_HANDLER_ARGS)
 	else
 		freq = 1;
 
-	for (cpuid = 0; cpuid < ncpus; ++cpuid)
+	origcpu = mycpuid;
+	for (cpuid = 0; cpuid < ncpus; ++cpuid) {
+		lwkt_migratecpu(cpuid);
 		systimer_adjust_periodic(&emergency_intr_timer[cpuid], freq);
+	}
+	lwkt_migratecpu(origcpu);
 	return 0;
 }
 
 static int
 sysctl_emergency_freq(SYSCTL_HANDLER_ARGS)
 {
-        int error, phz, cpuid, freq;
+        int error, phz, cpuid, freq, origcpu;
 
         phz = emergency_intr_freq;
         error = sysctl_handle_int(oidp, &phz, 0, req);
@@ -197,8 +213,12 @@ sysctl_emergency_freq(SYSCTL_HANDLER_ARGS)
 	else
 		freq = 1;
 
-	for (cpuid = 0; cpuid < ncpus; ++cpuid)
+	origcpu = mycpuid;
+	for (cpuid = 0; cpuid < ncpus; ++cpuid) {
+		lwkt_migratecpu(cpuid);
 		systimer_adjust_periodic(&emergency_intr_timer[cpuid], freq);
+	}
+	lwkt_migratecpu(origcpu);
         return 0;
 }
 
@@ -227,7 +247,7 @@ register_swi_mp(int intr, inthand2_t *handler, void *arg, const char *name,
     if (cpuid < 0)
 	cpuid = intr % ncpus;
     return(register_int(intr, handler, arg, name, serializer,
-        INTR_MPSAFE, cpuid));
+			INTR_MPSAFE, cpuid));
 }
 
 void *
@@ -236,7 +256,7 @@ register_int(int intr, inthand2_t *handler, void *arg, const char *name,
 {
     struct intr_info *info;
     struct intrec **list;
-    intrec_t rec;
+    intrec_t rec = NULL;
     int orig_cpuid;
 
     KKASSERT(cpuid >= 0 && cpuid < ncpus);
@@ -245,7 +265,24 @@ register_int(int intr, inthand2_t *handler, void *arg, const char *name,
 	panic("register_int: bad intr %d", intr);
     if (name == NULL)
 	name = "???";
-    info = &intr_info_ary[cpuid][intr];
+    info = &intr_block->ary[cpuid][intr];
+
+    int_moveto_destcpu(&orig_cpuid, cpuid);
+
+    /*
+     * This intr has been registered as exclusive one, so
+     * it can't shared.
+     */
+    if (info->i_flags & INTR_EXCL)
+	goto done;
+
+    /*
+     * This intr has been registered as shared one, so it
+     * can't be used for exclusive handler.
+     */
+    list = &info->i_reclist;
+    if ((intr_flags & INTR_EXCL) && *list != NULL)
+	goto done;
 
     /*
      * Construct an interrupt handler record
@@ -262,20 +299,22 @@ register_int(int intr, inthand2_t *handler, void *arg, const char *name,
     rec->next = NULL;
     rec->serializer = serializer;
 
-    int_moveto_destcpu(&orig_cpuid, cpuid);
-
     /*
      * Create an emergency polling thread and set up a systimer to wake
-     * it up.
+     * it up.  objcache isn't operational yet so use kmalloc.
+     *
+     * objcache may not be operational yet, use kmalloc().
      */
-    if (emergency_intr_thread[cpuid].td_kstack == NULL) {
+    if (emergency_intr_thread[cpuid] == NULL) {
+	emergency_intr_thread[cpuid] = kmalloc(sizeof(struct thread), M_DEVBUF,
+					       M_INTWAIT | M_ZERO);
 	lwkt_create(ithread_emergency, NULL, NULL,
-		    &emergency_intr_thread[cpuid],
+		    emergency_intr_thread[cpuid],
 		    TDF_NOSTART | TDF_INTTHREAD, cpuid, "ithreadE %d",
 		    cpuid);
 	systimer_init_periodic_nq(&emergency_intr_timer[cpuid],
 		    emergency_intr_timer_callback,
-		    &emergency_intr_thread[cpuid],
+		    emergency_intr_thread[cpuid],
 		    (emergency_intr_enable ? emergency_intr_freq : 1));
     }
 
@@ -286,7 +325,7 @@ register_int(int intr, inthand2_t *handler, void *arg, const char *name,
     if (info->i_state == ISTATE_NOTHREAD) {
 	info->i_state = ISTATE_NORMAL;
 	info->i_thread = kmalloc(sizeof(struct thread), M_DEVBUF,
-	    M_INTWAIT | M_ZERO);
+				 M_INTWAIT | M_ZERO);
 	lwkt_create(ithread_handler, (void *)(intptr_t)intr, NULL,
 		    info->i_thread, TDF_NOSTART | TDF_INTTHREAD, cpuid,
 		    "ithread%d %d", intr, cpuid);
@@ -297,19 +336,32 @@ register_int(int intr, inthand2_t *handler, void *arg, const char *name,
 	info->i_thread->td_preemptable = lwkt_preempt;
     }
 
-    list = &info->i_reclist;
-
     /*
      * Keep track of how many fast and slow interrupts we have.
      * Set i_mplock_required if any handler in the chain requires
      * the MP lock to operate.
      */
-    if ((intr_flags & INTR_MPSAFE) == 0)
+    if ((intr_flags & INTR_MPSAFE) == 0) {
 	info->i_mplock_required = 1;
-    if (intr_flags & INTR_CLOCK)
+	kprintf("interrupt uses mplock: %s\n", name);
+    }
+    if (intr_flags & INTR_CLOCK) {
+	atomic_set_int(&info->i_thread->td_flags, TDF_CLKTHREAD);
 	++info->i_fast;
-    else
+    } else {
 	++info->i_slow;
+    }
+
+    info->i_flags |= (intr_flags & INTR_EXCL);
+    if (info->i_slow + info->i_fast == 1 && (intr_flags & INTR_HIFREQ)) {
+	/*
+	 * Allow high frequency interrupt, if this intr is not
+	 * shared yet.
+	 */
+	info->i_flags |= INTR_HIFREQ;
+    } else {
+	info->i_flags &= ~INTR_HIFREQ;
+    }
 
     /*
      * Enable random number generation keying off of this interrupt.
@@ -346,8 +398,8 @@ register_int(int intr, inthand2_t *handler, void *arg, const char *name,
     if (intr < FIRST_SOFTINT && info->i_slow + info->i_fast == 1)
 	machintr_intr_setup(intr, intr_flags);
 
+done:
     int_moveto_origcpu(orig_cpuid, cpuid);
-
     return(rec);
 }
 
@@ -375,7 +427,7 @@ unregister_int(void *id, int cpuid)
     if (intr < 0 || intr >= MAX_INTS)
 	panic("register_int: bad intr %d", intr);
 
-    info = &intr_info_ary[cpuid][intr];
+    info = &intr_block->ary[cpuid][intr];
 
     int_moveto_destcpu(&orig_cpuid, cpuid);
 
@@ -413,8 +465,15 @@ unregister_int(void *id, int cpuid)
 	    info->i_mplock_required = 0;
     }
 
-    if (intr >= FIRST_SOFTINT && info->i_reclist == NULL)
-	swi_info_ary[intr - FIRST_SOFTINT] = NULL;
+    if (info->i_reclist == NULL) {
+	info->i_flags = 0;
+	if (intr >= FIRST_SOFTINT)
+	    swi_info_ary[intr - FIRST_SOFTINT] = NULL;
+    } else if (info->i_fast + info->i_slow == 1 &&
+	(info->i_reclist->intr_flags & INTR_HIFREQ)) {
+	/* Unshared high frequency interrupt. */
+	info->i_flags |= INTR_HIFREQ;
+    }
 
     crit_exit();
 
@@ -441,7 +500,7 @@ get_interrupt_counter(int intr, int cpuid)
 
     if (intr < 0 || intr >= MAX_INTS)
 	panic("register_int: bad intr %d", intr);
-    info = &intr_info_ary[cpuid][intr];
+    info = &intr_block->ary[cpuid][intr];
     return(info->i_count);
 }
 
@@ -455,7 +514,7 @@ register_randintr(int intr)
 	panic("register_randintr: bad intr %d", intr);
 
     for (cpuid = 0; cpuid < ncpus; ++cpuid) {
-	info = &intr_info_ary[cpuid][intr];
+	info = &intr_block->ary[cpuid][intr];
 	info->i_random.sc_intr = intr;
 	info->i_random.sc_enabled = 1;
     }
@@ -471,7 +530,7 @@ unregister_randintr(int intr)
 	panic("register_swi: bad intr %d", intr);
 
     for (cpuid = 0; cpuid < ncpus; ++cpuid) {
-	info = &intr_info_ary[cpuid][intr];
+	info = &intr_block->ary[cpuid][intr];
 	info->i_random.sc_enabled = -1;
     }
 }
@@ -488,7 +547,7 @@ next_registered_randintr(int intr)
 	int cpuid;
 
 	for (cpuid = 0; cpuid < ncpus; ++cpuid) {
-	    info = &intr_info_ary[cpuid][intr];
+	    info = &intr_block->ary[cpuid][intr];
 	    if (info->i_random.sc_enabled > 0)
 		return intr;
 	}
@@ -562,7 +621,7 @@ void
 sched_ithd_hard(int intr)
 {
 	KKASSERT(intr >= 0 && intr < MAX_HARDINTS);
-	sched_ithd_intern(&intr_info_ary[mycpuid][intr]);
+	sched_ithd_intern(&intr_block->ary[mycpuid][intr]);
 }
 
 #ifdef _KERNEL_VIRTUAL
@@ -571,7 +630,7 @@ void
 sched_ithd_hard_virtual(int intr)
 {
 	KKASSERT(intr >= 0 && intr < MAX_HARDINTS);
-	sched_ithd_intern(&intr_info_ary[0][intr]);
+	sched_ithd_intern(&intr_block->ary[0][intr]);
 }
 
 void *
@@ -616,7 +675,7 @@ ithread_livelock_wakeup(systimer_t st, int in_ipi __unused,
 {
     struct intr_info *info;
 
-    info = &intr_info_ary[mycpuid][(int)(intptr_t)st->data];
+    info = &intr_block->ary[mycpuid][(int)(intptr_t)st->data];
     if (info->i_state != ISTATE_NOTHREAD)
 	lwkt_schedule(info->i_thread);
 }
@@ -624,22 +683,16 @@ ithread_livelock_wakeup(systimer_t st, int in_ipi __unused,
 /*
  * Schedule ithread within fast intr handler
  *
- * XXX Protect sched_ithd_hard() call with gd_intr_nesting_level?
- * Interrupts aren't enabled, but still...
+ * Temporarily bump the current thread's td_nest_count to prevent deep
+ * preemptions and splz/doreti stacks.
  */
 static __inline void
 ithread_fast_sched(int intr, thread_t td)
 {
     ++td->td_nest_count;
-
-    /*
-     * We are already in critical section, exit it now to
-     * allow preemption.
-     */
     crit_exit_quick(td);
     sched_ithd_hard(intr);
     crit_enter_quick(td);
-
     --td->td_nest_count;
 }
 
@@ -674,7 +727,11 @@ ithread_fast_handler(struct intrframe *frame)
     /* We must be in critical section. */
     KKASSERT(td->td_critcount);
 
-    info = &intr_info_ary[mycpuid][intr];
+    /* Race condition during early boot */
+    if (intr_block == NULL)
+	return 0;
+
+    info = &intr_block->ary[mycpuid][intr];
 
     /*
      * If we are not processing any FAST interrupts, just schedule the thing.
@@ -775,7 +832,7 @@ ithread_handler(void *arg)
 {
     struct intr_info *info;
     int use_limit;
-    __uint32_t lseconds;
+    uint32_t lseconds;
     int intr, cpuid = mycpuid;
     int mpheld;
     struct intrec **list;
@@ -783,11 +840,12 @@ ithread_handler(void *arg)
     globaldata_t gd;
     struct systimer ill_timer;	/* enforced freq. timer */
     u_int ill_count;		/* interrupt livelock counter */
+    int upper_limit;		/* interrupt livelock upper limit */
     TD_INVARIANTS_DECLARE;
 
     ill_count = 0;
     intr = (int)(intptr_t)arg;
-    info = &intr_info_ary[cpuid][intr];
+    info = &intr_block->ary[cpuid][intr];
     list = &info->i_reclist;
 
     /*
@@ -837,6 +895,9 @@ ithread_handler(void *arg)
 	    for (rec = *list; rec; rec = nrec) {
 		/* rec may be invalid after call */
 		nrec = rec->next;
+		if (rec->handler == NULL) {
+		    kprintf("NULL HANDLER %s\n", rec->name);
+		} else
 		if (rec->serializer) {
 		    lwkt_serialize_handler_call(rec->serializer, rec->handler,
 						rec->argument, NULL);
@@ -893,7 +954,11 @@ ithread_handler(void *arg)
 	     * If we did not exceed the frequency limit, we are done.  
 	     * If the interrupt has not retriggered we deschedule ourselves.
 	     */
-	    if (ill_count <= livelock_limit) {
+	    if (info->i_flags & INTR_HIFREQ)
+		upper_limit = livelock_limit_hi;
+	    else
+		upper_limit = livelock_limit;
+	    if (ill_count <= upper_limit) {
 		if (info->i_running == 0) {
 		    lwkt_deschedule_self(gd->gd_curthread);
 		    lwkt_switch();
@@ -906,9 +971,9 @@ ithread_handler(void *arg)
 	     * to wake the thread up at the limit frequency.
 	     */
 	    kprintf("intr %d on cpu%d at %d/%d hz, livelocked limit engaged!\n",
-		    intr, cpuid, ill_count, livelock_limit);
+		    intr, cpuid, ill_count, upper_limit);
 	    info->i_state = ISTATE_LIVELOCKED;
-	    if ((use_limit = livelock_limit) < 100)
+	    if ((use_limit = upper_limit) < 100)
 		use_limit = 100;
 	    else if (use_limit > 500000)
 		use_limit = 500000;
@@ -978,7 +1043,7 @@ ithread_emergency(void *arg __unused)
 
     for (;;) {
 	for (intr = 0; intr < max_installed_hard_intr[cpuid]; ++intr) {
-	    info = &intr_info_ary[cpuid][intr];
+	    info = &intr_block->ary[cpuid][intr];
 	    for (rec = info->i_reclist; rec; rec = nrec) {
 		/* rec may be invalid after call */
 		nrec = rec->next;
@@ -1034,7 +1099,7 @@ sysctl_intrnames(SYSCTL_HANDLER_ARGS)
 
     for (cpuid = 0; cpuid < ncpus; ++cpuid) {
 	for (intr = 0; error == 0 && intr < MAX_INTS; ++intr) {
-	    info = &intr_info_ary[cpuid][intr];
+	    info = &intr_block->ary[cpuid][intr];
 
 	    len = 0;
 	    buf[0] = 0;
@@ -1065,7 +1130,7 @@ sysctl_intrcnt_all(SYSCTL_HANDLER_ARGS)
 
     for (cpuid = 0; cpuid < ncpus; ++cpuid) {
 	for (intr = 0; intr < MAX_INTS; ++intr) {
-	    info = &intr_info_ary[cpuid][intr];
+	    info = &intr_block->ary[cpuid][intr];
 
 	    error = SYSCTL_OUT(req, &info->i_count, sizeof(info->i_count));
 	    if (error)
@@ -1105,13 +1170,16 @@ intr_init(void *dummy __unused)
 {
 	int cpuid;
 
-	kprintf("Initialize MI interrupts\n");
+	kprintf("Initialize MI interrupts for %d cpus\n", ncpus);
+
+	intr_block = kmalloc(offsetof(struct intr_info_block, ary[ncpus][0]),
+			     M_INTRMNG, M_INTWAIT | M_ZERO);
 
 	for (cpuid = 0; cpuid < ncpus; ++cpuid) {
 		int intr;
 
 		for (intr = 0; intr < MAX_INTS; ++intr) {
-			struct intr_info *info = &intr_info_ary[cpuid][intr];
+			struct intr_info *info = &intr_block->ary[cpuid][intr];
 
 			info->i_cpuid = cpuid;
 			info->i_intr = intr;

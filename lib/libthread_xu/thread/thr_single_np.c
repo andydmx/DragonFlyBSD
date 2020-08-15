@@ -10,10 +10,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by John Birrell.
- * 4. Neither the name of the author nor the names of any co-contributors
+ * 3. Neither the name of the author nor the names of any co-contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -29,7 +26,6 @@
  * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
  *
- * $DragonFly: src/lib/libthread_xu/thread/thr_single_np.c,v 1.4 2008/09/30 16:57:06 swildner Exp $
  */
 
 #include "namespace.h"
@@ -37,7 +33,8 @@
 #include <pthread_np.h>
 #include "un-namespace.h"
 
-int _pthread_single_np(void)
+int
+_pthread_single_np(void)
 {
 
 	/* Enter single-threaded (non-POSIX) scheduling mode: */

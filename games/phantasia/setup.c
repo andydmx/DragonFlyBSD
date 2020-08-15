@@ -2,20 +2,25 @@
  * setup.c - set up all files for Phantasia
  *
  * $FreeBSD: src/games/phantasia/setup.c,v 1.11 1999/11/16 02:57:34 billf Exp $
- * $DragonFly: src/games/phantasia/setup.c,v 1.3 2005/05/31 00:06:26 swildner Exp $
  */
-#include "include.h"
+/*#include "include.h"*/
+#include <sys/param.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <fcntl.h>
+#include <math.h>
+#include <setjmp.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 
-/* functions which we need to know about */
-/* phantglobs.c */
-extern	double	drandom(void);
+#include "include.h"
 
-void	Error(const char *, const char *);
+void Error(const char *, const char *) __dead2;
 
-static const char *files[] = {		/* all files to create */
+static const char *const files[] = {		/* all files to create */
 	_SPATH_MONST,
 	_SPATH_PEOPLE,
 	_SPATH_MESS,
@@ -48,7 +53,7 @@ const char *monsterfile = "monsters.asc";
 int
 main(int argc, char *argv[])
 {
-	const	char	**filename;	/* for pointing to file names */
+	const char *const *filename;	/* for pointing to file names */
 	int	fd;			/* file descriptor */
 	FILE	*fp;			/* for opening files */
 	struct stat	fbuf;		/* for getting files statistics */

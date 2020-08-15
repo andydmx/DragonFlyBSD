@@ -42,10 +42,13 @@
 #include <sys/lockf.h>
 #include <sys/stat.h>
 #include <sys/vnode.h>
+#include <sys/file.h>
 
+#ifdef MALLOC_DECLARE
 MALLOC_DECLARE(M_DIRFS);
 MALLOC_DECLARE(M_DIRFS_NODE);
 MALLOC_DECLARE(M_DIRFS_MISC);
+#endif
 
 #ifndef KTR_DIRFS
 #define KTR_DIRFS KTR_ALL
@@ -73,19 +76,22 @@ extern int getdirentries(int, char *, int, long *);
 extern int statfs(const char *, struct statfs *);
 
 /*
- * Debugging macros. The impact should be determined and in case it has a
- * considerable performance penalty, it should be enclosed in a DEBUG #ifdef.
+ * Debugging macros.
+ *
+ * LEVEL	USED FOR
+ *
+ *     1	Calls to VFS operations (mount, umount, ...)
+ *     3	Calls to VN operations (open, close, read, ...)
+ *     5	Calls to subroutines
+ *     9	Everything
+ *
  */
-#define debug_called() do {					\
-		dbg(9, "called\n", __func__);			\
-} while(0)
-
 #define dbg(lvl, fmt, ...) do {					\
 		debug(lvl, "%s: " fmt, __func__, ##__VA_ARGS__);	\
 } while(0)
 
 #define debug_node(s) do {						\
-		dbg(5, "mode=%u flags=%u dn_name=%s "			\
+		dbg(9, "mode=%u flags=%u dn_name=%s "			\
 		    "uid=%u gid=%u objtype=%u nlinks=%d "		\
 		    "size=%jd ctime=%ju atime=%ju mtime=%ju\n",		\
 		    s->dn_mode, s->dn_flags, s->dn_name,		\
@@ -96,7 +102,7 @@ extern int statfs(const char *, struct statfs *);
 } while(0)
 
 #define debug_node2(n) do {						\
-		dbg(5, "dnp=%p name=%s fd=%d parent=%p vnode=%p "	\
+		dbg(9, "dnp=%p name=%s fd=%d parent=%p vnode=%p "	\
 		    "refcnt=%d state=%s\n",				\
 		    n, n->dn_name, n->dn_fd, n->dn_parent, n->dn_vnode,	\
 		    n->dn_refcnt, dirfs_flag2str(n));			\
@@ -153,7 +159,7 @@ struct dirfs_node {
 	uid_t			dn_uid;
 	gid_t			dn_gid;
 	mode_t			dn_mode;
-	int			dn_flags;
+	u_int			dn_flags;
 	nlink_t			dn_links;
 	int32_t			dn_atime;
 	int32_t			dn_atimensec;
@@ -206,6 +212,7 @@ extern long passive_fd_list_hits;
 
 extern struct vop_ops dirfs_vnode_vops;
 
+#ifdef _KERNEL
 /*
  * Misc functions for node operations
  */
@@ -237,6 +244,7 @@ dirfs_node_clrflags(dirfs_node_t dnp, int flags)
 	atomic_clear_int(&dnp->dn_state, flags);
 }
 
+#endif
 
 /*
  * Prototypes
@@ -264,7 +272,7 @@ int dirfs_close_helper(dirfs_node_t);
 int dirfs_node_refcnt(dirfs_node_t);
 char *dirfs_flag2str(dirfs_node_t);
 int dirfs_node_getperms(dirfs_node_t, int *);
-int dirfs_node_chflags(dirfs_node_t, int, struct ucred *);
+int dirfs_node_chflags(dirfs_node_t, u_long, struct ucred *);
 int dirfs_node_chtimes(dirfs_node_t);
 int dirfs_node_chmod(dirfs_mount_t, dirfs_node_t, mode_t cur_mode);
 int dirfs_node_chown(dirfs_mount_t, dirfs_node_t,

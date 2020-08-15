@@ -1,4 +1,3 @@
-/* $DragonFly: src/sys/netbt/l2cap_signal.c,v 1.2 2008/03/18 13:41:42 hasso Exp $ */
 /* $OpenBSD: src/sys/netbt/l2cap_signal.c,v 1.3 2008/02/24 21:34:48 uwe Exp $ */
 /* $NetBSD: l2cap_signal.c,v 1.9 2007/11/10 23:12:23 plunky Exp $ */
 
@@ -32,10 +31,9 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
-#include <stdarg.h>
-
 #include <sys/param.h>
 #include <sys/kernel.h>
+#include <sys/malloc.h>	/* for M_NOWAIT */
 #include <sys/mbuf.h>
 #include <sys/proc.h>
 #include <sys/queue.h>
@@ -952,7 +950,7 @@ l2cap_send_signal(struct hci_link *link, uint8_t code, uint8_t ident,
 		    device_get_nameunit(link->hl_unit->hci_dev));
 #endif
 
-	m = m_gethdr(MB_DONTWAIT, MT_DATA);
+	m = m_gethdr(M_NOWAIT, MT_DATA);
 	if (m == NULL)
 		return ENOMEM;
 
@@ -1000,9 +998,9 @@ l2cap_send_command_rej(struct hci_link *link, uint8_t ident,
 {
 	l2cap_cmd_rej_cp cp;
 	int len = 0;
-	va_list ap;
+	__va_list ap;
 
-	va_start(ap, reason);
+	__va_start(ap, reason);
 
 	cp.reason = htole16(reason);
 
@@ -1013,15 +1011,15 @@ l2cap_send_command_rej(struct hci_link *link, uint8_t ident,
 
 	case L2CAP_REJ_MTU_EXCEEDED:
 		len = 4;
-		cp.data[0] = va_arg(ap, int);		/* SigMTU */
+		cp.data[0] = __va_arg(ap, int);		/* SigMTU */
 		cp.data[0] = htole16(cp.data[0]);
 		break;
 
 	case L2CAP_REJ_INVALID_CID:
 		len = 6;
-		cp.data[0] = va_arg(ap, int);		/* dcid */
+		cp.data[0] = __va_arg(ap, int);		/* dcid */
 		cp.data[0] = htole16(cp.data[0]);
-		cp.data[1] = va_arg(ap, int);		/* scid */
+		cp.data[1] = __va_arg(ap, int);		/* scid */
 		cp.data[1] = htole16(cp.data[1]);
 		break;
 
@@ -1030,7 +1028,7 @@ l2cap_send_command_rej(struct hci_link *link, uint8_t ident,
 		return EINVAL;
 	}
 
-	va_end(ap);
+	__va_end(ap);
 
 	return l2cap_send_signal(link, L2CAP_COMMAND_REJ, ident, len, &cp);
 }

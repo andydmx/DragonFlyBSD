@@ -77,8 +77,6 @@ struct protosw btsw[] = {
 		.pr_ctloutput = hci_ctloutput,
 		.pr_ctlport = NULL,
 		.pr_init = 0,
-		.pr_fasttimo =	0,
-		.pr_slowtimo = 0,
 		.pr_drain = 0,
 		.pr_usrreqs = &hci_usrreqs
 	},
@@ -93,8 +91,6 @@ struct protosw btsw[] = {
 		.pr_ctloutput = sco_ctloutput,
 		.pr_ctlport = NULL,
 		.pr_init = 0,
-		.pr_fasttimo =	0,
-		.pr_slowtimo = 0,
 		.pr_drain = 0,
 		.pr_usrreqs = &sco_usrreqs
 
@@ -110,8 +106,6 @@ struct protosw btsw[] = {
 		.pr_ctloutput = l2cap_ctloutput,
 		.pr_ctlport = NULL,
 		.pr_init = 0,
-		.pr_fasttimo =	0,
-		.pr_slowtimo = 0,
 		.pr_drain = 0,
 		.pr_usrreqs = &l2cap_usrreqs
 	},
@@ -126,8 +120,6 @@ struct protosw btsw[] = {
 		.pr_ctloutput = rfcomm_ctloutput,
 		.pr_ctlport = NULL,
 		.pr_init = 0,
-		.pr_fasttimo =	0,
-		.pr_slowtimo = 0,
 		.pr_drain = 0,
 		.pr_usrreqs = &rfcomm_usrreqs
 	},
@@ -145,15 +137,16 @@ static void
 netbt_init(void)
 {
 	l2cap_pdu_pool = zinit("l2cap_pdu", sizeof(struct l2cap_pdu), 1,
-	    ZONE_DESTROYABLE, 1);
+			       ZONE_DESTROYABLE);
 	if (l2cap_pdu_pool == NULL)
 		goto fail;
 	l2cap_req_pool = zinit("l2cap_req", sizeof(struct l2cap_req), 1,
-	    ZONE_DESTROYABLE, 1);
+			       ZONE_DESTROYABLE);
 	if (l2cap_req_pool == NULL)
 		goto fail;
 	rfcomm_credit_pool = zinit("rfcomm_credit",
-	    sizeof(struct rfcomm_credit), 1, ZONE_DESTROYABLE, 1);
+				   sizeof(struct rfcomm_credit), 1,
+				   ZONE_DESTROYABLE);
 	if (rfcomm_credit_pool == NULL)
 		goto fail;
 	return;

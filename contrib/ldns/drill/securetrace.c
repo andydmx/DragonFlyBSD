@@ -62,7 +62,7 @@ ds_key_match(ldns_rr_list *ds, ldns_rr_list *trusted)
 }
 #endif
 
-ldns_pkt *
+static ldns_pkt *
 get_dnssec_pkt(ldns_resolver *r, ldns_rdf *name, ldns_rr_type t) 
 {
 	ldns_pkt *p = NULL;
@@ -97,7 +97,7 @@ get_ds(ldns_pkt *p, ldns_rdf *ownername, ldns_rr_list **rrlist, ldns_rr_list **o
 }
 #endif /* HAVE_SSL */
 
-void
+static void
 remove_resolver_nameservers(ldns_resolver *res)
 {
 	ldns_rdf *pop;
@@ -109,17 +109,6 @@ remove_resolver_nameservers(ldns_resolver *res)
 
 }
 
-void
-show_current_nameservers(FILE *out, ldns_resolver *res)
-{
-	size_t i;
-	fprintf(out, "Current nameservers for resolver object:\n");
-	for (i = 0; i < ldns_resolver_nameserver_count(res); i++) {
-		ldns_rdf_print(out, ldns_resolver_nameservers(res)[i]);
-		fprintf(out, "\n");
-	}
-}
-	
 /*ldns_pkt **/
 #ifdef HAVE_SSL
 int
@@ -138,7 +127,7 @@ do_secure_trace(ldns_resolver *local_res, ldns_rdf *name, ldns_rr_type t,
 	size_t j;
 	size_t k;
 	size_t l;
-	uint8_t labels_count;
+	uint8_t labels_count = 0;
 
 	/* dnssec */
 	ldns_rr_list *key_list;
@@ -156,6 +145,9 @@ do_secure_trace(ldns_resolver *local_res, ldns_rdf *name, ldns_rr_type t,
 
 	/* empty non-terminal check */
 	bool ent;
+	ldns_rr  *nsecrr;      /* The nsec that proofs the non-terminal */
+	ldns_rdf *hashed_name; /* The query hashed with nsec3 params */
+	ldns_rdf *label0;      /* The first label of an nsec3 owner name */
 
 	/* glue handling */
 	ldns_rr_list *new_ns_addr;
@@ -220,6 +212,8 @@ do_secure_trace(ldns_resolver *local_res, ldns_rdf *name, ldns_rr_type t,
 			ldns_resolver_usevc(local_res));
 	ldns_resolver_set_random(res,
 			ldns_resolver_random(local_res));
+	ldns_resolver_set_source(res,
+			ldns_resolver_source(local_res));
 	ldns_resolver_set_recursive(local_res, true);
 
 	ldns_resolver_set_recursive(res, false);
@@ -247,7 +241,7 @@ do_secure_trace(ldns_resolver *local_res, ldns_rdf *name, ldns_rr_type t,
 			goto done;
 		}
 	}
-	labels = LDNS_XMALLOC(ldns_rdf*, labels_count + 2);
+	labels = LDNS_CALLOC(ldns_rdf*, labels_count + 2);
 	if (!labels) {
 		goto done;
 	}
@@ -262,6 +256,13 @@ do_secure_trace(ldns_resolver *local_res, ldns_rdf *name, ldns_rr_type t,
 	 */
 	for(i = (ssize_t)labels_count + 1; i > 0; i--) {
 		status = ldns_resolver_send(&local_p, res, labels[i], LDNS_RR_TYPE_NS, c, 0);
+		if (status != LDNS_STATUS_OK) {
+			fprintf(stderr, "Error sending query: %s\n", ldns_get_errorstr_by_id(status));
+			result = status;
+			goto done;
+		}
+
+		/* TODO: handle status */
 
 		if (verbosity >= 5) {
 			ldns_pkt_print(stdout, local_p);
@@ -380,8 +381,27 @@ do_secure_trace(ldns_resolver *local_res, ldns_rdf *name, ldns_rr_type t,
 				/* there might be an empty non-terminal, in which case we need to continue */
 				ent = false;
 				for (j = 0; j < ldns_rr_list_rr_count(nsec_rrs); j++) {
-					if (ldns_dname_is_subdomain(ldns_rr_rdf(ldns_rr_list_rr(nsec_rrs, j), 0), labels[i])) {
+					nsecrr = ldns_rr_list_rr(nsec_rrs, j);
+					/* For NSEC when the next name is a subdomain of the question */
+					if (ldns_rr_get_type(nsecrr) == LDNS_RR_TYPE_NSEC &&
+							ldns_dname_is_subdomain(ldns_rr_rdf(nsecrr, 0), labels[i])) {
 						ent = true;
+
+					/* For NSEC3, the hash matches the name and the type bitmap is empty*/
+					} else if (ldns_rr_get_type(nsecrr) == LDNS_RR_TYPE_NSEC3) {
+						hashed_name = ldns_nsec3_hash_name_frm_nsec3(nsecrr, labels[i]);
+						label0 = ldns_dname_label(ldns_rr_owner(nsecrr), 0);
+						if (hashed_name && label0 &&
+								ldns_dname_compare(hashed_name, label0) == 0 &&
+								ldns_nsec3_bitmap(nsecrr) == NULL) {
+							ent = true;
+						}
+						if (label0) {
+							LDNS_FREE(label0);
+						}
+						if (hashed_name) {
+							LDNS_FREE(hashed_name);
+						}
 					}
 				}
 				if (!ent) {
@@ -484,12 +504,43 @@ do_secure_trace(ldns_resolver *local_res, ldns_rdf *name, ldns_rr_type t,
 			p = get_dnssec_pkt(res, labels[i-1], LDNS_RR_TYPE_DS);
 			(void) get_ds(p, labels[i-1], &ds_list, &ds_sig_list);
 			if (!ds_list) {
-				ldns_pkt_free(p);
-				if (ds_sig_list) {
+				ldns_rr_list_deep_free(ds_sig_list);
+				(void) get_dnssec_rr( p, labels[i-1]
+				                    , LDNS_RR_TYPE_CNAME
+				                    , &ds_list, &ds_sig_list);
+				if (ds_list) {
+					st = ldns_verify( ds_list, ds_sig_list
+					                , correct_key_list
+					                , current_correct_keys);
+
+					if (st == LDNS_STATUS_OK) {
+						printf(";; No DS record found "
+						       "for ");
+						ldns_rdf_print(stdout,
+							labels[i-1]);
+						printf(", but valid CNAME");
+					} else {
+						printf("[B] Unable to verify de"
+						       "nial of existence for ");
+						ldns_rdf_print(stdout,
+							labels[i-1]);
+						printf(", because of BOGUS CNAME");
+					}
+					printf("\n");
 					ldns_rr_list_deep_free(ds_sig_list);
+					ldns_pkt_free(p);
+					ldns_rr_list_deep_free(ds_list);
+					ds_list = NULL;
+					ds_sig_list = NULL;
+					p = NULL;
+				} else {
+					ldns_rr_list_deep_free(ds_sig_list);
+					ldns_pkt_free(p);
+					p = get_dnssec_pkt(res, name,
+							LDNS_RR_TYPE_DNSKEY);
+					(void) get_ds(p, NULL
+					             , &ds_list, &ds_sig_list); 
 				}
-				p = get_dnssec_pkt(res, name, LDNS_RR_TYPE_DNSKEY);
-				(void) get_ds(p, NULL, &ds_list, &ds_sig_list); 
 			}
 			if (ds_sig_list) {
 				if (ds_list) {

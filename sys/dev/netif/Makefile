@@ -1,16 +1,14 @@
-SUBDIR= an age alc ale ath bce bfe bge bwn \
-	dc em ep et \
-	fwe fxp ic iwi iwn jme lge lnc \
-	mii_layer my msk mxge ndis nfe nge oce pcn \
-	ral re rl sbsh sf sis sk sln ste stge ti tl tx txp \
-	vge vr vx wb wi wpi xe xl ig_hal emx ae igb ix bnx
+SUBDIR= age alc ale bce bfe bge \
+	dc em et \
+	fwe fxp ic jme lge lnc \
+	mii_layer my msk mxge nfe nge oce pcn \
+	re rl sbsh sf sis sk sln ste stge ti tl tx txp \
+	vge vr wb xe xl ig_hal emx ae igb ix bnx
 
-.if ${MACHINE_ARCH} == "i386"
-SUBDIR+=ar ed sbni sr
-.endif
+SUBDIR+= ath bwn iwm iwi iwn ndis ral wi wpi
 
-# XXX need to be updated to the new net80211 stack
-# SUBDIR+= acx bwi iwl rtw
-# .endif
+# Empty for concurrent build
+#
+SUBDIR_ORDERED=
 
 .include <bsd.subdir.mk>

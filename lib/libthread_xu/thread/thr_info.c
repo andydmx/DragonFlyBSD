@@ -27,47 +27,61 @@
  * SUCH DAMAGE.
  *
  * $FreeBSD: src/lib/libthr/thread/thr_info.c,v 1.10 2007/04/05 07:20:31 davidxu Exp $
- * $DragonFly: src/lib/libthread_xu/thread/thr_info.c,v 1.6 2008/01/19 14:05:29 corecode Exp $
  */
 
 #include "namespace.h"
+#include <sys/lwp.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 #include <pthread.h>
 #include <pthread_np.h>
 #include "un-namespace.h"
 
 #include "thr_private.h"
 
-__weak_reference(_pthread_set_name_np, pthread_set_name_np);
-
 /* Set the thread name for debug. */
 void
-_pthread_set_name_np(pthread_t thread __unused, const char *name __unused)
+_pthread_set_name_np(pthread_t thread, const char *name)
 {
-#if 0
-	struct pthread *curthread = _get_curthread();
-	int ret = 0;
+	struct pthread *curthread = tls_get_curthread();
 
 	if (curthread == thread) {
-		if (thr_set_name(thread->tid, name))
-			ret = errno;
+		lwp_setname(thread->tid, name);
 	} else {
 		if (_thr_ref_add(curthread, thread, 0) == 0) {
 			THR_THREAD_LOCK(curthread, thread);
-			if (thread->state != PS_DEAD) {
-				if (thr_set_name(thread->tid, name))
-					ret = errno;
-			}
+			if (thread->state != PS_DEAD)
+				lwp_setname(thread->tid, name);
 			THR_THREAD_UNLOCK(curthread, thread);
 			_thr_ref_delete(curthread, thread);
-		} else {
-			ret = ESRCH;
 		}
 	}
-#if 0
-	/* XXX should return error code. */
-	return (ret);
-#endif
-#endif
 }
+
+/* Set the thread name for debug. */
+void
+_pthread_get_name_np(pthread_t thread, char *name, size_t len)
+{
+	struct pthread *curthread = tls_get_curthread();
+
+	if (curthread == thread) {
+		lwp_getname(thread->tid, name, len);
+	} else {
+		if (_thr_ref_add(curthread, thread, 0) == 0) {
+			THR_THREAD_LOCK(curthread, thread);
+			if (thread->state != PS_DEAD)
+				lwp_getname(thread->tid, name, len);
+			else if (len)
+				name[0] = 0;
+			THR_THREAD_UNLOCK(curthread, thread);
+			_thr_ref_delete(curthread, thread);
+		} else if (len) {
+			errno = EINVAL;
+			name[0] = 0;
+		}
+	}
+}
+
+__strong_reference(_pthread_get_name_np, pthread_get_name_np);
+__strong_reference(_pthread_set_name_np, pthread_set_name_np);

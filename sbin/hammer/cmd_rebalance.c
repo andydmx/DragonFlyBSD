@@ -58,16 +58,21 @@ hammer_cmd_rebalance(char **av, int ac)
 
 	rebal.key_end.localization = HAMMER_MAX_LOCALIZATION;
 	rebal.key_end.obj_id = HAMMER_MAX_OBJID;
+	rebal.allpfs = AllPFS;
 
-	if (ac == 0)
+	if (ac == 0) {
 		rebalance_usage(1);
+		/* not reached */
+	}
 	filesystem = av[0];
 	if (ac == 1) {
 		perc = 85;
 	} else {
 		perc = strtol(av[1], NULL, 0);
-		if (perc < 50 || perc > 100)
+		if (perc < 50 || perc > 100) {
 			rebalance_usage(1);
+			/* not reached */
+		}
 	}
 	rebal.saturation = HAMMER_BTREE_INT_ELMS * perc / 100;
 
@@ -76,8 +81,10 @@ hammer_cmd_rebalance(char **av, int ac)
 		rebal.key_beg.localization);
 
 	fd = open(filesystem, O_RDONLY);
-	if (fd < 0)
+	if (fd < 0) {
 		err(1, "Unable to open %s", filesystem);
+		/* not reached */
+	}
 	RunningIoctl = 1;
 	if (ioctl(fd, HAMMERIOC_REBALANCE, &rebal) < 0) {
 		printf("Rebalance %s failed: %s\n",
@@ -87,9 +94,8 @@ hammer_cmd_rebalance(char **av, int ac)
 			filesystem,
 			(uintmax_t)rebal.key_cur.obj_id,
 			rebal.key_cur.localization);
-		if (CyclePath) {
+		if (CyclePath)
 			hammer_set_cycle(&rebal.key_cur, 0);
-		}
 	} else {
 		if (CyclePath)
 			hammer_reset_cycle();
@@ -98,10 +104,10 @@ hammer_cmd_rebalance(char **av, int ac)
 	RunningIoctl = 0;
 	close(fd);
 	printf("Rebalance:\n"
-	       "    %jd btree nodes scanned\n"
-	       "    %jd btree nodes deleted\n"
+	       "    %jd B-Tree nodes scanned\n"
+	       "    %jd B-Tree nodes deleted\n"
 	       "    %jd collision retries\n"
-	       "    %jd btree nodes rebalanced\n",
+	       "    %jd B-Tree nodes rebalanced\n",
 	       (intmax_t)rebal.stat_ncount,
 	       (intmax_t)rebal.stat_deletions,
 	       (intmax_t)rebal.stat_collisions,

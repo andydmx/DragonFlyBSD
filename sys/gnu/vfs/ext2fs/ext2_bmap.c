@@ -15,11 +15,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -52,7 +48,7 @@
 #include "dinode.h"
 #include "inode.h"
 #include "ext2_fs_sb.h"
-#include "ext2mount.h"
+#include "ext2_mount.h"
 #include "ext2_extern.h"
 #include "fs.h"
 
@@ -125,7 +121,7 @@ ext2_bmaparray(struct vnode *vp, ext2_daddr_t bn, ext2_daddr_t *bnp,
 {
 	struct inode *ip;
 	struct buf *bp;
-	struct ext2mount *ump;
+	struct ext2_mount *ump;
 	struct mount *mp;
 	struct ext2_sb_info *fs;
 	struct indir a[NIADDR+1], *xap;
@@ -204,7 +200,6 @@ ext2_bmaparray(struct vnode *vp, ext2_daddr_t bn, ext2_daddr_t *bnp,
 		if (bp)
 			bqrelse(bp);
 
-		xap->in_exists = 1;
 		bp = getblk(vp, lblktodoff(fs, metalbn),
 			    mp->mnt_stat.f_iosize, 0, 0);
 		if ((bp->b_flags & B_CACHE) == 0) {
@@ -269,7 +264,7 @@ int
 ext2_getlbns(struct vnode *vp, ext2_daddr_t bn, struct indir *ap, int *nump)
 {
 	long blockcnt, metalbn, realbn;
-	struct ext2mount *ump;
+	struct ext2_mount *ump;
 	int i, numlevels, off;
 	int64_t qblockcnt;
 
@@ -319,7 +314,6 @@ ext2_getlbns(struct vnode *vp, ext2_daddr_t bn, struct indir *ap, int *nump)
 	 */
 	ap->in_lbn = metalbn;
 	ap->in_off = off = NIADDR - i;
-	ap->in_exists = 0;
 	ap++;
 	for (++numlevels; i <= NIADDR; i++) {
 		/* If searching for a meta-data block, quit when found. */
@@ -331,7 +325,6 @@ ext2_getlbns(struct vnode *vp, ext2_daddr_t bn, struct indir *ap, int *nump)
 		++numlevels;
 		ap->in_lbn = metalbn;
 		ap->in_off = off;
-		ap->in_exists = 0;
 		++ap;
 
 		metalbn -= -1 + off * blockcnt;

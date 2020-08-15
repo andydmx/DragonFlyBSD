@@ -86,6 +86,7 @@ _iconv_open(const char *out, const char *in, struct _citrus_iconv *handle)
 	}
 
 	handle->cv_shared->ci_discard_ilseq = strcasestr(out, "//IGNORE");
+	handle->cv_shared->ci_ilseq_invalid = false;
 	handle->cv_shared->ci_hooks = NULL;
 
 	return ((iconv_t)(void *)handle);
@@ -122,7 +123,7 @@ iconv_close(iconv_t handle)
 }
 
 size_t
-iconv(iconv_t handle, const char **in, size_t *szin, char **out, size_t *szout)
+iconv(iconv_t handle, char **in, size_t *szin, char **out, size_t *szout)
 {
 	size_t ret;
 	int err;
@@ -143,7 +144,7 @@ iconv(iconv_t handle, const char **in, size_t *szin, char **out, size_t *szout)
 }
 
 size_t
-__iconv(iconv_t handle, const char **in, size_t *szin, char **out,
+__iconv(iconv_t handle, char **in, size_t *szin, char **out,
     size_t *szout, uint32_t flags, size_t *invalids)
 {
 	size_t ret;
@@ -226,7 +227,7 @@ iconvlist(int (*do_one) (unsigned int, const char * const *,
 			return;
 		}
 		strlcpy(curkey, list[i], slashpos - list[i] + 1);
-		names[j++] = strdup(curkey);
+		names[j++] = curkey;
 		for (; (i < sz) && (memcmp(curkey, list[i], strlen(curkey)) == 0); i++) {
 			slashpos = strchr(list[i], '/');
 			curitem = (char *)malloc(strlen(slashpos) + 1);
@@ -238,7 +239,7 @@ iconvlist(int (*do_one) (unsigned int, const char * const *,
 			if (strcmp(curkey, curitem) == 0) {
 				continue;
 			}
-			names[j++] = strdup(curitem);
+			names[j++] = curitem;
 		}
 		np = (const char * const *)names;
 		do_one(j, np, data);

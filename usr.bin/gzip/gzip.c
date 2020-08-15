@@ -142,7 +142,7 @@ static suffixes_t suffixes[] = {
 #endif /* SMALL */
 #undef SUFFIX
 };
-#define NUM_SUFFIXES (sizeof suffixes / sizeof suffixes[0])
+#define NUM_SUFFIXES NELEM(suffixes)
 
 #define SUFFIX_MAXLEN  30
 
@@ -195,8 +195,8 @@ static	void	handle_stdin(void);
 static	void	handle_stdout(void);
 static	void	print_ratio(off_t, off_t, FILE *);
 static	void	print_list(int fd, off_t, const char *, time_t);
-static	void	usage(void);
-static	void	display_version(void);
+static	void	usage(void) __dead2;
+static	void	display_version(void) __dead2;
 static	const suffixes_t *check_suffix(char *, int);
 static	ssize_t	read_retry(int, void *, size_t);
 
@@ -1057,8 +1057,10 @@ copymodes(int fd, const struct stat *sbp, const char *file)
 		maybe_warn("couldn't fchmod: %s", file);
 
 	/* only try flags if they exist already */
+#ifdef _ST_FLAGS_PRESENT_
         if (sb.st_flags != 0 && fchflags(fd, sb.st_flags) < 0)
 		maybe_warn("couldn't fchflags: %s", file);
+#endif
 
 	TIMESPEC_TO_TIMEVAL(&times[0], &sb.st_atimespec);
 	TIMESPEC_TO_TIMEVAL(&times[1], &sb.st_mtimespec);

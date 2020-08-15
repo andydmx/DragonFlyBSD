@@ -13,6 +13,8 @@
 /* The feature bitmap for virtio net */
 #define VIRTIO_NET_F_CSUM	0x00001 /* Host handles pkts w/ partial csum */
 #define VIRTIO_NET_F_GUEST_CSUM 0x00002 /* Guest handles pkts w/ partial csum*/
+#define VIRTIO_NET_F_CTRL_GUEST_OFFLOADS 0x00004 /* Guest can do dynamic
+					 * offloads state configuration */
 #define VIRTIO_NET_F_MAC	0x00020 /* Host has given MAC address. */
 #define VIRTIO_NET_F_GSO	0x00040 /* Host handles pkts w/ any GSO type */
 #define VIRTIO_NET_F_GUEST_TSO4	0x00080 /* Guest can handle TSOv4 in. */
@@ -33,6 +35,7 @@
 					 * network */
 #define VIRTIO_NET_F_MQ		0x400000 /* Device supports Receive Flow
 					  * Steering */
+#define VIRTIO_NET_F_CTRL_MAC_ADDR 0x800000 /* Set MAC address */
 
 #define VIRTIO_NET_S_LINK_UP	1	/* Link is up */
 #define VIRTIO_NET_S_ANNOUNCE	2	/* Announcement is needed */
@@ -131,6 +134,7 @@ struct virtio_net_ctrl_mac {
 
 #define VIRTIO_NET_CTRL_MAC		1
 #define VIRTIO_NET_CTRL_MAC_TABLE_SET	0
+#define VIRTIO_NET_CTRL_MAC_ADDR_SET	1
 
 /*
  * Control VLAN filtering

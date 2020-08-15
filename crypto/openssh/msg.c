@@ -1,4 +1,4 @@
-/* $OpenBSD: msg.c,v 1.15 2006/08/03 03:34:42 deraadt Exp $ */
+/* $OpenBSD: msg.c,v 1.18 2020/01/22 04:49:16 djm Exp $ */
 /*
  * Copyright (c) 2002 Markus Friedl.  All rights reserved.
  *
@@ -34,55 +34,60 @@
 #include <unistd.h>
 #include <stdarg.h>
 
-#include "buffer.h"
+#include "sshbuf.h"
+#include "ssherr.h"
 #include "log.h"
 #include "atomicio.h"
 #include "msg.h"
 #include "misc.h"
 
 int
-ssh_msg_send(int fd, u_char type, Buffer *m)
+ssh_msg_send(int fd, u_char type, struct sshbuf *m)
 {
 	u_char buf[5];
-	u_int mlen = buffer_len(m);
+	u_int mlen = sshbuf_len(m);
 
-	debug3("ssh_msg_send: type %u", (unsigned int)type & 0xff);
+	debug3("%s: type %u", __func__, (unsigned int)type & 0xff);
 
 	put_u32(buf, mlen + 1);
 	buf[4] = type;		/* 1st byte of payload is mesg-type */
 	if (atomicio(vwrite, fd, buf, sizeof(buf)) != sizeof(buf)) {
-		error("ssh_msg_send: write");
+		error("%s: write: %s", __func__, strerror(errno));
 		return (-1);
 	}
-	if (atomicio(vwrite, fd, buffer_ptr(m), mlen) != mlen) {
-		error("ssh_msg_send: write");
+	if (atomicio(vwrite, fd, sshbuf_mutable_ptr(m), mlen) != mlen) {
+		error("%s: write: %s", __func__, strerror(errno));
 		return (-1);
 	}
 	return (0);
 }
 
 int
-ssh_msg_recv(int fd, Buffer *m)
+ssh_msg_recv(int fd, struct sshbuf *m)
 {
-	u_char buf[4];
+	u_char buf[4], *p;
 	u_int msg_len;
+	int r;
 
 	debug3("ssh_msg_recv entering");
 
 	if (atomicio(read, fd, buf, sizeof(buf)) != sizeof(buf)) {
 		if (errno != EPIPE)
-			error("ssh_msg_recv: read: header");
+			error("%s: read header: %s", __func__, strerror(errno));
 		return (-1);
 	}
 	msg_len = get_u32(buf);
 	if (msg_len > 256 * 1024) {
-		error("ssh_msg_recv: read: bad msg_len %u", msg_len);
+		error("%s: read: bad msg_len %u", __func__, msg_len);
 		return (-1);
 	}
-	buffer_clear(m);
-	buffer_append_space(m, msg_len);
-	if (atomicio(read, fd, buffer_ptr(m), msg_len) != msg_len) {
-		error("ssh_msg_recv: read: %s", strerror(errno));
+	sshbuf_reset(m);
+	if ((r = sshbuf_reserve(m, msg_len, &p)) != 0) {
+		error("%s: buffer error: %s", __func__, ssh_err(r));
+		return -1;
+	}
+	if (atomicio(read, fd, p, msg_len) != msg_len) {
+		error("%s: read: %s", __func__, strerror(errno));
 		return (-1);
 	}
 	return (0);

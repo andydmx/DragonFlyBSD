@@ -29,7 +29,6 @@
  * @(#) Copyright (c) 1993 The Regents of the University of California.  All rights reserved.
  * @(#)jot.c	8.1 (Berkeley) 6/6/93
  * $FreeBSD: src/usr.bin/jot/jot.c,v 1.13.2.3 2001/12/17 13:49:50 gallatin Exp $
- * $DragonFly: src/usr.bin/jot/jot.c,v 1.4 2004/07/31 10:19:53 eirikn Exp $
  */
 
 /*
@@ -55,10 +54,6 @@
 
 #define	is_default(s)	(strcmp((s), "-") == 0)
 
-double	begin;
-double	ender;
-double	s;
-long	reps;
 int	randomize;
 int	infinity;
 int	boring;
@@ -68,13 +63,13 @@ int	intdata;
 int	chardata;
 int	nosign;
 int	nofinalnl;
-const	char *sepstring = "\n";
-char	format[BUFSIZ];
+static const	char *sepstring = "\n";
+static char	format[BUFSIZ];
 
-void		getformat(void);
-int		getprec(char *);
-int		putdata(double, long);
-static void	usage(void);
+static void	getformat(void);
+static int	getprec(const char *);
+static int	putdata(double, long);
+static void	usage(void) __dead2;
 
 int
 main(int argc, char **argv)
@@ -87,6 +82,10 @@ main(int argc, char **argv)
 	unsigned int	mask = 0;
 	int	n = 0;
 	int	ch;
+	double	begin = BEGIN_DEF;
+	double	ender = ENDER_DEF;
+	double	s = STEP_DEF;
+	long	reps = REPS_DEF;
 
 	while ((ch = getopt(argc, argv, "rb:w:cs:np:")) != -1)
 		switch ((char)ch) {
@@ -128,6 +127,7 @@ main(int argc, char **argv)
 				errx(1, "bad s value: %s", argv[3]);
 			mask |= 01;
 		}
+		/* FALLTHROUGH */
 	case 3:
 		if (!is_default(argv[2])) {
 			if (!sscanf(argv[2], "%lf", &ender))
@@ -136,6 +136,7 @@ main(int argc, char **argv)
 			if (!prec)
 				n = getprec(argv[2]);
 		}
+		/* FALLTHROUGH */
 	case 2:
 		if (!is_default(argv[1])) {
 			if (!sscanf(argv[1], "%lf", &begin))
@@ -146,6 +147,7 @@ main(int argc, char **argv)
 			if (n > prec)		/* maximum precision */
 				prec = n;
 		}
+		/* FALLTHROUGH */
 	case 1:
 		if (!is_default(argv[0])) {
 			if (!sscanf(argv[0], "%ld", &reps))
@@ -275,7 +277,7 @@ main(int argc, char **argv)
 	exit(0);
 }
 
-int
+static int
 putdata(double x, long notlast)
 {
 
@@ -319,11 +321,11 @@ usage(void)
 	exit(1);
 }
 
-int
-getprec(char *str)
+static int
+getprec(const char *str)
 {
-	char	*p;
-	char	*q;
+	const char	*p;
+	const char	*q;
 
 	for (p = str; *p; p++)
 		if (*p == '.')
@@ -336,7 +338,7 @@ getprec(char *str)
 	return (p - q);
 }
 
-void
+static void
 getformat(void)
 {
 	char	*p, *p2;
@@ -397,15 +399,15 @@ getformat(void)
 			intdata = 1;
 			break;
 		case 'D':
-			if (!longdata) {
-				intdata = 1;
-				break;
-			}
+			if (longdata)
+				goto fmt_broken;
+			intdata = 1;
+			break;
 		case 'O': case 'U':
-			if (!longdata) {
-				intdata = nosign = 1;
-				break;
-			}
+			if (longdata)
+				goto fmt_broken;
+			intdata = nosign = 1;
+			break;
 		case 'c':
 			if (!(intdata | longdata)) {
 				chardata = 1;

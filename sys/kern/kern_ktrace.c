@@ -34,7 +34,8 @@
 
 #include <sys/param.h>
 #include <sys/systm.h>
-#include <sys/sysproto.h>
+#include <sys/uio.h>
+#include <sys/sysmsg.h>
 #include <sys/kernel.h>
 #include <sys/proc.h>
 #include <sys/fcntl.h>
@@ -47,8 +48,6 @@
 #include <sys/sysent.h>
 
 #include <vm/vm_zone.h>
-
-#include <sys/mplock2.h>
 
 static MALLOC_DEFINE(M_KTRACE, "KTRACE", "KTRACE");
 
@@ -108,12 +107,13 @@ ktrputsyscall(struct ktr_syscall *ktp_cache, struct ktr_syscall *ktp)
 }
 
 void
-ktrsyscall(struct lwp *lp, int code, int narg, register_t args[])
+ktrsyscall(struct lwp *lp, int code, int narg, union sysunion *uap)
 {
 	struct ktr_header kth;
 	struct ktr_syscall ktp_cache;
 	struct ktr_syscall *ktp;
 	register_t *argp;
+	register_t *args = (void *)uap;
 	int i;
 
 	/*
@@ -254,7 +254,7 @@ static int ktrace_clear_callback(struct proc *p, void *data);
  * MPALMOSTSAFE
  */
 int
-sys_ktrace(struct ktrace_args *uap)
+sys_ktrace(struct sysmsg *sysmsg, const struct ktrace_args *uap)
 {
 #ifdef KTRACE
 	struct ktrace_clear_info info;
@@ -270,8 +270,9 @@ sys_ktrace(struct ktrace_args *uap)
 	struct nlookupdata nd;
 	ktrace_node_t tracenode = NULL;
 
-	get_mplock();
+	lwkt_gettoken(&curp->p_token);
 	curp->p_traceflag |= KTRFAC_ACTIVE;
+
 	if (ops != KTROP_CLEAR) {
 		/*
 		 * an operation which requires a file argument.
@@ -303,7 +304,7 @@ sys_ktrace(struct ktrace_args *uap)
 		info.tracenode = tracenode;
 		info.error = 0;
 		info.rootclear = 0;
-		allproc_scan(ktrace_clear_callback, &info);
+		allproc_scan(ktrace_clear_callback, &info, 0);
 		error = info.error;
 		goto done;
 	}
@@ -359,7 +360,7 @@ done:
 	if (tracenode)
 		ktrdestroy(&tracenode);
 	curp->p_traceflag &= ~KTRFAC_ACTIVE;
-	rel_mplock();
+	lwkt_reltoken(&curp->p_token);
 	return (error);
 #else
 	return ENOSYS;
@@ -404,7 +405,7 @@ ktrace_clear_callback(struct proc *p, void *data)
  * MPALMOSTSAFE
  */
 int
-sys_utrace(struct utrace_args *uap)
+sys_utrace(struct sysmsg *sysmsg, const struct utrace_args *uap)
 {
 #ifdef KTRACE
 	struct ktr_header kth;
@@ -617,7 +618,7 @@ ktrwrite(struct lwp *lp, struct ktr_header *kth, struct uio *uio)
 		info.tracenode = tracenode;
 		info.error = 0;
 		info.rootclear = 1;
-		allproc_scan(ktrace_clear_callback, &info);
+		allproc_scan(ktrace_clear_callback, &info, 0);
 	}
 	ktrdestroy(&tracenode);
 }

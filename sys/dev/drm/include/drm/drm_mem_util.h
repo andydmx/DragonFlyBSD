@@ -27,8 +27,7 @@
 #ifndef _DRM_MEM_UTIL_H_
 #define _DRM_MEM_UTIL_H_
 
-#include <sys/types.h>
-#include <sys/malloc.h>
+#include <linux/vmalloc.h>
 
 static __inline__ void *drm_calloc_large(size_t nmemb, size_t size)
 {
@@ -47,9 +46,17 @@ static __inline__ void *drm_malloc_ab(size_t nmemb, size_t size)
 	return kmalloc(nmemb * size, M_DRM, M_WAITOK);
 }
 
+static __inline__ void *drm_malloc_gfp(size_t nmemb, size_t size, gfp_t gfp)
+{
+	if (size != 0 && nmemb > SIZE_MAX / size)
+		return NULL;
+
+	return kmalloc(nmemb * size, M_DRM, gfp);
+}
+
 static __inline void drm_free_large(void *ptr)
 {
-	kfree(ptr, M_DRM);
+	kfree(ptr);
 }
 
 #endif

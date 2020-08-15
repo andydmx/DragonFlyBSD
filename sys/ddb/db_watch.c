@@ -24,7 +24,6 @@
  * rights to redistribute these changes.
  *
  * $FreeBSD: src/sys/ddb/db_watch.c,v 1.20.2.1 2001/07/25 01:00:08 bsd Exp $
- * $DragonFly: src/sys/ddb/db_watch.c,v 1.5 2005/12/23 21:35:44 swildner Exp $
  */
 
 /*
@@ -72,7 +71,7 @@ int  db_md_clr_watchpoint   (db_expr_t addr, db_expr_t size);
 void db_md_list_watchpoints (void);
 
 
-db_watchpoint_t
+static db_watchpoint_t
 db_watchpoint_alloc(void)
 {
 	db_watchpoint_t	watch;
@@ -91,7 +90,7 @@ db_watchpoint_alloc(void)
 	return (watch);
 }
 
-void
+static void
 db_watchpoint_free(db_watchpoint_t watch)
 {
 	watch->link = db_free_watchpoints;
@@ -305,4 +304,11 @@ db_hwatchpoint_cmd(db_expr_t addr, boolean_t have_addr, db_expr_t count,
 	rc = db_md_set_watchpoint(addr, count);
 	if (rc < 0)
 		db_printf("hardware watchpoint could not be set\n");
+}
+
+void
+db_invltlb_cmd(db_expr_t addr, boolean_t have_addr, db_expr_t count,
+	       char *modif)
+{
+	cpu_invltlb();
 }

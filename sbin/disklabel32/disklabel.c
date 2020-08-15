@@ -36,7 +36,6 @@
  */
 
 #include <sys/param.h>
-#include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #define DKTYPENAMES
@@ -47,6 +46,7 @@
 #include <sys/dtype.h>
 #include <sys/sysctl.h>
 #include <disktab.h>
+#include <fcntl.h>
 #include <fstab.h>
 
 #include <vfs/ufs/dinode.h>
@@ -102,7 +102,7 @@ int	getasciipartspec(char *, struct disklabel32 *, int, int);
 int	checklabel(struct disklabel32 *);
 void	setbootflag(struct disklabel32 *);
 void	Warning(const char *, ...) __printflike(1, 2);
-void	usage(void);
+void	usage(void) __dead2;
 int	checkoldboot(int, const char *);
 const char *fixlabel(int, struct disklabel32 *, int);
 struct disklabel32 *getvirginlabel(void);
@@ -637,7 +637,7 @@ makebootarea(char *boot, struct disklabel32 *dp, int f)
 	bootsize = (int)sb.st_size - dp->d_bbsize;
 	if (bootsize > 0) {
 		/* XXX assume d_secsize is a power of two */
-		bootsize = (bootsize + dp->d_secsize-1) & ~(dp->d_secsize-1);
+		bootsize = roundup2(bootsize, dp->d_secsize);
 		bootbuf = (char *)malloc((size_t)bootsize);
 		if (bootbuf == NULL)
 			err(4, "%s", xxboot);

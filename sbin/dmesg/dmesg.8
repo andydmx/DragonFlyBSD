@@ -9,11 +9,7 @@
 .\" 2. Redistributions in binary form must reproduce the above copyright
 .\"    notice, this list of conditions and the following disclaimer in the
 .\"    documentation and/or other materials provided with the distribution.
-.\" 3. All advertising materials mentioning features or use of this software
-.\"    must display the following acknowledgment:
-.\"	This product includes software developed by the University of
-.\"	California, Berkeley and its contributors.
-.\" 4. Neither the name of the University nor the names of its contributors
+.\" 3. Neither the name of the University nor the names of its contributors
 .\"    may be used to endorse or promote products derived from this software
 .\"    without specific prior written permission.
 .\"
@@ -32,7 +28,7 @@
 .\"     @(#)dmesg.8	8.1 (Berkeley) 6/5/93
 .\" $FreeBSD: src/sbin/dmesg/dmesg.8,v 1.5.2.5 2002/08/21 18:58:17 trhodes Exp $
 .\"
-.Dd May 10, 2013
+.Dd September 29, 2016
 .Dt DMESG 8
 .Os
 .Sh NAME
@@ -45,6 +41,7 @@
 .Op Fl f[f]
 .Op Fl M Ar core
 .Op Fl N Ar system
+.Op Fl n Ar dumpnr
 .Sh DESCRIPTION
 The
 .Nm
@@ -78,17 +75,23 @@ monitors the kernel for additional data and displays it as it arrives.
 will not terminate until killed in this mode.
 If this option is specified twice,
 .Nm
-will live loop (use the cpu heavily) to obtain updates as quickly as
+will live loop (using the CPU heavily) to obtain updates as quickly as
 possible.
 This second mode should only be used when trying to debug a kernel crashing
 situation.
-.It Fl M
-Extract values associated with the name list from the specified core
+.It Fl M Ar core
+Extract values associated with the name list from the specified
+.Ar core
 instead of the default
 .Pa /dev/kmem .
-.It Fl N
-Extract the name list from the specified system instead of the default,
-which is the kernel image the system has booted from.
+.It Fl N Ar system
+Extract the name list from the specified
+.Ar system
+instead of the default, which is the kernel image the system has booted from.
+.It Fl n Ar dumpnr
+Use the kernel core dump file numbered
+.Ar dumpnr
+for debugging.
 .El
 .Sh FILES
 .Bl -tag -width ".Pa /var/run/dmesg.boot" -compact
@@ -104,4 +107,4 @@ at startup time
 The
 .Nm
 utility appeared in
-.Bx 4.0 .
+.Bx 3.0 .

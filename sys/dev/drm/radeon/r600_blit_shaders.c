@@ -22,17 +22,17 @@
  *
  * Authors:
  *     Alex Deucher <alexander.deucher@amd.com>
- *
- * $FreeBSD: head/sys/dev/drm2/radeon/r600_blit_shaders.c 254885 2013-08-25 19:37:15Z dumbbell $
  */
 
-#include <drm/drmP.h>
+#include <linux/bug.h>
+#include <linux/types.h>
+#include <linux/kernel.h>
 
 /*
  * R6xx+ cards need to use the 3D engine to blit data which requires
  * quite a bit of hw state setup.  Rather than pull the whole 3D driver
  * (which normally generates the 3D state) into the DRM, we opt to use
- * statically generated state tables.  The regsiter state and shaders
+ * statically generated state tables.  The register state and shaders
  * were hand generated to support blitting functionality.  See the 3D
  * driver or documentation for descriptions of the registers and
  * shader instructions.
@@ -713,7 +713,7 @@ const u32 r6xx_ps[] =
 	0x00000000,
 };
 
-const u32 r6xx_ps_size = DRM_ARRAY_SIZE(r6xx_ps);
-const u32 r6xx_vs_size = DRM_ARRAY_SIZE(r6xx_vs);
-const u32 r6xx_default_size = DRM_ARRAY_SIZE(r6xx_default_state);
-const u32 r7xx_default_size = DRM_ARRAY_SIZE(r7xx_default_state);
+const u32 r6xx_ps_size = ARRAY_SIZE(r6xx_ps);
+const u32 r6xx_vs_size = ARRAY_SIZE(r6xx_vs);
+const u32 r6xx_default_size = ARRAY_SIZE(r6xx_default_state);
+const u32 r7xx_default_size = ARRAY_SIZE(r7xx_default_state);

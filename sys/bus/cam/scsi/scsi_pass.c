@@ -39,7 +39,6 @@
 #include <sys/errno.h>
 #include <sys/devicestat.h>
 #include <sys/buf2.h>
-#include <sys/thread2.h>
 
 #include "../cam.h"
 #include "../cam_ccb.h"
@@ -66,6 +65,7 @@ typedef enum {
 } pass_state;
 
 typedef enum {
+	PASS_CCB_POLLED,
 	PASS_CCB_BUFFER_IO,
 	PASS_CCB_WAITING
 } pass_ccb_types;
@@ -108,13 +108,10 @@ static struct periph_driver passdriver =
 PERIPHDRIVER_DECLARE(pass, passdriver);
 
 static struct dev_ops pass_ops = {
-	{ "pass", 0, 0 },
+	{ "pass", 0, D_MPSAFE },
 	.d_open =	passopen,
 	.d_close =	passclose,
-	.d_read =	noread,
-	.d_write =	nowrite,
 	.d_ioctl =	passioctl,
-	.d_strategy =	nostrategy,
 };
 
 static struct extend_array *passperiphs;
@@ -288,8 +285,10 @@ passregister(struct cam_periph *periph, void *arg)
 	 */
 	xpt_register_async(AC_LOST_DEVICE, passasync, periph, periph->path);
 
+#if 0
 	if (bootverbose)
 		xpt_announce_periph(periph, NULL);
+#endif
 
 	return(CAM_REQ_CMP);
 }
@@ -414,9 +413,14 @@ passdone(struct cam_periph *periph, union ccb *done_ccb)
 	struct ccb_scsiio *csio;
 
 	csio = &done_ccb->csio;
+
 	switch (csio->ccb_h.ccb_type) {
 	case PASS_CCB_WAITING:
 		/* Caller will release the CCB */
+		wakeup(&done_ccb->ccb_h.cbfcnp);
+		return;
+	case PASS_CCB_POLLED:
+		/* polled, caller releases ccb */
 		wakeup(&done_ccb->ccb_h.cbfcnp);
 		return;
 	}
@@ -494,10 +498,11 @@ passioctl(struct dev_ioctl_args *ap)
 			break;
 		}
 
+		ccb->ccb_h.ccb_type = PASS_CCB_POLLED;
 		error = passsendccb(periph, ccb, inccb);
 
 		if (ccb_malloced)
-			xpt_free_ccb(ccb);
+			xpt_free_ccb(&ccb->ccb_h);
 		else
 			xpt_release_ccb(ccb);
 

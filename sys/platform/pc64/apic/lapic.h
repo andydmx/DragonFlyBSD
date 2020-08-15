@@ -51,10 +51,15 @@ struct lapic_enumerator {
 #define LAPIC_ENUM_PRIO_MPTABLE		20
 #define LAPIC_ENUM_PRIO_MADT		40
 
-extern volatile lapic_t		*lapic;
+extern volatile lapic_t		*lapic_mem;
 extern int			cpu_id_to_apic_id[];
 extern int			apic_id_to_cpu_id[];
 extern int			lapic_enable;
+extern int			lapic_usable;
+extern int			x2apic_enable;
+extern void			(*lapic_eoi)(void);
+extern int			(*apic_ipi)(int, int, int);
+extern void			(*single_apic_ipi)(int, int, int);
 
 void	apic_dump(char*);
 void	lapic_init(boolean_t);
@@ -62,22 +67,24 @@ void	lapic_set_cpuid(int, int);
 int	lapic_config(void);
 void	lapic_enumerator_register(struct lapic_enumerator *);
 void	set_apic_timer(int);
-int	get_apic_timer_frequency(void);
 int	read_apic_timer(void);
 void	u_sleep(int);
 
 void	lapic_map(vm_paddr_t);
 int	lapic_unused_apic_id(int);
 void	lapic_fixup_noioapic(void);
+void	lapic_seticr_sync(uint32_t, uint32_t);
+void	lapic_x2apic_enter(boolean_t);
 
 #ifndef _MACHINE_SMP_H_
 #include <machine/smp.h>
 #endif
 
-int	apic_ipi(int, int, int);
+#ifndef _SYS_CPUMASK_H_
+#include <sys/cpumask.h>
+#endif
+
 void	selected_apic_ipi(cpumask_t, int, int);
-void	single_apic_ipi(int, int, int);
-int	single_apic_ipi_passive(int, int, int);
 
 /*
  * Send an IPI INTerrupt containing 'vector' to all CPUs EXCEPT myself
@@ -89,5 +96,30 @@ all_but_self_ipi(int vector)
 		return 0;
 	return apic_ipi(APIC_DEST_ALLESELF, vector, APIC_DELMODE_FIXED);
 }
+
+#define LAPIC_MEM_READ(field)		(lapic_mem->field)
+#define LAPIC_MEM_WRITE(field, val)	\
+do {					\
+	lapic_mem->field = (val);	\
+} while (0)
+
+#define LAPIC_MSR_READ(msr)		rdmsr((msr))
+#define LAPIC_MSR_WRITE(msr, val)	wrmsr((msr), (val))
+
+#define LAPIC_READ(field)						\
+	(x2apic_enable ? (uint32_t)LAPIC_MSR_READ(LAPIC2MSR(field)) 	\
+		       : LAPIC_MEM_READ(field))
+
+#define LAPIC_WRITE(field, val)						\
+do {									\
+	if (x2apic_enable)						\
+		LAPIC_MSR_WRITE(LAPIC2MSR(field), (val));		\
+	else								\
+		LAPIC_MEM_WRITE(field, (val));				\
+} while (0)
+
+#define LAPIC_READID							\
+	(x2apic_enable ? (uint32_t)LAPIC_MSR_READ(MSR_X2APIC_ID) 	\
+		       : APIC_ID(LAPIC_MEM_READ(id)))
 
 #endif /* _ARCH_APIC_LAPIC_H_ */

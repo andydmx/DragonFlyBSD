@@ -37,8 +37,6 @@
 #include <sys/socket.h>
 #include <net/if.h>
 
-#include <machine/inttypes.h>
-
 #include <errno.h>
 #include <err.h>
 #include <fcntl.h>
@@ -81,7 +79,6 @@ void  log_pcap_stats(void);
 int   flush_buffer(FILE *);
 int   if_exists(char *);
 int   init_pcap(void);
-void  logmsg(int, const char *, ...) __printflike(2, 3);
 void  purge_buffer(void);
 int   reset_dump(int);
 int   scan_dump(FILE *, off_t);
@@ -91,7 +88,7 @@ void  sig_alrm(int);
 void  sig_usr1(int);
 void  sig_close(int);
 void  sig_hup(int);
-void  usage(void);
+void  usage(void) __dead2;
 
 static int try_reset_dump(int);
 
@@ -722,7 +719,7 @@ main(int argc, char **argv)
 		np = pcap_dispatch(hpcap, PCAP_NUM_PKTS,
 		    phandler, (u_char *)dpcap);
 		if (np < 0) {
-			if (!if_exists(__DECONST(char *, interface)) == -1) {
+			if (!if_exists(__DECONST(char *, interface))) {
 				logmsg(LOG_NOTICE, "interface %s went away",
 				    interface);
 				ret = -1;

@@ -305,9 +305,6 @@ struct mfi_softc {
 	struct lock			mfi_io_lock;
 	struct lock			mfi_config_lock;
 
-	struct sysctl_ctx_list		mfi_sysctl_ctx;
-	struct sysctl_oid		*mfi_sysctl_tree;
-
 	/* Controller type specific interfaces */
 	void	(*mfi_enable_intr)(struct mfi_softc *sc);
 	void	(*mfi_disable_intr)(struct mfi_softc *sc);
@@ -585,7 +582,9 @@ mfi_lockassert(struct lock *lockp)
 #define MFI_READ1(sc, reg)		bus_space_read_1((sc)->mfi_btag, \
 	(sc)->mfi_bhandle, (reg))
 
+#ifdef MALLOC_DECLARE
 MALLOC_DECLARE(M_MFIBUF);
+#endif
 
 #define MFI_RESET_WAIT_TIME 180
 #define MFI_CMD_TIMEOUT 30

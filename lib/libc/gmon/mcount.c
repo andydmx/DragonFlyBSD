@@ -10,11 +10,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -32,7 +28,6 @@
  *
  * @(#)mcount.c	8.1 (Berkeley) 6/4/93
  * $FreeBSD: src/lib/libc/gmon/mcount.c,v 1.20 2004/10/16 06:32:43 obrien Exp $
- * $DragonFly: src/lib/libc/gmon/mcount.c,v 1.5 2005/11/13 01:18:20 swildner Exp $
  */
 
 #include <sys/param.h>
@@ -64,12 +59,12 @@ void	user(void);
  * perform this optimization.
  */
 /* _mcount; may be static, inline, etc */
-_MCOUNT_DECL(uintfptr_t frompc, uintfptr_t selfpc)
+_MCOUNT_DECL(u_long frompc, u_long selfpc)
 {
 #ifdef GUPROF
 	u_int delta;
 #endif
-	fptrdiff_t frompci;
+	u_long frompci;
 	u_short *frompcindex;
 	struct tostruct *top, *prevtop;
 	struct gmonparam *p;
@@ -102,9 +97,9 @@ _MCOUNT_DECL(uintfptr_t frompc, uintfptr_t selfpc)
 	 */
 	if (frompci >= p->textsize) {
 		if (frompci + p->lowpc
-		    >= (uintfptr_t)(VM_MAXUSER_ADDRESS + UPAGES * PAGE_SIZE))
+		    >= (u_long)(VM_MAXUSER_ADDRESS + UPAGES * PAGE_SIZE))
 			goto done;
-		frompci = (uintfptr_t)user - p->lowpc;
+		frompci = (u_long)user - p->lowpc;
 		if (frompci >= p->textsize)
 		    goto done;
 	}
@@ -166,12 +161,11 @@ skip_guprof_stuff:
 	 * exceptions appear in the call graph as calls from btrap() and
 	 * bintr() instead of calls from all over.
 	 */
-	if ((uintfptr_t)selfpc >= (uintfptr_t)btrap
-	    && (uintfptr_t)selfpc < (uintfptr_t)eintr) {
-		if ((uintfptr_t)selfpc >= (uintfptr_t)bintr)
-			frompci = (uintfptr_t)bintr - p->lowpc;
+	if ((selfpc >= (u_long)btrap) && (selfpc < (u_long)eintr)) {
+		if (selfpc >= (u_long)bintr)
+			frompci = (u_long)bintr - p->lowpc;
 		else
-			frompci = (uintfptr_t)btrap - p->lowpc;
+			frompci = (u_long)btrap - p->lowpc;
 	}
 #endif
 
@@ -277,13 +271,13 @@ MCOUNT
 
 #ifdef GUPROF
 void
-mexitcount(uintfptr_t selfpc)
+mexitcount(u_long selfpc)
 {
 	struct gmonparam *p;
-	uintfptr_t selfpcdiff;
+	u_long selfpcdiff;
 
 	p = &_gmonparam;
-	selfpcdiff = selfpc - (uintfptr_t)p->lowpc;
+	selfpcdiff = selfpc - p->lowpc;
 	if (selfpcdiff < p->textsize) {
 		u_int delta;
 

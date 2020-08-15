@@ -31,6 +31,7 @@
 #include <sys/param.h>
 #include <sys/kernel.h>
 #include <sys/limits.h>
+#include <sys/malloc.h>
 #include <sys/mbuf.h>
 #include <sys/syslog.h>
 #include <sys/systm.h>
@@ -156,7 +157,7 @@ get_export_dgram(priv_p priv)
 		struct netflow_v5_export_dgram *dgram;
 		struct mbuf *m;
 
-		m = m_getcl(MB_DONTWAIT, MT_DATA, M_PKTHDR);
+		m = m_getcl(M_NOWAIT, MT_DATA, M_PKTHDR);
 		if (m == NULL)
 			return (NULL);
 		item = ng_package_data(m, NG_NOFLAGS);

@@ -61,6 +61,7 @@
 
 struct vmspace_rb_tree;
 struct vmspace_entry;
+struct lwp;
 RB_PROTOTYPE(vmspace_rb_tree, vmspace_entry, rb_entry, rb_vmspace_compare);
 
 /*
@@ -74,6 +75,7 @@ struct vkernel_lwp {
 	struct trapframe *user_trapframe;	/* copyback to vkernel */
 	struct vextframe *user_vextframe;
 	struct vmspace_entry *ve;
+	struct vmspace_entry *ve_cache;
 };
 
 struct vkernel_proc {
@@ -86,12 +88,13 @@ struct vkernel_proc {
 struct vmspace_entry {
 	void *id;
 	struct vmspace *vmspace;
-	int flags;
-	int refs;				/* current LWP assignments */
+	uint32_t flags;
+	uint32_t refs;			/* in-use + 1(on-tree */
+	uint32_t cache_refs;		/* cache count (separate) */
 	RB_ENTRY(vmspace_entry) rb_entry;
 };
 
-#define VKE_DELETED	0x0001
+#define VKE_REF_DELETED	0x80000000U
 
 #ifdef _KERNEL
 
@@ -116,9 +119,7 @@ void vkernel_trap(struct lwp *lp, struct trapframe *frame);
 /*
  * KERNEL AND USER DEFINITIONS
  *
- * WARNING: vpte_t is 64 bits on a 64-bit box and 32 bits on a 32 bit box.
- *	    A 2-layer page table is used on 32 bit boxes and a 4-layer
- *	    page table is used on 64 bit boxes.
+ * WARNING: vpte_t is 64 bits.  A 4-layer page table is used.
  */
 typedef u_long	vpte_t;
 
@@ -149,7 +150,7 @@ typedef u_long	vpte_t;
 #define VPTE_G		0x00000100	/* global bit ?? */
 #define VPTE_WIRED	0x00000200	/* wired */
 #define VPTE_MANAGED	0x00000400	/* managed bit ?? */
-
+#define VPTE_NX		0x00000800	/* no-execute bit */
 
 #endif
 

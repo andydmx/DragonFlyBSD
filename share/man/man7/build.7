@@ -24,7 +24,7 @@
 .\"
 .\" $FreeBSD: src/share/man/man7/build.7,v 1.19.2.1 2002/03/18 08:33:02 murray Exp $
 .\"
-.Dd October 26, 2014
+.Dd July 31, 2020
 .Dt BUILD 7
 .Os
 .Sh NAME
@@ -81,7 +81,7 @@ Installs the results of the build for this directory.
 The other
 .Pa /usr/src
 make targets are:
-.Bl -tag -width ".Cm backup-auto-clean"
+.Bl -tag -width ".Cm installworld-force"
 .It Cm buildworld
 Rebuild everything but the kernel.
 .It Cm quickworld
@@ -99,10 +99,28 @@ but also skip the depend step.
 Just do the bootstrap, build and cross-build steps.
 .It Cm installworld
 Install everything built by
-.Cm buildworld .
+.Cm buildworld ,
+as well as the rescue tools and the initial ramdisk if they do not exist
+yet.
+.It Cm installworld-force
+Force an
+.Cm installworld .
+This will install to a temporary directory, then copy the main binaries
+and libraries with a static
+.Xr cpdup 1
+to
+.Ev DESTDIR
+and finally will issue a normal
+.Cm installworld
+and
+.Cm upgrade .
+It is a special case to be used on older systems as a last resort when
+the normal
+.Cm installworld
+doesn't work.
 .It Cm world
 .Cm buildworld +
-.Cm installworld .
+.Cm installworld
 .It Cm buildkernel
 Rebuild the kernel and the kernel-modules.
 .It Cm nativekernel
@@ -110,21 +128,34 @@ Rebuild the kernel and the kernel-modules using native tools.
 .It Cm quickkernel
 Same as
 .Cm buildkernel ,
-but skip the depend step and do not clean out the
-obj modules.
+but do not clean out the obj modules.
 This target can be used for incremental upgrades once a full
 build of the kernel has been done with
 .Cm buildkernel .
+.It Cm realquickkernel
+Same as
+.Cm quickkernel ,
+but also skip the depend step.
 .It Cm installkernel
 Install the kernel and the kernel-modules.
 .It Cm reinstallkernel
 Reinstall the kernel and the kernel-modules.
 .It Cm kernel
 .Cm buildkernel +
-.Cm installkernel .
+.Cm installkernel
+.It Cm build-all
+.Cm buildworld +
+.Cm buildkernel
+.Pp
+The option -j hw.ncpu is added automatically to optimally utilize the system.
+.It Cm install-all
+.Cm installkernel +
+.Cm installworld +
+.Cm upgrade
 .It Cm preupgrade
 Perform certain upgrades that have to be done before
-.Cm installworld .
+.Cm installworld ,
+such as adding new users and groups.
 .Cm installworld
 will complain if they have not been done.
 .It Cm upgrade
@@ -132,12 +163,21 @@ Upgrade the files in /etc and also setup the rest of the system for
 the version of
 .Dx
 just installed.
-.It Cm rescue
-Create a rescue initrd.
-.It Cm most
-Build user commands, no libraries or include files.
-.It Cm installmost
-Install user commands, no libraries or include files.
+Also, check for existence of objects being deprecated with the new installation.
+.Pp
+Note that deprecated system libraries may still be linked from packages
+installed under
+.Pa /usr/local/
+or other 3rd party objects placed elsewhere.
+The check tries to detect these dependencies, by default searching
+.Pa /usr/local/ .
+Other places to search may be specified in
+.Ev CHECK_DEPRECATED_DIRS
+variable.
+If defined, these directories will be searched in addition to default.
+.It Cm initrd
+Install the statically linked rescue tools and the initial ramdisk built by
+.Cm buildworld .
 .It Cm backupworld
 Manually archive binaries from installed world to location specified by
 .Ev WORLD_BACKUP .
@@ -165,14 +205,6 @@ These have to be set for cross-building.
 is analogous to the
 .Dq Nm uname Fl p
 output.
-To build for the 32 bit
-.Tn Intel
-architecture known as IA-32, x86 or x86-32, use:
-.Bd -literal -offset indent
-TARGET_ARCH=i386
-TARGET_PLATFORM=pc32
-.Ed
-.Pp
 For the 64 bit
 .Tn AMD
 architecture known as AMD64, x86-64 or Intel 64, use:
@@ -194,9 +226,9 @@ Used to override the path of
 (the default is
 .Pa /etc/make.conf ) .
 .It Ev KERNCONF
-The name of the kernel configuration file from which the kernel should
+The name of one or more kernel configurations from which kernels should
 be built (the default is
-.Li GENERIC ) .
+.Li X86_64_GENERIC ) .
 .It Ev KERNCONFDIR
 The directory where the kernel configuration files are kept (the default is
 .Pa /usr/src/sys/config ) .
@@ -208,9 +240,9 @@ make DESTLABEL=test installkernel
 .Ed
 .Pp
 installs them as
-.Pa /boot/kernel.test
+.Pa /boot/kernel.test/kernel
 and
-.Pa /boot/modules.test ,
+.Pa /boot/kernel.test ,
 respectively.
 .It Ev DESTKERNDIR
 Where to install the kernel and the modules (the default is
@@ -241,12 +273,77 @@ Directory for automatic backup of binaries of installed world (default:
 When defined, the automatic backup feature of
 .Cm installworld
 is inhibited.
+.It Ev COPTFLAGS
+Overrides the default optimization flags for kernel and module compiles.
+.It Ev KCFLAGS
+Allows you to add additional compiler flags for kernel and module compiles.
+But use
+.Ev COPTFLAGS
+to specify any optimization overrides, as some modules may have to override
+it to enforce a lower optimization level.
+.It Ev CHECK_DEPRECATED_DIRS
+Directories to search for objects being still linked to deprecated system
+libraries.
+This space separated list will be used by
+.Cm upgrade
+target in addition to default
+.Pa /usr/local/ .
+.It Ev REMOVE_DEPRECATED
+Remove system objects marked as deprecated.
+Used by
+.Cm upgrade
+target.
 .El
+.Sh OTHER
+There are two other mechanisms that users should be aware of.  First,
+when you issue a
+.Cm installkernel
+.Dx
+will make a backup of the current kernel in
+.Pa /boot/kernel.old .
+Because people often do multiple installkernel operations, this backup
+kernel can also get lost in the noise.
+It is usually prudent to make a backup of the old kernel manually
+every once in a while when you know that it is a good kernel.  you can
+do this after issuing the
+.Cm installkernel
+by running the command:
+.Bd -literal -offset indent
+cpdup /boot/kernel.old /boot/kernel.bak
+.Ed
+.Pp
+The advantage of this is that no installation mechanism will overwrite
+your
+.Pa /boot/kernel.bak ,
+and in addition to that the loader's boot menu will check for its
+existence and present a menu option 'b' to allow you to boot from it.
+.Pp
+The second mechanism is related to the two-stage root mount.
+When using an encrypted root, the system will actually boot from a
+small initial ramdisk (a.k.a. initrd) image stored as
+.Pa /boot/kernel/initrd.img.gz .
+This image will handle the encrypted configuration, mount, and chroot
+to the real root.
+This image is also used as the rescue ramdisk boot menu option.
+This image is NOT updated automatically by
+.Cm installworld
+or
+.Cm installkernel .
+Instead, updating this image has to be done by running the manual command:
+.Bd -literal -offset indent
+make initrd
+.Ed
+.Pp
+It is usually a good idea to run this command after rebooting into the new
+world that you installed (so you know the world you installed is good).
+This command will update the initrd image in
+.Pa /boot/kernel
+and the rescue tools in
+.Pa /rescue .
 .Sh FILES
 .Bl -tag -width ".Pa /usr/src/Makefile_upgrade.inc" -compact
 .It Pa /etc/make.conf
 .It Pa /etc/defaults/make.conf
-.It Pa /usr/src/share/doc/Makefile
 .It Pa /usr/src/Makefile
 .It Pa /usr/src/Makefile.inc1
 .It Pa /usr/src/Makefile_upgrade.inc
@@ -261,18 +358,12 @@ make buildkernel KERNCONF=FOO
 make installkernel KERNCONF=FOO
 make installworld
 make upgrade
+reboot
+make initrd
 .Ed
 .Pp
-After running these commands a system reboot is required,
-otherwise many programs which have been rebuilt (such as
-.Xr ps 1 ,
-.Xr top 1 ,
-etc.) may not work with the old kernel which is still running.
-.Sh CAVEATS
-The build and install order in the
-.Sx EXAMPLES
-section enforces that the new kernel is installed before the new
-world.
+The above mentioned build and install order enforces that the new kernel
+is installed before the new world.
 Sometimes it might be necessary to reboot the system between those two
 steps.
 In this case

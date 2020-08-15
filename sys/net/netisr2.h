@@ -43,11 +43,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -74,17 +70,12 @@
 #error "kernel only header file"
 #endif
 
-#ifndef _SYS_SYSTM_H_
 #include <sys/systm.h>
-#endif
-#ifndef _SYS_THREAD_H_
+#include <sys/msgport2.h>
 #include <sys/thread.h>
-#endif
-#ifndef _NET_NETISR_H_
 #include <net/netisr.h>
-#endif
 
-extern struct thread netisr_cpu[MAXCPU];
+extern struct thread *netisr_threads[MAXCPU];
 
 /*
  * Return the message port for the general protocol message servicing
@@ -94,7 +85,7 @@ static __inline lwkt_port_t
 netisr_cpuport(int cpu)
 {
 	KKASSERT(cpu >= 0 && cpu < ncpus);
-	return &netisr_cpu[cpu].td_msgport;
+	return &netisr_threads[cpu]->td_msgport;
 }
 
 /*
@@ -107,12 +98,23 @@ netisr_curport(void)
 }
 
 /*
+ * Return the LSB of the hash.
+ */
+static __inline uint32_t
+netisr_hashlsb(uint32_t hash)
+{
+
+	return (hash & NETISR_CPUMASK);
+}
+
+/*
  * Return the cpu for the hash.
  */
 static __inline int
 netisr_hashcpu(uint16_t hash)
 {
-	return (hash & ncpus2_mask);
+
+	return (netisr_hashlsb(hash) % netisr_ncpus);
 }
 
 /*
@@ -125,9 +127,113 @@ netisr_hashport(uint16_t hash)
 	return netisr_cpuport(netisr_hashcpu(hash));
 }
 
-#define ASSERT_CANDOMSG_NETISR0(td) \
-	KASSERT((td)->td_type != TD_TYPE_NETISR || \
-	    &(td)->td_msgport == netisr_cpuport(0), \
-	    ("can't domsg to netisr0 in thread %p", (td)))
+#define IN_NETISR(n)			\
+	(&curthread->td_msgport == netisr_cpuport((n)))
+#define IN_NETISR_NCPUS(n)		\
+	((n) < netisr_ncpus && IN_NETISR((n)))
+#define ASSERT_NETISR0			\
+	KASSERT(IN_NETISR(0), ("thread %p is not netisr0", curthread))
+#define ASSERT_NETISR_NCPUS(n)		\
+	KASSERT(IN_NETISR_NCPUS(n),	\
+	    ("thread %p cpu%d is not within netisr_ncpus %d", \
+	     curthread, (n), netisr_ncpus))
+
+static __inline int
+netisr_domsg_port(struct netmsg_base *nm, lwkt_port_t port)
+{
+
+#ifdef INVARIANTS
+	/*
+	 * Only netisr0, netisrN itself, or non-netisr threads
+	 * can perform synchronous message sending to netisrN.
+	 */
+	KASSERT(curthread->td_type != TD_TYPE_NETISR ||
+	    IN_NETISR(0) || port == &curthread->td_msgport,
+	    ("can't domsg to netisr port %p from thread %p", port, curthread));
+#endif
+	return (lwkt_domsg(port, &nm->lmsg, 0));
+}
+
+static __inline int
+netisr_domsg(struct netmsg_base *nm, int cpu)
+{
+
+	return (netisr_domsg_port(nm, netisr_cpuport(cpu)));
+}
+
+static __inline int
+netisr_domsg_global(struct netmsg_base *nm)
+{
+
+	/* Start from netisr0. */
+	return (netisr_domsg(nm, 0));
+}
+
+static __inline void
+netisr_sendmsg(struct netmsg_base *nm, int cpu)
+{
+
+	lwkt_sendmsg(netisr_cpuport(cpu), &nm->lmsg);
+}
+
+static __inline void
+netisr_sendmsg_oncpu(struct netmsg_base *nm)
+{
+
+	lwkt_sendmsg_oncpu(netisr_cpuport(mycpuid), &nm->lmsg);
+}
+
+static __inline void
+netisr_replymsg(struct netmsg_base *nm, int error)
+{
+
+	lwkt_replymsg(&nm->lmsg, error);
+}
+
+static __inline void
+netisr_dropmsg(struct netmsg_base *nm)
+{
+
+	lwkt_dropmsg(&nm->lmsg);
+}
+
+/*
+ * To all netisrs, instead of netisr_ncpus.
+ */
+static __inline void
+netisr_forwardmsg_all(struct netmsg_base *nm, int next_cpu)
+{
+
+	KKASSERT(next_cpu > mycpuid && next_cpu <= ncpus);
+	if (next_cpu < ncpus)
+		lwkt_forwardmsg(netisr_cpuport(next_cpu), &nm->lmsg);
+	else
+		netisr_replymsg(nm, 0);
+}
+
+/*
+ * To netisr_ncpus.
+ */
+static __inline void
+netisr_forwardmsg_error(struct netmsg_base *nm, int next_cpu,
+    int error)
+{
+
+	KKASSERT(next_cpu > mycpuid && next_cpu <= netisr_ncpus);
+	if (next_cpu < netisr_ncpus)
+		lwkt_forwardmsg(netisr_cpuport(next_cpu), &nm->lmsg);
+	else
+		netisr_replymsg(nm, error);
+}
+
+/*
+ * To netisr_ncpus.
+ */
+static __inline void
+netisr_forwardmsg(struct netmsg_base *nm, int next_cpu)
+{
+
+	netisr_forwardmsg_error(nm, next_cpu, 0);
+}
 
 #endif	/* _NET_NETISR2_H_ */

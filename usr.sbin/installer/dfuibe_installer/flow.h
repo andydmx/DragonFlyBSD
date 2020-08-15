@@ -39,24 +39,21 @@
 #ifndef __FLOW_H_
 #define __FLOW_H_
 
-#define	DISK_MIN	2048
-#define	HAMMER_MIN	51200
-#if defined(__i386__)
-#define	SWAP_MAX	32768
-#elif defined(__x86_64__)
-#define	SWAP_MAX	524288
-#endif
+#define	DISK_MIN	4096
+#define	HAMMER_WARN	51200
+#define	HAMMER_MIN	10240
 
-#define	MTPT_ROOT	0
-#define	MTPT_SWAP	1
-#define	MTPT_VAR	2
-#define	MTPT_TMP	3
-#define	MTPT_USR	4
-#define	MTPT_HOME	5
+#define	SWAP_MIN	256	/* suggested minimum */
+#define	SWAP_MAX	524288
+#define BUILD_MIN	10240	/* suggested */
+#define BUILD_MAX	20480	/* suggested */
 
 struct i_fn_args;
-int use_hammer;
-int during_install;
+
+extern int use_hammer;		/* 0=UFS 1=HAMMER 2=HAMMER2 */
+extern int use_uefi;
+extern int during_install;
+
 /*** PROTOTYPES ***/
 
 /* Menus */
@@ -77,6 +74,7 @@ void 		 state_diskutil_menu(struct i_fn_args *);
 
 void		 state_begin_install(struct i_fn_args *);
 void		 state_begin_upgrade(struct i_fn_args *);
+void		 state_ask_uefi(struct i_fn_args *);
 void		 state_select_disk(struct i_fn_args *);
 void		 state_ask_fs(struct i_fn_args *);
 void		 state_format_disk(struct i_fn_args *);
@@ -90,6 +88,6 @@ void		 state_setup_remote_installation_server(struct i_fn_args *);
 
 /* Entry Point */
 
-int		 flow(int, char *, char *, int livecd_configuration, int upgrade_menu_toggle);
+int		 flow(int, char *, char *, int);
 
 #endif /* !__FLOW_H_ */

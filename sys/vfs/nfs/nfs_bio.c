@@ -33,9 +33,9 @@
  * $FreeBSD: /repoman/r/ncvs/src/sys/nfsclient/nfs_bio.c,v 1.130 2004/04/14 23:23:55 peadar Exp $
  */
 
-
 #include <sys/param.h>
 #include <sys/systm.h>
+#include <sys/uio.h>
 #include <sys/resourcevar.h>
 #include <sys/signalvar.h>
 #include <sys/proc.h>
@@ -43,6 +43,7 @@
 #include <sys/vnode.h>
 #include <sys/mount.h>
 #include <sys/kernel.h>
+#include <sys/malloc.h>
 #include <sys/mbuf.h>
 
 #include <vm/vm.h>
@@ -72,6 +73,14 @@ static void nfsiodone_sync(struct bio *bio);
 static void nfs_readrpc_bio_done(nfsm_info_t info);
 static void nfs_writerpc_bio_done(nfsm_info_t info);
 static void nfs_commitrpc_bio_done(nfsm_info_t info);
+
+static __inline
+void
+nfs_knote(struct vnode *vp, int flags)
+{
+	if (flags)
+		KNOTE(&vp->v_pollinfo.vpi_kqinfo.ki_note, flags);
+}
 
 /*
  * Vnode op for read using bio
@@ -110,7 +119,7 @@ nfs_bioread(struct vnode *vp, struct uio *uio, int ioflag)
 	    (uio->uio_offset + uio->uio_resid) > nmp->nm_maxfilesize)
 		return (EFBIG);
 	biosize = vp->v_mount->mnt_stat.f_iosize;
-	seqcount = (int)((off_t)(ioflag >> IO_SEQSHIFT) * biosize / BKVASIZE);
+	seqcount = (int)((off_t)(ioflag >> IO_SEQSHIFT) * biosize / MAXBSIZE);
 
 	/*
 	 * For nfs, cache consistency can only be maintained approximately.
@@ -121,7 +130,9 @@ nfs_bioread(struct vnode *vp, struct uio *uio, int ioflag)
 	 *		directory, the directory must be invalidated and
 	 *		the attribute cache must be cleared.
 	 *
-	 *		GETATTR is called to synchronize the file size.
+	 *		GETATTR is called to synchronize the file size.  To
+	 *		avoid a deadlock again the VM system, we cannot do
+	 *		this for UIO_NOCOPY reads.
 	 *
 	 *		If remote changes are detected local data is flushed
 	 *		and the cache is invalidated.
@@ -137,9 +148,17 @@ nfs_bioread(struct vnode *vp, struct uio *uio, int ioflag)
 			return (error);
 		np->n_attrstamp = 0;
 	}
-	error = VOP_GETATTR(vp, &vattr);
-	if (error)
-		return (error);
+
+	/*
+	 * Synchronize the file size when possible.  We can't do this without
+	 * risking a deadlock if this is NOCOPY read from a vm_fault->getpages
+	 * sequence.
+	 */
+	if (uio->uio_segflg != UIO_NOCOPY) {
+		error = VOP_GETATTR(vp, &vattr);
+		if (error)
+			return (error);
+	}
 
 	/*
 	 * This can deadlock getpages/putpages for regular
@@ -194,7 +213,7 @@ nfs_bioread(struct vnode *vp, struct uio *uio, int ioflag)
 		/*
 		 * Obtain the buffer cache block.  Figure out the buffer size
 		 * when we are at EOF.  If we are modifying the size of the
-		 * buffer based on an EOF condition we need to hold 
+		 * buffer based on an EOF condition we need to hold
 		 * nfs_rslock() through obtaining the buffer to prevent
 		 * a potential writer-appender from messing with n_size.
 		 * Otherwise we may accidently truncate the buffer and
@@ -369,7 +388,7 @@ nfs_bioread(struct vnode *vp, struct uio *uio, int ioflag)
 		 * to EOF.  *BUT* this information is lost if the buffer goes
 		 * away and is reconstituted into a B_CACHE state ( due to
 		 * being VMIO ) later.  So we keep track of the directory eof
-		 * in np->n_direofoffset and chop it off as an extra step 
+		 * in np->n_direofoffset and chop it off as an extra step
 		 * right here.
 		 *
 		 * NOTE: boff could already be beyond EOF.
@@ -492,6 +511,7 @@ nfs_write(struct vop_write_args *ap)
 	int bcount;
 	int biosize;
 	int trivial;
+	int kflags = 0;
 
 #ifdef DIAGNOSTIC
 	if (uio->uio_rw != UIO_WRITE)
@@ -614,9 +634,11 @@ again:
 		if (uio->uio_offset + bytes > np->n_size) {
 			np->n_flag |= NLMODIFIED;
 			trivial = (uio->uio_segflg != UIO_NOCOPY &&
-				   uio->uio_offset <= np->n_size);
+				   uio->uio_offset <= np->n_size) ?
+				  NVEXTF_TRIVIAL : 0;
 			nfs_meta_setsize(vp, td, uio->uio_offset + bytes,
 					 trivial);
+			kflags |= NOTE_EXTEND;
 		}
 		bp = nfs_getcacheblk(vp, loffset, biosize, td);
 		if (bp == NULL) {
@@ -672,17 +694,18 @@ again:
 			bp->b_resid = 0;
 		}
 		np->n_flag |= NLMODIFIED;
+		kflags |= NOTE_WRITE;
 
 		/*
 		 * If dirtyend exceeds file size, chop it down.  This should
 		 * not normally occur but there is an append race where it
-		 * might occur XXX, so we log it. 
+		 * might occur XXX, so we log it.
 		 *
 		 * If the chopping creates a reverse-indexed or degenerate
 		 * situation with dirtyoff/end, we 0 both of them.
 		 */
 		if (bp->b_dirtyend > bcount) {
-			kprintf("NFS append race @%08llx:%d\n", 
+			kprintf("NFS append race @%08llx:%d\n",
 			    (long long)bp->b_bio2.bio_offset,
 			    bp->b_dirtyend - bcount);
 			bp->b_dirtyend = bcount;
@@ -696,9 +719,9 @@ again:
 		 * area, just update the b_dirtyoff and b_dirtyend,
 		 * otherwise force a write rpc of the old dirty area.
 		 *
-		 * While it is possible to merge discontiguous writes due to 
+		 * While it is possible to merge discontiguous writes due to
 		 * our having a B_CACHE buffer ( and thus valid read data
-		 * for the hole), we don't because it could lead to 
+		 * for the hole), we don't because it could lead to
 		 * significant cache coherency problems with multiple clients,
 		 * especially if locking is implemented later on.
 		 *
@@ -734,7 +757,7 @@ again:
 		}
 
 		/*
-		 * Only update dirtyoff/dirtyend if not a degenerate 
+		 * Only update dirtyoff/dirtyend if not a degenerate
 		 * condition.
 		 *
 		 * The underlying VM pages have been marked valid by
@@ -782,6 +805,7 @@ again:
 		nfs_rsunlock(np);
 
 done:
+	nfs_knote(vp, kflags);
 	lwkt_reltoken(&nmp->nm_token);
 	return (error);
 }
@@ -1068,7 +1092,7 @@ nfs_doio(struct vnode *vp, struct bio *bio, struct thread *td)
 	 */
 	bp->b_flags &= ~(B_ERROR | B_INVAL);
 
-	KASSERT(bp->b_cmd != BUF_CMD_DONE, 
+	KASSERT(bp->b_cmd != BUF_CMD_DONE,
 		("nfs_doio: bp %p already marked done!", bp));
 
 	if (bp->b_cmd == BUF_CMD_READ) {
@@ -1134,7 +1158,7 @@ nfs_doio(struct vnode *vp, struct bio *bio, struct thread *td)
 	    }
 	    bp->b_resid = uiop->uio_resid;
 	} else {
-	    /* 
+	    /*
 	     * If we only need to commit, try to commit.
 	     *
 	     * NOTE: The I/O has already been staged for the write and
@@ -1270,7 +1294,7 @@ nfs_doio(struct vnode *vp, struct bio *bio, struct thread *td)
  * still mapped into the buffer straddling EOF are not invalidated.
  */
 int
-nfs_meta_setsize(struct vnode *vp, struct thread *td, off_t nsize, int trivial)
+nfs_meta_setsize(struct vnode *vp, struct thread *td, off_t nsize, int flags)
 {
 	struct nfsnode *np = VTONFS(vp);
 	off_t osize;
@@ -1281,11 +1305,10 @@ nfs_meta_setsize(struct vnode *vp, struct thread *td, off_t nsize, int trivial)
 	np->n_size = nsize;
 
 	if (nsize < osize) {
-		error = nvtruncbuf(vp, nsize, biosize, -1, 0);
+		error = nvtruncbuf(vp, nsize, biosize, -1, flags);
 	} else {
 		error = nvextendbuf(vp, osize, nsize,
-				    biosize, biosize, -1, -1,
-				    trivial);
+				    biosize, biosize, -1, -1, flags);
 	}
 	return(error);
 }

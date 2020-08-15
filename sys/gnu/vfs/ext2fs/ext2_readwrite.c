@@ -16,11 +16,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -41,8 +37,6 @@
  */
 
 #define	BLKSIZE(a, b, c)	blksize(a, b, c)
-#define	FS			struct ext2_sb_info
-#define	I_FS			i_e2fs
 
 /*
  * Vnode op for reading.
@@ -57,14 +51,14 @@ ext2_read(struct vop_read_args *ap)
 	struct vnode *vp;
 	struct inode *ip;
 	struct uio *uio;
-	FS *fs;
+	struct ext2_sb_info *fs;
 	struct buf *bp;
 	daddr_t lbn, nextlbn;
 	off_t nextloffset;
 	off_t bytesinfile;
 	long size, xfersize, blkoffset;
 	int error, orig_resid;
-	int seqcount = ap->a_ioflag >> 16;
+	int seqcount = ap->a_ioflag >> IO_SEQSHIFT;
 
 	vp = ap->a_vp;
 	ip = VTOI(vp);
@@ -80,7 +74,7 @@ ext2_read(struct vop_read_args *ap)
 	} else if (vp->v_type != VREG && vp->v_type != VDIR)
 		panic("ext2_read: type %d", vp->v_type);
 #endif
-	fs = ip->I_FS;
+	fs = ip->i_e2fs;
 #if 0
 	if ((u_quad_t)uio->uio_offset > fs->fs_maxfilesize)
 		return (EFBIG);
@@ -108,7 +102,7 @@ ext2_read(struct vop_read_args *ap)
 			error = cluster_read(vp, (off_t)ip->i_size,
 					     lblktodoff(fs, lbn), size,
 					     uio->uio_resid,
-					     (ap->a_ioflag >> 16) * BKVASIZE,
+					     (ap->a_ioflag >> IO_SEQSHIFT) * MAXBSIZE,
 					     &bp);
 		} else if (seqcount > 1) {
 			int nextsize = BLKSIZE(fs, ip, nextlbn);
@@ -163,7 +157,7 @@ ext2_write(struct vop_write_args *ap)
 	struct vnode *vp;
 	struct uio *uio;
 	struct inode *ip;
-	FS *fs;
+	struct ext2_sb_info *fs;
 	struct buf *bp;
 	struct thread *td;
 	daddr_t lbn;
@@ -172,7 +166,7 @@ ext2_write(struct vop_write_args *ap)
 	int blkoffset, error, flags, ioflag, resid, size, xfersize;
 
 	ioflag = ap->a_ioflag;
-	seqcount = ap->a_ioflag >> 16;
+	seqcount = ap->a_ioflag >> IO_SEQSHIFT;
 	uio = ap->a_uio;
 	vp = ap->a_vp;
 	ip = VTOI(vp);
@@ -199,7 +193,7 @@ ext2_write(struct vop_write_args *ap)
 		panic("ext2_write: type");
 	}
 
-	fs = ip->I_FS;
+	fs = ip->i_e2fs;
 #if 0
 	if (uio->uio_offset < 0 ||
 	    (u_quad_t)uio->uio_offset + uio->uio_resid > fs->fs_maxfilesize)

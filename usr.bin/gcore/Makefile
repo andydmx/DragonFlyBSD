@@ -6,5 +6,7 @@ SRCS=	elfcore.c gcore.c
 DPADD=	${LIBKVM}
 LDADD=	-lkvm
 WARNS?=	2
+NO_WARRAY_BOUNDS=
+NO_STRICT_ALIASING=
 
 .include <bsd.prog.mk>

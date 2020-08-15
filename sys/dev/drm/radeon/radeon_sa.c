@@ -40,10 +40,7 @@
  *
  * If we are asked to block we wait on all the oldest fence of all
  * rings. We just wait for any of those fence to complete.
- *
- * $FreeBSD: head/sys/dev/drm2/radeon/radeon_sa.c 254885 2013-08-25 19:37:15Z dumbbell $
  */
-
 #include <drm/drmP.h>
 #include "radeon.h"
 
@@ -52,24 +49,23 @@ static void radeon_sa_bo_try_free(struct radeon_sa_manager *sa_manager);
 
 int radeon_sa_bo_manager_init(struct radeon_device *rdev,
 			      struct radeon_sa_manager *sa_manager,
-			      unsigned size, u32 domain)
+			      unsigned size, u32 align, u32 domain, u32 flags)
 {
 	int i, r;
 
-	lockinit(&sa_manager->wq_lock, "drm__radeon_sa_manager_wq_mtx", 0,
-		 LK_CANRECURSE);
-	cv_init(&sa_manager->wq, "drm__radeon_sa_manager__wq");
+	init_waitqueue_head(&sa_manager->wq);
 	sa_manager->bo = NULL;
 	sa_manager->size = size;
 	sa_manager->domain = domain;
+	sa_manager->align = align;
 	sa_manager->hole = &sa_manager->olist;
 	INIT_LIST_HEAD(&sa_manager->olist);
 	for (i = 0; i < RADEON_NUM_RINGS; ++i) {
 		INIT_LIST_HEAD(&sa_manager->flist[i]);
 	}
 
-	r = radeon_bo_create(rdev, size, RADEON_GPU_PAGE_SIZE, true,
-			     RADEON_GEM_DOMAIN_CPU, NULL, &sa_manager->bo);
+	r = radeon_bo_create(rdev, size, align, true,
+			     domain, flags, NULL, NULL, &sa_manager->bo);
 	if (r) {
 		dev_err(rdev->dev, "(%d) failed to allocate bo for manager\n", r);
 		return r;
@@ -95,8 +91,6 @@ void radeon_sa_bo_manager_fini(struct radeon_device *rdev,
 	}
 	radeon_bo_unref(&sa_manager->bo);
 	sa_manager->size = 0;
-	cv_destroy(&sa_manager->wq);
-	lockuninit(&sa_manager->wq_lock);
 }
 
 int radeon_sa_bo_manager_start(struct radeon_device *rdev,
@@ -154,7 +148,7 @@ static void radeon_sa_bo_remove_locked(struct radeon_sa_bo *sa_bo)
 	list_del_init(&sa_bo->olist);
 	list_del_init(&sa_bo->flist);
 	radeon_fence_unref(&sa_bo->fence);
-	drm_free(sa_bo, M_DRM);
+	kfree(sa_bo);
 }
 
 static void radeon_sa_bo_try_free(struct radeon_sa_manager *sa_manager)
@@ -318,17 +312,16 @@ static bool radeon_sa_bo_next_hole(struct radeon_sa_manager *sa_manager,
 int radeon_sa_bo_new(struct radeon_device *rdev,
 		     struct radeon_sa_manager *sa_manager,
 		     struct radeon_sa_bo **sa_bo,
-		     unsigned size, unsigned align, bool block)
+		     unsigned size, unsigned align)
 {
 	struct radeon_fence *fences[RADEON_NUM_RINGS];
 	unsigned tries[RADEON_NUM_RINGS];
 	int i, r;
 
-	KASSERT(align <= RADEON_GPU_PAGE_SIZE, ("align > RADEON_GPU_PAGE_SIZE"));
-	KASSERT(size <= sa_manager->size, ("size > sa_manager->size"));
+	BUG_ON(align > sa_manager->align);
+	BUG_ON(size > sa_manager->size);
 
-	*sa_bo = kmalloc(sizeof(struct radeon_sa_bo), M_DRM,
-			 M_WAITOK | M_ZERO);
+	*sa_bo = kmalloc(sizeof(struct radeon_sa_bo), M_DRM, GFP_KERNEL);
 	if ((*sa_bo) == NULL) {
 		return -ENOMEM;
 	}
@@ -337,7 +330,7 @@ int radeon_sa_bo_new(struct radeon_device *rdev,
 	INIT_LIST_HEAD(&(*sa_bo)->olist);
 	INIT_LIST_HEAD(&(*sa_bo)->flist);
 
-	lockmgr(&sa_manager->wq_lock, LK_EXCLUSIVE);
+	lockmgr(&sa_manager->wq.lock, LK_EXCLUSIVE);
 	do {
 		for (i = 0; i < RADEON_NUM_RINGS; ++i) {
 			fences[i] = NULL;
@@ -349,33 +342,33 @@ int radeon_sa_bo_new(struct radeon_device *rdev,
 
 			if (radeon_sa_bo_try_alloc(sa_manager, *sa_bo,
 						   size, align)) {
-				lockmgr(&sa_manager->wq_lock, LK_RELEASE);
+				lockmgr(&sa_manager->wq.lock, LK_RELEASE);
 				return 0;
 			}
 
 			/* see if we can skip over some allocations */
 		} while (radeon_sa_bo_next_hole(sa_manager, fences, tries));
 
-		lockmgr(&sa_manager->wq_lock, LK_RELEASE);
-		r = radeon_fence_wait_any(rdev, fences, false);
-		lockmgr(&sa_manager->wq_lock, LK_EXCLUSIVE);
-		/* if we have nothing to wait for block */
-		if (r == -ENOENT && block) {
-			while (!radeon_sa_event(sa_manager, size, align)) {
-				r = -cv_wait_sig(&sa_manager->wq,
-						 &sa_manager->wq_lock);
-				if (r != 0)
-					break;
-			}
+		for (i = 0; i < RADEON_NUM_RINGS; ++i)
+			radeon_fence_ref(fences[i]);
 
-		} else if (r == -ENOENT) {
-			r = -ENOMEM;
+		lockmgr(&sa_manager->wq.lock, LK_RELEASE);
+		r = radeon_fence_wait_any(rdev, fences, false);
+		for (i = 0; i < RADEON_NUM_RINGS; ++i)
+			radeon_fence_unref(&fences[i]);
+		lockmgr(&sa_manager->wq.lock, LK_EXCLUSIVE);
+		/* if we have nothing to wait for block */
+		if (r == -ENOENT) {
+			r = wait_event_interruptible_locked(
+				sa_manager->wq, 
+				radeon_sa_event(sa_manager, size, align)
+			);
 		}
 
 	} while (!r);
 
-	lockmgr(&sa_manager->wq_lock, LK_RELEASE);
-	drm_free(*sa_bo, M_DRM);
+	lockmgr(&sa_manager->wq.lock, LK_RELEASE);
+	kfree(*sa_bo);
 	*sa_bo = NULL;
 	return r;
 }
@@ -390,7 +383,7 @@ void radeon_sa_bo_free(struct radeon_device *rdev, struct radeon_sa_bo **sa_bo,
 	}
 
 	sa_manager = (*sa_bo)->manager;
-	lockmgr(&sa_manager->wq_lock, LK_EXCLUSIVE);
+	lockmgr(&sa_manager->wq.lock, LK_EXCLUSIVE);
 	if (fence && !radeon_fence_signaled(fence)) {
 		(*sa_bo)->fence = radeon_fence_ref(fence);
 		list_add_tail(&(*sa_bo)->flist,
@@ -398,8 +391,8 @@ void radeon_sa_bo_free(struct radeon_device *rdev, struct radeon_sa_bo **sa_bo,
 	} else {
 		radeon_sa_bo_remove_locked(*sa_bo);
 	}
-	cv_broadcast(&sa_manager->wq);
-	lockmgr(&sa_manager->wq_lock, LK_RELEASE);
+	wake_up_all_locked(&sa_manager->wq);
+	lockmgr(&sa_manager->wq.lock, LK_RELEASE);
 	*sa_bo = NULL;
 }
 
@@ -409,21 +402,23 @@ void radeon_sa_bo_dump_debug_info(struct radeon_sa_manager *sa_manager,
 {
 	struct radeon_sa_bo *i;
 
-	spin_lock(&sa_manager->wq.lock);
+	lockmgr(&sa_manager->wq.lock, LK_EXCLUSIVE);
 	list_for_each_entry(i, &sa_manager->olist, olist) {
+		uint64_t soffset = i->soffset + sa_manager->gpu_addr;
+		uint64_t eoffset = i->eoffset + sa_manager->gpu_addr;
 		if (&i->olist == sa_manager->hole) {
 			seq_printf(m, ">");
 		} else {
 			seq_printf(m, " ");
 		}
-		seq_printf(m, "[0x%08x 0x%08x] size %8d",
-			   i->soffset, i->eoffset, i->eoffset - i->soffset);
+		seq_printf(m, "[0x%010llx 0x%010llx] size %8lld",
+			   soffset, eoffset, eoffset - soffset);
 		if (i->fence) {
 			seq_printf(m, " protected by 0x%016llx on ring %d",
 				   i->fence->seq, i->fence->ring);
 		}
 		seq_printf(m, "\n");
 	}
-	spin_unlock(&sa_manager->wq.lock);
+	lockmgr(&sa_manager->wq.lock, LK_RELEASE);
 }
 #endif

@@ -234,7 +234,7 @@ struct allowedpeer {
  * we move to the next interval until we reach the largest.
  */
 int	repeatinterval[] = { 30, 120, 600 };	/* # of secs before flush */
-#define	MAXREPEAT ((sizeof(repeatinterval) / sizeof(repeatinterval[0])) - 1)
+#define	MAXREPEAT (NELEM(repeatinterval) - 1)
 #define	REPEATTIME(f)	((f)->f_time + repeatinterval[(f)->f_repeatcount])
 #define	BACKOFF(f)	{ if (++(f)->f_repeatcount > MAXREPEAT) \
 				 (f)->f_repeatcount = MAXREPEAT; \
@@ -1388,10 +1388,10 @@ reapchild(int signo __unused)
 
 		/* First, look if it's a process from the dead queue. */
 		if (deadq_remove(pid))
-			goto oncemore;
+			continue;
 
 		/* Now, look in list of active processes. */
-		for (f = Files; f; f = f->f_next)
+		for (f = Files; f; f = f->f_next) {
 			if (f->f_type == F_PIPE &&
 			    f->f_un.f_pipe.f_pid == pid) {
 				(void)close(f->f_file);
@@ -1400,8 +1400,7 @@ reapchild(int signo __unused)
 					      f->f_un.f_pipe.f_pname);
 				break;
 			}
-	  oncemore:
-		continue;
+		}
 	}
 }
 
@@ -1496,7 +1495,7 @@ die(int signo)
 	for (f = Files; f != NULL; f = f->f_next) {
 		/* flush any pending output */
 		if (f->f_prevcount)
-			fprintlog(f, 0, (char *)NULL);
+			fprintlog(f, 0, NULL);
 		if (f->f_type == F_PIPE && f->f_un.f_pipe.f_pid > 0) {
 			(void)close(f->f_file);
 			f->f_un.f_pipe.f_pid = 0;

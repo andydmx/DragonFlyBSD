@@ -12,7 +12,7 @@
  * no representations about the suitability of this software for any
  * purpose.  It is provided "as is" without express or implied
  * warranty.
- * 
+ *
  * THIS SOFTWARE IS PROVIDED BY M.I.T. ``AS IS''.  M.I.T. DISCLAIMS
  * ALL EXPRESS OR IMPLIED WARRANTIES WITH REGARD TO THIS SOFTWARE,
  * INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF
@@ -30,6 +30,7 @@
  */
 
 #include <sys/param.h>
+#include <sys/malloc.h>	/* for M_NOWAIT */
 #include <sys/mbuf.h>
 #include <sys/serialize.h>
 
@@ -76,7 +77,7 @@ vlan_start_dispatch(netmsg_t msg)
 		uint16_t vlantag = m->m_pkthdr.ether_vlantag;
 		struct ether_vlan_header *evl;
 
-		M_PREPEND(m, EVL_ENCAPLEN, MB_DONTWAIT);
+		M_PREPEND(m, EVL_ENCAPLEN, M_NOWAIT);
 		if (m == NULL) {
 			if_printf(ifp, "vlan%u M_PREPEND failed", vlantag);
 			return;
@@ -129,7 +130,7 @@ vlan_ether_ptap(struct bpf_if *bp, struct mbuf *m, uint16_t vlantag)
 	bpf_ptap(bp, m, &evh, ETHER_HDR_LEN + EVL_ENCAPLEN);
 
 	/* XXX assumes data was left intact */
-	M_PREPEND(m, ETHER_HDR_LEN, MB_WAIT);
+	M_PREPEND(m, ETHER_HDR_LEN, M_WAITOK);
 }
 
 void

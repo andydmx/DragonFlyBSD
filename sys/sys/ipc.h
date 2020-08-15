@@ -20,11 +20,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -42,33 +38,53 @@
  *
  *	@(#)ipc.h	8.4 (Berkeley) 2/19/95
  * $FreeBSD: src/sys/sys/ipc.h,v 1.15 1999/12/29 04:24:43 peter Exp $
- * $DragonFly: src/sys/sys/ipc.h,v 1.5 2006/05/20 02:42:13 dillon Exp $
  */
 
 /*
  * SVID compatible ipc.h file
  */
 #ifndef _SYS_IPC_H_
-#define _SYS_IPC_H_
+#define	_SYS_IPC_H_
 
-#ifndef _SYS_TYPES_H_
-#include <sys/types.h>
+#include <sys/cdefs.h>
+#include <machine/stdint.h>
+
+#ifndef _GID_T_DECLARED
+typedef	__uint32_t	gid_t;	/* group id */
+#define	_GID_T_DECLARED
+#endif
+
+#ifndef _KEY_T_DECLARED
+typedef	long		key_t;	/* IPC key (for Sys V IPC) */
+#define _KEY_T_DECLARED
+#endif
+
+#ifndef _MODE_T_DECLARED
+typedef	__uint16_t	mode_t;	/* permissions */
+#define	_MODE_T_DECLARED
+#endif
+
+#ifndef _UID_T_DECLARED
+typedef	__uint32_t	uid_t;	/* user id */
+#define	_UID_T_DECLARED
 #endif
 
 struct ipc_perm {
-	ushort	cuid;	/* creator user id */
-	ushort	cgid;	/* creator group id */
-	ushort	uid;	/* user id */
-	ushort	gid;	/* group id */
-	ushort	mode;	/* r/w permission */
-	ushort	seq;	/* sequence # (to generate unique msg/sem/shm id) */
-	key_t	key;	/* user specified msg/sem/shm key */
+	uid_t		cuid;	/* creator user id */
+	gid_t		cgid;	/* creator group id */
+	uid_t		uid;	/* user id */
+	gid_t		gid;	/* group id */
+	mode_t		mode;	/* r/w permission */
+	unsigned short	seq;	/* sequence # (to generate unique msg/sem/shm id) */
+	key_t		key;	/* user specified msg/sem/shm key */
 };
 
+#if __BSD_VISIBLE
 /* common mode bits */
 #define	IPC_R		000400	/* read permission */
 #define	IPC_W		000200	/* write/alter permission */
 #define	IPC_M		010000	/* permission to change control info */
+#endif
 
 /* SVID required constants (same values as system 5) */
 #define	IPC_CREAT	001000	/* create entry if key does not exist */
@@ -86,7 +102,7 @@ struct ipc_perm {
 /* Macros to convert between ipc ids and array indices or sequence ids */
 #define	IPCID_TO_IX(id)		((id) & 0xffff)
 #define	IPCID_TO_SEQ(id)	(((id) >> 16) & 0xffff)
-#define	IXSEQ_TO_IPCID(ix,perm)	(((perm.seq) << 16) | (ix & 0xffff))
+#define	IXSEQ_TO_IPCID(ix,perm)	(((perm.seq) << 16) | ((ix) & 0xffff))
 
 struct proc;
 
@@ -94,16 +110,14 @@ struct proc;
 
 #ifdef _KERNEL
 
-int	ipcperm (struct proc *, struct ipc_perm *, int);
+int	ipcperm(struct proc *, struct ipc_perm *, int);
 
 #else /* ! _KERNEL */
 
 /* XXX doesn't really belong here, but has been historical practice in SysV. */
 
-#include <sys/cdefs.h>
-
 __BEGIN_DECLS
-key_t	ftok (const char *, int);
+key_t	ftok(const char *, int);
 __END_DECLS
 
 #endif /* _KERNEL */

@@ -28,7 +28,7 @@
 .\"	@(#)hier.7	8.1 (Berkeley) 6/5/93
 .\" $FreeBSD: src/share/man/man7/hier.7,v 1.29.2.17 2003/01/13 21:43:50 ceri Exp $
 .\"
-.Dd October 10, 2014
+.Dd June 4, 2020
 .Dt HIER 7
 .Os
 .Sh NAME
@@ -44,7 +44,7 @@ user utilities fundamental to both single-user and multi-user environments
 .It Pa /boot/
 programs and configuration files used during operating system bootstrap
 .Pp
-.Bl -tag -width ".Pa defaults/" -compact
+.Bl -tag -width ".Pa modules.local/" -compact
 .It Pa defaults/
 default bootstrapping configuration files; see
 .Xr loader.conf 5
@@ -53,6 +53,9 @@ pure kernel executable (the operating system loaded into memory
 at boot time) and loadable kernel modules;
 see
 .Xr kldstat 8
+.It Pa modules.local/
+local loadable kernel modules and wrapped external firmware images; see
+.Xr firmware 9
 .El
 .It Pa /compat/
 files related to compatibility layers
@@ -70,18 +73,25 @@ block and character device files
 .It Pa fd/
 file descriptor files;
 see
-.Xr \&fd 4
+.Xr fd 4
 .El
 .It Pa /etc/
 system configuration files and scripts
 .Pp
 .Bl -tag -width ".Pa bluetooth/" -compact
+.It Pa autofs/
+shell scripts to implement special maps and directory services via
+.Xr autofs 5
 .It Pa bluetooth/
 bluetooth configuration files
 .It Pa defaults/
 default system configuration files;
 see
 .Xr rc 8
+.It Pa devd/
+hardware specific
+.Xr devd 8
+configuration files
 .It Pa dma/
 .Xr dma 8
 configuration files
@@ -116,19 +126,29 @@ OpenSSH configuration files;
 see
 .Xr ssh 1
 .It Pa ssl/
-OpenSSL configuration files
+LibreSSL configuration files
 .It Pa upgrade/
 Files relevant to system upgrades
-.It Pa uucp/
-uucp configuration files;
-see
-.Xr uucp 1
 .El
 .It Pa /home/
 HOME directories of non-root users
+.It Pa /lib/
+critical system libraries needed for binaries in
+.Pa /bin
+and
+.Pa /sbin
+.It Pa /libexec/
+critical system utilities needed for binaries in
+.Pa /bin
+and
+.Pa /sbin
 .It Pa /mnt/
 empty directory commonly used by
 system administrators as a temporary mount point
+.It Pa /net/
+automounted NFS shares;
+see
+.Xr auto_master 5
 .It Pa /pfs/
 pseudo file system directory (on
 .Xr hammer 5
@@ -138,6 +158,9 @@ process file system;
 see
 .Xr procfs 5 ,
 .Xr mount_procfs 8
+.It Pa /rescue/
+statically linked rescue tools, see
+.Xr initrd 7
 .It Pa /root/
 root's HOME directory
 .It Pa /sbin/
@@ -164,48 +187,26 @@ useful and semi-frivolous programs
 .It Pa include/
 standard C include files
 .Pp
-.Bl -tag -width ".Pa libmilter/" -compact
+.Bl -tag -width ".Pa protocols/" -compact
 .It Pa arpa/
 C include files for Internet service protocols
+.It Pa bus/
+C include files for programming various
+.Dx
+buses
 .It Pa c++/
 C++ include files
-.It Pa cam/
-C include files for the Common Access Methods Layer
-.Pp
-.Bl -tag -width ".Pa scsi/" -compact
-.It Pa scsi/
-The SCSI device on top of CAM
-.El
-.Pp
+.It Pa compat/
+C include files for compatibility with code ported from other
+operating systems
 .It Pa dev/
 C include files for programming various
 .Dx
 devices
-.It Pa emulation/
-Include Files for various emulation layers
-.It Pa fs/
-.Pp
-.Bl -tag -width ".Pa smbfs/" -compact
-.It Pa smbfs/
-SMB/CIFS filesystem
-.El
-.Pp
-.It Pa isofs/
-.Pp
-.Bl -tag -width ".Pa cd9660/" -compact
-.It Pa cd9660/
-iso9660 filesystem
-.El
-.Pp
-.It Pa libmilter/
-C include files for libmilter,
-the sendmail mail filter API
 .It Pa libprop/
 C include files for libprop
 .It Pa machine/
 machine-specific C include files
-.It Pa msdosfs/
-MS-DOS file system
 .It Pa net/
 misc network C include files
 .It Pa netinet/
@@ -216,20 +217,12 @@ see
 C include files for Internet protocol version 6;
 see
 .Xr inet6 4
-.It Pa netkey/
-kernel key-management service
 .It Pa netsmb/
 SMB/CIFS requester
-.It Pa nfs/
-C include files for NFS (Network File System)
-.It Pa openssl/
-OpenSSL (Cryptography/SSL toolkit) headers
 .It Pa pcap/
 Packet Capture (libpcap) headers;
 see
 .Xr pcap 3
-.It Pa pccard/
-PC-CARD controllers
 .It Pa protocols/
 C include files for Berkeley service protocols
 .It Pa readline/
@@ -245,23 +238,11 @@ definition of RPC service structures; see
 .Xr rpc 3
 .It Pa security/
 PAM; see
-.Xr pam 8
+.Xr pam 3
 .It Pa sys/
 system C include files (kernel data structures)
-.It Pa ufs/
-C include files for UFS (The U-word File System)
-.Pp
-.Bl -tag -width ".Pa ffs/" -compact
-.It Pa ffs/
-Fast filesystem
-.It Pa mfs/
-memory file system;
-see
-.Xr mount_mfs 8
-.It Pa ufs/
-UFS filesystem
-.El
-.Pp
+.It Pa vfs/
+C include files for various file systems
 .It Pa vm/
 virtual memory;
 see
@@ -270,39 +251,28 @@ see
 .Pp
 .It Pa lib/
 archive libraries
-.Pp
-.Bl -tag -width ".Pa compat/" -compact
-.It Pa aout/
-a.out archive libraries
-.It Pa compat/
-shared libraries for compatibility
-.Pp
-.Bl -tag -width ".Pa aout/" -compact
-.It Pa aout/
-a.out backward compatibility libraries
-.El
-.It Pa engines/
-OpenSSL dynamic engines
-.El
-.Pp
 .It Pa libdata/
 misc. utility data files
 .It Pa libexec/
 system daemons & system utilities (executed by other programs)
 .Pp
-.Bl -tag -width ".Pa binutils222/" -compact
-.It Pa binutils222/
+.Bl -tag -width ".Pa binutils234/" -compact
+.It Pa binutils227/
 .Pp
-.Bl -tag -width ".Pa ldscripts/" -compact
+.Bl -tag -width ".Pa bfd-plugins/" -compact
+.It Pa bfd-plugins/
+linker plugins
 .It Pa ldscripts/
 linker scripts;
 see
 .Xr ld 1
 .El
 .Pp
-.It Pa binutils224/
+.It Pa binutils234/
 .Pp
-.Bl -tag -width ".Pa ldscripts/" -compact
+.Bl -tag -width ".Pa bfd-plugins/" -compact
+.It Pa bfd-plugins/
+linker plugins
 .It Pa ldscripts/
 linker scripts;
 see
@@ -313,20 +283,6 @@ see
 utilities and filters for LP print system;
 see
 .Xr lpr 1
-.It Pa sendmail/
-the sendmail binary;
-see
-.Xr mailwrapper 8
-and
-.Xr sendmail 8
-.It Pa sm.bin/
-restricted shell for sendmail;
-see
-.Xr smrsh 8
-.It Pa uucp/
-uucp utilities;
-see
-.Xr uucp 1
 .El
 .Pp
 .It Pa local/
@@ -365,7 +321,7 @@ system daemons & system utilities (executed by users)
 .It Pa share/
 architecture-independent files
 .Pp
-.Bl -tag -width ".Pa groff_font/" -compact
+.Bl -tag -width ".Pa installer/" -compact
 .It Pa calendar/
 a variety of pre-fab calendar files;
 see
@@ -394,12 +350,13 @@ miscellaneous documentation
 License files for vendor supplied firmware
 .El
 .Pp
+.It Pa dsynth/
+.Xr dsynth 1
+scripts
 .It Pa examples/
 various examples for users and programmers
 .It Pa games/
 ASCII text files used by various games
-.It Pa groff_font/
-device description file for device name
 .It Pa i18n/
 internationalization databases; see
 .Xr iconv 3
@@ -413,10 +370,6 @@ see
 .Xr setlocale 3
 .It Pa man/
 manual pages
-.It Pa me/
-macros for use with the me macro package;
-see
-.Xr me 7
 .It Pa misc/
 misc system-wide ASCII text files
 .Pp
@@ -434,14 +387,7 @@ see
 .It Pa nls/
 national language support files;
 see
-.Xr mklocale 1
-.It Pa openssl/
-.Pp
-.Bl -tag -width ".Pa man/" -compact
-.It Pa man/
-OpenSSL manual pages
-.El
-.Pp
+.Xr nls 7
 .It Pa sendmail/
 sendmail configuration files;
 see
@@ -478,12 +424,6 @@ see
 compiled
 .Xr terminfo 5
 database files
-.It Pa tmac/
-text processing macros;
-see
-.Xr nroff 1
-and
-.Xr troff 1
 .It Pa vi/
 localization support and utilities for
 .Xr vi 1
@@ -529,9 +469,6 @@ release
 .It Pa sbin/
 source code for files in
 .Pa /sbin
-.It Pa secure/
-build directory for files in
-.Pa /usr/src/crypto
 .It Pa share/
 source for files in
 .Pa /usr/share
@@ -565,7 +502,7 @@ see
 .It Pa at/
 timed command scheduling files;
 see
-.Xr \&at 1
+.Xr at 1
 .Pp
 .Bl -tag -width ".Pa spool/" -compact
 .It Pa jobs/
@@ -608,11 +545,11 @@ file systems
 .It Pa log/
 misc. system log files
 .Pp
-.Bl -tag -width ".Pa wtmp" -compact
-.It Pa wtmp
+.Bl -tag -width ".Pa wtmpx" -compact
+.It Pa wtmpx
 login/logout log;
 see
-.Xr wtmp 5
+.Xr wtmpx 5
 .El
 .Pp
 .It Pa mail/
@@ -625,27 +562,38 @@ see
 temporary home of files preserved after an accidental death
 of an editor;
 see
-.Xr \&ex 1
+.Xr ex 1
 .It Pa quotas/
 filesystem quota information files
 .It Pa run/
 system information files describing various info about
 system since it was booted
 .Pp
-.Bl -tag -width ".Pa ppp/" -compact
+.Bl -tag -width ".Pa resolvconf/" -compact
+.It Pa dhcpcd/
+for storing files by
+.Xr dhcpcd 8
+hooks
 .It Pa ppp/
 writable by the
 .Dq network
 group for command connection sockets; see
 .Xr ppp 8
-.It Pa utmp
+.It Pa resolvconf/
+state directory for
+.Xr resolvconf 8
+.It Pa utmpx
 database of current users;
 see
-.Xr utmp 5
+.Xr utmpx 5
 .It Pa sem/
-rendez-vous files for posix named semaphores;
+rendez-vous files for POSIX named semaphores;
 see
 .Xr sem_open 3
+.It Pa shm/
+files associated with POSIX shared memory objects;
+see
+.Xr shm_open 3
 .El
 .Pp
 .It Pa rwho/
@@ -677,12 +625,6 @@ see
 .Xr sendmail 8
 .It Pa output/
 line printer spooling directories
-.It Pa uucp/
-uucp spool directory
-.It Pa uucppublic/
-commonly
-.Pa ~uucp ;
-public uucp temporary directory
 .El
 .Pp
 .It Pa tmp/

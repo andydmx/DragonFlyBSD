@@ -59,7 +59,7 @@
 #include <libtelnet/encrypt.h>
 #endif
 #include <libtelnet/misc.h>
-
+
 #define	strip(x) ((my_want_state_is_wont(TELOPT_BINARY)) ? ((x)&0x7f) : (x))
 
 static unsigned char	subbuffer[SUBBUFSIZE],
@@ -86,7 +86,7 @@ int
 	connected,
 	showoptions,
 	ISend,		/* trying to send network data in */
-	debug = 0,
+	telnet_debug = 0,
 	crmod,
 	netdata,	/* Print out network data flow */
 	crlf,		/* Should '\r' be mapped to <CR><LF> (or <CR><NUL>)? */
@@ -107,7 +107,7 @@ int
 
 char *prompt = NULL;
 #ifdef ENCRYPTION
-char *line;		/* hack around breakage in sra.c :-( !! */
+char line[16];		/* hack around breakage in sra.c :-( !! */
 #endif
 
 cc_t escape;
@@ -154,7 +154,7 @@ static int is_unique(char *, char **, char **);
  */
 
 Clocks clocks;
-
+
 /*
  * Initialize telnet environment.
  */
@@ -188,7 +188,7 @@ init_telnet(void)
     flushline = 1;
     telrcv_state = TS_DATA;
 }
-
+
 
 /*
  * These routines are in charge of sending option negotiations
@@ -732,8 +732,8 @@ suboption(void)
 	    name = gettermname();
 	    len = strlen(name) + 4 + 2;
 	    if (len < NETROOM()) {
-		sprintf(temp, "%c%c%c%c%s%c%c", IAC, SB, TELOPT_TTYPE,
-				TELQUAL_IS, name, IAC, SE);
+		snprintf(temp, sizeof(temp), "%c%c%c%c%s%c%c",
+			 IAC, SB, TELOPT_TTYPE, TELQUAL_IS, name, IAC, SE);
 		ring_supply_data(&netoring, temp, len);
 		printsub('>', &temp[2], len-2);
 	    } else {
@@ -754,8 +754,9 @@ suboption(void)
 
 	    TerminalSpeeds(&ispeed, &ospeed);
 
-	    sprintf((char *)temp, "%c%c%c%c%ld,%ld%c%c", IAC, SB, TELOPT_TSPEED,
-		    TELQUAL_IS, ospeed, ispeed, IAC, SE);
+	    snprintf((char *)temp, sizeof(temp), "%c%c%c%c%ld,%ld%c%c",
+		     IAC, SB, TELOPT_TSPEED, TELQUAL_IS,
+		     ospeed, ispeed, IAC, SE);
 	    len = strlen((char *)temp+4) + 4;	/* temp[3] is 0 ... */
 
 	    if (len < NETROOM()) {
@@ -1068,7 +1069,7 @@ lm_mode(unsigned char *cmd, int len, int init)
 	setconnmode(0);	/* set changed mode */
 }
 
-
+
 
 /*
  * slc()
@@ -1612,7 +1613,7 @@ env_opt_end(int emptyok)
 	}
 }
 
-
+
 
 int
 telrcv(void)
@@ -1997,7 +1998,7 @@ telsnd(void)
 	ring_consumed(&ttyiring, count);
     return returnValue||count;		/* Non-zero if we did anything */
 }
-
+
 /*
  * Scheduler()
  *
@@ -2050,7 +2051,7 @@ Scheduler(int block)
     }
     return returnValue;
 }
-
+
 #ifdef	AUTHENTICATION
 #define __unusedhere
 #else
@@ -2117,7 +2118,7 @@ telnet(char *user __unusedhere)
 	}
     }
 }
-
+
 #if	0	/* XXX - this not being in is a bug */
 /*
  * nextitem()
@@ -2182,7 +2183,7 @@ netclear(void)
 {
 	/* Deleted */
 }
-
+
 /*
  * These routines add various telnet commands to the data stream.
  */

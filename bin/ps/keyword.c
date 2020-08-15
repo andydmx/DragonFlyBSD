@@ -30,7 +30,6 @@
  * $FreeBSD: src/bin/ps/keyword.c,v 1.24.2.3 2002/10/10 20:05:32 jmallett Exp $
  */
 
-#include <sys/user.h>
 #include <sys/kinfo.h>
 #include <sys/param.h>
 #include <sys/time.h>
@@ -79,6 +78,7 @@ static const VAR var[] = {
 	{"acflag", "ACFLG", NULL, 0, pvar, NULL, 3, POFF(acflag), USHORT, "x",
 		NULL},
 	{"acflg", "", "acflag", 0, NULL, NULL, 0, 0, 0, NULL, NULL},
+	{"args", "", "command", 0, NULL, NULL, 0, 0, 0, NULL, NULL},
 	{"batch", "BAT", NULL, 0, lpest, NULL, 3, LPOFF(origcpu), UINT, "d", NULL},
 	{"blocked", "", "sigmask", 0, NULL, NULL, 0, 0, 0, NULL, NULL},
 	{"caught", "", "sigcatch", 0, NULL, NULL, 0, 0, 0, NULL, NULL},
@@ -286,16 +286,15 @@ makevarent(const char *p)
 	if (hp)
 		*hp++ = '\0';
 
+aliased:
 	key.name = p;
 	v = bsearch(&key, var, sizeof(var)/sizeof(VAR) - 1, sizeof(VAR), vcmp);
 
 	if (v && v->alias) {
-		if (hp) {
-			warnx("%s: illegal keyword specification", p);
-			eval = 1;
-		}
-		parsefmt(v->alias);
-		return(NULL);
+		p = v->alias;
+		if (hp == NULL && v->header[0] != '\0')
+			hp = strdup(v->header);
+		goto aliased;
 	}
 	if (!v) {
 		warnx("%s: keyword not found", p);

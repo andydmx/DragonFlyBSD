@@ -14,11 +14,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -36,8 +32,13 @@
  *
  *	@(#)kvm_private.h	8.1 (Berkeley) 6/4/93
  * $FreeBSD: src/lib/libkvm/kvm_private.h,v 1.5 1999/12/27 07:14:58 peter Exp $
- * $DragonFly: src/lib/libkvm/kvm_private.h,v 1.4 2007/02/01 10:33:25 corecode Exp $
  */
+
+#ifndef _KVM_PRIVATE_H_
+#define	_KVM_PRIVATE_H_
+
+#include <sys/cdefs.h>
+#include <sys/types.h>
 
 struct __kvm {
 	/*
@@ -88,13 +89,6 @@ kvm_isvkernel(kvm_t *kd)
 	return kd->flags & KVMF_VKERN;
 }
 
-static inline
-int
-kvm_notrans(kvm_t *kd)
-{
-	return kvm_ishost(kd) || kvm_isvkernel(kd);
-}
-
 /*
  * Functions used internally by kvm, but across kvm modules.
  */
@@ -112,3 +106,5 @@ int	 _kvm_uvatop (kvm_t *, const struct proc *, u_long, u_long *);
 void     _kvm_minidump_freevtop(kvm_t *);
 int      _kvm_minidump_initvtop(kvm_t *);
 int      _kvm_minidump_kvatop(kvm_t *, u_long, off_t *);
+
+#endif /* !_KVM_PRIVATE_H_ */

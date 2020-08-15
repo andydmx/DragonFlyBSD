@@ -49,7 +49,11 @@
 	 * Define layout of the global data.  On SMP this lives in
 	 * the per-cpu address space, otherwise it's in the data segment.
 	 */
+	.globl	gd_trampoline, gd_debug1, gd_debug2
 	.globl	gd_curthread, gd_npxthread, gd_reqflags, gd_common_tss
+	.set	gd_trampoline,globaldata + GD_TRAMPOLINE
+	.set	gd_debug1,globaldata + GD_DEBUG1
+	.set	gd_debug2,globaldata + GD_DEBUG2
 	.set	gd_curthread,globaldata + GD_CURTHREAD
 	.set	gd_npxthread,globaldata + GD_NPXTHREAD
 	.set	gd_reqflags,globaldata + GD_REQFLAGS
@@ -66,6 +70,9 @@
 	.set	gd_fpu_lock, globaldata + GD_FPU_LOCK
 	.set	gd_savefpu, globaldata + GD_SAVEFPU
 
+	.globl	gd_ireserved
+	.set	gd_ireserved, globaldata + GD_IRESERVED
+
 	/*
 	 * The BSP version of these get setup in locore.s and pmap.c, while
 	 * the AP versions are setup in mp_machdep.c.
@@ -74,9 +81,12 @@
 	.globl	gd_ss_eflags, gd_intr_nesting_level
 	.globl  gd_spending, gd_ipending
 	.globl	gd_cnt, gd_private_tss
-	.globl	gd_scratch_rsp
 	.globl	gd_user_fs, gd_user_gs
 	.globl	gd_sample_pc
+	.globl	gd_sample_sp
+	.globl	gd_npoll
+	.globl	gd_cpumask_simple
+	.globl	gd_cpumask_offset
 
 	.set    gd_cpuid,globaldata + GD_CPUID
 	.set    gd_cpumask,globaldata + GD_CPUMASK
@@ -87,8 +97,11 @@
 	.set	gd_ipending,globaldata + GD_IPENDING
 	.set	gd_spending,globaldata + GD_SPENDING
 	.set	gd_cnt,globaldata + GD_CNT
-	.set	gd_scratch_rsp,globaldata + GD_SCRATCH_RSP
 	.set	gd_user_fs,globaldata + GD_USER_FS
 	.set	gd_user_gs,globaldata + GD_USER_GS
 	.set	gd_sample_pc,globaldata + GD_SAMPLE_PC
+	.set	gd_sample_sp,globaldata + GD_SAMPLE_SP
+	.set	gd_npoll,globaldata + GD_NPOLL
+	.set	gd_cpumask_simple,globaldata + GD_CPUMASK_SIMPLE
+	.set	gd_cpumask_offset,globaldata + GD_CPUMASK_OFFSET
 

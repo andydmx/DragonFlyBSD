@@ -33,16 +33,7 @@
 /*
  * XXX These routines belong in libm, but they must remain in libc for
  *     binary compat until we can bump libm's major version number.
- *
- * Note this only applies to the dynamic versions of libm and libc, so
- * for the static and profiled versions we stub out the definitions.
- * Otherwise you cannot link statically to libm and libc at the same
- * time, when calling both functions.
  */
-
-#ifdef PIC
-__weak_reference(__isnan, isnan);
-__weak_reference(__isnanf, isnanf);
 
 int
 __isnan(double d)
@@ -61,4 +52,6 @@ __isnanf(float f)
 	u.f = f;
 	return (u.bits.exp == 255 && u.bits.man != 0);
 }
-#endif /* PIC */
+
+__weak_reference(__isnan, isnan);
+__weak_reference(__isnanf, isnanf);

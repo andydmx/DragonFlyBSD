@@ -160,7 +160,7 @@ extern struct dev_ops netmap_cdevsw;
 /*
  * common headers
  */
-#include <net/netmap.h>
+#include <net/netmap/netmap.h>
 #include <net/netmap/netmap_kern.h>
 #include <net/netmap/netmap_mem2.h>
 
@@ -181,18 +181,18 @@ int netmap_verbose;
 
 static int netmap_no_timestamp; /* don't timestamp on rxsync */
 
-SYSCTL_NODE(_net, OID_AUTO, netmap, CTLFLAG_RW, 0, "Netmap args");
-SYSCTL_INT(_net_netmap, OID_AUTO, verbose,
+SYSCTL_NODE(_dev, OID_AUTO, netmap, CTLFLAG_RW, 0, "Netmap args");
+SYSCTL_INT(_dev_netmap, OID_AUTO, verbose,
     CTLFLAG_RW, &netmap_verbose, 0, "Verbose mode");
-SYSCTL_INT(_net_netmap, OID_AUTO, no_timestamp,
+SYSCTL_INT(_dev_netmap, OID_AUTO, no_timestamp,
     CTLFLAG_RW, &netmap_no_timestamp, 0, "no_timestamp");
 int netmap_mitigate = 1;
-SYSCTL_INT(_net_netmap, OID_AUTO, mitigate, CTLFLAG_RW, &netmap_mitigate, 0, "");
+SYSCTL_INT(_dev_netmap, OID_AUTO, mitigate, CTLFLAG_RW, &netmap_mitigate, 0, "");
 int netmap_no_pendintr = 1;
-SYSCTL_INT(_net_netmap, OID_AUTO, no_pendintr,
+SYSCTL_INT(_dev_netmap, OID_AUTO, no_pendintr,
     CTLFLAG_RW, &netmap_no_pendintr, 0, "Always look for new received packets.");
 int netmap_txsync_retry = 2;
-SYSCTL_INT(_net_netmap, OID_AUTO, txsync_retry, CTLFLAG_RW,
+SYSCTL_INT(_dev_netmap, OID_AUTO, txsync_retry, CTLFLAG_RW,
     &netmap_txsync_retry, 0 , "Number of txsync loops in bridge's flush.");
 
 int netmap_flags = 0;	/* debug flags */
@@ -215,12 +215,12 @@ static int netmap_admode = NETMAP_ADMODE_BEST;
 int netmap_generic_mit = 100*1000;   /* Generic mitigation interval in nanoseconds. */
 int netmap_generic_ringsize = 1024;   /* Generic ringsize. */
 
-SYSCTL_INT(_net_netmap, OID_AUTO, flags, CTLFLAG_RW, &netmap_flags, 0 , "");
-SYSCTL_INT(_net_netmap, OID_AUTO, fwd, CTLFLAG_RW, &netmap_fwd, 0 , "");
-SYSCTL_INT(_net_netmap, OID_AUTO, mmap_unreg, CTLFLAG_RW, &netmap_mmap_unreg, 0, "");
-SYSCTL_INT(_net_netmap, OID_AUTO, admode, CTLFLAG_RW, &netmap_admode, 0 , "");
-SYSCTL_INT(_net_netmap, OID_AUTO, generic_mit, CTLFLAG_RW, &netmap_generic_mit, 0 , "");
-SYSCTL_INT(_net_netmap, OID_AUTO, generic_ringsize, CTLFLAG_RW, &netmap_generic_ringsize, 0 , "");
+SYSCTL_INT(_dev_netmap, OID_AUTO, flags, CTLFLAG_RW, &netmap_flags, 0 , "");
+SYSCTL_INT(_dev_netmap, OID_AUTO, fwd, CTLFLAG_RW, &netmap_fwd, 0 , "");
+SYSCTL_INT(_dev_netmap, OID_AUTO, mmap_unreg, CTLFLAG_RW, &netmap_mmap_unreg, 0, "");
+SYSCTL_INT(_dev_netmap, OID_AUTO, admode, CTLFLAG_RW, &netmap_admode, 0 , "");
+SYSCTL_INT(_dev_netmap, OID_AUTO, generic_mit, CTLFLAG_RW, &netmap_generic_mit, 0 , "");
+SYSCTL_INT(_dev_netmap, OID_AUTO, generic_ringsize, CTLFLAG_RW, &netmap_generic_ringsize, 0 , "");
 
 NMG_LOCK_T	netmap_global_lock;
 
@@ -751,7 +751,7 @@ netmap_grab_packets(struct netmap_kring *kring, struct mbq *q, int force)
 		}
 		slot->flags &= ~NS_FORWARD; // XXX needed ?
 		/* XXX adapt to the case of a multisegment packet */
-		m = m_devget(BDG_NMB(na, slot), slot->len, 0, na->ifp, NULL);
+		m = m_devget(BDG_NMB(na, slot), slot->len, 0, na->ifp);
 
 		if (m == NULL)
 			break;
@@ -1017,7 +1017,6 @@ netmap_get_hw_na(struct ifnet *ifp, struct netmap_adapter **na)
 	gna = (struct netmap_generic_adapter*)NA(ifp);
 	gna->prev = prev_na; /* save old na */
 	if (prev_na != NULL) {
-		ifunit(ifp->if_xname);	/* XXX huh? */
 		// XXX add a refcount ?
 		netmap_adapter_get(prev_na);
 	}
@@ -1063,9 +1062,12 @@ netmap_get_na(struct nmreq *nmr, struct netmap_adapter **na, int create)
 	if (error || *na != NULL) /* valid match in netmap_get_bdg_na() */
 		return error;
 
+	ifnet_lock();
+
 	ifp = ifunit(nmr->nr_name);
 	if (ifp == NULL) {
-	        return ENXIO;
+		error = ENXIO;
+		goto out;
 	}
 
 	error = netmap_get_hw_na(ifp, &ret);
@@ -1083,10 +1085,7 @@ netmap_get_na(struct nmreq *nmr, struct netmap_adapter **na, int create)
 		netmap_adapter_get(ret);
 	}
 out:
-#if 0
-	if_rele(ifp);
-#endif
-
+	ifnet_unlock();
 	return error;
 }
 

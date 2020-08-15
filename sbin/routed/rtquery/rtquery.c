@@ -10,11 +10,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgment:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -52,31 +48,15 @@ char copyright[] =
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#ifdef sgi
-#include <strings.h>
-#include <bstring.h>
-#endif
+#include <openssl/md5.h>
 
-#if !defined(sgi) && !defined(__NetBSD__)
+#if !defined(__NetBSD__)
 static char sccsid[] __attribute__((unused))= "@(#)query.c	8.1 (Berkeley) 6/5/93";
 #elif defined(__NetBSD__)
 __RCSID("$NetBSD: rtquery.c,v 1.10 1999/02/23 10:47:41 christos Exp $");
 #endif
 
-#ifndef sgi
 #define _HAVE_SIN_LEN
-#endif
-
-#define MD5_DIGEST_LEN 16
-typedef struct {
-	u_int32_t state[4];		/* state (ABCD) */
-	u_int32_t count[2];		/* # of bits, modulo 2^64 (LSB 1st) */
-	unsigned char buffer[64];	/* input buffer */
-} MD5_CTX;
-extern void MD5Init(MD5_CTX*);
-extern void MD5Update(MD5_CTX*, u_char*, u_int);
-extern void MD5Final(u_char[MD5_DIGEST_LEN], MD5_CTX*);
-
 
 #define	WTIME	15		/* Time to wait for all responses */
 #define	STIME	(250*1000)	/* usec to wait for another response */
@@ -394,12 +374,12 @@ query_loop(char *argv[], int argc)
 			NA0.au.a_md5.md5_pkt_len = htons(cc);
 			NA2.a_family = RIP_AF_AUTH;
 			NA2.a_type = htons(1);
-			MD5Init(&md5_ctx);
-			MD5Update(&md5_ctx,
+			MD5_Init(&md5_ctx);
+			MD5_Update(&md5_ctx,
 				  (u_char *)&OMSG, cc);
-			MD5Update(&md5_ctx,
+			MD5_Update(&md5_ctx,
 				  (u_char *)passwd, RIP_AUTH_MD5_LEN);
-			MD5Final(NA2.au.au_pw, &md5_ctx);
+			MD5_Final(NA2.au.au_pw, &md5_ctx);
 			omsg_len += 2*sizeof(OMSG.rip_nets[0]);
 		}
 
@@ -729,12 +709,12 @@ rip_input(struct sockaddr_in *from,
 			putc('\n', stdout);
 			if (md5_authed && n+1 > lim
 			    && na->a_type == ntohs(1)) {
-				MD5Init(&md5_ctx);
-				MD5Update(&md5_ctx, (u_char *)&IMSG,
+				MD5_Init(&md5_ctx);
+				MD5_Update(&md5_ctx, (u_char *)&IMSG,
 					  (char *)na-(char *)&IMSG);
-				MD5Update(&md5_ctx, (u_char *)passwd,
+				MD5_Update(&md5_ctx, (u_char *)passwd,
 					  RIP_AUTH_MD5_LEN);
-				MD5Final(hash, &md5_ctx);
+				MD5_Final(hash, &md5_ctx);
 				printf("    %s hash\n",
 				       memcmp(hash, na->au.au_pw, sizeof(hash))
 				       ? "WRONG" : "correct");

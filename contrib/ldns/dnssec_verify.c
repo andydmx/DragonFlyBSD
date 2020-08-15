@@ -16,7 +16,7 @@
 #include <openssl/md5.h>
 
 ldns_dnssec_data_chain *
-ldns_dnssec_data_chain_new()
+ldns_dnssec_data_chain_new(void)
 {
 	ldns_dnssec_data_chain *nc = LDNS_CALLOC(ldns_dnssec_data_chain, 1);
         if(!nc) return NULL;
@@ -216,7 +216,7 @@ ldns_dnssec_build_data_chain_other(ldns_resolver *res,
 	}
 }
 
-ldns_dnssec_data_chain *
+static ldns_dnssec_data_chain *
 ldns_dnssec_build_data_chain_nokeyname(ldns_resolver *res,
                                        uint16_t qflags,
                                        ldns_rr *orig_rr,
@@ -415,14 +415,17 @@ ldns_dnssec_build_data_chain(ldns_resolver *res,
 		                                              new_chain);
 	}
 	if (type != LDNS_RR_TYPE_DNSKEY) {
-		ldns_dnssec_build_data_chain_dnskey(res,
-		                                    qflags,
-		                                    pkt,
-		                                    signatures,
-		                                    new_chain,
-		                                    key_name,
-		                                    c
-		                                   );
+		if (type != LDNS_RR_TYPE_DS ||
+				ldns_dname_is_subdomain(name, key_name)) {
+			ldns_dnssec_build_data_chain_dnskey(res,
+			                                    qflags,
+			                                    pkt,
+			                                    signatures,
+			                                    new_chain,
+			                                    key_name,
+			                                    c
+			                                   );
+		}
 	} else {
 		ldns_dnssec_build_data_chain_other(res,
 		                                   qflags,
@@ -439,7 +442,7 @@ ldns_dnssec_build_data_chain(ldns_resolver *res,
 }
 
 ldns_dnssec_trust_tree *
-ldns_dnssec_trust_tree_new()
+ldns_dnssec_trust_tree_new(void)
 {
 	ldns_dnssec_trust_tree *new_tree = LDNS_XMALLOC(ldns_dnssec_trust_tree,
 										   1);
@@ -495,7 +498,7 @@ print_tabs(FILE *out, size_t nr, uint8_t *map, size_t treedepth)
 	}
 }
 
-void
+static void
 ldns_dnssec_trust_tree_print_sm_fmt(FILE *out, 
 		const ldns_output_format *fmt,
 		ldns_dnssec_trust_tree *tree,
@@ -626,18 +629,6 @@ ldns_dnssec_trust_tree_print_sm_fmt(FILE *out,
 	if (mapset) {
 		LDNS_FREE(sibmap);
 	}
-}
-
-void
-ldns_dnssec_trust_tree_print_sm(FILE *out, 
-		ldns_dnssec_trust_tree *tree,
-		size_t tabs,
-		bool extended,
-		uint8_t *sibmap,
-		size_t treedepth)
-{
-	ldns_dnssec_trust_tree_print_sm_fmt(out, ldns_output_format_default, 
-			tree, tabs, extended, sibmap, treedepth);
 }
 
 void
@@ -915,8 +906,9 @@ ldns_dnssec_derive_trust_tree_dnskey_rrset_time(
 				cur_status = ldns_verify_rrsig_time(
 						cur_rrset, cur_sig_rr, 
 						cur_parent_rr, check_time);
-				(void) ldns_dnssec_trust_tree_add_parent(new_tree,
-				            cur_parent_tree, cur_sig_rr, cur_status);
+				if (ldns_dnssec_trust_tree_add_parent(new_tree,
+				            cur_parent_tree, cur_sig_rr, cur_status))
+					ldns_dnssec_trust_tree_free(cur_parent_tree);
 			}
 		}
 	}
@@ -1030,8 +1022,10 @@ ldns_dnssec_derive_trust_tree_no_sig_time(
 						data_chain->parent, 
 						cur_parent_rr,
 						check_time);
-			(void) ldns_dnssec_trust_tree_add_parent(new_tree,
-			            cur_parent_tree, NULL, result);
+			if (ldns_dnssec_trust_tree_add_parent(new_tree,
+			            cur_parent_tree, NULL, result))
+				ldns_dnssec_trust_tree_free(cur_parent_tree);
+
 		}
 	}
 }
@@ -1100,8 +1094,8 @@ ldns_dnssec_trust_tree_contains_keys(ldns_dnssec_trust_tree *tree,
 
 ldns_status
 ldns_verify_time(
-		ldns_rr_list *rrset,
-		ldns_rr_list *rrsig, 
+		const ldns_rr_list *rrset,
+		const ldns_rr_list *rrsig, 
 		const ldns_rr_list *keys, 
 		time_t check_time,
 		ldns_rr_list *good_keys
@@ -1595,8 +1589,6 @@ ldns_dnssec_verify_denial_nsec3_match( ldns_rr *rr
 	bool wildcard_covered = false;
 	ldns_rdf *zone_name;
 	ldns_rdf *hashed_name;
-	/* self assignment to suppress uninitialized warning */
-	ldns_rdf *next_closer = NULL;
 	ldns_rdf *hashed_next_closer;
 	size_t i;
 	ldns_status result = LDNS_STATUS_DNSSEC_NSEC_RR_NOT_COVERED;
@@ -1671,6 +1663,7 @@ ldns_dnssec_verify_denial_nsec3_match( ldns_rr *rr
 				}
 			}
 		}
+		ldns_rdf_deep_free(hashed_name);
 		result = LDNS_STATUS_DNSSEC_NSEC_RR_NOT_COVERED;
 		/* wildcard no data? section 8.7 */
 		closest_encloser = ldns_dnssec_nsec3_closest_encloser(
@@ -1760,7 +1753,9 @@ ldns_dnssec_verify_denial_nsec3_match( ldns_rr *rr
 			/* Query name *is* the "next closer". */
 			hashed_next_closer = hashed_name;
 		} else {
-
+			ldns_rdf *next_closer;
+			
+			ldns_rdf_deep_free(hashed_name);
 			/* "next closer" has less labels than the query name.
 			 * Create the name and hash it.
 			 */
@@ -1774,6 +1769,7 @@ ldns_dnssec_verify_denial_nsec3_match( ldns_rr *rr
 					next_closer
 					);
 			(void) ldns_dname_cat(hashed_next_closer, zone_name);
+			ldns_rdf_deep_free(next_closer);
 		}
 		/* Find the NSEC3 that covers the "next closer" */
 		for (i = 0; i < ldns_rr_list_rr_count(nsecs); i++) {
@@ -1788,15 +1784,7 @@ ldns_dnssec_verify_denial_nsec3_match( ldns_rr *rr
 				break;
 			}
 		}
-		if (ldns_dname_label_count(closest_encloser) + 1
-		    < ldns_dname_label_count(ldns_rr_owner(rr))) {
-
-			/* "next closer" has less labels than the query name.
-			 * Dispose of the temporary variables that held that name.
-			 */
-			ldns_rdf_deep_free(hashed_next_closer);
-			ldns_rdf_deep_free(next_closer);
-		}
+		ldns_rdf_deep_free(hashed_next_closer);
 		ldns_rdf_deep_free(closest_encloser);
 	}
 
@@ -1821,7 +1809,7 @@ ldns_dnssec_verify_denial_nsec3(ldns_rr *rr,
 
 #ifdef USE_GOST
 EVP_PKEY*
-ldns_gost2pkey_raw(unsigned char* key, size_t keylen)
+ldns_gost2pkey_raw(const unsigned char* key, size_t keylen)
 {
 	/* prefix header for X509 encoding */
 	uint8_t asn[37] = { 0x30, 0x63, 0x30, 0x1c, 0x06, 0x06, 0x2a, 0x85, 
@@ -1844,8 +1832,8 @@ ldns_gost2pkey_raw(unsigned char* key, size_t keylen)
 }
 
 static ldns_status
-ldns_verify_rrsig_gost_raw(unsigned char* sig, size_t siglen, 
-	ldns_buffer* rrset, unsigned char* key, size_t keylen)
+ldns_verify_rrsig_gost_raw(const unsigned char* sig, size_t siglen, 
+	const ldns_buffer* rrset, const unsigned char* key, size_t keylen)
 {
 	EVP_PKEY *evp_key;
 	ldns_status result;
@@ -1866,9 +1854,85 @@ ldns_verify_rrsig_gost_raw(unsigned char* sig, size_t siglen,
 }
 #endif
 
+#ifdef USE_ED25519
+EVP_PKEY*
+ldns_ed255192pkey_raw(const unsigned char* key, size_t keylen)
+{
+	/* ASN1 for ED25519 is 302a300506032b6570032100 <32byteskey> */
+	uint8_t pre[] = {0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65,
+		0x70, 0x03, 0x21, 0x00};
+        int pre_len = 12;
+	uint8_t buf[256];
+        EVP_PKEY *evp_key;
+	/* pp gets modified by d2i() */
+        const unsigned char* pp = (unsigned char*)buf;
+	if(keylen != 32 || keylen + pre_len > sizeof(buf))
+		return NULL; /* wrong length */
+	memmove(buf, pre, pre_len);
+	memmove(buf+pre_len, key, keylen);
+	evp_key = d2i_PUBKEY(NULL, &pp, (int)(pre_len+keylen));
+        return evp_key;
+}
+
+static ldns_status
+ldns_verify_rrsig_ed25519_raw(unsigned char* sig, size_t siglen,
+	ldns_buffer* rrset, unsigned char* key, size_t keylen)
+{
+        EVP_PKEY *evp_key;
+        ldns_status result;
+
+        evp_key = ldns_ed255192pkey_raw(key, keylen);
+        if(!evp_key) {
+		/* could not convert key */
+		return LDNS_STATUS_CRYPTO_BOGUS;
+        }
+	result = ldns_verify_rrsig_evp_raw(sig, siglen, rrset, evp_key, NULL);
+	EVP_PKEY_free(evp_key);
+	return result;
+}
+#endif /* USE_ED25519 */
+
+#ifdef USE_ED448
+EVP_PKEY*
+ldns_ed4482pkey_raw(const unsigned char* key, size_t keylen)
+{
+	/* ASN1 for ED448 is 3043300506032b6571033a00 <57byteskey> */
+	uint8_t pre[] = {0x30, 0x43, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65,
+		0x71, 0x03, 0x3a, 0x00};
+        int pre_len = 12;
+	uint8_t buf[256];
+        EVP_PKEY *evp_key;
+	/* pp gets modified by d2i() */
+        const unsigned char* pp = (unsigned char*)buf;
+	if(keylen != 57 || keylen + pre_len > sizeof(buf))
+		return NULL; /* wrong length */
+	memmove(buf, pre, pre_len);
+	memmove(buf+pre_len, key, keylen);
+	evp_key = d2i_PUBKEY(NULL, &pp, (int)(pre_len+keylen));
+        return evp_key;
+}
+
+static ldns_status
+ldns_verify_rrsig_ed448_raw(unsigned char* sig, size_t siglen,
+	ldns_buffer* rrset, unsigned char* key, size_t keylen)
+{
+        EVP_PKEY *evp_key;
+        ldns_status result;
+
+        evp_key = ldns_ed4482pkey_raw(key, keylen);
+        if(!evp_key) {
+		/* could not convert key */
+		return LDNS_STATUS_CRYPTO_BOGUS;
+        }
+	result = ldns_verify_rrsig_evp_raw(sig, siglen, rrset, evp_key, NULL);
+	EVP_PKEY_free(evp_key);
+	return result;
+}
+#endif /* USE_ED448 */
+
 #ifdef USE_ECDSA
 EVP_PKEY*
-ldns_ecdsa2pkey_raw(unsigned char* key, size_t keylen, uint8_t algo)
+ldns_ecdsa2pkey_raw(const unsigned char* key, size_t keylen, uint8_t algo)
 {
 	unsigned char buf[256+2]; /* sufficient for 2*384/8+1 */
         const unsigned char* pp = buf;
@@ -1947,6 +2011,7 @@ ldns_verify_rrsig_buffers_raw(unsigned char* sig, size_t siglen,
 {
 	/* check for right key */
 	switch(algo) {
+#ifdef USE_DSA
 	case LDNS_DSA:
 	case LDNS_DSA_NSEC3:
 		return ldns_verify_rrsig_dsa_raw(sig,
@@ -1955,6 +2020,7 @@ ldns_verify_rrsig_buffers_raw(unsigned char* sig, size_t siglen,
 								   key,
 								   keylen);
 		break;
+#endif
 	case LDNS_RSASHA1:
 	case LDNS_RSASHA1_NSEC3:
 		return ldns_verify_rrsig_rsasha1_raw(sig,
@@ -1992,6 +2058,18 @@ ldns_verify_rrsig_buffers_raw(unsigned char* sig, size_t siglen,
 			key, keylen, algo);
 		break;
 #endif
+#ifdef USE_ED25519
+	case LDNS_ED25519:
+		return ldns_verify_rrsig_ed25519_raw(sig, siglen, verify_buf,
+			key, keylen);
+		break;
+#endif
+#ifdef USE_ED448
+	case LDNS_ED448:
+		return ldns_verify_rrsig_ed448_raw(sig, siglen, verify_buf,
+			key, keylen);
+		break;
+#endif
 	case LDNS_RSAMD5:
 		return ldns_verify_rrsig_rsamd5_raw(sig,
 									 siglen,
@@ -2014,7 +2092,7 @@ ldns_verify_rrsig_buffers_raw(unsigned char* sig, size_t siglen,
  * @param sig: signature to take TTL and wildcard values from
  */
 static void
-ldns_rrset_use_signature_ttl(ldns_rr_list* rrset_clone, ldns_rr* rrsig)
+ldns_rrset_use_signature_ttl(ldns_rr_list* rrset_clone, const ldns_rr* rrsig)
 {
 	uint32_t orig_ttl;
 	uint16_t i;
@@ -2063,7 +2141,7 @@ ldns_rrset_use_signature_ttl(ldns_rr_list* rrset_clone, ldns_rr* rrsig)
  * @return OK or more specific error.
  */
 static ldns_status
-ldns_rrsig2rawsig_buffer(ldns_buffer* rawsig_buf, ldns_rr* rrsig)
+ldns_rrsig2rawsig_buffer(ldns_buffer* rawsig_buf, const ldns_rr* rrsig)
 {
 	uint8_t sig_algo;
        
@@ -2092,6 +2170,12 @@ ldns_rrsig2rawsig_buffer(ldns_buffer* rawsig_buf, ldns_rr* rrsig)
 #ifdef USE_GOST
 	case LDNS_ECC_GOST:
 #endif
+#ifdef USE_ED25519
+	case LDNS_ED25519:
+#endif
+#ifdef USE_ED448
+	case LDNS_ED448:
+#endif
 		if (ldns_rr_rdf(rrsig, 8) == NULL) {
 			return LDNS_STATUS_MISSING_RDATA_FIELDS_RRSIG;
 		}
@@ -2100,6 +2184,7 @@ ldns_rrsig2rawsig_buffer(ldns_buffer* rawsig_buf, ldns_rr* rrsig)
 			return LDNS_STATUS_MEM_ERR;
 		}
 		break;
+#ifdef USE_DSA
 	case LDNS_DSA:
 	case LDNS_DSA_NSEC3:
 		/* EVP takes rfc2459 format, which is a tad longer than dns format */
@@ -2116,6 +2201,7 @@ ldns_rrsig2rawsig_buffer(ldns_buffer* rawsig_buf, ldns_rr* rrsig)
 			return LDNS_STATUS_MEM_ERR;
 		}
 		break;
+#endif
 #ifdef USE_ECDSA
         case LDNS_ECDSAP256SHA256:
         case LDNS_ECDSAP384SHA384:
@@ -2148,7 +2234,7 @@ ldns_rrsig2rawsig_buffer(ldns_buffer* rawsig_buf, ldns_rr* rrsig)
  * @return status code LDNS_STATUS_OK if all is fine.
  */
 static ldns_status
-ldns_rrsig_check_timestamps(ldns_rr* rrsig, time_t now)
+ldns_rrsig_check_timestamps(const ldns_rr* rrsig, time_t now)
 {
 	int32_t inception, expiration;
 	
@@ -2183,7 +2269,7 @@ ldns_rrsig_check_timestamps(ldns_rr* rrsig, time_t now)
  */
 static ldns_status
 ldns_prepare_for_verify(ldns_buffer* rawsig_buf, ldns_buffer* verify_buf, 
-	ldns_rr_list* rrset_clone, ldns_rr* rrsig)
+	ldns_rr_list* rrset_clone, const ldns_rr* rrsig)
 {
 	ldns_status result;
 
@@ -2230,7 +2316,7 @@ ldns_prepare_for_verify(ldns_buffer* rawsig_buf, ldns_buffer* verify_buf,
  */
 static ldns_status
 ldns_verify_test_sig_key(ldns_buffer* rawsig_buf, ldns_buffer* verify_buf, 
-	ldns_rr* rrsig, ldns_rr* key)
+	const ldns_rr* rrsig, ldns_rr* key)
 {
 	uint8_t sig_algo;
        
@@ -2297,8 +2383,8 @@ ldns_verify_test_sig_key(ldns_buffer* rawsig_buf, ldns_buffer* verify_buf,
  */
 ldns_status
 ldns_verify_rrsig_keylist_time(
-		ldns_rr_list *rrset,
-		ldns_rr *rrsig,
+		const ldns_rr_list *rrset,
+		const ldns_rr *rrsig,
 		const ldns_rr_list *keys, 
 		time_t check_time,
 		ldns_rr_list *good_keys)
@@ -2346,8 +2432,8 @@ ldns_verify_rrsig_keylist(ldns_rr_list *rrset,
 }
 
 ldns_status
-ldns_verify_rrsig_keylist_notime(ldns_rr_list *rrset,
-					 ldns_rr *rrsig,
+ldns_verify_rrsig_keylist_notime(const ldns_rr_list *rrset,
+					 const ldns_rr *rrsig,
 					 const ldns_rr_list *keys, 
 					 ldns_rr_list *good_keys)
 {
@@ -2494,24 +2580,46 @@ ldns_verify_rrsig_evp(ldns_buffer *sig,
 }
 
 ldns_status
-ldns_verify_rrsig_evp_raw(unsigned char *sig, size_t siglen, 
-					 ldns_buffer *rrset, EVP_PKEY *key, const EVP_MD *digest_type)
+ldns_verify_rrsig_evp_raw(const unsigned char *sig, size_t siglen, 
+					 const ldns_buffer *rrset, EVP_PKEY *key, const EVP_MD *digest_type)
 {
-	EVP_MD_CTX ctx;
+	EVP_MD_CTX *ctx;
 	int res;
 
-	EVP_MD_CTX_init(&ctx);
+#ifdef HAVE_EVP_MD_CTX_NEW
+	ctx = EVP_MD_CTX_new();
+#else
+	ctx = (EVP_MD_CTX*)malloc(sizeof(*ctx));
+	if(ctx) EVP_MD_CTX_init(ctx);
+#endif
+	if(!ctx)
+		return LDNS_STATUS_MEM_ERR;
 	
-	EVP_VerifyInit(&ctx, digest_type);
-	EVP_VerifyUpdate(&ctx,
-				  ldns_buffer_begin(rrset),
-				  ldns_buffer_position(rrset));
-	res = EVP_VerifyFinal(&ctx, sig, (unsigned int) siglen, key);
+#if defined(USE_ED25519) || defined(USE_ED448)
+	if(!digest_type) {
+		res = EVP_DigestVerifyInit(ctx, NULL, digest_type, NULL, key);
+		if(res == 1) {
+			res = EVP_DigestVerify(ctx, sig, siglen,
+				ldns_buffer_begin(rrset),
+				ldns_buffer_position(rrset));
+		}
+	} else {
+#else
+	res = 0;
+	if(digest_type) {
+#endif
+		EVP_VerifyInit(ctx, digest_type);
+		EVP_VerifyUpdate(ctx,
+					  ldns_buffer_begin(rrset),
+					  ldns_buffer_position(rrset));
+		res = EVP_VerifyFinal(ctx, sig, (unsigned int) siglen, key);
+	}
 	
-	EVP_MD_CTX_cleanup(&ctx);
+	EVP_MD_CTX_destroy(ctx);
 	
 	if (res == 1) {
 		return LDNS_STATUS_OK;
+
 	} else if (res == 0) {
 		return LDNS_STATUS_CRYPTO_BOGUS;
 	}
@@ -2557,6 +2665,7 @@ ldns_status
 ldns_verify_rrsig_dsa_raw(unsigned char* sig, size_t siglen,
 					 ldns_buffer* rrset, unsigned char* key, size_t keylen)
 {
+#ifdef USE_DSA
 	EVP_PKEY *evp_key;
 	ldns_status result;
 
@@ -2566,13 +2675,21 @@ ldns_verify_rrsig_dsa_raw(unsigned char* sig, size_t siglen,
 								siglen,
 								rrset,
 								evp_key,
-								EVP_dss1());
+# ifdef HAVE_EVP_DSS1
+								EVP_dss1()
+# else
+								EVP_sha1()
+# endif
+								);
 	} else {
 		result = LDNS_STATUS_SSL_ERR;
 	}
 	EVP_PKEY_free(evp_key);
 	return result;
-
+#else
+	(void)sig; (void)siglen; (void)rrset; (void)key; (void)keylen;
+	return LDNS_STATUS_CRYPTO_ALGO_NOT_IMPL;
+#endif
 }
 
 ldns_status

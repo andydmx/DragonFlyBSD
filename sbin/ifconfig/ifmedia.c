@@ -105,7 +105,7 @@ media_status(int s)
 	int *media_list, i;
 
 	memset(&ifmr, 0, sizeof(ifmr));
-	strncpy(ifmr.ifm_name, name, sizeof(ifmr.ifm_name));
+	strlcpy(ifmr.ifm_name, name, sizeof(ifmr.ifm_name));
 
 	if (ioctl(s, SIOCGIFMEDIA, &ifmr) < 0) {
 		/*
@@ -195,9 +195,8 @@ ifmedia_getstate(int s)
 		if (ifmr == NULL)
 			err(1, "malloc");
 
-		(void) memset(ifmr, 0, sizeof(struct ifmediareq));
-		(void) strncpy(ifmr->ifm_name, name,
-		    sizeof(ifmr->ifm_name));
+		memset(ifmr, 0, sizeof(struct ifmediareq));
+		strlcpy(ifmr->ifm_name, name, sizeof(ifmr->ifm_name));
 
 		ifmr->ifm_count = 0;
 		ifmr->ifm_ulist = NULL;
@@ -218,7 +217,7 @@ ifmedia_getstate(int s)
 		mwords = (int *)malloc(ifmr->ifm_count * sizeof(int));
 		if (mwords == NULL)
 			err(1, "malloc");
-  
+
 		ifmr->ifm_ulist = mwords;
 		if (ioctl(s, SIOCGIFMEDIA, (caddr_t)ifmr) < 0)
 			err(1, "SIOCGIFMEDIA");
@@ -248,7 +247,6 @@ setmedia(const char *val, int d, int s, const struct afswtch *afp)
 {
 	struct ifmediareq *ifmr;
 	int subtype;
-	
 
 	ifmr = ifmedia_getstate(s);
 
@@ -263,7 +261,7 @@ setmedia(const char *val, int d, int s, const struct afswtch *afp)
 	 */
 	subtype = get_media_subtype(IFM_TYPE(ifmr->ifm_ulist[0]), val);
 
-	strncpy(ifr.ifr_name, name, sizeof(ifr.ifr_name));
+	strlcpy(ifr.ifr_name, name, sizeof(ifr.ifr_name));
 	ifr.ifr_media = (ifmr->ifm_current & ~(IFM_NMASK|IFM_TMASK)) |
 	    IFM_TYPE(ifmr->ifm_ulist[0]) | subtype;
 
@@ -299,7 +297,7 @@ domediaopt(const char *val, int clear, int s)
 
 	options = get_media_options(IFM_TYPE(ifmr->ifm_ulist[0]), val);
 
-	strncpy(ifr.ifr_name, name, sizeof(ifr.ifr_name));
+	strlcpy(ifr.ifr_name, name, sizeof(ifr.ifr_name));
 	ifr.ifr_media = ifmr->ifm_current;
 	if (clear)
 		ifr.ifr_media &= ~options;
@@ -321,7 +319,7 @@ setmediamode(const char *val, int d, int s, const struct afswtch *afp)
 
 	mode = get_media_mode(IFM_TYPE(ifmr->ifm_ulist[0]), val);
 
-	strncpy(ifr.ifr_name, name, sizeof(ifr.ifr_name));
+	strlcpy(ifr.ifr_name, name, sizeof(ifr.ifr_name));
 	ifr.ifr_media = (ifmr->ifm_current & ~IFM_MMASK) | mode;
 
 	ifmr->ifm_current = ifr.ifr_media;
@@ -343,6 +341,9 @@ static struct ifmedia_description ifm_subtype_ethernet_aliases[] =
 
 static struct ifmedia_description ifm_subtype_ethernet_option_descriptions[] =
     IFM_SUBTYPE_ETHERNET_OPTION_DESCRIPTIONS;
+
+static struct ifmedia_description ifm_subtype_ethernet_option_alias[] =
+    IFM_SUBTYPE_ETHERNET_OPTION_ALIAS;
 
 static struct ifmedia_description ifm_subtype_ieee80211_descriptions[] =
     IFM_SUBTYPE_IEEE80211_DESCRIPTIONS;
@@ -385,7 +386,7 @@ struct ifmedia_type_to_subtype {
 	struct {
 		struct ifmedia_description *desc;
 		int alias;
-	} options[3];
+	} options[4];
 	struct {
 		struct ifmedia_description *desc;
 		int alias;
@@ -405,6 +406,7 @@ static struct ifmedia_type_to_subtype ifmedia_types_to_subtypes[] = {
 		{
 			{ &ifm_shared_option_descriptions[0], 0 },
 			{ &ifm_subtype_ethernet_option_descriptions[0], 0 },
+			{ &ifm_subtype_ethernet_option_alias[0], 1 },
 			{ NULL, 0 },
 		},
 		{
@@ -572,7 +574,7 @@ static struct ifmedia_type_to_subtype *get_toptype_ttos(int ifmw)
 	return ttos;
 }
 
-static struct ifmedia_description *get_subtype_desc(int ifmw, 
+static struct ifmedia_description *get_subtype_desc(int ifmw,
     struct ifmedia_type_to_subtype *ttos)
 {
 	int i;
@@ -591,7 +593,7 @@ static struct ifmedia_description *get_subtype_desc(int ifmw,
 	return NULL;
 }
 
-static struct ifmedia_description *get_mode_desc(int ifmw, 
+static struct ifmedia_description *get_mode_desc(int ifmw,
     struct ifmedia_type_to_subtype *ttos)
 {
 	int i;
@@ -738,11 +740,9 @@ static struct afswtch af_media = {
 static __constructor(101) void
 ifmedia_ctor(void)
 {
-#define	N(a)	(sizeof(a) / sizeof(a[0]))
-	int i;
+	size_t i;
 
-	for (i = 0; i < N(media_cmds);  i++)
+	for (i = 0; i < nitems(media_cmds);  i++)
 		cmd_register(&media_cmds[i]);
 	af_register(&af_media);
-#undef N
 }

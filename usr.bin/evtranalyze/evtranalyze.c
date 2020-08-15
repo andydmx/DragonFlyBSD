@@ -1031,20 +1031,25 @@ cmd_show(int argc, char **argv)
 		err(1, "Can't initialize query\n");
 	while(!evtr_query_next(q, &ev)) {
 		char buf[1024];
+		char *tmpbuf;
 
 		if (!last_ts)
 			last_ts = ev.ts;
+
+		tmpbuf = strdup(ev.file);
+
 		if (freq < 0.0) {
 			printf("%s\t%ju cycles\t[%.3d]\t%s:%d",
 			       ev.td ? ev.td->comm : "unknown",
 			       (uintmax_t)(ev.ts - last_ts), ev.cpu,
-			       basename(ev.file), ev.line);
+			       basename(tmpbuf), ev.line);
 		} else {
 			printf("%s\t%.3lf usecs\t[%.3d]\t%s:%d",
 			       ev.td ? ev.td->comm : "unknown",
 			       (ev.ts - last_ts) / freq, ev.cpu,
-			       basename(ev.file), ev.line);
+			       basename(tmpbuf), ev.line);
 		}
+		free(tmpbuf);
 		if (ev.fmt) {
 			evtr_event_data(&ev, buf, sizeof(buf));
 			printf(" !\t%s\n", buf);
@@ -1077,7 +1082,7 @@ struct stats_integer_ctx {
 	struct plotter *plotter;
 	plotid_t time_plot;
 	uintmax_t sum;
-	uintmax_t occurences;
+	uintmax_t occurrences;
 };
 
 static
@@ -1108,7 +1113,7 @@ stats_integer_prepare(int argc, char **argv, struct evtr_filter *filt)
 	if (argc != 1)
 		err(2, "Need exactly one variable");
 	ctx->varname = argv[0];
-	ctx->sum = ctx->occurences = 0;
+	ctx->sum = ctx->occurrences = 0;
 	filt->flags = 0;
 	filt->cpu = -1;
 	filt->ev_type = EVTR_TYPE_STMT;
@@ -1143,7 +1148,7 @@ stats_integer_each(void *_ctx, evtr_event_t ev)
 		ctx->plotter->plot_line(ctx->plotter_ctx, ctx->time_plot,
 					(double)ev->ts, (double)ev->stmt.val->num);
 	ctx->sum += ev->stmt.val->num;
-	++ctx->occurences;
+	++ctx->occurrences;
 }
 
 static
@@ -1152,7 +1157,7 @@ stats_integer_report(void *_ctx)
 {
 	struct stats_integer_ctx *ctx = _ctx;
 	printf("median for variable %s is %lf\n", ctx->varname,
-	       (double)ctx->sum / ctx->occurences);
+	       (double)ctx->sum / ctx->occurrences);
 	if (ctx->plotter)
 		ctx->plotter->plot_finish(ctx->plotter_ctx);
 

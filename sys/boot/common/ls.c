@@ -33,12 +33,11 @@
  * SUCH DAMAGE.
  *
  * $FreeBSD: src/sys/boot/common/ls.c,v 1.11 2003/08/25 23:30:41 obrien Exp $
- * $DragonFly: src/sys/boot/common/ls.c,v 1.5 2008/09/02 17:21:12 dillon Exp $
  */
 
 #include <sys/param.h>
-#include <ufs/ufs/dinode.h>
-#include <ufs/ufs/dir.h>
+#include <vfs/ufs/dinode.h>
+#include <vfs/ufs/dir.h>
 
 #include <stand.h>
 #include <string.h>
@@ -102,7 +101,10 @@ command_ls(int argc, char *argv[])
 		/* stat the file, if possible */
 		sb.st_size = 0;
 		buf = malloc(strlen(path) + strlen(d->d_name) + 2);
-		sprintf(buf, "%s/%s", path, d->d_name);
+		if (strlen(path) == 0)
+		    sprintf(buf, "%s", d->d_name);
+		else
+		    sprintf(buf, "%s/%s", path, d->d_name);
 		/* ignore return, could be symlink, etc. */
 		if (rel_stat(buf, &sb))
 		    sb.st_size = 0;
@@ -145,21 +147,25 @@ ls_getdir(char **pathp)
 
     /* Make sure the path is respectable to begin with */
     if (archsw.arch_getdev(NULL, path, &cp)) {
-	sprintf(command_errbuf, "bad path '%s'", path);
+	snprintf(command_errbuf, sizeof(command_errbuf),
+	    "bad path '%s'", path);
 	goto out;
     }
     
     fd = rel_open(cp, NULL, O_RDONLY);
     if (fd < 0) {
-	sprintf(command_errbuf, "open '%s' failed: %s", path, strerror(errno));
+	snprintf(command_errbuf, sizeof(command_errbuf),
+	    "open '%s' failed: %s", path, strerror(errno));
 	goto out;
     }
     if (fstat(fd, &sb) < 0) {
-	sprintf(command_errbuf, "stat failed: %s", strerror(errno));
+	snprintf(command_errbuf, sizeof(command_errbuf),
+	    "stat failed: %s", strerror(errno));
 	goto out;
     }
     if (!S_ISDIR(sb.st_mode)) {
-	sprintf(command_errbuf, "%s: %s", path, strerror(ENOTDIR));
+	snprintf(command_errbuf, sizeof(command_errbuf),
+	    "%s: %s", path, strerror(ENOTDIR));
 	goto out;
     }
 

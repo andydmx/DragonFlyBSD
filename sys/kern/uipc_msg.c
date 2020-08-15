@@ -1,10 +1,10 @@
 /*
  * Copyright (c) 2003, 2004 Jeffrey M. Hsu.  All rights reserved.
  * Copyright (c) 2003, 2004 The DragonFly Project.  All rights reserved.
- * 
+ *
  * This code is derived from software contributed to The DragonFly Project
  * by Jeffrey M. Hsu.
- * 
+ *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
  * are met:
@@ -16,7 +16,7 @@
  * 3. Neither the name of The DragonFly Project nor the names of its
  *    contributors may be used to endorse or promote products derived
  *    from this software without specific, prior written permission.
- * 
+ *
  * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
  * ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
  * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
@@ -34,13 +34,13 @@
 #include <sys/param.h>
 #include <sys/systm.h>
 #include <sys/kernel.h>
+#include <sys/malloc.h>
 #include <sys/msgport.h>
 #include <sys/protosw.h>
 #include <sys/socket.h>
 #include <sys/socketvar.h>
 #include <sys/socketops.h>
 #include <sys/thread.h>
-#include <sys/thread2.h>
 #include <sys/msgport2.h>
 #include <sys/spinlock2.h>
 #include <sys/sysctl.h>
@@ -48,6 +48,7 @@
 #include <vm/pmap.h>
 
 #include <net/netmsg2.h>
+#include <net/netisr2.h>
 #include <sys/socketvar2.h>
 
 #include <net/netisr.h>
@@ -56,21 +57,6 @@
 static int async_rcvd_drop_race = 0;
 SYSCTL_INT(_kern_ipc, OID_AUTO, async_rcvd_drop_race, CTLFLAG_RW,
     &async_rcvd_drop_race, 0, "# of asynchronized pru_rcvd msg drop races");
-
-/*
- * Abort a socket and free it.  Called from soabort() only.  soabort()
- * got a ref on the socket which we must free on reply.
- */
-void
-so_pru_abort(struct socket *so)
-{
-	struct netmsg_pru_abort msg;
-
-	netmsg_init(&msg.base, so, &curthread->td_msgport,
-		    0, so->so_proto->pr_usrreqs->pru_abort);
-	lwkt_domsg(so->so_port, &msg.base.lmsg, 0);
-	sofree(msg.base.nm_so);
-}
 
 /*
  * Abort a socket and free it, asynchronously.  Called from
@@ -89,8 +75,9 @@ so_pru_abort_async(struct socket *so)
 }
 
 /*
- * Abort a socket and free it.  Called from soabort_oncpu() only.
+ * Abort a socket and free it.  Called from soabort_direct() only.
  * Caller must make sure that the current CPU is inpcb's owner CPU.
+ * soabort_direct() got a ref on the socket which we must free.
  */
 void
 so_pru_abort_direct(struct socket *so)
@@ -148,6 +135,37 @@ so_pru_attach_direct(struct socket *so, int proto, struct pru_attach_info *ai)
 	return(msg.base.lmsg.ms_error);
 }
 
+int
+so_pru_attach_fast(struct socket *so, int proto, struct pru_attach_info *ai)
+{
+	struct netmsg_pru_attach *msg;
+	int error;
+
+	error = so->so_proto->pr_usrreqs->pru_preattach(so, proto, ai);
+	if (error)
+		return error;
+
+	msg = kmalloc(sizeof(*msg), M_LWKTMSG, M_WAITOK | M_NULLOK);
+	if (msg == NULL) {
+		/*
+		 * Fail to allocate message; fallback to
+		 * synchronized pru_attach.
+		 */
+		return so_pru_attach(so, proto, NULL /* postattach */);
+	}
+
+	netmsg_init(&msg->base, so, &netisr_afree_rport, 0,
+	    so->so_proto->pr_usrreqs->pru_attach);
+	msg->nm_proto = proto;
+	msg->nm_ai = NULL; /* postattach */
+	if (so->so_port == netisr_curport())
+		lwkt_sendmsg_oncpu(so->so_port, &msg->base.lmsg);
+	else
+		lwkt_sendmsg(so->so_port, &msg->base.lmsg);
+
+	return 0;
+}
+
 /*
  * NOTE: If the target port changes the bind operation will deal with it.
  */
@@ -161,6 +179,7 @@ so_pru_bind(struct socket *so, struct sockaddr *nam, struct thread *td)
 		    0, so->so_proto->pr_usrreqs->pru_bind);
 	msg.nm_nam = nam;
 	msg.nm_td = td;		/* used only for prison_ip() */
+	msg.nm_flags = 0;
 	error = lwkt_domsg(so->so_port, &msg.base.lmsg, 0);
 	return (error);
 }
@@ -192,11 +211,12 @@ so_pru_connect_async(struct socket *so, struct sockaddr *nam, struct thread *td)
 	    ("async pru_connect is not supported"));
 
 	/* NOTE: sockaddr immediately follows netmsg */
-	msg = kmalloc(sizeof(*msg) + nam->sa_len, M_LWKTMSG, M_NOWAIT);
+	msg = kmalloc(sizeof(*msg) + nam->sa_len, M_LWKTMSG,
+	    M_WAITOK | M_NULLOK);
 	if (msg == NULL) {
 		/*
-		 * Fail to allocate message w/o waiting;
-		 * fallback to synchronized pru_connect.
+		 * Fail to allocate message; fallback to
+		 * synchronized pru_connect.
 		 */
 		return so_pru_connect(so, nam, td);
 	}
@@ -221,7 +241,10 @@ so_pru_connect_async(struct socket *so, struct sockaddr *nam, struct thread *td)
 	msg->nm_m = NULL;
 	msg->nm_sndflags = 0;
 	msg->nm_flags = flags;
-	lwkt_sendmsg(so->so_port, &msg->base.lmsg);
+	if (so->so_port == netisr_curport())
+		lwkt_sendmsg_oncpu(so->so_port, &msg->base.lmsg);
+	else
+		lwkt_sendmsg(so->so_port, &msg->base.lmsg);
 	return 0;
 }
 
@@ -371,7 +394,10 @@ so_pru_rcvd_async(struct socket *so)
 		if (lmsg->ms_flags & MSGF_DONE) {
 			lwkt_sendmsg_prepare(so->so_port, lmsg);
 			spin_unlock(&so->so_rcvd_spin);
-			lwkt_sendmsg_start(so->so_port, lmsg);
+			if (so->so_port == netisr_curport())
+				lwkt_sendmsg_start_oncpu(so->so_port, lmsg);
+			else
+				lwkt_sendmsg_start(so->so_port, lmsg);
 		} else {
 			spin_unlock(&so->so_rcvd_spin);
 		}
@@ -463,7 +489,10 @@ so_pru_send_async(struct socket *so, int flags, struct mbuf *m,
 	msg->nm_addr = addr;
 	msg->nm_control = control;
 	msg->nm_td = td;
-	lwkt_sendmsg(so->so_port, &msg->base.lmsg);
+	if (so->so_port == netisr_curport())
+		lwkt_sendmsg_oncpu(so->so_port, &msg->base.lmsg);
+	else
+		lwkt_sendmsg(so->so_port, &msg->base.lmsg);
 }
 
 int
@@ -511,11 +540,44 @@ so_pr_ctloutput(struct socket *so, struct sockopt *sopt)
 	int error;
 
 	KKASSERT(!sopt->sopt_val || kva_p(sopt->sopt_val));
+
+	if (sopt->sopt_dir == SOPT_SET && so->so_proto->pr_ctloutmsg != NULL) {
+		struct netmsg_pr_ctloutput *amsg;
+
+		/* Fast path: asynchronous pr_ctloutput */
+		amsg = so->so_proto->pr_ctloutmsg(sopt);
+		if (amsg != NULL) {
+			netmsg_init(&amsg->base, so, &netisr_afree_rport, 0,
+			    so->so_proto->pr_ctloutput);
+			/* nm_flags and nm_sopt are setup by pr_ctloutmsg */
+			if (so->so_port == netisr_curport()) {
+				lwkt_sendmsg_oncpu(so->so_port,
+				    &amsg->base.lmsg);
+			} else {
+				lwkt_sendmsg(so->so_port, &amsg->base.lmsg);
+			}
+			return 0;
+		}
+		/* FALLTHROUGH */
+	}
+
 	netmsg_init(&msg.base, so, &curthread->td_msgport,
 		    0, so->so_proto->pr_ctloutput);
+	msg.nm_flags = 0;
 	msg.nm_sopt = sopt;
 	error = lwkt_domsg(so->so_port, &msg.base.lmsg, 0);
 	return (error);
+}
+
+struct lwkt_port *
+so_pr_ctlport(struct protosw *pr, int cmd, struct sockaddr *arg,
+    void *extra, int *cpuid)
+{
+	if (pr->pr_ctlport == NULL)
+		return NULL;
+	KKASSERT(pr->pr_ctlinput != NULL);
+
+	return pr->pr_ctlport(cmd, arg, extra, cpuid);
 }
 
 /*
@@ -531,21 +593,47 @@ so_pr_ctloutput(struct socket *so, struct sockopt *sopt)
 void
 so_pr_ctlinput(struct protosw *pr, int cmd, struct sockaddr *arg, void *extra)
 {
-	struct netmsg_pru_ctlinput msg;
+	struct netmsg_pr_ctlinput msg;
 	lwkt_port_t port;
+	int cpuid;
 
-	if (pr->pr_ctlport == NULL)
-		return;
-	KKASSERT(pr->pr_ctlinput != NULL);
-	port = pr->pr_ctlport(cmd, arg, extra);
+	port = so_pr_ctlport(pr, cmd, arg, extra, &cpuid);
 	if (port == NULL)
 		return;
 	netmsg_init(&msg.base, NULL, &curthread->td_msgport,
 		    0, pr->pr_ctlinput);
 	msg.nm_cmd = cmd;
+	msg.nm_direct = 0;
 	msg.nm_arg = arg;
 	msg.nm_extra = extra;
 	lwkt_domsg(port, &msg.base.lmsg, 0);
+}
+
+void
+so_pr_ctlinput_direct(struct protosw *pr, int cmd, struct sockaddr *arg,
+    void *extra)
+{
+	struct netmsg_pr_ctlinput msg;
+	netisr_fn_t func;
+	lwkt_port_t port;
+	int cpuid;
+
+	port = so_pr_ctlport(pr, cmd, arg, extra, &cpuid);
+	if (port == NULL)
+		return;
+	if (cpuid != netisr_ncpus && cpuid != mycpuid)
+		return;
+
+	func = pr->pr_ctlinput;
+	netmsg_init(&msg.base, NULL, &netisr_adone_rport, 0, func);
+	msg.base.lmsg.ms_flags &= ~(MSGF_REPLY | MSGF_DONE);
+	msg.base.lmsg.ms_flags |= MSGF_SYNC;
+	msg.nm_cmd = cmd;
+	msg.nm_direct = 1;
+	msg.nm_arg = arg;
+	msg.nm_extra = extra;
+	func((netmsg_t)&msg);
+	KKASSERT(msg.base.lmsg.ms_flags & MSGF_DONE);
 }
 
 /*
@@ -562,12 +650,10 @@ so_pr_ctlinput(struct protosw *pr, int cmd, struct sockaddr *arg, void *extra)
 void
 netmsg_so_notify(netmsg_t msg)
 {
-	struct lwkt_token *tok;
+	struct socket *so = msg->base.nm_so;
 	struct signalsockbuf *ssb;
 
-	ssb = (msg->notify.nm_etype & NM_REVENT) ?
-			&msg->base.nm_so->so_rcv :
-			&msg->base.nm_so->so_snd;
+	ssb = (msg->notify.nm_etype & NM_REVENT) ? &so->so_rcv : &so->so_snd;
 
 	/*
 	 * Reply immediately if the event has occured, otherwise queue the
@@ -576,17 +662,16 @@ netmsg_so_notify(netmsg_t msg)
 	 * NOTE: Socket can change if this is an accept predicate so cache
 	 *	 the token.
 	 */
-	tok = lwkt_token_pool_lookup(msg->base.nm_so);
-	lwkt_gettoken(tok);
+	lwkt_getpooltoken(so);
 	atomic_set_int(&ssb->ssb_flags, SSB_MEVENT);
 	if (msg->notify.nm_predicate(&msg->notify)) {
-		if (TAILQ_EMPTY(&ssb->ssb_kq.ki_mlist))
+		if (TAILQ_EMPTY(&ssb->ssb_mlist))
 			atomic_clear_int(&ssb->ssb_flags, SSB_MEVENT);
-		lwkt_reltoken(tok);
+		lwkt_relpooltoken(so);
 		lwkt_replymsg(&msg->base.lmsg,
 			      msg->base.lmsg.ms_error);
 	} else {
-		TAILQ_INSERT_TAIL(&ssb->ssb_kq.ki_mlist, &msg->notify, nm_list);
+		TAILQ_INSERT_TAIL(&ssb->ssb_mlist, &msg->notify, nm_list);
 		/*
 		 * NOTE:
 		 * If predict ever blocks, 'tok' will be released, so
@@ -595,7 +680,7 @@ netmsg_so_notify(netmsg_t msg)
 		 * SSB_MEVENT again, after the notify has been queued.
 		 */
 		atomic_set_int(&ssb->ssb_flags, SSB_MEVENT);
-		lwkt_reltoken(tok);
+		lwkt_relpooltoken(so);
 	}
 }
 
@@ -631,7 +716,7 @@ netmsg_so_notify_doabort(lwkt_msg_t lmsg)
 /*
  * Predicate requests can be aborted.  This function is only called once
  * and will interlock against processing/reply races (since such races
- * occur on the same thread that controls the port where the abort is 
+ * occur on the same thread that controls the port where the abort is
  * requeued).
  *
  * This part of the abort request occurs on the target cpu.  The message
@@ -660,7 +745,7 @@ netmsg_so_notify_abort(netmsg_t msg)
 		ssb = (nmsg->nm_etype & NM_REVENT) ?
 				&nmsg->base.nm_so->so_rcv :
 				&nmsg->base.nm_so->so_snd;
-		TAILQ_REMOVE(&ssb->ssb_kq.ki_mlist, nmsg, nm_list);
+		TAILQ_REMOVE(&ssb->ssb_mlist, nmsg, nm_list);
 		lwkt_relpooltoken(nmsg->base.nm_so);
 		lwkt_replymsg(&nmsg->base.lmsg, EINTR);
 	} else {

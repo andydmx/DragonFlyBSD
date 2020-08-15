@@ -10,11 +10,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -58,9 +54,8 @@ struct file_list {
  */
 #define NORMAL		1
 #define	INVISIBLE	2
-#define	PROFILING	3
-#define NODEPEND	4
-#define LOCAL		5
+#define NODEPEND	3
+#define LOCAL		4
 #define DEVDONE		0x80000000
 #define TYPEMASK	0x7fffffff
 
@@ -108,9 +103,9 @@ struct config {
  * it will build from ``Makefile.i386'' and use ``../i386/inline''
  * in the makerules, etc.
  */
-char	*platformname;		/* MACHINE_PLATFORM  - (machine/ headers) */
-char	*machinename;		/* MACHINE      - third party programs */
-char	*machinearchname;	/* MACHINE_ARCH - (cpu/ headers) */
+extern char	*platformname;	/* MACHINE_PLATFORM  - (machine/ headers) */
+extern char	*machinename;	/* MACHINE      - third party programs */
+extern char	*machinearchname; /* MACHINE_ARCH - (cpu/ headers) */
 
 /*
  * For each machine, a set of CPU's may be specified as supported.
@@ -119,7 +114,8 @@ char	*machinearchname;	/* MACHINE_ARCH - (cpu/ headers) */
 struct cputype {
 	char	*cpu_name;
 	struct	cputype *cpu_next;
-} *cputype;
+};
+extern struct cputype *cputype;
 
 /*
  * A set of options may also be specified which are like CPU types,
@@ -132,13 +128,15 @@ struct opt {
 	int	op_line;	/* line number for error-reporting */
 	int	op_ownfile;	/* true = own file, false = makefile */
 	struct	opt *op_next;
-} *opt, *mkopt;
+};
+extern struct opt *opt, *mkopt;
 
 struct opt_list {
 	char *o_name;
 	char *o_file;
 	struct opt_list *o_next;
-} *otab;
+};
+extern struct opt_list *otab;
 
 extern char	*ident;
 extern int	do_trace;
@@ -161,7 +159,6 @@ extern int	yyline;
 
 extern struct	file_list *ftab;
 
-extern int	profiling;
 extern int	debugging;
 
 extern int	maxusers;

@@ -46,7 +46,7 @@ ACPI_MODULE_NAME("BUTTON")
 struct acpi_button_softc {
     device_t	button_dev;
     ACPI_HANDLE	button_handle;
-    boolean_t	button_type;
+    int		button_type;
 #define		ACPI_POWER_BUTTON	0
 #define		ACPI_SLEEP_BUTTON	1
     boolean_t	fixed;
@@ -86,11 +86,12 @@ static driver_t acpi_button_driver = {
     "acpi_button",
     acpi_button_methods,
     sizeof(struct acpi_button_softc),
+    .gpri = KOBJ_GPRI_ACPI
 };
 
 static devclass_t acpi_button_devclass;
 DRIVER_MODULE(acpi_button, acpi, acpi_button_driver, acpi_button_devclass,
-	      0, 0);
+    NULL, NULL);
 MODULE_DEPEND(acpi_button, acpi, 1, 1, 1);
 
 static int
@@ -257,7 +258,7 @@ acpi_button_notify_handler(ACPI_HANDLE h, UINT32 notify, void *context)
 	AcpiOsExecute(OSL_NOTIFY_HANDLER, acpi_button_notify_wakeup, sc);
 	break;   
     default:
-	device_printf(sc->button_dev, "unknown notify %#x\n", notify);
+	device_printf(sc->button_dev, "unknown notify: %#x\n", notify);
 	break;
     }
 }

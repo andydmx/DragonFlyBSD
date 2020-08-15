@@ -596,7 +596,7 @@ ale_attach(device_t dev)
 	/* Create device sysctl node. */
 	ale_sysctl_node(sc);
 
-	if ((error = ale_dma_alloc(sc) != 0))
+	if ((error = ale_dma_alloc(sc)) != 0)
 		goto fail;
 
 	/* Load station address. */
@@ -665,9 +665,6 @@ ale_detach(device_t dev)
 		ether_ifdetach(ifp);
 	}
 
-	if (sc->ale_sysctl_tree != NULL)
-		sysctl_ctx_free(&sc->ale_sysctl_ctx);
-
 	if (sc->ale_miibus != NULL)
 		device_delete_child(dev, sc->ale_miibus);
 	bus_generic_detach(dev);
@@ -700,19 +697,9 @@ ale_sysctl_node(struct ale_softc *sc)
 	struct ale_hw_stats *stats;
 	int error;
 
-	sysctl_ctx_init(&sc->ale_sysctl_ctx);
-	sc->ale_sysctl_tree = SYSCTL_ADD_NODE(&sc->ale_sysctl_ctx,
-				SYSCTL_STATIC_CHILDREN(_hw), OID_AUTO,
-				device_get_nameunit(sc->ale_dev),
-				CTLFLAG_RD, 0, "");
-	if (sc->ale_sysctl_tree == NULL) {
-		device_printf(sc->ale_dev, "can't add sysctl node\n");
-		return;
-	}
-
 	stats = &sc->ale_stats;
-	ctx = &sc->ale_sysctl_ctx;
-	child = SYSCTL_CHILDREN(sc->ale_sysctl_tree);
+	ctx = device_get_sysctl_ctx(sc->ale_dev);
+	child = SYSCTL_CHILDREN(device_get_sysctl_tree(sc->ale_dev));
 
 	SYSCTL_ADD_PROC(ctx, child, OID_AUTO, "int_rx_mod",
 	    CTLTYPE_INT | CTLFLAG_RW, &sc->ale_int_rx_mod, 0,
@@ -1553,7 +1540,7 @@ ale_encap(struct ale_softc *sc, struct mbuf **m_head)
 				      *m_head, ale_dmamap_buf_cb, &ctx,
 				      BUS_DMA_NOWAIT);
 	if (error == EFBIG) {
-		m = m_defrag(*m_head, MB_DONTWAIT);
+		m = m_defrag(*m_head, M_NOWAIT);
 		if (m == NULL) {
 			m_freem(*m_head);
 			*m_head = NULL;
@@ -2240,7 +2227,7 @@ ale_rxeof(struct ale_softc *sc)
 			}
 		}
 		/*
-		 * m_devget(9) is major bottle-neck of ale(4)(It comes
+		 * m_devget(9) is major bottle-neck of ale(4) (It comes
 		 * from hardware limitation). For jumbo frames we could
 		 * get a slightly better performance if driver use
 		 * m_getjcl(9) with proper buffer size argument. However
@@ -2249,7 +2236,7 @@ ale_rxeof(struct ale_softc *sc)
 		 * on these low-end consumer ethernet controller.
 		 */
 		m = m_devget((char *)(rs + 1), length - ETHER_CRC_LEN,
-		    ETHER_ALIGN, ifp, NULL);
+			     ETHER_ALIGN, ifp);
 		if (m == NULL) {
 			IFNET_STAT_INC(ifp, iqdrops, 1);
 			ale_rx_update_page(sc, &rx_page, length, &prod);

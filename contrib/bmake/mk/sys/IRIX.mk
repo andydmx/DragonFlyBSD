@@ -7,87 +7,83 @@ OS!=		uname -s
 ROOT_GROUP!=	sed -n /:0:/s/:.*//p /etc/group
 .MAKEOVERRIDES+= OS ROOT_GROUP
 .endif
-unix?=		We run ${OS}.
+unix ?=		We run ${OS}.
 .endif
 
-.SUFFIXES: .out .a .ln .o .s .S .c .cc .cpp .cxx .C .F .f .r .y .l .cl .p .h
+.SUFFIXES: .out .a .ln .o .s .S .c ${CXX_SUFFIXES} .F .f .r .y .l .cl .p .h
 .SUFFIXES: .sh .m4
 
 .LIBS:		.a
 
-AR?=		ar
-ARFLAGS?=	rl
-RANLIB?=	ranlib
+AR ?=		ar
+ARFLAGS ?=	rl
+RANLIB ?=	ranlib
 
-AS?=		as
-AFLAGS?=
-COMPILE.s?=	${CC} ${AFLAGS} -c
-LINK.s?=	${CC} ${AFLAGS} ${LDFLAGS}
-COMPILE.S?=	${CC} ${AFLAGS} ${CPPFLAGS} -c -traditional-cpp
-LINK.S?=	${CC} ${AFLAGS} ${CPPFLAGS} ${LDFLAGS}
+AS ?=		as
+AFLAGS ?=
+COMPILE.s ?=	${CC} ${AFLAGS} -c
+LINK.s ?=	${CC} ${AFLAGS} ${LDFLAGS}
+COMPILE.S ?=	${CC} ${AFLAGS} ${CPPFLAGS} -c -traditional-cpp
+LINK.S ?=	${CC} ${AFLAGS} ${CPPFLAGS} ${LDFLAGS}
 
-CC?=		cc
-NOGCCERROR?=	# defined
-DBG?=	-O2
-CFLAGS?=	${DBG}
-COMPILE.c?=	${CC} ${CFLAGS} ${CPPFLAGS} -c
-LINK.c?=	${CC} ${CFLAGS} ${CPPFLAGS} ${LDFLAGS}
+CC ?=		cc
+NOGCCERROR ?=	# defined
+DBG ?=	-O2
+CFLAGS ?=	${DBG}
+COMPILE.c ?=	${CC} ${CFLAGS} ${CPPFLAGS} -c
+LINK.c ?=	${CC} ${CFLAGS} ${CPPFLAGS} ${LDFLAGS}
 
-CXX?=		CC
-CXXFLAGS?=	${CFLAGS}
-COMPILE.cc?=	${CXX} ${CXXFLAGS} ${CPPFLAGS} -c
-LINK.cc?=	${CXX} ${CXXFLAGS} ${CPPFLAGS} ${LDFLAGS}
+CXX ?=		CC
+CXXFLAGS ?=	${CFLAGS}
+COMPILE.cc ?=	${CXX} ${CXXFLAGS} ${CPPFLAGS} -c
+LINK.cc ?=	${CXX} ${CXXFLAGS} ${CPPFLAGS} ${LDFLAGS}
 
-OBJC?=		${CC}
-OBJCFLAGS?=	${CFLAGS}
-COMPILE.m?=	${OBJC} ${OBJCFLAGS} ${CPPFLAGS} -c
-LINK.m?=	${OBJC} ${OBJCFLAGS} ${CPPFLAGS} ${LDFLAGS}
+OBJC ?=		${CC}
+OBJCFLAGS ?=	${CFLAGS}
+COMPILE.m ?=	${OBJC} ${OBJCFLAGS} ${CPPFLAGS} -c
+LINK.m ?=	${OBJC} ${OBJCFLAGS} ${CPPFLAGS} ${LDFLAGS}
 
-CPP?=		CC
-CPPFLAGS?=	
+CPP ?=		CC
+CPPFLAGS ?=	
 
-FC?=		f77
-FFLAGS?=	-O
-RFLAGS?=
-COMPILE.f?=	${FC} ${FFLAGS} -c
-LINK.f?=	${FC} ${FFLAGS} ${LDFLAGS}
-COMPILE.F?=	${FC} ${FFLAGS} ${CPPFLAGS} -c
-LINK.F?=	${FC} ${FFLAGS} ${CPPFLAGS} ${LDFLAGS}
-COMPILE.r?=	${FC} ${FFLAGS} ${RFLAGS} -c
-LINK.r?=	${FC} ${FFLAGS} ${RFLAGS} ${LDFLAGS}
+FC ?=		f77
+FFLAGS ?=	-O
+RFLAGS ?=
+COMPILE.f ?=	${FC} ${FFLAGS} -c
+LINK.f ?=	${FC} ${FFLAGS} ${LDFLAGS}
+COMPILE.F ?=	${FC} ${FFLAGS} ${CPPFLAGS} -c
+LINK.F ?=	${FC} ${FFLAGS} ${CPPFLAGS} ${LDFLAGS}
+COMPILE.r ?=	${FC} ${FFLAGS} ${RFLAGS} -c
+LINK.r ?=	${FC} ${FFLAGS} ${RFLAGS} ${LDFLAGS}
 
-INSTALL?=	${PREFIX}/bin/install-sh
+INSTALL ?=	${PREFIX}/bin/install-sh
 
-LEX?=		lex
-LFLAGS?=
-LEX.l?=		${LEX} ${LFLAGS}
+LEX ?=		lex
+LFLAGS ?=
+LEX.l ?=		${LEX} ${LFLAGS}
 
-LD?=		ld
-LDFLAGS?=
+LD ?=		ld
+LDFLAGS ?=
 
-LINT?=		lint
-LINTFLAGS?=	-chapbxzF
+LINT ?=		lint
+LINTFLAGS ?=	-chapbxzF
 
-LORDER?=	lorder
+LORDER ?=	lorder
 
-MAKE?=		make
+NM ?=		nm
 
-NM?=		nm
+PC ?=		pc
+PFLAGS ?=
+COMPILE.p ?=	${PC} ${PFLAGS} ${CPPFLAGS} -c
+LINK.p ?=	${PC} ${PFLAGS} ${CPPFLAGS} ${LDFLAGS}
 
-PC?=		pc
-PFLAGS?=
-COMPILE.p?=	${PC} ${PFLAGS} ${CPPFLAGS} -c
-LINK.p?=	${PC} ${PFLAGS} ${CPPFLAGS} ${LDFLAGS}
+SIZE ?=		size
 
-SHELL?=		sh
+TSORT ?= 	tsort -q
 
-SIZE?=		size
-
-TSORT?= 	tsort -q
-
-YACC?=		yacc
-YFLAGS?=
-YACC.y?=	${YACC} ${YFLAGS}
+YACC ?=		yacc
+YFLAGS ?=
+YACC.y ?=	${YACC} ${YFLAGS}
 
 # C
 .c:
@@ -102,11 +98,11 @@ YACC.y?=	${YACC} ${YFLAGS}
 	${LINT} ${LINTFLAGS} ${CPPFLAGS:M-[IDU]*} -i ${.IMPSRC}
 
 # C++
-.cc .cpp .cxx .C:
+${CXX_SUFFIXES}:
 	${LINK.cc} -o ${.TARGET} ${.IMPSRC} ${LDLIBS}
-.cc.o .cpp.o .cxx.o .C.o:
+${CXX_SUFFIXES:%=%.o}:
 	${COMPILE.cc} ${.IMPSRC}
-.cc.a .cpp.a .cxx.a .C.a:
+${CXX_SUFFIXES:%=%.a}:
 	${COMPILE.cc} ${.IMPSRC}
 	${AR} ${ARFLAGS} $@ $*.o
 	rm -f $*.o

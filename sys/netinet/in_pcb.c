@@ -63,7 +63,6 @@
  * $FreeBSD: src/sys/netinet/in_pcb.c,v 1.59.2.27 2004/01/02 04:06:42 ambrisko Exp $
  */
 
-#include "opt_ipsec.h"
 #include "opt_inet6.h"
 
 #include <sys/param.h>
@@ -80,7 +79,6 @@
 #include <sys/kernel.h>
 #include <sys/sysctl.h>
 
-#include <sys/thread2.h>
 #include <sys/socketvar2.h>
 #include <sys/msgport2.h>
 
@@ -90,6 +88,7 @@
 #include <net/if_types.h>
 #include <net/route.h>
 #include <net/netisr2.h>
+#include <net/toeplitz2.h>
 
 #include <netinet/in.h>
 #include <netinet/in_pcb.h>
@@ -100,24 +99,12 @@
 #include <netinet6/ip6_var.h>
 #endif /* INET6 */
 
-#ifdef IPSEC
-#include <netinet6/ipsec.h>
-#include <netproto/key/key.h>
-#include <netproto/ipsec/esp_var.h>
-#endif
-
-#ifdef FAST_IPSEC
-#if defined(IPSEC) || defined(IPSEC_ESP)
-#error "Bad idea: don't compile with both IPSEC and FAST_IPSEC!"
-#endif
-
-#include <netproto/ipsec/ipsec.h>
-#include <netproto/ipsec/key.h>
-#define	IPSEC
-#endif /* FAST_IPSEC */
-
 #define INP_LOCALGROUP_SIZMIN	8
 #define INP_LOCALGROUP_SIZMAX	256
+
+static struct inpcb *in_pcblookup_local(struct inpcbporthead *porthash,
+		struct in_addr laddr, u_int lport_arg, int wild_okay,
+		struct ucred *cred);
 
 struct in_addr zeroin_addr;
 
@@ -184,6 +171,12 @@ SYSCTL_PROC(_net_inet_ip_portrange, OID_AUTO, hifirst, CTLTYPE_INT|CTLFLAG_RW,
 SYSCTL_PROC(_net_inet_ip_portrange, OID_AUTO, hilast, CTLTYPE_INT|CTLFLAG_RW,
 	   &ipport_hilastauto, 0, &sysctl_net_ipport_check, "I", "");
 
+/* Initialized by ip_init() */
+int ip_porthash_trycount;
+SYSCTL_INT(_net_inet_ip, OID_AUTO, porthash_trycount, CTLFLAG_RW,
+    &ip_porthash_trycount, 0,
+    "Number of tries to find local port matching hash of 4-tuple");
+
 /*
  * in_pcb.c: manage the Protocol Control Blocks.
  *
@@ -198,7 +191,7 @@ SYSCTL_PROC(_net_inet_ip_portrange, OID_AUTO, hilast, CTLTYPE_INT|CTLFLAG_RW,
 void
 in_pcbinfo_init(struct inpcbinfo *pcbinfo, int cpu, boolean_t shared)
 {
-	KASSERT(cpu >= 0 && cpu < ncpus, ("invalid cpu%d", cpu));
+	KASSERT(cpu >= 0 && cpu < netisr_ncpus, ("invalid cpu%d", cpu));
 	pcbinfo->cpu = cpu;
 
 	LIST_INIT(&pcbinfo->pcblisthead);
@@ -214,6 +207,16 @@ in_pcbinfo_init(struct inpcbinfo *pcbinfo, int cpu, boolean_t shared)
 	}
 }
 
+void
+in_pcbportinfo_set(struct inpcbinfo *pcbinfo, struct inpcbportinfo *portinfo,
+    int portinfo_cnt)
+{
+
+	KASSERT(portinfo_cnt > 0, ("invalid portinfo_cnt %d", portinfo_cnt));
+	pcbinfo->portinfo = portinfo;
+	pcbinfo->portinfo_cnt = portinfo_cnt;
+}
+
 struct baddynamicports baddynamicports;
 
 /*
@@ -226,11 +229,6 @@ in_baddynamic(u_int16_t port, u_int16_t proto)
 	case IPPROTO_TCP:
 		return (DP_ISSET(baddynamicports.tcp, port));
 	case IPPROTO_UDP:
-#ifdef IPSEC
-		/* Cannot preset this as it is a sysctl */
-		if (port == udpencap_port)
-			return (1);
-#endif
 		return (DP_ISSET(baddynamicports.udp, port));
 	default:
 		return (0);
@@ -278,9 +276,6 @@ int
 in_pcballoc(struct socket *so, struct inpcbinfo *pcbinfo)
 {
 	struct inpcb *inp;
-#ifdef IPSEC
-	int error;
-#endif
 
 	inp = kmalloc(pcbinfo->ipi_size, M_PCB, M_WAITOK|M_ZERO|M_NULLOK);
 	if (inp == NULL)
@@ -289,19 +284,14 @@ in_pcballoc(struct socket *so, struct inpcbinfo *pcbinfo)
 	inp->inp_gencnt = ++pcbinfo->ipi_gencnt;
 	inp->inp_pcbinfo = pcbinfo;
 	inp->inp_socket = so;
-#ifdef IPSEC
-	error = ipsec_init_policy(so, &inp->inp_sp);
-	if (error != 0) {
-		kfree(inp, M_PCB);
-		return (error);
-	}
-#endif
 #ifdef INET6
-	if (INP_SOCKAF(so) == AF_INET6 && ip6_v6only)
-		inp->inp_flags |= IN6P_IPV6_V6ONLY;
-	if (ip6_auto_flowlabel)
-		inp->inp_flags |= IN6P_AUTOFLOWLABEL;
+	if (INP_CHECK_SOCKAF(so, AF_INET6)) {
+		if (ip6_auto_flowlabel)
+			inp->inp_flags |= IN6P_AUTOFLOWLABEL;
+		inp->inp_af = AF_INET6;
+	} else
 #endif
+	inp->inp_af = AF_INET;
 	soreference(so);
 	so->so_pcb = inp;
 
@@ -351,28 +341,49 @@ in_pcblink(struct inpcb *inp, struct inpcbinfo *pcbinfo)
 	return in_pcblink_flags(inp, pcbinfo, INP_WILDCARD);
 }
 
+static boolean_t
+in_pcbporthash_update(struct inpcbportinfo *portinfo,
+    struct inpcb *inp, u_short lport, struct ucred *cred, int wild)
+{
+	struct inpcbporthead *porthash;
+
+	/*
+	 * This has to be atomic.  If the porthash is shared across multiple
+	 * protocol threads, e.g. tcp and udp, then the token must be held.
+	 */
+	porthash = in_pcbporthash_head(portinfo, lport);
+	GET_PORTHASH_TOKEN(porthash);
+
+	if (in_pcblookup_local(porthash, inp->inp_laddr, lport, wild, cred)) {
+		REL_PORTHASH_TOKEN(porthash);
+		return FALSE;
+	}
+	inp->inp_lport = lport;
+	in_pcbinsporthash(porthash, inp);
+
+	REL_PORTHASH_TOKEN(porthash);
+	return TRUE;
+}
+
 static int
 in_pcbsetlport(struct inpcb *inp, int wild, struct ucred *cred)
 {
 	struct inpcbinfo *pcbinfo = inp->inp_pcbinfo;
 	struct inpcbportinfo *portinfo;
-	u_short first, last, lport, step;
-	u_short *lastport;
+	u_short first, last, lport, step, first0, last0;
 	int count, error;
 	int portinfo_first, portinfo_idx;
+	uint32_t cut;
 
 	inp->inp_flags |= INP_ANONPORT;
 
-	step = pcbinfo->portinfo_mask + 1;
-	portinfo_first = mycpuid & pcbinfo->portinfo_mask;
+	step = pcbinfo->portinfo_cnt;
+	portinfo_first = mycpuid % pcbinfo->portinfo_cnt;
 	portinfo_idx = portinfo_first;
-loop:
-	portinfo = &pcbinfo->portinfo[portinfo_idx];
 
 	if (inp->inp_flags & INP_HIGHPORT) {
-		first = ipport_hifirstauto;	/* sysctl */
-		last  = ipport_hilastauto;
-		lastport = &portinfo->lasthi;
+		first0 = ipport_hifirstauto;	/* sysctl */
+		last0  = ipport_hilastauto;
 	} else if (inp->inp_flags & INP_LOWPORT) {
 		if (cred &&
 		    (error =
@@ -380,79 +391,61 @@ loop:
 			inp->inp_laddr.s_addr = INADDR_ANY;
 			return error;
 		}
-		first = ipport_lowfirstauto;	/* 1023 */
-		last  = ipport_lowlastauto;	/* 600 */
-		lastport = &portinfo->lastlow;
+		first0 = ipport_lowfirstauto;	/* 1023 */
+		last0  = ipport_lowlastauto;	/* 600 */
 	} else {
-		first = ipport_firstauto;	/* sysctl */
-		last  = ipport_lastauto;
-		lastport = &portinfo->lastport;
+		first0 = ipport_firstauto;	/* sysctl */
+		last0  = ipport_lastauto;
 	}
+	if (first0 > last0) {
+		lport = last0;
+		last0 = first0;
+		first0 = lport;
+	}
+	KKASSERT(last0 >= first0);
 
-	/*
-	 * This has to be atomic.  If the porthash is shared across multiple
-	 * protocol threads (aka tcp) then the token must be held.
-	 */
-	GET_PORT_TOKEN(portinfo);
+	cut = karc4random();
+loop:
+	portinfo = &pcbinfo->portinfo[portinfo_idx];
+	first = first0;
+	last = last0;
 
 	/*
 	 * Simple check to ensure all ports are not used up causing
 	 * a deadlock here.
-	 *
-	 * We split the two cases (up and down) so that the direction
-	 * is not being tested on each round of the loop.
 	 */
-	if (first > last) {
-		/*
-		 * counting down
-		 */
-		in_pcbportrange(&first, &last, portinfo->offset, step);
-		count = (first - last) / step;
+	in_pcbportrange(&last, &first, portinfo->offset, step);
+	lport = last - first;
+	count = lport / step;
 
-		do {
-			if (count-- < 0) {	/* completely used? */
-				error = EADDRNOTAVAIL;
-				goto done;
-			}
-			*lastport -= step;
-			if (*lastport > first || *lastport < last)
-				*lastport = first;
-			KKASSERT((*lastport & pcbinfo->portinfo_mask) ==
-			    portinfo->offset);
-			lport = htons(*lastport);
-		} while (in_pcblookup_local(portinfo, inp->inp_laddr, lport,
-		    wild, cred));
-	} else {
-		/*
-		 * counting up
-		 */
-		in_pcbportrange(&last, &first, portinfo->offset, step);
-		count = (last - first) / step;
+	lport = rounddown(cut % lport, step) + first;
+	KKASSERT(lport % step == portinfo->offset);
 
-		do {
-			if (count-- < 0) {	/* completely used? */
-				error = EADDRNOTAVAIL;
-				goto done;
-			}
-			*lastport += step;
-			if (*lastport < first || *lastport > last)
-				*lastport = first;
-			KKASSERT((*lastport & pcbinfo->portinfo_mask) ==
-			    portinfo->offset);
-			lport = htons(*lastport);
-		} while (in_pcblookup_local(portinfo, inp->inp_laddr, lport,
-		    wild, cred));
+	for (;;) {
+		if (count-- < 0) {	/* completely used? */
+			error = EADDRNOTAVAIL;
+			break;
+		}
+
+		if (__predict_false(lport < first || lport > last)) {
+			lport = first;
+			KKASSERT(lport % step == portinfo->offset);
+		}
+
+		if (in_pcbporthash_update(portinfo, inp, htons(lport),
+					  cred, wild)) {
+			error = 0;
+			break;
+		}
+
+		lport += step;
+		KKASSERT(lport % step == portinfo->offset);
 	}
-	inp->inp_lport = lport;
-	in_pcbinsporthash(portinfo, inp);
-	error = 0;
-done:
-	REL_PORT_TOKEN(portinfo);
 
 	if (error) {
 		/* Try next portinfo */
 		portinfo_idx++;
-		portinfo_idx &= pcbinfo->portinfo_mask;
+		portinfo_idx %= pcbinfo->portinfo_cnt;
 		if (portinfo_idx != portinfo_first)
 			goto loop;
 		inp->inp_laddr.s_addr = INADDR_ANY;
@@ -482,6 +475,7 @@ in_pcbbind(struct inpcb *inp, struct sockaddr *nam, struct thread *td)
 		struct sockaddr_in *sin = (struct sockaddr_in *)nam;
 		struct inpcbinfo *pcbinfo;
 		struct inpcbportinfo *portinfo;
+		struct inpcbporthead *porthash;
 		struct inpcb *t;
 		u_short lport, lport_ho;
 		int reuseport = (so->so_options & SO_REUSEPORT);
@@ -547,37 +541,28 @@ in_pcbbind(struct inpcb *inp, struct sockaddr *nam, struct thread *td)
 		 */
 		pcbinfo = inp->inp_pcbinfo;
 		portinfo =
-		    &pcbinfo->portinfo[lport_ho & pcbinfo->portinfo_mask];
-		KKASSERT((lport_ho & pcbinfo->portinfo_mask) ==
+		    &pcbinfo->portinfo[lport_ho % pcbinfo->portinfo_cnt];
+		KKASSERT((lport_ho % pcbinfo->portinfo_cnt) ==
 		    portinfo->offset);
 
 		/*
 		 * This has to be atomic.  If the porthash is shared across
-		 * multiple protocol threads (aka tcp) then the token must
-		 * be held.
+		 * multiple protocol threads, e.g. tcp and udp then the token
+		 * must be held.
 		 */
-		GET_PORT_TOKEN(portinfo);
+		porthash = in_pcbporthash_head(portinfo, lport);
+		GET_PORTHASH_TOKEN(porthash);
 
 		if (so->so_cred->cr_uid != 0 &&
 		    !IN_MULTICAST(ntohl(sin->sin_addr.s_addr))) {
-			t = in_pcblookup_local(portinfo, sin->sin_addr, lport,
-			    INPLOOKUP_WILDCARD, cred);
+			t = in_pcblookup_local(porthash, sin->sin_addr, lport,
+					       INPLOOKUP_WILDCARD, cred);
 			if (t &&
-			    (!in_nullhost(sin->sin_addr) ||
-			     !in_nullhost(t->inp_laddr) ||
-			     (t->inp_socket->so_options & SO_REUSEPORT) == 0) &&
 			    (so->so_cred->cr_uid !=
 			     t->inp_socket->so_cred->cr_uid)) {
-#ifdef INET6
-				if (!in_nullhost(sin->sin_addr) ||
-				    !in_nullhost(t->inp_laddr) ||
-				    INP_SOCKAF(so) == INP_SOCKAF(t->inp_socket))
-#endif
-				{
-					inp->inp_laddr.s_addr = INADDR_ANY;
-					error = EADDRINUSE;
-					goto done;
-				}
+				inp->inp_laddr.s_addr = INADDR_ANY;
+				error = EADDRINUSE;
+				goto done;
 			}
 		}
 		if (cred && !prison_replace_wildcards(td, nam)) {
@@ -585,25 +570,27 @@ in_pcbbind(struct inpcb *inp, struct sockaddr *nam, struct thread *td)
 			error = EADDRNOTAVAIL;
 			goto done;
 		}
-		t = in_pcblookup_local(portinfo, sin->sin_addr, lport,
-		    wild, cred);
-		if (t && !(reuseport & t->inp_socket->so_options)) {
-#ifdef INET6
-			if (!in_nullhost(sin->sin_addr) ||
-			    !in_nullhost(t->inp_laddr) ||
-			    INP_SOCKAF(so) == INP_SOCKAF(t->inp_socket))
-#endif
-			{
-				inp->inp_laddr.s_addr = INADDR_ANY;
-				error = EADDRINUSE;
-				goto done;
-			}
+
+		/*
+		 * When binding to a local port if the best match is against
+		 * an accepted socket we generally want to allow the binding.
+		 * This means that there is no longer any specific socket
+		 * bound or bound for listening.
+		 */
+		t = in_pcblookup_local(porthash, sin->sin_addr, lport,
+				       wild, cred);
+		if (t &&
+		    (reuseport & t->inp_socket->so_options) == 0 &&
+		    (t->inp_socket->so_state & SS_ACCEPTMECH) == 0) {
+			inp->inp_laddr.s_addr = INADDR_ANY;
+			error = EADDRINUSE;
+			goto done;
 		}
 		inp->inp_lport = lport;
-		in_pcbinsporthash(portinfo, inp);
+		in_pcbinsporthash(porthash, inp);
 		error = 0;
 done:
-		REL_PORT_TOKEN(portinfo);
+		REL_PORTHASH_TOKEN(porthash);
 		return (error);
 	} else {
 		jsin.sin_family = AF_INET;
@@ -618,20 +605,27 @@ done:
 	}
 }
 
+/*
+ * Lookup a PCB based on the local and remote address and port.
+ *
+ * This function is only used when scanning for a free port.
+ */
 static struct inpcb *
-in_pcblookup_localremote(struct inpcbportinfo *portinfo, struct in_addr laddr,
-    u_short lport, struct in_addr faddr, u_short fport, struct ucred *cred)
+in_pcblookup_localremote(struct inpcbporthead *porthash, struct in_addr laddr,
+			 u_short lport, struct in_addr faddr, u_short fport,
+			 struct ucred *cred)
 {
 	struct inpcb *inp;
-	struct inpcbporthead *porthash;
 	struct inpcbport *phd;
 	struct inpcb *match = NULL;
+	struct prison *pscan;
+	struct prison *pr;
 
 	/*
 	 * If the porthashbase is shared across several cpus, it must
 	 * have been locked.
 	 */
-	ASSERT_PORT_TOKEN_HELD(portinfo);
+	ASSERT_PORTHASH_TOKEN_HELD(porthash);
 
 	/*
 	 * Best fit PCB lookup.
@@ -639,21 +633,29 @@ in_pcblookup_localremote(struct inpcbportinfo *portinfo, struct in_addr laddr,
 	 * First see if this local port is in use by looking on the
 	 * port hash list.
 	 */
-	porthash = &portinfo->porthashbase[
-			INP_PCBPORTHASH(lport, portinfo->porthashmask)];
 	LIST_FOREACH(phd, porthash, phd_hash) {
 		if (phd->phd_port == lport)
 			break;
 	}
 	if (phd != NULL) {
+		pr = cred ? cred->cr_prison : NULL;
+
 		LIST_FOREACH(inp, &phd->phd_pcblist, inp_portlist) {
 #ifdef INET6
-			if ((inp->inp_vflag & INP_IPV4) == 0)
+			if (!INP_ISIPV4(inp))
 				continue;
 #endif
-			if (inp->inp_laddr.s_addr != INADDR_ANY &&
-			    inp->inp_laddr.s_addr != laddr.s_addr)
-				continue;
+			if (inp->inp_laddr.s_addr == INADDR_ANY) {
+				if (inp->inp_socket && inp->inp_socket->so_cred)
+					pscan = inp->inp_socket->so_cred->cr_prison;
+				else
+					pscan = NULL;
+				if (pr != pscan)
+					continue;
+			} else {
+				if (inp->inp_laddr.s_addr != laddr.s_addr)
+					continue;
+			}
 
 			if (inp->inp_faddr.s_addr != INADDR_ANY &&
 			    inp->inp_faddr.s_addr != faddr.s_addr)
@@ -662,15 +664,37 @@ in_pcblookup_localremote(struct inpcbportinfo *portinfo, struct in_addr laddr,
 			if (inp->inp_fport != 0 && inp->inp_fport != fport)
 				continue;
 
-			if (cred == NULL ||
-			    cred->cr_prison ==
-			    inp->inp_socket->so_cred->cr_prison) {
-				match = inp;
-				break;
-			}
+			match = inp;
+			break;
 		}
 	}
 	return (match);
+}
+
+static boolean_t
+in_pcbporthash_update4(struct inpcbportinfo *portinfo, struct inpcb *inp,
+		       u_short lport, const struct sockaddr_in *sin,
+		       struct ucred *cred)
+{
+	struct inpcbporthead *porthash;
+
+	/*
+	 * This has to be atomic.  If the porthash is shared across multiple
+	 * protocol threads, e.g. tcp and udp, then the token must be held.
+	 */
+	porthash = in_pcbporthash_head(portinfo, lport);
+	GET_PORTHASH_TOKEN(porthash);
+
+	if (in_pcblookup_localremote(porthash, inp->inp_laddr, lport,
+				     sin->sin_addr, sin->sin_port, cred)) {
+		REL_PORTHASH_TOKEN(porthash);
+		return FALSE;
+	}
+	inp->inp_lport = lport;
+	in_pcbinsporthash(porthash, inp);
+
+	REL_PORTHASH_TOKEN(porthash);
+	return TRUE;
 }
 
 int
@@ -678,17 +702,19 @@ in_pcbbind_remote(struct inpcb *inp, const struct sockaddr *remote,
     struct thread *td)
 {
 	struct proc *p = td->td_proc;
-	unsigned short *lastport;
 	const struct sockaddr_in *sin = (const struct sockaddr_in *)remote;
 	struct sockaddr_in jsin;
 	struct inpcbinfo *pcbinfo = inp->inp_pcbinfo;
-	struct inpcbportinfo *portinfo;
 	struct ucred *cred = NULL;
-	u_short first, last, lport, step;
-	int count, error, dup;
-	int portinfo_first, portinfo_idx;
+	u_short first, last, lport;
+	int count, hash_count;
+	int error, selfconn = 0;
+	int cpuid = mycpuid;
+	uint32_t hash_base = 0, hash;
 
-	if (TAILQ_EMPTY(&in_ifaddrheads[mycpuid])) /* XXX broken! */
+	ASSERT_NETISR_NCPUS(cpuid);
+
+	if (TAILQ_EMPTY(&in_ifaddrheads[cpuid])) /* XXX broken! */
 		return (EADDRNOTAVAIL);
 
 	KKASSERT(inp->inp_laddr.s_addr != INADDR_ANY);
@@ -706,19 +732,20 @@ in_pcbbind_remote(struct inpcb *inp, const struct sockaddr *remote,
 	}
 	inp->inp_laddr.s_addr = jsin.sin_addr.s_addr;
 
-	inp->inp_flags |= INP_ANONPORT;
+	hash_count = ip_porthash_trycount;
+	if (hash_count > 0) {
+		hash_base = toeplitz_piecemeal_addr(sin->sin_addr.s_addr) ^
+		    toeplitz_piecemeal_addr(inp->inp_laddr.s_addr) ^
+		    toeplitz_piecemeal_port(sin->sin_port);
+	} else {
+		hash_count = 0;
+	}
 
-	step = pcbinfo->portinfo_mask + 1;
-	portinfo_first = mycpuid & pcbinfo->portinfo_mask;
-	portinfo_idx = portinfo_first;
-loop:
-	portinfo = &pcbinfo->portinfo[portinfo_idx];
-	dup = 0;
+	inp->inp_flags |= INP_ANONPORT;
 
 	if (inp->inp_flags & INP_HIGHPORT) {
 		first = ipport_hifirstauto;	/* sysctl */
 		last  = ipport_hilastauto;
-		lastport = &portinfo->lasthi;
 	} else if (inp->inp_flags & INP_LOWPORT) {
 		if (cred &&
 		    (error =
@@ -727,120 +754,87 @@ loop:
 			return (error);
 		}
 		first = ipport_lowfirstauto;	/* 1023 */
-		last  = ipport_lowlastauto;	/* 600 */
-		lastport = &portinfo->lastlow;
+		last = ipport_lowlastauto;	/* 600 */
 	} else {
 		first = ipport_firstauto;	/* sysctl */
 		last  = ipport_lastauto;
-		lastport = &portinfo->lastport;
 	}
+	if (first > last) {
+		lport = last;
+		last = first;
+		first = lport;
+	}
+	KKASSERT(last >= first);
 
-	/*
-	 * This has to be atomic.  If the porthash is shared across multiple
-	 * protocol threads (aka tcp) then the token must be held.
-	 */
-	GET_PORT_TOKEN(portinfo);
+	count = last - first;
+	lport = (karc4random() % count) + first;
+	count += hash_count;
 
-again:
 	/*
 	 * Simple check to ensure all ports are not used up causing
 	 * a deadlock here.
-	 *
-	 * We split the two cases (up and down) so that the direction
-	 * is not being tested on each round of the loop.
 	 */
-	if (first > last) {
-		/*
-		 * counting down
-		 */
-		in_pcbportrange(&first, &last, portinfo->offset, step);
-		count = (first - last) / step;
+	for (;;) {
+		u_short lport_no;
 
-		do {
-			if (count-- < 0) {	/* completely used? */
-				error = EADDRNOTAVAIL;
-				goto done;
-			}
-			*lastport -= step;
-			if (*lastport > first || *lastport < last)
-				*lastport = first;
-			KKASSERT((*lastport & pcbinfo->portinfo_mask) ==
-			    portinfo->offset);
-			lport = htons(*lastport);
-		} while (in_pcblookup_localremote(portinfo, inp->inp_laddr,
-		    lport, sin->sin_addr, sin->sin_port, cred));
-	} else {
-		/*
-		 * counting up
-		 */
-		in_pcbportrange(&last, &first, portinfo->offset, step);
-		count = (last - first) / step;
-
-		do {
-			if (count-- < 0) {	/* completely used? */
-				error = EADDRNOTAVAIL;
-				goto done;
-			}
-			*lastport += step;
-			if (*lastport < first || *lastport > last)
-				*lastport = first;
-			KKASSERT((*lastport & pcbinfo->portinfo_mask) ==
-			    portinfo->offset);
-			lport = htons(*lastport);
-		} while (in_pcblookup_localremote(portinfo, inp->inp_laddr,
-		    lport, sin->sin_addr, sin->sin_port, cred));
-	}
-
-	/* This could happen on loopback interface */
-	if (sin->sin_port == lport &&
-	    sin->sin_addr.s_addr == inp->inp_laddr.s_addr) {
-		if (dup) {
-			/*
-			 * Duplicate again; give up
-			 */
+		if (count-- < 0) {	/* completely used? */
 			error = EADDRNOTAVAIL;
-			goto done;
+			break;
 		}
-		dup = 1;
-		goto again;
-	}
-	inp->inp_lport = lport;
-	in_pcbinsporthash(portinfo, inp);
-	error = 0;
-done:
-	REL_PORT_TOKEN(portinfo);
 
-	if (error) {
-		/* Try next portinfo */
-		portinfo_idx++;
-		portinfo_idx &= pcbinfo->portinfo_mask;
-		if (portinfo_idx != portinfo_first)
-			goto loop;
-		inp->inp_laddr.s_addr = INADDR_ANY;
+		if (__predict_false(lport < first || lport > last))
+			lport = first;
+		lport_no = htons(lport);
+
+		/* This could happen on loopback interface */
+		if (__predict_false(sin->sin_port == lport_no &&
+		    sin->sin_addr.s_addr == inp->inp_laddr.s_addr)) {
+			if (!selfconn) {
+				++count; /* don't count this try */
+				selfconn = 1;
+			}
+			goto next;
+		}
+
+		if (hash_count) {
+			--hash_count;
+			hash = hash_base ^
+			    toeplitz_piecemeal_port(lport_no);
+			if (netisr_hashcpu(hash) != cpuid && hash_count)
+				goto next;
+		}
+
+		if (in_pcbporthash_update4(
+			    &pcbinfo->portinfo[lport % pcbinfo->portinfo_cnt],
+			    inp, lport_no, sin, cred)) {
+			error = 0;
+			break;
+		}
+next:
+		++lport;
 	}
-	return error;
+
+	if (error)
+		inp->inp_laddr.s_addr = INADDR_ANY;
+	return (error);
 }
 
 /*
- *   Transform old in_pcbconnect() into an inner subroutine for new
- *   in_pcbconnect(): Do some validity-checking on the remote
- *   address (in mbuf 'nam') and then determine local host address
- *   (i.e., which interface) to use to access that remote host.
- *
- *   This preserves definition of in_pcbconnect(), while supporting a
- *   slightly different version for T/TCP.  (This is more than
- *   a bit of a kludge, but cleaning up the internal interfaces would
- *   have forced minor changes in every protocol).
+ * Figure out the local interface address to pair against the requested
+ * target address, as well as validate the target address.
  */
 int
 in_pcbladdr_find(struct inpcb *inp, struct sockaddr *nam,
-    struct sockaddr_in **plocal_sin, struct thread *td, int find)
+		 struct sockaddr_in **plocal_sin, struct thread *td, int find)
 {
+	struct in_ifaddr_container *iac;
 	struct in_ifaddr *ia;
 	struct ucred *cred = NULL;
 	struct sockaddr_in *sin = (struct sockaddr_in *)nam;
 	struct sockaddr *jsin;
-	int jailed = 0, alloc_route = 0;
+	struct prison *pr;
+	struct route *ro;
+	int alloc_route = 0;
 
 	if (nam->sa_len != sizeof *sin)
 		return (EINVAL);
@@ -848,142 +842,190 @@ in_pcbladdr_find(struct inpcb *inp, struct sockaddr *nam,
 		return (EAFNOSUPPORT);
 	if (sin->sin_port == 0)
 		return (EADDRNOTAVAIL);
+
+	/*
+	 * Are we in a jail?
+	 */
+	pr = NULL;
 	if (td && td->td_proc && td->td_proc->p_ucred)
 		cred = td->td_proc->p_ucred;
-	if (cred && cred->cr_prison)
-		jailed = 1;
-	if (!TAILQ_EMPTY(&in_ifaddrheads[mycpuid])) {
-		ia = TAILQ_FIRST(&in_ifaddrheads[mycpuid])->ia;
-		/*
-		 * If the destination address is INADDR_ANY,
-		 * use the primary local address.
-		 * If the supplied address is INADDR_BROADCAST,
-		 * and the primary interface supports broadcast,
-		 * choose the broadcast address for that interface.
-		 */
-		if (sin->sin_addr.s_addr == INADDR_ANY)
-			sin->sin_addr = IA_SIN(ia)->sin_addr;
-		else if (sin->sin_addr.s_addr == (u_long)INADDR_BROADCAST &&
-		    (ia->ia_ifp->if_flags & IFF_BROADCAST))
-			sin->sin_addr = satosin(&ia->ia_broadaddr)->sin_addr;
+	if (cred)
+		pr = cred->cr_prison;
+
+	/*
+	 * If the destination address is INADDR_ANY then use the primary
+	 * local address.
+	 *
+	 * If the supplied address is INADDR_BROADCAST, and the primary
+	 * interface supports broadcast, choose the broadcast address for
+	 * that interface.
+	 *
+	 * If jailed, locate an interface address acceptable to the jail.
+	 */
+	if (sin->sin_addr.s_addr == INADDR_ANY) {
+		TAILQ_FOREACH(iac, &in_ifaddrheads[mycpuid], ia_link) {
+			ia = iac->ia;
+			if (pr == NULL ||
+			    jailed_ip(pr, sintosa(&ia->ia_addr))) {
+				sin->sin_addr = IA_SIN(ia)->sin_addr;
+				break;
+			}
+		}
+	} else if (sin->sin_addr.s_addr == (u_long)INADDR_BROADCAST) {
+		TAILQ_FOREACH(iac, &in_ifaddrheads[mycpuid], ia_link) {
+			ia = iac->ia;
+			if ((pr == NULL ||
+			     jailed_ip(pr, sintosa(&ia->ia_addr))) &&
+			    (iac->ia->ia_ifp->if_flags & IFF_BROADCAST)) {
+				sin->sin_addr =
+				    satosin(&ia->ia_broadaddr)->sin_addr;
+				break;
+			}
+		}
 	}
-	if (find) {
-		struct route *ro;
 
+	/*
+	 * If asked to do a search, use the cached route or do a route table
+	 * lookup to try to find an acceptable local interface IP.
+	 */
+	if (find == 0)
+		return 0;
+
+	ia = NULL;
+
+	/*
+	 * If we have a cached route, check to see if it is acceptable.
+	 * If not, free it.
+	 */
+	ro = &inp->inp_route;
+	if (ro->ro_rt &&
+	    (!(ro->ro_rt->rt_flags & RTF_UP) ||
+	     ro->ro_dst.sa_family != AF_INET ||
+	     satosin(&ro->ro_dst)->sin_addr.s_addr !=
+			      sin->sin_addr.s_addr ||
+	     inp->inp_socket->so_options & SO_DONTROUTE)) {
+		RTFREE(ro->ro_rt);
+		ro->ro_rt = NULL;
+	}
+
+	/*
+	 * If we do not have a route, construct one and do a lookup,
+	 * unless we are forbidden to do so.
+	 *
+	 * Note that we should check the address family of the cached
+	 * destination, in case of sharing the cache with IPv6.
+	 */
+	if (!(inp->inp_socket->so_options & SO_DONTROUTE) && /*XXX*/
+	    (ro->ro_rt == NULL || ro->ro_rt->rt_ifp == NULL)) {
+		bzero(&ro->ro_dst, sizeof(struct sockaddr_in));
+		ro->ro_dst.sa_family = AF_INET;
+		ro->ro_dst.sa_len = sizeof(struct sockaddr_in);
+		((struct sockaddr_in *)&ro->ro_dst)->sin_addr = sin->sin_addr;
+		rtalloc(ro);
+		alloc_route = 1;
+	}
+
+	/*
+	 * If we found a route, use the address corresponding to the
+	 * outgoing interface.
+	 *
+	 * If jailed, try to find a compatible address on the outgoing
+	 * interface.
+	 */
+	if (ro->ro_rt) {
+		ia = ifatoia(ro->ro_rt->rt_ifa);
+		if (pr == NULL)
+			goto skip;
+		if (jailed_ip(pr, sintosa(&ia->ia_addr)))
+			goto skip;
+		TAILQ_FOREACH(iac, &in_ifaddrheads[mycpuid], ia_link) {
+			if (iac->ia->ia_ifp != ia->ia_ifp)
+				continue;
+			ia = iac->ia;
+			if (jailed_ip(pr, sintosa(&ia->ia_addr)))
+				goto skip;
+		}
 		ia = NULL;
-		/*
-		 * If route is known or can be allocated now,
-		 * our src addr is taken from the i/f, else punt.
-		 * Note that we should check the address family of the cached
-		 * destination, in case of sharing the cache with IPv6.
-		 */
-		ro = &inp->inp_route;
-		if (ro->ro_rt &&
-		    (!(ro->ro_rt->rt_flags & RTF_UP) ||
-		     ro->ro_dst.sa_family != AF_INET ||
-		     satosin(&ro->ro_dst)->sin_addr.s_addr !=
-				      sin->sin_addr.s_addr ||
-		     inp->inp_socket->so_options & SO_DONTROUTE)) {
-			RTFREE(ro->ro_rt);
-			ro->ro_rt = NULL;
-		}
-		if (!(inp->inp_socket->so_options & SO_DONTROUTE) && /*XXX*/
-		    (ro->ro_rt == NULL ||
-		    ro->ro_rt->rt_ifp == NULL)) {
-			/* No route yet, so try to acquire one */
-			bzero(&ro->ro_dst, sizeof(struct sockaddr_in));
-			ro->ro_dst.sa_family = AF_INET;
-			ro->ro_dst.sa_len = sizeof(struct sockaddr_in);
-			((struct sockaddr_in *) &ro->ro_dst)->sin_addr =
-				sin->sin_addr;
-			rtalloc(ro);
-			alloc_route = 1;
-		}
-		/*
-		 * If we found a route, use the address
-		 * corresponding to the outgoing interface
-		 * unless it is the loopback (in case a route
-		 * to our address on another net goes to loopback).
-		 */
-		if (ro->ro_rt &&
-		    !(ro->ro_rt->rt_ifp->if_flags & IFF_LOOPBACK)) {
-			if (jailed) {
-				if (jailed_ip(cred->cr_prison, 
-				    ro->ro_rt->rt_ifa->ifa_addr)) {
-					ia = ifatoia(ro->ro_rt->rt_ifa);
-				}
-			} else {
-				ia = ifatoia(ro->ro_rt->rt_ifa);
-			}
-		}
-		if (ia == NULL) {
-			u_short fport = sin->sin_port;
+	}
+skip:
 
-			sin->sin_port = 0;
-			ia = ifatoia(ifa_ifwithdstaddr(sintosa(sin)));
-			if (ia && jailed && !jailed_ip(cred->cr_prison,
-			    sintosa(&ia->ia_addr)))
-				ia = NULL;
+	/*
+	 * If the route didn't work or there was no route,
+	 * fall-back to the first address in in_ifaddrheads[].
+	 *
+	 * If jailed and this address is not available for
+	 * the jail, leave ia set to NULL.
+	 */
+	if (ia == NULL) {
+		u_short fport = sin->sin_port;
+
+		sin->sin_port = 0;
+		ia = ifatoia(ifa_ifwithdstaddr(sintosa(sin)));
+		if (ia && pr && !jailed_ip(pr, sintosa(&ia->ia_addr)))
+			ia = NULL;
+
+		if (ia == NULL)
+			ia = ifatoia(ifa_ifwithnet(sintosa(sin)));
+		if (ia && pr && !jailed_ip(pr, sintosa(&ia->ia_addr)))
+			ia = NULL;
+
+		sin->sin_port = fport;
+		if (ia == NULL && !TAILQ_EMPTY(&in_ifaddrheads[mycpuid]))
+			ia = TAILQ_FIRST(&in_ifaddrheads[mycpuid])->ia;
+
+		if (ia && pr && !jailed_ip(pr, sintosa(&ia->ia_addr)))
+			ia = NULL;
+
+		if (pr == NULL && ia == NULL)
+			goto fail;
+	}
+
+	/*
+	 * If the destination address is multicast and an outgoing
+	 * interface has been set as a multicast option, use the
+	 * address of that interface as our source address.
+	 */
+	if (pr == NULL && IN_MULTICAST(ntohl(sin->sin_addr.s_addr)) &&
+	    inp->inp_moptions != NULL) {
+		struct ip_moptions *imo;
+		struct ifnet *ifp;
+
+		imo = inp->inp_moptions;
+		if ((ifp = imo->imo_multicast_ifp) != NULL) {
+			struct in_ifaddr_container *iac;
+
+			ia = NULL;
+			TAILQ_FOREACH(iac, &in_ifaddrheads[mycpuid], ia_link) {
+				if (iac->ia->ia_ifp == ifp) {
+					ia = iac->ia;
+					break;
+				}
+			}
 			if (ia == NULL)
-				ia = ifatoia(ifa_ifwithnet(sintosa(sin)));
-			if (ia && jailed && !jailed_ip(cred->cr_prison,
-			    sintosa(&ia->ia_addr)))
-				ia = NULL;
-			sin->sin_port = fport;
-			if (ia == NULL &&
-			    !TAILQ_EMPTY(&in_ifaddrheads[mycpuid]))
-				ia = TAILQ_FIRST(&in_ifaddrheads[mycpuid])->ia;
-			if (ia && jailed && !jailed_ip(cred->cr_prison,
-			    sintosa(&ia->ia_addr)))
-				ia = NULL;
-
-			if (!jailed && ia == NULL)
 				goto fail;
 		}
-		/*
-		 * If the destination address is multicast and an outgoing
-		 * interface has been set as a multicast option, use the
-		 * address of that interface as our source address.
-		 */
-		if (!jailed && IN_MULTICAST(ntohl(sin->sin_addr.s_addr)) &&
-		    inp->inp_moptions != NULL) {
-			struct ip_moptions *imo;
-			struct ifnet *ifp;
+	}
 
-			imo = inp->inp_moptions;
-			if (imo->imo_multicast_ifp != NULL) {
-				struct in_ifaddr_container *iac;
-
-				ifp = imo->imo_multicast_ifp;
-				ia = NULL;
-				TAILQ_FOREACH(iac,
-				&in_ifaddrheads[mycpuid], ia_link) {
-					if (iac->ia->ia_ifp == ifp) {
-						ia = iac->ia;
-						break;
-					}
-				}
-				if (ia == NULL)
-					goto fail;
-			}
-		}
-		/*
-		 * Don't do pcblookup call here; return interface in plocal_sin
-		 * and exit to caller, that will do the lookup.
-		 */
-		if (ia == NULL && jailed) {
-			if ((jsin = prison_get_nonlocal(
-				cred->cr_prison, AF_INET, NULL)) != NULL ||
-			    (jsin = prison_get_local(
-				cred->cr_prison, AF_INET, NULL)) != NULL) {
-				*plocal_sin = satosin(jsin);
-			} else {
-				/* IPv6 only Jail */
-				goto fail;
-			}
-		} else {
-			*plocal_sin = &ia->ia_addr;
-		}
+	/*
+	 * If we still don't have a local address, and are jailed,
+	 * use the jail's first non-localhost IP.  If there isn't
+	 * one, use the jail's first localhost IP.
+	 *
+	 * Don't do pcblookup call here; return interface in plocal_sin
+	 * and exit to caller, that will do the lookup.
+	 */
+	if (ia == NULL && pr) {
+		jsin = prison_get_nonlocal(cred->cr_prison, AF_INET, NULL);
+		if (jsin == NULL)
+			jsin = prison_get_local(cred->cr_prison, AF_INET, NULL);
+		if (jsin)
+			*plocal_sin = satosin(jsin);
+		else
+			goto fail;
+	} else if (ia) {
+		*plocal_sin = &ia->ia_addr;
+	} else {
+		goto fail;
 	}
 	return (0);
 fail:
@@ -994,10 +1036,10 @@ fail:
 
 int
 in_pcbladdr(struct inpcb *inp, struct sockaddr *nam,
-    struct sockaddr_in **plocal_sin, struct thread *td)
+	    struct sockaddr_in **plocal_sin, struct thread *td)
 {
 	return in_pcbladdr_find(inp, nam, plocal_sin, td,
-	    (inp->inp_laddr.s_addr == INADDR_ANY));
+				(inp->inp_laddr.s_addr == INADDR_ANY));
 }
 
 /*
@@ -1013,6 +1055,8 @@ in_pcbconnect(struct inpcb *inp, struct sockaddr *nam, struct thread *td)
 	struct sockaddr_in *if_sin;
 	struct sockaddr_in *sin = (struct sockaddr_in *)nam;
 	int error;
+
+	if_sin = NULL;	/* avoid gcc warnings */
 
 	/* Call inner routine to assign local interface address. */
 	if ((error = in_pcbladdr(inp, nam, &if_sin, td)) != 0)
@@ -1053,9 +1097,6 @@ in_pcbdetach(struct inpcb *inp)
 	struct socket *so = inp->inp_socket;
 	struct inpcbinfo *ipi = inp->inp_pcbinfo;
 
-#ifdef IPSEC
-	ipsec4_delete_pcbpolicy(inp);
-#endif /*IPSEC*/
 	inp->inp_gencnt = ++ipi->ipi_gencnt;
 	KKASSERT((so->so_state & SS_ASSERTINPROG) == 0);
 	in_pcbremlists(inp);
@@ -1066,43 +1107,29 @@ in_pcbdetach(struct inpcb *inp)
 	if (inp->inp_route.ro_rt)
 		rtfree(inp->inp_route.ro_rt);
 	ip_freemoptions(inp->inp_moptions);
-	inp->inp_vflag = 0;
 	kfree(inp, M_PCB);
 }
 
 /*
- * The calling convention of in_setsockaddr() and in_setpeeraddr() was
- * modified to match the pru_sockaddr() and pru_peeraddr() entry points
- * in struct pr_usrreqs, so that protocols can just reference then directly
- * without the need for a wrapper function.  The socket must have a valid
- * (i.e., non-nil) PCB, but it should be impossible to get an invalid one
- * except through a kernel programming error, so it is acceptable to panic
- * (or in this case trap) if the PCB is invalid.  (Actually, we don't trap
- * because there actually /is/ a programming error somewhere... XXX)
+ * The socket may have an invalid PCB, i.e. NULL.  For example, a TCP
+ * socket received RST.
  */
-int
+static int
 in_setsockaddr(struct socket *so, struct sockaddr **nam)
 {
 	struct inpcb *inp;
 	struct sockaddr_in *sin;
 
-	/*
-	 * Do the malloc first in case it blocks.
-	 */
+	KASSERT(curthread->td_type == TD_TYPE_NETISR, ("not in netisr"));
+	inp = so->so_pcb;
+	if (!inp)
+		return (ECONNRESET);
+
 	sin = kmalloc(sizeof *sin, M_SONAME, M_WAITOK | M_ZERO);
 	sin->sin_family = AF_INET;
 	sin->sin_len = sizeof *sin;
-
-	crit_enter();
-	inp = so->so_pcb;
-	if (!inp) {
-		crit_exit();
-		kfree(sin, M_SONAME);
-		return (ECONNRESET);
-	}
 	sin->sin_port = inp->inp_lport;
 	sin->sin_addr = inp->inp_laddr;
-	crit_exit();
 
 	*nam = (struct sockaddr *)sin;
 	return (0);
@@ -1117,29 +1144,26 @@ in_setsockaddr_dispatch(netmsg_t msg)
 	lwkt_replymsg(&msg->lmsg, error);
 }
 
+/*
+ * The socket may have an invalid PCB, i.e. NULL.  For example, a TCP
+ * socket received RST.
+ */
 int
 in_setpeeraddr(struct socket *so, struct sockaddr **nam)
 {
 	struct inpcb *inp;
 	struct sockaddr_in *sin;
 
-	/*
-	 * Do the malloc first in case it blocks.
-	 */
+	KASSERT(curthread->td_type == TD_TYPE_NETISR, ("not in netisr"));
+	inp = so->so_pcb;
+	if (!inp)
+		return (ECONNRESET);
+
 	sin = kmalloc(sizeof *sin, M_SONAME, M_WAITOK | M_ZERO);
 	sin->sin_family = AF_INET;
 	sin->sin_len = sizeof *sin;
-
-	crit_enter();
-	inp = so->so_pcb;
-	if (!inp) {
-		crit_exit();
-		kfree(sin, M_SONAME);
-		return (ECONNRESET);
-	}
 	sin->sin_port = inp->inp_fport;
 	sin->sin_addr = inp->inp_faddr;
-	crit_exit();
 
 	*nam = (struct sockaddr *)sin;
 	return (0);
@@ -1156,13 +1180,13 @@ in_setpeeraddr_dispatch(netmsg_t msg)
 
 void
 in_pcbnotifyall(struct inpcbinfo *pcbinfo, struct in_addr faddr, int err,
-		void (*notify)(struct inpcb *, int))
+    inp_notify_t notify)
 {
 	struct inpcb *inp, *marker;
 
 	KASSERT(&curthread->td_msgport == netisr_cpuport(pcbinfo->cpu),
 	    ("not in the correct netisr"));
-	marker = &in_pcbmarkers[mycpuid];
+	marker = in_pcbmarker();
 
 	/*
 	 * NOTE:
@@ -1181,7 +1205,7 @@ in_pcbnotifyall(struct inpcbinfo *pcbinfo, struct in_addr faddr, int err,
 		if (inp->inp_flags & INP_PLACEMARKER)
 			continue;
 #ifdef INET6
-		if (!(inp->inp_vflag & INP_IPV4))
+		if (!INP_ISIPV4(inp))
 			continue;
 #endif
 		if (inp->inp_faddr.s_addr != faddr.s_addr ||
@@ -1206,8 +1230,7 @@ in_pcbpurgeif0(struct inpcbinfo *pcbinfo, struct ifnet *ifp)
 	 * In this case, the pcbinfo must be able to be shared, i.e.
 	 * pcbinfo->infotoken is not NULL.
 	 */
-	KASSERT(&curthread->td_msgport == netisr_cpuport(0),
-	    ("not in netisr0"));
+	ASSERT_NETISR0;
 	KASSERT(pcbinfo->cpu == 0 || pcbinfo->infotoken != NULL,
 	    ("pcbinfo could not be shared"));
 
@@ -1223,7 +1246,7 @@ in_pcbpurgeif0(struct inpcbinfo *pcbinfo, struct ifnet *ifp)
 	 * even if the token was released due to the blocking multicast
 	 * address deletion.
 	 */
-	marker = &in_pcbmarkers[mycpuid];
+	marker = in_pcbmarker();
 
 	GET_PCBINFO_TOKEN(pcbinfo);
 
@@ -1237,7 +1260,7 @@ in_pcbpurgeif0(struct inpcbinfo *pcbinfo, struct ifnet *ifp)
 		if (inp->inp_flags & INP_PLACEMARKER)
 			continue;
 		imo = inp->inp_moptions;
-		if ((inp->inp_vflag & INP_IPV4) && imo != NULL) {
+		if (INP_ISIPV4(inp) && imo != NULL) {
 			int i, gap;
 
 			/*
@@ -1324,15 +1347,18 @@ in_rtchange(struct inpcb *inp, int err)
 
 /*
  * Lookup a PCB based on the local address and port.
+ *
+ * This function is only used when scanning for a free port.
  */
-struct inpcb *
-in_pcblookup_local(struct inpcbportinfo *portinfo, struct in_addr laddr,
+static struct inpcb *
+in_pcblookup_local(struct inpcbporthead *porthash, struct in_addr laddr,
 		   u_int lport_arg, int wild_okay, struct ucred *cred)
 {
+	struct prison *pscan;
+	struct prison *pr;
 	struct inpcb *inp;
 	int matchwild = 3, wildcard;
 	u_short lport = lport_arg;
-	struct inpcbporthead *porthash;
 	struct inpcbport *phd;
 	struct inpcb *match = NULL;
 
@@ -1340,7 +1366,7 @@ in_pcblookup_local(struct inpcbportinfo *portinfo, struct in_addr laddr,
 	 * If the porthashbase is shared across several cpus, it must
 	 * have been locked.
 	 */
-	ASSERT_PORT_TOKEN_HELD(portinfo);
+	ASSERT_PORTHASH_TOKEN_HELD(porthash);
 
 	/*
 	 * Best fit PCB lookup.
@@ -1348,45 +1374,64 @@ in_pcblookup_local(struct inpcbportinfo *portinfo, struct in_addr laddr,
 	 * First see if this local port is in use by looking on the
 	 * port hash list.
 	 */
-	porthash = &portinfo->porthashbase[
-			INP_PCBPORTHASH(lport, portinfo->porthashmask)];
 	LIST_FOREACH(phd, porthash, phd_hash) {
 		if (phd->phd_port == lport)
 			break;
 	}
 	if (phd != NULL) {
+		pr = cred ? cred->cr_prison : NULL;
+
 		/*
 		 * Port is in use by one or more PCBs. Look for best
 		 * fit.
+		 *
+		 * If in a prison we may wish to allow the jail to override
+		 * a wildcard listen on the host.  Since the jail forces its
+		 * own wildcard listens to a specific set of jail IPs, this
+		 * override allows most services on the host to remain as
+		 * they were and still be 'jail friendly'.
 		 */
 		LIST_FOREACH(inp, &phd->phd_pcblist, inp_portlist) {
 			wildcard = 0;
 #ifdef INET6
-			if ((inp->inp_vflag & INP_IPV4) == 0)
+			if (!INP_ISIPV4(inp))
 				continue;
 #endif
 			if (inp->inp_faddr.s_addr != INADDR_ANY)
 				wildcard++;
-			if (inp->inp_laddr.s_addr != INADDR_ANY) {
+
+			/*
+			 * Prison are independent of each other in terms
+			 * of allowing bindings.  This can result in multiple
+			 * overloaded bindings which in_pcblookup_pkthash()
+			 * will have to sort out.
+			 *
+			 * Allow wildcarded entries to co-exist with specific
+			 * entries.  Specific entries override wildcarded
+			 * entries.
+			 */
+			if (inp->inp_socket && inp->inp_socket->so_cred)
+				pscan = inp->inp_socket->so_cred->cr_prison;
+			else
+				pscan = NULL;
+			if (pr != pscan)
+				continue;
+			if (inp->inp_laddr.s_addr == INADDR_ANY) {
+				if (laddr.s_addr != INADDR_ANY)
+					wildcard++;
+			} else {
 				if (laddr.s_addr == INADDR_ANY)
 					wildcard++;
 				else if (inp->inp_laddr.s_addr != laddr.s_addr)
 					continue;
-			} else {
-				if (laddr.s_addr != INADDR_ANY)
-					wildcard++;
 			}
 			if (wildcard && !wild_okay)
 				continue;
-			if (wildcard < matchwild &&
-			    (cred == NULL ||
-			     cred->cr_prison == 
-					inp->inp_socket->so_cred->cr_prison)) {
+			if (wildcard < matchwild) {
 				match = inp;
 				matchwild = wildcard;
-				if (matchwild == 0) {
+				if (matchwild == 0)
 					break;
-				}
 			}
 		}
 	}
@@ -1410,7 +1455,7 @@ in_pcblocalgroup_last(const struct inpcbinfo *pcbinfo,
 	    INP_PCBLOCALGRPHASH(inp->inp_lport, pcbinfo->localgrphashmask)];
 
 	LIST_FOREACH(grp, hdr, il_list) {
-		if (grp->il_vflag == inp->inp_vflag &&
+		if (grp->il_af == inp->inp_af &&
 		    grp->il_lport == inp->inp_lport &&
 		    memcmp(&grp->il_dependladdr,
 			&inp->inp_inc.inc_ie.ie_dependladdr,
@@ -1443,9 +1488,18 @@ static struct inpcb *
 inp_localgroup_lookup(const struct inpcbinfo *pcbinfo,
     struct in_addr laddr, uint16_t lport, uint32_t pkt_hash)
 {
-	struct inpcb *local_wild = NULL;
+	struct inpcb *local_wild;
+	struct inpcb *jinp;
+	struct inpcb *jinp_wild;
+	struct inpcb *inp;
 	const struct inp_localgrphead *hdr;
 	const struct inp_localgroup *grp;
+	struct sockaddr_in jsin;
+	struct prison *pr;
+	struct ucred *cred;
+	int idx;
+	int net_listen_ov_local;
+	int net_listen_ov_wild;
 
 	ASSERT_PCBINFO_TOKEN_HELD(pcbinfo);
 
@@ -1457,37 +1511,82 @@ inp_localgroup_lookup(const struct inpcbinfo *pcbinfo,
 	 * 1. non-wild.
 	 * 2. wild.
 	 *
-	 * NOTE:
-	 * - Local group does not contain jailed sockets
-	 * - Local group does not contain IPv4 mapped INET6 wild sockets
+	 * NOTE: Local group does not contain jailed sockets
 	 */
+	jsin.sin_family = AF_INET;
+	jsin.sin_addr.s_addr = laddr.s_addr;
+
+	jinp = NULL;
+	jinp_wild = NULL;
+	local_wild = NULL;
+	net_listen_ov_local = 0;
+	net_listen_ov_wild = 0;
+
 	LIST_FOREACH(grp, hdr, il_list) {
 #ifdef INET6
-		if (!(grp->il_vflag & INP_IPV4))
+		if (grp->il_af != AF_INET)
 			continue;
 #endif
-		if (grp->il_lport == lport) {
-			int idx;
+		if (grp->il_lport != lport)
+			continue;
 
-			/*
-			 * Modulo-N is used here, which greatly reduces
-			 * completion queue token contention, thus more
-			 * cpu time is saved.
-			 */
-			idx = pkt_hash % grp->il_inpcnt;
-			if (grp->il_laddr.s_addr == laddr.s_addr)
-				return grp->il_inp[idx];
-			else if (grp->il_laddr.s_addr == INADDR_ANY)
-				local_wild = grp->il_inp[idx];
+		/*
+		 * look for a match
+		 */
+		idx = netisr_hashlsb(pkt_hash) % grp->il_inpcnt;
+		inp = grp->il_inp[idx];
+
+		/*
+		 * Modulo-N is used here, which greatly reduces
+		 * completion queue token contention, thus more
+		 * cpu time is saved.
+		 */
+		if (grp->il_jailed) {
+			if (inp->inp_socket == NULL)
+				continue;
+			cred = inp->inp_socket->so_cred;
+			if (cred == NULL)
+				continue;
+			pr = cred->cr_prison;
+			if (pr == NULL)
+				continue;
+			if (!jailed_ip(pr, (struct sockaddr *)&jsin))
+				continue;
+			if (grp->il_laddr.s_addr == laddr.s_addr) {
+				jinp = inp;
+				if (PRISON_CAP_ISSET(pr->pr_caps, PRISON_CAP_NET_LISTEN_OVERRIDE))
+					net_listen_ov_local = 1;
+
+			} else if (grp->il_laddr.s_addr == INADDR_ANY &&
+				   jinp_wild == NULL) {
+				jinp_wild = inp;
+				if (PRISON_CAP_ISSET(pr->pr_caps, PRISON_CAP_NET_LISTEN_OVERRIDE))
+					net_listen_ov_wild = 1;
+			}
+		} else {
+			if (grp->il_laddr.s_addr == laddr.s_addr) {
+				return inp;
+			} else if (grp->il_laddr.s_addr == INADDR_ANY) {
+				local_wild = inp;
+			}
 		}
 	}
-	if (local_wild != NULL)
-		return local_wild;
-	return NULL;
+
+	if (net_listen_ov_local)
+		return jinp;
+	if (net_listen_ov_wild)
+		return jinp_wild;
+	if (local_wild)
+		return (local_wild);
+	if (jinp)
+		return (jinp);
+	return (jinp_wild);
 }
 
 /*
  * Lookup PCB in hash list.
+ *
+ * This is used to match incoming packets to a pcb
  */
 struct inpcb *
 in_pcblookup_pkthash(struct inpcbinfo *pcbinfo, struct in_addr faddr,
@@ -1502,49 +1601,58 @@ in_pcblookup_pkthash(struct inpcbinfo *pcbinfo, struct in_addr faddr,
 	 * First look for an exact match.
 	 */
 	head = &pcbinfo->hashbase[INP_PCBCONNHASH(faddr.s_addr, fport,
-	    laddr.s_addr, lport, pcbinfo->hashmask)];
+						  laddr.s_addr, lport,
+						  pcbinfo->hashmask)];
 	LIST_FOREACH(inp, head, inp_hash) {
 #ifdef INET6
-		if (!(inp->inp_vflag & INP_IPV4))
+		if (!INP_ISIPV4(inp))
 			continue;
 #endif
 		if (in_hosteq(inp->inp_faddr, faddr) &&
 		    in_hosteq(inp->inp_laddr, laddr) &&
 		    inp->inp_fport == fport && inp->inp_lport == lport) {
-			/* found */
+			/*
+			 * Found specific address, host overrides jailed
+			 * inpcb.
+			 */
 			if (inp->inp_socket == NULL ||
 			    inp->inp_socket->so_cred->cr_prison == NULL) {
 				return (inp);
-			} else {
-				if  (jinp == NULL)
-					jinp = inp;
 			}
+			if (jinp == NULL)
+				jinp = inp;
 		}
 	}
 	if (jinp != NULL)
 		return (jinp);
 
+	/*
+	 * We generally get here for connections to wildcarded listeners.
+	 * Any wildcarded listeners in jails must be restricted to the
+	 * jailed IPs only.
+	 */
 	if (wildcard) {
 		struct inpcb *local_wild = NULL;
 		struct inpcb *jinp_wild = NULL;
-#ifdef INET6
-		struct inpcb *local_wild_mapped = NULL;
-#endif
 		struct inpcontainer *ic;
 		struct inpcontainerhead *chead;
 		struct sockaddr_in jsin;
 		struct ucred *cred;
+		struct prison *pr;
+		int net_listen_ov_local = 0;
+		int net_listen_ov_wild = 0;
 
 		GET_PCBINFO_TOKEN(pcbinfo);
 
 		/*
-		 * Check local group first
+		 * Check local group first.  When present, the localgroup
+		 * hash utilizes the same non-jailed-vs/jailed priortization
+		 * that the normal wildcardhash does.
 		 */
 		if (pcbinfo->localgrphashbase != NULL &&
-		    m != NULL && (m->m_flags & M_HASH) &&
-		    !(ifp && ifp->if_type == IFT_FAITH)) {
-			inp = inp_localgroup_lookup(pcbinfo,
-			    laddr, lport, m->m_pkthdr.hash);
+		    m != NULL && (m->m_flags & M_HASH)) {
+			inp = inp_localgroup_lookup(pcbinfo, laddr, lport,
+						    m->m_pkthdr.hash);
 			if (inp != NULL) {
 				REL_PCBINFO_TOKEN(pcbinfo);
 				return inp;
@@ -1553,73 +1661,89 @@ in_pcblookup_pkthash(struct inpcbinfo *pcbinfo, struct in_addr faddr,
 
 		/*
 		 * Order of socket selection:
+		 *
 		 * 1. non-jailed, non-wild.
-		 * 2. non-jailed, wild.
+		 * 2. non-jailed, wild.		(allow_listen_override on)
 		 * 3. jailed, non-wild.
 		 * 4. jailed, wild.
+		 * 5. non-jailed, wild.		(allow_listen_override off)
+		 *
+		 * NOTE: jailed wildcards are still restricted to the jail
+		 *	 IPs.
+		 *
+		 * NOTE: (1) and (3) already handled above.
 		 */
 		jsin.sin_family = AF_INET;
 		chead = &pcbinfo->wildcardhashbase[
 		    INP_PCBWILDCARDHASH(lport, pcbinfo->wildcardhashmask)];
+
 		LIST_FOREACH(ic, chead, ic_list) {
 			inp = ic->ic_inp;
 			if (inp->inp_flags & INP_PLACEMARKER)
 				continue;
 
-			jsin.sin_addr.s_addr = laddr.s_addr;
+			/*
+			 * Basic validation
+			 */
 #ifdef INET6
-			if (!(inp->inp_vflag & INP_IPV4))
+			if (!INP_ISIPV4(inp))
 				continue;
 #endif
-			if (inp->inp_socket != NULL)
+			if (inp->inp_lport != lport)
+				continue;
+
+			/*
+			 * Calculate prison, setup jsin for jailed_ip()
+			 * check.
+			 */
+			jsin.sin_addr.s_addr = laddr.s_addr;
+			pr = NULL;
+			cred = NULL;
+			if (inp->inp_socket) {
 				cred = inp->inp_socket->so_cred;
-			else
-				cred = NULL;
-			if (cred != NULL && jailed(cred)) {
-				if (jinp != NULL)
-					continue;
-				else
-					if (!jailed_ip(cred->cr_prison,
-					    (struct sockaddr *)&jsin))
-						continue;
+				if (cred)
+					pr = cred->cr_prison;
 			}
-			if (inp->inp_lport == lport) {
-				if (ifp && ifp->if_type == IFT_FAITH &&
-				    !(inp->inp_flags & INP_FAITH))
+
+			/*
+			 * Assign jinp, jinp_wild, and local_wild as
+			 * appropriate, track whether the jail supports
+			 * listen overrides.
+			 */
+			if (pr) {
+				if (!jailed_ip(pr, (struct sockaddr *)&jsin))
 					continue;
+				if (inp->inp_laddr.s_addr == laddr.s_addr &&
+				    jinp == NULL) {
+					jinp = inp;
+					if (PRISON_CAP_ISSET(pr->pr_caps, PRISON_CAP_NET_LISTEN_OVERRIDE))
+						net_listen_ov_local = 1;
+				}
+				if (inp->inp_laddr.s_addr == INADDR_ANY &&
+				    jinp_wild == NULL) {
+					jinp_wild = inp;
+					if (PRISON_CAP_ISSET(pr->pr_caps, PRISON_CAP_NET_LISTEN_OVERRIDE))
+						net_listen_ov_wild = 1;
+				}
+			} else {
 				if (inp->inp_laddr.s_addr == laddr.s_addr) {
-					if (cred != NULL && jailed(cred)) {
-						jinp = inp;
-					} else {
-						REL_PCBINFO_TOKEN(pcbinfo);
-						return (inp);
-					}
+					REL_PCBINFO_TOKEN(pcbinfo);
+					return (inp);
 				}
-				if (inp->inp_laddr.s_addr == INADDR_ANY) {
-#ifdef INET6
-					if (INP_CHECK_SOCKAF(inp->inp_socket,
-							     AF_INET6))
-						local_wild_mapped = inp;
-					else
-#endif
-						if (cred != NULL &&
-						    jailed(cred))
-							jinp_wild = inp;
-						else
-							local_wild = inp;
-				}
+				if (inp->inp_laddr.s_addr == INADDR_ANY)
+					local_wild = inp;
 			}
 		}
 
 		REL_PCBINFO_TOKEN(pcbinfo);
 
-		if (local_wild != NULL)
+		if (net_listen_ov_local)
+			return jinp;
+		if (net_listen_ov_wild)
+			return jinp_wild;
+		if (local_wild)
 			return (local_wild);
-#ifdef INET6
-		if (local_wild_mapped != NULL)
-			return (local_wild_mapped);
-#endif
-		if (jinp != NULL)
+		if (jinp)
 			return (jinp);
 		return (jinp_wild);
 	}
@@ -1650,7 +1774,7 @@ in_pcbinsconnhash(struct inpcb *inp)
 	u_int32_t hashkey_faddr, hashkey_laddr;
 
 #ifdef INET6
-	if (inp->inp_vflag & INP_IPV6) {
+	if (INP_ISIPV6(inp)) {
 		hashkey_faddr = inp->in6p_faddr.s6_addr32[3] /* XXX JH */;
 		hashkey_laddr = inp->in6p_laddr.s6_addr32[3] /* XXX JH */;
 	} else {
@@ -1694,23 +1818,20 @@ in_pcbremconnhash(struct inpcb *inp)
  * Insert PCB into port hash table.
  */
 void
-in_pcbinsporthash(struct inpcbportinfo *portinfo, struct inpcb *inp)
+in_pcbinsporthash(struct inpcbporthead *pcbporthash, struct inpcb *inp)
 {
 	struct inpcbinfo *pcbinfo = inp->inp_pcbinfo;
-	struct inpcbporthead *pcbporthash;
 	struct inpcbport *phd;
 
 	/*
 	 * If the porthashbase is shared across several cpus, it must
 	 * have been locked.
 	 */
-	ASSERT_PORT_TOKEN_HELD(portinfo);
+	ASSERT_PORTHASH_TOKEN_HELD(pcbporthash);
 
 	/*
 	 * Insert into the port hash table.
 	 */
-	pcbporthash = &portinfo->porthashbase[
-	    INP_PCBPORTHASH(inp->inp_lport, portinfo->porthashmask)];
 
 	/* Go through port list and look for a head for this lport. */
 	LIST_FOREACH(phd, pcbporthash, phd_hash) {
@@ -1728,7 +1849,7 @@ in_pcbinsporthash(struct inpcbportinfo *portinfo, struct inpcb *inp)
 		LIST_INSERT_HEAD(pcbporthash, phd, phd_hash);
 	}
 
-	inp->inp_portinfo = portinfo;
+	inp->inp_porthash = pcbporthash;
 	inp->inp_phd = phd;
 	LIST_INSERT_HEAD(&phd->phd_pcblist, inp, inp_portlist);
 
@@ -1749,27 +1870,57 @@ in_pcbinsporthash_lport(struct inpcb *inp)
 {
 	struct inpcbinfo *pcbinfo = inp->inp_pcbinfo;
 	struct inpcbportinfo *portinfo;
+	struct inpcbporthead *porthash;
 	u_short lport_ho;
 
 	/* Locate the proper portinfo based on lport */
 	lport_ho = ntohs(inp->inp_lport);
-	portinfo = &pcbinfo->portinfo[lport_ho & pcbinfo->portinfo_mask];
-	KKASSERT((lport_ho & pcbinfo->portinfo_mask) == portinfo->offset);
+	portinfo = &pcbinfo->portinfo[lport_ho % pcbinfo->portinfo_cnt];
+	KKASSERT((lport_ho % pcbinfo->portinfo_cnt) == portinfo->offset);
 
-	GET_PORT_TOKEN(portinfo);
-	in_pcbinsporthash(portinfo, inp);
-	REL_PORT_TOKEN(portinfo);
+	porthash = in_pcbporthash_head(portinfo, inp->inp_lport);
+	GET_PORTHASH_TOKEN(porthash);
+	in_pcbinsporthash(porthash, inp);
+	REL_PORTHASH_TOKEN(porthash);
+}
+
+void
+in_pcbremporthash(struct inpcb *inp)
+{
+	struct inpcbporthead *porthash;
+	struct inpcbport *phd;
+
+	if (inp->inp_phd == NULL)
+		return;
+	KASSERT(inp->inp_lport != 0, ("inpcb has no lport"));
+
+	porthash = inp->inp_porthash;
+	KASSERT(porthash != NULL, ("no porthash"));
+
+	GET_PORTHASH_TOKEN(porthash);
+
+	phd = inp->inp_phd;
+	LIST_REMOVE(inp, inp_portlist);
+	if (LIST_FIRST(&phd->phd_pcblist) == NULL) {
+		LIST_REMOVE(phd, phd_hash);
+		kfree(phd, M_PCB);
+	}
+
+	REL_PORTHASH_TOKEN(porthash);
+
+	inp->inp_phd = NULL;
+	/* NOTE: Don't whack inp_lport, which may be used later */
 }
 
 static struct inp_localgroup *
-inp_localgroup_alloc(u_char vflag,
-    uint16_t port, const union in_dependaddr *addr, int size)
+inp_localgroup_alloc(u_char af, uint16_t port,
+    const union in_dependaddr *addr, int size)
 {
 	struct inp_localgroup *grp;
 
 	grp = kmalloc(__offsetof(struct inp_localgroup, il_inp[size]),
-	    M_TEMP, M_INTWAIT | M_ZERO);
-	grp->il_vflag = vflag;
+		      M_TEMP, M_INTWAIT | M_ZERO);
+	grp->il_af = af;
 	grp->il_lport = port;
 	grp->il_dependladdr = *addr;
 	grp->il_inpsiz = size;
@@ -1792,7 +1943,7 @@ inp_localgroup_destroy(struct inp_localgroup *grp)
 
 static void
 inp_localgroup_copy(struct inp_localgroup *grp,
-    const struct inp_localgroup *old_grp)
+		    const struct inp_localgroup *old_grp)
 {
 	int i;
 
@@ -1809,7 +1960,7 @@ in_pcbinslocalgrphash_oncpu(struct inpcb *inp, struct inpcbinfo *pcbinfo)
 {
 	struct inp_localgrphead *hdr;
 	struct inp_localgroup *grp, *grp_alloc = NULL;
-	struct ucred *cred;
+	u_char isjailed;
 	int i, idx;
 
 	ASSERT_PCBINFO_TOKEN_HELD(pcbinfo);
@@ -1818,35 +1969,31 @@ in_pcbinslocalgrphash_oncpu(struct inpcb *inp, struct inpcbinfo *pcbinfo)
 		return;
 
 	/*
-	 * XXX don't allow jailed socket to join local group
+	 * Further separate groups by whether the inp is jailed or not.
+	 * This allows the inp_localgroup_lookup() code to manage port
+	 * overloading between jails and non-jails.
+	 *
+	 * XXX all jails are collected into one group, which works fine
+	 *     as we expect the jails to be listening on different addresses.
+	 *     If this changes in the future we may have to break the groups
+	 *     up by prison pointer as well.
 	 */
-	if (inp->inp_socket != NULL)
-		cred = inp->inp_socket->so_cred;
+	if (inp->inp_socket && inp->inp_socket->so_cred)
+		isjailed = jailed(inp->inp_socket->so_cred);
 	else
-		cred = NULL;
-	if (cred != NULL && jailed(cred))
-		return;
-
-#ifdef INET6
-	/*
-	 * XXX don't allow IPv4 mapped INET6 wild socket
-	 */
-	if ((inp->inp_vflag & INP_IPV4) &&
-	    inp->inp_laddr.s_addr == INADDR_ANY &&
-	    INP_CHECK_SOCKAF(inp->inp_socket, AF_INET6))
-		return;
-#endif
+		isjailed = 0;
 
 	hdr = &pcbinfo->localgrphashbase[
 	    INP_PCBLOCALGRPHASH(inp->inp_lport, pcbinfo->localgrphashmask)];
 
 again:
 	LIST_FOREACH(grp, hdr, il_list) {
-		if (grp->il_vflag == inp->inp_vflag &&
+		if (grp->il_af == inp->inp_af &&
 		    grp->il_lport == inp->inp_lport &&
+		    grp->il_jailed == isjailed &&
 		    memcmp(&grp->il_dependladdr,
-		        &inp->inp_inc.inc_ie.ie_dependladdr,
-		        sizeof(grp->il_dependladdr)) == 0) {
+			   &inp->inp_inc.inc_ie.ie_dependladdr,
+			   sizeof(grp->il_dependladdr)) == 0) {
 			break;
 		}
 	}
@@ -1855,7 +2002,7 @@ again:
 		 * Create a new local group
 		 */
 		if (grp_alloc == NULL) {
-			grp_alloc = inp_localgroup_alloc(inp->inp_vflag,
+			grp_alloc = inp_localgroup_alloc(inp->inp_af,
 			    inp->inp_lport, &inp->inp_inc.inc_ie.ie_dependladdr,
 			    INP_LOCALGROUP_SIZMIN);
 			/*
@@ -1868,10 +2015,17 @@ again:
 		} else {
 			/* Local group has been allocated; link it */
 			grp = grp_alloc;
+			grp->il_jailed = isjailed;
 			grp_alloc = NULL;
 			LIST_INSERT_HEAD(hdr, grp, il_list);
 		}
 	} else if (grp->il_inpcnt == grp->il_inpsiz) {
+#if 0
+		/*
+		 * REMOVED - Ensure that all entries are placed in the
+		 *	     localgroup so jail operations can be
+		 *	     deterministic on a il_lport basis.
+		 */
 		if (grp->il_inpsiz >= INP_LOCALGROUP_SIZMAX) {
 			static int limit_logged = 0;
 
@@ -1890,6 +2044,7 @@ again:
 			}
 			return;
 		}
+#endif
 
 		/*
 		 * Expand this local group
@@ -1898,7 +2053,7 @@ again:
 		    grp->il_inpcnt >= grp_alloc->il_inpsiz) {
 			if (grp_alloc != NULL)
 				inp_localgroup_free(grp_alloc);
-			grp_alloc = inp_localgroup_alloc(grp->il_vflag,
+			grp_alloc = inp_localgroup_alloc(grp->il_af,
 			    grp->il_lport, &grp->il_dependladdr,
 			    grp->il_inpsiz * 2);
 			/*
@@ -1919,6 +2074,7 @@ again:
 		inp_localgroup_destroy(grp);
 
 		grp = grp_alloc;
+		grp->il_jailed = isjailed;
 		grp_alloc = NULL;
 	} else {
 		/*
@@ -2115,27 +2271,7 @@ in_pcbremwildcardhash(struct inpcb *inp)
 void
 in_pcbremlists(struct inpcb *inp)
 {
-	if (inp->inp_lport) {
-		struct inpcbportinfo *portinfo;
-		struct inpcbport *phd;
-
-		/*
-		 * NOTE:
-		 * inp->inp_portinfo is _not_ necessary same as
-		 * inp->inp_pcbinfo->portinfo.
-		 */
-		portinfo = inp->inp_portinfo;
-		GET_PORT_TOKEN(portinfo);
-
-		phd = inp->inp_phd;
-		LIST_REMOVE(inp, inp_portlist);
-		if (LIST_FIRST(&phd->phd_pcblist) == NULL) {
-			LIST_REMOVE(phd, phd_hash);
-			kfree(phd, M_PCB);
-		}
-
-		REL_PORT_TOKEN(portinfo);
-	}
+	in_pcbremporthash(inp);
 	if (inp->inp_flags & INP_WILDCARD) {
 		in_pcbremwildcardhash(inp);
 	} else if (inp->inp_flags & INP_CONNECTED) {
@@ -2164,7 +2300,7 @@ prison_xinpcb(struct thread *td, struct inpcb *inp)
 }
 
 int
-in_pcblist_global(SYSCTL_HANDLER_ARGS)
+in_pcblist_range(SYSCTL_HANDLER_ARGS)
 {
 	struct inpcbinfo *pcbinfo_arr = arg1;
 	int pcbinfo_arrlen = arg2;
@@ -2172,7 +2308,7 @@ in_pcblist_global(SYSCTL_HANDLER_ARGS)
 	int cpu, origcpu;
 	int error, n;
 
-	KASSERT(pcbinfo_arrlen <= ncpus && pcbinfo_arrlen >= 1,
+	KASSERT(pcbinfo_arrlen <= netisr_ncpus && pcbinfo_arrlen >= 1,
 	    ("invalid pcbinfo count %d", pcbinfo_arrlen));
 
 	/*
@@ -2253,9 +2389,10 @@ in_pcblist_global(SYSCTL_HANDLER_ARGS)
 }
 
 int
-in_pcblist_global_ncpus2(SYSCTL_HANDLER_ARGS)
+in_pcblist_ncpus(SYSCTL_HANDLER_ARGS)
 {
-	return in_pcblist_global(oidp, arg1, ncpus2, req);
+
+	return (in_pcblist_range(oidp, arg1, netisr_ncpus, req));
 }
 
 void
@@ -2277,23 +2414,13 @@ in_savefaddr(struct socket *so, const struct sockaddr *faddr)
 
 void
 in_pcbportinfo_init(struct inpcbportinfo *portinfo, int hashsize,
-    boolean_t shared, u_short offset)
+    u_short offset)
 {
 	memset(portinfo, 0, sizeof(*portinfo));
 
 	portinfo->offset = offset;
-	portinfo->lastport = offset;
-	portinfo->lastlow = offset;
-	portinfo->lasthi = offset;
-
-	portinfo->porthashbase = hashinit(hashsize, M_PCB,
-	    &portinfo->porthashmask);
-
-	if (shared) {
-		portinfo->porttoken = kmalloc(sizeof(struct lwkt_token),
-		    M_PCB, M_WAITOK);
-		lwkt_token_init(portinfo->porttoken, "porttoken");
-	}
+	portinfo->porthashbase = phashinit(hashsize, M_PCB,
+	    &portinfo->porthashcnt);
 }
 
 void
@@ -2307,12 +2434,12 @@ in_pcbportrange(u_short *hi0, u_short *lo0, u_short ofs, u_short step)
 	hi = *hi0;
 	lo = *lo0;
 
-	hi = rounddown2(hi, step);
+	hi = rounddown(hi, step);
 	hi += ofs;
 	if (hi > (int)*hi0)
 		hi -= step;
 
-	lo = roundup2(lo, step);
+	lo = roundup(lo, step);
 	lo -= (step - ofs);
 	if (lo < (int)*lo0)
 		lo += step;
@@ -2326,12 +2453,13 @@ in_pcbglobalinit(void)
 {
 	int cpu;
 
-	in_pcbmarkers = kmalloc(ncpus * sizeof(struct inpcb), M_PCB,
+	in_pcbmarkers = kmalloc(netisr_ncpus * sizeof(struct inpcb), M_PCB,
 	    M_WAITOK | M_ZERO);
-	in_pcbcontainer_markers = kmalloc(ncpus * sizeof(struct inpcontainer),
-	    M_PCB, M_WAITOK | M_ZERO);
+	in_pcbcontainer_markers =
+	    kmalloc(netisr_ncpus * sizeof(struct inpcontainer), M_PCB,
+	    M_WAITOK | M_ZERO);
 
-	for (cpu = 0; cpu < ncpus; ++cpu) {
+	for (cpu = 0; cpu < netisr_ncpus; ++cpu) {
 		struct inpcontainer *ic = &in_pcbcontainer_markers[cpu];
 		struct inpcb *marker = &in_pcbmarkers[cpu];
 
@@ -2341,21 +2469,19 @@ in_pcbglobalinit(void)
 }
 
 struct inpcb *
-in_pcbmarker(int cpuid)
+in_pcbmarker(void)
 {
-	KASSERT(cpuid >= 0 && cpuid < ncpus, ("invalid cpuid %d", cpuid));
-	KASSERT(curthread->td_type == TD_TYPE_NETISR, ("not in netisr"));
 
-	return &in_pcbmarkers[cpuid];
+	ASSERT_NETISR_NCPUS(mycpuid);
+	return &in_pcbmarkers[mycpuid];
 }
 
 struct inpcontainer *
-in_pcbcontainer_marker(int cpuid)
+in_pcbcontainer_marker(void)
 {
-	KASSERT(cpuid >= 0 && cpuid < ncpus, ("invalid cpuid %d", cpuid));
-	KASSERT(curthread->td_type == TD_TYPE_NETISR, ("not in netisr"));
 
-	return &in_pcbcontainer_markers[cpuid];
+	ASSERT_NETISR_NCPUS(mycpuid);
+	return &in_pcbcontainer_markers[mycpuid];
 }
 
 void

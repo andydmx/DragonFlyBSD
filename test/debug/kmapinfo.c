@@ -1,7 +1,7 @@
 /*
  * KMAPINFO.C
  *
- * cc -I/usr/src/sys kmapinfo.c -o /usr/local/bin/kmapinfo -lkvm
+ * cc -I/usr/src/sys kmapinfo.c -o ~/bin/kmapinfo -lkvm
  *
  * Dump the kernel_map
  *
@@ -49,7 +49,6 @@
 #include <vm/vm.h>
 #include <vm/vm_page.h>
 #include <vm/vm_kern.h>
-#include <vm/vm_page.h>
 #include <vm/vm_object.h>
 #include <vm/vm_map.h>
 #include <vm/swap_pager.h>
@@ -73,9 +72,13 @@ int verboseopt;
 struct vm_map kmap;
 vm_offset_t total_empty;
 vm_offset_t total_used;
+vm_offset_t total_real;
+vm_offset_t total_used_byid[VM_SUBSYS_LIMIT];
 
+static const char *formatnum(int64_t value);
+static const char *entryid(vm_subsys_t id, int *realmemp);
 static void kkread(kvm_t *kd, u_long addr, void *buf, size_t nbytes);
-static void mapscan(kvm_t *kd, vm_map_entry_t entry,
+static void mapscan(kvm_t *kd, vm_map_entry_t kptr, vm_map_entry_t ken,
 		    vm_offset_t *lastp);
 
 int
@@ -83,16 +86,12 @@ main(int ac, char **av)
 {
     const char *corefile = NULL;
     const char *sysfile = NULL;
-    vm_page_t mptr;
-    struct vm_page m;
-    struct vm_object obj;
     kvm_t *kd;
     int ch;
-    int hv;
     int i;
-    const char *qstr;
-    const char *ostr;
     vm_offset_t last;
+    struct vm_map_entry entry;
+    struct vm_map_entry *kptr;
 
     while ((ch = getopt(ac, av, "M:N:dv")) != -1) {
 	switch(ch) {
@@ -125,49 +124,208 @@ main(int ac, char **av)
 	exit(1);
     }
     kkread(kd, Nl[0].n_value, &kmap, sizeof(kmap));
-    last = kmap.header.start;
-    mapscan(kd, kmap.rb_root.rbh_root, &last);
+    last = kmap.min_addr;
 
-    printf("%4ldM 0x%016jx %08lx-%08lx (%6ldK) EMPTY\n",
+    kptr = kvm_vm_map_entry_first(kd, &kmap, &entry);
+    while (kptr) {
+	mapscan(kd, kptr, &entry, &last);
+	kptr = kvm_vm_map_entry_next(kd, kptr, &entry);
+    }
+
+    printf("%4ldM 0x%016jx %08lx-%08lx (%6s) EMPTY\n",
 	total_used / 1024 / 1024,
 	(intmax_t)NULL,
-	last, kmap.header.end,
-	(kmap.header.end - last) / 1024);
-    total_empty += kmap.header.end - last;
+	last, kmap.max_addr,
+	formatnum(kmap.max_addr - last));
+    total_empty += kmap.max_addr - last;
 
     printf("-----------------------------------------------\n");
-    printf("Total empty space: %7ldK\n", total_empty / 1024);
-    printf("Total used  space: %7ldK\n", total_used / 1024);
+    for (i = 0; i < VM_SUBSYS_LIMIT; ++i) {
+	int realmem;
+	const char *id = entryid(i, &realmem);
+
+	printf("Total-id: %9s %s%s\n",
+		id,
+		formatnum(total_used_byid[i]),
+		(realmem ? " (real memory)" : ""));
+    }
+
+    printf("-----------------------------------------------\n");
+    printf("Total empty space: %s\n", formatnum(total_empty));
+    printf("Total used  space: %s\n", formatnum(total_used));
+    printf("Total real  space: %s\n", formatnum(total_real));
+}
+
+static const char *
+formatnum(int64_t value)
+{
+	static char buf[64];
+	const char *neg;
+	const char *suffix;
+	int64_t div = 1;
+
+	if (value < 0) {
+		value = -value;
+		neg = "-";
+	} else {
+		neg = "";
+	}
+	if (value < 100000) {
+		div = 1;
+		suffix = "";
+	} else if (value < 1 * 1024 * 1024) {
+		div = 1024;
+		suffix = "K";
+	} else if (value < 1024 * 1024 * 1024) {
+		div = 1024 * 1024;
+		suffix = "M";
+	} else if (value < 1024LL * 1024 * 1024 * 1024) {
+		div = 1024 * 1024 * 1024;
+		suffix = "G";
+	} else {
+		div = 1024LL * 1024 * 1024 * 1024;
+		suffix = "T";
+	}
+	if (value == 0) {
+		snprintf(buf, sizeof(buf), "");
+	} else if (div == 1) {
+		snprintf(buf, sizeof(buf), "%s%7.0f%s",
+			 neg,
+			 (double)value / (double)div,
+			 suffix);
+	} else {
+		snprintf(buf, sizeof(buf), "%s%6.2f%s",
+			 neg,
+			 (double)value / (double)div,
+			 suffix);
+	}
+	return buf;
 }
 
 static void
-mapscan(kvm_t *kd, vm_map_entry_t entryp, vm_offset_t *lastp)
+mapscan(kvm_t *kd, vm_map_entry_t kptr, vm_map_entry_t ken, vm_offset_t *lastp)
 {
-    struct vm_map_entry entry;
+    int realmem;
 
-    if (entryp == NULL)
-	return;
-    kkread(kd, (u_long)entryp, &entry, sizeof(entry));
-    mapscan(kd, entry.rb_entry.rbe_left, lastp);
-    if (*lastp != entry.start) {
-	    printf("%4ldM %p %08lx-%08lx (%6ldK) EMPTY\n",
+    if (*lastp != ken->ba.start) {
+	    printf("%4ldM %p %08lx-%08lx (%s) EMPTY\n",
 		total_used / 1024 / 1024,
-		entryp,
-		*lastp, entry.start,
-		(entry.start - *lastp) / 1024);
-	    total_empty += entry.start - *lastp;
+		kptr,
+		*lastp, ken->ba.start,
+		formatnum(ken->ba.start - *lastp));
+	    total_empty += ken->ba.start - *lastp;
     }
-    printf("%4ldM %p %08lx-%08lx (%6ldK) type=%d object=%p\n",
+    printf("%4ldM %p %08lx-%08lx (%6ldK) id=%-8s object=%p\n",
 	total_used / 1024 / 1024,
-	entryp,
-	entry.start, entry.end,
-	(entry.end - entry.start) / 1024,
-	entry.maptype,
-	entry.object);
-    total_used += entry.end - entry.start;
-    *lastp = entry.end;
-    mapscan(kd, entry.rb_entry.rbe_right, lastp);
+	kptr,
+	ken->ba.start, ken->ba.end,
+	(ken->ba.end - ken->ba.start) / 1024,
+	entryid(ken->id, &realmem),
+	ken->ba.map_object);
+    total_used += ken->ba.end - ken->ba.start;
+
+    if (ken->id < VM_SUBSYS_LIMIT)
+	total_used_byid[ken->id] += ken->ba.end - ken->ba.start;
+    else
+	total_used_byid[0] += ken->ba.end - ken->ba.start;
+
+    if (realmem)
+	total_real += ken->ba.end - ken->ba.start;
+
+    *lastp = ken->ba.end;
 }
+
+static
+const char *
+entryid(vm_subsys_t id, int *realmemp)
+{
+	static char buf[32];
+	int dummy = 0;
+	int *realmem = (realmemp ? realmemp : &dummy);
+
+	*realmem = 0;
+
+	switch(id) {
+	case VM_SUBSYS_UNKNOWN:
+		return("UNKNOWN");
+	case VM_SUBSYS_KMALLOC:
+		*realmem = 1;
+		return("KMALLOC");
+	case VM_SUBSYS_STACK:
+		*realmem = 1;
+		return("STACK");
+	case VM_SUBSYS_IMGACT:
+		return("IMGACT");
+	case VM_SUBSYS_EFI:
+		return("EFI");
+	case VM_SUBSYS_RESERVED:
+		*realmem = 1;
+		return("BOOT+KERN");
+	case VM_SUBSYS_INIT:
+		return("INIT");
+	case VM_SUBSYS_PIPE:
+		return("PIPE");
+	case VM_SUBSYS_PROC:
+		return("PROC");
+	case VM_SUBSYS_SHMEM:
+		return("SHMEM");
+	case VM_SUBSYS_SYSMAP:
+		return("SYSMAP");
+	case VM_SUBSYS_MMAP:
+		return("MMAP");
+	case VM_SUBSYS_BRK:
+		return("BRK");
+	case VM_SUBSYS_BOGUS:
+		return("BOGUS");
+	case VM_SUBSYS_BUF:
+		*realmem = 1;
+		return("BUF");
+	case VM_SUBSYS_BUFDATA:
+		return("BUFDATA");
+	case VM_SUBSYS_GD:
+		*realmem = 1;
+		return("GD");
+	case VM_SUBSYS_IPIQ:
+		*realmem = 1;
+		return("IPIQ");
+	case VM_SUBSYS_PVENTRY:
+		return("PVENTRY");
+	case VM_SUBSYS_PML4:
+		*realmem = 1;
+		return("PML4");
+	case VM_SUBSYS_MAPDEV:
+		return("MAPDEV");
+	case VM_SUBSYS_ZALLOC:
+		return("ZALLOC");
+
+	case VM_SUBSYS_DM:
+		return("DM");
+	case VM_SUBSYS_CONTIG:
+		return("CONTIG");
+	case VM_SUBSYS_DRM:
+		return("DRM");
+	case VM_SUBSYS_DRM_GEM:
+		return("DRM_GEM");
+	case VM_SUBSYS_DRM_SCAT:
+		return("DRM_SCAT");
+	case VM_SUBSYS_DRM_VMAP:
+		*realmem = 1;
+		return("DRM_VMAP");
+	case VM_SUBSYS_DRM_TTM:
+		return("DRM_TTM");
+	case VM_SUBSYS_HAMMER:
+		return("HAMMER");
+	case VM_SUBSYS_VMPGHASH:
+		*realmem = 1;
+		return("VMPGHASH");
+	default:
+		break;
+	}
+	snprintf(buf, sizeof(buf), "%d", (int)id);
+
+	return buf;
+}
+
 
 static void
 kkread(kvm_t *kd, u_long addr, void *buf, size_t nbytes)

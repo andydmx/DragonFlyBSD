@@ -37,6 +37,7 @@
 
 #include <sys/param.h>
 #include <sys/systm.h>
+#include <sys/uio.h>
 #include <sys/fcntl.h>
 #include <sys/file.h>
 #include <sys/stat.h>
@@ -52,17 +53,16 @@
 #include <sys/sysctl.h>
 #include <sys/syslog.h>
 
-#include <sys/thread2.h>
 #include <sys/mplock2.h>
 
 static int vn_closefile (struct file *fp);
 static int vn_ioctl (struct file *fp, u_long com, caddr_t data,
 		struct ucred *cred, struct sysmsg *msg);
-static int vn_read (struct file *fp, struct uio *uio, 
+static int vn_read (struct file *fp, struct uio *uio,
 		struct ucred *cred, int flags);
 static int vn_kqfilter (struct file *fp, struct knote *kn);
 static int vn_statfile (struct file *fp, struct stat *sb, struct ucred *cred);
-static int vn_write (struct file *fp, struct uio *uio, 
+static int vn_write (struct file *fp, struct uio *uio,
 		struct ucred *cred, int flags);
 
 struct fileops vnode_fileops = {
@@ -102,6 +102,7 @@ vn_open(struct nlookupdata *nd, struct file *fp, int fmode, int cmode)
 	struct vattr vat;
 	struct vattr *vap = &vat;
 	int error;
+	int vpexcl;
 	u_int flags;
 	uint64_t osize;
 	struct mount *mp;
@@ -139,15 +140,21 @@ vn_open(struct nlookupdata *nd, struct file *fp, int fmode, int cmode)
 		 *
 		 * Setting NLC_CREATE causes a negative hit to store
 		 * the negative hit ncp and not return an error.  Then
-		 * nc_error or nc_vp may be checked to see if the ncp 
+		 * nc_error or nc_vp may be checked to see if the ncp
 		 * represents a negative hit.  NLC_CREATE also requires
 		 * write permission on the governing directory or EPERM
 		 * is returned.
+		 * If the file exists but is missing write permission,
+		 * nlookup() returns EACCES. This has to be handled specially
+		 * when combined with O_EXCL.
 		 */
 		nd->nl_flags |= NLC_CREATE;
 		nd->nl_flags |= NLC_REFDVP;
 		bwillinode(1);
 		error = nlookup(nd);
+		if (error == EACCES && nd->nl_nch.ncp->nc_vp != NULL &&
+			(fmode & O_EXCL))
+			error = EEXIST;
 	} else {
 		/*
 		 * NORMAL OPEN FILE CASE
@@ -161,15 +168,28 @@ vn_open(struct nlookupdata *nd, struct file *fp, int fmode, int cmode)
 	/*
 	 * split case to allow us to re-resolve and retry the ncp in case
 	 * we get ESTALE.
+	 *
+	 * (error is 0 on entry / retry)
 	 */
 again:
+	/*
+	 * Checks for (likely) filesystem-modifying cases and allows
+	 * the filesystem to stall the front-end.
+	 */
+	if ((fmode & (FWRITE | O_TRUNC)) ||
+	    ((fmode & O_CREAT) && nd->nl_nch.ncp->nc_vp == NULL)) {
+		error = ncp_writechk(&nd->nl_nch);
+		if (error)
+			return error;
+	}
+
+	vpexcl = 1;
 	if (fmode & O_CREAT) {
 		if (nd->nl_nch.ncp->nc_vp == NULL) {
-			if ((error = ncp_writechk(&nd->nl_nch)) != 0)
-				return (error);
 			VATTR_NULL(vap);
 			vap->va_type = VREG;
 			vap->va_mode = cmode;
+			vap->va_fuseflags = fmode; /* FUSE */
 			if (fmode & O_EXCL)
 				vap->va_vaflags |= VA_EXCLUSIVE;
 			error = VOP_NCREATE(&nd->nl_nch, nd->nl_dvp, &vp,
@@ -182,7 +202,7 @@ again:
 			if (fmode & O_EXCL) {
 				error = EEXIST;
 			} else {
-				error = cache_vget(&nd->nl_nch, cred, 
+				error = cache_vget(&nd->nl_nch, cred,
 						    LK_EXCLUSIVE, &vp);
 			}
 			if (error)
@@ -190,8 +210,22 @@ again:
 			fmode &= ~O_CREAT;
 		}
 	} else {
-		if (nd->nl_flags & NLC_SHAREDLOCK) {
+		/*
+		 * In most other cases a shared lock on the vnode is
+		 * sufficient.  However, the O_RDWR case needs an
+		 * exclusive lock if the vnode is executable.  The
+		 * NLC_EXCLLOCK_IFEXEC and NCF_NOTX flags help resolve
+		 * this.
+		 *
+		 * NOTE: If NCF_NOTX is not set, we do not know the
+		 *	 the state of the 'x' bits and have to get
+		 *	 an exclusive lock for the EXCLLOCK_IFEXEC case.
+		 */
+		if ((nd->nl_flags & NLC_SHAREDLOCK) &&
+		    ((nd->nl_flags & NLC_EXCLLOCK_IFEXEC) == 0 ||
+		     nd->nl_nch.ncp->nc_flag & NCF_NOTX)) {
 			error = cache_vget(&nd->nl_nch, cred, LK_SHARED, &vp);
+			vpexcl = 0;
 		} else {
 			error = cache_vget(&nd->nl_nch, cred,
 					   LK_EXCLUSIVE, &vp);
@@ -222,7 +256,12 @@ again:
 				error = EISDIR;
 				goto bad;
 			}
-			error = vn_writechk(vp, &nd->nl_nch);
+
+			/*
+			 * Additional checks on vnode (does not substitute
+			 * for ncp_writechk()).
+			 */
+			error = vn_writechk(vp);
 			if (error) {
 				/*
 				 * Special stale handling, re-resolve the
@@ -231,7 +270,7 @@ again:
 				if (error == ESTALE) {
 					vput(vp);
 					vp = NULL;
-					if (nd->nl_flags & NLC_SHAREDLOCK) {
+					if (vpexcl == 0) {
 						cache_unlock(&nd->nl_nch);
 						cache_lock(&nd->nl_nch);
 					}
@@ -251,7 +290,7 @@ again:
 		osize = vp->v_filesize;
 		VATTR_NULL(vap);
 		vap->va_size = 0;
-		error = VOP_SETATTR(vp, vap, cred);
+		error = VOP_SETATTR_FP(vp, vap, cred, fp);
 		if (error)
 			goto bad;
 		error = VOP_GETATTR(vp, vap);
@@ -278,7 +317,7 @@ again:
 
 	/*
 	 * Setup the fp so VOP_OPEN can override it.  No descriptor has been
-	 * associated with the fp yet so we own it clean.  
+	 * associated with the fp yet so we own it clean.
 	 *
 	 * f_nchandle inherits nl_nch.  This used to be necessary only for
 	 * directories but now we do it unconditionally so f*() ops
@@ -366,10 +405,15 @@ vn_opendisk(const char *devname, int fmode, struct vnode **vpp)
 }
 
 /*
- * Check for write permissions on the specified vnode.  nch may be NULL.
+ * Checks for special conditions on the vnode which might prevent writing
+ * after the vnode has (likely) been locked.  The vnode might or might not
+ * be locked as of this call, but will be at least referenced.
+ *
+ * Also re-checks the mount RDONLY flag that ncp_writechk() checked prior
+ * to the vnode being locked.
  */
 int
-vn_writechk(struct vnode *vp, struct nchandle *nch)
+vn_writechk(struct vnode *vp)
 {
 	/*
 	 * If there's shared text associated with
@@ -378,31 +422,30 @@ vn_writechk(struct vnode *vp, struct nchandle *nch)
 	 */
 	if (vp->v_flag & VTEXT)
 		return (ETXTBSY);
-
-	/*
-	 * If the vnode represents a regular file, check the mount
-	 * point via the nch.  This may be a different mount point
-	 * then the one embedded in the vnode (e.g. nullfs).
-	 *
-	 * We can still write to non-regular files (e.g. devices)
-	 * via read-only mounts.
-	 */
-	if (nch && nch->ncp && vp->v_type == VREG)
-		return (ncp_writechk(nch));
-	return (0);
+	if (vp->v_mount && (vp->v_mount->mnt_flag & MNT_RDONLY))
+		return (EROFS);
+	return 0;
 }
 
 /*
- * Check whether the underlying mount is read-only.  The mount point 
+ * Check whether the underlying mount is read-only.  The mount point
  * referenced by the namecache may be different from the mount point
  * used by the underlying vnode in the case of NULLFS, so a separate
  * check is needed.
+ *
+ * Must be called PRIOR to any vnodes being locked.
  */
 int
 ncp_writechk(struct nchandle *nch)
 {
-	if (nch->mount && (nch->mount->mnt_flag & MNT_RDONLY))
-		return (EROFS);
+	struct mount *mp;
+
+	if ((mp = nch->mount) != NULL) {
+		if (mp->mnt_flag & MNT_RDONLY)
+			return (EROFS);
+		if (mp->mnt_op->vfs_modifying != vfs_stdmodifying)
+			VFS_MODIFYING(mp);
+	}
 	return(0);
 }
 
@@ -443,7 +486,7 @@ sequential_heuristic(struct uio *uio, struct file *fp)
 	    uio->uio_offset == fp->f_nextoff) {
 		int tmpseq = fp->f_seqcount;
 
-		tmpseq += (uio->uio_resid + BKVASIZE - 1) / BKVASIZE;
+		tmpseq += (uio->uio_resid + MAXBSIZE - 1) / MAXBSIZE;
 		if (tmpseq > IO_SEQMAX)
 			tmpseq = IO_SEQMAX;
 		fp->f_seqcount = tmpseq;
@@ -467,7 +510,7 @@ sequential_heuristic(struct uio *uio, struct file *fp)
  * set - set and unlock the f_offset field.
  *
  * These routines serve the dual purpose of serializing access to the
- * f_offset field (at least on i386) and guaranteeing operational integrity
+ * f_offset field (at least on x86) and guaranteeing operational integrity
  * when multiple read()ers and write()ers are present on the same fp.
  *
  * MPSAFE
@@ -554,7 +597,7 @@ vn_poll_fpf_offset(struct file *fp)
  */
 int
 vn_rdwr(enum uio_rw rw, struct vnode *vp, caddr_t base, int len,
-	off_t offset, enum uio_seg segflg, int ioflg, 
+	off_t offset, enum uio_seg segflg, int ioflg,
 	struct ucred *cred, int *aresid)
 {
 	struct uio auio;
@@ -590,7 +633,7 @@ vn_rdwr(enum uio_rw rw, struct vnode *vp, caddr_t base, int len,
 /*
  * Package up an I/O request on a vnode into a uio and do it.  The I/O
  * request is split up into smaller chunks and we try to avoid saturating
- * the buffer cache while potentially holding a vnode locked, so we 
+ * the buffer cache while potentially holding a vnode locked, so we
  * check bwillwrite() before calling vn_rdwr().  We also call lwkt_user_yield()
  * to give other processes a chance to lock the vnode (either other processes
  * core'ing the same binary, or unrelated processes scanning the directory).
@@ -617,7 +660,7 @@ vn_rdwr_inchunks(enum uio_rw rw, struct vnode *vp, caddr_t base, int len,
 
 		if (chunk > len)
 			chunk = len;
-		if (vp->v_type == VREG) {
+		if (vp->v_type == VREG && (ioflg & IO_RECURSE) == 0) {
 			switch(rw) {
 			case UIO_READ:
 				bwillread(chunk);
@@ -665,11 +708,7 @@ vn_read(struct file *fp, struct uio *uio, struct ucred *cred, int flags)
 	} else if (fp->f_flag & FNONBLOCK) {
 		ioflag |= IO_NDELAY;
 	}
-	if (flags & O_FBUFFERED) {
-		/* ioflag &= ~IO_DIRECT; */
-	} else if (flags & O_FUNBUFFERED) {
-		ioflag |= IO_DIRECT;
-	} else if (fp->f_flag & O_DIRECT) {
+	if (fp->f_flag & O_DIRECT) {
 		ioflag |= IO_DIRECT;
 	}
 	if ((flags & O_FOFFSET) == 0 && (vp->v_flag & VNOTSEEKABLE) == 0)
@@ -677,7 +716,7 @@ vn_read(struct file *fp, struct uio *uio, struct ucred *cred, int flags)
 	vn_lock(vp, LK_SHARED | LK_RETRY);
 	ioflag |= sequential_heuristic(uio, fp);
 
-	error = VOP_READ(vp, uio, ioflag, cred);
+	error = VOP_READ_FP(vp, uio, ioflag, cred, fp);
 	fp->f_nextoff = uio->uio_offset;
 	vn_unlock(vp);
 	if ((flags & O_FOFFSET) == 0 && (vp->v_flag & VNOTSEEKABLE) == 0)
@@ -711,11 +750,7 @@ vn_write(struct file *fp, struct uio *uio, struct ucred *cred, int flags)
 	} else if (fp->f_flag & FNONBLOCK) {
 		ioflag |= IO_NDELAY;
 	}
-	if (flags & O_FBUFFERED) {
-		/* ioflag &= ~IO_DIRECT; */
-	} else if (flags & O_FUNBUFFERED) {
-		ioflag |= IO_DIRECT;
-	} else if (fp->f_flag & O_DIRECT) {
+	if (fp->f_flag & O_DIRECT) {
 		ioflag |= IO_DIRECT;
 	}
 	if (flags & O_FASYNCWRITE) {
@@ -730,9 +765,11 @@ vn_write(struct file *fp, struct uio *uio, struct ucred *cred, int flags)
 		ioflag |= IO_SYNC;
 	if ((flags & O_FOFFSET) == 0)
 		uio->uio_offset = vn_get_fpf_offset(fp);
+	if (vp->v_mount)
+		VFS_MODIFYING(vp->v_mount);
 	vn_lock(vp, LK_EXCLUSIVE | LK_RETRY);
 	ioflag |= sequential_heuristic(uio, fp);
-	error = VOP_WRITE(vp, uio, ioflag, cred);
+	error = VOP_WRITE_FP(vp, uio, ioflag, cred, fp);
 	fp->f_nextoff = uio->uio_offset;
 	vn_unlock(vp);
 	if ((flags & O_FOFFSET) == 0)
@@ -766,6 +803,9 @@ vn_stat(struct vnode *vp, struct stat *sb, struct ucred *cred)
 	u_short mode;
 	cdev_t dev;
 
+	/*
+	 * vp already has a ref and is validated, can call unlocked.
+	 */
 	vap = &vattr;
 	error = VOP_GETATTR(vp, vap);
 	if (error)
@@ -775,7 +815,6 @@ vn_stat(struct vnode *vp, struct stat *sb, struct ucred *cred)
 	 * Zero the spare stat fields
 	 */
 	sb->st_lspare = 0;
-	sb->st_qspare1 = 0;
 	sb->st_qspare2 = 0;
 
 	/*
@@ -827,7 +866,7 @@ vn_stat(struct vnode *vp, struct stat *sb, struct ucred *cred)
 		sb->st_nlink = vap->va_nlink;
 	sb->st_uid = vap->va_uid;
 	sb->st_gid = vap->va_gid;
-	sb->st_rdev = dev2udev(vp->v_rdev);
+	sb->st_rdev = devid_from_dev(vp->v_rdev);
 	sb->st_size = vap->va_size;
 	sb->st_atimespec = vap->va_atime;
 	sb->st_mtimespec = vap->va_mtime;
@@ -857,8 +896,8 @@ vn_stat(struct vnode *vp, struct stat *sb, struct ucred *cred)
 	}
 
         /*
-	 * According to www.opengroup.org, the meaning of st_blksize is 
-	 *   "a filesystem-specific preferred I/O block size for this 
+	 * According to www.opengroup.org, the meaning of st_blksize is
+	 *   "a filesystem-specific preferred I/O block size for this
 	 *    object.  In some filesystem types, this may vary from file
 	 *    to file"
 	 * Default to PAGE_SIZE after much discussion.
@@ -882,7 +921,7 @@ vn_stat(struct vnode *vp, struct stat *sb, struct ucred *cred)
 	} else {
 		sb->st_blksize = PAGE_SIZE;
 	}
-	
+
 	sb->st_flags = vap->va_flags;
 
 	error = priv_check_cred(cred, PRIV_VFS_GENERATION, 0);
@@ -892,6 +931,13 @@ vn_stat(struct vnode *vp, struct stat *sb, struct ucred *cred)
 		sb->st_gen = (u_int32_t)vap->va_gen;
 
 	sb->st_blocks = vap->va_bytes / S_BLKSIZE;
+
+	/*
+	 * This is for ABI compatibility <= 5.7 (for ABI change made in
+	 * 5.7 master).
+	 */
+	sb->__old_st_blksize = sb->st_blksize;
+
 	return (0);
 }
 
@@ -991,23 +1037,12 @@ vn_ioctl(struct file *fp, u_long com, caddr_t data, struct ucred *ucred,
  * regardless of whether you pass in LK_FAILRECLAIM
  */
 int
-#ifndef	DEBUG_LOCKS
 vn_lock(struct vnode *vp, int flags)
-#else
-debug_vn_lock(struct vnode *vp, int flags, const char *filename, int line)
-#endif
 {
 	int error;
-	
+
 	do {
-#ifdef	DEBUG_LOCKS
-		vp->filename = filename;
-		vp->line = line;
-		error = debuglockmgr(&vp->v_lock, flags,
-				     "vn_lock", filename, line);
-#else
 		error = lockmgr(&vp->v_lock, flags);
-#endif
 		if (error == 0)
 			break;
 	} while (flags & LK_RETRY);
@@ -1024,6 +1059,20 @@ debug_vn_lock(struct vnode *vp, int flags, const char *filename, int line)
 		}
 	}
 	return (error);
+}
+
+int
+vn_relock(struct vnode *vp, int flags)
+{
+	int error;
+
+	do {
+		error = lockmgr(&vp->v_lock, flags);
+		if (error == 0)
+			break;
+	} while (flags & LK_RETRY);
+
+	return error;
 }
 
 #ifdef DEBUG_VN_UNLOCK

@@ -23,7 +23,7 @@
  * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
  *
- * $FreeBSD: src/sys/dev/acpi_support/acpi_wmi.c,v 1.9 2011/11/22 21:28:20 marius Exp $
+ * $FreeBSD: head/sys/dev/acpi_support/acpi_wmi.c 241537 2012-10-14 09:31:11Z avg $
  */
 
 /*
@@ -74,6 +74,7 @@ struct acpi_wmi_softc {
 	struct sbuf	wmistat_sbuf;	/* sbuf for /dev/wmistat output */
 	pid_t		wmistat_open_pid; /* pid operating on /dev/wmistat */
 	int		wmistat_bufptr;	/* /dev/wmistat ptr to buffer position */
+	TAILQ_HEAD(wmi_info_list_head, wmi_info) wmi_info_list;
 };
 
 /*
@@ -105,8 +106,6 @@ struct wmi_info {
 	void			*event_handler_user_data; /* ev handler cookie  */
 };
 
-TAILQ_HEAD(wmi_info_list_head, wmi_info)
-    wmi_info_list = TAILQ_HEAD_INITIALIZER(wmi_info_list);
 
 ACPI_SERIAL_DECL(acpi_wmi, "ACPI-WMI Mapping");
 
@@ -144,13 +143,13 @@ static ACPI_STATUS	acpi_wmi_ec_handler(UINT32 function,
 			    UINT64 *value, void *context,
 			    void *region_context);
 /* helpers */
-static ACPI_STATUS	acpi_wmi_read_wdg_blocks(ACPI_HANDLE h);
+static ACPI_STATUS	acpi_wmi_read_wdg_blocks(struct acpi_wmi_softc *sc, ACPI_HANDLE h);
 static ACPI_STATUS	acpi_wmi_toggle_we_event_generation(device_t dev,
 			    struct wmi_info *winfo,
 			    enum event_generation_state state);
 static int		acpi_wmi_guid_string_to_guid(const UINT8 *guid_string,
 			    UINT8 *guid);
-static struct wmi_info* acpi_wmi_lookup_wmi_info_by_guid_string(
+static struct wmi_info* acpi_wmi_lookup_wmi_info_by_guid_string(struct acpi_wmi_softc *sc,
 			    const char *guid_string);
 
 static d_open_t acpi_wmi_wmistat_open;
@@ -159,7 +158,7 @@ static d_read_t acpi_wmi_wmistat_read;
 
 /* handler /dev/wmistat device */
 static struct dev_ops wmistat_ops = {
-	{ .name = "wmistat" },
+	{ "wmistat", 0, D_MPSAFE },
 	.d_open = acpi_wmi_wmistat_open,
 	.d_close = acpi_wmi_wmistat_close,
 	.d_read = acpi_wmi_wmistat_read,
@@ -230,6 +229,7 @@ acpi_wmi_attach(device_t dev)
 	int ret;
 	ACPI_STATUS status;
 
+	ACPI_SERIAL_INIT(acpi_wmi);
 	ACPI_FUNCTION_TRACE((char *)(uintptr_t)__func__);
 	sc = device_get_softc(dev);
 	ret = ENXIO;
@@ -237,7 +237,7 @@ acpi_wmi_attach(device_t dev)
 	ACPI_SERIAL_BEGIN(acpi_wmi);
 	sc->wmi_dev = dev;
 	sc->wmi_handle = acpi_get_handle(dev);
-	TAILQ_INIT(&wmi_info_list);
+	TAILQ_INIT(&sc->wmi_info_list);
 	/* XXX Only works with one EC, but nearly all systems only have one. */
 	if ((sc->ec_dev = devclass_get_device(devclass_find("acpi_ec"), 0))
 	    == NULL)
@@ -253,7 +253,7 @@ acpi_wmi_attach(device_t dev)
 		    AcpiFormatException(status));
 		AcpiRemoveNotifyHandler(sc->wmi_handle, ACPI_DEVICE_NOTIFY,
 		    acpi_wmi_notify_handler);
-	} else if (ACPI_FAILURE((status = acpi_wmi_read_wdg_blocks(
+	} else if (ACPI_FAILURE((status = acpi_wmi_read_wdg_blocks(sc,
 		    sc->wmi_handle)))) {
 		device_printf(sc->wmi_dev, "couldn't parse _WDG - %s\n",
 		    AcpiFormatException(status));
@@ -304,11 +304,11 @@ acpi_wmi_detach(device_t dev)
 		    acpi_wmi_notify_handler);
 		AcpiRemoveAddressSpaceHandler(sc->wmi_handle,
 		    ACPI_ADR_SPACE_EC, acpi_wmi_ec_handler);
-		TAILQ_FOREACH_MUTABLE(winfo, &wmi_info_list, wmi_list, tmp) {
+		TAILQ_FOREACH_MUTABLE(winfo, &sc->wmi_info_list, wmi_list, tmp) {
 			if (winfo->event_handler)
 				acpi_wmi_toggle_we_event_generation(dev,
 				    winfo, EVENT_GENERATION_OFF);
-			TAILQ_REMOVE(&wmi_info_list, winfo, wmi_list);
+			TAILQ_REMOVE(&sc->wmi_info_list, winfo, wmi_list);
 			kfree(winfo, M_ACPIWMI);
 		}
 		if (sc->wmistat_bufptr != -1) {
@@ -333,12 +333,14 @@ acpi_wmi_detach(device_t dev)
 static int
 acpi_wmi_provides_guid_string_method(device_t dev, const char *guid_string)
 {
+	struct acpi_wmi_softc *sc;
 	struct wmi_info *winfo;
 	int ret;
 
+	sc = device_get_softc(dev);
 	ACPI_FUNCTION_TRACE((char *)(uintptr_t)__func__);
 	ACPI_SERIAL_BEGIN(acpi_wmi);
-	winfo = acpi_wmi_lookup_wmi_info_by_guid_string(guid_string);
+	winfo = acpi_wmi_lookup_wmi_info_by_guid_string(sc, guid_string);
 	ret = (winfo == NULL)?0:winfo->ginfo.max_instance+1;
 	ACPI_SERIAL_END(acpi_wmi);
 
@@ -364,7 +366,7 @@ acpi_wmi_evaluate_call_method(device_t dev, const char *guid_string,
 
 	sc = device_get_softc(dev);
 	ACPI_SERIAL_BEGIN(acpi_wmi);
-	if ((winfo = acpi_wmi_lookup_wmi_info_by_guid_string(guid_string))
+	if ((winfo = acpi_wmi_lookup_wmi_info_by_guid_string(sc, guid_string))
 		    == NULL)
 		status = AE_NOT_FOUND;
 	else if (!(winfo->ginfo.flags & ACPI_WMI_REGFLAG_METHOD))
@@ -406,6 +408,7 @@ static ACPI_STATUS
 acpi_wmi_install_event_handler_method(device_t dev, const char *guid_string,
     ACPI_NOTIFY_HANDLER event_handler, void *data)
 {
+	struct acpi_wmi_softc *sc = device_get_softc(dev);
 	struct wmi_info *winfo;
 	ACPI_STATUS status;
 
@@ -415,7 +418,7 @@ acpi_wmi_install_event_handler_method(device_t dev, const char *guid_string,
 	ACPI_SERIAL_BEGIN(acpi_wmi);
 	if (guid_string == NULL || event_handler == NULL)
 		status = AE_BAD_PARAMETER;
-	else if ((winfo = acpi_wmi_lookup_wmi_info_by_guid_string(guid_string))
+	else if ((winfo = acpi_wmi_lookup_wmi_info_by_guid_string(sc, guid_string))
 		    == NULL)
 		status = AE_NOT_EXIST;
 	else if (winfo->event_handler != NULL ||
@@ -437,6 +440,7 @@ acpi_wmi_install_event_handler_method(device_t dev, const char *guid_string,
 static ACPI_STATUS
 acpi_wmi_remove_event_handler_method(device_t dev, const char *guid_string)
 {
+	struct acpi_wmi_softc *sc = device_get_softc(dev);
 	struct wmi_info *winfo;
 	ACPI_STATUS status;
 
@@ -445,7 +449,7 @@ acpi_wmi_remove_event_handler_method(device_t dev, const char *guid_string)
 	status = AE_OK;
 	ACPI_SERIAL_BEGIN(acpi_wmi);
 	if (guid_string &&
-	    (winfo = acpi_wmi_lookup_wmi_info_by_guid_string(guid_string))
+	    (winfo = acpi_wmi_lookup_wmi_info_by_guid_string(sc, guid_string))
 	    != NULL && winfo->event_handler) {
 		status = acpi_wmi_toggle_we_event_generation(dev, winfo,
 			    EVENT_GENERATION_OFF);
@@ -480,7 +484,7 @@ acpi_wmi_get_event_data_method(device_t dev, UINT32 event_id, ACPI_BUFFER *out)
 	params[0].Integer.Value = event_id;
 	input.Pointer = params;
 	input.Count = 1;
-	TAILQ_FOREACH(winfo, &wmi_info_list, wmi_list) {
+	TAILQ_FOREACH(winfo, &sc->wmi_info_list, wmi_list) {
 		if ((winfo->ginfo.flags & ACPI_WMI_REGFLAG_EVENT) &&
 		    ((UINT8) winfo->ginfo.oid[0] == event_id)) {
 			status = AcpiEvaluateObject(sc->wmi_handle, "_WED",
@@ -524,7 +528,7 @@ acpi_wmi_get_block_method(device_t dev, const char *guid_string, UINT8 instance,
 	ACPI_SERIAL_BEGIN(acpi_wmi);
 	if (guid_string == NULL || out == NULL)
 		status = AE_BAD_PARAMETER;
-	else if ((winfo = acpi_wmi_lookup_wmi_info_by_guid_string(guid_string))
+	else if ((winfo = acpi_wmi_lookup_wmi_info_by_guid_string(sc, guid_string))
 		    == NULL)
 		status = AE_ERROR;
 	else if (instance > winfo->ginfo.max_instance)
@@ -588,7 +592,7 @@ acpi_wmi_set_block_method(device_t dev, const char *guid_string, UINT8 instance,
 	ACPI_SERIAL_BEGIN(acpi_wmi);
 	if (guid_string == NULL || in == NULL)
 		status = AE_BAD_DATA;
-	else if ((winfo = acpi_wmi_lookup_wmi_info_by_guid_string(guid_string))
+	else if ((winfo = acpi_wmi_lookup_wmi_info_by_guid_string(sc, guid_string))
 		    == NULL)
 		status = AE_ERROR;
 	else if (instance > winfo->ginfo.max_instance)
@@ -622,6 +626,7 @@ acpi_wmi_set_block_method(device_t dev, const char *guid_string, UINT8 instance,
 static void
 acpi_wmi_notify_handler(ACPI_HANDLE h, UINT32 notify, void *context)
 {
+	struct acpi_wmi_softc *sc = context;
 	ACPI_NOTIFY_HANDLER handler;
 	void *handler_data;
 	struct wmi_info *winfo;
@@ -631,7 +636,7 @@ acpi_wmi_notify_handler(ACPI_HANDLE h, UINT32 notify, void *context)
 	handler = NULL;
 	handler_data = NULL;
 	ACPI_SERIAL_BEGIN(acpi_wmi);
-	TAILQ_FOREACH(winfo, &wmi_info_list, wmi_list) {
+	TAILQ_FOREACH(winfo, &sc->wmi_info_list, wmi_list) {
 		if ((winfo->ginfo.flags & ACPI_WMI_REGFLAG_EVENT) &&
 				((UINT8) winfo->ginfo.oid[0] == notify)) {
 			if (winfo->event_handler) {
@@ -704,7 +709,7 @@ acpi_wmi_ec_handler(UINT32 function, ACPI_PHYSICAL_ADDRESS address,
  * into wmi_info_list.
  */
 static ACPI_STATUS
-acpi_wmi_read_wdg_blocks(ACPI_HANDLE h)
+acpi_wmi_read_wdg_blocks(struct acpi_wmi_softc *sc, ACPI_HANDLE h)
 {
 	ACPI_BUFFER out = {ACPI_ALLOCATE_BUFFER, NULL};
 	struct guid_info *ginfo;
@@ -735,7 +740,7 @@ acpi_wmi_read_wdg_blocks(ACPI_HANDLE h)
 			return (AE_NO_MEMORY);
 		}
 		winfo->ginfo = ginfo[i];
-		TAILQ_INSERT_TAIL(&wmi_info_list, winfo, wmi_list);
+		TAILQ_INSERT_TAIL(&sc->wmi_info_list, winfo, wmi_list);
 	}
 	AcpiOsFree(out.Pointer);
 	kfree(ginfo, M_ACPIWMI);
@@ -845,7 +850,7 @@ acpi_wmi_guid_string_to_guid(const UINT8 *guid_string, UINT8 *guid)
  * Return NULL if the GUID is unknown in the _WDG
  */
 static struct wmi_info*
-acpi_wmi_lookup_wmi_info_by_guid_string(const char *guid_string)
+acpi_wmi_lookup_wmi_info_by_guid_string(struct acpi_wmi_softc *sc, const char *guid_string)
 {
 	char guid[16];
 	struct wmi_info *winfo;
@@ -855,7 +860,7 @@ acpi_wmi_lookup_wmi_info_by_guid_string(const char *guid_string)
 	ACPI_SERIAL_ASSERT(acpi_wmi);
 
 	if (!acpi_wmi_guid_string_to_guid(guid_string, guid)) {
-		TAILQ_FOREACH(winfo, &wmi_info_list, wmi_list) {
+		TAILQ_FOREACH(winfo, &sc->wmi_info_list, wmi_list) {
 			if (!memcmp(winfo->ginfo.guid, guid, 16)) {
 				return (winfo);
 			}
@@ -958,7 +963,7 @@ acpi_wmi_wmistat_read(struct dev_read_args *ap)
 			sbuf_printf(&sc->wmistat_sbuf, "GUID                 "
 				    "                 INST EXPE METH STR "
 				    "EVENT OID\n");
-			TAILQ_FOREACH(winfo, &wmi_info_list, wmi_list) {
+			TAILQ_FOREACH(winfo, &sc->wmi_info_list, wmi_list) {
 				guid = (UINT8*)winfo->ginfo.guid;
 				sbuf_printf(&sc->wmistat_sbuf,
 					    "{%02X%02X%02X%02X-%02X%02X-"

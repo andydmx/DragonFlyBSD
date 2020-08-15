@@ -11,11 +11,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -61,7 +57,7 @@
  *	0xff (255) +-------------+
  *		   |             | 15 (IPIs: Xcpustop, Xspuriousint)
  *	0xf0 (240) +-------------+
- *		   |             | 14 (IPIs: Xinvltlb, Xipiq, Xtimer)
+ *		   |             | 14 (IPIs: Xinvltlb, Xipiq, Xtimer, Xsniff)
  *	0xe0 (224) +-------------+
  *		   |             | 13
  *	0xd0 (208) +-------------+
@@ -115,7 +111,10 @@
 /* TIMER rendezvous */
 #define XTIMER_OFFSET		(IDT_OFFSET_IPIG1 + 4)
 
-/* IPI group1 5 ~ 15: unused */
+/* SNIFF rendezvous */
+#define XSNIFF_OFFSET		(IDT_OFFSET_IPIG1 + 5)
+
+/* IPI group1 6 ~ 15: unused */
 
 
 /*
@@ -142,12 +141,13 @@ typedef void inthand_t(u_int cs, u_int ef, u_int esp, u_int ss);
 
 inthand_t
 	Xspuriousint,	/* handle APIC "spurious INTs" */
-	Xtimer;		/* handle LAPIC timer INT */
+	Xtimer;		/* handle per-cpu timer INT */
 
 inthand_t
 	Xinvltlb,	/* TLB shootdowns */
 	Xcpustop,	/* CPU stops & waits for another CPU to restart it */
-	Xipiq;		/* handle lwkt_send_ipiq() requests */
+	Xipiq,		/* handle lwkt_send_ipiq() requests */
+	Xsniff;		/* sniff CPU */
 
 #endif /* LOCORE */
 

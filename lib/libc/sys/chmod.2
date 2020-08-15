@@ -28,7 +28,7 @@
 .\"     @(#)chmod.2	8.1 (Berkeley) 6/4/93
 .\" $FreeBSD: src/lib/libc/sys/chmod.2,v 1.16.2.7 2001/12/14 18:34:00 ru Exp $
 .\"
-.Dd August 9, 2009
+.Dd August 3, 2016
 .Dt CHMOD 2
 .Os
 .Sh NAME
@@ -126,7 +126,7 @@ defined in
 #define S_ISUID 0004000    /* set user id on execution */
 #define S_ISGID 0002000    /* set group id on execution */
 #define S_ISVTX 0001000    /* sticky bit */
-#ifndef _POSIX_SOURCE
+#if __BSD_VISIBLE
 #define S_ISTXT 0001000
 #endif
 .Ed
@@ -150,14 +150,15 @@ permissions.
 For more details of the properties of the sticky bit, see
 .Xr sticky 8 .
 .Pp
-If mode ISUID (set UID) is set on a directory,
-and the MNT_SUIDDIR option was used in the mount of the filesystem,
+If mode ISUID (set UID) is set on a directory, and the
+.Dv MNT_SUIDDIR
+option was used in the mount of the filesystem,
 then the owner of any new files and sub-directories
 created within this directory are set
 to be the same as the owner of that directory.
 If this function is enabled, new directories will inherit
-the bit from their parents.  Execute bits are removed from
-the file, and it will not be given to root.
+the bit from their parents.
+Execute bits are removed from the file, and it will not be given to root.
 This behavior does not change the
 requirements for the user to be allowed to write the file, but only the eventual
 owner after it has been created.

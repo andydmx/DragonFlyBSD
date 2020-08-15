@@ -348,7 +348,6 @@ static const char *sppp_phase_name(enum ppp_phase phase);
 static const char *sppp_proto_name(u_short proto);
 static const char *sppp_state_name(int state);
 static int sppp_params(struct sppp *sp, u_long cmd, void *data);
-static int sppp_strnlen(u_char *p, int max);
 static void sppp_get_ip_addrs(struct sppp *sp, u_long *src, u_long *dst,
 			      u_long *srcmask);
 static void sppp_keepalive(void *dummy);
@@ -558,7 +557,7 @@ drop2:
 				 * enough leading space in the existing mbuf).
 				 */
 				m_adj(m, vjlen);
-				M_PREPEND(m, hlen, MB_DONTWAIT);
+				M_PREPEND(m, hlen, M_NOWAIT);
 				if (m == NULL)
 					goto drop2;
 				bcopy(iphdr, mtod(m, u_char *), hlen);
@@ -796,7 +795,7 @@ sppp_output_serialized(struct ifnet *ifp, struct ifaltq_subque *ifsq,
 	/*
 	 * Prepend general data packet PPP header. For now, IP only.
 	 */
-	M_PREPEND (m, PPP_HEADER_LEN, MB_DONTWAIT);
+	M_PREPEND (m, PPP_HEADER_LEN, M_NOWAIT);
 	if (! m) {
 		if (debug)
 			log(LOG_DEBUG, SPP_FMT "no memory for transmit header\n",
@@ -883,7 +882,7 @@ sppp_output_serialized(struct ifnet *ifp, struct ifaltq_subque *ifsq,
 		rv = ifsq_enqueue(ifsq, m, &pktattr);
 	}
 	if (rv) {
-		IFNET_STAT_INC(ifp, oerrors, 1);
+		IFNET_STAT_INC(ifp, oqdrops, 1);
 		crit_exit();
 		return(rv);
 	}
@@ -1282,7 +1281,7 @@ sppp_cisco_send(struct sppp *sp, int type, long par1, long par2)
 
 	getmicrouptime(&tv);
 
-	MGETHDR (m, MB_DONTWAIT, MT_DATA);
+	MGETHDR (m, M_NOWAIT, MT_DATA);
 	if (! m)
 		return;
 	m->m_pkthdr.len = m->m_len = PPP_HEADER_LEN + CISCO_PACKET_LEN;
@@ -1338,7 +1337,7 @@ sppp_cp_send(struct sppp *sp, u_short proto, u_char type,
 
 	if (len > MHLEN - PPP_HEADER_LEN - LCP_HEADER_LEN)
 		len = MHLEN - PPP_HEADER_LEN - LCP_HEADER_LEN;
-	MGETHDR (m, MB_DONTWAIT, MT_DATA);
+	MGETHDR (m, M_NOWAIT, MT_DATA);
 	if (! m)
 		return;
 	m->m_pkthdr.len = m->m_len = PPP_HEADER_LEN + LCP_HEADER_LEN + len;
@@ -2023,7 +2022,7 @@ sppp_to_event(const struct cp *cp, struct sppp *sp)
  * Change the state of a control protocol in the state automaton.
  * Takes care of starting/stopping the restart timer.
  */
-void
+static void
 sppp_cp_change_state(const struct cp *cp, struct sppp *sp, int newstate)
 {
 	sp->state[cp->protoidx] = newstate;
@@ -3888,7 +3887,7 @@ sppp_ipv6cp_scr(struct sppp *sp)
 /*
  * Handle incoming CHAP packets.
  */
-void
+static void
 sppp_chap_input(struct sppp *sp, struct mbuf *m)
 {
 	STDDCL;
@@ -3947,7 +3946,7 @@ sppp_chap_input(struct sppp *sp, struct mbuf *m)
 		MD5Init(&ctx);
 		MD5Update(&ctx, &h->ident, 1);
 		MD5Update(&ctx, sp->myauth.secret,
-			  sppp_strnlen(sp->myauth.secret, AUTHKEYLEN));
+			  strnlen(sp->myauth.secret, AUTHKEYLEN));
 		MD5Update(&ctx, value, value_len);
 		MD5Final(digest, &ctx);
 		dsize = sizeof digest;
@@ -3955,7 +3954,7 @@ sppp_chap_input(struct sppp *sp, struct mbuf *m)
 		sppp_auth_send(&chap, sp, CHAP_RESPONSE, h->ident,
 			       sizeof dsize, (const char *)&dsize,
 			       sizeof digest, digest,
-			       (size_t)sppp_strnlen(sp->myauth.name, AUTHNAMELEN),
+			       (size_t)strnlen(sp->myauth.name, AUTHNAMELEN),
 			       sp->myauth.name,
 			       0);
 		break;
@@ -4032,14 +4031,14 @@ sppp_chap_input(struct sppp *sp, struct mbuf *m)
 				    h->ident, sp->confid[IDX_CHAP]);
 			break;
 		}
-		if (name_len != sppp_strnlen(sp->hisauth.name, AUTHNAMELEN)
+		if (name_len != strnlen(sp->hisauth.name, AUTHNAMELEN)
 		    || bcmp(name, sp->hisauth.name, name_len) != 0) {
 			log(LOG_INFO, SPP_FMT "chap response, his name ",
 			    SPP_ARGS(ifp));
 			sppp_print_string(name, name_len);
 			log(-1, " != expected ");
 			sppp_print_string(sp->hisauth.name,
-					  sppp_strnlen(sp->hisauth.name, AUTHNAMELEN));
+					  strnlen(sp->hisauth.name, AUTHNAMELEN));
 			log(-1, "\n");
 		}
 		if (debug) {
@@ -4067,7 +4066,7 @@ sppp_chap_input(struct sppp *sp, struct mbuf *m)
 		MD5Init(&ctx);
 		MD5Update(&ctx, &h->ident, 1);
 		MD5Update(&ctx, sp->hisauth.secret,
-			  sppp_strnlen(sp->hisauth.secret, AUTHKEYLEN));
+			  strnlen(sp->hisauth.secret, AUTHKEYLEN));
 		MD5Update(&ctx, sp->myauth.challenge, AUTHKEYLEN);
 		MD5Final(digest, &ctx);
 
@@ -4262,7 +4261,7 @@ sppp_chap_scr(struct sppp *sp)
 
 	/* Compute random challenge. */
 	ch = (u_long *)sp->myauth.challenge;
-	read_random(&seed, sizeof seed);
+	read_random(&seed, sizeof(seed), 0);
 	ch[0] = seed ^ krandom();
 	ch[1] = seed ^ krandom();
 	ch[2] = seed ^ krandom();
@@ -4274,7 +4273,7 @@ sppp_chap_scr(struct sppp *sp)
 	sppp_auth_send(&chap, sp, CHAP_CHALLENGE, sp->confid[IDX_CHAP],
 		       sizeof clen, (const char *)&clen,
 		       (size_t)AUTHKEYLEN, sp->myauth.challenge,
-		       (size_t)sppp_strnlen(sp->myauth.name, AUTHNAMELEN),
+		       (size_t)strnlen(sp->myauth.name, AUTHNAMELEN),
 		       sp->myauth.name,
 		       0);
 }
@@ -4352,8 +4351,8 @@ sppp_pap_input(struct sppp *sp, struct mbuf *m)
 			sppp_print_string((char*)passwd, passwd_len);
 			log(-1, ">\n");
 		}
-		if (name_len != sppp_strnlen(sp->hisauth.name, AUTHNAMELEN) ||
-		    passwd_len != sppp_strnlen(sp->hisauth.secret, AUTHKEYLEN) ||
+		if (name_len != strnlen(sp->hisauth.name, AUTHNAMELEN) ||
+		    passwd_len != strnlen(sp->hisauth.secret, AUTHKEYLEN) ||
 		    bcmp(name, sp->hisauth.name, name_len) != 0 ||
 		    bcmp(passwd, sp->hisauth.secret, passwd_len) != 0) {
 			/* action scn, tld */
@@ -4591,8 +4590,8 @@ sppp_pap_scr(struct sppp *sp)
 	u_char idlen, pwdlen;
 
 	sp->confid[IDX_PAP] = ++sp->pp_seq[IDX_PAP];
-	pwdlen = sppp_strnlen(sp->myauth.secret, AUTHKEYLEN);
-	idlen = sppp_strnlen(sp->myauth.name, AUTHNAMELEN);
+	pwdlen = strnlen(sp->myauth.secret, AUTHKEYLEN);
+	idlen = strnlen(sp->myauth.name, AUTHNAMELEN);
 
 	sppp_auth_send(&pap, sp, PAP_REQ, sp->confid[IDX_PAP],
 		       sizeof idlen, (const char *)&idlen,
@@ -4633,7 +4632,7 @@ sppp_auth_send(const struct cp *cp, struct sppp *sp,
 	struct ifaltq_subque *ifsq;
 	__va_list ap;
 
-	MGETHDR (m, MB_DONTWAIT, MT_DATA);
+	MGETHDR (m, M_NOWAIT, MT_DATA);
 	if (! m)
 		return;
 	m->m_pkthdr.rcvif = 0;
@@ -4756,6 +4755,8 @@ sppp_get_ip_addrs(struct sppp *sp, u_long *src, u_long *dst, u_long *srcmask)
 
 	sm = NULL;
 	ssrc = ddst = 0L;
+	if (srcmask)
+		*srcmask = 0;	/* avoid gcc warnings */
 	/*
 	 * Pick the first AF_INET address from the list,
 	 * aliases don't make any sense on a p2p link anyway.
@@ -4981,7 +4982,7 @@ sppp_params(struct sppp *sp, u_long cmd, void *data)
 	 * Check the cmd word first before attempting to fetch all the
 	 * data.
 	 */
-	if ((subcmd = fuword(ifr->ifr_data)) == -1) {
+	if ((subcmd = fuword64(ifr->ifr_data)) == -1) {
 		rv = EFAULT;
 		goto quit;
 	}
@@ -5318,16 +5319,6 @@ sppp_dotted_quad(u_long addr)
 		(int)((addr >> 8) & 0xff),
 		(int)(addr & 0xff));
 	return s;
-}
-
-static int
-sppp_strnlen(u_char *p, int max)
-{
-	int len;
-
-	for (len = 0; len < max && *p; ++p)
-		++len;
-	return len;
 }
 
 /* a dummy, used to drop uninteresting events */

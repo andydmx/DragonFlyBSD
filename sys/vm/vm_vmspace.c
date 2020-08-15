@@ -37,7 +37,7 @@
 #include <sys/param.h>
 #include <sys/kernel.h>
 #include <sys/systm.h>
-#include <sys/sysproto.h>
+#include <sys/sysmsg.h>
 #include <sys/kern_syscall.h>
 #include <sys/mman.h>
 #include <sys/thread.h>
@@ -53,12 +53,13 @@
 #include <machine/vmparam.h>
 #include <machine/vmm.h>
 
-#include <sys/sysref2.h>
-
 static struct vmspace_entry *vkernel_find_vmspace(struct vkernel_proc *vkp,
-						  void *id);
-static void vmspace_entry_delete(struct vmspace_entry *ve,
-				 struct vkernel_proc *vkp);
+						  void *id, int havetoken);
+static int vmspace_entry_delete(struct vmspace_entry *ve,
+				 struct vkernel_proc *vkp, int refs);
+static void vmspace_entry_cache_ref(struct vmspace_entry *ve);
+static void vmspace_entry_cache_drop(struct vmspace_entry *ve);
+static void vmspace_entry_drop(struct vmspace_entry *ve);
 
 static MALLOC_DEFINE(M_VKERNEL, "vkernel", "VKernel structures");
 
@@ -76,7 +77,8 @@ static MALLOC_DEFINE(M_VKERNEL, "vkernel", "VKernel structures");
  * No requirements.
  */
 int
-sys_vmspace_create(struct vmspace_create_args *uap)
+sys_vmspace_create(struct sysmsg *sysmsg,
+		   const struct vmspace_create_args *uap)
 {
 	struct vmspace_entry *ve;
 	struct vkernel_proc *vkp;
@@ -116,6 +118,8 @@ sys_vmspace_create(struct vmspace_create_args *uap)
 	ve = kmalloc(sizeof(struct vmspace_entry), M_VKERNEL, M_WAITOK|M_ZERO);
 	ve->vmspace = vmspace_alloc(VM_MIN_USER_ADDRESS, VM_MAX_USER_ADDRESS);
 	ve->id = uap->id;
+	ve->refs = 0;		/* active refs (none) */
+	ve->cache_refs = 1;	/* on-tree, not deleted (prevent kfree) */
 	pmap_pinit2(vmspace_pmap(ve->vmspace));
 
 	lwkt_gettoken(&vkp->token);
@@ -138,30 +142,28 @@ sys_vmspace_create(struct vmspace_create_args *uap)
  * No requirements.
  */
 int
-sys_vmspace_destroy(struct vmspace_destroy_args *uap)
+sys_vmspace_destroy(struct sysmsg *sysmsg,
+		    const struct vmspace_destroy_args *uap)
 {
 	struct vkernel_proc *vkp;
 	struct vmspace_entry *ve;
 	int error;
 
-	if ((vkp = curproc->p_vkernel) == NULL) {
-		error = EINVAL;
-		goto done3;
-	}
+	if ((vkp = curproc->p_vkernel) == NULL)
+		return EINVAL;
+
+	/*
+	 * vkp->token protects the deletion against a new RB tree search.
+	 */
 	lwkt_gettoken(&vkp->token);
-	if ((ve = vkernel_find_vmspace(vkp, uap->id)) == NULL) {
-		error = ENOENT;
-		goto done2;
+	error = ENOENT;
+	if ((ve = vkernel_find_vmspace(vkp, uap->id, 1)) != NULL) {
+		error = vmspace_entry_delete(ve, vkp, 1);
+		if (error == 0)
+			vmspace_entry_cache_drop(ve);
 	}
-	if (ve->refs) {
-		error = EBUSY;
-		goto done2;
-	}
-	vmspace_entry_delete(ve, vkp);
-	error = 0;
-done2:
 	lwkt_reltoken(&vkp->token);
-done3:
+
 	return(error);
 }
 
@@ -176,7 +178,8 @@ done3:
  * No requirements.
  */
 int
-sys_vmspace_ctl(struct vmspace_ctl_args *uap)
+sys_vmspace_ctl(struct sysmsg *sysmsg,
+		const struct vmspace_ctl_args *uap)
 {
 	struct vkernel_proc *vkp;
 	struct vkernel_lwp *vklp;
@@ -196,8 +199,7 @@ sys_vmspace_ctl(struct vmspace_ctl_args *uap)
 	 * ve only matters when VMM is not used.
 	 */
 	if (curthread->td_vmm == NULL) {
-		lwkt_gettoken(&vkp->token);
-		if ((ve = vkernel_find_vmspace(vkp, uap->id)) == NULL) {
+		if ((ve = vkernel_find_vmspace(vkp, uap->id, 0)) == NULL) {
 			error = ENOENT;
 			goto done;
 		}
@@ -210,52 +212,56 @@ sys_vmspace_ctl(struct vmspace_ctl_args *uap)
 		 * install the passed register context.  Return with
 		 * EJUSTRETURN so the syscall code doesn't adjust the context.
 		 */
-		if (curthread->td_vmm == NULL)
-			atomic_add_int(&ve->refs, 1);
-
 		framesz = sizeof(struct trapframe);
 		if ((vklp = lp->lwp_vkernel) == NULL) {
 			vklp = kmalloc(sizeof(*vklp), M_VKERNEL,
 				       M_WAITOK|M_ZERO);
 			lp->lwp_vkernel = vklp;
 		}
+		if (ve && vklp->ve_cache != ve) {
+			vmspace_entry_cache_ref(ve);
+			if (vklp->ve_cache)
+				vmspace_entry_cache_drop(vklp->ve_cache);
+			vklp->ve_cache = ve;
+		}
 		vklp->user_trapframe = uap->tframe;
 		vklp->user_vextframe = uap->vframe;
-		bcopy(uap->sysmsg_frame, &vklp->save_trapframe, framesz);
+		bcopy(sysmsg->sysmsg_frame, &vklp->save_trapframe, framesz);
 		bcopy(&curthread->td_tls, &vklp->save_vextframe.vx_tls,
 		      sizeof(vklp->save_vextframe.vx_tls));
-		error = copyin(uap->tframe, uap->sysmsg_frame, framesz);
+		error = copyin(uap->tframe, sysmsg->sysmsg_frame, framesz);
 		if (error == 0) {
 			error = copyin(&uap->vframe->vx_tls,
 				       &curthread->td_tls,
 				       sizeof(struct savetls));
 		}
 		if (error == 0)
-			error = cpu_sanitize_frame(uap->sysmsg_frame);
+			error = cpu_sanitize_frame(sysmsg->sysmsg_frame);
 		if (error == 0)
 			error = cpu_sanitize_tls(&curthread->td_tls);
 		if (error) {
-			bcopy(&vklp->save_trapframe, uap->sysmsg_frame,
+			bcopy(&vklp->save_trapframe, sysmsg->sysmsg_frame,
 			      framesz);
 			bcopy(&vklp->save_vextframe.vx_tls, &curthread->td_tls,
 			      sizeof(vklp->save_vextframe.vx_tls));
 			set_user_TLS();
-			if (curthread->td_vmm == NULL)
-				atomic_subtract_int(&ve->refs, 1);
 		} else {
-			/* If it's a VMM thread just set the CR3. We also set the
-			 * vklp->ve to a key to be able to distinguish when a
-			 * vkernel user process runs and when not (when it's NULL)
+			/*
+			 * If it's a VMM thread just set the CR3. We also set
+			 * the vklp->ve to a key to be able to distinguish
+			 * when a vkernel user process runs and when not
+			 * (when it's NULL)
 			 */
 			if (curthread->td_vmm == NULL) {
 				vklp->ve = ve;
+				atomic_add_int(&ve->refs, 1);
 				pmap_setlwpvm(lp, ve->vmspace);
 			} else {
 				vklp->ve = uap->id;
 				vmm_vm_set_guest_cr3((register_t)uap->id);
 			}
 			set_user_TLS();
-			set_vkernel_fp(uap->sysmsg_frame);
+			set_vkernel_fp(sysmsg->sysmsg_frame);
 			error = EJUSTRETURN;
 		}
 		break;
@@ -264,8 +270,9 @@ sys_vmspace_ctl(struct vmspace_ctl_args *uap)
 		break;
 	}
 done:
-	if (curthread->td_vmm == NULL)
-		lwkt_reltoken(&vkp->token);
+	if (ve)
+		vmspace_entry_drop(ve);
+
 	return(error);
 }
 
@@ -279,37 +286,29 @@ done:
  * No requirements.
  */
 int
-sys_vmspace_mmap(struct vmspace_mmap_args *uap)
+sys_vmspace_mmap(struct sysmsg *sysmsg,
+		 const struct vmspace_mmap_args *uap)
 {
 	struct vkernel_proc *vkp;
 	struct vmspace_entry *ve;
 	int error;
 
-	/*
-	 * We hold the vmspace token to serialize calls to vkernel_find_vmspace.
-	 */
-	lwkt_gettoken(&vmspace_token);
 	if ((vkp = curproc->p_vkernel) == NULL) {
 		error = EINVAL;
-		goto done3;
+		goto done2;
 	}
 
-	/*
-	 * NOTE: kern_mmap() can block so we need to temporarily ref ve->refs.
-	 */
-	lwkt_gettoken(&vkp->token);
-	if ((ve = vkernel_find_vmspace(vkp, uap->id)) != NULL) {
-		atomic_add_int(&ve->refs, 1);
-		error = kern_mmap(ve->vmspace, uap->addr, uap->len,
-				  uap->prot, uap->flags,
-				  uap->fd, uap->offset, &uap->sysmsg_resultp);
-		atomic_subtract_int(&ve->refs, 1);
-	} else {
+	if ((ve = vkernel_find_vmspace(vkp, uap->id, 0)) == NULL) {
 		error = ENOENT;
+		goto done2;
 	}
-	lwkt_reltoken(&vkp->token);
-done3:
-	lwkt_reltoken(&vmspace_token);
+
+	error = kern_mmap(ve->vmspace, uap->addr, uap->len,
+			  uap->prot, uap->flags,
+			  uap->fd, uap->offset, &sysmsg->sysmsg_resultp);
+
+	vmspace_entry_drop(ve);
+done2:
 	return (error);
 }
 
@@ -321,7 +320,8 @@ done3:
  * No requirements.
  */
 int
-sys_vmspace_munmap(struct vmspace_munmap_args *uap)
+sys_vmspace_munmap(struct sysmsg *sysmsg,
+		   const struct vmspace_munmap_args *uap)
 {
 	struct vkernel_proc *vkp;
 	struct vmspace_entry *ve;
@@ -333,10 +333,10 @@ sys_vmspace_munmap(struct vmspace_munmap_args *uap)
 
 	if ((vkp = curproc->p_vkernel) == NULL) {
 		error = EINVAL;
-		goto done3;
+		goto done2;
 	}
-	lwkt_gettoken(&vkp->token);
-	if ((ve = vkernel_find_vmspace(vkp, uap->id)) == NULL) {
+
+	if ((ve = vkernel_find_vmspace(vkp, uap->id, 0)) == NULL) {
 		error = ENOENT;
 		goto done2;
 	}
@@ -345,7 +345,6 @@ sys_vmspace_munmap(struct vmspace_munmap_args *uap)
 	 * NOTE: kern_munmap() can block so we need to temporarily
 	 *	 ref ve->refs.
 	 */
-	atomic_add_int(&ve->refs, 1);
 
 	/*
 	 * Copied from sys_munmap()
@@ -387,10 +386,8 @@ sys_vmspace_munmap(struct vmspace_munmap_args *uap)
 	vm_map_remove(map, addr, addr + size);
 	error = 0;
 done1:
-	atomic_subtract_int(&ve->refs, 1);
+	vmspace_entry_drop(ve);
 done2:
-	lwkt_reltoken(&vkp->token);
-done3:
 	return (error);
 }
 
@@ -406,7 +403,8 @@ done3:
  * No requirements.
  */
 int
-sys_vmspace_pread(struct vmspace_pread_args *uap)
+sys_vmspace_pread(struct sysmsg *sysmsg,
+		  const struct vmspace_pread_args *uap)
 {
 	struct vkernel_proc *vkp;
 	struct vmspace_entry *ve;
@@ -416,14 +414,13 @@ sys_vmspace_pread(struct vmspace_pread_args *uap)
 		error = EINVAL;
 		goto done3;
 	}
-	lwkt_gettoken(&vkp->token);
-	if ((ve = vkernel_find_vmspace(vkp, uap->id)) == NULL) {
+
+	if ((ve = vkernel_find_vmspace(vkp, uap->id, 0)) == NULL) {
 		error = ENOENT;
-		goto done2;
+		goto done3;
 	}
+	vmspace_entry_drop(ve);
 	error = EINVAL;
-done2:
-	lwkt_reltoken(&vkp->token);
 done3:
 	return (error);
 }
@@ -440,7 +437,8 @@ done3:
  * No requirements.
  */
 int
-sys_vmspace_pwrite(struct vmspace_pwrite_args *uap)
+sys_vmspace_pwrite(struct sysmsg *sysmsg,
+		   const struct vmspace_pwrite_args *uap)
 {
 	struct vkernel_proc *vkp;
 	struct vmspace_entry *ve;
@@ -450,14 +448,12 @@ sys_vmspace_pwrite(struct vmspace_pwrite_args *uap)
 		error = EINVAL;
 		goto done3;
 	}
-	lwkt_gettoken(&vkp->token);
-	if ((ve = vkernel_find_vmspace(vkp, uap->id)) == NULL) {
+	if ((ve = vkernel_find_vmspace(vkp, uap->id, 0)) == NULL) {
 		error = ENOENT;
-		goto done2;
+		goto done3;
 	}
+	vmspace_entry_drop(ve);
 	error = EINVAL;
-done2:
-	lwkt_reltoken(&vkp->token);
 done3:
 	return (error);
 }
@@ -470,29 +466,26 @@ done3:
  * No requirements.
  */
 int
-sys_vmspace_mcontrol(struct vmspace_mcontrol_args *uap)
+sys_vmspace_mcontrol(struct sysmsg *sysmsg,
+		     const struct vmspace_mcontrol_args *uap)
 {
 	struct vkernel_proc *vkp;
 	struct vmspace_entry *ve;
+	struct lwp *lp;
 	vm_offset_t start, end;
 	vm_offset_t tmpaddr = (vm_offset_t)uap->addr + uap->len;
 	int error;
 
+	lp = curthread->td_lwp;
 	if ((vkp = curproc->p_vkernel) == NULL) {
 		error = EINVAL;
 		goto done3;
 	}
-	lwkt_gettoken(&vkp->token);
-	if ((ve = vkernel_find_vmspace(vkp, uap->id)) == NULL) {
-		error = ENOENT;
-		goto done2;
-	}
 
-	/*
-	 * NOTE: kern_madvise() can block so we need to temporarily
-	 *	 ref ve->refs.
-	 */
-	atomic_add_int(&ve->refs, 1);
+	if ((ve = vkernel_find_vmspace(vkp, uap->id, 0)) == NULL) {
+		error = ENOENT;
+		goto done3;
+	}
 
 	/*
 	 * This code is basically copied from sys_mcontrol()
@@ -521,9 +514,7 @@ sys_vmspace_mcontrol(struct vmspace_mcontrol_args *uap)
 	error = vm_map_madvise(&ve->vmspace->vm_map, start, end,
 				uap->behav, uap->value);
 done1:
-	atomic_subtract_int(&ve->refs, 1);
-done2:
-	lwkt_reltoken(&vkp->token);
+	vmspace_entry_drop(ve);
 done3:
 	return (error);
 }
@@ -559,33 +550,96 @@ rb_vmspace_delete(struct vmspace_entry *ve, void *data)
 {
 	struct vkernel_proc *vkp = data;
 
-	KKASSERT(ve->refs == 0);
-	vmspace_entry_delete(ve, vkp);
+	if (vmspace_entry_delete(ve, vkp, 0) == 0)
+		vmspace_entry_cache_drop(ve);
+	else
+		panic("rb_vmspace_delete: invalid refs %d", ve->refs);
 	return(0);
 }
 
 /*
  * Remove a vmspace_entry from the RB tree and destroy it.  We have to clean
- * up the pmap, the vm_map, then destroy the vmspace.
+ * up the pmap, the vm_map, then destroy the vmspace.  We gain control of
+ * the associated cache_refs ref, which the caller will drop for us.
  *
- * This function must remove the ve immediately before it might potentially
- * block.
+ * The ve must not have any active references other than those from the
+ * caller.  If it does, EBUSY is returned.  The ve may still maintain
+ * any number of cache references which will drop as the related LWPs
+ * execute vmspace operations or exit.
+ *
+ * 0 is returned on success, EBUSY on failure.  On success the caller must
+ * drop the last cache_refs.  We have dropped the callers active refs.
  *
  * The caller must hold vkp->token.
  */
 static
-void
-vmspace_entry_delete(struct vmspace_entry *ve, struct vkernel_proc *vkp)
+int
+vmspace_entry_delete(struct vmspace_entry *ve, struct vkernel_proc *vkp,
+		     int refs)
 {
+	/*
+	 * Interlocked by vkp->token.
+	 *
+	 * Drop the callers refs and set VKE_REF_DELETED atomically, if
+	 * the remaining refs match exactly.  Dropping refs and setting
+	 * the DELETED flag atomically protects other threads from trying
+	 * to use the ve.
+	 *
+	 * The caller now owns the final cache_ref that was previously
+	 * associated with the live state of the ve.
+	 */
+	if (atomic_cmpset_int(&ve->refs, refs, VKE_REF_DELETED) == 0) {
+		KKASSERT(ve->refs >= refs);
+		return EBUSY;
+	}
 	RB_REMOVE(vmspace_rb_tree, &vkp->root, ve);
 
 	pmap_remove_pages(vmspace_pmap(ve->vmspace),
 			  VM_MIN_USER_ADDRESS, VM_MAX_USER_ADDRESS);
 	vm_map_remove(&ve->vmspace->vm_map,
-		      VM_MIN_USER_ADDRESS, VM_MAX_USER_ADDRESS);
+			  VM_MIN_USER_ADDRESS, VM_MAX_USER_ADDRESS);
 	vmspace_rel(ve->vmspace);
 	ve->vmspace = NULL; /* safety */
-	kfree(ve, M_VKERNEL);
+
+	return 0;
+}
+
+/*
+ * Ref a ve for cache purposes
+ */
+static
+void
+vmspace_entry_cache_ref(struct vmspace_entry *ve)
+{
+	atomic_add_int(&ve->cache_refs, 1);
+}
+
+/*
+ * The ve cache_drop is the final word for a ve.  It gains an extra ref
+ * representing it being on the RB tree and not being in a deleted state.
+ * Removal from the RB tree and deletion manipulate this ref.  The last
+ * drop will thus include full deletion of the ve in addition to the last
+ * cached user going away.
+ */
+static
+void
+vmspace_entry_cache_drop(struct vmspace_entry *ve)
+{
+	if (atomic_fetchadd_int(&ve->cache_refs, -1) == 1) {
+		KKASSERT(ve->refs & VKE_REF_DELETED);
+		kfree(ve, M_VKERNEL);
+	}
+}
+
+/*
+ * Drop primary reference.  The ve cannot be freed on the 1->0 transition.
+ * Instead, ve deletion interlocks the final kfree() via cache_refs.
+ */
+static
+void
+vmspace_entry_drop(struct vmspace_entry *ve)
+{
+	atomic_fetchadd_int(&ve->refs, -1);
 }
 
 /*
@@ -593,17 +647,65 @@ vmspace_entry_delete(struct vmspace_entry *ve, struct vkernel_proc *vkp)
  * will bump ve->refs which prevents the ve from being immediately destroyed
  * (but it can still be removed).
  *
- * The caller must hold vkp->token.
+ * The cache can potentially contain a stale ve, check by testing ve->vmspace.
+ *
+ * The caller must hold vkp->token if excl is non-zero.
  */
 static
 struct vmspace_entry *
-vkernel_find_vmspace(struct vkernel_proc *vkp, void *id)
+vkernel_find_vmspace(struct vkernel_proc *vkp, void *id, int excl)
 {
 	struct vmspace_entry *ve;
 	struct vmspace_entry key;
+	struct vkernel_lwp *vklp;
+	struct lwp *lp = curthread->td_lwp;
 
+	/*
+	 * Cache check.  Since we already hold a ref on the cache entry
+	 * the ve cannot be ripped out from under us while we cycle
+	 * ve->refs.
+	 */
+	if ((vklp = lp->lwp_vkernel) != NULL) {
+		ve = vklp->ve_cache;
+		if (ve && ve->id == id) {
+			uint32_t n;
+
+			/*
+			 * Bump active refs, check to see if the cache
+			 * entry is stale.  If not, we are good.
+			 */
+			n = atomic_fetchadd_int(&ve->refs, 1);
+			if ((n & VKE_REF_DELETED) == 0) {
+				KKASSERT(ve->vmspace);
+				return ve;
+			}
+
+			/*
+			 * Cache is stale, clean it out and fall through
+			 * to a normal search.
+			 */
+			vklp->ve_cache = NULL;
+			vmspace_entry_drop(ve);
+			vmspace_entry_cache_drop(ve);
+		}
+	}
+
+	/*
+	 * Normal search protected by vkp->token.  No new ve's can be marked
+	 * DELETED while we hold the token so we are safe.
+	 */
+	if (excl == 0)
+		lwkt_gettoken_shared(&vkp->token);
 	key.id = id;
 	ve = RB_FIND(vmspace_rb_tree, &vkp->root, &key);
+	if (ve) {
+		if (atomic_fetchadd_int(&ve->refs, 1) & VKE_REF_DELETED) {
+			vmspace_entry_drop(ve);
+			ve = NULL;
+		}
+	}
+	if (excl == 0)
+		lwkt_reltoken(&vkp->token);
 	return (ve);
 }
 
@@ -672,14 +774,29 @@ vkernel_lwp_exit(struct lwp *lp)
 	struct vmspace_entry *ve;
 
 	if ((vklp = lp->lwp_vkernel) != NULL) {
-		if ((ve = vklp->ve) != NULL) {
-			kprintf("Warning, pid %d killed with "
-				"active VC!\n", lp->lwp_proc->p_pid);
-			pmap_setlwpvm(lp, lp->lwp_proc->p_vmspace);
+		if (lp->lwp_thread->td_vmm == NULL) {
+			/*
+			 * vkernel thread
+			 */
+			if ((ve = vklp->ve) != NULL) {
+				kprintf("Warning, pid %d killed with "
+					"active VC!\n", lp->lwp_proc->p_pid);
+				pmap_setlwpvm(lp, lp->lwp_proc->p_vmspace);
+				vklp->ve = NULL;
+				KKASSERT(ve->refs > 0);
+				vmspace_entry_drop(ve);
+			}
+		} else {
+			/*
+			 * guest thread
+			 */
 			vklp->ve = NULL;
-			KKASSERT(ve->refs > 0);
-			atomic_subtract_int(&ve->refs, 1);
 		}
+		if ((ve = vklp->ve_cache) != NULL) {
+			vklp->ve_cache = NULL;
+			vmspace_entry_cache_drop(ve);
+		}
+
 		lp->lwp_vkernel = NULL;
 		kfree(vklp, M_VKERNEL);
 	}
@@ -716,12 +833,13 @@ vkernel_trap(struct lwp *lp, struct trapframe *frame)
 		vklp->ve = NULL;
 		pmap_setlwpvm(lp, p->p_vmspace);
 		KKASSERT(ve->refs > 0);
-		atomic_subtract_int(&ve->refs, 1);
+		vmspace_entry_drop(ve);
 		/* ve is invalid once we kill our ref */
 	} else {
 		vklp->ve = NULL;
 		vmm_vm_set_guest_cr3(p->p_vkernel->vkernel_cr3);
 	}
+
 	/*
 	 * Copy the emulated process frame to the virtual kernel process.
 	 * The emulated process cannot change TLS descriptors so don't

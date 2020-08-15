@@ -1636,6 +1636,7 @@ mpt_read_extcfg_header(struct mpt_softc *mpt, int PageVersion, int PageNumber,
 		return (ENOMEM);
 	}
 
+	bzero(&params, sizeof(params));
 	params.Action = MPI_CONFIG_ACTION_PAGE_HEADER;
 	params.PageVersion = PageVersion;
 	params.PageLength = 0;
@@ -1741,6 +1742,7 @@ mpt_read_cfg_header(struct mpt_softc *mpt, int PageType, int PageNumber,
 		return (ENOMEM);
 	}
 
+	bzero(&params, sizeof(params));
 	params.Action = MPI_CONFIG_ACTION_PAGE_HEADER;
 	params.PageVersion = 0;
 	params.PageLength = 0;
@@ -1797,6 +1799,7 @@ mpt_read_cfg_page(struct mpt_softc *mpt, int Action, uint32_t PageAddress,
 		return (-1);
 	}
 
+	bzero(&params, sizeof(params));
 	params.Action = Action;
 	params.PageVersion = hdr->PageVersion;
 	params.PageLength = hdr->PageLength;
@@ -1858,6 +1861,7 @@ mpt_write_cfg_page(struct mpt_softc *mpt, int Action, uint32_t PageAddress,
 	 * if you then mask them going down to issue the request.
 	 */
 
+	bzero(&params, sizeof(params));
 	params.Action = Action;
 	params.PageVersion = hdr->PageVersion;
 	params.PageLength = hdr->PageLength;
@@ -2144,17 +2148,17 @@ mpt_disable_ints(struct mpt_softc *mpt)
 static void
 mpt_sysctl_attach(struct mpt_softc *mpt)
 {
-	SYSCTL_ADD_UINT(&mpt->mpt_sysctl_ctx,
-		       SYSCTL_CHILDREN(mpt->mpt_sysctl_tree), OID_AUTO,
+	struct sysctl_ctx_list *ctx = device_get_sysctl_ctx(mpt->dev);
+	struct sysctl_oid *tree = device_get_sysctl_tree(mpt->dev);
+
+	SYSCTL_ADD_UINT(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
 		       "debug", CTLFLAG_RW, &mpt->verbose, 0,
 		       "Debugging/Verbose level");
-	SYSCTL_ADD_UINT(&mpt->mpt_sysctl_ctx,
-		       SYSCTL_CHILDREN(mpt->mpt_sysctl_tree), OID_AUTO,
+	SYSCTL_ADD_UINT(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
 		       "role", CTLFLAG_RD, &mpt->role, 0,
 		       "HBA role");
 #ifdef	MPT_TEST_MULTIPATH
-	SYSCTL_ADD_INT(&mpt->mpt_sysctl_ctx,
-		       SYSCTL_CHILDREN(mpt->mpt_sysctl_tree), OID_AUTO,
+	SYSCTL_ADD_INT(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
 		       "failure_id", CTLFLAG_RW, &mpt->failure_id, -1,
 		       "Next Target to Fail");
 #endif
@@ -2279,14 +2283,6 @@ mpt_core_attach(struct mpt_softc *mpt)
 	mpt->failure_id = -1;
 #endif
 	mpt->scsi_tgt_handler_id = MPT_HANDLER_ID_NONE;
-	sysctl_ctx_init(&mpt->mpt_sysctl_ctx);
-	mpt->mpt_sysctl_tree = SYSCTL_ADD_NODE(&mpt->mpt_sysctl_ctx,
-	    SYSCTL_STATIC_CHILDREN(_hw), OID_AUTO,
-	    device_get_nameunit(mpt->dev), CTLFLAG_RD, 0, "");
-	if (mpt->mpt_sysctl_tree == NULL) {
-		device_printf(mpt->dev, "can't add sysctl node\n");
-		return (EINVAL);
-	}
 	mpt_sysctl_attach(mpt);
 	mpt_lprt(mpt, MPT_PRT_DEBUG, "doorbell req = %s\n",
 	    mpt_ioc_diag(mpt_read(mpt, MPT_OFFSET_DOORBELL)));
@@ -2373,9 +2369,6 @@ mpt_core_detach(struct mpt_softc *mpt)
 	}
 
 	mpt_dma_buf_free(mpt);
-
-	if (mpt->mpt_sysctl_tree != NULL)
-		sysctl_ctx_free(&mpt->mpt_sysctl_ctx);
 }
 
 static int

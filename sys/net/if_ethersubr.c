@@ -75,6 +75,7 @@
 #include <netinet/if_ether.h>
 #include <netinet/ip_flow.h>
 #include <net/ipfw/ip_fw.h>
+#include <net/ipfw3/ip_fw.h>
 #include <net/dummynet/ip_dummynet.h>
 #endif
 #ifdef INET6
@@ -103,7 +104,7 @@ static int ether_output(struct ifnet *, struct mbuf *, struct sockaddr *,
 static void ether_restore_header(struct mbuf **, const struct ether_header *,
 				 const struct ether_header *);
 static int ether_characterize(struct mbuf **);
-static void ether_dispatch(int, struct mbuf *, int);
+static void ether_dispatch(struct ifnet *, int, struct mbuf *, int);
 
 /*
  * if_bridge support
@@ -151,8 +152,14 @@ static int ether_input_ckhash;
 
 #define ETHER_TSOLEN_DEFAULT	(4 * ETHERMTU)
 
+#define ETHER_NMBCLUSTERS_DEFMIN	32
+#define ETHER_NMBCLUSTERS_DEFAULT	256
+
 static int ether_tsolen_default = ETHER_TSOLEN_DEFAULT;
 TUNABLE_INT("net.link.ether.tsolen", &ether_tsolen_default);
+
+static int ether_nmbclusters_default = ETHER_NMBCLUSTERS_DEFAULT;
+TUNABLE_INT("net.link.ether.nmbclusters", &ether_nmbclusters_default);
 
 SYSCTL_DECL(_net_link);
 SYSCTL_NODE(_net_link, IFT_ETHER, ether, CTLFLAG_RW, 0, "Ethernet");
@@ -219,6 +226,7 @@ ether_output(struct ifnet *ifp, struct mbuf *m, struct sockaddr *dst,
 	struct arpcom *ac = IFP2AC(ifp);
 	int error;
 
+	ASSERT_NETISR_NCPUS(mycpuid);
 	ASSERT_IFNET_NOT_SERIALIZED_ALL(ifp);
 
 	if (ifp->if_flags & IFF_MONITOR)
@@ -226,7 +234,7 @@ ether_output(struct ifnet *ifp, struct mbuf *m, struct sockaddr *dst,
 	if ((ifp->if_flags & (IFF_UP | IFF_RUNNING)) != (IFF_UP | IFF_RUNNING))
 		gotoerr(ENETDOWN);
 
-	M_PREPEND(m, sizeof(struct ether_header), MB_DONTWAIT);
+	M_PREPEND(m, sizeof(struct ether_header), M_NOWAIT);
 	if (m == NULL)
 		return (ENOBUFS);
 	m->m_pkthdr.csum_lhlen = sizeof(struct ether_header);
@@ -239,8 +247,9 @@ ether_output(struct ifnet *ifp, struct mbuf *m, struct sockaddr *dst,
 	switch (dst->sa_family) {
 #ifdef INET
 	case AF_INET:
-		if (!arpresolve(ifp, rt, m, dst, edst))
-			return (0);	/* if not yet resolved */
+		error = arpresolve(ifp, rt, m, dst, edst);
+		if (error != 0)
+			return error == EWOULDBLOCK ? 0 : error;
 #ifdef MPLS
 		if (m->m_flags & M_MPLSLABELED)
 			eh->ether_type = htons(ETHERTYPE_MPLS);
@@ -251,8 +260,9 @@ ether_output(struct ifnet *ifp, struct mbuf *m, struct sockaddr *dst,
 #endif
 #ifdef INET6
 	case AF_INET6:
-		if (!nd6_storelladdr(&ac->ac_if, rt, m, dst, edst))
-			return (0);		/* Something bad happenned. */
+		error = nd6_resolve(&ac->ac_if, rt, m, dst, edst);
+		if (error != 0)
+			return error == EWOULDBLOCK ? 0 : error;
 		eh->ether_type = htons(ETHERTYPE_IPV6);
 		break;
 #endif
@@ -284,7 +294,7 @@ ether_output(struct ifnet *ifp, struct mbuf *m, struct sockaddr *dst,
 			("%s: if_bridge not loaded!", __func__));
 		return bridge_output_p(ifp, m);
 	}
-#if XXX
+#if 0 /* XXX */
 	if (ifp->if_lagg) {
 		KASSERT(lagg_output_p != NULL,
 			("%s: if_lagg not loaded!", __func__));
@@ -311,7 +321,7 @@ ether_output(struct ifnet *ifp, struct mbuf *m, struct sockaddr *dst,
 		if ((m->m_flags & M_BCAST) || (loop_copy > 0)) {
 			struct mbuf *n;
 
-			if ((n = m_copypacket(m, MB_DONTWAIT)) != NULL) {
+			if ((n = m_copypacket(m, M_NOWAIT)) != NULL) {
 				n->m_pkthdr.csum_flags |= csum_flags;
 				if (csum_flags & CSUM_DATA_VALID)
 					n->m_pkthdr.csum_data = 0xffff;
@@ -421,7 +431,7 @@ ether_output_frame(struct ifnet *ifp, struct mbuf *m)
 	if (ifq_is_enabled(&ifp->if_snd))
 		altq_etherclassify(&ifp->if_snd, m, &pktattr);
 	crit_enter();
-	if (IPFW_LOADED && ether_ipfw != 0) {
+	if ((IPFW_LOADED || IPFW3_LOADED) && ether_ipfw != 0) {
 		struct ether_header save_eh, *eh;
 
 		eh = mtod(m, struct ether_header *);
@@ -493,6 +503,8 @@ ether_ipfw_chk(struct mbuf **m0, struct ifnet *dst, struct ip_fw **rule,
 		(*m0)->m_pkthdr.fw_flags &= ~IPFORWARD_MBUF_TAGGED;
 	}
 
+	args.flags = 0;
+	args.xlat = NULL;
 	args.m = *m0;		/* the packet we are looking at		*/
 	args.oif = dst;		/* destination, if any			*/
 	args.rule = *rule;	/* matching rule to restart		*/
@@ -528,9 +540,10 @@ ether_ipfw_chk(struct mbuf **m0, struct ifnet *dst, struct ip_fw **rule,
 		if (m == NULL)
 			return FALSE;
 
-		ip_fw_dn_io_ptr(m, args.cookie,
-				dst ? DN_TO_ETH_OUT: DN_TO_ETH_DEMUX, &args);
-		ip_dn_queue(m);
+		m = ip_fw_dn_io_ptr(m, args.cookie,
+		    dst ? DN_TO_ETH_OUT: DN_TO_ETH_DEMUX, &args);
+		if (m != NULL)
+			ip_dn_queue(m);
 		return FALSE;
 
 	default:
@@ -557,6 +570,25 @@ ether_ifattach_bpf(struct ifnet *ifp, const uint8_t *lla,
 	char ethstr[ETHER_ADDRSTRLEN + 1];
 	struct ifaltq *ifq;
 	int i;
+
+	/*
+	 * If driver does not configure # of mbuf clusters/jclusters
+	 * that could sit on the device queues for quite some time,
+	 * we then assume:
+	 * - The device queues only consume mbuf clusters.
+	 * - No more than ether_nmbclusters_default (by default 256)
+	 *   mbuf clusters will sit on the device queues for quite
+	 *   some time.
+	 */
+	if (ifp->if_nmbclusters <= 0 && ifp->if_nmbjclusters <= 0) {
+		if (ether_nmbclusters_default < ETHER_NMBCLUSTERS_DEFMIN) {
+			kprintf("ether nmbclusters %d -> %d\n",
+			    ether_nmbclusters_default,
+			    ETHER_NMBCLUSTERS_DEFAULT);
+			ether_nmbclusters_default = ETHER_NMBCLUSTERS_DEFAULT;
+		}
+		ifp->if_nmbclusters = ether_nmbclusters_default;
+	}
 
 	ifp->if_type = IFT_ETHER;
 	ifp->if_addrlen = ETHER_ADDR_LEN;
@@ -672,7 +704,7 @@ do { \
 #undef IF_INIT
 }
 
-int
+static int
 ether_resolvemulti(
 	struct ifnet *ifp,
 	struct sockaddr **llsa,
@@ -910,7 +942,7 @@ ether_restore_header(struct mbuf **m0, const struct ether_header *eh,
 	} else {
 		ether_prepend_hdr++;
 
-		M_PREPEND(m, ETHER_HDR_LEN, MB_DONTWAIT);
+		M_PREPEND(m, ETHER_HDR_LEN, M_NOWAIT);
 		if (m != NULL) {
 			bcopy(save_eh, mtod(m, struct ether_header *),
 			      ETHER_HDR_LEN);
@@ -993,7 +1025,7 @@ ether_demux_oncpu(struct ifnet *ifp, struct mbuf *m)
 	}
 
 post_stats:
-	if (IPFW_LOADED && ether_ipfw != 0 && !discard) {
+	if ((IPFW_LOADED || IPFW3_LOADED) && ether_ipfw != 0 && !discard) {
 		struct ether_header save_eh = *eh;
 
 		/* XXX old crufty stuff, needs to be removed */
@@ -1025,6 +1057,8 @@ post_stats:
 		void (*vlan_input_func)(struct mbuf *);
 
 		vlan_input_func = vlan_input_p;
+		/* Make sure 'vlan_input_func' is really used. */
+		cpu_ccfence();
 		if (vlan_input_func != NULL) {
 			vlan_input_func(m);
 		} else {
@@ -1101,7 +1135,7 @@ post_stats:
 			 * Put back the ethernet header so netgraph has a
 			 * consistent view of inbound packets.
 			 */
-			M_PREPEND(m, ETHER_HDR_LEN, MB_DONTWAIT);
+			M_PREPEND(m, ETHER_HDR_LEN, M_NOWAIT);
 			if (m == NULL) {
 				/*
 				 * M_PREPEND frees the mbuf in case of failure.
@@ -1263,33 +1297,39 @@ static __inline boolean_t
 ether_vlancheck(struct mbuf **m0)
 {
 	struct mbuf *m = *m0;
-	struct ether_header *eh;
-	uint16_t ether_type;
+	struct ether_header *eh = mtod(m, struct ether_header *);
+	uint16_t ether_type = ntohs(eh->ether_type);
 
-	eh = mtod(m, struct ether_header *);
-	ether_type = ntohs(eh->ether_type);
+	if (ether_type == ETHERTYPE_VLAN) {
+		if ((m->m_flags & M_VLANTAG) == 0) {
+			/*
+			 * Extract vlan tag if hardware does not do
+			 * it for us.
+			 */
+			vlan_ether_decap(&m);
+			if (m == NULL)
+				goto failed;
 
-	if (ether_type == ETHERTYPE_VLAN && (m->m_flags & M_VLANTAG) == 0) {
-		/*
-		 * Extract vlan tag if hardware does not do it for us
-		 */
-		vlan_ether_decap(&m);
-		if (m == NULL)
+			eh = mtod(m, struct ether_header *);
+			ether_type = ntohs(eh->ether_type);
+			if (ether_type == ETHERTYPE_VLAN) {
+				/*
+				 * To prevent possible dangerous recursion,
+				 * we don't do vlan-in-vlan.
+				 */
+				IFNET_STAT_INC(m->m_pkthdr.rcvif, noproto, 1);
+				goto failed;
+			}
+		} else {
+			/*
+			 * To prevent possible dangerous recursion,
+			 * we don't do vlan-in-vlan.
+			 */
+			IFNET_STAT_INC(m->m_pkthdr.rcvif, noproto, 1);
 			goto failed;
-
-		eh = mtod(m, struct ether_header *);
-		ether_type = ntohs(eh->ether_type);
+		}
+		KKASSERT(ether_type != ETHERTYPE_VLAN);
 	}
-
-	if (ether_type == ETHERTYPE_VLAN && (m->m_flags & M_VLANTAG)) {
-		/*
-		 * To prevent possible dangerous recursion,
-		 * we don't do vlan-in-vlan
-		 */
-		IFNET_STAT_INC(m->m_pkthdr.rcvif, noproto, 1);
-		goto failed;
-	}
-	KKASSERT(ether_type != ETHERTYPE_VLAN);
 
 	m->m_flags |= M_ETHER_VLANCHECKED;
 	*m0 = m;
@@ -1318,6 +1358,8 @@ ether_input_handler(netmsg_t nmsg)
 			return;
 		}
 	}
+
+	ifp = m->m_pkthdr.rcvif;
 	if ((m->m_flags & (M_HASH | M_CKHASH)) == (M_HASH | M_CKHASH) ||
 	    __predict_false(ether_input_ckhash)) {
 		int isr;
@@ -1336,13 +1378,12 @@ ether_input_handler(netmsg_t nmsg)
 			/*
 			 * Wrong hardware supplied hash; redispatch
 			 */
-			ether_dispatch(isr, m, -1);
+			ether_dispatch(ifp, isr, m, -1);
 			if (__predict_false(ether_input_ckhash))
 				atomic_add_long(&ether_input_wronghwhash, 1);
 			return;
 		}
 	}
-	ifp = m->m_pkthdr.rcvif;
 
 	eh = mtod(m, struct ether_header *);
 	if (ETHER_IS_MULTICAST(eh->ether_dhost)) {
@@ -1364,7 +1405,7 @@ ether_input_handler(netmsg_t nmsg)
  * so we know which netisr to send it to.
  */
 static void
-ether_dispatch(int isr, struct mbuf *m, int cpuid)
+ether_dispatch(struct ifnet *ifp, int isr, struct mbuf *m, int cpuid)
 {
 	struct netmsg_packet *pmsg;
 	int target_cpuid;
@@ -1380,8 +1421,12 @@ ether_dispatch(int isr, struct mbuf *m, int cpuid)
 
 	logether(disp_beg, NULL);
 	if (target_cpuid == cpuid) {
-		lwkt_sendmsg_oncpu(netisr_cpuport(target_cpuid),
-		    &pmsg->base.lmsg);
+		if ((ifp->if_flags & IFF_IDIRECT) && IN_NETISR_NCPUS(cpuid)) {
+			ether_input_handler((netmsg_t)pmsg);
+		} else {
+			lwkt_sendmsg_oncpu(netisr_cpuport(target_cpuid),
+			    &pmsg->base.lmsg);
+		}
 	} else {
 		lwkt_sendmsg(netisr_cpuport(target_cpuid),
 		    &pmsg->base.lmsg);
@@ -1455,7 +1500,7 @@ ether_input(struct ifnet *ifp, struct mbuf *m, const struct pktinfo *pi,
 #endif
 		netisr_hashcheck(pi->pi_netisr, m, pi);
 		if (m->m_flags & M_HASH) {
-			ether_dispatch(pi->pi_netisr, m, cpuid);
+			ether_dispatch(ifp, pi->pi_netisr, m, cpuid);
 #ifdef RSS_DEBUG
 			atomic_add_long(&ether_pktinfo_hit, 1);
 #endif
@@ -1495,7 +1540,7 @@ ether_input(struct ifnet *ifp, struct mbuf *m, const struct pktinfo *pi,
 	/*
 	 * Finally dispatch it
 	 */
-	ether_dispatch(isr, m, cpuid);
+	ether_dispatch(ifp, isr, m, cpuid);
 
 	logether(pkt_end, ifp);
 }

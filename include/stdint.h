@@ -22,14 +22,12 @@
  * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
  * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
- *
- * $DragonFly: src/include/stdint.h,v 1.2 2003/11/15 19:28:42 asmodai Exp $
  */
 
 #ifndef _STDINT_H_
 #define _STDINT_H_
 
-#include <sys/stdint.h>
+#include <machine/stdint.h>
 
 typedef __int8_t	int8_t;
 typedef __int16_t	int16_t;
@@ -41,16 +39,14 @@ typedef __uint16_t	uint16_t;
 typedef __uint32_t	uint32_t;
 typedef __uint64_t	uint64_t;
 
+#ifndef _INTPTR_T_DECLARED
+#define _INTPTR_T_DECLARED
 typedef __intptr_t	intptr_t;
+#endif
 typedef __uintptr_t	uintptr_t;
 
 typedef __intmax_t	intmax_t;
 typedef __uintmax_t	uintmax_t;
-
-#ifndef _PTRDIFF_T_DECLARED
-#define _PTRDIFF_T_DECLARED
-typedef __ptrdiff_t		ptrdiff_t;            /* ptr1 - ptr2 */
-#endif
 
 typedef __int_fast8_t		int_fast8_t;
 typedef __int_fast16_t		int_fast16_t;
@@ -69,13 +65,31 @@ typedef __uint_least16_t	uint_least16_t;
 typedef __uint_least32_t	uint_least32_t;
 typedef __uint_least64_t	uint_least64_t;
 
-#if !defined(__cplusplus) || defined(__STDC_CONSTANT_MACROS)
 #include <machine/int_const.h>
-#endif /* !defined(__cplusplus) || defined(__STDC_CONSTANT_MACROS) */
-
-#if !defined(__cplusplus) || defined(__STDC_LIMIT_MACROS)
 #include <machine/int_limits.h>
+#include <machine/wchar_limits.h>
+
+/* Also possibly defined in <wchar.h> */
+/* Limits of wchar_t. */
+#ifndef WCHAR_MIN
+#define	WCHAR_MIN	__WCHAR_MIN
+#endif
+#ifndef WCHAR_MAX
+#define	WCHAR_MAX	__WCHAR_MAX
 #endif
 
+/* Limits of wint_t. */
+#ifndef WINT_MIN
+#define	WINT_MIN	__WINT_MIN
+#endif
+#ifndef WINT_MAX
+#define	WINT_MAX	__WINT_MAX
 #endif
 
+#if __EXT1_VISIBLE
+#ifndef RSIZE_MAX
+#define	RSIZE_MAX (SIZE_MAX >> 1)
+#endif
+#endif /* __EXT1_VISIBLE */
+
+#endif /* !_STDINT_H_ */

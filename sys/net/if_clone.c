@@ -28,156 +28,125 @@
  *
  *	@(#)if.c	8.3 (Berkeley) 1/4/94
  * $FreeBSD: src/sys/net/if.c,v 1.185 2004/03/13 02:35:03 brooks Exp $
- * $DragonFly: src/sys/net/if_clone.c,v 1.1 2008/01/11 11:59:40 sephe Exp $
  */
 
 #include <sys/param.h>
 #include <sys/kernel.h>
 #include <sys/malloc.h>
+#include <sys/eventhandler.h>
+#include <sys/limits.h>
 
 #include <net/if.h>
+#include <net/if_var.h>
 #include <net/if_clone.h>
 
 static LIST_HEAD(, if_clone) if_cloners = LIST_HEAD_INITIALIZER(if_cloners);
-static int		if_cloners_count;
+static int if_cloners_count;
 
 MALLOC_DEFINE(M_CLONE, "clone", "interface cloning framework");
 
-static struct if_clone	*if_clone_lookup(const char *, int *);
+static int	if_name2unit(const char *, int *);
+static bool	if_clone_match(struct if_clone *, const char *);
+static struct if_clone *if_clone_lookup(const char *);
+static int	if_clone_alloc_unit(struct if_clone *, int *);
+static void	if_clone_free_unit(struct if_clone *, int);
+static int	if_clone_createif(struct if_clone *, int, caddr_t, caddr_t);
 
 /*
- * Create a clone network interface.
+ * Lookup the cloner and create a clone network interface.
  */
 int
-if_clone_create(char *name, int len, caddr_t params)
+if_clone_create(char *name, int len, caddr_t params, caddr_t data)
 {
 	struct if_clone *ifc;
-	char *dp;
-	int wildcard, bytoff, bitoff;
+	char ifname[IFNAMSIZ];
+	bool wildcard;
 	int unit;
 	int err;
 
-	ifc = if_clone_lookup(name, &unit);
-	if (ifc == NULL)
+	if ((ifc = if_clone_lookup(name)) == NULL)
 		return (EINVAL);
-
-	if (ifunit(name) != NULL)
-		return (EEXIST);
-
-	bytoff = bitoff = 0;
-	wildcard = (unit < 0);
-	/*
-	 * Find a free unit if none was given.
-	 */
-	if (wildcard) {
-		while (bytoff < ifc->ifc_bmlen &&
-		    ifc->ifc_units[bytoff] == 0xff)
-			bytoff++;
-		if (bytoff >= ifc->ifc_bmlen)
-			return (ENOSPC);
-		while ((ifc->ifc_units[bytoff] & (1 << bitoff)) != 0)
-			bitoff++;
-		unit = (bytoff << 3) + bitoff;
-	}
-
-	if (unit > ifc->ifc_maxunit)
-		return (ENXIO);
-
-	err = (*ifc->ifc_create)(ifc, unit, params);
-	if (err != 0)
+	if ((err = if_name2unit(name, &unit)) != 0)
 		return (err);
 
-	if (!wildcard) {
-		bytoff = unit >> 3;
-		bitoff = unit - (bytoff << 3);
+	wildcard = (unit < 0);
+
+	ifnet_lock();
+	if ((err = if_clone_alloc_unit(ifc, &unit)) != 0) {
+		ifnet_unlock();
+		return (err);
 	}
+
+	ksnprintf(ifname, IFNAMSIZ, "%s%d", ifc->ifc_name, unit);
 
 	/*
-	 * Allocate the unit in the bitmap.
+	 * Update the name with the allocated unit for the caller,
+	 * who must preserve enough space.
 	 */
-	KASSERT((ifc->ifc_units[bytoff] & (1 << bitoff)) == 0,
-	    ("%s: bit is already set", __func__));
-	ifc->ifc_units[bytoff] |= (1 << bitoff);
-
-	/* In the wildcard case, we need to update the name. */
-	if (wildcard) {
-		for (dp = name; *dp != '\0'; dp++);
-		if (ksnprintf(dp, len - (dp-name), "%d", unit) >
-		    len - (dp-name) - 1) {
-			/*
-			 * This can only be a programmer error and
-			 * there's no straightforward way to recover if
-			 * it happens.
-			 */
-			panic("if_clone_create(): interface name too long");
-		}
-
+	if (wildcard && strlcpy(name, ifname, len) >= len) {
+		if_clone_free_unit(ifc, unit);
+		ifnet_unlock();
+		return (ENOSPC);
 	}
 
-	EVENTHANDLER_INVOKE(if_clone_event, ifc);
+	err = if_clone_createif(ifc, unit, params, data);
+	if (err)
+		if_clone_free_unit(ifc, unit);
+	ifnet_unlock();
 
-	return (0);
+	return (err);
 }
 
 /*
- * Destroy a clone network interface.
+ * Lookup the cloner and destroy a clone network interface.
  */
 int
 if_clone_destroy(const char *name)
 {
 	struct if_clone *ifc;
 	struct ifnet *ifp;
-	int bytoff, bitoff;
 	int unit, error;
 
-	ifc = if_clone_lookup(name, &unit);
-	if (ifc == NULL)
-		return (EINVAL);
-
-	if (unit < ifc->ifc_minifs)
-		return (EINVAL);
-
+	ifnet_lock();
 	ifp = ifunit(name);
+	ifnet_unlock();
 	if (ifp == NULL)
 		return (ENXIO);
+
+	if ((ifc = if_clone_lookup(ifp->if_dname)) == NULL)
+		return (EINVAL);
+
+	unit = ifp->if_dunit;
+	if (unit < ifc->ifc_minifs)
+		return (EINVAL);
 
 	if (ifc->ifc_destroy == NULL)
 		return (EOPNOTSUPP);
 
+	ifnet_lock();
+	if_clone_free_unit(ifc, unit);
 	error = ifc->ifc_destroy(ifp);
 	if (error)
-		return error;
+		if_clone_alloc_unit(ifc, &unit);
+	/* else ifc structure is dead */
+	ifnet_unlock();
 
-	/*
-	 * Compute offset in the bitmap and deallocate the unit.
-	 */
-	bytoff = unit >> 3;
-	bitoff = unit - (bytoff << 3);
-	KASSERT((ifc->ifc_units[bytoff] & (1 << bitoff)) != 0,
-	    ("%s: bit is already cleared", __func__));
-	ifc->ifc_units[bytoff] &= ~(1 << bitoff);
-	return (0);
+	return (error);
 }
 
 /*
  * Register a network interface cloner.
  */
-void
+int
 if_clone_attach(struct if_clone *ifc)
 {
-	int bytoff, bitoff;
-	int err;
+	struct if_clone *ifct;
 	int len, maxclone;
 	int unit;
-	struct if_clone *ifct;
 
-	/* Duplicate entries in if_cloners lead
-           to infinite loops in if_clone_create */
 	LIST_FOREACH(ifct, &if_cloners, ifc_list) {
-		if (ifct == ifc) {
-			panic("%s: duplicate entry %s\n",
-			      __func__, ifc->ifc_name);
-		}
+		if (strcmp(ifct->ifc_name, ifc->ifc_name) == 0)
+			return (EEXIST);
 	}
 
 	KASSERT(ifc->ifc_minifs - 1 <= ifc->ifc_maxunit,
@@ -197,17 +166,20 @@ if_clone_attach(struct if_clone *ifc)
 	LIST_INSERT_HEAD(&if_cloners, ifc, ifc_list);
 	if_cloners_count++;
 
+	ifnet_lock();
 	for (unit = 0; unit < ifc->ifc_minifs; unit++) {
-		err = (*ifc->ifc_create)(ifc, unit, NULL);
-		KASSERT(err == 0,
-		    ("%s: failed to create required interface %s%d",
-		    __func__, ifc->ifc_name, unit));
-
-		/* Allocate the unit in the bitmap. */
-		bytoff = unit >> 3;
-		bitoff = unit - (bytoff << 3);
-		ifc->ifc_units[bytoff] |= (1 << bitoff);
+		if_clone_alloc_unit(ifc, &unit);
+		if (if_clone_createif(ifc, unit, NULL, NULL) != 0) {
+			ifnet_unlock();
+			panic("%s: failed to create required interface %s%d",
+			      __func__, ifc->ifc_name, unit);
+		}
 	}
+	ifnet_unlock();
+
+	EVENTHANDLER_INVOKE(if_clone_event, ifc);
+
+	return (0);
 }
 
 /*
@@ -244,8 +216,10 @@ if_clone_list(struct if_clonereq *ifcr)
 	count = (if_cloners_count < ifcr->ifcr_count) ?
 	    if_cloners_count : ifcr->ifcr_count;
 
-	for (ifc = LIST_FIRST(&if_cloners); ifc != NULL && count != 0;
+	for (ifc = LIST_FIRST(&if_cloners);
+	     ifc != NULL && count != 0;
 	     ifc = LIST_NEXT(ifc, ifc_list), count--, dst += IFNAMSIZ) {
+		bzero(outbuf, IFNAMSIZ);	/* sanitize */
 		strlcpy(outbuf, ifc->ifc_name, IFNAMSIZ);
 		error = copyout(outbuf, dst, IFNAMSIZ);
 		if (error)
@@ -256,42 +230,176 @@ if_clone_list(struct if_clonereq *ifcr)
 }
 
 /*
- * Look up a network interface cloner.
+ * Extract the unit number from interface name of the form "name###".
+ * A unit of -1 is stored if the given name doesn't have a unit.
+ *
+ * Returns 0 on success and an error on failure.
  */
-static struct if_clone *
-if_clone_lookup(const char *name, int *unitp)
+static int
+if_name2unit(const char *name, int *unit)
 {
-	struct if_clone *ifc;
+	const char *cp;
+	int cutoff = INT_MAX / 10;
+	int cutlim = INT_MAX % 10;
+
+	for (cp = name; *cp != '\0' && (*cp < '0' || *cp > '9'); cp++)
+		;
+	if (*cp == '\0') {
+		*unit = -1;
+	} else if (cp[0] == '0' && cp[1] != '\0') {
+		/* Disallow leading zeroes. */
+		return (EINVAL);
+	} else {
+		for (*unit = 0; *cp != '\0'; cp++) {
+			if (*cp < '0' || *cp > '9') {
+				/* Bogus unit number. */
+				return (EINVAL);
+			}
+			if (*unit > cutoff ||
+			    (*unit == cutoff && *cp - '0' > cutlim))
+				return (EINVAL);
+			*unit = (*unit * 10) + (*cp - '0');
+		}
+	}
+
+	return (0);
+}
+
+/*
+ * Check whether the interface cloner matches the name.
+ */
+static bool
+if_clone_match(struct if_clone *ifc, const char *name)
+{
 	const char *cp;
 	int i;
 
-	for (ifc = LIST_FIRST(&if_cloners); ifc != NULL;) {
-		for (cp = name, i = 0; i < ifc->ifc_namelen; i++, cp++) {
-			if (ifc->ifc_name[i] != *cp)
-				goto next_ifc;
-		}
-		goto found_name;
- next_ifc:
-		ifc = LIST_NEXT(ifc, ifc_list);
+	/* Match the name */
+	for (cp = name, i = 0; i < strlen(ifc->ifc_name); i++, cp++) {
+		if (ifc->ifc_name[i] != *cp)
+			return (false);
 	}
 
-	/* No match. */
+	/* Make sure there's a unit number or nothing after the name */
+	for ( ; *cp != '\0'; cp++) {
+		if (*cp < '0' || *cp > '9')
+			return (false);
+	}
+
+	return (true);
+}
+
+/*
+ * Look up a network interface cloner.
+ */
+static struct if_clone *
+if_clone_lookup(const char *name)
+{
+	struct if_clone *ifc;
+
+	LIST_FOREACH(ifc, &if_cloners, ifc_list) {
+		if (if_clone_match(ifc, name))
+			return ifc;
+	}
+
 	return (NULL);
+}
 
- found_name:
-	if (*cp == '\0') {
-		i = -1;
+/*
+ * Allocate a unit number.
+ *
+ * ifnet must be locked.
+ *
+ * Returns 0 on success and an error on failure.
+ */
+static int
+if_clone_alloc_unit(struct if_clone *ifc, int *unit)
+{
+	int bytoff, bitoff;
+
+	if (*unit < 0) {
+		/*
+		 * Wildcard mode: find a free unit.
+		 */
+		bytoff = bitoff = 0;
+		while (bytoff < ifc->ifc_bmlen &&
+		       ifc->ifc_units[bytoff] == 0xff)
+			bytoff++;
+		if (bytoff >= ifc->ifc_bmlen)
+			return (ENOSPC);
+		while ((ifc->ifc_units[bytoff] & (1 << bitoff)) != 0)
+			bitoff++;
+		*unit = (bytoff << 3) + bitoff;
 	} else {
-		for (i = 0; *cp != '\0'; cp++) {
-			if (*cp < '0' || *cp > '9') {
-				/* Bogus unit number. */
-				return (NULL);
-			}
-			i = (i * 10) + (*cp - '0');
-		}
+		bytoff = *unit >> 3;
+		bitoff = *unit - (bytoff << 3);
 	}
 
-	if (unitp != NULL)
-		*unitp = i;
-	return (ifc);
+	if (*unit > ifc->ifc_maxunit)
+		return (ENXIO);
+
+	/*
+	 * Allocate the unit in the bitmap.
+	 */
+#if 0
+	KASSERT((ifc->ifc_units[bytoff] & (1 << bitoff)) == 0,
+		("%s: bit is already set", __func__));
+#endif
+	if (ifc->ifc_units[bytoff] & (1 << bitoff))
+		return (EEXIST);
+	ifc->ifc_units[bytoff] |= (1 << bitoff);
+
+	return (0);
+}
+
+/*
+ * Free an allocated unit number.
+ *
+ * ifnet must be locked.
+ */
+static void
+if_clone_free_unit(struct if_clone *ifc, int unit)
+{
+	int bytoff, bitoff;
+
+	bytoff = unit >> 3;
+	bitoff = unit - (bytoff << 3);
+	KASSERT((ifc->ifc_units[bytoff] & (1 << bitoff)) != 0,
+		("%s: bit is already cleared", __func__));
+	ifc->ifc_units[bytoff] &= ~(1 << bitoff);
+}
+
+/*
+ * Create a clone network interface.
+ *
+ * ifnet must be locked
+ */
+static int
+if_clone_createif(struct if_clone *ifc, int unit, caddr_t params, caddr_t data)
+{
+	struct ifnet *ifp;
+	char ifname[IFNAMSIZ];
+	int err;
+
+	ksnprintf(ifname, IFNAMSIZ, "%s%d", ifc->ifc_name, unit);
+
+	ifp = ifunit(ifname);
+	if (ifp != NULL)
+		return (EEXIST);
+
+	/*ifnet_unlock();*/
+	err = (*ifc->ifc_create)(ifc, unit, params, data);
+	/*ifnet_lock();*/
+	if (err != 0)
+		return (err);
+
+	ifp = ifunit(ifname);
+	if (ifp == NULL)
+		return (ENXIO);
+
+	err = if_addgroup(ifp, ifc->ifc_name);
+	if (err != 0)
+		return (err);
+
+	return (0);
 }

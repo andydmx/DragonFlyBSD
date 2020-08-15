@@ -51,6 +51,7 @@
 
 #include "namespace.h"
 #include <sys/param.h>
+#include <sys/file.h>
 
 #include <errno.h>
 #include <fcntl.h>
@@ -673,7 +674,7 @@ overflow_page(HTAB *hashp)
 			bit = hashp->LAST_FREED &
 			    ((hashp->BSIZE << BYTE_SHIFT) - 1);
 			j = bit / BITS_PER_MAP;
-			bit = bit & ~(BITS_PER_MAP - 1);
+			bit = rounddown2(bit, BITS_PER_MAP);
 		} else {
 			bit = 0;
 			j = 0;
@@ -859,8 +860,8 @@ open_temp(HTAB *hashp)
 	/* Block signals; make sure file goes away at process exit. */
 	sigfillset(&set);
 	_sigprocmask(SIG_BLOCK, &set, &oset);
-	if ((hashp->fp = mkstemp(path)) != -1) {
-		unlink(path);
+	if ((hashp->fp = mkostemp(path, O_CLOEXEC)) != -1) {
+		_unlink(path);
 		_fcntl(hashp->fp, F_SETFD, 1);
 	}
 	_sigprocmask(SIG_SETMASK, &oset, NULL);

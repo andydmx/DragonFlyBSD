@@ -37,14 +37,13 @@
 #include <sys/kernel.h>
 #include <sys/bus.h>
 #include <sys/cpu_topology.h>
+#include <sys/cpuhelper.h>
+#include <sys/malloc.h>
 #include <sys/module.h>
 #include <sys/queue.h>
 #include <sys/serialize.h>
 #include <sys/sysctl.h>
 #include <sys/systm.h>
-
-#include <net/netmsg2.h>
-#include <net/netisr2.h>
 
 #include <machine/specialreg.h>
 #include <machine/cpufunc.h>
@@ -52,11 +51,6 @@
 #include <machine/md_var.h>
 
 struct clockmod_dom;
-
-struct netmsg_clockmod {
-	struct netmsg_base	base;
-	uint64_t		ctl_value;
-};
 
 struct clockmod_softc {
 	TAILQ_ENTRY(clockmod_softc) sc_link;
@@ -97,7 +91,7 @@ static int	clockmod_probe(device_t);
 static int	clockmod_attach(device_t);
 static int	clockmod_detach(device_t);
 
-static void	clockmod_select_handler(netmsg_t);
+static void	clockmod_select_handler(struct cpuhelper_msg *);
 static int	clockmod_select(const struct clockmod_softc *,
 		    const struct clockmod_dom_ctrl *);
 
@@ -338,7 +332,7 @@ clockmod_dom_create(cpumask_t mask)
 				ctrl->ctl_value |= 1 << 4;
 
 			if (bootverbose) {
-				kprintf("  0x%04jx %s\n", 
+				kprintf("  0x%04jx %s\n",
 				    (uintmax_t)ctrl->ctl_value,
 				    ctrl->ctl_name);
 			}
@@ -465,31 +459,30 @@ back:
 }
 
 static void
-clockmod_select_handler(netmsg_t msg)
+clockmod_select_handler(struct cpuhelper_msg *msg)
 {
-	struct netmsg_clockmod *cmsg = (struct netmsg_clockmod *)msg;
+	uint64_t ctl_value = *((const uint64_t *)msg->ch_cbarg);
 
 #if 0
 	if (bootverbose) {
 		kprintf("cpu%d: clockmod 0x%04jx\n", mycpuid,
-		    (uintmax_t)cmsg->ctl_value);
+		    (uintmax_t)ctl_value);
 	}
 #endif
-
-	wrmsr(MSR_THERM_CONTROL, cmsg->ctl_value);
-	lwkt_replymsg(&cmsg->base.lmsg, 0);
+	wrmsr(MSR_THERM_CONTROL, ctl_value);
+	cpuhelper_replymsg(msg, 0);
 }
 
-static int 
+static int
 clockmod_select(const struct clockmod_softc *sc,
     const struct clockmod_dom_ctrl *ctrl)
 {
-	struct netmsg_clockmod msg;
+	struct cpuhelper_msg msg;
 
-	netmsg_init(&msg.base, NULL, &curthread->td_msgport, MSGF_PRIORITY,
-	    clockmod_select_handler);
-	msg.ctl_value = ctrl->ctl_value;
-	return lwkt_domsg(netisr_cpuport(sc->sc_cpuid), &msg.base.lmsg, 0);
+	cpuhelper_initmsg(&msg, &curthread->td_msgport,
+	    clockmod_select_handler, __DECONST(void *, &ctrl->ctl_value),
+	    MSGF_PRIORITY);
+	return (cpuhelper_domsg(&msg, sc->sc_cpuid));
 }
 
 static boolean_t

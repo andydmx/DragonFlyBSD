@@ -4,12 +4,8 @@
 CONTRIBDIR=	${GCCDIR}/gcc
 
 LANG1=c
-.if !defined(NO_CXX)
 LANG2=, c++
-.endif
-.if !defined(NO_OBJC)
 LANG3=, objc
-.endif
 LANG4=, LTO
 
 version.c: ${CONTRIBDIR}/version.c Makefile ../Makefile.inc
@@ -68,6 +64,10 @@ tm.h:
 	echo '#ifndef GCC_TM_H'				> ${.TARGET}
 	echo '#define GCC_TM_H'				>> ${.TARGET}
 	echo '#ifdef IN_GCC'				>> ${.TARGET}
+.if defined(REALLY_NOSHARED)
+	echo '#undef HAVE_LTO_PLUGIN'			>> ${.TARGET}
+	echo '#define HAVE_LTO_PLUGIN 0'		>> ${.TARGET}
+.endif
 .for H in ${TARGET_INC}
 	echo '# include "$H"'				>> ${.TARGET}
 .endfor

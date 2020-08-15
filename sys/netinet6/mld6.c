@@ -1,5 +1,4 @@
 /*	$FreeBSD: src/sys/netinet6/mld6.c,v 1.4.2.4 2003/01/23 21:06:47 sam Exp $	*/
-/*	$DragonFly: src/sys/netinet6/mld6.c,v 1.6 2005/06/03 19:56:08 eirikn Exp $	*/
 /*	$KAME: mld6.c,v 1.27 2001/04/04 05:17:30 itojun Exp $	*/
 
 /*
@@ -71,11 +70,11 @@
 
 #include <sys/param.h>
 #include <sys/systm.h>
+#include <sys/malloc.h>	/* for M_NOWAIT */
 #include <sys/mbuf.h>
 #include <sys/socket.h>
 #include <sys/protosw.h>
 #include <sys/syslog.h>
-#include <sys/thread2.h>
 
 #include <net/if.h>
 
@@ -106,7 +105,7 @@ static int mld6_timers_are_running;
 static struct in6_addr mld6_all_nodes_linklocal = IN6ADDR_LINKLOCAL_ALLNODES_INIT;
 static struct in6_addr mld6_all_routers_linklocal = IN6ADDR_LINKLOCAL_ALLROUTERS_INIT;
 
-static void mld6_sendpkt (struct in6_multi *, int, const struct in6_addr *);
+static void mld6_sendpkt(struct in6_multi *, int, const struct in6_addr *);
 
 static struct lwkt_token mld6_token = LWKT_TOKEN_INITIALIZER(mp_token);
 
@@ -171,7 +170,7 @@ mld6_stop_listening(struct in6_multi *in6m)
 
 	if (in6m->in6m_state == MLD6_IREPORTEDLAST &&
 	    (!IN6_ARE_ADDR_EQUAL(&in6m->in6m_addr, &mld6_all_nodes_linklocal)) &&
-	    IPV6_ADDR_MC_SCOPE(&in6m->in6m_addr) > IPV6_ADDR_SCOPE_NODELOCAL)
+	    IPV6_ADDR_MC_SCOPE(&in6m->in6m_addr) > IPV6_ADDR_SCOPE_INTFACELOCAL)
 		mld6_sendpkt(in6m, MLD_LISTENER_DONE,
 			     &mld6_all_routers_linklocal);
 }
@@ -201,7 +200,7 @@ mld6_input(struct mbuf *m, int off)
 
 	lwkt_gettoken(&mld6_token);
 	/* source address validation */
-	ip6 = mtod(m, struct ip6_hdr *);/* in case mpullup */
+	ip6 = mtod(m, struct ip6_hdr *); /* in case mpullup */
 	if (!IN6_IS_ADDR_LINKLOCAL(&ip6->ip6_src)) {
 #if 0
 		log(LOG_ERR,
@@ -263,7 +262,8 @@ mld6_input(struct mbuf *m, int off)
 		 * the calculated value equals to zero when Max Response
 		 * Delay is positive.
 		 */
-		timer = ntohs(mldh->mld_maxdelay)*PR_FASTHZ/MLD6_TIMER_SCALE;
+		timer = ntohs(mldh->mld_maxdelay) * PR_FASTHZ /
+		    MLD6_TIMER_SCALE;
 		if (timer == 0 && mldh->mld_maxdelay)
 			timer = 1;
 		mld6_all_nodes_linklocal.s6_addr16[1] =
@@ -288,6 +288,7 @@ mld6_input(struct mbuf *m, int off)
 			if (ifma->ifma_addr->sa_family != AF_INET6)
 				continue;
 			in6m = (struct in6_multi *)ifma->ifma_protospec;
+
 			if (IN6_ARE_ADDR_EQUAL(&in6m->in6m_addr,
 					&mld6_all_nodes_linklocal) ||
 			    IPV6_ADDR_MC_SCOPE(&in6m->in6m_addr) <
@@ -326,6 +327,7 @@ mld6_input(struct mbuf *m, int off)
 		if (IN6_IS_ADDR_MC_LINKLOCAL(&mldh->mld_addr))
 			mldh->mld_addr.s6_addr16[1] = 0; /* XXX */
 		break;
+
 	case MLD_LISTENER_REPORT:
 		/*
 		 * For fast leave to work, we have to know that we are the
@@ -378,6 +380,7 @@ mld6_fasttimeo(void)
 	 * to minimize the overhead of fasttimo processing.
 	 */
 	lwkt_gettoken(&mld6_token);
+
 	if (!mld6_timers_are_running) {
 		lwkt_reltoken(&mld6_token);
 		return;
@@ -396,6 +399,7 @@ mld6_fasttimeo(void)
 		}
 		IN6_NEXT_MULTI(step, in6m);
 	}
+
 	lwkt_reltoken(&mld6_token);
 }
 
@@ -423,10 +427,10 @@ mld6_sendpkt(struct in6_multi *in6m, int type, const struct in6_addr *dst)
 	 * We allocate 2 mbufs and make chain in advance because
 	 * it is more convenient when inserting the hop-by-hop option later.
 	 */
-	MGETHDR(mh, MB_DONTWAIT, MT_HEADER);
+	MGETHDR(mh, M_NOWAIT, MT_HEADER);
 	if (mh == NULL)
 		return;
-	MGET(md, MB_DONTWAIT, MT_DATA);
+	MGET(md, M_NOWAIT, MT_DATA);
 	if (md == NULL) {
 		m_free(mh);
 		return;
@@ -461,9 +465,8 @@ mld6_sendpkt(struct in6_multi *in6m, int type, const struct in6_addr *dst)
 	mldh->mld_addr = in6m->in6m_addr;
 	if (IN6_IS_ADDR_MC_LINKLOCAL(&mldh->mld_addr))
 		mldh->mld_addr.s6_addr16[1] = 0; /* XXX */
-	mldh->mld_cksum = in6_cksum(mh, IPPROTO_ICMPV6,
-				     sizeof(struct ip6_hdr),
-				     sizeof(struct mld_hdr));
+	mldh->mld_cksum = in6_cksum(mh, IPPROTO_ICMPV6, sizeof(struct ip6_hdr),
+	    sizeof(struct mld_hdr));
 
 	/* construct multicast option */
 	bzero(&im6o, sizeof(im6o));

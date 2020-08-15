@@ -56,9 +56,6 @@
 
 typedef struct link_map {
 	caddr_t		l_addr;			/* Base Address of library */
-#ifdef __mips__
-	caddr_t		l_offs;			/* Load Offset of library */
-#endif
 	const char	*l_name;		/* Absolute Path to Library */
 	const void	*l_ld;			/* Pointer to .dynamic in memory */
 	struct link_map	*l_next, *l_prev;	/* linked list of of mapped libs */
@@ -91,7 +88,7 @@ struct dl_phdr_info
 __BEGIN_DECLS
 
 typedef int (*__dl_iterate_hdr_callback)(struct dl_phdr_info *, size_t, void *);
-extern int dl_iterate_phdr(__dl_iterate_hdr_callback, void *);
+int dl_iterate_phdr(__dl_iterate_hdr_callback, void *);
 int _rtld_addr_phdr(const void *, struct dl_phdr_info *);
 int _rtld_get_stack_prot(void);
 

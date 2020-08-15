@@ -1,4 +1,4 @@
-/* $OpenBSD: dh.h,v 1.10 2008/06/26 09:19:40 djm Exp $ */
+/* $OpenBSD: dh.h,v 1.18 2019/09/06 05:23:55 djm Exp $ */
 
 /*
  * Copyright (c) 2000 Niels Provos.  All rights reserved.
@@ -26,6 +26,8 @@
 #ifndef DH_H
 #define DH_H
 
+#ifdef WITH_OPENSSL
+
 struct dhgroup {
 	int size;
 	BIGNUM *g;
@@ -37,13 +39,20 @@ DH	*dh_new_group_asc(const char *, const char *);
 DH	*dh_new_group(BIGNUM *, BIGNUM *);
 DH	*dh_new_group1(void);
 DH	*dh_new_group14(void);
+DH	*dh_new_group16(void);
+DH	*dh_new_group18(void);
+DH	*dh_new_group_fallback(int);
 
-void	 dh_gen_key(DH *, int);
-int	 dh_pub_is_valid(DH *, BIGNUM *);
+int	 dh_gen_key(DH *, int);
+int	 dh_pub_is_valid(const DH *, const BIGNUM *);
 
-int	 dh_estimate(int);
+u_int	 dh_estimate(int);
 
-#define DH_GRP_MIN	1024
+/*
+ * Max value from RFC4419.
+ * Min value from RFC8270.
+ */
+#define DH_GRP_MIN	2048
 #define DH_GRP_MAX	8192
 
 /*
@@ -69,5 +78,6 @@ int	 dh_estimate(int);
 #define MODULI_TESTS_JACOBI		(0x08)
 #define MODULI_TESTS_ELLIPTIC		(0x10)
 
+#endif /* WITH_OPENSSL */
 
-#endif
+#endif /* DH_H */

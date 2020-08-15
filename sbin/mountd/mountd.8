@@ -26,10 +26,9 @@
 .\" SUCH DAMAGE.
 .\"
 .\"     @(#)mountd.8	8.4 (Berkeley) 4/28/95
-.\" $FreeBSD: src/sbin/mountd/mountd.8,v 1.16.2.2 2000/12/08 14:04:02 ru Exp $
-.\" $DragonFly: src/sbin/mountd/mountd.8,v 1.5 2008/05/09 20:31:04 swildner Exp $
+.\" $FreeBSD: head/usr.sbin/mountd/mountd.8 172827 2007-10-20 11:25:34Z matteo $
 .\"
-.Dd April 28, 1995
+.Dd December 1, 2014
 .Dt MOUNTD 8
 .Os
 .Sh NAME
@@ -40,7 +39,9 @@ mount requests
 .Sh SYNOPSIS
 .Nm
 .Op Fl 2dlnr
-.Op Ar exportsfile
+.Op Fl h Ar bindip
+.Op Fl p Ar port
+.Op Ar exportsfile ...
 .Sh DESCRIPTION
 .Nm Mountd
 is the server for
@@ -63,6 +64,23 @@ version 2
 protocol to mount filesystems from this server.
 .It Fl d
 Output debugging information.
+.It Fl h Ar bindip
+Specify specific IP addresses to bind to for TCP and UDP requests.
+This option may be specified multiple times.
+If no
+.Fl h
+option is specified,
+.Nm
+will bind to
+.Dv INADDR_ANY .
+Note that when specifying IP addresses with
+.Fl h ,
+.Nm
+will automatically add
+.Li 127.0.0.1
+and if IPv6 is enabled,
+.Li ::1
+to the list.
 .It Fl l
 Cause all succeeded
 .Nm
@@ -75,6 +93,21 @@ It will automatically clear the
 .Va vfs.nfs.nfs_privport
 sysctl flag, which
 controls if the kernel will accept NFS requests from reserved ports only.
+.It Fl p Ar port
+Force
+.Nm
+to bind to the specified port, for both
+.Vt AF_INET
+and
+.Vt AF_INET6
+address families.
+This is typically done to ensure that the port which
+.Nm
+binds to is a known quantity which can be used in firewall rulesets.
+If
+.Nm
+cannot bind to this port, an appropriate error will be recorded in
+the system log, and the daemon will then exit.
 .It Fl r
 Allow mount RPCs requests for regular files to be served.
 Although this seems to violate the mount protocol specification,
@@ -89,6 +122,7 @@ flag.
 .It Ar exportsfile
 Specify an alternate location
 for the exports file.
+There can many exports files.
 .El
 .Pp
 When

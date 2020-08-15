@@ -43,7 +43,7 @@
 #define ASSUME_CONS25
 #define ASSUME_XTERM
 
-#include <sys/types.h>
+#include <sys/param.h>
 #include <fcntl.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -78,8 +78,7 @@ extern const char *pos_string;		/* Absolute cursor positioning */
 #define MAX_CHARS	1024		/* Maximum chars on one line */
 
 /* LINE_START must be rounded up to the lowest SHIFT_SIZE */
-#define LINE_START	(((-MAX_CHARS - 1) / SHIFT_SIZE) * SHIFT_SIZE \
-  				   - SHIFT_SIZE)
+#define LINE_START	(rounddown(-MAX_CHARS - 1, SHIFT_SIZE) - SHIFT_SIZE)
 #define LINE_END	(MAX_CHARS + 1)	/* Highest x-coordinate for line */
 
 #define LINE_LEN	(XMAX + 1)	/* Number of characters on line */
@@ -307,7 +306,7 @@ void	 bad_write(int fd);
 void	 catch(int sig);
 void	 abort_mined(void);
 void	 raw_mode(FLAG state);
-void	 panic(const char *message);
+void	 panic(const char *message) __dead2;
 void	*alloc(int bytes);
 void	 free_space(char *p);
 void	 initialize(void);

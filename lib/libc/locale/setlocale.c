@@ -14,7 +14,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -81,7 +81,7 @@ static char current_categories[_LC_LAST][ENCODING_LEN + 1] = {
 /*
  * Path to locale storage directory
  */
-char	*_PathLocale;
+char *_PathLocale;
 
 /*
  * The locales we are going to try and load
@@ -91,15 +91,17 @@ static char saved_categories[_LC_LAST][ENCODING_LEN + 1];
 
 static char current_locale_string[_LC_LAST * (ENCODING_LEN + 1/*"/"*/ + 1)];
 
-static char	*currentlocale(void);
-static char	*loadlocale(int);
+static char *currentlocale(void);
+static char *loadlocale(int);
 const char *__get_locale_env(int);
+int __get_locale_str(int category, const char *str, char * const res);
 
 char *
 setlocale(int category, const char *locale)
 {
 	int i, j, len, saverr;
-        const char *env, *r;
+	const char *env, *r;
+	char lres[ENCODING_LEN + 1] = "";
 
 	if (category < LC_ALL || category >= _LC_LAST) {
 		errno = EINVAL;
@@ -144,14 +146,7 @@ setlocale(int category, const char *locale)
 		}
 		(void)strcpy(new_categories[category], locale);
 	} else {
-		if ((r = strchr(locale, '/')) == NULL) {
-			if (strlen(locale) > ENCODING_LEN) {
-				errno = EINVAL;
-				return (NULL);
-			}
-			for (i = 1; i < _LC_LAST; ++i)
-				(void)strcpy(new_categories[i], locale);
-		} else {
+		if ((r = strchr(locale, '/')) != NULL) {
 			for (i = 1; r[1] == '/'; ++r)
 				;
 			if (!r[1]) {
@@ -160,7 +155,7 @@ setlocale(int category, const char *locale)
 			}
 			do {
 				if (i == _LC_LAST)
-					break;  /* Too many slashes... */
+					break;	/* Too many slashes... */
 				if ((len = r - locale) > ENCODING_LEN) {
 					errno = EINVAL;
 					return (NULL);
@@ -176,9 +171,21 @@ setlocale(int category, const char *locale)
 			} while (*locale);
 			while (i < _LC_LAST) {
 				(void)strcpy(new_categories[i],
-					     new_categories[i-1]);
+					     new_categories[i - 1]);
 				i++;
 			}
+		} else if ('L' == locale[0] && strchr(locale, ';')) {
+			for (i = 1; i < _LC_LAST; ++i) {
+				__get_locale_str(i, locale, lres);
+				(void)strcpy(new_categories[i], lres);
+			}
+		} else {
+			if (strlen(locale) > ENCODING_LEN) {
+				errno = EINVAL;
+				return (NULL);
+			}
+			for (i = 1; i < _LC_LAST; ++i)
+				(void)strcpy(new_categories[i], locale);
 		}
 	}
 
@@ -280,25 +287,85 @@ loadlocale(int category)
 	return (NULL);
 }
 
+static int
+getlocstr(const char *name, const char *str, char * const res)
+{
+	const char *np, *cp;
+	int len;
+
+	np = str;
+
+	while ((cp = strchr (np, '=')) != NULL) {
+		if (!strncmp(np, name, (cp - np))) {
+			np = cp + 1;
+			cp = strchr(cp, ';');
+			if (cp == NULL)
+				cp = str + strlen(str);
+			len = cp - np;
+			if (len > ENCODING_LEN)
+				len = ENCODING_LEN;
+			strncpy(res, np, len);
+			res[len] = '\0';
+			return 0;
+		} else {
+			cp = strchr(cp, ';');
+			if (cp != NULL)
+				np = cp + 1;
+			else
+				break;
+		}
+	}
+
+	return 1;
+}
+/*
+ * Similar function like __get_locale_env() but from a string.
+ */
+int
+__get_locale_str(int category, const char *str, char * const res)
+{
+	int check;
+
+	/* 1. check LC_ALL. */
+	check = getlocstr(categories[0], str, res);
+
+	/* 2. check LC_* */
+	if (check)
+		check = getlocstr(categories[category], str, res);
+
+	/* 3. check LANG */
+	if (check)
+		check = getlocstr("LANG", str, res);
+
+	/* 4. if none is set, fall to "C" */
+	if (check) {
+		res[0] = 'C';
+		res[1] = '\0';
+	}
+
+	return check;
+}
+
+
 const char *
 __get_locale_env(int category)
 {
-        const char *env;
+	const char *env;
 
-        /* 1. check LC_ALL. */
-        env = getenv(categories[0]);
+	/* 1. check LC_ALL. */
+	env = getenv(categories[0]);
 
-        /* 2. check LC_* */
+	/* 2. check LC_* */
 	if (env == NULL || !*env)
-                env = getenv(categories[category]);
+		env = getenv(categories[category]);
 
-        /* 3. check LANG */
+	/* 3. check LANG */
 	if (env == NULL || !*env)
-                env = getenv("LANG");
+		env = getenv("LANG");
 
-        /* 4. if none is set, fall to "C" */
+	/* 4. if none is set, fall to "C" */
 	if (env == NULL || !*env)
-                env = "C";
+		env = "C";
 
 	return (env);
 }

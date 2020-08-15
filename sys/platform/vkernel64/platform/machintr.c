@@ -125,10 +125,12 @@ splz(void)
 	thread_t td = gd->mi.gd_curthread;
 	int irq;
 
-	while (gd->mi.gd_reqflags & (RQF_IPIQ|RQF_INTPEND)) {
+	while (gd->mi.gd_reqflags & (RQF_IPIQ|RQF_INTPEND|
+				     RQF_TIMER|RQF_KQUEUE)) {
 		crit_enter_quick(td);
 		if (gd->mi.gd_reqflags & RQF_IPIQ) {
 			atomic_clear_int(&gd->mi.gd_reqflags, RQF_IPIQ);
+			atomic_swap_int(&gd->mi.gd_npoll, 0);
 			lwkt_process_ipiq();
 		}
 		if (gd->mi.gd_reqflags & RQF_INTPEND) {
@@ -144,6 +146,14 @@ splz(void)
 				atomic_clear_int(&gd->gd_fpending, 1 << irq);
 				sched_ithd_hard_virtual(irq);
 			}
+		}
+		if (gd->mi.gd_reqflags & RQF_TIMER) {
+			atomic_clear_int(&gd->mi.gd_reqflags, RQF_TIMER);
+			vktimer_intr(NULL);
+		}
+		if (gd->mi.gd_reqflags & RQF_KQUEUE) {
+			atomic_clear_int(&gd->mi.gd_reqflags, RQF_KQUEUE);
+			kqueue_intr(NULL);
 		}
 		crit_exit_noyield(td);
 	}
@@ -167,8 +177,10 @@ signalintr(int intr)
 		umtx_wakeup(&gd->mi.gd_reqflags, 0);
 	} else {
 		++td->td_nest_count;
+		cpu_ccfence();
 		atomic_clear_int(&gd->gd_fpending, 1 << intr);
 		sched_ithd_hard_virtual(intr);
+		cpu_ccfence();
 		--td->td_nest_count;
 	}
 }
@@ -179,7 +191,8 @@ signalintr(int intr)
 void
 cpu_disable_intr(void)
 {
-	sigblock(sigmask(SIGALRM)|sigmask(SIGIO)|sigmask(SIGUSR1));
+	sigblock(sigmask(SIGALRM)|sigmask(SIGIO)|sigmask(SIGUSR1)|
+		 sigmask(SIGURG));
 }
 
 void
@@ -193,11 +206,24 @@ cpu_mask_all_signals(void)
 {
 	sigblock(sigmask(SIGALRM)|sigmask(SIGIO)|sigmask(SIGQUIT)|
 		 sigmask(SIGUSR1)|sigmask(SIGTERM)|sigmask(SIGWINCH)|
-		 sigmask(SIGUSR2));
+		 sigmask(SIGUSR2)|sigmask(SIGURG));
 }
 
 void
 cpu_unmask_all_signals(void)
 {
 	sigsetmask(0);
+}
+
+int
+cpu_interrupt_running(struct thread *td)
+{
+	struct mdglobaldata *gd = mdcpu;
+
+	if ((td->td_flags & TDF_INTTHREAD) ||
+	    gd->gd_fpending ||
+	    gd->gd_spending) {
+		return 1;
+	}
+	return 0;
 }

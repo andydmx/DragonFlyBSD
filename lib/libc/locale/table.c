@@ -18,7 +18,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -45,13 +45,14 @@
 #include "mblocal.h"
 
 const _RuneLocale _DefaultRuneLocale = {
-    _RUNE_MAGIC_1,
-    "NONE",
-    NULL,
-    NULL,
-    0xFFFD,
+    .__magic = _RUNE_MAGIC_1,
+    .__encoding = "NONE",
+    .__sgetrune = NULL,
+    .__sputrune = NULL,
+    .__invalid_rune = 0xFFFD,
 
-    {	/*00*/	_CTYPE_C,
+    .__runetype = {
+	/*00*/	_CTYPE_C,
 		_CTYPE_C,
 		_CTYPE_C,
 		_CTYPE_C,
@@ -99,16 +100,16 @@ const _RuneLocale _DefaultRuneLocale = {
 		_CTYPE_P|_CTYPE_R|_CTYPE_G,
 		_CTYPE_P|_CTYPE_R|_CTYPE_G,
 		_CTYPE_P|_CTYPE_R|_CTYPE_G,
-	/*30*/	_CTYPE_D|_CTYPE_R|_CTYPE_G|_CTYPE_X|0,
-		_CTYPE_D|_CTYPE_R|_CTYPE_G|_CTYPE_X|1,
-		_CTYPE_D|_CTYPE_R|_CTYPE_G|_CTYPE_X|2,
-		_CTYPE_D|_CTYPE_R|_CTYPE_G|_CTYPE_X|3,
-		_CTYPE_D|_CTYPE_R|_CTYPE_G|_CTYPE_X|4,
-		_CTYPE_D|_CTYPE_R|_CTYPE_G|_CTYPE_X|5,
-		_CTYPE_D|_CTYPE_R|_CTYPE_G|_CTYPE_X|6,
-		_CTYPE_D|_CTYPE_R|_CTYPE_G|_CTYPE_X|7,
-	/*38*/	_CTYPE_D|_CTYPE_R|_CTYPE_G|_CTYPE_X|8,
-		_CTYPE_D|_CTYPE_R|_CTYPE_G|_CTYPE_X|9,
+	/*30*/	_CTYPE_D|_CTYPE_R|_CTYPE_G|_CTYPE_X|_CTYPE_N|0,
+		_CTYPE_D|_CTYPE_R|_CTYPE_G|_CTYPE_X|_CTYPE_N|1,
+		_CTYPE_D|_CTYPE_R|_CTYPE_G|_CTYPE_X|_CTYPE_N|2,
+		_CTYPE_D|_CTYPE_R|_CTYPE_G|_CTYPE_X|_CTYPE_N|3,
+		_CTYPE_D|_CTYPE_R|_CTYPE_G|_CTYPE_X|_CTYPE_N|4,
+		_CTYPE_D|_CTYPE_R|_CTYPE_G|_CTYPE_X|_CTYPE_N|5,
+		_CTYPE_D|_CTYPE_R|_CTYPE_G|_CTYPE_X|_CTYPE_N|6,
+		_CTYPE_D|_CTYPE_R|_CTYPE_G|_CTYPE_X|_CTYPE_N|7,
+	/*38*/	_CTYPE_D|_CTYPE_R|_CTYPE_G|_CTYPE_X|_CTYPE_N|8,
+		_CTYPE_D|_CTYPE_R|_CTYPE_G|_CTYPE_X|_CTYPE_N|9,
 		_CTYPE_P|_CTYPE_R|_CTYPE_G,
 		_CTYPE_P|_CTYPE_R|_CTYPE_G,
 		_CTYPE_P|_CTYPE_R|_CTYPE_G,
@@ -180,7 +181,8 @@ const _RuneLocale _DefaultRuneLocale = {
 		_CTYPE_P|_CTYPE_R|_CTYPE_G,
 		_CTYPE_C,
     },
-    {	0x00,	0x01,	0x02,	0x03,	0x04,	0x05,	0x06,	0x07,
+    .__maplower = {
+	0x00,	0x01,	0x02,	0x03,	0x04,	0x05,	0x06,	0x07,
      	0x08,	0x09,	0x0a,	0x0b,	0x0c,	0x0d,	0x0e,	0x0f,
 	0x10,	0x11,	0x12,	0x13,	0x14,	0x15,	0x16,	0x17,
      	0x18,	0x19,	0x1a,	0x1b,	0x1c,	0x1d,	0x1e,	0x1f,
@@ -213,7 +215,8 @@ const _RuneLocale _DefaultRuneLocale = {
 	0xf0,	0xf1,	0xf2,	0xf3,	0xf4,	0xf5,	0xf6,	0xf7,
      	0xf8,	0xf9,	0xfa,	0xfb,	0xfc,	0xfd,	0xfe,	0xff,
     },
-    {	0x00,	0x01,	0x02,	0x03,	0x04,	0x05,	0x06,	0x07,
+    .__mapupper = {
+	0x00,	0x01,	0x02,	0x03,	0x04,	0x05,	0x06,	0x07,
      	0x08,	0x09,	0x0a,	0x0b,	0x0c,	0x0d,	0x0e,	0x0f,
 	0x10,	0x11,	0x12,	0x13,	0x14,	0x15,	0x16,	0x17,
      	0x18,	0x19,	0x1a,	0x1b,	0x1c,	0x1d,	0x1e,	0x1f,
@@ -245,7 +248,7 @@ const _RuneLocale _DefaultRuneLocale = {
      	0xe8,	0xe9,	0xea,	0xeb,	0xec,	0xed,	0xee,	0xef,
 	0xf0,	0xf1,	0xf2,	0xf3,	0xf4,	0xf5,	0xf6,	0xf7,
      	0xf8,	0xf9,	0xfa,	0xfb,	0xfc,	0xfd,	0xfe,	0xff,
-    },
+    }
 };
 
 #undef _CurrentRuneLocale

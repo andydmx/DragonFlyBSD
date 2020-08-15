@@ -1,6 +1,5 @@
 #	@(#)Makefile	8.1 (Berkeley) 6/6/93
 # $FreeBSD: src/usr.bin/window/Makefile,v 1.3.14.2 2001/04/25 11:29:47 ru Exp $
-# $DragonFly: src/usr.bin/window/Makefile,v 1.3 2007/08/27 16:51:01 pavalos Exp $
 
 PROG=	window
 SRCS=	char.c cmd.c cmd1.c cmd2.c cmd3.c cmd4.c cmd5.c cmd6.c cmd7.c \
@@ -17,7 +16,10 @@ SRCS=	char.c cmd.c cmd1.c cmd2.c cmd3.c cmd4.c cmd5.c cmd6.c cmd7.c \
 	wwterminfo.c wwtty.c wwunframe.c wwupdate.c wwwrite.c xx.c xxflush.c \
 	compress.c
 
-DPADD=	${LIBTERMCAP} ${LIBUTIL}
-LDADD=	-ltermcap -lutil
+DPADD=	${LIBNCURSES} ${LIBUTIL}
+LDADD=	-lprivate_ncurses -lutil
+
+CFLAGS+=	-I${_SHLIBDIRPREFIX}/usr/include/priv/ncurses
+LDFLAGS+=	${PRIVATELIB_LDFLAGS}
 
 .include <bsd.prog.mk>

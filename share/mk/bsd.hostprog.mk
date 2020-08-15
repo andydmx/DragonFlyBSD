@@ -1,6 +1,8 @@
-# $DragonFly: src/share/mk/bsd.hostprog.mk,v 1.8 2008/05/19 10:26:02 corecode Exp $
-
 .include <bsd.init.mk>
+
+# Hint HOST_CCVER handling.
+__USE_HOST_CCVER=
+NO_WERROR=
 
 .SUFFIXES: .out .nx .no .c .cc .cpp .cxx .C .m .y .l .s .S
 
@@ -26,12 +28,7 @@ OBJCLIBS?= -lobjc
 LDADD+=	${OBJCLIBS}
 .endif
 
-OBJS+=  ${SRCS:N*.h:N*.patch:R:S/$/.no/g}
-.for _PATCH in ${SRCS:T:N*.h.patch:M*.patch}
-.for _OBJ in ${_PATCH:R:R:S/$/.no/}
-OBJS:=	${OBJS:N${_OBJ}} ${_OBJ}
-.endfor
-.endfor
+OBJS+=  ${SRCS:N*.h:R:S/$/.no/g}
 
 ${PROG}.nx: ${OBJS}
 .if defined(PROG_CXX)

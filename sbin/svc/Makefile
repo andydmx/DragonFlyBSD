@@ -3,9 +3,10 @@
 
 PROG=	svc
 MAN=	svc.8
+NOSHARED?= yes	# dep on libpthread.so.0 in /sbin
+
 SRCS=	svc.c subs.c remote.c execute.c
-#WARNS?=	2
-CFLAGS+=	-pthread
-LDADD=		-lpthread
+CFLAGS+=-pthread
+DPADD=	${LIBPTHREAD}
 
 .include <bsd.prog.mk>

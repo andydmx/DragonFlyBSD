@@ -54,10 +54,15 @@
 #undef		listen
 #undef		nanosleep
 #undef		open
+#undef		openat
+#undef		unlink
+#undef		unlinkat
 #undef		poll
+#undef		ppoll
 #undef		pthread_atfork
 #undef		pthread_attr_destroy
 #undef		pthread_attr_get_np
+#undef		pthread_attr_getaffinity_np
 #undef		pthread_attr_getdetachstate
 #undef		pthread_attr_getguardsize
 #undef		pthread_attr_getinheritsched
@@ -68,6 +73,7 @@
 #undef		pthread_attr_getstackaddr
 #undef		pthread_attr_getstacksize
 #undef		pthread_attr_init
+#undef		pthread_attr_setaffinity_np
 #undef		pthread_attr_setcreatesuspend_np
 #undef		pthread_attr_setdetachstate
 #undef		pthread_attr_setguardsize
@@ -104,10 +110,13 @@
 #undef		pthread_detach
 #undef		pthread_equal
 #undef		pthread_exit
+#undef		pthread_getaffinity_np
 #undef		pthread_getconcurrency
+#undef		pthread_getcpuclockid
 #undef		pthread_getprio
 #undef		pthread_getschedparam
 #undef		pthread_getspecific
+#undef		pthread_getthreadid_np
 #undef		pthread_join
 #undef		pthread_key_create
 #undef		pthread_key_delete
@@ -151,7 +160,9 @@
 #undef		pthread_rwlockattr_init
 #undef		pthread_rwlockattr_setpshared
 #undef		pthread_self
+#undef		pthread_get_name_np
 #undef		pthread_set_name_np
+#undef		pthread_setaffinity_np
 #undef		pthread_setcancelstate
 #undef		pthread_setcanceltype
 #undef		pthread_setconcurrency
@@ -197,7 +208,9 @@
 #undef		socketpair
 #undef		usleep
 #undef		wait4
+#undef		wait6
 #undef		waitpid
+#undef		waitid
 #undef		write
 #undef		writev
 

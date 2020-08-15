@@ -24,7 +24,7 @@
 .\"
 .\" $FreeBSD: src/sys/boot/i386/pxeldr/pxeboot.8,v 1.7 2002/12/12 17:25:59 ru Exp $
 .\"
-.Dd October 6, 2010
+.Dd November 1, 2019
 .Dt PXEBOOT 8
 .Os
 .Sh NAME
@@ -73,6 +73,14 @@ subnet 10.0.0.0 netmask 255.255.255.0 {
 
 .Ed
 .Nm
+defaults to a conservative 1024 byte NFS data packet.
+This may be changed by setting the
+.Va nfs.read_size
+variable in
+.Pa /boot/loader.conf .
+Valid values range from 1024 to 4096 bytes.
+.Pp
+.Nm
 recognizes
 .Va next-server
 and
@@ -90,8 +98,6 @@ uses
 .Pa /boot/kernel.BOOTP
 and
 .Pa /boot/loader-bootp.conf
-and
-.Pa nextboot-bootp.conf
 instead of
 .Pa /boot/kernel
 and

@@ -2,6 +2,7 @@
  * Copyright (c) 1993 The Regents of the University of California.
  * Copyright (c) 2003 Peter Wemm.
  * Copyright (c) 2008 The DragonFly Project.
+ * Copyright (c) 2008-2020 The DragonFly Project.
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -12,7 +13,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -32,6 +33,7 @@
  */
 
 #include <machine/asmacros.h>
+#include <machine/asm_mjgmacros.h>
 #include <machine/pmap.h>
 
 #include "assym.s"
@@ -41,162 +43,140 @@
 	.text
 
 /*
- * bcopy family
- * void bzero(void *buf, size_t len)
+ * bzero(ptr:%rdi, bytes:%rsi)
+ *
+ * Using rep stosq is 70% faster than a %rax loop and almost as fast as
+ * a %xmm0 loop on a modern intel cpu.
+ *
+ * Do not use non-termportal instructions here as we do not know the caller's
+ * intent.
  */
-
-/* done */
 ENTRY(bzero)
-	movq	%rsi,%rcx
+	subq	%r10,%r10
+	movq	%rsi,%rdx
+	MEMSET erms=0 end=ret
+END(bzero)
+
+	.weak	_bzero
+	.equ	_bzero, bzero
+
+/*
+ * void *memset(ptr:%rdi, char:%rsi, bytes:%rdx)
+ *
+ * Same as bzero except we load the char into all byte
+ * positions of %rax.  Returns original (ptr).
+ */
+ENTRY(memset)
+	movzbq	%sil,%r8
+	movabs  $0x0101010101010101,%r10
+	imulq   %r8,%r10
+	MEMSET erms=0 end=ret
+END(memset)
+
+	.weak	_memset
+	.equ	_memset, memset
+
+/*
+ * pagezero(ptr:%rdi)
+ *
+ * Modern intel and AMD cpus do a good job with rep stosq on page-sized
+ * blocks.  The cross-point on intel is at the 256 byte mark and on AMD
+ * it is around the 1024 byte mark.  With large counts, rep stosq will
+ * internally use non-termporal instructions and a cache sync at the end.
+ */
+#if 1
+
+ENTRY(pagezero)
+	movq	$PAGE_SIZE>>3,%rcx
 	xorl	%eax,%eax
-	shrq	$3,%rcx
-	cld
 	rep
 	stosq
-	movq	%rsi,%rcx
-	andq	$7,%rcx
-	rep
-	stosb
 	ret
+END(pagezero)
 
-/* Address: %rdi */
+#else
+
 ENTRY(pagezero)
-	movq	$-PAGE_SIZE,%rdx
-	subq	%rdx,%rdi
-	xorl	%eax,%eax
+	addq	$4096,%rdi
+	movq	$-4096,%rax
+	ALIGN_TEXT
 1:
-	movq	%rax,(%rdi,%rdx)	/* movnti */
-	movq	%rax,8(%rdi,%rdx)	/* movnti */
-	movq	%rax,16(%rdi,%rdx)	/* movnti */
-	movq	%rax,24(%rdi,%rdx)	/* movnti */
-	addq	$32,%rdx
+	movq	$0,(%rdi,%rax,1)
+	movq	$0,8(%rdi,%rax,1)
+	addq	$16,%rax
 	jne	1b
-	/*sfence*/
 	ret
+END(pagezero)
 
-ENTRY(bcmp)
-	movq	%rdx,%rcx
-	shrq	$3,%rcx
-	cld					/* compare forwards */
-	repe
-	cmpsq
-	jne	1f
-
-	movq	%rdx,%rcx
-	andq	$7,%rcx
-	repe
-	cmpsb
-1:
-	setne	%al
-	movsbl	%al,%eax
-	ret
+#endif
 
 /*
- * bcopy(src, dst, cnt)
- *       rdi, rsi, rdx
- *  ws@tools.de     (Wolfgang Solfrank, TooLs GmbH) +49-228-985800
+ * bcopy(src:%rdi, dst:%rsi, cnt:%rdx)
+ *
+ * ws@tools.de (Wolfgang Solfrank, TooLs GmbH) +49-228-985800
  */
-ENTRY(generic_bcopy)	/* generic_bcopy is bcopy without FPU */
-ENTRY(ovbcopy) /* our bcopy doesn't use the FPU, so ovbcopy is the same */
 ENTRY(bcopy)
 	xchgq	%rsi,%rdi
-	movq	%rdx,%rcx
+	MEMMOVE	erms=0 overlap=1 end=ret
+END(bcopy)
 
+	/*
+	 * Use in situations where a bcopy function pointer is needed.
+	 */
+	.weak	_bcopy
+	.equ	_bcopy, bcopy
+
+	/*
+	 * memmove(dst:%rdi, src:%rsi, cnt:%rdx)
+	 * (same as bcopy but without the xchgq, and must return (dst)).
+	 *
+	 * NOTE: gcc builtin backs-off to memmove() call
+	 * NOTE: returns dst
+	 */
+ENTRY(memmove)
 	movq	%rdi,%rax
-	subq	%rsi,%rax
-	cmpq	%rcx,%rax			/* overlapping && src < dst? */
-	jb	1f
+	MEMMOVE erms=0 overlap=1 end=ret
+END(memmove)
 
-	shrq	$3,%rcx				/* copy by 64-bit words */
-	cld					/* nope, copy forwards */
-	rep
-	movsq
-	movq	%rdx,%rcx
-	andq	$7,%rcx				/* any bytes left? */
-	rep
-	movsb
-	ret
+	.weak	_memmove
+	.equ	_memmove, memmove
 
-	/* ALIGN_TEXT */
-1:
-	addq	%rcx,%rdi			/* copy backwards */
-	addq	%rcx,%rsi
-	decq	%rdi
-	decq	%rsi
-	andq	$7,%rcx				/* any fractional bytes? */
-	std
-	rep
-	movsb
-	movq	%rdx,%rcx			/* copy remainder by 32-bit words */
-	shrq	$3,%rcx
-	subq	$7,%rsi
-	subq	$7,%rdi
-	rep
-	movsq
-	cld
-	ret
 ENTRY(reset_dbregs)
-	movq	$0x200,%rax   /* the manual says that bit 10 must be set to 1 */
-	movq    %rax,%dr7     /* disable all breapoints first */
-	movq    $0,%rax
-	movq    %rax,%dr0
-	movq    %rax,%dr1
-	movq    %rax,%dr2
-	movq    %rax,%dr3
-	movq    %rax,%dr6
+	movq	$0x200,%rax	/* the manual says that bit 10 must be set to 1 */
+	movq	%rax,%dr7	/* disable all breapoints first */
+	movq	$0,%rax
+	movq	%rax,%dr0
+	movq	%rax,%dr1
+	movq	%rax,%dr2
+	movq	%rax,%dr3
+	movq	%rax,%dr6
 	ret
+END(reset_dbregs)
 
 /*
- * Note: memcpy does not support overlapping copies
+ * memcpy(dst:%rdi, src:%rsi, bytes:%rdx)
+ *
+ * NOTE: memcpy does not support overlapping copies
+ * NOTE: returns dst
  */
 ENTRY(memcpy)
-	movq	%rdx,%rcx
-	shrq	$3,%rcx				/* copy by 64-bit words */
-	cld					/* copy forwards */
-	rep
-	movsq
-	movq	%rdx,%rcx
-	andq	$7,%rcx				/* any bytes left? */
-	rep
-	movsb
-	ret
+	movq	%rdi,%rax
+	MEMMOVE erms=0 overlap=0 end=ret
+END(memcpy)
 
-/*
- * pagecopy(%rdi=from, %rsi=to)
- */
-ENTRY(pagecopy)
-	movq	$-PAGE_SIZE,%rax
-	movq	%rax,%rdx
-	subq	%rax,%rdi
-	subq	%rax,%rsi
-1:
-	/*prefetchnta (%rdi,%rax)*/
-	/*addq	$64,%rax*/
-	/*jne	1b*/
-2:
-	movq	(%rdi,%rdx),%rax
-	movq	%rax,(%rsi,%rdx)	/* movnti */
-	movq	8(%rdi,%rdx),%rax
-	movq	%rax,8(%rsi,%rdx)	/* movnti */
-	movq	16(%rdi,%rdx),%rax
-	movq	%rax,16(%rsi,%rdx)	/* movnti */
-	movq	24(%rdi,%rdx),%rax
-	movq	%rax,24(%rsi,%rdx)	/* movnti */
-	addq	$32,%rdx
-	jne	2b
-	/*sfence*/
-	ret
+	.weak	_memcpy
+	.equ	_memcpy, memcpy
 
-/* fillw(pat, base, cnt) */  
+/* fillw(pat, base, cnt) */
 /*       %rdi,%rsi, %rdx */
 ENTRY(fillw)
-	movq	%rdi,%rax   
+	movq	%rdi,%rax
 	movq	%rsi,%rdi
 	movq	%rdx,%rcx
-	cld
 	rep
 	stosw
 	ret
+END(fillw)
 
 /*****************************************************************************/
 /* copyout and fubyte family                                                 */
@@ -211,10 +191,42 @@ ENTRY(fillw)
  */
 
 /*
+ * uint64_t:%rax kreadmem64(addr:%rdi)
+ *
+ * Read kernel or user memory with fault protection.
+ */
+ENTRY(kreadmem64)
+	SMAP_OPEN
+	movq	PCPU(curthread),%rcx
+	movq	TD_PCB(%rcx), %rcx
+	movq	$kreadmem64fault,PCB_ONFAULT(%rcx)
+	movq	%rsp,PCB_ONFAULT_SP(%rcx)
+	movq	(%rdi),%rax
+	movq	$0,PCB_ONFAULT(%rcx)
+	SMAP_CLOSE
+	ret
+
+kreadmem64fault:
+	SMAP_CLOSE
+	movq	PCPU(curthread),%rcx
+	xorl	%eax,%eax
+	movq	TD_PCB(%rcx),%rcx
+	movq	%rax,PCB_ONFAULT(%rcx)
+	decq	%rax
+	ret
+END(kreadmem64)
+
+.macro COPYOUT_END
+	jmp	done_copyout
+	nop
+.endm
+
+/*
  * std_copyout(from_kernel, to_user, len)  - MP SAFE
  *         %rdi,        %rsi,    %rdx
  */
 ENTRY(std_copyout)
+	SMAP_OPEN
 	movq	PCPU(curthread),%rax
 	movq	TD_PCB(%rax), %rax
 	movq	$copyout_fault,PCB_ONFAULT(%rax)
@@ -246,19 +258,10 @@ ENTRY(std_copyout)
 	ja	copyout_fault
 
 	xchgq	%rdi,%rsi
-	/* bcopy(%rsi, %rdi, %rdx) */
-	movq	%rdx,%rcx
-
-	shrq	$3,%rcx
-	cld
-	rep
-	movsq
-	movb	%dl,%cl
-	andb	$7,%cl
-	rep
-	movsb
+	MEMMOVE erms=0 overlap=0 end=COPYOUT_END
 
 done_copyout:
+	SMAP_CLOSE
 	xorl	%eax,%eax
 	movq	PCPU(curthread),%rdx
 	movq	TD_PCB(%rdx), %rdx
@@ -267,17 +270,25 @@ done_copyout:
 
 	ALIGN_TEXT
 copyout_fault:
+	SMAP_CLOSE
 	movq	PCPU(curthread),%rdx
 	movq	TD_PCB(%rdx), %rdx
 	movq	$0,PCB_ONFAULT(%rdx)
 	movq	$EFAULT,%rax
 	ret
+END(std_copyout)
+
+.macro COPYIN_END
+	jmp	done_copyin
+	nop
+.endm
 
 /*
  * std_copyin(from_user, to_kernel, len) - MP SAFE
  *        %rdi,      %rsi,      %rdx
  */
 ENTRY(std_copyin)
+	SMAP_OPEN
 	movq	PCPU(curthread),%rax
 	movq	TD_PCB(%rax), %rax
 	movq	$copyin_fault,PCB_ONFAULT(%rax)
@@ -296,18 +307,10 @@ ENTRY(std_copyin)
 	ja	copyin_fault
 
 	xchgq	%rdi,%rsi
-	movq	%rdx,%rcx
-	movb	%cl,%al
-	shrq	$3,%rcx				/* copy longword-wise */
-	cld
-	rep
-	movsq
-	movb	%al,%cl
-	andb	$7,%cl				/* copy remaining bytes */
-	rep
-	movsb
+	MEMMOVE erms=0 overlap=0 end=COPYIN_END
 
 done_copyin:
+	SMAP_CLOSE
 	xorl	%eax,%eax
 	movq	PCPU(curthread),%rdx
 	movq	TD_PCB(%rdx), %rdx
@@ -316,17 +319,20 @@ done_copyin:
 
 	ALIGN_TEXT
 copyin_fault:
+	SMAP_CLOSE
 	movq	PCPU(curthread),%rdx
 	movq	TD_PCB(%rdx), %rdx
 	movq	$0,PCB_ONFAULT(%rdx)
 	movq	$EFAULT,%rax
 	ret
+END(std_copyin)
 
 /*
- * casuword32.  Compare and set user integer.  Returns -1 or the current value.
- *        dst = %rdi, old = %rsi, new = %rdx
+ * casu32 - Compare and set user integer.  Returns -1 or the current value.
+ *          dst = %rdi, old = %rsi, new = %rdx
  */
-ENTRY(casuword32)
+ENTRY(casu32)
+	SMAP_OPEN
 	movq	PCPU(curthread),%rcx
 	movq	TD_PCB(%rcx), %rcx
 	movq	$fusufault,PCB_ONFAULT(%rcx)
@@ -349,13 +355,72 @@ ENTRY(casuword32)
 	movq	PCPU(curthread),%rcx
 	movq	TD_PCB(%rcx), %rcx
 	movq	$0,PCB_ONFAULT(%rcx)
+	SMAP_CLOSE
 	ret
+END(casu32)
 
 /*
- * casuword.  Compare and set user word.  Returns -1 or the current value.
- *        dst = %rdi, old = %rsi, new = %rdx
+ * swapu32 - Swap int in user space.  ptr = %rdi, val = %rsi
  */
-ENTRY(casuword)
+ENTRY(std_swapu32)
+	SMAP_OPEN
+	movq	PCPU(curthread),%rcx
+	movq	TD_PCB(%rcx), %rcx
+	movq	$fusufault,PCB_ONFAULT(%rcx)
+	movq	%rsp,PCB_ONFAULT_SP(%rcx)
+
+	movq	$VM_MAX_USER_ADDRESS-4,%rax
+	cmpq	%rax,%rdi			/* verify address is valid */
+	ja	fusufault
+
+	movq	%rsi,%rax			/* old */
+	xchgl	%eax,(%rdi)
+
+	/*
+	 * The old value is in %rax.  If the store succeeded it will be the
+	 * value we expected (old) from before the store, otherwise it will
+	 * be the current value.
+	 */
+
+	movq	PCPU(curthread),%rcx
+	movq	TD_PCB(%rcx), %rcx
+	movq	$0,PCB_ONFAULT(%rcx)
+	SMAP_CLOSE
+	ret
+END(std_swapu32)
+
+ENTRY(std_fuwordadd32)
+	SMAP_OPEN
+	movq	PCPU(curthread),%rcx
+	movq	TD_PCB(%rcx), %rcx
+	movq	$fusufault,PCB_ONFAULT(%rcx)
+	movq	%rsp,PCB_ONFAULT_SP(%rcx)
+
+	movq	$VM_MAX_USER_ADDRESS-4,%rax
+	cmpq	%rax,%rdi			/* verify address is valid */
+	ja	fusufault
+
+	movq	%rsi,%rax			/* qty to add */
+	lock xaddl	%eax,(%rdi)
+
+	/*
+	 * The old value is in %rax.  If the store succeeded it will be the
+	 * value we expected (old) from before the store, otherwise it will
+	 * be the current value.
+	 */
+	movq	PCPU(curthread),%rcx
+	movq	TD_PCB(%rcx), %rcx
+	movq	$0,PCB_ONFAULT(%rcx)
+	SMAP_CLOSE
+	ret
+END(std_fuwordadd32)
+
+/*
+ * casu64 - Compare and set user word.  Returns -1 or the current value.
+ *          dst = %rdi, old = %rsi, new = %rdx
+ */
+ENTRY(casu64)
+	SMAP_OPEN
 	movq	PCPU(curthread),%rcx
 	movq	TD_PCB(%rcx), %rcx
 	movq	$fusufault,PCB_ONFAULT(%rcx)
@@ -378,7 +443,66 @@ ENTRY(casuword)
 	movq	PCPU(curthread),%rcx
 	movq	TD_PCB(%rcx), %rcx
 	movq	$0,PCB_ONFAULT(%rcx)
+	SMAP_CLOSE
 	ret
+END(casu64)
+
+/*
+ * swapu64 - Swap long in user space.  ptr = %rdi, val = %rsi
+ */
+ENTRY(std_swapu64)
+	SMAP_OPEN
+	movq	PCPU(curthread),%rcx
+	movq	TD_PCB(%rcx), %rcx
+	movq	$fusufault,PCB_ONFAULT(%rcx)
+	movq	%rsp,PCB_ONFAULT_SP(%rcx)
+
+	movq	$VM_MAX_USER_ADDRESS-8,%rax
+	cmpq	%rax,%rdi			/* verify address is valid */
+	ja	fusufault
+
+	movq	%rsi,%rax			/* old */
+	xchgq	%rax,(%rdi)
+
+	/*
+	 * The old value is in %rax.  If the store succeeded it will be the
+	 * value we expected (old) from before the store, otherwise it will
+	 * be the current value.
+	 */
+
+	movq	PCPU(curthread),%rcx
+	movq	TD_PCB(%rcx), %rcx
+	movq	$0,PCB_ONFAULT(%rcx)
+	SMAP_CLOSE
+	ret
+END(std_swapu64)
+
+ENTRY(std_fuwordadd64)
+	SMAP_OPEN
+	movq	PCPU(curthread),%rcx
+	movq	TD_PCB(%rcx), %rcx
+	movq	$fusufault,PCB_ONFAULT(%rcx)
+	movq	%rsp,PCB_ONFAULT_SP(%rcx)
+
+	movq	$VM_MAX_USER_ADDRESS-8,%rax
+	cmpq	%rax,%rdi			/* verify address is valid */
+	ja	fusufault
+
+	movq	%rsi,%rax			/* value to add */
+	lock xaddq	%rax,(%rdi)
+
+	/*
+	 * The old value is in %rax.  If the store succeeded it will be the
+	 * value we expected (old) from before the store, otherwise it will
+	 * be the current value.
+	 */
+
+	movq	PCPU(curthread),%rcx
+	movq	TD_PCB(%rcx), %rcx
+	movq	$0,PCB_ONFAULT(%rcx)
+	SMAP_CLOSE
+	ret
+END(std_fuwordadd64)
 
 /*
  * Fetch (load) a 64-bit word, a 32-bit word, a 16-bit word, or an 8-bit
@@ -386,8 +510,8 @@ ENTRY(casuword)
  * addr = %rdi
  */
 
-ALTENTRY(fuword64)
-ENTRY(std_fuword)
+ENTRY(std_fuword64)
+	SMAP_OPEN
 	movq	PCPU(curthread),%rcx
 	movq	TD_PCB(%rcx), %rcx
 	movq	$fusufault,PCB_ONFAULT(%rcx)
@@ -399,9 +523,12 @@ ENTRY(std_fuword)
 
 	movq	(%rdi),%rax
 	movq	$0,PCB_ONFAULT(%rcx)
+	SMAP_CLOSE
 	ret
+END(std_fuword64)
 
-ENTRY(fuword32)
+ENTRY(std_fuword32)
+	SMAP_OPEN
 	movq	PCPU(curthread),%rcx
 	movq	TD_PCB(%rcx), %rcx
 	movq	$fusufault,PCB_ONFAULT(%rcx)
@@ -413,35 +540,12 @@ ENTRY(fuword32)
 
 	movl	(%rdi),%eax
 	movq	$0,PCB_ONFAULT(%rcx)
+	SMAP_CLOSE
 	ret
-
-/*
- * fuswintr() and suswintr() are specialized variants of fuword16() and
- * suword16(), respectively.  They are called from the profiling code,
- * potentially at interrupt time.  If they fail, that's okay; good things
- * will happen later.  They always fail for now, until the trap code is
- * able to deal with this.
- */
-ALTENTRY(suswintr)
-ENTRY(fuswintr)
-	movq	$-1,%rax
-	ret
-
-ENTRY(fuword16)
-	movq	PCPU(curthread),%rcx
-	movq	TD_PCB(%rcx), %rcx
-	movq	$fusufault,PCB_ONFAULT(%rcx)
-	movq	%rsp,PCB_ONFAULT_SP(%rcx)
-
-	movq	$VM_MAX_USER_ADDRESS-2,%rax
-	cmpq	%rax,%rdi
-	ja	fusufault
-
-	movzwl	(%rdi),%eax
-	movq	$0,PCB_ONFAULT(%rcx)
-	ret
+END(std_fuword32)
 
 ENTRY(std_fubyte)
+	SMAP_OPEN
 	movq	PCPU(curthread),%rcx
 	movq	TD_PCB(%rcx), %rcx
 	movq	$fusufault,PCB_ONFAULT(%rcx)
@@ -453,6 +557,7 @@ ENTRY(std_fubyte)
 
 	movzbl	(%rdi),%eax
 	movq	$0,PCB_ONFAULT(%rcx)
+	SMAP_CLOSE
 	ret
 
 	ALIGN_TEXT
@@ -462,7 +567,9 @@ fusufault:
 	movq	TD_PCB(%rcx), %rcx
 	movq	%rax,PCB_ONFAULT(%rcx)
 	decq	%rax
+	SMAP_CLOSE
 	ret
+END(std_fubyte)
 
 /*
  * Store a 64-bit word, a 32-bit word, a 16-bit word, or an 8-bit byte to
@@ -472,8 +579,8 @@ fusufault:
  *
  * Write a long
  */
-ALTENTRY(suword64)
-ENTRY(std_suword)
+ENTRY(std_suword64)
+	SMAP_OPEN
 	movq	PCPU(curthread),%rcx
 	movq	TD_PCB(%rcx), %rcx
 	movq	$fusufault,PCB_ONFAULT(%rcx)
@@ -488,12 +595,15 @@ ENTRY(std_suword)
 	movq	PCPU(curthread),%rcx
 	movq	TD_PCB(%rcx), %rcx
 	movq	%rax,PCB_ONFAULT(%rcx)
+	SMAP_CLOSE
 	ret
+END(std_suword64)
 
 /*
  * Write an int
  */
 ENTRY(std_suword32)
+	SMAP_OPEN
 	movq	PCPU(curthread),%rcx
 	movq	TD_PCB(%rcx), %rcx
 	movq	$fusufault,PCB_ONFAULT(%rcx)
@@ -508,26 +618,12 @@ ENTRY(std_suword32)
 	movq	PCPU(curthread),%rcx
 	movq	TD_PCB(%rcx), %rcx
 	movq	%rax,PCB_ONFAULT(%rcx)
+	SMAP_CLOSE
 	ret
-
-ENTRY(suword16)
-	movq	PCPU(curthread),%rcx
-	movq	TD_PCB(%rcx), %rcx
-	movq	$fusufault,PCB_ONFAULT(%rcx)
-	movq	%rsp,PCB_ONFAULT_SP(%rcx)
-
-	movq	$VM_MAX_USER_ADDRESS-2,%rax
-	cmpq	%rax,%rdi			/* verify address validity */
-	ja	fusufault
-
-	movw	%si,(%rdi)
-	xorl	%eax,%eax
-	movq	PCPU(curthread),%rcx		/* restore trashed register */
-	movq	TD_PCB(%rcx), %rcx
-	movq	%rax,PCB_ONFAULT(%rcx)
-	ret
+END(std_suword32)
 
 ENTRY(std_subyte)
+	SMAP_OPEN
 	movq	PCPU(curthread),%rcx
 	movq	TD_PCB(%rcx), %rcx
 	movq	$fusufault,PCB_ONFAULT(%rcx)
@@ -543,7 +639,9 @@ ENTRY(std_subyte)
 	movq	PCPU(curthread),%rcx		/* restore trashed register */
 	movq	TD_PCB(%rcx), %rcx
 	movq	%rax,PCB_ONFAULT(%rcx)
+	SMAP_CLOSE
 	ret
+END(std_subyte)
 
 /*
  * std_copyinstr(from, to, maxlen, int *lencopied) - MP SAFE
@@ -555,9 +653,9 @@ ENTRY(std_subyte)
  *	return the actual length in *lencopied.
  */
 ENTRY(std_copyinstr)
+	SMAP_OPEN
 	movq	%rdx,%r8			/* %r8 = maxlen */
 	movq	%rcx,%r9			/* %r9 = *len */
-	xchgq	%rdi,%rsi			/* %rdi = from, %rsi = to */
 	movq	PCPU(curthread),%rcx
 	movq	TD_PCB(%rcx), %rcx
 	movq	$cpystrflt,PCB_ONFAULT(%rcx)
@@ -566,7 +664,7 @@ ENTRY(std_copyinstr)
 	movq	$VM_MAX_USER_ADDRESS,%rax
 
 	/* make sure 'from' is within bounds */
-	subq	%rsi,%rax
+	subq	%rdi,%rax
 	jbe	cpystrflt
 
 	/* restrict maxlen to <= VM_MAX_USER_ADDRESS-from */
@@ -576,15 +674,16 @@ ENTRY(std_copyinstr)
 	movq	%rax,%r8
 1:
 	incq	%rdx
-	cld
 
 2:
 	decq	%rdx
 	jz	3f
 
-	lodsb
-	stosb
-	orb	%al,%al
+	movb	(%rdi),%al			/* faster than lodsb+stosb */
+	movb	%al,(%rsi)
+	leaq	1(%rdi),%rdi
+	leaq	1(%rsi),%rsi
+	testb	%al,%al
 	jnz	2b
 
 	/* Success -- 0 byte reached */
@@ -604,6 +703,7 @@ cpystrflt:
 	movq	$EFAULT,%rax
 
 cpystrflt_x:
+	SMAP_CLOSE
 	/* set *lencopied and return %eax */
 	movq	PCPU(curthread),%rcx
 	movq	TD_PCB(%rcx), %rcx
@@ -615,7 +715,7 @@ cpystrflt_x:
 	movq	%r8,(%r9)
 1:
 	ret
-
+END(std_copyinstr)
 
 /*
  * copystr(from, to, maxlen, int *lencopied) - MP SAFE
@@ -623,16 +723,16 @@ cpystrflt_x:
  */
 ENTRY(copystr)
 	movq	%rdx,%r8			/* %r8 = maxlen */
-
-	xchgq	%rdi,%rsi
 	incq	%rdx
-	cld
 1:
 	decq	%rdx
 	jz	4f
-	lodsb
-	stosb
-	orb	%al,%al
+
+	movb	(%rdi),%al			/* faster than lodsb+stosb */
+	movb	%al,(%rsi)
+	leaq	1(%rdi),%rdi
+	leaq	1(%rsi),%rsi
+	testb	%al,%al
 	jnz	1b
 
 	/* Success -- 0 byte reached */
@@ -644,7 +744,6 @@ ENTRY(copystr)
 	movq	$ENAMETOOLONG,%rax
 
 6:
-
 	testq	%rcx,%rcx
 	jz	7f
 	/* set *lencopied and return %rax */
@@ -652,6 +751,7 @@ ENTRY(copystr)
 	movq	%r8,(%rcx)
 7:
 	ret
+END(copystr)
 
 /*
  * Handling of special x86_64 registers and descriptor tables etc
@@ -679,6 +779,7 @@ ENTRY(lgdt)
 	pushq	%rax
 	MEXITCOUNT
 	lretq
+END(lgdt)
 
 /*****************************************************************************/
 /* setjmp, longjmp                                                           */
@@ -696,6 +797,7 @@ ENTRY(setjmp)
 	movq	%rdx,56(%rdi)			/* save rip */
 	xorl	%eax,%eax			/* return(0); */
 	ret
+END(setjmp)
 
 ENTRY(longjmp)
 	movq	0(%rdi),%rbx			/* restore rbx */
@@ -710,6 +812,7 @@ ENTRY(longjmp)
 	xorl	%eax,%eax			/* return(1); */
 	incl	%eax
 	ret
+END(longjmp)
 
 /*
  * Support for reading MSRs in the safe manner.
@@ -730,6 +833,7 @@ ENTRY(rdmsr_safe)
 	xorq	%rax,%rax
 	movq	%rax,PCB_ONFAULT(%r8)
 	ret
+END(rdmsr_safe)
 
 /*
  * Support for writing MSRs in the safe manner.
@@ -739,7 +843,7 @@ ENTRY(wrmsr_safe)
 	movq	PCPU(curthread),%r8
 	movq	TD_PCB(%r8), %r8
 	movq	$msr_onfault,PCB_ONFAULT(%r8)
-	movq    %rsp,PCB_ONFAULT_SP(%rcx)
+	movq	%rsp,PCB_ONFAULT_SP(%r8)
 	movl	%edi,%ecx
 	movl	%esi,%eax
 	sarq	$32,%rsi
@@ -749,6 +853,7 @@ ENTRY(wrmsr_safe)
 	xorq	%rax,%rax
 	movq	%rax,PCB_ONFAULT(%r8)
 	ret
+END(wrmsr_safe)
 
 /*
  * MSR operations fault handler
@@ -761,21 +866,12 @@ msr_onfault:
 	movl	$EFAULT,%eax
 	ret
 
-/*
- * Support for BB-profiling (gcc -a).  The kernbb program will extract
- * the data from the kernel.
- */
+ENTRY(smap_open)
+	SMAP_OPEN
+	ret
+END(smap_open)
 
-	.data
-	ALIGN_DATA
-	.globl bbhead
-bbhead:
-	.quad 0
-
-	.text
-NON_GPROF_ENTRY(__bb_init_func)
-	movq	$1,(%rdi)
-	movq	bbhead,%rax
-	movq	%rax,32(%rdi)
-	movq	%rdi,bbhead
-	NON_GPROF_RET
+ENTRY(smap_close)
+	SMAP_CLOSE
+	ret
+END(smap_close)

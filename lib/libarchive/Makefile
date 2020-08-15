@@ -6,22 +6,27 @@ CONTRIBDIR=	${.CURDIR}/../../contrib/libarchive/libarchive
 .PATH: ${CONTRIBDIR}
 
 SHLIB_MAJOR=	5
-CFLAGS+=	-DPLATFORM_CONFIG_H=\"config.h\"
+CFLAGS+=	-DHAVE_CONFIG_H
 CFLAGS+=	-I${.OBJDIR} -I${.CURDIR} -I${CONTRIBDIR}
 # This can be changed back to CFLAGS once iconv works correctly with
 # statically linked libraries (iconv uses dynamic-only dlopen(3))
 SHARED_CFLAGS+=	-DHAVE_ICONV=1 -DHAVE_ICONV_H=1
 WARNS?=	2
 
-DPADD=	${LIBBZ2} ${LIBLZMA} ${LIBMD} ${LIBZ}
-LDADD=	-lbz2 -llzma -lmd -lz
+DPADD=	${LIBBZ2} ${LIBLZMA} ${LIBCRYPTO} ${LIBZ}
+LDADD=	-lbz2 -llzma -lprivate_crypto -lz
+LDFLAGS+=	${PRIVATELIB_LDFLAGS}
+CFLAGS+=	-I${.CURDIR}/../../crypto/libressl/include
 
 INCS=	archive.h archive_entry.h
 
 SRCS=	archive_acl.c					\
+	archive_blake2s_ref.c				\
+	archive_blake2sp_ref.c				\
 	archive_check_magic.c				\
 	archive_cmdline.c				\
-	archive_crypto.c				\
+	archive_cryptor.c				\
+	archive_digest.c				\
 	archive_entry.c					\
 	archive_entry_copy_stat.c			\
 	archive_entry_link_resolver.c			\
@@ -30,18 +35,24 @@ SRCS=	archive_acl.c					\
 	archive_entry_strmode.c				\
 	archive_entry_xattr.c				\
 	archive_getdate.c				\
+	archive_hmac.c					\
 	archive_match.c					\
 	archive_options.c				\
+	archive_pack_dev.c				\
 	archive_pathmatch.c				\
 	archive_ppmd7.c					\
+	archive_ppmd8.c					\
+	archive_random.c				\
 	archive_rb.c					\
 	archive_read.c					\
+	archive_read_add_passphrase.c			\
 	archive_read_append_filter.c			\
 	archive_read_data_into_fd.c			\
 	archive_read_disk_entry_from_file.c		\
 	archive_read_disk_posix.c			\
 	archive_read_disk_set_standard_lookup.c		\
 	archive_read_extract.c				\
+	archive_read_extract2.c				\
 	archive_read_open_fd.c				\
 	archive_read_open_file.c			\
 	archive_read_open_filename.c			\
@@ -54,12 +65,14 @@ SRCS=	archive_acl.c					\
 	archive_read_support_filter_grzip.c		\
 	archive_read_support_filter_gzip.c		\
 	archive_read_support_filter_lrzip.c		\
+	archive_read_support_filter_lz4.c		\
 	archive_read_support_filter_lzop.c		\
 	archive_read_support_filter_none.c		\
 	archive_read_support_filter_program.c		\
 	archive_read_support_filter_rpm.c		\
 	archive_read_support_filter_uu.c		\
 	archive_read_support_filter_xz.c		\
+	archive_read_support_filter_zstd.c		\
 	archive_read_support_format_7zip.c		\
 	archive_read_support_format_all.c		\
 	archive_read_support_format_ar.c		\
@@ -71,22 +84,18 @@ SRCS=	archive_acl.c					\
 	archive_read_support_format_lha.c		\
 	archive_read_support_format_mtree.c		\
 	archive_read_support_format_rar.c		\
+	archive_read_support_format_rar5.c		\
 	archive_read_support_format_raw.c		\
 	archive_read_support_format_tar.c		\
+	archive_read_support_format_warc.c		\
 	archive_read_support_format_xar.c		\
 	archive_read_support_format_zip.c		\
 	archive_string.c				\
 	archive_string_sprintf.c			\
 	archive_util.c					\
+	archive_version_details.c			\
 	archive_virtual.c				\
 	archive_write.c					\
-	archive_write_disk_acl.c			\
-	archive_write_disk_posix.c			\
-	archive_write_disk_set_standard_lookup.c	\
-	archive_write_open_fd.c				\
-	archive_write_open_file.c			\
-	archive_write_open_filename.c			\
-	archive_write_open_memory.c			\
 	archive_write_add_filter.c			\
 	archive_write_add_filter_b64encode.c		\
 	archive_write_add_filter_by_name.c		\
@@ -95,37 +104,52 @@ SRCS=	archive_acl.c					\
 	archive_write_add_filter_grzip.c		\
 	archive_write_add_filter_gzip.c			\
 	archive_write_add_filter_lrzip.c		\
+	archive_write_add_filter_lz4.c			\
 	archive_write_add_filter_lzop.c			\
 	archive_write_add_filter_none.c			\
 	archive_write_add_filter_program.c		\
 	archive_write_add_filter_uuencode.c		\
 	archive_write_add_filter_xz.c			\
+	archive_write_add_filter_zstd.c			\
+	archive_write_disk_posix.c			\
+	archive_write_disk_set_standard_lookup.c	\
+	archive_write_open_fd.c				\
+	archive_write_open_file.c			\
+	archive_write_open_filename.c			\
+	archive_write_open_memory.c			\
 	archive_write_set_format.c			\
 	archive_write_set_format_7zip.c			\
 	archive_write_set_format_ar.c			\
 	archive_write_set_format_by_name.c		\
 	archive_write_set_format_cpio.c			\
 	archive_write_set_format_cpio_newc.c		\
+	archive_write_set_format_filter_by_ext.c	\
+	archive_write_set_format_gnutar.c		\
 	archive_write_set_format_iso9660.c		\
 	archive_write_set_format_mtree.c		\
 	archive_write_set_format_pax.c			\
+	archive_write_set_format_raw.c			\
 	archive_write_set_format_shar.c			\
 	archive_write_set_format_ustar.c		\
 	archive_write_set_format_v7tar.c		\
-	archive_write_set_format_gnutar.c		\
+	archive_write_set_format_warc.c			\
 	archive_write_set_format_xar.c			\
 	archive_write_set_format_zip.c			\
 	archive_write_set_options.c			\
-	filter_fork_posix.c
+	archive_write_set_passphrase.c			\
+	filter_fork_posix.c				\
+	xxhash.c
 
 MAN=	archive_entry.3					\
 	archive_entry_acl.3				\
 	archive_entry_linkify.3				\
+	archive_entry_misc.3				\
 	archive_entry_paths.3				\
 	archive_entry_perms.3				\
 	archive_entry_stat.3				\
 	archive_entry_time.3				\
 	archive_read.3					\
+	archive_read_add_passphrase.3			\
 	archive_read_data.3				\
 	archive_read_disk.3				\
 	archive_read_extract.3				\
@@ -149,6 +173,7 @@ MAN=	archive_entry.3					\
 	archive_write_new.3				\
 	archive_write_open.3				\
 	archive_write_set_options.3			\
+	archive_write_set_passphrase.3			\
 	cpio.5						\
 	libarchive.3					\
 	libarchive_changes.3				\
@@ -173,6 +198,8 @@ MLINKS=	archive_entry.3 archive_entry_clear.3 \
 	archive_entry_linkify.3 archive_entry_linkresolver_new.3 \
 	archive_entry_linkify.3 archive_entry_linkresolver_set_strategy.3 \
 	archive_entry_linkify.3 archive_entry_linkresolver_free.3 \
+	archive_entry_misc.3 archive_entry_set_symlink_type.3 \
+	archive_entry_misc.3 archive_entry_symlink_type.3 \
 	archive_entry_paths.3 archive_entry_hardlink.3 \
 	archive_entry_paths.3 archive_entry_hardlink_w.3 \
 	archive_entry_paths.3 archive_entry_set_hardlink.3 \
@@ -269,6 +296,7 @@ MLINKS=	archive_entry.3 archive_entry_clear.3 \
 	archive_entry_time.3 archive_entry_mtime_is_set.3 \
 	archive_entry_time.3 archive_entry_set_mtime.3 \
 	archive_entry_time.3 archive_entry_unset_mtime.3 \
+	archive_read_add_passphrase.3 archive_read_set_passphrase_callback.3 \
 	archive_read_data.3 archive_read_data_block.3 \
 	archive_read_data.3 archive_read_data_skip.3 \
 	archive_read_data.3 archive_read_data_into_fd.3 \
@@ -377,12 +405,11 @@ MLINKS=	archive_entry.3 archive_entry_clear.3 \
 	archive_write_open.3 archive_write_open_memory.3 \
 	archive_write_set_options.3 archive_write_set_filter_option.3 \
 	archive_write_set_options.3 archive_write_set_format_option.3 \
-	archive_write_set_options.3 archive_write_set_option.3
+	archive_write_set_options.3 archive_write_set_option.3 \
+	archive_write_set_passphrase.3 archive_write_set_passphrase_callback.3 \
+	libarchive.3 archive.3
 
-.if defined(RELEASE36)
-SHLIB_MAJOR=	6
 VERSION_DEF=	${.CURDIR}/Versions.def
 SYMBOL_MAPS=	${.CURDIR}/Symbol.map
-.endif
 
 .include <bsd.lib.mk>

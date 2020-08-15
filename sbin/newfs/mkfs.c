@@ -34,7 +34,8 @@
 
 #include <inttypes.h>
 #include <stdlib.h>
-#include <sys/ioctl_compat.h>
+
+#include <bus/cam/scsi/scsi_daio.h>
 
 /*
  * make file system for cylinder-group style file systems
@@ -51,7 +52,6 @@
 
 #define UMASK		0755
 #define MAXINOPB	(MAXBSIZE / sizeof(struct ufs1_dinode))
-#define POWEROF2(num)	(((num) & ((num) - 1)) == 0)
 
 #ifdef STANDALONE
 #error "mkfs.c: STANDALONE compilation no longer supported"
@@ -134,7 +134,7 @@ int makedir(struct direct *, int);
 void parentready(int);
 void rdfs(daddr_t, int, char *);
 void setblock(struct fs *, unsigned char *, int);
-void started(int);
+void started(int) __dead2;
 void erfs(off_t, off_t);
 void wtfs(daddr_t, int, char *);
 void wtfsflush(void);
@@ -230,7 +230,7 @@ mkfs(char *fsys, int fi, int fo, const char *mfscopy)
 		sblock.fs_maxsymlinklen = 0;
 	} else {
 		sblock.fs_inodefmt = FS_44INODEFMT;
-		sblock.fs_maxsymlinklen = MAXSYMLINKLEN;
+		sblock.fs_maxsymlinklen = UFS1_MAXSYMLINKLEN;
 	}
 	if (Uflag)
 		sblock.fs_flags |= FS_DOSOFTDEP;
@@ -270,12 +270,12 @@ mkfs(char *fsys, int fi, int fo, const char *mfscopy)
 	 */
 	sblock.fs_bsize = bsize;
 	sblock.fs_fsize = fsize;
-	if (!POWEROF2(sblock.fs_bsize)) {
+	if (!powerof2(sblock.fs_bsize)) {
 		printf("block size must be a power of 2, not %d\n",
 		    sblock.fs_bsize);
 		exit(16);
 	}
-	if (!POWEROF2(sblock.fs_fsize)) {
+	if (!powerof2(sblock.fs_fsize)) {
 		printf("fragment size must be a power of 2, not %d\n",
 		    sblock.fs_fsize);
 		exit(17);
@@ -327,10 +327,10 @@ mkfs(char *fsys, int fi, int fo, const char *mfscopy)
 	    howmany(sblock.fs_nsect, NSPF(&sblock)), sblock.fs_frag);
 	for (sblock.fs_cgmask = 0xffffffff, i = sblock.fs_ntrak; i > 1; i >>= 1)
 		sblock.fs_cgmask <<= 1;
-	if (!POWEROF2(sblock.fs_ntrak))
+	if (!powerof2(sblock.fs_ntrak))
 		sblock.fs_cgmask <<= 1;
-	sblock.fs_maxfilesize = sblock.fs_bsize * NDADDR - 1;
-	for (sizepb = sblock.fs_bsize, i = 0; i < NIADDR; i++) {
+	sblock.fs_maxfilesize = sblock.fs_bsize * UFS_NDADDR - 1;
+	for (sizepb = sblock.fs_bsize, i = 0; i < UFS_NIADDR; i++) {
 		sizepb *= NINDIR(&sblock);
 		sblock.fs_maxfilesize += sizepb;
 	}
@@ -823,7 +823,7 @@ initcg(int cylno, time_t utime)
 	}
 	acg.cg_cs.cs_nifree += sblock.fs_ipg;
 	if (cylno == 0) {
-		for (k = 0; k < ROOTINO; k++) {
+		for (k = 0; k < UFS_ROOTINO; k++) {
 			setbit(cg_inosused(&acg), k);
 			acg.cg_cs.cs_nifree--;
 		}
@@ -932,8 +932,8 @@ struct ufs1_dinode node;
 #endif
 
 struct direct root_dir[] = {
-	{ ROOTINO, sizeof(struct direct), DT_DIR, 1, "." },
-	{ ROOTINO, sizeof(struct direct), DT_DIR, 2, ".." },
+	{ UFS_ROOTINO, sizeof(struct direct), DT_DIR, 1, "." },
+	{ UFS_ROOTINO, sizeof(struct direct), DT_DIR, 2, ".." },
 #ifdef LOSTDIR
 	{ LOSTFOUNDINO, sizeof(struct direct), DT_DIR, 10, "lost+found" },
 #endif
@@ -944,8 +944,8 @@ struct odirect {
 	u_short	d_namlen;
 	u_char	d_name[MAXNAMLEN + 1];
 } oroot_dir[] = {
-	{ ROOTINO, sizeof(struct direct), 1, "." },
-	{ ROOTINO, sizeof(struct direct), 2, ".." },
+	{ UFS_ROOTINO, sizeof(struct direct), 1, "." },
+	{ UFS_ROOTINO, sizeof(struct direct), 2, ".." },
 #ifdef LOSTDIR
 	{ LOSTFOUNDINO, sizeof(struct direct), 10, "lost+found" },
 #endif
@@ -953,12 +953,12 @@ struct odirect {
 #ifdef LOSTDIR
 struct direct lost_found_dir[] = {
 	{ LOSTFOUNDINO, sizeof(struct direct), DT_DIR, 1, "." },
-	{ ROOTINO, sizeof(struct direct), DT_DIR, 2, ".." },
+	{ UFS_ROOTINO, sizeof(struct direct), DT_DIR, 2, ".." },
 	{ 0, DIRBLKSIZ, 0, 0, 0 },
 };
 struct odirect olost_found_dir[] = {
 	{ LOSTFOUNDINO, sizeof(struct direct), 1, "." },
-	{ ROOTINO, sizeof(struct direct), 2, ".." },
+	{ UFS_ROOTINO, sizeof(struct direct), 2, ".." },
 	{ 0, DIRBLKSIZ, 0, 0 },
 };
 #endif
@@ -1015,7 +1015,7 @@ fsinit(time_t utime)
 	node.di_db[0] = alloc(sblock.fs_fsize, node.di_mode);
 	node.di_blocks = btodb(fragroundup(&sblock, node.di_size));
 	wtfs(fsbtodb(&sblock, node.di_db[0]), sblock.fs_fsize, buf);
-	iput(&node, ROOTINO);
+	iput(&node, UFS_ROOTINO);
 }
 
 /*
@@ -1263,7 +1263,7 @@ erfs(off_t byte_start, off_t size)
 	off_t ioarg[2];
 	ioarg[0] = byte_start;
 	ioarg[1] = size;
-	if (ioctl(fsi, IOCTLTRIM, ioarg) < 0) {
+	if (ioctl(fsi, DAIOCTRIM, ioarg) < 0) {
 		err(37, "Device trim failed\n");
 	}
 }

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 1995 John Birrell <jb@cimlogic.com.au>.
+ * Copyright (c) 2005, David Xu <davidxu@freebsd.org>
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -10,34 +10,28 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by John Birrell.
- * 4. Neither the name of the author nor the names of any co-contributors
- *    may be used to endorse or promote products derived from this software
- *    without specific prior written permission.
  *
- * THIS SOFTWARE IS PROVIDED BY JOHN BIRRELL AND CONTRIBUTORS ``AS IS'' AND
- * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
- * ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE
- * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
- * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
- * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
- * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
- * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
- * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
- * SUCH DAMAGE.
+ * THIS SOFTWARE IS PROVIDED BY THE AUTHOR ``AS IS'' AND ANY EXPRESS OR
+ * IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+ * OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+ * IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY DIRECT, INDIRECT,
+ * INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT
+ * NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+ * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+ * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
+ * THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
 #include "namespace.h"
 #include <machine/tls.h>
-
 #include <errno.h>
 #include <pthread.h>
 #include "un-namespace.h"
 
 #include "thr_private.h"
+
+#define cpu_ccfence()       __asm __volatile("" : : : "memory")
 
 int _pthread_timedjoin_np(pthread_t pthread, void **thread_return,
 	const struct timespec *abstime);
@@ -81,7 +75,7 @@ join_common(pthread_t pthread, void **thread_return,
 	long state;
 	int oldcancel;
 	int ret = 0;
- 
+
 	if (pthread == NULL)
 		return (EINVAL);
 
@@ -110,9 +104,10 @@ join_common(pthread_t pthread, void **thread_return,
 	oldcancel = _thr_cancel_enter(curthread);
 
 	while ((state = pthread->state) != PS_DEAD) {
+		cpu_ccfence();
 		if (abstime != NULL) {
 			clock_gettime(CLOCK_REALTIME, &ts);
-			TIMESPEC_SUB(&ts2, abstime, &ts);
+			timespecsub(abstime, &ts, &ts2);
 			if (ts2.tv_sec < 0) {
 				ret = ETIMEDOUT;
 				break;
@@ -121,7 +116,7 @@ join_common(pthread_t pthread, void **thread_return,
 		} else
 			tsp = NULL;
 		ret = _thr_umtx_wait(&pthread->state, state, tsp,
-			 CLOCK_REALTIME);
+				     CLOCK_REALTIME);
 		if (ret == ETIMEDOUT)
 			break;
 	}
@@ -150,4 +145,3 @@ join_common(pthread_t pthread, void **thread_return,
 
 __strong_reference(_pthread_join, pthread_join);
 __strong_reference(_pthread_timedjoin_np, pthread_timedjoin_np);
-

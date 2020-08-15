@@ -183,7 +183,7 @@ rman_fini(struct rman *rm)
 
 struct resource *
 rman_reserve_resource(struct rman *rm, u_long start, u_long end, u_long count,
-		      u_int flags, struct device *dev)
+		      u_int flags, device_t dev)
 {
 	u_int	want_activate;
 	struct	resource *r, *s, *rv;
@@ -225,8 +225,8 @@ rman_reserve_resource(struct rman *rm, u_long start, u_long end, u_long count,
 			continue;
 		}
 		rstart = ulmax(s->r_start, start);
-		rstart = (rstart + ((1ul << RF_ALIGNMENT(flags))) - 1) &
-		    ~((1ul << RF_ALIGNMENT(flags)) - 1);
+		rstart = rounddown2(rstart + (1ul << RF_ALIGNMENT(flags)) - 1,
+		    1ul << RF_ALIGNMENT(flags));
 		rend = ulmin(s->r_end, ulmax(start + count - 1, end));
 		DPRINTF(("truncated region: [%#lx, %#lx]; size %#lx (requested %#lx)\n",
 		       rstart, rend, (rend - rstart + 1), count));
@@ -592,21 +592,27 @@ rman_release_resource(struct resource *r)
 	return (rv);
 }
 
+/*
+ * Find the hightest bit set, and add one if more than one bit
+ * set.  We're effectively computing the ceil(log2(size)) here.
+ *
+ * This function cannot compute alignments above (1LU<<63)+1
+ * as this would require returning '64' which will not fit in
+ * the flags field and doesn't work well for calculations either.
+ */
 uint32_t
-rman_make_alignment_flags(uint32_t size)
+rman_make_alignment_flags(size_t size)
 {
-	int	i;
+	int i;
 
-	/*
-	 * Find the hightest bit set, and add one if more than one bit
-	 * set.  We're effectively computing the ceil(log2(size)) here.
-	 */
-	for (i = 32; i > 0; i--)
-		if ((1 << i) & size)
+	for (i = 63; i; --i) {
+		if ((1LU << i) & size)
 			break;
-	if (~(1 << i) & size)
-		i++;
-
+	}
+	if (~(1LU << i) & size)
+		++i;
+	if (i == 64)
+		i = 63;
 	return(RF_ALIGNMENT_LOG2(i));
 }
 

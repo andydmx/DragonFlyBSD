@@ -1,13 +1,6 @@
 #	From: @(#)Makefile	8.3 (Berkeley) 1/7/94
 # $FreeBSD: src/usr.bin/Makefile,v 1.144.2.17 2003/01/04 17:17:07 obrien Exp $
 
-# XXX MISSING:		deroff diction graph learn plot
-#			spell spline struct xsend
-# XXX broken:		tconv
-# XXX Use GNU versions: apropos diff grep ld man ptx uucp whatis
-# Moved to secure: bdes
-#
-
 # No ordering dependencies, everything can run in parallel
 #
 SUBDIR_ORDERED=
@@ -19,9 +12,12 @@ SUBDIR=	alias \
 	awk \
 	banner \
 	basename \
+	bc \
+	bdes \
 	biff \
 	bmake \
 	brandelf \
+	bsdcat \
 	btpin \
 	bzip2 \
 	bzip2recover \
@@ -29,9 +25,7 @@ SUBDIR=	alias \
 	c99 \
 	calendar \
 	cap_mkdb \
-	catman \
 	chat \
-	checknr \
 	checkpt \
 	chflags \
 	chkey \
@@ -40,20 +34,20 @@ SUBDIR=	alias \
 	cmp \
 	col \
 	colcrt \
-	colldef \
 	colrm \
 	column \
 	comm \
-	compile_et \
 	compress \
 	cpio \
 	crunch \
 	csplit \
 	ctags \
 	cut \
+	dc \
 	dfregress \
 	dirname \
 	drill \
+	dsynth \
 	du \
 	ee \
 	enigma \
@@ -66,6 +60,7 @@ SUBDIR=	alias \
 	file2c \
 	find \
 	finger \
+	flame_graph \
 	flex \
 	fmt \
 	fold \
@@ -89,6 +84,7 @@ SUBDIR=	alias \
 	ipcs \
 	join \
 	jot \
+	kcollect \
 	kdump \
 	kenv \
 	keylogin \
@@ -106,6 +102,7 @@ SUBDIR=	alias \
 	lesskey \
 	limits \
 	locale \
+	localedef \
 	locate \
 	lock \
 	lockf \
@@ -119,18 +116,20 @@ SUBDIR=	alias \
 	lzmainfo \
 	m4 \
 	mail \
+	man \
 	mandoc \
 	mesg \
+	ministat \
 	mkcsmapper \
 	mkdep \
 	mkesdb \
 	mkfifo \
-	mklocale \
 	mkstr \
 	mktemp \
 	monitor \
 	msgs \
 	mt \
+	nc \
 	ncal \
 	netstat \
 	newgrp \
@@ -140,9 +139,7 @@ SUBDIR=	alias \
 	nl \
 	nohup \
 	objformat \
-	opieinfo \
-	opiekey \
-	opiepasswd \
+	openssl \
 	pagesize \
 	passwd \
 	paste \
@@ -156,35 +153,41 @@ SUBDIR=	alias \
 	printf \
 	pwait \
 	quota \
-	rdist \
 	relpath \
 	renice \
 	rev \
 	rfcomm_sppd \
-	rlogin \
 	rpcgen \
 	rpcinfo \
 	rs \
-	rsh \
 	rup \
 	ruptime \
 	rusers \
 	rwall \
 	rwho \
+	scp \
 	script \
 	sdpquery \
 	sed \
 	seq \
+	sftp \
 	shar \
 	shlock \
 	showmount \
+	smbutil \
 	sockstat \
 	soelim \
 	sort \
 	split \
+	ssh \
+	ssh-add \
+	ssh-agent \
+	ssh-copy-id \
+	ssh-keygen \
+	ssh-keyscan \
 	stat \
+	strfile \
 	su \
-	symorder \
 	systat \
 	tabs \
 	tail \
@@ -214,13 +217,14 @@ SUBDIR=	alias \
 	unifdef \
 	uniq \
 	units \
+	unstr \
 	unvis \
+	unzip \
 	usbhidaction \
 	u4bhidctl \
 	users \
 	uudecode \
 	uuencode \
-	vgrind \
 	vi \
 	vis \
 	vknet \
@@ -236,6 +240,7 @@ SUBDIR=	alias \
 	window \
 	wmake \
 	write \
+	wtmpcvt \
 	xargs \
 	xinstall \
 	xstr \
@@ -249,21 +254,6 @@ SUBDIR=	alias \
 
 .if defined(WANT_HESIOD)
 SUBDIR+=hesinfo
-.endif
-
-.if !defined(NO_OPENSSL)
-SUBDIR+=bc \
-	dc
-.endif
-
-
-.if !defined(NO_SENDMAIL)
-SUBDIR+=vacation 
-.endif
-
-.if ${MACHINE_ARCH} == "i386"
-# Things that don't compile on x86_64 or are i386 specific:
-SUBDIR+=smbutil
 .endif
 
 .include <bsd.subdir.mk>

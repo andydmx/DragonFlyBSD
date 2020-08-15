@@ -87,7 +87,7 @@ vid_realloc_array(void)
 		return ENOMEM;
 
 	crit_enter();
-	newsize = ((adapters + ARRAY_DELTA)/ARRAY_DELTA)*ARRAY_DELTA;
+	newsize = rounddown(adapters + ARRAY_DELTA, ARRAY_DELTA);
 	new_adp = kmalloc(sizeof(*new_adp)*newsize, M_DEVBUF, M_WAITOK | M_ZERO);
 	new_vidsw = kmalloc(sizeof(*new_vidsw)*newsize, M_DEVBUF,
 	    M_WAITOK | M_ZERO);
@@ -165,37 +165,37 @@ vid_register(video_adapter_t *adp)
 
 	adp->va_index = index;
 	adp->va_token = NULL;
-	lwkt_gettoken(&tty_token);
+	lwkt_gettoken(&vga_token);
 	SET_FOREACH(list, videodriver_set) {
 		p = *list;
 		if (strcmp(p->name, adp->va_name) == 0) {
 			adapter[index] = adp;
 			vidsw[index] = p->vidsw;
-			lwkt_reltoken(&tty_token);
+			lwkt_reltoken(&vga_token);
 			return index;
 		}
 	}
 
-	lwkt_reltoken(&tty_token);
+	lwkt_reltoken(&vga_token);
 	return -1;
 }
 
 int
 vid_unregister(video_adapter_t *adp)
 {
-	lwkt_gettoken(&tty_token);
+	lwkt_gettoken(&vga_token);
 	if ((adp->va_index < 0) || (adp->va_index >= adapters)) {
-		lwkt_reltoken(&tty_token);
+		lwkt_reltoken(&vga_token);
 		return ENOENT;
 	}
 	if (adapter[adp->va_index] != adp) {
-		lwkt_reltoken(&tty_token);
+		lwkt_reltoken(&vga_token);
 		return ENOENT;
 	}
 
 	adapter[adp->va_index] = NULL;
 	vidsw[adp->va_index] = NULL;
-	lwkt_reltoken(&tty_token);
+	lwkt_reltoken(&vga_token);
 	return 0;
 }
 
@@ -206,16 +206,16 @@ vid_get_switch(char *name)
 	const video_driver_t **list;
 	const video_driver_t *p;
 
-	lwkt_gettoken(&tty_token);
+	lwkt_gettoken(&vga_token);
 	SET_FOREACH(list, videodriver_set) {
 		p = *list;
 		if (strcmp(p->name, name) == 0) {
-			lwkt_reltoken(&tty_token);
+			lwkt_reltoken(&vga_token);
 			return p->vidsw;
 		}
 	}
 
-	lwkt_reltoken(&tty_token);
+	lwkt_reltoken(&vga_token);
 	return NULL;
 }
 
@@ -495,7 +495,7 @@ int genfbread(genfb_softc_t *sc, video_adapter_t *adp, struct uio *uio,
 	int error;
 	int len;
 
-	lwkt_gettoken(&tty_token);
+	lwkt_gettoken(&vga_token);
 	error = 0;
 	size = adp->va_buffer_size/adp->va_info.vi_planes;
 	while (uio->uio_resid > 0) {
@@ -512,7 +512,7 @@ int genfbread(genfb_softc_t *sc, video_adapter_t *adp, struct uio *uio,
 		if (error)
 			break;
 	}
-	lwkt_reltoken(&tty_token);
+	lwkt_reltoken(&vga_token);
 	return error;
 }
 
@@ -529,11 +529,11 @@ int genfbioctl(genfb_softc_t *sc, video_adapter_t *adp, u_long cmd,
 
 	if (adp == NULL)	/* XXX */
 		return ENXIO;
-	lwkt_gettoken(&tty_token);
+	lwkt_gettoken(&vga_token);
 	error = (*vidsw[adp->va_index]->ioctl)(adp, cmd, arg);
 	if (error == ENOIOCTL)
 		error = ENODEV;
-	lwkt_reltoken(&tty_token);
+	lwkt_reltoken(&vga_token);
 	return error;
 }
 
@@ -542,9 +542,9 @@ int genfbmmap(genfb_softc_t *sc, video_adapter_t *adp, vm_offset_t offset,
 {
 	int error;
 
-	lwkt_gettoken(&tty_token);
+	lwkt_gettoken(&vga_token);
 	error = (*vidsw[adp->va_index]->mmap)(adp, offset, prot);
-	lwkt_reltoken(&tty_token);
+	lwkt_reltoken(&vga_token);
 	return (error);
 }
 
@@ -656,7 +656,7 @@ fb_commonioctl(video_adapter_t *adp, u_long cmd, caddr_t arg)
 	error = 0;
 	crit_enter();
 
-	lwkt_gettoken(&tty_token);
+	lwkt_gettoken(&vga_token);
 	switch (cmd) {
 
 	case FBIO_ADAPTER:	/* get video adapter index */
@@ -679,24 +679,14 @@ fb_commonioctl(video_adapter_t *adp, u_long cmd, caddr_t arg)
 		((video_adapter_info_t *)arg)->va_io_size = adp->va_io_size;
 		((video_adapter_info_t *)arg)->va_mem_base = adp->va_mem_base;
 		((video_adapter_info_t *)arg)->va_mem_size = adp->va_mem_size;
-		((video_adapter_info_t *)arg)->va_window
-#ifdef __i386__
-			= vtophys(adp->va_window);
-#else
-			= adp->va_window;
-#endif
+		((video_adapter_info_t *)arg)->va_window = adp->va_window;
 		((video_adapter_info_t *)arg)->va_window_size
 			= adp->va_window_size;
 		((video_adapter_info_t *)arg)->va_window_gran
 			= adp->va_window_gran;
 		((video_adapter_info_t *)arg)->va_window_orig
 			= adp->va_window_orig;
-		((video_adapter_info_t *)arg)->va_unused0
-#ifdef __i386__
-			= (adp->va_buffer) ? vtophys(adp->va_buffer) : 0;
-#else
-			= adp->va_buffer;
-#endif
+		((video_adapter_info_t *)arg)->va_unused0 = adp->va_buffer;
 		((video_adapter_info_t *)arg)->va_buffer_size
 			= adp->va_buffer_size;
 		((video_adapter_info_t *)arg)->va_mode = adp->va_mode;
@@ -776,6 +766,6 @@ fb_commonioctl(video_adapter_t *adp, u_long cmd, caddr_t arg)
 	}
 
 	crit_exit();
-	lwkt_reltoken(&tty_token);
+	lwkt_reltoken(&vga_token);
 	return error;
 }

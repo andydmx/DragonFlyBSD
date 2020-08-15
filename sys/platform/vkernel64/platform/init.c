@@ -81,10 +81,11 @@
 #include <errno.h>
 #include <assert.h>
 #include <sysexits.h>
+#include <pthread.h>
 
 #define EX_VKERNEL_REBOOT	32
 
-vm_paddr_t phys_avail[16];
+vm_phystable_t phys_avail[16];
 vm_paddr_t Maxmem;
 vm_paddr_t Maxmem_bytes;
 long physmem;
@@ -115,15 +116,19 @@ u_int cpu_feature;	/* XXX */
 int tsc_present;
 int tsc_invariant;
 int tsc_mpsync;
-int64_t tsc_frequency;
 int optcpus;		/* number of cpus - see mp_start() */
+int cpu_bits;
 int lwp_cpu_lock;	/* if/how to lock virtual CPUs to real CPUs */
 int real_ncpus;		/* number of real CPUs */
 int next_cpu;		/* next real CPU to lock a virtual CPU to */
 int vkernel_b_arg;	/* no of logical CPU bits - only SMP */
 int vkernel_B_arg;	/* no of core bits - only SMP */
 int vmm_enabled;	/* VMM HW assisted enable */
+int use_precise_timer = 0;	/* use a precise timer (more expensive) */
 struct privatespace *CPU_prvspace;
+
+tsc_uclock_t tsc_frequency;
+tsc_uclock_t tsc_oneus_approx;
 
 extern uint64_t KPML4phys;	/* phys addr of kernel level 4 */
 
@@ -135,22 +140,28 @@ static void init_kern_memory(void);
 static void init_kern_memory_vmm(void);
 static void init_globaldata(void);
 static void init_vkernel(void);
-static void init_disk(char *diskExp[], int diskFileNum, enum vkdisk_type type);
+static void init_disk(char **diskExp, int *diskFlags, int diskFileNum, enum vkdisk_type type);
 static void init_netif(char *netifExp[], int netifFileNum);
 static void writepid(void);
 static void cleanpid(void);
 static int unix_connect(const char *path);
-static void usage_err(const char *ctl, ...);
+static void usage_err(const char *ctl, ...) __printflike(1, 2);
 static void usage_help(_Bool);
 static void init_locks(void);
+static void handle_term(int);
+
+pid_t childpid;
 
 static int save_ac;
+static int prezeromem;
 static char **save_av;
 
 /*
  * Kernel startup for virtual kernels - standard main()
  */
-int main(int ac, char **av) {
+int
+main(int ac, char **av)
+{
 	char *memImageFile = NULL;
 	char *netifFile[VKNETIF_MAX];
 	char *diskFile[VKDISK_MAX];
@@ -159,6 +170,7 @@ int main(int ac, char **av) {
 	char *endp;
 	char *tmp;
 	char *tok;
+	int diskFlags[VKDISK_MAX];
 	int netifFileNum = 0;
 	int diskFileNum = 0;
 	int cdFileNum = 0;
@@ -178,7 +190,6 @@ int main(int ac, char **av) {
 	size_t msize;
 	size_t kenv_size;
 	size_t kenv_size2;
-	pid_t pid;
 	int status;
 	struct sigaction sa;
 
@@ -194,7 +205,7 @@ int main(int ac, char **av) {
 		exit(1);
 	}
 
-	while ((pid = fork()) != 0) {
+	while ((childpid = fork()) != 0) {
 		/* Ignore signals */
 		bzero(&sa, sizeof(sa));
 		sigemptyset(&sa.sa_mask);
@@ -204,10 +215,17 @@ int main(int ac, char **av) {
 		sigaction(SIGHUP, &sa, NULL);
 
 		/*
+		 * Forward SIGTERM to the child so that
+		 * the shutdown process initiates correctly.
+		 */
+		sa.sa_handler = handle_term;
+		sigaction(SIGTERM, &sa, NULL);
+
+		/*
 		 * Wait for child to terminate, exit if
 		 * someone stole our child.
 		 */
-		while (waitpid(pid, &status, 0) != pid) {
+		while (waitpid(childpid, &status, 0) != childpid) {
 			if (errno == ECHILD)
 				exit(1);
 		}
@@ -223,11 +241,13 @@ int main(int ac, char **av) {
 	eflag = 0;
 	pos = 0;
 	kenv_size = 0;
+
 	/*
 	 * Process options
 	 */
 	kernel_mem_readonly = 1;
 	optcpus = 2;
+	cpu_bits = 1;
 	vkernel_b_arg = 0;
 	vkernel_B_arg = 0;
 	lwp_cpu_lock = LCL_NONE;
@@ -248,7 +268,7 @@ int main(int ac, char **av) {
 	if (ac < 2)
 		usage_help(false);
 
-	while ((c = getopt(ac, av, "c:hsvl:m:n:r:e:i:p:I:Ud")) != -1) {
+	while ((c = getopt(ac, av, "c:hsvztTl:m:n:r:R:e:i:p:I:Ud")) != -1) {
 		switch(c) {
 		case 'd':
 			dflag = 1;
@@ -296,6 +316,9 @@ int main(int ac, char **av) {
 		case 's':
 			boothowto |= RB_SINGLE;
 			break;
+		case 't':
+			use_precise_timer = 1;
+			break;
 		case 'v':
 			bootverbose = 1;
 			break;
@@ -307,10 +330,14 @@ int main(int ac, char **av) {
 				netifFile[netifFileNum++] = strdup(optarg);
 			break;
 		case 'r':
+		case 'R':
 			if (bootOnDisk < 0)
 				bootOnDisk = 1;
-			if (diskFileNum + cdFileNum < VKDISK_MAX)
-				diskFile[diskFileNum++] = strdup(optarg);
+			if (diskFileNum + cdFileNum < VKDISK_MAX) {
+				diskFile[diskFileNum] = strdup(optarg);
+				diskFlags[diskFileNum] = (c == 'R');
+				++diskFileNum;
+			}
 			break;
 		case 'c':
 			if (bootOnDisk < 0)
@@ -375,18 +402,31 @@ int main(int ac, char **av) {
 			optcpus = strtol(tok, NULL, 0);
 			if (optcpus < 1 || optcpus > MAXCPU)
 				usage_err("Bad ncpus, valid range is 1-%d", MAXCPU);
+			cpu_bits = 1;
+			while ((1 << cpu_bits) < optcpus)
+				++cpu_bits;
 
-			/* :lbits argument */
+			/*
+			 * By default assume simple hyper-threading
+			 */
+			vkernel_b_arg = 1;
+			vkernel_B_arg = cpu_bits - vkernel_b_arg;
+
+			/*
+			 * [:lbits[:cbits]] override # of cpu bits
+			 * for logical and core extraction, supplying
+			 * defaults for any omission.
+			 */
 			tok = strtok(NULL, ":");
 			if (tok != NULL) {
 				vkernel_b_arg = strtol(tok, NULL, 0);
+				vkernel_B_arg = cpu_bits - vkernel_b_arg;
 
 				/* :cbits argument */
 				tok = strtok(NULL, ":");
 				if (tok != NULL) {
 					vkernel_B_arg = strtol(tok, NULL, 0);
 				}
-
 			}
 			break;
 		case 'p':
@@ -397,6 +437,9 @@ int main(int ac, char **av) {
 			break;
 		case 'h':
 			usage_help(true);
+			break;
+		case 'z':
+			prezeromem = 1;
 			break;
 		default:
 			usage_help(false);
@@ -414,8 +457,10 @@ int main(int ac, char **av) {
 	cpu_disable_intr();
 	if (vmm_enabled) {
 		/* use a MAP_ANON directly */
+		printf("VMM is available\n");
 		init_kern_memory_vmm();
 	} else {
+		printf("VMM is not available\n");
 		init_sys_memory(memImageFile);
 		init_kern_memory();
 	}
@@ -439,6 +484,7 @@ int main(int ac, char **av) {
 	sysctlbyname("hw.tsc_frequency", &tsc_frequency, &vsize, NULL, 0);
 	if (tsc_present)
 		cpu_feature |= CPUID_TSC;
+	tsc_oneus_approx = ((tsc_frequency|1) + 999999) / 1000000;
 
 	/*
 	 * Check SSE
@@ -455,11 +501,11 @@ int main(int ac, char **av) {
 	 * We boot from the first installed disk.
 	 */
 	if (bootOnDisk == 1) {
-		init_disk(diskFile, diskFileNum, VKD_DISK);
-		init_disk(cdFile, cdFileNum, VKD_CD);
+		init_disk(diskFile, diskFlags, diskFileNum, VKD_DISK);
+		init_disk(cdFile, NULL, cdFileNum, VKD_CD);
 	} else {
-		init_disk(cdFile, cdFileNum, VKD_CD);
-		init_disk(diskFile, diskFileNum, VKD_DISK);
+		init_disk(cdFile, NULL, cdFileNum, VKD_CD);
+		init_disk(diskFile, diskFlags, diskFileNum, VKD_DISK);
 	}
 
 	init_netif(netifFile, netifFileNum);
@@ -467,6 +513,14 @@ int main(int ac, char **av) {
 	mi_startup();
 	/* NOT REACHED */
 	exit(EX_SOFTWARE);
+}
+
+/* SIGTERM handler */
+static
+void
+handle_term(int sig)
+{
+	kill(childpid, sig);
 }
 
 /*
@@ -573,7 +627,8 @@ init_kern_memory(void)
 	 * Try a number of different locations.
 	 */
 
-	base = mmap((void*)KERNEL_KVA_START, KERNEL_KVA_SIZE, PROT_READ|PROT_WRITE,
+	base = mmap((void*)KERNEL_KVA_START, KERNEL_KVA_SIZE,
+		    PROT_READ|PROT_WRITE|PROT_EXEC,
 		    MAP_FILE|MAP_SHARED|MAP_VPAGETABLE|MAP_FIXED|MAP_TRYFIXED,
 		    MemImageFd, (off_t)KERNEL_KVA_START);
 
@@ -599,6 +654,14 @@ init_kern_memory(void)
 	}
 
 	/*
+	 * Prefault the memory.  The vkernel is going to fault it all in
+	 * anyway, and faults on the backing store itself are very expensive
+	 * once we go SMP (contend a lot).  So do it now.
+	 */
+	if (prezeromem)
+		bzero(dmap_min_address, Maxmem_bytes);
+
+	/*
 	 * Bootstrap the kernel_pmap
 	 */
 	firstfree = NULL;
@@ -611,11 +674,12 @@ init_kern_memory(void)
 	 * phys_avail[] represents unallocated physical memory.  MI code
 	 * will use phys_avail[] to create the vm_page array.
 	 */
-	phys_avail[0] = (vm_paddr_t)firstfree;
-	phys_avail[0] = (phys_avail[0] + PAGE_MASK) & ~(vm_paddr_t)PAGE_MASK;
-	phys_avail[1] = Maxmem_bytes;
+	phys_avail[0].phys_beg = (vm_paddr_t)firstfree;
+	phys_avail[0].phys_beg = (phys_avail[0].phys_beg + PAGE_MASK) &
+				 ~(vm_paddr_t)PAGE_MASK;
+	phys_avail[0].phys_end = Maxmem_bytes;
 
-#if JGV
+#if 0 /* JGV */
 	/*
 	 * (virtual_start, virtual_end) represent unallocated kernel virtual
 	 * memory.  MI code will create kernel_map using these parameters.
@@ -635,9 +699,9 @@ init_kern_memory(void)
 	 */
 	proc0paddr = (void *)virtual_start;
 	for (i = 0; i < UPAGES; ++i) {
-		pmap_kenter_quick(virtual_start, phys_avail[0]);
+		pmap_kenter_quick(virtual_start, phys_avail[0].phys_beg);
 		virtual_start += PAGE_SIZE;
-		phys_avail[0] += PAGE_SIZE;
+		phys_avail[0].phys_beg += PAGE_SIZE;
 	}
 
 	/*
@@ -652,9 +716,9 @@ init_kern_memory(void)
 	assert((MSGBUF_SIZE & PAGE_MASK) == 0);
 	msgbufp = (void *)virtual_start;
 	for (i = 0; i < (MSGBUF_SIZE >> PAGE_SHIFT); ++i) {
-		pmap_kenter_quick(virtual_start, phys_avail[0]);
+		pmap_kenter_quick(virtual_start, phys_avail[0].phys_beg);
 		virtual_start += PAGE_SIZE;
-		phys_avail[0] += PAGE_SIZE;
+		phys_avail[0].phys_beg += PAGE_SIZE;
 	}
 	msgbufinit(msgbufp, MSGBUF_SIZE);
 
@@ -700,17 +764,20 @@ init_kern_memory_vmm(void)
 	 * MAP_ANON the region of the VKERNEL phyisical memory
 	 * (known as GPA - Guest Physical Address
 	 */
-	dmap_address = mmap(NULL, Maxmem_bytes, PROT_READ|PROT_WRITE|PROT_EXEC,
-	    MAP_ANON|MAP_SHARED, -1, 0);
+	dmap_address = mmap(NULL, Maxmem_bytes,
+			    PROT_READ|PROT_WRITE|PROT_EXEC,
+			    MAP_ANON|MAP_SHARED, -1, 0);
 	if (dmap_address == MAP_FAILED) {
 		err(1, "Unable to mmap() RAM region!");
 		/* NOT REACHED */
 	}
+	if (prezeromem)
+		bzero(dmap_address, Maxmem_bytes);
 
 	/* Alloc a new stack in the lowmem */
 	vkernel_stack = mmap(NULL, KERNEL_STACK_SIZE,
-	    PROT_READ|PROT_WRITE|PROT_EXEC,
-	    MAP_ANON, -1, 0);
+			     PROT_READ|PROT_WRITE|PROT_EXEC,
+			     MAP_ANON, -1, 0);
 	if (vkernel_stack == MAP_FAILED) {
 		err(1, "Unable to allocate stack\n");
 	}
@@ -725,6 +792,7 @@ init_kern_memory_vmm(void)
 	/*
 	 * Enter VMM mode
 	 */
+	bzero(&options, sizeof(options));
 	options.guest_cr3 = (register_t) KPML4phys;
 	options.new_stack = (uint64_t) vkernel_stack + KERNEL_STACK_SIZE;
 	options.master = 1;
@@ -736,9 +804,10 @@ init_kern_memory_vmm(void)
 	 * phys_avail[] represents unallocated physical memory.  MI code
 	 * will use phys_avail[] to create the vm_page array.
 	 */
-	phys_avail[0] = (vm_paddr_t)firstfree;
-	phys_avail[0] = (phys_avail[0] + PAGE_MASK) & ~(vm_paddr_t)PAGE_MASK;
-	phys_avail[1] = (vm_paddr_t)dmap_address + Maxmem_bytes;
+	phys_avail[0].phys_beg = (vm_paddr_t)firstfree;
+	phys_avail[0].phys_beg = (phys_avail[0].phys_beg + PAGE_MASK) &
+				 ~(vm_paddr_t)PAGE_MASK;
+	phys_avail[0].phys_end = (vm_paddr_t)dmap_address + Maxmem_bytes;
 
 	/*
 	 * pmap_growkernel() will set the correct value.
@@ -750,9 +819,9 @@ init_kern_memory_vmm(void)
 	 */
 	proc0paddr = (void *)virtual_start;
 	for (i = 0; i < UPAGES; ++i) {
-		pmap_kenter_quick(virtual_start, phys_avail[0]);
+		pmap_kenter_quick(virtual_start, phys_avail[0].phys_beg);
 		virtual_start += PAGE_SIZE;
-		phys_avail[0] += PAGE_SIZE;
+		phys_avail[0].phys_beg += PAGE_SIZE;
 	}
 
 	/*
@@ -768,9 +837,9 @@ init_kern_memory_vmm(void)
 	msgbufp = (void *)virtual_start;
 	for (i = 0; i < (MSGBUF_SIZE >> PAGE_SHIFT); ++i) {
 
-		pmap_kenter_quick(virtual_start, phys_avail[0]);
+		pmap_kenter_quick(virtual_start, phys_avail[0].phys_beg);
 		virtual_start += PAGE_SIZE;
-		phys_avail[0] += PAGE_SIZE;
+		phys_avail[0].phys_beg += PAGE_SIZE;
 	}
 
 	msgbufinit(msgbufp, MSGBUF_SIZE);
@@ -812,16 +881,16 @@ init_globaldata(void)
 	 * into KVA.  For cpu #0 only.
 	 */
 	for (i = 0; i < sizeof(struct mdglobaldata); i += PAGE_SIZE) {
-		pa = phys_avail[0];
+		pa = phys_avail[0].phys_beg;
 		va = (vm_offset_t)&CPU_prvspace[0].mdglobaldata + i;
 		pmap_kenter_quick(va, pa);
-		phys_avail[0] += PAGE_SIZE;
+		phys_avail[0].phys_beg += PAGE_SIZE;
 	}
 	for (i = 0; i < sizeof(CPU_prvspace[0].idlestack); i += PAGE_SIZE) {
-		pa = phys_avail[0];
+		pa = phys_avail[0].phys_beg;
 		va = (vm_offset_t)&CPU_prvspace[0].idlestack + i;
 		pmap_kenter_quick(va, pa);
-		phys_avail[0] += PAGE_SIZE;
+		phys_avail[0].phys_beg += PAGE_SIZE;
 	}
 
 	/*
@@ -866,9 +935,8 @@ init_vkernel(void)
 	gd->mi.gd_curthread = &thread0;
 	thread0.td_gd = &gd->mi;
 	ncpus = 1;
-	ncpus2 = 1;	/* rounded down power of 2 */
 	ncpus_fit = 1;	/* rounded up power of 2 */
-	/* ncpus2_mask and ncpus_fit_mask are 0 */
+	/* ncpus_fit_mask are 0 */
 	init_param1();
 	gd->mi.gd_prvspace = &CPU_prvspace[0];
 	mi_gdinit(&gd->mi, 0);
@@ -888,7 +956,8 @@ init_vkernel(void)
 #if 0
 	initializecpu();	/* Initialize CPU registers */
 #endif
-	init_param2((phys_avail[1] - phys_avail[0]) / PAGE_SIZE);
+	init_param2((phys_avail[0].phys_end -
+		     phys_avail[0].phys_beg) / PAGE_SIZE);
 
 #if 0
 	/*
@@ -915,7 +984,7 @@ init_vkernel(void)
  */
 static
 void
-init_disk(char *diskExp[], int diskFileNum, enum vkdisk_type type)
+init_disk(char **diskExp, int *diskFlags, int diskFileNum, enum vkdisk_type type)
 {
 	char *serno;
 	int i;
@@ -923,7 +992,7 @@ init_disk(char *diskExp[], int diskFileNum, enum vkdisk_type type)
         if (diskFileNum == 0)
                 return;
 
-	for(i=0; i < diskFileNum; i++){
+	for (i=0; i < diskFileNum; i++){
 		char *fname;
 		fname = diskExp[i];
 
@@ -940,7 +1009,7 @@ init_disk(char *diskExp[], int diskFileNum, enum vkdisk_type type)
 
 		if (DiskNum < VKDISK_MAX) {
 			struct stat st;
-			struct vkdisk_info* info = NULL;
+			struct vkdisk_info *info = NULL;
 			int fd;
 			size_t l = 0;
 
@@ -952,7 +1021,7 @@ init_disk(char *diskExp[], int diskFileNum, enum vkdisk_type type)
 				err(1, "Unable to open/create %s", fname);
 				/* NOT REACHED */
 			}
-			if (S_ISREG(st.st_mode)) {
+			if (S_ISREG(st.st_mode) && (diskFlags[i] & 1) == 0) {
 				if (flock(fd, LOCK_EX|LOCK_NB) < 0) {
 					errx(1, "Disk image %s is already "
 						"in use\n", fname);
@@ -966,6 +1035,7 @@ init_disk(char *diskExp[], int diskFileNum, enum vkdisk_type type)
 			info->unit = i;
 			info->fd = fd;
 			info->type = type;
+			info->flags = diskFlags[i];
 			memcpy(info->fname, fname, l);
 			info->serno = NULL;
 			if (serno) {
@@ -977,10 +1047,10 @@ init_disk(char *diskExp[], int diskFileNum, enum vkdisk_type type)
 
 			if (DiskNum == 0) {
 				if (type == VKD_CD) {
-				    rootdevnames[0] = "cd9660:vcd0";
+					rootdevnames[0] = "cd9660:vcd0";
 				} else if (type == VKD_DISK) {
-				    rootdevnames[0] = "ufs:vkd0s0a";
-				    rootdevnames[1] = "ufs:vkd0s1a";
+					rootdevnames[0] = "ufs:vkd0s0a";
+					rootdevnames[1] = "ufs:vkd0s1a";
 				}
 			}
 
@@ -1219,7 +1289,7 @@ unix_connect(const char *path)
 	}
 	setsockopt(net_fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
 	if (fstat(net_fd, &st) == 0)
-		printf("Network socket buffer: %d bytes\n", st.st_blksize);
+		printf("Network socket buffer: %ld bytes\n", st.st_blksize);
 	fcntl(net_fd, F_SETFL, O_NONBLOCK);
 	return(net_fd);
 }
@@ -1327,8 +1397,8 @@ netif_init_tap(int tap_unit, in_addr_t *addr, in_addr_t *mask, int s)
 
 		masklen = strtoul(masklen_str, NULL, 10);
 		if (masklen < 32 && masklen > 0) {
-			netmask = htonl(~((1LL << (32 - masklen)) - 1)
-					& 0xffffffff);
+			netmask =
+			    htonl(rounddown2(0xffffffff, 1LL << (32 - masklen)));
 		} else {
 			warnx("Invalid netmask len: %lu", masklen);
 			return -1;
@@ -1506,7 +1576,7 @@ static
 void
 usage_help(_Bool help)
 {
-	fprintf(stderr, "Usage: %s [-hsUvd] [-c file] [-e name=value:name=value:...]\n"
+	fprintf(stderr, "Usage: %s [-hsUvdt] [-c file] [-e name=value:name=value:...]\n"
 	    "\t[-i file] [-I interface[:address1[:address2][/netmask]]] [-l cpulock]\n"
 	    "\t[-m size] [-n numcpus[:lbits[:cbits]]]\n"
 	    "\t[-p file] [-r file]\n", save_av[0]);
@@ -1521,18 +1591,29 @@ usage_help(_Bool help)
 		    "\t-l\tSpecify which, if any, real CPUs to lock virtual CPUs to.\n"
 		    "\t-m\tSpecify the amount of memory to be used by the kernel in bytes.\n"
 		    "\t-n\tSpecify the number of CPUs and the topology you wish to emulate:\n"
-		    "\t  \t- numcpus - number of cpus\n"
-		    "\t  \t- :lbits - specify the number of bits within APICID(=CPUID) needed for representing\n"
-		    "\t  \t  the logical ID. Controls the number of threads/core (0bits - 1 thread, 1bit - 2 threads).\n"
-		    "\t  \t- :cbits - specify the number of bits within APICID(=CPUID) needed for representing\n"
-		    "\t  \t  the core ID. Controls the number of core/package (0bits - 1 core, 1bit - 2 cores).\n"
+		    "\t\t\tnumcpus - number of cpus\n"
+		    "\t\t\tlbits - specify the number of bits within APICID(=CPUID)\n"
+		    "\t\t\t        needed for representing the logical ID.\n"
+		    "\t\t\t        Controls the number of threads/core:\n"
+		    "\t\t\t        (0 bits - 1 thread, 1 bit - 2 threads).\n"
+		    "\t\t\tcbits - specify the number of bits within APICID(=CPUID)\n"
+		    "\t\t\t        needed for representing the core ID.\n"
+		    "\t\t\t        Controls the number of cores/package:\n"
+		    "\t\t\t        (0 bits - 1 core, 1 bit - 2 cores).\n"
 		    "\t-p\tSpecify a file in which to store the process ID.\n"
-		    "\t-r\tSpecify a R/W disk image file to be used by the kernel.\n"
+		    "\t-r\tSpecify a R/W disk image file, iterates vkd0..n\n"
+		    "\t-R\tSpecify a COW disk image file, iterates vkd0..n\n"
 		    "\t-s\tBoot into single-user mode.\n"
+		    "\t-t\tUse a precise host timer when calculating clock values.\n"
 		    "\t-U\tEnable writing to kernel memory and module loading.\n"
 		    "\t-v\tTurn on verbose booting.\n");
 
 	exit(EX_USAGE);
+}
+
+void
+cpu_smp_stopped(void)
+{
 }
 
 void
@@ -1542,7 +1623,6 @@ cpu_reset(void)
 	closefrom(3);
 	cleanpid();
 	exit(EX_VKERNEL_REBOOT);
-
 }
 
 void
@@ -1611,4 +1691,13 @@ vkernel_module_memory_free(vm_offset_t base, size_t bytes)
 	munmap((void *)base, bytes);
 #endif
 #endif
+}
+
+/*
+ * VKERNEL64 implementation functions using ptrheads.
+ */
+void
+vkernel_yield(void)
+{
+	pthread_yield();
 }

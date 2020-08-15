@@ -1,13 +1,13 @@
 /*
  * Copyright (c) 2007-2008 The DragonFly Project.  All rights reserved.
- * 
+ *
  * This code is derived from software contributed to The DragonFly Project
  * by Matthew Dillon <dillon@backplane.com>
- * 
+ *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
  * are met:
- * 
+ *
  * 1. Redistributions of source code must retain the above copyright
  *    notice, this list of conditions and the following disclaimer.
  * 2. Redistributions in binary form must reproduce the above copyright
@@ -17,7 +17,7 @@
  * 3. Neither the name of The DragonFly Project nor the names of its
  *    contributors may be used to endorse or promote products derived
  *    from this software without specific, prior written permission.
- * 
+ *
  * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
  * ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
  * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
@@ -100,7 +100,7 @@ hammer_init_cursor(hammer_transaction_t trans, hammer_cursor_t cursor,
 		cpu_ccfence();
 		if (rticks < xticks) {
 			if (hammer_debug_general & 0x0004)
-				kprintf("rt %3u, xt %3u, tt %3u\n",
+				hdkprintf("rt %3u, xt %3u, tt %3u\n",
 					rticks, xticks, tticks);
 			tsleep(&dummy, 0, "htdmux", xticks - rticks);
 		}
@@ -304,7 +304,7 @@ hammer_done_cursor(hammer_cursor_t cursor)
  * We upgrade the parent first as it is the most likely to collide first
  * with the downward traversal that the frontend typically does.
  *
- * If we fail to upgrade the lock and cursor->deadlk_node is NULL, 
+ * If we fail to upgrade the lock and cursor->deadlk_node is NULL,
  * we add another reference to the node that failed and set
  * cursor->deadlk_node so hammer_done_cursor() can block on it.
  */
@@ -359,8 +359,7 @@ hammer_cursor_upgrade_node(hammer_cursor_t cursor)
 }
 
 /*
- * Downgrade cursor->node and cursor->parent to shared locks.  This
- * function can return EDEADLK.
+ * Downgrade cursor->node and cursor->parent to shared locks.
  */
 void
 hammer_cursor_downgrade(hammer_cursor_t cursor)
@@ -540,7 +539,7 @@ hammer_cursor_up(hammer_cursor_t cursor)
 		return (ENOENT);
 
 	/*
-	 * Set the node to its parent. 
+	 * Set the node to its parent.
 	 */
 	hammer_unlock(&cursor->node->lock);
 	hammer_rel_node(cursor->node);
@@ -580,7 +579,7 @@ hammer_cursor_up_locked(hammer_cursor_t cursor)
 	save_index = cursor->index;
 
 	/*
-	 * Set the node to its parent. 
+	 * Set the node to its parent.
 	 */
 	cursor->node = cursor->parent;
 	cursor->index = cursor->parent_index;
@@ -640,31 +639,24 @@ hammer_cursor_down(hammer_cursor_t cursor)
 	elm = &node->ondisk->elms[cursor->parent_index];
 
 	/*
-	 * Ok, push down into elm.  If elm specifies an internal or leaf
-	 * node the current node must be an internal node.  If elm specifies
-	 * a spike then the current node must be a leaf node.
+	 * Ok, push down into elm of an internal node.
 	 */
-	switch(elm->base.btype) {
-	case HAMMER_BTREE_TYPE_INTERNAL:
-	case HAMMER_BTREE_TYPE_LEAF:
-		KKASSERT(node->ondisk->type == HAMMER_BTREE_TYPE_INTERNAL);
-		KKASSERT(elm->internal.subtree_offset != 0);
-		cursor->left_bound = &elm[0].internal.base;
-		cursor->right_bound = &elm[1].internal.base;
-		node = hammer_get_node(cursor->trans,
-				       elm->internal.subtree_offset, 0, &error);
-		if (error == 0) {
-			KASSERT(elm->base.btype == node->ondisk->type, ("BTYPE MISMATCH %c %c NODE %p", elm->base.btype, node->ondisk->type, node));
-			if (node->ondisk->parent != cursor->parent->node_offset)
-				panic("node %p %016llx vs %016llx", node, (long long)node->ondisk->parent, (long long)cursor->parent->node_offset);
-			KKASSERT(node->ondisk->parent == cursor->parent->node_offset);
-		}
-		break;
-	default:
-		panic("hammer_cursor_down: illegal btype %02x (%c)",
-		      elm->base.btype,
-		      (elm->base.btype ? elm->base.btype : '?'));
-		break;
+	KKASSERT(node->ondisk->type == HAMMER_BTREE_TYPE_INTERNAL);
+	KKASSERT(elm->internal.subtree_offset != 0);
+	cursor->left_bound = &elm[0].internal.base;
+	cursor->right_bound = &elm[1].internal.base;
+	node = hammer_get_node(cursor->trans,
+			       elm->internal.subtree_offset, 0, &error);
+	if (error == 0) {
+		KASSERT(elm->base.btype == node->ondisk->type,
+			("BTYPE MISMATCH %c %c NODE %p",
+			 elm->base.btype, node->ondisk->type, node));
+		if (node->ondisk->parent != cursor->parent->node_offset)
+			hpanic("node %p %016jx vs %016jx",
+				node,
+				(intmax_t)node->ondisk->parent,
+				(intmax_t)cursor->parent->node_offset);
+		KKASSERT(node->ondisk->parent == cursor->parent->node_offset);
 	}
 
 	/*
@@ -1067,7 +1059,7 @@ again2:
 		KKASSERT(cursor->node == oparent);
 		if (cursor->index != pindex)
 			continue;
-		kprintf("HAMMER debug: shifted cursor pointing at parent\n"
+		hkprintf("debug: shifted cursor pointing at parent\n"
 			"parent %016jx:%d onode %016jx:%d nnode %016jx:%d\n",
 			(intmax_t)oparent->node_offset, pindex,
 			(intmax_t)onode->node_offset, oindex,

@@ -31,16 +31,46 @@
  */
 
 #include <drm/drmP.h>
+#include "drm_legacy.h"
 
-int
-drm_sg_alloc(struct drm_device *dev, struct drm_scatter_gather *request)
+#include <vm/vm_kern.h>
+
+static void drm_sg_cleanup(struct drm_sg_mem * entry)
 {
+	if (entry == NULL)
+		return;
+
+	if (entry->vaddr != 0)
+		kmem_free(&kernel_map, entry->vaddr, IDX_TO_OFF(entry->pages));
+
+	kfree(entry->busaddr);
+	kfree(entry);
+}
+
+void drm_legacy_sg_cleanup(struct drm_device *dev)
+{
+	if (drm_core_check_feature(dev, DRIVER_SG) && dev->sg &&
+	    drm_core_check_feature(dev, DRIVER_LEGACY)) {
+		drm_sg_cleanup(dev->sg);
+		dev->sg = NULL;
+	}
+}
+
+int drm_legacy_sg_alloc(struct drm_device *dev, void *data,
+			struct drm_file *file_priv)
+{
+	struct drm_scatter_gather *request = data;
 	struct drm_sg_mem *entry;
 	vm_size_t size;
 	vm_pindex_t pindex;
 
+	DRM_DEBUG("\n");
+
+	if (!drm_core_check_feature(dev, DRIVER_LEGACY))
+		return -EINVAL;
+
 	if (dev->sg)
-		return EINVAL;
+		return -EINVAL;
 
 	DRM_DEBUG("request size=%ld\n", request->size);
 
@@ -51,11 +81,13 @@ drm_sg_alloc(struct drm_device *dev, struct drm_scatter_gather *request)
 	entry->busaddr = kmalloc(entry->pages * sizeof(*entry->busaddr),
 	    M_DRM, M_WAITOK | M_ZERO);
 
-	entry->vaddr = kmem_alloc_attr(&kernel_map, size, M_WAITOK | M_ZERO,
-	    0, BUS_SPACE_MAXADDR_32BIT, VM_MEMATTR_WRITE_COMBINING);
+	entry->vaddr = kmem_alloc_attr(&kernel_map, size,
+				       VM_SUBSYS_DRM_SCAT, M_WAITOK | M_ZERO,
+				       0, BUS_SPACE_MAXADDR_32BIT,
+				       VM_MEMATTR_WRITE_COMBINING);
 	if (entry->vaddr == 0) {
 		drm_sg_cleanup(entry);
-		return (ENOMEM);
+		return (-ENOMEM);
 	}
 
 	for(pindex = 0; pindex < entry->pages; pindex++) {
@@ -67,7 +99,7 @@ drm_sg_alloc(struct drm_device *dev, struct drm_scatter_gather *request)
 	if (dev->sg) {
 		DRM_UNLOCK(dev);
 		drm_sg_cleanup(entry);
-		return (EINVAL);
+		return (-EINVAL);
 	}
 	dev->sg = entry;
 	DRM_UNLOCK(dev);
@@ -81,49 +113,27 @@ drm_sg_alloc(struct drm_device *dev, struct drm_scatter_gather *request)
 	return (0);
 }
 
-int
-drm_sg_alloc_ioctl(struct drm_device *dev, void *data,
-		   struct drm_file *file_priv)
-{
-	struct drm_scatter_gather *request = data;
-
-	DRM_DEBUG("\n");
-
-	return (drm_sg_alloc(dev, request));
-}
-
-void
-drm_sg_cleanup(struct drm_sg_mem *entry)
-{
-	if (entry == NULL)
-		return;
-
-	if (entry->vaddr != 0)
-		kmem_free(&kernel_map, entry->vaddr, IDX_TO_OFF(entry->pages));
-
-	drm_free(entry->busaddr, M_DRM);
-	drm_free(entry, M_DRM);
-
-	return;
-}
-
-int
-drm_sg_free(struct drm_device *dev, void *data, struct drm_file *file_priv)
+int drm_legacy_sg_free(struct drm_device *dev, void *data,
+		       struct drm_file *file_priv)
 {
 	struct drm_scatter_gather *request = data;
 	struct drm_sg_mem *entry;
 
-	DRM_LOCK(dev);
+	if (!drm_core_check_feature(dev, DRIVER_LEGACY))
+		return -EINVAL;
+
+	if (!drm_core_check_feature(dev, DRIVER_SG))
+		return -EINVAL;
+
 	entry = dev->sg;
 	dev->sg = NULL;
-	DRM_UNLOCK(dev);
 
 	if (!entry || entry->vaddr != request->handle)
-		return (EINVAL);
+		return -EINVAL;
 
 	DRM_DEBUG("free 0x%jx\n", (uintmax_t)entry->vaddr);
 
 	drm_sg_cleanup(entry);
 
-	return (0);
+	return 0;
 }

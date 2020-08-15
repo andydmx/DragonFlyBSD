@@ -2,14 +2,14 @@
  * (MPSAFE)
  *
  * Copyright (c) 2003,2004 The DragonFly Project.  All rights reserved.
- * 
+ *
  * This code is derived from software contributed to The DragonFly Project
  * by Matthew Dillon <dillon@backplane.com>
- * 
+ *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
  * are met:
- * 
+ *
  * 1. Redistributions of source code must retain the above copyright
  *    notice, this list of conditions and the following disclaimer.
  * 2. Redistributions in binary form must reproduce the above copyright
@@ -19,7 +19,7 @@
  * 3. Neither the name of The DragonFly Project nor the names of its
  *    contributors may be used to endorse or promote products derived
  *    from this software without specific, prior written permission.
- * 
+ *
  * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
  * ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
  * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
@@ -37,7 +37,7 @@
 #include <sys/param.h>
 #include <sys/systm.h>
 #include <sys/kernel.h>
-#include <sys/sysproto.h>
+#include <sys/sysmsg.h>
 #include <sys/exec.h>
 #include <sys/imgact.h>
 #include <sys/imgact_aout.h>
@@ -48,10 +48,10 @@
 #include <sys/sysent.h>
 #include <sys/stat.h>
 #include <sys/vnode.h>
-#include <sys/inflate.h>
 #include <sys/sysctl.h>
 #include <sys/lock.h>
 #include <sys/resident.h>
+#include <sys/malloc.h>
 
 #include <vm/vm.h>
 #include <vm/vm_param.h>
@@ -59,8 +59,6 @@
 #include <vm/vm_map.h>
 #include <vm/vm_kern.h>
 #include <vm/vm_extern.h>
-
-#include <sys/sysref2.h>
 
 static int exec_res_id = 0;
 
@@ -106,7 +104,7 @@ fill_xresident(struct vmresident *vr, struct xresident *in, struct thread *td)
 		error = vget(vrtmp, LK_EXCLUSIVE);
 		if (error)
 			goto done;
-	
+
 		/* retrieve underlying stat information and release vnode */
 		error = vn_stat(vrtmp, &st, td->td_ucred);
 		vput(vrtmp);
@@ -139,7 +137,7 @@ sysctl_vm_resident(SYSCTL_HANDLER_ARGS)
 
 	if (exec_res_id == 0)
 	    return error;
-	
+
 	/* client queried for number of resident binaries */
 	if (!req->oldptr)
 	    return SYSCTL_OUT(req, 0, exec_res_id);
@@ -151,7 +149,7 @@ sysctl_vm_resident(SYSCTL_HANDLER_ARGS)
 		error = fill_xresident(vmres, &xres, td);
 		if (error != 0)
 			break;
-		
+
 		error = SYSCTL_OUT(req, (void *)&xres,
 				sizeof(struct xresident));
 		if (error != 0)
@@ -205,7 +203,8 @@ exec_resident_imgact(struct image_params *imgp)
  * MPALMOSTSAFE
  */
 int
-sys_exec_sys_register(struct exec_sys_register_args *uap)
+sys_exec_sys_register(struct sysmsg *sysmsg,
+		      const struct exec_sys_register_args *uap)
 {
     struct thread *td = curthread;
     struct vmresident *vmres;
@@ -234,7 +233,7 @@ sys_exec_sys_register(struct exec_sys_register_args *uap)
     vmres->vr_sysent = p->p_sysent;
     vmres->vr_id = ++exec_res_id;
     vmres->vr_entry_addr = (intptr_t)uap->entry;
-    vmres->vr_vmspace = vmspace_fork(p->p_vmspace); /* XXX order */
+    vmres->vr_vmspace = vmspace_fork(p->p_vmspace, NULL, NULL); /* XXX order */
     pmap_pinit2(vmspace_pmap(vmres->vr_vmspace));
     vp->v_resident = vmres;
 
@@ -254,7 +253,8 @@ sys_exec_sys_register(struct exec_sys_register_args *uap)
  * MPALMOSTSAFE
  */
 int
-sys_exec_sys_unregister(struct exec_sys_unregister_args *uap)
+sys_exec_sys_unregister(struct sysmsg *sysmsg,
+			const struct exec_sys_unregister_args *uap)
 {
     struct thread *td = curthread;
     struct vmresident *vmres;
@@ -318,7 +318,7 @@ restart:
     lockmgr(&exec_list_lock, LK_RELEASE);
 
     if (error == 0)
-	uap->sysmsg_result = count;
+	sysmsg->sysmsg_result = count;
     return(error);
 }
 

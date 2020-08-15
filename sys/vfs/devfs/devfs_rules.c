@@ -34,7 +34,7 @@
 #include <sys/param.h>
 #include <sys/systm.h>
 #include <sys/kernel.h>
-#include <sys/types.h>
+#include <sys/malloc.h>
 #include <sys/lock.h>
 #include <sys/spinlock2.h>
 #include <sys/fcntl.h>
@@ -58,7 +58,7 @@ static void devfs_rule_create_link(struct devfs_node *, struct devfs_rule *);
 static int devfs_rule_checkname(struct devfs_rule *, struct devfs_node *);
 
 static struct objcache	*devfs_rule_cache;
-static struct lock 		devfs_rule_lock;
+static struct lock	devfs_rule_lock;
 
 static struct objcache_malloc_args devfs_rule_malloc_args = {
 	sizeof(struct devfs_rule), M_DEVFS };
@@ -68,7 +68,7 @@ static struct devfs_rule_head devfs_rule_list =
 		TAILQ_HEAD_INITIALIZER(devfs_rule_list);
 
 static struct dev_ops devfs_dev_ops = {
-	{ "devfs", 0, 0 },
+	{ "devfs", 0, D_MPSAFE },
 	.d_open = devfs_dev_open,
 	.d_close = devfs_dev_close,
 	.d_ioctl = devfs_dev_ioctl
@@ -198,8 +198,8 @@ devfs_rule_clear(struct devfs_rule_ioctl *templ)
 	lockmgr(&devfs_rule_lock, LK_EXCLUSIVE);
 	TAILQ_FOREACH_MUTABLE(rule1, &devfs_rule_list, link, rule2) {
 		if ((templ->mntpoint[0] == '*') ||
-			( (mntpointlen == rule1->mntpointlen) &&
-			  (!memcmp(templ->mntpoint, rule1->mntpoint, mntpointlen)) )) {
+		    ((mntpointlen == rule1->mntpointlen) &&
+		     (!memcmp(templ->mntpoint, rule1->mntpoint, mntpointlen)))) {
 			devfs_rule_remove(rule1);
 		}
 	}
@@ -399,7 +399,8 @@ devfs_dev_open(struct dev_open_args *ap)
 	 * We don't allow nonblocking access.
 	 */
 	if ((ap->a_oflags & O_NONBLOCK) != 0) {
-		devfs_debug(DEVFS_DEBUG_SHOW, "devfs_dev: can't do nonblocking access\n");
+		devfs_debug(DEVFS_DEBUG_SHOW,
+			    "devfs_dev: can't do nonblocking access\n");
 		return(ENODEV);
 	}
 
@@ -460,18 +461,14 @@ devfs_dev_init(void *unused)
 {
 	lockinit(&devfs_rule_lock, "devfs_rule lock", 0, 0);
 
-    devfs_rule_cache = objcache_create("devfs-rule-cache", 0, 0,
-			NULL, NULL, NULL,
-			objcache_malloc_alloc,
-			objcache_malloc_free,
-			&devfs_rule_malloc_args );
+	devfs_rule_cache = objcache_create("devfs-rule-cache", 0, 0,
+					   NULL, NULL, NULL,
+					   objcache_malloc_alloc,
+					   objcache_malloc_free,
+					   &devfs_rule_malloc_args);
 
-    devfs_dev = make_dev(&devfs_dev_ops,
-            0,
-            UID_ROOT,
-            GID_WHEEL,
-            0600,
-            "devfs");
+	devfs_dev = make_dev(&devfs_dev_ops, 0, UID_ROOT, GID_WHEEL,
+			     0600, "devfs");
 }
 
 
@@ -479,11 +476,11 @@ static void
 devfs_dev_uninit(void *unused)
 {
 	/* XXX: destroy all rules first */
-    destroy_dev(devfs_dev);
+	destroy_dev(devfs_dev);
 	objcache_destroy(devfs_rule_cache);
 }
 
 
-SYSINIT(devfsdev,SI_SUB_DRIVERS,SI_ORDER_FIRST,devfs_dev_init,NULL)
-SYSUNINIT(devfsdev, SI_SUB_DRIVERS,SI_ORDER_FIRST,devfs_dev_uninit, NULL);
+SYSINIT(devfsdev, SI_SUB_DRIVERS, SI_ORDER_FIRST, devfs_dev_init, NULL);
+SYSUNINIT(devfsdev, SI_SUB_DRIVERS, SI_ORDER_FIRST, devfs_dev_uninit, NULL);
 

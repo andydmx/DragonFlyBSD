@@ -44,22 +44,27 @@
 #define	_UTX_IDSIZE	4
 #define _UTX_HOSTSIZE	256
 
+#if __BSD_VISIBLE
 #define UTX_USERSIZE	_UTX_USERSIZE
 #define UTX_LINESIZE	_UTX_LINESIZE
 #define	UTX_IDSIZE	_UTX_IDSIZE
 #define UTX_HOSTSIZE	_UTX_HOSTSIZE
+#endif
 
 
-#define EMPTY		0
+#define EMPTY		0	/* No valid user accounting information. */
+#if __BSD_VISIBLE
 #define RUN_LVL		1
-#define BOOT_TIME	2
-#define OLD_TIME	3
-#define NEW_TIME	4
-#define INIT_PROCESS	5
-#define LOGIN_PROCESS	6
-#define USER_PROCESS	7
-#define DEAD_PROCESS	8
+#endif
+#define BOOT_TIME	2	/* Time of system boot. */
+#define OLD_TIME	3	/* Time when system clock changed. */
+#define NEW_TIME	4	/* Time after system clock changed. */
+#define INIT_PROCESS	5	/* A process spawned by the init process. */
+#define LOGIN_PROCESS	6	/* The session leader of a logged-in user. */
+#define USER_PROCESS	7	/* A process. */
+#define DEAD_PROCESS	8	/* A session leader who has exited. */
 
+#if __BSD_VISIBLE
 #define ACCOUNTING	9
 #define SIGNATURE	10
 #define DOWN_TIME	11
@@ -73,20 +78,28 @@
 #define	NTIME_MSG	"new time"
 #define	DOWN_MSG	"system down"
 
-#define ut_user ut_name
-#define ut_xtime ut_tv.tv_sec
-
 typedef enum {
 	UTX_DB_UTMPX,
 	UTX_DB_WTMPX,
 	UTX_DB_LASTLOGX
 } utx_db_t;
+#endif
 
 struct exit_status
 {
 	uint16_t e_termination;		/* termination status */
 	uint16_t e_exit;		/* exit status */
 };
+
+/*
+ * The following structure describes the fields of the utmpx entries
+ * stored in _PATH_UTMPX or _PATH_WTMPX. This is not necessarily the
+ * format the entries are stored in the files, and application should
+ * only access entries using routines described in getutxent(3).
+ */
+
+#define ut_user ut_name
+#define ut_xtime ut_tv.tv_sec
 
 struct utmpx {
 	char ut_name[_UTX_USERSIZE];	/* login name */
@@ -95,7 +108,7 @@ struct utmpx {
 	char ut_host[_UTX_HOSTSIZE];	/* host name */
 	uint8_t	ut_unused[16];		/* reserved for future use */
 	uint16_t ut_session;		/* session id used for windowing */
-	uint16_t ut_type;		/* type of this entry */
+	short ut_type;			/* type of this entry */
 	pid_t ut_pid;			/* process id creating the entry */
 	struct exit_status ut_exit;	/* process termination/exit status */
 	struct sockaddr_storage ut_ss;	/* address where entry was made from */
@@ -103,12 +116,14 @@ struct utmpx {
 	uint8_t ut_unused2[16];		/* reserved for future use */
 };
 
+#if __BSD_VISIBLE
 struct lastlogx {
 	struct timeval ll_tv;		/* time entry was created */
 	char ll_line[_UTX_LINESIZE];	/* tty name */
 	char ll_host[_UTX_HOSTSIZE];	/* host name */
 	struct sockaddr_storage ll_ss;	/* address where entry was made from */
 };
+#endif
 
 __BEGIN_DECLS
 void          endutxent(void);
@@ -118,16 +133,14 @@ struct utmpx *getutxline(const struct utmpx *);
 struct utmpx *pututxline(const struct utmpx *);
 void          setutxent(void);
 
-#ifdef __BSD_VISIBLE
+#if __BSD_VISIBLE
 int _updwtmpx(const char *, const struct utmpx *);
 void updwtmpx(const char *, const struct utmpx *);
 struct lastlogx *getlastlogx(const char *, uid_t, struct lastlogx *);
 int updlastlogx(const char *, uid_t, struct lastlogx *);
-struct utmp;
-void getutmp(const struct utmpx *, struct utmp *);
-void getutmpx(const struct utmp *, struct utmpx *);
 int utmpxname(const char *);
-int setutxdb(utx_db_t, char *);
+struct utmpx *getutxuser(const char *);
+int setutxdb(utx_db_t, const char *);
 #endif
 __END_DECLS
 

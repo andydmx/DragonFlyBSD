@@ -60,9 +60,10 @@ struct lock hpfs_hphash_lock;
 void
 hpfs_hphashinit(void)
 {
+	int hsize = vfs_inodehashsize();
 
-	lockinit (&hpfs_hphash_lock, "hpfs_hphashlock", 0, 0);
-	hpfs_hphashtbl = hashinit(desiredvnodes, M_HPFSHASH, &hpfs_hphash);
+	lockinit(&hpfs_hphash_lock, "hpfs_hphashlock", 0, 0);
+	hpfs_hphashtbl = hashinit(hsize, M_HPFSHASH, &hpfs_hphash);
 	lwkt_token_init(&hpfs_hphash_token, "hpfsihash");
 }
 

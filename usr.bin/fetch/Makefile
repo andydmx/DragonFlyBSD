@@ -1,11 +1,12 @@
-# $FreeBSD: src/usr.bin/fetch/Makefile,v 1.3.6.4 2003/01/09 11:54:58 des Exp $
+# $FreeBSD: head/usr.bin/fetch/Makefile 275042 2014-11-25 14:29:10Z bapt $
 
 PROG=		fetch
 DPADD=		${LIBFETCH}
 LDADD=		-lfetch
-.if !defined(NO_CRYPT) && !defined(NO_OPENSSL)
+
 DPADD+=		${LIBSSL} ${LIBCRYPTO}
-LDADD+=		-lssl -lcrypto
-.endif
+LDADD+=		-lprivate_ssl -lprivate_crypto
+CFLAGS+=	${PRIVATELIB_CFLAGS}
+LDFLAGS+=	${PRIVATELIB_LDFLAGS}
 
 .include <bsd.prog.mk>

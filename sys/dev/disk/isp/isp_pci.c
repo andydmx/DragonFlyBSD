@@ -530,11 +530,7 @@ isp_get_specific_options(device_t dev, int chan, ispsoftc_t *isp)
 		if (IS_FC(isp)) {
 			ISP_FC_PC(isp, chan)->default_id = 109 - chan;
 		} else {
-#ifdef __sparc64__
-			ISP_SPI_PC(isp, chan)->iid = OF_getscsinitid(dev);
-#else
 			ISP_SPI_PC(isp, chan)->iid = 7;
-#endif
 		}
 	} else {
 		if (IS_FC(isp)) {
@@ -864,6 +860,11 @@ isp_pci_attach(device_t dev)
 	}
 	if (isp->isp_osinfo.fw == NULL) {
 		ksnprintf(fwname, sizeof (fwname), "isp_%04x", did);
+#ifdef USE_SMALLER_2100_FIRMWARE
+		if (IS_21XX(isp)) {
+			ksnprintf(fwname, sizeof (fwname), "%s_variant_1", fwname);
+		}
+#endif
 		isp->isp_osinfo.fw = firmware_get(fwname);
 	}
 	if (isp->isp_osinfo.fw != NULL) {

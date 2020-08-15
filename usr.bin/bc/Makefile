@@ -5,12 +5,14 @@ SRCS=		bc.y scan.l tty.c y.tab.h
 CFLAGS+=	-I. -I${.CURDIR}
 WARNS?=		3
 
-DPADD=		${LIBEDIT} ${LIBTERMCAP}
-LDADD=		-ledit -ltermcap
+CFLAGS+=	${PRIVATELIB_CFLAGS}
+DPADD=		${LIBEDIT} ${LIBNCURSES}
+LDADD=		-lprivate_edit -lprivate_ncurses
+LDFLAGS+=	${PRIVATELIB_LDFLAGS}
 
-SCRIPTS=	bc.library
-SCRIPTSMODE=	444
-SCRIPTSDIR=	/usr/share/misc
-SCRIPTSNAME_bc.library= ${SCRIPTS}
+.if !defined(NO_SHARE)
+FILES=		bc.library
+FILESDIR=	/usr/share/misc
+.endif
 
 .include <bsd.prog.mk>

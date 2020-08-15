@@ -44,6 +44,7 @@ typedef __uintptr_t	devinfo_handle_t;
 typedef enum devinfo_state {
 	DIS_NOTPRESENT,			/* not probed or probe failed */
 	DIS_ALIVE,			/* probe succeeded */
+	DIS_INPROGRESS,			/* attach in progress */
 	DIS_ATTACHED,			/* attach method called */
 	DIS_BUSY			/* device is open */
 } devinfo_state_t;
@@ -59,7 +60,8 @@ struct devinfo_dev {
 	char			*dd_location;	/* Where bus thinks dev at */
 	uint32_t		dd_devflags;	/* API flags */
 	uint16_t		dd_flags;	/* internal dev flags */
-	devinfo_state_t		dd_state;	/* attacement state of dev */
+#define DIF_ENABLED	0x0001		/* device should be probed/attached */
+	devinfo_state_t		dd_state;	/* attachement state of dev */
 };
 
 struct devinfo_rman {

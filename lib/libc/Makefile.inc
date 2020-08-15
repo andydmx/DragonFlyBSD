@@ -1,6 +1,6 @@
 # $FreeBSD: src/lib/libc/Makefile.inc,v 1.5 1999/08/27 23:58:06 peter Exp $
 #
-# This file contains make rules that are shared by libc and libc_r.
+# This file contains make rules that are shared by libc and libc_rtld.
 #
 # Define (empty) variables so that make doesn't give substitution
 # errors if the included makefiles don't change these:
@@ -11,6 +11,12 @@ MIASM=
 NOASM=
 
 WARNS=2
+
+# for now do not let the use of -flto (check -plugin-opt=-pass-through=-lc !)
+.if ${CFLAGS:M-flto}
+CFLAGS+=	-fno-lto
+LDFLAGS+=	-flto
+.endif
 
 .include "${.CURDIR}/../libc/${MACHINE_ARCH}/Makefile.inc"
 
@@ -23,14 +29,15 @@ WARNS=2
 .include "${.CURDIR}/../libc/sysvipc/Makefile.inc"
 .include "${.CURDIR}/../libc/gmon/Makefile.inc"
 .include "${.CURDIR}/../libc/iconv/Makefile.inc"
+.include "${.CURDIR}/../libc/inet/Makefile.inc"
+.include "${.CURDIR}/../libc/isc/Makefile.inc"
 .include "${.CURDIR}/../libc/locale/Makefile.inc"
+.include "${.CURDIR}/../libc/nameser/Makefile.inc"
 .include "${.CURDIR}/../libc/net/Makefile.inc"
 .include "${.CURDIR}/../libc/nls/Makefile.inc"
-.if ${MACHINE_ARCH} != "x86_64"
-.include "${.CURDIR}/../libc/quad/Makefile.inc"
-.endif
-.include "${.CURDIR}/../libc/regex/Makefile.inc"
+.include "${.CURDIR}/../libc/tre-regex/Makefile.inc"
 .include "${.CURDIR}/../libc/resolv/Makefile.inc"
+.include "${.CURDIR}/../libc/secure/Makefile.inc"
 .include "${.CURDIR}/../libc/stdio/Makefile.inc"
 .include "${.CURDIR}/../libc/stdlib/Makefile.inc"
 .include "${.CURDIR}/../libc/stdtime/Makefile.inc"

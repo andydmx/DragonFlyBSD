@@ -174,7 +174,6 @@ revive_block(int sdno)
     {
 	dev = SD[sdno].sd_dev;
 	KKASSERT(dev != NULL);
-	bp->b_flags |= B_ORDERED;		    /* and make this an ordered write */
 	bp->b_cmd = BUF_CMD_WRITE;
 	bp->b_resid = bp->b_bcount;
 	bp->b_bio1.bio_offset = (off_t)sd->revived << DEV_BSHIFT;		    /* write it to here */
@@ -197,7 +196,7 @@ revive_block(int sdno)
 	if (lock)					    /* we took a lock, */
 	    unlockrange(sd->plexno, lock);		    /* give it back */
 	while (sd->waitlist) {				    /* we have waiting requests */
-#if VINUMDEBUG
+#ifdef VINUMDEBUG
 	    struct request *rq = sd->waitlist;
 	    cdev_t dev;
 
@@ -275,6 +274,7 @@ parityops(struct vinum_ioctl_msg *data)
     size = imin(DEFAULT_REVIVE_BLOCKSIZE,		    /* one block at a time */
 	plex->stripesize << DEV_BSHIFT);
 
+    errorloc = 0;	/* avoid gcc warnings */
     pbp = parityrebuild(plex, pstripe, size, op, &lock, &errorloc); /* do the grunt work */
     if (pbp == NULL) {					    /* no buffer space */
 	reply->error = ENOMEM;

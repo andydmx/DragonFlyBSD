@@ -1,5 +1,4 @@
 /*	$NetBSD: pfil.c,v 1.20 2001/11/12 23:49:46 lukem Exp $	*/
-/* $DragonFly: src/sys/net/pfil.c,v 1.14 2008/09/20 06:08:13 sephe Exp $ */
 
 /*
  * Copyright (c) 1996 Matthew R. Green
@@ -37,26 +36,15 @@
 #include <sys/systm.h>
 #include <sys/proc.h>
 #include <sys/queue.h>
+#include <sys/sysctl.h>
 
 #include <net/if.h>
+#include <net/if_var.h>
 #include <net/pfil.h>
 #include <net/netmsg2.h>
 #include <net/netisr2.h>
-#include <sys/mplock2.h>
 
 #define PFIL_CFGPORT	netisr_cpuport(0)
-
-#define PFIL_GETMPLOCK(pfh) \
-do { \
-	if (((pfh)->pfil_flags & PFIL_MPSAFE) == 0) \
-		get_mplock(); \
-} while (0)
-
-#define PFIL_RELMPLOCK(pfh) \
-do { \
-	if (((pfh)->pfil_flags & PFIL_MPSAFE) == 0) \
-		rel_mplock(); \
-} while (0)
 
 /*
  * The packet filter hooks are designed for anything to call them to
@@ -92,6 +80,12 @@ static struct packet_filter_hook *
 static void		pfil_remove_hook_dispatch(netmsg_t);
 static void		pfil_add_hook_dispatch(netmsg_t);
 
+int filters_default_to_accept = 0;
+SYSCTL_INT(_net, OID_AUTO, filters_default_to_accept, CTLFLAG_RW,
+    &filters_default_to_accept, 0,
+    "cause ipfw* modules to not block by default");
+TUNABLE_INT("net.filters_default_to_accept", &filters_default_to_accept);
+
 /*
  * pfil_run_hooks() runs the specified packet filter hooks.
  */
@@ -111,12 +105,11 @@ pfil_run_hooks(struct pfil_head *ph, struct mbuf **mp, struct ifnet *ifp,
 	else
 		return 0; /* XXX panic? */
 
+	/* Make sure 'list' is really used. */
+	cpu_ccfence();
 	TAILQ_FOREACH(pfh, list, pfil_link) {
 		if (pfh->pfil_func != NULL) {
-			PFIL_GETMPLOCK(pfh);
 			rv = pfh->pfil_func(pfh->pfil_arg, &m, ifp, dir);
-			PFIL_RELMPLOCK(pfh);
-
 			if (rv != 0 || m == NULL)
 				break;
 		}
@@ -262,7 +255,6 @@ reply:
  *	PFIL_IN		call me on incoming packets
  *	PFIL_OUT	call me on outgoing packets
  *	PFIL_ALL	call me on all of the above
- *	PFIL_MPSAFE	call me without BGL
  */
 int
 pfil_add_hook(pfil_func_t func, void *arg, int flags, struct pfil_head *ph)

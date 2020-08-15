@@ -1,13 +1,13 @@
 /*
  * Copyright (c) 2003-2007 The DragonFly Project.  All rights reserved.
- * 
+ *
  * This code is derived from software contributed to The DragonFly Project
  * by Matthew Dillon <dillon@backplane.com>
- * 
+ *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
  * are met:
- * 
+ *
  * 1. Redistributions of source code must retain the above copyright
  *    notice, this list of conditions and the following disclaimer.
  * 2. Redistributions in binary form must reproduce the above copyright
@@ -17,7 +17,7 @@
  * 3. Neither the name of The DragonFly Project nor the names of its
  *    contributors may be used to endorse or promote products derived
  *    from this software without specific, prior written permission.
- * 
+ *
  * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
  * ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
  * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
@@ -30,7 +30,7 @@
  * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT
  * OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
- * 
+ *
  * ----------------------------------------------------------------------------
  * "THE BEER-WARE LICENSE" (Revision 42):
  * <phk@FreeBSD.ORG> wrote this file.  As long as you retain this notice you
@@ -90,6 +90,7 @@
 #include <sys/param.h>
 #include <sys/systm.h>
 #include <sys/kernel.h>
+#include <sys/malloc.h>
 #include <sys/proc.h>
 #include <sys/sysctl.h>
 #include <sys/buf.h>
@@ -155,6 +156,24 @@ l32_getnumparts(disklabel_t lp)
 	return(lp.lab32->d_npartitions);
 }
 
+static int
+l32_getpackname(disklabel_t lp, char *buf, size_t bytes)
+{
+	size_t slen;
+
+	if (lp.lab32->d_packname[0] == 0) {
+		buf[0] = 0;
+		return -1;
+	}
+	slen = strnlen(lp.lab32->d_packname, sizeof(lp.lab32->d_packname));
+	if (slen >= bytes)
+		slen = bytes - 1;
+	bcopy(lp.lab32->d_packname, buf, slen);
+	buf[slen] = 0;
+
+	return 0;
+}
+
 static void
 l32_freedisklabel(disklabel_t *lpp)
 {
@@ -163,7 +182,7 @@ l32_freedisklabel(disklabel_t *lpp)
 }
 
 /*
- * Attempt to read a disk label from a device.  
+ * Attempt to read a disk label from a device.
  *
  * Returns NULL on sucess, and an error string on failure
  */
@@ -177,13 +196,15 @@ l32_readdisklabel(cdev_t dev, struct diskslice *sp, disklabel_t *lpp,
 	const char *msg = NULL;
 	int secsize = info->d_media_blksize;
 
-	bp = geteblk(secsize);
+	bp = getpbuf_mem(NULL);
+	KKASSERT(secsize <= bp->b_bufsize);
 	bp->b_bio1.bio_offset = (off_t)LABELSECTOR32 * secsize;
 	bp->b_bio1.bio_done = biodone_sync;
 	bp->b_bio1.bio_flags |= BIO_SYNC;
 	bp->b_bcount = secsize;
 	bp->b_flags &= ~B_INVAL;
 	bp->b_cmd = BUF_CMD_READ;
+	bp->b_flags |= B_FAILONDIS;
 	dev_dstrategy(dev, &bp->b_bio1);
 	if (biowait(&bp->b_bio1, "labrd"))
 		msg = "I/O error";
@@ -197,7 +218,7 @@ l32_readdisklabel(cdev_t dev, struct diskslice *sp, disklabel_t *lpp,
 			 * NOTE! dsreadandsetlabel() does a strcmp() on
 			 * this string.
 			 */
-			if (msg == NULL) 
+			if (msg == NULL)
 				msg = "no disk label";
 		} else if (dlp->d_npartitions > MAXPARTITIONS32 ||
 			   dkcksum32(dlp) != 0) {
@@ -214,7 +235,8 @@ l32_readdisklabel(cdev_t dev, struct diskslice *sp, disklabel_t *lpp,
 		}
 	}
 	bp->b_flags |= B_INVAL | B_AGE;
-	brelse(bp);
+	relpbuf(bp, NULL);
+
 	return (msg);
 }
 
@@ -307,11 +329,13 @@ l32_writedisklabel(cdev_t dev, struct diskslices *ssp, struct diskslice *sp,
 	if (lp->d_partitions[RAW_PART].p_offset != 0)
 		return (EXDEV);			/* not quite right */
 
-	bp = geteblk((int)lp->d_secsize);
+	bp = getpbuf_mem(NULL);
+	KKASSERT((int)lp->d_secsize <= bp->b_bufsize);
 	bp->b_bio1.bio_offset = (off_t)LABELSECTOR32 * lp->d_secsize;
 	bp->b_bio1.bio_done = biodone_sync;
 	bp->b_bio1.bio_flags |= BIO_SYNC;
 	bp->b_bcount = lp->d_secsize;
+	bp->b_flags |= B_FAILONDIS;
 
 #if 1
 	/*
@@ -364,7 +388,8 @@ done:
 	error = biowait(&bp->b_bio1, "labwr");
 #endif
 	bp->b_flags |= B_INVAL | B_AGE;
-	brelse(bp);
+	relpbuf(bp, NULL);
+
 	return (error);
 }
 
@@ -630,6 +655,7 @@ struct disklabel_ops disklabel32_ops = {
 	.op_loadpartinfo = l32_loadpartinfo,
 	.op_getnumparts = l32_getnumparts,
 	.op_makevirginlabel = l32_makevirginlabel,
+	.op_getpackname = l32_getpackname,
 	.op_freedisklabel = l32_freedisklabel
 };
 

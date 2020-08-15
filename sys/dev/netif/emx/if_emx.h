@@ -140,6 +140,9 @@
 #define EMX_FC_PAUSE_TIME		1000
 #define EMX_EEPROM_APME			0x400;
 
+#define EMX_PCICFG_DESC_RING_STATUS	0xe4
+#define EMX_FLUSH_DESC_REQUIRED		0x100
+
 /*
  * TDBA/RDBA should be aligned on 16 byte boundary. But TDLEN/RDLEN should be
  * multiple of 128 bytes. So we align TDBA/RDBA on 128 byte boundary. This will
@@ -152,6 +155,13 @@
  * 82571EB/82572EI only, used to improve small packet transmit performance.
  */
 #define EMX_TARC_SPEED_MODE		(1 << 21)
+
+#define EMX_TARC_COMPENSATION_MODE	(1 << 7) /* Compensation Mode */
+
+#define EMX_TARC_MQ_FIX			(1 << 23) | \
+					(1 << 24) | \
+					(1 << 25) /* Handle errata in MQ mode */
+#define EMX_TARC_ERRATA 		(1 << 26) /* 82574 errata */
 
 /*
  * Multiple TX queues arbitration count mask in TARC0/TARC1.
@@ -184,6 +194,8 @@
 #define EMX_NRETA			32
 #define EMX_RETA_SIZE			4
 #define EMX_RETA_RINGIDX_SHIFT		7
+
+#define EMX_RDRTABLE_SIZE		(EMX_NRETA * EMX_RETA_SIZE)
 
 #define EMX_NRX_RING			2
 #define EMX_NTX_RING			2
@@ -247,7 +259,10 @@ struct emx_txdata {
 	struct emx_softc	*sc;
 	struct ifaltq_subque	*ifsq;
 	int			idx;
-	uint32_t		tx_flags;
+	int16_t			tx_running;
+#define EMX_TX_RUNNING		100
+#define EMX_TX_RUNNING_DEC	25
+	uint16_t		tx_flags;
 #define EMX_TXFLAG_TSO_PULLEX	0x1
 #define EMX_TXFLAG_ENABLED	0x2
 #define EMX_TXFLAG_FORCECTX	0x4
@@ -270,6 +285,7 @@ struct emx_txdata {
 	bus_dma_tag_t		txtag;		/* dma tag for tx */
 	int			spare_tx_desc;
 	int			oact_tx_desc;
+	int			tx_nmbuf;
 
 	/* Saved csum offloading context information */
 	int			csum_flags;
@@ -324,11 +340,13 @@ struct emx_txdata {
 	int			tx_dd[EMX_TXDD_MAX];
 
 	struct ifsubq_watchdog	tx_watchdog;
+	struct callout		tx_gc_timer;
 
 	/* TX statistics */
 	unsigned long		tx_pkts;
 	unsigned long		tso_segments;
 	unsigned long		tso_ctx_reused;
+	unsigned long		tx_gc;
 
 	bus_dma_tag_t		tx_desc_dtag;
 	bus_dmamap_t		tx_desc_dmap;
@@ -378,9 +396,6 @@ struct emx_softc {
 	uint32_t		smartspeed;
 	int			int_throttle_ceil;
 
-	int			rx_npoll_off;
-	int			tx_npoll_off;
-
 	struct lwkt_serialize	main_serialize;
 	struct lwkt_serialize	*serializes[EMX_NSERIALIZE];
 
@@ -392,14 +407,16 @@ struct emx_softc {
 	int			rx_ring_cnt;
 	struct emx_rxdata	rx_data[EMX_NRX_RING];
 
+	int			ifm_flowctrl;
+
 	/* Misc stats maintained by the driver */
 	unsigned long		rx_overruns;
 
-	/* sysctl tree glue */
-	struct sysctl_ctx_list	sysctl_ctx;
-	struct sysctl_oid	*sysctl_tree;
-
 	struct e1000_hw_stats	stats;
+
+	struct if_ringmap	*rx_rmap;
+	struct if_ringmap	*tx_rmap;
+	int			rdr_table[EMX_RDRTABLE_SIZE];
 };
 
 struct emx_txbuf {

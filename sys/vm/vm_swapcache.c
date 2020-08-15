@@ -1,7 +1,7 @@
 /*
  * (MPSAFE)
  *
- * Copyright (c) 2010 The DragonFly Project.  All rights reserved.
+ * Copyright (c) 2010,2019 The DragonFly Project.  All rights reserved.
  *
  * This code is derived from software contributed to The DragonFly Project
  * by Matthew Dillon <dillon@backplane.com>
@@ -75,24 +75,32 @@
 #include <vm/swap_pager.h>
 #include <vm/vm_extern.h>
 
-#include <sys/thread2.h>
 #include <sys/spinlock2.h>
 #include <vm/vm_page2.h>
+
+struct swmarker {
+	struct vm_object dummy_obj;
+	struct vm_object *save_obj;
+	vm_ooffset_t save_off;
+};
+
+typedef struct swmarker swmarker_t;
 
 /* the kernel process "vm_pageout"*/
 static int vm_swapcached_flush (vm_page_t m, int isblkdev);
 static int vm_swapcache_test(vm_page_t m);
 static int vm_swapcache_writing_heuristic(void);
 static int vm_swapcache_writing(vm_page_t marker, int count, int scount);
-static void vm_swapcache_cleaning(vm_object_t marker, int *swindexp);
-static void vm_swapcache_movemarker(vm_object_t marker, int swindex,
-				vm_object_t object);
+static void vm_swapcache_cleaning(swmarker_t *marker,
+			struct vm_object_hash **swindexp);
+static void vm_swapcache_movemarker(swmarker_t *marker,
+			struct vm_object_hash *swindex, vm_object_t object);
 struct thread *swapcached_thread;
 
 SYSCTL_NODE(_vm, OID_AUTO, swapcache, CTLFLAG_RW, NULL, NULL);
 
 int vm_swapcache_read_enable;
-int vm_swapcache_inactive_heuristic;
+static long vm_swapcache_wtrigger;
 static int vm_swapcache_sleep;
 static int vm_swapcache_maxscan = PQ_L2_SIZE * 8;
 static int vm_swapcache_maxlaunder = PQ_L2_SIZE * 4;
@@ -101,7 +109,7 @@ static int vm_swapcache_meta_enable = 0;
 static int vm_swapcache_maxswappct = 75;
 static int vm_swapcache_hysteresis;
 static int vm_swapcache_min_hysteresis;
-int vm_swapcache_use_chflags = 1;	/* require chflags cache */
+int vm_swapcache_use_chflags = 0;	/* require chflags cache */
 static int64_t vm_swapcache_minburst = 10000000LL;	/* 10MB */
 static int64_t vm_swapcache_curburst = 4000000000LL;	/* 4G after boot */
 static int64_t vm_swapcache_maxburst = 2000000000LL;	/* 2G nominal max */
@@ -172,8 +180,8 @@ vm_swapcached_thread(void)
 	enum { SWAPC_WRITING, SWAPC_CLEANING } state = SWAPC_WRITING;
 	enum { SWAPB_BURSTING, SWAPB_RECOVERING } burst = SWAPB_BURSTING;
 	static struct vm_page page_marker[PQ_L2_SIZE];
-	static struct vm_object swmarker;
-	static int swindex;
+	static swmarker_t swmarker;
+	static struct vm_object_hash *swindex;
 	int q;
 
 	/*
@@ -190,7 +198,8 @@ vm_swapcached_thread(void)
 	 */
 	bzero(&page_marker, sizeof(page_marker));
 	for (q = 0; q < PQ_L2_SIZE; ++q) {
-		page_marker[q].flags = PG_BUSY | PG_FICTITIOUS | PG_MARKER;
+		page_marker[q].flags = PG_FICTITIOUS | PG_MARKER;
+		page_marker[q].busy_count = PBUSY_LOCKED;
 		page_marker[q].queue = PQ_INACTIVE + q;
 		page_marker[q].pc = q;
 		page_marker[q].wire_count = 1;
@@ -203,18 +212,17 @@ vm_swapcached_thread(void)
 
 	vm_swapcache_min_hysteresis = 1024;
 	vm_swapcache_hysteresis = vm_swapcache_min_hysteresis;
-	vm_swapcache_inactive_heuristic = -vm_swapcache_hysteresis;
+	vm_swapcache_wtrigger = -vm_swapcache_hysteresis;
 
 	/*
 	 * Initialize our marker for the vm_object scan (SWAPC_CLEANING)
 	 */
 	bzero(&swmarker, sizeof(swmarker));
-	swmarker.type = OBJT_MARKER;
-	swindex = 0;
-	lwkt_gettoken(&vmobj_tokens[swindex]);
-	TAILQ_INSERT_HEAD(&vm_object_lists[swindex],
-			  &swmarker, object_list);
-	lwkt_reltoken(&vmobj_tokens[swindex]);
+	swmarker.dummy_obj.type = OBJT_MARKER;
+	swindex = &vm_object_hash[0];
+	lwkt_gettoken(&swindex->token);
+	TAILQ_INSERT_HEAD(&swindex->list, &swmarker.dummy_obj, object_entry);
+	lwkt_reltoken(&swindex->token);
 
 	for (;;) {
 		int reached_end;
@@ -231,7 +239,8 @@ vm_swapcached_thread(void)
 		 * is present.
 		 */
 		if ((vm_swapcache_data_enable == 0 &&
-		     vm_swapcache_meta_enable == 0) ||
+		     vm_swapcache_meta_enable == 0 &&
+		     vm_swap_cache_use <= SWAPMAX(0)) ||
 		    vm_swap_max == 0) {
 			tsleep(&vm_swapcache_sleep, 0, "csleep", hz * 5);
 			continue;
@@ -307,8 +316,7 @@ vm_swapcached_thread(void)
 			burst = SWAPB_BURSTING;
 		}
 		if (reached_end == PQ_L2_SIZE) {
-			vm_swapcache_inactive_heuristic =
-				-vm_swapcache_hysteresis;
+			vm_swapcache_wtrigger = -vm_swapcache_hysteresis;
 		}
 	}
 
@@ -323,9 +331,9 @@ vm_swapcached_thread(void)
 		vm_page_queues_spin_unlock(PQ_INACTIVE + q);
 	}
 
-	lwkt_gettoken(&vmobj_tokens[swindex]);
-	TAILQ_REMOVE(&vm_object_lists[swindex], &swmarker, object_list);
-	lwkt_reltoken(&vmobj_tokens[swindex]);
+	lwkt_gettoken(&swindex->token);
+	TAILQ_REMOVE(&swindex->list, &swmarker.dummy_obj, object_entry);
+	lwkt_reltoken(&swindex->token);
 }
 
 static struct kproc_desc swpc_kp = {
@@ -333,7 +341,7 @@ static struct kproc_desc swpc_kp = {
 	vm_swapcached_thread,
 	&swapcached_thread
 };
-SYSINIT(swapcached, SI_SUB_KTHREAD_PAGE, SI_ORDER_SECOND, kproc_start, &swpc_kp)
+SYSINIT(swapcached, SI_SUB_KTHREAD_PAGE, SI_ORDER_SECOND, kproc_start, &swpc_kp);
 
 /*
  * Deal with an overflow of the heuristic counter or if the user
@@ -350,6 +358,8 @@ static int
 vm_swapcache_writing_heuristic(void)
 {
 	int hyst;
+	int q;
+	long adds;
 
 	hyst = vmstats.v_inactive_count / 4;
 	if (hyst < vm_swapcache_min_hysteresis)
@@ -357,10 +367,14 @@ vm_swapcache_writing_heuristic(void)
 	cpu_ccfence();
 	vm_swapcache_hysteresis = hyst;
 
-	if (vm_swapcache_inactive_heuristic < -hyst)
-		vm_swapcache_inactive_heuristic = -hyst;
-
-	return (vm_swapcache_inactive_heuristic >= 0);
+	adds = 0;
+	for (q = PQ_INACTIVE; q < PQ_INACTIVE + PQ_L2_SIZE; ++q) {
+		adds += atomic_swap_long(&vm_page_queues[q].adds, 0);
+	}
+	vm_swapcache_wtrigger += adds;
+	if (vm_swapcache_wtrigger < -hyst)
+		vm_swapcache_wtrigger = -hyst;
+	return (vm_swapcache_wtrigger >= 0);
 }
 
 /*
@@ -386,8 +400,18 @@ vm_swapcache_writing(vm_page_t marker, int count, int scount)
 	       count > 0 && scount-- > 0) {
 		KKASSERT(m->queue == marker->queue);
 
+		/*
+		 * Stop using swap if paniced, dumping, or dumped.
+		 * Don't try to write if our curburst has been exhausted.
+		 */
+		if (panicstr || dumping)
+			break;
 		if (vm_swapcache_curburst < 0)
 			break;
+
+		/*
+		 * Move marker
+		 */
 		TAILQ_REMOVE(
 			&vm_page_queues[marker->queue].pl, marker, pageq);
 		TAILQ_INSERT_AFTER(
@@ -650,7 +674,7 @@ vm_swapcache_test(vm_page_t m)
 {
 	vm_object_t object;
 
-	if (m->flags & PG_UNMANAGED)
+	if (m->flags & (PG_UNQUEUED | PG_FICTITIOUS))
 		return(1);
 	if (m->hold_count || m->wire_count)
 		return(1);
@@ -677,13 +701,14 @@ vm_swapcache_test(vm_page_t m)
  */
 static
 void
-vm_swapcache_cleaning(vm_object_t marker, int *swindexp)
+vm_swapcache_cleaning(swmarker_t *marker, struct vm_object_hash **swindexp)
 {
 	vm_object_t object;
 	struct vnode *vp;
 	int count;
 	int scount;
 	int n;
+	int didmove;
 
 	count = vm_swapcache_maxlaunder;
 	scount = vm_swapcache_maxscan;
@@ -691,16 +716,19 @@ vm_swapcache_cleaning(vm_object_t marker, int *swindexp)
 	/*
 	 * Look for vnode objects
 	 */
-	lwkt_gettoken(&vmobj_tokens[*swindexp]);
+	lwkt_gettoken(&(*swindexp)->token);
 
+	didmove = 0;
 outerloop:
-	while ((object = TAILQ_NEXT(marker, object_list)) != NULL) {
+	while ((object = TAILQ_NEXT(&marker->dummy_obj,
+				    object_entry)) != NULL) {
 		/*
 		 * We have to skip markers.  We cannot hold/drop marker
 		 * objects!
 		 */
 		if (object->type == OBJT_MARKER) {
 			vm_swapcache_movemarker(marker, *swindexp, object);
+			didmove = 1;
 			continue;
 		}
 
@@ -729,6 +757,7 @@ outerloop:
 			vm_object_drop(object);
 			/* object may be invalid now */
 			vm_swapcache_movemarker(marker, *swindexp, object);
+			didmove = 1;
 			continue;
 		}
 
@@ -736,10 +765,11 @@ outerloop:
 		 * Reset the object pindex stored in the marker if the
 		 * working object has changed.
 		 */
-		if (marker->backing_object != object) {
-			marker->size = 0;
-			marker->backing_object_offset = 0;
-			marker->backing_object = object;
+		if (marker->save_obj != object || didmove) {
+			marker->dummy_obj.size = 0;
+			marker->save_off = 0;
+			marker->save_obj = object;
+			didmove = 0;
 		}
 
 		/*
@@ -760,48 +790,49 @@ outerloop:
 		 * tree leafs.
 		 */
 		lwkt_token_swap();
-		lwkt_reltoken(&vmobj_tokens[*swindexp]);
+		lwkt_reltoken(&(*swindexp)->token);
 
-		n = swap_pager_condfree(object, &marker->size,
+		n = swap_pager_condfree(object, &marker->dummy_obj.size,
 				    (count + SWAP_META_MASK) & ~SWAP_META_MASK);
 
 		vm_object_drop(object);		/* object may be invalid now */
-		lwkt_gettoken(&vmobj_tokens[*swindexp]);
+		lwkt_gettoken(&(*swindexp)->token);
 
 		/*
 		 * If we have exhausted the object or deleted our per-pass
 		 * page limit then move us to the next object.  Note that
-		 * the current object may no longer be on the vm_object_list.
+		 * the current object may no longer be on the vm_object_entry.
 		 */
 		if (n <= 0 ||
-		    marker->backing_object_offset > vm_swapcache_cleanperobj) {
+		    marker->save_off > vm_swapcache_cleanperobj) {
 			vm_swapcache_movemarker(marker, *swindexp, object);
+			didmove = 1;
 		}
 
 		/*
 		 * If we have exhausted our max-launder stop for now.
 		 */
 		count -= n;
-		marker->backing_object_offset += n * PAGE_SIZE;
+		marker->save_off += n * PAGE_SIZE;
 		if (count < 0)
 			goto breakout;
 	}
 
 	/*
-	 * Iterate vm_object_lists[] hash table
+	 * Iterate vm_object_hash[] hash table
 	 */
-	TAILQ_REMOVE(&vm_object_lists[*swindexp], marker, object_list);
-	lwkt_reltoken(&vmobj_tokens[*swindexp]);
-	if (++*swindexp >= VMOBJ_HSIZE)
-		*swindexp = 0;
-	lwkt_gettoken(&vmobj_tokens[*swindexp]);
-	TAILQ_INSERT_HEAD(&vm_object_lists[*swindexp], marker, object_list);
+	TAILQ_REMOVE(&(*swindexp)->list, &marker->dummy_obj, object_entry);
+	lwkt_reltoken(&(*swindexp)->token);
+	if (++*swindexp >= &vm_object_hash[VMOBJ_HSIZE])
+		*swindexp = &vm_object_hash[0];
+	lwkt_gettoken(&(*swindexp)->token);
+	TAILQ_INSERT_HEAD(&(*swindexp)->list, &marker->dummy_obj, object_entry);
 
-	if (*swindexp != 0)
+	if (*swindexp != &vm_object_hash[0])
 		goto outerloop;
 
 breakout:
-	lwkt_reltoken(&vmobj_tokens[*swindexp]);
+	lwkt_reltoken(&(*swindexp)->token);
 }
 
 /*
@@ -811,11 +842,12 @@ breakout:
  * the marker past it.
  */
 static void
-vm_swapcache_movemarker(vm_object_t marker, int swindex, vm_object_t object)
+vm_swapcache_movemarker(swmarker_t *marker, struct vm_object_hash *swindex,
+			vm_object_t object)
 {
-	if (TAILQ_NEXT(marker, object_list) == object) {
-		TAILQ_REMOVE(&vm_object_lists[swindex], marker, object_list);
-		TAILQ_INSERT_AFTER(&vm_object_lists[swindex], object,
-				   marker, object_list);
+	if (TAILQ_NEXT(&marker->dummy_obj, object_entry) == object) {
+		TAILQ_REMOVE(&swindex->list, &marker->dummy_obj, object_entry);
+		TAILQ_INSERT_AFTER(&swindex->list, object,
+				   &marker->dummy_obj, object_entry);
 	}
 }

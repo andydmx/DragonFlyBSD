@@ -34,7 +34,6 @@
  * SUCH DAMAGE.
  *
  * @(#)ufs_vnops.c	8.27 (Berkeley) 5/27/95
- * $DragonFly: src/sys/kern/vfs_helper.c,v 1.5 2008/05/25 18:34:46 dillon Exp $
  */
 
 #include "opt_quota.h"
@@ -42,6 +41,7 @@
 
 #include <sys/param.h>
 #include <sys/systm.h>
+#include <sys/uio.h>
 #include <sys/conf.h>
 #include <sys/kernel.h>
 #include <sys/fcntl.h>
@@ -62,14 +62,8 @@
 #ifdef LWBUF_IS_OPTIMAL
 
 static int vm_read_shortcut_enable = 1;
-static long vm_read_shortcut_count;
-static long vm_read_shortcut_failed;
 SYSCTL_INT(_vm, OID_AUTO, read_shortcut_enable, CTLFLAG_RW,
 	  &vm_read_shortcut_enable, 0, "Direct vm_object vop_read shortcut");
-SYSCTL_LONG(_vm, OID_AUTO, read_shortcut_count, CTLFLAG_RW,
-	  &vm_read_shortcut_count, 0, "Statistics");
-SYSCTL_LONG(_vm, OID_AUTO, read_shortcut_failed, CTLFLAG_RW,
-	  &vm_read_shortcut_failed, 0, "Statistics");
 
 #endif
 
@@ -188,7 +182,8 @@ vop_helper_setattr_flags(u_int32_t *ino_flags, u_int32_t vaflags,
 		return(error);
 	}
 	if (cred->cr_uid == 0 &&
-	    (!jailed(cred)|| jail_chflags_allowed)) {
+	    (!jailed(cred) || PRISON_CAP_ISSET(cred->cr_prison->pr_caps,
+		PRISON_CAP_VFS_CHFLAGS))) {
 		if ((*ino_flags & (SF_NOUNLINK|SF_IMMUTABLE|SF_APPEND)) &&
 		    securelevel > 0)
 			return (EPERM);
@@ -338,7 +333,6 @@ vop_helper_read_shortcut(struct vop_read_args *ap)
 	 *
 	 * XXX can we leave the object held shared during the uiomove()?
 	 */
-	++vm_read_shortcut_count;
 	obj = vp->v_object;
 	vm_object_hold_shared(obj);
 
@@ -355,16 +349,14 @@ vop_helper_read_shortcut(struct vop_read_args *ap)
 		if (n == 0)
 			break;	/* hit EOF */
 
-		m = vm_page_lookup_busy_try(obj, OFF_TO_IDX(uio->uio_offset),
-					    FALSE, &error);
+		m = vm_page_lookup_sbusy_try(obj, OFF_TO_IDX(uio->uio_offset),
+					     0, PAGE_SIZE);
 		if (error || m == NULL) {
-			++vm_read_shortcut_failed;
 			error = 0;
 			break;
 		}
 		if ((m->valid & VM_PAGE_BITS_ALL) != VM_PAGE_BITS_ALL) {
-			++vm_read_shortcut_failed;
-			vm_page_wakeup(m);
+			vm_page_sbusy_drop(m);
 			break;
 		}
 		lwb = lwbuf_alloc(m, &lwb_cache);
@@ -381,7 +373,7 @@ vop_helper_read_shortcut(struct vop_read_args *ap)
 
 		vm_page_flag_set(m, PG_REFERENCED);
 		lwbuf_free(lwb);
-		vm_page_wakeup(m);
+		vm_page_sbusy_drop(m);
 	}
 	vm_object_drop(obj);
 

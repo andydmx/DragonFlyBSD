@@ -1,9 +1,9 @@
-# $DragonFly: src/lib/libthread_xu/thread/Makefile.inc,v 1.5 2008/01/19 14:05:29 corecode Exp $
 
 # thr sources
 .PATH: ${.CURDIR}/thread
 
 SRCS+= \
+	thr_affinity.c \
 	thr_attr.c \
 	thr_barrier.c \
 	thr_barrierattr.c \
@@ -13,13 +13,17 @@ SRCS+= \
 	thr_cond.c \
 	thr_condattr.c \
 	thr_create.c \
+	thr_ctrdtr.c \
 	thr_detach.c \
+	thr_distribute.c \
 	thr_equal.c \
 	thr_event.c \
 	thr_exit.c \
 	thr_fork.c \
+	thr_getcpuclockid.c \
 	thr_getprio.c \
 	thr_getschedparam.c \
+	thr_getthreadid_np.c \
 	thr_info.c \
 	thr_init.c \
 	thr_join.c \
@@ -30,12 +34,12 @@ SRCS+= \
 	thr_multi_np.c \
 	thr_mutex.c \
 	thr_mutexattr.c \
-	thr_mutex_prioceiling.c \
-	thr_mutex_protocol.c \
 	thr_once.c \
 	thr_printf.c \
 	thr_pspinlock.c \
 	thr_resume_np.c \
+	thr_rtld.c \
+	thr_malloc.c \
 	thr_rwlock.c \
 	thr_rwlockattr.c \
 	thr_self.c \

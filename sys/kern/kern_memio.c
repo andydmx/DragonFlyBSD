@@ -47,11 +47,13 @@
 #include <sys/conf.h>
 #include <sys/fcntl.h>
 #include <sys/filio.h>
+#include <sys/interrupt.h>
 #include <sys/kernel.h>
 #include <sys/malloc.h>
 #include <sys/memrange.h>
 #include <sys/proc.h>
 #include <sys/priv.h>
+#include <sys/queue.h>
 #include <sys/random.h>
 #include <sys/signalvar.h>
 #include <sys/uio.h>
@@ -59,10 +61,11 @@
 #include <sys/sysctl.h>
 
 #include <sys/signal2.h>
-#include <sys/mplock2.h>
+#include <sys/spinlock2.h>
 
 #include <vm/vm.h>
 #include <vm/pmap.h>
+#include <vm/vm_map.h>
 #include <vm/vm_extern.h>
 
 
@@ -75,10 +78,38 @@ static	d_ioctl_t	mmioctl;
 static	d_mmap_t	memmmap;
 #endif
 static	d_kqfilter_t	mmkqfilter;
-static int memuksmap(cdev_t dev, vm_page_t fake);
+static int memuksmap(vm_map_backing_t ba, int op, cdev_t dev, vm_page_t fake);
 
 #define CDEV_MAJOR 2
 static struct dev_ops mem_ops = {
+	{ "mem", 0, D_MPSAFE | D_QUICK },
+	.d_open =	mmopen,
+	.d_close =	mmclose,
+	.d_read =	mmread,
+	.d_write =	mmwrite,
+	.d_ioctl =	mmioctl,
+	.d_kqfilter =	mmkqfilter,
+#if 0
+	.d_mmap =	memmmap,
+#endif
+	.d_uksmap =	memuksmap
+};
+
+static struct dev_ops mem_ops_mem = {
+	{ "mem", 0, D_MEM | D_MPSAFE | D_QUICK },
+	.d_open =	mmopen,
+	.d_close =	mmclose,
+	.d_read =	mmread,
+	.d_write =	mmwrite,
+	.d_ioctl =	mmioctl,
+	.d_kqfilter =	mmkqfilter,
+#if 0
+	.d_mmap =	memmmap,
+#endif
+	.d_uksmap =	memuksmap
+};
+
+static struct dev_ops mem_ops_noq = {
 	{ "mem", 0, D_MPSAFE },
 	.d_open =	mmopen,
 	.d_close =	mmclose,
@@ -95,6 +126,7 @@ static struct dev_ops mem_ops = {
 static int rand_bolt;
 static caddr_t	zbuf;
 static cdev_t	zerodev = NULL;
+static struct lock mem_lock = LOCK_INITIALIZER("memlk", 0, 0);
 
 MALLOC_DEFINE(M_MEMDESC, "memdesc", "memory range descriptors");
 static int mem_ioctl (cdev_t, u_long, caddr_t, int, struct ucred *);
@@ -263,7 +295,7 @@ mmrw(cdev_t dev, struct uio *uio, int flags)
 					error = EPERM;
 				}
 			} else {
-				poolsize = read_random(buf, c);
+				poolsize = read_random(buf, c, 0);
 				if (poolsize == 0) {
 					if (buf)
 						kfree(buf, M_TEMP);
@@ -296,7 +328,7 @@ mmrw(cdev_t dev, struct uio *uio, int flags)
 			}
 			if (buf == NULL)
 				buf = kmalloc(PAGE_SIZE, M_TEMP, M_WAITOK);
-			poolsize = read_random_unlimited(buf, c);
+			poolsize = read_random(buf, c, 1);
 			c = min(c, poolsize);
 			error = uiomove(buf, (int)c, uio);
 			continue;
@@ -350,83 +382,79 @@ mmwrite(struct dev_write_args *ap)
 * instead of going through read/write			*
 \*******************************************************/
 
-static int user_kernel_mapping(int num, vm_ooffset_t offset,
-				vm_ooffset_t *resultp);
-
-#if 0
+static int user_kernel_mapping(vm_map_backing_t ba, int num,
+			vm_ooffset_t offset, vm_ooffset_t *resultp);
 
 static int
-memmmap(struct dev_mmap_args *ap)
-{
-	cdev_t dev = ap->a_head.a_dev;
-	vm_ooffset_t result;
-	int error;
-
-	switch (minor(dev)) {
-	case 0:
-		/* 
-		 * minor device 0 is physical memory 
-		 */
-		ap->a_result = atop(ap->a_offset);
-		error = 0;
-		break;
-	case 1:
-		/*
-		 * minor device 1 is kernel memory 
-		 */
-		ap->a_result = atop(vtophys(ap->a_offset));
-		error = 0;
-		break;
-	case 5:
-	case 6:
-		/*
-		 * minor device 5 is /dev/upmap (see sys/upmap.h)
-		 * minor device 6 is /dev/kpmap (see sys/upmap.h)
-		 */
-		result = 0;
-		error = user_kernel_mapping(minor(dev), ap->a_offset, &result);
-		ap->a_result = atop(result);
-		break;
-	default:
-		error = EINVAL;
-		break;
-	}
-	return error;
-}
-
-#endif
-
-static int
-memuksmap(cdev_t dev, vm_page_t fake)
+memuksmap(vm_map_backing_t ba, int op, cdev_t dev, vm_page_t fake)
 {
 	vm_ooffset_t result;
 	int error;
+	struct lwp *lp;
 
-	switch (minor(dev)) {
-	case 0:
+	error = 0;
+
+	switch(op) {
+	case UKSMAPOP_ADD:
 		/*
-		 * minor device 0 is physical memory
+		 * We only need to track mappings for /dev/lpmap, all process
+		 * mappings will be deleted when the process exits and we
+		 * do not need to track kernel mappings.
 		 */
-		fake->phys_addr = ptoa(fake->pindex);
-		error = 0;
+		if (minor(dev) == 7) {
+			lp = ba->aux_info;
+			spin_lock(&lp->lwp_spin);
+			TAILQ_INSERT_TAIL(&lp->lwp_lpmap_backing_list,
+					  ba, entry);
+			spin_unlock(&lp->lwp_spin);
+		}
 		break;
-	case 1:
+	case UKSMAPOP_REM:
 		/*
-		 * minor device 1 is kernel memory
+		 * We only need to track mappings for /dev/lpmap, all process
+		 * mappings will be deleted when the process exits and we
+		 * do not need to track kernel mappings.
 		 */
-		fake->phys_addr = vtophys(ptoa(fake->pindex));
-		error = 0;
+		if (minor(dev) == 7) {
+			lp = ba->aux_info;
+			spin_lock(&lp->lwp_spin);
+			TAILQ_REMOVE(&lp->lwp_lpmap_backing_list, ba, entry);
+			spin_unlock(&lp->lwp_spin);
+		}
 		break;
-	case 5:
-	case 6:
-		/*
-		 * minor device 5 is /dev/upmap (see sys/upmap.h)
-		 * minor device 6 is /dev/kpmap (see sys/upmap.h)
-		 */
-		result = 0;
-		error = user_kernel_mapping(minor(dev),
-					    ptoa(fake->pindex), &result);
-		fake->phys_addr = result;
+	case UKSMAPOP_FAULT:
+		switch (minor(dev)) {
+		case 0:
+			/*
+			 * minor device 0 is physical memory
+			 */
+			fake->phys_addr = ptoa(fake->pindex);
+			break;
+		case 1:
+			/*
+			 * minor device 1 is kernel memory
+			 */
+			fake->phys_addr = vtophys(ptoa(fake->pindex));
+			break;
+		case 5:
+		case 6:
+		case 7:
+			/*
+			 * minor device 5 is /dev/upmap (see sys/upmap.h)
+			 * minor device 6 is /dev/kpmap (see sys/upmap.h)
+			 * minor device 7 is /dev/lpmap (see sys/upmap.h)
+			 */
+			result = 0;
+			error = user_kernel_mapping(ba,
+						    minor(dev),
+						    ptoa(fake->pindex),
+						    &result);
+			fake->phys_addr = result;
+			break;
+		default:
+			error = EINVAL;
+			break;
+		}
 		break;
 	default:
 		error = EINVAL;
@@ -441,7 +469,7 @@ mmioctl(struct dev_ioctl_args *ap)
 	cdev_t dev = ap->a_head.a_dev;
 	int error;
 
-	get_mplock();
+	lockmgr(&mem_lock, LK_EXCLUSIVE);
 
 	switch (minor(dev)) {
 	case 0:
@@ -458,7 +486,8 @@ mmioctl(struct dev_ioctl_args *ap)
 		break;
 	}
 
-	rel_mplock();
+	lockmgr(&mem_lock, LK_RELEASE);
+
 	return (error);
 }
 
@@ -634,7 +663,7 @@ static struct filterops mm_read_filtops =
 static struct filterops mm_write_filtops =
         { FILTEROP_ISFD|FILTEROP_MPSAFE, NULL, dummy_filter_detach, mm_filter_write };
 
-int
+static int
 mmkqfilter(struct dev_kqfilter_args *ap)
 {
 	struct knote *kn = ap->a_kn;
@@ -670,37 +699,19 @@ iszerodev(cdev_t dev)
 }
 
 /*
- * /dev/upmap and /dev/kpmap.
+ * /dev/lpmap, /dev/upmap, /dev/kpmap.
  */
 static int
-user_kernel_mapping(int num, vm_ooffset_t offset, vm_ooffset_t *resultp)
+user_kernel_mapping(vm_map_backing_t ba, int num, vm_ooffset_t offset,
+		    vm_ooffset_t *resultp)
 {
 	struct proc *p;
+	struct lwp *lp;
 	int error;
 	int invfork;
 
-	if ((p = curproc) == NULL)
+	if (offset < 0)
 		return (EINVAL);
-
-	/*
-	 * If this is a child currently in vfork the pmap is shared with
-	 * the parent!  We need to actually set-up the parent's p_upmap,
-	 * not the child's, and we need to set the invfork flag.  Userland
-	 * will probably adjust its static state so it must be consistent
-	 * with the parent or userland will be really badly confused.
-	 *
-	 * (this situation can happen when user code in vfork() calls
-	 *  libc's getpid() or some other function which then decides
-	 *  it wants the upmap).
-	 */
-	if (p->p_flags & P_PPWAIT) {
-		p = p->p_pptr;
-		if (p == NULL)
-			return (EINVAL);
-		invfork = 1;
-	} else {
-		invfork = 0;
-	}
 
 	error = EINVAL;
 
@@ -709,11 +720,43 @@ user_kernel_mapping(int num, vm_ooffset_t offset, vm_ooffset_t *resultp)
 		/*
 		 * /dev/upmap - maps RW per-process shared user-kernel area.
 		 */
+
+		/*
+		 * If this is a child currently in vfork the pmap is shared
+		 * with the parent!  We need to actually set-up the parent's
+		 * p_upmap, not the child's, and we need to set the invfork
+		 * flag.  Userland will probably adjust its static state so
+		 * it must be consistent with the parent or userland will be
+		 * really badly confused.
+		 *
+		 * (this situation can happen when user code in vfork() calls
+		 *  libc's getpid() or some other function which then decides
+		 *  it wants the upmap).
+		 */
+		p = ba->aux_info;
+		if (p == NULL)
+			break;
+		if (p->p_flags & P_PPWAIT) {
+			p = p->p_pptr;
+			if (p == NULL)
+				return (EINVAL);
+			invfork = 1;
+		} else {
+			invfork = 0;
+		}
+
+		/*
+		 * Create the kernel structure as required, set the invfork
+		 * flag if we are faulting in on a vfork().
+		 */
 		if (p->p_upmap == NULL)
 			proc_usermap(p, invfork);
-		else if (invfork)
+		if (p->p_upmap && invfork)
 			p->p_upmap->invfork = invfork;
 
+		/*
+		 * Extract address for pmap
+		 */
 		if (p->p_upmap &&
 		    offset < roundup2(sizeof(*p->p_upmap), PAGE_SIZE)) {
 			/* only good for current process */
@@ -725,10 +768,36 @@ user_kernel_mapping(int num, vm_ooffset_t offset, vm_ooffset_t *resultp)
 	case 6:
 		/*
 		 * /dev/kpmap - maps RO shared kernel global page
+		 *
+		 * Extract address for pmap
 		 */
 		if (kpmap &&
 		    offset < roundup2(sizeof(*kpmap), PAGE_SIZE)) {
-			*resultp = pmap_kextract((vm_offset_t)kpmap +
+			*resultp = pmap_kextract((vm_offset_t)kpmap + offset);
+			error = 0;
+		}
+		break;
+	case 7:
+		/*
+		 * /dev/lpmap - maps RW per-thread shared user-kernel area.
+		 */
+		lp = ba->aux_info;
+		if (lp == NULL)
+			break;
+
+		/*
+		 * Create the kernel structure as required
+		 */
+		if (lp->lwp_lpmap == NULL)
+			lwp_usermap(lp, -1);	/* second arg not yet XXX */
+
+		/*
+		 * Extract address for pmap
+		 */
+		if (lp->lwp_lpmap &&
+		    offset < roundup2(sizeof(*lp->lwp_lpmap), PAGE_SIZE)) {
+			/* only good for current process */
+			*resultp = pmap_kextract((vm_offset_t)lp->lwp_lpmap +
 						 offset);
 			error = 0;
 		}
@@ -747,16 +816,18 @@ mem_drvinit(void *unused)
 	if (mem_range_softc.mr_op != NULL)
 		mem_range_softc.mr_op->init(&mem_range_softc);
 
-	make_dev(&mem_ops, 0, UID_ROOT, GID_KMEM, 0640, "mem");
-	make_dev(&mem_ops, 1, UID_ROOT, GID_KMEM, 0640, "kmem");
+	make_dev(&mem_ops_mem, 0, UID_ROOT, GID_KMEM, 0640, "mem");
+	make_dev(&mem_ops_mem, 1, UID_ROOT, GID_KMEM, 0640, "kmem");
 	make_dev(&mem_ops, 2, UID_ROOT, GID_WHEEL, 0666, "null");
 	make_dev(&mem_ops, 3, UID_ROOT, GID_WHEEL, 0644, "random");
 	make_dev(&mem_ops, 4, UID_ROOT, GID_WHEEL, 0644, "urandom");
 	make_dev(&mem_ops, 5, UID_ROOT, GID_WHEEL, 0666, "upmap");
 	make_dev(&mem_ops, 6, UID_ROOT, GID_WHEEL, 0444, "kpmap");
+	make_dev(&mem_ops, 7, UID_ROOT, GID_WHEEL, 0666, "lpmap");
 	zerodev = make_dev(&mem_ops, 12, UID_ROOT, GID_WHEEL, 0666, "zero");
-	make_dev(&mem_ops, 14, UID_ROOT, GID_WHEEL, 0600, "io");
+	make_dev(&mem_ops_noq, 14, UID_ROOT, GID_WHEEL, 0600, "io");
 }
 
-SYSINIT(memdev,SI_SUB_DRIVERS,SI_ORDER_MIDDLE+CDEV_MAJOR,mem_drvinit,NULL)
+SYSINIT(memdev, SI_SUB_DRIVERS, SI_ORDER_MIDDLE + CDEV_MAJOR, mem_drvinit,
+    NULL);
 

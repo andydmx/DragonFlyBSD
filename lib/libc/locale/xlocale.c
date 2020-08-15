@@ -26,15 +26,18 @@
  * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
  *
- * $FreeBSD: head/lib/libc/locale/xlocale.c 232498 2012-03-04 15:31:13Z theraven $
+ * $FreeBSD: head/lib/libc/locale/xlocale.c 303495 2016-07-29 17:18:47Z ed $
  */
 
+#include "namespace.h"
+#include <errno.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <string.h>
 #include <runetype.h>
 #include "libc_private.h"
 #include "xlocale_private.h"
+#include "un-namespace.h"
 
 /**
  * Each locale loader declares a global component.  This is used by setlocale()
@@ -66,14 +69,13 @@ int __has_thread_locale;
 /*
  * Private functions in setlocale.c.
  */
-const char *
-__get_locale_env(int category);
-int
-__detect_path_locale(void);
+const char * __get_locale_env(int category);
+int __get_locale_str(int category, const char *str, char * const res);
+int __detect_path_locale(void);
 
 struct _xlocale __xlocale_global_locale = {
-	{0},
-	{
+	.header = {0},
+	.components = {
 		&__xlocale_global_collate,
 		&__xlocale_global_ctype,
 		&__xlocale_global_monetary,
@@ -81,23 +83,23 @@ struct _xlocale __xlocale_global_locale = {
 		&__xlocale_global_time,
 		&__xlocale_global_messages
 	},
-	1,
-	0,
-	1,
-	0
+	.monetary_locale_changed = 1,
+	.using_monetary_locale = 0,
+	.numeric_locale_changed = 1,
+	.using_numeric_locale = 0
 };
 
 struct _xlocale __xlocale_C_locale = {
-	{0},
-	{
+	.header = {0},
+	.components = {
 		&__xlocale_C_collate,
 		&__xlocale_C_ctype,
 		0, 0, 0, 0
 	},
-	1,
-	0,
-	1,
-	0
+	.monetary_locale_changed = 1,
+	.using_monetary_locale = 0,
+	.numeric_locale_changed = 1,
+	.using_numeric_locale = 0
 };
 
 static void*(*constructors[])(const char*, locale_t) =
@@ -117,10 +119,10 @@ static locale_t thread_local_locale;
 static void init_key(void)
 {
 
-	pthread_key_create(&locale_info_key, xlocale_release);
-	pthread_setspecific(locale_info_key, (void*)42);
-	if (pthread_getspecific(locale_info_key) == (void*)42) {
-		pthread_setspecific(locale_info_key, 0);
+	_pthread_key_create(&locale_info_key, xlocale_release);
+	_pthread_setspecific(locale_info_key, (void*)42);
+	if (_pthread_getspecific(locale_info_key) == (void*)42) {
+		_pthread_setspecific(locale_info_key, 0);
 	} else {
 		fake_tls = 1;
 	}
@@ -138,7 +140,7 @@ get_thread_locale(void)
 	_once(&once_control, init_key);
 	
 	return (fake_tls ? thread_local_locale :
-		pthread_getspecific(locale_info_key));
+		_pthread_getspecific(locale_info_key));
 }
 
 #ifdef __NO_TLS
@@ -154,23 +156,24 @@ __get_locale(void)
 static void
 set_thread_locale(locale_t loc)
 {
+	locale_t l = (loc == LC_GLOBAL_LOCALE) ? 0 : loc;
 
 	_once(&once_control, init_key);
 	
-	if (NULL != loc) {
-		xlocale_retain((struct xlocale_refcounted*)loc);
+	if (NULL != l) {
+		xlocale_retain((struct xlocale_refcounted*)l);
 	}
-	locale_t old = pthread_getspecific(locale_info_key);
-	if ((NULL != old) && (loc != old)) {
+	locale_t old = _pthread_getspecific(locale_info_key);
+	if ((NULL != old) && (l != old)) {
 		xlocale_release((struct xlocale_refcounted*)old);
 	}
 	if (fake_tls) {
-		thread_local_locale = loc;
+		thread_local_locale = l;
 	} else {
-		pthread_setspecific(locale_info_key, loc);
+		_pthread_setspecific(locale_info_key, l);
 	}
 #ifndef __NO_TLS
-	__thread_locale = loc;
+	__thread_locale = l;
 	__set_thread_rune_locale(loc);
 #endif
 }
@@ -250,7 +253,12 @@ locale_t newlocale(int mask, const char *locale, locale_t base)
 {
 	int type;
 	const char *realLocale = locale;
+	const char *np, *cp;
+	char lres[ENCODING_LEN + 1] = "";
+	int len;
 	int useenv = 0;
+	int useslh = 0;
+	int usestr = 0;
 	int success = 1;
 
 	_once(&once_control, init_key);
@@ -267,12 +275,49 @@ locale_t newlocale(int mask, const char *locale, locale_t base)
 		realLocale = "C";
 	} else if ('\0' == locale[0]) {
 		useenv = 1;
+	} else if (strchr(locale, '/') != NULL) {
+		/*
+		 * Handle system native locale string
+		 * e.g. "C/en_US.UTF-8/C/C/lt_LT/C"
+		 */
+		useslh = 1;
+		np = locale;
+	} else if ('L' == locale[0] && strchr(locale, ';') != NULL) {
+		/*
+		 * We are called from c++ runtime lib with LC_*; string??
+		 */
+		usestr = 1;
 	}
 
 	for (type=0 ; type<XLC_LAST ; type++) {
+		if (useslh) {
+			cp = strchr(np, '/');
+			if (cp == NULL && type == XLC_LAST - 1) {
+				cp = locale + strlen(locale);
+			} else if (cp == NULL || type == XLC_LAST - 1) {
+				errno = EINVAL;
+				success = 0;
+				break;
+			}
+			len = cp - np;
+			if (len > ENCODING_LEN || len <= 0) {
+				errno = EINVAL;
+				success = 0;
+				break;
+			}
+			strncpy(lres, np, len);
+			lres[len] = '\0';
+			np = cp + 1;
+		}
+
 		if (mask & 1) {
 			if (useenv) {
-				realLocale = __get_locale_env(type);
+				realLocale = __get_locale_env(type + 1);
+			} else if (useslh) {
+				realLocale = lres;
+			} else if (usestr) {
+				__get_locale_str(type + 1, locale, lres);
+				realLocale = lres;
 			}
 			new->components[type] =
 			     constructors[type](realLocale, new);
@@ -324,20 +369,18 @@ locale_t duplocale(locale_t base)
  * Free a locale_t.  This is quite a poorly named function.  It actually
  * disclaims a reference to a locale_t, rather than freeing it.  
  */
-int
+void
 freelocale(locale_t loc)
 {
-	/* Fail if we're passed something that isn't a locale. */
-	if ((NULL == loc) || (LC_GLOBAL_LOCALE == loc)) {
-		return (-1);
-	}
-	/* If we're passed the global locale, pretend that we freed it but don't
-	 * actually do anything. */
-	if (&__xlocale_global_locale == loc) {
-		return (0);
-	}
-	xlocale_release(loc);
-	return (0);
+
+	/*
+	 * Fail if we're passed something that isn't a locale. If we're
+	 * passed the global locale, pretend that we freed it but don't
+	 * actually do anything.
+	 */
+	if (loc != NULL && loc != LC_GLOBAL_LOCALE &&
+	    loc != &__xlocale_global_locale)
+		xlocale_release(loc);
 }
 
 /*
@@ -361,9 +404,6 @@ locale_t uselocale(locale_t loc)
 {
 	locale_t old = get_thread_locale();
 	if (NULL != loc) {
-		if (LC_GLOBAL_LOCALE == loc) {
-			loc = NULL;
-		}
 		set_thread_locale(loc);
 	}
 	return (old ? old : LC_GLOBAL_LOCALE);

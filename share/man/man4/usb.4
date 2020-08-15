@@ -24,7 +24,7 @@
 .\"
 .\" $FreeBSD: head/share/man/man4/usb.4 258618 2013-11-26 07:52:40Z lwhsu $
 .\"
-.Dd November 15, 2014
+.Dd December 2, 2018
 .Dt USB 4
 .Os
 .Sh NAME
@@ -84,39 +84,39 @@ root hub.
 .Dx
 provides support for the following devices.
 .Ss Storage devices
-.Bl -tag -width ".Xr snd_uaudio 4" -offset indent -compact
+.Bl -tag -width ".Xr umoscom 4" -offset indent -compact
 .\".It Xr natausb 4
 .\"...
 .It Xr umass 4
 Mass Storage Devices, e.g., external disk drives
+.It Xr urio 4
+Diamond Rio 500 MP3 player
 .It Xr usfs 4
 Mass storage driver for device-side mode
 .El
 .Ss Wired network interfaces
-.Bl -tag -width ".Xr snd_uaudio 4" -offset indent -compact
+.Bl -tag -width ".Xr umoscom 4" -offset indent -compact
 .It Xr aue 4
 ADMtek AN986 Pegasus Ethernet driver
 .It Xr axe 4
 ASIX Electronics AX88x7x/760 USB Ethernet driver
 .It Xr axge 4
 ASIX Electronics AX88178A/AX88179 USB Gigabit Ethernet driver
+.It Xr cdce 4
+USB Communication Device Class Ethernet driver
 .It Xr cue 4
 CATC USB-EL1210A Ethernet driver
 .It Xr ipheth 4
 USB Apple iPhone/iPad tethered Ethernet driver
 .It Xr kue 4
 Kawasaki LSI KL5KUSB101B Ethernet driver
-.\".It Xr lgue 4
-.\"USB CDC (communication device class) driver for the LG P-500 smartphone
 .It Xr mos 4
 Moschip MCS7730/MCS7830/MCS7832 USB Ethernet driver
-.\".It Xr rue 4
-.\"RealTek RTL8150 Ethernet driver
 .It Xr udav 4
 Davicom DM9601 USB Ethernet driver
 .El
 .Ss Wireless network interfaces
-.Bl -tag -width ".Xr snd_uaudio 4" -offset indent -compact
+.Bl -tag -width ".Xr umoscom 4" -offset indent -compact
 .It Xr ndis 4
 NDIS miniport driver wrapper
 .It Xr rum 4
@@ -125,17 +125,13 @@ Ralink Technology RT2501USB/RT2601USB IEEE 802.11 driver
 Ralink Technology RT2700U/RT2800U/RT3000U IEEE 802.11 driver
 .\".It Xr ubt 4
 .\"Bluetooth adapters
-.\".It Xr ural 4
-.\"Ralink Technology RT2500USB IEEE 802.11 driver
 .It Xr urndis 4
 RNDIS USB ethernet driver
 .It Xr urtwn 4
 Realtek RTL8188CU/RTL8192CU IEEE 802.11 driver
 .El
 .Ss Serial and parallel interfaces
-.Bl -tag -width ".Xr snd_uaudio 4" -offset indent -compact
-.\".It Xr moscom 4
-.\"MosChip Semiconductor MCS7703 based serial adapters
+.Bl -tag -width ".Xr umoscom 4" -offset indent -compact
 .It Xr u3g 4
 support for 3G datacards
 .It Xr uark 4
@@ -172,27 +168,23 @@ serial adapters based on the MCS7703 chip
 Prolific PL-2303/2303X/2303HX serial adapters
 .It Xr uslcom 4
 Silicon Laboratories CP2101, CP2102 and CP2103 USB to serial bridge
-.\".It Xr uticom 4
-.\"Texas Instruments TUSB3410 RS232 to USB converter
 .It Xr uvisor 4
 support for the Handspring Visor, a Palmpilot compatible PDA
 .It Xr uvscom 4
 SUNTAC Slipper U VS-10U serial adapters
 .El
-.\".Ss Audio devices
-.\".Bl -tag -width ".Xr snd_uaudio 4" -offset indent -compact
-.\".It Xr snd_uaudio 4
-.\"audio device driver
-.\".It Xr urio 4
-.\"driver for the Rio500 MP3 player
-.\".El
+.Ss Audio devices
+.Bl -tag -width ".Xr umoscom 4" -offset indent -compact
+.It Xr uaudio 4
+audio device driver
+.El
 .Ss Radio receiver devices
-.Bl -tag -width ".Xr snd_uaudio 4" -offset indent -compact
+.Bl -tag -width ".Xr umoscom 4" -offset indent -compact
 .It Xr ufm 4
 Cypress Semiconductor FM Radio
 .El
 .Ss Human Interface Devices
-.Bl -tag -width ".Xr snd_uaudio 4" -offset indent -compact
+.Bl -tag -width ".Xr umoscom 4" -offset indent -compact
 .It Xr uep 4
 eGalax touchscreen driver
 .It Xr uhid 4
@@ -202,11 +194,6 @@ keyboards that follow the boot protocol
 .It Xr ums 4
 mouse devices
 .El
-.\".Ss Miscellaneous devices
-.\".Bl -tag -width ".Xr snd_uaudio 4" -offset indent -compact
-.\".It Xr uscanner 4
-.\"scanner support
-.\".El
 .Sh INTRODUCTION TO USB
 The
 .Tn USB
@@ -274,6 +261,7 @@ specifications can be found at:
 .Xr aue 4 ,
 .Xr axe 4 ,
 .Xr axge 4 ,
+.Xr cdce 4 ,
 .Xr cue 4 ,
 .Xr ehci 4 ,
 .Xr ipheth 4 ,
@@ -282,11 +270,11 @@ specifications can be found at:
 .Xr ndis 4 ,
 .Xr ohci 4 ,
 .Xr pci 4 ,
-.\".Xr rue 4 ,
 .Xr rum 4 ,
 .Xr run 4 ,
 .Xr u3g 4 ,
 .Xr uark 4 ,
+.Xr uaudio 4 ,
 .Xr ubsa 4 ,
 .Xr ubser 4 ,
 .Xr uchcom 4 ,
@@ -310,7 +298,8 @@ specifications can be found at:
 .Xr umoscom 4 ,
 .Xr ums 4 ,
 .Xr uplcom 4 ,
-.\".Xr urio 4 ,
+.Xr urio 4 ,
+.Xr urndis 4 ,
 .Xr urtwn 4 ,
 .Xr usfs 4 ,
 .Xr uslcom 4 ,

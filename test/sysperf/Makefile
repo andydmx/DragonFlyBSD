@@ -2,14 +2,17 @@ TARGETS=/tmp/sc1 /tmp/sc2 /tmp/sc3 /tmp/sc4 /tmp/sc5 /tmp/sc6 /tmp/sc7 \
 	/tmp/loop1 /tmp/loop2 /tmp/loop3 /tmp/loop4 \
 	/tmp/call1 /tmp/call2 /tmp/call3 /tmp/cmp \
 	/tmp/mt2 /tmp/mt3 /tmp/mt4 \
-	/tmp/fork1 /tmp/pipe1 /tmp/pipe2 \
+	/tmp/fork1 /tmp/pipe1 /tmp/pipe2 /tmp/pipe3 \
+	/tmp/umtx1 \
 	/tmp/sp1 \
 	/tmp/sw1 /tmp/sw2 /tmp/sw3 \
 	/tmp/mbw1 \
 	/tmp/exec1 /tmp/exec2 \
 	/tmp/mem1 /tmp/mem2 \
 	/tmp/cld1 \
-	/tmp/rr1
+	/tmp/rr1 \
+	/tmp/lockmgr1 /tmp/lockmgr2 /tmp/lockmgr3 \
+	/tmp/loop900k /tmp/pipe900k /tmp/sleep900k
 
 .if defined(NO_OPTIMIZE)
 COPTFLAGS= -O
@@ -26,11 +29,11 @@ all:	$(TARGETS)
 /tmp/sc1: syscall1.c blib.c
 	$(CC) $(CFLAGS) syscall1.c blib.c -o /tmp/sc1
 
-/tmp/sc2: syscall2.c getuid_msg.c blib.c
-	$(CC) $(CFLAGS) syscall2.c getuid_msg.c blib.c -o /tmp/sc2
+/tmp/sc2: syscall2.c blib.c
+	$(CC) $(CFLAGS) syscall2.c blib.c -o /tmp/sc2
 
-/tmp/sc3: syscall3.c getuid_msg.c blib.c
-	$(CC) $(CFLAGS) syscall3.c getuid_msg.c blib.c -o /tmp/sc3
+/tmp/sc3: syscall3.c blib.c
+	$(CC) $(CFLAGS) syscall3.c blib.c -o /tmp/sc3
 
 /tmp/sc4: syscall4.c blib.c
 	$(CC) $(CFLAGS) syscall4.c blib.c -o /tmp/sc4
@@ -52,6 +55,12 @@ all:	$(TARGETS)
 
 /tmp/pipe2: pipe2.c blib.c
 	$(CC) $(CFLAGS) pipe2.c blib.c -o /tmp/pipe2
+
+/tmp/pipe3: pipe3.c blib.c
+	$(CC) $(CFLAGS) pipe3.c blib.c -pthread -o /tmp/pipe3
+
+/tmp/umtx1: umtx1.c blib.c
+	$(CC) $(CFLAGS) umtx1.c blib.c -pthread -o /tmp/umtx1
 
 /tmp/sp1: socketpair.c blib.c
 	$(CC) $(CFLAGS) socketpair.c blib.c -o /tmp/sp1
@@ -121,6 +130,24 @@ all:	$(TARGETS)
 
 /tmp/rr1: randread.c blib.c
 	$(CC) $(CFLAGS) randread.c blib.c -o /tmp/rr1
+
+/tmp/lockmgr1: lockmgr1.c blib.c
+	$(CC) lockmgr1.c blib.c -o /tmp/lockmgr1
+
+/tmp/lockmgr2: lockmgr2.c blib.c
+	$(CC) lockmgr2.c blib.c -o /tmp/lockmgr2
+
+/tmp/lockmgr3: lockmgr3.c blib.c
+	$(CC) lockmgr3.c blib.c -o /tmp/lockmgr3
+
+/tmp/loop900k: loop900k.c
+	$(CC) $(CFLAGS) loop900k.c -o /tmp/loop900k -static
+
+/tmp/pipe900k: pipe900k.c
+	$(CC) $(CFLAGS) pipe900k.c -o /tmp/pipe900k -static
+
+/tmp/sleep900k: sleep900k.c
+	$(CC) $(CFLAGS) sleep900k.c -o /tmp/sleep900k -static
 
 clean:
 	rm -f $(TARGETS)

@@ -14,11 +14,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -47,7 +43,6 @@
  * and the drivers are initialized.
  */
 #include "opt_bootp.h"
-#include "opt_ffs.h"
 #include "opt_cd9660.h"
 #include "opt_nfs.h"
 #include "opt_nfsroot.h"
@@ -89,10 +84,6 @@ static void	configure_first (void *);
 static void	configure (void *);
 static void	configure_final (void *);
 
-#if defined(FFS) && defined(FFS_ROOT)
-static void	setroot (void);
-#endif
-
 #if defined(NFS) && defined(NFS_ROOT)
 #if !defined(BOOTP_NFSROOT)
 static void	pxe_setup_nfsdiskless(void);
@@ -109,6 +100,18 @@ cdev_t	rootdev = NULL;
 cdev_t	dumpdev = NULL;
 
 /*
+ * nfsroot.iosize may be set in loader.conf, 32768 is recommended to
+ * be able to max-out a GigE link if the server supports it.  Many servers
+ * do not so the default is 8192.
+ *
+ * nfsroot.rahead defaults to something reasonable, can be overridden.
+ */
+static int nfsroot_iosize = 8192;
+TUNABLE_INT("nfsroot.iosize", &nfsroot_iosize);
+static int nfsroot_rahead = 4;
+TUNABLE_INT("nfsroot.rahead", &nfsroot_rahead);
+
+/*
  * Determine i/o configuration for a machine.
  */
 static void
@@ -119,9 +122,22 @@ configure_first(void *dummy)
 static void
 configure(void *dummy)
 {
+#if NISA > 0
+	void *low_dma_reserve;
+
+	/*
+	 * Try to reserve 512k of low dma memory for later isa attach.
+	 * Document as a REALLY bad hack.
+	 */
+	low_dma_reserve = contigmalloc(0x80000, M_TEMP, M_NOWAIT, 0ul,
+				       0xfffffful, 1ul, 0x20000ul);
+	if (bootverbose)
+		kprintf("low dma reserve placed @ %p\n", low_dma_reserve);
+#endif
+
 	/*
 	 * This will configure all devices, generally starting with the
-	 * nexus (i386/i386/nexus.c).  The nexus ISA code explicitly
+	 * nexus (pc64/x86_64/nexus.c).  The nexus ISA code explicitly
 	 * dummies up the attach in order to delay legacy initialization
 	 * until after all other busses/subsystems have had a chance
 	 * at those resources.
@@ -129,6 +145,15 @@ configure(void *dummy)
 	root_bus_configure();
 
 #if NISA > 0
+	/*
+	 * Free up reserve if we got it.
+	 */
+	if (low_dma_reserve != NULL) {
+		contigfree(low_dma_reserve, 0x80000, M_TEMP);
+	} else if (bootverbose) {
+		kprintf("low dma reserve was not allocated\n");
+	}
+
 	/*
 	 * Explicitly probe and attach ISA last.  The isa bus saves
 	 * it's device node at attach time for us here.
@@ -146,47 +171,15 @@ configure(void *dummy)
 	safepri = TDPRI_KERN_USER;
 }
 
+/*
+ * Finalize configure.  Reprobe for the console, in case it was one
+ * of the devices which attached, then finish console initialization.
+ */
 static void
 configure_final(void *dummy)
 {
+	cninit();
 	cninit_finish();
-
-	if (bootverbose) {
-#if JG
-		/*
-		 * Print out the BIOS's idea of the disk geometries.
-		 */
-		int i;
-		kprintf("BIOS Geometries:\n");
-		for (i = 0; i < N_BIOS_GEOM; i++) {
-			unsigned long bios_geom;
-			int max_cylinder, max_head, max_sector;
-
-			bios_geom = bootinfo.bi_bios_geom[i];
-
-			/*
-			 * XXX the bootstrap punts a 1200K floppy geometry
-			 * when the get-disk-geometry interrupt fails.  Skip
-			 * drives that have this geometry.
-			 */
-			if (bios_geom == 0x4f010f)
-				continue;
-
-			kprintf(" %x:%08lx ", i, bios_geom);
-			max_cylinder = bios_geom >> 16;
-			max_head = (bios_geom >> 8) & 0xff;
-			max_sector = bios_geom & 0xff;
-			kprintf(
-		"0..%d=%d cylinders, 0..%d=%d heads, 1..%d=%d sectors\n",
-			       max_cylinder, max_cylinder + 1,
-			       max_head, max_head + 1,
-			       max_sector, max_sector);
-		}
-		kprintf(" %d accounted for\n", bootinfo.bi_n_bios_used);
-
-		kprintf("Device configuration finished.\n");
-#endif
-	}
 }
 
 #ifdef BOOTP
@@ -208,104 +201,8 @@ cpu_rootconf(void)
 #endif
 		rootdevnames[0] = "nfs:";
 #endif
-#if defined(FFS) && defined(FFS_ROOT)
-        if (!rootdevnames[0])
-                setroot();
-#endif
 }
-SYSINIT(cpu_rootconf, SI_SUB_ROOT_CONF, SI_ORDER_FIRST, cpu_rootconf, NULL)
-
-u_long	bootdev = 0;		/* not a cdev_t - encoding is different */
-
-#if defined(FFS) && defined(FFS_ROOT)
-#define FDMAJOR 	2
-#define FDUNITSHIFT     6
-
-/*
- * The boot code uses old block device major numbers to pass bootdev to
- * us.  We have to translate these to character device majors because
- * we don't have block devices any more.
- */
-static int
-boot_translate_majdev(int bmajor)
-{
-	static int conv[] = { BOOTMAJOR_CONVARY };
-
-	if (bmajor >= 0 && bmajor < NELEM(conv))
-		return(conv[bmajor]);
-	return(-1);
-}
-
-/*
- * Attempt to find the device from which we were booted.
- * If we can do so, and not instructed not to do so,
- * set rootdevs[] and rootdevnames[] to correspond to the
- * boot device(s).
- *
- * This code survives in order to allow the system to be 
- * booted from legacy environments that do not correctly
- * populate the kernel environment. There are significant
- * restrictions on the bootability of the system in this
- * situation; it can only be mounting root from a 'da'
- * 'wd' or 'fd' device, and the root filesystem must be ufs.
- */
-static void
-setroot(void)
-{
-	int majdev, mindev, unit, slice, part;
-	cdev_t newrootdev, dev;
-	char partname[2];
-	char *sname;
-
-	if ((bootdev & B_MAGICMASK) != B_DEVMAGIC) {
-		kprintf("no B_DEVMAGIC (bootdev=%#lx)\n", bootdev);
-		return;
-	}
-	majdev = boot_translate_majdev(B_TYPE(bootdev));
-	if (bootverbose) {
-		kprintf("bootdev: %08lx type=%ld unit=%ld "
-			"slice=%ld part=%ld major=%d\n",
-			bootdev, B_TYPE(bootdev), B_UNIT(bootdev),
-			B_SLICE(bootdev), B_PARTITION(bootdev), majdev);
-	}
-	dev = udev2dev(makeudev(majdev, 0), 0);
-	if (!dev_is_good(dev))
-		return;
-	unit = B_UNIT(bootdev);
-	slice = B_SLICE(bootdev);
-	if (slice == WHOLE_DISK_SLICE)
-		slice = COMPATIBILITY_SLICE;
-	if (slice < 0 || slice >= MAX_SLICES) {
-		kprintf("bad slice\n");
-		return;
-	}
-
-	part = B_PARTITION(bootdev);
-	mindev = dkmakeminor(unit, slice, part);
-	newrootdev = udev2dev(makeudev(majdev, mindev), 0);
-	if (!dev_is_good(newrootdev))
-		return;
-	sname = dsname(newrootdev, unit, slice, part, partname);
-	rootdevnames[0] = kmalloc(strlen(sname) + 6, M_DEVBUF, M_WAITOK);
-	ksprintf(rootdevnames[0], "ufs:%s%s", sname, partname);
-
-	/*
-	 * For properly dangerously dedicated disks (ones with a historical
-	 * bogus partition table), the boot blocks will give slice = 4, but
-	 * the kernel will only provide the compatibility slice since it
-	 * knows that slice 4 is not a real slice.  Arrange to try mounting
-	 * the compatibility slice as root if mounting the slice passed by
-	 * the boot blocks fails.  This handles the dangerously dedicated
-	 * case and perhaps others.
-	 */
-	if (slice == COMPATIBILITY_SLICE)
-		return;
-	slice = COMPATIBILITY_SLICE;
-	sname = dsname(newrootdev, unit, slice, part, partname);
-	rootdevnames[1] = kmalloc(strlen(sname) + 6, M_DEVBUF, M_WAITOK);
-	ksprintf(rootdevnames[1], "ufs:%s%s", sname, partname);
-}
-#endif
+SYSINIT(cpu_rootconf, SI_SUB_ROOT_CONF, SI_ORDER_FIRST, cpu_rootconf, NULL);
 
 #if defined(NFS) && defined(NFS_ROOT)
 #if !defined(BOOTP_NFSROOT)
@@ -375,7 +272,7 @@ hwaddr_to_sockaddr(char *ev, struct sockaddr_dl *sa)
 }
 
 static int
-decode_nfshandle(char *ev, u_char *fh) 
+decode_nfshandle(char *ev, u_char *fh)
 {
 	u_char	*cp;
 	int	len, val;
@@ -436,7 +333,8 @@ pxe_setup_nfsdiskless(void)
 		kprintf("PXE: no hardware address\n");
 		return;
 	}
-	TAILQ_FOREACH(ifp, &ifnet, if_link) {
+	ifnet_lock();
+	TAILQ_FOREACH(ifp, &ifnetlist, if_link) {
 		struct ifaddr_container *ifac;
 
 		TAILQ_FOREACH(ifac, &ifp->if_addrheads[mycpuid], ifa_link) {
@@ -447,27 +345,33 @@ pxe_setup_nfsdiskless(void)
 				if ((sdl->sdl_type == ourdl.sdl_type) &&
 				    (sdl->sdl_alen == ourdl.sdl_alen) &&
 				    !bcmp(sdl->sdl_data + sdl->sdl_nlen,
-					  ourdl.sdl_data + ourdl.sdl_nlen, 
-					  sdl->sdl_alen))
-				    goto match_done;
+					  ourdl.sdl_data + ourdl.sdl_nlen,
+					  sdl->sdl_alen)) {
+					strlcpy(nd->myif.ifra_name,
+					    ifp->if_xname,
+					    sizeof(nd->myif.ifra_name));
+					ifnet_unlock();
+					goto match_done;
+				}
 			}
 		}
 	}
+	ifnet_unlock();
 	kprintf("PXE: no interface\n");
 	return;	/* no matching interface */
 match_done:
-	strlcpy(nd->myif.ifra_name, ifp->if_xname, sizeof(nd->myif.ifra_name));
-	
 	/* set up gateway */
 	inaddr_to_sockaddr("boot.netif.gateway", &nd->mygateway);
 
 	/* XXX set up swap? */
 
 	/* set up root mount */
-	nd->root_args.rsize = 8192;		/* XXX tunable? */
-	nd->root_args.wsize = 8192;
+	nd->root_args.rsize = nfsroot_iosize;
+	nd->root_args.wsize = nfsroot_iosize;
 	nd->root_args.sotype = SOCK_STREAM;
-	nd->root_args.flags = NFSMNT_WSIZE | NFSMNT_RSIZE | NFSMNT_RESVPORT;
+	nd->root_args.readahead = nfsroot_rahead;
+	nd->root_args.flags = NFSMNT_WSIZE | NFSMNT_RSIZE | NFSMNT_RESVPORT |
+			      NFSMNT_READAHEAD;
 	if (inaddr_to_sockaddr("boot.nfsroot.server", &nd->root_saddr)) {
 		kprintf("PXE: no server\n");
 		return;
@@ -475,7 +379,7 @@ match_done:
 	nd->root_saddr.sin_port = htons(NFS_PORT);
 
 	/*
-	 * A tftp-only loader may pass NFS path information without a 
+	 * A tftp-only loader may pass NFS path information without a
 	 * root handle.  Generate a warning but continue configuring.
 	 */
 	if (decode_nfshandle("boot.nfsroot.nfshandle", &nd->root_fh[0]) == 0) {

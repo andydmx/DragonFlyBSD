@@ -10,11 +10,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -37,6 +33,8 @@
 #ifndef _VM_VM_PAGE2_H_
 #define _VM_VM_PAGE2_H_
 
+#ifdef _KERNEL
+
 #ifndef _SYS_VMMETER_H_
 #include <sys/vmmeter.h>
 #endif
@@ -53,8 +51,21 @@
 #include <sys/spinlock2.h>
 #endif
 
-#ifdef _KERNEL
-
+/*
+ * SMP NOTE
+ *
+ * VM fault rates are highly dependent on SMP locking conflicts and, on
+ * multi-socket systems, cache mastership changes for globals due to atomic
+ * ops (even simple atomic_add_*() calls).  Cache mastership changes can
+ * limit the aggregate fault rate.
+ *
+ * For this reason we go through some hoops to access VM statistics for
+ * low-memory handling, pageout, and other triggers.  Each cpu collects
+ * adjustments in gd->gd_vmstats_adj.  These get rolled up into the global
+ * vmstats structure.  The global vmstats structure is then pulled into
+ * gd->gd_vmstats by each cpu when it needs it.  Critical path checks always
+ * use the pcpu gd->gd_vmstats structure.
+ */
 /*
  * Return TRUE if we are under our severe low-free-pages threshold
  *
@@ -67,9 +78,11 @@ static __inline
 int
 vm_page_count_severe(void)
 {
-    return (vmstats.v_free_severe >
-	    vmstats.v_free_count + vmstats.v_cache_count ||
-	    vmstats.v_free_reserved > vmstats.v_free_count);
+    globaldata_t gd = mycpu;
+
+    return (gd->gd_vmstats.v_free_severe >
+	    gd->gd_vmstats.v_free_count + gd->gd_vmstats.v_cache_count ||
+	    gd->gd_vmstats.v_free_reserved > gd->gd_vmstats.v_free_count);
 }
 
 /*
@@ -81,11 +94,13 @@ vm_page_count_severe(void)
  */
 static __inline 
 int
-vm_page_count_min(int donotcount)
+vm_page_count_min(long donotcount)
 {
-    return (vmstats.v_free_min + donotcount >
-	    (vmstats.v_free_count + vmstats.v_cache_count) ||
-	    vmstats.v_free_reserved > vmstats.v_free_count);
+    globaldata_t gd = mycpu;
+
+    return (gd->gd_vmstats.v_free_min + donotcount >
+	    (gd->gd_vmstats.v_free_count + gd->gd_vmstats.v_cache_count) ||
+	    gd->gd_vmstats.v_free_reserved > gd->gd_vmstats.v_free_count);
 }
 
 /*
@@ -100,9 +115,11 @@ static __inline
 int
 vm_page_count_target(void)
 {
-    return (vmstats.v_free_target >
-	    (vmstats.v_free_count + vmstats.v_cache_count) ||
-	    vmstats.v_free_reserved > vmstats.v_free_count);
+    globaldata_t gd = mycpu;
+
+    return (gd->gd_vmstats.v_free_target >
+	    (gd->gd_vmstats.v_free_count + gd->gd_vmstats.v_cache_count) ||
+	    gd->gd_vmstats.v_free_reserved > gd->gd_vmstats.v_free_count);
 }
 
 /*
@@ -117,13 +134,13 @@ vm_page_count_target(void)
  * This function DOES NOT return TRUE or FALSE.
  */
 static __inline 
-int
+long
 vm_paging_target(void)
 {
-    return (
-	(vmstats.v_free_target + vmstats.v_cache_min) - 
-	(vmstats.v_free_count + vmstats.v_cache_count)
-    );
+    globaldata_t gd = mycpu;
+
+    return ((gd->gd_vmstats.v_free_target + gd->gd_vmstats.v_cache_min) -
+	    (gd->gd_vmstats.v_free_count + gd->gd_vmstats.v_cache_count));
 }
 
 /*
@@ -136,33 +153,17 @@ vm_paging_target(void)
  */
 static __inline 
 int
-vm_paging_needed(void)
+vm_paging_needed(int adj)
 {
-    if (vmstats.v_free_min + vmstats.v_cache_min >
-	vmstats.v_free_count + vmstats.v_cache_count) {
+    globaldata_t gd = mycpu;
+
+    if (gd->gd_vmstats.v_free_min + gd->gd_vmstats.v_cache_min >
+	gd->gd_vmstats.v_free_count + gd->gd_vmstats.v_cache_count + adj) {
 		return 1;
     }
-    if (vmstats.v_free_min > vmstats.v_free_count)
+    if (gd->gd_vmstats.v_free_min > gd->gd_vmstats.v_free_count + adj)
 		return 1;
     return 0;
-}
-
-static __inline
-void
-vm_page_event(vm_page_t m, vm_page_event_t event)
-{
-    if (m->flags & PG_ACTIONLIST)
-	vm_page_event_internal(m, event);
-}
-
-static __inline
-void
-vm_page_init_action(vm_page_t m, vm_page_action_t action,
-		    void (*func)(vm_page_t, vm_page_action_t), void *data)
-{
-    action->m = m;
-    action->func = func;
-    action->data = data;
 }
 
 /*
@@ -208,14 +209,14 @@ static __inline
 void
 vm_page_spin_lock(vm_page_t m)
 {
-    spin_pool_lock(m);
+    spin_lock(&m->spin);
 }
 
 static __inline
 void
 vm_page_spin_unlock(vm_page_t m)
 {
-    spin_pool_unlock(m);
+    spin_unlock(&m->spin);
 }
 
 /*
@@ -272,16 +273,38 @@ vm_page_flag_clear(vm_page_t m, unsigned int bits)
 /*
  * Wakeup anyone waiting for the page after potentially unbusying
  * (hard or soft) or doing other work on a page that might make a
- * waiter ready.  The setting of PG_WANTED is integrated into the
+ * waiter ready.  The setting of PBUSY_WANTED is integrated into the
  * related flags and it can't be set once the flags are already
  * clear, so there should be no races here.
  */
-
 static __inline void
 vm_page_flash(vm_page_t m)
 {
-	if (m->flags & PG_WANTED) {
-		vm_page_flag_clear(m, PG_WANTED);
+	if (m->busy_count & PBUSY_WANTED) {
+		atomic_clear_int(&m->busy_count, PBUSY_WANTED);
+		wakeup(m);
+	}
+}
+
+/*
+ * Adjust the soft-busy count on a page.  The drop code will issue an
+ * integrated wakeup if busy_count becomes 0.
+ */
+static __inline void
+vm_page_sbusy_hold(vm_page_t m)
+{
+	atomic_add_int(&m->busy_count, 1);
+}
+
+static __inline void
+vm_page_sbusy_drop(vm_page_t m)
+{
+	uint32_t ocount;
+
+	ocount = atomic_fetchadd_int(&m->busy_count, -1);
+	if (ocount - 1 == PBUSY_WANTED) {
+		/* WANTED and no longer BUSY or SBUSY */
+		atomic_clear_int(&m->busy_count, PBUSY_WANTED);
 		wakeup(m);
 	}
 }
@@ -300,20 +323,24 @@ vm_page_flash(vm_page_t m)
  * Since 'prot' is usually a constant, this inline usually winds up optimizing
  * out the primary conditional.
  *
+ * Must be called with (m) hard-busied.
+ *
  * WARNING: VM_PROT_NONE can block, but will loop until all mappings have
- * been cleared.  Callers should be aware that other page related elements
- * might have changed, however.
+ *	    been cleared.  Callers should be aware that other page related
+ *	    elements might have changed, however.
  */
 static __inline void
 vm_page_protect(vm_page_t m, int prot)
 {
-	KKASSERT(m->flags & PG_BUSY);
+	KKASSERT(m->busy_count & PBUSY_LOCKED);
 	if (prot == VM_PROT_NONE) {
-		if (m->flags & (PG_WRITEABLE|PG_MAPPED)) {
+		if (pmap_mapped_sync(m) & (PG_MAPPED | PG_WRITEABLE)) {
 			pmap_page_protect(m, VM_PROT_NONE);
 			/* PG_WRITEABLE & PG_MAPPED cleared by call */
 		}
-	} else if ((prot == VM_PROT_READ) && (m->flags & PG_WRITEABLE)) {
+	} else if ((prot == VM_PROT_READ) &&
+		   (m->flags & PG_WRITEABLE) &&
+		   (pmap_mapped_sync(m) & PG_WRITEABLE)) {
 		pmap_page_protect(m, VM_PROT_READ);
 		/* PG_WRITEABLE cleared by call */
 	}
@@ -344,16 +371,10 @@ vm_page_copy(vm_page_t src_m, vm_page_t dest_m)
 
 /*
  * Free a page.  The page must be marked BUSY.
- *
- * Always clear PG_ZERO when freeing a page, which ensures the flag is not
- * set unless we are absolutely certain the page is zerod.  This is
- * particularly important when the vm_page_alloc*() code moves pages from
- * PQ_CACHE to PQ_FREE.
  */
 static __inline void
 vm_page_free(vm_page_t m)
 {
-	vm_page_flag_clear(m, PG_ZERO);
 	vm_page_free_toq(m);
 }
 
@@ -376,7 +397,6 @@ vm_page_free_zero(vm_page_t m)
 	}
 #endif
 #endif
-	vm_page_flag_set(m, PG_ZERO);
 	vm_page_free_toq(m);
 }
 

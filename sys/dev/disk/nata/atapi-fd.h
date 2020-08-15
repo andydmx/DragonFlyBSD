@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 1998 - 2006 Søren Schmidt <sos@FreeBSD.org>
+ * Copyright (c) 1998 - 2008 Søren Schmidt <sos@FreeBSD.org>
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -24,7 +24,6 @@
  * THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  * $FreeBSD: src/sys/dev/ata/atapi-fd.h,v 1.26 2006/03/05 20:30:54 sos Exp $
- * $DragonFly: src/sys/dev/disk/nata/atapi-fd.h,v 1.1 2006/12/04 14:40:37 tgen Exp $
  */
 
 #include <sys/param.h>

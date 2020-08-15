@@ -42,6 +42,7 @@ struct hammer2_media_config {
 	hammer2_volconf_t	copy_run;
 	hammer2_volconf_t	copy_pend;
 	pthread_t		thread;
+	int			thread_started;
 	pthread_cond_t		cond;
 	int			ctl;
 	int			fd;
@@ -227,7 +228,6 @@ service_thread(void *data)
 	 * Start up a thread to handle block device monitoring for
 	 * export to the cluster.
 	 */
-	thread = NULL;
 	pthread_create(&thread, NULL, udev_thread, NULL);
 
 	/*
@@ -239,7 +239,6 @@ service_thread(void *data)
 	/*
 	 * Start thread to manage /etc/hammer2/autoconn
 	 */
-	thread = NULL;
 	pthread_create(&thread, NULL, autoconn_thread, NULL);
 
 	/*
@@ -266,7 +265,6 @@ service_thread(void *data)
 		}
 		opt = 1;
 		setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof opt);
-		thread = NULL;
 		fprintf(stderr, "service_thread: accept fd %d\n", fd);
 		info = malloc(sizeof(*info));
 		bzero(info, sizeof(*info));
@@ -326,7 +324,7 @@ hammer2_usrmsg_handler(dmsg_msg_t *msg, int unmanaged)
 		for (i = 0; i < HAMMER2_COPYID_COUNT; ++i) {
 			if (conf[i].thread) {
 				pthread_join(conf[i].thread, NULL);
-				conf->thread = NULL;
+				conf->thread_started = 0;
 				pthread_cond_destroy(&conf[i].cond);
 			}
 		}
@@ -366,11 +364,12 @@ hammer2_usrmsg_handler(dmsg_msg_t *msg, int unmanaged)
 		conf->copy_pend = msgconf->copy;
 		conf->ctl |= H2CONFCTL_UPDATE;
 		pthread_mutex_unlock(&confmtx);
-		if (conf->thread == NULL) {
+		if (conf->thread_started == 0) {
 			fprintf(stderr, "VOLCONF THREAD STARTED\n");
 			pthread_cond_init(&conf->cond, NULL);
 			pthread_create(&conf->thread, NULL,
 				       hammer2_volconf_thread, (void *)conf);
+			conf->thread_started = 1;
 		}
 		pthread_cond_signal(&conf->cond);
 		break;
@@ -385,6 +384,8 @@ static void *
 hammer2_volconf_thread(void *info)
 {
 	hammer2_media_config_t *conf = info;
+
+	setproctitle("hammer2 volconf");
 
 	pthread_mutex_lock(&confmtx);
 	while ((conf->ctl & H2CONFCTL_STOP) == 0) {
@@ -405,15 +406,15 @@ hammer2_volconf_thread(void *info)
 			hammer2_volconf_stop(conf);
 			conf->copy_run = conf->copy_pend;
 			if (conf->copy_run.copyid != 0 &&
-			    strncmp(conf->copy_run.path, "span:", 5) == 0) {
+			    strncmp((char*)conf->copy_run.path, "span:", 5) == 0) {
 				hammer2_volconf_start(conf,
-						      conf->copy_run.path + 5);
+						      (char*)conf->copy_run.path + 5);
 			}
 			pthread_mutex_lock(&confmtx);
 			fprintf(stderr, "VOLCONF UPDATE DONE state %d\n", conf->state);
 		}
 		if (conf->state == H2MC_CONNECT) {
-			hammer2_volconf_start(conf, conf->copy_run.path + 5);
+			hammer2_volconf_start(conf, (char*)conf->copy_run.path + 5);
 			pthread_mutex_unlock(&confmtx);
 			sleep(5);
 			pthread_mutex_lock(&confmtx);
@@ -476,7 +477,6 @@ hammer2_volconf_stop(hammer2_media_config_t *conf)
 		close(conf->pipefd[1]);
 		conf->pipefd[1] = -1;
 		pthread_join(conf->iocom_thread, NULL);
-		conf->iocom_thread = NULL;
 		conf->state = H2MC_STOPPED;
 		break;
 	}
@@ -500,6 +500,7 @@ udev_thread(void *data __unused)
 	int	seq = 0;
 
 	pthread_detach(pthread_self());
+	setproctitle("hammer2 udev_thread");
 
 	if ((fd = open(UDEV_DEVICE_PATH, O_RDWR)) < 0) {
 		fprintf(stderr, "udev_thread: unable to open \"%s\"\n",
@@ -537,6 +538,7 @@ autoconn_thread(void *data __unused)
 	lmod = 0;
 
 	pthread_detach(pthread_self());
+	setproctitle("hammer2 autoconn_thread");
 	for (;;) {
 		/*
 		 * Polling interval
@@ -650,7 +652,6 @@ autoconn_thread(void *data __unused)
 				if (pipe(ac->pipefd) == 0) {
 					ac->stopme = 0;
 					ac->state = AUTOCONN_ACTIVE;
-					thread = NULL;
 					pthread_create(&thread, NULL,
 						       autoconn_connect_thread,
 						       ac);
@@ -699,12 +700,16 @@ autoconn_connect_thread(void *data)
 
 	ac = data;
 	pthread_detach(pthread_self());
+	setproctitle("hammer2 dmsg");
 
 	while (ac->stopme == 0) {
 		fd = dmsg_connect(ac->host);
 		if (fd < 0) {
-			fprintf(stderr, "autoconn: Connect failure: %s\n",
-				ac->host);
+			if (DMsgDebugOpt > 2) {
+				fprintf(stderr,
+					"autoconn: Connect failure: %s\n",
+					ac->host);
+			}
 			sleep(5);
 			continue;
 		}
@@ -989,4 +994,81 @@ xdisk_connect(void)
 			strerror(errno));
 		return;
 	}
+}
+
+/*
+ * Execute the specified function as a detached independent process/daemon,
+ * unless we are in debug mode.  If we are in debug mode the function is
+ * executed as a pthread in the current process.
+ */
+void
+hammer2_demon(void *(*func)(void *), void *arg)
+{
+	pthread_t thread;
+	pid_t pid;
+	int ttyfd;
+
+	/*
+	 * Do not disconnect in debug mode
+	 */
+	if (DebugOpt) {
+                pthread_create(&thread, NULL, func, arg);
+		NormalExit = 0;
+		return;
+	}
+
+	/*
+	 * Otherwise disconnect us.  Double-fork to get rid of the ppid
+	 * association and disconnect the TTY.
+	 */
+	if ((pid = fork()) < 0) {
+		fprintf(stderr, "hammer2: fork(): %s\n", strerror(errno));
+		exit(1);
+	}
+	if (pid > 0) {
+		while (waitpid(pid, NULL, 0) != pid)
+			;
+		return;		/* parent returns */
+	}
+
+	/*
+	 * Get rid of the TTY/session before double-forking to finish off
+	 * the ppid.
+	 */
+	ttyfd = open("/dev/null", O_RDWR);
+	if (ttyfd >= 0) {
+		if (ttyfd != 0)
+			dup2(ttyfd, 0);
+		if (ttyfd != 1)
+			dup2(ttyfd, 1);
+		if (ttyfd != 2)
+			dup2(ttyfd, 2);
+		if (ttyfd > 2)
+			close(ttyfd);
+	}
+
+	ttyfd = open("/dev/tty", O_RDWR);
+	if (ttyfd >= 0) {
+		ioctl(ttyfd, TIOCNOTTY, 0);
+		close(ttyfd);
+	}
+	setsid();
+
+	/*
+	 * Second fork to disconnect ppid (the original parent waits for
+	 * us to exit).
+	 */
+	if ((pid = fork()) < 0) {
+		_exit(2);
+	}
+	if (pid > 0)
+		_exit(0);
+
+	/*
+	 * The double child
+	 */
+	setsid();
+	pthread_create(&thread, NULL, func, arg);
+	pthread_exit(NULL);
+	_exit(2);	/* NOT REACHED */
 }

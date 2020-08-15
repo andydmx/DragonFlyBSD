@@ -126,7 +126,7 @@ The default editor in DragonFly BSD is vi, which is efficient to use when you
 have learned it, but somewhat user-unfriendly.  To use ee (an easier but less
 powerful editor) instead, set the environment variable EDITOR to /usr/bin/ee
 %
-If you accidently end up inside vi, you can quit it by pressing Escape, colon
+If you accidentally end up inside vi, you can quit it by pressing Escape, colon
 (:), q (q), bang (!) and pressing return.
 %
 You can use aliases to decrease the amount of typing you need to do to get
@@ -146,9 +146,9 @@ In csh or tcsh, these would be
 To remove an alias, you can usually use 'unalias aliasname'.  To list all
 aliases, you can usually type just 'alias'.
 %
-In order to support national characters for european languages in tools like
-less without creating other nationalisation aspects, set the environment
-variable LC_ALL to 'en_US.ISO8859-1'.
+In order to support international characters in tools like less without
+creating other nationalisation aspects, set the environment
+variable LC_ALL to 'en_US.UTF-8'.
 %
 You can search for documentation on a keyword by typing
 
@@ -456,16 +456,16 @@ want no backup:
 
 	sed -i '' s/e/o/g foo
 %
-By default pkg-install(1) downloads all packages from a random DragonFly BSD mirror.
-To use a particular mirror set the mirror,
+To use a particular mirror for pkg-install downloads, copy the example config:
 
 	cp /usr/local/etc/pkg/repos/df-latest.conf.sample \
 		/usr/local/etc/pkg/repos/df-latest.conf
 
-and choose the mirror you want to use.
+and choose the mirror you want to use in df-latest.conf.
 
-You can also use the file df-release.conf.sample is you prefer to use the
-RELEASE repository instead.
+This will always point to the latest version of dports.  You can copy the file 
+'df-releases.conf.sample' to use the repository that matches the current 
+release version of DragonFly.
 %
 If you want to search for a particular package, use pkg-search(1):
 
@@ -563,3 +563,7 @@ DEST can be created on the fly, it must be a slave PFS, and will be read-only.
 See "man HAMMER" for details.
 %
 Moo
+%
+Just started parallel buildworld?  Try typing "hangman -k" and tell
+what that kernel symbol does.
+%

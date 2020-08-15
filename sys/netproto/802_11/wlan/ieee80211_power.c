@@ -21,9 +21,10 @@
  * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
  * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
  * THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- *
- * $FreeBSD: head/sys/net80211/ieee80211_power.c 186302 2008-12-18 23:00:09Z sam $
  */
+
+#include <sys/cdefs.h>
+__FBSDID("$FreeBSD$");
 
 /*
  * IEEE 802.11 power save support.
@@ -33,14 +34,14 @@
 #include <sys/param.h>
 #include <sys/systm.h> 
 #include <sys/kernel.h>
+#include <sys/malloc.h>
  
 #include <sys/socket.h>
 
 #include <net/if.h>
+#include <net/if_var.h>
 #include <net/if_media.h>
-#include <net/ifq_var.h>
 #include <net/ethernet.h>
-#include <net/route.h>
 
 #include <netproto/802_11/ieee80211_var.h>
 
@@ -49,7 +50,7 @@
 static void ieee80211_update_ps(struct ieee80211vap *, int);
 static int ieee80211_set_tim(struct ieee80211_node *, int);
 
-MALLOC_DEFINE(M_80211_POWER, "80211power", "802.11 power save state");
+static MALLOC_DEFINE(M_80211_POWER, "80211power", "802.11 power save state");
 
 void
 ieee80211_power_attach(struct ieee80211com *ic)
@@ -83,8 +84,14 @@ ieee80211_power_latevattach(struct ieee80211vap *vap)
 	 */
 	if (vap->iv_opmode == IEEE80211_M_HOSTAP) {
 		vap->iv_tim_len = howmany(vap->iv_max_aid,8) * sizeof(uint8_t);
+#if defined(__DragonFly__)
 		vap->iv_tim_bitmap = (uint8_t *) kmalloc(vap->iv_tim_len,
 			M_80211_POWER, M_INTWAIT | M_ZERO);
+#else
+		vap->iv_tim_bitmap = (uint8_t *) IEEE80211_MALLOC(vap->iv_tim_len,
+			M_80211_POWER,
+			IEEE80211_M_NOWAIT | IEEE80211_M_ZERO);
+#endif
 		if (vap->iv_tim_bitmap == NULL) {
 			kprintf("%s: no memory for TIM bitmap!\n", __func__);
 			/* XXX good enough to keep from crashing? */
@@ -97,7 +104,7 @@ void
 ieee80211_power_vdetach(struct ieee80211vap *vap)
 {
 	if (vap->iv_tim_bitmap != NULL) {
-		kfree(vap->iv_tim_bitmap, M_80211_POWER);
+		IEEE80211_FREE(vap->iv_tim_bitmap, M_80211_POWER);
 		vap->iv_tim_bitmap = NULL;
 	}
 }
@@ -107,6 +114,7 @@ ieee80211_psq_init(struct ieee80211_psq *psq, const char *name)
 {
 	memset(psq, 0, sizeof(*psq));
 	psq->psq_maxlen = IEEE80211_PS_MAX_QUEUE;
+	IEEE80211_PSQ_INIT(psq, name);		/* OS-dependent setup */
 }
 
 void
@@ -117,6 +125,7 @@ ieee80211_psq_cleanup(struct ieee80211_psq *psq)
 #else
 	KASSERT(psq->psq_len == 0, ("%d frames on ps q", psq->psq_len));
 #endif
+	IEEE80211_PSQ_DESTROY(psq);		/* OS-dependent cleanup */
 }
 
 /*
@@ -129,6 +138,7 @@ ieee80211_node_psq_dequeue(struct ieee80211_node *ni, int *qlen)
 	struct ieee80211_psq_head *qhead;
 	struct mbuf *m;
 
+	IEEE80211_PSQ_LOCK(psq);
 	qhead = &psq->psq_head[0];
 again:
 	if ((m = qhead->head) != NULL) {
@@ -147,6 +157,7 @@ again:
 	}
 	if (qlen != NULL)
 		*qlen = psq->psq_len;
+	IEEE80211_PSQ_UNLOCK(psq);
 	return m;
 }
 
@@ -176,6 +187,7 @@ psq_drain(struct ieee80211_psq *psq)
 	struct mbuf *m;
 	int qlen;
 
+	IEEE80211_PSQ_LOCK(psq);
 	qlen = psq->psq_len;
 	qhead = &psq->psq_head[0];
 again:
@@ -190,6 +202,7 @@ again:
 		goto again;
 	}
 	psq->psq_len = 0;
+	IEEE80211_PSQ_UNLOCK(psq);
 
 	return qlen;
 }
@@ -227,6 +240,7 @@ ieee80211_node_psq_age(struct ieee80211_node *ni)
 		struct ieee80211_psq_head *qhead;
 		struct mbuf *m;
 
+		IEEE80211_PSQ_LOCK(psq);
 		qhead = &psq->psq_head[0];
 	again:
 		while ((m = qhead->head) != NULL &&
@@ -248,6 +262,7 @@ ieee80211_node_psq_age(struct ieee80211_node *ni)
 		}
 		if (m != NULL)
 			M_AGE_SUB(m, IEEE80211_INACT_WAIT);
+		IEEE80211_PSQ_UNLOCK(psq);
 
 		IEEE80211_NOTE(vap, IEEE80211_MSG_POWER, ni,
 		    "discard %u frames for age", discard);
@@ -275,6 +290,7 @@ static int
 ieee80211_set_tim(struct ieee80211_node *ni, int set)
 {
 	struct ieee80211vap *vap = ni->ni_vap;
+	struct ieee80211com *ic = ni->ni_ic;
 	uint16_t aid;
 	int changed;
 
@@ -286,6 +302,7 @@ ieee80211_set_tim(struct ieee80211_node *ni, int set)
 	KASSERT(aid < vap->iv_max_aid,
 		("bogus aid %u, max %u", aid, vap->iv_max_aid));
 
+	IEEE80211_LOCK(ic);
 	changed = (set != (isset(vap->iv_tim_bitmap, aid) != 0));
 	if (changed) {
 		if (set) {
@@ -298,6 +315,7 @@ ieee80211_set_tim(struct ieee80211_node *ni, int set)
 		/* NB: we know vap is in RUN state so no need to check */
 		vap->iv_update_beacon(vap, IEEE80211_BEACON_TIM);
 	}
+	IEEE80211_UNLOCK(ic);
 
 	return changed;
 }
@@ -316,8 +334,10 @@ ieee80211_pwrsave(struct ieee80211_node *ni, struct mbuf *m)
 	struct ieee80211_psq_head *qhead;
 	int qlen, age;
 
+	IEEE80211_PSQ_LOCK(psq);
 	if (psq->psq_len >= psq->psq_maxlen) {
 		psq->psq_drops++;
+		IEEE80211_PSQ_UNLOCK(psq);
 		IEEE80211_NOTE(vap, IEEE80211_MSG_ANY, ni,
 		    "pwr save q overflow, drops %d (size %d)",
 		    psq->psq_drops, psq->psq_len);
@@ -380,6 +400,7 @@ ieee80211_pwrsave(struct ieee80211_node *ni, struct mbuf *m)
 	qhead->tail = m;
 	qhead->len++;
 	qlen = ++(psq->psq_len);
+	IEEE80211_PSQ_UNLOCK(psq);
 
 	IEEE80211_NOTE(vap, IEEE80211_MSG_POWER, ni,
 	    "save frame with age %d, %u now queued", age, qlen);
@@ -400,74 +421,60 @@ static void
 pwrsave_flushq(struct ieee80211_node *ni)
 {
 	struct ieee80211_psq *psq = &ni->ni_psq;
+	struct ieee80211com *ic = ni->ni_ic;
 	struct ieee80211vap *vap = ni->ni_vap;
 	struct ieee80211_psq_head *qhead;
-	struct ifnet *parent, *ifp;
-	struct ifaltq_subque *ifp_ifsq, *parent_ifsq;
+	struct mbuf *parent_q = NULL, *ifp_q = NULL;
+	struct mbuf *m;
 
 	IEEE80211_NOTE(vap, IEEE80211_MSG_POWER, ni,
 	    "flush ps queue, %u packets queued", psq->psq_len);
 
+	IEEE80211_PSQ_LOCK(psq);
 	qhead = &psq->psq_head[0];	/* 802.11 frames */
 	if (qhead->head != NULL) {
-		const struct mbuf *m;
-		int bcnt = 0;
-
-		for (m = qhead->head; m != NULL; m = m->m_nextpkt)
-			bcnt += m->m_pkthdr.len;
-
 		/* XXX could dispatch through vap and check M_ENCAP */
-		parent = vap->iv_ic->ic_ifp;
-		parent_ifsq = ifq_get_subq_default(&parent->if_snd);
-
-		/* XXX this breaks ALTQ's packet scheduler */
-		ALTQ_SQ_LOCK(parent_ifsq);
 		/* XXX need different driver interface */
 		/* XXX bypasses q max and OACTIVE */
-		IF_PREPEND_LIST(parent_ifsq, qhead->head, qhead->tail,
-		    qhead->len, bcnt);
-		ALTQ_SQ_UNLOCK(parent_ifsq);
-
+		parent_q = qhead->head;
 		qhead->head = qhead->tail = NULL;
 		qhead->len = 0;
-	} else {
-		parent = NULL;
-		parent_ifsq = NULL;
 	}
 
 	qhead = &psq->psq_head[1];	/* 802.3 frames */
 	if (qhead->head != NULL) {
-		const struct mbuf *m;
-		int bcnt = 0;
-
-		for (m = qhead->head; m != NULL; m = m->m_nextpkt)
-			bcnt += m->m_pkthdr.len;
-
-		ifp = vap->iv_ifp;
-		ifp_ifsq = ifq_get_subq_default(&ifp->if_snd);
-
-		/* XXX this breaks ALTQ's packet scheduler */
-		ALTQ_SQ_LOCK(ifp_ifsq);
 		/* XXX need different driver interface */
 		/* XXX bypasses q max and OACTIVE */
-		IF_PREPEND_LIST(ifp_ifsq, qhead->head, qhead->tail,
-		    qhead->len, bcnt);
-		ALTQ_SQ_UNLOCK(ifp_ifsq);
-
+		ifp_q = qhead->head;
 		qhead->head = qhead->tail = NULL;
 		qhead->len = 0;
-	} else {
-		ifp = NULL;
-		ifp_ifsq = NULL;
 	}
 	psq->psq_len = 0;
+	IEEE80211_PSQ_UNLOCK(psq);
 
 	/* NB: do this outside the psq lock */
 	/* XXX packets might get reordered if parent is OACTIVE */
-	if (parent != NULL && parent_ifsq != NULL)
-		parent->if_start(parent, parent_ifsq);
-	if (ifp != NULL && ifp_ifsq != NULL)
-		ifp->if_start(ifp, ifp_ifsq);
+	/* parent frames, should be encapsulated */
+	while (parent_q != NULL) {
+		m = parent_q;
+		parent_q = m->m_nextpkt;
+		m->m_nextpkt = NULL;
+		/* must be encapsulated */
+		KASSERT((m->m_flags & M_ENCAP),
+		    ("%s: parentq with non-M_ENCAP frame!\n",
+		    __func__));
+		(void) ieee80211_parent_xmitpkt(ic, m);
+	}
+
+	/* VAP frames, aren't encapsulated */
+	while (ifp_q != NULL) {
+		m = ifp_q;
+		ifp_q = m->m_nextpkt;
+		m->m_nextpkt = NULL;
+		KASSERT((!(m->m_flags & M_ENCAP)),
+		    ("%s: vapq with M_ENCAP frame!\n", __func__));
+		(void) ieee80211_vap_xmitpkt(vap, m);
+	}
 }
 
 /*
@@ -546,10 +553,15 @@ ieee80211_sta_pwrsave(struct ieee80211vap *vap, int enable)
  * Handle being notified that we have data available for us in a TIM/ATIM.
  *
  * This may schedule a transition from _SLEEP -> _RUN if it's appropriate.
+ *
+ * In STA mode, we may have put to sleep during scan and need to be dragged
+ * back out of powersave mode.
  */
 void
 ieee80211_sta_tim_notify(struct ieee80211vap *vap, int set)
 {
+	struct ieee80211com *ic = vap->iv_ic;
+
 	/*
 	 * Schedule the driver state change.  It'll happen at some point soon.
 	 * Since the hardware shouldn't know that we're running just yet
@@ -560,10 +572,26 @@ ieee80211_sta_tim_notify(struct ieee80211vap *vap, int set)
 	 * XXX TODO: verify that the transition to RUN will wake up the
 	 * BSS node!
 	 */
-	IEEE80211_DPRINTF(vap, IEEE80211_MSG_POWER, "%s: TIM=%d\n", __func__, set);
+	IEEE80211_LOCK(vap->iv_ic);
 	if (set == 1 && vap->iv_state == IEEE80211_S_SLEEP) {
 		ieee80211_new_state_locked(vap, IEEE80211_S_RUN, 0);
+		IEEE80211_DPRINTF(vap, IEEE80211_MSG_POWER,
+		    "%s: TIM=%d; wakeup\n", __func__, set);
+	} else if ((set == 1) && (ic->ic_flags_ext & IEEE80211_FEXT_BGSCAN)) {
+		/*
+		 * XXX only do this if we're in RUN state?
+		 */
+		IEEE80211_DPRINTF(vap, IEEE80211_MSG_POWER,
+		    "%s: wake up from bgscan vap sleep\n",
+		    __func__);
+		/*
+		 * We may be in BGSCAN mode - this means the VAP is is in STA
+		 * mode powersave.  If it is, we need to wake it up so we
+		 * can process outbound traffic.
+		 */
+		vap->iv_sta_ps(vap, 0);
 	}
+	IEEE80211_UNLOCK(vap->iv_ic);
 }
 
 /*
@@ -600,7 +628,7 @@ ieee80211_sta_ps_timer_check(struct ieee80211vap *vap)
 
 	/* If we've done any data within our idle interval, bail */
 	/* XXX hard-coded to one second for now, ew! */
-	if (time_after(ic->ic_lastdata + 500, ticks))
+	if (ieee80211_time_after(ic->ic_lastdata + 500, ticks))
 		goto out;
 
 	/*

@@ -37,7 +37,6 @@
 #include <sys/param.h>
 #include <sys/stat.h>
 #include <sys/diskslice.h>
-#include <sys/file.h>
 #include <sys/mount.h>
 #include <sys/sysctl.h>
 
@@ -49,6 +48,7 @@
 #include <ctype.h>
 #include <err.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <mntopts.h>
 #include <inttypes.h>
 #include <paths.h>
@@ -74,7 +74,7 @@ struct mntopt mopts[] = {
 	MOPT_NULL,
 };
 
-void	fatal(const char *fmt, ...) __printflike(1, 2);
+void	fatal(const char *fmt, ...) __dead2 __printflike(1, 2);
 
 #define	COMPAT			/* allow non-labeled disks */
 
@@ -432,9 +432,7 @@ main(int argc, char **argv)
 		sprintf(sysctl_name, "kern.cam.da.%s.trim_enabled",
 		    dev_name);
 
-		sysctlbyname(sysctl_name, &trim_enabled, &olen, NULL, 0);
-
-		if(errno == ENOENT) {
+		if (sysctlbyname(sysctl_name, &trim_enabled, &olen, NULL, 0) < 0) {
 			printf("Device:%s does not support the TRIM command\n",
 			    special);
 			usage();

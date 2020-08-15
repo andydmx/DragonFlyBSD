@@ -80,9 +80,12 @@
 #include <sys/time.h>
 #include <sys/malloc.h>
 #include <sys/spinlock.h>
+#include <sys/kbio.h>
+#include <sys/ctype.h>
+#include <sys/limits.h>
+
 #include <sys/thread2.h>
 #include <sys/spinlock2.h>
-#include <sys/ctype.h>
 
 #include <machine/cpu.h>
 #include <machine/cpufunc.h>
@@ -99,6 +102,20 @@
 #define KTR_ENTRIES_MASK	(KTR_ENTRIES - 1)
 
 /*
+ * Used by earlier boot; default value consumes ~64K BSS.
+ *
+ * NOTE:
+ * We use a small value here; this prevents kernel or module loading
+ * failure due to excessive BSS usage if KTR_ENTRIES is large.
+ */
+#if (KTR_ENTRIES < 256)
+#define KTR_ENTRIES_BOOT0	KTR_ENTRIES
+#else
+#define KTR_ENTRIES_BOOT0	256
+#endif
+#define KTR_ENTRIES_BOOT0_MASK	(KTR_ENTRIES_BOOT0 - 1)
+
+/*
  * test logging support.  When ktr_testlogcnt is non-zero each synchronization
  * interrupt will issue six back-to-back ktr logging messages on cpu 0
  * so the user can determine KTR logging overheads.
@@ -108,19 +125,45 @@
 #endif
 KTR_INFO_MASTER(testlog);
 #if KTR_TESTLOG
-KTR_INFO(KTR_TESTLOG, testlog, test1, 0, "test1 %d %d %d %d", int dummy1, int dummy2, int dummy3, int dummy4);
-KTR_INFO(KTR_TESTLOG, testlog, test2, 1, "test2 %d %d %d %d", int dummy1, int dummy2, int dummy3, int dummy4);
-KTR_INFO(KTR_TESTLOG, testlog, test3, 2, "test3 %d %d %d %d", int dummy1, int dummy2, int dummy3, int dummy4);
-KTR_INFO(KTR_TESTLOG, testlog, test4, 3, "test4");
-KTR_INFO(KTR_TESTLOG, testlog, test5, 4, "test5");
-KTR_INFO(KTR_TESTLOG, testlog, test6, 5, "test6");
-KTR_INFO(KTR_TESTLOG, testlog, pingpong, 6, "pingpong");
-KTR_INFO(KTR_TESTLOG, testlog, pipeline, 7, "pipeline");
-KTR_INFO(KTR_TESTLOG, testlog, crit_beg, 8, "crit_beg");
-KTR_INFO(KTR_TESTLOG, testlog, crit_end, 9, "crit_end");
-KTR_INFO(KTR_TESTLOG, testlog, spin_beg, 10, "spin_beg");
-KTR_INFO(KTR_TESTLOG, testlog, spin_end, 11, "spin_end");
-#define logtest(name)	KTR_LOG(testlog_ ## name, 0, 0, 0, 0)
+KTR_INFO(KTR_TESTLOG, testlog, charfmt, 0,
+    "charfmt %hhd %hhi %#hho %hhu %#hhx %#hhX\n",
+    signed char d1, signed char d2,
+    unsigned char d3, unsigned char d4,
+    unsigned char d5, unsigned char d6);
+KTR_INFO(KTR_TESTLOG, testlog, shortfmt, 1,
+    "shortfmt %hd %hi %#ho %hu %#hx %#hX\n",
+    short d1, short d2,
+    unsigned short d3, unsigned short d4,
+    unsigned short d5, unsigned short d6);
+KTR_INFO(KTR_TESTLOG, testlog, longfmt, 2,
+    "longfmt %ld %li %#lo %lu %#lx %#lX\n",
+    long d1, long d2,
+    unsigned long d3, unsigned long d4,
+    unsigned long d5, unsigned long d6);
+KTR_INFO(KTR_TESTLOG, testlog, longlongfmt, 3,
+    "longlongfmt %lld %lli %#llo %llu %#llx %#llX\n",
+    long long d1, long long d2,
+    unsigned long long d3, unsigned long long d4,
+    unsigned long long d5, unsigned long long d6);
+KTR_INFO(KTR_TESTLOG, testlog, intmaxfmt, 4,
+    "intmaxfmt %jd %ji %#jo %ju %#jx %#jX\n",
+    intmax_t d1, intmax_t d2,
+    uintmax_t d3, uintmax_t d4,
+    uintmax_t d5, uintmax_t d6);
+KTR_INFO(KTR_TESTLOG, testlog, ptrdifffmt, 5,
+    "ptrdifffmt %td %ti\n",
+    ptrdiff_t d1, ptrdiff_t d2);
+KTR_INFO(KTR_TESTLOG, testlog, sizefmt, 6,
+    "sizefmt %zd %zi %#zo %zu %#zx %#zX\n",
+    ssize_t d1, ssize_t d2,
+    size_t d3, size_t d4,
+    size_t d5, size_t d6);
+KTR_INFO(KTR_TESTLOG, testlog, pingpong, 17, "pingpong");
+KTR_INFO(KTR_TESTLOG, testlog, pipeline, 18, "pipeline");
+KTR_INFO(KTR_TESTLOG, testlog, crit_beg, 19, "crit_beg");
+KTR_INFO(KTR_TESTLOG, testlog, crit_end, 20, "crit_end");
+KTR_INFO(KTR_TESTLOG, testlog, spin_beg, 21, "spin_beg");
+KTR_INFO(KTR_TESTLOG, testlog, spin_end, 22, "spin_end");
 #define logtest_noargs(name)	KTR_LOG(testlog_ ## name)
 #endif
 
@@ -128,11 +171,12 @@ MALLOC_DEFINE(M_KTR, "ktr", "ktr buffers");
 
 SYSCTL_NODE(_debug, OID_AUTO, ktr, CTLFLAG_RW, 0, "ktr");
 
-int		ktr_entries = KTR_ENTRIES;
+static int	ktr_entries = KTR_ENTRIES_BOOT0;
 SYSCTL_INT(_debug_ktr, OID_AUTO, entries, CTLFLAG_RD, &ktr_entries, 0,
     "Size of the event buffer");
+static int	ktr_entries_mask = KTR_ENTRIES_BOOT0_MASK;
 
-int		ktr_version = KTR_VERSION;
+static int	ktr_version = KTR_VERSION;
 SYSCTL_INT(_debug_ktr, OID_AUTO, version, CTLFLAG_RD, &ktr_version, 0, "");
 
 static int	ktr_stacktrace = 1;
@@ -158,7 +202,7 @@ SYSCTL_INT(_debug_ktr, OID_AUTO, testspincnt, CTLFLAG_RW, &ktr_testspincnt, 0, "
  * Give cpu0 a static buffer so the tracepoint facility can be used during
  * early boot (note however that we still use a critical section, XXX).
  */
-static struct	ktr_entry ktr_buf0[KTR_ENTRIES];
+static struct	ktr_entry ktr_buf0[KTR_ENTRIES_BOOT0];
 
 struct ktr_cpu ktr_cpu[MAXCPU] = {
 	{ .core.ktr_buf = &ktr_buf0[0] }
@@ -184,11 +228,19 @@ ktr_sysinit(void *dummy)
 	struct ktr_cpu_core *kcpu;
 	int i;
 
-	for(i = 1; i < ncpus; ++i) {
+	for (i = 0; i < ncpus; ++i) {
 		kcpu = &ktr_cpu[i].core;
 		kcpu->ktr_buf = kmalloc(KTR_ENTRIES * sizeof(struct ktr_entry),
 					M_KTR, M_WAITOK | M_ZERO);
+		if (i == 0) {
+			/* Migrate ktrs on CPU0 to the new location */
+			memcpy(kcpu->ktr_buf, ktr_buf0, sizeof(ktr_buf0));
+		}
 	}
+	cpu_sfence();
+	ktr_entries = KTR_ENTRIES;
+	ktr_entries_mask = KTR_ENTRIES_MASK;
+
 	callout_init_mp(&ktr_resync_callout);
 	callout_reset(&ktr_resync_callout, hz / 10, ktr_resync_callback, NULL);
 }
@@ -235,12 +287,32 @@ ktr_resync_callback(void *dummy __unused)
 	if (ktr_testlogcnt) {
 		--ktr_testlogcnt;
 		cpu_disable_intr();
-		logtest(test1);
-		logtest(test2);
-		logtest(test3);
-		logtest_noargs(test4);
-		logtest_noargs(test5);
-		logtest_noargs(test6);
+		KTR_LOG(testlog_charfmt,
+		    (signed char)UCHAR_MAX, (signed char)UCHAR_MAX,
+		    (unsigned char)-1, (unsigned char)-1,
+		    (unsigned char)-1, (unsigned char)-1);
+		KTR_LOG(testlog_shortfmt,
+		    (short)USHRT_MAX, (short)USHRT_MAX,
+		    (unsigned short)-1, (unsigned short)-1,
+		    (unsigned short)-1, (unsigned short)-1);
+		KTR_LOG(testlog_longfmt,
+		    (long)ULONG_MAX, (long)ULONG_MAX,
+		    (unsigned long)-1, (unsigned long)-1,
+		    (unsigned long)-1, (unsigned long)-1);
+		KTR_LOG(testlog_longlongfmt,
+		    (long long)ULLONG_MAX, (long long)ULLONG_MAX,
+		    (unsigned long long)-1, (unsigned long long)-1,
+		    (unsigned long long)-1, (unsigned long long)-1);
+		KTR_LOG(testlog_intmaxfmt,
+		    (intmax_t)UINTMAX_MAX, (intmax_t)UINTMAX_MAX,
+		    (uintmax_t)-1, (uintmax_t)-1,
+		    (uintmax_t)-1, (uintmax_t)-1);
+		KTR_LOG(testlog_ptrdifffmt,
+		    (ptrdiff_t)PTRDIFF_MAX, (ptrdiff_t)PTRDIFF_MAX);
+		KTR_LOG(testlog_sizefmt,
+		    (ssize_t)SIZE_T_MAX, (ssize_t)SIZE_T_MAX,
+		    (size_t)-1, (size_t)-1,
+		    (size_t)-1, (size_t)-1);
 		cpu_enable_intr();
 	}
 
@@ -383,12 +455,32 @@ ktr_resync_callback(void *dummy __unused)
 	if (ktr_testlogcnt) {
 		--ktr_testlogcnt;
 		cpu_disable_intr();
-		logtest(test1);
-		logtest(test2);
-		logtest(test3);
-		logtest_noargs(test4);
-		logtest_noargs(test5);
-		logtest_noargs(test6);
+		KTR_LOG(testlog_charfmt,
+		    (signed char)UCHAR_MAX, (signed char)UCHAR_MAX,
+		    (unsigned char)-1, (unsigned char)-1,
+		    (unsigned char)-1, (unsigned char)-1);
+		KTR_LOG(testlog_shortfmt,
+		    (short)USHRT_MAX, (short)USHRT_MAX,
+		    (unsigned short)-1, (unsigned short)-1,
+		    (unsigned short)-1, (unsigned short)-1);
+		KTR_LOG(testlog_longfmt,
+		    (long)ULONG_MAX, (long)ULONG_MAX,
+		    (unsigned long)-1, (unsigned long)-1,
+		    (unsigned long)-1, (unsigned long)-1);
+		KTR_LOG(testlog_longlongfmt,
+		    (long long)ULLONG_MAX, (long long)ULLONG_MAX,
+		    (unsigned long long)-1, (unsigned long long)-1,
+		    (unsigned long long)-1, (unsigned long long)-1);
+		KTR_LOG(testlog_intmaxfmt,
+		    (intmax_t)UINTMAX_MAX, (intmax_t)UINTMAX_MAX,
+		    (uintmax_t)-1, (uintmax_t)-1,
+		    (uintmax_t)-1, (uintmax_t)-1);
+		KTR_LOG(testlog_ptrdifffmt,
+		    (ptrdiff_t)PTRDIFF_MAX, (ptrdiff_t)PTRDIFF_MAX);
+		KTR_LOG(testlog_sizefmt,
+		    (ssize_t)SIZE_T_MAX, (ssize_t)SIZE_T_MAX,
+		    (size_t)-1, (size_t)-1,
+		    (size_t)-1, (size_t)-1);
 		cpu_enable_intr();
 	}
 	callout_reset(&ktr_resync_callout, hz / 10, ktr_resync_callback, NULL);
@@ -416,7 +508,7 @@ ktr_begin_write_entry(struct ktr_info *info, const char *file, int line)
 		return NULL;
 
 	crit_enter();
-	entry = kcpu->ktr_buf + (kcpu->ktr_idx & KTR_ENTRIES_MASK);
+	entry = kcpu->ktr_buf + (kcpu->ktr_idx & ktr_entries_mask);
 	++kcpu->ktr_idx;
 #ifdef _RDTSC_SUPPORTED_
 	if (cpu_feature & CPUID_TSC) {
@@ -475,7 +567,7 @@ DB_SHOW_COMMAND(ktr, db_ktr_all)
 	for(i = 0; i < ncpus; i++) {
 		kcpu = &ktr_cpu[i].core;
 		tstate[i].first = -1;
-		tstate[i].cur = (kcpu->ktr_idx - 1) & KTR_ENTRIES_MASK;
+		tstate[i].cur = (kcpu->ktr_idx - 1) & ktr_entries_mask;
 	}
 	db_ktr_verbose = 0;
 	while ((c = *(modif++)) != '\0') {
@@ -505,17 +597,21 @@ DB_SHOW_COMMAND(ktr, db_ktr_all)
 		return;
 	}
 	/*
-	 * Lopp throug all the buffers and print the content of them, sorted
+	 * Loop throug all the buffers and print the content of them, sorted
 	 * by the timestamp.
 	 */
 	while (1) {
 		int counter;
 		u_int64_t highest_ts;
-		int highest_cpu;
 		struct ktr_entry *kp;
+		int highest_cpu;
+		int c;
 
-		if (a_flag == 1 && cncheckc() != -1)
-			return;
+		if (a_flag == 1) {
+			c = cncheckc();
+			if (c != -1 && c != NOKEY)
+				return;
+		}
 		highest_ts = 0;
 		highest_cpu = -1;
 		/*
@@ -550,7 +646,7 @@ DB_SHOW_COMMAND(ktr, db_ktr_all)
 		if (tstate[i].first == -1)
 			tstate[i].first = tstate[i].cur;
 		if (--tstate[i].cur < 0)
-			tstate[i].cur = KTR_ENTRIES - 1;
+			tstate[i].cur = ktr_entries - 1;
 		if (tstate[i].first == tstate[i].cur) {
 			db_mach_vtrace(i, kp, tstate[i].cur + 1);
 			tstate[i].cur = -1;
@@ -578,10 +674,6 @@ db_mach_vtrace(int cpu, struct ktr_entry *kp, int idx)
 	}
 	db_printf("%s\t", kp->ktr_info->kf_name);
 	db_printf("from(%p,%p) ", kp->ktr_caller1, kp->ktr_caller2);
-#ifdef __i386__
-	if (kp->ktr_info->kf_format)
-		db_vprintf(kp->ktr_info->kf_format, (__va_list)kp->ktr_data);
-#endif
 	db_printf("\n");
 
 	return(1);

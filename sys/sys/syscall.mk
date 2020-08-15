@@ -10,6 +10,7 @@ MIASM =  \
 	open.o \
 	close.o \
 	wait4.o \
+	__nosys.o \
 	link.o \
 	unlink.o \
 	chdir.o \
@@ -109,9 +110,6 @@ MIASM =  \
 	statfs.o \
 	fstatfs.o \
 	getfh.o \
-	getdomainname.o \
-	setdomainname.o \
-	uname.o \
 	sysarch.o \
 	rtprio.o \
 	extpread.o \
@@ -223,7 +221,7 @@ MIASM =  \
 	getresgid.o \
 	kqueue.o \
 	kevent.o \
-	sctp_peeloff.o \
+	kenv.o \
 	lchflags.o \
 	uuidgen.o \
 	sendfile.o \
@@ -300,4 +298,19 @@ MIASM =  \
 	lpathconf.o \
 	vmm_guest_ctl.o \
 	vmm_guest_sync_addr.o \
-	procctl.o
+	procctl.o \
+	chflagsat.o \
+	pipe2.o \
+	utimensat.o \
+	futimens.o \
+	accept4.o \
+	lwp_setname.o \
+	ppoll.o \
+	lwp_setaffinity.o \
+	lwp_getaffinity.o \
+	lwp_create2.o \
+	getcpuclockid.o \
+	wait6.o \
+	lwp_getname.o \
+	getrandom.o \
+	__realpath.o

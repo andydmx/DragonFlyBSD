@@ -33,21 +33,15 @@
 #include <sys/param.h>
 #include <sys/linker.h>
 #include <machine/metadata.h>
+#include <machine/pc/bios.h>
+#include <machine/psl.h>
 #include "bootstrap.h"
 #include "libi386.h"
 #include "btxv86.h"
 
-#define SMAPSIG	0x534D4150
+static struct bios_smap smap;
 
-struct smap {
-	u_int64_t	base;
-	u_int64_t	length;
-	u_int32_t	type;
-} __packed;
-
-static struct smap smap;
-
-static struct smap *smapbase;
+static struct bios_smap *smapbase;
 static int smaplen;
 
 void
@@ -63,12 +57,12 @@ bios_getsmap(void)
 		v86.ctl = V86_FLAGS;
 		v86.addr = 0x15;		/* int 0x15 function 0xe820*/
 		v86.eax = 0xe820;
-		v86.ecx = sizeof(struct smap);
-		v86.edx = SMAPSIG;
+		v86.ecx = sizeof(struct bios_smap);
+		v86.edx = SMAP_SIG;
 		v86.es = VTOPSEG(&smap);
 		v86.edi = VTOPOFF(&smap);
 		v86int();
-		if ((v86.efl & 1) || (v86.eax != SMAPSIG))
+		if ((v86.efl & PSL_C) || (v86.eax != SMAP_SIG))
 			break;
 		n++;
 	} while (v86.ebx != 0);
@@ -83,13 +77,45 @@ bios_getsmap(void)
 		v86.ctl = V86_FLAGS;
 		v86.addr = 0x15;		/* int 0x15 function 0xe820*/
 		v86.eax = 0xe820;
-		v86.ecx = sizeof(struct smap);
-		v86.edx = SMAPSIG;
-		v86.es = VTOPSEG(&smapbase[smaplen]);
-		v86.edi = VTOPOFF(&smapbase[smaplen]);
+		v86.ecx = sizeof(struct bios_smap);
+		v86.edx = SMAP_SIG;
+		v86.es = VTOPSEG(&smap);
+		v86.edi = VTOPOFF(&smap);
 		v86int();
-		smaplen++;
-		if ((v86.efl & 1) || (v86.eax != SMAPSIG))
+
+		/*
+		 * Our heap is now in high memory and must be removed from
+		 * the smap so the kernel does not blow away passed-in
+		 * arguments, smap, kenv, etc.
+		 *
+		 * This wastes a little memory.
+		 */
+		if (smap.type == SMAP_TYPE_MEMORY &&
+		    smap.base + smap.length > heapbase &&
+		    smap.base < memtop) {
+			if (smap.base <= heapbase) {
+				if (heapbase - smap.base) {
+					smapbase[smaplen] = smap;
+					smapbase[smaplen].length =
+						heapbase - smap.base;
+					++smaplen;
+				}
+			}
+			if (smap.base + smap.length >= memtop) {
+				if (smap.base + smap.length - memtop) {
+					smapbase[smaplen] = smap;
+					smapbase[smaplen].base = memtop;
+					smapbase[smaplen].length =
+						smap.base + smap.length -
+						memtop;
+					++smaplen;
+				}
+			}
+		} else {
+			smapbase[smaplen] = smap;
+			++smaplen;
+		}
+		if ((v86.efl & PSL_C) || (v86.eax != SMAP_SIG))
 			break;
 	} while (v86.ebx != 0 && smaplen < n);
 }

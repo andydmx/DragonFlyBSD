@@ -41,7 +41,7 @@ client_init(void)
 {
 }
 
-int
+void
 client_main(struct server_info **info_ary, int count)
 {
     struct server_info *best_off;
@@ -489,7 +489,7 @@ client_manage_polling_mode(struct server_info *info, int *didreconnect)
 	    ) {
 		logdebuginfo(info, 2, 
 		    "WARNING: Unable to shift this source to "
-		    "maintenance mode.  Target correlation is aweful\n");
+		    "maintenance mode.  Target correlation is awful\n");
 	    }
 	    break;
 	}

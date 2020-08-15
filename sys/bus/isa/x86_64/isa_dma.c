@@ -13,11 +13,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -94,36 +90,44 @@ static int dmapageport[8] = { 0x87, 0x83, 0x81, 0x82, 0x8f, 0x8b, 0x89, 0x8a };
 /*
  * Setup a DMA channel's bounce buffer.
  */
-void
-isa_dmainit(int chan, u_int bouncebufsize)
+int
+isa_dma_init(int chan, u_int bouncebufsize, int flags)
 {
 	void *buf;
 
 #ifdef DIAGNOSTIC
 	if (chan & ~VALID_DMA_MASK)
-		panic("isa_dmainit: channel out of range");
+		panic("isa_dma_init: channel out of range");
 
 	if (dma_bouncebuf[chan] != NULL)
-		panic("isa_dmainit: impossible request"); 
+		panic("isa_dma_init: impossible request");
 #endif
 
-	dma_bouncebufsize[chan] = bouncebufsize;
-
 	/* Try malloc() first.  It works better if it works. */
-	buf = kmalloc(bouncebufsize, M_DEVBUF, M_NOWAIT);
+	buf = kmalloc(bouncebufsize, M_DEVBUF, flags);
 	if (buf != NULL) {
-		if (isa_dmarangecheck(buf, bouncebufsize, chan) == 0) {
-			dma_bouncebuf[chan] = buf;
-			return;
+		if (isa_dmarangecheck(buf, bouncebufsize, chan) != 0) {
+			kfree(buf, M_DEVBUF);
+			buf = NULL;
+			if (bootverbose)
+				kprintf("isa_dma_init: kmalloc rejected\n");
 		}
-		kfree(buf, M_DEVBUF);
 	}
-	buf = contigmalloc(bouncebufsize, M_DEVBUF, M_NOWAIT, 0ul, 0xfffffful,
-			   1ul, chan & 4 ? 0x20000ul : 0x10000ul);
-	if (buf == NULL)
-		kprintf("isa_dmainit(%d, %d) failed\n", chan, bouncebufsize);
-	else
-		dma_bouncebuf[chan] = buf;
+
+	if (buf == NULL) {
+		buf = contigmalloc(bouncebufsize, M_DEVBUF, flags, 0ul, 0xfffffful,
+				   1ul, chan & 4 ? 0x20000ul : 0x10000ul);
+	}
+
+	if (buf == NULL) {
+		kprintf("isa_dma_init(%d, %d) failed\n", chan, bouncebufsize);
+		return ENOMEM;
+	}
+
+	dma_bouncebufsize[chan] = bouncebufsize;
+	dma_bouncebuf[chan] = buf;
+
+	return 0;
 }
 
 /*
@@ -248,7 +252,7 @@ isa_dmastart(int flags, caddr_t addr, u_int nbytes, int chan)
 	}
 
 	/* translate to physical */
-	phys = pmap_extract(&kernel_pmap, (vm_offset_t)addr);
+	phys = pmap_kextract((vm_offset_t)addr);
 
 	if (flags & ISADMA_RAW) {
 	    dma_auto_mode |= (1 << chan);
@@ -370,7 +374,7 @@ isa_dmarangecheck(caddr_t va, u_int length, int chan)
 
 	endva = (vm_offset_t)round_page((vm_offset_t)va + length);
 	for (; va < (caddr_t) endva ; va += PAGE_SIZE) {
-		phys = trunc_page(pmap_extract(&kernel_pmap, (vm_offset_t)va));
+		phys = trunc_page(pmap_kextract((vm_offset_t)va));
 #define ISARAM_END	RAM_END
 		if (phys == 0)
 			panic("isa_dmacheck: no physical page present");

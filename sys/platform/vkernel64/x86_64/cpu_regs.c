@@ -39,16 +39,14 @@
  * $FreeBSD: src/sys/i386/i386/machdep.c,v 1.385.2.30 2003/05/31 08:48:05 alc Exp $
  */
 
-#include "opt_compat.h"
 #include "opt_ddb.h"
-#include "opt_directio.h"
 #include "opt_inet.h"
 #include "opt_msgbuf.h"
 #include "opt_swap.h"
 
 #include <sys/param.h>
 #include <sys/systm.h>
-#include <sys/sysproto.h>
+#include <sys/sysmsg.h>
 #include <sys/signalvar.h>
 #include <sys/kernel.h>
 #include <sys/linker.h>
@@ -76,9 +74,7 @@
 #include <vm/vm_extern.h>
 
 #include <sys/thread2.h>
-#include <sys/mplock2.h>
 
-#include <sys/user.h>
 #include <sys/exec.h>
 #include <sys/cons.h>
 
@@ -88,12 +84,10 @@
 #include <machine/clock.h>
 #include <machine/specialreg.h>
 #include <machine/md_var.h>
-#include <machine/pcb_ext.h>		/* pcb.h included via sys/user.h */
+#include <machine/pcb.h>
+#include <machine/pcb_ext.h>
 #include <machine/globaldata.h>		/* CPU_prvspace */
 #include <machine/smp.h>
-#ifdef PERFMON
-#include <machine/perfmon.h>
-#endif
 #include <machine/cputypes.h>
 
 #include <bus/isa/rtc.h>
@@ -101,15 +95,11 @@
 #include <sys/ptrace.h>
 #include <machine/sigframe.h>
 #include <unistd.h>		/* umtx_* functions */
-#include <pthread.h>		/* pthread_yield() */
 
 extern void dblfault_handler (void);
 
 static void set_fpregs_xmm (struct save87 *, struct savexmm *);
 static void fill_fpregs_xmm (struct savexmm *, struct save87 *);
-#ifdef DIRECTIO
-extern void ffs_rawread_setup(void);
-#endif /* DIRECTIO */
 
 int64_t tsc_offsets[MAXCPU];
 
@@ -125,8 +115,10 @@ static int
 sysctl_hw_physmem(SYSCTL_HANDLER_ARGS)
 {
 	u_long pmem = ctob(physmem);
+	int error;
 
-	int error = sysctl_handle_long(oidp, &pmem, 0, req);
+	error = sysctl_handle_long(oidp, &pmem, 0, req);
+
 	return (error);
 }
 
@@ -136,62 +128,18 @@ SYSCTL_PROC(_hw, HW_PHYSMEM, physmem, CTLTYPE_ULONG|CTLFLAG_RD,
 static int
 sysctl_hw_usermem(SYSCTL_HANDLER_ARGS)
 {
-	/* JG */
-	int error = sysctl_handle_int(oidp, 0,
-		ctob((int)Maxmem - vmstats.v_wire_count), req);
+	u_long usermem = ctob(Maxmem - vmstats.v_wire_count);
+	int error;
+
+	error = sysctl_handle_long(oidp, &usermem, 0, req);
+
 	return (error);
 }
 
-SYSCTL_PROC(_hw, HW_USERMEM, usermem, CTLTYPE_INT|CTLFLAG_RD,
-	0, 0, sysctl_hw_usermem, "IU", "");
+SYSCTL_PROC(_hw, HW_USERMEM, usermem, CTLTYPE_ULONG|CTLFLAG_RD,
+	0, 0, sysctl_hw_usermem, "LU", "");
 
 SYSCTL_ULONG(_hw, OID_AUTO, availpages, CTLFLAG_RD, &Maxmem, 0, "");
-
-#if 0
-
-static int
-sysctl_machdep_msgbuf(SYSCTL_HANDLER_ARGS)
-{
-	int error;
-
-	/* Unwind the buffer, so that it's linear (possibly starting with
-	 * some initial nulls).
-	 */
-	error=sysctl_handle_opaque(oidp,msgbufp->msg_ptr+msgbufp->msg_bufr,
-		msgbufp->msg_size-msgbufp->msg_bufr,req);
-	if(error) return(error);
-	if(msgbufp->msg_bufr>0) {
-		error=sysctl_handle_opaque(oidp,msgbufp->msg_ptr,
-			msgbufp->msg_bufr,req);
-	}
-	return(error);
-}
-
-SYSCTL_PROC(_machdep, OID_AUTO, msgbuf, CTLTYPE_STRING|CTLFLAG_RD,
-	0, 0, sysctl_machdep_msgbuf, "A","Contents of kernel message buffer");
-
-static int msgbuf_clear;
-
-static int
-sysctl_machdep_msgbuf_clear(SYSCTL_HANDLER_ARGS)
-{
-	int error;
-	error = sysctl_handle_int(oidp, oidp->oid_arg1, oidp->oid_arg2,
-		req);
-	if (!error && req->newptr) {
-		/* Clear the buffer and reset write pointer */
-		bzero(msgbufp->msg_ptr,msgbufp->msg_size);
-		msgbufp->msg_bufr=msgbufp->msg_bufx=0;
-		msgbuf_clear=0;
-	}
-	return (error);
-}
-
-SYSCTL_PROC(_machdep, OID_AUTO, msgbuf_clear, CTLTYPE_INT|CTLFLAG_RW,
-	&msgbuf_clear, 0, sysctl_machdep_msgbuf_clear, "I",
-	"Clear kernel message buffer");
-
-#endif
 
 /*
  * Send an interrupt to process.
@@ -223,7 +171,8 @@ sendsig(sig_t catcher, int sig, sigset_t *mask, u_long code)
 	sf.sf_uc.uc_stack = lp->lwp_sigstk;
 	sf.sf_uc.uc_mcontext.mc_onstack = oonstack;
 	KKASSERT(__offsetof(struct trapframe, tf_rdi) == 0);
-	bcopy(regs, &sf.sf_uc.uc_mcontext.mc_rdi, sizeof(struct trapframe));
+	/* gcc8 craps out on -Warray-bounds w/ optimized bcopy */
+	_bcopy(regs, &sf.sf_uc.uc_mcontext.mc_rdi, sizeof(struct trapframe));
 
 	/* Make the size of the saved context visible to userland */
 	sf.sf_uc.uc_mcontext.mc_len = sizeof(sf.sf_uc.uc_mcontext);
@@ -231,8 +180,8 @@ sendsig(sig_t catcher, int sig, sigset_t *mask, u_long code)
 	/* Allocate and validate space for the signal handler context. */
         if ((lp->lwp_flags & LWP_ALTSTACK) != 0 && !oonstack &&
 	    SIGISMEMBER(psp->ps_sigonstack, sig)) {
-		sp = (char *)(lp->lwp_sigstk.ss_sp + lp->lwp_sigstk.ss_size -
-			      sizeof(struct sigframe));
+		sp = (char *)lp->lwp_sigstk.ss_sp + lp->lwp_sigstk.ss_size -
+		    sizeof(struct sigframe);
 		lp->lwp_sigstk.ss_flags |= SS_ONSTACK;
 	} else {
 		/* We take red zone into account */
@@ -268,6 +217,8 @@ sendsig(sig_t catcher, int sig, sigset_t *mask, u_long code)
 
 		/* fill siginfo structure */
 		sf.sf_si.si_signo = sig;
+		sf.sf_si.si_pid = psp->ps_frominfo[sig].pid;
+		sf.sf_si.si_uid = psp->ps_frominfo[sig].uid;
 		sf.sf_si.si_code = code;
 		sf.sf_si.si_addr = (void *)regs->tf_addr;
 	} else {
@@ -329,10 +280,11 @@ sendsig(sig_t catcher, int sig, sigset_t *mask, u_long code)
 	}
 
 	regs->tf_rsp = (register_t)sfp;
-	regs->tf_rip = PS_STRINGS - *(p->p_sysent->sv_szsigcode);
+	regs->tf_rip = trunc_page64(PS_STRINGS - *(p->p_sysent->sv_szsigcode));
+	regs->tf_rip -= SZSIGCODE_EXTRA_BYTES;
 
 	/*
-	 * i386 abi specifies that the direction flag must be cleared
+	 * x86 abi specifies that the direction flag must be cleared
 	 * on function entry
 	 */
 	regs->tf_rflags &= ~(PSL_T|PSL_D);
@@ -391,7 +343,7 @@ cpu_sanitize_tls(struct savetls *tls)
 #define	CS_SECURE(cs)		(ISPL(cs) == SEL_UPL)
 
 int
-sys_sigreturn(struct sigreturn_args *uap)
+sys_sigreturn(struct sysmsg *sysmsg, const struct sigreturn_args *uap)
 {
 	struct lwp *lp = curthread->td_lwp;
 	struct trapframe *regs;
@@ -516,15 +468,9 @@ sys_sigreturn(struct sigreturn_args *uap)
  * Note on cpu_idle_hlt:  On an SMP system we rely on a scheduler IPI
  * to wake a HLTed cpu up.
  */
-static int	cpu_idle_hlt = 1;
-static int	cpu_idle_hltcnt;
-static int	cpu_idle_spincnt;
+__read_mostly static int	cpu_idle_hlt = 1;
 SYSCTL_INT(_machdep, OID_AUTO, cpu_idle_hlt, CTLFLAG_RW,
     &cpu_idle_hlt, 0, "Idle loop HLT enable");
-SYSCTL_INT(_machdep, OID_AUTO, cpu_idle_hltcnt, CTLFLAG_RW,
-    &cpu_idle_hltcnt, 0, "Idle loop entry halts");
-SYSCTL_INT(_machdep, OID_AUTO, cpu_idle_spincnt, CTLFLAG_RW,
-    &cpu_idle_spincnt, 0, "Idle loop entry spins");
 
 void
 cpu_idle(void)
@@ -572,11 +518,9 @@ cpu_idle(void)
 				}
 #endif
 			}
-			++cpu_idle_hltcnt;
 		} else {
 			splz();
 			__asm __volatile("pause");
-			++cpu_idle_spincnt;
 		}
 	}
 }
@@ -605,7 +549,6 @@ exec_setregs(u_long entry, u_long stack, u_long ps_strings)
 	struct pcb *pcb = td->td_pcb;
 	struct trapframe *regs = lp->lwp_md.md_regs;
 
-	/* was i386_user_cleanup() in NetBSD */
 	user_ldt_free(pcb);
 
 	bzero((char *)regs, sizeof(struct trapframe));
@@ -660,7 +603,7 @@ exec_setregs(u_long entry, u_long stack, u_long ps_strings)
 
 	/*
 	 * NOTE: The MSR values must be correct so we can return to
-	 * 	 userland.  gd_user_fs/gs must be correct so the switch
+	 *	 userland.  gd_user_fs/gs must be correct so the switch
 	 *	 code knows what the current MSR values are.
 	 */
 	pcb->pcb_fsbase = 0;	/* Values loaded from PCB on switch */
@@ -705,12 +648,8 @@ sysctl_machdep_adjkerntz(SYSCTL_HANDLER_ARGS)
 SYSCTL_PROC(_machdep, CPU_ADJKERNTZ, adjkerntz, CTLTYPE_INT|CTLFLAG_RW,
 	&adjkerntz, 0, sysctl_machdep_adjkerntz, "I", "");
 
-extern u_long bootdev;		/* not a cdev_t - encoding is different */
-SYSCTL_ULONG(_machdep, OID_AUTO, guessed_bootdev,
-	CTLFLAG_RD, &bootdev, 0, "Boot device (not in cdev_t format)");
-
 /*
- * Initialize 386 and configure to run kernel
+ * Initialize x86 and configure to run kernel
  */
 
 /*
@@ -728,10 +667,6 @@ extern inthand_t
 	IDTVEC(page), IDTVEC(mchk), IDTVEC(rsvd), IDTVEC(fpu), IDTVEC(align),
 	IDTVEC(xmm), IDTVEC(dblfault),
 	IDTVEC(fast_syscall), IDTVEC(fast_syscall32);
-#endif
-
-#ifdef DEBUG_INTERRUPTS
-extern inthand_t *Xrsvdary[256];
 #endif
 
 int

@@ -66,16 +66,17 @@
  * - Vlan is linked/unlinked onto parent interface's trunk using following
  *   way:
  *
- *       CPU0             CPU1             CPU2             CPU3
+ *       CPU0             CPU1              CPU2              CPU3
  *
- *      netisr0 <---------------------------------------------+
- *  (config/unconfig)                                         |
- *         |                                                  |
- *         | domsg                                            | replymsg
- *         |                                                  |
- *         V     fwdmsg           fwdmsg           fwdmsg     |
- *       ifnet0 --------> ifnet1 --------> ifnet2 --------> ifnet3
- *    (link/unlink)    (link/unlink)    (link/unlink)    (link/unlink)
+ *      netisr0 <----------------------------------------------+
+ *  (config/unconfig)                                          |
+ *         |                                                   |
+ *         | domsg                                             | replymsg
+ *         : (link/unlink)                                     |
+ *         :                                                   |
+ *         :   fwdmsg             fwdmsg            fwdmsg     |
+ *         :-----------> netisr1 --------> netisr2 --------> netisr3
+ *                    (link/unlink)     (link/unlink)     (link/unlink)
  *
  * - Parent interface's trunk is destroyed in the following lockless way:
  *
@@ -178,7 +179,7 @@ SYSCTL_NODE(_net_link_vlan, PF_LINK, link, CTLFLAG_RW, 0, "for consistency");
 static MALLOC_DEFINE(M_VLAN, "vlan", "802.1Q Virtual LAN Interface");
 static LIST_HEAD(, ifvlan) ifv_list;
 
-static int	vlan_clone_create(struct if_clone *, int, caddr_t);
+static int	vlan_clone_create(struct if_clone *, int, caddr_t, caddr_t);
 static int	vlan_clone_destroy(struct ifnet *);
 static void	vlan_ifdetach(void *, struct ifnet *);
 
@@ -442,17 +443,18 @@ vlan_ifdetach(void *arg __unused, struct ifnet *ifp)
 }
 
 static int
-vlan_clone_create(struct if_clone *ifc, int unit, caddr_t param __unused)
+vlan_clone_create(struct if_clone *ifc, int unit,
+		  caddr_t params __unused, caddr_t data __unused)
 {
 	struct ifvlan *ifv;
 	struct ifnet *ifp;
 	int vlan_size, i;
 
 	vlan_size = sizeof(struct ifvlan)
-		  + ((ncpus - 1) * sizeof(struct vlan_entry));
+		  + ((netisr_ncpus - 1) * sizeof(struct vlan_entry));
 	ifv = kmalloc(vlan_size, M_VLAN, M_WAITOK | M_ZERO);
 	SLIST_INIT(&ifv->vlan_mc_listhead);
-	for (i = 0; i < ncpus; ++i)
+	for (i = 0; i < netisr_ncpus; ++i)
 		ifv->ifv_entries[i].ifv = ifv;
 
 	crit_enter();	/* XXX not MP safe */
@@ -579,11 +581,16 @@ vlan_input(struct mbuf *m)
 	struct ifnet *rcvif;
 	struct vlan_trunk *vlantrunks;
 	struct vlan_entry *entry;
+	int cpuid = mycpuid;
+
+	ASSERT_NETISR_NCPUS(cpuid);
 
 	rcvif = m->m_pkthdr.rcvif;
 	KKASSERT(m->m_flags & M_VLANTAG);
 
 	vlantrunks = rcvif->if_vlantrunks;
+	/* Make sure 'vlantrunks' is really used. */
+	cpu_ccfence();
 	if (vlantrunks == NULL) {
 		IFNET_STAT_INC(rcvif, noproto, 1);
 		m_freem(m);
@@ -591,7 +598,7 @@ vlan_input(struct mbuf *m)
 	}
 
 	crit_enter();	/* XXX Necessary? */
-	LIST_FOREACH(entry, &vlantrunks[mycpuid].vlan_list, ifv_link) {
+	LIST_FOREACH(entry, &vlantrunks[cpuid].vlan_list, ifv_link) {
 		if (entry->ifv->ifv_tag ==
 		    EVL_VLANOFTAG(m->m_pkthdr.ether_vlantag)) {
 			ifv = entry->ifv;
@@ -642,7 +649,7 @@ vlan_link_dispatch(netmsg_t msg)
 	LIST_INSERT_HEAD(&trunk->vlan_list, entry, ifv_link);
 	crit_exit();
 
-	ifnet_forwardmsg(&vmsg->base.lmsg, cpu + 1);
+	netisr_forwardmsg(&vmsg->base, cpu + 1);
 }
 
 static void
@@ -657,9 +664,9 @@ vlan_link(struct ifvlan *ifv, struct ifnet *ifp_p)
 		struct vlan_trunk *vlantrunks;
 		int i;
 
-		vlantrunks = kmalloc(sizeof(*vlantrunks) * ncpus, M_VLAN,
+		vlantrunks = kmalloc(sizeof(*vlantrunks) * netisr_ncpus, M_VLAN,
 				     M_WAITOK | M_ZERO);
-		for (i = 0; i < ncpus; ++i)
+		for (i = 0; i < netisr_ncpus; ++i)
 			LIST_INIT(&vlantrunks[i].vlan_list);
 
 		ifp_p->if_vlantrunks = vlantrunks;
@@ -672,7 +679,7 @@ vlan_link(struct ifvlan *ifv, struct ifnet *ifp_p)
 	vmsg.nv_ifv = ifv;
 	vmsg.nv_ifp_p = ifp_p;
 
-	ifnet_domsg(&vmsg.base.lmsg, 0);
+	netisr_domsg(&vmsg.base, 0);
 }
 
 static void
@@ -686,7 +693,7 @@ vlan_config_dispatch(netmsg_t msg)
 
 	/* Assert in netisr0 */
 
-	ifp_p = ifunit(vmsg->nv_parent_name);
+	ifp_p = ifunit_netisr(vmsg->nv_parent_name);
 	if (ifp_p == NULL) {
 		error = ENOENT;
 		goto reply;
@@ -800,7 +807,7 @@ vlan_unlink_dispatch(netmsg_t msg)
 	LIST_REMOVE(entry, ifv_link);
 	crit_exit();
 
-	ifnet_forwardmsg(&vmsg->base.lmsg, cpu + 1);
+	netisr_forwardmsg(&vmsg->base, cpu + 1);
 }
 
 static void
@@ -822,7 +829,7 @@ vlan_unlink(struct ifvlan *ifv, struct ifnet *ifp_p)
 	vmsg.nv_ifv = ifv;
 	vmsg.nv_ifp_p = ifp_p;
 
-	ifnet_domsg(&vmsg.base.lmsg, 0);
+	netisr_domsg(&vmsg.base, 0);
 
 	crit_enter();
 	if (LIST_EMPTY(&vlantrunks[mycpuid].vlan_list)) {

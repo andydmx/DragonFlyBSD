@@ -35,6 +35,7 @@
 #include <elf-hints.h>
 #include <link.h>
 #include <stdarg.h>
+#include <stdbool.h>
 #include <setjmp.h>
 #include <stddef.h>
 
@@ -47,11 +48,6 @@
 
 #define NEW(type)	((type *) xmalloc(sizeof(type)))
 #define CNEW(type)	((type *) xcalloc(1, sizeof(type)))
-
-/* We might as well do booleans like C++. */
-typedef unsigned char bool;
-#define false	0
-#define true	1
 
 extern size_t tls_last_offset;
 extern size_t tls_last_size;
@@ -158,8 +154,6 @@ typedef struct Struct_Obj_Entry {
     const Elf_Phdr *phdr;	/* Program header if it is mapped, else NULL */
     size_t phsize;		/* Size of program header in bytes */
     const char *interp;		/* Pathname of the interpreter, if any */
-    caddr_t relro_page; 	/* Address of first page of read-only data */
-    size_t relro_size;  	/* Size of relro page(s) in bytes */
     Elf_Word stack_flags;
 
     /* TLS information */
@@ -169,6 +163,9 @@ typedef struct Struct_Obj_Entry {
     size_t tlssize;		/* Size of TLS block for this module */
     size_t tlsoffset;		/* Offset of static TLS block for this module */
     size_t tlsalign;		/* Alignment of static TLS block */
+
+    caddr_t relro_page; 	/* Address of first page of read-only data */
+    size_t relro_size;  	/* Size of relro page(s) in bytes */
 
     /* Items from the dynamic section. */
     Elf_Addr *pltgot;		/* PLT or GOT, depending on architecture */
@@ -243,7 +240,7 @@ typedef struct Struct_Obj_Entry {
     bool z_noopen : 1;		/* Do not load on dlopen */
     bool z_loadfltr : 1;	/* Immediately load filtees */
     bool z_interpose : 1;	/* Interpose all objects but main */
-    bool z_nodeflib : 1;	/* Don't search default /usr/lib path */
+    bool z_nodeflib : 1;	/* Don't search default library path */
     bool ref_nodel : 1;		/* Refcount increased to prevent dlclose */
     bool init_scanned: 1;	/* Object is already on init list. */
     bool on_fini_list: 1;	/* Object is already on fini list. */
@@ -251,10 +248,14 @@ typedef struct Struct_Obj_Entry {
     bool filtees_loaded : 1;	/* Filtees loaded */
     bool irelative : 1;		/* Object has R_MACHDEP_IRELATIVE relocs */
     bool gnu_ifunc : 1;		/* Object has references to STT_GNU_IFUNC */
+    bool non_plt_gnu_ifunc : 1;	/* Object has non-plt IFUNC references */
     bool crt_no_init : 1;	/* Object's crt does not call _init/_fini */
     bool note_present : 1;	/* True if at least one PT_NOTE header found */
     bool valid_hash_sysv : 1;	/* A valid System V hash hash tag is available */
     bool valid_hash_gnu : 1;	/* A valid GNU hash tag is available */
+    bool relro_protected : 1;	/* relro section has been protected */
+    bool static_tls : 1;	/* Object wants to use static TLS space */
+    bool static_tls_copied : 1;	/* Object's static TLS space initialized */
 
     struct link_map linkmap;	/* For GDB and dlinfo() */
     Objlist dldags;		/* Object belongs to these dlopened DAGs (%) */
@@ -274,6 +275,8 @@ typedef struct Struct_Obj_Entry {
 #define SYMLOOK_DLSYM	0x02	/* Return newest versioned symbol. Used by
 				   dlsym. */
 #define	SYMLOOK_EARLY	0x04	/* Symlook is done during initialization. */
+#define	SYMLOOK_IFUNC	0x08	/* Allow IFUNC processing in
+				   reloc_non_plt(). */
 
 /* Flags for load_object(). */
 #define	RTLD_LO_NOLOAD	0x01	/* dlopen() specified RTLD_NOLOAD. */
@@ -366,6 +369,7 @@ void *allocate_module_tls(int index);
 bool allocate_tls_offset(Obj_Entry *obj);
 void free_tls_offset(Obj_Entry *obj);
 const Ver_Entry *fetch_ventry(const Obj_Entry *obj, unsigned long);
+int convert_prot(int);  /* Elf flags -> mmap protection */
 
 /*
  * MD function declarations.

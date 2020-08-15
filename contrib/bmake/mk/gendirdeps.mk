@@ -1,6 +1,7 @@
-# $Id: gendirdeps.mk,v 1.23 2013/09/04 17:49:20 sjg Exp $
+# $Id: gendirdeps.mk,v 1.44 2020/06/23 04:21:51 sjg Exp $
 
-# Copyright (c) 2010-2013, Juniper Networks, Inc.
+# Copyright (c) 2011-2020, Simon J. Gerraty
+# Copyright (c) 2010-2018, Juniper Networks, Inc.
 # All rights reserved.
 # 
 # Redistribution and use in source and binary forms, with or without
@@ -50,7 +51,7 @@ all:
 _CURDIR ?= ${.CURDIR}
 _OBJDIR ?= ${.OBJDIR}
 _OBJTOP ?= ${OBJTOP}
-_OBJROOT ?= ${OBJROOT:U${_OBJTOP}}
+_OBJROOT ?= ${OBJROOT:U${_OBJTOP:H}}
 .if ${_OBJROOT:M*/}
 _slash=/
 .else
@@ -79,10 +80,9 @@ _DIRDEPS := ${DIRDEPS:U:O:u}
 .endif
 
 META_FILES := ${META_FILES:T:O:u}
-.export META_FILES
 
 # pickup customizations
-.-include "local.gendirdeps.mk"
+.-include <local.gendirdeps.mk>
 
 # these are actually prefixes that we'll skip
 # they should all be absolute paths
@@ -91,6 +91,17 @@ SKIP_GENDIRDEPS ?=
 _skip_gendirdeps = egrep -v '^(${SKIP_GENDIRDEPS:O:u:ts|})' |
 .else
 _skip_gendirdeps =
+.endif
+
+# Below we will turn _{VAR} into ${VAR} which keeps this simple
+# GENDIRDEPS_FILTER_DIR_VARS is a list of dirs to be substiuted for.
+# GENDIRDEPS_FILTER_VARS is more general.
+# In each case order matters.
+.if !empty(GENDIRDEPS_FILTER_DIR_VARS)
+GENDIRDEPS_FILTER += ${GENDIRDEPS_FILTER_DIR_VARS:@v@S,${$v},_{${v}},@}
+.endif
+.if !empty(GENDIRDEPS_FILTER_VARS)
+GENDIRDEPS_FILTER += ${GENDIRDEPS_FILTER_VARS:@v@S,/${$v}/,/_{${v}}/,@:NS,//,*:u}
 .endif
 
 # this (*should* be set in meta.sys.mk) 
@@ -127,12 +138,16 @@ META2DEPS_CMD += -T ${TARGET_OBJ_SPEC}
 .endif
 META2DEPS_CMD += \
 	-R ${RELDIR} -H ${HOST_TARGET} \
-	${M2D_OBJROOTS:O:u:@o@-O $o@}
+	${M2D_OBJROOTS:O:u:@o@-O $o@} \
+	${M2D_EXCLUDES:O:u:@o@-X $o@} \
 
 
 M2D_OBJROOTS += ${OBJTOP} ${_OBJROOT} ${_objroot}
 .if defined(SB_OBJROOT)
 M2D_OBJROOTS += ${SB_OBJROOT}
+.endif
+.if defined(STAGE_ROOT)
+M2D_OBJROOTS += ${STAGE_ROOT}
 .endif
 .if ${.MAKE.DEPENDFILE_PREFERENCE:U${.MAKE.DEPENDFILE}:M*.${MACHINE}} == ""
 # meta2deps.py only groks objroot
@@ -145,17 +160,44 @@ META2DEPS_CMD += -S ${SB_BACKING_SB}/src
 M2D_OBJROOTS += ${SB_BACKING_SB}/${SB_OBJPREFIX}
 .endif
 
+GENDIRDEPS_SEDCMDS += \
+	-e 's,//*$$,,;s,\.${HOST_TARGET:Uhost}$$,.host,' \
+	-e 's,\.${HOST_TARGET32:Uhost32}$$,.host32,' \
+	-e 's,\.${MACHINE}$$,,' \
+	-e 's:\.${TARGET_SPEC:U${MACHINE}}$$::'
+
 # we are only interested in the dirs
-# sepecifically those we read something from.
+# specifically those we read something from.
 # we canonicalize them to keep things simple
 # if we are using a split-fs sandbox, it gets a little messier.
 _objtop := ${_OBJTOP:tA}
+
+# some people put *.meta in META_XTRAS to make sure we get here
+_meta_files := ${META_FILES:N\*.meta:O:u}
+# assume a big list
+_meta_files_arg= @meta.list
+.if empty(_meta_files) && ${META_FILES:M\*.meta} != ""
+# XXX this should be considered a bad idea, 
+# since we cannot ignore stale .meta
+x != cd ${_OBJDIR} && find . -name '*.meta' -print -o \( -type d ! -name . -prune \) | sed 's,^./,,' > meta.list; echo
+.elif ${_meta_files:[#]} > 500
+.export _meta_files
+x != echo; for m in $$_meta_files; do echo $$m; done > meta.list
+# _meta_files is consuming a lot of env space
+# that can impact command line length,
+# and we do not need it any more
+.undef _meta_files
+.unexport _meta_files
+.else
+_meta_files_arg:= ${_meta_files}
+.endif
+
 dir_list != cd ${_OBJDIR} && \
 	${META2DEPS_CMD} MACHINE=${MACHINE} \
 	SRCTOP=${SRCTOP} RELDIR=${RELDIR} CURDIR=${_CURDIR} \
 	${META2DEPS_ARGS} \
-	${META_FILES:O:u} | ${META2DEPS_FILTER} ${_skip_gendirdeps} \
-	sed 's,//*$$,,;s,\.${HOST_TARGET}$$,.host,'
+	${_meta_files_arg} | ${META2DEPS_FILTER} ${_skip_gendirdeps} \
+	sed ${GENDIRDEPS_SEDCMDS}
 
 .if ${dir_list:M*ERROR\:*} != ""
 .warning ${dir_list:tW:C,.*(ERROR),\1,}
@@ -179,7 +221,7 @@ dpadd_dir_list += ${f:H:tA}
 .endfor
 .if !empty(ddep_list)
 ddeps != cat ${ddep_list:O:u} | ${META2DEPS_FILTER} ${_skip_gendirdeps} \
-        sed 's,//*$$,,;s,\.${HOST_TARGET}$$,.host,;s,\.${MACHINE}$$,,'
+	sed ${GENDIRDEPS_SEDCMDS}
 
 .if ${DEBUG_GENDIRDEPS:Uno:@x@${RELDIR:M$x}@} != ""
 .info ${RELDIR}: raw_dir_list='${dir_list}'
@@ -229,7 +271,7 @@ DIRDEPS = \
 	${qualdir_list:N${RELDIR}.*:N${RELDIR}/*}
 
 # We only consider things below $RELDIR/ if they have a makefile.
-# This is the same test that _DIRDEPS_USE applies.
+# This is the same test that _DIRDEP_USE applies.
 # We have do a double test with dirdep_list as it _may_ contain 
 # qualified dirs - if we got anything from a stage dir.
 # qualdir_list we know are all qualified.
@@ -240,10 +282,13 @@ DIRDEPS += \
 	${dirdep_list:M${RELDIR}/*:@d@${.MAKE.MAKEFILE_PREFERENCE:@m@${exists(${SRCTOP}/$d/$m):?$d:${exists(${SRCTOP}/${d:R}/$m):?$d:}}@}@} \
 	${qualdir_list:M${RELDIR}/*:@d@${.MAKE.MAKEFILE_PREFERENCE:@m@${exists(${SRCTOP}/${d:R}/$m):?$d:}@}@}
 
-DIRDEPS := ${DIRDEPS:${GENDIRDEPS_FILTER:UNno:ts:}:O:u}
+# what modifiers do we allow in GENDIRDEPS_FILTER
+GENDIRDEPS_FILTER_MASK += @CMNS
+DIRDEPS := ${DIRDEPS:${GENDIRDEPS_FILTER:UNno:M[${GENDIRDEPS_FILTER_MASK:O:u:ts}]*:ts:}:C,//+,/,g:O:u}
 
 .if ${DEBUG_GENDIRDEPS:Uno:@x@${RELDIR:M$x}@} != ""
 .info ${RELDIR}: M2D_OBJROOTS=${M2D_OBJROOTS}
+.info ${RELDIR}: M2D_EXCLUDES=${M2D_EXCLUDES}
 .info ${RELDIR}: dir_list='${dir_list}'
 .info ${RELDIR}: dpadd_dir_list='${dpadd_dir_list}'
 .info ${RELDIR}: dirdep_list='${dirdep_list}'
@@ -261,7 +306,7 @@ src_dirdep_list = \
 SRC_DIRDEPS = \
 	${src_dirdep_list:N${RELDIR}:N${RELDIR}/*:C,(/h)/.*,,}
 
-SRC_DIRDEPS := ${SRC_DIRDEPS:${GENDIRDEPS_SRC_FILTER:UN/*:ts:}:O:u}
+SRC_DIRDEPS := ${SRC_DIRDEPS:${GENDIRDEPS_SRC_FILTER:UN/*:ts:}:C,//+,/,g:O:u}
 
 # if you want to capture SRC_DIRDEPS in .MAKE.DEPENDFILE put
 # SRC_DIRDEPS_FILE = ${_DEPENDFILE} 
@@ -294,19 +339,24 @@ CAT_DEPEND ?= .depend
 .PHONY: ${_DEPENDFILE}
 .endif
 
+.if ${BUILD_AT_LEVEL0:Uno:tl} == "no"
+LOCAL_DEPENDS_GUARD ?= _{.MAKE.LEVEL} > 0
+.else
+LOCAL_DEPENDS_GUARD ?= _{DEP_RELDIR} == _{_DEP_RELDIR}
+.endif
+
 # 'cat .depend' should suffice, but if we are mixing build modes
 # .depend may contain things we don't want.
 # The sed command at the end of the stream, allows for the filters
 # to output _{VAR} tokens which we will turn into proper ${VAR} references.
-${_DEPENDFILE}: ${CAT_DEPEND:M.depend} ${META_FILES:O:u:@m@${exists($m):?$m:}@} ${_this} ${META2DEPS}
-	@(echo '# Autogenerated - do NOT edit!'; echo; \
-	echo 'DEP_RELDIR := $${_PARSEDIR:S,$${SRCTOP}/,,}'; echo; \
+${_DEPENDFILE}: .NOMETA ${CAT_DEPEND:M.depend} ${META_FILES:O:u:@m@${exists($m):?$m:}@} ${_this} ${META2DEPS}
+	@(${GENDIRDEPS_HEADER} echo '# Autogenerated - do NOT edit!'; echo; \
 	echo 'DIRDEPS = \'; \
 	echo '${DIRDEPS:@d@	$d \\${.newline}@}'; echo; \
 	${_include_src_dirdeps} \
 	echo '.include <dirdeps.mk>'; \
 	echo; \
-	echo '.if $${DEP_RELDIR} == $${_DEP_RELDIR}'; \
+	echo '.if ${LOCAL_DEPENDS_GUARD}'; \
 	echo '# local dependencies - needed for -jN in clean tree'; \
 	[ -s ${CAT_DEPEND} ] && { grep : ${CAT_DEPEND} | grep -v '[/\\]'; }; \
 	echo '.endif' ) | sed 's,_\([{(]\),$$\1,g' > $@.new${.MAKE.PID}
@@ -319,9 +369,8 @@ DIRDEPS := ${SUBDIR:S,^,${RELDIR}/,:O:u}
 
 all:	${_DEPENDFILE}
 
-${_DEPENDFILE}: ${MAKEFILE} ${_this}
-	@(echo '# Autogenerated - do NOT edit!'; echo; \
-	echo 'DEP_RELDIR := $${_PARSEDIR:S,$${SRCTOP}/,,}'; echo; \
+${_DEPENDFILE}: .NOMETA ${MAKEFILE} ${_this}
+	@(${GENDIRDEPS_HEADER} echo '# Autogenerated - do NOT edit!'; echo; \
 	echo 'DIRDEPS = \'; \
 	echo '${DIRDEPS:@d@	$d \\${.newline}@}'; echo; \
 	echo '.include <dirdeps.mk>'; \
@@ -335,3 +384,6 @@ all ${_DEPENDFILE}:
 
 .endif
 ${_DEPENDFILE}: .PRECIOUS
+
+# don't waste time looking for ways to make .meta files
+.SUFFIXES:

@@ -1,4 +1,4 @@
-DF306.0 {
+DF404.0 {
     bcmp;
     bcopy;
     bzero;
@@ -15,6 +15,7 @@ DF306.0 {
     memcpy;
     memmem;
     memmove;
+    mempcpy;
     memrchr;
     memset;
     rindex;
@@ -29,6 +30,7 @@ DF306.0 {
     strchrnul;
     strcmp;
     strcoll;
+    strcoll_l;
     strcpy;
     strcspn;
     strdup;
@@ -55,6 +57,7 @@ DF306.0 {
     strtok;
     strtok_r;
     strxfrm;
+    strxfrm_l;
     swab;
     wcpcpy;
     wcpncpy;
@@ -63,6 +66,7 @@ DF306.0 {
     wcschr;
     wcscmp;
     wcscoll;
+    wcscoll_l;
     wcscpy;
     wcscspn;
     wcsdup;
@@ -82,7 +86,7 @@ DF306.0 {
     wcswidth;
     wcswidth_l;
     wcsxfrm;
-    wcwidth_l;
+    wcsxfrm_l;
     wmemchr;
     wmemcmp;
     wmemcpy;
@@ -90,6 +94,17 @@ DF306.0 {
     wmemset;
 };
 
+DF506.0 {
+    explicit_bzero;
+    timingsafe_bcmp;
+    timingsafe_memcmp;
+};
+
+DF508.0 {
+    memset_s;
+};
+
 DFprivate_1.0 {
+    __strchrnul;
     __strtok_r;
 };

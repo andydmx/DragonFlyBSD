@@ -10,11 +10,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -60,6 +56,10 @@
 struct	sigacts {
 	sig_t	 ps_sigact[_SIG_MAXSIG];	/* disposition of signals */
 	sigset_t ps_catchmask[_SIG_MAXSIG];	/* signals to be blocked */
+	struct {
+		int	pid;
+		int	uid;
+	} ps_frominfo[_SIG_MAXSIG];
 	sigset_t ps_sigignore;		/* Signals being ignored. */
 	sigset_t ps_sigcatch;		/* Signals being caught by user. */
 	sigset_t ps_sigonstack;		/* signals to take on sigstack */
@@ -91,8 +91,14 @@ struct	sigacts {
 #define SIGADDSET(set, signo)						\
 	(set).__bits[_SIG_WORD(signo)] |= _SIG_BIT(signo)
 
+#define SIGADDSET_ATOMIC(set, signo)					\
+	atomic_set_int(&(set).__bits[_SIG_WORD(signo)], _SIG_BIT(signo))
+
 #define SIGDELSET(set, signo)						\
 	(set).__bits[_SIG_WORD(signo)] &= ~_SIG_BIT(signo)
+
+#define SIGDELSET_ATOMIC(set, signo)					\
+	atomic_clear_int(&(set).__bits[_SIG_WORD(signo)], _SIG_BIT(signo))
 
 #define SIGEMPTYSET(set)						\
 	do {								\
@@ -138,6 +144,12 @@ struct	sigacts {
 			(set1).__bits[__i] &= ~(set2).__bits[__i];	\
 	} while (0)
 
+#define SIGSETOR_CANTMASK(set)						\
+	SIGADDSET(set, SIGKILL), SIGADDSET(set, SIGSTOP)
+
+#define SIG_CONDBLOCKALLSIGS(set, lp)					\
+	__sig_condblockallsigs(&(set), lp)
+
 #define SIG_CANTMASK(set)						\
 	SIGDELSET(set, SIGKILL), SIGDELSET(set, SIGSTOP)
 
@@ -145,8 +157,15 @@ struct	sigacts {
 	SIGDELSET(set, SIGSTOP), SIGDELSET(set, SIGTSTP),		\
 	SIGDELSET(set, SIGTTIN), SIGDELSET(set, SIGTTOU)
 
+#define SIG_STOPSIGMASK_ATOMIC(set)					\
+	SIGDELSET_ATOMIC(set, SIGSTOP), SIGDELSET_ATOMIC(set, SIGTSTP),	\
+	SIGDELSET_ATOMIC(set, SIGTTIN), SIGDELSET_ATOMIC(set, SIGTTOU)
+
 #define SIG_CONTSIGMASK(set)						\
 	SIGDELSET(set, SIGCONT)
+
+#define SIG_CONTSIGMASK_ATOMIC(set)					\
+	SIGDELSET_ATOMIC(set, SIGCONT)
 
 #define sigcantmask	(sigmask(SIGKILL) | sigmask(SIGSTOP))
 
@@ -183,18 +202,19 @@ struct proc;
 struct sigio;
 
 extern int sugid_coredump;	/* Sysctl variable kern.sugid_coredump */
+extern sigset_t sigcantmask_mask;
 
 /*
  * Machine-independent functions:
  */
 void	execsigs (struct proc *p);
 void	gsignal (int pgid, int sig);
-int	issignal (struct lwp *lp, int maytrace);
+int	issignal (struct lwp *lp, int maytrace, int *ptokp);
 int	iscaught (struct lwp *p);
 void	killproc (struct proc *p, char *why);
 void	pgsigio (struct sigio *, int signum, int checkctty);
 void	pgsignal (struct pgrp *pgrp, int sig, int checkctty);
-void	postsig (int sig);
+void	postsig (int sig, int ptok);
 void	ksignal (struct proc *p, int sig);
 void	lwpsignal (struct proc *p, struct lwp *lp, int sig);
 void	siginit (struct proc *p);
@@ -204,7 +224,7 @@ void	trapsignal (struct lwp *p, int sig, u_long code);
  * Machine-dependent functions:
  */
 void	sendsig (sig_t action, int sig, sigset_t *retmask, u_long code);
-void	sigexit (struct lwp *lp, int sig);
+void	sigexit (struct lwp *lp, int sig) __dead2;
 int	checkpoint_signal_handler(struct lwp *p);
 
 #endif	/* _KERNEL */

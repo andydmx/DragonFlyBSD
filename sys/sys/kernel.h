@@ -47,7 +47,7 @@
 
 #ifndef _KERNEL
 #error "This file should not be included by userland programs."
-#else
+#endif
 
 #ifndef _SYS_PARAM_H_
 #include <sys/param.h>
@@ -85,7 +85,7 @@ extern int profhz;			/* profiling clock's frequency */
 extern int ticks;
 extern int lbolt;			/* once a second sleep address */
 extern void *lbolt_syncer;		/* approx 1 hz but may be sped up */
-extern enum vmm_guest_type vmm_guest; 	/* Running as virtual machine guest? */
+extern char vmm_vendor[16];
 
 enum vmm_guest_type {
 	VMM_GUEST_NONE = 0,
@@ -96,13 +96,15 @@ enum vmm_guest_type {
 	VMM_GUEST_BHYVE,
 	VMM_GUEST_KVM,
 	VMM_GUEST_VMWARE,
-	VMM_GUEST_VPC,
+	VMM_GUEST_HYPERV,
 	VMM_GUEST_VBOX,
 	VMM_GUEST_PARALLELS,
 	VMM_GUEST_VKERNEL,
 	VMM_GUEST_UNKNOWN,
 	VMM_GUEST_LAST
 };
+
+extern enum vmm_guest_type vmm_guest; 	/* Running as virtual machine guest? */
 
 /*
  * Enumerated types for known system startup interfaces.
@@ -134,6 +136,7 @@ enum sysinit_sub_id {
 	SI_BOOT1_VM		= 0x1000000,	/* virtual memory system init*/
 	SI_BOOT1_ALLOCATOR	= 0x1400000,	/* slab allocator */
 	SI_BOOT1_KMALLOC	= 0x1600000,	/* kmalloc inits */
+	SI_BOOT1_DYNALLOC	= 0x1700000,	/* permanent kernel allocs */
 	SI_BOOT1_POST		= 0x1800000,	/* post boot1 inits */
 
 	/*
@@ -148,12 +151,15 @@ enum sysinit_sub_id {
 	SI_BOOT2_PRESMP		= 0x1a00000,	/* register SMP configs */
 	SI_BOOT2_START_CPU	= 0x1a40000,	/* start CPU (BSP) */
 	SI_BOOT2_LAPIC		= 0x1a50000,	/* configure Local APIC */
+	SI_BOOT2_CPU_TOPOLOGY	= 0x1a58000,
+	SI_BOOT2_NUMA		= 0x1a5c000,
 	SI_BOOT2_START_APS	= 0x1a60000,	/* start all APs */
 	SI_BOOT2_IOAPIC		= 0x1a70000,	/* configure I/O APIC */
 	SI_BOOT2_FINISH_PIC	= 0x1a80000,	/* finish PIC configure */
 	SI_BOOT2_FINISH_CPU	= 0x1a90000,	/* finish CPU startup */
 	SI_BOOT2_CLOCKREG	= 0x1ac0000,	/* register available clocks */
 	SI_BOOT2_OBJCACHE	= 0x1b00000,
+	SI_BOOT2_LWKT_INIT	= 0x1b40000,
 	SI_BOOT2_SOFTCLOCK	= 0x1b80000,
 	SI_BOOT2_CLOCKS		= 0x1c00000,	/* select & start clocks */
 	SI_BOOT2_FINISH_SMP	= 0x1c80000,	/* SMP go (& synch clocks) */
@@ -163,10 +169,9 @@ enum sysinit_sub_id {
 	 * Finish up core kernel initialization and set up the process
 	 * abstraction.
 	 */
-	SI_BOOT2_BIOS		= 0x1d00000,
 	SI_BOOT2_MACHDEP	= 0x1d80000,
 	SI_BOOT2_KLD		= 0x1e00000,
-	SI_BOOT2_CPU_TOPOLOGY	= 0x1e40000,
+	SI_BOOT2_VMM		= 0x1e40000,
 	SI_BOOT2_USCHED		= 0x1e80000,
 	SI_BOOT2_PROC0		= 0x1f00000,
 
@@ -174,13 +179,14 @@ enum sysinit_sub_id {
 	 * Continue with miscellanious system initialization
 	 */
 	SI_SUB_CREATE_INIT	= 0x2300000,	/* create the init process */
-	SI_SUB_PRE_DRIVERS	= 0x2380000,
+	SI_SUB_PROP		= 0x2340000,
+	SI_SUB_DEVFS_CORE	= 0x2380000,
+	SI_SUB_PRE_DRIVERS	= 0x23C0000,
 	SI_SUB_DRIVERS		= 0x2400000,	/* Let Drivers initialize */
 	SI_SUB_CONFIGURE	= 0x3800000,	/* Configure devices */
 	SI_SUB_ISWARM		= 0x3c00000,	/* No longer in cold boot */
 	SI_SUB_VFS		= 0x4000000,	/* virtual file system*/
 	SI_SUB_HELPER_THREADS	= 0x5400000,	/* misc helper threads */
-	SI_SUB_CLIST		= 0x5800000,	/* clists*/
 	SI_SUB_SYSV_SHM		= 0x6400000,	/* System V shared memory*/
 	SI_SUB_SYSV_SEM		= 0x6800000,	/* System V semaphores*/
 	SI_SUB_SYSV_MSG		= 0x6C00000,	/* System V message queues*/
@@ -192,7 +198,6 @@ enum sysinit_sub_id {
 	SI_SUB_PROTO_IFATTACHDOMAIN	
 				= 0x8800001,	/* domain dependent data init */
 	SI_SUB_PROTO_END	= 0x8ffffff,	/* network protocol post-init */
-	SI_SUB_KPROF		= 0x9000000,	/* kernel profiling*/
 	SI_SUB_KICK_SCHEDULER	= 0xa000000,	/* start the timeout events*/
 	SI_SUB_INT_CONFIG_HOOKS	= 0xa800000,	/* Interrupts enabled config */
 
@@ -220,11 +225,14 @@ enum sysinit_sub_id {
  * Some enumerated orders; "ANY" sorts last.
  */
 enum sysinit_elem_order {
-	SI_ORDER_FIRST		= 0x0000000,	/* first*/
-	SI_ORDER_SECOND		= 0x0000001,	/* second*/
-	SI_ORDER_THIRD		= 0x0000002,	/* third*/
+	SI_ORDER_FIRST		= 0x0000000,	/* first */
+	SI_ORDER_SECOND		= 0x0000001,	/* second */
+	SI_ORDER_THIRD		= 0x0000002,	/* third */
+	SI_ORDER_FOURTH		= 0x0000003,	/* fourth */
+	SI_ORDER_EARLIER	= 0x0800000,	/* earlier */
 	SI_ORDER_MIDDLE		= 0x1000000,	/* somewhere in the middle */
-	SI_ORDER_ANY		= 0xfffffff	/* last*/
+	SI_ORDER_LATER		= 0x2000000,	/* later */
+	SI_ORDER_ANY		= 0xfffffff	/* last */
 };
 
 
@@ -282,7 +290,7 @@ struct sysinit {
 		ident,						\
 		#uniquifier                                     \
 	};							\
-	DATA_SET(sysinit_set,uniquifier ## _sys_init);
+	DATA_SET(sysinit_set,uniquifier ## _sys_init)
 
 #define	SYSINIT(uniquifier, subsystem, order, func, ident)	\
 	C_SYSINIT(uniquifier, subsystem, order,			\
@@ -312,7 +320,7 @@ void	sysinit_add (struct sysinit **, struct sysinit **);
  * in a SYSINIT function at SI_BOOT1_TUNABLES with SI_ORDER_LAST.
  */
 
-extern void tunable_int_init(void *);
+void tunable_int_init(void *);
 
 struct tunable_int {
 	const char *path;
@@ -344,7 +352,7 @@ static void __Tunable_ ## var (void *ignored)	\
 SYSINIT(__Tunable_init_ ## var, SI_BOOT1_TUNABLES, SI_ORDER_MIDDLE, \
 	__Tunable_ ## var , NULL);
 
-extern void tunable_long_init(void *);
+void tunable_long_init(void *);
 
 struct tunable_long {
 	const char *path;
@@ -366,7 +374,7 @@ struct tunable_long {
 
 #define	TUNABLE_LONG_FETCH(path, var)	kgetenv_long((path), (var))
 
-extern void tunable_ulong_init(void *);
+void tunable_ulong_init(void *);
 
 struct tunable_ulong {
 	const char *path;
@@ -388,7 +396,7 @@ struct tunable_ulong {
 
 #define	TUNABLE_ULONG_FETCH(path, var)	kgetenv_ulong((path), (var))
 
-extern void tunable_quad_init(void *);
+void tunable_quad_init(void *);
 struct tunable_quad {
 	const char *path;
 	quad_t *var;
@@ -409,7 +417,7 @@ struct tunable_quad {
 
 #define	TUNABLE_QUAD_FETCH(path, var)	kgetenv_quad((path), (var))
 
-extern void tunable_str_init(void *);
+void tunable_str_init(void *);
 struct tunable_str {
 	const char *path;
 	char *var;
@@ -474,5 +482,4 @@ struct intr_config_hook {
 int	config_intrhook_establish (struct intr_config_hook *);
 void	config_intrhook_disestablish (struct intr_config_hook *);
 
-#endif	/* _KERNEL */
 #endif /* !_SYS_KERNEL_H_*/

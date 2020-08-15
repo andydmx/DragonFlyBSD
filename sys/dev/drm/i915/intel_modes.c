@@ -23,12 +23,12 @@
  * DEALINGS IN THE SOFTWARE.
  */
 
+#include <linux/slab.h>
 #include <linux/i2c.h>
-#include <drm/drmP.h>
 #include <drm/drm_edid.h>
+#include <drm/drmP.h>
 #include "intel_drv.h"
 #include "i915_drv.h"
-#include <bus/iicbus/iiconf.h>
 
 /**
  * intel_connector_update_modes - update connector from edid
@@ -55,7 +55,7 @@ int intel_connector_update_modes(struct drm_connector *connector,
  * Fetch the EDID information from @connector using the DDC bus.
  */
 int intel_ddc_get_modes(struct drm_connector *connector,
-			device_t adapter)
+			struct i2c_adapter *adapter)
 {
 	struct edid *edid;
 	int ret;
@@ -65,7 +65,7 @@ int intel_ddc_get_modes(struct drm_connector *connector,
 		return 0;
 
 	ret = intel_connector_update_modes(connector, edid);
-	kfree(edid, M_DRM);
+	kfree(edid);
 
 	return ret;
 }
@@ -81,7 +81,7 @@ void
 intel_attach_force_audio_property(struct drm_connector *connector)
 {
 	struct drm_device *dev = connector->dev;
-	struct drm_i915_private *dev_priv = dev->dev_private;
+	struct drm_i915_private *dev_priv = to_i915(dev);
 	struct drm_property *prop;
 
 	prop = dev_priv->force_audio_property;
@@ -99,15 +99,16 @@ intel_attach_force_audio_property(struct drm_connector *connector)
 }
 
 static const struct drm_prop_enum_list broadcast_rgb_names[] = {
-	{ 0, "Full" },
-	{ 1, "Limited 16:235" },
+	{ INTEL_BROADCAST_RGB_AUTO, "Automatic" },
+	{ INTEL_BROADCAST_RGB_FULL, "Full" },
+	{ INTEL_BROADCAST_RGB_LIMITED, "Limited 16:235" },
 };
 
 void
 intel_attach_broadcast_rgb_property(struct drm_connector *connector)
 {
 	struct drm_device *dev = connector->dev;
-	struct drm_i915_private *dev_priv = dev->dev_private;
+	struct drm_i915_private *dev_priv = to_i915(dev);
 	struct drm_property *prop;
 
 	prop = dev_priv->broadcast_rgb_property;
@@ -123,4 +124,13 @@ intel_attach_broadcast_rgb_property(struct drm_connector *connector)
 	}
 
 	drm_object_attach_property(&connector->base, prop, 0);
+}
+
+void
+intel_attach_aspect_ratio_property(struct drm_connector *connector)
+{
+	if (!drm_mode_create_aspect_ratio_property(connector->dev))
+		drm_object_attach_property(&connector->base,
+			connector->dev->mode_config.aspect_ratio_property,
+			DRM_MODE_PICTURE_ASPECT_NONE);
 }

@@ -1,5 +1,7 @@
 #!/bin/sh
 #
+# SPDX-License-Identifier: BSD-2-Clause-FreeBSD
+#
 # Copyright (c) September 1995 Wolfram Schneider <wosch@FreeBSD.org>. Berlin.
 # All rights reserved.
 #
@@ -26,12 +28,16 @@
 #
 # updatedb - update locate database for local mounted filesystems
 #
-# $FreeBSD: src/usr.bin/locate/locate/updatedb.sh,v 1.17 2000/01/12 08:01:01 kris Exp $
-# $DragonFly: src/usr.bin/locate/locate/updatedb.sh,v 1.3 2008/07/09 19:53:27 swildner Exp $
+# $FreeBSD: head/usr.bin/locate/locate/updatedb.sh 326276 2017-11-27 15:37:16Z pfg $
 
+if [ "$(id -u)" = "0" ]; then
+	echo ">>> WARNING" 1>&2
+	echo ">>> Executing updatedb as root.  This WILL reveal all filenames" 1>&2
+	echo ">>> on your machine to all login users, which is a security risk." 1>&2
+fi
 : ${LOCATE_CONFIG="/etc/locate.rc"}
 if [ -f "$LOCATE_CONFIG" -a -r "$LOCATE_CONFIG" ]; then
-       . $LOCATE_CONFIG
+	. $LOCATE_CONFIG
 fi
 
 # The directory containing locate subprograms
@@ -46,44 +52,66 @@ PATH=$LIBEXECDIR:/bin:/usr/bin:$PATH; export PATH
 
 : ${mklocatedb:=locate.mklocatedb}	 # make locate database program
 : ${FCODES:=/var/db/locate.database}	 # the database
-: ${SEARCHPATHS:="/"}		# directories to be put in the database
 : ${PRUNEPATHS:="/tmp /usr/tmp /var/tmp"} # unwanted directories
-: ${FILESYSTEMS:="hammer ufs"}		 # allowed filesystems 
-: ${find:=find}
+: ${PRUNEDIRS:=".git"}	# unwanted directories, in any parent
+# allowed filesystems
+: ${FILESYSTEMS:="$(lsvfs | tail -n +3 | \
+	egrep -vw 'loopback|network|synthetic|read-only|0' | \
+	cut -d ' ' -f1)"}
+# directories to be searched to create the database
+: ${SEARCHPATHS:="/"}
+# the find program and its options
+: ${FIND:="find"}
 
-case X"$SEARCHPATHS" in 
-	X) echo "$0: empty variable SEARCHPATHS"; exit 1;; esac
-case X"$FILESYSTEMS" in 
-	X) echo "$0: empty variable FILESYSTEMS"; exit 1;; esac
+if [ -z "$SEARCHPATHS" ]; then
+	echo "$0: empty variable SEARCHPATHS" >&2; exit 1
+fi
+if [ -z "$FILESYSTEMS" ]; then
+	echo "$0: empty variable FILESYSTEMS" >&2; exit 1
+fi
+ROOTFS="$(df -T / | awk '$NF=="/" { print $2 }')"
+if ! echo "$FILESYSTEMS" | grep -qw "$ROOTFS"; then
+	echo "WARNING: root filesystem '$ROOTFS' was excluded" >&2
+fi
 
 # Make a list a paths to exclude in the locate run
-excludes="! (" or=""
-for fstype in $FILESYSTEMS
-do
-       excludes="$excludes $or -fstype $fstype"
-       or="-or"
+excludes="! ("
+or=""
+for fstype in $FILESYSTEMS; do
+	excludes="$excludes $or -fstype $fstype"
+	or="-or"
 done
 excludes="$excludes ) -prune"
 
-case X"$PRUNEPATHS" in
-	X) ;;
-	*) for path in $PRUNEPATHS
-           do 
+if [ -n "$PRUNEPATHS" ]; then
+	for path in $PRUNEPATHS; do
 		excludes="$excludes -or -path $path -prune"
-	   done;;
-esac
+	done
+fi
+
+if [ -n "$PRUNEDIRS" ]; then
+	for dir in $PRUNEDIRS; do
+		excludes="$excludes -or -name $dir -type d -prune"
+	done
+fi
 
 tmp=$TMPDIR/_updatedb$$
 trap 'rm -f $tmp; rmdir $TMPDIR' 0 1 2 3 5 10 15
-		
+
 # search locally
-# echo $find $SEARCHPATHS $excludes -or -print && exit
-if $find -s $SEARCHPATHS $excludes -or -print 2>/dev/null |
-        $mklocatedb -presort > $tmp
+echo $FIND $SEARCHPATHS $excludes -or -print
+if $FIND $SEARCHPATHS $excludes -or -print 2>/dev/null | \
+	sort | uniq | $mklocatedb -presort > $tmp
 then
-	case X"`$find $tmp -size -257c -print`" in
-		X) cat $tmp > $FCODES;;
-		*) echo "updatedb: locate database $tmp is empty"
-		   exit 1
-	esac
+	if [ "$(stat -f '%z' $tmp)" -lt "257" ]; then
+		echo "updatedb: locate database $tmp is empty" >&2
+		exit 1
+	else
+		# Use "cat" instead of "cp", since the permission of the
+		# database is set up the by caller (i.e., peridoic task)
+		# which has privilege, while this tool should be run as
+		# a non-privilege user.
+		cat $tmp > $FCODES
+		echo "updatedb: built new locate database: $FCODES"
+	fi
 fi

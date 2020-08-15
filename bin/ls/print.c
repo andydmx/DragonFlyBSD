@@ -1,4 +1,4 @@
-/*
+/*-
  * Copyright (c) 1989, 1993, 1994
  *	The Regents of the University of California.  All rights reserved.
  *
@@ -31,7 +31,6 @@
  *
  * @(#)print.c	8.4 (Berkeley) 4/17/94
  * $FreeBSD: src/bin/ls/print.c,v 1.73 2004/06/08 09:27:42 das Exp $
- * $DragonFly: src/bin/ls/print.c,v 1.20 2008/06/24 21:55:48 y0netan1 Exp $
  */
 
 #include <sys/param.h>
@@ -47,6 +46,7 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <locale.h>
 #ifdef COLORLS
 #include <ctype.h>
 #include <termcap.h>
@@ -58,7 +58,7 @@
 
 static int	printaname(const FTSENT *, u_long, u_long);
 static void	printlink(const FTSENT *);
-static void	printtime(time_t);
+static void	printtime(const struct timespec);
 static int	printtype(u_int);
 static void	printsize(size_t, off_t);
 #ifdef COLORLS
@@ -166,11 +166,12 @@ printlong(const DISPLAY *dp)
 		else
 			printsize(dp->s_size, sp->st_size);
 		if (f_accesstime)
-			printtime(sp->st_atime);
+			printtime(sp->st_atim);
 		else if (f_statustime)
-			printtime(sp->st_ctime);
+			printtime(sp->st_ctim);
 		else
-			printtime(sp->st_mtime);
+			printtime(sp->st_mtim);
+		putchar(' ');
 #ifdef COLORLS
 		if (f_color)
 			color_printed = colortype(sp->st_mode);
@@ -212,7 +213,7 @@ printstream(const DISPLAY *dp)
 	if (chcnt)
 		putchar('\n');
 }
-		
+
 void
 printcol(const DISPLAY *dp)
 {
@@ -264,7 +265,7 @@ printcol(const DISPLAY *dp)
 	if (f_type)
 		colwidth += 1;
 
-	colwidth = (colwidth + tabwidth) & ~(tabwidth - 1);
+	colwidth = rounddown2(colwidth + tabwidth, tabwidth);
 	if (termwidth < 2 * colwidth) {
 		printscol(dp);
 		return;
@@ -295,7 +296,7 @@ printcol(const DISPLAY *dp)
 				base += numrows;
 			if (base >= num)
 				break;
-			while ((cnt = ((chcnt + tabwidth) & ~(tabwidth - 1)))
+			while ((cnt = (rounddown2(chcnt + tabwidth, tabwidth)))
 			    <= endcol) {
 				if (f_sortacross && col + 1 >= numcols)
 					break;
@@ -345,30 +346,69 @@ printaname(const FTSENT *p, u_long inodefield, u_long sizefield)
 }
 
 static void
-printtime(time_t ftime)
+printtime(const struct timespec stt)
 {
 	char longstring[80];
 	static time_t now;
+	const struct tm *ptime;
 	const char *format;
-	static int d_first = -1;
+	static char *lc_time;
+	static int posix_time;
 
-	if (d_first < 0)
-		d_first = (*nl_langinfo(D_MD_ORDER) == 'd');
+#define	SIXMONTHS	((365 / 2) * 86400)
+
 	if (now == 0)
 		now = time(NULL);
 
-#define	SIXMONTHS	((365 / 2) * 86400)
-	if (f_sectime)
-		/* mmm dd hh:mm:ss yyyy || dd mmm hh:mm:ss yyyy */
-		format = d_first ? "%e %b %T %Y " : "%b %e %T %Y ";
-	else if (ftime + SIXMONTHS > now && ftime < now + SIXMONTHS)
-		/* mmm dd hh:mm || dd mmm hh:mm */
-		format = d_first ? "%e %b %R " : "%b %e %R ";
+	if (lc_time == NULL) {
+		lc_time = setlocale(LC_TIME, NULL);
+		posix_time = (strcmp(lc_time, "C") == 0);
+	}
+
+	if (f_timeformat) {
+		/*
+		 * User specified format
+		 */
+		format = f_timeformat;
+	} else if (f_sectime) {
+		/*
+		 * POSIX: Not covered by standard.  If C/POSIX locale used
+		 *        the old convention of mmm dd hh:mm:ss yyyy is kept.
+		 * Named locales use the extended ISO 8601 format without T:
+		 *        YYYY-DD-MM hh:mm:ss
+		 */
+		format = posix_time ? "%b %e %T %Y" : "%F %T";
+	} else if (posix_time) {
+		/*
+		 * POSIX: Future or older than 6 months returns equivalent of
+		 *        date "+%b %e  %Y"
+		 *        If file was modified within the past 6 months,
+		 *        return equivalent of: date "+%b %e %H:%M"
+		 */
+		if ((stt.tv_sec > now) || (stt.tv_sec < now - SIXMONTHS))
+			format = "%b %e  %Y";
+		else
+			format = "%b %e %R";
+	} else {
+		/*
+		 * Named locales use format DD-MMM-YYYY hh:mm
+		 * Regardless of locale, English is used for month field
+		 */
+		format = "%d-%b-%Y %H:%M";
+	}
+
+	/*
+	 * If printing the nanotime field, always use GMT time
+	 */
+	if (f_nanotime)
+		ptime = gmtime(&(stt.tv_sec));
 	else
-		/* mmm dd  yyyy || dd mmm  yyyy */
-		format = d_first ? "%e %b  %Y " : "%b %e  %Y ";
-	strftime(longstring, sizeof(longstring), format, localtime(&ftime));
+		ptime = localtime(&(stt.tv_sec));
+
+	strftime_l(longstring, sizeof(longstring), format, ptime, NULL);
 	fputs(longstring, stdout);
+	if (f_nanotime)
+		printf(".%09ju", stt.tv_nsec);
 }
 
 static int

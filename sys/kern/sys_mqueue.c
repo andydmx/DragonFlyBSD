@@ -41,7 +41,6 @@
  *	  -> mqueue::mq_mtx
  */
 
-#include <stdbool.h>
 #include <sys/param.h>
 #include <sys/types.h>
 #include <sys/errno.h>
@@ -63,7 +62,7 @@
 #include <sys/spinlock2.h>
 #include <sys/stat.h>
 #include <sys/sysctl.h>
-#include <sys/sysproto.h>
+#include <sys/sysmsg.h>
 #include <sys/systm.h>
 #include <sys/lock.h>
 #include <sys/unistd.h>
@@ -92,7 +91,6 @@ static int	mqfilter_read(struct knote *kn, long hint);
 static int	mqfilter_write(struct knote *kn, long hint);
 
 /* Some time-related utility functions */
-static int	itimespecfix(struct timespec *ts);
 static int	tstohz(const struct timespec *ts);
 
 /* File operations vector */
@@ -182,7 +180,7 @@ mqueue_get(struct lwp *l, mqd_t mqd, file_t **fpr)
 	struct mqueue *mq;
 	file_t *fp;
 
-	fp = holdfp(curproc->p_fd, (int)mqd, -1);	/* XXX: Why -1 ? */
+	fp = holdfp(curthread, (int)mqd, -1);	/* XXX: Why -1 ? */
 	if (__predict_false(fp == NULL))
 		return EBADF;
 
@@ -219,22 +217,9 @@ mqueue_linear_insert(struct mqueue *mq, struct mq_msg *msg)
 }
 
 /*
- * Validate input.
- */
-int
-itimespecfix(struct timespec *ts)
-{
-	if (ts->tv_sec < 0 || ts->tv_nsec < 0 || ts->tv_nsec >= 1000000000)
-		return (EINVAL);
-	if (ts->tv_sec == 0 && ts->tv_nsec != 0 && ts->tv_nsec < nstick)
-		ts->tv_nsec = nstick;
-	return (0);
-}
-
-/*
  * Compute number of ticks in the specified amount of time.
  */
-int
+static int
 tstohz(const struct timespec *ts)
 {
 	struct timeval tv;
@@ -262,7 +247,7 @@ abstimeout2timo(struct timespec *ts, int *timo)
 		return error;
 	}
 	getnanotime(&tsd);
-	timespecsub(ts, &tsd);
+	timespecsub(ts, &tsd, ts);
 	if (ts->tv_sec < 0 || (ts->tv_sec == 0 && ts->tv_nsec <= 0)) {
 		return ETIMEDOUT;
 	}
@@ -426,7 +411,7 @@ mq_close_fop(file_t *fp)
  */
 
 int
-sys_mq_open(struct mq_open_args *uap)
+sys_mq_open(struct sysmsg *sysmsg, const struct mq_open_args *uap)
 {
 	/* {
 		syscallarg(const char *) name;
@@ -617,7 +602,7 @@ exit:
 		fp->f_ops = &badfileops;
 	} else {
 		fsetfd(fdp, fp, mqd);
-		uap->sysmsg_result = mqd;
+		sysmsg->sysmsg_result = mqd;
 	}
 	fdrop(fp);
 	kfree(name, M_MQBUF);
@@ -626,9 +611,9 @@ exit:
 }
 
 int
-sys_mq_close(struct mq_close_args *uap)
+sys_mq_close(struct sysmsg *sysmsg, const struct mq_close_args *uap)
 {
-	return sys_close((void *)uap);
+	return sys_close(sysmsg, (const void *)uap);
 }
 
 /*
@@ -739,7 +724,7 @@ error:
 }
 
 int
-sys_mq_receive(struct mq_receive_args *uap)
+sys_mq_receive(struct sysmsg *sysmsg, const struct mq_receive_args *uap)
 {
 	/* {
 		syscallarg(mqd_t) mqdes;
@@ -753,13 +738,13 @@ sys_mq_receive(struct mq_receive_args *uap)
 	error = mq_receive1(curthread->td_lwp, SCARG(uap, mqdes), SCARG(uap, msg_ptr),
 	    SCARG(uap, msg_len), SCARG(uap, msg_prio), 0, &mlen);
 	if (error == 0)
-		uap->sysmsg_result = mlen;
+		sysmsg->sysmsg_result = mlen;
 
 	return error;
 }
 
 int
-sys_mq_timedreceive(struct mq_timedreceive_args *uap)
+sys_mq_timedreceive(struct sysmsg *sysmsg, const struct mq_timedreceive_args *uap)
 {
 	/* {
 		syscallarg(mqd_t) mqdes;
@@ -785,7 +770,7 @@ sys_mq_timedreceive(struct mq_timedreceive_args *uap)
 	error = mq_receive1(curthread->td_lwp, SCARG(uap, mqdes), SCARG(uap, msg_ptr),
 	    SCARG(uap, msg_len), SCARG(uap, msg_prio), tsp, &mlen);
 	if (error == 0)
-		uap->sysmsg_result = mlen;
+		sysmsg->sysmsg_result = mlen;
 
 	return error;
 }
@@ -927,7 +912,7 @@ error:
 }
 
 int
-sys_mq_send(struct mq_send_args *uap)
+sys_mq_send(struct sysmsg *sysmsg, const struct mq_send_args *uap)
 {
 	/* {
 		syscallarg(mqd_t) mqdes;
@@ -941,7 +926,7 @@ sys_mq_send(struct mq_send_args *uap)
 }
 
 int
-sys_mq_timedsend(struct mq_timedsend_args *uap)
+sys_mq_timedsend(struct sysmsg *sysmsg, const struct mq_timedsend_args *uap)
 {
 	/* {
 		syscallarg(mqd_t) mqdes;
@@ -968,7 +953,7 @@ sys_mq_timedsend(struct mq_timedsend_args *uap)
 }
 
 int
-sys_mq_notify(struct mq_notify_args *uap)
+sys_mq_notify(struct sysmsg *sysmsg, const struct mq_notify_args *uap)
 {
 	/* {
 		syscallarg(mqd_t) mqdes;
@@ -1016,7 +1001,7 @@ sys_mq_notify(struct mq_notify_args *uap)
 }
 
 int
-sys_mq_getattr(struct mq_getattr_args *uap)
+sys_mq_getattr(struct sysmsg *sysmsg, const struct mq_getattr_args *uap)
 {
 	/* {
 		syscallarg(mqd_t) mqdes;
@@ -1040,7 +1025,7 @@ sys_mq_getattr(struct mq_getattr_args *uap)
 }
 
 int
-sys_mq_setattr(struct mq_setattr_args *uap)
+sys_mq_setattr(struct sysmsg *sysmsg, const struct mq_setattr_args *uap)
 {
 	/* {
 		syscallarg(mqd_t) mqdes;
@@ -1090,7 +1075,7 @@ sys_mq_setattr(struct mq_setattr_args *uap)
 }
 
 int
-sys_mq_unlink(struct mq_unlink_args *uap)
+sys_mq_unlink(struct sysmsg *sysmsg, const struct mq_unlink_args *uap)
 {
 	/* {
 		syscallarg(const char *) name;

@@ -202,7 +202,7 @@ static char *rnames[] = {
     "kidspad",
     "versapad",
     "jogdial",
-#if notyet
+#if 0 /* not yet */
     "mariqua",
 #endif
     NULL
@@ -280,7 +280,7 @@ static symtab_t pnpprod[] = {
     { "PNP0F04",	MOUSE_PROTO_MSC,	MOUSE_MODEL_GENERIC },
     /* MouseSystems */
     { "PNP0F05",	MOUSE_PROTO_MSC,	MOUSE_MODEL_GENERIC },
-#if notyet
+#if 0 /* not yet */
     /* Genius Mouse */
     { "PNP0F06",	MOUSE_PROTO_XXX,	MOUSE_MODEL_GENERIC },
     /* Genius Mouse */
@@ -302,7 +302,7 @@ static symtab_t pnpprod[] = {
     { "PNP0F0E",	MOUSE_PROTO_PS2,	MOUSE_MODEL_GENERIC },
     /* MS BallPoint comatible */
     { "PNP0F0F",	MOUSE_PROTO_MS,		MOUSE_MODEL_GENERIC },
-#if notyet
+#if 0 /* not yet */
     /* TI QuickPort */
     { "PNP0F10",	MOUSE_PROTO_XXX,	MOUSE_MODEL_GENERIC },
 #endif
@@ -312,13 +312,13 @@ static symtab_t pnpprod[] = {
     { "PNP0F12",	MOUSE_PROTO_PS2,	MOUSE_MODEL_GENERIC },
     /* PS/2 */
     { "PNP0F13",	MOUSE_PROTO_PS2,	MOUSE_MODEL_GENERIC },
-#if notyet
+#if 0 /* not yet */
     /* MS Kids Mouse */
     { "PNP0F14",	MOUSE_PROTO_XXX,	MOUSE_MODEL_GENERIC },
 #endif
     /* Logitech bus */
     { "PNP0F15",	MOUSE_PROTO_BUS,	MOUSE_MODEL_GENERIC },
-#if notyet
+#if 0 /* not yet */
     /* Logitech SWIFT */
     { "PNP0F16",	MOUSE_PROTO_XXX,	MOUSE_MODEL_GENERIC },
 #endif
@@ -328,7 +328,7 @@ static symtab_t pnpprod[] = {
     { "PNP0F18",	MOUSE_PROTO_BUS,	MOUSE_MODEL_GENERIC },
     /* Logitech PS/2 compatible */
     { "PNP0F19",	MOUSE_PROTO_PS2,	MOUSE_MODEL_GENERIC },
-#if notyet
+#if 0 /* not yet */
     /* Logitech SWIFT compatible */
     { "PNP0F1A",	MOUSE_PROTO_XXX,	MOUSE_MODEL_GENERIC },
     /* HP Omnibook */
@@ -366,7 +366,7 @@ static unsigned short rodentcflags[] =
     (CS8 | PARENB | PARODD | CREAD | CLOCAL | HUPCL),	/* kidspad etc. */
     (CS8		   | CREAD | CLOCAL | HUPCL),	/* VersaPad */
     0,							/* JogDial */
-#if notyet
+#if 0 /* not yet */
     (CS8 | CSTOPB	   | CREAD | CLOCAL | HUPCL),	/* Mariqua */
 #endif
 };
@@ -890,8 +890,10 @@ moused(void)
     mousestatus_t action2;		/* mapped action */
     struct timeval timeout;
     fd_set fds;
-    u_char b;
+    u_char buf[16];
     FILE *fp;
+    int fill = 0;
+    int pos = 0;
     int flags;
     int c;
     int i;
@@ -924,7 +926,7 @@ moused(void)
 	bstate[i].count = 0;
 	bstate[i].tv = mouse_button_state_tv;
     }
-    for (i = 0; i < sizeof(zstate)/sizeof(zstate[0]); ++i) {
+    for (i = 0; i < NELEM(zstate); ++i) {
 	zstate[i].count = 0;
 	zstate[i].tv = mouse_button_state_tv;
     }
@@ -937,6 +939,9 @@ moused(void)
     timeout.tv_sec = 0;
     timeout.tv_usec = 20000;		/* 20 msec */
     for (;;) {
+	if (fill > pos)
+	    goto more;
+	fill = 0;
 
 	FD_ZERO(&fds);
 	FD_SET(rodent.mfd, &fds);
@@ -974,13 +979,15 @@ moused(void)
 		continue;
 	    }
 	    /* mouse movement */
-	    if (read(rodent.mfd, &b, 1) == -1) {
+	    if ((fill = read(rodent.mfd, buf, sizeof(buf))) == -1) {
 		if (errno == EWOULDBLOCK)
 		    continue;
 		else
 		    return;
 	    }
-	    if ((flags = r_protocol(b, &action0)) == 0)
+	    pos = 0;
+more:
+	    if ((flags = r_protocol(buf[pos++], &action0)) == 0)
 		continue;
 
 	    if (rodent.flags & VirtualScroll) {
@@ -1247,7 +1254,7 @@ static unsigned char proto[][7] = {
     {	0x80,	0x80,	0x00,	0x00,	5,    0x00,  0xff }, /* KIDSPAD */
     {	0xc3,	0xc0,	0x00,	0x00,	6,    0x00,  0xff }, /* VersaPad */
     {	0x00,	0x00,	0x00,	0x00,	1,    0x00,  0xff }, /* JogDial */
-#if notyet
+#if 0 /* not yet */
     {	0xf8,	0x80,	0x00,	0x00,	5,   ~0x2f,  0x10 }, /* Mariqua */
 #endif
 };
@@ -1287,7 +1294,7 @@ r_identify(void)
     rodent.mode.level = 0;
     if (ioctl(rodent.mfd, MOUSE_GETMODE, &rodent.mode) == 0) {
 	if ((rodent.mode.protocol == MOUSE_PROTO_UNKNOWN)
-	    || (rodent.mode.protocol >= sizeof(proto)/sizeof(proto[0]))) {
+	    || (rodent.mode.protocol >= NELEM(proto))) {
 	    logwarnx("unknown mouse protocol (%d)", rodent.mode.protocol);
 	    return MOUSE_PROTO_UNKNOWN;
 	} else {
@@ -1368,7 +1375,7 @@ static char *
 r_name(int type)
 {
     return ((type == MOUSE_PROTO_UNKNOWN)
-	|| (type > sizeof(rnames)/sizeof(rnames[0]) - 1))
+	|| (type > NELEM(rnames) - 1))
 	? "unknown" : rnames[type];
 }
 
@@ -1764,7 +1771,7 @@ r_protocol(u_char rBuf, mousestatus_t *act)
 	}
 
 	switch (rodent.rtype) {
-#if notyet
+#if 0 /* not yet */
 	case MOUSE_PROTO_MARIQUA:
 	    /*
 	     * This mouse has 16! buttons in addition to the standard
@@ -1878,7 +1885,7 @@ r_protocol(u_char rBuf, mousestatus_t *act)
 	break;
 
     case MOUSE_PROTO_MSC:		/* MouseSystems Corp */
-#if notyet
+#if 0 /* not yet */
     case MOUSE_PROTO_MARIQUA:		/* Mariqua */
 #endif
 	act->button = butmapmsc[(~pBuf[0]) & MOUSE_MSC_BUTTONS];
@@ -2327,10 +2334,8 @@ r_timestamp(mousestatus_t *act)
     int i;
 
     mask = act->flags & MOUSE_BUTTONS;
-#if 0
     if (mask == 0)
 	return;
-#endif
 
     gettimeofday(&tv1, NULL);
 

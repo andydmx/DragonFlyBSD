@@ -15,11 +15,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -46,36 +42,8 @@
 #warning "Don't #include ioctl.h in the kernel.  Include xxxio.h instead."
 #endif
 
-#include <sys/ttycom.h>
-
-/*
- * Pun for SunOS prior to 3.2.  SunOS 3.2 and later support TIOCGWINSZ
- * and TIOCSWINSZ (yes, even 3.2-3.5, the fact that it wasn't documented
- * notwithstanding).
- */
-struct ttysize {
-	unsigned short	ts_lines;
-	unsigned short	ts_cols;
-	unsigned short	ts_xxx;
-	unsigned short	ts_yyy;
-};
-#define	TIOCGSIZE	TIOCGWINSZ
-#define	TIOCSSIZE	TIOCSWINSZ
-
-#include <sys/ioccom.h>
-
 #include <sys/filio.h>
 #include <sys/sockio.h>
+#include <sys/ttycom.h>
 
 #endif /* !_SYS_IOCTL_H_ */
-
-/*
- * Keep outside _SYS_IOCTL_H_
- * Compatibility with old terminal driver
- *
- * Source level -> #define USE_OLD_TTY
- * Kernel level -> options COMPAT_43
- */
-#if defined(USE_OLD_TTY) || defined(COMPAT_43)
-#include <sys/ioctl_compat.h>
-#endif

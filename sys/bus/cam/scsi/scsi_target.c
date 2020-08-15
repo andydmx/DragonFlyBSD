@@ -31,6 +31,7 @@
 
 #include <sys/param.h>
 #include <sys/systm.h>
+#include <sys/uio.h>
 #include <sys/kernel.h>
 #include <sys/conf.h>
 #include <sys/device.h>
@@ -98,7 +99,7 @@ static d_write_t	targwrite;
 static d_ioctl_t	targioctl;
 static d_kqfilter_t	targkqfilter;
 static d_clone_t	targclone;
-DEVFS_DECLARE_CLONE_BITMAP(targ);
+DEVFS_DEFINE_CLONE_BITMAP(targ);
 
 static void		targfiltdetach(struct knote *kn);
 static int		targreadfilt(struct knote *kn, long hint);
@@ -285,26 +286,27 @@ targioctl(struct dev_ioctl_args *ap)
 	case TARGIOCDEBUG:
 	{
 #ifdef	CAMDEBUG
-		struct ccb_debug cdbg;
+		struct ccb_debug *cdbg;
 
 		/* If no periph available, disallow debugging changes */
 		if ((softc->state & TARG_STATE_LUN_ENABLED) == 0) {
 			status = CAM_DEV_NOT_THERE;
 			break;
 		}
-		bzero(&cdbg, sizeof cdbg);
+		cdbg = &xpt_alloc_ccb()->cdbg;
 		if (*((int *)ap->a_data) != 0)
-			cdbg.flags = CAM_DEBUG_PERIPH;
+			cdbg->flags = CAM_DEBUG_PERIPH;
 		else
-			cdbg.flags = CAM_DEBUG_NONE;
+			cdbg->flags = CAM_DEBUG_NONE;
 		cam_periph_lock(softc->periph);
-		xpt_setup_ccb(&cdbg.ccb_h, softc->path, /*priority*/0);
-		cdbg.ccb_h.func_code = XPT_DEBUG;
-		cdbg.ccb_h.cbfcnp = targdone;
+		xpt_setup_ccb(&cdbg->ccb_h, softc->path, /*priority*/0);
+		cdbg->ccb_h.func_code = XPT_DEBUG;
+		cdbg->ccb_h.cbfcnp = targdone;
 
-		xpt_action((union ccb *)&cdbg);
+		xpt_action((union ccb *)cdbg);
 		cam_periph_unlock(softc->periph);
-		status = cdbg.ccb_h.status & CAM_STATUS_MASK;
+		status = cdbg->ccb_h.status & CAM_STATUS_MASK;
+		xpt_free_ccb(&cdbg->ccb_h);
 #else
 		status = CAM_FUNC_NOTAVAIL;
 #endif
@@ -380,22 +382,25 @@ targwritefilt(struct knote *kn, long hint)
 static cam_status
 targendislun(struct cam_path *path, int enable, int grp6_len, int grp7_len)
 {
-	struct ccb_en_lun en_ccb;
+	struct ccb_en_lun *en_ccb;
 	cam_status	  status;
 
 	/* Tell the lun to begin answering selects */
-	xpt_setup_ccb(&en_ccb.ccb_h, path, /*priority*/1);
-	en_ccb.ccb_h.func_code = XPT_EN_LUN;
+	en_ccb = &xpt_alloc_ccb()->cel;
+	xpt_setup_ccb(&en_ccb->ccb_h, path, /*priority*/1);
+	en_ccb->ccb_h.func_code = XPT_EN_LUN;
 	/* Don't need support for any vendor specific commands */
-	en_ccb.grp6_len = grp6_len;
-	en_ccb.grp7_len = grp7_len;
-	en_ccb.enable = enable ? 1 : 0;
-	xpt_action((union ccb *)&en_ccb);
-	status = en_ccb.ccb_h.status & CAM_STATUS_MASK;
+	en_ccb->grp6_len = grp6_len;
+	en_ccb->grp7_len = grp7_len;
+	en_ccb->enable = enable ? 1 : 0;
+	xpt_action((union ccb *)en_ccb);
+	status = en_ccb->ccb_h.status & CAM_STATUS_MASK;
 	if (status != CAM_REQ_CMP) {
 		xpt_print(path, "%sable lun CCB rejected, status %#x\n",
 		    enable ? "en" : "dis", status);
 	}
+	xpt_free_ccb(&en_ccb->ccb_h);
+
 	return (status);
 }
 
@@ -405,22 +410,23 @@ targenable(struct targ_softc *softc, struct cam_path *path, int grp6_len,
 	   int grp7_len)
 {
 	struct cam_periph *periph;
-	struct ccb_pathinq cpi;
+	struct ccb_pathinq *cpi;
 	cam_status	   status;
 
 	if ((softc->state & TARG_STATE_LUN_ENABLED) != 0)
 		return (CAM_LUN_ALRDY_ENA);
 
 	/* Make sure SIM supports target mode */
-	xpt_setup_ccb(&cpi.ccb_h, path, /*priority*/1);
-	cpi.ccb_h.func_code = XPT_PATH_INQ;
-	xpt_action((union ccb *)&cpi);
-	status = cpi.ccb_h.status & CAM_STATUS_MASK;
+	cpi = &xpt_alloc_ccb()->cpi;
+	xpt_setup_ccb(&cpi->ccb_h, path, /*priority*/1);
+	cpi->ccb_h.func_code = XPT_PATH_INQ;
+	xpt_action((union ccb *)cpi);
+	status = cpi->ccb_h.status & CAM_STATUS_MASK;
 	if (status != CAM_REQ_CMP) {
 		kprintf("pathinq failed, status %#x\n", status);
 		goto enable_fail;
 	}
-	if ((cpi.target_sprt & PIT_PROCESSOR) == 0) {
+	if ((cpi->target_sprt & PIT_PROCESSOR) == 0) {
 		kprintf("controller does not support target mode\n");
 		status = CAM_FUNC_NOTAVAIL;
 		goto enable_fail;
@@ -466,6 +472,8 @@ targenable(struct targ_softc *softc, struct cam_path *path, int grp6_len,
 	softc->state |= TARG_STATE_LUN_ENABLED;
 
 enable_fail:
+	xpt_free_ccb(&cpi->ccb_h);
+
 	return (status);
 }
 
@@ -562,12 +570,12 @@ targwrite(struct dev_write_args *ap)
 				  ("write - uiomove failed (%d)\n", error));
 			break;
 		}
-		priority = fuword(&user_ccb->ccb_h.pinfo.priority);
+		priority = fuword32(&user_ccb->ccb_h.pinfo.priority);
 		if (priority == -1) {
 			error = EINVAL;
 			break;
 		}
-		func_code = fuword(&user_ccb->ccb_h.func_code);
+		func_code = fuword32(&user_ccb->ccb_h.func_code);
 		switch (func_code) {
 		case XPT_ACCEPT_TARGET_IO:
 		case XPT_IMMED_NOTIFY:
@@ -661,8 +669,8 @@ targstart(struct cam_periph *periph, union ccb *start_ccb)
 			xpt_print(periph->path,
 			    "targsendccb failed, err %d\n", error);
 			xpt_release_ccb(start_ccb);
-			suword(&descr->user_ccb->ccb_h.status,
-			       CAM_REQ_CMP_ERR);
+			suword32(&descr->user_ccb->ccb_h.status,
+			         CAM_REQ_CMP_ERR);
 			crit_enter();
 			TAILQ_INSERT_TAIL(&softc->abort_queue, descr, tqe);
 			crit_exit();
@@ -691,10 +699,10 @@ targusermerge(struct targ_softc *softc, struct targ_cmd_descr *descr,
 	 * preserved, the rest we get from the user ccb. (See xpt_merge_ccb)
 	 */
 	xpt_setup_ccb(k_ccbh, softc->path, descr->priority);
-	k_ccbh->retry_count = fuword(&u_ccbh->retry_count);
+	k_ccbh->retry_count = fuword32(&u_ccbh->retry_count);
 	k_ccbh->func_code = descr->func_code;
-	k_ccbh->flags = fuword(&u_ccbh->flags);
-	k_ccbh->timeout = fuword(&u_ccbh->timeout);
+	k_ccbh->flags = fuword32(&u_ccbh->flags);
+	k_ccbh->timeout = fuword32(&u_ccbh->timeout);
 	ccb_len = targccblen(k_ccbh->func_code) - sizeof(struct ccb_hdr);
 	error = copyin(u_ccbh + 1, k_ccbh + 1, ccb_len);
 	if (error != 0) {
@@ -912,7 +920,7 @@ targread(struct dev_read_args *ap)
 		CAM_DEBUG(softc->path, CAM_DEBUG_PERIPH,
 			  ("targread aborted descr %p (%p)\n",
 			  user_descr, user_ccb));
-		suword(&user_ccb->ccb_h.status, CAM_REQ_ABORTED);
+		suword32(&user_ccb->ccb_h.status, CAM_REQ_ABORTED);
 		cam_periph_unlock(softc->periph);
 		error = uiomove((caddr_t)&user_ccb, sizeof(user_ccb), uio);
 		cam_periph_lock(softc->periph);
@@ -973,16 +981,20 @@ static union ccb *
 targgetccb(struct targ_softc *softc, xpt_opcode type, int priority)
 {
 	union ccb *ccb;
-	int ccb_len;
 
+#if 0
+	int ccb_len;
 	ccb_len = targccblen(type);
 	ccb = kmalloc(ccb_len, M_TARG, M_INTWAIT);
+#endif
+	ccb = xpt_alloc_ccb();
 	CAM_DEBUG(softc->path, CAM_DEBUG_PERIPH, ("getccb %p\n", ccb));
 
 	xpt_setup_ccb(&ccb->ccb_h, softc->path, priority);
 	ccb->ccb_h.func_code = type;
 	ccb->ccb_h.cbfcnp = targdone;
 	ccb->ccb_h.targ_descr = targgetdescr(softc);
+
 	return (ccb);
 }
 
@@ -992,12 +1004,13 @@ targfreeccb(struct targ_softc *softc, union ccb *ccb)
 	CAM_DEBUG_PRINT(CAM_DEBUG_PERIPH, ("targfreeccb descr %p and\n",
 			ccb->ccb_h.targ_descr));
 	kfree(ccb->ccb_h.targ_descr, M_TARG);
+	ccb->ccb_h.targ_descr = NULL;	/* safety */
 
 	switch (ccb->ccb_h.func_code) {
 	case XPT_ACCEPT_TARGET_IO:
 	case XPT_IMMED_NOTIFY:
 		CAM_DEBUG_PRINT(CAM_DEBUG_PERIPH, ("freeing ccb %p\n", ccb));
-		kfree(ccb, M_TARG);
+		xpt_free_ccb(&ccb->ccb_h);
 		break;
 	default:
 		/* Send back CCB if we got it from the periph */
@@ -1008,7 +1021,7 @@ targfreeccb(struct targ_softc *softc, union ccb *ccb)
 		} else {
 			CAM_DEBUG_PRINT(CAM_DEBUG_PERIPH,
 					("freeing ccb %p\n", ccb));
-			kfree(ccb, M_TARG);
+			xpt_free_ccb(&ccb->ccb_h);
 		}
 		break;
 	}
@@ -1055,7 +1068,7 @@ static void
 abort_all_pending(struct targ_softc *softc)
 {
 	struct targ_cmd_descr   *descr;
-	struct ccb_abort	 cab;
+	struct ccb_abort	 *cab;
 	struct ccb_hdr		*ccb_h;
 	struct cam_sim		*sim;
 
@@ -1073,32 +1086,36 @@ abort_all_pending(struct targ_softc *softc)
 	 * Then abort all pending CCBs.
 	 * targdone() will return the aborted CCB via user_ccb_queue
 	 */
-	xpt_setup_ccb(&cab.ccb_h, softc->path, /*priority*/0);
-	cab.ccb_h.func_code = XPT_ABORT;
-	cab.ccb_h.status = CAM_REQ_CMP_ERR;
+	cab = &xpt_alloc_ccb()->cab;
+	xpt_setup_ccb(&cab->ccb_h, softc->path, /*priority*/0);
+	cab->ccb_h.func_code = XPT_ABORT;
+	cab->ccb_h.status = CAM_REQ_CMP_ERR;
 	TAILQ_FOREACH(ccb_h, &softc->pending_ccb_queue, periph_links.tqe) {
 		CAM_DEBUG(softc->path, CAM_DEBUG_PERIPH,
 			  ("Aborting pending CCB %p\n", ccb_h));
-		cab.abort_ccb = (union ccb *)ccb_h;
-		xpt_action((union ccb *)&cab);
-		if (cab.ccb_h.status != CAM_REQ_CMP) {
-			xpt_print(cab.ccb_h.path,
+		cab->abort_ccb = (union ccb *)ccb_h;
+		xpt_action((union ccb *)cab);
+		if (cab->ccb_h.status != CAM_REQ_CMP) {
+			xpt_print(cab->ccb_h.path,
 			    "Unable to abort CCB, status %#x\n",
-			    cab.ccb_h.status);
+			    cab->ccb_h.status);
 		}
 	}
 
 	/* If we aborted at least one pending CCB ok, wait for it. */
-	if (cab.ccb_h.status == CAM_REQ_CMP) {
+	if (cab->ccb_h.status == CAM_REQ_CMP) {
 		sim = xpt_path_sim(softc->path);
 		sim_lock_sleep(&softc->pending_ccb_queue, PCATCH, "tgabrt", 0,
 			       sim->lock);
 	}
 
 	/* If we aborted anything from the work queue, wakeup user. */
-	if (!TAILQ_EMPTY(&softc->user_ccb_queue)
-	 || !TAILQ_EMPTY(&softc->abort_queue))
+	if (!TAILQ_EMPTY(&softc->user_ccb_queue) ||
+	    !TAILQ_EMPTY(&softc->abort_queue)) {
 		notify_user(softc);
+	}
+
+	xpt_free_ccb(&cab->ccb_h);
 }
 
 /* Notify the user that data is ready */

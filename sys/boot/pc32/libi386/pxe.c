@@ -65,6 +65,7 @@ static BOOTPLAYER	bootplayer;	/* PXE Cached information. */
 static int 	pxe_debug = 0;
 static int	pxe_sock = -1;
 static int	pxe_opens = 0;
+static int	bugged_bios_pxe = 0;
 
 void		pxe_enable(void *pxeinfo);
 static void	(*pxe_call)(int func);
@@ -310,10 +311,18 @@ pxe_open(struct open_file *f, ...)
 
 		setenv("boot.nfsroot.server", inet_ntoa(rootip), 1);
 		setenv("boot.nfsroot.path", rootpath, 1);
+
+		if (bootplayer.yip != INADDR_ANY &&
+		    bootplayer.yip != myip.s_addr) {
+			printf("Warning: PXE negotiated a different IP "
+			       "in the preloader\n");
+			bugged_bios_pxe = 1;
+		}
 	}
     }
     pxe_opens++;
-    f->f_devdata = &pxe_sock;
+    devreplace(f, &pxe_sock);
+
     return (error);
 }
 
@@ -404,6 +413,24 @@ pxe_perror(int err)
 	return;
 }
 
+/* To prevent LTO warnings. Must match libstand/nfs.c struct. */
+struct nfsv2_fattrs {
+	n_long	fa_type;
+	n_long	fa_mode;
+	n_long	fa_nlink;
+	n_long	fa_uid;
+	n_long	fa_gid;
+	n_long	fa_size;
+	n_long	fa_blocksize;
+	n_long	fa_rdev;
+	n_long	fa_blocks;
+	n_long	fa_fsid;
+	n_long	fa_fileid;
+	struct nfsv2_time fa_atime;
+	struct nfsv2_time fa_mtime;
+	struct nfsv2_time fa_ctime;
+};
+
 /*
  * Reach inside the libstand NFS code and dig out an NFS handle
  * for the root filesystem.  If there is no nfs handle but a NFS root
@@ -416,6 +443,7 @@ struct nfs_iodesc {
 	off_t	off;
 	u_char	fh[NFS_FHSIZE];
 	/* structure truncated here */
+	struct nfsv2_fattrs unused;	/* unused */
 };
 extern struct	nfs_iodesc nfs_root_node;
 
@@ -601,9 +629,18 @@ readudp(struct iodesc *h, void *pkt, size_t len, time_t timeout)
 	
 	uh = (struct udphdr *) pkt - 1;
 	ip = (struct ip *)uh - 1;
+again:
 	bzero(udpread_p, sizeof(*udpread_p));
-	
-	udpread_p->dest_ip        = h->myip.s_addr;
+
+	/*
+	 * Bugged BIOSes (e.g. Gigabyte H97N-WIFI) can wind up asking for
+	 * a different IP than we negotiated, then using that IP instead
+	 * of the one we specified in the udpopen().
+	 */
+	if (bugged_bios_pxe)
+		udpread_p->dest_ip = INADDR_ANY;
+	else
+		udpread_p->dest_ip = h->myip.s_addr;
 	udpread_p->d_port         = h->myport;
 	udpread_p->buffer_size    = len;
 	udpread_p->buffer.segment = VTOPSEG(data_buffer);
@@ -611,16 +648,29 @@ readudp(struct iodesc *h, void *pkt, size_t len, time_t timeout)
 
 	pxe_call(PXENV_UDP_READ);
 
-#if 0
-	/* XXX - I dont know why we need this. */
-	delay(1000);
-#endif
 	if (udpread_p->status != 0) {
 		/* XXX: This happens a lot.  It shouldn't. */
 		if (udpread_p->status != 1)
 			printf("readudp failed %x\n", udpread_p->status);
 		return -1;
 	}
+
+	/*
+	 * If the BIOS is bugged in this manner we were forced to allow
+	 * any address in dest_ip and have to filter the packets ourselves.
+	 * The bugged BIOS used the wrong IP in the udpwrite (it used the
+	 * previously negotiated bootplayer.yip IP).  So make sure the IP
+	 * is either that one or the one we negotiated and specified in the
+	 * udpopen ourselves.
+	 */
+	if (bugged_bios_pxe) {
+		if (udpread_p->dest_ip != h->myip.s_addr &&
+		    udpread_p->dest_ip != bootplayer.yip &&
+		    udpread_p->dest_ip != INADDR_ANY) {
+			goto again;
+		}
+	}
+
 	bcopy(data_buffer, pkt, udpread_p->buffer_size);
 	uh->uh_sport = udpread_p->s_port;
 	ip->ip_src.s_addr = udpread_p->src_ip;

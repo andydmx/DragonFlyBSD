@@ -166,7 +166,8 @@ struct acpi_ec_softc {
 #define EC_POLL_DELAY	50
 
 /* Total time in ms spent waiting for a response from EC. */
-#define EC_TIMEOUT	750
+#define EC_TIMEOUT		750
+#define EC_TIMEOUT_BACKOFF	100
 
 #define EVENT_READY(event, status)			\
 	(((event) == EC_EVENT_OUTPUT_BUFFER_FULL &&	\
@@ -175,6 +176,8 @@ struct acpi_ec_softc {
 	 ((status) & EC_FLAG_INPUT_BUFFER) == 0))
 
 ACPI_SERIAL_DECL(ec, "ACPI embedded controller");
+
+extern int acpi_silence_all;
 
 static SYSCTL_NODE(_debug_acpi, OID_AUTO, ec, CTLFLAG_RD, NULL, "EC debugging");
 
@@ -190,6 +193,16 @@ static int	ec_timeout = EC_TIMEOUT;
 TUNABLE_INT("debug.acpi.ec.timeout", &ec_timeout);
 SYSCTL_INT(_debug_acpi_ec, OID_AUTO, timeout, CTLFLAG_RW, &ec_timeout,
     EC_TIMEOUT, "Total time spent waiting for a response (poll+sleep)");
+static int	ec_timeout_backoff = EC_TIMEOUT_BACKOFF;
+TUNABLE_INT("debug.acpi.ec.timeout_backoff", &ec_timeout_backoff);
+SYSCTL_INT(_debug_acpi_ec, OID_AUTO, timeout_backoff, CTLFLAG_RW,
+	&ec_timeout_backoff, EC_TIMEOUT_BACKOFF,
+	"Total time spent retrying for a response (poll+sleep) in case of failure");
+static int	ec_auto_silence = 10;	/* silence after 10 errors */
+TUNABLE_INT("debug.acpi.ec.auto_silence", &ec_auto_silence);
+SYSCTL_INT(_debug_acpi_ec, OID_AUTO, auto_silence, CTLFLAG_RW,
+	&ec_auto_silence, 1,
+	"Auto-silence ACPI messages after x retries in case of failure");
 
 #ifndef KTR_ACPI_EC
 #define	KTR_ACPI_EC	KTR_ALL
@@ -203,7 +216,7 @@ KTR_INFO(KTR_ACPI_EC, acpi_ec, burstdisok, 1,
 KTR_INFO(KTR_ACPI_EC, acpi_ec, burstenl, 2,
     "ec burst enabled");
 KTR_INFO(KTR_ACPI_EC, acpi_ec, cmdrun, 3,
-    "ec running command %#x", EC_COMMAND cmd);
+    "ec running command %#hhx", EC_COMMAND cmd);
 KTR_INFO(KTR_ACPI_EC, acpi_ec, gpehdlstart, 4,
     "ec gpe handler start");
 KTR_INFO(KTR_ACPI_EC, acpi_ec, gpequeuehdl, 5,
@@ -211,17 +224,17 @@ KTR_INFO(KTR_ACPI_EC, acpi_ec, gpequeuehdl, 5,
 KTR_INFO(KTR_ACPI_EC, acpi_ec, gperun, 6,
     "ec running gpe handler directly");
 KTR_INFO(KTR_ACPI_EC, acpi_ec, qryoknotrun, 7,
-    "ec query ok, not running _Q%02X", uint8_t Data);
+    "ec query ok, not running _Q%02hhX", uint8_t Data);
 KTR_INFO(KTR_ACPI_EC, acpi_ec, qryokrun, 8,
-    "ec query ok, running _Q%02X", uint8_t Data);
+    "ec query ok, running _Q%02hhX", uint8_t Data);
 KTR_INFO(KTR_ACPI_EC, acpi_ec, readaddr, 9,
-    "ec read from %#x", UINT8 Address);
+    "ec read from %#hhx", UINT8 Address);
 KTR_INFO(KTR_ACPI_EC, acpi_ec, timeout, 10,
     "error: ec wait timed out");
 KTR_INFO(KTR_ACPI_EC, acpi_ec, waitrdy, 11,
-    "ec %s wait ready, status %#x", const char *msg, EC_STATUS ec_status);
+    "ec %s wait ready, status %#hhx", const char *msg, EC_STATUS ec_status);
 KTR_INFO(KTR_ACPI_EC, acpi_ec, writeaddr, 12,
-    "ec write to %#x, data %#x", UINT8 Address, UINT8 Data);
+    "ec write to %#hhx, data %#hhx", UINT8 Address, UINT8 Data);
 
 static ACPI_STATUS
 EcLock(struct acpi_ec_softc *sc)
@@ -291,6 +304,7 @@ static driver_t acpi_ec_driver = {
     "acpi_ec",
     acpi_ec_methods,
     sizeof(struct acpi_ec_softc),
+    .gpri = KOBJ_GPRI_ACPI
 };
 
 static devclass_t acpi_ec_devclass;
@@ -933,8 +947,14 @@ EcWaitEvent(struct acpi_ec_softc *sc, EC_EVENT Event, u_int gen_count)
 	    "not getting interrupts, switched to polled mode\n");
 	ec_polled_mode = 1;
     }
-    if (ACPI_FAILURE(Status))
+    if (ACPI_FAILURE(Status)) {
+	ec_timeout = ec_timeout_backoff;
+	if (ec_auto_silence > 0) {
+	    if (--ec_auto_silence <= 0)
+		acpi_silence_all = 1;
+	}
 	KTR_LOG(acpi_ec_timeout);
+    }
     return (Status);
 }
 

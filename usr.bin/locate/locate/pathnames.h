@@ -1,4 +1,6 @@
 /*
+ * SPDX-License-Identifier: BSD-4-Clause
+ *
  * Copyright (c) 1989, 1993
  *	The Regents of the University of California.  All rights reserved.
  *
@@ -31,6 +33,7 @@
  * SUCH DAMAGE.
  *
  *	@(#)pathnames.h	8.1 (Berkeley) 6/6/93
+ * $FreeBSD: head/usr.bin/locate/locate/pathnames.h 325966 2017-11-18 14:26:50Z pfg $
  */
 
 #define	_PATH_FCODES	"/var/db/locate.database"

@@ -1,27 +1,13 @@
+/*	$NetBSD: io.c,v 1.14 2009/08/31 08:27:16 dholland Exp $	*/
+
 /*
  * io.c - input/output routines for Phantasia
- *
- * $FreeBSD: src/games/phantasia/io.c,v 1.6 1999/11/16 02:57:33 billf Exp $
- * $DragonFly: src/games/phantasia/io.c,v 1.3 2005/05/31 00:06:26 swildner Exp $
  */
 
 #include <string.h>
 #include "include.h"
 
-/* functions which we need to know about */
-/* misc.c */
-extern	void	death(const char *);
-extern	void	leavegame(void);
-/* phantglobs.c */
-extern	double	drandom(void);
-
-void	catchalarm(void);
-int	getanswer(const char *, bool);
-void	getstring(char *, int);
-double	infloat(void);
-int	inputoption(void);
-void	interrupt(void);
-void	more(int);
+static void catchalarm(int) __dead2;
 
 /*
  * FUNCTION: read a string from operator
@@ -282,7 +268,7 @@ getanswer(const char *choices, bool def)
 #ifdef BSD41
 			sigset(SIGALRM, catchalarm);
 #else
-			signal(SIGALRM, (sig_t)catchalarm);
+			signal(SIGALRM, catchalarm);
 #endif
 			/* set timeout */
 			if (Timeout)
@@ -298,12 +284,12 @@ getanswer(const char *choices, bool def)
 				/* caught some signal */
 				++loop;
 				continue;
-			} else if (ch == CH_REDRAW)       {
+			} else if (ch == CH_REDRAW) {
 				/* redraw screen */
 				clearok(stdscr, TRUE);	/* force clear screen */
 				++loop;	/* don't count this input */
 				continue;
-			} else if (Echo)       {
+			} else if (Echo) {
 				addch(ch);	/* echo character */
 				refresh();
 			}
@@ -341,8 +327,8 @@ YELL:				mvprintw(oldy + 1, 0,
  *	Simply longjmp() into getanswer().
  */
 
-void
-catchalarm(void)
+static void
+catchalarm(__unused int sig)
 {
 	longjmp(Timeoenv, 1);
 }

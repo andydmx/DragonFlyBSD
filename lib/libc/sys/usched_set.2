@@ -30,7 +30,7 @@
 .\" OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
 .\" SUCH DAMAGE.
 .\"
-.Dd October 16, 2012
+.Dd January 9, 2017
 .Dt USCHED_SET 2
 .Os
 .Sh NAME
@@ -53,7 +53,9 @@ and removing a CPU from the list of available CPUs for an LWP.
 The
 .Fn usched_set
 function requires superuser privileges for all commands except
-.Dv USCHED_GET_CPU .
+.Dv USCHED_GET_CPU
+and
+.Dv USCHED_GET_CPUMASK .
 .Pp
 The
 .Fa cmd
@@ -72,6 +74,12 @@ assign the LWP to the cpuid pointed to by
 .Fa data .
 .It Dv USCHED_GET_CPU
 copy the LWP's CPU ID to the cpuid pointed to by
+.Fa data .
+.It Dv USCHED_GET_CPUMASK
+copy the LWP's CPU mask to the cpumask_t type pointed to by
+.Fa data .
+.It Dv USCHED_SET_CPUMASK
+set the LWP's CPU mask to the cpumask_t type pointed to by
 .Fa data .
 .It Dv USCHED_ADD_CPU
 add the cpuid specified by
@@ -112,12 +120,20 @@ function call was added in
 .Dx 1.9 .
 .Sh AUTHORS
 .An -nosplit
-.Fn Usched_set
-was written by
+The
+.Fn usched_set
+system call was written by
 .An Matt Dillon .
 This manual page was written by
 .An Joe Talbott .
 .Sh BUGS
 Only
 .Fa pid
-equals current LWP PID is implemented.
+equals current LWP PID or 0 is implemented.
+The current LWP PID is used for
+.Fa pid
+when
+.Fa pid
+is 0.
+One would normally only use 0 for
+.Fa pid .

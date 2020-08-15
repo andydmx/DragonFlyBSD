@@ -133,7 +133,7 @@ prepdisk()
     fdisk -IB ${disk} >> ${logfile} 2>&1
     ckstatus $? "fdisk"
 
-    disklabel -r -w ${disk}s1 auto >> ${logfile} 2>&1
+    disklabel -r -w ${disk}s1 >> ${logfile} 2>&1
     ckstatus $? "disklabel"
 
     if [ ! "${bootdisk}" = "" ]; then
@@ -344,7 +344,7 @@ echo "* Performing LVM operations"
 lvmops
 
 # Format the volumes
-echo "* Formating ${bootdisk} and LVs lv_root"
+echo "* Formatting ${bootdisk} and LVs lv_root"
 newfs /dev/${bootdisk}s1a >> ${logfile} 2>&1
 lvmexit $?
 

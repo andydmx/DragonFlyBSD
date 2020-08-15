@@ -22,10 +22,13 @@
 #include <sys/sysctl.h>
 #include <sys/sensors.h>
 
+#include <ctype.h>
 #include <err.h>
 #include <errno.h>
+#include <libutil.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "systat.h"
 #include "extern.h"
@@ -35,6 +38,21 @@ struct sensordev sensordev;
 int row, sensor_cnt;
 void printline(void);
 static char * fmttime(double);
+
+struct sensordev_xname {
+	char	xname[24];
+	int	xname_len;
+	u_int	flags;	/* XNAME_FLAG_ */
+};
+
+#define XNAME_FLAG_WILDCARD	0x1
+
+static int	sensors_enabled[SENSOR_MAX_TYPES];
+
+#define XNAME_MAX		64
+
+static int	sensordev_xname_cnt;
+static struct sensordev_xname sensordev_xname[XNAME_MAX];
 
 WINDOW *
 opensensors(void)
@@ -67,8 +85,15 @@ void
 fetchsensors(void)
 {
 	enum sensor_type type;
-	size_t		 slen, sdlen;
-	int		 mib[5], dev, numt;
+	size_t		 slen, sdlen, idmax_len;
+	int		 mib[5], dev, numt, idmax;
+	int		 maxsensordevices;
+
+	maxsensordevices = MAXSENSORDEVICES;
+	idmax_len = sizeof(idmax);
+	if (sysctlbyname("hw.sensors.dev_idmax", &idmax, &idmax_len,
+	    NULL, 0) == 0)
+		maxsensordevices = idmax;
 
 	mib[0] = CTL_HW;
 	mib[1] = HW_SENSORS;
@@ -81,14 +106,47 @@ fetchsensors(void)
 	wmove(wnd, row, 0);
 	wclrtobot(wnd);
 
-	for (dev = 0; dev < MAXSENSORDEVICES; dev++) {
+	for (dev = 0; dev < maxsensordevices; dev++) {
 		mib[2] = dev;
 		if (sysctl(mib, 3, &sensordev, &sdlen, NULL, 0) == -1) {
 			if (errno != ENOENT)
 				warn("sysctl");
 			continue;
 		}
+
+		if (sensordev_xname_cnt > 0) {
+			int i, match = 0, xname_len;
+
+			xname_len = strlen(sensordev.xname);
+			for (i = 0; i < sensordev_xname_cnt; ++i) {
+				const struct sensordev_xname *x;
+
+				x = &sensordev_xname[i];
+				if (x->flags & XNAME_FLAG_WILDCARD) {
+					if (xname_len <= x->xname_len)
+						continue;
+					if (!isdigit(
+					    sensordev.xname[x->xname_len]))
+						continue;
+					if (strncmp(x->xname, sensordev.xname,
+					    x->xname_len) == 0) {
+						match = 1;
+						break;
+					}
+				} else if (xname_len == x->xname_len &&
+				    strcmp(x->xname, sensordev.xname) == 0) {
+					match = 1;
+					break;
+				}
+			}
+			if (!match)
+				continue;
+		}
+
 		for (type = 0; type < SENSOR_MAX_TYPES; type++) {
+			if (!sensors_enabled[type])
+				continue;
+
 			mib[3] = type;
 			for (numt = 0; numt < sensordev.maxnumt[type]; numt++) {
 				mib[4] = numt;
@@ -123,12 +181,18 @@ showsensors(void)
 int
 initsensors(void)
 {
+	int i;
+
+	for (i = 0; i < SENSOR_MAX_TYPES; ++i)
+		sensors_enabled[i] = 1;
 	return (1);
 }
 
 void
 printline(void)
 {
+	char buf[9];
+
 	mvwprintw(wnd, row, 0, "%s.%s%d", sensordev.xname,
 	    sensor_type_s[sensor.type], sensor.numt);
 	switch (sensor.type) {
@@ -142,6 +206,9 @@ printline(void)
 	case SENSOR_VOLTS_DC:
 		mvwprintw(wnd, row, 24, "%10.2f V DC",
 		    sensor.value / 1000000.0);
+		break;
+	case SENSOR_WATTS:
+		mvwprintw(wnd, row, 24, "%13.2f W", sensor.value / 1000000.0);
 		break;
 	case SENSOR_AMPS:
 		mvwprintw(wnd, row, 24, "%10.2f A", sensor.value / 1000000.0);
@@ -160,7 +227,7 @@ printline(void)
 		break;
 	case SENSOR_DRIVE:
 		if (0 < sensor.value &&
-		    (size_t)sensor.value < sizeof(drvstat)/sizeof(drvstat[0])) {
+		    (size_t)sensor.value < NELEM(drvstat)) {
 			mvwprintw(wnd, row, 24, "%15s", drvstat[sensor.value]);
 			break;
 		}
@@ -173,6 +240,11 @@ printline(void)
 		break;
 	case SENSOR_AMPHOUR:
 		mvwprintw(wnd, row, 24, "%10.2f Ah", sensor.value / 1000000.0);
+		break;
+	case SENSOR_FREQ:
+		humanize_number(buf, sizeof(buf), sensor.value, "Hz",
+		    HN_AUTOSCALE, HN_DIVISOR_1000 | HN_DECIMAL);
+		mvwprintw(wnd, row, 24, "%15s", buf);
 		break;
 	default:
 		mvwprintw(wnd, row, 24, "%10lld", sensor.value);
@@ -253,4 +325,72 @@ fmttime(double in)
 	    signbit == -1 ? "-" : "", in, unit);
 
 	return outbuf;
+}
+
+int
+cmdsensors(const char *cmd, char *args)
+{
+	if (prefix(cmd, "type")) {
+		const char *t;
+		int i, has_type = 0;
+
+		for (i = 0; i < SENSOR_MAX_TYPES; ++i)
+			sensors_enabled[i] = 0;
+
+		while ((t = strsep(&args, " ")) != NULL) {
+			if (*t == '\0')
+				continue;
+
+			has_type = 1;
+			for (i = 0; i < SENSOR_MAX_TYPES; ++i) {
+				if (strcmp(t, sensor_type_s[i]) == 0) {
+					sensors_enabled[i] = 1;
+					break;
+				}
+			}
+		}
+
+		if (!has_type) {
+			for (i = 0; i < SENSOR_MAX_TYPES; ++i)
+				sensors_enabled[i] = 1;
+		}
+	} else if (prefix(cmd, "match")) {
+		const char *xname;
+
+		sensordev_xname_cnt = 0;
+		while ((xname = strsep(&args, " ")) != NULL) {
+			struct sensordev_xname *x;
+			int xname_len, cp_len;
+
+			xname_len = strlen(xname);
+			if (xname_len == 0)
+				continue;
+
+			x = &sensordev_xname[sensordev_xname_cnt];
+			x->flags = 0;
+
+			if (xname[xname_len - 1] == '*') {
+				--xname_len;
+				if (xname_len == 0)
+					continue;
+				x->flags |= XNAME_FLAG_WILDCARD;
+			}
+			cp_len = xname_len;
+			if (cp_len >= (int)sizeof(x->xname))
+				cp_len = sizeof(x->xname) - 1;
+
+			memcpy(x->xname, xname, cp_len);
+			x->xname[cp_len] = '\0';
+			x->xname_len = strlen(x->xname);
+
+			sensordev_xname_cnt++;
+			if (sensordev_xname_cnt == XNAME_MAX)
+				break;
+		}
+	}
+
+	wclear(wnd);
+	labelsensors();
+	refresh();
+	return (1);
 }

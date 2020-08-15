@@ -17,11 +17,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Lawrence Berkeley Laboratory and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -38,8 +34,8 @@
  * SUCH DAMAGE.
  */
 
-#ifndef __SYS_LIBNETBOOT_IODESC_H
-#define __SYS_LIBNETBOOT_IODESC_H
+#ifndef _STAND_IODESC_H_
+#define	_STAND_IODESC_H_
 
 struct iodesc {
 	struct	in_addr destip;		/* dest. ip addr, net order */
@@ -51,4 +47,4 @@ struct iodesc {
 	struct netif *io_netif;
 };
 
-#endif /* __SYS_LIBNETBOOT_IODESC_H */
+#endif /* !_STAND_IODESC_H_ */

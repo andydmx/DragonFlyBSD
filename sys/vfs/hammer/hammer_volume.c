@@ -35,172 +35,99 @@
  */
 
 #include "hammer.h"
-#include <sys/fcntl.h>
-#include <sys/nlookup.h>
-#include <sys/buf.h>
-
-#include <sys/buf2.h>
 
 static int
-hammer_setup_device(struct vnode **devvpp, const char *dev_path, int ronly);
-
-static void
-hammer_close_device(struct vnode **devvpp, int ronly);
-
-static int
-hammer_format_volume_header(struct hammer_mount *hmp, struct vnode *devvp,
-	const char *vol_name, int vol_no, int vol_count,
-	int64_t vol_size, int64_t boot_area_size, int64_t mem_area_size);
+hammer_format_volume_header(hammer_mount_t hmp,
+	struct hammer_ioc_volume *ioc,
+	hammer_volume_ondisk_t ondisk,
+	int vol_no);
 
 static int
-hammer_clear_volume_header(struct vnode *devvp);
-
-struct bigblock_stat {
-	uint64_t total_bigblocks;
-	uint64_t total_free_bigblocks;
-	uint64_t counter;
-};
+hammer_update_volumes_header(hammer_transaction_t trans,
+	int64_t total_bigblocks, int64_t empty_bigblocks);
 
 static int
-hammer_format_freemap(hammer_transaction_t trans, hammer_volume_t volume,
-	struct bigblock_stat *stat);
+hammer_do_reblock(hammer_transaction_t trans, hammer_inode_t ip);
 
 static int
-hammer_free_freemap(hammer_transaction_t trans, hammer_volume_t volume,
-	struct bigblock_stat *stat);
+hammer_format_freemap(hammer_transaction_t trans, hammer_volume_t volume);
+
+static int
+hammer_free_freemap(hammer_transaction_t trans, hammer_volume_t volume);
+
+static int
+hammer_count_bigblocks(hammer_mount_t hmp, hammer_volume_t volume,
+	int64_t *total_bigblocks, int64_t *empty_bigblocks);
 
 int
 hammer_ioc_volume_add(hammer_transaction_t trans, hammer_inode_t ip,
 		struct hammer_ioc_volume *ioc)
 {
-	struct hammer_mount *hmp = trans->hmp;
+	hammer_mount_t hmp = trans->hmp;
 	struct mount *mp = hmp->mp;
+	struct hammer_volume_ondisk ondisk;
 	hammer_volume_t volume;
+	int64_t total_bigblocks, empty_bigblocks;
+	int free_vol_no = 0;
 	int error;
 
 	if (mp->mnt_flag & MNT_RDONLY) {
-		kprintf("Cannot add volume to read-only HAMMER filesystem\n");
-		return (EINVAL);
-	}
-
-	if (hmp->nvolumes + 1 >= HAMMER_MAX_VOLUMES) {
-		kprintf("Max number of HAMMER volumes exceeded\n");
+		hmkprintf(hmp, "Cannot add volume to read-only HAMMER filesystem\n");
 		return (EINVAL);
 	}
 
 	if (hammer_lock_ex_try(&hmp->volume_lock) != 0) {
-		kprintf("Another volume operation is in progress!\n");
+		hmkprintf(hmp, "Another volume operation is in progress!\n");
 		return (EAGAIN);
+	}
+
+	if (hmp->nvolumes >= HAMMER_MAX_VOLUMES) {
+		hammer_unlock(&hmp->volume_lock);
+		hmkprintf(hmp, "Max number of HAMMER volumes exceeded\n");
+		return (EINVAL);
 	}
 
 	/*
 	 * Find an unused volume number.
 	 */
-	int free_vol_no = 0;
 	while (free_vol_no < HAMMER_MAX_VOLUMES &&
-	       RB_LOOKUP(hammer_vol_rb_tree, &hmp->rb_vols_root, free_vol_no)) {
+		hammer_volume_number_test(hmp, free_vol_no)) {
 		++free_vol_no;
 	}
 	if (free_vol_no >= HAMMER_MAX_VOLUMES) {
-		kprintf("Max number of HAMMER volumes exceeded\n");
-		hammer_unlock(&hmp->volume_lock);
-		return (EINVAL);
+		hmkprintf(hmp, "Max number of HAMMER volumes exceeded\n");
+		error = EINVAL;
+		goto end;
 	}
 
-	struct vnode *devvp = NULL;
-	error = hammer_setup_device(&devvp, ioc->device_name, 0);
-	if (error)
-		goto end;
-	KKASSERT(devvp);
-	error = hammer_format_volume_header(
-		hmp,
-		devvp,
-		hmp->rootvol->ondisk->vol_name,
-		free_vol_no,
-		hmp->nvolumes+1,
-		ioc->vol_size,
-		ioc->boot_area_size,
-		ioc->mem_area_size);
-	hammer_close_device(&devvp, 0);
+	error = hammer_format_volume_header(hmp, ioc, &ondisk, free_vol_no);
 	if (error)
 		goto end;
 
-	error = hammer_install_volume(hmp, ioc->device_name, NULL);
+	error = hammer_install_volume(hmp, ioc->device_name, NULL, &ondisk);
 	if (error)
 		goto end;
 
 	hammer_sync_lock_sh(trans);
 	hammer_lock_ex(&hmp->blkmap_lock);
 
-	++hmp->nvolumes;
-
-	/*
-	 * Set each volumes new value of the vol_count field.
-	 */
-	for (int vol_no = 0; vol_no < HAMMER_MAX_VOLUMES; ++vol_no) {
-		volume = hammer_get_volume(hmp, vol_no, &error);
-		if (volume == NULL && error == ENOENT) {
-			/*
-			 * Skip unused volume numbers
-			 */
-			error = 0;
-			continue;
-		}
-		KKASSERT(volume != NULL && error == 0);
-		hammer_modify_volume_field(trans, volume, vol_count);
-		volume->ondisk->vol_count = hmp->nvolumes;
-		hammer_modify_volume_done(volume);
-
-		/*
-		 * Only changes to the header of the root volume
-		 * are automatically flushed to disk. For all
-		 * other volumes that we modify we do it here.
-		 *
-		 * No interlock is needed, volume buffers are not
-		 * messed with by bioops.
-		 */
-		if (volume != trans->rootvol && volume->io.modified) {
-			hammer_crc_set_volume(volume->ondisk);
-			hammer_io_flush(&volume->io, 0);
-		}
-
-		hammer_rel_volume(volume, 0);
-	}
-
 	volume = hammer_get_volume(hmp, free_vol_no, &error);
 	KKASSERT(volume != NULL && error == 0);
 
-	struct bigblock_stat stat;
-	error =	hammer_format_freemap(trans, volume, &stat);
+	error =	hammer_format_freemap(trans, volume);
 	KKASSERT(error == 0);
 
-	/*
-	 * Increase the total number of bigblocks and update stat/vstat totals.
-	 */
-	hammer_modify_volume_field(trans, trans->rootvol,
-		vol0_stat_bigblocks);
-	trans->rootvol->ondisk->vol0_stat_bigblocks += stat.total_bigblocks;
-	hammer_modify_volume_done(trans->rootvol);
-	/*
-	 * Bigblock count changed so recompute the total number of blocks.
-	 */
-	mp->mnt_stat.f_blocks = trans->rootvol->ondisk->vol0_stat_bigblocks *
-	    (HAMMER_LARGEBLOCK_SIZE / HAMMER_BUFSIZE);
-	mp->mnt_vstat.f_blocks = trans->rootvol->ondisk->vol0_stat_bigblocks *
-	    (HAMMER_LARGEBLOCK_SIZE / HAMMER_BUFSIZE);
-
-	/*
-	 * Increase the number of free bigblocks
-	 * (including the copy in hmp)
-	 */
-	hammer_modify_volume_field(trans, trans->rootvol,
-		vol0_stat_freebigblocks);
-	trans->rootvol->ondisk->vol0_stat_freebigblocks += stat.total_free_bigblocks;
-	hmp->copy_stat_freebigblocks =
-		trans->rootvol->ondisk->vol0_stat_freebigblocks;
-	hammer_modify_volume_done(trans->rootvol);
+	error = hammer_count_bigblocks(hmp, volume,
+			&total_bigblocks, &empty_bigblocks);
+	KKASSERT(error == 0);
+	KKASSERT(total_bigblocks == empty_bigblocks);
 
 	hammer_rel_volume(volume, 0);
+
+	++hmp->nvolumes;
+	error = hammer_update_volumes_header(trans,
+			total_bigblocks, empty_bigblocks);
+	KKASSERT(error == 0);
 
 	hammer_unlock(&hmp->blkmap_lock);
 	hammer_sync_unlock(trans);
@@ -209,7 +136,7 @@ hammer_ioc_volume_add(hammer_transaction_t trans, hammer_inode_t ip,
 end:
 	hammer_unlock(&hmp->volume_lock);
 	if (error)
-		kprintf("An error occurred: %d\n", error);
+		hmkprintf(hmp, "An error occurred: %d\n", error);
 	return (error);
 }
 
@@ -221,35 +148,36 @@ int
 hammer_ioc_volume_del(hammer_transaction_t trans, hammer_inode_t ip,
 		struct hammer_ioc_volume *ioc)
 {
-	struct hammer_mount *hmp = trans->hmp;
+	hammer_mount_t hmp = trans->hmp;
 	struct mount *mp = hmp->mp;
+	struct hammer_volume_ondisk ondisk;
 	hammer_volume_t volume;
+	int64_t total_bigblocks, empty_bigblocks;
+	int vol_no;
 	int error = 0;
 
 	if (mp->mnt_flag & MNT_RDONLY) {
-		kprintf("Cannot del volume from read-only HAMMER filesystem\n");
+		hmkprintf(hmp, "Cannot del volume from read-only HAMMER filesystem\n");
 		return (EINVAL);
 	}
 
 	if (hammer_lock_ex_try(&hmp->volume_lock) != 0) {
-		kprintf("Another volume operation is in progress!\n");
+		hmkprintf(hmp, "Another volume operation is in progress!\n");
 		return (EAGAIN);
 	}
 
-	volume = NULL;
+	if (hmp->nvolumes <= 1) {
+		hammer_unlock(&hmp->volume_lock);
+		hmkprintf(hmp, "No HAMMER volume to delete\n");
+		return (EINVAL);
+	}
 
 	/*
 	 * find volume by volname
 	 */
-	for (int vol_no = 0; vol_no < HAMMER_MAX_VOLUMES; ++vol_no) {
+	volume = NULL;
+	HAMMER_VOLUME_NUMBER_FOREACH(hmp, vol_no) {
 		volume = hammer_get_volume(hmp, vol_no, &error);
-		if (volume == NULL && error == ENOENT) {
-			/*
-			 * Skip unused volume numbers
-			 */
-			error = 0;
-			continue;
-		}
 		KKASSERT(volume != NULL && error == 0);
 		if (strcmp(volume->vol_name, ioc->device_name) == 0) {
 			break;
@@ -259,34 +187,172 @@ hammer_ioc_volume_del(hammer_transaction_t trans, hammer_inode_t ip,
 	}
 
 	if (volume == NULL) {
-		kprintf("Couldn't find volume\n");
+		hmkprintf(hmp, "Couldn't find volume\n");
 		error = EINVAL;
 		goto end;
 	}
 
 	if (volume == trans->rootvol) {
-		kprintf("Cannot remove root-volume\n");
+		hmkprintf(hmp, "Cannot remove root-volume\n");
 		hammer_rel_volume(volume, 0);
 		error = EINVAL;
 		goto end;
 	}
 
 	/*
-	 *
+	 * Reblock filesystem if the volume is not empty
 	 */
-
 	hmp->volume_to_remove = volume->vol_no;
+
+	error = hammer_count_bigblocks(hmp, volume,
+			&total_bigblocks, &empty_bigblocks);
+	KKASSERT(error == 0);
+
+	if (total_bigblocks == empty_bigblocks) {
+		hmkprintf(hmp, "%s is already empty\n", volume->vol_name);
+	} else if (ioc->flag & HAMMER_IOC_VOLUME_REBLOCK) {
+		error = hammer_do_reblock(trans, ip);
+		if (error) {
+			hmp->volume_to_remove = -1;
+			hammer_rel_volume(volume, 0);
+			goto end;
+		}
+	} else {
+		hmkprintf(hmp, "%s is not empty\n", volume->vol_name);
+		hammer_rel_volume(volume, 0);
+		error = ENOTEMPTY;
+		goto end;
+	}
+
+	hammer_sync_lock_sh(trans);
+	hammer_lock_ex(&hmp->blkmap_lock);
+
+	error = hammer_count_bigblocks(hmp, volume,
+			&total_bigblocks, &empty_bigblocks);
+	KKASSERT(error == 0);
+
+	error = hammer_free_freemap(trans, volume);
+	if (error) {
+		hmkprintf(hmp, "Failed to free volume: ");
+		if (error == EBUSY)
+			kprintf("Volume %d not empty\n", volume->vol_no);
+		else
+			kprintf("%d\n", error);
+		hmp->volume_to_remove = -1;
+		hammer_rel_volume(volume, 0);
+		goto end1;
+	}
+	hammer_rel_volume(volume, 0);
+
+	/*
+	 * XXX: Temporary solution for
+	 * http://lists.dragonflybsd.org/pipermail/kernel/2015-August/175027.html
+	 */
+	hammer_unlock(&hmp->blkmap_lock);
+	hammer_sync_unlock(trans);
+	hammer_flusher_sync(hmp); /* 1 */
+	hammer_flusher_sync(hmp); /* 2 */
+	hammer_flusher_sync(hmp); /* 3 */
+	hammer_sync_lock_sh(trans);
+	hammer_lock_ex(&hmp->blkmap_lock);
+
+	/*
+	 * Unload buffers
+	 */
+        RB_SCAN(hammer_buf_rb_tree, &hmp->rb_bufs_root, NULL,
+		hammer_unload_buffer, volume);
+
+	bzero(&ondisk, sizeof(ondisk));
+	error = hammer_unload_volume(volume, &ondisk);
+	if (error == -1) {
+		hmkprintf(hmp, "Failed to unload volume\n");
+		goto end1;
+	}
+
+	--hmp->nvolumes;
+	error = hammer_update_volumes_header(trans,
+			-total_bigblocks, -empty_bigblocks);
+	KKASSERT(error == 0);
+	hmp->volume_to_remove = -1;
+
+end1:
+	hammer_unlock(&hmp->blkmap_lock);
+	hammer_sync_unlock(trans);
+
+end:
+	hammer_unlock(&hmp->volume_lock);
+	if (error)
+		hmkprintf(hmp, "An error occurred: %d\n", error);
+	return (error);
+}
+
+
+int
+hammer_ioc_volume_list(hammer_transaction_t trans, hammer_inode_t ip,
+    struct hammer_ioc_volume_list *ioc)
+{
+	hammer_mount_t hmp = trans->hmp;
+	hammer_volume_t volume;
+	int32_t vol_no;
+	int error = 0;
+	int i, len, cnt = 0;
+
+	if (hammer_lock_ex_try(&hmp->volume_lock) != 0) {
+		hmkprintf(hmp, "Another volume operation is in progress!\n");
+		return (EAGAIN);
+	}
+
+	HAMMER_VOLUME_NUMBER_FOREACH(hmp, i) {
+		if (cnt >= ioc->nvols)
+			break;
+		volume = hammer_get_volume(hmp, i, &error);
+		KKASSERT(volume != NULL && error == 0);
+
+		len = strlen(volume->vol_name) + 1;
+		KKASSERT(len <= MAXPATHLEN);
+
+		vol_no = volume->vol_no;
+		error = copyout(&vol_no, &ioc->vols[cnt].vol_no,
+				sizeof(ioc->vols[cnt].vol_no));
+		if (error == 0)
+			error = copyout(volume->vol_name,
+					&ioc->vols[cnt].device_name[0], len);
+		hammer_rel_volume(volume, 0);
+		if (error)
+			goto end;
+		cnt++;
+	}
+	ioc->nvols = cnt;
+
+end:
+	hammer_unlock(&hmp->volume_lock);
+	return (error);
+}
+
+static
+int
+hammer_do_reblock(hammer_transaction_t trans, hammer_inode_t ip)
+{
+	hammer_mount_t hmp = trans->hmp;
+	int error;
+	int vol_no;
 
 	struct hammer_ioc_reblock reblock;
 	bzero(&reblock, sizeof(reblock));
+
+	vol_no = trans->hmp->volume_to_remove;
+	KKASSERT(vol_no != -1);
 
 	reblock.key_beg.localization = HAMMER_MIN_LOCALIZATION;
 	reblock.key_beg.obj_id = HAMMER_MIN_OBJID;
 	reblock.key_end.localization = HAMMER_MAX_LOCALIZATION;
 	reblock.key_end.obj_id = HAMMER_MAX_OBJID;
 	reblock.head.flags = HAMMER_IOC_DO_FLAGS;
-	reblock.free_level = 0;
+	reblock.free_level = 0;	/* reblock all big-blocks */
+	reblock.allpfs = 1;	/* reblock all PFS */
+	reblock.vol_no = vol_no;
 
+	hmkprintf(hmp, "reblock started\n");
 	error = hammer_ioc_reblock(trans, ip, &reblock);
 
 	if (reblock.head.flags & HAMMER_IOC_HEAD_INTR) {
@@ -295,87 +361,330 @@ hammer_ioc_volume_del(hammer_transaction_t trans, hammer_inode_t ip,
 
 	if (error) {
 		if (error == EINTR) {
-			kprintf("reblock was interrupted\n");
+			hmkprintf(hmp, "reblock was interrupted\n");
 		} else {
-			kprintf("reblock failed: %d\n", error);
+			hmkprintf(hmp, "reblock failed: %d\n", error);
 		}
-		hmp->volume_to_remove = -1;
-		hammer_rel_volume(volume, 0);
-		goto end;
+		return(error);
 	}
+
+	return(0);
+}
+
+/*
+ * XXX This somehow needs to stop doing hammer_modify_buffer() for
+ * layer2 entries.  In theory adding a large block device could
+ * blow away UNDO fifo.  The best way is to format layer2 entries
+ * in userspace without UNDO getting involved before the device is
+ * safely added to the filesystem.  HAMMER has no interest in what
+ * has happened to the device before it safely joins the filesystem.
+ */
+static int
+hammer_format_freemap(hammer_transaction_t trans, hammer_volume_t volume)
+{
+	hammer_mount_t hmp = trans->hmp;
+	hammer_volume_ondisk_t ondisk;
+	hammer_blockmap_t freemap;
+	hammer_off_t alloc_offset;
+	hammer_off_t phys_offset;
+	hammer_off_t block_offset;
+	hammer_off_t layer1_offset;
+	hammer_off_t layer2_offset;
+	hammer_off_t vol_free_end;
+	hammer_off_t aligned_vol_free_end;
+	hammer_blockmap_layer1_t layer1;
+	hammer_blockmap_layer2_t layer2;
+	hammer_buffer_t buffer1 = NULL;
+	hammer_buffer_t buffer2 = NULL;
+	int64_t vol_buf_size;
+	int64_t layer1_count = 0;
+	int error = 0;
+
+	KKASSERT(volume->vol_no != HAMMER_ROOT_VOLNO);
+
+	ondisk = volume->ondisk;
+	vol_buf_size = HAMMER_VOL_BUF_SIZE(ondisk);
+	KKASSERT((vol_buf_size & ~HAMMER_OFF_SHORT_MASK) == 0);
+	vol_free_end = HAMMER_ENCODE_RAW_BUFFER(ondisk->vol_no,
+			vol_buf_size & ~HAMMER_BIGBLOCK_MASK64);
+	aligned_vol_free_end = HAMMER_BLOCKMAP_LAYER2_DOALIGN(vol_free_end);
+
+	freemap = &hmp->blockmap[HAMMER_ZONE_FREEMAP_INDEX];
+	alloc_offset = HAMMER_ENCODE_RAW_BUFFER(volume->vol_no, 0);
+
+	hmkprintf(hmp, "Initialize freemap volume %d\n", volume->vol_no);
+
+	for (phys_offset = HAMMER_ENCODE_RAW_BUFFER(volume->vol_no, 0);
+	     phys_offset < aligned_vol_free_end;
+	     phys_offset += HAMMER_BLOCKMAP_LAYER2) {
+		layer1_offset = freemap->phys_offset +
+				HAMMER_BLOCKMAP_LAYER1_OFFSET(phys_offset);
+		layer1 = hammer_bread(hmp, layer1_offset, &error, &buffer1);
+		if (error)
+			goto end;
+		if (layer1->phys_offset == HAMMER_BLOCKMAP_UNAVAIL) {
+			hammer_modify_buffer(trans, buffer1, layer1, sizeof(*layer1));
+			bzero(layer1, sizeof(*layer1));
+			layer1->phys_offset = alloc_offset;
+			layer1->blocks_free = 0;
+			hammer_crc_set_layer1(hmp->version, layer1);
+			hammer_modify_buffer_done(buffer1);
+			alloc_offset += HAMMER_BIGBLOCK_SIZE;
+		}
+	}
+
+	for (phys_offset = HAMMER_ENCODE_RAW_BUFFER(volume->vol_no, 0);
+	     phys_offset < aligned_vol_free_end;
+	     phys_offset += HAMMER_BLOCKMAP_LAYER2) {
+		layer1_count = 0;
+		layer1_offset = freemap->phys_offset +
+				HAMMER_BLOCKMAP_LAYER1_OFFSET(phys_offset);
+		layer1 = hammer_bread(hmp, layer1_offset, &error, &buffer1);
+		if (error)
+			goto end;
+		KKASSERT(layer1->phys_offset != HAMMER_BLOCKMAP_UNAVAIL);
+
+		for (block_offset = 0;
+		     block_offset < HAMMER_BLOCKMAP_LAYER2;
+		     block_offset += HAMMER_BIGBLOCK_SIZE) {
+			layer2_offset = layer1->phys_offset +
+				        HAMMER_BLOCKMAP_LAYER2_OFFSET(block_offset);
+			layer2 = hammer_bread(hmp, layer2_offset, &error, &buffer2);
+			if (error)
+				goto end;
+
+			hammer_modify_buffer(trans, buffer2, layer2, sizeof(*layer2));
+			bzero(layer2, sizeof(*layer2));
+
+			if (phys_offset + block_offset < alloc_offset) {
+				layer2->zone = HAMMER_ZONE_FREEMAP_INDEX;
+				layer2->append_off = HAMMER_BIGBLOCK_SIZE;
+				layer2->bytes_free = 0;
+			} else if (phys_offset + block_offset < vol_free_end) {
+				layer2->zone = 0;
+				layer2->append_off = 0;
+				layer2->bytes_free = HAMMER_BIGBLOCK_SIZE;
+				++layer1_count;
+			} else {
+				layer2->zone = HAMMER_ZONE_UNAVAIL_INDEX;
+				layer2->append_off = HAMMER_BIGBLOCK_SIZE;
+				layer2->bytes_free = 0;
+			}
+
+			hammer_crc_set_layer2(hmp->version, layer2);
+			hammer_modify_buffer_done(buffer2);
+		}
+
+		hammer_modify_buffer(trans, buffer1, layer1, sizeof(*layer1));
+		layer1->blocks_free += layer1_count;
+		hammer_crc_set_layer1(hmp->version, layer1);
+		hammer_modify_buffer_done(buffer1);
+	}
+
+end:
+	if (buffer1)
+		hammer_rel_buffer(buffer1, 0);
+	if (buffer2)
+		hammer_rel_buffer(buffer2, 0);
+
+	return error;
+}
+
+/*
+ * XXX This somehow needs to stop doing hammer_modify_buffer() for
+ * layer2 entries.  In theory removing a large block device could
+ * blow away UNDO fifo.  The best way is to erase layer2 entries
+ * in userspace without UNDO getting involved after the device has
+ * been safely removed from the filesystem.  HAMMER has no interest
+ * in what happens to the device once it's safely removed.
+ */
+static int
+hammer_free_freemap(hammer_transaction_t trans, hammer_volume_t volume)
+{
+	hammer_mount_t hmp = trans->hmp;
+	hammer_volume_ondisk_t ondisk;
+	hammer_blockmap_t freemap;
+	hammer_off_t phys_offset;
+	hammer_off_t block_offset;
+	hammer_off_t layer1_offset;
+	hammer_off_t layer2_offset;
+	hammer_off_t vol_free_end;
+	hammer_off_t aligned_vol_free_end;
+	hammer_blockmap_layer1_t layer1;
+	hammer_blockmap_layer2_t layer2;
+	hammer_buffer_t buffer1 = NULL;
+	hammer_buffer_t buffer2 = NULL;
+	int64_t vol_buf_size;
+	int error = 0;
+
+	KKASSERT(volume->vol_no != HAMMER_ROOT_VOLNO);
+
+	ondisk = volume->ondisk;
+	vol_buf_size = HAMMER_VOL_BUF_SIZE(ondisk);
+	KKASSERT((vol_buf_size & ~HAMMER_OFF_SHORT_MASK) == 0);
+	vol_free_end = HAMMER_ENCODE_RAW_BUFFER(ondisk->vol_no,
+			vol_buf_size & ~HAMMER_BIGBLOCK_MASK64);
+	aligned_vol_free_end = HAMMER_BLOCKMAP_LAYER2_DOALIGN(vol_free_end);
+
+	freemap = &hmp->blockmap[HAMMER_ZONE_FREEMAP_INDEX];
+
+	hmkprintf(hmp, "Free freemap volume %d\n", volume->vol_no);
+
+	for (phys_offset = HAMMER_ENCODE_RAW_BUFFER(volume->vol_no, 0);
+	     phys_offset < aligned_vol_free_end;
+	     phys_offset += HAMMER_BLOCKMAP_LAYER2) {
+		layer1_offset = freemap->phys_offset +
+				HAMMER_BLOCKMAP_LAYER1_OFFSET(phys_offset);
+		layer1 = hammer_bread(hmp, layer1_offset, &error, &buffer1);
+		if (error)
+			goto end;
+		KKASSERT(layer1->phys_offset != HAMMER_BLOCKMAP_UNAVAIL);
+
+		for (block_offset = 0;
+		     block_offset < HAMMER_BLOCKMAP_LAYER2;
+		     block_offset += HAMMER_BIGBLOCK_SIZE) {
+			layer2_offset = layer1->phys_offset +
+				        HAMMER_BLOCKMAP_LAYER2_OFFSET(block_offset);
+			layer2 = hammer_bread(hmp, layer2_offset, &error, &buffer2);
+			if (error)
+				goto end;
+
+			switch (layer2->zone) {
+			case HAMMER_ZONE_UNDO_INDEX:
+				KKASSERT(0);
+			case HAMMER_ZONE_FREEMAP_INDEX:
+			case HAMMER_ZONE_UNAVAIL_INDEX:
+				continue;
+			default:
+				KKASSERT(phys_offset + block_offset < aligned_vol_free_end);
+				if (layer2->append_off == 0 &&
+				    layer2->bytes_free == HAMMER_BIGBLOCK_SIZE)
+					continue;
+				break;
+			}
+			return EBUSY;  /* Not empty */
+		}
+	}
+
+	for (phys_offset = HAMMER_ENCODE_RAW_BUFFER(volume->vol_no, 0);
+	     phys_offset < aligned_vol_free_end;
+	     phys_offset += HAMMER_BLOCKMAP_LAYER2) {
+		layer1_offset = freemap->phys_offset +
+				HAMMER_BLOCKMAP_LAYER1_OFFSET(phys_offset);
+		layer1 = hammer_bread(hmp, layer1_offset, &error, &buffer1);
+		if (error)
+			goto end;
+		KKASSERT(layer1->phys_offset != HAMMER_BLOCKMAP_UNAVAIL);
+
+		for (block_offset = 0;
+		     block_offset < HAMMER_BLOCKMAP_LAYER2;
+		     block_offset += HAMMER_BIGBLOCK_SIZE) {
+			layer2_offset = layer1->phys_offset +
+				        HAMMER_BLOCKMAP_LAYER2_OFFSET(block_offset);
+			layer2 = hammer_bread(hmp, layer2_offset, &error, &buffer2);
+			if (error)
+				goto end;
+
+			switch (layer2->zone) {
+			case HAMMER_ZONE_UNDO_INDEX:
+				KKASSERT(0);
+			default:
+				KKASSERT(phys_offset + block_offset < aligned_vol_free_end);
+				hammer_modify_buffer(trans, buffer2, layer2, sizeof(*layer2));
+				bzero(layer2, sizeof(*layer2));
+				hammer_modify_buffer_done(buffer2);
+				break;
+			}
+		}
+
+		hammer_modify_buffer(trans, buffer1, layer1, sizeof(*layer1));
+		bzero(layer1, sizeof(*layer1));
+		layer1->phys_offset = HAMMER_BLOCKMAP_UNAVAIL;
+		hammer_crc_set_layer1(hmp->version, layer1);
+		hammer_modify_buffer_done(buffer1);
+	}
+
+end:
+	if (buffer1)
+		hammer_rel_buffer(buffer1, 0);
+	if (buffer2)
+		hammer_rel_buffer(buffer2, 0);
+
+	return error;
+}
+
+static int
+hammer_format_volume_header(hammer_mount_t hmp,
+	struct hammer_ioc_volume *ioc,
+	hammer_volume_ondisk_t ondisk,
+	int vol_no)
+{
+	hammer_volume_ondisk_t root_ondisk;
+	int64_t vol_alloc;
+
+	KKASSERT(HAMMER_BUFSIZE >= sizeof(struct hammer_volume_ondisk));
 
 	/*
-	 * Sync filesystem
+	 * Just copy from the root volume header.
 	 */
-	int count = 0;
-	while (hammer_flusher_haswork(hmp)) {
-		hammer_flusher_sync(hmp);
-		++count;
-		if (count >= 5) {
-			if (count == 5)
-				kprintf("HAMMER: flushing.");
-			else
-				kprintf(".");
-			tsleep(&count, 0, "hmrufl", hz);
-		}
-		if (count == 30) {
-			kprintf("giving up");
-			break;
-		}
-	}
-	kprintf("\n");
+	root_ondisk = hmp->rootvol->ondisk;
+	bzero(ondisk, sizeof(struct hammer_volume_ondisk));
+	ondisk->vol_fsid = root_ondisk->vol_fsid;
+	ondisk->vol_fstype = root_ondisk->vol_fstype;
+	ksnprintf(ondisk->vol_label, sizeof(ondisk->vol_label), "%s",
+		root_ondisk->vol_label);
+	ondisk->vol_version = root_ondisk->vol_version;
+	ondisk->vol_rootvol = root_ondisk->vol_no;
+	ondisk->vol_signature = root_ondisk->vol_signature;
 
-	hammer_sync_lock_sh(trans);
-	hammer_lock_ex(&hmp->blkmap_lock);
+	KKASSERT(ondisk->vol_rootvol == HAMMER_ROOT_VOLNO);
+	KKASSERT(ondisk->vol_signature == HAMMER_FSBUF_VOLUME);
 
 	/*
-	 * We use stat later to update rootvol's bigblock stats
+	 * Assign the new vol_no and vol_count.
 	 */
-	struct bigblock_stat stat;
-	error = hammer_free_freemap(trans, volume, &stat);
-	if (error) {
-		kprintf("Failed to free volume. Volume not empty!\n");
-		hmp->volume_to_remove = -1;
-		hammer_rel_volume(volume, 0);
-		hammer_unlock(&hmp->blkmap_lock);
-		hammer_sync_unlock(trans);
-		goto end;
-	}
-
-	hmp->volume_to_remove = -1;
-
-	hammer_rel_volume(volume, 0);
+	ondisk->vol_no = vol_no;
+	ondisk->vol_count = root_ondisk->vol_count + 1;
 
 	/*
-	 * Unload buffers
+	 * Reserve space for (future) header junk.
 	 */
-        RB_SCAN(hammer_buf_rb_tree, &hmp->rb_bufs_root, NULL,
-		hammer_unload_buffer, volume);
+	vol_alloc = root_ondisk->vol_bot_beg;
+	ondisk->vol_bot_beg = vol_alloc;
+	vol_alloc += ioc->boot_area_size;
+	ondisk->vol_mem_beg = vol_alloc;
+	vol_alloc += ioc->memory_log_size;
 
-	error = hammer_unload_volume(volume, NULL);
-	if (error == -1) {
-		kprintf("Failed to unload volume\n");
-		hammer_unlock(&hmp->blkmap_lock);
-		hammer_sync_unlock(trans);
-		goto end;
+	/*
+	 * The remaining area is the zone 2 buffer allocation area.
+	 */
+	ondisk->vol_buf_beg = vol_alloc;
+	ondisk->vol_buf_end = ioc->vol_size & ~(int64_t)HAMMER_BUFMASK;
+
+	if (HAMMER_VOL_BUF_SIZE(ondisk) < 0) { /* int64_t */
+		hmkprintf(hmp, "volume %d is too small to hold the volume header\n",
+			ondisk->vol_no);
+		return(EFTYPE);
 	}
 
-	volume = NULL;
-	--hmp->nvolumes;
+	return(0);
+}
+
+static int
+hammer_update_volumes_header(hammer_transaction_t trans,
+	int64_t total_bigblocks, int64_t empty_bigblocks)
+{
+	hammer_mount_t hmp = trans->hmp;
+	struct mount *mp = hmp->mp;
+	hammer_volume_t volume;
+	int vol_no;
+	int error = 0;
 
 	/*
 	 * Set each volume's new value of the vol_count field.
 	 */
-	for (int vol_no = 0; vol_no < HAMMER_MAX_VOLUMES; ++vol_no) {
+	HAMMER_VOLUME_NUMBER_FOREACH(hmp, vol_no) {
 		volume = hammer_get_volume(hmp, vol_no, &error);
-		if (volume == NULL && error == ENOENT) {
-			/*
-			 * Skip unused volume numbers
-			 */
-			error = 0;
-			continue;
-		}
-
 		KKASSERT(volume != NULL && error == 0);
 		hammer_modify_volume_field(trans, volume, vol_count);
 		volume->ondisk->vol_count = hmp->nvolumes;
@@ -390,7 +699,7 @@ hammer_ioc_volume_del(hammer_transaction_t trans, hammer_inode_t ip,
 		 * messed with by bioops.
 		 */
 		if (volume != trans->rootvol && volume->io.modified) {
-			hammer_crc_set_volume(volume->ondisk);
+			hammer_crc_set_volume(hmp->version, volume->ondisk);
 			hammer_io_flush(&volume->io, 0);
 		}
 
@@ -398,514 +707,123 @@ hammer_ioc_volume_del(hammer_transaction_t trans, hammer_inode_t ip,
 	}
 
 	/*
-	 * Update the total number of bigblocks
+	 * Update the total number of big-blocks.
 	 */
-	hammer_modify_volume_field(trans, trans->rootvol,
-		vol0_stat_bigblocks);
-	trans->rootvol->ondisk->vol0_stat_bigblocks -= stat.total_bigblocks;
+	hammer_modify_volume_field(trans, trans->rootvol, vol0_stat_bigblocks);
+	trans->rootvol->ondisk->vol0_stat_bigblocks += total_bigblocks;
 	hammer_modify_volume_done(trans->rootvol);
 
 	/*
-	 * Update the number of free bigblocks
-	 * (including the copy in hmp)
+	 * Big-block count changed so recompute the total number of blocks.
+	 */
+	mp->mnt_stat.f_blocks = trans->rootvol->ondisk->vol0_stat_bigblocks *
+				HAMMER_BUFFERS_PER_BIGBLOCK;
+	mp->mnt_vstat.f_blocks = trans->rootvol->ondisk->vol0_stat_bigblocks *
+				HAMMER_BUFFERS_PER_BIGBLOCK;
+
+	/*
+	 * Update the total number of free big-blocks.
 	 */
 	hammer_modify_volume_field(trans, trans->rootvol,
 		vol0_stat_freebigblocks);
-	trans->rootvol->ondisk->vol0_stat_freebigblocks -= stat.total_free_bigblocks;
+	trans->rootvol->ondisk->vol0_stat_freebigblocks += empty_bigblocks;
+	hammer_modify_volume_done(trans->rootvol);
+
+	/*
+	 * Update the copy in hmp.
+	 */
 	hmp->copy_stat_freebigblocks =
 		trans->rootvol->ondisk->vol0_stat_freebigblocks;
-	hammer_modify_volume_done(trans->rootvol);
-	/*
-	 * Bigblock count changed so recompute the total number of blocks.
-	 */
-	mp->mnt_stat.f_blocks = trans->rootvol->ondisk->vol0_stat_bigblocks *
-	    (HAMMER_LARGEBLOCK_SIZE / HAMMER_BUFSIZE);
-	mp->mnt_vstat.f_blocks = trans->rootvol->ondisk->vol0_stat_bigblocks *
-	    (HAMMER_LARGEBLOCK_SIZE / HAMMER_BUFSIZE);
 
-	hammer_unlock(&hmp->blkmap_lock);
-	hammer_sync_unlock(trans);
-
-	/*
-	 * Erase the volume header of the removed device.
-	 *
-	 * This is to not accidentally mount the volume again.
-	 */
-	struct vnode *devvp = NULL;
-	error = hammer_setup_device(&devvp, ioc->device_name, 0);
-	if (error) {
-		kprintf("Failed to open device: %s\n", ioc->device_name);
-		goto end;
-	}
-	KKASSERT(devvp);
-	error = hammer_clear_volume_header(devvp);
-	if (error) {
-		kprintf("Failed to clear volume header of device: %s\n",
-			ioc->device_name);
-		goto end;
-	}
-	hammer_close_device(&devvp, 0);
-
-	KKASSERT(error == 0);
-end:
-	hammer_unlock(&hmp->volume_lock);
-	return (error);
-}
-
-
-int
-hammer_ioc_volume_list(hammer_transaction_t trans, hammer_inode_t ip,
-    struct hammer_ioc_volume_list *ioc)
-{
-	struct hammer_mount *hmp = trans->hmp;
-	hammer_volume_t volume;
-	int error = 0;
-	int i, cnt, len;
-
-	for (i = 0, cnt = 0; i < HAMMER_MAX_VOLUMES && cnt < ioc->nvols; i++) {
-		volume = hammer_get_volume(hmp, i, &error);
-		if (volume == NULL && error == ENOENT) {
-			error = 0;
-			continue;
-		}
-		KKASSERT(volume != NULL && error == 0);
-
-		len = strlen(volume->vol_name) + 1;
-		KKASSERT(len <= MAXPATHLEN);
-
-		error = copyout(volume->vol_name, ioc->vols[cnt].device_name,
-				len);
-		if (error) {
-			hammer_rel_volume(volume, 0);
-			return (error);
-		}
-		cnt++;
-		hammer_rel_volume(volume, 0);
-	}
-	ioc->nvols = cnt;
-
-	return (error);
+	return(error);
 }
 
 /*
- * Iterate over all usable L1 entries of the volume and
- * the corresponding L2 entries.
+ * Count total big-blocks and empty big-blocks within the volume.
+ * The volume must be a non-root volume.
+ *
+ * Note that total big-blocks doesn't include big-blocks for layer2
+ * (and obviously layer1 and undomap).  This is requirement of the
+ * volume header and this function is to retrieve that information.
  */
 static int
-hammer_iterate_l1l2_entries(hammer_transaction_t trans, hammer_volume_t volume,
-	int (*callback)(hammer_transaction_t, hammer_volume_t, hammer_buffer_t*,
-		struct hammer_blockmap_layer1*, struct hammer_blockmap_layer2*,
-		hammer_off_t, hammer_off_t, void*),
-	void *data)
+hammer_count_bigblocks(hammer_mount_t hmp, hammer_volume_t volume,
+	int64_t *total_bigblocks, int64_t *empty_bigblocks)
 {
-	struct hammer_mount *hmp = trans->hmp;
-	hammer_blockmap_t freemap = &hmp->blockmap[HAMMER_ZONE_FREEMAP_INDEX];
-	hammer_buffer_t buffer = NULL;
+	hammer_volume_ondisk_t ondisk;
+	hammer_blockmap_t freemap;
+	hammer_off_t phys_offset;
+	hammer_off_t block_offset;
+	hammer_off_t layer1_offset;
+	hammer_off_t layer2_offset;
+	hammer_off_t vol_free_end;
+	hammer_off_t aligned_vol_free_end;
+	hammer_blockmap_layer1_t layer1;
+	hammer_blockmap_layer2_t layer2;
+	hammer_buffer_t buffer1 = NULL;
+	hammer_buffer_t buffer2 = NULL;
+	int64_t vol_buf_size;
+	int64_t total = 0;
+	int64_t empty = 0;
 	int error = 0;
 
-	hammer_off_t phys_off;
-	hammer_off_t block_off;
-	hammer_off_t layer1_off;
-	hammer_off_t layer2_off;
-	hammer_off_t aligned_buf_end_off;
-	struct hammer_blockmap_layer1 *layer1;
-	struct hammer_blockmap_layer2 *layer2;
+	KKASSERT(volume->vol_no != HAMMER_ROOT_VOLNO);
 
-	/*
-	 * Calculate the usable size of the volume, which
-	 * must be aligned at a bigblock (8 MB) boundary.
-	 */
-	aligned_buf_end_off = (HAMMER_ENCODE_RAW_BUFFER(volume->ondisk->vol_no,
-		(volume->ondisk->vol_buf_end - volume->ondisk->vol_buf_beg)
-		& ~HAMMER_LARGEBLOCK_MASK64));
+	*total_bigblocks = 0;	/* avoid gcc warnings */
+	*empty_bigblocks = 0;	/* avoid gcc warnings */
 
-	/*
-	 * Iterate the volume's address space in chunks of 4 TB, where each
-	 * chunk consists of at least one physically available 8 MB bigblock.
-	 *
-	 * For each chunk we need one L1 entry and one L2 bigblock.
-	 * We use the first bigblock of each chunk as L2 block.
-	 */
-	for (phys_off = HAMMER_ENCODE_RAW_BUFFER(volume->ondisk->vol_no, 0);
-	     phys_off < aligned_buf_end_off;
-	     phys_off += HAMMER_BLOCKMAP_LAYER2) {
-		for (block_off = 0;
-		     block_off < HAMMER_BLOCKMAP_LAYER2;
-		     block_off += HAMMER_LARGEBLOCK_SIZE) {
-			layer2_off = phys_off +
-				HAMMER_BLOCKMAP_LAYER2_OFFSET(block_off);
-			layer2 = hammer_bread(hmp, layer2_off, &error, &buffer);
+	ondisk = volume->ondisk;
+	vol_buf_size = HAMMER_VOL_BUF_SIZE(ondisk);
+	KKASSERT((vol_buf_size & ~HAMMER_OFF_SHORT_MASK) == 0);
+	vol_free_end = HAMMER_ENCODE_RAW_BUFFER(ondisk->vol_no,
+			vol_buf_size & ~HAMMER_BIGBLOCK_MASK64);
+	aligned_vol_free_end = HAMMER_BLOCKMAP_LAYER2_DOALIGN(vol_free_end);
+
+	freemap = &hmp->blockmap[HAMMER_ZONE_FREEMAP_INDEX];
+
+	for (phys_offset = HAMMER_ENCODE_RAW_BUFFER(volume->ondisk->vol_no, 0);
+	     phys_offset < aligned_vol_free_end;
+	     phys_offset += HAMMER_BLOCKMAP_LAYER2) {
+		layer1_offset = freemap->phys_offset +
+				HAMMER_BLOCKMAP_LAYER1_OFFSET(phys_offset);
+		layer1 = hammer_bread(hmp, layer1_offset, &error, &buffer1);
+		if (error)
+			goto end;
+
+		for (block_offset = 0;
+		     block_offset < HAMMER_BLOCKMAP_LAYER2;
+		     block_offset += HAMMER_BIGBLOCK_SIZE) {
+			layer2_offset = layer1->phys_offset +
+					HAMMER_BLOCKMAP_LAYER2_OFFSET(block_offset);
+			layer2 = hammer_bread(hmp, layer2_offset, &error, &buffer2);
 			if (error)
 				goto end;
 
-			error = callback(trans, volume, &buffer, NULL,
-					 layer2, phys_off, block_off, data);
-			if (error)
-				goto end;
+			switch (layer2->zone) {
+			case HAMMER_ZONE_UNDO_INDEX:
+				KKASSERT(0);
+			case HAMMER_ZONE_FREEMAP_INDEX:
+			case HAMMER_ZONE_UNAVAIL_INDEX:
+				continue;
+			default:
+				KKASSERT(phys_offset + block_offset < aligned_vol_free_end);
+				total++;
+				if (layer2->append_off == 0 &&
+				    layer2->bytes_free == HAMMER_BIGBLOCK_SIZE)
+					empty++;
+				break;
+			}
 		}
-
-		layer1_off = freemap->phys_offset +
-				HAMMER_BLOCKMAP_LAYER1_OFFSET(phys_off);
-		layer1 = hammer_bread(hmp, layer1_off, &error, &buffer);
-		if (error)
-			goto end;
-
-		error = callback(trans, volume, &buffer, layer1, NULL,
-				 phys_off, 0, data);
-		if (error)
-			goto end;
 	}
 
+	hmkprintf(hmp, "big-blocks total=%jd empty=%jd\n", total, empty);
+	*total_bigblocks = total;
+	*empty_bigblocks = empty;
 end:
-	if (buffer) {
-		hammer_rel_buffer(buffer, 0);
-		buffer = NULL;
-	}
+	if (buffer1)
+		hammer_rel_buffer(buffer1, 0);
+	if (buffer2)
+		hammer_rel_buffer(buffer2, 0);
 
 	return error;
-}
-
-
-static int
-format_callback(hammer_transaction_t trans, hammer_volume_t volume,
-	hammer_buffer_t *bufferp,
-	struct hammer_blockmap_layer1 *layer1,
-	struct hammer_blockmap_layer2 *layer2,
-	hammer_off_t phys_off,
-	hammer_off_t block_off,
-	void *data)
-{
-	struct bigblock_stat *stat = (struct bigblock_stat*)data;
-
-	/*
-	 * Calculate the usable size of the volume, which must be aligned
-	 * at a bigblock (8 MB) boundary.
-	 */
-	hammer_off_t aligned_buf_end_off;
-	aligned_buf_end_off = (HAMMER_ENCODE_RAW_BUFFER(volume->ondisk->vol_no,
-		(volume->ondisk->vol_buf_end - volume->ondisk->vol_buf_beg)
-		& ~HAMMER_LARGEBLOCK_MASK64));
-
-	if (layer1) {
-		KKASSERT(layer1->phys_offset == HAMMER_BLOCKMAP_UNAVAIL);
-
-		hammer_modify_buffer(trans, *bufferp, layer1, sizeof(*layer1));
-		bzero(layer1, sizeof(*layer1));
-		layer1->phys_offset = phys_off;
-		layer1->blocks_free = stat->counter;
-		layer1->layer1_crc = crc32(layer1, HAMMER_LAYER1_CRCSIZE);
-		hammer_modify_buffer_done(*bufferp);
-
-		stat->total_free_bigblocks += stat->counter;
-		stat->counter = 0; /* reset */
-	} else if (layer2) {
-		hammer_modify_buffer(trans, *bufferp, layer2, sizeof(*layer2));
-		bzero(layer2, sizeof(*layer2));
-
-		if (block_off == 0) {
-			/*
-			 * The first entry represents the L2 bigblock itself.
-			 */
-			layer2->zone = HAMMER_ZONE_FREEMAP_INDEX;
-			layer2->append_off = HAMMER_LARGEBLOCK_SIZE;
-			layer2->bytes_free = 0;
-			++stat->total_bigblocks;
-		} else if (phys_off + block_off < aligned_buf_end_off) {
-			/*
-			 * Available bigblock
-			 */
-			layer2->zone = 0;
-			layer2->append_off = 0;
-			layer2->bytes_free = HAMMER_LARGEBLOCK_SIZE;
-			++stat->total_bigblocks;
-			++stat->counter;
-		} else {
-			/*
-			 * Bigblock outside of physically available
-			 * space
-			 */
-			layer2->zone = HAMMER_ZONE_UNAVAIL_INDEX;
-			layer2->append_off = HAMMER_LARGEBLOCK_SIZE;
-			layer2->bytes_free = 0;
-		}
-
-		layer2->entry_crc = crc32(layer2, HAMMER_LAYER2_CRCSIZE);
-		hammer_modify_buffer_done(*bufferp);
-	} else {
-		KKASSERT(0);
-	}
-
-	return 0;
-}
-
-static int
-hammer_format_freemap(hammer_transaction_t trans, hammer_volume_t volume,
-	struct bigblock_stat *stat)
-{
-	stat->total_bigblocks = 0;
-	stat->total_free_bigblocks = 0;
-	stat->counter = 0;
-	return hammer_iterate_l1l2_entries(trans, volume, format_callback, stat);
-}
-
-static int
-free_callback(hammer_transaction_t trans, hammer_volume_t volume __unused,
-	hammer_buffer_t *bufferp,
-	struct hammer_blockmap_layer1 *layer1,
-	struct hammer_blockmap_layer2 *layer2,
-	hammer_off_t phys_off,
-	hammer_off_t block_off __unused,
-	void *data)
-{
-	struct bigblock_stat *stat = (struct bigblock_stat*)data;
-
-	/*
-	 * No modifications to ondisk structures
-	 */
-	int testonly = (stat == NULL);
-
-	if (layer1) {
-		if (layer1->phys_offset == HAMMER_BLOCKMAP_UNAVAIL) {
-			/*
-			 * This layer1 entry is already free.
-			 */
-			return 0;
-		}
-
-		KKASSERT((int)HAMMER_VOL_DECODE(layer1->phys_offset) ==
-			trans->hmp->volume_to_remove);
-
-		if (testonly)
-			return 0;
-
-		/*
-		 * Free the L1 entry
-		 */
-		hammer_modify_buffer(trans, *bufferp, layer1, sizeof(*layer1));
-		bzero(layer1, sizeof(*layer1));
-		layer1->phys_offset = HAMMER_BLOCKMAP_UNAVAIL;
-		layer1->layer1_crc = crc32(layer1, HAMMER_LAYER1_CRCSIZE);
-		hammer_modify_buffer_done(*bufferp);
-
-		return 0;
-	} else if (layer2) {
-		if (layer2->zone == HAMMER_ZONE_UNAVAIL_INDEX) {
-			return 0;
-		}
-
-		if (layer2->zone == HAMMER_ZONE_FREEMAP_INDEX) {
-			if (stat) {
-				++stat->total_bigblocks;
-			}
-			return 0;
-		}
-
-		if (layer2->append_off == 0 &&
-		    layer2->bytes_free == HAMMER_LARGEBLOCK_SIZE) {
-			if (stat) {
-				++stat->total_bigblocks;
-				++stat->total_free_bigblocks;
-			}
-			return 0;
-		}
-
-		/*
-		 * We found a layer2 entry that is not empty!
-		 */
-		return EBUSY;
-	} else {
-		KKASSERT(0);
-	}
-
-	return EINVAL;
-}
-
-static int
-hammer_free_freemap(hammer_transaction_t trans, hammer_volume_t volume,
-	struct bigblock_stat *stat)
-{
-	int error;
-
-	stat->total_bigblocks = 0;
-	stat->total_free_bigblocks = 0;
-	stat->counter = 0;
-
-	error = hammer_iterate_l1l2_entries(trans, volume, free_callback, NULL);
-	if (error)
-		return error;
-
-	error = hammer_iterate_l1l2_entries(trans, volume, free_callback, stat);
-	return error;
-}
-
-/************************************************************************
- *				MISC					*
- ************************************************************************
- */
-
-static int
-hammer_setup_device(struct vnode **devvpp, const char *dev_path, int ronly)
-{
-	int error;
-	struct nlookupdata nd;
-
-	/*
-	 * Get the device vnode
-	 */
-	if (*devvpp == NULL) {
-		error = nlookup_init(&nd, dev_path, UIO_SYSSPACE, NLC_FOLLOW);
-		if (error == 0)
-			error = nlookup(&nd);
-		if (error == 0)
-			error = cache_vref(&nd.nl_nch, nd.nl_cred, devvpp);
-		nlookup_done(&nd);
-	} else {
-		error = 0;
-	}
-
-	if (error == 0) {
-		if (vn_isdisk(*devvpp, &error)) {
-			error = vfs_mountedon(*devvpp);
-		}
-	}
-	if (error == 0 && vcount(*devvpp) > 0)
-		error = EBUSY;
-	if (error == 0) {
-		vn_lock(*devvpp, LK_EXCLUSIVE | LK_RETRY);
-		error = vinvalbuf(*devvpp, V_SAVE, 0, 0);
-		if (error == 0) {
-			error = VOP_OPEN(*devvpp,
-					 (ronly ? FREAD : FREAD|FWRITE),
-					 FSCRED, NULL);
-		}
-		vn_unlock(*devvpp);
-	}
-	if (error && *devvpp) {
-		vrele(*devvpp);
-		*devvpp = NULL;
-	}
-	return (error);
-}
-
-static void
-hammer_close_device(struct vnode **devvpp, int ronly)
-{
-	if (*devvpp) {
-		vn_lock(*devvpp, LK_EXCLUSIVE | LK_RETRY);
-		vinvalbuf(*devvpp, ronly ? 0 : V_SAVE, 0, 0);
-		VOP_CLOSE(*devvpp, (ronly ? FREAD : FREAD|FWRITE), NULL);
-		vn_unlock(*devvpp);
-		vrele(*devvpp);
-		*devvpp = NULL;
-	}
-}
-
-static int
-hammer_format_volume_header(struct hammer_mount *hmp, struct vnode *devvp,
-	const char *vol_name, int vol_no, int vol_count,
-	int64_t vol_size, int64_t boot_area_size, int64_t mem_area_size)
-{
-	struct buf *bp = NULL;
-	struct hammer_volume_ondisk *ondisk;
-	int error;
-
-	/*
-	 * Extract the volume number from the volume header and do various
-	 * sanity checks.
-	 */
-	KKASSERT(HAMMER_BUFSIZE >= sizeof(struct hammer_volume_ondisk));
-	error = bread(devvp, 0LL, HAMMER_BUFSIZE, &bp);
-	if (error || bp->b_bcount < sizeof(struct hammer_volume_ondisk))
-		goto late_failure;
-
-	ondisk = (struct hammer_volume_ondisk*) bp->b_data;
-
-	/*
-	 * Note that we do NOT allow to use a device that contains
-	 * a valid HAMMER signature. It has to be cleaned up with dd
-	 * before.
-	 */
-	if (ondisk->vol_signature == HAMMER_FSBUF_VOLUME) {
-		kprintf("hammer_volume_add: Formatting of valid HAMMER volume "
-			"%s denied. Erase with dd!\n", vol_name);
-		error = EFTYPE;
-		goto late_failure;
-	}
-
-	bzero(ondisk, sizeof(struct hammer_volume_ondisk));
-	ksnprintf(ondisk->vol_name, sizeof(ondisk->vol_name), "%s", vol_name);
-	ondisk->vol_fstype = hmp->rootvol->ondisk->vol_fstype;
-	ondisk->vol_signature = HAMMER_FSBUF_VOLUME;
-	ondisk->vol_fsid = hmp->fsid;
-	ondisk->vol_rootvol = hmp->rootvol->vol_no;
-	ondisk->vol_no = vol_no;
-	ondisk->vol_count = vol_count;
-	ondisk->vol_version = hmp->version;
-
-	/*
-	 * Reserve space for (future) header junk, setup our poor-man's
-	 * bigblock allocator.
-	 */
-	int64_t vol_alloc = HAMMER_BUFSIZE * 16;
-
-	ondisk->vol_bot_beg = vol_alloc;
-	vol_alloc += boot_area_size;
-	ondisk->vol_mem_beg = vol_alloc;
-	vol_alloc += mem_area_size;
-
-	/*
-	 * The remaining area is the zone 2 buffer allocation area.  These
-	 * buffers
-	 */
-	ondisk->vol_buf_beg = vol_alloc;
-	ondisk->vol_buf_end = vol_size & ~(int64_t)HAMMER_BUFMASK;
-
-	if (ondisk->vol_buf_end < ondisk->vol_buf_beg) {
-		kprintf("volume %d %s is too small to hold the volume header",
-		     ondisk->vol_no, ondisk->vol_name);
-		error = EFTYPE;
-		goto late_failure;
-	}
-
-	ondisk->vol_nblocks = (ondisk->vol_buf_end - ondisk->vol_buf_beg) /
-			      HAMMER_BUFSIZE;
-	ondisk->vol_blocksize = HAMMER_BUFSIZE;
-
-	/*
-	 * Write volume header to disk
-	 */
-	error = bwrite(bp);
-	bp = NULL;
-
-late_failure:
-	if (bp)
-		brelse(bp);
-	return (error);
-}
-
-/*
- * Invalidates the volume header. Used by volume-del.
- */
-static int
-hammer_clear_volume_header(struct vnode *devvp)
-{
-	struct buf *bp = NULL;
-	struct hammer_volume_ondisk *ondisk;
-	int error;
-
-	KKASSERT(HAMMER_BUFSIZE >= sizeof(struct hammer_volume_ondisk));
-	error = bread(devvp, 0LL, HAMMER_BUFSIZE, &bp);
-	if (error || bp->b_bcount < sizeof(struct hammer_volume_ondisk))
-		goto late_failure;
-
-	ondisk = (struct hammer_volume_ondisk*) bp->b_data;
-	bzero(ondisk, sizeof(struct hammer_volume_ondisk));
-
-	error = bwrite(bp);
-	bp = NULL;
-
-late_failure:
-	if (bp)
-		brelse(bp);
-	return (error);
 }

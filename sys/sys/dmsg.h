@@ -35,14 +35,16 @@
 #ifndef _SYS_DMSG_H_
 #define _SYS_DMSG_H_
 
-#ifndef _SYS_MALLOC_H_
-#include <sys/malloc.h>
+#ifndef _SYS_TYPES_H_
+#include <sys/types.h>
 #endif
+#if defined(_KERNEL) || defined(_KERNEL_STRUCTURES)
 #ifndef _SYS_TREE_H_
 #include <sys/tree.h>
 #endif
 #ifndef _SYS_THREAD_H_
 #include <sys/thread.h>
+#endif
 #endif
 #ifndef _SYS_UUID_H_
 #include <sys/uuid.h>
@@ -104,6 +106,9 @@
  * transaction tracking structure will be referenced and will track the
  * sub-transaction.  Note that msgids must still be unique on an
  * iocom-by-iocom basis.
+ *
+ * Messages can race closing circuits.  When a circuit is lost,
+ * messages are simulated to delete any sub-transactions.
  *
  *			    MESSAGE TRANSACTIONAL STATES
  *
@@ -199,6 +204,9 @@
  * may be negotiated away later.
  */
 
+#define DMSG_TERMINATE_STRING(ary)	\
+	do { (ary)[sizeof(ary) - 1] = 0; } while (0)
+
 /*
  * dmsg_hdr must be 64 bytes
  */
@@ -229,9 +237,17 @@ typedef struct dmsg_hdr dmsg_hdr_t;
 
 /*
  * Administrative protocol limits.
+ *
+ * NOTE: A dmsg header must completely fit in the (fifo) buffer, but
+ *	 dmsg aux data does not have to completely fit.  The dmsg
+ *	 structure allows headers up to 255*64 = 16320 bytes.  There
+ *	 is no real limit on the aux_data other than what we deem
+ *	 reasonable and defenseable (i.e. not run processes or the
+ *	 kernel out of memory).  But it should be able to handle at
+ *	 least MAXPHYS bytes which is typically 128KB or 256KB.
  */
-#define DMSG_HDR_MAX		2048	/* <= 65535 */
-#define DMSG_AUX_MAX		65536	/* <= 1MB */
+#define DMSG_HDR_MAX		2048		/* <= 8192 */
+#define DMSG_AUX_MAX		(1024*1024)	/* <= 1MB */
 #define DMSG_BUF_SIZE		(DMSG_HDR_MAX * 4)
 #define DMSG_BUF_MASK		(DMSG_BUF_SIZE - 1)
 
@@ -377,58 +393,54 @@ struct dmsg_lnk_auth {
  * LNK_CONN - Register connection info for SPAN protocol
  *	      (transaction, left open, iocom->state0 only).
  *
- * LNK_CONN identifies a streaming connection into the cluster and serves
- * to identify, enable, and specify filters for the SPAN protocol.
+ * LNK_CONN identifies a streaming connection into the cluster.
  *
  * peer_mask serves to filter the SPANs we receive by peer_type.  A cluster
  * controller typically sets this to (uint64_t)-1, indicating that it wants
  * everything.  A block devfs interface might set it to 1 << DMSG_PEER_DISK,
  * and a hammer2 mount might set it to 1 << DMSG_PEER_HAMMER2.
  *
- * mediaid allows multiple (e.g. HAMMER2) connections belonging to the same
- * media to transmit duplicative LNK_VOLCONF updates without causing
- * confusion in the cluster controller.
+ * media_iud allows multiple (e.g. HAMMER2) connections belonging to the same
+ * media to transmit duplicative LNK_VOLCONF updates without causing confusion
+ * in the cluster controller.
  *
  * pfs_clid, pfs_fsid, pfs_type, and label are peer-specific and must be
  * left empty (zero-fill) if not supported by a particular peer.
- *
- * DMSG_PEER_CLUSTER		filter: none
- * DMSG_PEER_BLOCK		filter: label
- * DMSG_PEER_HAMMER2		filter: pfs_clid if not empty, and label
  */
 struct dmsg_lnk_conn {
 	dmsg_hdr_t	head;
-	uuid_t		mediaid;	/* media configuration id */
-	uuid_t		pfs_clid;	/* rendezvous pfs uuid */
-	uuid_t		pfs_fsid;	/* unique pfs uuid */
+	uuid_t		media_id;	/* media configuration id */
+	uuid_t		peer_id;	/* unique peer uuid */
+	uuid_t		reserved01;
 	uint64_t	peer_mask;	/* PEER mask for SPAN filtering */
 	uint8_t		peer_type;	/* see DMSG_PEER_xxx */
-	uint8_t		pfs_type;	/* pfs type */
+	uint8_t		reserved02;
 	uint16_t	proto_version;	/* high level protocol support */
 	uint32_t	status;		/* status flags */
 	uint32_t	rnss;		/* node's generated rnss */
-	uint8_t		reserved02[8];
-	uint32_t	reserved03[12];
-	uint64_t	pfs_mask;	/* PFS mask for SPAN filtering */
-	char		cl_label[DMSG_LABEL_SIZE]; /* cluster label */
-	char		fs_label[DMSG_LABEL_SIZE]; /* PFS label */
+	uint8_t		reserved03[8];
+	uint32_t	reserved04[14];
+	char		peer_label[DMSG_LABEL_SIZE]; /* peer identity string */
 };
 
 typedef struct dmsg_lnk_conn dmsg_lnk_conn_t;
 
 /*
- * PFSTYPEs 0-15 used by sys/dmsg.h 16-31 reserved by hammer2.
+ * PEER types 0-63 are defined here.  There is a limit of 64 types due to
+ * the width of peer_mask.
+ *
+ * PFS types depend on the peer type.  sys/dmsg.h only defines the default.
+ * peer-specific headers define PFS types for any given peer.
  */
-#define DMSG_PFSTYPE_NONE		0
-#define DMSG_PFSTYPE_ADMIN		1
-#define DMSG_PFSTYPE_CLIENT		2
-#define DMSG_PFSTYPE_SERVER		3
-#define DMSG_PFSTYPE_MAX		32
+#define DMSG_PEER_NONE			0
+#define DMSG_PEER_ROUTER		1	/* server: cluster controller */
+#define DMSG_PEER_BLOCK			2	/* server: block devices */
+#define DMSG_PEER_HAMMER2		3	/* server: h2 mounted volume */
+#define DMSG_PEER_CLIENT		63	/* a client connection */
+#define DMSG_PEER_MAX			64
 
-#define DMSG_PEER_NONE		0
-#define DMSG_PEER_CLUSTER	1	/* a cluster controller */
-#define DMSG_PEER_BLOCK		2	/* block devices */
-#define DMSG_PEER_HAMMER2	3	/* hammer2-mounted volumes */
+#define DMSG_PFSTYPE_DEFAULT		0
+#define DMSG_PFSTYPE_MASK		0x0F
 
 /*
  * Structures embedded in LNK_SPAN
@@ -436,6 +448,7 @@ typedef struct dmsg_lnk_conn dmsg_lnk_conn_t;
 struct dmsg_media_block {
 	uint64_t	bytes;		/* media size in bytes */
 	uint32_t	blksize;	/* media block size */
+	uint32_t	reserved01;
 };
 
 typedef struct dmsg_media_block dmsg_media_block_t;
@@ -489,8 +502,8 @@ typedef struct dmsg_media_block dmsg_media_block_t;
  */
 struct dmsg_lnk_span {
 	dmsg_hdr_t	head;
-	uuid_t		pfs_clid;	/* rendezvous pfs uuid */
-	uuid_t		pfs_fsid;	/* unique pfs id (differentiate node) */
+	uuid_t		peer_id;
+	uuid_t		pfs_id;		/* unique pfs id */
 	uint8_t		pfs_type;	/* PFS type */
 	uint8_t		peer_type;	/* PEER type */
 	uint16_t	proto_version;	/* high level protocol support */
@@ -510,8 +523,8 @@ struct dmsg_lnk_span {
 	 *	 for PEER_BLOCK cl_label is typically host/device and
 	 *	 fs_label is typically the serial number string.
 	 */
-	char		cl_label[DMSG_LABEL_SIZE]; /* cluster label */
-	char		fs_label[DMSG_LABEL_SIZE]; /* PFS label */
+	char		peer_label[DMSG_LABEL_SIZE];	/* peer label */
+	char		pfs_label[DMSG_LABEL_SIZE];	/* PFS label */
 };
 
 typedef struct dmsg_lnk_span dmsg_lnk_span_t;
@@ -692,11 +705,12 @@ struct xa_softc;
 struct kdmsg_iocom;
 struct kdmsg_state;
 struct kdmsg_msg;
+struct kdmsg_data;
 
 /*
  * msg_ctl flags (atomic)
  */
-#define KDMSG_CLUSTERCTL_KILL		0x00000001
+#define KDMSG_CLUSTERCTL_UNUSED01	0x00000001
 #define KDMSG_CLUSTERCTL_KILLRX		0x00000002 /* staged helper exit */
 #define KDMSG_CLUSTERCTL_KILLTX		0x00000004 /* staged helper exit */
 #define KDMSG_CLUSTERCTL_SLEEPING	0x00000008 /* interlocked w/msglk */
@@ -705,16 +719,28 @@ struct kdmsg_msg;
  * Transactional state structure, representing an open transaction.  The
  * transaction might represent a cache state (and thus have a chain
  * association), or a VOP op, LNK_SPAN, or other things.
+ *
+ * NOTE: A non-empty subq represents one ref.
+ *	 If we are inserted on a parent's subq, that's one ref (SUBINSERTED).
+ *	 If we are inserted on a RB tree, that's one ref (RBINSERTED).
+ *	 msg->state represents a ref.
+ *	 Other code references may hold refs.
+ *
+ * NOTE: The parent association stays intact as long as a state has a
+ *	 non-empty subq.  Otherwise simulated failures might not be able
+ *	 to reach the children.
  */
 TAILQ_HEAD(kdmsg_state_list, kdmsg_state);
 
 struct kdmsg_state {
 	RB_ENTRY(kdmsg_state) rbnode;		/* indexed by msgid */
+	struct kdmsg_state	*scan;		/* scan check */
 	struct kdmsg_state_list	subq;		/* active stacked states */
 	TAILQ_ENTRY(kdmsg_state) entry;		/* on parent subq */
 	TAILQ_ENTRY(kdmsg_state) user_entry;	/* available to devices */
 	struct kdmsg_iocom *iocom;
 	struct kdmsg_state *parent;
+	int		refs;			/* refs */
 	uint32_t	icmd;			/* record cmd creating state */
 	uint32_t	txcmd;			/* mostly for CMDF flags */
 	uint32_t	rxcmd;			/* mostly for CMDF flags */
@@ -730,12 +756,16 @@ struct kdmsg_state {
 	} any;
 };
 
-#define KDMSG_STATE_INSERTED	0x0001
+#define KDMSG_STATE_SUBINSERTED	0x0001
 #define KDMSG_STATE_DYNAMIC	0x0002
-#define KDMSG_STATE_DELPEND	0x0004		/* transmit delete pending */
+#define KDMSG_STATE_UNUSED0004	0x0004
 #define KDMSG_STATE_ABORTING	0x0008		/* avoids recursive abort */
 #define KDMSG_STATE_OPPOSITE	0x0010		/* opposite direction */
-#define KDMSG_STATE_DYING	0x0020		/* indicates circuit failure */
+#define KDMSG_STATE_DYING	0x0020		/* atomic recursive circ fail */
+#define KDMSG_STATE_INTERLOCK	0x0040
+#define KDMSG_STATE_RBINSERTED	0x0080
+#define KDMSG_STATE_SIGNAL	0x0400
+#define KDMSG_STATE_NEW		0x0800		/* defer abort processing */
 
 struct kdmsg_msg {
 	TAILQ_ENTRY(kdmsg_msg) qentry;		/* serialized queue */
@@ -748,16 +778,26 @@ struct kdmsg_msg {
 	dmsg_any_t	any;			/* variable sized */
 };
 
+struct kdmsg_data {
+	char		*aux_data;
+	size_t		aux_size;
+	struct kdmsg_iocom *iocom;
+};
+
 #define KDMSG_FLAG_AUXALLOC	0x0001
 
 typedef struct kdmsg_link kdmsg_link_t;
 typedef struct kdmsg_state kdmsg_state_t;
 typedef struct kdmsg_msg kdmsg_msg_t;
+typedef struct kdmsg_data kdmsg_data_t;
 
 struct kdmsg_state_tree;
 int kdmsg_state_cmp(kdmsg_state_t *state1, kdmsg_state_t *state2);
 RB_HEAD(kdmsg_state_tree, kdmsg_state);
 RB_PROTOTYPE(kdmsg_state_tree, kdmsg_state, rbnode, kdmsg_state_cmp);
+
+struct file;			/* forward decl */
+struct malloc_type;
 
 /*
  * Structure embedded in e.g. mount, master control structure for
@@ -798,8 +838,9 @@ typedef struct kdmsg_iocom	kdmsg_iocom_t;
 				 KDMSG_IOCOMF_AUTORXSPAN |	\
 				 KDMSG_IOCOMF_AUTOTXSPAN)
 
-uint32_t kdmsg_icrc32(const void *buf, size_t size);
-uint32_t kdmsg_icrc32c(const void *buf, size_t size, uint32_t crc);
+#endif	/* _KERNEL || _KERNEL_STRUCTURES */
+
+#ifdef _KERNEL
 
 /*
  * kern_dmsg.c
@@ -823,7 +864,9 @@ void kdmsg_msg_reply(kdmsg_msg_t *msg, uint32_t error);
 void kdmsg_msg_result(kdmsg_msg_t *msg, uint32_t error);
 void kdmsg_state_reply(kdmsg_state_t *state, uint32_t error);
 void kdmsg_state_result(kdmsg_state_t *state, uint32_t error);
+void kdmsg_detach_aux_data(kdmsg_msg_t *msg, kdmsg_data_t *data);
+void kdmsg_free_aux_data(kdmsg_data_t *data);
 
-#endif
+#endif	/* _KERNEL */
 
-#endif
+#endif	/* !_SYS_DMSG_H_ */

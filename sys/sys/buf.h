@@ -15,11 +15,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -164,9 +160,9 @@ struct buf {
 	unsigned int b_qindex;		/* buffer queue index */
 	unsigned int b_qcpu;		/* buffer queue cpu */
 	unsigned char b_act_count;	/* similar to vm_page act_count */
-	unsigned char b_unused01;
+	unsigned char b_swindex;
+	cpumask_t b_cpumask;		/* KVABIO API */
 	struct lock b_lock;		/* Buffer lock */
-	void	*b_iosched;		/* I/O scheduler priv data */
 	buf_cmd_t b_cmd;		/* I/O command */
 	int	b_bufsize;		/* Allocated buffer size. */
 	int	b_runningbufspace;	/* when I/O is running, pipelining */
@@ -181,7 +177,10 @@ struct buf {
 	int	b_refs;			/* FINDBLK_REF/bqhold()/bqdrop() */
 	struct	xio b_xio;  		/* data buffer page list management */
 	struct  bio_ops *b_ops;		/* bio_ops used w/ b_dep */
-	struct	workhead b_dep;		/* List of filesystem dependencies. */
+	union {
+		struct workhead b_dep;	/* List of filesystem dependencies. */
+		void *b_priv;		/* Filesystem private data */
+	};
 };
 
 /*
@@ -210,10 +209,12 @@ struct buf {
 #define GETBLK_BHEAVY	0x0002	/* heavy weight buffer */
 #define GETBLK_SZMATCH	0x0004	/* pre-existing buffer must match */
 #define GETBLK_NOWAIT	0x0008	/* non-blocking */
+#define GETBLK_KVABIO	0x0010	/* request a B_KVABIO buffer */
 
-#define FINDBLK_TEST	0x0010	/* test only, do not lock */
-#define FINDBLK_NBLOCK	0x0020	/* use non-blocking lock, can return NULL */
-#define FINDBLK_REF	0x0040	/* ref the buf to prevent reuse */
+#define FINDBLK_TEST	0x0020	/* test only, do not lock */
+#define FINDBLK_NBLOCK	0x0040	/* use non-blocking lock, can return NULL */
+#define FINDBLK_REF	0x0080	/* ref the buf to prevent reuse */
+#define FINDBLK_KVABIO	0x0100	/* (if locking only) request B_KVABIO buffer */
 
 /*
  * These flags are kept in b_flags.
@@ -235,9 +236,6 @@ struct buf {
  *
  *			The 'entire buffer' is defined to be the range from
  *			0 through b_bcount.
- *
- *	B_MALLOC	Request that the buffer be allocated from the malloc
- *			pool, DEV_BSIZE aligned instead of PAGE_SIZE aligned.
  *
  *	B_CLUSTEROK	This flag is typically set for B_DELWRI buffers
  *			by filesystems that allow clustering when the buffer
@@ -287,6 +285,19 @@ struct buf {
  *			swapcache to not try to cache them.
  *
  *	B_MARKER	Special marker buf, always skip.
+ *
+ *	B_KVABIO	Owner of buffer (but not necessarily the underlying
+ *			vnode or device) supports the KVABIO API.  The owner
+ *			of the buffer will only operate on the buffer's
+ *			b_data via the API.  Locked buffers only.  This
+ *			flag is cleared on brelse/bqrelse
+ *
+ * WARNING! bp->b_data is not necessarily synchronized to the current cpu
+ *	    when B_KVABIO operations is specified.  Callers using bp->b_data
+ *	    who specify B_KVABIO operation must call bkvasync() if they use
+ *	    bp->b_data directly, or whenever they pass a buffer between cpus
+ *	    (between threads, e.g. from helper threads) if the target thread
+ *	    intends to access bp->b_data.
  */
 
 #define	B_AGE		0x00000001	/* Reuse more quickly */
@@ -301,22 +312,22 @@ struct buf {
 #define	B_HASBOGUS	0x00000200	/* Contains bogus pages */
 #define	B_EINTR		0x00000400	/* I/O was interrupted */
 #define	B_ERROR		0x00000800	/* I/O error occurred. */
-#define	B_IODEBUG	0x00001000	/* (Debugging only bread) */
+#define	B_IOISSUED	0x00001000	/* Flag when I/O issued (vfs can clr) */
 #define	B_INVAL		0x00002000	/* Does not contain valid info. */
 #define	B_LOCKED	0x00004000	/* Locked in core (not reusable). */
 #define	B_NOCACHE	0x00008000	/* Destroy buffer AND backing store */
-#define	B_MALLOC	0x00010000	/* malloced b_data */
+#define	B_KVABIO	0x00010000	/* Lockholder uses the KVABIO API */
 #define	B_CLUSTEROK	0x00020000	/* Pagein op, so swap() can count it. */
 #define	B_MARKER	0x00040000	/* Special marker buf in queue */
 #define	B_RAW		0x00080000	/* Set by physio for raw transfers. */
 #define	B_HEAVY		0x00100000	/* Heavy-weight buffer */
 #define	B_DIRTY		0x00200000	/* Needs writing later. */
 #define	B_RELBUF	0x00400000	/* Release VMIO buffer. */
-#define	B_UNUSED23	0x00800000	/* Request wakeup on done */
+#define	B_FAILONDIS	0x00800000	/* Fail on disconnect */
 #define	B_VNCLEAN	0x01000000	/* On vnode clean list */
 #define	B_VNDIRTY	0x02000000	/* On vnode dirty list */
 #define	B_PAGING	0x04000000	/* volatile paging I/O -- bypass VMIO */
-#define	B_ORDERED	0x08000000	/* Must guarantee I/O ordering */
+#define	B_TTC		0x08000000	/* Try to recycle pages to PQ_CACHE */
 #define B_RAM		0x10000000	/* Read ahead mark (flag) */
 #define B_VMIO		0x20000000	/* VMIO flag */
 #define B_CLUSTER	0x40000000	/* pagein op, so swap() can count it */
@@ -359,10 +370,11 @@ struct cluster_save {
 /*
  * Zero out the buffer's data area.
  */
-#define	clrbuf(bp) {							\
+#define	clrbuf(bp) do {							\
+	bkvasync((bp));							\
 	bzero((bp)->b_data, (u_int)(bp)->b_bcount);			\
 	(bp)->b_resid = 0;						\
-}
+} while(0)
 
 /*
  * Flags to low-level bitmap allocation routines (balloc).
@@ -376,6 +388,12 @@ struct cluster_save {
 #define B_CLRBUF	0x01		/* Cleared invalid areas of buffer. */
 #define B_SYNC		0x02		/* Do all allocations synchronously. */
 
+/*
+ * Split nswbuf_kva by N, allowing each block device or mounted filesystem
+ * to use up to (nswbuf_kva / N) pbufs.
+ */
+#define NSWBUF_SPLIT	10		/* split nswbuf_kva by N */
+
 #ifdef _KERNEL
 extern long	nbuf;			/* The number of buffer headers */
 extern long	maxswzone;		/* Max KVA for swap structures */
@@ -385,8 +403,12 @@ extern int      buf_maxio;              /* nominal maximum I/O for buffer */
 extern struct buf *buf;			/* The buffer headers. */
 extern char	*buffers;		/* The buffer contents. */
 extern int	bufpages;		/* Number of memory pages in the buffer pool. */
-extern struct	buf *swbuf;		/* Swap I/O buffer headers. */
-extern long	nswbuf;			/* Number of swap I/O buffer headers. */
+extern struct	buf *swbuf_mem;		/* Swap I/O buffer headers. */
+extern struct	buf *swbuf_kva;		/* Swap I/O buffer headers. */
+extern struct	buf *swbuf_raw;		/* Swap I/O buffer headers. */
+extern long	nswbuf_mem;		/* Number of swap I/O buffer headers. */
+extern long	nswbuf_kva;		/* Number of swap I/O buffer headers. */
+extern long	nswbuf_raw;		/* Number of swap I/O buffer headers. */
 extern int	bioq_reorder_burst_interval;
 extern int	bioq_reorder_burst_bytes;
 extern int	bioq_reorder_minor_interval;
@@ -405,10 +427,10 @@ void	uninitbufbio(struct buf *);
 void	reinitbufbio(struct buf *);
 void	clearbiocache(struct bio *);
 void	bremfree (struct buf *);
-int	breadx (struct vnode *, off_t, int, struct buf **);
-int	breadnx (struct vnode *, off_t, int, off_t *, int *, int,
+int	breadx (struct vnode *, off_t, int, int, struct buf **);
+int	breadnx (struct vnode *, off_t, int, int, off_t *, int *, int,
 		struct buf **);
-void	breadcb(struct vnode *, off_t, int,
+void	breadcb(struct vnode *, off_t, int, int,
 		void (*)(struct bio *), void *);
 int	bwrite (struct buf *);
 void	bdwrite (struct buf *);
@@ -417,17 +439,22 @@ void	bawrite (struct buf *);
 void	bdirty (struct buf *);
 void	bheavy (struct buf *);
 void	bundirty (struct buf *);
-int	bowrite (struct buf *);
 void	brelse (struct buf *);
 void	bqrelse (struct buf *);
 int	cluster_awrite (struct buf *);
+
+void	bkvareset(struct buf *bp);
+void	bkvasync(struct buf *bp);
+void	bkvasync_all(struct buf *bp);
+
 struct buf *getpbuf (int *);
+struct buf *getpbuf_mem (int *);
 struct buf *getpbuf_kva (int *);
+
 int	inmem (struct vnode *, off_t);
 struct buf *findblk (struct vnode *, off_t, int);
 struct buf *getblk (struct vnode *, off_t, int, int, int);
 struct buf *getcacheblk (struct vnode *, off_t, int, int);
-struct buf *geteblk (int);
 struct buf *getnewbuf(int, int, int, int);
 void	bqhold(struct buf *bp);
 void	bqdrop(struct buf *bp);
@@ -442,9 +469,9 @@ void	biodone_sync (struct bio *);
 void	pbuf_adjcount(int *pfreecnt, int n);
 
 void	cluster_append(struct bio *, struct buf *);
-int	cluster_readx (struct vnode *, off_t, off_t, int,
+int	cluster_readx (struct vnode *, off_t, off_t, int, int,
 	    size_t, size_t, struct buf **);
-void	cluster_readcb (struct vnode *, off_t, off_t, int,
+void	cluster_readcb (struct vnode *, off_t, off_t, int, int,
 	    size_t, size_t, void (*func)(struct bio *), void *arg);
 void	cluster_write (struct buf *, off_t, int, int);
 int	physread (struct dev_read_args *);
@@ -452,20 +479,16 @@ int	physwrite (struct dev_write_args *);
 void	vfs_bio_clrbuf (struct buf *);
 void	vfs_busy_pages (struct vnode *, struct buf *);
 void	vfs_unbusy_pages (struct buf *);
-int	vmapbuf (struct buf *, caddr_t, int);
-void	vunmapbuf (struct buf *);
 void	relpbuf (struct buf *, int *);
 void	brelvp (struct buf *);
 int	bgetvp (struct vnode *, struct buf *, int);
 void	bsetrunningbufspace(struct buf *, int);
-int	allocbuf (struct buf *bp, int size);
+void	allocbuf (struct buf *bp, int size);
 int	scan_all_buffers (int (*)(struct buf *, void *), void *);
 void	reassignbuf (struct buf *);
 struct	buf *trypbuf (int *);
 struct	buf *trypbuf_kva (int *);
 void	bio_ops_sync(struct mount *mp);
-void	vm_hold_free_pages(struct buf *bp, vm_offset_t from, vm_offset_t to);
-void	vm_hold_load_pages(struct buf *bp, vm_offset_t from, vm_offset_t to);
 void	nestiobuf_done(struct bio *mbio, int donebytes, int error, struct devstat *stats);
 void	nestiobuf_init(struct bio *mbio);
 void	nestiobuf_add(struct bio *mbio, struct buf *bp, int off, size_t size, struct devstat *stats);

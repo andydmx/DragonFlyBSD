@@ -15,11 +15,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -44,15 +40,9 @@
 #ifndef _NET_BPF_H_
 #define _NET_BPF_H_
 
-#ifndef _SYS_TYPES_H_
-#include <sys/types.h>
-#endif
-#ifndef _SYS_TIME_H_
+#include <sys/param.h>
 #include <sys/time.h>
-#endif
-#ifndef _SYS_IOCCOM_H_
 #include <sys/ioccom.h>
-#endif
 
 __BEGIN_DECLS
 
@@ -69,7 +59,7 @@ typedef	u_int32_t bpf_u_int32;
  * even multiple of BPF_ALIGNMENT.
  */
 #define BPF_ALIGNMENT sizeof(long)
-#define BPF_WORDALIGN(x) (((x)+(BPF_ALIGNMENT-1))&~(BPF_ALIGNMENT-1))
+#define BPF_WORDALIGN(x) roundup2(x, BPF_ALIGNMENT)
 
 #define BPF_MAXINSNS 512
 #define BPF_MAXBUFSIZE 0x80000
@@ -134,6 +124,9 @@ struct bpf_version {
 #define	BIOCGDLTLIST	_IOWR('B',121, struct bpf_dltlist)
 #define	BIOCLOCK	_IO('B', 122)
 #define	BIOCSETWF	_IOW('B',123, struct bpf_program)
+#define BIOCGFEEDBACK	 _IOR('B',124, u_int)
+#define BIOCSFEEDBACK	 _IOW('B',125, u_int)
+#define BIOCFEEDBACK     BIOCSFEEDBACK		/* FreeBSD name */
 
 /*
  * Structure prepended to each packet.
@@ -155,9 +148,8 @@ struct bpf_hdr {
     sizeof(struct bpf_hdr))
 #endif
 
-#ifndef _NET_DLT_H
+/* Pull in data-link level type codes. */
 #include <net/dlt.h>
-#endif
 
 /*
  * The instruction encodings.
@@ -197,6 +189,8 @@ struct bpf_hdr {
 #define		BPF_LSH		0x60
 #define		BPF_RSH		0x70
 #define		BPF_NEG		0x80
+#define		BPF_MOD		0x90
+#define		BPF_XOR		0xa0
 #define		BPF_JA		0x00
 #define		BPF_JEQ		0x10
 #define		BPF_JGT		0x20
@@ -276,6 +270,17 @@ u_int	 bpf_filter(const struct bpf_insn *, u_char *, u_int, u_int);
 		bpf_reltoken();						\
 	}								\
 } while (0)
+
+/*
+ * BPF attach/detach events
+ */
+
+#include <sys/eventhandler.h>
+struct ifnet;
+
+typedef void (*bpf_track_fn)(void *, struct ifnet *, int /* dlt */,
+    int /* 1 =>'s attach */);
+EVENTHANDLER_DECLARE(bpf_track, bpf_track_fn);
 
 #endif	/* _KERNEL */
 

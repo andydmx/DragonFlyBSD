@@ -13,16 +13,16 @@ CONTRIBDIR=	${.CURDIR}/../../contrib/zlib-1.2
 
 SRCS=	adler32.c compress.c crc32.c deflate.c gzclose.c gzlib.c gzread.c
 SRCS+=	gzwrite.c infback.c
-SRCS+=	inffast.c inflate.c inftrees.c trees.c uncompr.c zopen.c zutil.c
+SRCS+=	inffast.c inflate.c inftrees.c trees.c uncompr.c zutil.c
 
-CFLAGS+= -I${CONTRIBDIR} -I${.CURDIR}
+CFLAGS+=-I${CONTRIBDIR} -I${.CURDIR}
+#CFLAGS+=-DZLIB_DEBUG
 
 INCS=		zconf.h zlib.h
 
-.if defined(RELEASE36)
-SHLIB_MAJOR=	4
 VERSION_DEF=	${.CURDIR}/Versions.def
 SYMBOL_MAPS=	${.CURDIR}/Symbol.map
-.endif
+FILES=		zlib.pc
+FILESDIR=	${LIBDATADIR}/pkgconfig
 
 .include <bsd.lib.mk>

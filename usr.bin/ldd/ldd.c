@@ -34,7 +34,6 @@
 #include <sys/wait.h>
 
 #include <machine/elf.h>
-#include <a.out.h>
 #include <dlfcn.h>
 #include <err.h>
 #include <fcntl.h>
@@ -42,13 +41,12 @@
 #include <stdlib.h>
 #include <unistd.h>
 
-extern void	dump_file(const char *);
-extern int	error_count;
+static void	usage(void);
 
-void
+static void
 usage(void)
 {
-	fprintf(stderr, "usage: ldd [-a] [-v] [-f format] program ...\n");
+	fprintf(stderr, "usage: ldd [-av] [-f format] program ...\n");
 	exit(1);
 }
 
@@ -58,10 +56,10 @@ main(int argc, char **argv)
 	char		*fmt1 = NULL, *fmt2 = NULL;
 	int		rval;
 	int		c;
-	int		aflag, vflag;
+	int		aflag;
 
-	aflag = vflag = 0;
-	while ((c = getopt(argc, argv, "avf:")) != -1) {
+	aflag = 0;
+	while ((c = getopt(argc, argv, "af:v")) != -1) {
 		switch (c) {
 		case 'a':
 			aflag++;
@@ -75,7 +73,6 @@ main(int argc, char **argv)
 				fmt1 = optarg;
 			break;
 		case 'v':
-			vflag++;
 			break;
 		default:
 			usage();
@@ -85,21 +82,10 @@ main(int argc, char **argv)
 	argc -= optind;
 	argv += optind;
 
-	if (vflag && fmt1)
-		errx(1, "-v may not be used with -f");
-
 	if (argc <= 0) {
 		usage();
 		/* NOTREACHED */
 	}
-
-#ifdef __i386__
-	if (vflag) {
-		for (c = 0; c < argc; c++)
-			dump_file(argv[c]);
-		exit(error_count == 0 ? EXIT_SUCCESS : EXIT_FAILURE);
-	}
-#endif
 
 	/* ld.so magic */
 	if (setenv("LD_TRACE_LOADED_OBJECTS", "yes", 1) == -1)
@@ -117,10 +103,9 @@ main(int argc, char **argv)
 	for ( ;  argc > 0;  argc--, argv++) {
 		int	fd;
 		union {
-			struct exec aout;
 			Elf_Ehdr elf;
 		} hdr;
-		int	n;
+		ssize_t	n;
 		int	status;
 		int	file_ok;
 		int	is_shlib;
@@ -132,24 +117,14 @@ main(int argc, char **argv)
 		}
 		if ((n = read(fd, &hdr, sizeof hdr)) == -1) {
 			warn("%s: can't read program header", *argv);
-			(void)close(fd);
+			close(fd);
 			rval |= 1;
 			continue;
 		}
 
 		file_ok = 1;
 		is_shlib = 0;
-		if (n >= sizeof hdr.aout && !N_BADMAG(hdr.aout)) {
-			/* a.out file */
-			if ((N_GETFLAG(hdr.aout) & EX_DPMASK) != EX_DYNAMIC
-#if 1 /* Compatibility */
-			    || hdr.aout.a_entry < __LDPGSZ
-#endif
-				) {
-				warnx("%s: not a dynamic executable", *argv);
-				file_ok = 0;
-			}
-		} else if (n >= sizeof hdr.elf && IS_ELF(hdr.elf)) {
+		if ((size_t)n >= sizeof hdr.elf && IS_ELF(hdr.elf)) {
 			Elf_Ehdr ehdr;
 			Elf_Phdr phdr;
 			int dynamic = 0, i;
@@ -183,7 +158,7 @@ main(int argc, char **argv)
 			warnx("%s: not a dynamic executable", *argv);
 			file_ok = 0;
 		}
-		(void)close(fd);
+		close(fd);
 		if (!file_ok) {
 			rval |= 1;
 			continue;

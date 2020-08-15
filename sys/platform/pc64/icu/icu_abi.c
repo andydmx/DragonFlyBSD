@@ -52,8 +52,6 @@
 #include <machine/smp.h>
 #include <machine/msi_var.h>
 
-#include <sys/thread2.h>
-
 #include <machine_base/icu/elcr_var.h>
 
 #include <machine_base/icu/icu.h>
@@ -459,8 +457,7 @@ icu_abi_msi_alloc_intern(int type, const char *desc,
 	    ("invalid cpuid %d", cpuid));
 
 	KASSERT(count > 0 && count <= 32, ("invalid count %d", count));
-	KASSERT((count & (count - 1)) == 0,
-	    ("count %d is not power of 2", count));
+	KASSERT(powerof2(count), ("count %d is not power of 2", count));
 
 	lwkt_gettoken(&icu_irqmap_tok);
 
@@ -609,7 +606,7 @@ icu_abi_msix_alloc(int *intr, int cpuid)
 static void
 icu_abi_msix_release(int intr, int cpuid)
 {
-	icu_abi_msi_release_intern(ICU_IMT_MSIX, "MXI-X",
+	icu_abi_msi_release_intern(ICU_IMT_MSIX, "MSI-X",
 	    &intr, 1, cpuid);
 }
 

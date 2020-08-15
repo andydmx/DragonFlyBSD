@@ -34,8 +34,10 @@
 #include <sys/un.h>
 #include <sys/file.h>
 #include <sys/socket.h>
+#include <sys/wait.h>
 #include <netinet/in.h>
 
+#include <assert.h>
 #include <ctype.h>
 #include <err.h>
 #include <errno.h>
@@ -94,7 +96,7 @@ static char _hostname[MAXHOSTNAMELEN];
 
 static int help(int, char **);
 static int call(intrtn_t, ...);
-static void cmdrc(char *, char *);
+static void cmdrc(const char *, const char *);
 #ifdef INET6
 static int switch_af(struct addrinfo **);
 #endif
@@ -116,35 +118,6 @@ static char line[256];
 static char saveline[256];
 static int margc;
 static char *margv[20];
-
-#ifdef OPIE
-#include <sys/wait.h>
-#define PATH_OPIEKEY	"/usr/bin/opiekey"
-static int
-opie_calc(int argc, char *argv[])
-{
-	int status;
-
-	if(argc != 3) {
-		printf("%s sequence challenge\n", argv[0]);
-		return (0);
-	}
-
-	switch(fork()) {
-	case 0:
-		execv(PATH_OPIEKEY, argv);
-		exit (1);
-	case -1:
-		perror("fork");
-		break;
-	default:
-		(void) wait(&status);
-		if (WIFEXITED(status))
-			return (WEXITSTATUS(status));
-	}
-	return (0);
-}
-#endif
 
 static void
 makeargv(void)
@@ -279,7 +252,7 @@ struct sendlist {
     int		nbyte;		/* Number of bytes to send this command */
     int		what;		/* Character to be sent (<0 ==> special) */
 };
-
+
 
 static int
 	send_esc(void),
@@ -504,7 +477,7 @@ send_help(void)
     }
     return(0);
 }
-
+
 /*
  * The following are the routines and data structures referred
  * to by the arguments to the "toggle" command.
@@ -522,11 +495,11 @@ togdebug(void)
 {
 #ifndef	NOT43
     if (net > 0 &&
-	(SetSockOpt(net, SOL_SOCKET, SO_DEBUG, debug)) < 0) {
+	(SetSockOpt(net, SOL_SOCKET, SO_DEBUG, telnet_debug)) < 0) {
 	    perror("setsockopt (SO_DEBUG)");
     }
 #else	/* NOT43 */
-    if (debug) {
+    if (telnet_debug) {
 	if (net > 0 && SetSockOpt(net, SOL_SOCKET, SO_DEBUG, 1) < 0)
 	    perror("setsockopt (SO_DEBUG)");
     } else
@@ -731,7 +704,7 @@ static struct togglelist Togglelist[] = {
     { "debug",
 	"debugging",
 	    (int (*)(int))togdebug,
-		&debug,
+		&telnet_debug,
 		    "turn on socket level debugging" },
     { "netdata",
 	"printing of hexadecimal network data (debugging)",
@@ -844,7 +817,7 @@ toggle(int argc, char *argv[])
     }
     return retval;
 }
-
+
 /*
  * The following perform the "set" command.
  */
@@ -1040,7 +1013,7 @@ unsetcmd(int argc, char *argv[])
     }
     return 1;
 }
-
+
 /*
  * The following are the data structures and routines for the
  * 'mode' command.
@@ -1197,7 +1170,7 @@ modecmd(int argc, char *argv[])
     }
     return 0;
 }
-
+
 /*
  * The following data structures and routines implement the
  * "display" command.
@@ -1263,7 +1236,7 @@ display(int argc, char *argv[])
 #undef	doset
 #undef	dotog
 }
-
+
 /*
  * The following are the data structures, and many of the routines,
  * relating to command processing.
@@ -1420,7 +1393,7 @@ logout(void)
 	return 1;
 }
 
-
+
 /*
  * The SLC command.
  */
@@ -1493,7 +1466,7 @@ slccmd(int argc, char *argv[])
     slcstate();
     return 1;
 }
-
+
 /*
  * The ENVIRON command.
  */
@@ -1508,12 +1481,12 @@ struct envlist {
 extern struct env_lst *
 	env_define(const unsigned char *, unsigned char *);
 extern void
-	env_undefine(unsigned char *),
+	env_undefine(const unsigned char *),
 	env_export(const unsigned char *),
 	env_unexport(const unsigned char *),
-	env_send(unsigned char *),
+	env_send(const unsigned char *),
 #if defined(OLD_ENVIRON) && defined(ENV_HACK)
-	env_varval(unsigned char *),
+	env_varval(const unsigned char *),
 #endif
 	env_list(void);
 static void
@@ -1643,11 +1616,14 @@ env_init(void)
 		|| (strncmp((char *)ep->value, "unix:", 5) == 0))) {
 		char hbuf[256+1];
 		char *cp2 = strchr((char *)ep->value, ':');
+		size_t buflen;
 
-		gethostname(hbuf, 256);
-		hbuf[256] = '\0';
-		cp = (char *)malloc(strlen(hbuf) + strlen(cp2) + 1);
-		sprintf((char *)cp, "%s%s", hbuf, cp2);
+		gethostname(hbuf, sizeof(hbuf));
+		hbuf[sizeof(hbuf)-1] = '\0';
+		buflen = strlen(hbuf) + strlen(cp2) + 1;
+		cp = (char *)malloc(sizeof(char)*buflen);
+		assert(cp != NULL);
+		snprintf((char *)cp, buflen, "%s%s", hbuf, cp2);
 		free(ep->value);
 		ep->value = (unsigned char *)cp;
 	}
@@ -1690,7 +1666,7 @@ env_define(const unsigned char *var, unsigned char *value)
 }
 
 void
-env_undefine(unsigned char *var)
+env_undefine(const unsigned char *var)
 {
 	struct env_lst *ep;
 
@@ -1725,7 +1701,7 @@ env_unexport(const unsigned char *var)
 }
 
 void
-env_send(unsigned char *var)
+env_send(const unsigned char *var)
 {
 	struct env_lst *ep;
 
@@ -1768,7 +1744,7 @@ env_default(int init, int welldefined)
 
 	if (init) {
 		nep = &envlisthead;
-		return(NULL);
+		return NULL;
 	}
 	if (nep) {
 		while ((nep = nep->next)) {
@@ -1791,7 +1767,7 @@ env_getvalue(const unsigned char *var)
 
 #if defined(OLD_ENVIRON) && defined(ENV_HACK)
 void
-env_varval(unsigned char *what)
+env_varval(const unsigned char *what)
 {
 	extern int old_env_var, old_env_value, env_auto;
 	int len = strlen((char *)what);
@@ -2104,34 +2080,6 @@ sockaddr_ntop(struct sockaddr *sa)
     return addrbuf;
 }
 
-#if defined(IPSEC) && defined(IPSEC_POLICY_IPSEC)
-static int
-setpolicy(int lnet, struct addrinfo *res, char *policy)
-{
-	char *buf;
-	int level;
-	int optname;
-
-	if (policy == NULL)
-		return 0;
-
-	buf = ipsec_set_policy(policy, strlen(policy));
-	if (buf == NULL) {
-		printf("%s\n", ipsec_strerror());
-		return -1;
-	}
-	level = res->ai_family == AF_INET ? IPPROTO_IP : IPPROTO_IPV6;
-	optname = res->ai_family == AF_INET ? IP_IPSEC_POLICY : IPV6_IPSEC_POLICY;
-	if (setsockopt(lnet, level, optname, buf, ipsec_get_policylen(buf)) < 0){
-		perror("setsockopt");
-		return -1;
-	}
-
-	free(buf);
-	return 0;
-}
-#endif
-
 #ifdef INET6
 /*
  * When an Address Family related error happend, check if retry with
@@ -2175,7 +2123,7 @@ tn(int argc, char *argv[])
 	return 0;
     }
     if (argc < 2) {
-	(void) strcpy(line, "open ");
+	(void) strlcpy(line, "open ", sizeof(line));
 	printf("(to) ");
 	(void) fgets(&line[strlen(line)], sizeof(line) - strlen(line), stdin);
 	makeargv();
@@ -2395,7 +2343,7 @@ tn(int argc, char *argv[])
 	}
 #endif	/* defined(IPPROTO_IP) && defined(IP_TOS) */
 
-	if (debug && SetSockOpt(net, SOL_SOCKET, SO_DEBUG, 1) < 0) {
+	if (telnet_debug && SetSockOpt(net, SOL_SOCKET, SO_DEBUG, 1) < 0) {
 		perror("setsockopt (SO_DEBUG)");
 	}
 
@@ -2419,16 +2367,6 @@ tn(int argc, char *argv[])
 		goto fail;
 	    }
 	}
-#if defined(IPSEC) && defined(IPSEC_POLICY_IPSEC)
-	if (setpolicy(net, res, ipsec_policy_in) < 0) {
-		(void) NetClose(net);
-		goto fail;
-	}
-	if (setpolicy(net, res, ipsec_policy_out) < 0) {
-		(void) NetClose(net);
-		goto fail;
-	}
-#endif
 
 	if (connect(net, res->ai_addr, res->ai_addrlen) < 0) {
 	    struct addrinfo *next;
@@ -2459,7 +2397,7 @@ tn(int argc, char *argv[])
     if (src_res0 != NULL)
         freeaddrinfo(src_res0);
     cmdrc(hostp, hostname);
- af_unix:    
+ af_unix:
     if (autologin && user == NULL) {
 	struct passwd *pw;
 
@@ -2512,9 +2450,6 @@ static char
 	encrypthelp[] =	"turn on (off) encryption ('encrypt ?' for more)",
 #endif	/* ENCRYPTION */
 	zhelp[] =	"suspend telnet",
-#ifdef OPIE
-	opiehelp[] =    "compute response to OPIE challenge",
-#endif
 	shellhelp[] =	"invoke a subshell",
 	envhelp[] =	"change environment variables ('environ ?' for more)",
 	modestring[] = "try to enter line or character mode ('mode ?' for more)";
@@ -2543,9 +2478,6 @@ static Command cmdtab[] = {
 	{ "!",		shellhelp,	shell,		1 },
 	{ "environ",	envhelp,	env_cmd,	0 },
 	{ "?",		helphelp,	help,		0 },
-#ifdef OPIE
-	{ "opie",       opiehelp,       opie_calc,      0 },
-#endif		
 	{ NULL, NULL, NULL, 0 }
 };
 
@@ -2657,7 +2589,7 @@ command(int top, const char *tbuf, int cnt)
 	setconnmode(0);
     }
 }
-
+
 /*
  * Help command.
  */
@@ -2692,15 +2624,16 @@ help(int argc, char *argv[])
 static char *rcname = NULL;
 static char rcbuf[128];
 
-void
-cmdrc(char *m1, char *m2)
+static void
+cmdrc(const char *m1, const char *m2)
 {
     Command *c;
     FILE *rcfile;
     int gotmachine = 0;
     int l1 = strlen(m1);
     int l2 = strlen(m2);
-    char m1save[MAXHOSTNAMELEN];
+    char m1save[MAXHOSTNAMELEN + 1];
+    char temp[sizeof(line)];
 
     if (skiprc)
 	return;
@@ -2736,13 +2669,16 @@ cmdrc(char *m1, char *m2)
 	if (gotmachine == 0) {
 	    if (isspace(line[0]))
 		continue;
-	    if (strncasecmp(line, m1, l1) == 0)
-		strncpy(line, &line[l1], sizeof(line) - l1);
-	    else if (strncasecmp(line, m2, l2) == 0)
-		strncpy(line, &line[l2], sizeof(line) - l2);
-	    else if (strncasecmp(line, "DEFAULT", 7) == 0)
-		strncpy(line, &line[7], sizeof(line) - 7);
-	    else
+	    if (strncasecmp(line, m1, l1) == 0) {
+		strncpy(temp, &line[l1], sizeof(line) - l1);
+		strncpy(line, temp, sizeof(line) - l1);
+	    } else if (strncasecmp(line, m2, l2) == 0) {
+		strncpy(temp, &line[l2], sizeof(line) - l2);
+		strncpy(line, temp, sizeof(line) - l2);
+	    } else if (strncasecmp(line, "DEFAULT", 7) == 0) {
+		strncpy(temp, &line[7], sizeof(line) - 7);
+		strncpy(line, temp, sizeof(line) - 7);
+	    } else
 		continue;
 	    if (line[0] != ' ' && line[0] != '\t' && line[0] != '\n')
 		continue;

@@ -6,13 +6,6 @@
  */
 
 union sysunion {
-#ifdef _KERNEL /* header only applies in kernel */
-	struct	lwkt_msg lmsg;
-	struct	sysmsg sysmsg;
-#endif
-#ifdef COMPAT_43
-#endif
-	struct	nosys_args nosys;
 	struct	exit_args exit;
 	struct	fork_args fork;
 	struct	read_args read;
@@ -20,9 +13,7 @@ union sysunion {
 	struct	open_args open;
 	struct	close_args close;
 	struct	wait_args wait4;
-#ifdef COMPAT_43
-	struct	ocreat_args sys_ocreat;
-#endif
+	struct	nosys_args nosys;
 	struct	link_args link;
 	struct	unlink_args unlink;
 	struct	chdir_args chdir;
@@ -32,9 +23,6 @@ union sysunion {
 	struct	chown_args chown;
 	struct	obreak_args obreak;
 	struct	getfsstat_args getfsstat;
-#ifdef COMPAT_43
-	struct	olseek_args sys_olseek;
-#endif
 	struct	getpid_args getpid;
 	struct	mount_args mount;
 	struct	unmount_args unmount;
@@ -53,13 +41,7 @@ union sysunion {
 	struct	fchflags_args fchflags;
 	struct	sync_args sync;
 	struct	kill_args kill;
-#ifdef COMPAT_43
-	struct	ostat_args sys_ostat;
-#endif
 	struct	getppid_args getppid;
-#ifdef COMPAT_43
-	struct	olstat_args sys_olstat;
-#endif
 	struct	dup_args dup;
 	struct	pipe_args pipe;
 	struct	getegid_args getegid;
@@ -78,23 +60,10 @@ union sysunion {
 	struct	execve_args execve;
 	struct	umask_args umask;
 	struct	chroot_args chroot;
-#ifdef COMPAT_43
-	struct	ofstat_args sys_ofstat;
-#endif
-#ifdef COMPAT_43
-	struct	getkerninfo_args getkerninfo;
-#endif
-	struct	getpagesize_args getpagesize;
 	struct	msync_args msync;
 	struct	vfork_args vfork;
 	struct	sbrk_args sbrk;
 	struct	sstk_args sstk;
-#ifdef COMPAT_43
-	struct	ommap_args sys_ommap;
-#endif
-#ifdef COMPAT_43
-	struct	ovadvise_args vadvise;
-#endif
 	struct	munmap_args munmap;
 	struct	mprotect_args mprotect;
 	struct	madvise_args madvise;
@@ -104,15 +73,8 @@ union sysunion {
 	struct	getpgrp_args getpgrp;
 	struct	setpgid_args setpgid;
 	struct	setitimer_args setitimer;
-	struct	owait_args sys_owait;
 	struct	swapon_args swapon;
 	struct	getitimer_args getitimer;
-#ifdef COMPAT_43
-	struct	gethostname_args gethostname;
-#endif
-#ifdef COMPAT_43
-	struct	sethostname_args sethostname;
-#endif
 	struct	getdtablesize_args getdtablesize;
 	struct	dup2_args dup2;
 	struct	fcntl_args fcntl;
@@ -122,33 +84,9 @@ union sysunion {
 	struct	socket_args socket;
 	struct	connect_args connect;
 	struct	getpriority_args getpriority;
-#ifdef COMPAT_43
-	struct	osend_args sys_osend;
-#endif
-#ifdef COMPAT_43
-	struct	orecv_args sys_orecv;
-#endif
 	struct	bind_args bind;
 	struct	setsockopt_args setsockopt;
 	struct	listen_args listen;
-#ifdef COMPAT_43
-	struct	osigvec_args sys_osigvec;
-#endif
-#ifdef COMPAT_43
-	struct	osigblock_args sys_osigblock;
-#endif
-#ifdef COMPAT_43
-	struct	osigsetmask_args sys_osigsetmask;
-#endif
-#ifdef COMPAT_43
-	struct	osigstack_args sys_osigstack;
-#endif
-#ifdef COMPAT_43
-	struct	orecvmsg_args sys_orecvmsg;
-#endif
-#ifdef COMPAT_43
-	struct	osendmsg_args sys_osendmsg;
-#endif
 	struct	gettimeofday_args gettimeofday;
 	struct	getrusage_args getrusage;
 	struct	getsockopt_args getsockopt;
@@ -160,12 +98,6 @@ union sysunion {
 	struct	setreuid_args setreuid;
 	struct	setregid_args setregid;
 	struct	rename_args rename;
-#ifdef COMPAT_43
-	struct	otruncate_args sys_otruncate;
-#endif
-#ifdef COMPAT_43
-	struct	oftruncate_args sys_oftruncate;
-#endif
 	struct	flock_args flock;
 	struct	mkfifo_args mkfifo;
 	struct	sendto_args sendto;
@@ -175,35 +107,12 @@ union sysunion {
 	struct	rmdir_args rmdir;
 	struct	utimes_args utimes;
 	struct	adjtime_args adjtime;
-#ifdef COMPAT_43
-	struct	ogetpeername_args sys_ogetpeername;
-#endif
-	struct	ogethostid_args sys_ogethostid;
-#ifdef COMPAT_43
-	struct	osethostid_args sys_osethostid;
-#endif
-#ifdef COMPAT_43
-	struct	ogetrlimit_args sys_ogetrlimit;
-#endif
-#ifdef COMPAT_43
-	struct	osetrlimit_args sys_osetrlimit;
-#endif
-#ifdef COMPAT_43
-	struct	okillpg_args sys_okillpg;
-#endif
 	struct	setsid_args setsid;
 	struct	quotactl_args quotactl;
-	struct	oquota_args sys_oquota;
 	struct	nfssvc_args nfssvc;
-#ifdef COMPAT_43
-	struct	ogetdirentries_args sys_ogetdirentries;
-#endif
 	struct	statfs_args statfs;
 	struct	fstatfs_args fstatfs;
 	struct	getfh_args getfh;
-	struct	getdomainname_args getdomainname;
-	struct	setdomainname_args setdomainname;
-	struct	uname_args uname;
 	struct	sysarch_args sysarch;
 	struct	rtprio_args rtprio;
 	struct	extpread_args extpread;
@@ -212,22 +121,10 @@ union sysunion {
 	struct	setgid_args setgid;
 	struct	setegid_args setegid;
 	struct	seteuid_args seteuid;
-#ifdef COMPAT_DF12
-	struct	dfbsd12_stat_args sys_dfbsd12_stat;
-#endif
-#ifdef COMPAT_DF12
-	struct	dfbsd12_fstat_args sys_dfbsd12_fstat;
-#endif
-#ifdef COMPAT_DF12
-	struct	dfbsd12_lstat_args sys_dfbsd12_lstat;
-#endif
 	struct	pathconf_args pathconf;
 	struct	fpathconf_args fpathconf;
 	struct	__getrlimit_args getrlimit;
 	struct	__setrlimit_args setrlimit;
-#ifdef COMPAT_DF12
-	struct	dfbsd12_getdirentries_args sys_dfbsd12_getdirentries;
-#endif
 	struct	mmap_args mmap;
 	struct	lseek_args lseek;
 	struct	truncate_args truncate;
@@ -259,18 +156,12 @@ union sysunion {
 	struct	openbsd_poll_args openbsd_poll;
 	struct	issetugid_args issetugid;
 	struct	lchown_args lchown;
-#ifdef COMPAT_DF12
-	struct	dfbsd12_getdents_args sys_dfbsd12_getdents;
-#endif
 	struct	lchmod_args lchmod;
 	struct	lutimes_args lutimes;
 	struct	extpreadv_args extpreadv;
 	struct	extpwritev_args extpwritev;
 	struct	fhstatfs_args fhstatfs;
 	struct	fhopen_args fhopen;
-#ifdef COMPAT_DF12
-	struct	dfbsd12_fhstat_args sys_dfbsd12_fhstat;
-#endif
 	struct	modnext_args modnext;
 	struct	modstat_args modstat;
 	struct	modfnext_args modfnext;
@@ -330,7 +221,7 @@ union sysunion {
 	struct	getresgid_args getresgid;
 	struct	kqueue_args kqueue;
 	struct	kevent_args kevent;
-	struct	sctp_peeloff_args sctp_peeloff;
+	struct	kenv_args kenv;
 	struct	lchflags_args lchflags;
 	struct	uuidgen_args uuidgen;
 	struct	sendfile_args sendfile;
@@ -408,4 +299,19 @@ union sysunion {
 	struct	vmm_guest_ctl_args vmm_guest_ctl;
 	struct	vmm_guest_sync_addr_args vmm_guest_sync_addr;
 	struct	procctl_args procctl;
+	struct	chflagsat_args chflagsat;
+	struct	pipe2_args pipe2;
+	struct	utimensat_args utimensat;
+	struct	futimens_args futimens;
+	struct	accept4_args accept4;
+	struct	lwp_setname_args lwp_setname;
+	struct	ppoll_args ppoll;
+	struct	lwp_setaffinity_args lwp_setaffinity;
+	struct	lwp_getaffinity_args lwp_getaffinity;
+	struct	lwp_create2_args lwp_create2;
+	struct	getcpuclockid_args getcpuclockid;
+	struct	wait6_args wait6;
+	struct	lwp_getname_args lwp_getname;
+	struct	getrandom_args getrandom;
+	struct	__realpath_args __realpath;
 };

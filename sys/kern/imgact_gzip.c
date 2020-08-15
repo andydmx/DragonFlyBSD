@@ -111,7 +111,7 @@ exec_gzip_imgact(struct image_params *imgp)
 			if (igz.idx >= PAGE_SIZE)
 				return ENOEXEC;
 	}
-	igz.len = imgp->attr->va_size;
+	igz.len = imgp->lvap->va_size;
 
 	error = inflate(&infl);
 
@@ -126,8 +126,8 @@ exec_gzip_imgact(struct image_params *imgp)
 		vmspace = imgp->proc->p_vmspace;
 		error = vm_map_protect(&vmspace->vm_map,
 			(vm_offset_t) vmspace->vm_taddr,
-			(vm_offset_t) (vmspace->vm_taddr + 
-				      (vmspace->vm_tsize << PAGE_SHIFT)) ,
+			round_page((vm_offset_t)
+				   (vmspace->vm_taddr + vmspace->vm_tsize)),
 			VM_PROT_READ|VM_PROT_EXECUTE,0);
 	}
 
@@ -249,7 +249,8 @@ do_aout_hdr(struct imgact_gzip * gz)
 		error = vm_map_find(&vmspace->vm_map,
 				    NULL, NULL,
 				    0, &vmaddr, gz->bss_size, PAGE_SIZE,
-				    FALSE, VM_MAPTYPE_NORMAL,
+				    FALSE,
+				    VM_MAPTYPE_NORMAL, VM_SUBSYS_IMGACT,
 				    VM_PROT_ALL, VM_PROT_ALL, 0);
 		if (error) {
 			gz->where = __LINE__;
@@ -257,8 +258,8 @@ do_aout_hdr(struct imgact_gzip * gz)
 		}
 	}
 	/* Fill in process VM information */
-	vmspace->vm_tsize = gz->a_out.a_text >> PAGE_SHIFT;
-	vmspace->vm_dsize = (gz->a_out.a_data + gz->bss_size) >> PAGE_SHIFT;
+	vmspace->vm_tsize = gz->a_out.a_text;			/* in bytes */
+	vmspace->vm_dsize = gz->a_out.a_data + gz->bss_size;	/* in bytes */
 	vmspace->vm_taddr = (caddr_t) (uintptr_t) gz->virtual_offset;
 	vmspace->vm_daddr = (caddr_t) (uintptr_t)
 			    (gz->virtual_offset + gz->a_out.a_text);

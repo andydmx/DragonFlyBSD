@@ -10,11 +10,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -32,7 +28,6 @@
  *
  *	@(#)vmmeter.h	8.2 (Berkeley) 7/10/94
  * $FreeBSD: src/sys/sys/vmmeter.h,v 1.21.2.2 2002/10/10 19:28:21 dillon Exp $
- * $DragonFly: src/sys/sys/vmmeter.h,v 1.10 2006/05/20 02:42:13 dillon Exp $
  */
 
 #ifndef _SYS_VMMETER_H_
@@ -41,6 +36,8 @@
 #ifndef _SYS_TYPES_H_
 #include <sys/types.h>
 #endif
+
+struct globaldata;
 
 /*
  * System wide statistics counters.
@@ -98,40 +95,52 @@ struct vmmeter {
 	u_int v_forwarded_ints; /* forwarded interrupts due to MP lock */
 	u_int v_forwarded_hits;
 	u_int v_forwarded_misses;
-	u_int v_sendsys;	/* calls to sendsys() */
-	u_int v_waitsys;	/* calls to waitsys() */
 	u_int v_smpinvltlb;	/* nasty global invltlbs */
 	u_int v_ppwakeups;	/* wakeups on processes stalled on VM */
 	u_int v_lock_colls;	/* # of token, lock, or spin collisions */
 	char  v_lock_name[16];	/* last-colliding token, lock, or spin name */
-	u_int v_reserved6;
+	u_int v_wakeup_colls;	/* possible spurious wakeup IPIs */
 	u_int v_reserved7;
 #define vmmeter_uint_end	v_reserved7
 };
 
+/*
+ * vmstats structure, global vmstats is the rollup, pcpu vmstats keeps
+ * track of minor (generally positive) adjustments.  For moving targets,
+ * the global vmstats structure represents the smallest likely value.
+ *
+ * This structure is cache sensitive, separate nominal read-only elements
+ * from variable elements.
+ */
 struct vmstats {
 	/*
 	 * Distribution of page usages.
 	 */
 	u_int v_page_size;	/* page size in bytes */
-	u_int v_page_count;	/* total number of pages in system */
-	u_int v_free_reserved;	/* number of pages reserved for deadlock */
-	u_int v_free_target;	/* number of pages desired free */
-	u_int v_free_min;	/* minimum number of pages desired free */
-	u_int v_free_count;	/* number of pages free */
-	u_int v_wire_count;	/* number of pages wired down */
-	u_int v_active_count;	/* number of pages active */
-	u_int v_inactive_target; /* number of pages desired inactive */
-	u_int v_inactive_count;	/* number of pages inactive */
-	u_int v_cache_count;	/* number of pages on buffer cache queue */
-	u_int v_cache_min;	/* min number of pages desired on cache queue */
-	u_int v_cache_max;	/* max number of pages in cached obj */
-	u_int v_pageout_free_min;   /* min number pages reserved for kernel */
-	u_int v_interrupt_free_min; /* reserved number of pages for int code */
-	u_int v_free_severe;	/* severe depletion of pages below this pt */
-	u_int v_dma_avail;	/* free dma-reserved pages */
-	u_int v_dma_pages;	/* total dma-reserved pages */
-	u_int v_unused[8];
+	u_int v_unused01;
+	long v_page_count;	/* total number of pages in system */
+	long v_free_reserved;	/* number of pages reserved for deadlock */
+	long v_free_target;	/* number of pages desired free */
+	long v_free_min;	/* minimum number of pages desired free */
+
+	long v_cache_min;	/* min number of pages desired on cache queue */
+	long v_cache_max;	/* max number of pages in cached obj */
+	long v_pageout_free_min; /* min number pages reserved for kernel */
+	long v_interrupt_free_min; /* reserved number of pages for int code */
+	long v_free_severe;	/* severe depletion of pages below this pt */
+	long v_dma_pages;	/* total dma-reserved pages */
+
+	long v_unused_fixed[5];
+
+	long v_free_count;	/* number of pages free */
+	long v_wire_count;	/* number of pages wired down */
+	long v_active_count;	/* number of pages active */
+	long v_inactive_target;	/* number of pages desired inactive */
+	long v_inactive_count;	/* number of pages inactive */
+	long v_cache_count;	/* number of pages on buffer cache queue */
+	long v_dma_avail;	/* free dma-reserved pages */
+
+	long v_unused_variable[9];
 };
 
 #ifdef _KERNEL
@@ -197,4 +206,11 @@ u_int rectime;		/* accumulator for reclaim times */
 u_int pgintime;		/* accumulator for page in times */
 
 #endif	/* PGINPROF */
+
+#ifdef _KERNEL
+
+void vmstats_rollup(void);
+void vmstats_rollup_cpu(struct globaldata *gd);
+
+#endif
 #endif

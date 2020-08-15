@@ -10,11 +10,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -33,42 +29,46 @@
  *	@(#)stddef.h	8.1 (Berkeley) 6/2/93
  *
  * $FreeBSD: src/include/stddef.h,v 1.2.8.4 2002/08/07 15:49:32 imp Exp $
- * $DragonFly: src/include/stddef.h,v 1.5 2008/06/05 17:53:10 swildner Exp $
  */
 
 #ifndef _STDDEF_H_
 #define _STDDEF_H_
 
-#ifndef _SYS_STDINT_H_
-#include <sys/stdint.h>			/* __rune_t and friends */
+#include <sys/cdefs.h>
+#include <sys/_null.h>
+#include <machine/stdint.h>
+#ifndef __cplusplus
+#include <machine/wchar.h>		/* for ___wchar_t */
 #endif
 
 #ifndef _SIZE_T_DECLARED
 #define _SIZE_T_DECLARED
-typedef	__size_t	size_t;		/* open group */
+typedef	__size_t	size_t;		/* open group, _GCC_SIZE_T OK */
 #endif
 
 #ifndef _PTRDIFF_T_DECLARED
 #define _PTRDIFF_T_DECLARED
-typedef	__ptrdiff_t	ptrdiff_t;	/* open group */
-#endif
-
-#if !defined(_ANSI_SOURCE) && !defined(_POSIX_SOURCE)
-#ifndef _RUNE_T_DECLARED
-#define _RUNE_T_DECLARED
-typedef	__rune_t	rune_t;
-#endif
+typedef	__ptrdiff_t	ptrdiff_t;	/* open group, _GCC_PTRDIFF_T OK */
 #endif
 
 #ifndef	__cplusplus
 #ifndef _WCHAR_T_DECLARED
 #define _WCHAR_T_DECLARED
-typedef __wchar_t	wchar_t;	/* open group */
+typedef	___wchar_t	wchar_t;	/* open group, _GCC_WCHAR_T OK */
 #endif
 #endif
-
-#include <sys/_null.h>
 
 #define	offsetof(type, member)	__offsetof(type, member)
+
+#if (defined(__STDC_VERSION__) && (__STDC_VERSION__ >= 201112L) || \
+    (defined(__cplusplus) && __cplusplus >= 201103L))
+#ifndef _MAX_ALIGN_T_DECLARED
+#define _MAX_ALIGN_T_DECLARED
+typedef struct {
+	long long __max_align_nonce1 __aligned(__alignof(long long));
+	long double __max_align_nonce2 __aligned(__alignof(long double));
+} max_align_t;
+#endif
+#endif
 
 #endif /* _STDDEF_H_ */

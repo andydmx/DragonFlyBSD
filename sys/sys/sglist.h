@@ -39,6 +39,10 @@
 #ifndef __SGLIST_H__
 #define	__SGLIST_H__
 
+#ifndef _KERNEL
+#error "This file should not be included by userland programs."
+#endif
+
 #include <sys/refcount.h>
 
 struct sglist_seg {
@@ -48,7 +52,7 @@ struct sglist_seg {
 
 struct sglist {
 	struct sglist_seg *sg_segs;
-	int		sg_refs;
+	u_int		sg_refs;
 	u_short		sg_nseg;
 	u_short		sg_maxseg;
 };

@@ -2,7 +2,7 @@
  * Copyright (c) 1982, 1987, 1990 The Regents of the University of California.
  * Copyright (c) 1992 Terrence R. Lambert.
  * Copyright (c) 2003 Peter Wemm.
- * Copyright (c) 2008 The DragonFly Project.
+ * Copyright (c) 2008-2017 The DragonFly Project.
  * All rights reserved.
  *
  * This code is derived from software contributed to Berkeley by
@@ -42,17 +42,15 @@
 
 //#include "use_npx.h"
 #include "use_isa.h"
-#include "opt_compat.h"
 #include "opt_cpu.h"
 #include "opt_ddb.h"
-#include "opt_directio.h"
 #include "opt_inet.h"
 #include "opt_msgbuf.h"
 #include "opt_swap.h"
 
 #include <sys/param.h>
 #include <sys/systm.h>
-#include <sys/sysproto.h>
+#include <sys/sysmsg.h>
 #include <sys/signalvar.h>
 #include <sys/kernel.h>
 #include <sys/linker.h>
@@ -86,31 +84,29 @@
 
 #include <sys/thread2.h>
 #include <sys/mplock2.h>
-#include <sys/mutex2.h>
 
-#include <sys/user.h>
 #include <sys/exec.h>
 #include <sys/cons.h>
+
+#include <sys/efi.h>
 
 #include <ddb/ddb.h>
 
 #include <machine/cpu.h>
 #include <machine/clock.h>
 #include <machine/specialreg.h>
-#if JG
+#if 0 /* JG */
 #include <machine/bootinfo.h>
 #endif
 #include <machine/md_var.h>
 #include <machine/metadata.h>
 #include <machine/pc/bios.h>
-#include <machine/pcb_ext.h>		/* pcb.h included via sys/user.h */
+#include <machine/pcb_ext.h>
 #include <machine/globaldata.h>		/* CPU_prvspace */
 #include <machine/smp.h>
-#ifdef PERFMON
-#include <machine/perfmon.h>
-#endif
 #include <machine/cputypes.h>
 #include <machine/intr_machdep.h>
+#include <machine/framebuffer.h>
 
 #ifdef OLD_BUS_ARCH
 #include <bus/isa/isa_device.h>
@@ -130,14 +126,12 @@
 #include <machine/mptable.h>
 
 #define PHYSMAP_ENTRIES		10
+#define MAXBUFSTRUCTSIZE	((size_t)512 * 1024 * 1024)
 
 extern u_int64_t hammer_time(u_int64_t, u_int64_t);
 
 extern void printcpuinfo(void);	/* XXX header file */
 extern void identify_cpu(void);
-#if JG
-extern void finishidentcpu(void);
-#endif
 extern void panicifcpuunsupported(void);
 
 static void cpu_startup(void *);
@@ -146,14 +140,13 @@ static void cpu_finish(void *);
 
 static void set_fpregs_xmm(struct save87 *, struct savexmm *);
 static void fill_fpregs_xmm(struct savexmm *, struct save87 *);
-#ifdef DIRECTIO
-extern void ffs_rawread_setup(void);
-#endif /* DIRECTIO */
 static void init_locks(void);
 
-SYSINIT(cpu, SI_BOOT2_START_CPU, SI_ORDER_FIRST, cpu_startup, NULL)
-SYSINIT(pic_finish, SI_BOOT2_FINISH_PIC, SI_ORDER_FIRST, pic_finish, NULL)
-SYSINIT(cpu_finish, SI_BOOT2_FINISH_CPU, SI_ORDER_FIRST, cpu_finish, NULL)
+extern void pcpu_timer_always(struct intrframe *);
+
+SYSINIT(cpu, SI_BOOT2_START_CPU, SI_ORDER_FIRST, cpu_startup, NULL);
+SYSINIT(pic_finish, SI_BOOT2_FINISH_PIC, SI_ORDER_FIRST, pic_finish, NULL);
+SYSINIT(cpu_finish, SI_BOOT2_FINISH_CPU, SI_ORDER_FIRST, cpu_finish, NULL);
 
 #ifdef DDB
 extern vm_offset_t ksym_start, ksym_end;
@@ -162,11 +155,16 @@ extern vm_offset_t ksym_start, ksym_end;
 struct privatespace CPU_prvspace_bsp __aligned(4096);
 struct privatespace *CPU_prvspace[MAXCPU] = { &CPU_prvspace_bsp };
 
+vm_paddr_t efi_systbl_phys;
 int	_udatasel, _ucodesel, _ucode32sel;
 u_long	atdevbase;
 int64_t tsc_offsets[MAXCPU];
+cpumask_t smp_idleinvl_mask;
+cpumask_t smp_idleinvl_reqs;
 
-static int cpu_mwait_halt;	/* MWAIT hint (EAX) or CPU_MWAIT_HINT_ */
+ /* MWAIT hint (EAX) or CPU_MWAIT_HINT_ */
+__read_mostly static int cpu_mwait_halt_global;
+__read_mostly static int clock_debug1;
 
 #if defined(SWTCH_OPTIM_STATS)
 extern int swtch_optim_stats;
@@ -175,10 +173,18 @@ SYSCTL_INT(_debug, OID_AUTO, swtch_optim_stats,
 SYSCTL_INT(_debug, OID_AUTO, tlb_flush_count,
 	CTLFLAG_RD, &tlb_flush_count, 0, "");
 #endif
+SYSCTL_INT(_debug, OID_AUTO, clock_debug1,
+	CTLFLAG_RW, &clock_debug1, 0, "");
 SYSCTL_INT(_hw, OID_AUTO, cpu_mwait_halt,
-	CTLFLAG_RD, &cpu_mwait_halt, 0, "");
-SYSCTL_INT(_hw, OID_AUTO, cpu_mwait_spin, CTLFLAG_RD, &cpu_mwait_spin, 0,
-    "monitor/mwait target state");
+	CTLFLAG_RD, &cpu_mwait_halt_global, 0, "");
+SYSCTL_INT(_hw, OID_AUTO, cpu_mwait_spin,
+	CTLFLAG_RD, &cpu_mwait_spin, 0, "monitor/mwait target state");
+
+#define CPU_MWAIT_HAS_CX	\
+	((cpu_feature2 & CPUID2_MON) && \
+	 (cpu_mwait_feature & CPUID_MWAIT_EXT))
+
+#define CPU_MWAIT_CX_NAMELEN	16
 
 #define CPU_MWAIT_C1		1
 #define CPU_MWAIT_C2		2
@@ -222,11 +228,13 @@ static int			cpu_mwait_c3_preamble =
 
 SYSCTL_STRING(_machdep_mwait_CX, OID_AUTO, supported, CTLFLAG_RD,
     cpu_mwait_cx_supported, 0, "MWAIT supported C states");
+SYSCTL_INT(_machdep_mwait_CX, OID_AUTO, c3_preamble, CTLFLAG_RD,
+    &cpu_mwait_c3_preamble, 0, "C3+ preamble mask");
 
-static struct lwkt_serialize cpu_mwait_cx_slize = LWKT_SERIALIZE_INITIALIZER;
 static int	cpu_mwait_cx_select_sysctl(SYSCTL_HANDLER_ARGS,
 		    int *, boolean_t);
 static int	cpu_mwait_cx_idle_sysctl(SYSCTL_HANDLER_ARGS);
+static int	cpu_mwait_cx_pcpu_idle_sysctl(SYSCTL_HANDLER_ARGS);
 static int	cpu_mwait_cx_spin_sysctl(SYSCTL_HANDLER_ARGS);
 
 SYSCTL_PROC(_machdep_mwait_CX, OID_AUTO, idle, CTLTYPE_STRING|CTLFLAG_RW,
@@ -245,41 +253,50 @@ int imcr_present = 0;
 int naps = 0; /* # of Applications processors */
 
 u_int base_memory;
-struct mtx dt_lock;		/* lock for GDT and LDT */
 
 static int
 sysctl_hw_physmem(SYSCTL_HANDLER_ARGS)
 {
 	u_long pmem = ctob(physmem);
+	int error;
 
-	int error = sysctl_handle_long(oidp, &pmem, 0, req);
+	error = sysctl_handle_long(oidp, &pmem, 0, req);
+
 	return (error);
 }
 
 SYSCTL_PROC(_hw, HW_PHYSMEM, physmem, CTLTYPE_ULONG|CTLFLAG_RD,
-	0, 0, sysctl_hw_physmem, "LU", "Total system memory in bytes (number of pages * page size)");
+	0, 0, sysctl_hw_physmem, "LU",
+	"Total system memory in bytes (number of pages * page size)");
 
 static int
 sysctl_hw_usermem(SYSCTL_HANDLER_ARGS)
 {
-	int error = sysctl_handle_int(oidp, 0,
-		ctob(physmem - vmstats.v_wire_count), req);
+	u_long usermem = ctob(physmem - vmstats.v_wire_count);
+	int error;
+
+	error = sysctl_handle_long(oidp, &usermem, 0, req);
+
 	return (error);
 }
 
-SYSCTL_PROC(_hw, HW_USERMEM, usermem, CTLTYPE_INT|CTLFLAG_RD,
-	0, 0, sysctl_hw_usermem, "IU", "");
+SYSCTL_PROC(_hw, HW_USERMEM, usermem, CTLTYPE_ULONG|CTLFLAG_RD,
+	0, 0, sysctl_hw_usermem, "LU", "");
 
 static int
 sysctl_hw_availpages(SYSCTL_HANDLER_ARGS)
 {
-	int error = sysctl_handle_int(oidp, 0,
-		x86_64_btop(avail_end - avail_start), req);
+	int error;
+	u_long availpages;
+
+	availpages = x86_64_btop(avail_end - avail_start);
+	error = sysctl_handle_long(oidp, &availpages, 0, req);
+
 	return (error);
 }
 
-SYSCTL_PROC(_hw, OID_AUTO, availpages, CTLTYPE_INT|CTLFLAG_RD,
-	0, 0, sysctl_hw_availpages, "I", "");
+SYSCTL_PROC(_hw, OID_AUTO, availpages, CTLTYPE_ULONG|CTLFLAG_RD,
+	0, 0, sysctl_hw_availpages, "LU", "");
 
 vm_paddr_t Maxmem;
 vm_paddr_t Realmem;
@@ -290,19 +307,19 @@ vm_paddr_t Realmem;
  * physical address that is accessible by ISA DMA is split into two
  * PHYSSEG entries.
  */
-#define	PHYSMAP_SIZE	(2 * (VM_PHYSSEG_MAX - 1))
+vm_phystable_t phys_avail[VM_PHYSSEG_MAX + 1];
+vm_phystable_t dump_avail[VM_PHYSSEG_MAX + 1];
 
-vm_paddr_t phys_avail[PHYSMAP_SIZE + 2];
-vm_paddr_t dump_avail[PHYSMAP_SIZE + 2];
-
-/* must be 2 less so 0 0 can signal end of chunks */
-#define PHYS_AVAIL_ARRAY_END (NELEM(phys_avail) - 2)
-#define DUMP_AVAIL_ARRAY_END (NELEM(dump_avail) - 2)
+/* must be 1 less so 0 0 can signal end of chunks */
+#define PHYS_AVAIL_ARRAY_END (NELEM(phys_avail) - 1)
+#define DUMP_AVAIL_ARRAY_END (NELEM(dump_avail) - 1)
 
 static vm_offset_t buffer_sva, buffer_eva;
 vm_offset_t clean_sva, clean_eva;
 static vm_offset_t pager_sva, pager_eva;
 static struct trapframe proc0_tf;
+
+static void cpu_implement_smap(void);
 
 static void
 cpu_startup(void *dummy)
@@ -318,9 +335,9 @@ cpu_startup(void *dummy)
 	startrtclock();
 	printcpuinfo();
 	panicifcpuunsupported();
-#ifdef PERFMON
-	perfmon_init();
-#endif
+	if (cpu_stdext_feature & CPUID_STDEXT_SMAP)
+		cpu_implement_smap();
+
 	kprintf("real memory  = %ju (%ju MB)\n",
 		(intmax_t)Realmem,
 		(intmax_t)Realmem / 1024 / 1024);
@@ -331,12 +348,15 @@ cpu_startup(void *dummy)
 		int indx;
 
 		kprintf("Physical memory chunk(s):\n");
-		for (indx = 0; phys_avail[indx + 1] != 0; indx += 2) {
-			vm_paddr_t size1 = phys_avail[indx + 1] - phys_avail[indx];
+		for (indx = 0; phys_avail[indx].phys_end != 0; ++indx) {
+			vm_paddr_t size1;
+
+			size1 = phys_avail[indx].phys_end -
+				phys_avail[indx].phys_beg;
 
 			kprintf("0x%08jx - 0x%08jx, %ju bytes (%ju pages)\n",
-				(intmax_t)phys_avail[indx],
-				(intmax_t)phys_avail[indx + 1] - 1,
+				(intmax_t)phys_avail[indx].phys_beg,
+				(intmax_t)phys_avail[indx].phys_end - 1,
 				(intmax_t)size1,
 				(intmax_t)(size1 / PAGE_SIZE));
 		}
@@ -367,26 +387,28 @@ again:
 	    (name) = (type *)v; v = (caddr_t)((lim) = ((name)+(num)))
 
 	/*
-	 * The nominal buffer size (and minimum KVA allocation) is BKVASIZE.
-	 * For the first 64MB of ram nominally allocate sufficient buffers to
-	 * cover 1/4 of our ram.  Beyond the first 64MB allocate additional
-	 * buffers to cover 1/20 of our ram over 64MB.  When auto-sizing
-	 * the buffer cache we limit the eventual kva reservation to
-	 * maxbcache bytes.
+	 * Calculate nbuf such that maxbufspace uses approximately 1/20
+	 * of physical memory by default, with a minimum of 50 buffers.
 	 *
-	 * factor represents the 1/4 x ram conversion.
+	 * The calculation is made after discounting 128MB.
+	 *
+	 * NOTE: maxbufspace is (nbuf * NBUFCALCSIZE) (NBUFCALCSIZE ~= 16KB).
+	 *	 nbuf = (kbytes / factor) would cover all of memory.
 	 */
 	if (nbuf == 0) {
-		long factor = 4 * BKVASIZE / 1024;
-		long kbytes = physmem * (PAGE_SIZE / 1024);
+		long factor = NBUFCALCSIZE / 1024;		/* KB/nbuf */
+		long kbytes = physmem * (PAGE_SIZE / 1024);	/* physmem */
 
 		nbuf = 50;
-		if (kbytes > 4096)
-			nbuf += min((kbytes - 4096) / factor, 65536 / factor);
-		if (kbytes > 65536)
-			nbuf += (kbytes - 65536) * 2 / (factor * 5);
-		if (maxbcache && nbuf > maxbcache / BKVASIZE)
-			nbuf = maxbcache / BKVASIZE;
+		if (kbytes > 128 * 1024)
+			nbuf += (kbytes - 128 * 1024) / (factor * 20);
+		if (maxbcache && nbuf > maxbcache / NBUFCALCSIZE)
+			nbuf = maxbcache / NBUFCALCSIZE;
+		if ((size_t)nbuf * sizeof(struct buf) > MAXBUFSTRUCTSIZE) {
+			kprintf("Warning: nbuf capped at %ld due to the "
+				"reasonability limit\n", nbuf);
+			nbuf = MAXBUFSTRUCTSIZE / sizeof(struct buf);
+		}
 	}
 
 	/*
@@ -394,9 +416,9 @@ again:
 	 * kernel_map.
 	 */
 	if (nbuf > (virtual_end - virtual_start +
-		    virtual2_end - virtual2_start) / (BKVASIZE * 2)) {
+		    virtual2_end - virtual2_start) / (MAXBSIZE * 2)) {
 		nbuf = (virtual_end - virtual_start +
-			virtual2_end - virtual2_start) / (BKVASIZE * 2);
+			virtual2_end - virtual2_start) / (MAXBSIZE * 2);
 		kprintf("Warning: nbufs capped at %ld due to kvm\n", nbuf);
 	}
 
@@ -406,33 +428,42 @@ again:
 	 * individual buffers are typically wired, having too many bufs
 	 * can prevent the system from paging properly.
 	 */
-	if (nbuf > physmem * PAGE_SIZE / (BKVASIZE * 2)) {
-		nbuf = physmem * PAGE_SIZE / (BKVASIZE * 2);
+	if (nbuf > physmem * PAGE_SIZE / (NBUFCALCSIZE * 2)) {
+		nbuf = physmem * PAGE_SIZE / (NBUFCALCSIZE * 2);
 		kprintf("Warning: nbufs capped at %ld due to physmem\n", nbuf);
 	}
 
 	/*
-	 * Do not allow the sizeof(struct buf) * nbuf to exceed half of
+	 * Do not allow the sizeof(struct buf) * nbuf to exceed 1/4 of
 	 * the valloc space which is just the virtual_end - virtual_start
-	 * section.  We use valloc() to allocate the buf header array.
+	 * section.  This is typically ~2GB regardless of the amount of
+	 * memory, so we use 500MB as a metric.
+	 *
+	 * This is because we use valloc() to allocate the buf header array.
+	 *
+	 * NOTE: buffer space in bytes is limited by vfs.*bufspace sysctls.
 	 */
-	if (nbuf > (virtual_end - virtual_start) / sizeof(struct buf) / 2) {
+	if (nbuf > (virtual_end - virtual_start) / (sizeof(struct buf) * 4)) {
 		nbuf = (virtual_end - virtual_start) /
-		       sizeof(struct buf) / 2;
-		kprintf("Warning: nbufs capped at %ld due to valloc "
-			"considerations", nbuf);
+		       (sizeof(struct buf) * 4);
+		kprintf("Warning: nbufs capped at %ld due to "
+			"valloc considerations\n",
+			nbuf);
 	}
 
-	nswbuf = lmax(lmin(nbuf / 4, 256), 16);
+	nswbuf_mem = lmax(lmin(nbuf / 32, 512), 8);
 #ifdef NSWBUF_MIN
-	if (nswbuf < NSWBUF_MIN)
-		nswbuf = NSWBUF_MIN;
+	if (nswbuf_mem < NSWBUF_MIN)
+		nswbuf_mem = NSWBUF_MIN;
 #endif
-#ifdef DIRECTIO
-	ffs_rawread_setup();
+	nswbuf_kva = lmax(lmin(nbuf / 4, 512), 16);
+#ifdef NSWBUF_MIN
+	if (nswbuf_kva < NSWBUF_MIN)
+		nswbuf_kva = NSWBUF_MIN;
 #endif
 
-	valloc(swbuf, struct buf, nswbuf);
+	valloc(swbuf_mem, struct buf, nswbuf_mem);
+	valloc(swbuf_kva, struct buf, nswbuf_kva);
 	valloc(buf, struct buf, nbuf);
 
 	/*
@@ -440,7 +471,8 @@ again:
 	 */
 	if (firstaddr == 0) {
 		size = (vm_size_t)(v - firstaddr);
-		firstaddr = kmem_alloc(&kernel_map, round_page(size));
+		firstaddr = kmem_alloc(&kernel_map, round_page(size),
+				       VM_SUBSYS_BUF);
 		if (firstaddr == 0)
 			panic("startup: no room for tables");
 		goto again;
@@ -459,20 +491,15 @@ again:
 		panic("startup: table size inconsistency");
 
 	kmem_suballoc(&kernel_map, &clean_map, &clean_sva, &clean_eva,
-		      ((vm_offset_t)(nbuf + 16) * BKVASIZE) +
-		      (nswbuf * MAXPHYS) + pager_map_size);
+		      ((vm_offset_t)(nbuf + 16) * MAXBSIZE) +
+		      ((nswbuf_mem + nswbuf_kva) * MAXPHYS) + pager_map_size);
 	kmem_suballoc(&clean_map, &buffer_map, &buffer_sva, &buffer_eva,
-		      ((vm_offset_t)(nbuf + 16) * BKVASIZE));
+		      ((vm_offset_t)(nbuf + 16) * MAXBSIZE));
 	buffer_map.system_map = 1;
 	kmem_suballoc(&clean_map, &pager_map, &pager_sva, &pager_eva,
-		      ((vm_offset_t)nswbuf * MAXPHYS) + pager_map_size);
+		      ((vm_offset_t)(nswbuf_mem + nswbuf_kva) * MAXPHYS) +
+		      pager_map_size);
 	pager_map.system_map = 1;
-
-#if defined(USERCONFIG)
-	userconfig();
-	cninit();		/* the preferred console may have changed */
-#endif
-
 	kprintf("avail memory = %ju (%ju MB)\n",
 		(uintmax_t)ptoa(vmstats.v_free_count + vmstats.v_dma_pages),
 		(uintmax_t)ptoa(vmstats.v_free_count + vmstats.v_dma_pages) /
@@ -480,6 +507,8 @@ again:
 }
 
 struct cpu_idle_stat {
+	int	hint;
+	int	reserved;
 	u_long	halt;
 	u_long	spin;
 	u_long	repeat;
@@ -540,8 +569,7 @@ cpu_mwait_attach(void)
 	struct sbuf sb;
 	int hint_idx, i;
 
-	if ((cpu_feature2 & CPUID2_MON) == 0 ||
-	    (cpu_mwait_feature & CPUID_MWAIT_EXT) == 0)
+	if (!CPU_MWAIT_HAS_CX)
 		return;
 
 	if (cpu_vendor_id == CPU_VENDOR_INTEL &&
@@ -550,14 +578,15 @@ cpu_mwait_attach(void)
 	      CPUID_TO_MODEL(cpu_id) >= 0xf))) {
 		int bm_sts = 1;
 
-		atomic_clear_int(&cpu_mwait_c3_preamble,
-		    CPU_MWAIT_C3_PREAMBLE_BM_ARB);
+		/*
+		 * Pentium dual-core, Core 2 and beyond do not need any
+		 * additional activities to enter deep C-state, i.e. C3(+).
+		 */
+		cpu_mwait_cx_no_bmarb();
 
 		TUNABLE_INT_FETCH("machdep.cpu.mwait.bm_sts", &bm_sts);
-		if (!bm_sts) {
-			atomic_clear_int(&cpu_mwait_c3_preamble,
-			    CPU_MWAIT_C3_PREAMBLE_BM_STS);
-		}
+		if (!bm_sts)
+			cpu_mwait_cx_no_bmsts();
 	}
 
 	sbuf_new(&sb, cpu_mwait_cx_supported,
@@ -599,7 +628,7 @@ cpu_mwait_attach(void)
 	for (i = CPU_MWAIT_C1; i < CPU_MWAIT_C3; ++i)
 		cpu_mwait_hints_cnt += cpu_mwait_cx_info[i].subcnt;
 	cpu_mwait_hints = kmalloc(sizeof(int) * cpu_mwait_hints_cnt,
-	    M_DEVBUF, M_WAITOK);
+				  M_DEVBUF, M_WAITOK);
 
 	hint_idx = 0;
 	for (i = CPU_MWAIT_C1; i < CPU_MWAIT_C3; ++i) {
@@ -663,6 +692,16 @@ cpu_mwait_attach(void)
 		}
 	}
 	cpu_idle_repeat_max = 256 * cpu_mwait_deep_hints_cnt;
+
+	for (i = 0; i < ncpus; ++i) {
+		char name[16];
+
+		ksnprintf(name, sizeof(name), "idle%d", i);
+		SYSCTL_ADD_PROC(NULL,
+		    SYSCTL_STATIC_CHILDREN(_machdep_mwait_CX), OID_AUTO,
+		    name, (CTLTYPE_STRING | CTLFLAG_RW), &cpu_idle_stats[i],
+		    0, cpu_mwait_cx_pcpu_idle_sysctl, "A", "");
+	}
 }
 
 static void
@@ -715,7 +754,8 @@ sendsig(sig_t catcher, int sig, sigset_t *mask, u_long code)
 	sf.sf_uc.uc_stack = lp->lwp_sigstk;
 	sf.sf_uc.uc_mcontext.mc_onstack = oonstack;
 	KKASSERT(__offsetof(struct trapframe, tf_rdi) == 0);
-	bcopy(regs, &sf.sf_uc.uc_mcontext.mc_rdi, sizeof(struct trapframe));
+	/* gcc errors out on optimized bcopy */
+	_bcopy(regs, &sf.sf_uc.uc_mcontext.mc_rdi, sizeof(struct trapframe));
 
 	/* Make the size of the saved context visible to userland */
 	sf.sf_uc.uc_mcontext.mc_len = sizeof(sf.sf_uc.uc_mcontext);
@@ -723,8 +763,8 @@ sendsig(sig_t catcher, int sig, sigset_t *mask, u_long code)
 	/* Allocate and validate space for the signal handler context. */
         if ((lp->lwp_flags & LWP_ALTSTACK) != 0 && !oonstack &&
 	    SIGISMEMBER(psp->ps_sigonstack, sig)) {
-		sp = (char *)(lp->lwp_sigstk.ss_sp + lp->lwp_sigstk.ss_size -
-			      sizeof(struct sigframe));
+		sp = (char *)lp->lwp_sigstk.ss_sp + lp->lwp_sigstk.ss_size -
+		    sizeof(struct sigframe);
 		lp->lwp_sigstk.ss_flags |= SS_ONSTACK;
 	} else {
 		/* We take red zone into account */
@@ -768,6 +808,8 @@ sendsig(sig_t catcher, int sig, sigset_t *mask, u_long code)
 
 		/* fill siginfo structure */
 		sf.sf_si.si_signo = sig;
+		sf.sf_si.si_pid = psp->ps_frominfo[sig].pid;
+		sf.sf_si.si_uid = psp->ps_frominfo[sig].uid;
 		sf.sf_si.si_code = code;
 		sf.sf_si.si_addr = (void *)regs->tf_addr;
 	} else {
@@ -786,7 +828,7 @@ sendsig(sig_t catcher, int sig, sigset_t *mask, u_long code)
 	 * We also change eflags to be our emulated eflags, not the actual
 	 * eflags.
 	 */
-#if JG
+#if 0 /* JG */
 	if (regs->tf_eflags & PSL_VM) {
 		struct trapframe_vm86 *tf = (struct trapframe_vm86 *)regs;
 		struct vm86_kernel *vm86 = &lp->lwp_thread->td_pcb->pcb_ext->ext_vm86;
@@ -829,13 +871,14 @@ sendsig(sig_t catcher, int sig, sigset_t *mask, u_long code)
 	}
 
 	regs->tf_rsp = (register_t)sfp;
-	regs->tf_rip = PS_STRINGS - *(p->p_sysent->sv_szsigcode);
+	regs->tf_rip = trunc_page64(PS_STRINGS - *(p->p_sysent->sv_szsigcode));
+	regs->tf_rip -= SZSIGCODE_EXTRA_BYTES;
 
 	/*
-	 * i386 abi specifies that the direction flag must be cleared
+	 * x86 abi specifies that the direction flag must be cleared
 	 * on function entry
 	 */
-	regs->tf_rflags &= ~(PSL_T|PSL_D);
+	regs->tf_rflags &= ~(PSL_T | PSL_D);
 
 	/*
 	 * 64 bit mode has a code and stack selector but
@@ -894,7 +937,7 @@ cpu_sanitize_tls(struct savetls *tls)
 #define	CS_SECURE(cs)		(ISPL(cs) == SEL_UPL)
 
 int
-sys_sigreturn(struct sigreturn_args *uap)
+sys_sigreturn(struct sysmsg *sysmsg, const struct sigreturn_args *uap)
 {
 	struct lwp *lp = curthread->td_lwp;
 	struct trapframe *regs;
@@ -918,7 +961,7 @@ sys_sigreturn(struct sigreturn_args *uap)
 	/* VM (8086) mode not supported */
 	rflags &= ~PSL_VM_UNSUPP;
 
-#if JG
+#if 0 /* JG */
 	if (eflags & PSL_VM) {
 		struct trapframe_vm86 *tf = (struct trapframe_vm86 *)regs;
 		struct vm86_kernel *vm86;
@@ -973,7 +1016,7 @@ sys_sigreturn(struct sigreturn_args *uap)
 		 */
 		if (!EFL_SECURE(rflags & ~PSL_RF, regs->tf_rflags & ~PSL_RF)) {
 			kprintf("sigreturn: rflags = 0x%lx\n", (long)rflags);
-	    		return(EINVAL);
+			return(EINVAL);
 		}
 
 		/*
@@ -987,7 +1030,9 @@ sys_sigreturn(struct sigreturn_args *uap)
 			trapsignal(lp, SIGBUS, T_PROTFLT);
 			return(EINVAL);
 		}
-		bcopy(&ucp->uc_mcontext.mc_rdi, regs, sizeof(struct trapframe));
+		/* gcc errors out on optimized bcopy */
+		_bcopy(&ucp->uc_mcontext.mc_rdi, regs,
+		       sizeof(struct trapframe));
 	}
 
 	/*
@@ -1036,7 +1081,7 @@ cpu_halt(void)
  *
  * The main loop is entered with a critical section held, we must release
  * the critical section before doing anything else.  lwkt_switch() will
- * check for pending interrupts due to entering and exiting its own 
+ * check for pending interrupts due to entering and exiting its own
  * critical section.
  *
  * NOTE: On an SMP system we rely on a scheduler IPI to wake a HLTed cpu up.
@@ -1046,6 +1091,8 @@ cpu_halt(void)
  *
  * NOTE: cpu_idle_repeat determines how many entries into the idle thread
  *	 must occur before it starts using ACPI halt.
+ *
+ * NOTE: Value overridden in hammer_time().
  */
 static int	cpu_idle_hlt = 2;
 SYSCTL_INT(_machdep, OID_AUTO, cpu_idle_hlt, CTLFLAG_RW,
@@ -1077,10 +1124,9 @@ cpu_mwait_cx_hint(struct cpu_idle_stat *stat)
 	int hint, cx_idx;
 	u_int idx;
 
-	if (cpu_mwait_halt >= 0) {
-		hint = cpu_mwait_halt;
+	hint = stat->hint;
+	if (hint >= 0)
 		goto done;
-	}
 
 	idx = (stat->repeat + stat->repeat_last + stat->repeat_delta) >>
 	    cpu_mwait_repeat_shift;
@@ -1088,7 +1134,7 @@ cpu_mwait_cx_hint(struct cpu_idle_stat *stat)
 		/* Step up faster, once we walked through all C1 states */
 		stat->repeat_delta += 1 << (cpu_mwait_repeat_shift + 1);
 	}
-	if (cpu_mwait_halt == CPU_MWAIT_HINT_AUTODEEP) {
+	if (hint == CPU_MWAIT_HINT_AUTODEEP) {
 		if (idx >= cpu_mwait_deep_hints_cnt)
 			idx = cpu_mwait_deep_hints_cnt - 1;
 		hint = cpu_mwait_deep_hints[idx];
@@ -1111,7 +1157,6 @@ cpu_idle(void)
 	struct cpu_idle_stat *stat = &cpu_idle_stats[gd->gd_cpuid];
 	struct thread *td __debugvar = gd->gd_curthread;
 	int reqflags;
-	int quick;
 
 	stat->repeat = stat->repeat_last = cpu_idle_repeat_max;
 
@@ -1132,27 +1177,47 @@ cpu_idle(void)
 		 * cpu_idle_hlt:
 		 *	0	Never halt, just spin
 		 *
-		 *	1	Always use HLT (or MONITOR/MWAIT if avail).
-		 *		This typically eats more power than the
-		 *		ACPI halt.
+		 *	1	Always use MONITOR/MWAIT if avail, HLT
+		 *		otherwise.
+		 *
+		 *		Better default for modern (Haswell+) Intel
+		 *		cpus.
 		 *
 		 *	2	Use HLT/MONITOR/MWAIT up to a point and then
 		 *		use the ACPI halt (default).  This is a hybrid
 		 *		approach.  See machdep.cpu_idle_repeat.
+		 *
+		 *		Better default for modern AMD cpus and older
+		 *		Intel cpus.
 		 *
 		 *	3	Always use the ACPI halt.  This typically
 		 *		eats the least amount of power but the cpu
 		 *		will be slow waking up.  Slows down e.g.
 		 *		compiles and other pipe/event oriented stuff.
 		 *
+		 *		Usually the best default for AMD cpus.
+		 *
 		 *	4	Always use HLT.
+		 *
+		 *	5	Always spin.
 		 *
 		 * NOTE: Interrupts are enabled and we are not in a critical
 		 *	 section.
 		 *
 		 * NOTE: Preemptions do not reset gd_idle_repeat.   Also we
 		 *	 don't bother capping gd_idle_repeat, it is ok if
-		 *	 it overflows.
+		 *	 it overflows (we do make it unsigned, however).
+		 *
+		 * Implement optimized invltlb operations when halted
+		 * in idle.  By setting the bit in smp_idleinvl_mask
+		 * we inform other cpus that they can set _reqs to
+		 * request an invltlb.  Current the code to do that
+		 * sets the bits in _reqs anyway, but then check _mask
+		 * to determine if they can assume the invltlb will execute.
+		 *
+		 * A critical section is required to ensure that interrupts
+		 * do not fully run until after we've had a chance to execute
+		 * the request.
 		 */
 		if (gd->gd_idle_repeat == 0) {
 			stat->repeat = (stat->repeat + stat->repeat_last) >> 1;
@@ -1163,33 +1228,222 @@ cpu_idle(void)
 		}
 		++stat->repeat_last;
 
+		/*
+		 * General idle thread halt code
+		 *
+		 * IBRS NOTES - IBRS is a SPECTRE mitigation.  When going
+		 *		idle, disable IBRS to reduce hyperthread
+		 *		overhead.
+		 */
 		++gd->gd_idle_repeat;
-		reqflags = gd->gd_reqflags;
-		quick = (cpu_idle_hlt == 1) ||
-			(cpu_idle_hlt < 3 &&
-			 gd->gd_idle_repeat < cpu_idle_repeat);
 
-		if (quick && (cpu_mi_feature & CPU_MI_MONITOR) &&
-		    (reqflags & RQF_IDLECHECK_WK_MASK) == 0) {
-			splz(); /* XXX */
-			cpu_mmw_pause_int(&gd->gd_reqflags, reqflags,
-			    cpu_mwait_cx_hint(stat), 0);
-			stat->halt++;
-		} else if (cpu_idle_hlt) {
-			__asm __volatile("cli");
-			splz();
-			if ((gd->gd_reqflags & RQF_IDLECHECK_WK_MASK) == 0) {
-				if (quick)
-					cpu_idle_default_hook();
-				else
-					cpu_idle_hook();
-			}
-			__asm __volatile("sti");
-			stat->halt++;
-		} else {
+		switch(cpu_idle_hlt) {
+		default:
+		case 0:
+			/*
+			 * Always spin
+			 */
+			;
+do_spin:
 			splz();
 			__asm __volatile("sti");
 			stat->spin++;
+			crit_enter_gd(gd);
+			crit_exit_gd(gd);
+			break;
+		case 2:
+			/*
+			 * Use MONITOR/MWAIT (or HLT) for a few cycles,
+			 * then start using the ACPI halt code if we
+			 * continue to be idle.
+			 */
+			if (gd->gd_idle_repeat >= cpu_idle_repeat)
+				goto do_acpi;
+			/* FALL THROUGH */
+		case 1:
+			/*
+			 * Always use MONITOR/MWAIT (will use HLT if
+			 * MONITOR/MWAIT not available).
+			 */
+			if (cpu_mi_feature & CPU_MI_MONITOR) {
+				splz(); /* XXX */
+				reqflags = gd->gd_reqflags;
+				if (reqflags & RQF_IDLECHECK_WK_MASK)
+					goto do_spin;
+				crit_enter_gd(gd);
+				ATOMIC_CPUMASK_ORBIT(smp_idleinvl_mask, gd->gd_cpuid);
+				/*
+				 * IBRS/STIBP
+				 */
+				if (pscpu->trampoline.tr_pcb_spec_ctrl[1] &
+				    SPEC_CTRL_DUMMY_ENABLE) {
+					wrmsr(MSR_SPEC_CTRL, pscpu->trampoline.tr_pcb_spec_ctrl[1] & (SPEC_CTRL_IBRS|SPEC_CTRL_STIBP));
+				}
+				cpu_mmw_pause_int(&gd->gd_reqflags, reqflags,
+						  cpu_mwait_cx_hint(stat), 0);
+				if (pscpu->trampoline.tr_pcb_spec_ctrl[0] &
+				    SPEC_CTRL_DUMMY_ENABLE) {
+					wrmsr(MSR_SPEC_CTRL, pscpu->trampoline.tr_pcb_spec_ctrl[0] & (SPEC_CTRL_IBRS|SPEC_CTRL_STIBP));
+				}
+				stat->halt++;
+				ATOMIC_CPUMASK_NANDBIT(smp_idleinvl_mask, gd->gd_cpuid);
+				if (ATOMIC_CPUMASK_TESTANDCLR(smp_idleinvl_reqs,
+							      gd->gd_cpuid)) {
+					cpu_invltlb();
+					cpu_mfence();
+				}
+				crit_exit_gd(gd);
+				break;
+			}
+			/* FALLTHROUGH */
+		case 4:
+			/*
+			 * Use HLT
+			 */
+			__asm __volatile("cli");
+			splz();
+			crit_enter_gd(gd);
+			if ((gd->gd_reqflags & RQF_IDLECHECK_WK_MASK) == 0) {
+				ATOMIC_CPUMASK_ORBIT(smp_idleinvl_mask,
+						     gd->gd_cpuid);
+				if (pscpu->trampoline.tr_pcb_spec_ctrl[1] &
+				    SPEC_CTRL_DUMMY_ENABLE) {
+					wrmsr(MSR_SPEC_CTRL, pscpu->trampoline.tr_pcb_spec_ctrl[1] & (SPEC_CTRL_IBRS|SPEC_CTRL_STIBP));
+				}
+				cpu_idle_default_hook();
+				if (pscpu->trampoline.tr_pcb_spec_ctrl[0] &
+				    SPEC_CTRL_DUMMY_ENABLE) {
+					wrmsr(MSR_SPEC_CTRL, pscpu->trampoline.tr_pcb_spec_ctrl[0] & (SPEC_CTRL_IBRS|SPEC_CTRL_STIBP));
+				}
+				ATOMIC_CPUMASK_NANDBIT(smp_idleinvl_mask,
+						       gd->gd_cpuid);
+				if (ATOMIC_CPUMASK_TESTANDCLR(smp_idleinvl_reqs,
+							      gd->gd_cpuid)) {
+					cpu_invltlb();
+					cpu_mfence();
+				}
+			}
+			__asm __volatile("sti");
+			stat->halt++;
+			crit_exit_gd(gd);
+			break;
+		case 3:
+			/*
+			 * Use ACPI halt
+			 */
+			;
+do_acpi:
+			__asm __volatile("cli");
+			splz();
+			crit_enter_gd(gd);
+			if ((gd->gd_reqflags & RQF_IDLECHECK_WK_MASK) == 0) {
+				ATOMIC_CPUMASK_ORBIT(smp_idleinvl_mask,
+						     gd->gd_cpuid);
+				if (pscpu->trampoline.tr_pcb_spec_ctrl[1] &
+				    SPEC_CTRL_DUMMY_ENABLE) {
+					wrmsr(MSR_SPEC_CTRL, pscpu->trampoline.tr_pcb_spec_ctrl[1] & (SPEC_CTRL_IBRS|SPEC_CTRL_STIBP));
+				}
+				cpu_idle_hook();
+				if (pscpu->trampoline.tr_pcb_spec_ctrl[0] &
+				    SPEC_CTRL_DUMMY_ENABLE) {
+					wrmsr(MSR_SPEC_CTRL, pscpu->trampoline.tr_pcb_spec_ctrl[0] & (SPEC_CTRL_IBRS|SPEC_CTRL_STIBP));
+				}
+				ATOMIC_CPUMASK_NANDBIT(smp_idleinvl_mask,
+						       gd->gd_cpuid);
+				if (ATOMIC_CPUMASK_TESTANDCLR(smp_idleinvl_reqs,
+							      gd->gd_cpuid)) {
+					cpu_invltlb();
+					cpu_mfence();
+				}
+			}
+			__asm __volatile("sti");
+			stat->halt++;
+			crit_exit_gd(gd);
+			break;
+		}
+	}
+}
+
+/*
+ * Called from deep ACPI via cpu_idle_hook() (see above) to actually halt
+ * the cpu in C1.  ACPI might use other halt methods for deeper states
+ * and not reach here.
+ *
+ * For now we always use HLT as we are not sure what ACPI may have actually
+ * done.  MONITOR/MWAIT might not be appropriate.
+ *
+ * NOTE: MONITOR/MWAIT does not appear to throttle AMD cpus, while HLT
+ *	 does.  On Intel, MONITOR/MWAIT does appear to throttle the cpu.
+ */
+void
+cpu_idle_halt(void)
+{
+	globaldata_t gd;
+
+	gd = mycpu;
+#if 0
+	/* DISABLED FOR NOW */
+	struct cpu_idle_stat *stat;
+	int reqflags;
+
+
+	if ((cpu_idle_hlt == 1 || cpu_idle_hlt == 2) &&
+	    (cpu_mi_feature & CPU_MI_MONITOR) &&
+	    cpu_vendor_id != CPU_VENDOR_AMD) {
+		/*
+		 * Use MONITOR/MWAIT
+		 *
+		 * (NOTE: On ryzen, MWAIT does not throttle clocks, so we
+		 *	  have to use HLT)
+		 */
+		stat = &cpu_idle_stats[gd->gd_cpuid];
+		reqflags = gd->gd_reqflags;
+		if ((reqflags & RQF_IDLECHECK_WK_MASK) == 0) {
+			__asm __volatile("sti");
+			cpu_mmw_pause_int(&gd->gd_reqflags, reqflags,
+					  cpu_mwait_cx_hint(stat), 0);
+		} else {
+			__asm __volatile("sti; pause");
+		}
+	} else
+#endif
+	{
+		/*
+		 * Use HLT
+		 */
+		if ((gd->gd_reqflags & RQF_IDLECHECK_WK_MASK) == 0)
+			__asm __volatile("sti; hlt");
+		else
+			__asm __volatile("sti; pause");
+	}
+}
+
+
+/*
+ * Called in a loop indirectly via Xcpustop
+ */
+void
+cpu_smp_stopped(void)
+{
+	globaldata_t gd = mycpu;
+	volatile __uint64_t *ptr;
+	__uint64_t ovalue;
+
+	ptr = CPUMASK_ADDR(started_cpus, gd->gd_cpuid);
+	ovalue = *ptr;
+	if ((ovalue & CPUMASK_SIMPLE(gd->gd_cpuid & 63)) == 0) {
+		if (cpu_mi_feature & CPU_MI_MONITOR) {
+			if (cpu_mwait_hints) {
+				cpu_mmw_pause_long(__DEVOLATILE(void *, ptr),
+					   ovalue,
+					   cpu_mwait_hints[
+						cpu_mwait_hints_cnt - 1], 0);
+			} else {
+				cpu_mmw_pause_long(__DEVOLATILE(void *, ptr),
+					   ovalue, 0, 0);
+			}
+		} else {
+			cpu_halt();	/* depend on lapic timer */
 		}
 	}
 }
@@ -1216,9 +1470,8 @@ exec_setregs(u_long entry, u_long stack, u_long ps_strings)
 	struct pcb *pcb = td->td_pcb;
 	struct trapframe *regs = lp->lwp_md.md_regs;
 
-	/* was i386_user_cleanup() in NetBSD */
 	user_ldt_free(pcb);
-  
+
 	clear_quickret();
 	bzero((char *)regs, sizeof(struct trapframe));
 	regs->tf_rip = entry;
@@ -1270,7 +1523,7 @@ exec_setregs(u_long entry, u_long stack, u_long ps_strings)
 
 	/*
 	 * NOTE: The MSR values must be correct so we can return to
-	 * 	 userland.  gd_user_fs/gs must be correct so the switch
+	 *	 userland.  gd_user_fs/gs must be correct so the switch
 	 *	 code knows what the current MSR values are.
 	 */
 	pcb->pcb_fsbase = 0;	/* Values loaded from PCB on switch */
@@ -1320,20 +1573,36 @@ SYSCTL_PROC(_machdep, CPU_ADJKERNTZ, adjkerntz, CTLTYPE_INT|CTLFLAG_RW,
 SYSCTL_INT(_machdep, CPU_DISRTCSET, disable_rtc_set,
 	CTLFLAG_RW, &disable_rtc_set, 0, "");
 
-#if JG
-SYSCTL_STRUCT(_machdep, CPU_BOOTINFO, bootinfo, 
+#if 0 /* JG */
+SYSCTL_STRUCT(_machdep, CPU_BOOTINFO, bootinfo,
 	CTLFLAG_RD, &bootinfo, bootinfo, "");
 #endif
 
 SYSCTL_INT(_machdep, CPU_WALLCLOCK, wall_cmos_clock,
 	CTLFLAG_RW, &wall_cmos_clock, 0, "");
 
-extern u_long bootdev;		/* not a cdev_t - encoding is different */
-SYSCTL_ULONG(_machdep, OID_AUTO, guessed_bootdev,
-	CTLFLAG_RD, &bootdev, 0, "Boot device (not in cdev_t format)");
+static int
+efi_map_sysctl_handler(SYSCTL_HANDLER_ARGS)
+{
+	struct efi_map_header *efihdr;
+	caddr_t kmdp;
+	uint32_t efisize;
+
+	kmdp = preload_search_by_type("elf kernel");
+	if (kmdp == NULL)
+		kmdp = preload_search_by_type("elf64 kernel");
+	efihdr = (struct efi_map_header *)preload_search_info(kmdp,
+	    MODINFO_METADATA | MODINFOMD_EFI_MAP);
+	if (efihdr == NULL)
+		return (0);
+	efisize = *((uint32_t *)efihdr - 1);
+	return (SYSCTL_OUT(req, efihdr, efisize));
+}
+SYSCTL_PROC(_machdep, OID_AUTO, efi_map, CTLTYPE_OPAQUE|CTLFLAG_RD, NULL, 0,
+    efi_map_sysctl_handler, "S,efi_map_header", "Raw EFI Memory Map");
 
 /*
- * Initialize 386 and configure to run kernel
+ * Initialize x86 and configure to run kernel
  */
 
 /*
@@ -1343,7 +1612,7 @@ SYSCTL_ULONG(_machdep, OID_AUTO, guessed_bootdev,
 int _default_ldt;
 struct user_segment_descriptor gdt[NGDT * MAXCPU];	/* global descriptor table */
 struct gate_descriptor idt_arr[MAXCPU][NIDT];
-#if JG
+#if 0 /* JG */
 union descriptor ldt[NLDT];		/* local descriptor table */
 #endif
 
@@ -1367,7 +1636,7 @@ struct soft_segment_descriptor gdt_segs[] = {
 	0,			/* segment descriptor present */
 	0,			/* long */
 	0,			/* default 32 vs 16 bit size */
-	0  			/* limit granularity (byte/page units)*/ },
+	0			/* limit granularity (byte/page units)*/ },
 /* GCODE_SEL	1 Code Descriptor for kernel */
 {	0x0,			/* segment base address  */
 	0xfffff,		/* length - all address space */
@@ -1376,7 +1645,7 @@ struct soft_segment_descriptor gdt_segs[] = {
 	1,			/* segment descriptor present */
 	1,			/* long */
 	0,			/* default 32 vs 16 bit size */
-	1  			/* limit granularity (byte/page units)*/ },
+	1			/* limit granularity (byte/page units)*/ },
 /* GDATA_SEL	2 Data Descriptor for kernel */
 {	0x0,			/* segment base address  */
 	0xfffff,		/* length - all address space */
@@ -1385,7 +1654,7 @@ struct soft_segment_descriptor gdt_segs[] = {
 	1,			/* segment descriptor present */
 	1,			/* long */
 	0,			/* default 32 vs 16 bit size */
-	1  			/* limit granularity (byte/page units)*/ },
+	1			/* limit granularity (byte/page units)*/ },
 /* GUCODE32_SEL	3 32 bit Code Descriptor for user */
 {	0x0,			/* segment base address  */
 	0xfffff,		/* length - all address space */
@@ -1394,7 +1663,7 @@ struct soft_segment_descriptor gdt_segs[] = {
 	1,			/* segment descriptor present */
 	0,			/* long */
 	1,			/* default 32 vs 16 bit size */
-	1  			/* limit granularity (byte/page units)*/ },
+	1			/* limit granularity (byte/page units)*/ },
 /* GUDATA_SEL	4 32/64 bit Data Descriptor for user */
 {	0x0,			/* segment base address  */
 	0xfffff,		/* length - all address space */
@@ -1403,7 +1672,7 @@ struct soft_segment_descriptor gdt_segs[] = {
 	1,			/* segment descriptor present */
 	0,			/* long */
 	1,			/* default 32 vs 16 bit size */
-	1  			/* limit granularity (byte/page units)*/ },
+	1			/* limit granularity (byte/page units)*/ },
 /* GUCODE_SEL	5 64 bit Code Descriptor for user */
 {	0x0,			/* segment base address  */
 	0xfffff,		/* length - all address space */
@@ -1412,7 +1681,7 @@ struct soft_segment_descriptor gdt_segs[] = {
 	1,			/* segment descriptor present */
 	1,			/* long */
 	0,			/* default 32 vs 16 bit size */
-	1  			/* limit granularity (byte/page units)*/ },
+	1			/* limit granularity (byte/page units)*/ },
 /* GPROC0_SEL	6 Proc 0 Tss Descriptor */
 {
 	0x0,			/* segment base address */
@@ -1422,7 +1691,7 @@ struct soft_segment_descriptor gdt_segs[] = {
 	1,			/* segment descriptor present */
 	0,			/* long */
 	0,			/* unused - default 32 vs 16 bit size */
-	0  			/* limit granularity (byte/page units)*/ },
+	0			/* limit granularity (byte/page units)*/ },
 /* Actually, the TSS is a system descriptor which is double size */
 {	0x0,			/* segment base address  */
 	0x0,			/* length */
@@ -1431,7 +1700,7 @@ struct soft_segment_descriptor gdt_segs[] = {
 	0,			/* segment descriptor present */
 	0,			/* long */
 	0,			/* default 32 vs 16 bit size */
-	0  			/* limit granularity (byte/page units)*/ },
+	0			/* limit granularity (byte/page units)*/ },
 /* GUGS32_SEL	8 32 bit GS Descriptor for user */
 {	0x0,			/* segment base address  */
 	0xfffff,		/* length - all address space */
@@ -1440,7 +1709,7 @@ struct soft_segment_descriptor gdt_segs[] = {
 	1,			/* segment descriptor present */
 	0,			/* long */
 	1,			/* default 32 vs 16 bit size */
-	1  			/* limit granularity (byte/page units)*/ },
+	1			/* limit granularity (byte/page units)*/ },
 };
 
 void
@@ -1486,13 +1755,142 @@ extern inthand_t
 	IDTVEC(div), IDTVEC(dbg), IDTVEC(nmi), IDTVEC(bpt), IDTVEC(ofl),
 	IDTVEC(bnd), IDTVEC(ill), IDTVEC(dna), IDTVEC(fpusegm),
 	IDTVEC(tss), IDTVEC(missing), IDTVEC(stk), IDTVEC(prot),
-	IDTVEC(page), IDTVEC(mchk), IDTVEC(rsvd), IDTVEC(fpu), IDTVEC(align),
+	IDTVEC(page), IDTVEC(mchk), IDTVEC(fpu), IDTVEC(align),
 	IDTVEC(xmm), IDTVEC(dblfault),
 	IDTVEC(fast_syscall), IDTVEC(fast_syscall32);
 
-#ifdef DEBUG_INTERRUPTS
-extern inthand_t *Xrsvdary[256];
-#endif
+extern inthand_t
+	IDTVEC(rsvd00), IDTVEC(rsvd01), IDTVEC(rsvd02), IDTVEC(rsvd03),
+	IDTVEC(rsvd04), IDTVEC(rsvd05), IDTVEC(rsvd06), IDTVEC(rsvd07),
+	IDTVEC(rsvd08), IDTVEC(rsvd09), IDTVEC(rsvd0a), IDTVEC(rsvd0b),
+	IDTVEC(rsvd0c), IDTVEC(rsvd0d), IDTVEC(rsvd0e), IDTVEC(rsvd0f),
+	IDTVEC(rsvd10), IDTVEC(rsvd11), IDTVEC(rsvd12), IDTVEC(rsvd13),
+	IDTVEC(rsvd14), IDTVEC(rsvd15), IDTVEC(rsvd16), IDTVEC(rsvd17),
+	IDTVEC(rsvd18), IDTVEC(rsvd19), IDTVEC(rsvd1a), IDTVEC(rsvd1b),
+	IDTVEC(rsvd1c), IDTVEC(rsvd1d), IDTVEC(rsvd1e), IDTVEC(rsvd1f),
+	IDTVEC(rsvd20), IDTVEC(rsvd21), IDTVEC(rsvd22), IDTVEC(rsvd23),
+	IDTVEC(rsvd24), IDTVEC(rsvd25), IDTVEC(rsvd26), IDTVEC(rsvd27),
+	IDTVEC(rsvd28), IDTVEC(rsvd29), IDTVEC(rsvd2a), IDTVEC(rsvd2b),
+	IDTVEC(rsvd2c), IDTVEC(rsvd2d), IDTVEC(rsvd2e), IDTVEC(rsvd2f),
+	IDTVEC(rsvd30), IDTVEC(rsvd31), IDTVEC(rsvd32), IDTVEC(rsvd33),
+	IDTVEC(rsvd34), IDTVEC(rsvd35), IDTVEC(rsvd36), IDTVEC(rsvd37),
+	IDTVEC(rsvd38), IDTVEC(rsvd39), IDTVEC(rsvd3a), IDTVEC(rsvd3b),
+	IDTVEC(rsvd3c), IDTVEC(rsvd3d), IDTVEC(rsvd3e), IDTVEC(rsvd3f),
+	IDTVEC(rsvd40), IDTVEC(rsvd41), IDTVEC(rsvd42), IDTVEC(rsvd43),
+	IDTVEC(rsvd44), IDTVEC(rsvd45), IDTVEC(rsvd46), IDTVEC(rsvd47),
+	IDTVEC(rsvd48), IDTVEC(rsvd49), IDTVEC(rsvd4a), IDTVEC(rsvd4b),
+	IDTVEC(rsvd4c), IDTVEC(rsvd4d), IDTVEC(rsvd4e), IDTVEC(rsvd4f),
+	IDTVEC(rsvd50), IDTVEC(rsvd51), IDTVEC(rsvd52), IDTVEC(rsvd53),
+	IDTVEC(rsvd54), IDTVEC(rsvd55), IDTVEC(rsvd56), IDTVEC(rsvd57),
+	IDTVEC(rsvd58), IDTVEC(rsvd59), IDTVEC(rsvd5a), IDTVEC(rsvd5b),
+	IDTVEC(rsvd5c), IDTVEC(rsvd5d), IDTVEC(rsvd5e), IDTVEC(rsvd5f),
+	IDTVEC(rsvd60), IDTVEC(rsvd61), IDTVEC(rsvd62), IDTVEC(rsvd63),
+	IDTVEC(rsvd64), IDTVEC(rsvd65), IDTVEC(rsvd66), IDTVEC(rsvd67),
+	IDTVEC(rsvd68), IDTVEC(rsvd69), IDTVEC(rsvd6a), IDTVEC(rsvd6b),
+	IDTVEC(rsvd6c), IDTVEC(rsvd6d), IDTVEC(rsvd6e), IDTVEC(rsvd6f),
+	IDTVEC(rsvd70), IDTVEC(rsvd71), IDTVEC(rsvd72), IDTVEC(rsvd73),
+	IDTVEC(rsvd74), IDTVEC(rsvd75), IDTVEC(rsvd76), IDTVEC(rsvd77),
+	IDTVEC(rsvd78), IDTVEC(rsvd79), IDTVEC(rsvd7a), IDTVEC(rsvd7b),
+	IDTVEC(rsvd7c), IDTVEC(rsvd7d), IDTVEC(rsvd7e), IDTVEC(rsvd7f),
+	IDTVEC(rsvd80), IDTVEC(rsvd81), IDTVEC(rsvd82), IDTVEC(rsvd83),
+	IDTVEC(rsvd84), IDTVEC(rsvd85), IDTVEC(rsvd86), IDTVEC(rsvd87),
+	IDTVEC(rsvd88), IDTVEC(rsvd89), IDTVEC(rsvd8a), IDTVEC(rsvd8b),
+	IDTVEC(rsvd8c), IDTVEC(rsvd8d), IDTVEC(rsvd8e), IDTVEC(rsvd8f),
+	IDTVEC(rsvd90), IDTVEC(rsvd91), IDTVEC(rsvd92), IDTVEC(rsvd93),
+	IDTVEC(rsvd94), IDTVEC(rsvd95), IDTVEC(rsvd96), IDTVEC(rsvd97),
+	IDTVEC(rsvd98), IDTVEC(rsvd99), IDTVEC(rsvd9a), IDTVEC(rsvd9b),
+	IDTVEC(rsvd9c), IDTVEC(rsvd9d), IDTVEC(rsvd9e), IDTVEC(rsvd9f),
+	IDTVEC(rsvda0), IDTVEC(rsvda1), IDTVEC(rsvda2), IDTVEC(rsvda3),
+	IDTVEC(rsvda4), IDTVEC(rsvda5), IDTVEC(rsvda6), IDTVEC(rsvda7),
+	IDTVEC(rsvda8), IDTVEC(rsvda9), IDTVEC(rsvdaa), IDTVEC(rsvdab),
+	IDTVEC(rsvdac), IDTVEC(rsvdad), IDTVEC(rsvdae), IDTVEC(rsvdaf),
+	IDTVEC(rsvdb0), IDTVEC(rsvdb1), IDTVEC(rsvdb2), IDTVEC(rsvdb3),
+	IDTVEC(rsvdb4), IDTVEC(rsvdb5), IDTVEC(rsvdb6), IDTVEC(rsvdb7),
+	IDTVEC(rsvdb8), IDTVEC(rsvdb9), IDTVEC(rsvdba), IDTVEC(rsvdbb),
+	IDTVEC(rsvdbc), IDTVEC(rsvdbd), IDTVEC(rsvdbe), IDTVEC(rsvdbf),
+	IDTVEC(rsvdc0), IDTVEC(rsvdc1), IDTVEC(rsvdc2), IDTVEC(rsvdc3),
+	IDTVEC(rsvdc4), IDTVEC(rsvdc5), IDTVEC(rsvdc6), IDTVEC(rsvdc7),
+	IDTVEC(rsvdc8), IDTVEC(rsvdc9), IDTVEC(rsvdca), IDTVEC(rsvdcb),
+	IDTVEC(rsvdcc), IDTVEC(rsvdcd), IDTVEC(rsvdce), IDTVEC(rsvdcf),
+	IDTVEC(rsvdd0), IDTVEC(rsvdd1), IDTVEC(rsvdd2), IDTVEC(rsvdd3),
+	IDTVEC(rsvdd4), IDTVEC(rsvdd5), IDTVEC(rsvdd6), IDTVEC(rsvdd7),
+	IDTVEC(rsvdd8), IDTVEC(rsvdd9), IDTVEC(rsvdda), IDTVEC(rsvddb),
+	IDTVEC(rsvddc), IDTVEC(rsvddd), IDTVEC(rsvdde), IDTVEC(rsvddf),
+	IDTVEC(rsvde0), IDTVEC(rsvde1), IDTVEC(rsvde2), IDTVEC(rsvde3),
+	IDTVEC(rsvde4), IDTVEC(rsvde5), IDTVEC(rsvde6), IDTVEC(rsvde7),
+	IDTVEC(rsvde8), IDTVEC(rsvde9), IDTVEC(rsvdea), IDTVEC(rsvdeb),
+	IDTVEC(rsvdec), IDTVEC(rsvded), IDTVEC(rsvdee), IDTVEC(rsvdef),
+	IDTVEC(rsvdf0), IDTVEC(rsvdf1), IDTVEC(rsvdf2), IDTVEC(rsvdf3),
+	IDTVEC(rsvdf4), IDTVEC(rsvdf5), IDTVEC(rsvdf6), IDTVEC(rsvdf7),
+	IDTVEC(rsvdf8), IDTVEC(rsvdf9), IDTVEC(rsvdfa), IDTVEC(rsvdfb),
+	IDTVEC(rsvdfc), IDTVEC(rsvdfd), IDTVEC(rsvdfe), IDTVEC(rsvdff);
+
+inthand_t *rsvdary[NIDT] = {
+	&IDTVEC(rsvd00), &IDTVEC(rsvd01), &IDTVEC(rsvd02), &IDTVEC(rsvd03),
+	&IDTVEC(rsvd04), &IDTVEC(rsvd05), &IDTVEC(rsvd06), &IDTVEC(rsvd07),
+	&IDTVEC(rsvd08), &IDTVEC(rsvd09), &IDTVEC(rsvd0a), &IDTVEC(rsvd0b),
+	&IDTVEC(rsvd0c), &IDTVEC(rsvd0d), &IDTVEC(rsvd0e), &IDTVEC(rsvd0f),
+	&IDTVEC(rsvd10), &IDTVEC(rsvd11), &IDTVEC(rsvd12), &IDTVEC(rsvd13),
+	&IDTVEC(rsvd14), &IDTVEC(rsvd15), &IDTVEC(rsvd16), &IDTVEC(rsvd17),
+	&IDTVEC(rsvd18), &IDTVEC(rsvd19), &IDTVEC(rsvd1a), &IDTVEC(rsvd1b),
+	&IDTVEC(rsvd1c), &IDTVEC(rsvd1d), &IDTVEC(rsvd1e), &IDTVEC(rsvd1f),
+	&IDTVEC(rsvd20), &IDTVEC(rsvd21), &IDTVEC(rsvd22), &IDTVEC(rsvd23),
+	&IDTVEC(rsvd24), &IDTVEC(rsvd25), &IDTVEC(rsvd26), &IDTVEC(rsvd27),
+	&IDTVEC(rsvd28), &IDTVEC(rsvd29), &IDTVEC(rsvd2a), &IDTVEC(rsvd2b),
+	&IDTVEC(rsvd2c), &IDTVEC(rsvd2d), &IDTVEC(rsvd2e), &IDTVEC(rsvd2f),
+	&IDTVEC(rsvd30), &IDTVEC(rsvd31), &IDTVEC(rsvd32), &IDTVEC(rsvd33),
+	&IDTVEC(rsvd34), &IDTVEC(rsvd35), &IDTVEC(rsvd36), &IDTVEC(rsvd37),
+	&IDTVEC(rsvd38), &IDTVEC(rsvd39), &IDTVEC(rsvd3a), &IDTVEC(rsvd3b),
+	&IDTVEC(rsvd3c), &IDTVEC(rsvd3d), &IDTVEC(rsvd3e), &IDTVEC(rsvd3f),
+	&IDTVEC(rsvd40), &IDTVEC(rsvd41), &IDTVEC(rsvd42), &IDTVEC(rsvd43),
+	&IDTVEC(rsvd44), &IDTVEC(rsvd45), &IDTVEC(rsvd46), &IDTVEC(rsvd47),
+	&IDTVEC(rsvd48), &IDTVEC(rsvd49), &IDTVEC(rsvd4a), &IDTVEC(rsvd4b),
+	&IDTVEC(rsvd4c), &IDTVEC(rsvd4d), &IDTVEC(rsvd4e), &IDTVEC(rsvd4f),
+	&IDTVEC(rsvd50), &IDTVEC(rsvd51), &IDTVEC(rsvd52), &IDTVEC(rsvd53),
+	&IDTVEC(rsvd54), &IDTVEC(rsvd55), &IDTVEC(rsvd56), &IDTVEC(rsvd57),
+	&IDTVEC(rsvd58), &IDTVEC(rsvd59), &IDTVEC(rsvd5a), &IDTVEC(rsvd5b),
+	&IDTVEC(rsvd5c), &IDTVEC(rsvd5d), &IDTVEC(rsvd5e), &IDTVEC(rsvd5f),
+	&IDTVEC(rsvd60), &IDTVEC(rsvd61), &IDTVEC(rsvd62), &IDTVEC(rsvd63),
+	&IDTVEC(rsvd64), &IDTVEC(rsvd65), &IDTVEC(rsvd66), &IDTVEC(rsvd67),
+	&IDTVEC(rsvd68), &IDTVEC(rsvd69), &IDTVEC(rsvd6a), &IDTVEC(rsvd6b),
+	&IDTVEC(rsvd6c), &IDTVEC(rsvd6d), &IDTVEC(rsvd6e), &IDTVEC(rsvd6f),
+	&IDTVEC(rsvd70), &IDTVEC(rsvd71), &IDTVEC(rsvd72), &IDTVEC(rsvd73),
+	&IDTVEC(rsvd74), &IDTVEC(rsvd75), &IDTVEC(rsvd76), &IDTVEC(rsvd77),
+	&IDTVEC(rsvd78), &IDTVEC(rsvd79), &IDTVEC(rsvd7a), &IDTVEC(rsvd7b),
+	&IDTVEC(rsvd7c), &IDTVEC(rsvd7d), &IDTVEC(rsvd7e), &IDTVEC(rsvd7f),
+	&IDTVEC(rsvd80), &IDTVEC(rsvd81), &IDTVEC(rsvd82), &IDTVEC(rsvd83),
+	&IDTVEC(rsvd84), &IDTVEC(rsvd85), &IDTVEC(rsvd86), &IDTVEC(rsvd87),
+	&IDTVEC(rsvd88), &IDTVEC(rsvd89), &IDTVEC(rsvd8a), &IDTVEC(rsvd8b),
+	&IDTVEC(rsvd8c), &IDTVEC(rsvd8d), &IDTVEC(rsvd8e), &IDTVEC(rsvd8f),
+	&IDTVEC(rsvd90), &IDTVEC(rsvd91), &IDTVEC(rsvd92), &IDTVEC(rsvd93),
+	&IDTVEC(rsvd94), &IDTVEC(rsvd95), &IDTVEC(rsvd96), &IDTVEC(rsvd97),
+	&IDTVEC(rsvd98), &IDTVEC(rsvd99), &IDTVEC(rsvd9a), &IDTVEC(rsvd9b),
+	&IDTVEC(rsvd9c), &IDTVEC(rsvd9d), &IDTVEC(rsvd9e), &IDTVEC(rsvd9f),
+	&IDTVEC(rsvda0), &IDTVEC(rsvda1), &IDTVEC(rsvda2), &IDTVEC(rsvda3),
+	&IDTVEC(rsvda4), &IDTVEC(rsvda5), &IDTVEC(rsvda6), &IDTVEC(rsvda7),
+	&IDTVEC(rsvda8), &IDTVEC(rsvda9), &IDTVEC(rsvdaa), &IDTVEC(rsvdab),
+	&IDTVEC(rsvdac), &IDTVEC(rsvdad), &IDTVEC(rsvdae), &IDTVEC(rsvdaf),
+	&IDTVEC(rsvdb0), &IDTVEC(rsvdb1), &IDTVEC(rsvdb2), &IDTVEC(rsvdb3),
+	&IDTVEC(rsvdb4), &IDTVEC(rsvdb5), &IDTVEC(rsvdb6), &IDTVEC(rsvdb7),
+	&IDTVEC(rsvdb8), &IDTVEC(rsvdb9), &IDTVEC(rsvdba), &IDTVEC(rsvdbb),
+	&IDTVEC(rsvdbc), &IDTVEC(rsvdbd), &IDTVEC(rsvdbe), &IDTVEC(rsvdbf),
+	&IDTVEC(rsvdc0), &IDTVEC(rsvdc1), &IDTVEC(rsvdc2), &IDTVEC(rsvdc3),
+	&IDTVEC(rsvdc4), &IDTVEC(rsvdc5), &IDTVEC(rsvdc6), &IDTVEC(rsvdc7),
+	&IDTVEC(rsvdc8), &IDTVEC(rsvdc9), &IDTVEC(rsvdca), &IDTVEC(rsvdcb),
+	&IDTVEC(rsvdcc), &IDTVEC(rsvdcd), &IDTVEC(rsvdce), &IDTVEC(rsvdcf),
+	&IDTVEC(rsvdd0), &IDTVEC(rsvdd1), &IDTVEC(rsvdd2), &IDTVEC(rsvdd3),
+	&IDTVEC(rsvdd4), &IDTVEC(rsvdd5), &IDTVEC(rsvdd6), &IDTVEC(rsvdd7),
+	&IDTVEC(rsvdd8), &IDTVEC(rsvdd9), &IDTVEC(rsvdda), &IDTVEC(rsvddb),
+	&IDTVEC(rsvddc), &IDTVEC(rsvddd), &IDTVEC(rsvdde), &IDTVEC(rsvddf),
+	&IDTVEC(rsvde0), &IDTVEC(rsvde1), &IDTVEC(rsvde2), &IDTVEC(rsvde3),
+	&IDTVEC(rsvde4), &IDTVEC(rsvde5), &IDTVEC(rsvde6), &IDTVEC(rsvde7),
+	&IDTVEC(rsvde8), &IDTVEC(rsvde9), &IDTVEC(rsvdea), &IDTVEC(rsvdeb),
+	&IDTVEC(rsvdec), &IDTVEC(rsvded), &IDTVEC(rsvdee), &IDTVEC(rsvdef),
+	&IDTVEC(rsvdf0), &IDTVEC(rsvdf1), &IDTVEC(rsvdf2), &IDTVEC(rsvdf3),
+	&IDTVEC(rsvdf4), &IDTVEC(rsvdf5), &IDTVEC(rsvdf6), &IDTVEC(rsvdf7),
+	&IDTVEC(rsvdf8), &IDTVEC(rsvdf9), &IDTVEC(rsvdfa), &IDTVEC(rsvdfb),
+	&IDTVEC(rsvdfc), &IDTVEC(rsvdfd), &IDTVEC(rsvdfe), &IDTVEC(rsvdff)
+};
 
 void
 sdtossd(struct user_segment_descriptor *sd, struct soft_segment_descriptor *ssd)
@@ -1557,9 +1955,266 @@ ssdtosyssd(struct soft_segment_descriptor *ssd,
 
 #define PHYSMAP_ALIGN		(vm_paddr_t)(128 * 1024)
 #define PHYSMAP_ALIGN_MASK	(vm_paddr_t)(PHYSMAP_ALIGN - 1)
-	vm_paddr_t physmap[PHYSMAP_SIZE];
-	struct bios_smap *smapbase, *smap, *smapend;
-	u_int32_t smapsize;
+#define PHYSMAP_SIZE		VM_PHYSSEG_MAX
+
+vm_paddr_t physmap[PHYSMAP_SIZE];
+struct bios_smap *smapbase, *smap, *smapend;
+struct efi_map_header *efihdrbase;
+u_int32_t smapsize;
+
+#define PHYSMAP_HANDWAVE	(vm_paddr_t)(2 * 1024 * 1024)
+#define PHYSMAP_HANDWAVE_MASK	(PHYSMAP_HANDWAVE - 1)
+
+static void
+add_smap_entries(int *physmap_idx)
+{
+	int i;
+
+	smapsize = *((u_int32_t *)smapbase - 1);
+	smapend = (struct bios_smap *)((uintptr_t)smapbase + smapsize);
+
+	for (smap = smapbase; smap < smapend; smap++) {
+		if (boothowto & RB_VERBOSE)
+			kprintf("SMAP type=%02x base=%016lx len=%016lx\n",
+			    smap->type, smap->base, smap->length);
+
+		if (smap->type != SMAP_TYPE_MEMORY)
+			continue;
+
+		if (smap->length == 0)
+			continue;
+
+		for (i = 0; i <= *physmap_idx; i += 2) {
+			if (smap->base < physmap[i + 1]) {
+				if (boothowto & RB_VERBOSE) {
+					kprintf("Overlapping or non-monotonic "
+						"memory region, ignoring "
+						"second region\n");
+				}
+				break;
+			}
+		}
+		if (i <= *physmap_idx)
+			continue;
+
+		Realmem += smap->length;
+
+		if (smap->base == physmap[*physmap_idx + 1]) {
+			physmap[*physmap_idx + 1] += smap->length;
+			continue;
+		}
+
+		*physmap_idx += 2;
+		if (*physmap_idx == PHYSMAP_SIZE) {
+			kprintf("Too many segments in the physical "
+				"address map, giving up\n");
+			break;
+		}
+		physmap[*physmap_idx] = smap->base;
+		physmap[*physmap_idx + 1] = smap->base + smap->length;
+	}
+}
+
+static void
+add_efi_map_entries(int *physmap_idx)
+{
+	struct efi_md *map, *p;
+	const char *type;
+	size_t efisz;
+	int i, ndesc;
+
+	static const char *types[] = {
+		"Reserved",
+		"LoaderCode",
+		"LoaderData",
+		"BootServicesCode",
+		"BootServicesData",
+		"RuntimeServicesCode",
+		"RuntimeServicesData",
+		"ConventionalMemory",
+		"UnusableMemory",
+		"ACPIReclaimMemory",
+		"ACPIMemoryNVS",
+		"MemoryMappedIO",
+		"MemoryMappedIOPortSpace",
+		"PalCode"
+	 };
+
+	/*
+	 * Memory map data provided by UEFI via the GetMemoryMap
+	 * Boot Services API.
+	 */
+	efisz = (sizeof(struct efi_map_header) + 0xf) & ~0xf;
+	map = (struct efi_md *)((uint8_t *)efihdrbase + efisz);
+
+	if (efihdrbase->descriptor_size == 0)
+		return;
+	ndesc = efihdrbase->memory_size / efihdrbase->descriptor_size;
+
+	if (boothowto & RB_VERBOSE)
+		kprintf("%23s %12s %12s %8s %4s\n",
+		    "Type", "Physical", "Virtual", "#Pages", "Attr");
+
+	for (i = 0, p = map; i < ndesc; i++,
+	    p = efi_next_descriptor(p, efihdrbase->descriptor_size)) {
+		if (boothowto & RB_VERBOSE) {
+			if (p->md_type <= EFI_MD_TYPE_PALCODE)
+				type = types[p->md_type];
+			else
+				type = "<INVALID>";
+			kprintf("%23s %012lx %12p %08lx ", type, p->md_phys,
+			    p->md_virt, p->md_pages);
+			if (p->md_attr & EFI_MD_ATTR_UC)
+				kprintf("UC ");
+			if (p->md_attr & EFI_MD_ATTR_WC)
+				kprintf("WC ");
+			if (p->md_attr & EFI_MD_ATTR_WT)
+				kprintf("WT ");
+			if (p->md_attr & EFI_MD_ATTR_WB)
+				kprintf("WB ");
+			if (p->md_attr & EFI_MD_ATTR_UCE)
+				kprintf("UCE ");
+			if (p->md_attr & EFI_MD_ATTR_WP)
+				kprintf("WP ");
+			if (p->md_attr & EFI_MD_ATTR_RP)
+				kprintf("RP ");
+			if (p->md_attr & EFI_MD_ATTR_XP)
+				kprintf("XP ");
+			if (p->md_attr & EFI_MD_ATTR_RT)
+				kprintf("RUNTIME");
+			kprintf("\n");
+		}
+
+		switch (p->md_type) {
+		case EFI_MD_TYPE_CODE:
+		case EFI_MD_TYPE_DATA:
+		case EFI_MD_TYPE_BS_CODE:
+		case EFI_MD_TYPE_BS_DATA:
+		case EFI_MD_TYPE_FREE:
+			/*
+			 * We're allowed to use any entry with these types.
+			 */
+			break;
+		default:
+			continue;
+		}
+
+		Realmem += p->md_pages * PAGE_SIZE;
+
+		if (p->md_phys == physmap[*physmap_idx + 1]) {
+			physmap[*physmap_idx + 1] += p->md_pages * PAGE_SIZE;
+			continue;
+		}
+
+		*physmap_idx += 2;
+		if (*physmap_idx == PHYSMAP_SIZE) {
+			kprintf("Too many segments in the physical "
+				"address map, giving up\n");
+			break;
+		}
+		physmap[*physmap_idx] = p->md_phys;
+		physmap[*physmap_idx + 1] = p->md_phys + p->md_pages * PAGE_SIZE;
+	 }
+}
+
+struct fb_info efi_fb_info;
+static int have_efi_framebuffer = 0;
+
+static void
+efi_fb_init_vaddr(int direct_map)
+{
+	uint64_t sz;
+	vm_offset_t addr, v;
+
+	v = efi_fb_info.vaddr;
+	sz = efi_fb_info.stride * efi_fb_info.height;
+
+	if (direct_map) {
+		addr = PHYS_TO_DMAP(efi_fb_info.paddr);
+		if (addr >= DMAP_MIN_ADDRESS && addr + sz <= DMapMaxAddress)
+			efi_fb_info.vaddr = addr;
+	} else {
+		efi_fb_info.vaddr =
+			(vm_offset_t)pmap_mapdev_attr(efi_fb_info.paddr,
+						      sz,
+						      PAT_WRITE_COMBINING);
+	}
+}
+
+static u_int
+efifb_color_depth(struct efi_fb *efifb)
+{
+	uint32_t mask;
+	u_int depth;
+
+	mask = efifb->fb_mask_red | efifb->fb_mask_green |
+	    efifb->fb_mask_blue | efifb->fb_mask_reserved;
+	if (mask == 0)
+		return (0);
+	for (depth = 1; mask != 1; depth++)
+		mask >>= 1;
+	return (depth);
+}
+
+int
+probe_efi_fb(int early)
+{
+	struct efi_fb	*efifb;
+	caddr_t		kmdp;
+	u_int		depth;
+
+	if (have_efi_framebuffer) {
+		if (!early &&
+		    (efi_fb_info.vaddr == 0 ||
+		     efi_fb_info.vaddr == PHYS_TO_DMAP(efi_fb_info.paddr)))
+			efi_fb_init_vaddr(0);
+		return 0;
+	}
+
+	kmdp = preload_search_by_type("elf kernel");
+	if (kmdp == NULL)
+		kmdp = preload_search_by_type("elf64 kernel");
+	efifb = (struct efi_fb *)preload_search_info(kmdp,
+	    MODINFO_METADATA | MODINFOMD_EFI_FB);
+	if (efifb == NULL)
+		return 1;
+
+	depth = efifb_color_depth(efifb);
+	/*
+	 * Our bootloader should already notice, when we won't be able to
+	 * use the UEFI framebuffer.
+	 */
+	if (depth != 24 && depth != 32)
+		return 1;
+
+	have_efi_framebuffer = 1;
+
+	efi_fb_info.is_vga_boot_display = 1;
+	efi_fb_info.width = efifb->fb_width;
+	efi_fb_info.height = efifb->fb_height;
+	efi_fb_info.depth = depth;
+	efi_fb_info.stride = efifb->fb_stride * (depth / 8);
+	efi_fb_info.paddr = efifb->fb_addr;
+	if (early) {
+		efi_fb_info.vaddr = 0;
+	} else {
+		efi_fb_init_vaddr(0);
+	}
+	efi_fb_info.fbops.fb_set_par = NULL;
+	efi_fb_info.fbops.fb_blank = NULL;
+	efi_fb_info.fbops.fb_debug_enter = NULL;
+	efi_fb_info.device = NULL;
+
+	return 0;
+}
+
+static void
+efifb_startup(void *arg)
+{
+	probe_efi_fb(0);
+}
+
+SYSINIT(efi_fb_info, SI_BOOT1_POST, SI_ORDER_FIRST, efifb_startup, NULL);
 
 static void
 getmemsize(caddr_t kmdp, u_int64_t first)
@@ -1582,54 +2237,17 @@ getmemsize(caddr_t kmdp, u_int64_t first)
 	 * "Consumer may safely assume that size value precedes data."
 	 * ie: an int32_t immediately precedes smap.
 	 */
+	efihdrbase = (struct efi_map_header *)preload_search_info(kmdp,
+		     MODINFO_METADATA | MODINFOMD_EFI_MAP);
 	smapbase = (struct bios_smap *)preload_search_info(kmdp,
-	    MODINFO_METADATA | MODINFOMD_SMAP);
-	if (smapbase == NULL)
-		panic("No BIOS smap info from loader!");
+		   MODINFO_METADATA | MODINFOMD_SMAP);
+	if (smapbase == NULL && efihdrbase == NULL)
+		panic("No BIOS smap or EFI map info from loader!");
 
-	smapsize = *((u_int32_t *)smapbase - 1);
-	smapend = (struct bios_smap *)((uintptr_t)smapbase + smapsize);
-
-	for (smap = smapbase; smap < smapend; smap++) {
-		if (boothowto & RB_VERBOSE)
-			kprintf("SMAP type=%02x base=%016lx len=%016lx\n",
-			    smap->type, smap->base, smap->length);
-
-		if (smap->type != SMAP_TYPE_MEMORY)
-			continue;
-
-		if (smap->length == 0)
-			continue;
-
-		for (i = 0; i <= physmap_idx; i += 2) {
-			if (smap->base < physmap[i + 1]) {
-				if (boothowto & RB_VERBOSE) {
-					kprintf("Overlapping or non-monotonic "
-						"memory region, ignoring "
-						"second region\n");
-				}
-				break;
-			}
-		}
-		if (i <= physmap_idx)
-			continue;
-
-		Realmem += smap->length;
-
-		if (smap->base == physmap[physmap_idx + 1]) {
-			physmap[physmap_idx + 1] += smap->length;
-			continue;
-		}
-
-		physmap_idx += 2;
-		if (physmap_idx == PHYSMAP_SIZE) {
-			kprintf("Too many segments in the physical "
-				"address map, giving up\n");
-			break;
-		}
-		physmap[physmap_idx] = smap->base;
-		physmap[physmap_idx + 1] = smap->base + smap->length;
-	}
+	if (efihdrbase == NULL)
+		add_smap_entries(&physmap_idx);
+	else
+		add_efi_map_entries(&physmap_idx);
 
 	base_memory = physmap[1] / 1024;
 	/* make hole for AP bootstrap code */
@@ -1703,6 +2321,9 @@ getmemsize(caddr_t kmdp, u_int64_t first)
 
 	/*
 	 * Align anything else used in the validation loop.
+	 *
+	 * Also make sure that our 2MB kernel text+data+bss mappings
+	 * do not overlap potentially allocatable space.
 	 */
 	first = (first + PHYSMAP_ALIGN_MASK) & ~PHYSMAP_ALIGN_MASK;
 
@@ -1710,10 +2331,11 @@ getmemsize(caddr_t kmdp, u_int64_t first)
 	 * Size up each available chunk of physical memory.
 	 */
 	pa_indx = 0;
-	da_indx = 1;
-	phys_avail[pa_indx++] = physmap[0];
-	phys_avail[pa_indx] = physmap[0];
-	dump_avail[da_indx] = physmap[0];
+	da_indx = 0;
+	phys_avail[pa_indx].phys_beg = physmap[0];
+	phys_avail[pa_indx].phys_end = physmap[0];
+	dump_avail[da_indx].phys_beg = 0;
+	dump_avail[da_indx].phys_end = physmap[0];
 	pte = CMAP1;
 
 	/*
@@ -1727,72 +2349,116 @@ getmemsize(caddr_t kmdp, u_int64_t first)
 	 * Validate the physical memory.  The physical memory segments
 	 * have already been aligned to PHYSMAP_ALIGN which is a multiple
 	 * of PAGE_SIZE.
+	 *
+	 * We no longer perform an exhaustive memory test.  Instead we
+	 * simply test the first and last word in each physmap[]
+	 * segment.
 	 */
 	for (i = 0; i <= physmap_idx; i += 2) {
 		vm_paddr_t end;
+		vm_paddr_t incr;
 
 		end = physmap[i + 1];
 
-		for (pa = physmap[i]; pa < end; pa += PHYSMAP_ALIGN) {
-			int tmp, page_bad, full;
-			int *ptr = (int *)CADDR1;
+		for (pa = physmap[i]; pa < end; pa += incr) {
+			int page_bad, full;
+			volatile uint64_t *ptr = (uint64_t *)CADDR1;
+			uint64_t tmp;
 
 			full = FALSE;
-			/*
-			 * block out kernel memory as not available.
-			 */
-			if (pa >= 0x200000 && pa < first)
-				goto do_dump_avail;
 
 			/*
-			 * block out dcons buffer
+			 * Calculate incr.  Just test the first and
+			 * last page in each physmap[] segment.
 			 */
-			if (dcons_addr > 0
-			    && pa >= trunc_page(dcons_addr)
-			    && pa < dcons_addr + dcons_size) {
+			if (pa == end - PAGE_SIZE)
+				incr = PAGE_SIZE;
+			else
+				incr = end - pa - PAGE_SIZE;
+
+			/*
+			 * Make sure we don't skip blacked out areas.
+			 */
+			if (pa < 0x200000 && 0x200000 < end) {
+				incr = 0x200000 - pa;
+			}
+			if (dcons_addr > 0 &&
+			    pa < dcons_addr &&
+			    dcons_addr < end) {
+				incr = dcons_addr - pa;
+			}
+
+			/*
+			 * Block out kernel memory as not available.
+			 */
+			if (pa >= 0x200000 && pa < first) {
+				incr = first - pa;
+				if (pa + incr > end)
+					incr = end - pa;
+				goto do_dump_avail;
+			}
+
+			/*
+			 * Block out the dcons buffer if it exists.
+			 */
+			if (dcons_addr > 0 &&
+			    pa >= trunc_page(dcons_addr) &&
+			    pa < dcons_addr + dcons_size) {
+				incr = dcons_addr + dcons_size - pa;
+				incr = (incr + PAGE_MASK) &
+				       ~(vm_paddr_t)PAGE_MASK;
+				if (pa + incr > end)
+					incr = end - pa;
 				goto do_dump_avail;
 			}
 
 			page_bad = FALSE;
 
 			/*
-			 * map page into kernel: valid, read/write,non-cacheable
+			 * Map the page non-cacheable for the memory
+			 * test.
 			 */
 			*pte = pa |
 			    kernel_pmap.pmap_bits[PG_V_IDX] |
 			    kernel_pmap.pmap_bits[PG_RW_IDX] |
 			    kernel_pmap.pmap_bits[PG_N_IDX];
-			cpu_invltlb();
+			cpu_invlpg(__DEVOLATILE(void *, ptr));
+			cpu_mfence();
 
+			/*
+			 * Save original value for restoration later.
+			 */
 			tmp = *ptr;
+
 			/*
 			 * Test for alternating 1's and 0's
 			 */
-			*(volatile int *)ptr = 0xaaaaaaaa;
+			*ptr = 0xaaaaaaaaaaaaaaaaLLU;
 			cpu_mfence();
-			if (*(volatile int *)ptr != 0xaaaaaaaa)
+			if (*ptr != 0xaaaaaaaaaaaaaaaaLLU)
 				page_bad = TRUE;
 			/*
 			 * Test for alternating 0's and 1's
 			 */
-			*(volatile int *)ptr = 0x55555555;
+			*ptr = 0x5555555555555555LLU;
 			cpu_mfence();
-			if (*(volatile int *)ptr != 0x55555555)
+			if (*ptr != 0x5555555555555555LLU)
 				page_bad = TRUE;
 			/*
 			 * Test for all 1's
 			 */
-			*(volatile int *)ptr = 0xffffffff;
+			*ptr = 0xffffffffffffffffLLU;
 			cpu_mfence();
-			if (*(volatile int *)ptr != 0xffffffff)
+			if (*ptr != 0xffffffffffffffffLLU)
 				page_bad = TRUE;
 			/*
 			 * Test for all 0's
 			 */
-			*(volatile int *)ptr = 0x0;
+			*ptr = 0x0;
 			cpu_mfence();
-			if (*(volatile int *)ptr != 0x0)
+			if (*ptr != 0x0)
 				page_bad = TRUE;
+
 			/*
 			 * Restore original value.
 			 */
@@ -1801,45 +2467,60 @@ getmemsize(caddr_t kmdp, u_int64_t first)
 			/*
 			 * Adjust array of valid/good pages.
 			 */
-			if (page_bad == TRUE)
+			if (page_bad == TRUE) {
+				incr = PAGE_SIZE;
 				continue;
+			}
+
 			/*
-			 * If this good page is a continuation of the
-			 * previous set of good pages, then just increase
-			 * the end pointer. Otherwise start a new chunk.
-			 * Note that "end" points one higher than end,
-			 * making the range >= start and < end.
-			 * If we're also doing a speculative memory
-			 * test and we at or past the end, bump up Maxmem
-			 * so that we keep going. The first bad page
-			 * will terminate the loop.
+			 * Collapse page address into phys_avail[].  Do a
+			 * continuation of the current phys_avail[] index
+			 * when possible.
 			 */
-			if (phys_avail[pa_indx] == pa) {
-				phys_avail[pa_indx] += PHYSMAP_ALIGN;
+			if (phys_avail[pa_indx].phys_end == pa) {
+				/*
+				 * Continuation
+				 */
+				phys_avail[pa_indx].phys_end += incr;
+			} else if (phys_avail[pa_indx].phys_beg ==
+				   phys_avail[pa_indx].phys_end) {
+				/*
+				 * Current phys_avail is completely empty,
+				 * reuse the index.
+				 */
+				phys_avail[pa_indx].phys_beg = pa;
+				phys_avail[pa_indx].phys_end = pa + incr;
 			} else {
-				pa_indx++;
+				/*
+				 * Allocate next phys_avail index.
+				 */
+				++pa_indx;
 				if (pa_indx == PHYS_AVAIL_ARRAY_END) {
 					kprintf(
 		"Too many holes in the physical address space, giving up\n");
-					pa_indx--;
+					--pa_indx;
 					full = TRUE;
 					goto do_dump_avail;
 				}
-				phys_avail[pa_indx++] = pa;
-				phys_avail[pa_indx] = pa + PHYSMAP_ALIGN;
+				phys_avail[pa_indx].phys_beg = pa;
+				phys_avail[pa_indx].phys_end = pa + incr;
 			}
-			physmem += PHYSMAP_ALIGN / PAGE_SIZE;
+			physmem += incr / PAGE_SIZE;
+
+			/*
+			 * pa available for dumping
+			 */
 do_dump_avail:
-			if (dump_avail[da_indx] == pa) {
-				dump_avail[da_indx] += PHYSMAP_ALIGN;
+			if (dump_avail[da_indx].phys_end == pa) {
+				dump_avail[da_indx].phys_end += incr;
 			} else {
-				da_indx++;
+				++da_indx;
 				if (da_indx == DUMP_AVAIL_ARRAY_END) {
-					da_indx--;
+					--da_indx;
 					goto do_next;
 				}
-				dump_avail[da_indx++] = pa;
-				dump_avail[da_indx] = pa + PHYSMAP_ALIGN;
+				dump_avail[da_indx].phys_beg = pa;
+				dump_avail[da_indx].phys_end = pa + incr;
 			}
 do_next:
 			if (full)
@@ -1848,6 +2529,7 @@ do_next:
 	}
 	*pte = 0;
 	cpu_invltlb();
+	cpu_mfence();
 
 	/*
 	 * The last chunk must contain at least one page plus the message
@@ -1856,24 +2538,52 @@ do_next:
 	 */
 	msgbuf_size = (MSGBUF_SIZE + PHYSMAP_ALIGN_MASK) & ~PHYSMAP_ALIGN_MASK;
 
-	while (phys_avail[pa_indx - 1] + PHYSMAP_ALIGN +
-	       msgbuf_size >= phys_avail[pa_indx]) {
-		physmem -= atop(phys_avail[pa_indx] - phys_avail[pa_indx - 1]);
-		phys_avail[pa_indx--] = 0;
-		phys_avail[pa_indx--] = 0;
+	while (phys_avail[pa_indx].phys_beg + PHYSMAP_ALIGN + msgbuf_size >=
+	       phys_avail[pa_indx].phys_end) {
+		physmem -= atop(phys_avail[pa_indx].phys_end -
+				phys_avail[pa_indx].phys_beg);
+		phys_avail[pa_indx].phys_beg = 0;
+		phys_avail[pa_indx].phys_end = 0;
+		--pa_indx;
 	}
 
-	Maxmem = atop(phys_avail[pa_indx]);
+	Maxmem = atop(phys_avail[pa_indx].phys_end);
 
 	/* Trim off space for the message buffer. */
-	phys_avail[pa_indx] -= msgbuf_size;
+	phys_avail[pa_indx].phys_end -= msgbuf_size;
 
-	avail_end = phys_avail[pa_indx];
+	avail_end = phys_avail[pa_indx].phys_end;
 
 	/* Map the message buffer. */
 	for (off = 0; off < msgbuf_size; off += PAGE_SIZE) {
-		pmap_kenter((vm_offset_t)msgbufp + off,
-			    phys_avail[pa_indx] + off);
+		pmap_kenter((vm_offset_t)msgbufp + off, avail_end + off);
+	}
+
+	/*
+	 * Try to get EFI framebuffer working as early as possible.
+	 *
+	 * WARN: Some BIOSes do not list the EFI framebuffer memory, causing
+	 * the pmap probe code to create a DMAP that does not cover its
+	 * physical address space, efi_fb_init_vaddr(1) might not return
+	 * an initialized framebuffer base pointer.  In this situation the
+	 * later efi_fb_init_vaddr(0) call will deal with it.
+	 *
+	 * HACK: Setting machdep.hack_efifb_probe_early=1 works around
+	 * an issue that occurs on some recent systems where there is
+	 * no system console when booting via UEFI. Bug #3167.
+	 *
+	 * NOTE: This is not intended to be a permant fix.
+	 */
+	{
+
+		int hack_efifb_probe_early = 0;
+		TUNABLE_INT_FETCH("machdep.hack_efifb_probe_early",
+				  &hack_efifb_probe_early);
+
+		if (hack_efifb_probe_early)
+			probe_efi_fb(1);
+		else if (have_efi_framebuffer)
+			efi_fb_init_vaddr(1);
 	}
 }
 
@@ -1909,17 +2619,20 @@ hammer_time(u_int64_t modulep, u_int64_t physfree)
 {
 	caddr_t kmdp;
 	int gsel_tss, x, cpu;
-#if JG
+#if 0 /* JG */
 	int metadata_missing, off;
 #endif
 	struct mdglobaldata *gd;
+	struct privatespace *ps;
 	u_int64_t msr;
 
 	/*
 	 * Prevent lowering of the ipl if we call tsleep() early.
 	 */
 	gd = &CPU_prvspace[0]->mdglobaldata;
+	ps = (struct privatespace *)gd;
 	bzero(gd, sizeof(*gd));
+	bzero(&ps->common_tss, sizeof(ps->common_tss));
 
 	/*
 	 * Note: on both UP and SMP curthread must be set non-NULL
@@ -1932,7 +2645,7 @@ hammer_time(u_int64_t modulep, u_int64_t physfree)
 
 	atdevbase = ISA_HOLE_START + PTOV_OFFSET;
 
-#if JG
+#if 0 /* JG */
 	metadata_missing = 0;
 	if (bootinfo.bi_modulep) {
 		preload_metadata = (caddr_t)bootinfo.bi_modulep + KERNBASE;
@@ -1955,6 +2668,7 @@ hammer_time(u_int64_t modulep, u_int64_t physfree)
 	ksym_start = MD_FETCH(kmdp, MODINFOMD_SSYM, uintptr_t);
 	ksym_end = MD_FETCH(kmdp, MODINFOMD_ESYM, uintptr_t);
 #endif
+	efi_systbl_phys = MD_FETCH(kmdp, MODINFOMD_FW_HANDLE, vm_paddr_t);
 
 	if (boothowto & RB_VERBOSE)
 		bootverbose++;
@@ -1965,11 +2679,9 @@ hammer_time(u_int64_t modulep, u_int64_t physfree)
 	MachIntrABI = MachIntrABI_ICU;
 
 	/*
-	 * start with one cpu.  Note: with one cpu, ncpus2_shift, ncpus2_mask,
-	 * and ncpus_fit_mask remain 0.
+	 * start with one cpu.  Note: with one cpu, ncpus_fit_mask remain 0.
 	 */
 	ncpus = 1;
-	ncpus2 = 1;
 	ncpus_fit = 1;
 	/* Init basic tunables, hz etc */
 	init_param1();
@@ -1978,7 +2690,7 @@ hammer_time(u_int64_t modulep, u_int64_t physfree)
 	 * make gdt memory segments
 	 */
 	gdt_segs[GPROC0_SEL].ssd_base =
-		(uintptr_t) &CPU_prvspace[0]->mdglobaldata.gd_common_tss;
+		(uintptr_t) &CPU_prvspace[0]->common_tss;
 
 	gd->mi.gd_prvspace = CPU_prvspace[0];
 
@@ -2008,11 +2720,11 @@ hammer_time(u_int64_t modulep, u_int64_t physfree)
 
 	/* exceptions */
 	for (x = 0; x < NIDT; x++)
-		setidt_global(x, &IDTVEC(rsvd), SDT_SYSIGT, SEL_KPL, 0);
+		setidt_global(x, rsvdary[x], SDT_SYSIGT, SEL_KPL, 0);
 	setidt_global(IDT_DE, &IDTVEC(div),  SDT_SYSIGT, SEL_KPL, 0);
-	setidt_global(IDT_DB, &IDTVEC(dbg),  SDT_SYSIGT, SEL_KPL, 0);
+	setidt_global(IDT_DB, &IDTVEC(dbg),  SDT_SYSIGT, SEL_KPL, 2);
 	setidt_global(IDT_NMI, &IDTVEC(nmi),  SDT_SYSIGT, SEL_KPL, 1);
- 	setidt_global(IDT_BP, &IDTVEC(bpt),  SDT_SYSIGT, SEL_UPL, 0);
+	setidt_global(IDT_BP, &IDTVEC(bpt),  SDT_SYSIGT, SEL_UPL, 0);
 	setidt_global(IDT_OF, &IDTVEC(ofl),  SDT_SYSIGT, SEL_KPL, 0);
 	setidt_global(IDT_BR, &IDTVEC(bnd),  SDT_SYSIGT, SEL_KPL, 0);
 	setidt_global(IDT_UD, &IDTVEC(ill),  SDT_SYSIGT, SEL_KPL, 0);
@@ -2041,7 +2753,7 @@ hammer_time(u_int64_t modulep, u_int64_t physfree)
 	 */
 	cninit();
 
-#if JG
+#if 0 /* JG */
 	if (metadata_missing)
 		kprintf("WARNING: loader(8) metadata is missing!\n");
 #endif
@@ -2067,13 +2779,35 @@ hammer_time(u_int64_t modulep, u_int64_t physfree)
 		Debugger("Boot flags requested debugger");
 #endif
 
-#if JG
-	finishidentcpu();	/* Final stage of CPU initialization */
-	setidt(6, &IDTVEC(ill),  SDT_SYS386IGT, SEL_KPL, GSEL(GCODE_SEL, SEL_KPL));
-	setidt(13, &IDTVEC(prot),  SDT_SYS386IGT, SEL_KPL, GSEL(GCODE_SEL, SEL_KPL));
-#endif
 	identify_cpu();		/* Final stage of CPU initialization */
 	initializecpu(0);	/* Initialize CPU registers */
+
+	/*
+	 * On modern Intel cpus, haswell or later, cpu_idle_hlt=1 is better
+	 * because the cpu does significant power management in MWAIT
+	 * (also suggested is to set sysctl machdep.mwait.CX.idle=AUTODEEP).
+	 *
+	 * On many AMD cpus cpu_idle_hlt=3 is better, because the cpu does
+	 * significant power management only when using ACPI halt mode.
+	 * (However, on Ryzen, mode 4 (HLT) also does power management).
+	 *
+	 * On older AMD or Intel cpus, cpu_idle_hlt=2 is better because ACPI
+	 * is needed to reduce power consumption, but wakeup times are often
+	 * too long.
+	 */
+	if (cpu_vendor_id == CPU_VENDOR_INTEL &&
+	    CPUID_TO_MODEL(cpu_id) >= 0x3C) {	/* Haswell or later */
+		cpu_idle_hlt = 1;
+	}
+	if (cpu_vendor_id == CPU_VENDOR_AMD) {
+		if (CPUID_TO_FAMILY(cpu_id) >= 0x17) {
+			/* Ryzen or later */
+			cpu_idle_hlt = 3;
+		} else if (CPUID_TO_FAMILY(cpu_id) >= 0x14) {
+			/* Bobcat or later */
+			cpu_idle_hlt = 3;
+		}
+	}
 
 	TUNABLE_INT_FETCH("hw.apic_io_enable", &ioapic_enable); /* for compat */
 	TUNABLE_INT_FETCH("hw.ioapic_enable", &ioapic_enable);
@@ -2097,20 +2831,34 @@ hammer_time(u_int64_t modulep, u_int64_t physfree)
 			ioapic_enable = 1;
 	}
 
-	/* make an initial tss so cpu can get interrupt stack on syscall! */
-	gd->gd_common_tss.tss_rsp0 =
-		(register_t)(thread0.td_kstack +
-			     KSTACK_PAGES * PAGE_SIZE - sizeof(struct pcb));
-	/* Ensure the stack is aligned to 16 bytes */
-	gd->gd_common_tss.tss_rsp0 &= ~(register_t)0xF;
+	/*
+	 * TSS entry point for interrupts, traps, and exceptions
+	 * (sans NMI).  This will always go to near the top of the pcpu
+	 * trampoline area.  Hardware-pushed data will be copied into
+	 * the trap-frame on entry, and (if necessary) returned to the
+	 * trampoline on exit.
+	 *
+	 * We store some pcb data for the trampoline code above the
+	 * stack the cpu hw pushes into, and arrange things so the
+	 * address of tr_pcb_rsp is the same as the desired top of
+	 * stack.
+	 */
+	ps->common_tss.tss_rsp0 = (register_t)&ps->trampoline.tr_pcb_rsp;
+	ps->trampoline.tr_pcb_rsp = ps->common_tss.tss_rsp0;
+	ps->trampoline.tr_pcb_gs_kernel = (register_t)gd;
+	ps->trampoline.tr_pcb_cr3 = KPML4phys;	/* adj to user cr3 live */
+	ps->dbltramp.tr_pcb_gs_kernel = (register_t)gd;
+	ps->dbltramp.tr_pcb_cr3 = KPML4phys;
+	ps->dbgtramp.tr_pcb_gs_kernel = (register_t)gd;
+	ps->dbgtramp.tr_pcb_cr3 = KPML4phys;
 
 	/* double fault stack */
-	gd->gd_common_tss.tss_ist1 =
-		(long)&gd->mi.gd_prvspace->idlestack[
-			sizeof(gd->mi.gd_prvspace->idlestack)];
+	ps->common_tss.tss_ist1 = (register_t)&ps->dbltramp.tr_pcb_rsp;
+	/* #DB debugger needs its own stack */
+	ps->common_tss.tss_ist2 = (register_t)&ps->dbgtramp.tr_pcb_rsp;
 
 	/* Set the IO permission bitmap (empty due to tss seg limit) */
-	gd->gd_common_tss.tss_iobase = sizeof(struct x86_64tss);
+	ps->common_tss.tss_iobase = sizeof(struct x86_64tss);
 
 	gsel_tss = GSEL(GPROC0_SEL, SEL_KPL);
 	gd->gd_tss_gdt = &gdt[GPROC0_SEL];
@@ -2125,7 +2873,7 @@ hammer_time(u_int64_t modulep, u_int64_t physfree)
 	msr = ((u_int64_t)GSEL(GCODE_SEL, SEL_KPL) << 32) |
 	      ((u_int64_t)GSEL(GUCODE32_SEL, SEL_UPL) << 48);
 	wrmsr(MSR_STAR, msr);
-	wrmsr(MSR_SF_MASK, PSL_NT|PSL_T|PSL_I|PSL_C|PSL_D|PSL_IOPL);
+	wrmsr(MSR_SF_MASK, PSL_NT|PSL_T|PSL_I|PSL_C|PSL_D|PSL_IOPL|PSL_AC);
 
 	getmemsize(kmdp, physfree);
 	init_param2(physmem);
@@ -2133,7 +2881,7 @@ hammer_time(u_int64_t modulep, u_int64_t physfree)
 	/* now running on new page tables, configured,and u/iom is accessible */
 
 	/* Map the message buffer. */
-#if JG
+#if 0 /* JG */
 	for (off = 0; off < round_page(MSGBUF_SIZE); off += PAGE_SIZE)
 		pmap_kenter((vm_offset_t)msgbufp + off, avail_end + off);
 #endif
@@ -2154,6 +2902,7 @@ hammer_time(u_int64_t modulep, u_int64_t physfree)
 	/* setup proc 0's pcb */
 	thread0.td_pcb->pcb_flags = 0;
 	thread0.td_pcb->pcb_cr3 = KPML4phys;
+	thread0.td_pcb->pcb_cr3_iso = 0;
 	thread0.td_pcb->pcb_ext = NULL;
 	lwp0.lwp_md.md_regs = &proc0_tf;	/* XXX needed? */
 
@@ -2176,9 +2925,9 @@ cpu_gdinit(struct mdglobaldata *gd, int cpu)
 	if (cpu)
 		gd->mi.gd_curthread = &gd->mi.gd_idlethread;
 
-	lwkt_init_thread(&gd->mi.gd_idlethread, 
-			gd->mi.gd_prvspace->idlestack, 
-			sizeof(gd->mi.gd_prvspace->idlestack), 
+	lwkt_init_thread(&gd->mi.gd_idlethread,
+			gd->mi.gd_prvspace->idlestack,
+			sizeof(gd->mi.gd_prvspace->idlestack),
 			0, &gd->mi);
 	lwkt_set_comm(&gd->mi.gd_idlethread, "idle_%d", cpu);
 	gd->mi.gd_idlethread.td_switch = cpu_lwkt_switch;
@@ -2393,11 +3142,11 @@ set_dbregs(struct lwp *lp, struct dbreg *dbregs)
 		 * carried to decide if it is safe and useful to
 		 * provide access to that capability
 		 */
-		for (i = 0, mask1 = 0x3<<16, mask2 = 0x2<<16; i < 4; 
+		for (i = 0, mask1 = 0x3<<16, mask2 = 0x2<<16; i < 4;
 		     i++, mask1 <<= 4, mask2 <<= 4)
 			if ((dbregs->dr[7] & mask1) == mask2)
 				return (EINVAL);
-		
+
 		pcb = lp->lwp_thread->td_pcb;
 		ucred = lp->lwp_proc->p_ucred;
 
@@ -2467,7 +3216,7 @@ user_dbreg_trap(void)
         int nbp;            /* number of breakpoints that triggered */
         caddr_t addr[4];    /* breakpoint addresses */
         int i;
-        
+
         dr7 = rdr7();
         if ((dr7 & 0xff) == 0) {
                 /*
@@ -2508,9 +3257,8 @@ user_dbreg_trap(void)
                 addr[nbp++] = (caddr_t)rdr3();
         }
 
-        for (i=0; i<nbp; i++) {
-                if (addr[i] <
-                    (caddr_t)VM_MAX_USER_ADDRESS) {
+        for (i = 0; i < nbp; i++) {
+                if (addr[i] < (caddr_t)VM_MAX_USER_ADDRESS) {
                         /*
                          * addr[i] is in user space
                          */
@@ -2588,15 +3336,6 @@ outb(u_int port, u_char data)
 /* critical region when masking or unmasking interupts */
 struct spinlock_deprecated imen_spinlock;
 
-/* critical region for old style disable_intr/enable_intr */
-struct spinlock_deprecated mpintr_spinlock;
-
-/* critical region around INTR() routines */
-struct spinlock_deprecated intr_spinlock;
-
-/* lock region used by kernel profiling */
-struct spinlock_deprecated mcount_spinlock;
-
 /* locks com (tty) data/hardware accesses: a FASTINTR() */
 struct spinlock_deprecated com_spinlock;
 
@@ -2612,12 +3351,9 @@ init_locks(void)
 	 */
 	cpu_get_initial_mplock();
 	/* DEPRECATED */
-	spin_lock_init(&mcount_spinlock);
-	spin_lock_init(&intr_spinlock);
-	spin_lock_init(&mpintr_spinlock);
-	spin_lock_init(&imen_spinlock);
-	spin_lock_init(&com_spinlock);
-	spin_lock_init(&clock_spinlock);
+	spin_init_deprecated(&imen_spinlock);
+	spin_init_deprecated(&com_spinlock);
+	spin_init_deprecated(&clock_spinlock);
 
 	/* our token pool needs to work early */
 	lwkt_token_pool_init();
@@ -2645,14 +3381,17 @@ cpu_mwait_cx_no_bmsts(void)
 	atomic_clear_int(&cpu_mwait_c3_preamble, CPU_MWAIT_C3_PREAMBLE_BM_STS);
 }
 
-static int
-cpu_mwait_cx_select_sysctl(SYSCTL_HANDLER_ARGS, int *hint0,
-    boolean_t allow_auto)
+void
+cpu_mwait_cx_no_bmarb(void)
 {
-	int error, cx_idx, old_cx_idx, sub = 0, hint;
-	char name[16], *ptr, *start;
+	atomic_clear_int(&cpu_mwait_c3_preamble, CPU_MWAIT_C3_PREAMBLE_BM_ARB);
+}
 
-	hint = *hint0;
+static int
+cpu_mwait_cx_hint2name(int hint, char *name, int namelen, boolean_t allow_auto)
+{
+	int old_cx_idx, sub = 0;
+
 	if (hint >= 0) {
 		old_cx_idx = MWAIT_EAX_TO_CX(hint);
 		sub = MWAIT_EAX_TO_CX_SUB(hint);
@@ -2664,26 +3403,26 @@ cpu_mwait_cx_select_sysctl(SYSCTL_HANDLER_ARGS, int *hint0,
 		old_cx_idx = CPU_MWAIT_CX_MAX;
 	}
 
-	if ((cpu_feature2 & CPUID2_MON) == 0 ||
-	    (cpu_mwait_feature & CPUID_MWAIT_EXT) == 0)
-		strlcpy(name, "NONE", sizeof(name));
+	if (!CPU_MWAIT_HAS_CX)
+		strlcpy(name, "NONE", namelen);
 	else if (allow_auto && hint == CPU_MWAIT_HINT_AUTO)
-		strlcpy(name, "AUTO", sizeof(name));
+		strlcpy(name, "AUTO", namelen);
 	else if (allow_auto && hint == CPU_MWAIT_HINT_AUTODEEP)
-		strlcpy(name, "AUTODEEP", sizeof(name));
+		strlcpy(name, "AUTODEEP", namelen);
 	else if (old_cx_idx >= CPU_MWAIT_CX_MAX ||
 	    sub >= cpu_mwait_cx_info[old_cx_idx].subcnt)
-		strlcpy(name, "INVALID", sizeof(name));
+		strlcpy(name, "INVALID", namelen);
 	else
-		ksnprintf(name, sizeof(name), "C%d/%d", old_cx_idx, sub);
+		ksnprintf(name, namelen, "C%d/%d", old_cx_idx, sub);
 
-	error = sysctl_handle_string(oidp, name, sizeof(name), req);
-	if (error != 0 || req->newptr == NULL)
-		return error;
+	return old_cx_idx;
+}
 
-	if ((cpu_feature2 & CPUID2_MON) == 0 ||
-	    (cpu_mwait_feature & CPUID_MWAIT_EXT) == 0)
-		return EOPNOTSUPP;
+static int
+cpu_mwait_cx_name2hint(char *name, int *hint0, boolean_t allow_auto)
+{
+	int cx_idx, sub, hint;
+	char *ptr, *start;
 
 	if (allow_auto && strcmp(name, "AUTO") == 0) {
 		hint = CPU_MWAIT_HINT_AUTO;
@@ -2697,50 +3436,144 @@ cpu_mwait_cx_select_sysctl(SYSCTL_HANDLER_ARGS, int *hint0,
 	}
 
 	if (strlen(name) < 4 || toupper(name[0]) != 'C')
-		return EINVAL;
+		return -1;
 	start = &name[1];
 	ptr = NULL;
 
 	cx_idx = strtol(start, &ptr, 10);
 	if (ptr == start || *ptr != '/')
-		return EINVAL;
+		return -1;
 	if (cx_idx < 0 || cx_idx >= CPU_MWAIT_CX_MAX)
-		return EINVAL;
+		return -1;
 
 	start = ptr + 1;
 	ptr = NULL;
 
 	sub = strtol(start, &ptr, 10);
 	if (*ptr != '\0')
-		return EINVAL;
+		return -1;
 	if (sub < 0 || sub >= cpu_mwait_cx_info[cx_idx].subcnt)
-		return EINVAL;
+		return -1;
 
 	hint = MWAIT_EAX_HINT(cx_idx, sub);
 done:
+	*hint0 = hint;
+	return cx_idx;
+}
+
+static int
+cpu_mwait_cx_transit(int old_cx_idx, int cx_idx)
+{
 	if (cx_idx >= CPU_MWAIT_C3 && cpu_mwait_c3_preamble)
 		return EOPNOTSUPP;
 	if (old_cx_idx < CPU_MWAIT_C3 && cx_idx >= CPU_MWAIT_C3) {
+		int error;
+
 		error = cputimer_intr_powersave_addreq();
 		if (error)
 			return error;
 	} else if (old_cx_idx >= CPU_MWAIT_C3 && cx_idx < CPU_MWAIT_C3) {
 		cputimer_intr_powersave_remreq();
 	}
+	return 0;
+}
+
+static int
+cpu_mwait_cx_select_sysctl(SYSCTL_HANDLER_ARGS, int *hint0,
+    boolean_t allow_auto)
+{
+	int error, cx_idx, old_cx_idx, hint;
+	char name[CPU_MWAIT_CX_NAMELEN];
+
+	hint = *hint0;
+	old_cx_idx = cpu_mwait_cx_hint2name(hint, name, sizeof(name),
+	    allow_auto);
+
+	error = sysctl_handle_string(oidp, name, sizeof(name), req);
+	if (error != 0 || req->newptr == NULL)
+		return error;
+
+	if (!CPU_MWAIT_HAS_CX)
+		return EOPNOTSUPP;
+
+	cx_idx = cpu_mwait_cx_name2hint(name, &hint, allow_auto);
+	if (cx_idx < 0)
+		return EINVAL;
+
+	error = cpu_mwait_cx_transit(old_cx_idx, cx_idx);
+	if (error)
+		return error;
 
 	*hint0 = hint;
 	return 0;
 }
 
 static int
+cpu_mwait_cx_setname(struct cpu_idle_stat *stat, const char *cx_name)
+{
+	int error, cx_idx, old_cx_idx, hint;
+	char name[CPU_MWAIT_CX_NAMELEN];
+
+	KASSERT(CPU_MWAIT_HAS_CX, ("cpu does not support mwait CX extension"));
+
+	hint = stat->hint;
+	old_cx_idx = cpu_mwait_cx_hint2name(hint, name, sizeof(name), TRUE);
+
+	strlcpy(name, cx_name, sizeof(name));
+	cx_idx = cpu_mwait_cx_name2hint(name, &hint, TRUE);
+	if (cx_idx < 0)
+		return EINVAL;
+
+	error = cpu_mwait_cx_transit(old_cx_idx, cx_idx);
+	if (error)
+		return error;
+
+	stat->hint = hint;
+	return 0;
+}
+
+static int
 cpu_mwait_cx_idle_sysctl(SYSCTL_HANDLER_ARGS)
 {
+	int hint = cpu_mwait_halt_global;
+	int error, cx_idx, cpu;
+	char name[CPU_MWAIT_CX_NAMELEN], cx_name[CPU_MWAIT_CX_NAMELEN];
+
+	cpu_mwait_cx_hint2name(hint, name, sizeof(name), TRUE);
+
+	error = sysctl_handle_string(oidp, name, sizeof(name), req);
+	if (error != 0 || req->newptr == NULL)
+		return error;
+
+	if (!CPU_MWAIT_HAS_CX)
+		return EOPNOTSUPP;
+
+	/* Save name for later per-cpu CX configuration */
+	strlcpy(cx_name, name, sizeof(cx_name));
+
+	cx_idx = cpu_mwait_cx_name2hint(name, &hint, TRUE);
+	if (cx_idx < 0)
+		return EINVAL;
+
+	/* Change per-cpu CX configuration */
+	for (cpu = 0; cpu < ncpus; ++cpu) {
+		error = cpu_mwait_cx_setname(&cpu_idle_stats[cpu], cx_name);
+		if (error)
+			return error;
+	}
+
+	cpu_mwait_halt_global = hint;
+	return 0;
+}
+
+static int
+cpu_mwait_cx_pcpu_idle_sysctl(SYSCTL_HANDLER_ARGS)
+{
+	struct cpu_idle_stat *stat = arg1;
 	int error;
 
-	lwkt_serialize_enter(&cpu_mwait_cx_slize);
 	error = cpu_mwait_cx_select_sysctl(oidp, arg1, arg2, req,
-	    &cpu_mwait_halt, TRUE);
-	lwkt_serialize_exit(&cpu_mwait_cx_slize);
+	    &stat->hint, TRUE);
 	return error;
 }
 
@@ -2749,9 +3582,121 @@ cpu_mwait_cx_spin_sysctl(SYSCTL_HANDLER_ARGS)
 {
 	int error;
 
-	lwkt_serialize_enter(&cpu_mwait_cx_slize);
 	error = cpu_mwait_cx_select_sysctl(oidp, arg1, arg2, req,
 	    &cpu_mwait_spin, FALSE);
-	lwkt_serialize_exit(&cpu_mwait_cx_slize);
 	return error;
+}
+
+/*
+ * This manual debugging code is called unconditionally from Xtimer
+ * (the per-cpu timer interrupt) whether the current thread is in a
+ * critical section or not) and can be useful in tracking down lockups.
+ *
+ * NOTE: MANUAL DEBUG CODE
+ */
+#if 0
+static int saveticks[SMP_MAXCPU];
+static int savecounts[SMP_MAXCPU];
+#endif
+
+void
+pcpu_timer_always(struct intrframe *frame)
+{
+#if 0
+	globaldata_t gd = mycpu;
+	int cpu = gd->gd_cpuid;
+	char buf[64];
+	short *gptr;
+	int i;
+
+	if (cpu <= 20) {
+		gptr = (short *)0xFFFFFFFF800b8000 + 80 * cpu;
+		*gptr = ((*gptr + 1) & 0x00FF) | 0x0700;
+		++gptr;
+
+		ksnprintf(buf, sizeof(buf), " %p %16s %d %16s ",
+		    (void *)frame->if_rip, gd->gd_curthread->td_comm, ticks,
+		    gd->gd_infomsg);
+		for (i = 0; buf[i]; ++i) {
+			gptr[i] = 0x0700 | (unsigned char)buf[i];
+		}
+	}
+#if 0
+	if (saveticks[gd->gd_cpuid] != ticks) {
+		saveticks[gd->gd_cpuid] = ticks;
+		savecounts[gd->gd_cpuid] = 0;
+	}
+	++savecounts[gd->gd_cpuid];
+	if (savecounts[gd->gd_cpuid] > 2000 && panicstr == NULL) {
+		panic("cpud %d panicing on ticks failure",
+			gd->gd_cpuid);
+	}
+	for (i = 0; i < ncpus; ++i) {
+		int delta;
+		if (saveticks[i] && panicstr == NULL) {
+			delta = saveticks[i] - ticks;
+			if (delta < -10 || delta > 10) {
+				panic("cpu %d panicing on cpu %d watchdog",
+				      gd->gd_cpuid, i);
+			}
+		}
+	}
+#endif
+#endif
+}
+
+SET_DECLARE(smap_open, char);
+SET_DECLARE(smap_close, char);
+
+static void
+cpu_implement_smap(void)
+{
+	char **scan;
+
+	for (scan = SET_BEGIN(smap_open);		/* nop -> stac */
+	     scan < SET_LIMIT(smap_open); ++scan) {
+		(*scan)[0] = 0x0F;
+		(*scan)[1] = 0x01;
+		(*scan)[2] = 0xCB;
+	}
+	for (scan = SET_BEGIN(smap_close);		/* nop -> clac */
+	     scan < SET_LIMIT(smap_close); ++scan) {
+		(*scan)[0] = 0x0F;
+		(*scan)[1] = 0x01;
+		(*scan)[2] = 0xCA;
+	}
+}
+
+/*
+ * From a hard interrupt
+ */
+int
+cpu_interrupt_running(struct thread *td)
+{
+	struct mdglobaldata *gd = mdcpu;
+
+	if (clock_debug1 > 0) {
+		--clock_debug1;
+		kprintf("%d %016lx %016lx %016lx\n",
+			((td->td_flags & TDF_INTTHREAD) != 0),
+			gd->gd_ipending[0],
+			gd->gd_ipending[1],
+			gd->gd_ipending[2]);
+		if (td->td_flags & TDF_CLKTHREAD) {
+			kprintf("CLKTD %s PREEMPT %s\n",
+				td->td_comm,
+				(td->td_preempted ?
+				 td->td_preempted->td_comm : ""));
+		} else {
+			kprintf("NORTD %s\n", td->td_comm);
+		}
+	}
+	if ((td->td_flags & TDF_INTTHREAD) ||
+	    gd->gd_ipending[0] ||
+	    gd->gd_ipending[1] ||
+	    gd->gd_ipending[2]) {
+		return 1;
+	} else {
+		return 0;
+	}
 }

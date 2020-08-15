@@ -72,6 +72,7 @@ struct vmx_thread_info {
 
 	/* Guest unsaved registers in VMCS */
 	struct trapframe guest; /* put them directly in trapframe */
+	/*union savefpu	guest_fpu; FUTURE */
 	register_t	guest_cr2;
 
 	/* Host unsaved registers in VMCS */
@@ -91,6 +92,7 @@ struct vmx_thread_info {
 	uint64_t	vmexit_instruction_length;
 	uint64_t	guest_physical_address;
 
+	uint64_t	guest_cr0;
 	uint64_t	guest_cr3;
 	uint64_t	vmm_cr3;
 	invept_desc_t	invept_desc;
@@ -153,7 +155,7 @@ void vmx_vmexit(void);
 #define 	VMX_REGION_SIZE(reg_val)	((reg_val >> 32) & 0x01fff) /* 32:44 */
 #define 	VMX_WIDTH_ADDR(reg_val)		(reg_val >> 48 & 0x1) /* 48 */
 #define		VMXON_REGION_ALIGN_SIZE		4096ULL
-#define		VMXON_REGION_ALIGN(p)		(((unsigned long long)(p) + VMXON_REGION_ALIGN_SIZE) & ~(VMXON_REGION_ALIGN_SIZE - 1))
+#define		VMXON_REGION_ALIGN(p)		rounddown2((unsigned long long)(p) + VMXON_REGION_ALIGN_SIZE, VMXON_REGION_ALIGN_SIZE)
 
 
 

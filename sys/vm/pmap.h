@@ -13,11 +13,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -98,6 +94,27 @@ struct vmspace;
 struct vmspace_entry;
 struct vm_map_entry;
 
+struct pmap_pgscan_info {
+	struct pmap	*pmap;
+	vm_offset_t	beg_addr;
+	vm_offset_t	end_addr;
+	vm_offset_t	offset;
+	vm_pindex_t	limit;
+	vm_pindex_t	busycount;
+	vm_pindex_t	cleancount;
+	vm_pindex_t	actioncount;
+	int		(*callback)(struct pmap_pgscan_info *,
+				    vm_offset_t va,
+				    struct vm_page *);
+};
+
+typedef struct vm_phystable {
+	vm_paddr_t	phys_beg;
+	vm_paddr_t	phys_end;
+	uint32_t	flags;
+	uint32_t	affinity;
+} vm_phystable_t;
+
 /*
  * Most of these variables represent parameters set up by low level MD kernel
  * boot code to be used by higher level MI initialization code to identify
@@ -108,6 +125,10 @@ struct vm_map_entry;
  *			  might omit certain special mapping areas.  It is
  *			  used to determine what kernel memory userland has
  *			  access to.
+ *
+ * DMapMaxAddress	- Maximum virtual address for DMap (not physical addr).
+ *			  We do not allocate the entire space from
+ *			  DMAP_MIN_ADDRESS to DMAP_MAX_ADDRESS.
  *
  * virtual_{start,end}	- KVA space available for allocation, not including
  *			  KVA space reserved during MD startup.  Used by
@@ -120,11 +141,18 @@ struct vm_map_entry;
 extern vm_offset_t KvaStart;
 extern vm_offset_t KvaEnd;
 extern vm_offset_t KvaSize;
+extern vm_offset_t DMapMaxAddress;
 extern vm_offset_t virtual_start;
 extern vm_offset_t virtual_end;
 extern vm_offset_t virtual2_start;
 extern vm_offset_t virtual2_end;
-extern vm_paddr_t phys_avail[];	
+extern vm_phystable_t phys_avail[];
+extern vm_phystable_t dump_avail[];
+
+/*
+ * High-level pmap scan
+ */
+void pmap_pgscan(struct pmap_pgscan_info *info);
 
 /*
  * Return true if the passed address is in the kernel address space.
@@ -143,8 +171,7 @@ kva_p(const void *addr)
 #endif
 }
 
-void		 pmap_change_wiring (pmap_t, vm_offset_t, boolean_t,
-			vm_map_entry_t);
+vm_page_t	 pmap_unwire (pmap_t, vm_offset_t);
 void		 pmap_clear_modify (struct vm_page *m);
 void		 pmap_clear_reference (struct vm_page *m);
 void		 pmap_collect (void);
@@ -154,41 +181,45 @@ void		 pmap_copy_page (vm_paddr_t, vm_paddr_t);
 void		 pmap_copy_page_frag (vm_paddr_t, vm_paddr_t, size_t bytes);
 void		 pmap_enter (pmap_t, vm_offset_t, struct vm_page *,
 			vm_prot_t, boolean_t, struct vm_map_entry *);
-void		 pmap_enter_quick (pmap_t, vm_offset_t, struct vm_page *);
-vm_page_t	 pmap_fault_page_quick(pmap_t, vm_offset_t, vm_prot_t);
-vm_paddr_t	 pmap_extract (pmap_t pmap, vm_offset_t va);
+void		 pmap_maybethreaded(pmap_t);
+int		 pmap_mapped_sync(vm_page_t m);
+vm_page_t	 pmap_fault_page_quick(pmap_t, vm_offset_t, vm_prot_t, int *);
+vm_paddr_t	 pmap_extract (pmap_t pmap, vm_offset_t va, void **handlep);
+void		 pmap_extract_done (void *handle);
 void		 pmap_growkernel (vm_offset_t, vm_offset_t);
 void		 pmap_init (void);
 boolean_t	 pmap_is_modified (struct vm_page *m);
 int		 pmap_ts_referenced (struct vm_page *m);
 vm_offset_t	 pmap_map (vm_offset_t *, vm_paddr_t, vm_paddr_t, int);
-void		 pmap_object_init_pt (pmap_t pmap, vm_offset_t addr,
-		    vm_prot_t prot, vm_object_t object, vm_pindex_t pindex,
-		    vm_offset_t size, int pagelimit);
-boolean_t	 pmap_page_exists_quick (pmap_t pmap, struct vm_page *m);
+void		 pmap_object_init_pt (pmap_t pmap, struct vm_map_entry *entry,
+			vm_offset_t addr, vm_offset_t size, int pagelimit);
 void		 pmap_page_protect (struct vm_page *m, vm_prot_t prot);
 void		 pmap_page_init (struct vm_page *m);
+vm_paddr_t	 uservtophys(vm_offset_t va);
 vm_paddr_t	 pmap_phys_address (vm_pindex_t);
 void		 pmap_pinit (pmap_t);
 void		 pmap_puninit (pmap_t);
 void		 pmap_pinit0 (pmap_t);
 void		 pmap_pinit2 (pmap_t);
 void		 pmap_protect (pmap_t, vm_offset_t, vm_offset_t, vm_prot_t);
+void		 pmap_remove_specific (pmap_t, vm_page_t);
 void		 pmap_qenter (vm_offset_t, struct vm_page **, int);
+void		 pmap_qenter_noinval (vm_offset_t, struct vm_page **, int);
 void		 pmap_qremove (vm_offset_t, int);
+void		 pmap_qremove_quick (vm_offset_t, int);
+void		 pmap_qremove_noinval (vm_offset_t, int);
 void		 pmap_kenter (vm_offset_t, vm_paddr_t);
-void		 pmap_kenter_quick (vm_offset_t, vm_paddr_t);
-void		 pmap_kenter_sync (vm_offset_t);
-void		 pmap_kenter_sync_quick (vm_offset_t);
+int		 pmap_kenter_quick (vm_offset_t, vm_paddr_t);
+int		 pmap_kenter_noinval (vm_offset_t, vm_paddr_t);
 void		 pmap_kmodify_rw(vm_offset_t va);
 void		 pmap_kmodify_nc(vm_offset_t va);
 void		 pmap_kremove (vm_offset_t);
 void		 pmap_kremove_quick (vm_offset_t);
+void		 pmap_kremove_noinval (vm_offset_t);
 void		 pmap_reference (pmap_t);
 void		 pmap_remove (pmap_t, vm_offset_t, vm_offset_t);
 void		 pmap_remove_pages (pmap_t, vm_offset_t, vm_offset_t);
 void		 pmap_zero_page (vm_paddr_t);
-void		 pmap_page_assertzero (vm_paddr_t);
 void		 pmap_zero_page_area (vm_paddr_t, int off, int size);
 int		 pmap_prefault_ok (pmap_t, vm_offset_t);
 void		 pmap_change_attr(vm_offset_t va, vm_size_t count, int mode);
@@ -197,6 +228,8 @@ void		 pmap_init_proc (struct proc *);
 void		 pmap_init_thread (struct thread *td);
 void		 pmap_replacevm (struct proc *, struct vmspace *, int);
 void		 pmap_setlwpvm (struct lwp *, struct vmspace *);
+vm_paddr_t	 pmap_kextract(vm_offset_t);
+void		 pmap_invalidate_range(pmap_t, vm_offset_t, vm_offset_t);
 
 vm_offset_t	 pmap_addr_hint (vm_object_t obj, vm_offset_t addr, vm_size_t size);
 void		*pmap_kenter_temporary (vm_paddr_t pa, long i);
@@ -204,6 +237,8 @@ void		 pmap_init2 (void);
 struct vm_page	*pmap_kvtom(vm_offset_t va);
 void		 pmap_object_init(vm_object_t object);
 void		 pmap_object_free(vm_object_t object);
+void		 smap_smep_disable(void);
+void		 smap_smep_enable(void);
 
 
 #endif /* _KERNEL */

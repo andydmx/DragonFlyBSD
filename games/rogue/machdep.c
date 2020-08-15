@@ -76,7 +76,7 @@
  *      #endif
  *      }
  *
- * Appropriate variations of this are of course acceptible.
+ * Appropriate variations of this are of course acceptable.
  * The use of "#elseif" is discouraged because of non-portability.
  * If the correct #define doesn't exist, "UNIX_SYSV" in this case, make it up
  * and insert it in the list at the top of the file.  Alter the CFLAGS
@@ -88,9 +88,9 @@
 
 #include <stdio.h>
 #include <sys/types.h>
-#include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <fcntl.h>
 #include <pwd.h>
 #include <time.h>
 
@@ -217,9 +217,9 @@ md_control_keybord(boolean mode)
 void
 md_heed_signals(void)
 {
-	signal(SIGINT, (sig_t)onintr);
-	signal(SIGQUIT, (sig_t)byebye);
-	signal(SIGHUP, (sig_t)error_save);
+	signal(SIGINT, onintr);
+	signal(SIGQUIT, byebye);
+	signal(SIGHUP, error_save);
 }
 
 /* md_ignore_signals():

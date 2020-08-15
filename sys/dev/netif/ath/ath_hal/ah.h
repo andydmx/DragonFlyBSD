@@ -414,7 +414,7 @@ typedef enum {
 						/* Allow all mcast/bcast frames */
 
 	/*
-	 * Magic RX filter flags that aren't targetting hardware bits
+	 * Magic RX filter flags that aren't targeting hardware bits
 	 * but instead the HAL sets individual bits - eg PHYERR will result
 	 * in OFDM/CCK timing error frames being received.
 	 */
@@ -538,15 +538,16 @@ typedef enum {
 
 /* XXX this is duplicate information! */
 typedef struct {
-	u_int32_t	cyclecnt_diff;		/* delta cycle count */
-	u_int32_t	rxclr_cnt;		/* rx clear count */
-	u_int32_t	txframecnt_diff;	/* delta tx frame count */
-	u_int32_t	rxframecnt_diff;	/* delta rx frame count */
-	u_int32_t	listen_time;		/* listen time in msec - time for which ch is free */
-	u_int32_t	ofdmphyerr_cnt;		/* OFDM err count since last reset */
-	u_int32_t	cckphyerr_cnt;		/* CCK err count since last reset */
-	u_int32_t	ofdmphyerrcnt_diff;	/* delta OFDM Phy Error Count */
-	HAL_BOOL	valid;			/* if the stats are valid*/
+	u_int32_t       cyclecnt_diff;          /* delta cycle count */
+	u_int32_t       rxclr_cnt;              /* rx clear count */
+	u_int32_t       extrxclr_cnt;           /* ext chan rx clear count */
+	u_int32_t       txframecnt_diff;        /* delta tx frame count */
+	u_int32_t       rxframecnt_diff;        /* delta rx frame count */
+	u_int32_t       listen_time;            /* listen time in msec - time for which ch is free */
+	u_int32_t       ofdmphyerr_cnt;         /* OFDM err count since last reset */
+	u_int32_t       cckphyerr_cnt;          /* CCK err count since last reset */
+	u_int32_t       ofdmphyerrcnt_diff;     /* delta OFDM Phy Error Count */
+	HAL_BOOL        valid;                  /* if the stats are valid*/
 } HAL_ANISTATS;
 
 typedef struct {
@@ -752,6 +753,12 @@ typedef enum {
 	HAL_M_MONITOR	= 8			/* Monitor mode */
 } HAL_OPMODE;
 
+typedef enum {
+	HAL_RESET_NORMAL	= 0,		/* Do normal reset */
+	HAL_RESET_BBPANIC	= 1,		/* Reset because of BB panic */
+	HAL_RESET_FORCE_COLD	= 2,		/* Force full reset */
+} HAL_RESET_TYPE;
+
 typedef struct {
 	uint8_t		kv_type;		/* one of HAL_CIPHER */
 	uint8_t		kv_apsd;		/* Mask for APSD enabled ACs */
@@ -849,6 +856,48 @@ typedef struct {
 
 #define	HAL_RSSI_EP_MULTIPLIER	(1<<7)	/* pow2 to optimize out * and / */
 
+/*
+ * This is the ANI state and MIB stats.
+ *
+ * It's used by the HAL modules to keep state /and/ by the debug ioctl
+ * to fetch ANI information.
+ */
+typedef struct {
+	uint32_t        ast_ani_niup;   /* ANI increased noise immunity */
+	uint32_t        ast_ani_nidown; /* ANI decreased noise immunity */
+	uint32_t        ast_ani_spurup; /* ANI increased spur immunity */
+	uint32_t        ast_ani_spurdown;/* ANI descreased spur immunity */
+	uint32_t        ast_ani_ofdmon; /* ANI OFDM weak signal detect on */
+	uint32_t        ast_ani_ofdmoff;/* ANI OFDM weak signal detect off */
+	uint32_t        ast_ani_cckhigh;/* ANI CCK weak signal threshold high */
+	uint32_t        ast_ani_ccklow; /* ANI CCK weak signal threshold low */
+	uint32_t        ast_ani_stepup; /* ANI increased first step level */
+	uint32_t        ast_ani_stepdown;/* ANI decreased first step level */
+	uint32_t        ast_ani_ofdmerrs;/* ANI cumulative ofdm phy err count */
+	uint32_t        ast_ani_cckerrs;/* ANI cumulative cck phy err count */
+	uint32_t        ast_ani_reset;  /* ANI parameters zero'd for non-STA */
+	uint32_t        ast_ani_lzero;  /* ANI listen time forced to zero */
+	uint32_t        ast_ani_lneg;   /* ANI listen time calculated < 0 */
+	HAL_MIB_STATS   ast_mibstats;   /* MIB counter stats */
+	HAL_NODE_STATS  ast_nodestats;  /* Latest rssi stats from driver */
+} HAL_ANI_STATS;
+
+typedef struct {
+	uint8_t         noiseImmunityLevel;
+	uint8_t         spurImmunityLevel;
+	uint8_t         firstepLevel;
+	uint8_t         ofdmWeakSigDetectOff;
+	uint8_t         cckWeakSigThreshold;
+	uint32_t        listenTime;
+
+	/* NB: intentionally ordered so data exported to user space is first */
+	uint32_t        txFrameCount;   /* Last txFrameCount */
+	uint32_t        rxFrameCount;   /* Last rx Frame count */
+	uint32_t        cycleCount;     /* Last cycleCount
+					   (to detect wrap-around) */
+	uint32_t        ofdmPhyErrCount;/* OFDM err count since last reset */
+	uint32_t        cckPhyErrCount; /* CCK err count since last reset */
+} HAL_ANI_STATE;
 
 struct ath_desc;
 struct ath_tx_status;
@@ -1045,11 +1094,6 @@ typedef enum {
 	HAL_GEN_TIMER_TSF_ANY
 } HAL_GEN_TIMER_DOMAIN;
 
-typedef enum {
-	HAL_RESET_NONE = 0x0,
-	HAL_RESET_BBPANIC = 0x1,
-} HAL_RESET_TYPE;
-
 /*
  * BT Co-existence definitions
  */
@@ -1180,7 +1224,7 @@ typedef struct {
 	/*
 	 * slotted mode only. rx_clear and bt_ant decision
 	 * will be held the entire time that BT_ACTIVE is asserted,
-	 * otherwise the decision is made before every slot boundry.
+	 * otherwise the decision is made before every slot boundary.
 	 */
 	HAL_BOOL	bt_hold_rxclear;
 } HAL_BT_COEX_CONFIG;
@@ -1264,6 +1308,7 @@ typedef struct
 	int ath_hal_show_bb_panic;
 	int ath_hal_ant_ctrl_comm2g_switch_enable;
 	int ath_hal_ext_atten_margin_cfg;
+	int ath_hal_min_gainidx;
 	int ath_hal_war70c;
 	uint32_t ath_hal_mci_config;
 } HAL_OPS_CONFIG;
@@ -1310,7 +1355,9 @@ struct ath_hal {
 	/* Reset functions */
 	HAL_BOOL  __ahdecl(*ah_reset)(struct ath_hal *, HAL_OPMODE,
 				struct ieee80211_channel *,
-				HAL_BOOL bChannelChange, HAL_STATUS *status);
+				HAL_BOOL bChannelChange,
+				HAL_RESET_TYPE resetType,
+				HAL_STATUS *status);
 	HAL_BOOL  __ahdecl(*ah_phyDisable)(struct ath_hal *);
 	HAL_BOOL  __ahdecl(*ah_disable)(struct ath_hal *);
 	void	  __ahdecl(*ah_configPCIE)(struct ath_hal *, HAL_BOOL restore,
@@ -1588,6 +1635,18 @@ struct ath_hal {
 	void	    __ahdecl(*ah_btCoexDisable)(struct ath_hal *);
 	int	    __ahdecl(*ah_btCoexEnable)(struct ath_hal *);
 
+	/* Bluetooth MCI methods */
+	void	    __ahdecl(*ah_btMciSetup)(struct ath_hal *,
+				uint32_t, void *, uint16_t, uint32_t);
+	HAL_BOOL    __ahdecl(*ah_btMciSendMessage)(struct ath_hal *,
+				uint8_t, uint32_t, uint32_t *, uint8_t,
+				HAL_BOOL, HAL_BOOL);
+	uint32_t    __ahdecl(*ah_btMciGetInterrupt)(struct ath_hal *,
+				uint32_t *, uint32_t *);
+	uint32_t    __ahdecl(*ah_btMciGetState)(struct ath_hal *,
+				uint32_t, uint32_t *);
+	void	    __ahdecl(*ah_btMciDetach)(struct ath_hal *);
+
 	/* LNA diversity configuration */
 	void	    __ahdecl(*ah_divLnaConfGet)(struct ath_hal *,
 				HAL_ANT_COMB_CONFIG *);
@@ -1616,7 +1675,8 @@ extern	const char *__ahdecl ath_hal_probe(uint16_t vendorid, uint16_t devid);
  * be returned if the status parameter is non-zero.
  */
 extern	struct ath_hal * __ahdecl ath_hal_attach(uint16_t devid, HAL_SOFTC,
-		HAL_BUS_TAG, HAL_BUS_HANDLE, uint16_t *eepromdata, HAL_STATUS* status);
+		HAL_BUS_TAG, HAL_BUS_HANDLE, uint16_t *eepromdata,
+		HAL_OPS_CONFIG *ah_config, HAL_STATUS* status);
 
 extern	const char *ath_hal_mac_name(struct ath_hal *);
 extern	const char *ath_hal_rf_name(struct ath_hal *);

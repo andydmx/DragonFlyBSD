@@ -21,6 +21,12 @@ STOPDIR=	${.CURDIR}/${TOP_PREFIX}..
 
 TOOLDIR=	${OTOPDIR}/cc_tools/tools
 
+# for now do not let the use of -flto
+.if ${CFLAGS:M-flto}
+CFLAGS+=	-fno-lto
+LDFLAGS+=	-flto
+.endif
+
 .if defined(LOCAL_CONFIG)
 CFLAGS+=	-I${.CURDIR}
 CFLAGS+=	-I${.OBJDIR}
@@ -50,6 +56,17 @@ CFLAGS+=	-DPREFIX2=\"${USRDATA_PREFIX}/usr\"
 
 .if ${TARGET_ARCH} != ${MACHINE_ARCH}
 CFLAGS+= -DCROSS_COMPILE
+.endif
+
+# when building with newer GCCs it creates just too much noise
+.if ${CCVER:Mgcc*} && !${CCVER:Mgcc4[789]}
+CWARNFLAGS+=	-Wno-switch-bool
+.endif
+
+# only gcc 4.8 and later has support for -Og
+.if defined(WORLD_CCOPTLEVEL) && ${WORLD_CCOPTLEVEL:Mg} && ${CCVER:Mgcc47}
+WORLD_CCOPTLEVEL:=	1
+.MAKEFLAGS: WORLD_CCOPTLEVEL=1
 .endif
 
 .if defined(GCC_LANG_DIR)

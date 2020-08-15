@@ -434,7 +434,7 @@ ng_iface_output(struct ifnet *ifp, struct mbuf *m,
 	ng_iface_bpftap(ifp, m, dst->sa_family);
 
 	if (ifq_is_enabled(&ifp->if_snd)) {
-		M_PREPEND(m, sizeof(sa_family_t), MB_DONTWAIT);
+		M_PREPEND(m, sizeof(sa_family_t), M_NOWAIT);
 		if (m == NULL) {
 			IFNET_STAT_INC(ifp, oerrors, 1);
 			return (ENOBUFS);
@@ -818,6 +818,7 @@ ng_iface_rcvdata(hook_p hook, item_p item)
 	if (harvest.point_to_point)
 		random_harvest(m, 16, 3, 0, RANDOM_NET);
 #endif
+	m->m_flags &= ~M_HASH;
 	netisr_queue(isr, m);
 	return (0);
 }

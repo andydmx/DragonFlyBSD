@@ -136,7 +136,7 @@ prepdisk()
     fdisk -IB ${disk} >> ${logfile} 2>&1
     ckstatus $? "fdisk"
 
-    disklabel -r -w ${disk}s1 auto >> ${logfile} 2>&1
+    disklabel -r -w ${disk}s1 >> ${logfile} 2>&1
     ckstatus $? "disklabel"
 
     if [ ! "${bootdisk}" = "" ]; then
@@ -276,7 +276,7 @@ sleep 1
 mklabel ccd0 root
 
 # Format the volumes
-echo "* Formating ccd0"
+echo "* Formatting ccd0"
 newfs /dev/${bootdisk}s1a >> ${logfile} 2>&1
 ccdexit $?
 

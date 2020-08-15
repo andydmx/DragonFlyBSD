@@ -26,28 +26,49 @@
 .\" SUCH DAMAGE.
 .\"
 .\"	@(#)bcd.6	8.1 (Berkeley) 5/31/93
-.\" $FreeBSD: src/games/bcd/bcd.6,v 1.7.2.4 2001/03/05 18:10:20 ru Exp $
-.\" $DragonFly: src/games/bcd/bcd.6,v 1.2 2003/06/17 04:25:23 dillon Exp $
+.\" $OpenBSD: bcd.6,v 1.21 2014/11/20 01:35:47 schwarze Exp $
 .\"
-.Dd December 7, 2000
+.Dd September 6, 2016
 .Dt BCD 6
 .Os
 .Sh NAME
-.Nm bcd ,
-.Nm ppt
-.Nd "reformat input as punch cards or paper tape"
+.Nm bcd
+.Nd reformat input as punch cards
 .Sh SYNOPSIS
 .Nm
+.Op Fl l
 .Op Ar string ...
-.Nm ppt
-.Op Ar string ...
-.Sh DESCRIPTION
-The commands
 .Nm
-and
-.Nm ppt
-read the given input and reformat it in the form of punched cards or
-paper tape.
+.Fl d
+.Op Fl l
+.Sh DESCRIPTION
+The
+.Nm
+command reads the given input and reformats it in the form of punched cards.
 Acceptable input are command line arguments or the standard input.
+.Pp
+The options are as follows:
+.Bl -tag -width Ds
+.It Fl d
+Decode punch cards on the standard input back to ASCII.
+.It Fl l
+Create or decode 80 column punch cards.
+The default is 48 columns.
+.El
 .Sh SEE ALSO
-.Xr morse 6
+.Xr ppt 6
+.Sh STANDARDS
+.Rs
+.%I ISO 1681:1973
+.%R "Information processing--Unpunched paper cards--Specification"
+.Re
+.Pp
+.Rs
+.%I ISO 1682:1973
+.%R "Information processing--80 columns punched paper cards--Dimensions and location of rectangular punched holes"
+.Re
+.Sh HISTORY
+The
+.Nm
+command first appeared in
+.Bx 3 .

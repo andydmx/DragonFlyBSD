@@ -1,5 +1,6 @@
 /*
- * Copyright (c) 2003,2004,2009 The DragonFly Project.  All rights reserved.
+ * Copyright (c) 2003-2006,2009-2019 The DragonFly Project.
+ * All rights reserved.
  * 
  * This code is derived from software contributed to The DragonFly Project
  * by Matthew Dillon <dillon@backplane.com>
@@ -82,12 +83,16 @@
 
 extern int lwkt_sched_debug;
 
-#ifndef LWKT_NUM_POOL_TOKENS
-#define LWKT_NUM_POOL_TOKENS	4001	/* prime number */
-#endif
+#define LWKT_POOL_TOKENS	16384		/* must be power of 2 */
+#define LWKT_POOL_MASK		(LWKT_POOL_TOKENS - 1)
 
-static lwkt_token	pool_tokens[LWKT_NUM_POOL_TOKENS];
-struct spinlock		tok_debug_spin = SPINLOCK_INITIALIZER(&tok_debug_spin, "tok_debug_spin");
+struct lwkt_pool_token {
+	struct lwkt_token	token;
+} __cachealign;
+
+static struct lwkt_pool_token	pool_tokens[LWKT_POOL_TOKENS];
+struct spinlock tok_debug_spin = SPINLOCK_INITIALIZER(&tok_debug_spin,
+						      "tok_debug_spin");
 
 #define TOKEN_STRING	"REF=%p TOK=%p TD=%p"
 #define TOKEN_ARGS	lwkt_tokref_t ref, lwkt_token_t tok, struct thread *td
@@ -136,14 +141,22 @@ struct lwkt_token kvm_token = LWKT_TOKEN_INITIALIZER(kvm_token);
 struct lwkt_token sigio_token = LWKT_TOKEN_INITIALIZER(sigio_token);
 struct lwkt_token tty_token = LWKT_TOKEN_INITIALIZER(tty_token);
 struct lwkt_token vnode_token = LWKT_TOKEN_INITIALIZER(vnode_token);
-struct lwkt_token ifnet_token = LWKT_TOKEN_INITIALIZER(ifnet_token);
+struct lwkt_token vga_token = LWKT_TOKEN_INITIALIZER(vga_token);
+struct lwkt_token kbd_token = LWKT_TOKEN_INITIALIZER(kbd_token);
 
-static int lwkt_token_spin = 5;
-SYSCTL_INT(_lwkt, OID_AUTO, token_spin, CTLFLAG_RW,
-    &lwkt_token_spin, 0, "Decontention spin loops");
-static int lwkt_token_delay = 0;
-SYSCTL_INT(_lwkt, OID_AUTO, token_delay, CTLFLAG_RW,
-    &lwkt_token_delay, 0, "Decontention spin delay in ns");
+/*
+ * Exponential backoff (exclusive tokens) and TSC windowing (shared tokens)
+ * parameters.  Remember that tokens backoff to the scheduler.  This is a bit
+ * of trade-off.  Smaller values like 128 work better in some situations,
+ * but under extreme loads larger values like 4096 seem to provide the most
+ * determinism.
+ */
+static int token_backoff_max __cachealign = 4096;
+SYSCTL_INT(_lwkt, OID_AUTO, token_backoff_max, CTLFLAG_RW,
+    &token_backoff_max, 0, "Tokens exponential backoff");
+static int token_window_shift __cachealign = 8;
+SYSCTL_INT(_lwkt, OID_AUTO, token_window_shift, CTLFLAG_RW,
+    &token_window_shift, 0, "Tokens TSC windowing shift");
 
 /*
  * The collision count is bumped every time the LWKT scheduler fails
@@ -173,17 +186,6 @@ int tokens_debug_output;
 SYSCTL_INT(_lwkt, OID_AUTO, tokens_debug_output, CTLFLAG_RW,
     &tokens_debug_output, 0, "Generate stack trace N times");
 
-
-#ifdef DEBUG_LOCKS_LATENCY
-
-static long tokens_add_latency;
-SYSCTL_LONG(_debug, OID_AUTO, tokens_add_latency, CTLFLAG_RW,
-	    &tokens_add_latency, 0,
-	    "Add spinlock latency");
-
-#endif
-
-
 static int _lwkt_getalltokens_sorted(thread_t td);
 
 /*
@@ -203,14 +205,21 @@ cpu_get_initial_mplock(void)
  * Return a pool token given an address.  Use a prime number to reduce
  * overlaps.
  */
+#define POOL_HASH_PRIME1	66555444443333333ULL
+#define POOL_HASH_PRIME2	989042931893ULL
+
 static __inline
 lwkt_token_t
 _lwkt_token_pool_lookup(void *ptr)
 {
-	u_int i;
+	uintptr_t hash1;
+	uintptr_t hash2;
 
-	i = (u_int)(uintptr_t)ptr % LWKT_NUM_POOL_TOKENS;
-	return(&pool_tokens[i]);
+	hash1 = (uintptr_t)ptr + ((uintptr_t)ptr >> 18);
+	hash1 %= POOL_HASH_PRIME1;
+	hash2 = ((uintptr_t)ptr >> 8) + ((uintptr_t)ptr >> 24);
+	hash2 %= POOL_HASH_PRIME2;
+	return (&pool_tokens[(hash1 ^ hash2) & LWKT_POOL_MASK].token);
 }
 
 /*
@@ -255,8 +264,9 @@ _lwkt_trytokref(lwkt_tokref_t ref, thread_t td, long mode)
 		/*
 		 * Attempt to get an exclusive token
 		 */
+		count = tok->t_count;
+
 		for (;;) {
-			count = tok->t_count;
 			oref = tok->t_ref;	/* can be NULL */
 			cpu_ccfence();
 			if ((count & ~TOK_EXCLREQ) == 0) {
@@ -265,9 +275,9 @@ _lwkt_trytokref(lwkt_tokref_t ref, thread_t td, long mode)
 				 * We must clear TOK_EXCLREQ on successful
 				 * acquisition.
 				 */
-				if (atomic_cmpset_long(&tok->t_count, count,
-						       (count & ~TOK_EXCLREQ) |
-						       TOK_EXCLUSIVE)) {
+				if (atomic_fcmpset_long(&tok->t_count, &count,
+							(count & ~TOK_EXCLREQ) |
+							TOK_EXCLUSIVE)) {
 					KKASSERT(tok->t_ref == NULL);
 					tok->t_ref = ref;
 					return TRUE;
@@ -280,7 +290,9 @@ _lwkt_trytokref(lwkt_tokref_t ref, thread_t td, long mode)
 				 * Our thread already holds the exclusive
 				 * bit, we treat this tokref as a shared
 				 * token (sorta) to make the token release
-				 * code easier.
+				 * code easier.  Treating this as a shared
+				 * token allows us to simply increment the
+				 * count field.
 				 *
 				 * NOTE: oref cannot race above if it
 				 *	 happens to be ours, so we're good.
@@ -322,20 +334,30 @@ _lwkt_trytokref(lwkt_tokref_t ref, thread_t td, long mode)
 		 * Attempt to get a shared token.  Note that TOK_EXCLREQ
 		 * for shared tokens simply means the caller intends to
 		 * block.  We never actually set the bit in tok->t_count.
+		 *
+		 * Due to the token's no-deadlock guarantee, and complications
+		 * created by the sorted reacquisition code, we can only
+		 * give exclusive requests priority over shared requests
+		 * in situations where the thread holds only one token.
 		 */
+		count = tok->t_count;
+
 		for (;;) {
-			count = tok->t_count;
 			oref = tok->t_ref;	/* can be NULL */
 			cpu_ccfence();
-			if ((count & (TOK_EXCLUSIVE/*|TOK_EXCLREQ*/)) == 0) {
-				/* XXX EXCLREQ should work */
+			if ((count & (TOK_EXCLUSIVE|mode)) == 0 ||
+			    ((count & TOK_EXCLUSIVE) == 0 &&
+			    td->td_toks_stop != &td->td_toks_base + 1)
+			) {
 				/*
-				 * It is possible to get the token shared.
+				 * It may be possible to get the token shared.
 				 */
-				if (atomic_cmpset_long(&tok->t_count, count,
-						       count + TOK_INCR)) {
+				if ((atomic_fetchadd_long(&tok->t_count, TOK_INCR) & TOK_EXCLUSIVE) == 0) {
 					return TRUE;
 				}
+				count = atomic_fetchadd_long(&tok->t_count,
+							     -TOK_INCR);
+				count -= TOK_INCR;
 				/* retry */
 			} else if ((count & TOK_EXCLUSIVE) &&
 				   oref >= &td->td_toks_base &&
@@ -361,35 +383,52 @@ static __inline
 int
 _lwkt_trytokref_spin(lwkt_tokref_t ref, thread_t td, long mode)
 {
-	int spin;
-
-	if (_lwkt_trytokref(ref, td, mode)) {
-#ifdef DEBUG_LOCKS_LATENCY
-		long j;
-		for (j = tokens_add_latency; j > 0; --j)
-			cpu_ccfence();
-#endif
+	if (_lwkt_trytokref(ref, td, mode))
 		return TRUE;
-	}
-	for (spin = lwkt_token_spin; spin > 0; --spin) {
-		if (lwkt_token_delay)
-			tsc_delay(lwkt_token_delay);
-		else
-			cpu_pause();
-		if (_lwkt_trytokref(ref, td, mode)) {
-#ifdef DEBUG_LOCKS_LATENCY
-			long j;
-			for (j = tokens_add_latency; j > 0; --j)
-				cpu_ccfence();
-#endif
-			return TRUE;
+
+	if (mode & TOK_EXCLUSIVE) {
+		/*
+		 * Contested exclusive token, use exponential backoff
+		 * algorithm.
+		 */
+		long expbackoff;
+		long loop;
+
+		expbackoff = 0;
+		while (expbackoff < 6 + token_backoff_max) {
+			expbackoff = (expbackoff + 1) * 3 / 2;
+			if ((rdtsc() >> token_window_shift) % ncpus != mycpuid)  {
+				for (loop = expbackoff; loop; --loop)
+					cpu_pause();
+			}
+			if (_lwkt_trytokref(ref, td, mode))
+				return TRUE;
 		}
+	} else {
+		/*
+		 * Contested shared token, use TSC windowing.  Note that
+		 * exclusive tokens have priority over shared tokens only
+		 * for the first token.
+		 */
+		if ((rdtsc() >> token_window_shift) % ncpus == mycpuid) {
+			if (_lwkt_trytokref(ref, td, mode & ~TOK_EXCLREQ))
+				return TRUE;
+		} else {
+			if (_lwkt_trytokref(ref, td, mode))
+				return TRUE;
+		}
+
 	}
+	++mycpu->gd_cnt.v_lock_colls;
+
 	return FALSE;
 }
 
 /*
  * Release a token that we hold.
+ *
+ * Since tokens are polled, we don't have to deal with wakeups and releasing
+ * is really easy.
  */
 static __inline
 void
@@ -399,36 +438,24 @@ _lwkt_reltokref(lwkt_tokref_t ref, thread_t td)
 	long count;
 
 	tok = ref->tr_tok;
-	for (;;) {
-		count = tok->t_count;
-		cpu_ccfence();
-		if (tok->t_ref == ref) {
-			/*
-			 * We are an exclusive holder.  We must clear tr_ref
-			 * before we clear the TOK_EXCLUSIVE bit.  If we are
-			 * unable to clear the bit we must restore
-			 * tok->t_ref.
-			 */
-			KKASSERT(count & TOK_EXCLUSIVE);
-			tok->t_ref = NULL;
-			if (atomic_cmpset_long(&tok->t_count, count,
-					       count & ~TOK_EXCLUSIVE)) {
-				return;
-			}
-			tok->t_ref = ref;
-			/* retry */
-		} else {
-			/*
-			 * We are a shared holder
-			 */
-			KKASSERT(count & TOK_COUNTMASK);
-			if (atomic_cmpset_long(&tok->t_count, count,
-					       count - TOK_INCR)) {
-				return;
-			}
-			/* retry */
-		}
-		/* retry */
+	if (tok->t_ref == ref) {
+		/*
+		 * We are an exclusive holder.  We must clear tr_ref
+		 * before we clear the TOK_EXCLUSIVE bit.  If we are
+		 * unable to clear the bit we must restore
+		 * tok->t_ref.
+		 */
+#if 0
+		KKASSERT(count & TOK_EXCLUSIVE);
+#endif
+		tok->t_ref = NULL;
+		atomic_clear_long(&tok->t_count, TOK_EXCLUSIVE);
+	} else {
+		/*
+		 * We are a shared holder
+		 */
+		count = atomic_fetchadd_long(&tok->t_count, -TOK_INCR);
+		KKASSERT(count & TOK_COUNTMASK);	/* count prior */
 	}
 }
 
@@ -478,10 +505,10 @@ lwkt_getalltokens(thread_t td, int spinning)
 			 */
 			KASSERT(tok->t_desc,
 				("token %p is not initialized", tok));
-			strncpy(td->td_gd->gd_cnt.v_lock_name,
+			td->td_gd->gd_cnt.v_lock_name[0] = 't';
+			strncpy(td->td_gd->gd_cnt.v_lock_name + 1,
 				tok->t_desc,
-				sizeof(td->td_gd->gd_cnt.v_lock_name) - 1);
-
+				sizeof(td->td_gd->gd_cnt.v_lock_name) - 2);
 			if (lwkt_sched_debug > 0) {
 				--lwkt_sched_debug;
 				kprintf("toka %p %s %s\n",
@@ -550,6 +577,9 @@ _lwkt_getalltokens_sorted(thread_t td)
 	 *
 	 * NOTE: Recursively acquired tokens are ordered the same as in the
 	 *	 td_toks_array so we can always get the earliest one first.
+	 *	 This is particularly important when a token is acquired
+	 *	 exclusively multiple times, as only the first acquisition
+	 *	 is treated as an exclusive token.
 	 */
 	i = 0;
 	scan = &td->td_toks_base;
@@ -590,6 +620,10 @@ _lwkt_getalltokens_sorted(thread_t td)
 			 * Otherwise we failed to acquire all the tokens.
 			 * Release whatever we did get.
 			 */
+			td->td_gd->gd_cnt.v_lock_name[0] = 't';
+			strncpy(td->td_gd->gd_cnt.v_lock_name + 1,
+				tok->t_desc,
+				sizeof(td->td_gd->gd_cnt.v_lock_name) - 2);
 			if (lwkt_sched_debug > 0) {
 				--lwkt_sched_debug;
 				kprintf("tokb %p %s %s\n",
@@ -669,13 +703,14 @@ good:
 	if (tokens_debug_output > 0) {
 		--tokens_debug_output;
 		spin_lock(&tok_debug_spin);
-		kprintf("Excl Token thread %p %s %s\n",
-			td, tok->t_desc, td->td_comm);
+		kprintf("Excl Token %p thread %p %s %s\n",
+			tok, td, tok->t_desc, td->td_comm);
 		print_backtrace(6);
 		kprintf("\n");
 		spin_unlock(&tok_debug_spin);
 	}
 
+	atomic_set_int(&td->td_mpflags, TDF_MP_DIDYIELD);
 	lwkt_switch();
 	logtoken(succ, ref);
 	KKASSERT(tok->t_ref == ref);
@@ -698,15 +733,15 @@ lwkt_gettoken_shared(lwkt_token_t tok)
 	_lwkt_tokref_init(ref, tok, td, TOK_EXCLREQ);
 
 #ifdef DEBUG_LOCKS
-        /*
-         * Taking a pool token in shared mode is a bad idea; other
-         * addresses deeper in the call stack may hash to the same pool
-         * token and you may end up with an exclusive-shared livelock.
-         * Warn in this condition.
-         */
-        if ((tok >= &pool_tokens[0]) &&
-            (tok < &pool_tokens[LWKT_NUM_POOL_TOKENS]))
-                kprintf("Warning! Taking pool token %p in shared mode\n", tok);
+	/*
+	 * Taking a pool token in shared mode is a bad idea; other
+	 * addresses deeper in the call stack may hash to the same pool
+	 * token and you may end up with an exclusive-shared livelock.
+	 * Warn in this condition.
+	 */
+	if ((tok >= &pool_tokens[0].token) &&
+	    (tok < &pool_tokens[LWKT_POOL_TOKENS].token))
+		kprintf("Warning! Taking pool token %p in shared mode\n", tok);
 #endif
 
 
@@ -732,13 +767,14 @@ lwkt_gettoken_shared(lwkt_token_t tok)
 	if (tokens_debug_output > 0) {
 		--tokens_debug_output;
 		spin_lock(&tok_debug_spin);
-		kprintf("Shar Token thread %p %s %s\n",
-			td, tok->t_desc, td->td_comm);
+		kprintf("Shar Token %p thread %p %s %s\n",
+			tok, td, tok->t_desc, td->td_comm);
 		print_backtrace(6);
 		kprintf("\n");
 		spin_unlock(&tok_debug_spin);
 	}
 
+	atomic_set_int(&td->td_mpflags, TDF_MP_DIDYIELD);
 	lwkt_switch();
 	logtoken(succ, ref);
 }
@@ -774,14 +810,6 @@ lwkt_trytoken(lwkt_token_t tok)
 	return FALSE;
 }
 
-
-void
-lwkt_gettoken_hard(lwkt_token_t tok)
-{
-	lwkt_gettoken(tok);
-	crit_enter_hard();
-}
-
 lwkt_token_t
 lwkt_getpooltoken(void *ptr)
 {
@@ -809,17 +837,22 @@ lwkt_reltoken(lwkt_token_t tok)
 	 * the token passed in.  Tokens must be released in reverse order.
 	 */
 	ref = td->td_toks_stop - 1;
-	KKASSERT(ref >= &td->td_toks_base && ref->tr_tok == tok);
+	if (__predict_false(ref < &td->td_toks_base || ref->tr_tok != tok)) {
+		kprintf("LWKT_RELTOKEN ASSERTION td %p tok %p ref %p/%p\n",
+			td, tok, &td->td_toks_base, ref);
+		kprintf("REF CONTENT: tok=%p count=%016lx owner=%p\n",
+			ref->tr_tok, ref->tr_count, ref->tr_owner);
+		if (ref < &td->td_toks_base) {
+			kprintf("lwkt_reltoken: no tokens to release\n");
+		} else {
+			kprintf("lwkt_reltoken: release wants %s and got %s\n",
+				tok->t_desc, ref->tr_tok->t_desc);
+		}
+		panic("lwkt_reltoken: illegal release");
+	}
 	_lwkt_reltokref(ref, td);
 	cpu_sfence();
 	td->td_toks_stop = ref;
-}
-
-void
-lwkt_reltoken_hard(lwkt_token_t tok)
-{
-	lwkt_reltoken(tok);
-	crit_exit_hard();
 }
 
 /*
@@ -863,8 +896,8 @@ lwkt_token_pool_init(void)
 {
 	int i;
 
-	for (i = 0; i < LWKT_NUM_POOL_TOKENS; ++i)
-		lwkt_token_init(&pool_tokens[i], "pool");
+	for (i = 0; i < LWKT_POOL_TOKENS; ++i)
+		lwkt_token_init(&pool_tokens[i].token, "pool");
 }
 
 lwkt_token_t

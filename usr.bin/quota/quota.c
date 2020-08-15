@@ -40,7 +40,6 @@
 
 #include <sys/param.h>
 #include <sys/types.h>
-#include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/mount.h>
 #include <sys/socket.h>
@@ -52,6 +51,7 @@
 #include <vfs/ufs/quota.h>
 
 #include <ctype.h>
+#include <fcntl.h>
 #include <err.h>
 #include <fstab.h>
 #include <grp.h>
@@ -584,13 +584,6 @@ getnfsquota(struct statfs *fst, struct quotause *qup, long id, int quotatype)
  
 	*cp = '\0';
 	if (*(cp+1) != '/') {
-		*cp = ':';
-		return (0);
-	}
-
-	/* Avoid attempting the RPC for special amd(8) filesystems. */
-	if (strncmp(fst->f_mntfromname, "pid", 3) == 0 &&
-	    strchr(fst->f_mntfromname, '@') != NULL) {
 		*cp = ':';
 		return (0);
 	}

@@ -2,15 +2,15 @@
 
 /*
  * Copyright (c) 2006 The DragonFly Project.  All rights reserved.
- * 
+ *
  * This code is derived from software contributed to The DragonFly Project
  * by Sepherosa Ziehau <sepherosa@gmail.com> and
  * Matthew Dillon <dillon@apollo.backplane.com>
- * 
+ *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
  * are met:
- * 
+ *
  * 1. Redistributions of source code must retain the above copyright
  *    notice, this list of conditions and the following disclaimer.
  * 2. Redistributions in binary form must reproduce the above copyright
@@ -20,7 +20,7 @@
  * 3. Neither the name of The DragonFly Project nor the names of its
  *    contributors may be used to endorse or promote products derived
  *    from this software without specific, prior written permission.
- * 
+ *
  * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
  * ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
  * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
@@ -59,6 +59,7 @@
 #include <sys/param.h>
 #include <sys/endian.h>
 #include <sys/kernel.h>
+#include <sys/malloc.h>
 #include <sys/bus.h>
 #include <sys/interrupt.h>
 #include <sys/proc.h>
@@ -460,6 +461,8 @@ nfe_attach(device_t dev)
 {
 	struct nfe_softc *sc = device_get_softc(dev);
 	struct ifnet *ifp = &sc->arpcom.ac_if;
+	struct sysctl_ctx_list *ctx;
+	struct sysctl_oid *tree;
 	uint8_t eaddr[ETHER_ADDR_LEN];
 	bus_addr_t lowaddr;
 	int error;
@@ -577,33 +580,20 @@ nfe_attach(device_t dev)
 	/*
 	 * Create sysctl tree
 	 */
-	sysctl_ctx_init(&sc->sc_sysctl_ctx);
-	sc->sc_sysctl_tree = SYSCTL_ADD_NODE(&sc->sc_sysctl_ctx,
-					     SYSCTL_STATIC_CHILDREN(_hw),
-					     OID_AUTO,
-					     device_get_nameunit(dev),
-					     CTLFLAG_RD, 0, "");
-	if (sc->sc_sysctl_tree == NULL) {
-		device_printf(dev, "can't add sysctl node\n");
-		error = ENXIO;
-		goto fail;
-	}
-	SYSCTL_ADD_PROC(&sc->sc_sysctl_ctx,
-			SYSCTL_CHILDREN(sc->sc_sysctl_tree),
+	ctx = device_get_sysctl_ctx(dev);
+	tree = device_get_sysctl_tree(dev);
+	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree),
 			OID_AUTO, "imtimer", CTLTYPE_INT | CTLFLAG_RW,
 			sc, 0, nfe_sysctl_imtime, "I",
 			"Interrupt moderation time (usec).  "
 			"0 to disable interrupt moderation.");
-	SYSCTL_ADD_INT(&sc->sc_sysctl_ctx,
-		       SYSCTL_CHILDREN(sc->sc_sysctl_tree), OID_AUTO,
+	SYSCTL_ADD_INT(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
 		       "rx_ring_count", CTLFLAG_RD, &sc->sc_rx_ring_count,
 		       0, "RX ring count");
-	SYSCTL_ADD_INT(&sc->sc_sysctl_ctx,
-		       SYSCTL_CHILDREN(sc->sc_sysctl_tree), OID_AUTO,
+	SYSCTL_ADD_INT(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
 		       "tx_ring_count", CTLFLAG_RD, &sc->sc_tx_ring_count,
 		       0, "TX ring count");
-	SYSCTL_ADD_INT(&sc->sc_sysctl_ctx,
-		       SYSCTL_CHILDREN(sc->sc_sysctl_tree), OID_AUTO,
+	SYSCTL_ADD_INT(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
 		       "debug", CTLFLAG_RW, &sc->sc_debug,
 		       0, "control debugging printfs");
 
@@ -624,6 +614,7 @@ nfe_attach(device_t dev)
 #endif
 	ifp->if_watchdog = nfe_watchdog;
 	ifp->if_init = nfe_init;
+	ifp->if_nmbclusters = sc->sc_rx_ring_count;
 	ifq_set_maxlen(&ifp->if_snd, sc->sc_tx_ring_count);
 	ifq_set_ready(&ifp->if_snd);
 
@@ -649,9 +640,8 @@ nfe_attach(device_t dev)
 	ifq_set_cpuid(&ifp->if_snd, rman_get_cpuid(sc->sc_irq_res));
 
 #ifdef IFPOLL_ENABLE
-	ifpoll_compat_setup(&sc->sc_npoll,
-	    &sc->sc_sysctl_ctx, sc->sc_sysctl_tree, device_get_unit(dev),
-	    ifp->if_serializer);
+	ifpoll_compat_setup(&sc->sc_npoll, ctx, (struct sysctl_oid *)tree,
+	    device_get_unit(dev), ifp->if_serializer);
 #endif
 
 	error = bus_setup_intr(dev, sc->sc_irq_res, INTR_MPSAFE, nfe_intr, sc,
@@ -687,9 +677,6 @@ nfe_detach(device_t dev)
 	if (sc->sc_miibus != NULL)
 		device_delete_child(dev, sc->sc_miibus);
 	bus_generic_detach(dev);
-
-	if (sc->sc_sysctl_tree != NULL)
-		sysctl_ctx_free(&sc->sc_sysctl_ctx);
 
 	if (sc->sc_irq_res != NULL) {
 		bus_release_resource(dev, SYS_RES_IRQ, sc->sc_irq_rid,
@@ -1189,8 +1176,8 @@ nfe_txeof(struct nfe_softc *sc, int start)
 				goto skip;
 
 			if ((flags & NFE_TX_ERROR_V1) != 0) {
-				if_printf(ifp, "tx v1 error 0x%4b\n", flags,
-					  NFE_V1_TXERR);
+				if_printf(ifp, "tx v1 error 0x%pb%i\n",
+					  NFE_V1_TXERR, flags);
 				IFNET_STAT_INC(ifp, oerrors, 1);
 			} else {
 				IFNET_STAT_INC(ifp, opackets, 1);
@@ -1200,8 +1187,8 @@ nfe_txeof(struct nfe_softc *sc, int start)
 				goto skip;
 
 			if ((flags & NFE_TX_ERROR_V2) != 0) {
-				if_printf(ifp, "tx v2 error 0x%4b\n", flags,
-					  NFE_V2_TXERR);
+				if_printf(ifp, "tx v2 error 0x%pb%i\n",
+					  NFE_V2_TXERR, flags);
 				IFNET_STAT_INC(ifp, oerrors, 1);
 			} else {
 				IFNET_STAT_INC(ifp, opackets, 1);
@@ -1282,7 +1269,7 @@ nfe_encap(struct nfe_softc *sc, struct nfe_tx_ring *ring, struct mbuf *m0)
 	}
 
 	/*
-	 * XXX urm. somebody is unaware of how hardware works.  You 
+	 * XXX urm. somebody is unaware of how hardware works.  You
 	 * absolutely CANNOT set NFE_TX_VALID on the next descriptor in
 	 * the ring until the entire chain is actually *VALID*.  Otherwise
 	 * the hardware may encounter a partially initialized chain that
@@ -2217,7 +2204,7 @@ nfe_newbuf_std(struct nfe_softc *sc, struct nfe_rx_ring *ring, int idx,
 	struct mbuf *m;
 	int nsegs, error;
 
-	m = m_getcl(wait ? MB_WAIT : MB_DONTWAIT, MT_DATA, M_PKTHDR);
+	m = m_getcl(wait ? M_WAITOK : M_NOWAIT, MT_DATA, M_PKTHDR);
 	if (m == NULL)
 		return ENOBUFS;
 	m->m_len = m->m_pkthdr.len = MCLBYTES;
@@ -2266,7 +2253,7 @@ nfe_newbuf_jumbo(struct nfe_softc *sc, struct nfe_rx_ring *ring, int idx,
 	struct nfe_jbuf *jbuf;
 	struct mbuf *m;
 
-	MGETHDR(m, wait ? MB_WAIT : MB_DONTWAIT, MT_DATA);
+	MGETHDR(m, wait ? M_WAITOK : M_NOWAIT, MT_DATA);
 	if (m == NULL)
 		return ENOBUFS;
 

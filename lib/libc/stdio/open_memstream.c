@@ -1,5 +1,6 @@
 /*-
- * Copyright (c) 2011 Venkatesh Srinivas, 
+ * Copyright (c) 2013 Hudson River Trading LLC
+ * Written by: John H. Baldwin <jhb@FreeBSD.org>
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -22,139 +23,186 @@
  * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
  * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
+ *
+ * $FreeBSD: head/lib/libc/stdio/open_memstream.c 281887 2015-04-23 14:22:20Z jhb $
  */
 
+#include "namespace.h"
+#include <assert.h>
+#include <errno.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <strings.h>
-#include <errno.h>
+#include <string.h>
+#include <wchar.h>
+#include "un-namespace.h"
 
-struct memstream_cookie {
-	char **pub_buf;
-	size_t *pub_size;
+/* XXX: There is no FPOS_MAX.  This assumes fpos_t is an off_t. */
+#define	FPOS_MAX	OFF_MAX
 
-	char *head;
-	size_t pos;
-	size_t tail;
+struct memstream {
+	char **bufp;
+	size_t *sizep;
+	ssize_t len;
+	fpos_t offset;
 };
 
-static void
-sync_pub_cookie(struct memstream_cookie *cp)
+static int
+memstream_grow(struct memstream *ms, fpos_t newoff)
 {
-	*cp->pub_buf = cp->head;
-	*cp->pub_size = cp->tail; 
+	char *buf;
+	ssize_t newsize;
+
+	if (newoff < 0 || newoff >= SSIZE_MAX)
+		newsize = SSIZE_MAX - 1;
+	else
+		newsize = newoff;
+	if (newsize > ms->len) {
+		buf = realloc(*ms->bufp, newsize + 1);
+		if (buf != NULL) {
+#ifdef DEBUG
+			fprintf(stderr, "MS: %p growing from %zd to %zd\n",
+			    ms, ms->len, newsize);
+#endif
+			memset(buf + ms->len + 1, 0, newsize - ms->len);
+			*ms->bufp = buf;
+			ms->len = newsize;
+			return (1);
+		}
+		return (0);
+	}
+	return (1);
+}
+
+static void
+memstream_update(struct memstream *ms)
+{
+
+	assert(ms->len >= 0 && ms->offset >= 0);
+	*ms->sizep = ms->len < ms->offset ? ms->len : ms->offset;
 }
 
 static int
-memstream_writefn(void *cookie, const char *buf, int len)
+memstream_write(void *cookie, const char *buf, int len)
 {
-	struct memstream_cookie *c;
-	size_t reqsize;
+	struct memstream *ms;
+	ssize_t tocopy;
 
-	c = cookie;
-
-	/* Write is contained within valid region */
-	if (c->pos + len < c->tail) {
-		bcopy(buf, &c->head[c->pos], len);
-		c->pos += len;
-		return (len);
-	}
-
-	/* Write results in resizing buffer */
-	reqsize = c->pos + len + 1;
-	c->head = reallocf(c->head, reqsize);
-	if (c->head == NULL) {
-		errno = ENOMEM;
-		return (0);
-	}
-
-	bcopy(buf, &c->head[c->pos], len);
-	
-	c->tail = c->pos + len;
-	c->pos = c->tail;
-	c->head[c->tail] = '\0';
-
-	sync_pub_cookie(c);
-
-	return (len);
+	ms = cookie;
+	if (!memstream_grow(ms, ms->offset + len))
+		return (-1);
+	tocopy = ms->len - ms->offset;
+	if (len < tocopy)
+		tocopy = len;
+	memcpy(*ms->bufp + ms->offset, buf, tocopy);
+	ms->offset += tocopy;
+	memstream_update(ms);
+#ifdef DEBUG
+	fprintf(stderr, "MS: write(%p, %d) = %zd\n", ms, len, tocopy);
+#endif
+	return (tocopy);
 }
 
 static fpos_t
-memstream_seekfn(void *cookie, fpos_t pos, int whence)
+memstream_seek(void *cookie, fpos_t pos, int whence)
 {
-	struct memstream_cookie *c;
-	
-	c = cookie;
+	struct memstream *ms;
+#ifdef DEBUG
+	fpos_t old;
+#endif
 
-	/* XXX: Should validate SEEK_SET and SEEK_CUR positions */
-	/* XXX: What to do wrt SEEK_END? Is it relative to tail? to pos? */
-
-	switch(whence) {
-	case (SEEK_SET):
-		c->pos = pos;
-		return (c->pos);
+	ms = cookie;
+#ifdef DEBUG
+	old = ms->offset;
+#endif
+	switch (whence) {
+	case SEEK_SET:
+		/* _fseeko() checks for negative offsets. */
+		assert(pos >= 0);
+		ms->offset = pos;
 		break;
-	case (SEEK_CUR):
-		c->pos += pos;
-		return (c->pos);
+	case SEEK_CUR:
+		/* This is only called by _ftello(). */
+		assert(pos == 0);
 		break;
-	case (SEEK_END):
-	default:
-		errno = EINVAL;
-		return (fpos_t) -1;
+	case SEEK_END:
+		if (pos < 0) {
+			if (pos + ms->len < 0) {
+#ifdef DEBUG
+				fprintf(stderr,
+				    "MS: bad SEEK_END: pos %jd, len %zd\n",
+				    (intmax_t)pos, ms->len);
+#endif
+				errno = EINVAL;
+				return (-1);
+			}
+		} else {
+			if (FPOS_MAX - ms->len < pos) {
+#ifdef DEBUG
+				fprintf(stderr,
+				    "MS: bad SEEK_END: pos %jd, len %zd\n",
+				    (intmax_t)pos, ms->len);
+#endif
+				errno = EOVERFLOW;
+				return (-1);
+			}
+		}
+		ms->offset = ms->len + pos;
+		break;
 	}
+	memstream_update(ms);
+#ifdef DEBUG
+	fprintf(stderr, "MS: seek(%p, %jd, %d) %jd -> %jd\n", ms, (intmax_t)pos,
+	    whence, (intmax_t)old, (intmax_t)ms->offset);
+#endif
+	return (ms->offset);
 }
 
 static int
-memstream_closefn(void *cookie)
+memstream_close(void *cookie)
 {
-	struct memstream_cookie *c;
 
-	c = cookie;
-
-	sync_pub_cookie(c);
-
-	free(c);
+	free(cookie);
 	return (0);
 }
 
 FILE *
 open_memstream(char **bufp, size_t *sizep)
 {
+	struct memstream *ms;
+	int save_errno;
 	FILE *fp;
-	struct memstream_cookie *c;
 
-	fp = NULL;
 	if (bufp == NULL || sizep == NULL) {
 		errno = EINVAL;
-		goto out;
+		return (NULL);
 	}
-
-	c = malloc(sizeof(struct memstream_cookie));
-	if (c == NULL) {
-		errno = EINVAL;
-		goto out;
+	*bufp = calloc(1, 1);
+	if (*bufp == NULL)
+		return (NULL);
+	ms = malloc(sizeof(*ms));
+	if (ms == NULL) {
+		save_errno = errno;
+		free(*bufp);
+		*bufp = NULL;
+		errno = save_errno;
+		return (NULL);
 	}
-
-	fp = funopen(c,
-		     NULL,
-		     memstream_writefn,
-		     memstream_seekfn,
-		     memstream_closefn
-		    );
-
+	ms->bufp = bufp;
+	ms->sizep = sizep;
+	ms->len = 0;
+	ms->offset = 0;
+	memstream_update(ms);
+	fp = funopen(ms, NULL, memstream_write, memstream_seek,
+	    memstream_close);
 	if (fp == NULL) {
-		free(c);
-		errno = ENOMEM;
-		goto out;
+		save_errno = errno;
+		free(ms);
+		free(*bufp);
+		*bufp = NULL;
+		errno = save_errno;
+		return (NULL);
 	}
-
-	c->pub_buf = bufp;
-	c->pub_size = sizep;
-	c->head = NULL;
-	c->tail = 0;
-	c->pos = 0;
-
-out:
+	fwide(fp, -1);
 	return (fp);
 }

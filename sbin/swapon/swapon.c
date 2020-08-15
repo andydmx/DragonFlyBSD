@@ -34,8 +34,8 @@
 #include <sys/param.h>
 #include <sys/stat.h>
 #include <sys/sysctl.h>
+#include <sys/linker.h>
 #include <sys/diskslice.h>
-#include <sys/ioctl_compat.h>
 #include <vm/vm_param.h>
 
 #include <err.h>
@@ -48,9 +48,14 @@
 #include <fcntl.h>
 #include <libutil.h>
 
+#include <bus/cam/scsi/scsi_daio.h>
+
 static void usage(void);
 static int swap_on_off(char *name, int doingall, int trim, int ask);
+static char *docrypt(char *fs_spec, int pass);
 static void swaplist(int lflag, int sflag, int hflag);
+
+static int qflag;
 
 enum { SWAPON, SWAPOFF, SWAPCTL } orig_prog, which_prog = SWAPCTL;
 
@@ -61,7 +66,7 @@ main(int argc, char **argv)
 	char *ptr;
 	int ret;
 	int ch;
-	int doall, sflag, lflag, hflag, qflag, eflag, iflag;
+	int doall, sflag, lflag, hflag, eflag, cflag, iflag;
 
 	if ((ptr = strrchr(argv[0], '/')) == NULL)
 		ptr = argv[0];
@@ -71,8 +76,8 @@ main(int argc, char **argv)
 		which_prog = SWAPOFF;
 	orig_prog = which_prog;
 
-	sflag = lflag = hflag = qflag = doall = eflag = iflag = 0;
-	while ((ch = getopt(argc, argv, "AadeghiklmqsU")) != -1) {
+	sflag = lflag = hflag = doall = eflag = cflag = iflag = 0;
+	while ((ch = getopt(argc, argv, "acdeghiklmqsAEU")) != -1) {
 		switch((char)ch) {
 		case 'A':
 			if (which_prog == SWAPCTL) {
@@ -94,6 +99,10 @@ main(int argc, char **argv)
 			else
 				usage();
 			break;
+		case 'c':
+			cflag = 1;
+			break;
+		case 'E':
 		case 'e':
 			eflag = 1;
 			break;
@@ -141,33 +150,65 @@ main(int argc, char **argv)
 	if (which_prog == SWAPON || which_prog == SWAPOFF) {
 		if (doall) {
 			while ((fsp = getfsent()) != NULL) {
+				char *fs_spec;
+				int dotrim = eflag;
+
 				if (strcmp(fsp->fs_type, FSTAB_SW))
 					continue;
 				if (strstr(fsp->fs_mntops, "noauto"))
 					continue;
-				if (swap_on_off(fsp->fs_spec, 1, eflag, iflag)) {
+
+				if (strstr(fsp->fs_mntops, "notrim"))
+					dotrim = 0;
+				else if (strstr(fsp->fs_mntops, "trim"))
+					dotrim = 1;
+
+				if (cflag || strstr(fsp->fs_mntops, "crypt"))
+					fs_spec = docrypt(fsp->fs_spec, 1);
+				else
+					fs_spec = strdup(fsp->fs_spec);
+				if (swap_on_off(fs_spec, 1, dotrim, iflag)) {
 					ret = 1;
 				} else {
+					if (cflag ||
+					    strstr(fsp->fs_mntops, "crypt")) {
+						docrypt(fsp->fs_spec, 2);
+					}
 					if (!qflag) {
-						printf("%s: %sing %s as swap device\n",
+						printf("%s: %sing %s as swap "
+						       "device\n",
 						    getprogname(),
-						    which_prog == SWAPOFF ? "remov" : "add",
-						    fsp->fs_spec);
+						    (which_prog == SWAPOFF ?
+							    "remov" : "add"),
+						    fs_spec);
 					}
 				}
+				free(fs_spec);
 			}
 		} else if (*argv == NULL) {
 			usage();
 		}
 		for (; *argv; ++argv) {
-			if (swap_on_off(getdevpath(*argv, 0), 0, eflag, iflag)) {
+			char *ospec = getdevpath(*argv, 0);
+			char *fs_spec;
+			if (cflag)
+				fs_spec = docrypt(ospec, 1);
+			else
+				fs_spec = strdup(ospec);
+			if (swap_on_off(fs_spec, 0, eflag, iflag)) {
 				ret = 1;
-			} else if (orig_prog == SWAPCTL) {
-				printf("%s: %sing %s as swap device\n",
-				    getprogname(),
-				    which_prog == SWAPOFF ? "remov" : "add",
-				    *argv);
+			} else {
+				if (cflag)
+					docrypt(ospec, 2);
+				if (!qflag) {
+					printf("%s: %sing %s as swap device\n",
+					    getprogname(),
+					    (which_prog == SWAPOFF ?
+						"remov" : "add"),
+					    fs_spec);
+				}
 			}
+			free(fs_spec);
 		}
 	} else {
 		if (lflag || sflag)
@@ -176,6 +217,69 @@ main(int argc, char **argv)
 			usage();
 	}
 	exit(ret);
+}
+
+static
+char *
+docrypt(char *fs_spec, int pass)
+{
+	char *id;
+	char *res;
+	char *buf;
+
+	if ((id = strrchr(fs_spec, '/')) == NULL)
+		id = fs_spec;
+	else
+		++id;
+	asprintf(&id, "swap-%s", id);
+	asprintf(&res, "/dev/mapper/%s", id);
+
+	switch(which_prog) {
+	case SWAPOFF:
+		if (pass != 2)
+			break;
+		asprintf(&buf, "/sbin/cryptsetup remove %s", id);
+		system(buf);
+		free(buf);
+		free(id);
+		break;
+	case SWAPON:
+		if (pass != 1)
+			break;
+		if (kldfind("dm_target_crypt") < 0)
+			kldload("dm_target_crypt");
+
+		asprintf(&buf,
+			 "/sbin/cryptsetup --key-file /dev/urandom "
+			 "--key-size 256 create %s %s",
+			 id, fs_spec);
+		if (qflag == 0)
+			printf("%s\n", buf);
+		system(buf);
+		free(buf);
+		free(id);
+
+		/*
+		 * NOTE: Don't revert to /dev/da* on error because this could
+		 *	 inadvertently add both /dev/da* and
+		 *	 /dev/mapper/swap-da*.
+		 *
+		 *	 Allow the swapon operation to report failure or
+		 *	 report a duplicate.
+		 */
+		break;
+	default:
+		free(res);
+		free(id);
+		res = strdup(fs_spec);
+		break;
+	}
+
+	if (pass == 2) {
+		free (res);
+		res = NULL;
+	}
+	return res;
 }
 
 /*
@@ -237,12 +341,10 @@ trim_volume(char * name)
 	/*Trim the Device*/	
 	ioarg[0] = pinfo.media_offset;
 	ioarg[1] = pinfo.media_size;
-	printf("Trimming Device:%s, sectors (%llu -%llu)\n",name,
-	     (unsigned long long)ioarg[0]/512,
-	     (unsigned long long)ioarg[1]/512);
-	if (ioctl(fd, IOCTLTRIM, ioarg) < 0) {
+	printf("Trimming Device:%s, start=%jd bytes=%jd)\n",
+	     name, (intmax_t)ioarg[0], (intmax_t)ioarg[1]);
+	if (ioctl(fd, DAIOCTRIM, ioarg) < 0) {
 		printf("Device trim failed\n");
-		usage ();
 	}
 	close(fd);
 }
@@ -261,27 +363,8 @@ swap_on_off(char *name, int doingall, int trim, int ask)
 			return(1);
 
 	}
-	if (which_prog == SWAPON && trim){
-		char sysctl_name[64];
-		int trim_enabled = 0;
-		size_t olen = sizeof(trim_enabled);
-		char *dev_name = strdup(name);
-		dev_name = strtok(dev_name + strlen("/dev/da"),"s");
-		sprintf(sysctl_name, "kern.cam.da.%s.trim_enabled", dev_name);
-		sysctlbyname(sysctl_name, &trim_enabled, &olen, NULL, 0);
-		if(errno == ENOENT) {
-			printf("Device:%s does not support the TRIM command\n",
-			    name);
-			usage();
-		}
-		if(!trim_enabled) {
-			printf("Erase device option selected, but sysctl (%s) "
-			    "is not enabled\n",sysctl_name);
-			usage();
-		}
-
+	if (which_prog == SWAPON && trim) {
 		trim_volume(name);
-
 	}
 	if ((which_prog == SWAPOFF ? swapoff(name) : swapon(name)) == -1) {
 		switch(errno) {

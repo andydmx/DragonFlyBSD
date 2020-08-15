@@ -15,11 +15,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -52,8 +48,9 @@
 #include <machine/npx.h>
 
 struct pcb {
-	register_t	padxx[8];
-	register_t	pcb_cr3;
+	register_t	padxx[7];
+	register_t	pcb_cr3_iso;	/* isolated U (+minimal K) PML4e */
+	register_t	pcb_cr3;	/* U+K PML4e */
 	register_t	pcb_r15;
 	register_t	pcb_r14;
 	register_t	pcb_r13;
@@ -87,10 +84,16 @@ struct pcb {
 	struct  pcb_ext *pcb_ext;	/* optional pcb extension */
 };
 
-#define	PCB_DBREGS	0x02	/* process using debug registers */
-#define	PCB_FPUINITDONE	0x08	/* fpu state is initialized */
-#define FP_SOFTFP       0x01    /* process using software fltng pnt emulator */
-#define	FP_VIRTFP	0x04	/* virtual kernel wants exception */
+#define	PCB_DBREGS	0x00000002	/* process using debug registers */
+#define	PCB_FPUINITDONE	0x00000008	/* fpu state is initialized */
+#define PCB_ISOMMU	0x00000010	/* MMU isolation */
+
+#define FP_SOFTFP       0x01		/* process using soft flt emulator */
+#define	FP_VIRTFP	0x04		/* vkernel wants exception */
+
+#define SPEC_CTRL_DUMMY_IBPB	SPEC_CTRL_DUMMY1
+#define SPEC_CTRL_DUMMY_ENABLE	SPEC_CTRL_DUMMY2
+#define SPEC_CTRL_MDS_ENABLE	SPEC_CTRL_DUMMY3
 
 #ifdef _KERNEL
 void	savectx(struct pcb *);

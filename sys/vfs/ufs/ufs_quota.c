@@ -35,6 +35,7 @@
 
 #include <sys/param.h>
 #include <sys/systm.h>
+#include <sys/uio.h>
 #include <sys/kernel.h>
 #include <sys/malloc.h>
 #include <sys/fcntl.h>
@@ -367,7 +368,7 @@ ufs_quotawarn(struct ufs_dquot *dq)
 		dqticks = ticks / hz;
 		uprintf("%s: warning, quota file expanded, quotacheck "
 			"was not run!\n",
-			dq->dq_ump->um_mountp->mnt_stat.f_mntfromname); 
+			dq->dq_ump->um_mountp->mnt_stat.f_mntfromname);
 	}
 }
 
@@ -736,7 +737,9 @@ static long ufs_numdquot, ufs_desireddquot = DQUOTINC;
 void
 ufs_dqinit(void)
 {
-	ufs_dqhashtbl = hashinit(desiredvnodes, M_DQUOT, &ufs_dqhash);
+	int hsize = vfs_inodehashsize();
+
+	ufs_dqhashtbl = hashinit(hsize, M_DQUOT, &ufs_dqhash);
 	TAILQ_INIT(&ufs_dqfreelist);
 }
 
@@ -778,11 +781,14 @@ ufs_dqget(struct vnode *vp, u_long id, struct ufsmount *ump, int type,
 		*dqp = dq;
 		return (0);
 	}
+
 	/*
 	 * Not in cache, allocate a new one.
 	 */
-	if (TAILQ_EMPTY(&ufs_dqfreelist) && ufs_numdquot < MAXQUOTAS * desiredvnodes)
+	if (TAILQ_EMPTY(&ufs_dqfreelist) &&
+	    ufs_numdquot < MAXQUOTAS * maxvnodes) {
 		ufs_desireddquot += DQUOTINC;
+	}
 	if (ufs_numdquot < ufs_desireddquot) {
 		dq = (struct ufs_dquot *)
 			kmalloc(sizeof *dq, M_DQUOT, M_WAITOK | M_ZERO);

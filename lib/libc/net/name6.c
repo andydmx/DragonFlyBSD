@@ -42,11 +42,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- * 	This product includes software developed by the University of
- * 	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -330,7 +326,7 @@ getipnodebyaddr(const void *src, size_t len, int af, int *errp)
 			*errp = NO_RECOVERY;
 			return NULL;
 		}
-		if ((long)src & ~(sizeof(struct in_addr) - 1)) {
+		if (rounddown2((long)src, sizeof(struct in_addr))) {
 			memcpy(&addrbuf, src, len);
 			src = &addrbuf;
 		}
@@ -343,7 +339,7 @@ getipnodebyaddr(const void *src, size_t len, int af, int *errp)
 			*errp = NO_RECOVERY;
 			return NULL;
 		}
-		if ((long)src & ~(sizeof(struct in6_addr) / 2 - 1)) {	/*XXX*/
+		if (rounddown2((long)src, sizeof(struct in6_addr) / 2)) {	/*XXX*/
 			memcpy(&addrbuf, src, len);
 			src = &addrbuf;
 		}
@@ -734,11 +730,11 @@ get_addrselectpolicy(struct policyhead *head)
 	char *buf;
 	struct in6_addrpolicy *pol, *ep;
 
-	if (sysctl(mib, sizeof(mib) / sizeof(mib[0]), NULL, &l, NULL, 0) < 0)
+	if (sysctl(mib, NELEM(mib), NULL, &l, NULL, 0) < 0)
 		return (0);
 	if ((buf = malloc(l)) == NULL)
 		return (0);
-	if (sysctl(mib, sizeof(mib) / sizeof(mib[0]), buf, &l, NULL, 0) < 0) {
+	if (sysctl(mib, NELEM(mib), buf, &l, NULL, 0) < 0) {
 		free(buf);
 		return (0);
 	}

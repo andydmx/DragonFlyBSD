@@ -1,5 +1,4 @@
-
-/*
+/*-
  * Copyright (c) 1989, 1993
  *	The Regents of the University of California.  All rights reserved.
  *
@@ -14,7 +13,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -32,7 +31,6 @@
  *
  *	from: @(#)ls.h	8.1 (Berkeley) 5/31/93
  * $FreeBSD: src/bin/ls/ls.h,v 1.21 2005/01/10 08:39:23 imp Exp $
- * $DragonFly: src/bin/ls/ls.h,v 1.7 2005/09/18 17:54:48 asmodai Exp $
  */
 
 #define NO_PRINT	1
@@ -47,12 +45,14 @@ extern int f_inode;		/* print inode */
 extern int f_longform;		/* long listing format */
 extern int f_octal;		/* print unprintables in octal */
 extern int f_octal_escape;	/* like f_octal but use C escapes if possible */
+extern int f_nanotime;		/* include nanotime in long format */
 extern int f_nonprint;		/* show unprintables as ? */
 extern int f_sectime;		/* print the real time for all files */
 extern int f_size;		/* list size in short listing */
 extern int f_slash;		/* append a '/' if the file is a directory */
-extern int f_sortacross;	/* sort across rows, not down columns */ 
+extern int f_sortacross;	/* sort across rows, not down columns */
 extern int f_statustime;	/* use time of last mode change */
+extern const char *f_timeformat;	/* user-specified time format */
 extern int f_notabs;		/* don't use tab-separated multi-col output */
 extern int f_type;		/* add type character for non-regular files */
 #ifdef COLORLS

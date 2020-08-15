@@ -10,11 +10,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -37,6 +33,8 @@
 #ifndef _SYS_GMON_H_
 #define _SYS_GMON_H_
 
+#include <sys/cdefs.h>
+
 #include <machine/profile.h>
 
 /*
@@ -53,14 +51,7 @@ struct gmonhdr {
 };
 #define GMONVERSION	0x00051879
 
-/*
- * Type of histogram counters used in the kernel.
- */
-#ifdef GPROF4
-#define	HISTCOUNTER	int64_t
-#else
 #define	HISTCOUNTER	unsigned short
-#endif
 
 /*
  * Fraction of text space to allocate for histogram counters.
@@ -165,8 +156,8 @@ struct gmonparam {
 	struct tostruct	*tos;
 	u_long		tossize;
 	long		tolimit;
-	uintfptr_t	lowpc;
-	uintfptr_t	highpc;
+	u_long		lowpc;
+	u_long		highpc;
 	u_long		textsize;
 	u_long		hashfraction;
 	int		profrate;	/* XXX wrong type to match gmonhdr */
@@ -192,24 +183,9 @@ extern struct gmonparam _gmonparam;
 #define	GMON_PROF_OFF	3
 #define	GMON_PROF_HIRES	4
 
-/*
- * Sysctl definitions for extracting profiling information from the kernel.
- */
-#define	GPROF_STATE	0	/* int: profiling enabling variable */
-#define	GPROF_COUNT	1	/* struct: profile tick count buffer */
-#define	GPROF_FROMS	2	/* struct: from location hash bucket */
-#define	GPROF_TOS	3	/* struct: destination/count structure */
-#define	GPROF_GMONPARAM	4	/* struct: profiling parameters (see above) */
-
-#ifndef _KERNEL
-
-#include <sys/cdefs.h>
-
 __BEGIN_DECLS
 void	moncontrol(int);
 void	monstartup(u_long, u_long);
 __END_DECLS
-
-#endif /* !_KERNEL */
 
 #endif /* !_SYS_GMON_H_ */

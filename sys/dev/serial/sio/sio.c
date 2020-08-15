@@ -12,11 +12,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -38,7 +34,6 @@
  */
 
 #include "opt_comconsole.h"
-#include "opt_compat.h"
 #include "opt_ddb.h"
 #include "opt_sio.h"
 #include "use_pci.h"
@@ -58,6 +53,7 @@
 #include <sys/reboot.h>
 #include <sys/malloc.h>
 #include <sys/tty.h>
+#include <sys/ttydefaults.h>	/* for TTYDEF_* */
 #include <sys/proc.h>
 #include <sys/priv.h>
 #include <sys/module.h>
@@ -174,6 +170,7 @@ static	void	comstop		(struct tty *tp, int rw);
 static	timeout_t comwakeup;
 static	void	disc_optim	(struct tty	*tp, struct termios *t,
 				     struct com_s *com);
+static void siocntxwait	(Port_t iobase);
 
 #if NPCI > 0
 static	int	sio_pci_attach (device_t dev);
@@ -260,7 +257,6 @@ int	comconsole = -1;
 static	volatile speed_t	comdefaultrate = CONSPEED;
 static	u_long			comdefaultrclk = DEFAULT_RCLK;
 SYSCTL_ULONG(_machdep, OID_AUTO, conrclk, CTLFLAG_RW, &comdefaultrclk, 0, "");
-static	u_int	com_events;	/* input chars + weighted output completions */
 static	Port_t	siocniobase;
 static	int	siocnunit;
 static	Port_t	siogdbiobase;
@@ -268,7 +264,7 @@ static	int	siogdbunit = -1;
 static	bool_t	sio_registered;
 static	int	sio_timeout;
 static	int	sio_timeouts_until_log;
-static	struct	callout	sio_timeout_handle;
+static	struct	callout sio_timeout_handle;
 static	int	sio_numunits;
 
 #ifdef COM_ESP
@@ -279,7 +275,7 @@ static	Port_t	likely_esp_ports[] = { 0x140, 0x180, 0x280, 0 };
 
 /*
  * handle sysctl read/write requests for console speed
- * 
+ *
  * In addition to setting comdefaultrate for I/O through /dev/console,
  * also set the initial and lock values for the /dev/ttyXX device
  * if there is one associated with the console.  Finally, if the /dev/tty
@@ -362,6 +358,11 @@ static struct pci_ids pci_ids[] = {
 	{ 0x7101135e, "SeaLevel Ultra 530.PCI Single Port Serial", 0x18 },
 	{ 0x0000151f, "SmartLink 5634PCV SurfRider", 0x10 },
 	{ 0x98459710, "Netmos Nm9845 PCI Bridge with Dual UART", 0x10 },
+	{ 0x99229710, "MCS9922 PCIe Multi-I/O Controller", 0x10 },
+	{ 0x8c3d8086, "Intel Lynx Point KT Controller", 0x10 },
+	{ 0x9c3d8086, "Intel Lynx Point-LP HECI KT", 0x10 },
+	{ 0x8cbd8086, "Intel Wildcat Point KT Controller", 0x10 },
+	{ 0x9cbd8086, "Intel Wildcat Point-LP KT Controller", 0x10 },
 	{ 0x00000000, NULL, 0 }
 };
 
@@ -395,7 +396,7 @@ sio_pci_kludge_unit(device_t dev)
 
 	unit = 0;
 	start = 0;
-	while (resource_int_value("sio", unit, "port", &start) == 0 && 
+	while (resource_int_value("sio", unit, "port", &start) == 0 &&
 	    start > 0)
 		unit++;
 	if (device_get_unit(dev) < unit) {
@@ -724,10 +725,21 @@ sioprobe(device_t dev, int xrid, u_long rclk)
 		(void)sio_getreg(com, com_data);
 	}
 	if (fn == 256) {
+		/*
+		 * Serial port might be probed but not exist, disable
+		 * if so.  Clear console flags if the serial port does
+		 * not exist.  This is very common for sio0 and sio1
+		 * now and avoids unnecessary user confusion (user does
+		 * not have to clear the sio0 console flag if sio0 does
+		 * not exist and the user wants the console on another
+		 * sio).
+		 */
 		com_unlock();
 		lwkt_reltoken(&tty_token);
 		kprintf("sio%d: can't drain, serial port might "
 			"not exist, disabling\n", device_get_unit(dev));
+		com->flags &= ~0x30;
+
 		return (ENXIO);
 	}
 
@@ -969,6 +981,8 @@ sioattach(device_t dev, int xrid, u_long rclk)
 	int		rid;
 	struct resource *port;
 	int		ret;
+	char		tbuf[MAKEDEV_MINNBUF];
+	char		*unit_in_base32;
 	static int	did_init;
 
 	lwkt_gettoken(&tty_token);
@@ -1137,7 +1151,6 @@ sioattach(device_t dev, int xrid, u_long rclk)
 
 		break;
 	}
-	
 #ifdef COM_ESP
 	if (com->esp) {
 		/*
@@ -1188,22 +1201,24 @@ determined_type: ;
 	kprintf("\n");
 
 	if (!sio_registered) {
-		register_swi(SWI_TTY, siopoll, NULL ,"swi_siopoll", NULL, -1);
+		register_swi_mp(SWI_TTY, siopoll, NULL,
+				"swi_siopoll", NULL, -1);
 		sio_registered = TRUE;
 	}
 	minorbase = UNIT_TO_MINOR(unit);
+	unit_in_base32 = makedev_unit_b32(tbuf, unit);
 	make_dev(&sio_ops, minorbase,
-	    UID_ROOT, GID_WHEEL, 0600, "ttyd%r", unit);
+	    UID_ROOT, GID_WHEEL, 0600, "ttyd%s", unit_in_base32);
 	make_dev(&sio_ops, minorbase | CONTROL_INIT_STATE,
-	    UID_ROOT, GID_WHEEL, 0600, "ttyid%r", unit);
+	    UID_ROOT, GID_WHEEL, 0600, "ttyid%s", unit_in_base32);
 	make_dev(&sio_ops, minorbase | CONTROL_LOCK_STATE,
-	    UID_ROOT, GID_WHEEL, 0600, "ttyld%r", unit);
+	    UID_ROOT, GID_WHEEL, 0600, "ttyld%s", unit_in_base32);
 	make_dev(&sio_ops, minorbase | CALLOUT_MASK,
-	    UID_UUCP, GID_DIALER, 0660, "cuaa%r", unit);
+	    UID_UUCP, GID_DIALER, 0660, "cuaa%s", unit_in_base32);
 	make_dev(&sio_ops, minorbase | CALLOUT_MASK | CONTROL_INIT_STATE,
-	    UID_UUCP, GID_DIALER, 0660, "cuaia%r", unit);
+	    UID_UUCP, GID_DIALER, 0660, "cuaia%s", unit_in_base32);
 	make_dev(&sio_ops, minorbase | CALLOUT_MASK | CONTROL_LOCK_STATE,
-	    UID_UUCP, GID_DIALER, 0660, "cuala%r", unit);
+	    UID_UUCP, GID_DIALER, 0660, "cuala%s", unit_in_base32);
 	com->flags = flags;
 	com->pps.ppscap = PPS_CAPTUREASSERT | PPS_CAPTURECLEAR;
 	pps_init(&com->pps);
@@ -1255,7 +1270,8 @@ sioopen(struct dev_open_args *ap)
 	if (mynor & CONTROL_MASK)
 		return (0);
 	lwkt_gettoken(&tty_token);
-	tp = dev->si_tty = com->tp = ttymalloc(com->tp);
+	tp = ttymalloc(&com->tp);
+	dev->si_tty = tp;
 	crit_enter();
 	/*
 	 * We jump to this label after all non-interrupted sleeps to pick
@@ -1651,76 +1667,41 @@ siodtrwakeup(void *chan)
  *
  *	 Must be called with com_lock
  */
+#define SIOCOPYSIZE	64
+
 static void
 sioinput(struct com_s *com)
 {
-	u_char		*buf;
-	int		incc;
 	u_char		line_status;
 	int		recv_data;
+	int		incc;
+	int		i;
 	struct tty	*tp;
+	uint8_t		buf[SIOCOPYSIZE];
 
-	buf = com->ibuf;
+	/*
+	 * Process a block of data queued by siointr1() and shift the buffer
+	 * in order to allow the interrupt to continue to pipeline data as
+	 * we process each block.  This is a retrofit of old code, otherwise
+	 * I'd just use a rollover FIFO.
+	 */
 	tp = com->tp;
+again:
 	if (!(tp->t_state & TS_ISOPEN) || !(tp->t_cflag & CREAD)) {
-		com_events -= (com->iptr - com->ibuf);
 		com->iptr = com->ibuf;
 		return;
 	}
-	if (tp->t_state & TS_CAN_BYPASS_L_RINT) {
-		/*
-		 * Avoid the grotesquely inefficient lineswitch routine
-		 * (ttyinput) in "raw" mode.  It usually takes about 450
-		 * instructions (that's without canonical processing or echo!).
-		 * slinput is reasonably fast (usually 40 instructions plus
-		 * call overhead).
-		 */
-		do {
-			com_unlock();
-			incc = com->iptr - buf;
-			if (tp->t_rawq.c_cc + incc > tp->t_ihiwat
-			    && (com->state & CS_RTS_IFLOW
-				|| tp->t_iflag & IXOFF)
-			    && !(tp->t_state & TS_TBLOCK))
-				ttyblock(tp);
-			com->delta_error_counts[CE_TTY_BUF_OVERFLOW]
-				+= b_to_q((char *)buf, incc, &tp->t_rawq);
-			buf += incc;
-			tk_nin += incc;
-			tk_rawcc += incc;
-			tp->t_rawcc += incc;
-			ttwakeup(tp);
-			if (tp->t_state & TS_TTSTOP
-			    && (tp->t_iflag & IXANY
-				|| tp->t_cc[VSTART] == tp->t_cc[VSTOP])) {
-				tp->t_state &= ~TS_TTSTOP;
-				tp->t_lflag &= ~FLUSHO;
-				comstart(tp);
-			}
-			com_lock();
-		} while (buf < com->iptr);
+	incc = com->iptr - com->ibuf;
+	if (incc > SIOCOPYSIZE) {
+		bcopy(com->ibuf, buf, SIOCOPYSIZE);
+		bcopy(com->ibuf + SIOCOPYSIZE, com->ibuf, incc - SIOCOPYSIZE);
+		com->iptr = com->ibuf + incc - SIOCOPYSIZE;
+		incc = SIOCOPYSIZE;
 	} else {
-		do {
-			com_unlock();
-			line_status = buf[com->ierroff];
-			recv_data = *buf++;
-			if (line_status
-			    & (LSR_BI | LSR_FE | LSR_OE | LSR_PE)) {
-				if (line_status & LSR_BI)
-					recv_data |= TTY_BI;
-				if (line_status & LSR_FE)
-					recv_data |= TTY_FE;
-				if (line_status & LSR_OE)
-					recv_data |= TTY_OE;
-				if (line_status & LSR_PE)
-					recv_data |= TTY_PE;
-			}
-			(*linesw[tp->t_line].l_rint)(recv_data, tp);
-			com_lock();
-		} while (buf < com->iptr);
+		bcopy(com->ibuf, buf, incc);
+		com->iptr = com->ibuf;
 	}
-	com_events -= (com->iptr - com->ibuf);
-	com->iptr = com->ibuf;
+	line_status = com->iptr[com->ierroff];
 
 	/*
 	 * There is now room for another low-level buffer full of input,
@@ -1728,11 +1709,37 @@ sioinput(struct com_s *com)
 	 * high-level buffer.
 	 */
 	if ((com->state & CS_RTS_IFLOW) && !(com->mcr_image & MCR_RTS) &&
-	    !(tp->t_state & TS_TBLOCK))
+	    !(tp->t_state & TS_TBLOCK)) {
 		outb(com->modem_ctl_port, com->mcr_image |= MCR_RTS);
+	}
+	com_unlock();
+
+	/*
+	 * Process the input block
+	 */
+	for (i = 0; i < incc; ++i) {
+		recv_data = buf[i];
+		if (line_status
+		    & (LSR_BI | LSR_FE | LSR_OE | LSR_PE)) {
+			if (line_status & LSR_BI)
+				recv_data |= TTY_BI;
+			if (line_status & LSR_FE)
+				recv_data |= TTY_FE;
+			if (line_status & LSR_OE)
+				recv_data |= TTY_OE;
+			if (line_status & LSR_PE)
+				recv_data |= TTY_PE;
+		}
+		(*linesw[tp->t_line].l_rint)(recv_data, tp);
+		line_status = 0;
+	}
+	com_lock();
+
+	if (com->iptr != com->ibuf)
+		goto again;
 }
 
-void
+static void
 siointr(void *arg)
 {
 	lwkt_gettoken(&tty_token);
@@ -1761,7 +1768,7 @@ siointr(void *arg)
 			 * XXX com_lock();
 			 * would it work here, or be counter-productive?
 			 */
-			if (com != NULL 
+			if (com != NULL
 			    && !com->gone
 			    && (inb(com->int_id_port) & IIR_IMASK)
 			       != IIR_NOPEND) {
@@ -1798,8 +1805,8 @@ siointr1(struct com_s *com)
 			modem_status = inb(com->modem_status_port);
 		        if ((modem_status ^ com->last_modem_status) & MSR_DCD) {
 				count = sys_cputimer->count();
-				pps_event(&com->pps, count, 
-				    (modem_status & MSR_DCD) ? 
+				pps_event(&com->pps, count,
+				    (modem_status & MSR_DCD) ?
 				    PPS_CAPTUREASSERT : PPS_CAPTURECLEAR);
 			}
 		}
@@ -1883,12 +1890,11 @@ siointr1(struct com_s *com)
 			if (com->hotchar != 0 && recv_data == com->hotchar)
 				setsofttty();
 			ioptr = com->iptr;
-			if (ioptr >= com->ibufend)
+			if (ioptr >= com->ibufend) {
 				CE_RECORD(com, CE_INTERRUPT_BUF_OVERFLOW);
-			else {
+			} else {
 				if (com->do_timestamp)
 					microtime(&com->timestamp);
-				++com_events;
 				schedsofttty();
 #if 0 /* for testing input latency vs efficiency */
 if (com->iptr - com->ibuf == 8)
@@ -1928,7 +1934,6 @@ cont:
 			 */
 			com->last_modem_status = modem_status;
 			if (!(com->state & CS_CHECKMSR)) {
-				com_events += LOTS_OF_EVENTS;
 				com->state |= CS_CHECKMSR;
 				setsofttty();
 			}
@@ -1982,7 +1987,6 @@ cont:
 					com->state &= ~CS_BUSY;
 				}
 				if (!(com->state & CS_ODONE)) {
-					com_events += LOTS_OF_EVENTS;
 					com->state |= CS_ODONE;
 					setsofttty();	/* handle at high level ASAP */
 				}
@@ -1996,7 +2000,7 @@ cont:
 #ifdef COM_MULTIPORT
 		return;
 #else
-		if (inb(com->int_id_port) & IIR_NOPEND) 
+		if (inb(com->int_id_port) & IIR_NOPEND)
 			return;
 #endif
 	}
@@ -2011,10 +2015,7 @@ sioioctl(struct dev_ioctl_args *ap)
 	int		error;
 	int		mynor;
 	struct tty	*tp;
-#if defined(COMPAT_43)
-	u_long		oldcmd;
-	struct termios	term;
-#endif
+
 	lwkt_gettoken(&tty_token);
 	mynor = minor(dev);
 
@@ -2065,17 +2066,6 @@ sioioctl(struct dev_ioctl_args *ap)
 		}
 	}
 	tp = com->tp;
-#if defined(COMPAT_43)
-	term = tp->t_termios;
-	oldcmd = ap->a_cmd;
-	error = ttsetcompat(tp, &ap->a_cmd, data, &term);
-	if (error != 0) {
-		lwkt_reltoken(&tty_token);
-		return (error);
-	}
-	if (ap->a_cmd != oldcmd)
-		data = (caddr_t)&term;
-#endif
 	if (ap->a_cmd == TIOCSETA || ap->a_cmd == TIOCSETAW ||
 	    ap->a_cmd == TIOCSETAF) {
 		int	cc;
@@ -2178,15 +2168,12 @@ sioioctl(struct dev_ioctl_args *ap)
 static void
 siopoll(void *dummy, void *frame)
 {
-	int		unit;
+	int	unit;
+	int	any;
 
 	lwkt_gettoken(&tty_token);
-	if (com_events == 0) {
-		lwkt_reltoken(&tty_token);
-		return;
-	}
-
 repeat:
+	any = 0;
 	for (unit = 0; unit < sio_numunits; ++unit) {
 		struct com_s	*com;
 		int		incc;
@@ -2208,7 +2195,6 @@ repeat:
 				incc += LOTS_OF_EVENTS;
 				com->state &= ~CS_CHECKMSR;
 			}
-			com_events -= incc;
 			com_unlock();
 			continue;
 		}
@@ -2216,6 +2202,7 @@ repeat:
 			com_lock();
 			sioinput(com);
 			com_unlock();
+			any = 1;
 		}
 		if (com->state & CS_CHECKMSR) {
 			u_char	delta_modem_status;
@@ -2224,16 +2211,17 @@ repeat:
 			delta_modem_status = com->last_modem_status
 					     ^ com->prev_modem_status;
 			com->prev_modem_status = com->last_modem_status;
-			com_events -= LOTS_OF_EVENTS;
 			com->state &= ~CS_CHECKMSR;
 			com_unlock();
-			if (delta_modem_status & MSR_DCD)
+			if (delta_modem_status)
+				any = 1;
+			if (delta_modem_status & MSR_DCD) {
 				(*linesw[tp->t_line].l_modem)
 					(tp, com->prev_modem_status & MSR_DCD);
+			}
 		}
 		if (com->state & CS_ODONE) {
 			com_lock();
-			com_events -= LOTS_OF_EVENTS;
 			com->state &= ~CS_ODONE;
 			com_unlock();
 			if (!(com->state & CS_BUSY)
@@ -2244,10 +2232,8 @@ repeat:
 			}
 			(*linesw[tp->t_line].l_start)(tp);
 		}
-		if (com_events == 0)
-			break;
 	}
-	if (com_events >= LOTS_OF_EVENTS)
+	if (any)
 		goto repeat;
 	lwkt_reltoken(&tty_token);
 }
@@ -2277,9 +2263,9 @@ comparam(struct tty *tp, struct termios *t)
 		t->c_ispeed = t->c_ospeed;
 
 	/* check requested parameters */
-	if (t->c_ospeed == 0)
+	if (t->c_ospeed == 0) {
 		divisor = 0;
-	else {
+	} else {
 		if (t->c_ispeed != t->c_ospeed)
 			return (EINVAL);
 		divisor = siodivisor(com->rclk, t->c_ispeed);
@@ -2351,6 +2337,7 @@ comparam(struct tty *tp, struct termios *t)
 	 * the speed change atomically.  Keeping interrupts disabled is
 	 * especially important while com_data is hidden.
 	 */
+	siocntxwait(com->bsh);
 	(void) siosetwater(com, t->c_ispeed);
 
 	if (divisor != 0) {
@@ -2368,7 +2355,6 @@ comparam(struct tty *tp, struct termios *t)
 		if (sio_getreg(com, com_dlbh) != dlbh)
 			sio_setreg(com, com_dlbh, dlbh);
 	}
-
 	sio_setreg(com, com_cfcr, com->cfcr_image = cfcr);
 
 	if (!(tp->t_state & TS_TTSTOP))
@@ -2400,7 +2386,6 @@ comparam(struct tty *tp, struct termios *t)
 				   sio_getreg(com, com_fifo) & ~0x40);
 		}
 	}
-
 
 	/*
 	 * Set up state to handle output flow control.
@@ -2554,8 +2539,8 @@ comstart(struct tty *tp)
 
 		if (!com->obufs[0].l_queued) {
 			com->obufs[0].l_tail
-			    = com->obuf1 + q_to_b(&tp->t_outq, com->obuf1,
-						  sizeof com->obuf1);
+			    = com->obuf1 + clist_qtob(&tp->t_outq, com->obuf1,
+						      sizeof com->obuf1);
 			com->obufs[0].l_next = NULL;
 			com->obufs[0].l_queued = TRUE;
 			com_lock();
@@ -2574,8 +2559,8 @@ comstart(struct tty *tp)
 		}
 		if (tp->t_outq.c_cc != 0 && !com->obufs[1].l_queued) {
 			com->obufs[1].l_tail
-			    = com->obuf2 + q_to_b(&tp->t_outq, com->obuf2,
-						  sizeof com->obuf2);
+			    = com->obuf2 + clist_qtob(&tp->t_outq, com->obuf2,
+						      sizeof com->obuf2);
 			com->obufs[1].l_next = NULL;
 			com->obufs[1].l_queued = TRUE;
 			com_lock();
@@ -2625,8 +2610,6 @@ comstop(struct tty *tp, int rw)
 				   FIFO_XMT_RST | com->fifo_image);
 		com->obufs[0].l_queued = FALSE;
 		com->obufs[1].l_queued = FALSE;
-		if (com->state & CS_ODONE)
-			com_events -= LOTS_OF_EVENTS;
 		com->state &= ~(CS_ODONE | CS_BUSY);
 		com->tp->t_state &= ~TS_BUSY;
 	}
@@ -2638,7 +2621,6 @@ comstop(struct tty *tp, int rw)
 #endif
 			sio_setreg(com, com_fifo,
 				   FIFO_RCV_RST | com->fifo_image);
-		com_events -= (com->iptr - com->ibuf);
 		com->iptr = com->ibuf;
 	}
 	com_unlock();
@@ -2845,7 +2827,6 @@ static speed_t siocngetspeed (Port_t, u_long rclk);
 static void siocnclose	(struct siocnstate *sp, Port_t iobase);
 #endif
 static void siocnopen	(struct siocnstate *sp, Port_t iobase, int speed);
-static void siocntxwait	(Port_t iobase);
 
 static cn_probe_t siocnprobe;
 static cn_init_t siocninit;
@@ -2856,11 +2837,11 @@ static cn_putc_t siocnputc;
 
 #if defined(__i386__) || defined(__x86_64__)
 CONS_DRIVER(sio, siocnprobe, siocninit, siocninit_fini,
-	    NULL, siocngetc, siocncheckc, siocnputc, NULL);
+	    NULL, siocngetc, siocncheckc, siocnputc, NULL, NULL);
 #endif
 
 /* To get the GDB related variables */
-#if DDB > 0
+#if defined(DDB)
 #include <ddb/ddb.h>
 #endif
 
@@ -3006,7 +2987,8 @@ siocnprobe(struct consdev *cp)
 	for (unit = 0; unit < 16; unit++) { /* XXX need to know how many */
 		int flags;
 		int disabled;
-		if (resource_int_value("sio", unit, "disabled", &disabled) == 0) {
+
+		if (!resource_int_value("sio", unit, "disabled", &disabled)) {
 			if (disabled)
 				continue;
 		}
@@ -3017,9 +2999,24 @@ siocnprobe(struct consdev *cp)
 			int baud;
 			Port_t iobase;
 			speed_t boot_speed;
+			struct com_s *com;
 
-			if (resource_int_value("sio", unit, "port", &port))
-				continue;
+			/*
+			 * We need the port.  For built-in serial ports
+			 * (e.g. sio0/sio1) the resources exist.  For
+			 * add-on serial ports they resources might not
+			 * but the port may have been configured late
+			 * and we can find it when we re-probe.
+			 *
+			 * If the port is not specified check to see if
+			 * the device configured after the fact.
+			 */
+			com = com_addr(unit);
+			if (resource_int_value("sio", unit, "port", &port)) {
+				if (com == NULL || com->ioportres == NULL)
+					continue;
+				port = rman_get_bushandle(com->ioportres);
+			}
 			if (resource_int_value("sio", unit, "baud", &baud) == 0)
 				boot_speed = baud;
 			else
@@ -3034,10 +3031,12 @@ siocnprobe(struct consdev *cp)
 				if (boot_speed)
 					comdefaultrate = boot_speed;
 			}
+			if (boot_speed == 0)
+				boot_speed = comdefaultrate;
 
 			/*
 			 * Initialize the divisor latch.  We can't rely on
-			 * siocnopen() to do this the first time, since it 
+			 * siocnopen() to do this the first time, since it
 			 * avoids writing to the latch if the latch appears
 			 * to have the correct value.  Also, if we didn't
 			 * just read the speed from the hardware, then we
@@ -3047,21 +3046,36 @@ siocnprobe(struct consdev *cp)
 			com_lock();
 			cfcr = inb(iobase + com_cfcr);
 			outb(iobase + com_cfcr, CFCR_DLAB | cfcr);
-			divisor = siodivisor(comdefaultrclk, comdefaultrate);
+			divisor = siodivisor(comdefaultrclk, boot_speed);
 			outb(iobase + com_dlbl, divisor & 0xff);
 			outb(iobase + com_dlbh, divisor >> 8);
 			outb(iobase + com_cfcr, cfcr);
 
-			siocnopen(&sp, iobase, comdefaultrate);
+			/*
+			 * We want ttyopen
+			 */
+			if (com) {
+				com->it_in.c_iflag = TTYDEF_IFLAG;
+				com->it_in.c_oflag = TTYDEF_OFLAG;
+				com->it_in.c_cflag = TTYDEF_CFLAG | CLOCAL;
+				com->it_in.c_lflag = TTYDEF_LFLAG;
+				com->lt_out.c_cflag = com->lt_in.c_cflag = CLOCAL;
+				com->lt_out.c_ispeed = com->lt_out.c_ospeed =
+				com->lt_in.c_ispeed = com->lt_in.c_ospeed =
+				com->it_in.c_ispeed = com->it_in.c_ospeed =
+					boot_speed;
+			}
+
+			siocnopen(&sp, iobase, boot_speed);
 			com_unlock();
 
 			crit_exit();
 			if (COM_CONSOLE(flags) && !COM_LLCONSOLE(flags)) {
 				cp->cn_probegood = 1;
 				cp->cn_private = (void *)(intptr_t)unit;
-				cp->cn_pri = COM_FORCECONSOLE(flags)
-					     || boothowto & RB_SERIAL
-					     ? CN_REMOTE : CN_NORMAL;
+				cp->cn_pri = (COM_FORCECONSOLE(flags)
+					     || ((boothowto & RB_SERIAL)) ?
+						 CN_REMOTE : CN_NORMAL);
 				siocniobase = iobase;
 				siocnunit = unit;
 			}
@@ -3069,7 +3083,7 @@ siocnprobe(struct consdev *cp)
 				kprintf("sio%d: gdb debugging port\n", unit);
 				siogdbiobase = iobase;
 				siogdbunit = unit;
-#if DDB > 0
+#if defined(DDB)
 				cp->cn_gdbprivate = (void *)(intptr_t)unit;
 				gdb_tab = cp;
 #endif
@@ -3077,9 +3091,9 @@ siocnprobe(struct consdev *cp)
 		}
 	}
 #if defined(__i386__) || defined(__x86_64__)
-#if DDB > 0
+#if defined(DDB)
 	/*
-	 * XXX Ugly Compatability.
+	 * XXX Ugly Compatibility.
 	 * If no gdb port has been specified, set it to be the console
 	 * as some configuration files don't specify the gdb port.
 	 */
@@ -3107,18 +3121,22 @@ static void
 siocninit_fini(struct consdev *cp)
 {
 	cdev_t dev;
+	char tbuf[MAKEDEV_MINNBUF];
 	int unit;
 
 	if (cp->cn_probegood) {
 		unit = (int)(intptr_t)cp->cn_private;
+
 		/*
-		 * Call devfs_find_device_by_name on ttydX to find the correct device,
-		 * as it should have been created already at this point by the
-		 * attach routine.
-		 * If it isn't found, the serial port was not attached at all and we
-		 * shouldn't be here, so assert this case.
+		 * Call devfs_find_device_by_name on ttydX to find the correct
+		 * device, as it should have been created already at this
+		 * point by the attach routine.
+		 *
+		 * If it isn't found, the serial port was not attached at all
+		 * and we shouldn't be here, so assert this case.
 		 */
-		dev = devfs_find_device_by_name("ttyd%r", unit);
+		dev = devfs_find_device_by_name("ttyd%s",
+						makedev_unit_b32(tbuf, unit));
 
 		KKASSERT(dev != NULL);
 		cp->cn_dev = dev;
@@ -3139,8 +3157,8 @@ siocncheckc(void *private)
 		iobase = siogdbiobase;
 	else
 		iobase = siocniobase;
-	com_lock();
 	crit_enter();
+	com_lock();
 #if 0
 	siocnopen(&sp, iobase, comdefaultrate);
 #endif
@@ -3151,13 +3169,14 @@ siocncheckc(void *private)
 #if 0
 	siocnclose(&sp, iobase);
 #endif
-	crit_exit();
 	com_unlock();
+	crit_exit();
+
 	return (c);
 }
 
 
-int
+static int
 siocngetc(void *private)
 {
 	int	c;
@@ -3171,8 +3190,8 @@ siocngetc(void *private)
 		iobase = siogdbiobase;
 	else
 		iobase = siocniobase;
-	com_lock();
 	crit_enter();
+	com_lock();
 #if 0
 	siocnopen(&sp, iobase, comdefaultrate);
 #endif
@@ -3182,12 +3201,12 @@ siocngetc(void *private)
 #if 0
 	siocnclose(&sp, iobase);
 #endif
-	crit_exit();
 	com_unlock();
+	crit_exit();
 	return (c);
 }
 
-void
+static void
 siocnputc(void *private, int c)
 {
 	int	unit = (int)(intptr_t)private;
@@ -3200,8 +3219,8 @@ siocnputc(void *private, int c)
 		iobase = siogdbiobase;
 	else
 		iobase = siocniobase;
-	com_lock();
 	crit_enter();
+	com_lock();
 #if 0
 	siocnopen(&sp, iobase, comdefaultrate);
 #endif
@@ -3210,8 +3229,8 @@ siocnputc(void *private, int c)
 #if 0
 	siocnclose(&sp, iobase);
 #endif
-	crit_exit();
 	com_unlock();
+	crit_exit();
 }
 
 DRIVER_MODULE(sio, isa, sio_isa_driver, sio_devclass, NULL, NULL);

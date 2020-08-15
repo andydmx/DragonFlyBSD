@@ -1,13 +1,13 @@
 /*
  * Copyright (c) 2007-2008 The DragonFly Project.  All rights reserved.
- * 
+ *
  * This code is derived from software contributed to The DragonFly Project
  * by Matthew Dillon <dillon@backplane.com>
- * 
+ *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
  * are met:
- * 
+ *
  * 1. Redistributions of source code must retain the above copyright
  *    notice, this list of conditions and the following disclaimer.
  * 2. Redistributions in binary form must reproduce the above copyright
@@ -17,7 +17,7 @@
  * 3. Neither the name of The DragonFly Project nor the names of its
  *    contributors may be used to endorse or promote products derived
  *    from this software without specific, prior written permission.
- * 
+ *
  * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
  * ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
  * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
@@ -32,17 +32,8 @@
  * SUCH DAMAGE.
  */
 
-#include <sys/param.h>
-#include <sys/systm.h>
-#include <sys/kernel.h>
-#include <sys/vnode.h>
-#include <sys/mount.h>
-#include <sys/malloc.h>
-#include <sys/nlookup.h>
-#include <sys/fcntl.h>
-#include <sys/sysctl.h>
-#include <sys/buf.h>
-#include <sys/buf2.h>
+#include <sys/mountctl.h>
+
 #include "hammer.h"
 
 /*
@@ -52,16 +43,13 @@
 int hammer_supported_version = HAMMER_VOL_VERSION_DEFAULT;
 int hammer_debug_io;
 int hammer_debug_general;
-int hammer_debug_debug = 1;		/* medium-error panics */ 
 int hammer_debug_inode;
 int hammer_debug_locks;
 int hammer_debug_btree;
 int hammer_debug_tid;
 int hammer_debug_recover;		/* -1 will disable, +1 will force */
-int hammer_debug_recover_faults;
 int hammer_debug_critical;		/* non-zero enter debugger on error */
-int hammer_cluster_enable = 1;		/* enable read clustering by default */
-int hammer_live_dedup = 0;
+int hammer_cluster_enable = 2;		/* ena cluster_read, scale x 2 */
 int hammer_tdmux_ticks;
 int hammer_count_fsyncs;
 int hammer_count_inodes;
@@ -72,7 +60,6 @@ int hammer_count_record_datas;
 int hammer_count_volumes;
 int hammer_count_buffers;
 int hammer_count_nodes;
-int64_t hammer_count_extra_space_used;
 int64_t hammer_stats_btree_lookups;
 int64_t hammer_stats_btree_searches;
 int64_t hammer_stats_btree_inserts;
@@ -85,8 +72,6 @@ int64_t hammer_stats_record_iterations;
 
 int64_t hammer_stats_file_read;
 int64_t hammer_stats_file_write;
-int64_t hammer_stats_file_iopsr;
-int64_t hammer_stats_file_iopsw;
 int64_t hammer_stats_disk_read;
 int64_t hammer_stats_disk_write;
 int64_t hammer_stats_inode_flushes;
@@ -104,40 +89,27 @@ long hammer_limit_dirtybufspace;	/* per-mount */
 int hammer_limit_recs;			/* as a whole XXX */
 int hammer_limit_inode_recs = 2048;	/* per inode */
 int hammer_limit_reclaims;
-int hammer_live_dedup_cache_size = DEDUP_CACHE_SIZE;
+int hammer_live_dedup_cache_size = 4096;
 int hammer_limit_redo = 4096 * 1024;	/* per inode */
 int hammer_autoflush = 500;		/* auto flush (typ on reclaim) */
-int hammer_bio_count;
 int hammer_verify_zone;
 int hammer_verify_data = 1;
-int hammer_write_mode;
 int hammer_double_buffer;
 int hammer_btree_full_undo = 1;
 int hammer_yield_check = 16;
 int hammer_fsync_mode = 3;
 int64_t hammer_contention_count;
-int64_t hammer_zone_limit;
 
-/*
- * Live dedup debug counters (sysctls are writable so that counters
- * can be reset from userspace).
- */
-int64_t hammer_live_dedup_vnode_bcmps = 0;
-int64_t hammer_live_dedup_device_bcmps = 0;
-int64_t hammer_live_dedup_findblk_failures = 0;
-int64_t hammer_live_dedup_bmap_saves = 0;
-
+int hammer_noatime = 1;
+TUNABLE_INT("vfs.hammer.noatime", &hammer_noatime);
 
 SYSCTL_NODE(_vfs, OID_AUTO, hammer, CTLFLAG_RW, 0, "HAMMER filesystem");
-
 SYSCTL_INT(_vfs_hammer, OID_AUTO, supported_version, CTLFLAG_RD,
 	   &hammer_supported_version, 0, "");
 SYSCTL_INT(_vfs_hammer, OID_AUTO, debug_general, CTLFLAG_RW,
 	   &hammer_debug_general, 0, "");
 SYSCTL_INT(_vfs_hammer, OID_AUTO, debug_io, CTLFLAG_RW,
 	   &hammer_debug_io, 0, "");
-SYSCTL_INT(_vfs_hammer, OID_AUTO, debug_debug, CTLFLAG_RW,
-	   &hammer_debug_debug, 0, "");
 SYSCTL_INT(_vfs_hammer, OID_AUTO, debug_inode, CTLFLAG_RW,
 	   &hammer_debug_inode, 0, "");
 SYSCTL_INT(_vfs_hammer, OID_AUTO, debug_locks, CTLFLAG_RW,
@@ -148,22 +120,10 @@ SYSCTL_INT(_vfs_hammer, OID_AUTO, debug_tid, CTLFLAG_RW,
 	   &hammer_debug_tid, 0, "");
 SYSCTL_INT(_vfs_hammer, OID_AUTO, debug_recover, CTLFLAG_RW,
 	   &hammer_debug_recover, 0, "");
-SYSCTL_INT(_vfs_hammer, OID_AUTO, debug_recover_faults, CTLFLAG_RW,
-	   &hammer_debug_recover_faults, 0, "");
 SYSCTL_INT(_vfs_hammer, OID_AUTO, debug_critical, CTLFLAG_RW,
 	   &hammer_debug_critical, 0, "");
 SYSCTL_INT(_vfs_hammer, OID_AUTO, cluster_enable, CTLFLAG_RW,
 	   &hammer_cluster_enable, 0, "");
-/*
- * 0 - live dedup is disabled
- * 1 - dedup cache is populated on reads only
- * 2 - dedup cache is populated on both reads and writes
- *
- * LIVE_DEDUP IS DISABLED PERMANENTLY!  This feature appears to cause
- * blockmap corruption over time so we've turned it off permanently.
- */
-SYSCTL_INT(_vfs_hammer, OID_AUTO, live_dedup, CTLFLAG_RD,
-	   &hammer_live_dedup, 0, "Enable live dedup (experimental)");
 SYSCTL_INT(_vfs_hammer, OID_AUTO, tdmux_ticks, CTLFLAG_RW,
 	   &hammer_tdmux_ticks, 0, "Hammer tdmux ticks");
 
@@ -199,8 +159,6 @@ SYSCTL_INT(_vfs_hammer, OID_AUTO, count_buffers, CTLFLAG_RD,
 	   &hammer_count_buffers, 0, "");
 SYSCTL_INT(_vfs_hammer, OID_AUTO, count_nodes, CTLFLAG_RD,
 	   &hammer_count_nodes, 0, "");
-SYSCTL_QUAD(_vfs_hammer, OID_AUTO, count_extra_space_used, CTLFLAG_RD,
-	   &hammer_count_extra_space_used, 0, "");
 
 SYSCTL_QUAD(_vfs_hammer, OID_AUTO, stats_btree_searches, CTLFLAG_RD,
 	   &hammer_stats_btree_searches, 0, "");
@@ -225,10 +183,6 @@ SYSCTL_QUAD(_vfs_hammer, OID_AUTO, stats_file_read, CTLFLAG_RD,
 	   &hammer_stats_file_read, 0, "");
 SYSCTL_QUAD(_vfs_hammer, OID_AUTO, stats_file_write, CTLFLAG_RD,
 	   &hammer_stats_file_write, 0, "");
-SYSCTL_QUAD(_vfs_hammer, OID_AUTO, stats_file_iopsr, CTLFLAG_RD,
-	   &hammer_stats_file_iopsr, 0, "");
-SYSCTL_QUAD(_vfs_hammer, OID_AUTO, stats_file_iopsw, CTLFLAG_RD,
-	   &hammer_stats_file_iopsw, 0, "");
 SYSCTL_QUAD(_vfs_hammer, OID_AUTO, stats_disk_read, CTLFLAG_RD,
 	   &hammer_stats_disk_read, 0, "");
 SYSCTL_QUAD(_vfs_hammer, OID_AUTO, stats_disk_write, CTLFLAG_RD,
@@ -242,19 +196,6 @@ SYSCTL_QUAD(_vfs_hammer, OID_AUTO, stats_undo, CTLFLAG_RD,
 SYSCTL_QUAD(_vfs_hammer, OID_AUTO, stats_redo, CTLFLAG_RD,
 	   &hammer_stats_redo, 0, "");
 
-SYSCTL_QUAD(_vfs_hammer, OID_AUTO, live_dedup_vnode_bcmps, CTLFLAG_RW,
-	    &hammer_live_dedup_vnode_bcmps, 0,
-	    "successful vnode buffer comparisons");
-SYSCTL_QUAD(_vfs_hammer, OID_AUTO, live_dedup_device_bcmps, CTLFLAG_RW,
-	    &hammer_live_dedup_device_bcmps, 0,
-	    "successful device buffer comparisons");
-SYSCTL_QUAD(_vfs_hammer, OID_AUTO, live_dedup_findblk_failures, CTLFLAG_RW,
-	    &hammer_live_dedup_findblk_failures, 0,
-	    "block lookup failures for comparison");
-SYSCTL_QUAD(_vfs_hammer, OID_AUTO, live_dedup_bmap_saves, CTLFLAG_RW,
-	    &hammer_live_dedup_bmap_saves, 0,
-	    "useful physical block lookups");
-
 SYSCTL_LONG(_vfs_hammer, OID_AUTO, count_dirtybufspace, CTLFLAG_RD,
 	   &hammer_count_dirtybufspace, 0, "");
 SYSCTL_INT(_vfs_hammer, OID_AUTO, count_refedbufs, CTLFLAG_RD,
@@ -267,8 +208,6 @@ SYSCTL_INT(_vfs_hammer, OID_AUTO, count_io_locked, CTLFLAG_RD,
 	   &hammer_count_io_locked, 0, "");
 SYSCTL_LONG(_vfs_hammer, OID_AUTO, count_io_running_write, CTLFLAG_RD,
 	   &hammer_count_io_running_write, 0, "");
-SYSCTL_QUAD(_vfs_hammer, OID_AUTO, zone_limit, CTLFLAG_RW,
-	   &hammer_zone_limit, 0, "");
 SYSCTL_QUAD(_vfs_hammer, OID_AUTO, contention_count, CTLFLAG_RW,
 	   &hammer_contention_count, 0, "");
 SYSCTL_INT(_vfs_hammer, OID_AUTO, autoflush, CTLFLAG_RW,
@@ -277,8 +216,6 @@ SYSCTL_INT(_vfs_hammer, OID_AUTO, verify_zone, CTLFLAG_RW,
 	   &hammer_verify_zone, 0, "");
 SYSCTL_INT(_vfs_hammer, OID_AUTO, verify_data, CTLFLAG_RW,
 	   &hammer_verify_data, 0, "");
-SYSCTL_INT(_vfs_hammer, OID_AUTO, write_mode, CTLFLAG_RW,
-	   &hammer_write_mode, 0, "");
 SYSCTL_INT(_vfs_hammer, OID_AUTO, double_buffer, CTLFLAG_RW,
 	   &hammer_double_buffer, 0, "");
 SYSCTL_INT(_vfs_hammer, OID_AUTO, btree_full_undo, CTLFLAG_RW,
@@ -315,9 +252,10 @@ static int	hammer_vfs_checkexp(struct mount *mp, struct sockaddr *nam,
 
 
 static struct vfsops hammer_vfsops = {
+	.vfs_flags	= 0,
 	.vfs_mount	= hammer_vfs_mount,
 	.vfs_unmount	= hammer_vfs_unmount,
-	.vfs_root 	= hammer_vfs_root,
+	.vfs_root	= hammer_vfs_root,
 	.vfs_statfs	= hammer_vfs_statfs,
 	.vfs_statvfs	= hammer_vfs_statvfs,
 	.vfs_sync	= hammer_vfs_sync,
@@ -330,7 +268,7 @@ static struct vfsops hammer_vfsops = {
 
 MALLOC_DEFINE(M_HAMMER, "HAMMER-mount", "");
 
-VFS_SET(hammer_vfsops, hammer, 0);
+VFS_SET(hammer_vfsops, hammer, VFCF_MPSAFE);
 MODULE_VERSION(hammer, 1);
 
 static int
@@ -372,8 +310,11 @@ hammer_vfs_init(struct vfsconf *conf)
 	 * This limits the number of inodes in this state to prevent a
 	 * memory pool blowout.
 	 */
-	if (hammer_limit_reclaims == 0)
-		hammer_limit_reclaims = desiredvnodes / 10;
+	if (hammer_limit_reclaims == 0) {
+		hammer_limit_reclaims = maxvnodes / 10;
+		if (hammer_limit_reclaims > HAMMER_LIMIT_RECLAIMS)
+			hammer_limit_reclaims = HAMMER_LIMIT_RECLAIMS;
+	}
 
 	return(0);
 }
@@ -392,7 +333,13 @@ hammer_vfs_mount(struct mount *mp, char *mntpt, caddr_t data,
 	int error;
 	int i;
 	int master_id;
+	int nvolumes;
 	char *next_volume_ptr = NULL;
+
+	if (hammer_noatime) {
+		/* Force noatime */
+		mp->mnt_flag |= MNT_NOATIME;
+	}
 
 	/*
 	 * Accept hammer_mount_info.  mntpt is NULL for root mounts at boot.
@@ -434,10 +381,9 @@ hammer_vfs_mount(struct mount *mp, char *mntpt, caddr_t data,
 	 * master-id validation.  The master id may not be changed by a
 	 * mount update.
 	 */
-	if (info.hflags & HMNT_MASTERID) {
+	if (info.hflags & HMNT_MASTERID || info.hflags & HMNT_NOMIRROR) {
 		if (hmp && hmp->master_id != info.master_id) {
-			kprintf("hammer: cannot change master id "
-				"with mount update\n");
+			hkprintf("cannot change master id with mount update\n");
 			return(EINVAL);
 		}
 		master_id = info.master_id;
@@ -457,7 +403,6 @@ hammer_vfs_mount(struct mount *mp, char *mntpt, caddr_t data,
 		hmp = kmalloc(sizeof(*hmp), M_HAMMER, M_WAITOK | M_ZERO);
 		mp->mnt_data = (qaddr_t)hmp;
 		hmp->mp = mp;
-		/*TAILQ_INIT(&hmp->recycle_list);*/
 
 		/*
 		 * Make sure kmalloc type limits are set appropriately.
@@ -470,27 +415,32 @@ hammer_vfs_mount(struct mount *mp, char *mntpt, caddr_t data,
 
 		kmalloc_raise_limit(hmp->m_inodes, 0);	/* unlimited */
 
-		hmp->root_btree_beg.localization = 0x00000000U;
-		hmp->root_btree_beg.obj_id = -0x8000000000000000LL;
-		hmp->root_btree_beg.key = -0x8000000000000000LL;
+		hmp->root_btree_beg.localization =
+			HAMMER_MIN_ONDISK_LOCALIZATION;
+		hmp->root_btree_beg.obj_id = HAMMER_MIN_OBJID;
+		hmp->root_btree_beg.key = HAMMER_MIN_KEY;
 		hmp->root_btree_beg.create_tid = 1;
 		hmp->root_btree_beg.delete_tid = 1;
-		hmp->root_btree_beg.rec_type = 0;
+		hmp->root_btree_beg.rec_type = HAMMER_MIN_RECTYPE;
 		hmp->root_btree_beg.obj_type = 0;
+		hmp->root_btree_beg.btype = HAMMER_BTREE_TYPE_NONE;
 
-		hmp->root_btree_end.localization = 0xFFFFFFFFU;
-		hmp->root_btree_end.obj_id = 0x7FFFFFFFFFFFFFFFLL;
-		hmp->root_btree_end.key = 0x7FFFFFFFFFFFFFFFLL;
-		hmp->root_btree_end.create_tid = 0xFFFFFFFFFFFFFFFFULL;
+		hmp->root_btree_end.localization =
+			HAMMER_MAX_ONDISK_LOCALIZATION;
+		hmp->root_btree_end.obj_id = HAMMER_MAX_OBJID;
+		hmp->root_btree_end.key = HAMMER_MAX_KEY;
+		hmp->root_btree_end.create_tid = HAMMER_MAX_TID;
 		hmp->root_btree_end.delete_tid = 0;   /* special case */
-		hmp->root_btree_end.rec_type = 0xFFFFU;
+		hmp->root_btree_end.rec_type = HAMMER_MAX_RECTYPE;
 		hmp->root_btree_end.obj_type = 0;
+		hmp->root_btree_end.btype = HAMMER_BTREE_TYPE_NONE;
 
 		hmp->krate.freq = 1;	/* maximum reporting rate (hz) */
 		hmp->krate.count = -16;	/* initial burst */
+		hmp->kdiag.freq = 1;	/* maximum reporting rate (hz) */
+		hmp->kdiag.count = -16;	/* initial burst */
 
 		hmp->sync_lock.refs = 1;
-		hmp->free_lock.refs = 1;
 		hmp->undo_lock.refs = 1;
 		hmp->blkmap_lock.refs = 1;
 		hmp->snapshot_lock.refs = 1;
@@ -501,10 +451,6 @@ hammer_vfs_mount(struct mount *mp, char *mntpt, caddr_t data,
 		TAILQ_INIT(&hmp->objid_cache_list);
 		TAILQ_INIT(&hmp->undo_lru_list);
 		TAILQ_INIT(&hmp->reclaim_list);
-
-		RB_INIT(&hmp->rb_dedup_crc_root);
-		RB_INIT(&hmp->rb_dedup_off_root);	
-		TAILQ_INIT(&hmp->dedup_lru_list);
 	}
 	hmp->hflags &= ~HMNT_USERFLAGS;
 	hmp->hflags |= info.hflags & HMNT_USERFLAGS;
@@ -530,7 +476,7 @@ hammer_vfs_mount(struct mount *mp, char *mntpt, caddr_t data,
 		lwkt_gettoken(&hmp->fs_token);
 		error = 0;
 		if (hmp->ronly && (mp->mnt_kern_flag & MNTK_WANTRDWR)) {
-			kprintf("HAMMER read-only -> read-write\n");
+			hkprintf("read-only -> read-write\n");
 			hmp->ronly = 0;
 			RB_SCAN(hammer_vol_rb_tree, &hmp->rb_vols_root, NULL,
 				hammer_adjust_volume_mode, NULL);
@@ -547,7 +493,7 @@ hammer_vfs_mount(struct mount *mp, char *mntpt, caddr_t data,
 				hammer_reload_inode, NULL);
 			/* kernel clears MNT_RDONLY */
 		} else if (hmp->ronly == 0 && (mp->mnt_flag & MNT_RDONLY)) {
-			kprintf("HAMMER read-write -> read-only\n");
+			hkprintf("read-write -> read-only\n");
 			hmp->ronly = 1;	/* messy */
 			RB_SCAN(hammer_ino_rb_tree, &hmp->rb_inos_root, NULL,
 				hammer_reload_inode, NULL);
@@ -620,7 +566,7 @@ hammer_vfs_mount(struct mount *mp, char *mntpt, caddr_t data,
 			cdev_t dev = kgetdiskbyname(path);
 			error = bdevvp(dev, &devvp);
 			if (error) {
-				kprintf("hammer_mountroot: can't find devvp\n");
+				hdkprintf("can't find devvp\n");
 			}
 		} else {
 			error = copyin(&info.volumes[i], &upath,
@@ -630,7 +576,7 @@ hammer_vfs_mount(struct mount *mp, char *mntpt, caddr_t data,
 						  MAXPATHLEN, NULL);
 		}
 		if (error == 0)
-			error = hammer_install_volume(hmp, path, devvp);
+			error = hammer_install_volume(hmp, path, devvp, NULL);
 		if (error)
 			break;
 	}
@@ -639,23 +585,39 @@ hammer_vfs_mount(struct mount *mp, char *mntpt, caddr_t data,
 	/*
 	 * Make sure we found a root volume
 	 */
-	if (error == 0 && hmp->rootvol == NULL) {
-		kprintf("hammer_mount: No root volume found!\n");
-		error = EINVAL;
+	if (hmp->rootvol == NULL) {
+		if (error == EBUSY) {
+			hdkprintf("The volumes are probably mounted\n");
+		} else {
+			hdkprintf("No root volume found!\n");
+			error = EINVAL;
+		}
+		goto failed;
 	}
 
 	/*
 	 * Check that all required volumes are available
 	 */
 	if (error == 0 && hammer_mountcheck_volumes(hmp)) {
-		kprintf("hammer_mount: Missing volumes, cannot mount!\n");
+		hdkprintf("Missing volumes, cannot mount!\n");
 		error = EINVAL;
+		goto failed;
 	}
 
+	/*
+	 * Other errors
+	 */
 	if (error) {
-		/* called with fs_token held */
-		hammer_free_hmp(mp);
-		return (error);
+		hdkprintf("Failed to load volumes!\n");
+		goto failed;
+	}
+
+	nvolumes = hammer_get_installed_volumes(hmp);
+	if (hmp->nvolumes != nvolumes) {
+		hdkprintf("volume header says %d volumes, but %d installed\n",
+			hmp->nvolumes, nvolumes);
+		error = EINVAL;
+		goto failed;
 	}
 
 	/*
@@ -669,13 +631,11 @@ hammer_vfs_mount(struct mount *mp, char *mntpt, caddr_t data,
 	/*
 	 * MPSAFE code.  Note that VOPs and VFSops which are not MPSAFE
 	 * will acquire a per-mount token prior to entry and release it
-	 * on return, so even if we do not specify it we no longer get
-	 * the BGL regardlless of how we are flagged.
+	 * on return.
 	 */
 	mp->mnt_kern_flag |= MNTK_ALL_MPSAFE;
-	/*MNTK_RD_MPSAFE | MNTK_GA_MPSAFE | MNTK_IN_MPSAFE;*/
 
-	/* 
+	/*
 	 * note: f_iosize is used by vnode_pager_haspage() when constructing
 	 * its VOP_BMAP call.
 	 */
@@ -718,8 +678,7 @@ hammer_vfs_mount(struct mount *mp, char *mntpt, caddr_t data,
 	hmp->version = rootvol->ondisk->vol_version;
 	if (hmp->version < HAMMER_VOL_VERSION_MIN ||
 	    hmp->version > HAMMER_VOL_VERSION_MAX) {
-		kprintf("HAMMER: mount unsupported fs version %d\n",
-			hmp->version);
+		hkprintf("mount unsupported fs version %d\n", hmp->version);
 		error = ERANGE;
 		goto done;
 	}
@@ -732,7 +691,7 @@ hammer_vfs_mount(struct mount *mp, char *mntpt, caddr_t data,
 	 */
 	hmp->undo_rec_limit = hammer_undo_max(hmp) / 8192 + 100;
 	if (hammer_debug_general & 0x0001)
-		kprintf("HAMMER: undo_rec_limit %d\n", hmp->undo_rec_limit);
+		hkprintf("undo_rec_limit %d\n", hmp->undo_rec_limit);
 
 	/*
 	 * NOTE: Recover stage1 not only handles meta-data recovery, it
@@ -746,17 +705,15 @@ hammer_vfs_mount(struct mount *mp, char *mntpt, caddr_t data,
 
 	/*
 	 * Finish setup now that we have a good root volume.
-	 *
-	 * The top 16 bits of fsid.val[1] is a pfs id.
 	 */
 	ksnprintf(mp->mnt_stat.f_mntfromname,
 		  sizeof(mp->mnt_stat.f_mntfromname), "%s",
-		  rootvol->ondisk->vol_name);
+		  rootvol->ondisk->vol_label);
 	mp->mnt_stat.f_fsid.val[0] =
 		crc32((char *)&rootvol->ondisk->vol_fsid + 0, 8);
 	mp->mnt_stat.f_fsid.val[1] =
 		crc32((char *)&rootvol->ondisk->vol_fsid + 8, 8);
-	mp->mnt_stat.f_fsid.val[1] &= 0x0000FFFF;
+	mp->mnt_stat.f_fsid.val[1] &= HAMMER_LOCALIZE_MASK;
 
 	mp->mnt_vstat.f_fsid_uuid = rootvol->ondisk->vol_fsid;
 	mp->mnt_vstat.f_fsid = crc32(&mp->mnt_vstat.f_fsid_uuid,
@@ -782,17 +739,12 @@ hammer_vfs_mount(struct mount *mp, char *mntpt, caddr_t data,
 	hammer_flusher_create(hmp);
 
 	/*
-	 * Locate the root directory using the root cluster's B-Tree as a
-	 * starting point.  The root directory uses an obj_id of 1.
-	 *
-	 * FUTURE: Leave the root directory cached referenced but unlocked
-	 * in hmp->rootvp (need to flush it on unmount).
+	 * Locate the root directory with an obj_id of 1.
 	 */
-	error = hammer_vfs_vget(mp, NULL, 1, &rootvp);
+	error = hammer_vfs_root(mp, &rootvp);
 	if (error)
 		goto done;
 	vput(rootvp);
-	/*vn_unlock(hmp->rootvp);*/
 	if (hmp->ronly == 0)
 		error = hammer_recover_stage2(hmp, rootvol);
 
@@ -873,31 +825,12 @@ hammer_free_hmp(struct mount *mp)
 {
 	hammer_mount_t hmp = (void *)mp->mnt_data;
 	hammer_flush_group_t flg;
-	int count;
-	int dummy;
 
 	/*
 	 * Flush anything dirty.  This won't even run if the
 	 * filesystem errored-out.
 	 */
-	count = 0;
-	while (hammer_flusher_haswork(hmp)) {
-		hammer_flusher_sync(hmp);
-		++count;
-		if (count >= 5) {
-			if (count == 5)
-				kprintf("HAMMER: umount flushing.");
-			else
-				kprintf(".");
-			tsleep(&dummy, 0, "hmrufl", hz);
-		}
-		if (count == 30) {
-			kprintf("giving up\n");
-			break;
-		}
-	}
-	if (count >= 5 && count < 30)
-		kprintf("\n");
+	hammer_flush_dirty(hmp, 30);
 
 	/*
 	 * If the mount had a critical error we have to destroy any
@@ -917,7 +850,7 @@ hammer_free_hmp(struct mount *mp)
 		TAILQ_REMOVE(&hmp->flush_group_list, flg, flush_entry);
 		KKASSERT(RB_EMPTY(&flg->flush_tree));
 		if (flg->refs) {
-			kprintf("HAMMER: Warning, flush_group %p was "
+			hkprintf("Warning, flush_group %p was "
 				"not empty on umount!\n", flg);
 		}
 		kfree(flg, hmp->m_misc);
@@ -947,11 +880,6 @@ hammer_free_hmp(struct mount *mp)
 	mp->mnt_flag &= ~MNT_LOCAL;
 	hmp->mp = NULL;
 	hammer_destroy_objid_cache(hmp);
-	hammer_destroy_dedup_cache(hmp);
-	if (hmp->dedup_free_cache != NULL) {
-		kfree(hmp->dedup_free_cache, hmp->m_misc);
-		hmp->dedup_free_cache = NULL;
-	}
 	kmalloc_destroy(&hmp->m_misc);
 	kmalloc_destroy(&hmp->m_inodes);
 	lwkt_reltoken(&hmp->fs_token);
@@ -967,9 +895,8 @@ hammer_critical_error(hammer_mount_t hmp, hammer_inode_t ip,
 {
 	hmp->flags |= HAMMER_MOUNT_CRITICAL_ERROR;
 
-	krateprintf(&hmp->krate,
-		    "HAMMER(%s): Critical error inode=%jd error=%d %s\n",
-		    hmp->mp->mnt_stat.f_mntfromname,
+	hmkrateprintf(&hmp->krate, hmp,
+		    "Critical error inode=%jd error=%d %s\n",
 		    (intmax_t)(ip ? ip->obj_id : -1),
 		    error, msg);
 
@@ -978,8 +905,7 @@ hammer_critical_error(hammer_mount_t hmp, hammer_inode_t ip,
 		hmp->mp->mnt_flag |= MNT_RDONLY;
 		RB_SCAN(hammer_vol_rb_tree, &hmp->rb_vols_root, NULL,
 			hammer_adjust_volume_mode, NULL);
-		kprintf("HAMMER(%s): Forcing read-only mode\n",
-			hmp->mp->mnt_stat.f_mntfromname);
+		hmkprintf(hmp, "Forcing read-only mode\n");
 	}
 	hmp->error = error;
 	if (hammer_debug_critical)
@@ -996,10 +922,10 @@ hammer_vfs_vget(struct mount *mp, struct vnode *dvp,
 		ino_t ino, struct vnode **vpp)
 {
 	struct hammer_transaction trans;
-	struct hammer_mount *hmp = (void *)mp->mnt_data;
-	struct hammer_inode *ip;
+	hammer_mount_t hmp = (void *)mp->mnt_data;
+	hammer_inode_t ip;
 	int error;
-	u_int32_t localization;
+	uint32_t localization;
 
 	lwkt_gettoken(&hmp->fs_token);
 	hammer_simple_transaction(&trans, hmp);
@@ -1010,7 +936,7 @@ hammer_vfs_vget(struct mount *mp, struct vnode *dvp,
 	 * inodes in the root PFS.
 	 */
 	if (dvp) {
-		localization = HAMMER_DEF_LOCALIZATION +
+		localization = HAMMER_DEF_LOCALIZATION |
 				VTOI(dvp)->obj_localization;
 	} else {
 		localization = HAMMER_DEF_LOCALIZATION;
@@ -1046,14 +972,14 @@ hammer_vfs_root(struct mount *mp, struct vnode **vpp)
 {
 	int error;
 
-	error = hammer_vfs_vget(mp, NULL, 1, vpp);
+	error = hammer_vfs_vget(mp, NULL, HAMMER_OBJID_ROOT, vpp);
 	return (error);
 }
 
 static int
 hammer_vfs_statfs(struct mount *mp, struct statfs *sbp, struct ucred *cred)
 {
-	struct hammer_mount *hmp = (void *)mp->mnt_data;
+	hammer_mount_t hmp = (void *)mp->mnt_data;
 	hammer_volume_t volume;
 	hammer_volume_ondisk_t ondisk;
 	int error;
@@ -1073,9 +999,11 @@ hammer_vfs_statfs(struct mount *mp, struct statfs *sbp, struct ucred *cred)
 	 */
 	_hammer_checkspace(hmp, HAMMER_CHKSPC_WRITE, &breserved);
 	mp->mnt_stat.f_files = ondisk->vol0_stat_inodes;
-	bfree = ondisk->vol0_stat_freebigblocks * HAMMER_LARGEBLOCK_SIZE;
+	bfree = ondisk->vol0_stat_freebigblocks * HAMMER_BIGBLOCK_SIZE;
 	hammer_rel_volume(volume, 0);
 
+	if (breserved > bfree)
+		breserved = bfree;
 	mp->mnt_stat.f_bfree = (bfree - breserved) / HAMMER_BUFSIZE;
 	mp->mnt_stat.f_bavail = mp->mnt_stat.f_bfree;
 	if (mp->mnt_stat.f_files < 0)
@@ -1089,7 +1017,7 @@ hammer_vfs_statfs(struct mount *mp, struct statfs *sbp, struct ucred *cred)
 static int
 hammer_vfs_statvfs(struct mount *mp, struct statvfs *sbp, struct ucred *cred)
 {
-	struct hammer_mount *hmp = (void *)mp->mnt_data;
+	hammer_mount_t hmp = (void *)mp->mnt_data;
 	hammer_volume_t volume;
 	hammer_volume_ondisk_t ondisk;
 	int error;
@@ -1109,9 +1037,11 @@ hammer_vfs_statvfs(struct mount *mp, struct statvfs *sbp, struct ucred *cred)
 	 */
 	_hammer_checkspace(hmp, HAMMER_CHKSPC_WRITE, &breserved);
 	mp->mnt_vstat.f_files = ondisk->vol0_stat_inodes;
-	bfree = ondisk->vol0_stat_freebigblocks * HAMMER_LARGEBLOCK_SIZE;
+	bfree = ondisk->vol0_stat_freebigblocks * HAMMER_BIGBLOCK_SIZE;
 	hammer_rel_volume(volume, 0);
 
+	if (breserved > bfree)
+		breserved = bfree;
 	mp->mnt_vstat.f_bfree = (bfree - breserved) / HAMMER_BUFSIZE;
 	mp->mnt_vstat.f_bavail = mp->mnt_vstat.f_bfree;
 	if (mp->mnt_vstat.f_files < 0)
@@ -1132,7 +1062,7 @@ hammer_vfs_statvfs(struct mount *mp, struct statvfs *sbp, struct ucred *cred)
 static int
 hammer_vfs_sync(struct mount *mp, int waitfor)
 {
-	struct hammer_mount *hmp = (void *)mp->mnt_data;
+	hammer_mount_t hmp = (void *)mp->mnt_data;
 	int error;
 
 	lwkt_gettoken(&hmp->fs_token);
@@ -1159,7 +1089,7 @@ hammer_vfs_vptofh(struct vnode *vp, struct fid *fhp)
 	KKASSERT(MAXFIDSZ >= 16);
 	ip = VTOI(vp);
 	fhp->fid_len = offsetof(struct fid, fid_data[16]);
-	fhp->fid_ext = ip->obj_localization >> 16;
+	fhp->fid_ext = lo_to_pfs(ip->obj_localization);
 	bcopy(&ip->obj_id, fhp->fid_data + 0, sizeof(ip->obj_id));
 	bcopy(&ip->obj_asof, fhp->fid_data + 8, sizeof(ip->obj_asof));
 	return(0);
@@ -1178,17 +1108,17 @@ hammer_vfs_fhtovp(struct mount *mp, struct vnode *rootvp,
 {
 	hammer_mount_t hmp = (void *)mp->mnt_data;
 	struct hammer_transaction trans;
-	struct hammer_inode *ip;
+	hammer_inode_t ip;
 	struct hammer_inode_info info;
 	int error;
-	u_int32_t localization;
+	uint32_t localization;
 
 	bcopy(fhp->fid_data + 0, &info.obj_id, sizeof(info.obj_id));
 	bcopy(fhp->fid_data + 8, &info.obj_asof, sizeof(info.obj_asof));
 	if (rootvp)
 		localization = VTOI(rootvp)->obj_localization;
 	else
-		localization = (u_int32_t)fhp->fid_ext << 16;
+		localization = pfs_to_lo(fhp->fid_ext);
 
 	lwkt_gettoken(&hmp->fs_token);
 	hammer_simple_transaction(&trans, hmp);

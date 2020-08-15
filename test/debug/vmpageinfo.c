@@ -1,7 +1,7 @@
 /*
  * VMPAGEINFO.C
  *
- * cc -I/usr/src/sys vmpageinfo.c -o /usr/local/bin/vmpageinfo -lkvm
+ * cc -I/usr/src/sys vmpageinfo.c -o ~/bin/vmpageinfo -lkvm
  *
  * vmpageinfo
  *
@@ -39,8 +39,6 @@
  * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT
  * OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
- *
- * $DragonFly: src/test/debug/vmpageinfo.c,v 1.2 2006/05/23 01:00:05 dillon Exp $
  */
 
 #define _KERNEL_STRUCTURES_
@@ -55,7 +53,6 @@
 #include <vm/vm.h>
 #include <vm/vm_page.h>
 #include <vm/vm_kern.h>
-#include <vm/vm_page.h>
 #include <vm/vm_object.h>
 #include <vm/swap_pager.h>
 #include <vm/vnode_pager.h>
@@ -69,12 +66,15 @@
 #include <getopt.h>
 
 struct nlist Nl[] = {
-#if 0
-    { "_vm_page_buckets" },
-    { "_vm_page_hash_mask" },
-#endif
     { "_vm_page_array" },
     { "_vm_page_array_size" },
+    { "_kernel_object" },
+    { "_nbuf" },
+    { "_nswbuf_mem" },
+    { "_nswbuf_kva" },
+    { "_nswbuf_raw" },
+    { "_kernbase" },
+    { "__end" },
     { NULL }
 };
 
@@ -85,26 +85,58 @@ struct vm_page **vm_page_buckets;
 int vm_page_hash_mask;
 #endif
 struct vm_page *vm_page_array;
+struct vm_object *kernel_object_ptr;
 int vm_page_array_size;
+long nbuf;
+long nswbuf_mem;
+long nswbuf_kva;
+long nswbuf_raw;
+long kern_size;
 
 void checkpage(kvm_t *kd, vm_page_t mptr, vm_page_t m, struct vm_object *obj);
+static void kkread_vmpage(kvm_t *kd, u_long addr, vm_page_t m);
 static void kkread(kvm_t *kd, u_long addr, void *buf, size_t nbytes);
 static int kkread_err(kvm_t *kd, u_long addr, void *buf, size_t nbytes);
 
+#if 0
 static void addsltrack(vm_page_t m);
 static void dumpsltrack(kvm_t *kd);
+#endif
+static int unique_object(void *ptr);
+
+long count_free;
+long count_wired;		/* total */
+long count_wired_vnode;
+long count_wired_anon;
+long count_wired_in_pmap;
+long count_wired_pgtable;
+long count_wired_other;
+long count_wired_kernel;
+long count_wired_obj_other;
+
+long count_anon;
+long count_anon_in_pmap;
+long count_vnode;
+long count_device;
+long count_phys;
+long count_kernel;
+long count_unknown;
+long count_noobj_offqueue;
+long count_noobj_onqueue;
 
 int
 main(int ac, char **av)
 {
     const char *corefile = NULL;
     const char *sysfile = NULL;
-    vm_page_t mptr;
     struct vm_page m;
     struct vm_object obj;
     kvm_t *kd;
     int ch;
+#if 0
+    vm_page_t mptr;
     int hv;
+#endif
     int i;
     const char *qstr;
     const char *ostr;
@@ -140,12 +172,14 @@ main(int ac, char **av)
 	exit(1);
     }
 
-#if 0
-    kkread(kd, Nl[0].n_value, &vm_page_buckets, sizeof(vm_page_buckets));
-    kkread(kd, Nl[1].n_value, &vm_page_hash_mask, sizeof(vm_page_hash_mask));
-#endif
     kkread(kd, Nl[0].n_value, &vm_page_array, sizeof(vm_page_array));
     kkread(kd, Nl[1].n_value, &vm_page_array_size, sizeof(vm_page_array_size));
+    kernel_object_ptr = (void *)Nl[2].n_value;
+    kkread(kd, Nl[3].n_value, &nbuf, sizeof(nbuf));
+    kkread(kd, Nl[4].n_value, &nswbuf_mem, sizeof(nswbuf_mem));
+    kkread(kd, Nl[5].n_value, &nswbuf_kva, sizeof(nswbuf_kva));
+    kkread(kd, Nl[6].n_value, &nswbuf_raw, sizeof(nswbuf_raw));
+    kern_size = Nl[8].n_value - Nl[7].n_value;
 
     /*
      * Scan the vm_page_array validating all pages with associated objects
@@ -155,27 +189,70 @@ main(int ac, char **av)
 	    printf("page %d\r", i);
 	    fflush(stdout);
 	}
-	kkread(kd, (u_long)&vm_page_array[i], &m, sizeof(m));
+	kkread_vmpage(kd, (u_long)&vm_page_array[i], &m);
 	if (m.object) {
 	    kkread(kd, (u_long)m.object, &obj, sizeof(obj));
 	    checkpage(kd, &vm_page_array[i], &m, &obj);
 	}
+	if (m.queue >= PQ_HOLD) {
+	    qstr = "HOLD";
+	} else if (m.queue >= PQ_CACHE) {
+	    qstr = "CACHE";
+	} else if (m.queue >= PQ_ACTIVE) {
+	    qstr = "ACTIVE";
+	} else if (m.queue >= PQ_INACTIVE) {
+	    qstr = "INACTIVE";
+	} else if (m.queue >= PQ_FREE) {
+	    qstr = "FREE";
+	    ++count_free;
+	} else {
+	    qstr = "NONE";
+	}
+	if (m.wire_count) {
+		++count_wired;
+		if (m.object == NULL) {
+			if ((m.flags & PG_MAPPED) &&
+			    (m.flags & PG_WRITEABLE) &&
+			    (m.flags & PG_UNQUEUED)) {
+				++count_wired_pgtable;
+			} else {
+				++count_wired_other;
+			}
+		} else if (m.object == kernel_object_ptr) {
+			++count_wired_kernel;
+		} else {
+			switch(obj.type) {
+			case OBJT_VNODE:
+				++count_wired_vnode;
+				break;
+			case OBJT_DEFAULT:
+			case OBJT_SWAP:
+				if (m.md.pmap_count)
+					++count_wired_in_pmap;
+				else
+					++count_wired_anon;
+				break;
+			default:
+				++count_wired_obj_other;
+				break;
+			}
+		}
+	} else if (m.md.pmap_count) {
+		if (m.object && m.object != kernel_object_ptr) {
+			switch(obj.type) {
+			case OBJT_DEFAULT:
+			case OBJT_SWAP:
+				++count_anon_in_pmap;
+				break;
+			default:
+				break;
+			}
+		}
+	}
+
 	if (verboseopt) {
-	    if (m.queue >= PQ_HOLD) {
-		qstr = "HOLD";
-	    } else if (m.queue >= PQ_CACHE) {
-		qstr = "CACHE";
-	    } else if (m.queue >= PQ_ACTIVE) {
-		qstr = "ACTIVE";
-	    } else if (m.queue >= PQ_INACTIVE) {
-		qstr = "INACTIVE";
-	    } else if (m.queue >= PQ_FREE) {
-		qstr = "FREE";
-	    } else {
-		qstr = "NONE";
-	    } 
 	    printf("page %p obj %p/%-8ju(%016jx) val=%02x dty=%02x hold=%d "
-		   "wire=%-2d act=%-3d busy=%d %8s",
+		   "wire=%-2d act=%-3d busy=%d w/pmapcnt=%d/%d %8s",
 		&vm_page_array[i],
 		m.object,
 		(intmax_t)m.pindex,
@@ -185,40 +262,68 @@ main(int ac, char **av)
 		m.hold_count,
 		m.wire_count,
 		m.act_count,
-		m.busy,
+		m.busy_count,
+		m.md.writeable_count,
+		m.md.pmap_count,
 		qstr
 	    );
-	    if (m.object) {
-		switch(obj.type) {
-		case OBJT_DEFAULT:
-		    ostr = "default";
-		    break;
-		case OBJT_SWAP:
-		    ostr = "swap";
-		    break;
-		case OBJT_VNODE:
-		    ostr = "vnode";
-		    break;
-		case OBJT_DEVICE:
-		    ostr = "device";
-		    break;
-		case OBJT_PHYS:
-		    ostr = "phys";
-		    break;
-		case OBJT_DEAD:
-		    ostr = "dead";
-		    break;
-		default:
-		    ostr = "unknown";
-		    break;
-		}
-	    } else {
-		ostr = "-";
+	}
+
+	if (m.object == kernel_object_ptr) {
+		ostr = "kernel";
+		if (unique_object(m.object))
+			count_kernel += obj.resident_page_count;
+	} else if (m.object) {
+	    switch(obj.type) {
+	    case OBJT_DEFAULT:
+		ostr = "default";
+		if (unique_object(m.object))
+			count_anon += obj.resident_page_count;
+		break;
+	    case OBJT_SWAP:
+		ostr = "swap";
+		if (unique_object(m.object))
+			count_anon += obj.resident_page_count;
+		break;
+	    case OBJT_VNODE:
+		ostr = "vnode";
+		if (unique_object(m.object))
+			count_vnode += obj.resident_page_count;
+		break;
+	    case OBJT_DEVICE:
+		ostr = "device";
+		if (unique_object(m.object))
+			count_device += obj.resident_page_count;
+		break;
+	    case OBJT_PHYS:
+		ostr = "phys";
+		if (unique_object(m.object))
+			count_phys += obj.resident_page_count;
+		break;
+	    case OBJT_DEAD:
+		ostr = "dead";
+		if (unique_object(m.object))
+			count_unknown += obj.resident_page_count;
+		break;
+	    default:
+		if (unique_object(m.object))
+			count_unknown += obj.resident_page_count;
+		ostr = "unknown";
+		break;
 	    }
+	} else {
+	    ostr = "-";
+	    if (m.queue == PQ_NONE)
+		    ++count_noobj_offqueue;
+	    else if (m.queue - m.pc != PQ_FREE)
+		    ++count_noobj_onqueue;
+	}
+
+	if (verboseopt) {
 	    printf(" %-7s", ostr);
-	    if (m.flags & PG_BUSY)
+	    if (m.busy_count & PBUSY_LOCKED)
 		printf(" BUSY");
-	    if (m.flags & PG_WANTED)
+	    if (m.busy_count & PBUSY_WANTED)
 		printf(" WANTED");
 	    if (m.flags & PG_WINATCFLS)
 		printf(" WINATCFLS");
@@ -228,18 +333,18 @@ main(int ac, char **av)
 		printf(" WRITEABLE");
 	    if (m.flags & PG_MAPPED)
 		printf(" MAPPED");
-	    if (m.flags & PG_ZERO)
-		printf(" ZERO");
+	    if (m.flags & PG_NEED_COMMIT)
+		printf(" NEED_COMMIT");
 	    if (m.flags & PG_REFERENCED)
 		printf(" REFERENCED");
 	    if (m.flags & PG_CLEANCHK)
 		printf(" CLEANCHK");
-	    if (m.flags & PG_SWAPINPROG)
+	    if (m.busy_count & PBUSY_SWAPINPROG)
 		printf(" SWAPINPROG");
 	    if (m.flags & PG_NOSYNC)
 		printf(" NOSYNC");
-	    if (m.flags & PG_UNMANAGED)
-		printf(" UNMANAGED");
+	    if (m.flags & PG_UNQUEUED)
+		printf(" UNQUEUED");
 	    if (m.flags & PG_MARKER)
 		printf(" MARKER");
 	    if (m.flags & PG_RAM)
@@ -259,6 +364,51 @@ main(int ac, char **av)
     }
     if (debugopt || verboseopt)
 	printf("\n");
+    printf("%8.2fM free\n", count_free * 4096.0 / 1048576.0);
+
+    printf("%8.2fM wired vnode (in buffer cache)\n",
+	count_wired_vnode * 4096.0 / 1048576.0);
+    printf("%8.2fM wired in-pmap (probably vnode pages also in buffer cache)\n",
+	count_wired_in_pmap * 4096.0 / 1048576.0);
+    printf("%8.2fM wired pgtable\n",
+	count_wired_pgtable * 4096.0 / 1048576.0);
+    printf("%8.2fM wired anon\n",
+	count_wired_anon * 4096.0 / 1048576.0);
+    printf("%8.2fM wired kernel_object\n",
+	count_wired_kernel * 4096.0 / 1048576.0);
+
+	printf("\t%8.2fM vm_page_array\n",
+	    vm_page_array_size * sizeof(struct vm_page) / 1048576.0);
+	printf("\t%8.2fM buf, swbuf_mem, swbuf_kva, swbuf_raw\n",
+	    (nbuf + nswbuf_mem + nswbuf_kva + nswbuf_raw) *
+	    sizeof(struct buf) / 1048576.0);
+	printf("\t%8.2fM kernel binary\n", kern_size / 1048576.0);
+	printf("\t(also add in KMALLOC id kmapinfo, or loosely, vmstat -m)\n");
+
+    printf("%8.2fM wired other (unknown object)\n",
+	count_wired_obj_other * 4096.0 / 1048576.0);
+    printf("%8.2fM wired other (no object, probably kernel)\n",
+	count_wired_other * 4096.0 / 1048576.0);
+
+    printf("%8.2fM WIRED TOTAL\n",
+	count_wired * 4096.0 / 1048576.0);
+
+    printf("\n");
+    printf("%8.2fM anonymous (total, includes in-pmap)\n",
+	count_anon * 4096.0 / 1048576.0);
+    printf("%8.2fM anonymous memory in-pmap\n",
+	count_anon_in_pmap * 4096.0 / 1048576.0);
+    printf("%8.2fM vnode (includes wired)\n",
+	count_vnode * 4096.0 / 1048576.0);
+    printf("%8.2fM device\n", count_device * 4096.0 / 1048576.0);
+    printf("%8.2fM phys\n", count_phys * 4096.0 / 1048576.0);
+    printf("%8.2fM kernel (includes wired)\n",
+	count_kernel * 4096.0 / 1048576.0);
+    printf("%8.2fM unknown\n", count_unknown * 4096.0 / 1048576.0);
+    printf("%8.2fM no_object, off queue (includes wired w/o object)\n",
+	count_noobj_offqueue * 4096.0 / 1048576.0);
+    printf("%8.2fM no_object, on non-free queue (includes wired w/o object)\n",
+	count_noobj_onqueue * 4096.0 / 1048576.0);
 
 #if 0
     /*
@@ -290,7 +440,9 @@ main(int ac, char **av)
 #endif
     if (debugopt)
 	printf("\n");
+#if 0
     dumpsltrack(kd);
+#endif
     return(0);
 }
 
@@ -324,6 +476,29 @@ checkpage(kvm_t *kd, vm_page_t mptr, vm_page_t m, struct vm_object *obj)
 #endif
 }
 
+/*
+ * Acclerate the reading of VM pages
+ */
+static void
+kkread_vmpage(kvm_t *kd, u_long addr, vm_page_t m)
+{
+    static struct vm_page vpcache[1024];
+    static u_long vpbeg;
+    static u_long vpend;
+
+    if (addr < vpbeg || addr >= vpend) {
+	vpbeg = addr;
+	vpend = addr + 1024 * sizeof(*m);
+	if (vpend > (u_long)(uintptr_t)vm_page_array +
+		    vm_page_array_size * sizeof(*m)) {
+	    vpend = (u_long)(uintptr_t)vm_page_array +
+		    vm_page_array_size * sizeof(*m);
+	}
+	kkread(kd, vpbeg, vpcache, vpend - vpbeg);
+    }
+    *m = vpcache[(addr - vpbeg) / sizeof(*m)];
+}
+
 static void
 kkread(kvm_t *kd, u_long addr, void *buf, size_t nbytes)
 {
@@ -352,6 +527,7 @@ struct SLTrack {
 
 struct SLTrack *SLHash[SLHSIZE];
 
+#if 0
 static
 void
 addsltrack(vm_page_t m)
@@ -376,6 +552,7 @@ addsltrack(vm_page_t m)
 		SLHash[i] = slt;
 	}
 }
+#endif
 
 static
 void
@@ -409,4 +586,34 @@ dumpsltrack(kvm_t *kd)
 		}
 	}
 	printf("FullZones/TotalZones: %ld/%ld\n", full_zones, total_zones);
+}
+
+#define HASH_SIZE	(1024*1024)
+#define HASH_MASK	(HASH_SIZE - 1)
+
+struct dup_entry {
+	struct dup_entry *next;
+	void	*ptr;
+};
+
+struct dup_entry *dup_hash[HASH_SIZE];
+
+static int
+unique_object(void *ptr)
+{
+	struct dup_entry *hen;
+	int hv;
+
+	hv = (intptr_t)ptr ^ ((intptr_t)ptr >> 20);
+	hv &= HASH_MASK;
+	for (hen = dup_hash[hv]; hen; hen = hen->next) {
+		if (hen->ptr == ptr)
+			return 0;
+	}
+	hen = malloc(sizeof(*hen));
+	hen->next = dup_hash[hv];
+	hen->ptr = ptr;
+	dup_hash[hv] = hen;
+
+	return 1;
 }

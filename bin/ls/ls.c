@@ -1,4 +1,4 @@
-/*
+/*-
  * Copyright (c) 1989, 1993, 1994
  *	The Regents of the University of California.  All rights reserved.
  *
@@ -101,6 +101,7 @@ static int f_kblocks;		/* print size in kilobytes */
 static int f_listdir;		/* list actual directory, not contents */
 static int f_listdot;		/* list files beginning with . */
        int f_longform;		/* long listing format */
+       int f_nanotime;		/* include nanotime in long format */
        int f_nonprint;		/* show unprintables as ? */
 static int f_nosort;		/* don't sort output */
        int f_notabs;		/* don't use tab-separated multi-col output */
@@ -113,10 +114,11 @@ static int f_reversesort;	/* reverse whatever sort is used */
 static int f_singlecol;		/* use single column output */
        int f_size;		/* list size in short listing */
        int f_slash;		/* similar to f_type, but only for dirs */
-       int f_sortsize;		/* Sort by size */
-       int f_sortacross;	/* sort across rows, not down columns */ 
+       int f_sizesort;		/* Sort by size */
+       int f_sortacross;	/* sort across rows, not down columns */
        int f_statustime;	/* use time of last mode change */
 static int f_stream;		/* stream the output, separate with commas */
+       const char *f_timeformat;	/* user-specified time format */
 static int f_timesort;		/* sort by time vice name */
        int f_type;		/* add type character for non-regular files */
 static int f_whiteout;		/* show whiteout entries */
@@ -139,6 +141,7 @@ main(int argc, char *argv[])
 	struct winsize win;
 	int ch, fts_options, notused;
 	char *p;
+	const char nanotime_format[] = "%Y-%m-%d %H:%M:%S";
 #ifdef COLORLS
 	char termcapbuf[1024];	/* termcap definition buffer */
 	char tcapbuf[512];	/* capability buffer */
@@ -171,8 +174,8 @@ main(int argc, char *argv[])
 		f_listdot = 1;
 
 	fts_options = FTS_PHYSICAL;
-	while ((ch = getopt(argc, argv, "1ABCFGHILPSRTWabcdfghiklmnopqrstuwxy"))
-	    != -1) {
+	while ((ch = getopt(argc, argv,
+	    "1ABCD:FGHILPRSTW_abcdfghiklmnopqrstuwxy")) != -1) {
 		switch (ch) {
 		/*
 		 * The -1, -C, -x and -l options all override each other so
@@ -215,6 +218,9 @@ main(int argc, char *argv[])
 			f_accesstime = 1;
 			f_statustime = 0;
 			break;
+		case 'D':
+			f_timeformat = optarg;
+			break;
 		case 'F':
 			f_type = 1;
 			f_slash = 0;
@@ -241,12 +247,18 @@ main(int argc, char *argv[])
 		case 'R':
 			f_recursive = 1;
 			break;
+		/* The -t and -S options override each other. */
 		case 'S':
-			f_sortsize = 1;
+			f_sizesort = 1;
+			f_timesort = 0;
+			break;
+		case 't':
+			f_timesort = 1;
+			f_sizesort = 0;
 			break;
 		case 'f':
 			f_nosort = 1;
-		       /* FALLTHROUGH */
+			/* FALLTHROUGH */
 		case 'a':
 			fts_options |= FTS_SEEDOT;
 			/* FALLTHROUGH */
@@ -299,9 +311,6 @@ main(int argc, char *argv[])
 		case 'T':
 			f_sectime = 1;
 			break;
-		case 't':
-			f_timesort = 1;
-			break;
 		case 'W':
 			f_whiteout = 1;
 			break;
@@ -314,6 +323,10 @@ main(int argc, char *argv[])
 			f_nonprint = 0;
 			f_octal = 0;
 			f_octal_escape = 0;
+			break;
+		case '_':
+			f_nanotime = 1;
+			f_timeformat = nanotime_format;
 			break;
 		default:
 		case '?':
@@ -361,12 +374,12 @@ main(int argc, char *argv[])
 #endif
 
 	/*
-	 * If not -F, -i, -l, -s, -S  or -t options, don't require stat
+	 * If not -F, -i, -l, -s, -S or -t options, don't require stat
 	 * information, unless in color mode in which case we do
 	 * need this to determine which colors to display.
 	 */
-	if (!f_inode && !f_longform && !f_size && !f_sortsize && !f_timesort
-	    && !f_type
+	if (!f_inode && !f_longform && !f_size && !f_timesort &&
+	    !f_sizesort && !f_type
 #ifdef COLORLS
 	    && !f_color
 #endif
@@ -399,23 +412,23 @@ main(int argc, char *argv[])
 	}
 	/* Select a sort function. */
 	if (f_reversesort) {
-		if (!f_timesort)
+		if (!f_timesort && !f_sizesort)
 			sortfcn = revnamecmp;
+		else if (f_sizesort)
+			sortfcn = revsizecmp;
 		else if (f_accesstime)
 			sortfcn = revacccmp;
-		else if (f_sortsize)
-			sortfcn = revsizecmp;
 		else if (f_statustime)
 			sortfcn = revstatcmp;
 		else		/* Use modification time. */
 			sortfcn = revmodcmp;
 	} else {
-		if (!f_timesort)
+		if (!f_timesort && !f_sizesort)
 			sortfcn = namecmp;
+		else if (f_sizesort)
+			sortfcn = sizecmp;
 		else if (f_accesstime)
 			sortfcn = acccmp;
-		else if (f_sortsize)
-			sortfcn = sizecmp;
 		else if (f_statustime)
 			sortfcn = statcmp;
 		else		/* Use modification time. */
@@ -713,7 +726,7 @@ display(const FTSENT *p, FTSENT *list)
 				} else {
 					fsmid = 0;
 					fsmidlen = 0;
-				} 
+				}
 #else
 				fsmidlen = 0;
 #endif
@@ -739,7 +752,7 @@ display(const FTSENT *p, FTSENT *list)
 #ifdef _ST_FSMID_PRESENT_
 				if (f_fsmid) {
 					np->fsmid = np->data + ulen + glen + flen + 3;
-					snprintf(np->fsmid, fsmidlen + 1,  
+					snprintf(np->fsmid, fsmidlen + 1,
 						 "%016jx", (intmax_t)fsmid);
 				}
 #endif

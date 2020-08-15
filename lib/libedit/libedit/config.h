@@ -20,11 +20,11 @@
 /* Define to 1 if you have the <fcntl.h> header file. */
 #define HAVE_FCNTL_H 1
 
-/* Define to 1 if you have the `fgetln' function. */
-#define HAVE_FGETLN 1
-
 /* Define to 1 if you have the `fork' function. */
 #define HAVE_FORK 1
+
+/* Define to 1 if you have the `getline' function. */
+#define HAVE_GETLINE 1
 
 /* Define to 1 if you have getpwnam_r and getpwuid_r that are draft POSIX.1
    versions. */
@@ -51,15 +51,6 @@
 
 /* Define to 1 if you have the `termcap' library (-ltermcap). */
 /* #undef HAVE_LIBTERMCAP */
-
-/* Define to 1 if you have the `terminfo' library (-lterminfo). */
-/* #undef HAVE_LIBTERMINFO */
-
-/* Define to 1 if you have the `termlib' library (-ltermlib). */
-/* #undef HAVE_LIBTERMLIB */
-
-/* Define to 1 if you have the `tinfo' library (-ltinfo). */
-#define HAVE_LIBTINFO 1
 
 /* Define to 1 if you have the <limits.h> header file. */
 #define HAVE_LIMITS_H 1
@@ -209,12 +200,11 @@
    slash. */
 #define LSTAT_FOLLOWS_SLASHED_SYMLINK 1
 
-/* Define to the sub-directory in which libtool stores uninstalled libraries.
-   */
+/* Define to the sub-directory where libtool stores uninstalled libraries. */
 #define LT_OBJDIR ".libs/"
 
 /* Name of package */
-#define PACKAGE "libedit-20140620"
+#define PACKAGE "libedit-20190324"
 
 /* Define to the address where bug reports for this package should be sent. */
 #define PACKAGE_BUGREPORT ""
@@ -226,7 +216,7 @@
 #define PACKAGE_STRING "libedit 3.1"
 
 /* Define to the one symbol short name of this package. */
-#define PACKAGE_TARNAME "libedit-20140620"
+#define PACKAGE_TARNAME "libedit-20190324"
 
 /* Define to the home page for this package. */
 #define PACKAGE_URL ""
@@ -264,9 +254,6 @@
 
 /* Version number of package */
 #define VERSION "3.1"
-
-/* Define to 1 if you want wide-character code */
-#define WIDECHAR 1
 
 /* Define to 1 if on MINIX. */
 /* #undef _MINIX */

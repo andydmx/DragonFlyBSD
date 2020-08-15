@@ -38,7 +38,7 @@
 
 #include <sys/param.h>
 #include <sys/systm.h>
-#include <sys/sysproto.h>
+#include <sys/sysmsg.h>
 #include <sys/proc.h>
 #include <sys/priv.h>
 #include <sys/mount.h>
@@ -55,7 +55,7 @@
 
 #include <vm/vm_zone.h>
 
-#include <sys/mplock2.h>
+struct lock acct_lock = LOCK_INITIALIZER("acct_lock", 0, 0);
 
 /*
  * The routines implemented in this file are described in:
@@ -106,7 +106,7 @@ SYSCTL_INT(_kern, OID_AUTO, acct_chkfreq, CTLFLAG_RW,
 static void
 acct_init(void *arg __unused)
 {
-	callout_init(&acctwatch_handle);
+	callout_init_lk(&acctwatch_handle, &acct_lock);
 }
 SYSINIT(acct, SI_SUB_DRIVERS, SI_ORDER_ANY, acct_init, NULL);
 
@@ -119,7 +119,7 @@ SYSINIT(acct, SI_SUB_DRIVERS, SI_ORDER_ANY, acct_init, NULL);
  * MPALMOSTSAFE
  */
 int
-sys_acct(struct acct_args *uap)
+sys_acct(struct sysmsg *sysmsg, const struct acct_args *uap)
 {
 	struct thread *td = curthread;
 	struct nlookupdata nd;
@@ -130,7 +130,7 @@ sys_acct(struct acct_args *uap)
 	if (error)
 		return (error);
 
-	get_mplock();
+	lockmgr(&acct_lock, LK_EXCLUSIVE);
 
 	/*
 	 * If accounting is to be started to a file, open that file for
@@ -181,7 +181,8 @@ sys_acct(struct acct_args *uap)
 	acctp = vp;
 	acctwatch(NULL);
 done:
-	rel_mplock();
+	lockmgr(&acct_lock, LK_RELEASE);
+
 	return (error);
 }
 
@@ -201,12 +202,21 @@ acct_process(struct proc *p)
 	struct timeval tmp;
 	struct rlimit rlim;
 	int t;
+	int error;
 	struct vnode *vp;
 
-	/* If accounting isn't enabled, don't bother */
+	/*
+	 * If accounting isn't enabled, don't bother.  Lock acct_lock
+	 * make sure.
+	 */
+	if (acctp == NULLVP)
+		return 0;
+	lockmgr(&acct_lock, LK_SHARED);
 	vp = acctp;
-	if (vp == NULLVP)
-		return (0);
+	if (vp == NULLVP) {
+		lockmgr(&acct_lock, LK_RELEASE);
+		return 0;
+	}
 
 	/*
 	 * Get process accounting information.
@@ -244,10 +254,12 @@ acct_process(struct proc *p)
 	acct.ac_gid = p->p_ucred->cr_rgid;
 
 	/* (7) The terminal from which the process was started */
-	if ((p->p_flags & P_CONTROLT) && p->p_pgrp->pg_session->s_ttyp)
-		acct.ac_tty = dev2udev(p->p_pgrp->pg_session->s_ttyp->t_dev);
-	else
+	if ((p->p_flags & P_CONTROLT) && p->p_pgrp->pg_session->s_ttyp) {
+		acct.ac_tty =
+		    devid_from_dev(p->p_pgrp->pg_session->s_ttyp->t_dev);
+	} else {
 		acct.ac_tty = NOUDEV;
+	}
 
 	/* (8) The boolean flags that tell how the process terminated, etc. */
 	acct.ac_flag = p->p_acflag;
@@ -262,9 +274,12 @@ acct_process(struct proc *p)
 	/*
 	 * Write the accounting information to the file.
 	 */
-	return (vn_rdwr(UIO_WRITE, vp, (caddr_t)&acct, sizeof (acct),
-	    (off_t)0, UIO_SYSSPACE, IO_APPEND|IO_UNIT, p->p_ucred,
-	    NULL));
+	error = vn_rdwr(UIO_WRITE, vp, (caddr_t)&acct, sizeof (acct),
+			(off_t)0, UIO_SYSSPACE, IO_APPEND|IO_UNIT, p->p_ucred,
+			NULL);
+	lockmgr(&acct_lock, LK_RELEASE);
+
+	return error;
 }
 
 /*

@@ -45,11 +45,11 @@
 #include "vmm.h"
 
 static struct vmm_ctl *ctl = NULL;
+static struct sysctl_ctx_list vmm_sysctl_ctx;
+static int vmm_enabled;
 
-struct sysctl_ctx_list vmm_sysctl_ctx;
 struct sysctl_oid *vmm_sysctl_tree;
-
-int vmm_enabled;
+int vmm_debug;
 
 static int
 sysctl_vmm_enable(SYSCTL_HANDLER_ARGS)
@@ -89,7 +89,7 @@ sysctl_vmm_enable(SYSCTL_HANDLER_ARGS)
 static void
 vmm_shutdown(void)
 {
-	if(vmm_enabled)
+	if (vmm_enabled && panicstr == NULL)
 		ctl->disable();
 }
 
@@ -125,8 +125,20 @@ vmm_init(void)
 		    OID_AUTO, "enable", CTLTYPE_INT | CTLFLAG_WR,
 		    NULL, sizeof vmm_enabled, sysctl_vmm_enable, "I",
 		    "Control the state of the VMM");
+		SYSCTL_ADD_INT(&vmm_sysctl_ctx,
+		    SYSCTL_CHILDREN(vmm_sysctl_tree),
+		    OID_AUTO, "debug", CTLTYPE_INT | CTLFLAG_RW,
+		    &vmm_debug, 0,
+		    "vmm debugging");
 
-		if (ctl->enable()) {
+		/*
+		 * Normally enable VMM if it is supported.  But for now
+		 * lets not, because the vkernel is not stable with it
+		 * enabled.
+		 */
+		if (1) {
+			kprintf("VMM: available, disabled by default\n");
+		} else if (ctl->enable()) {
 			kprintf("VMM: vmm enable() failed\n");
 		} else {
 			vmm_enabled = 1;
@@ -135,7 +147,7 @@ vmm_init(void)
 		EVENTHANDLER_REGISTER(shutdown_pre_sync, vmm_shutdown, NULL, SHUTDOWN_PRI_DEFAULT-1);
 	}
 }
-SYSINIT(vmm_init, SI_BOOT2_CPU_TOPOLOGY, SI_ORDER_ANY, vmm_init, NULL);
+SYSINIT(vmm_init, SI_BOOT2_VMM, SI_ORDER_ANY, vmm_init, NULL);
 
 
 int
@@ -154,7 +166,6 @@ vmm_vmdestroy(void)
 	if (!vmm_enabled) {
 		return ENODEV;
 	}
-
 	return ctl->vmdestroy();
 }
 

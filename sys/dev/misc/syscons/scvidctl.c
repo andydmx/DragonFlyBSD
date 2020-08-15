@@ -5,7 +5,9 @@
  * All rights reserved.
  *
  * This code is derived from software contributed to The DragonFly Project
- * by Sascha Wildner <saw@online.de>
+ * by Sascha Wildner <saw@online.de>.
+ *
+ * Simple font scaling code by Sascha Wildner and Matthew Dillon
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -29,7 +31,6 @@
  * THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  * $FreeBSD: src/sys/dev/syscons/scvidctl.c,v 1.19.2.2 2000/05/05 09:16:08 nyan Exp $
- * $DragonFly: src/sys/dev/misc/syscons/scvidctl.c,v 1.16 2007/08/19 11:39:11 swildner Exp $
  */
 
 #include "opt_syscons.h"
@@ -43,6 +44,7 @@
 #include <sys/thread2.h>
 
 #include <machine/console.h>
+#include <machine/framebuffer.h>
 
 #include <dev/video/fb/fbreg.h>
 #include "syscons.h"
@@ -59,12 +61,11 @@ sc_set_text_mode(scr_stat *scp, struct tty *tp, int mode, int xsize, int ysize,
     int new_ysize;
     int error;
 
-    lwkt_gettoken(&tty_token);
+    lwkt_gettoken(&vga_token);
     if ((*vidsw[scp->sc->adapter]->get_info)(scp->sc->adp, mode, &info)) {
-	lwkt_reltoken(&tty_token);
+	lwkt_reltoken(&vga_token);
 	return ENODEV;
     }
-    lwkt_reltoken(&tty_token);
 
     /* adjust argument values */
     if (fontsize <= 0)
@@ -72,8 +73,10 @@ sc_set_text_mode(scr_stat *scp, struct tty *tp, int mode, int xsize, int ysize,
     if (fontsize < 14) {
 	fontsize = 8;
 #ifndef SC_NO_FONT_LOADING
-	if (!(scp->sc->fonts_loaded & FONT_8))
+	if (!(scp->sc->fonts_loaded & FONT_8)) {
+	    lwkt_reltoken(&vga_token);
 	    return EINVAL;
+	}
 	font = scp->sc->font_8;
 #else
 	font = NULL;
@@ -81,8 +84,10 @@ sc_set_text_mode(scr_stat *scp, struct tty *tp, int mode, int xsize, int ysize,
     } else if (fontsize >= 16) {
 	fontsize = 16;
 #ifndef SC_NO_FONT_LOADING
-	if (!(scp->sc->fonts_loaded & FONT_16))
+	if (!(scp->sc->fonts_loaded & FONT_16)) {
+	    lwkt_reltoken(&vga_token);
 	    return EINVAL;
+	}
 	font = scp->sc->font_16;
 #else
 	font = NULL;
@@ -90,8 +95,10 @@ sc_set_text_mode(scr_stat *scp, struct tty *tp, int mode, int xsize, int ysize,
     } else {
 	fontsize = 14;
 #ifndef SC_NO_FONT_LOADING
-	if (!(scp->sc->fonts_loaded & FONT_14))
+	if (!(scp->sc->fonts_loaded & FONT_14)) {
+	    lwkt_reltoken(&vga_token);
 	    return EINVAL;
+	}
 	font = scp->sc->font_14;
 #else
 	font = NULL;
@@ -103,14 +110,19 @@ sc_set_text_mode(scr_stat *scp, struct tty *tp, int mode, int xsize, int ysize,
 	ysize = info.vi_height;
 
     /* stop screen saver, etc */
-    crit_enter();
-    if ((error = sc_clean_up(scp))) {
-	crit_exit();
+    if ((error = sc_clean_up(scp, FALSE))) {
+	lwkt_reltoken(&vga_token);
 	return error;
     }
 
-    if (sc_render_match(scp, scp->sc->adp->va_name, V_INFO_MM_TEXT) == NULL) {
-	crit_exit();
+    if (scp->sc->fbi != NULL &&
+	sc_render_match(scp, "kms", V_INFO_MM_TEXT) == NULL) {
+	lwkt_reltoken(&vga_token);
+	return ENODEV;
+    }
+    if (scp->sc->fbi == NULL &&
+	sc_render_match(scp, scp->sc->adp->va_name, V_INFO_MM_TEXT) == NULL) {
+	lwkt_reltoken(&vga_token);
 	return ENODEV;
     }
 
@@ -138,7 +150,8 @@ sc_set_text_mode(scr_stat *scp, struct tty *tp, int mode, int xsize, int ysize,
     scp->xpixel = scp->xsize*8;
     scp->ypixel = scp->ysize*fontsize;
     scp->font = font;
-    scp->font_size = fontsize;
+    scp->font_height = fontsize;
+    scp->font_width = 8;
 
     /* allocate buffers */
     sc_alloc_scr_buffer(scp, TRUE, TRUE);
@@ -149,22 +162,23 @@ sc_set_text_mode(scr_stat *scp, struct tty *tp, int mode, int xsize, int ysize,
 #ifndef SC_NO_HISTORY
     sc_alloc_history_buffer(scp, new_ysize, prev_ysize, FALSE);
 #endif
-    crit_exit();
 
     if (scp == scp->sc->cur_scp)
 	set_mode(scp);
     scp->status &= ~UNKNOWN_MODE;
 
-    if (tp == NULL)
-	return 0;
-    DPRINTF(5, ("ws_*size (%d,%d), size (%d,%d)\n",
-	tp->t_winsize.ws_col, tp->t_winsize.ws_row, scp->xsize, scp->ysize));
-    if (tp->t_winsize.ws_col != scp->xsize
-	|| tp->t_winsize.ws_row != scp->ysize) {
-	tp->t_winsize.ws_col = scp->xsize;
-	tp->t_winsize.ws_row = scp->ysize;
-	pgsignal(tp->t_pgrp, SIGWINCH, 1);
+    if (tp) {
+	DPRINTF(5, ("ws_*size (%d,%d), size (%d,%d)\n",
+		tp->t_winsize.ws_col, tp->t_winsize.ws_row,
+		scp->xsize, scp->ysize));
+	if (tp->t_winsize.ws_col != scp->xsize ||
+	    tp->t_winsize.ws_row != scp->ysize) {
+	    tp->t_winsize.ws_col = scp->xsize;
+	    tp->t_winsize.ws_row = scp->ysize;
+	    pgsignal(tp->t_pgrp, SIGWINCH, 1);
+	}
     }
+    lwkt_reltoken(&vga_token);
 
     return 0;
 }
@@ -178,21 +192,27 @@ sc_set_graphics_mode(scr_stat *scp, struct tty *tp, int mode)
     video_info_t info;
     int error;
 
-    lwkt_gettoken(&tty_token);
+    lwkt_gettoken(&vga_token);
     if ((*vidsw[scp->sc->adapter]->get_info)(scp->sc->adp, mode, &info)) {
-        lwkt_reltoken(&tty_token);
+        lwkt_reltoken(&vga_token);
 	return ENODEV;
     }
-    lwkt_reltoken(&tty_token);
+    lwkt_reltoken(&vga_token);
 
     /* stop screen saver, etc */
     crit_enter();
-    if ((error = sc_clean_up(scp))) {
+    if ((error = sc_clean_up(scp, FALSE))) {
 	crit_exit();
 	return error;
     }
 
-    if (sc_render_match(scp, scp->sc->adp->va_name, V_INFO_MM_OTHER) == NULL) {
+    if (scp->sc->fbi != NULL &&
+	sc_render_match(scp, "kms", V_INFO_MM_OTHER) == NULL) {
+	crit_exit();
+	return ENODEV;
+    }
+    if (scp->sc->fbi == NULL &&
+	sc_render_match(scp, scp->sc->adp->va_name, V_INFO_MM_OTHER) == NULL) {
 	crit_exit();
 	return ENODEV;
     }
@@ -211,7 +231,8 @@ sc_set_graphics_mode(scr_stat *scp, struct tty *tp, int mode)
     scp->xpixel = info.vi_width;
     scp->ypixel = info.vi_height;
     scp->font = NULL;
-    scp->font_size = 0;
+    scp->font_height = 0;
+    scp->font_width = 0;
 #ifndef SC_NO_SYSMOUSE
     /* move the mouse cursor at the center of the screen */
     sc_mouse_move(scp, scp->xpixel / 2, scp->ypixel / 2);
@@ -225,13 +246,13 @@ sc_set_graphics_mode(scr_stat *scp, struct tty *tp, int mode)
     refresh_ega_palette(scp);
     scp->status &= ~UNKNOWN_MODE;
 
-    if (tp == NULL)
-	return 0;
-    if (tp->t_winsize.ws_xpixel != scp->xpixel
-	|| tp->t_winsize.ws_ypixel != scp->ypixel) {
-	tp->t_winsize.ws_xpixel = scp->xpixel;
-	tp->t_winsize.ws_ypixel = scp->ypixel;
-	pgsignal(tp->t_pgrp, SIGWINCH, 1);
+    if (tp) {
+	if (tp->t_winsize.ws_xpixel != scp->xpixel ||
+	    tp->t_winsize.ws_ypixel != scp->ypixel) {
+	    tp->t_winsize.ws_xpixel = scp->xpixel;
+	    tp->t_winsize.ws_ypixel = scp->ypixel;
+	    pgsignal(tp->t_pgrp, SIGWINCH, 1);
+	}
     }
 
     return 0;
@@ -251,12 +272,12 @@ sc_set_pixel_mode(scr_stat *scp, struct tty *tp, int xsize, int ysize,
     int new_ysize;
     int error;
 
-    lwkt_gettoken(&tty_token);
+    lwkt_gettoken(&vga_token);
     if ((*vidsw[scp->sc->adapter]->get_info)(scp->sc->adp, scp->mode, &info)) {
-        lwkt_reltoken(&tty_token);
+        lwkt_reltoken(&vga_token);
 	return ENODEV;		/* this shouldn't happen */
     }
-    lwkt_reltoken(&tty_token);
+    lwkt_reltoken(&vga_token);
 
     /* adjust argument values */
     if (fontsize <= 0)
@@ -329,7 +350,7 @@ sc_set_pixel_mode(scr_stat *scp, struct tty *tp, int xsize, int ysize,
 
     /* stop screen saver, etc */
     crit_enter();
-    if ((error = sc_clean_up(scp))) {
+    if ((error = sc_clean_up(scp, FALSE))) {
 	crit_exit();
 	return error;
     }
@@ -363,7 +384,8 @@ sc_set_pixel_mode(scr_stat *scp, struct tty *tp, int xsize, int ysize,
     scp->xoff = (scp->xpixel/8 - xsize)/2;
     scp->yoff = (scp->ypixel/fontsize - ysize)/2;
     scp->font = font;
-    scp->font_size = fontsize;
+    scp->font_height = fontsize;
+    scp->font_width = 8;
 
     /* allocate buffers */
     sc_alloc_scr_buffer(scp, TRUE, TRUE);
@@ -383,13 +405,13 @@ sc_set_pixel_mode(scr_stat *scp, struct tty *tp, int xsize, int ysize,
 
     scp->status &= ~UNKNOWN_MODE;
 
-    if (tp == NULL)
-	return 0;
-    if (tp->t_winsize.ws_col != scp->xsize
-	|| tp->t_winsize.ws_row != scp->ysize) {
-	tp->t_winsize.ws_col = scp->xsize;
-	tp->t_winsize.ws_row = scp->ysize;
-	pgsignal(tp->t_pgrp, SIGWINCH, 1);
+    if (tp) {
+	if (tp->t_winsize.ws_col != scp->xsize ||
+	    tp->t_winsize.ws_row != scp->ysize) {
+	    tp->t_winsize.ws_col = scp->xsize;
+	    tp->t_winsize.ws_row = scp->ysize;
+	    pgsignal(tp->t_pgrp, SIGWINCH, 1);
+	}
     }
 
     return 0;
@@ -405,103 +427,153 @@ sc_vid_ioctl(struct tty *tp, u_long cmd, caddr_t data, int flag)
 {
     scr_stat *scp;
     video_adapter_t *adp;
+#ifndef SC_NO_MODE_CHANGE
     video_info_t info;
+#endif
     int error, ret;
 
-	KKASSERT(tp->t_dev);
+    KKASSERT(tp->t_dev);
 
     scp = SC_STAT(tp->t_dev);
     if (scp == NULL)		/* tp == SC_MOUSE */
-		return ENOIOCTL;
+	return ENOIOCTL;
     adp = scp->sc->adp;
-    if (adp == NULL)		/* shouldn't happen??? */
-		return ENODEV;
+    if (adp == NULL && scp->sc->fbi == NULL)	/* shouldn't happen??? */
+	return ENODEV;
 
-    lwkt_gettoken(&tty_token);
+    lwkt_gettoken(&vga_token);
     switch (cmd) {
 
     case CONS_CURRENTADP:	/* get current adapter index */
     case FBIO_ADAPTER:
-	ret = fb_ioctl(adp, FBIO_ADAPTER, data);
-	lwkt_reltoken(&tty_token);
+	if (scp->sc->fbi != NULL) {
+	    ret = ENODEV;
+	} else {
+	    ret = fb_ioctl(adp, FBIO_ADAPTER, data);
+	}
+	lwkt_reltoken(&vga_token);
 	return ret;
 
     case CONS_CURRENT:  	/* get current adapter type */
     case FBIO_ADPTYPE:
-	ret = fb_ioctl(adp, FBIO_ADPTYPE, data);
-	lwkt_reltoken(&tty_token);
+	if (scp->sc->fbi != NULL) {
+	    ret = ENODEV;
+	} else {
+	    ret = fb_ioctl(adp, FBIO_ADPTYPE, data);
+	}
+	lwkt_reltoken(&vga_token);
 	return ret;
 
     case CONS_ADPINFO:		/* adapter information */
     case FBIO_ADPINFO:
+	if (scp->sc->fbi != NULL) {
+	    lwkt_reltoken(&vga_token);
+	    return ENODEV;
+	}
 	if (((video_adapter_info_t *)data)->va_index >= 0) {
 	    adp = vid_get_adapter(((video_adapter_info_t *)data)->va_index);
 	    if (adp == NULL) {
-		lwkt_reltoken(&tty_token);
+		lwkt_reltoken(&vga_token);
 		return ENODEV;
 	    }
 	}
 	ret = fb_ioctl(adp, FBIO_ADPINFO, data);
-	lwkt_reltoken(&tty_token);
+	lwkt_reltoken(&vga_token);
 	return ret;
 
     case CONS_GET:      	/* get current video mode */
     case FBIO_GETMODE:
 	*(int *)data = scp->mode;
-	lwkt_reltoken(&tty_token);
+	lwkt_reltoken(&vga_token);
 	return 0;
 
 #ifndef SC_NO_MODE_CHANGE
     case CONS_SET:
     case FBIO_SETMODE:		/* set video mode */
+	if (scp->sc->fbi != NULL) {
+		lwkt_reltoken(&vga_token);
+		if (*(int *)data != 0)
+			return ENODEV;
+		else
+			return 0;
+	}
 	if (!(adp->va_flags & V_ADP_MODECHANGE)) {
-	    lwkt_reltoken(&tty_token);
+	    lwkt_reltoken(&vga_token);
  	    return ENODEV;
 	}
 	info.vi_mode = *(int *)data;
 	error = fb_ioctl(adp, FBIO_MODEINFO, &info);
 	if (error) {
-	    lwkt_reltoken(&tty_token);
+	    lwkt_reltoken(&vga_token);
 	    return error;
 	}
 	if (info.vi_flags & V_INFO_GRAPHICS) {
-	    lwkt_reltoken(&tty_token);
+	    lwkt_reltoken(&vga_token);
 	    return sc_set_graphics_mode(scp, tp, *(int *)data);
 	} else {
-	    lwkt_reltoken(&tty_token);
+	    lwkt_reltoken(&vga_token);
 	    return sc_set_text_mode(scp, tp, *(int *)data, 0, 0, 0);
 	}
 #endif /* SC_NO_MODE_CHANGE */
 
     case CONS_MODEINFO:		/* get mode information */
     case FBIO_MODEINFO:
-	ret = fb_ioctl(adp, FBIO_MODEINFO, data);
-	lwkt_reltoken(&tty_token);
+	if (scp->sc->fbi != NULL) {
+	    /* Fabricate some mode information for KMS framebuffer */
+	    video_info_t *vinfo = (video_info_t *)data;
+	    vinfo->vi_mode = 0;
+	    vinfo->vi_flags = V_INFO_COLOR;
+	    vinfo->vi_width = scp->xsize;
+	    vinfo->vi_height = scp->ysize;
+	    vinfo->vi_cwidth = scp->font_width;
+	    vinfo->vi_cheight = scp->font_height;
+	    vinfo->vi_window = 0;
+	    vinfo->vi_window_size = 0;
+	    vinfo->vi_buffer = 0;
+	    vinfo->vi_buffer_size = 0;
+	    vinfo->vi_mem_model = V_INFO_MM_TEXT;
+	    ret = 0;
+	} else {
+	    ret = fb_ioctl(adp, FBIO_MODEINFO, data);
+	}
+	lwkt_reltoken(&vga_token);
 	return ret;
 
     case CONS_FINDMODE:		/* find a matching video mode */
     case FBIO_FINDMODE:
-	ret = fb_ioctl(adp, FBIO_FINDMODE, data);
-	lwkt_reltoken(&tty_token);
+	if (scp->sc->fbi != NULL) {
+	    ret = ENODEV;
+	} else {
+	    ret = fb_ioctl(adp, FBIO_FINDMODE, data);
+	}
+	lwkt_reltoken(&vga_token);
 	return ret;
 
     case CONS_SETWINORG:	/* set frame buffer window origin */
     case FBIO_SETWINORG:
 	if (scp != scp->sc->cur_scp) {
-	    lwkt_reltoken(&tty_token);
+	    lwkt_reltoken(&vga_token);
 	    return ENODEV;	/* XXX */
 	}
+	if (scp->sc->fbi != NULL) {
+	    lwkt_reltoken(&vga_token);
+	    return ENODEV;
+	}
 	ret = fb_ioctl(adp, FBIO_SETWINORG, data);
-	lwkt_reltoken(&tty_token);
+	lwkt_reltoken(&vga_token);
 	return ret;
 
     case FBIO_GETWINORG:	/* get frame buffer window origin */
 	if (scp != scp->sc->cur_scp) {
-	    lwkt_reltoken(&tty_token);
+	    lwkt_reltoken(&vga_token);
 	    return ENODEV;	/* XXX */
 	}
-	ret = fb_ioctl(adp, FBIO_GETWINORG, data);
-	lwkt_reltoken(&tty_token);
+	if (scp->sc->fbi != NULL) {
+	    ret = ENODEV;
+	} else {
+	    ret = fb_ioctl(adp, FBIO_GETWINORG, data);
+	}
+	lwkt_reltoken(&vga_token);
 	return ret;
 
     case FBIO_GETDISPSTART:
@@ -509,11 +581,37 @@ sc_vid_ioctl(struct tty *tp, u_long cmd, caddr_t data, int flag)
     case FBIO_GETLINEWIDTH:
     case FBIO_SETLINEWIDTH:
 	if (scp != scp->sc->cur_scp) {
-	    lwkt_reltoken(&tty_token);
+	    lwkt_reltoken(&vga_token);
 	    return ENODEV;	/* XXX */
 	}
-	ret = fb_ioctl(adp, cmd, data);
-	lwkt_reltoken(&tty_token);
+	if (scp->sc->fbi != NULL) {
+	    if (cmd == FBIO_GETLINEWIDTH) {
+		*(u_int *)data = scp->sc->fbi->stride;
+		ret = 0;
+	    } else {
+		ret = ENODEV;
+	    }
+	} else {
+	    ret = fb_ioctl(adp, cmd, data);
+	}
+	lwkt_reltoken(&vga_token);
+	return ret;
+
+    case FBIO_BLANK:
+	if (scp != scp->sc->cur_scp) {
+	    lwkt_reltoken(&vga_token);
+	    return ENODEV;
+	}
+	if (scp->sc->fbi != NULL && ISGRAPHSC(scp)) {
+	    if (*(int *)data == V_DISPLAY_ON)
+		sc_stop_scrn_saver(scp->sc);
+	    else
+		sc_start_scrn_saver(scp->sc);
+	    ret = 0;
+	} else {
+	    ret = ENODEV;
+	}
+	lwkt_reltoken(&vga_token);
 	return ret;
 
     case FBIO_GETPALETTE:
@@ -530,11 +628,26 @@ sc_vid_ioctl(struct tty *tp, u_long cmd, caddr_t data, int flag)
     case FBIOGCURPOS:
     case FBIOGCURMAX:
 	if (scp != scp->sc->cur_scp) {
-	    lwkt_reltoken(&tty_token);
+	    lwkt_reltoken(&vga_token);
 	    return ENODEV;	/* XXX */
 	}
-	ret = fb_ioctl(adp, cmd, data);
-	lwkt_reltoken(&tty_token);
+	if (scp->sc->fbi != NULL) {
+	    if (cmd == FBIOGTYPE) {
+		((struct fbtype *)data)->fb_type = FBTYPE_DUMBFB;
+		((struct fbtype *)data)->fb_height = scp->sc->fbi->height;
+		((struct fbtype *)data)->fb_width = scp->sc->fbi->width;
+		((struct fbtype *)data)->fb_depth = scp->sc->fbi->depth;
+		((struct fbtype *)data)->fb_cmsize = 0;
+		((struct fbtype *)data)->fb_size =
+		    scp->sc->fbi->height * scp->sc->fbi->stride;
+		ret = 0;
+	    } else {
+		ret = ENODEV;
+	    }
+	} else {
+	    ret = fb_ioctl(adp, cmd, data);
+	}
+	lwkt_reltoken(&vga_token);
 	return ret;
 
     case KDSETMODE:     	/* set current mode of this (virtual) console */
@@ -545,14 +658,14 @@ sc_vid_ioctl(struct tty *tp, u_long cmd, caddr_t data, int flag)
 	     * text mode to switch back to...
 	     */
 	    if (scp->status & GRAPHICS_MODE) {
-	        lwkt_reltoken(&tty_token);
+	        lwkt_reltoken(&vga_token);
 		return EINVAL;
 	    }
 	    /* restore fonts & palette ! */
 #if 0
 #ifndef SC_NO_FONT_LOADING
-	    if (ISFONTAVAIL(adp->va_flags) 
-		&& !(scp->status & (GRAPHICS_MODE | PIXEL_MODE)))
+	    if (scp->sc->fbi == NULL && ISFONTAVAIL(adp->va_flags)
+		&& !(scp->status & (GRAPHICS_MODE | PIXEL_MODE))) {
 		/*
 		 * FONT KLUDGE
 		 * Don't load fonts for now... XXX
@@ -567,12 +680,12 @@ sc_vid_ioctl(struct tty *tp, u_long cmd, caddr_t data, int flag)
 #endif /* SC_NO_FONT_LOADING */
 #endif
 
-#ifndef SC_NO_PALETTE_LOADING
-	    load_palette(adp, scp->sc->palette);
-#endif
+	    if (scp->sc->fbi == NULL)
+		load_palette(adp, scp->sc->palette);
 
 	    /* move hardware cursor out of the way */
-	    (*vidsw[adp->va_index]->set_hw_cursor)(adp, -1, -1);
+	    if (scp->sc->fbi == NULL)
+		(*vidsw[adp->va_index]->set_hw_cursor)(adp, -1, -1);
 	    /* FALL THROUGH */
 
 	case KD_TEXT1:  	/* switch to TEXT (known) mode */
@@ -581,13 +694,13 @@ sc_vid_ioctl(struct tty *tp, u_long cmd, caddr_t data, int flag)
 	     * text/pixel mode to switch back to...
 	     */
 	    if (scp->status & GRAPHICS_MODE) {
-	        lwkt_reltoken(&tty_token);
+	        lwkt_reltoken(&vga_token);
 		return EINVAL;
 	    }
 	    crit_enter();
-	    if ((error = sc_clean_up(scp))) {
+	    if ((error = sc_clean_up(scp, FALSE))) {
 		crit_exit();
-		lwkt_reltoken(&tty_token);
+		lwkt_reltoken(&vga_token);
 		return error;
 	    }
 	    scp->status |= UNKNOWN_MODE | MOUSE_HIDDEN;
@@ -597,65 +710,67 @@ sc_vid_ioctl(struct tty *tp, u_long cmd, caddr_t data, int flag)
 		set_mode(scp);
 	    sc_clear_screen(scp);
 	    scp->status &= ~UNKNOWN_MODE;
-	    lwkt_reltoken(&tty_token);
+	    lwkt_reltoken(&vga_token);
 	    return 0;
 
 #ifdef SC_PIXEL_MODE
 	case KD_PIXEL:		/* pixel (raster) display */
 	    if (!(scp->status & (GRAPHICS_MODE | PIXEL_MODE))) {
-	        lwkt_reltoken(&tty_token);
+	        lwkt_reltoken(&vga_token);
 		return EINVAL;
             }
+	    if (scp->sc->fbi != NULL) {
+		lwkt_reltoken(&vga_token);
+		return ENODEV;
+	    }
 	    if (scp->status & GRAPHICS_MODE) {
-	        lwkt_reltoken(&tty_token);
+	        lwkt_reltoken(&vga_token);
 		return sc_set_pixel_mode(scp, tp, scp->xsize, scp->ysize, 
-					 scp->font_size);
+					 scp->font_height);
 	    }
 	    crit_enter();
-	    if ((error = sc_clean_up(scp))) {
+	    if ((error = sc_clean_up(scp, FALSE))) {
 		crit_exit();
-		lwkt_reltoken(&tty_token);
+		lwkt_reltoken(&vga_token);
 		return error;
 	    }
 	    scp->status |= (UNKNOWN_MODE | PIXEL_MODE | MOUSE_HIDDEN);
 	    crit_exit();
 	    if (scp == scp->sc->cur_scp) {
 		set_mode(scp);
-#ifndef SC_NO_PALETTE_LOADING
 		load_palette(adp, scp->sc->palette);
-#endif
 	    }
 	    sc_clear_screen(scp);
 	    scp->status &= ~UNKNOWN_MODE;
-	    lwkt_reltoken(&tty_token);
+	    lwkt_reltoken(&vga_token);
 	    return 0;
 #endif /* SC_PIXEL_MODE */
 
 	case KD_GRAPHICS:	/* switch to GRAPHICS (unknown) mode */
 	    crit_enter();
-	    if ((error = sc_clean_up(scp))) {
+	    if ((error = sc_clean_up(scp, FALSE))) {
 		crit_exit();
-		lwkt_reltoken(&tty_token);
+		lwkt_reltoken(&vga_token);
 		return error;
 	    }
 	    scp->status |= UNKNOWN_MODE | MOUSE_HIDDEN;
 	    crit_exit();
-	    lwkt_reltoken(&tty_token);
+	    lwkt_reltoken(&vga_token);
 	    return 0;
 
 	default:
-	    lwkt_reltoken(&tty_token);
+	    lwkt_reltoken(&vga_token);
 	    return EINVAL;
 	}
 	/* NOT REACHED */
 
 #ifdef SC_PIXEL_MODE
     case KDRASTER:		/* set pixel (raster) display mode */
-	if (ISUNKNOWNSC(scp) || ISTEXTSC(scp)) {
-	    lwkt_reltoken(&tty_token);
+	if (scp->sc->fbi != NULL || ISUNKNOWNSC(scp) || ISTEXTSC(scp)) {
+	    lwkt_reltoken(&vga_token);
 	    return ENODEV;
 	}
-	lwkt_reltoken(&tty_token);
+	lwkt_reltoken(&vga_token);
 	return sc_set_pixel_mode(scp, tp, ((int *)data)[0], ((int *)data)[1], 
 				 ((int *)data)[2]);
 #endif /* SC_PIXEL_MODE */
@@ -666,18 +781,23 @@ sc_vid_ioctl(struct tty *tp, u_long cmd, caddr_t data, int flag)
 	 * as KD_TEXT... 
 	 */
 	*data = ISGRAPHSC(scp) ? KD_GRAPHICS : KD_TEXT;
-	lwkt_reltoken(&tty_token);
+	lwkt_reltoken(&vga_token);
 	return 0;
 
     case KDSBORDER:     	/* set border color of this (virtual) console */
-	scp->border = *data;
+	/* Only values in the range [0..15] allowed */
+	if (*(int *)data < 0 || *(int *)data > 15) {
+		lwkt_reltoken(&vga_token);
+		return EINVAL;
+	}
+	scp->border = *(int *)data;
 	if (scp == scp->sc->cur_scp)
 	    sc_set_border(scp, scp->border);
-	lwkt_reltoken(&tty_token);
+	lwkt_reltoken(&vga_token);
 	return 0;
     }
 
-    lwkt_reltoken(&tty_token);
+    lwkt_reltoken(&vga_token);
     return ENOIOCTL;
 }
 
@@ -728,4 +848,116 @@ sc_render_match(scr_stat *scp, char *name, int model)
 	}
 
 	return NULL;
+}
+
+#define VIRTUAL_TTY(sc, x) ((SC_DEV((sc),(x)) != NULL) ?	\
+	(SC_DEV((sc),(x))->si_tty) : NULL)
+
+void
+sc_update_render(scr_stat *scp)
+{
+	sc_rndr_sw_t *rndr;
+	sc_term_sw_t *sw;
+	struct tty *tp;
+	int prev_ysize, new_ysize;
+#ifndef SC_NO_HISTORY
+	int old_xpos, old_ypos;
+#endif
+	int error;
+
+	sw = scp->tsw;
+	if (sw == NULL) {
+		return;
+	}
+
+	if (scp->rndr == NULL)
+		return;
+
+	if (scp->fbi_generation == scp->sc->fbi_generation)
+		return;
+
+	crit_enter();
+	scp->fbi_generation = scp->sc->fbi_generation;
+	/* Needed in case we are implicitly leaving PIXEL_MODE here */
+	if (scp->model != V_INFO_MM_OTHER)
+		scp->model = V_INFO_MM_TEXT;
+	rndr = NULL;
+	if (strcmp(sw->te_renderer, "*") != 0) {
+		rndr = sc_render_match(scp, sw->te_renderer, scp->model);
+	}
+	if (rndr == NULL && scp->sc->fbi != NULL) {
+		rndr = sc_render_match(scp, "kms", scp->model);
+	}
+	if (rndr == NULL) {	/* this shouldn't happen */
+		rndr = sc_render_match(scp, scp->sc->adp->va_name, scp->model);
+		if (rndr != NULL)
+			scp->rndr = rndr;
+		crit_exit();
+		return;
+	}
+
+	scp->rndr = rndr;
+	/* Mostly copied from sc_set_text_mode */
+	if ((error = sc_clean_up(scp, FALSE))) {
+		crit_exit();
+		return;
+	}
+	new_ysize = 0;
+#ifndef SC_NO_HISTORY
+	old_xpos = old_ypos = 0;
+	if (scp->history != NULL) {
+		if (scp->xsize > 0) {
+			old_xpos = scp->xpos;
+			old_ypos = scp->ypos;
+		}
+		sc_hist_save(scp);
+		new_ysize = sc_vtb_rows(scp->history);
+	}
+#endif
+	prev_ysize = scp->ysize;
+	scp->status |= MOUSE_HIDDEN;
+	if (scp->status & GRAPHICS_MODE) {
+		/*
+		 * We don't handle GRAPHICS_MODE at all when using a KMS
+		 * framebuffer, so silently switch to UNKNOWN_MODE then.
+		 */
+		scp->status |= UNKNOWN_MODE;
+		scp->status &= ~GRAPHICS_MODE;
+	}
+	/* Implicitly leave PIXEL_MODE, but stay in UNKNOWN mode */
+	scp->status &= ~(PIXEL_MODE | MOUSE_VISIBLE);
+	scp->xpixel = scp->sc->fbi->width;
+	scp->ypixel = scp->sc->fbi->height;
+
+	/*
+	 * Assume square pixels for now
+	 */
+	sc_font_scale(scp, 0, 0);
+
+	DPRINTF(1, ("kms console: scale-to %dx%d cols=%d rows=%d\n",
+		scp->blk_width, scp->blk_height, scp->xsize, scp->ysize));
+
+	/* allocate buffers */
+	sc_alloc_scr_buffer(scp, TRUE, TRUE);
+	sc_init_emulator(scp, NULL);
+#ifndef SC_NO_CUTPASTE
+	sc_alloc_cut_buffer(scp, FALSE);
+#endif
+#ifndef SC_NO_HISTORY
+	sc_alloc_history_buffer(scp, new_ysize, prev_ysize, FALSE);
+	if (scp->history != NULL) {
+		sc_hist_getback(scp, prev_ysize);
+		sc_move_cursor(scp, old_xpos, old_ypos);
+	}
+#endif
+	crit_exit();
+	tp = VIRTUAL_TTY(scp->sc, scp->index);
+	if (tp == NULL)
+		return;
+	if (tp->t_winsize.ws_col != scp->xsize ||
+	    tp->t_winsize.ws_row != scp->ysize) {
+		tp->t_winsize.ws_col = scp->xsize;
+		tp->t_winsize.ws_row = scp->ysize;
+		pgsignal(tp->t_pgrp, SIGWINCH, 1);
+	}
 }

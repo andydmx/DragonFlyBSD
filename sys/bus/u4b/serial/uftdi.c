@@ -73,6 +73,7 @@ static int uftdi_debug = 0;
 static SYSCTL_NODE(_hw_usb, OID_AUTO, uftdi, CTLFLAG_RW, 0, "USB uftdi");
 SYSCTL_INT(_hw_usb_uftdi, OID_AUTO, debug, CTLFLAG_RW,
     &uftdi_debug, 0, "Debug level");
+TUNABLE_INT("hw.usb.uftdi.debug", &uftdi_debug);
 #endif
 
 #define	UFTDI_CONFIG_INDEX	0
@@ -201,7 +202,7 @@ MODULE_DEPEND(uftdi, ucom, 1, 1, 1);
 MODULE_DEPEND(uftdi, usb, 1, 1, 1);
 MODULE_VERSION(uftdi, 1);
 
-static STRUCT_USB_HOST_ID uftdi_devs[] = {
+static const STRUCT_USB_HOST_ID uftdi_devs[] = {
 #define	UFTDI_DEV(v,p,t) \
   { USB_VPI(USB_VENDOR_##v, USB_PRODUCT_##v##_##p, UFTDI_TYPE_##t) }
 	UFTDI_DEV(ATMEL, STK541, 8U232AM),

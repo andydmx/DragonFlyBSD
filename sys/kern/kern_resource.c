@@ -35,11 +35,9 @@
  * $FreeBSD: src/sys/kern/kern_resource.c,v 1.55.2.5 2001/11/03 01:41:08 ps Exp $
  */
 
-#include "opt_compat.h"
-
 #include <sys/param.h>
 #include <sys/systm.h>
-#include <sys/sysproto.h>
+#include <sys/sysmsg.h>
 #include <sys/file.h>
 #include <sys/kern_syscall.h>
 #include <sys/kernel.h>
@@ -68,7 +66,6 @@ static struct spinlock uihash_lock;
 static LIST_HEAD(uihashhead, uidinfo) *uihashtbl;
 static u_long uihash;		/* size of hash table - 1 */
 
-static struct uidinfo	*uicreate (uid_t uid);
 static struct uidinfo	*uilookup (uid_t uid);
 
 /*
@@ -86,7 +83,7 @@ static int getpriority_callback(struct proc *p, void *data);
  * MPALMOSTSAFE
  */
 int
-sys_getpriority(struct getpriority_args *uap)
+sys_getpriority(struct sysmsg *sysmsg, const struct getpriority_args *uap)
 {
 	struct getpriority_info info;
 	thread_t curtd = curthread;
@@ -94,14 +91,15 @@ sys_getpriority(struct getpriority_args *uap)
 	struct proc *p;
 	struct pgrp *pg;
 	int low = PRIO_MAX + 1;
+	int who = uap->who;
 	int error;
 
 	switch (uap->which) {
 	case PRIO_PROCESS:
-		if (uap->who == 0) {
+		if (who == 0) {
 			low = curp->p_nice;
 		} else {
-			p = pfind(uap->who);
+			p = pfind(who);
 			if (p) {
 				lwkt_gettoken_shared(&p->p_token);
 				if (PRISON_CHECK(curtd->td_ucred, p->p_ucred))
@@ -112,12 +110,12 @@ sys_getpriority(struct getpriority_args *uap)
 		}
 		break;
 	case PRIO_PGRP: 
-		if (uap->who == 0) {
+		if (who == 0) {
 			lwkt_gettoken_shared(&curp->p_token);
 			pg = curp->p_pgrp;
 			pgref(pg);
 			lwkt_reltoken(&curp->p_token);
-		} else if ((pg = pgfind(uap->who)) == NULL) {
+		} else if ((pg = pgfind(who)) == NULL) {
 			break;
 		} /* else ref held from pgfind */
 
@@ -132,11 +130,11 @@ sys_getpriority(struct getpriority_args *uap)
 		pgrel(pg);
 		break;
 	case PRIO_USER:
-		if (uap->who == 0)
-			uap->who = curtd->td_ucred->cr_uid;
+		if (who == 0)
+			who = curtd->td_ucred->cr_uid;
 		info.low = low;
-		info.who = uap->who;
-		allproc_scan(getpriority_callback, &info);
+		info.who = who;
+		allproc_scan(getpriority_callback, &info, 0);
 		low = info.low;
 		break;
 
@@ -148,7 +146,7 @@ sys_getpriority(struct getpriority_args *uap)
 		error = ESRCH;
 		goto done;
 	}
-	uap->sysmsg_result = low;
+	sysmsg->sysmsg_result = low;
 	error = 0;
 done:
 	return (error);
@@ -187,7 +185,7 @@ static int setpriority_callback(struct proc *p, void *data);
  * MPALMOSTSAFE
  */
 int
-sys_setpriority(struct setpriority_args *uap)
+sys_setpriority(struct sysmsg *sysmsg, const struct setpriority_args *uap)
 {
 	struct setpriority_info info;
 	thread_t curtd = curthread;
@@ -195,16 +193,17 @@ sys_setpriority(struct setpriority_args *uap)
 	struct proc *p;
 	struct pgrp *pg;
 	int found = 0, error = 0;
+	int who = uap->who;
 
 	switch (uap->which) {
 	case PRIO_PROCESS:
-		if (uap->who == 0) {
+		if (who == 0) {
 			lwkt_gettoken(&curp->p_token);
 			error = donice(curp, uap->prio);
 			found++;
 			lwkt_reltoken(&curp->p_token);
 		} else {
-			p = pfind(uap->who);
+			p = pfind(who);
 			if (p) {
 				lwkt_gettoken(&p->p_token);
 				if (PRISON_CHECK(curtd->td_ucred, p->p_ucred)) {
@@ -217,12 +216,12 @@ sys_setpriority(struct setpriority_args *uap)
 		}
 		break;
 	case PRIO_PGRP: 
-		if (uap->who == 0) {
+		if (who == 0) {
 			lwkt_gettoken_shared(&curp->p_token);
 			pg = curp->p_pgrp;
 			pgref(pg);
 			lwkt_reltoken(&curp->p_token);
-		} else if ((pg = pgfind(uap->who)) == NULL) {
+		} else if ((pg = pgfind(who)) == NULL) {
 			break;
 		} /* else ref held from pgfind */
 
@@ -247,13 +246,13 @@ restart:
 		pgrel(pg);
 		break;
 	case PRIO_USER:
-		if (uap->who == 0)
-			uap->who = curtd->td_ucred->cr_uid;
+		if (who == 0)
+			who = curtd->td_ucred->cr_uid;
 		info.prio = uap->prio;
-		info.who = uap->who;
+		info.who = who;
 		info.error = 0;
 		info.found = 0;
-		allproc_scan(setpriority_callback, &info);
+		allproc_scan(setpriority_callback, &info, 0);
 		error = info.error;
 		found = info.found;
 		break;
@@ -327,7 +326,7 @@ static int ioprio_get_callback(struct proc *p, void *data);
  * MPALMOSTSAFE
  */
 int
-sys_ioprio_get(struct ioprio_get_args *uap)
+sys_ioprio_get(struct sysmsg *sysmsg, const struct ioprio_get_args *uap)
 {
 	struct ioprio_get_info info;
 	thread_t curtd = curthread;
@@ -335,14 +334,15 @@ sys_ioprio_get(struct ioprio_get_args *uap)
 	struct proc *p;
 	struct pgrp *pg;
 	int high = IOPRIO_MIN-2;
+	int who = uap->who;
 	int error;
 
 	switch (uap->which) {
 	case PRIO_PROCESS:
-		if (uap->who == 0) {
+		if (who == 0) {
 			high = curp->p_ionice;
 		} else {
-			p = pfind(uap->who);
+			p = pfind(who);
 			if (p) {
 				lwkt_gettoken_shared(&p->p_token);
 				if (PRISON_CHECK(curtd->td_ucred, p->p_ucred))
@@ -353,12 +353,12 @@ sys_ioprio_get(struct ioprio_get_args *uap)
 		}
 		break;
 	case PRIO_PGRP:
-		if (uap->who == 0) {
+		if (who == 0) {
 			lwkt_gettoken_shared(&curp->p_token);
 			pg = curp->p_pgrp;
 			pgref(pg);
 			lwkt_reltoken(&curp->p_token);
-		} else if ((pg = pgfind(uap->who)) == NULL) {
+		} else if ((pg = pgfind(who)) == NULL) {
 			break;
 		} /* else ref held from pgfind */
 
@@ -372,11 +372,11 @@ sys_ioprio_get(struct ioprio_get_args *uap)
 		pgrel(pg);
 		break;
 	case PRIO_USER:
-		if (uap->who == 0)
-			uap->who = curtd->td_ucred->cr_uid;
+		if (who == 0)
+			who = curtd->td_ucred->cr_uid;
 		info.high = high;
-		info.who = uap->who;
-		allproc_scan(ioprio_get_callback, &info);
+		info.who = who;
+		allproc_scan(ioprio_get_callback, &info, 0);
 		high = info.high;
 		break;
 	default:
@@ -387,7 +387,7 @@ sys_ioprio_get(struct ioprio_get_args *uap)
 		error = ESRCH;
 		goto done;
 	}
-	uap->sysmsg_result = high;
+	sysmsg->sysmsg_result = high;
 	error = 0;
 done:
 	return (error);
@@ -427,7 +427,7 @@ static int ioprio_set_callback(struct proc *p, void *data);
  * MPALMOSTSAFE
  */
 int
-sys_ioprio_set(struct ioprio_set_args *uap)
+sys_ioprio_set(struct sysmsg *sysmsg, const struct ioprio_set_args *uap)
 {
 	struct ioprio_set_info info;
 	thread_t curtd = curthread;
@@ -435,16 +435,17 @@ sys_ioprio_set(struct ioprio_set_args *uap)
 	struct proc *p;
 	struct pgrp *pg;
 	int found = 0, error = 0;
+	int who = uap->who;
 
 	switch (uap->which) {
 	case PRIO_PROCESS:
-		if (uap->who == 0) {
+		if (who == 0) {
 			lwkt_gettoken(&curp->p_token);
 			error = doionice(curp, uap->prio);
 			lwkt_reltoken(&curp->p_token);
 			found++;
 		} else {
-			p = pfind(uap->who);
+			p = pfind(who);
 			if (p) {
 				lwkt_gettoken(&p->p_token);
 				if (PRISON_CHECK(curtd->td_ucred, p->p_ucred)) {
@@ -457,12 +458,12 @@ sys_ioprio_set(struct ioprio_set_args *uap)
 		}
 		break;
 	case PRIO_PGRP:
-		if (uap->who == 0) {
+		if (who == 0) {
 			lwkt_gettoken_shared(&curp->p_token);
 			pg = curp->p_pgrp;
 			pgref(pg);
 			lwkt_reltoken(&curp->p_token);
-		} else if ((pg = pgfind(uap->who)) == NULL) {
+		} else if ((pg = pgfind(who)) == NULL) {
 			break;
 		} /* else ref held from pgfind */
 
@@ -487,13 +488,13 @@ restart:
 		pgrel(pg);
 		break;
 	case PRIO_USER:
-		if (uap->who == 0)
-			uap->who = curtd->td_ucred->cr_uid;
+		if (who == 0)
+			who = curtd->td_ucred->cr_uid;
 		info.prio = uap->prio;
-		info.who = uap->who;
+		info.who = who;
 		info.error = 0;
 		info.found = 0;
-		allproc_scan(ioprio_set_callback, &info);
+		allproc_scan(ioprio_set_callback, &info, 0);
 		error = info.error;
 		found = info.found;
 		break;
@@ -527,7 +528,7 @@ ioprio_set_callback(struct proc *p, void *data)
 	return(0);
 }
 
-int
+static int
 doionice(struct proc *chgp, int n)
 {
 	struct ucred *cr = curthread->td_ucred;
@@ -553,7 +554,7 @@ doionice(struct proc *chgp, int n)
  * MPALMOSTSAFE
  */
 int
-sys_lwp_rtprio(struct lwp_rtprio_args *uap)
+sys_lwp_rtprio(struct sysmsg *sysmsg, const struct lwp_rtprio_args *uap)
 {
 	struct ucred *cr = curthread->td_ucred;
 	struct proc *p;
@@ -597,6 +598,11 @@ sys_lwp_rtprio(struct lwp_rtprio_args *uap)
 		}
 	}
 
+	/*
+	 * Make sure that this lwp is not ripped if any of the following
+	 * code blocks, e.g. copyout.
+	 */
+	LWPHOLD(lp);
 	switch (uap->function) {
 	case RTP_LOOKUP:
 		error = copyout(&lp->lwp_rtprio, uap->rtp,
@@ -652,6 +658,7 @@ sys_lwp_rtprio(struct lwp_rtprio_args *uap)
 		error = EINVAL;
 		break;
 	}
+	LWPRELE(lp);
 
 done:
 	if (p) {
@@ -667,7 +674,7 @@ done:
  * MPALMOSTSAFE
  */
 int
-sys_rtprio(struct rtprio_args *uap)
+sys_rtprio(struct sysmsg *sysmsg, const struct rtprio_args *uap)
 {
 	struct ucred *cr = curthread->td_ucred;
 	struct proc *p;
@@ -758,11 +765,8 @@ done:
 	return (error);
 }
 
-/*
- * MPSAFE
- */
 int
-sys_setrlimit(struct __setrlimit_args *uap)
+sys_setrlimit(struct sysmsg *sysmsg, const struct __setrlimit_args *uap)
 {
 	struct rlimit alim;
 	int error;
@@ -776,11 +780,8 @@ sys_setrlimit(struct __setrlimit_args *uap)
 	return (error);
 }
 
-/*
- * MPSAFE
- */
 int
-sys_getrlimit(struct __getrlimit_args *uap)
+sys_getrlimit(struct sysmsg *sysmsg, const struct __getrlimit_args *uap)
 {
 	struct rlimit lim;
 	int error;
@@ -862,7 +863,7 @@ calcru_proc(struct proc *p, struct rusage *ru)
  * MPALMOSTSAFE
  */
 int
-sys_getrusage(struct getrusage_args *uap)
+sys_getrusage(struct sysmsg *sysmsg, const struct getrusage_args *uap)
 {
 	struct proc *p = curproc;
 	struct rusage ru;
@@ -921,8 +922,6 @@ uihashinit(void)
 
 /*
  * NOTE: Must be called with uihash_lock held
- *
- * MPSAFE
  */
 static struct uidinfo *
 uilookup(uid_t uid)
@@ -942,9 +941,10 @@ uilookup(uid_t uid)
  * Helper function to creat ea uid that could not be found.
  * This function will properly deal with races.
  *
- * MPSAFE
+ * WARNING! Should only be used by this source file and by the proc0
+ *	    creation code.
  */
-static struct uidinfo *
+struct uidinfo *
 uicreate(uid_t uid)
 {
 	struct	uidinfo *uip, *tmp;
@@ -952,7 +952,7 @@ uicreate(uid_t uid)
 	/*
 	 * Allocate space and check for a race
 	 */
-	uip = kmalloc(sizeof(*uip), M_UIDINFO, M_WAITOK|M_ZERO);
+	uip = kmalloc(sizeof(*uip), M_UIDINFO, M_WAITOK | M_ZERO);
 
 	/*
 	 * Initialize structure and enter it into the hash table
@@ -961,6 +961,8 @@ uicreate(uid_t uid)
 	uip->ui_uid = uid;
 	uip->ui_ref = 1;	/* we're returning a ref */
 	varsymset_init(&uip->ui_varsymset, NULL);
+	uip->ui_pcpu = kmalloc(sizeof(*uip->ui_pcpu) * ncpus,
+			       M_UIDINFO, M_WAITOK | M_ZERO);
 
 	/*
 	 * Somebody may have already created the uidinfo for this
@@ -974,6 +976,7 @@ uicreate(uid_t uid)
 
 		spin_uninit(&uip->ui_lock);
 		varsymset_clean(&uip->ui_varsymset);
+		kfree(uip->ui_pcpu, M_UIDINFO);
 		kfree(uip, M_UIDINFO);
 		uip = tmp;
 	} else {
@@ -984,106 +987,107 @@ uicreate(uid_t uid)
 }
 
 /*
- *
- *
- * MPSAFE
+ * Find the uidinfo for a uid, creating one if necessary
  */
 struct uidinfo *
 uifind(uid_t uid)
 {
-	struct	uidinfo *uip;
+	struct uidinfo *uip;
+	thread_t td = curthread;
 
-	spin_lock(&uihash_lock);
+	if (td->td_ucred) {
+		uip = td->td_ucred->cr_uidinfo;
+		if (uip->ui_uid == uid) {
+			uihold(uip);
+			return uip;
+		}
+		uip = td->td_ucred->cr_ruidinfo;
+		if (uip->ui_uid == uid) {
+			uihold(uip);
+			return uip;
+		}
+	}
+
+	spin_lock_shared(&uihash_lock);
 	uip = uilookup(uid);
 	if (uip == NULL) {
-		spin_unlock(&uihash_lock);
+		spin_unlock_shared(&uihash_lock);
 		uip = uicreate(uid);
 	} else {
 		uihold(uip);
-		spin_unlock(&uihash_lock);
+		spin_unlock_shared(&uihash_lock);
 	}
 	return (uip);
 }
 
 /*
- * Helper funtion to remove a uidinfo whos reference count is
- * transitioning from 1->0.  The reference count is 1 on call.
- *
- * Zero is returned on success, otherwise non-zero and the
- * uiphas not been removed.
- *
- * MPSAFE
+ * Helper funtion to remove a uidinfo whos reference count may
+ * have transitioned to 0.  The reference count is likely 0
+ * on-call.
  */
-static __inline int
-uifree(struct uidinfo *uip)
+static __inline void
+uifree(uid_t uid)
 {
+	struct uidinfo *uip;
+
 	/*
 	 * If we are still the only holder after acquiring the uihash_lock
 	 * we can safely unlink the uip and destroy it.  Otherwise we lost
 	 * a race and must fail.
 	 */
 	spin_lock(&uihash_lock);
-	if (uip->ui_ref != 1) {
+	uip = uilookup(uid);
+	if (uip && uip->ui_ref == 0) {
+		LIST_REMOVE(uip, ui_hash);
 		spin_unlock(&uihash_lock);
-		return(-1);
-	}
-	LIST_REMOVE(uip, ui_hash);
-	spin_unlock(&uihash_lock);
 
-	/*
-	 * The uip is now orphaned and we can destroy it at our
-	 * leisure.
-	 */
-	if (uip->ui_sbsize != 0)
-		kprintf("freeing uidinfo: uid = %d, sbsize = %jd\n",
-		    uip->ui_uid, (intmax_t)uip->ui_sbsize);
-	if (uip->ui_proccnt != 0)
-		kprintf("freeing uidinfo: uid = %d, proccnt = %ld\n",
-		    uip->ui_uid, uip->ui_proccnt);
-	
-	varsymset_clean(&uip->ui_varsymset);
-	lockuninit(&uip->ui_varsymset.vx_lock);
-	spin_uninit(&uip->ui_lock);
-	kfree(uip, M_UIDINFO);
-	return(0);
+		/*
+		 * The uip is now orphaned and we can destroy it at our
+		 * leisure.
+		 */
+		if (uip->ui_sbsize != 0)
+			kprintf("freeing uidinfo: uid = %d, sbsize = %jd\n",
+			    uip->ui_uid, (intmax_t)uip->ui_sbsize);
+		if (uip->ui_proccnt != 0)
+			kprintf("freeing uidinfo: uid = %d, proccnt = %ld\n",
+			    uip->ui_uid, uip->ui_proccnt);
+
+		varsymset_clean(&uip->ui_varsymset);
+		lockuninit(&uip->ui_varsymset.vx_lock);
+		spin_uninit(&uip->ui_lock);
+		kfree(uip->ui_pcpu, M_UIDINFO);
+		kfree(uip, M_UIDINFO);
+	} else {
+		spin_unlock(&uihash_lock);
+	}
 }
 
 /*
- * MPSAFE
+ * Bump the ref count
  */
 void
 uihold(struct uidinfo *uip)
 {
-	atomic_add_int(&uip->ui_ref, 1);
 	KKASSERT(uip->ui_ref >= 0);
+	atomic_add_int(&uip->ui_ref, 1);
 }
 
 /*
- * NOTE: It is important for us to not drop the ref count to 0
- *	 because this can cause a 2->0/2->0 race with another
- *	 concurrent dropper.  Losing the race in that situation
- *	 can cause uip to become stale for one of the other
- *	 threads.
+ * Drop the ref count.  The last-drop code still needs to remove the
+ * uidinfo from the hash table which it does by re-looking-it-up.
  *
- * MPSAFE
+ * NOTE: The uip can be ripped out from under us after the fetchadd.
  */
 void
 uidrop(struct uidinfo *uip)
 {
-	int ref;
+	uid_t uid;
 
 	KKASSERT(uip->ui_ref > 0);
-
-	for (;;) {
-		ref = uip->ui_ref;
-		cpu_ccfence();
-		if (ref == 1) {
-			if (uifree(uip) == 0)
-				break;
-		} else if (atomic_cmpset_int(&uip->ui_ref, ref, ref - 1)) {
-			break;
-		}
-		/* else retry */
+	uid = uip->ui_uid;
+	cpu_ccfence();
+	if (atomic_fetchadd_int(&uip->ui_ref, -1) == 1) {
+		uifree(uid);
 	}
 }
 
@@ -1096,23 +1100,27 @@ uireplace(struct uidinfo **puip, struct uidinfo *nuip)
 
 /*
  * Change the count associated with number of processes
- * a given user is using.  When 'max' is 0, don't enforce a limit
+ * a given user is using.
+ *
+ * NOTE: When 'max' is 0, don't enforce a limit.
+ *
+ * NOTE: Due to concurrency, the count can sometimes exceed the max
+ *	 by a small amount.
  */
 int
 chgproccnt(struct uidinfo *uip, int diff, int max)
 {
 	int ret;
-	spin_lock(&uip->ui_lock);
+
 	/* don't allow them to exceed max, but allow subtraction */
 	if (diff > 0 && uip->ui_proccnt + diff > max && max != 0) {
 		ret = 0;
 	} else {
-		uip->ui_proccnt += diff;
+		atomic_add_long(&uip->ui_proccnt, diff);
 		if (uip->ui_proccnt < 0)
 			kprintf("negative proccnt for uid = %d\n", uip->ui_uid);
 		ret = 1;
 	}
-	spin_unlock(&uip->ui_lock);
 	return ret;
 }
 
@@ -1124,17 +1132,10 @@ chgsbsize(struct uidinfo *uip, u_long *hiwat, u_long to, rlim_t max)
 {
 	rlim_t new;
 
-#ifdef __x86_64__
 	rlim_t sbsize;
 
 	sbsize = atomic_fetchadd_long(&uip->ui_sbsize, to - *hiwat);
 	new = sbsize + to - *hiwat;
-#else
-	spin_lock(&uip->ui_lock);
-	new = uip->ui_sbsize + to - *hiwat;
-	uip->ui_sbsize = new;
-	spin_unlock(&uip->ui_lock);
-#endif
 	KKASSERT(new >= 0);
 
 	/*

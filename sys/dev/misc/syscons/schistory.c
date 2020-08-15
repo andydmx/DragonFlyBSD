@@ -51,7 +51,7 @@
 #endif
 
 #if !defined(SC_HISTORY_SIZE)
-#define SC_HISTORY_SIZE		(ROW * 4)
+#define SC_HISTORY_SIZE		(ROW * 10)
 #endif
 
 #if (SC_HISTORY_SIZE * MAXCONS * NSC) > SC_MAX_HISTORY_SIZE
@@ -60,12 +60,12 @@
 #endif
 
 /* local variables */
-static int		extra_history_size
-				= SC_MAX_HISTORY_SIZE - SC_HISTORY_SIZE*MAXCONS;
+static int extra_history_size = SC_MAX_HISTORY_SIZE - SC_HISTORY_SIZE*MAXCONS;
 
 /* local functions */
 static void copy_history(sc_vtb_t *from, sc_vtb_t *to);
 static void history_to_screen(scr_stat *scp);
+static void history_to_screen_lines(scr_stat *scp, int cnt);
 
 /* allocate a history buffer */
 int
@@ -82,6 +82,7 @@ sc_alloc_history_buffer(scr_stat *scp, int lines, int prev_ysize, int wait)
 	int cur_lines;				/* current buffer size */
 	int min_lines;				/* guaranteed buffer size */
 	int delta;				/* lines to put back */
+	int ok;
 
 	if (lines <= 0)
 		lines = SC_HISTORY_SIZE;	/* use the default value */
@@ -113,6 +114,7 @@ sc_alloc_history_buffer(scr_stat *scp, int lines, int prev_ysize, int wait)
 	}
 
 	/* allocate a new buffer */
+	ok = 0;
 	history = kmalloc(sizeof(*history), M_SYSCONS,
 			 (wait) ? M_WAITOK : M_NOWAIT);
 	if (history != NULL) {
@@ -121,25 +123,40 @@ sc_alloc_history_buffer(scr_stat *scp, int lines, int prev_ysize, int wait)
 		/* XXX error check? */
 		sc_vtb_init(history, VTB_RINGBUFFER, scp->xsize, lines,
 			    NULL, wait);
-		/* FIXME: XXX no good? */
-		sc_vtb_clear(history, scp->sc->scr_map[0x20],
-			     SC_NORM_ATTR << 8);
-		if (prev_history != NULL)
-			copy_history(prev_history, history);
-		scp->history_pos = sc_vtb_tail(history);
+		if (history->vtb_flags & VTB_VALID) {
+			/* FIXME: XXX no good? */
+			sc_vtb_clear(history, scp->sc->scr_map[0x20],
+				     SC_NORM_ATTR << 8);
+			if (prev_history != NULL)
+				copy_history(prev_history, history);
+			scp->history_pos = sc_vtb_tail(history);
+			ok = 1;
+		}
+	}
+
+	if (ok) {
+		/*
+		 * Install new buffer, destroy previous buffer
+		 */
+		if (prev_history != NULL) {
+			extra_history_size += delta;
+			sc_vtb_destroy(prev_history);
+			kfree(prev_history, M_SYSCONS);
+		}
+		scp->history = history;
 	} else {
+		/*
+		 * Destroy partially initialized new buffer, keep
+		 * previous buffer.   Anything could have happened
+		 * in the mean time so reset the history position.
+		 */
+		if (history) {
+			sc_vtb_destroy(history);
+			kfree(history, M_SYSCONS);
+		}
 		scp->history_pos = 0;
+		scp->history = prev_history;
 	}
-
-	/* destroy the previous buffer */
-	if (prev_history != NULL) {
-		extra_history_size += delta;
-		sc_vtb_destroy(prev_history);
-		kfree(prev_history, M_SYSCONS);
-	}
-
-	scp->history = history;
-
 	return 0;
 }
 
@@ -220,14 +237,22 @@ sc_hist_restore(scr_stat *scp)
 static void
 history_to_screen(scr_stat *scp)
 {
+	history_to_screen_lines(scp, scp->ysize);
+}
+
+/* copy cnt of saved lines */
+static void
+history_to_screen_lines(scr_stat *scp, int cnt)
+{
 	int pos;
 	int i;
+	int lines = imin(cnt, scp->ysize);
 
 	pos = scp->history_pos;
-	for (i = 1; i <= scp->ysize; ++i) {
+	for (i = 1; i <= lines; ++i) {
 		pos = sc_vtb_pos(scp->history, pos, -scp->xsize);
 		sc_vtb_copy(scp->history, pos,
-			    &scp->vtb, scp->xsize*(scp->ysize - i),
+			    &scp->vtb, scp->xsize*(lines - i),
 			    scp->xsize);
 	}
 	mark_all(scp);
@@ -239,6 +264,14 @@ sc_hist_home(scr_stat *scp)
 {
 	scp->history_pos = sc_vtb_tail(scp->history);
 	history_to_screen(scp);
+}
+
+/* Restore old_ysize lines from the tail of the history buffer */
+void
+sc_hist_getback(scr_stat *scp, int old_ysize)
+{
+	scp->history_pos = sc_vtb_tail(scp->history);
+	history_to_screen_lines(scp, old_ysize);
 }
 
 /* go to the top of the history buffer */

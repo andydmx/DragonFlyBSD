@@ -52,16 +52,16 @@
 #include "inetd.h"
 
 void		chargen_dg(int, struct servtab *);
-void		chargen_stream(int, struct servtab *);
+void		chargen_stream(int, struct servtab *) __dead2;
 void		daytime_dg(int, struct servtab *);
 void		daytime_stream(int, struct servtab *);
 void		discard_dg(int, struct servtab *);
-void		discard_stream(int, struct servtab *);
+void		discard_stream(int, struct servtab *) __dead2;
 void		echo_dg(int, struct servtab *);
-void		echo_stream(int, struct servtab *);
-static int	getline(int, char *, int);
-void		iderror(int, int, int, const char *);
-void		ident_stream(int, struct servtab *);
+void		echo_stream(int, struct servtab *) __dead2;
+static int	get_line(int, char *, int);
+void		iderror(int, int, int, const char *) __dead2;
+void		ident_stream(int, struct servtab *) __dead2;
 void		initring(void);
 unsigned long	machtime(void);
 void		machtime_dg(int, struct servtab *);
@@ -731,7 +731,7 @@ machtime_stream(int s, struct servtab *sep __unused)
 #define strwrite(fd, buf)	write(fd, buf, sizeof(buf)-1)
 
 static int		/* # of characters upto \r,\n or \0 */
-getline(int fd, char *buf, int len)
+get_line(int fd, char *buf, int len)
 {
 	int count = 0, n;
 	struct sigaction sa;
@@ -766,7 +766,7 @@ tcpmux(int s)
 	int len;
 
 	/* Get requested service name */
-	if ((len = getline(s, service, MAX_SERV_LEN)) < 0) {
+	if ((len = get_line(s, service, MAX_SERV_LEN)) < 0) {
 		strwrite(s, "-Error reading service name\r\n");
 		return (NULL);
 	}

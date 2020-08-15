@@ -39,9 +39,6 @@
 #ifndef _SYS_SYSTM_H_
 #include <sys/systm.h>
 #endif
-#ifndef _SYS_THREAD2_H_
-#include <sys/thread2.h>
-#endif
 #ifndef _SYS_SERIALIZE_H_
 #include <sys/serialize.h>
 #endif
@@ -88,7 +85,7 @@ void		ifq_set_maxlen(struct ifaltq *, int);
 void		ifq_set_methods(struct ifaltq *, altq_mapsubq_t,
 		    ifsq_enqueue_t, ifsq_dequeue_t, ifsq_request_t);
 int		ifq_mapsubq_default(struct ifaltq *, int);
-int		ifq_mapsubq_mask(struct ifaltq *, int);
+int		ifq_mapsubq_modulo(struct ifaltq *, int);
 
 void		ifsq_devstart(struct ifaltq_subque *ifsq);
 void		ifsq_devstart_sched(struct ifaltq_subque *ifsq);
@@ -399,6 +396,8 @@ ifq_handoff(struct ifnet *_ifp, struct mbuf *_m, struct altq_pktattr *_pa)
 			IFNET_STAT_INC(_ifp, omcasts, 1);
 		if (!ifsq_is_oactive(_ifsq))
 			(*_ifp->if_start)(_ifp, _ifsq);
+	} else {
+		IFNET_STAT_INC(_ifp, oqdrops, 1);
 	}
 	return(_error);
 }
@@ -556,10 +555,13 @@ ifq_set_subq_cnt(struct ifaltq *_ifq, int _cnt)
 }
 
 static __inline void
-ifq_set_subq_mask(struct ifaltq *_ifq, uint32_t _mask)
+ifq_set_subq_divisor(struct ifaltq *_ifq, uint32_t _divisor)
 {
-	KASSERT(((_mask + 1) & _mask) == 0, ("invalid mask %08x", _mask));
-	_ifq->altq_subq_mask = _mask;
+
+	KASSERT(_divisor > 0, ("invalid divisor %u", _divisor));
+	KASSERT(_divisor <= _ifq->altq_subq_cnt,
+	    ("invalid divisor %u, max %d", _divisor, _ifq->altq_subq_cnt));
+	_ifq->altq_subq_mappriv = _divisor;
 }
 
 /* COMPAT */

@@ -1,14 +1,14 @@
 /*-
  * Copyright (c) 2007 The DragonFly Project.  All rights reserved.
- * 
+ *
  * This code is derived from software contributed to The DragonFly Project
  * by Simon 'corecode' Schubert <corecode@fs.ei.tum.de>
  * by Thomas E. Spanjaard <tgen@netphreax.net>
- * 
+ *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
  * are met:
- * 
+ *
  * 1. Redistributions of source code must retain the above copyright
  *    notice, this list of conditions and the following disclaimer.
  * 2. Redistributions in binary form must reproduce the above copyright
@@ -18,7 +18,7 @@
  * 3. Neither the name of The DragonFly Project nor the names of its
  *    contributors may be used to endorse or promote products derived
  *    from this software without specific, prior written permission.
- * 
+ *
  * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
  * ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
  * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
@@ -51,17 +51,61 @@
 #include <sys/globaldata.h>
 #ifdef _KERNEL
 #include <sys/systm.h>
-#include <sys/sysref.h>
-#include <sys/sysref2.h>
 #else
 #include <string.h>
 
-dev_t dev2udev(cdev_t dev);	/* kvm_proc.c */
+dev_t devid_from_dev(cdev_t dev);	/* kvm_proc.c */
 #endif
 
 
+#ifndef _KERNEL
 /*
- * Fill in a struct kinfo_proc.
+ * This is a temporary hack for when libkvm compiles in this file
+ * from userland.  These functions don't belong here.
+ */
+static void
+timevalfix(struct timeval *t1)
+{
+
+	if (t1->tv_usec < 0) {
+		t1->tv_sec--;
+		t1->tv_usec += 1000000;
+	}
+	if (t1->tv_usec >= 1000000) {
+		t1->tv_sec++;
+		t1->tv_usec -= 1000000;
+	}
+}
+
+static void
+timevaladd(struct timeval *t1, const struct timeval *t2)
+{
+
+	t1->tv_sec += t2->tv_sec;
+	t1->tv_usec += t2->tv_usec;
+	timevalfix(t1);
+}
+
+static void
+ruadd(struct rusage *ru, struct rusage *ru2)
+{
+	long *ip, *ip2;
+	int i;
+
+	timevaladd(&ru->ru_utime, &ru2->ru_utime);
+	timevaladd(&ru->ru_stime, &ru2->ru_stime);
+	if (ru->ru_maxrss < ru2->ru_maxrss)
+		ru->ru_maxrss = ru2->ru_maxrss;
+	ip = &ru->ru_first; ip2 = &ru2->ru_first;
+	for (i = &ru->ru_last - &ru->ru_first; i >= 0; i--)
+		*ip++ += *ip2++;
+}
+
+#endif
+
+/*
+ * Fill in a struct kinfo_proc, and zero the lwp fields for a possible
+ * fill_kinfo_lwp() aggregation.
  *
  * NOTE!  We may be asked to fill in kinfo_proc for a zombied process, and
  * the process may be in the middle of being deallocated.  Check all pointers
@@ -131,7 +175,7 @@ fill_kinfo_proc(struct proc *p, struct kinfo_proc *kp)
 			kp->kp_auxflags |= KI_SLEADER;
 	}
 	if (sess && (p->p_flags & P_CONTROLT) != 0 && sess->s_ttyp != NULL) {
-		kp->kp_tdev = dev2udev(sess->s_ttyp->t_dev);
+		kp->kp_tdev = devid_from_dev(sess->s_ttyp->t_dev);
 		if (sess->s_ttyp->t_pgrp != NULL)
 			kp->kp_tpgid = sess->s_ttyp->t_pgrp->pg_id;
 		else
@@ -151,14 +195,10 @@ fill_kinfo_proc(struct proc *p, struct kinfo_proc *kp)
 	if ((vm = p->p_vmspace) != NULL) {
 		kp->kp_vm_map_size = vm->vm_map.size;
 		kp->kp_vm_rssize = vmspace_resident_count(vm);
-#ifdef _KERNEL
-		/*XXX MP RACES */
-		/*kp->kp_vm_prssize = vmspace_president_count(vm);*/
-#endif
 		kp->kp_vm_swrss = vm->vm_swrss;
-		kp->kp_vm_tsize = vm->vm_tsize;
-		kp->kp_vm_dsize = vm->vm_dsize;
-		kp->kp_vm_ssize = vm->vm_ssize;
+		kp->kp_vm_tsize = btoc(vm->vm_tsize);
+		kp->kp_vm_dsize = btoc(vm->vm_dsize);
+		kp->kp_vm_ssize = btoc(vm->vm_ssize);
 	}
 
 	if (p->p_ucred && jailed(p->p_ucred))
@@ -169,13 +209,15 @@ fill_kinfo_proc(struct proc *p, struct kinfo_proc *kp)
 }
 
 /*
- * Fill in a struct kinfo_lwp.
+ * Fill in a struct kinfo_lwp.  This routine also doubles as an aggregator
+ * of lwps for the proc.
+ *
+ * The kl structure must be initially zerod by the caller.  Note that
+ * fill_kinfo_proc() will do this for us.
  */
 void
 fill_kinfo_lwp(struct lwp *lwp, struct kinfo_lwp *kl)
 {
-	bzero(kl, sizeof(*kl));
-
 	kl->kl_pid = lwp->lwp_proc->p_pid;
 	kl->kl_tid = lwp->lwp_tid;
 
@@ -207,17 +249,17 @@ fill_kinfo_lwp(struct lwp *lwp, struct kinfo_lwp *kl)
 	kl->kl_tdprio = lwp->lwp_thread->td_pri;
 	kl->kl_rtprio = lwp->lwp_rtprio;
 
-	kl->kl_uticks = lwp->lwp_thread->td_uticks;
-	kl->kl_sticks = lwp->lwp_thread->td_sticks;
-	kl->kl_iticks = lwp->lwp_thread->td_iticks;
-	kl->kl_cpticks = lwp->lwp_cpticks;
-	kl->kl_pctcpu = lwp->lwp_pctcpu;
-	kl->kl_slptime = lwp->lwp_slptime;
+	kl->kl_uticks += lwp->lwp_thread->td_uticks;
+	kl->kl_sticks += lwp->lwp_thread->td_sticks;
+	kl->kl_iticks += lwp->lwp_thread->td_iticks;
+	kl->kl_cpticks += lwp->lwp_cpticks;
+	kl->kl_pctcpu += lwp->lwp_proc->p_stat == SZOMB ? 0 : lwp->lwp_pctcpu;
+	kl->kl_slptime += lwp->lwp_slptime;
 	kl->kl_origcpu = lwp->lwp_usdata.bsd4.batch;
 	kl->kl_estcpu = lwp->lwp_usdata.bsd4.estcpu;
 	kl->kl_cpuid = lwp->lwp_thread->td_gd->gd_cpuid;
 
-	kl->kl_ru = lwp->lwp_ru;
+	ruadd(&kl->kl_ru, &lwp->lwp_ru);
 
 	kl->kl_siglist = lwp->lwp_siglist;
 	kl->kl_sigmask = lwp->lwp_sigmask;
@@ -227,6 +269,7 @@ fill_kinfo_lwp(struct lwp *lwp, struct kinfo_lwp *kl)
 		strncpy(kl->kl_wmesg, lwp->lwp_thread->td_wmesg, WMESGLEN);
 		kl->kl_wmesg[WMESGLEN] = 0;
 	}
+	strlcpy(kl->kl_comm, lwp->lwp_thread->td_comm, sizeof(kl->kl_comm));
 }
 
 /*
@@ -245,7 +288,12 @@ fill_kinfo_proc_kthread(struct thread *td, struct kinfo_proc *kp)
 	strncpy(kp->kp_comm, td->td_comm, sizeof(kp->kp_comm) - 1);
 	kp->kp_comm[sizeof(kp->kp_comm) - 1] = 0;
 	kp->kp_flags = P_SYSTEM;
-	kp->kp_stat = SACTIVE;
+	if (td != &td->td_gd->gd_idlethread)
+		kp->kp_stat = SACTIVE;
+	else
+		kp->kp_stat = SIDL;
+	kp->kp_nthreads = 1;
+	kp->kp_ktaddr = (uintptr_t)td;
 
 	kp->kp_lwp.kl_pid = -1;
 	kp->kp_lwp.kl_tid = -1;
@@ -268,10 +316,11 @@ fill_kinfo_proc_kthread(struct thread *td, struct kinfo_proc *kp)
 	kp->kp_lwp.kl_wchan = (uintptr_t)td->td_wchan;
 	if (td->td_flags & TDF_RUNQ)
 		kp->kp_lwp.kl_stat = LSRUN;
-	else 
+	else
 		kp->kp_lwp.kl_stat = LSSLEEP;
 	if (td->td_wmesg) {
 		strncpy(kp->kp_lwp.kl_wmesg, td->td_wmesg, WMESGLEN);
 		kp->kp_lwp.kl_wmesg[WMESGLEN] = 0;
 	}
+	strlcpy(kp->kp_lwp.kl_comm, td->td_comm, sizeof(kp->kp_lwp.kl_comm));
 }

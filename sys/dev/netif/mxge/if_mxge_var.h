@@ -180,10 +180,10 @@ struct mxge_softc {
 	struct callout co_hdl;
 	u_long opackets;		/* saved ifnet.opackets */
 	u_long ipackets;		/* saved ifnet.ipackets */
-	struct sysctl_ctx_list sysctl_ctx;
-	struct sysctl_oid *sysctl_tree;
 	struct sysctl_oid *slice_sysctl_tree;
 	struct sysctl_ctx_list slice_sysctl_ctx;
+	struct if_ringmap *ring_map;
+	int rdr_table[NETISR_CPUMAX];
 	uint8_t	mac_addr[6];		/* eeprom mac address */
 	uint16_t pectl;			/* save PCIe CTL state */
 	char product_code_string[64];
@@ -207,6 +207,7 @@ struct mxge_softc {
 #define MXGE_XFP 1
 #define MXGE_SFP 2
 #define MXGE_QRF 3
+#define MXGE_UNK 4
 
 #define MXGE_HIGHPART_TO_U32(X) \
 	(sizeof (X) == 8) ? ((uint32_t)((uint64_t)(X) >> 32)) : (0)

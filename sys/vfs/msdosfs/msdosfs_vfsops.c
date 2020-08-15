@@ -1,7 +1,9 @@
-/* $FreeBSD: /usr/local/www/cvsroot/FreeBSD/src/sys/msdosfs/Attic/msdosfs_vfsops.c,v 1.60.2.8 2004/03/02 09:43:04 tjr Exp $ */
+/* $FreeBSD$ */
 /*	$NetBSD: msdosfs_vfsops.c,v 1.51 1997/11/17 15:36:58 ws Exp $	*/
 
 /*-
+ * SPDX-License-Identifier: BSD-4-Clause
+ *
  * Copyright (C) 1994, 1995, 1997 Wolfgang Solfrank.
  * Copyright (C) 1994, 1995, 1997 TooLs GmbH.
  * All rights reserved.
@@ -32,7 +34,7 @@
  * OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF
  * ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
-/*
+/*-
  * Written by Paul Popelka (paulp@uts.amdahl.com)
  *
  * You can do anything you want with this software, just don't say you wrote
@@ -60,22 +62,21 @@
 #include <sys/buf.h>
 #include <sys/fcntl.h>
 #include <sys/malloc.h>
-#include <sys/stat.h> 				/* defines ALLPERMS */
+#include <sys/stat.h>
 #include <vm/vm_zone.h>
 
 #include <sys/buf2.h>
 
-#include "bpb.h"
-#include "bootsect.h"
-#include "direntry.h"
-#include "denode.h"
-#include "msdosfsmount.h"
-#include "fat.h"
+#include <vfs/msdosfs/bootsect.h>
+#include <vfs/msdosfs/bpb.h>
+#include <vfs/msdosfs/direntry.h>
+#include <vfs/msdosfs/denode.h>
+#include <vfs/msdosfs/fat.h>
+#include <vfs/msdosfs/msdosfsmount.h>
 
 extern struct vop_ops msdosfs_vnode_vops;
-struct iconv_functions *msdos_iconv;
+struct iconv_functions *msdosfs_iconv;
 
-#define MSDOSFS_DFLTBSIZE       4096
 #define ENCODING_UNICODE        "UTF-16BE"
 #if 1 /*def PC98*/
 /*
@@ -91,72 +92,50 @@ struct iconv_functions *msdos_iconv;
 MALLOC_DEFINE(M_MSDOSFSMNT, "MSDOSFS mount", "MSDOSFS mount structure");
 static MALLOC_DEFINE(M_MSDOSFSFAT, "MSDOSFS FAT", "MSDOSFS file allocation table");
 
-static int	update_mp (struct mount *mp, struct msdosfs_args *argp);
-static int	mountmsdosfs (struct vnode *devvp, struct mount *mp,
-				  struct msdosfs_args *argp);
-static int	msdosfs_fhtovp (struct mount *, struct vnode *,
-				struct fid *, struct vnode **);
-static int	msdosfs_checkexp (struct mount *, struct sockaddr *, 
-				    int *, struct ucred **);
-static int	msdosfs_mount (struct mount *, char *, caddr_t,
-				   struct ucred *);
-static int	msdosfs_root (struct mount *, struct vnode **);
-static int	msdosfs_statfs (struct mount *, struct statfs *,
-				struct ucred *);
-static int	msdosfs_sync (struct mount *, int);
-static int	msdosfs_unmount (struct mount *, int);
-static int	msdosfs_vptofh (struct vnode *, struct fid *);
+static int mountmsdosfs(struct vnode *devvp, struct mount *mp,
+    struct msdosfs_args *argp);
+static int msdosfs_root(struct mount *, struct vnode **);
+static int msdosfs_statfs(struct mount *, struct statfs *, struct ucred *);
+static int msdosfs_unmount(struct mount *, int);
 
 static int
 update_mp(struct mount *mp, struct msdosfs_args *argp)
 {
 	struct msdosfsmount *pmp = VFSTOMSDOSFS(mp);
 	int error;
-        char cs_local[ICONV_CSNMAXLEN];
-        char cs_dos[ICONV_CSNMAXLEN];
+	char cs_local[ICONV_CSNMAXLEN];
+	char cs_dos[ICONV_CSNMAXLEN];
 
 	pmp->pm_gid = argp->gid;
 	pmp->pm_uid = argp->uid;
 	pmp->pm_mask = argp->mask & ALLPERMS;
+	pmp->pm_dirmask = argp->dirmask & ALLPERMS;
 	pmp->pm_flags |= argp->flags & MSDOSFSMNT_MNTOPT;
-	if (pmp->pm_flags & MSDOSFSMNT_KICONV && msdos_iconv) {
-		bcopy(argp->cs_local, cs_local, sizeof(cs_local));
-		bcopy(argp->cs_dos, cs_dos, sizeof(cs_dos));
+
+	if (pmp->pm_flags & MSDOSFSMNT_KICONV && msdosfs_iconv) {
+		memcpy(cs_local, argp->cs_local, sizeof(cs_local));
+		memcpy(cs_dos, argp->cs_dos, sizeof(cs_dos));
 		kprintf("local: %s dos: %s\n",argp->cs_local, argp->cs_dos);
-		error = msdos_iconv->open(cs_local, ENCODING_UNICODE, &pmp->pm_w2u);
+		error = msdosfs_iconv->open(cs_local, ENCODING_UNICODE,
+					    &pmp->pm_w2u);
 		if(error)
 			return error;
-		error = msdos_iconv->open(ENCODING_UNICODE, cs_local, &pmp->pm_u2w);
+		error = msdosfs_iconv->open(ENCODING_UNICODE, cs_local,
+					    &pmp->pm_u2w);
 		if(error)
 			return error;
-		error = msdos_iconv->open(cs_dos, cs_local, &pmp->pm_u2d);
+		error = msdosfs_iconv->open(cs_dos, cs_local, &pmp->pm_u2d);
 		if(error)
 			return error;
-		error = msdos_iconv->open(cs_local, cs_dos, &pmp->pm_d2u);
+		error = msdosfs_iconv->open(cs_local, cs_dos, &pmp->pm_d2u);
 		if(error)
 			return error;
 	}
 
 	if (pmp->pm_flags & MSDOSFSMNT_NOWIN95)
 		pmp->pm_flags |= MSDOSFSMNT_SHORTNAME;
-	else if (!(pmp->pm_flags &
-	    (MSDOSFSMNT_SHORTNAME | MSDOSFSMNT_LONGNAME))) {
-		struct vnode *rootvp;
-
-		/*
-		 * Try to divine whether to support Win'95 long filenames
-		 */
-		if (FAT32(pmp))
-			pmp->pm_flags |= MSDOSFSMNT_LONGNAME;
-		else {
-			if ((error = msdosfs_root(mp, &rootvp)) != 0)
-				return error;
-			pmp->pm_flags |= findwin95(VTODE(rootvp))
-				? MSDOSFSMNT_LONGNAME
-					: MSDOSFSMNT_SHORTNAME;
-			vput(rootvp);
-		}
-	}
+	else
+		pmp->pm_flags |= MSDOSFSMNT_LONGNAME;
 	return 0;
 }
 
@@ -180,8 +159,6 @@ msdosfs_mount(struct mount *mp, char *path, caddr_t data, struct ucred *cred)
 	error = copyin(data, (caddr_t)&args, sizeof(struct msdosfs_args));
 	if (error)
 		return (error);
-	if (args.magic != MSDOSFS_ARGSMAGIC)
-		args.flags = 0;
 	/*
 	 * If updating, check whether changing from read-only to
 	 * read/write; if there is no device name, that's all we do.
@@ -189,7 +166,8 @@ msdosfs_mount(struct mount *mp, char *path, caddr_t data, struct ucred *cred)
 	if (mp->mnt_flag & MNT_UPDATE) {
 		pmp = VFSTOMSDOSFS(mp);
 		error = 0;
-		if (!(pmp->pm_flags & MSDOSFSMNT_RONLY) && (mp->mnt_flag & MNT_RDONLY)) {
+		if (!(pmp->pm_flags & MSDOSFSMNT_RONLY) &&
+		    (mp->mnt_flag & MNT_RDONLY)) {
 			flags = WRITECLOSE;
 			if (mp->mnt_flag & MNT_FORCE)
 				flags |= FORCECLOSE;
@@ -204,11 +182,11 @@ msdosfs_mount(struct mount *mp, char *path, caddr_t data, struct ucred *cred)
 			}
 		}
 		if (!error && (mp->mnt_flag & MNT_RELOAD))
-			/* not yet implemented */
-			error = EOPNOTSUPP;
+			error = EOPNOTSUPP; /* not yet implemented */
 		if (error)
 			return (error);
-		if ((pmp->pm_flags & MSDOSFSMNT_RONLY) && (mp->mnt_kern_flag & MNTK_WANTRDWR)) {
+		if ((pmp->pm_flags & MSDOSFSMNT_RONLY) &&
+		    (mp->mnt_kern_flag & MNTK_WANTRDWR)) {
 			/*
 			 * If upgrade to read-write by non-root, then verify
 			 * that user has necessary permissions on the device.
@@ -216,7 +194,8 @@ msdosfs_mount(struct mount *mp, char *path, caddr_t data, struct ucred *cred)
 			devvp = pmp->pm_devvp;
 			vn_lock(devvp, LK_EXCLUSIVE | LK_RETRY);
 			if (cred->cr_uid != 0) {
-				error = VOP_EACCESS(devvp, VREAD | VWRITE, cred);
+				error = VOP_EACCESS(devvp, VREAD | VWRITE,
+						    cred);
 				if (error) {
 					vn_unlock(devvp);
 					return (error);
@@ -228,7 +207,7 @@ msdosfs_mount(struct mount *mp, char *path, caddr_t data, struct ucred *cred)
 			pmp->pm_flags &= ~MSDOSFSMNT_RONLY;
 		}
 		if (args.fspec == NULL) {
-#ifdef	__notyet__		/* doesn't work correctly with current mountd	XXX */
+#ifdef __notyet__	/* doesn't work correctly with current mountd XXX */
 			if (args.flags & MSDOSFSMNT_MNTOPT) {
 				pmp->pm_flags &= ~MSDOSFSMNT_MNTOPT;
 				pmp->pm_flags |= args.flags & MSDOSFSMNT_MNTOPT;
@@ -244,7 +223,7 @@ msdosfs_mount(struct mount *mp, char *path, caddr_t data, struct ucred *cred)
 	}
 	/*
 	 * Not an update, or updating the name: look up the name
-	 * and verify that it refers to a sensible block device.
+	 * and verify that it refers to a sensible disk device.
 	 */
 	devvp = NULL;
 	error = nlookup_init(&nd, args.fspec, UIO_USERSPACE, NLC_FOLLOW);
@@ -294,15 +273,17 @@ msdosfs_mount(struct mount *mp, char *path, caddr_t data, struct ucred *cred)
 
 	error = update_mp(mp, &args);
 	if (error) {
-		msdosfs_unmount(mp, MNT_FORCE);
+		if ((mp->mnt_flag & MNT_UPDATE) == 0)
+			msdosfs_unmount(mp, MNT_FORCE);
 		return error;
 	}
 
 	copyinstr(args.fspec, mp->mnt_stat.f_mntfromname, MNAMELEN - 1, &size);
-	bzero(mp->mnt_stat.f_mntfromname + size, MNAMELEN - size);
+	memset(mp->mnt_stat.f_mntfromname + size, 0, MNAMELEN - size);
 	msdosfs_statfs(mp, &mp->mnt_stat, cred);
 #ifdef MSDOSFS_DEBUG
-	kprintf("msdosfs_mount(): mp %p, pmp %p, inusemap %p\n", mp, pmp, pmp->pm_inusemap);
+	kprintf("msdosfs_mount(): mp %p, pmp %p, inusemap %p\n",
+		mp, pmp, pmp->pm_inusemap);
 #endif
 	return (0);
 }
@@ -317,9 +298,9 @@ mountmsdosfs(struct vnode *devvp, struct mount *mp, struct msdosfs_args *argp)
 	struct byte_bpb33 *b33;
 	struct byte_bpb50 *b50;
 	struct byte_bpb710 *b710;
-	u_int8_t SecPerClust;
+	uint8_t SecPerClust;
 	u_long clusters;
-	int	ronly, error;
+	int ronly, error;
 
 	/*
 	 * Disallow multiple mounts of the same device.
@@ -351,16 +332,16 @@ mountmsdosfs(struct vnode *devvp, struct mount *mp, struct msdosfs_args *argp)
 	 * Read the boot sector of the filesystem, and then check the
 	 * boot signature.  If not a dos boot sector then error out.
 	 *
-	 * NOTE: 2048 is a maximum sector size in current...
+	 * NOTE: 8192 is a magic size that works for ffs.
 	 */
-	error = bread(devvp, 0, 2048, &bp);
+	error = bread(devvp, 0, 8192, &bp);
 	if (error)
 		goto error_exit;
 	bp->b_flags |= B_AGE;
 	bsp = (union bootsector *)bp->b_data;
 	b33 = (struct byte_bpb33 *)bsp->bs33.bsBPB;
 	b50 = (struct byte_bpb50 *)bsp->bs50.bsBPB;
-	b710 = (struct byte_bpb710 *)bsp->bs710.bsPBP;
+	b710 = (struct byte_bpb710 *)bsp->bs710.bsBPB;
 
 #ifndef MSDOSFS_NOCHECKSIG
 	if (bsp->bs50.bsBootSectSig0 != BOOTSIG0
@@ -370,7 +351,7 @@ mountmsdosfs(struct vnode *devvp, struct mount *mp, struct msdosfs_args *argp)
 	}
 #endif
 
-	pmp = kmalloc(sizeof *pmp, M_MSDOSFSMNT, M_WAITOK | M_ZERO);
+	pmp = kmalloc(sizeof(*pmp), M_MSDOSFSMNT, M_WAITOK | M_ZERO);
 	pmp->pm_mountp = mp;
 
 	/*
@@ -380,6 +361,10 @@ mountmsdosfs(struct vnode *devvp, struct mount *mp, struct msdosfs_args *argp)
 	 */
 	SecPerClust = b50->bpbSecPerClust;
 	pmp->pm_BytesPerSec = getushort(b50->bpbBytesPerSec);
+	if (pmp->pm_BytesPerSec < DEV_BSIZE) {
+		error = EINVAL;
+		goto error_exit;
+	}
 	pmp->pm_ResSectors = getushort(b50->bpbResSectors);
 	pmp->pm_FATs = b50->bpbFATs;
 	pmp->pm_RootDirEnts = getushort(b50->bpbRootDirEnts);
@@ -412,8 +397,7 @@ mountmsdosfs(struct vnode *devvp, struct mount *mp, struct msdosfs_args *argp)
 	}
 
 	if (pmp->pm_RootDirEnts == 0) {
-		if (pmp->pm_Sectors
-		    || pmp->pm_FATsecs
+		if (pmp->pm_FATsecs
 		    || getushort(b710->bpbFSVers)) {
 			error = EINVAL;
 			kprintf("mountmsdosfs(): bad FAT32 filesystem\n");
@@ -435,19 +419,21 @@ mountmsdosfs(struct vnode *devvp, struct mount *mp, struct msdosfs_args *argp)
 	 * - logical sector size: power of 2, >= block size
 	 * - sectors per cluster: power of 2, >= 1
 	 * - number of sectors:   >= 1, <= size of partition
+	 * - number of FAT sectors: >= 1
 	 */
 	if ( (SecPerClust == 0)
 	  || (SecPerClust & (SecPerClust - 1))
 	  || (pmp->pm_BytesPerSec < DEV_BSIZE)
 	  || (pmp->pm_BytesPerSec & (pmp->pm_BytesPerSec - 1))
 	  || (pmp->pm_HugeSectors == 0)
-	) {
+	  || (pmp->pm_FATsecs == 0)
+	  || (SecPerClust * pmp->pm_BlkPerSec > MAXBSIZE / DEV_BSIZE)) {
 		error = EINVAL;
 		goto error_exit;
 	}
 
 	pmp->pm_HugeSectors *= pmp->pm_BlkPerSec;
-	pmp->pm_HiddenSects *= pmp->pm_BlkPerSec; /* XXX not used? */
+	pmp->pm_HiddenSects *= pmp->pm_BlkPerSec;	/* XXX not used? */
 	pmp->pm_FATsecs     *= pmp->pm_BlkPerSec;
 	SecPerClust         *= pmp->pm_BlkPerSec;
 
@@ -461,22 +447,20 @@ mountmsdosfs(struct vnode *devvp, struct mount *mp, struct msdosfs_args *argp)
 	} else {
 		pmp->pm_rootdirblk = pmp->pm_fatblk +
 			(pmp->pm_FATs * pmp->pm_FATsecs);
-		pmp->pm_rootdirsize = (pmp->pm_RootDirEnts * sizeof(struct direntry)
-				       + DEV_BSIZE - 1)
-			/ DEV_BSIZE; /* in blocks */
+		pmp->pm_rootdirsize = howmany(pmp->pm_RootDirEnts *
+			sizeof(struct direntry), DEV_BSIZE); /* in blocks */
 		pmp->pm_firstcluster = pmp->pm_rootdirblk + pmp->pm_rootdirsize;
 	}
 
 	pmp->pm_maxcluster = (pmp->pm_HugeSectors - pmp->pm_firstcluster) /
 	    SecPerClust + 1;
-	pmp->pm_fatsize = pmp->pm_FATsecs * DEV_BSIZE; /* XXX not used? */
 
 	if (pmp->pm_fatmask == 0) {
 		if (pmp->pm_maxcluster
 		    <= ((CLUST_RSRVD - CLUST_FIRST) & FAT12_MASK)) {
 			/*
 			 * This will usually be a floppy disk. This size makes
-			 * sure that one fat entry will not be split across
+			 * sure that one FAT entry will not be split across
 			 * multiple blocks.
 			 */
 			pmp->pm_fatmask = FAT12_MASK;
@@ -489,19 +473,20 @@ mountmsdosfs(struct vnode *devvp, struct mount *mp, struct msdosfs_args *argp)
 		}
 	}
 
-	clusters = (pmp->pm_fatsize / pmp->pm_fatmult) * pmp->pm_fatdiv;
+	clusters = ((pmp->pm_FATsecs * DEV_BSIZE) / pmp->pm_fatmult) *
+		pmp->pm_fatdiv;
 	if (pmp->pm_maxcluster >= clusters) {
 		kprintf("Warning: number of clusters (%ld) exceeds FAT "
 		    "capacity (%ld)\n", pmp->pm_maxcluster + 1, clusters);
 		pmp->pm_maxcluster = clusters - 1;
 	}
 
-
 	if (FAT12(pmp))
-		pmp->pm_fatblocksize = 3 * pmp->pm_BytesPerSec;
+		pmp->pm_fatblocksize = 3 * 512;
 	else
-		pmp->pm_fatblocksize = MSDOSFS_DFLTBSIZE;
-
+		pmp->pm_fatblocksize = PAGE_SIZE;
+	pmp->pm_fatblocksize = roundup(pmp->pm_fatblocksize,
+	    pmp->pm_BytesPerSec);
 	pmp->pm_fatblocksec = pmp->pm_fatblocksize / DEV_BSIZE;
 	pmp->pm_bnshift = DEV_BSHIFT;
 
@@ -530,20 +515,23 @@ mountmsdosfs(struct vnode *devvp, struct mount *mp, struct msdosfs_args *argp)
 	bp = NULL;
 
 	/*
-	 * Check FSInfo.
+	 * Check the fsinfo sector if we have one.  Silently fix up our
+	 * in-core copy of fp->fsinxtfree if it is unknown (0xffffffff)
+	 * or too large.  Ignore fp->fsinfree for now, since we need to
+	 * read the entire FAT anyway to fill the inuse map.
 	 */
 	if (pmp->pm_fsinfo) {
 		struct fsinfo *fp;
 
-		if ((error = bread(devvp, de_bntodoff(pmp, pmp->pm_fsinfo), fsi_size(pmp), &bp)) != 0)
+		if ((error = bread(devvp, de_bn2doff(pmp, pmp->pm_fsinfo),
+		    pmp->pm_BytesPerSec, &bp)) != 0)
 			goto error_exit;
 		fp = (struct fsinfo *)bp->b_data;
-		if (!bcmp(fp->fsisig1, "RRaA", 4)
-		    && !bcmp(fp->fsisig2, "rrAa", 4)
-		    && !bcmp(fp->fsisig3, "\0\0\125\252", 4)
-		    && !bcmp(fp->fsisig4, "\0\0\125\252", 4)) {
+		if (!memcmp(fp->fsisig1, "RRaA", 4) &&
+		    !memcmp(fp->fsisig2, "rrAa", 4) &&
+		    !memcmp(fp->fsisig3, "\0\0\125\252", 4)) {
 			pmp->pm_nxtfree = getulong(fp->fsinxtfree);
-			if (pmp->pm_nxtfree == (u_long) -1)
+			if (pmp->pm_nxtfree > pmp->pm_maxcluster)
 				pmp->pm_nxtfree = CLUST_FIRST;
 		} else
 			pmp->pm_fsinfo = 0;
@@ -553,41 +541,42 @@ mountmsdosfs(struct vnode *devvp, struct mount *mp, struct msdosfs_args *argp)
 	}
 
 	/*
-	 * Check and validate (or perhaps invalidate?) the fsinfo structure?
+	 * Finish initializing pmp->pm_nxtfree (just in case the first few
+	 * sectors aren't properly reserved in the FAT).  This completes
+	 * the fixup for fp->fsinxtfree, and fixes up the zero-initialized
+	 * value if there is no fsinfo.  We will use pmp->pm_nxtfree
+	 * internally even if there is no fsinfo.
 	 */
-	if (pmp->pm_fsinfo && pmp->pm_nxtfree > pmp->pm_maxcluster) {
-		kprintf(
-		"Next free cluster in FSInfo (%lu) exceeds maxcluster (%lu)\n",
-		    pmp->pm_nxtfree, pmp->pm_maxcluster);
-		error = EINVAL;
-		goto error_exit;
-	}
+	if (pmp->pm_nxtfree < CLUST_FIRST)
+		pmp->pm_nxtfree = CLUST_FIRST;
 
 	/*
 	 * Allocate memory for the bitmap of allocated clusters, and then
 	 * fill it in.
 	 */
-	pmp->pm_inusemap = kmalloc(((pmp->pm_maxcluster + N_INUSEBITS - 1)
-				   / N_INUSEBITS)
-				  * sizeof(*pmp->pm_inusemap),
-				  M_MSDOSFSFAT, M_WAITOK);
+	pmp->pm_inusemap = kmalloc(howmany(pmp->pm_maxcluster + 1, N_INUSEBITS)
+				   * sizeof(*pmp->pm_inusemap),
+				   M_MSDOSFSFAT, M_WAITOK);
 
 	/*
 	 * fillinusemap() needs pm_devvp.
 	 */
-	pmp->pm_dev = dev;
 	pmp->pm_devvp = devvp;
+	pmp->pm_dev = dev;
 
 	/*
 	 * Have the inuse map filled in.
 	 */
-	if ((error = fillinusemap(pmp)) != 0)
+	MSDOSFS_LOCK_MP(pmp);
+	error = fillinusemap(pmp);
+	MSDOSFS_UNLOCK_MP(pmp);
+	if (error != 0)
 		goto error_exit;
 
 	/*
-	 * If they want fat updates to be synchronous then let them suffer
+	 * If they want FAT updates to be synchronous then let them suffer
 	 * the performance degradation in exchange for the on disk copy of
-	 * the fat being correct just about all the time.  I suppose this
+	 * the FAT being correct just about all the time.  I suppose this
 	 * would be a good thing to turn on if the kernel is still flakey.
 	 */
 	if (mp->mnt_flag & MNT_SYNCHRONOUS)
@@ -601,13 +590,13 @@ mountmsdosfs(struct vnode *devvp, struct mount *mp, struct msdosfs_args *argp)
 	else
 		pmp->pm_fmod = 1;
 	mp->mnt_data = (qaddr_t) pmp;
-	mp->mnt_stat.f_fsid.val[0] = dev2udev(dev);
+	mp->mnt_stat.f_fsid.val[0] = devid_from_dev(dev);
 	mp->mnt_stat.f_fsid.val[1] = mp->mnt_vfc->vfc_typenum;
 	mp->mnt_flag |= MNT_LOCAL;
 	vfs_add_vnodeops(mp, &msdosfs_vnode_vops, &mp->mnt_vn_norm_ops);
 	dev->si_mountpoint = mp;
 
-	return 0;
+	return (0);
 
 error_exit:
 	if (bp) {
@@ -634,50 +623,48 @@ msdosfs_unmount(struct mount *mp, int mntflags)
 {
 	struct msdosfsmount *pmp;
 	int error, flags;
-
+#ifdef MSDOSFS_DEBUG
+	struct vnode *vp;
+#endif
 	flags = 0;
 	if (mntflags & MNT_FORCE)
 		flags |= FORCECLOSE;
 	error = vflush(mp, 0, flags);
 	if (error)
 		return error;
+
 	pmp = VFSTOMSDOSFS(mp);
 	pmp->pm_devvp->v_rdev->si_mountpoint = NULL;
-	if (pmp->pm_flags & MSDOSFSMNT_KICONV && msdos_iconv) {
-		if(pmp->pm_w2u)
-			msdos_iconv->close(pmp->pm_w2u);
-		if(pmp->pm_u2w)
-			msdos_iconv->close(pmp->pm_u2w);
-		if(pmp->pm_d2u)
-			msdos_iconv->close(pmp->pm_d2u);
-		if(pmp->pm_u2d)
-			msdos_iconv->close(pmp->pm_u2d);
-	}
-#ifdef MSDOSFS_DEBUG
-	{
-		struct vnode *vp = pmp->pm_devvp;
 
-		kprintf("msdosfs_umount(): just before calling VOP_CLOSE()\n");
-		kprintf("flag %08x, refcnt 0x%08x, writecount %d, "
-			"auxrefs 0x%08x\n",
-			vp->v_flag, vp->v_refcnt,
-			vp->v_writecount, vp->v_auxrefs);
-		kprintf("mount %p, op %p\n", vp->v_mount, vp->v_ops);
-		kprintf("mount %p\n", vp->v_mount);
-		kprintf("cleanblkhd %p, dirtyblkhd %p, numoutput %d, type %d\n",
-		    RB_ROOT(&vp->v_rbclean_tree),
-		    RB_ROOT(&vp->v_rbdirty_tree),
-		    bio_track_active(&vp->v_track_write),
-		    vp->v_type);
-		kprintf("union %p, tag %d, data[0] %08x, data[1] %08x\n",
-		    vp->v_socket, vp->v_tag,
-		    ((u_int *)vp->v_data)[0],
-		    ((u_int *)vp->v_data)[1]);
+	if (pmp->pm_flags & MSDOSFSMNT_KICONV && msdosfs_iconv) {
+		if (pmp->pm_w2u)
+			msdosfs_iconv->close(pmp->pm_w2u);
+		if (pmp->pm_u2w)
+			msdosfs_iconv->close(pmp->pm_u2w);
+		if (pmp->pm_d2u)
+			msdosfs_iconv->close(pmp->pm_d2u);
+		if (pmp->pm_u2d)
+			msdosfs_iconv->close(pmp->pm_u2d);
 	}
+
+#ifdef MSDOSFS_DEBUG
+	vp = pmp->pm_devvp;
+	kprintf("msdosfs_umount(): just before calling VOP_CLOSE()\n");
+	kprintf("flag %08x, refcnt 0x%08x, writecount %d, auxrefs 0x%08x\n",
+		vp->v_flag, vp->v_refcnt, vp->v_writecount, vp->v_auxrefs);
+	kprintf("mount %p, op %p\n", vp->v_mount, vp->v_ops);
+	kprintf("mount %p\n", vp->v_mount);
+	kprintf("cleanblkhd %p, dirtyblkhd %p, numoutput %d, type %d\n",
+		RB_ROOT(&vp->v_rbclean_tree), RB_ROOT(&vp->v_rbdirty_tree),
+		bio_track_active(&vp->v_track_write), vp->v_type);
+	kprintf("union %p, tag %d, data[0] %08x, data[1] %08x\n",
+		vp->v_socket, vp->v_tag, ((u_int *)vp->v_data)[0],
+		((u_int *)vp->v_data)[1]);
 #endif
+
 	vn_lock(pmp->pm_devvp, LK_EXCLUSIVE | LK_RETRY);
 	error = VOP_CLOSE(pmp->pm_devvp,
-		    (pmp->pm_flags&MSDOSFSMNT_RONLY) ? FREAD : FREAD | FWRITE,
+		    pmp->pm_flags & MSDOSFSMNT_RONLY ? FREAD : FREAD | FWRITE,
 		    NULL);
 	vn_unlock(pmp->pm_devvp);
 	vrele(pmp->pm_devvp);
@@ -695,9 +682,7 @@ msdosfs_root(struct mount *mp, struct vnode **vpp)
 	struct denode *ndep;
 	int error;
 
-#ifdef MSDOSFS_DEBUG
-	kprintf("msdosfs_root(); mp %p, pmp %p\n", mp, pmp);
-#endif
+	mprintf("msdosfs_root(); mp %p, pmp %p\n", mp, pmp);
 	error = deget(pmp, MSDOSFSROOT, MSDOSFSROOT_OFS, &ndep);
 	if (error)
 		return (error);
@@ -716,13 +701,32 @@ msdosfs_statfs(struct mount *mp, struct statfs *sbp, struct ucred *cred)
 	sbp->f_blocks = pmp->pm_maxcluster + 1;
 	sbp->f_bfree = pmp->pm_freeclustercount;
 	sbp->f_bavail = pmp->pm_freeclustercount;
-	sbp->f_files = pmp->pm_RootDirEnts;			/* XXX */
+	sbp->f_files = pmp->pm_RootDirEnts;	/* XXX */
 	sbp->f_ffree = 0;	/* what to put in here? */
 	if (sbp != &mp->mnt_stat) {
 		sbp->f_type = mp->mnt_vfc->vfc_typenum;
-		bcopy(mp->mnt_stat.f_mntfromname, sbp->f_mntfromname, MNAMELEN);
+		memcpy(sbp->f_mntfromname, mp->mnt_stat.f_mntfromname, MNAMELEN);
 	}
 	strncpy(sbp->f_fstypename, mp->mnt_vfc->vfc_name, MFSNAMELEN);
+	return (0);
+}
+
+static int
+msdosfs_statvfs(struct mount *mp, struct statvfs *sbp, struct ucred *cred)
+{
+	struct msdosfsmount *pmp;
+
+	pmp = VFSTOMSDOSFS(mp);
+	sbp->f_bsize = pmp->pm_bpcluster;
+	sbp->f_frsize = pmp->pm_bpcluster;
+	sbp->f_blocks = pmp->pm_maxcluster + 1;
+	sbp->f_bfree = pmp->pm_freeclustercount;
+	sbp->f_bavail = pmp->pm_freeclustercount;
+	sbp->f_files = pmp->pm_RootDirEnts;	/* XXX */
+	sbp->f_ffree = 0;	/* what to put in here? */
+	if (sbp != &mp->mnt_vstat) {
+		sbp->f_type = mp->mnt_vfc->vfc_typenum;
+	}
 	return (0);
 }
 
@@ -734,6 +738,41 @@ struct scaninfo {
 
 static int msdosfs_sync_scan(struct mount *mp, struct vnode *vp, void *data);
 
+/*
+ * If we have an FSInfo block, update it.
+ */
+static int
+msdosfs_fsiflush(struct msdosfsmount *pmp, int waitfor)
+{
+	struct fsinfo *fp;
+	struct buf *bp;
+	int error;
+
+	MSDOSFS_LOCK_MP(pmp);
+	if (pmp->pm_fsinfo == 0 || (pmp->pm_flags & MSDOSFS_FSIMOD) == 0) {
+		error = 0;
+		goto unlock;
+	}
+	error = bread(pmp->pm_devvp, de_bn2doff(pmp, pmp->pm_fsinfo),
+	    pmp->pm_BytesPerSec, &bp);
+	if (error != 0) {
+		brelse(bp);
+		goto unlock;
+	}
+
+	fp = (struct fsinfo *)bp->b_data;
+	putulong(fp->fsinfree, pmp->pm_freeclustercount);
+	putulong(fp->fsinxtfree, pmp->pm_nxtfree);
+	pmp->pm_flags &= ~MSDOSFS_FSIMOD;
+	if (waitfor == MNT_WAIT)
+		error = bwrite(bp);
+	else
+		bawrite(bp);
+unlock:
+	MSDOSFS_UNLOCK_MP(pmp);
+	return (error);
+}
+
 static int
 msdosfs_sync(struct mount *mp, int waitfor)
 {
@@ -742,14 +781,14 @@ msdosfs_sync(struct mount *mp, int waitfor)
 	int error;
 
 	/*
-	 * If we ever switch to not updating all of the fats all the time,
+	 * If we ever switch to not updating all of the FATs all the time,
 	 * this would be the place to update them from the first one.
 	 */
 	if (pmp->pm_fmod != 0) {
-		if (pmp->pm_flags & MSDOSFSMNT_RONLY)
+		if (pmp->pm_flags & MSDOSFSMNT_RONLY) {
 			panic("msdosfs_sync: rofs mod");
-		else {
-			/* update fats here */
+		} else {
+			/* update FATs here */
 		}
 	}
 	/*
@@ -759,7 +798,8 @@ msdosfs_sync(struct mount *mp, int waitfor)
 	scaninfo.rescan = 1;
 	while (scaninfo.rescan) {
 		scaninfo.rescan = 0;
-		vmntvnodescan(mp, VMSC_GETVP|VMSC_NOWAIT, NULL, msdosfs_sync_scan, &scaninfo);
+		vmntvnodescan(mp, VMSC_GETVP|VMSC_NOWAIT, NULL,
+			      msdosfs_sync_scan, &scaninfo);
 	}
 
 	/*
@@ -771,6 +811,10 @@ msdosfs_sync(struct mount *mp, int waitfor)
 			scaninfo.allerror = error;
 		vn_unlock(pmp->pm_devvp);
 	}
+
+	error = msdosfs_fsiflush(pmp, waitfor);
+	if (error != 0)
+		scaninfo.allerror = error;
 	return (scaninfo.allerror);
 }
 
@@ -842,16 +886,18 @@ msdosfs_vptofh(struct vnode *vp, struct fid *fhp)
 }
 
 static struct vfsops msdosfs_vfsops = {
-	.vfs_mount =     	msdosfs_mount,
-	.vfs_unmount =   	msdosfs_unmount,
-	.vfs_root =     	msdosfs_root,
-	.vfs_statfs =   	msdosfs_statfs,
-	.vfs_sync =     	msdosfs_sync,
-	.vfs_fhtovp =   	msdosfs_fhtovp,
-	.vfs_checkexp =  	msdosfs_checkexp,
-	.vfs_vptofh =   	msdosfs_vptofh,
-	.vfs_init =     	msdosfs_init,
-	.vfs_uninit =   	msdosfs_uninit
+	.vfs_flags =		0,
+	.vfs_mount =		msdosfs_mount,
+	.vfs_root =		msdosfs_root,
+	.vfs_statfs =		msdosfs_statfs,
+	.vfs_statvfs =		msdosfs_statvfs,
+	.vfs_sync =		msdosfs_sync,
+	.vfs_fhtovp =		msdosfs_fhtovp,
+	.vfs_checkexp =		msdosfs_checkexp,
+	.vfs_vptofh =		msdosfs_vptofh,
+	.vfs_init =		msdosfs_init,
+	.vfs_uninit =		msdosfs_uninit,
+	.vfs_unmount =		msdosfs_unmount,
 };
 
 VFS_SET(msdosfs_vfsops, msdos, 0);

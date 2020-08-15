@@ -10,11 +10,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -48,6 +44,7 @@
 #define	_TTYS_NOGROUP	"none"
 #define	_TTYS_DIALUP	"dialup"
 #define	_TTYS_NETWORK	"network"
+#define	_TTYS_IFCONSOLE	"ifconsole"
 
 struct ttyent {
 	char	*ty_name;	/* terminal device name */
@@ -57,6 +54,7 @@ struct ttyent {
 #define	TTY_SECURE	0x02	/* allow uid of 0 to login */
 #define	TTY_DIALUP	0x04	/* is a dialup tty */
 #define	TTY_NETWORK	0x08	/* is a network tty */
+#define	TTY_IFCONSOLE	0x10	/* only enable if console */
 	int	ty_status;	/* status flags */
 	char 	*ty_window;	/* command to start up window manager */
 	char	*ty_comment;	/* comment field */

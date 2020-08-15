@@ -29,6 +29,7 @@
  * $FreeBSD$
  */
 
+#include "opt_evdev.h"
 #include "opt_kbd.h"
 
 #include <sys/param.h>
@@ -42,7 +43,6 @@
 #include <sys/lock.h>
 #include <sys/malloc.h>
 #include <sys/module.h>
-#include <sys/mutex.h>
 #include <sys/poll.h>
 #include <sys/proc.h>
 #include <sys/queue.h>
@@ -52,6 +52,11 @@
 #include <sys/uio.h>
 #include <dev/misc/kbd/kbdreg.h>
 #include <dev/misc/kbd/kbdtables.h>
+
+#ifdef EVDEV_SUPPORT
+#include <dev/misc/evdev/evdev.h>
+#include <dev/misc/evdev/input.h>
+#endif
 
 #define KEYBOARD_NAME	"kbdmux"
 
@@ -65,18 +70,6 @@ MALLOC_DEFINE(M_KBDMUX, KEYBOARD_NAME, "Keyboard multiplexor");
  *****************************************************************************/
 
 #define	KBDMUX_Q_SIZE	512	/* input queue size */
-
-#define KBDMUX_LOCK_DECL_GLOBAL \
-	struct lock ks_lock
-
-#define KBDMUX_SLEEP(s, f, d, t) \
-	lksleep(&(s)->f, &(s)->ks_lock, PCATCH, (d), (t))
-
-#define KBDMUX_CALLOUT_INIT(s) \
-	callout_init_mp(&(s)->ks_timo)
-
-#define KBDMUX_QUEUE_INTR(s) \
-	taskqueue_enqueue(taskqueue_swi, &(s)->ks_task)
 
 /*
  * kbdmux keyboard
@@ -98,13 +91,10 @@ struct kbdmux_state
 	unsigned int		 ks_inq_start;
 	unsigned int		 ks_inq_length;
 	struct task		 ks_task;	/* interrupt task */
-	struct callout		 ks_timo;	/* timeout handler */
-#define TICKS			(hz)		/* rate */
 
 	int			 ks_flags;	/* flags */
 #define COMPOSE			(1 << 0)	/* compose char flag */
 #define POLLING			(1 << 1)	/* polling */
-#define TASK			(1 << 2)	/* interrupt task queued */
 
 	int			 ks_mode;	/* K_XLATE, K_RAW, K_CODE */
 	int			 ks_state;	/* state */
@@ -112,9 +102,12 @@ struct kbdmux_state
 	u_int			 ks_composed_char; /* composed char code */
 	u_char			 ks_prefix;	/* AT scan code prefix */
 
-	SLIST_HEAD(, kbdmux_kbd) ks_kbds;	/* keyboards */
+#ifdef EVDEV_SUPPORT
+	struct evdev_dev *	 ks_evdev;
+	int			 ks_evdev_state;
+#endif
 
-	KBDMUX_LOCK_DECL_GLOBAL;
+	SLIST_HEAD(, kbdmux_kbd) ks_kbds;	/* keyboards */
 };
 
 typedef struct kbdmux_state	kbdmux_state_t;
@@ -126,7 +119,6 @@ typedef struct kbdmux_state	kbdmux_state_t;
  *****************************************************************************/
 
 static task_fn_t		kbdmux_kbd_intr;
-static timeout_t		kbdmux_kbd_intr_timo;
 static kbd_callback_func_t	kbdmux_kbd_event;
 
 static void
@@ -160,51 +152,14 @@ kbdmux_kbd_getc(kbdmux_state_t *state)
 /*
  * Interrupt handler task
  */
-void
+static void
 kbdmux_kbd_intr(void *xkbd, int pending)
 {
 	keyboard_t	*kbd = (keyboard_t *) xkbd;
-	kbdmux_state_t	*state = (kbdmux_state_t *) kbd->kb_data;
 	KBD_LOCK_DECLARE;
 
 	KBD_LOCK(kbd);		/* recursive so ok */
 	kbd_intr(kbd, NULL);
-	state->ks_flags &= ~TASK;
-	wakeup(&state->ks_task);
-	KBD_UNLOCK(kbd);
-}
-
-/*
- * Schedule interrupt handler on timeout. Called with locked state.
- */
-void
-kbdmux_kbd_intr_timo(void *xkbd)
-{
-	keyboard_t	*kbd = (keyboard_t *) xkbd;
-	kbdmux_state_t	*state = (kbdmux_state_t *) kbd->kb_data;
-	KBD_LOCK_DECLARE;
-
-	KBD_LOCK(kbd);
-
-	if (callout_pending(&state->ks_timo)) {
-		KBD_UNLOCK(kbd);
-		return; /* callout was reset */
-	}
-
-	if (!callout_active(&state->ks_timo)) {
-		KBD_UNLOCK(kbd);
-		return; /* callout was stopped */
-	}
-
-	callout_deactivate(&state->ks_timo);
-
-	/* queue interrupt task if needed */
-	if (state->ks_inq_length > 0 && !(state->ks_flags & TASK) &&
-	    KBDMUX_QUEUE_INTR(state) == 0)
-		state->ks_flags |= TASK;
-
-	/* re-schedule timeout */
-	callout_reset(&state->ks_timo, TICKS, kbdmux_kbd_intr_timo, kbd);
 	KBD_UNLOCK(kbd);
 }
 
@@ -243,9 +198,8 @@ kbdmux_kbd_event(keyboard_t *kbd, int event, void *arg)
 		}
 
 		/* queue interrupt task if needed */
-		if (state->ks_inq_length > 0 && !(state->ks_flags & TASK) &&
-		    KBDMUX_QUEUE_INTR(state) == 0)
-			state->ks_flags |= TASK;
+		if (state->ks_inq_length > 0)
+			taskqueue_enqueue(taskqueue_swi, &state->ks_task);
 
 		} break;
 
@@ -321,6 +275,12 @@ static keyboard_switch_t kbdmuxsw = {
 	.diag =		genkbd_diag,
 };
 
+#ifdef EVDEV_SUPPORT
+static const struct evdev_methods kbdmux_evdev_methods = {
+	.ev_event = evdev_ev_kbd_event,
+};
+#endif
+
 /*
  * Return the number of found keyboards
  */
@@ -356,6 +316,10 @@ kbdmux_init(int unit, keyboard_t **kbdp, void *arg, int flags)
         fkeytab_t	*fkeymap = NULL;
 	keyboard_t	*kbd = NULL;
 	int		 error, needfree, fkeymap_size, delay[2];
+#ifdef EVDEV_SUPPORT
+	struct evdev_dev *evdev;
+	char		 phys_loc[NAMELEN];
+#endif
 
 	if (*kbdp == NULL) {
 		*kbdp = kbd = kmalloc(sizeof(*kbd), M_KBDMUX, M_NOWAIT | M_ZERO);
@@ -373,7 +337,6 @@ kbdmux_init(int unit, keyboard_t **kbdp, void *arg, int flags)
 		}
 
 		TASK_INIT(&state->ks_task, 0, kbdmux_kbd_intr, (void *) kbd);
-		KBDMUX_CALLOUT_INIT(state);
 		SLIST_INIT(&state->ks_kbds);
 	} else if (KBD_IS_INITIALIZED(*kbdp) && KBD_IS_CONFIGURED(*kbdp)) {
 		return (0);
@@ -414,6 +377,30 @@ kbdmux_init(int unit, keyboard_t **kbdp, void *arg, int flags)
 		delay[1] = kbd->kb_delay2;
 		kbdmux_ioctl(kbd, KDSETREPEAT, (caddr_t)delay);
 
+#ifdef EVDEV_SUPPORT
+		/* register as evdev provider */
+		evdev = evdev_alloc();
+		evdev_set_name(evdev, "System keyboard multiplexer");
+		ksnprintf(phys_loc, NAMELEN, KEYBOARD_NAME"%d", unit);
+		evdev_set_phys(evdev, phys_loc);
+		evdev_set_id(evdev, BUS_VIRTUAL, 0, 0, 0);
+		evdev_set_methods(evdev, kbd, &kbdmux_evdev_methods);
+		evdev_support_event(evdev, EV_SYN);
+		evdev_support_event(evdev, EV_KEY);
+		evdev_support_event(evdev, EV_LED);
+		evdev_support_event(evdev, EV_REP);
+		evdev_support_all_known_keys(evdev);
+		evdev_support_led(evdev, LED_NUML);
+		evdev_support_led(evdev, LED_CAPSL);
+		evdev_support_led(evdev, LED_SCROLLL);
+
+		if (evdev_register(evdev))
+			evdev_free(evdev);
+		else
+			state->ks_evdev = evdev;
+		state->ks_evdev_state = 0;
+#endif
+
 		KBD_INIT_DONE(kbd);
 	}
 
@@ -424,8 +411,6 @@ kbdmux_init(int unit, keyboard_t **kbdp, void *arg, int flags)
 		}
 
 		KBD_CONFIG_DONE(kbd);
-
-		callout_reset(&state->ks_timo, TICKS, kbdmux_kbd_intr_timo, kbd);
 	}
 
 	return (0);
@@ -459,12 +444,9 @@ kbdmux_term(keyboard_t *kbd)
 	kbdmux_state_t	*state = (kbdmux_state_t *) kbd->kb_data;
 	kbdmux_kbd_t	*k;
 
-	/* kill callout */
-	callout_stop(&state->ks_timo);
-
 	/* wait for interrupt task */
-	while (state->ks_flags & TASK)
-		KBDMUX_SLEEP(state, ks_task, "kbdmuxc", 0);
+	while (taskqueue_cancel(taskqueue_swi, &state->ks_task, NULL) != 0)
+		taskqueue_drain(taskqueue_swi, &state->ks_task);
 
 	/* release all keyboards from the mux */
 	while ((k = SLIST_FIRST(&state->ks_kbds)) != NULL) {
@@ -477,6 +459,10 @@ kbdmux_term(keyboard_t *kbd)
 	}
 
 	kbd_unregister(kbd);
+
+#ifdef EVDEV_SUPPORT
+	evdev_free(state->ks_evdev);
+#endif
 
 	bzero(state, sizeof(*state));
 	kfree(state, M_KBDMUX);
@@ -635,7 +621,14 @@ next_code:
 				goto next_code;
 		} else {
 			if (wait) {
-				KBDMUX_SLEEP(state, ks_task, "kbdwai", hz/10);
+				if (kbd->kb_flags & KB_POLLED) {
+					tsleep(&state->ks_task, PCATCH,
+						"kbdwai", hz/10);
+				} else {
+					lksleep(&state->ks_task,
+						&kbd->kb_lock, PCATCH,
+						"kbdwai", hz/10);
+				}
 				goto next_code;
 			}
 		}
@@ -643,6 +636,20 @@ next_code:
 	}
 
 	kbd->kb_count++;
+
+#ifdef EVDEV_SUPPORT
+	/* push evdev event */
+	if (evdev_rcpt_mask & EVDEV_RCPT_KBDMUX && state->ks_evdev != NULL) {
+		uint16_t key = evdev_scancode2key(&state->ks_evdev_state,
+		    scancode);
+
+		if (key != KEY_RESERVED) {
+			evdev_push_event(state->ks_evdev, EV_KEY,
+			    key, scancode & 0x80 ? 0 : 1);
+			evdev_sync(state->ks_evdev);
+		}
+	}
+#endif
 
 	/* return the byte as is for the K_RAW mode */
 	if (state->ks_mode == K_RAW)
@@ -882,7 +889,7 @@ kbdmux_ioctl(keyboard_t *kbd, u_long cmd, caddr_t arg)
 	kbdmux_state_t	*state = (kbdmux_state_t *) kbd->kb_data;
 	kbdmux_kbd_t	*k;
 	keyboard_info_t	*ki;
-	int		 error = 0, mode;
+	int		 error = 0, mode, i;
 
 	if (state == NULL)
 		return (ENXIO);
@@ -1006,7 +1013,11 @@ kbdmux_ioctl(keyboard_t *kbd, u_long cmd, caddr_t arg)
 			return (EINVAL);
 
 		KBD_LED_VAL(kbd) = *(int *)arg;
-
+#ifdef EVDEV_SUPPORT
+		if (state->ks_evdev != NULL &&
+		    evdev_rcpt_mask & EVDEV_RCPT_KBDMUX)
+			evdev_push_leds(state->ks_evdev, *(int *)arg);
+#endif
 		/* KDSETLED on all slave keyboards */
 		SLIST_FOREACH(k, &state->ks_kbds, next)
 			kbd_ioctl(k->kbd, KDSETLED, arg);
@@ -1031,30 +1042,28 @@ kbdmux_ioctl(keyboard_t *kbd, u_long cmd, caddr_t arg)
 		/* NOT REACHED */
 
 	case KDSETREPEAT: /* set keyboard repeat rate (new interface) */
-	case KDSETRAD: /* set keyboard repeat rate (old interface) */
-		if (cmd == KDSETREPEAT) {
-			int	i;
+		/* lookup delay */
+		for (i = NELEM(delays) - 1; i > 0; i --)
+			if (((int *)arg)[0] >= delays[i])
+				break;
+		mode = i << 5;
 
-			/* lookup delay */
-			for (i = NELEM(delays) - 1; i > 0; i --)
-				if (((int *)arg)[0] >= delays[i])
-					break;
-			mode = i << 5;
-
-			/* lookup rate */
-			for (i = NELEM(rates) - 1; i > 0; i --)
-				if (((int *)arg)[1] >= rates[i])
-					break;
-			mode |= i;
-		} else
-			mode = *(int *)arg;
+		/* lookup rate */
+		for (i = NELEM(rates) - 1; i > 0; i --)
+			if (((int *)arg)[1] >= rates[i])
+				break;
+		mode |= i;
 
 		if (mode & ~0x7f)
 			return (EINVAL);
 
 		kbd->kb_delay1 = delays[(mode >> 5) & 3];
 		kbd->kb_delay2 = rates[mode & 0x1f];
-
+#ifdef EVDEV_SUPPORT
+		if (state->ks_evdev != NULL &&
+		    evdev_rcpt_mask & EVDEV_RCPT_KBDMUX)
+			evdev_push_repeats(state->ks_evdev, kbd);
+#endif
 		/* perform command on all slave keyboards */
 		SLIST_FOREACH(k, &state->ks_kbds, next)
 			kbd_ioctl(k->kbd, cmd, arg);
@@ -1234,3 +1243,6 @@ kbdmux_modevent(module_t mod, int type, void *data)
 }
 
 DEV_MODULE(kbdmux, kbdmux_modevent, NULL);
+#ifdef EVDEV_SUPPORT
+MODULE_DEPEND(kbdmux, evdev, 1, 1, 1);
+#endif

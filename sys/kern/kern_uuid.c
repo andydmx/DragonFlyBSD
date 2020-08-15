@@ -24,7 +24,6 @@
  * THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  * $FreeBSD: src/sys/kern/kern_uuid.c,v 1.13 2007/04/23 12:53:00 pjd Exp $
- * $DragonFly: src/sys/kern/kern_uuid.c,v 1.4 2007/06/19 06:07:57 dillon Exp $
  */
 
 #include <sys/param.h>
@@ -33,12 +32,14 @@
 #include <sys/kernel.h>
 #include <sys/lock.h>
 #include <sys/kern_syscall.h>
+#include <sys/malloc.h>
 #include <sys/random.h>
 #include <sys/sbuf.h>
 #include <sys/socket.h>
-#include <sys/sysproto.h>
+#include <sys/sysmsg.h>
 #include <sys/uuid.h>
 #include <sys/gpt.h>
+#include <net/if.h>
 #include <net/if_var.h>
 
 /*
@@ -85,7 +86,7 @@ static void
 uuid_node(uint16_t *node)
 {
 	if (if_getanyethermac(node, UUID_NODE_LEN) != 0)
-		read_random(node, UUID_NODE_LEN);
+		read_random(node, UUID_NODE_LEN, 1);
 	*((uint8_t*)node) |= 0x01;
 }
 
@@ -122,7 +123,7 @@ kern_uuidgen(struct uuid *store, size_t count)
 	if (uuid_last.time.ll == 0LL || uuid_last.node[0] != uuid.node[0] ||
 	    uuid_last.node[1] != uuid.node[1] ||
 	    uuid_last.node[2] != uuid.node[2]) {
-		read_random(&uuid.seq, sizeof(uuid.seq));
+		read_random(&uuid.seq, sizeof(uuid.seq), 1);
 		uuid.seq &= 0x3fff;
 	} else if (uuid_last.time.ll >= time) {
 		uuid.seq = (uuid_last.seq + 1) & 0x3fff;
@@ -156,7 +157,7 @@ kern_uuidgen(struct uuid *store, size_t count)
  * Generate an array of new UUIDs
  */
 int
-sys_uuidgen(struct uuidgen_args *uap)
+sys_uuidgen(struct sysmsg *sysmsg, const struct uuidgen_args *uap)
 {
 	struct uuid *store;
 	size_t count;

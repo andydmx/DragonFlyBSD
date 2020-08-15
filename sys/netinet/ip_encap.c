@@ -55,7 +55,6 @@
  * So, clearly good old protosw does not work for protocol #4 and #41.
  * The code will let you match protocol via src/dst address pair.
  */
-/* XXX is M_NETADDR correct? */
 
 #include "opt_inet.h"
 #include "opt_inet6.h"
@@ -91,7 +90,7 @@
 #include <sys/kernel.h>
 #include <sys/malloc.h>
 #include <sys/thread2.h>
-MALLOC_DEFINE(M_NETADDR, "Export Host", "Export host address structure");
+MALLOC_DEFINE(M_IPENCAP, "IP Encapsulation", "IP Encapsulation");
 
 static void encap_add (struct encaptab *);
 static int mask_match (const struct encaptab *, const struct sockaddr *,
@@ -138,6 +137,25 @@ encap4_input(struct mbuf **mp, int *offp, int proto)
 	const struct protosw *psw;
 	struct encaptab *ep, *match;
 	int prio, matchprio;
+
+	if (!IN_NETISR(0)) {
+		/*
+		 * NOTE:
+		 * Some NICs, noticeably igb(4) and ix(4), use inner IP
+		 * datagram to calculate the packet hash, which leads us
+		 * here.
+		 */
+		m->m_flags &= ~M_HASH;
+		m = ip_rehashm(m, off);
+		if (m != NULL) {
+			lwkt_port_t port = netisr_hashport(m->m_pkthdr.hash);
+
+			KASSERT(port != &curthread->td_msgport,
+			    ("mbuf hash recursion"));
+			ip_transport_redispatch(port, m, off);
+		}
+		return (IPPROTO_DONE);
+	}
 
 	ip = mtod(m, struct ip *);
 	*mp = NULL;
@@ -335,7 +353,7 @@ encap_attach(int af, int proto, const struct sockaddr *sp,
 		goto fail;
 	}
 
-	ep = kmalloc(sizeof *ep, M_NETADDR, M_INTWAIT | M_ZERO | M_NULLOK);
+	ep = kmalloc(sizeof *ep, M_IPENCAP, M_INTWAIT | M_ZERO | M_NULLOK);
 	if (ep == NULL)
 		goto fail;
 
@@ -370,7 +388,7 @@ encap_attach_func(int af, int proto,
 	if (!func)
 		goto fail;
 
-	ep = kmalloc(sizeof *ep, M_NETADDR, M_INTWAIT | M_ZERO | M_NULLOK);
+	ep = kmalloc(sizeof *ep, M_IPENCAP, M_INTWAIT | M_ZERO | M_NULLOK);
 	if (ep == NULL)
 		goto fail;
 
@@ -399,7 +417,7 @@ encap_detach(const struct encaptab *cookie)
 	for (p = LIST_FIRST(&encaptab); p; p = LIST_NEXT(p, chain)) {
 		if (p == ep) {
 			LIST_REMOVE(p, chain);
-			kfree(p, M_NETADDR);	/*XXX*/
+			kfree(p, M_IPENCAP);	/*XXX*/
 			return 0;
 		}
 	}
@@ -463,7 +481,7 @@ encap_fillarg(struct mbuf *m, const struct encaptab *ep)
 {
 	struct m_tag *tag;
 
-	tag = m_tag_get(PACKET_TAG_ENCAP, sizeof(void *), MB_DONTWAIT);
+	tag = m_tag_get(PACKET_TAG_ENCAP, sizeof(void *), M_NOWAIT);
 	if (tag != NULL) {
 		*(void **)m_tag_data(tag) = ep->arg;
 		m_tag_prepend(m, tag);

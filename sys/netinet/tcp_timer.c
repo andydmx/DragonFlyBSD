@@ -61,10 +61,8 @@
  *
  *	@(#)tcp_timer.c	8.2 (Berkeley) 5/24/95
  * $FreeBSD: src/sys/netinet/tcp_timer.c,v 1.34.2.14 2003/02/03 02:33:41 hsu Exp $
- * $DragonFly: src/sys/netinet/tcp_timer.c,v 1.17 2008/03/30 20:39:01 dillon Exp $
  */
 
-#include "opt_compat.h"
 #include "opt_inet6.h"
 #include "opt_tcpdebug.h"
 
@@ -606,7 +604,7 @@ tcp_timer_rexmt_handler(struct tcpcb *tp)
 	 */
 	if (tp->t_rxtshift > TCP_MAXRXTSHIFT / 4) {
 #ifdef INET6
-		if ((tp->t_inpcb->inp_vflag & INP_IPV6) != 0)
+		if (INP_ISIPV6(tp->t_inpcb))
 			in6_losing(tp->t_inpcb);
 		else
 #endif

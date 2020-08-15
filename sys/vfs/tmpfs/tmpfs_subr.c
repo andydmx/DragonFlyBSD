@@ -36,10 +36,8 @@
 
 #include <sys/kernel.h>
 #include <sys/param.h>
-#include <sys/namei.h>
 #include <sys/priv.h>
 #include <sys/proc.h>
-#include <sys/spinlock2.h>
 #include <sys/stat.h>
 #include <sys/systm.h>
 #include <sys/vnode.h>
@@ -50,6 +48,8 @@
 #include <vm/vm_page.h>
 #include <vm/vm_pager.h>
 #include <vm/vm_extern.h>
+#include <vm/vm_pageout.h>
+#include <vm/vm_page2.h>
 
 #include <vfs/tmpfs/tmpfs.h>
 #include <vfs/tmpfs/tmpfs_vnops.h>
@@ -98,7 +98,7 @@ tmpfs_alloc_node(struct tmpfs_mount *tmp, enum vtype type,
 {
 	struct tmpfs_node *nnode;
 	struct timespec ts;
-	udev_t rdev;
+	dev_t rdev;
 
 	KKASSERT(IFF(type == VLNK, target != NULL));
 	KKASSERT(IFF(type == VBLK || type == VCHR, rmajor != VNOVAL));
@@ -139,6 +139,7 @@ tmpfs_alloc_node(struct tmpfs_mount *tmp, enum vtype type,
 	case VDIR:
 		RB_INIT(&nnode->tn_dir.tn_dirtree);
 		RB_INIT(&nnode->tn_dir.tn_cookietree);
+		nnode->tn_dir.tn_parent = NULL;
 		nnode->tn_size = 0;
 		break;
 
@@ -160,10 +161,11 @@ tmpfs_alloc_node(struct tmpfs_mount *tmp, enum vtype type,
 		break;
 
 	case VREG:
-		nnode->tn_reg.tn_aobj =
-		    swap_pager_alloc(NULL, 0, VM_PROT_DEFAULT, 0);
+		nnode->tn_reg.tn_aobj = swap_pager_alloc(NULL, 0,
+							 VM_PROT_DEFAULT, 0);
 		nnode->tn_reg.tn_aobj_pages = 0;
 		nnode->tn_size = 0;
+		vm_object_set_flag(nnode->tn_reg.tn_aobj, OBJ_NOPAGEIN);
 		break;
 
 	default:
@@ -199,6 +201,8 @@ tmpfs_alloc_node(struct tmpfs_mount *tmp, enum vtype type,
  * allocated, it cannot be deleted during the whole life of the file
  * system.  Instead, they are moved to the available list and remain there
  * until reused.
+ *
+ * A caller must have TMPFS_NODE_LOCK(node) and this function unlocks it.
  */
 void
 tmpfs_free_node(struct tmpfs_mount *tmp, struct tmpfs_node *node)
@@ -208,14 +212,13 @@ tmpfs_free_node(struct tmpfs_mount *tmp, struct tmpfs_node *node)
 #ifdef INVARIANTS
 	TMPFS_ASSERT_ELOCKED(node);
 	KKASSERT(node->tn_vnode == NULL);
-	KKASSERT((node->tn_vpstate & TMPFS_VNODE_ALLOCATING) == 0);
 #endif
 
 	TMPFS_LOCK(tmp);
 	LIST_REMOVE(node, tn_entries);
 	tmp->tm_nodes_inuse--;
 	TMPFS_UNLOCK(tmp);
-	TMPFS_NODE_UNLOCK(node);
+	TMPFS_NODE_UNLOCK(node);  /* Caller has this lock */
 
 	switch (node->tn_type) {
 	case VNON:
@@ -276,9 +279,8 @@ tmpfs_free_node(struct tmpfs_mount *tmp, struct tmpfs_node *node)
 	objcache_put(tmp->tm_node_pool, node);
 	/* node is now invalid */
 
-	TMPFS_LOCK(tmp);
-	tmp->tm_pages_used -= pages;
-	TMPFS_UNLOCK(tmp);
+	if (pages)
+		atomic_add_long(&tmp->tm_pages_used, -(long)pages);
 }
 
 /* --------------------------------------------------------------------- */
@@ -311,9 +313,7 @@ tmpfs_alloc_dirent(struct tmpfs_mount *tmp, struct tmpfs_node *node,
 
 	nde->td_node = node;
 
-	TMPFS_NODE_LOCK(node);
-	++node->tn_links;
-	TMPFS_NODE_UNLOCK(node);
+	atomic_add_int(&node->tn_links, 1);
 
 	*de = nde;
 
@@ -338,11 +338,8 @@ tmpfs_free_dirent(struct tmpfs_mount *tmp, struct tmpfs_dirent *de)
 
 	node = de->td_node;
 
-	TMPFS_NODE_LOCK(node);
-	TMPFS_ASSERT_ELOCKED(node);
 	KKASSERT(node->tn_links > 0);
-	node->tn_links--;
-	TMPFS_NODE_UNLOCK(node);
+	atomic_add_int(&node->tn_links, -1);
 
 	kfree(de->td_name, tmp->tm_name_zone);
 	de->td_namelen = 0;
@@ -359,29 +356,77 @@ tmpfs_free_dirent(struct tmpfs_mount *tmp, struct tmpfs_dirent *de)
  * resulting locked vnode is returned in *vpp.
  *
  * Returns zero on success or an appropriate error code on failure.
+ *
+ * The caller must ensure that node cannot go away (usually by holding
+ * the related directory entry).
+ *
+ * If dnode is non-NULL this routine avoids deadlocking against it but
+ * can return EAGAIN.  Caller must try again.  The dnode lock will cycle
+ * in this case, it remains locked on return in all cases.  dnode must
+ * be shared-locked.
  */
 int
-tmpfs_alloc_vp(struct mount *mp, struct tmpfs_node *node, int lkflag,
+tmpfs_alloc_vp(struct mount *mp,
+	       struct tmpfs_node *dnode, struct tmpfs_node *node, int lkflag,
 	       struct vnode **vpp)
 {
 	int error = 0;
 	struct vnode *vp;
 
 loop:
+	vp = NULL;
+	if (node->tn_vnode == NULL) {
+		error = getnewvnode(VT_TMPFS, mp, &vp,
+				    VLKTIMEOUT, LK_CANRECURSE);
+		if (error)
+			goto out;
+	}
+
 	/*
 	 * Interlocked extraction from node.  This can race many things.
 	 * We have to get a soft reference on the vnode while we hold
 	 * the node locked, then acquire it properly and check for races.
 	 */
 	TMPFS_NODE_LOCK(node);
-	if ((vp = node->tn_vnode) != NULL) {
+	if (node->tn_vnode) {
+		if (vp) {
+			vp->v_type = VBAD;
+			vx_put(vp);
+		}
+		vp = node->tn_vnode;
+
 		KKASSERT((node->tn_vpstate & TMPFS_VNODE_DOOMED) == 0);
 		vhold(vp);
 		TMPFS_NODE_UNLOCK(node);
 
-		if (vget(vp, lkflag | LK_EXCLUSIVE) != 0) {
-			vdrop(vp);
-			goto loop;
+		if (dnode) {
+			/*
+			 * Special-case handling to avoid deadlocking against
+			 * dnode.  This case has been validated and occurs
+			 * every so often during synth builds.
+			 */
+			if (vget(vp, (lkflag & ~LK_RETRY) |
+				     LK_NOWAIT |
+				     LK_EXCLUSIVE) != 0) {
+				TMPFS_NODE_UNLOCK(dnode);
+				if (vget(vp, (lkflag & ~LK_RETRY) |
+					     LK_SLEEPFAIL |
+					     LK_EXCLUSIVE) == 0) {
+					vn_unlock(vp);
+				}
+				vdrop(vp);
+				TMPFS_NODE_LOCK_SH(dnode);
+
+				return EAGAIN;
+			}
+		} else {
+			/*
+			 * Normal path
+			 */
+			if (vget(vp, lkflag | LK_EXCLUSIVE) != 0) {
+				vdrop(vp);
+				goto loop;
+			}
 		}
 		if (node->tn_vnode != vp) {
 			vput(vp);
@@ -391,40 +436,26 @@ loop:
 		vdrop(vp);
 		goto out;
 	}
-	/* vp is NULL */
+
+	/*
+	 * We need to assign node->tn_vnode.  If vp is NULL, loop up to
+	 * allocate the vp.  This can happen due to SMP races.
+	 */
+	if (vp == NULL) {
+		TMPFS_NODE_UNLOCK(node);
+		goto loop;
+	}
 
 	/*
 	 * This should never happen.
 	 */
 	if (node->tn_vpstate & TMPFS_VNODE_DOOMED) {
 		TMPFS_NODE_UNLOCK(node);
+		vp->v_type = VBAD;
+		vx_put(vp);
 		error = ENOENT;
 		goto out;
 	}
-
-	/*
-	 * Interlock against other calls to tmpfs_alloc_vp() trying to
-	 * allocate and assign a vp to node.
-	 */
-	if (node->tn_vpstate & TMPFS_VNODE_ALLOCATING) {
-		node->tn_vpstate |= TMPFS_VNODE_WANT;
-		error = tsleep(&node->tn_vpstate, PINTERLOCKED | PCATCH,
-			       "tmpfs_alloc_vp", 0);
-		TMPFS_NODE_UNLOCK(node);
-		if (error)
-			return error;
-		goto loop;
-	}
-	node->tn_vpstate |= TMPFS_VNODE_ALLOCATING;
-	TMPFS_NODE_UNLOCK(node);
-
-	/*
-	 * Allocate a new vnode (may block).  The ALLOCATING flag should
-	 * prevent a race against someone else assigning node->tn_vnode.
-	 */
-	error = getnewvnode(VT_TMPFS, mp, &vp, VLKTIMEOUT, LK_CANRECURSE);
-	if (error != 0)
-		goto unlock;
 
 	KKASSERT(node->tn_vnode == NULL);
 	KKASSERT(vp != NULL);
@@ -440,7 +471,12 @@ loop:
 	case VSOCK:
 		break;
 	case VREG:
-		vinitvmio(vp, node->tn_size, TMPFS_BLKMASK, -1);
+		/*
+		 * VMIO is mandatory.  Tmpfs also supports KVABIO
+		 * for its tmpfs_strategy().
+		 */
+		vsetflags(vp, VKVABIO);
+		vinitvmio(vp, node->tn_size, node->tn_blksize, -1);
 		break;
 	case VLNK:
 		break;
@@ -454,53 +490,15 @@ loop:
 		panic("tmpfs_alloc_vp: type %p %d", node, (int)node->tn_type);
 	}
 
-
-unlock:
-	TMPFS_NODE_LOCK(node);
-
-	KKASSERT(node->tn_vpstate & TMPFS_VNODE_ALLOCATING);
-	node->tn_vpstate &= ~TMPFS_VNODE_ALLOCATING;
 	node->tn_vnode = vp;
+	TMPFS_NODE_UNLOCK(node);
 
-	if (node->tn_vpstate & TMPFS_VNODE_WANT) {
-		node->tn_vpstate &= ~TMPFS_VNODE_WANT;
-		TMPFS_NODE_UNLOCK(node);
-		wakeup(&node->tn_vpstate);
-	} else {
-		TMPFS_NODE_UNLOCK(node);
-	}
-
+	vx_downgrade(vp);
 out:
 	*vpp = vp;
-
 	KKASSERT(IFF(error == 0, *vpp != NULL && vn_islocked(*vpp)));
-#ifdef INVARIANTS
-	TMPFS_NODE_LOCK(node);
-	KKASSERT(*vpp == node->tn_vnode);
-	TMPFS_NODE_UNLOCK(node);
-#endif
 
 	return error;
-}
-
-/* --------------------------------------------------------------------- */
-
-/*
- * Destroys the association between the vnode vp and the node it
- * references.
- */
-void
-tmpfs_free_vp(struct vnode *vp)
-{
-	struct tmpfs_node *node;
-
-	node = VP_TO_TMPFS_NODE(vp);
-
-	TMPFS_NODE_LOCK(node);
-	KKASSERT(lockcount(TMPFS_NODE_MTX(node)) > 0);
-	node->tn_vnode = NULL;
-	vp->v_data = NULL;
-	TMPFS_NODE_UNLOCK(node);
 }
 
 /* --------------------------------------------------------------------- */
@@ -529,40 +527,50 @@ tmpfs_alloc_file(struct vnode *dvp, struct vnode **vpp, struct vattr *vap,
 	dnode = VP_TO_TMPFS_DIR(dvp);
 	*vpp = NULL;
 
+	TMPFS_NODE_LOCK(dnode);
+
 	/*
 	 * If the directory was removed but a process was CD'd into it,
 	 * we do not allow any more file/dir creation within it.  Otherwise
 	 * we will lose track of it.
 	 */
 	KKASSERT(dnode->tn_type == VDIR);
-	if (dnode != tmp->tm_root && dnode->tn_dir.tn_parent == NULL)
+	if (dnode != tmp->tm_root && dnode->tn_dir.tn_parent == NULL) {
+		TMPFS_NODE_UNLOCK(dnode);
 		return ENOENT;
+	}
 
 	/*
 	 * Make sure the link count does not overflow.
 	 */
-	if (vap->va_type == VDIR && dnode->tn_links >= LINK_MAX)
+	if (vap->va_type == VDIR && dnode->tn_links >= LINK_MAX) {
+		TMPFS_NODE_UNLOCK(dnode);
 		return EMLINK;
+	}
 
 	/* Allocate a node that represents the new file. */
 	error = tmpfs_alloc_node(tmp, vap->va_type, cred->cr_uid,
 				 dnode->tn_gid, vap->va_mode, target,
 				 vap->va_rmajor, vap->va_rminor, &node);
-	if (error != 0)
+	if (error != 0) {
+		TMPFS_NODE_UNLOCK(dnode);
 		return error;
+	}
 	TMPFS_NODE_LOCK(node);
 
 	/* Allocate a directory entry that points to the new file. */
 	error = tmpfs_alloc_dirent(tmp, node, ncp->nc_name, ncp->nc_nlen, &de);
 	if (error != 0) {
+		TMPFS_NODE_UNLOCK(dnode);
 		tmpfs_free_node(tmp, node);
 		/* eats node lock */
 		return error;
 	}
 
 	/* Allocate a vnode for the new file. */
-	error = tmpfs_alloc_vp(dvp->v_mount, node, LK_EXCLUSIVE, vpp);
+	error = tmpfs_alloc_vp(dvp->v_mount, NULL, node, LK_EXCLUSIVE, vpp);
 	if (error != 0) {
+		TMPFS_NODE_UNLOCK(dnode);
 		tmpfs_free_dirent(tmp, de);
 		tmpfs_free_node(tmp, node);
 		/* eats node lock */
@@ -574,7 +582,8 @@ tmpfs_alloc_file(struct vnode *dvp, struct vnode **vpp, struct vattr *vap,
 	 * insert the new node into the directory, an operation that
 	 * cannot fail.
 	 */
-	tmpfs_dir_attach(dnode, de);
+	tmpfs_dir_attach_locked(dnode, de);
+	TMPFS_NODE_UNLOCK(dnode);
 	TMPFS_NODE_UNLOCK(node);
 
 	return error;
@@ -583,22 +592,23 @@ tmpfs_alloc_file(struct vnode *dvp, struct vnode **vpp, struct vattr *vap,
 /* --------------------------------------------------------------------- */
 
 /*
- * Attaches the directory entry de to the directory represented by vp.
+ * Attaches the directory entry de to the directory represented by dnode.
  * Note that this does not change the link count of the node pointed by
  * the directory entry, as this is done by tmpfs_alloc_dirent.
+ *
+ * dnode must be locked.
  */
 void
-tmpfs_dir_attach(struct tmpfs_node *dnode, struct tmpfs_dirent *de)
+tmpfs_dir_attach_locked(struct tmpfs_node *dnode, struct tmpfs_dirent *de)
 {
 	struct tmpfs_node *node = de->td_node;
 
-	TMPFS_NODE_LOCK(dnode);
 	if (node && node->tn_type == VDIR) {
 		TMPFS_NODE_LOCK(node);
-		++node->tn_links;
+		atomic_add_int(&node->tn_links, 1);
 		node->tn_status |= TMPFS_NODE_CHANGED;
 		node->tn_dir.tn_parent = dnode;
-		++dnode->tn_links;
+		atomic_add_int(&dnode->tn_links, 1);
 		TMPFS_NODE_UNLOCK(node);
 	}
 	RB_INSERT(tmpfs_dirtree, &dnode->tn_dir.tn_dirtree, de);
@@ -606,28 +616,27 @@ tmpfs_dir_attach(struct tmpfs_node *dnode, struct tmpfs_dirent *de)
 	dnode->tn_size += sizeof(struct tmpfs_dirent);
 	dnode->tn_status |= TMPFS_NODE_ACCESSED | TMPFS_NODE_CHANGED |
 			    TMPFS_NODE_MODIFIED;
-	TMPFS_NODE_UNLOCK(dnode);
 }
 
 /* --------------------------------------------------------------------- */
 
 /*
- * Detaches the directory entry de from the directory represented by vp.
+ * Detaches the directory entry de from the directory represented by dnode.
  * Note that this does not change the link count of the node pointed by
  * the directory entry, as this is done by tmpfs_free_dirent.
+ *
+ * dnode must be locked.
  */
 void
-tmpfs_dir_detach(struct tmpfs_node *dnode, struct tmpfs_dirent *de)
+tmpfs_dir_detach_locked(struct tmpfs_node *dnode, struct tmpfs_dirent *de)
 {
 	struct tmpfs_node *node = de->td_node;
 
-	TMPFS_NODE_LOCK(dnode);
 	RB_REMOVE(tmpfs_dirtree, &dnode->tn_dir.tn_dirtree, de);
 	RB_REMOVE(tmpfs_dirtree_cookie, &dnode->tn_dir.tn_cookietree, de);
 	dnode->tn_size -= sizeof(struct tmpfs_dirent);
 	dnode->tn_status |= TMPFS_NODE_ACCESSED | TMPFS_NODE_CHANGED |
 			    TMPFS_NODE_MODIFIED;
-	TMPFS_NODE_UNLOCK(dnode);
 
 	/*
 	 * Clean out the tn_parent pointer immediately when removing a
@@ -641,14 +650,12 @@ tmpfs_dir_detach(struct tmpfs_node *dnode, struct tmpfs_dirent *de)
 	 * scan.
 	 */
 	if (node && node->tn_type == VDIR && node->tn_dir.tn_parent) {
-		TMPFS_NODE_LOCK(dnode);
 		TMPFS_NODE_LOCK(node);
 		KKASSERT(node->tn_dir.tn_parent == dnode);
-		dnode->tn_links--;
-		node->tn_links--;
+		atomic_add_int(&dnode->tn_links, -1);
+		atomic_add_int(&node->tn_links, -1);
 		node->tn_dir.tn_parent = NULL;
 		TMPFS_NODE_UNLOCK(node);
-		TMPFS_NODE_UNLOCK(dnode);
 	}
 }
 
@@ -679,7 +686,7 @@ tmpfs_dir_lookup(struct tmpfs_node *node, struct tmpfs_node *f,
 
 	de = RB_FIND(tmpfs_dirtree, &node->tn_dir.tn_dirtree, &wanted);
 
-	KKASSERT(f == NULL || f == de->td_node);
+	KKASSERT(f == NULL || de == NULL || f == de->td_node);
 
 	return de;
 }
@@ -697,26 +704,14 @@ int
 tmpfs_dir_getdotdent(struct tmpfs_node *node, struct uio *uio)
 {
 	int error;
-	struct dirent dent;
-	int dirsize;
 
 	TMPFS_VALIDATE_DIR(node);
 	KKASSERT(uio->uio_offset == TMPFS_DIRCOOKIE_DOT);
 
-	dent.d_ino = node->tn_id;
-	dent.d_type = DT_DIR;
-	dent.d_namlen = 1;
-	dent.d_name[0] = '.';
-	dent.d_name[1] = '\0';
-	dirsize = _DIRENT_DIRSIZ(&dent);
-
-	if (dirsize > uio->uio_resid)
-		error = -1;
-	else {
-		error = uiomove((caddr_t)&dent, dirsize, uio);
-		if (error == 0)
-			uio->uio_offset = TMPFS_DIRCOOKIE_DOTDOT;
-	}
+	if (vop_write_dirent(&error, uio, node->tn_id, DT_DIR, 1, "."))
+		return -1;
+	if (error == 0)
+		uio->uio_offset = TMPFS_DIRCOOKIE_DOTDOT;
 	return error;
 }
 
@@ -734,8 +729,7 @@ tmpfs_dir_getdotdotdent(struct tmpfs_mount *tmp, struct tmpfs_node *node,
 			struct uio *uio)
 {
 	int error;
-	struct dirent dent;
-	int dirsize;
+	ino_t d_ino;
 
 	TMPFS_VALIDATE_DIR(node);
 	KKASSERT(uio->uio_offset == TMPFS_DIRCOOKIE_DOTDOT);
@@ -743,35 +737,23 @@ tmpfs_dir_getdotdotdent(struct tmpfs_mount *tmp, struct tmpfs_node *node,
 	if (node->tn_dir.tn_parent) {
 		TMPFS_NODE_LOCK(node);
 		if (node->tn_dir.tn_parent)
-			dent.d_ino = node->tn_dir.tn_parent->tn_id;
+			d_ino = node->tn_dir.tn_parent->tn_id;
 		else
-			dent.d_ino = tmp->tm_root->tn_id;
+			d_ino = tmp->tm_root->tn_id;
 		TMPFS_NODE_UNLOCK(node);
 	} else {
-		dent.d_ino = tmp->tm_root->tn_id;
+		d_ino = tmp->tm_root->tn_id;
 	}
 
-	dent.d_type = DT_DIR;
-	dent.d_namlen = 2;
-	dent.d_name[0] = '.';
-	dent.d_name[1] = '.';
-	dent.d_name[2] = '\0';
-	dirsize = _DIRENT_DIRSIZ(&dent);
-
-	if (dirsize > uio->uio_resid)
-		error = -1;
-	else {
-		error = uiomove((caddr_t)&dent, dirsize, uio);
-		if (error == 0) {
-			struct tmpfs_dirent *de;
-
-			de = RB_MIN(tmpfs_dirtree_cookie,
-				    &node->tn_dir.tn_cookietree);
-			if (de == NULL)
-				uio->uio_offset = TMPFS_DIRCOOKIE_EOF;
-			else
-				uio->uio_offset = tmpfs_dircookie(de);
-		}
+	if (vop_write_dirent(&error, uio, d_ino, DT_DIR, 2, ".."))
+		return -1;
+	if (error == 0) {
+		struct tmpfs_dirent *de;
+		de = RB_MIN(tmpfs_dirtree_cookie, &node->tn_dir.tn_cookietree);
+		if (de == NULL)
+			uio->uio_offset = TMPFS_DIRCOOKIE_EOF;
+		else
+			uio->uio_offset = tmpfs_dircookie(de);
 	}
 	return error;
 }
@@ -866,61 +848,52 @@ tmpfs_dir_getdents(struct tmpfs_node *node, struct uio *uio, off_t *cntp)
 	 * the directory or we exhaust uio space.
 	 */
 	do {
-		struct dirent d;
-		int reclen;
+		ino_t d_ino;
+		uint8_t d_type;
 
 		/* Create a dirent structure representing the current
 		 * tmpfs_node and fill it. */
-		d.d_ino = de->td_node->tn_id;
+		d_ino = de->td_node->tn_id;
 		switch (de->td_node->tn_type) {
 		case VBLK:
-			d.d_type = DT_BLK;
+			d_type = DT_BLK;
 			break;
 
 		case VCHR:
-			d.d_type = DT_CHR;
+			d_type = DT_CHR;
 			break;
 
 		case VDIR:
-			d.d_type = DT_DIR;
+			d_type = DT_DIR;
 			break;
 
 		case VFIFO:
-			d.d_type = DT_FIFO;
+			d_type = DT_FIFO;
 			break;
 
 		case VLNK:
-			d.d_type = DT_LNK;
+			d_type = DT_LNK;
 			break;
 
 		case VREG:
-			d.d_type = DT_REG;
+			d_type = DT_REG;
 			break;
 
 		case VSOCK:
-			d.d_type = DT_SOCK;
+			d_type = DT_SOCK;
 			break;
 
 		default:
 			panic("tmpfs_dir_getdents: type %p %d",
 			    de->td_node, (int)de->td_node->tn_type);
 		}
-		d.d_namlen = de->td_namelen;
-		KKASSERT(de->td_namelen < sizeof(d.d_name));
-		bcopy(de->td_name, d.d_name, d.d_namlen);
-		d.d_name[d.d_namlen] = '\0';
-		reclen = _DIRENT_RECLEN(d.d_namlen);
+		KKASSERT(de->td_namelen < 256); /* 255 + 1 */
 
-		/* Stop reading if the directory entry we are treating is
-		 * bigger than the amount of data that can be returned. */
-		if (reclen > uio->uio_resid) {
+		if (vop_write_dirent(&error, uio, d_ino, d_type,
+		    de->td_namelen, de->td_name)) {
 			error = -1;
 			break;
 		}
-
-		/* Copy the new dirent structure into the output buffer and
-		 * advance pointers. */
-		error = uiomove((caddr_t)&d, reclen, uio);
 
 		(*cntp)++;
 		de = RB_NEXT(tmpfs_dirtree_cookie,
@@ -944,10 +917,12 @@ tmpfs_dir_getdents(struct tmpfs_node *node, struct uio *uio, off_t *cntp)
  * the size newsize.  'vp' must point to a vnode that represents a regular
  * file.  'newsize' must be positive.
  *
- * pass trivial as 1 when buf content will be overwritten, otherwise set 0
+ * pass NVEXTF_TRIVIAL when buf content will be overwritten, otherwise set 0
  * to be zero filled.
  *
  * Returns zero on success or an appropriate error code on failure.
+ *
+ * Caller must hold the node exclusively locked.
  */
 int
 tmpfs_reg_resize(struct vnode *vp, off_t newsize, int trivial)
@@ -957,6 +932,7 @@ tmpfs_reg_resize(struct vnode *vp, off_t newsize, int trivial)
 	struct tmpfs_mount *tmp;
 	struct tmpfs_node *node;
 	off_t oldsize;
+	int nvextflags;
 
 #ifdef INVARIANTS
 	KKASSERT(vp->v_type == VREG);
@@ -972,7 +948,6 @@ tmpfs_reg_resize(struct vnode *vp, off_t newsize, int trivial)
 	 * because the last allocated page can accommodate the change on
 	 * its own.
 	 */
-	TMPFS_NODE_LOCK(node);
 	oldsize = node->tn_size;
 	oldpages = round_page64(oldsize) / PAGE_SIZE;
 	KKASSERT(oldpages == node->tn_reg.tn_aobj_pages);
@@ -980,32 +955,48 @@ tmpfs_reg_resize(struct vnode *vp, off_t newsize, int trivial)
 
 	if (newpages > oldpages &&
 	   tmp->tm_pages_used + newpages - oldpages > tmp->tm_pages_max) {
-		TMPFS_NODE_UNLOCK(node);
 		error = ENOSPC;
 		goto out;
 	}
 	node->tn_reg.tn_aobj_pages = newpages;
 	node->tn_size = newsize;
-	TMPFS_NODE_UNLOCK(node);
 
-	TMPFS_LOCK(tmp);
-	tmp->tm_pages_used += (newpages - oldpages);
-	TMPFS_UNLOCK(tmp);
+	if (newpages != oldpages)
+		atomic_add_long(&tmp->tm_pages_used, (newpages - oldpages));
+
+	/*
+	 * nvextflags to pass along for bdwrite() vs buwrite()
+	 */
+	if (vm_pages_needed || vm_paging_needed(0) ||
+	    tmpfs_bufcache_mode >= 2) {
+		nvextflags = 0;
+	} else {
+		nvextflags = NVEXTF_BUWRITE;
+	}
+
 
 	/*
 	 * When adjusting the vnode filesize and its VM object we must
 	 * also adjust our backing VM object (aobj).  The blocksize
 	 * used must match the block sized we use for the buffer cache.
 	 *
-	 * The backing VM object contains no VM pages, only swap
-	 * assignments.
+	 * The backing VM object may contain VM pages as well as swap
+	 * assignments if we previously renamed main object pages into
+	 * it during deactivation.
+	 *
+	 * To make things easier tmpfs uses a blksize in multiples of
+	 * PAGE_SIZE, and will only increase the blksize as a small file
+	 * increases in size.  Once a file has exceeded TMPFS_BLKSIZE (16KB),
+	 * the blksize is maxed out.  Truncating the file does not reduce
+	 * the blksize.
 	 */
 	if (newsize < oldsize) {
 		vm_pindex_t osize;
 		vm_pindex_t nsize;
 		vm_object_t aobj;
 
-		error = nvtruncbuf(vp, newsize, TMPFS_BLKSIZE, -1, 0);
+		error = nvtruncbuf(vp, newsize, node->tn_blksize,
+				   -1, nvextflags);
 		aobj = node->tn_reg.tn_aobj;
 		if (aobj) {
 			osize = aobj->size;
@@ -1014,14 +1005,31 @@ tmpfs_reg_resize(struct vnode *vp, off_t newsize, int trivial)
 				aobj->size = osize;
 				swap_pager_freespace(aobj, nsize,
 						     osize - nsize);
+				vm_object_page_remove(aobj, nsize, osize,
+						      FALSE);
 			}
 		}
 	} else {
 		vm_object_t aobj;
+		int nblksize;
+
+		/*
+		 * The first (and only the first) buffer in the file is resized
+		 * in multiples of PAGE_SIZE, up to TMPFS_BLKSIZE.
+		 */
+		nblksize = node->tn_blksize;
+		while (nblksize < TMPFS_BLKSIZE &&
+		       nblksize < newsize) {
+			nblksize += PAGE_SIZE;
+		}
+
+		if (trivial)
+			nvextflags |= NVEXTF_TRIVIAL;
 
 		error = nvextendbuf(vp, oldsize, newsize,
-				    TMPFS_BLKSIZE, TMPFS_BLKSIZE,
-				    -1, -1, trivial);
+				    node->tn_blksize, nblksize,
+				    -1, -1, nvextflags);
+		node->tn_blksize = nblksize;
 		aobj = node->tn_reg.tn_aobj;
 		if (aobj)
 			aobj->size = vp->v_object->size;
@@ -1039,7 +1047,7 @@ out:
  * The vnode must be locked on entry and remain locked on exit.
  */
 int
-tmpfs_chflags(struct vnode *vp, int vaflags, struct ucred *cred)
+tmpfs_chflags(struct vnode *vp, u_long vaflags, struct ucred *cred)
 {
 	int error;
 	struct tmpfs_node *node;
@@ -1249,8 +1257,10 @@ tmpfs_chtimes(struct vnode *vp, struct timespec *atime, struct timespec *mtime,
 	if (atime->tv_sec != VNOVAL && atime->tv_nsec != VNOVAL)
 		node->tn_status |= TMPFS_NODE_ACCESSED;
 
-	if (mtime->tv_sec != VNOVAL && mtime->tv_nsec != VNOVAL)
+	if (mtime->tv_sec != VNOVAL && mtime->tv_nsec != VNOVAL) {
 		node->tn_status |= TMPFS_NODE_MODIFIED;
+		vclrflags(vp, VLASTWRITETS);
+	}
 
 	TMPFS_NODE_UNLOCK(node);
 
@@ -1273,8 +1283,9 @@ tmpfs_itimes(struct vnode *vp, const struct timespec *acc,
 	node = VP_TO_TMPFS_NODE(vp);
 
 	if ((node->tn_status & (TMPFS_NODE_ACCESSED | TMPFS_NODE_MODIFIED |
-	    TMPFS_NODE_CHANGED)) == 0)
+	    TMPFS_NODE_CHANGED)) == 0) {
 		return;
+	}
 
 	vfs_timestamp(&now);
 
@@ -1295,8 +1306,10 @@ tmpfs_itimes(struct vnode *vp, const struct timespec *acc,
 		node->tn_ctime = now.tv_sec;
 		node->tn_ctimensec = now.tv_nsec;
 	}
-	node->tn_status &=
-	    ~(TMPFS_NODE_ACCESSED | TMPFS_NODE_MODIFIED | TMPFS_NODE_CHANGED);
+
+	node->tn_status &= ~(TMPFS_NODE_ACCESSED |
+			     TMPFS_NODE_MODIFIED |
+			     TMPFS_NODE_CHANGED);
 	TMPFS_NODE_UNLOCK(node);
 }
 
@@ -1310,6 +1323,9 @@ tmpfs_update(struct vnode *vp)
 
 /* --------------------------------------------------------------------- */
 
+/*
+ * Caller must hold an exclusive node lock.
+ */
 int
 tmpfs_truncate(struct vnode *vp, off_t length)
 {
@@ -1334,11 +1350,8 @@ tmpfs_truncate(struct vnode *vp, off_t length)
 
 	error = tmpfs_reg_resize(vp, length, 1);
 
-	if (error == 0) {
-		TMPFS_NODE_LOCK(node);
+	if (error == 0)
 		node->tn_status |= TMPFS_NODE_CHANGED | TMPFS_NODE_MODIFIED;
-		TMPFS_NODE_UNLOCK(node);
-	}
 
 out:
 	tmpfs_update(vp);
@@ -1353,7 +1366,7 @@ tmpfs_fetch_ino(struct tmpfs_mount *tmp)
 {
 	ino_t ret;
 
-	ret = tmp->tm_ino++;
+	ret = atomic_fetchadd_64(&tmp->tm_ino, 1);
 
 	return (ret);
 }
@@ -1377,4 +1390,45 @@ tmpfs_dirtree_compare_cookie(struct tmpfs_dirent *a, struct tmpfs_dirent *b)
 	if (a > b)
 		return(1);
 	return 0;
+}
+
+/*
+ * Lock for rename.  The namecache entries for the related terminal files
+ * are already locked but the directories are not.  A directory lock order
+ * reversal is possible so use a deterministic order.
+ *
+ * Generally order path parent-to-child or using a simple pointer comparison.
+ * Probably not perfect but it should catch most of the cases.
+ *
+ * Underlying files must be locked after the related directory.
+ */
+void
+tmpfs_lock4(struct tmpfs_node *node1, struct tmpfs_node *node2,
+	    struct tmpfs_node *node3, struct tmpfs_node *node4)
+{
+	if (node1->tn_dir.tn_parent != node2 &&
+	    (node1 < node2 || node2->tn_dir.tn_parent == node1)) {
+		TMPFS_NODE_LOCK(node1);		/* fdir */
+		TMPFS_NODE_LOCK(node3);		/* ffile */
+		TMPFS_NODE_LOCK(node2);		/* tdir */
+		if (node4)
+			TMPFS_NODE_LOCK(node4);	/* tfile */
+	} else {
+		TMPFS_NODE_LOCK(node2);		/* tdir */
+		if (node4)
+			TMPFS_NODE_LOCK(node4);	/* tfile */
+		TMPFS_NODE_LOCK(node1);		/* fdir */
+		TMPFS_NODE_LOCK(node3);		/* ffile */
+	}
+}
+
+void
+tmpfs_unlock4(struct tmpfs_node *node1, struct tmpfs_node *node2,
+	      struct tmpfs_node *node3, struct tmpfs_node *node4)
+{
+	if (node4)
+		TMPFS_NODE_UNLOCK(node4);
+	TMPFS_NODE_UNLOCK(node2);
+	TMPFS_NODE_UNLOCK(node3);
+	TMPFS_NODE_UNLOCK(node1);
 }

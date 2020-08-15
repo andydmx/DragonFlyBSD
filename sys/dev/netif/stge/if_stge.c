@@ -157,7 +157,7 @@ static void	stge_txeof(struct stge_softc *);
 static void	stge_rxeof(struct stge_softc *, int);
 static __inline void stge_discard_rxbuf(struct stge_softc *, int);
 static int	stge_newbuf(struct stge_softc *, int, int);
-#ifndef __i386__
+#ifndef __x86_64__
 static __inline struct mbuf *stge_fixup_rx(struct stge_softc *, struct mbuf *);
 #endif
 
@@ -570,6 +570,8 @@ stge_attach(device_t dev)
 {
 	struct stge_softc *sc;
 	struct ifnet *ifp;
+	struct sysctl_ctx_list *ctx;
+	struct sysctl_oid *tree;
 	uint8_t enaddr[ETHER_ADDR_LEN];
 	int error, i;
 	uint16_t cmd;
@@ -653,25 +655,13 @@ stge_attach(device_t dev)
 	sc->sc_rxint_nframe = STGE_RXINT_NFRAME_DEFAULT;
 	sc->sc_rxint_dmawait = STGE_RXINT_DMAWAIT_DEFAULT;
 
-	sysctl_ctx_init(&sc->sc_sysctl_ctx);
-	sc->sc_sysctl_tree = SYSCTL_ADD_NODE(&sc->sc_sysctl_ctx,
-					     SYSCTL_STATIC_CHILDREN(_hw),
-					     OID_AUTO,
-					     device_get_nameunit(dev),
-					     CTLFLAG_RD, 0, "");
-	if (sc->sc_sysctl_tree == NULL) {
-		device_printf(dev, "can't add sysctl node\n");
-		error = ENXIO;
-		goto fail;
-	}
-
-	SYSCTL_ADD_PROC(&sc->sc_sysctl_ctx,
-	    SYSCTL_CHILDREN(sc->sc_sysctl_tree), OID_AUTO,
+	ctx = device_get_sysctl_ctx(dev);
+	tree = device_get_sysctl_tree(dev);
+	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
 	    "rxint_nframe", CTLTYPE_INT|CTLFLAG_RW, &sc->sc_rxint_nframe, 0,
 	    sysctl_hw_stge_rxint_nframe, "I", "stge rx interrupt nframe");
 
-	SYSCTL_ADD_PROC(&sc->sc_sysctl_ctx,
-	    SYSCTL_CHILDREN(sc->sc_sysctl_tree), OID_AUTO,
+	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
 	    "rxint_dmawait", CTLTYPE_INT|CTLFLAG_RW, &sc->sc_rxint_dmawait, 0,
 	    sysctl_hw_stge_rxint_dmawait, "I", "stge rx interrupt dmawait");
 
@@ -765,9 +755,8 @@ stge_attach(device_t dev)
 	ether_ifattach(ifp, enaddr, NULL);
 
 #ifdef IFPOLL_ENABLE
-	ifpoll_compat_setup(&sc->sc_npoll,
-	    &sc->sc_sysctl_ctx, sc->sc_sysctl_tree, device_get_unit(dev),
-	    ifp->if_serializer);
+	ifpoll_compat_setup(&sc->sc_npoll, ctx, (struct sysctl_oid *)tree,
+	    device_get_unit(dev), ifp->if_serializer);
 #endif
 
 	/* VLAN capability setup */
@@ -836,9 +825,6 @@ stge_detach(device_t dev)
 
 		ether_ifdetach(ifp);
 	}
-
-	if (sc->sc_sysctl_tree != NULL)
-		sysctl_ctx_free(&sc->sc_sysctl_ctx);
 
 	if (sc->sc_miibus != NULL)
 		device_delete_child(dev, sc->sc_miibus);
@@ -1519,7 +1505,7 @@ stge_discard_rxbuf(struct stge_softc *sc, int idx)
 	rfd->rfd_status = 0;
 }
 
-#ifndef __i386__
+#ifndef __x86_64__
 /*
  * It seems that TC9021's DMA engine has alignment restrictions in
  * DMA scatter operations. The first DMA segment has no address
@@ -1542,7 +1528,7 @@ stge_fixup_rx(struct stge_softc *sc, struct mbuf *m)
 		m->m_data += ETHER_HDR_LEN;
 		n = m;
 	} else {
-		MGETHDR(n, MB_DONTWAIT, MT_DATA);
+		MGETHDR(n, M_NOWAIT, MT_DATA);
 		if (n != NULL) {
 			bcopy(m->m_data, n->m_data, ETHER_HDR_LEN);
 			m->m_data += ETHER_HDR_LEN;
@@ -1667,7 +1653,7 @@ stge_rxeof(struct stge_softc *sc, int count)
 				}
 			}
 
-#ifndef __i386__
+#ifndef __x86_64__
 			if (sc->sc_if_framesize > (MCLBYTES - ETHER_ALIGN)) {
 				if ((m = stge_fixup_rx(sc, m)) == NULL) {
 					STGE_RXCHAIN_RESET(sc);
@@ -2339,7 +2325,7 @@ stge_newbuf(struct stge_softc *sc, int idx, int waitok)
 	bus_dmamap_t map;
 	int error, nseg;
 
-	m = m_getcl(waitok ? MB_WAIT : MB_DONTWAIT, MT_DATA, M_PKTHDR);
+	m = m_getcl(waitok ? M_WAITOK : M_NOWAIT, MT_DATA, M_PKTHDR);
 	if (m == NULL)
 		return ENOBUFS;
 	m->m_len = m->m_pkthdr.len = MCLBYTES;

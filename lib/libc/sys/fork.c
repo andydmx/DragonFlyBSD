@@ -32,9 +32,11 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 
-void (*cb_prepare)(void) = 0;
-void (*cb_parent)(void) = 0;
-void (*cb_child)(void) = 0;
+int __fork(void);
+
+void (*cb_prepare)(void) = NULL;
+void (*cb_parent)(void) = NULL;
+void (*cb_child)(void) = NULL;
 
 int
 __fork(void)

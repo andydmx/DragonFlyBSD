@@ -26,7 +26,7 @@
 .\"
 .\" $FreeBSD: src/share/man/man9/printf.9,v 1.8 2006/09/08 14:05:03 ru Exp $
 .\"
-.Dd December 21, 2012
+.Dd March 13, 2020
 .Dt KPRINTF 9
 .Os
 .Sh NAME
@@ -56,12 +56,13 @@
 .Fn kvsprintf "char *str" "const char *format" "__va_list ap"
 .Ft int
 .Fn kvsnprintf "char *str" "size_t size" "const char *format" "__va_list ap"
-.Ft void
+.Ft int
 .Fn krateprintf "struct krate *rate" "const char *format" ...
 .Ft int
-.Fn tprintf "struct proc *p" "int pri" "const char *format" ...
-.Ft int
 .Fn uprintf "const char *format" ...
+.In sys/tprintf.h
+.Ft int
+.Fn tprintf "struct proc *p" "int pri" "const char *format" ...
 .In sys/syslog.h
 .Ft int
 .Fn log "int pri" "const char *format" ...
@@ -110,11 +111,11 @@ functions add another conversion specifier to
 .Fa format :
 .Pp
 The
-.Cm \&%b
+.Cm \&%pb%i
 identifier expects two arguments: an
-.Vt int
+.Vt "char *"
 and a
-.Vt "char *" .
+.Vt int .
 These are used as a register value and a print mask for decoding bitmasks.
 The print mask is made up of two parts: the base and the
 arguments.
@@ -182,17 +183,49 @@ The
 and
 .Fn log
 functions return the number of characters displayed.
+.Pp
+The
+.Fn krateprintf
+function returns 1 or 0, depending on whether anything was printed or not,
+allowing code to issue additional
+.Fn kprintf Ns s
+if desired.
+.Sh LOADER TUNABLES
+Tunables can be set at the
+.Xr loader 8
+prompt before booting the kernel or stored in
+.Xr loader.conf 5 .
+.Bl -tag -width "xxxxxx"
+.It Va kern.kprintf_logging
+A bit mask that specifies the targets of
+.Fn kprintf .
+Supported targets are the console (0x1) and the dmesg buffer (0x4).
+The default value is 5 (print to both).
+.It Va kern.log_console_output
+Specifies whether console output is duplicated to the syslog.
+The default value is 1.
+.It Va security.ptr_restrict
+Specifying 1 masks out the upper bits of pointers printed  with %p, and
+specifying 2 masks out pointer values altogether.
+The default value is 0.
+.It Va security.unprivileged_read_msgbuf
+Specifies if unprivileged processes may read the kernel buffer.
+The default value is 1.
+.El
+.Sh SYSCTL VARIABLES
+The loader tunables described in
+.Sx LOADER TUNABLES
+are also available as sysctl(8) variables of the same names.
 .Sh EXAMPLES
 This example demonstrates the use of the
-.Cm \&%b
+.Cm \&%pb%i
 conversion specifier.
 The function
 .Bd -literal -offset indent
 void
 kprintf_test(void)
 {
-
-	kprintf("reg=%b\en", 3, "\e10\e2BITTWO\e1BITONE\en");
+	kprintf("reg=%pb%i\en", "\e10\e2BITTWO\e1BITONE\en", 3);
 }
 .Ed
 .Pp

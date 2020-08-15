@@ -468,10 +468,9 @@ out:
 				 postat_ret, vap);
 		error = 0;
 		goto nfsmout;
-	} else {
-		fp = nfsm_build(&info, NFSX_V2FATTR);
-		nfsm_srvfattr(nfsd, vap, fp);
 	}
+	fp = nfsm_build(&info, NFSX_V2FATTR);
+	nfsm_srvfattr(nfsd, vap, fp);
 	/* fall through */
 
 nfsmout:
@@ -712,7 +711,7 @@ nfsrv_readlink(struct nfsrv_descript *nfsd, struct nfssvc_sock *slp,
 	len = 0;
 	i = 0;
 	while (len < NFS_MAXPATHLEN) {
-		mp1 = m_getcl(MB_WAIT, MT_DATA, 0);
+		mp1 = m_getcl(M_WAITOK, MT_DATA, 0);
 		mp1->m_len = MCLBYTES;
 		if (len == 0)
 			mp3 = mp2 = mp1;
@@ -913,7 +912,7 @@ nfsrv_read(struct nfsrv_descript *nfsd, struct nfssvc_sock *slp,
 				i++;
 			}
 			if (left > 0) {
-				m = m_getcl(MB_WAIT, MT_DATA, 0);
+				m = m_getcl(M_WAITOK, MT_DATA, 0);
 				m->m_len = 0;
 				m2->m_next = m;
 				m2 = m;
@@ -1601,13 +1600,13 @@ nfsrv_create(struct nfsrv_descript *nfsd, struct nfssvc_sock *slp,
 	u_int32_t *tl;
 	struct nlookupdata nd;
 	int error = 0, len, tsize, dirfor_ret = 1, diraft_ret = 1;
-	udev_t rdev = NOUDEV;
+	dev_t rdev = NOUDEV;
 	caddr_t cp;
 	int how, exclusive_flag = 0;
 	struct vnode *dirp;
 	struct vnode *dvp;
 	struct vnode *vp;
-	struct mount *mp;
+	struct mount *mp = NULL;
 	nfsfh_t nfh;
 	fhandle_t *fhp;
 	u_quad_t tempsize;
@@ -1873,6 +1872,8 @@ nfsmout:
 	}
 	if (vp)
 		vput(vp);
+	if (mp)
+		mount_drop(mp);
 	return (error);
 }
 
@@ -2929,7 +2930,7 @@ nfsrv_readdir(struct nfsrv_descript *nfsd, struct nfssvc_sock *slp,
 	}
 	off = toff;
 	cnt = fxdr_unsigned(int, *tl);
-	siz = ((cnt + DIRBLKSIZ - 1) & ~(DIRBLKSIZ - 1));
+	siz = roundup2(cnt, DIRBLKSIZ);
 	xfer = NFS_SRVMAXDATA(nfsd);
 	if ((unsigned)cnt > xfer)
 		cnt = xfer;
@@ -3231,7 +3232,7 @@ nfsrv_readdirplus(struct nfsrv_descript *nfsd, struct nfssvc_sock *slp,
 	siz = fxdr_unsigned(int, *tl++);
 	cnt = fxdr_unsigned(int, *tl);
 	off = toff;
-	siz = ((siz + DIRBLKSIZ - 1) & ~(DIRBLKSIZ - 1));
+	siz = roundup2(siz, DIRBLKSIZ);
 	xfer = NFS_SRVMAXDATA(nfsd);
 	if ((unsigned)cnt > xfer)
 		cnt = xfer;
@@ -3965,7 +3966,8 @@ nfsmout:
 /*
  * Perform access checking for vnodes obtained from file handles that would
  * refer to files already opened by a Unix client. You cannot just use
- * vn_writechk() and VOP_ACCESS() for two reasons.
+ * vn_writechk() and VOP_ACCESS() for two reasons:
+ *
  * 1 - You must check for exported rdonly as well as MNT_RDONLY for the write case
  * 2 - The owner is to be given access irrespective of mode bits for some
  *     operations, so that processes that chmod after opening a file don't

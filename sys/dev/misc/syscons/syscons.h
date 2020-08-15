@@ -29,7 +29,6 @@
  * THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  * $FreeBSD: src/sys/dev/syscons/syscons.h,v 1.60.2.6 2002/09/15 22:30:45 dd Exp $
- * $DragonFly: src/sys/dev/misc/syscons/syscons.h,v 1.21 2008/08/03 03:00:21 dillon Exp $
  */
 
 #ifndef _DEV_SYSCONS_SYSCONS_H_
@@ -113,9 +112,10 @@ MALLOC_DECLARE(M_SYSCONS);
 #define	VIDEO_MEMORY_POS(scp, pos, x) 					\
 	((scp)->sc->adp->va_window +					\
 	 (x) * (scp)->xoff +						\
-	 (scp)->yoff * (scp)->font_size * (scp)->sc->adp->va_line_width +\
+	 (scp)->yoff * (scp)->font_height * (scp)->sc->adp->va_line_width +\
 	 (x) * ((pos) % (scp)->xsize) +					\
-	 (scp)->font_size * (scp)->sc->adp->va_line_width * (pos / (scp)->xsize))
+	 (scp)->font_height * (scp)->sc->adp->va_line_width *		\
+	 (pos / (scp)->xsize))
 #endif
 
 /* vty status flags (scp->status) */
@@ -174,9 +174,9 @@ struct dev_ioctl_args;
 typedef struct sc_softc {
 	int		unit;			/* unit # */
 	int		config;			/* configuration flags */
-#define SC_VESA800X600	(1 << 7)
 #define SC_AUTODETECT_KBD (1 << 8)
 #define SC_KERNEL_CONSOLE (1 << 9)
+#define SC_EFI_FB	(1 << 10)
 
 	int		flags;			/* status flags */
 #define SC_VISUAL_BELL	(1 << 0)
@@ -199,6 +199,13 @@ typedef struct sc_softc {
 	struct video_adapter *adp;
 	int		initial_mode;		/* initial video mode */
 
+	uint64_t	fbi_generation;		/* increment on fbi update */
+	struct fb_info	*fbi;
+	struct fb_info	*dummy_fb_info;
+	struct task	*fb_set_par_task;
+	struct task	*fb_blank_task;
+	int		fb_blanked;
+
 	int		first_vty;
 	int		vtys;
 	cdev_t		*dev;
@@ -207,10 +214,10 @@ typedef struct sc_softc {
 	struct scr_stat	*new_scp;
 	struct scr_stat	*old_scp;
 	int     	delayed_next_scr;
+	int        	videoio_in_progress;
 
 	char        	font_loading_in_progress;
 	char        	switch_in_progress;
-	char        	videoio_in_progress;
 	char        	write_in_progress;
 	char        	blink_in_progress;
 
@@ -253,6 +260,7 @@ typedef struct scr_stat {
 	struct sc_rndr_sw *rndr;		/* renderer */
 	sc_vtb_t	scr;
 	sc_vtb_t	vtb;
+	uint64_t	fbi_generation;		/* track fb_info updates */
 
 	int 		xpos;			/* current X position */
 	int 		ypos;			/* current Y position */
@@ -264,10 +272,14 @@ typedef struct scr_stat {
 	int		yoff;			/* Y offset in pixel mode */
 
 	u_char		*font;			/* current font */
-	int		font_size;		/* fontsize in Y direction */
+	int		font_height;		/* font source Y pixels */
+	int		font_width;		/* font source X pixels */
+	int		blk_height;		/* fbtarget Y pixels */
+	int		blk_width;		/* fbtarget X pixels */
 
 	int		start;			/* modified area start */
 	int		end;			/* modified area end */
+	int		show_cursor;		/* used by async scrn_update */
 
 	struct sc_term_sw *tsw;
 	void		*ts;
@@ -312,8 +324,10 @@ typedef struct scr_stat {
 	int		history_pos;		/* position shown on screen */
 	int		history_size;		/* size of history buffer */
 
-	int		splash_save_mode;	/* saved mode for splash screen */
-	int		splash_save_status;	/* saved status for splash screen */
+	int		splash_save_mode;	/* saved mode for splash scr */
+	int		splash_save_status;	/* saved status for splash scr*/
+	int		queue_update_td;
+	struct thread	*asynctd;
 #ifdef _SCR_MD_STAT_DECLARED_
 	scr_md_stat_t	md;			/* machine dependent vars */
 #endif
@@ -330,6 +344,9 @@ typedef struct scr_stat {
 #endif
 #ifndef SC_KERNEL_CONS_REV_ATTR
 #define SC_KERNEL_CONS_REV_ATTR	(FG_BLACK | BG_LIGHTGREY)
+#endif
+#ifndef SC_BORDER_COLOR
+#define SC_BORDER_COLOR		FG_BLACK
 #endif
 
 /* terminal emulator */
@@ -507,16 +524,19 @@ void		sc_save_font(scr_stat *scp, int page, int size, u_char *font,
 			     int base, int count);
 void		sc_show_font(scr_stat *scp, int page);
 
+void		sc_start_scrn_saver(sc_softc_t *sc);
+void		sc_stop_scrn_saver(sc_softc_t *sc);
 void		sc_touch_scrn_saver(void);
 void		sc_draw_cursor_image(scr_stat *scp);
 void		sc_remove_cursor_image(scr_stat *scp);
 void		sc_set_cursor_image(scr_stat *scp);
-int		sc_clean_up(scr_stat *scp);
+int		sc_clean_up(scr_stat *scp, int need_unlock);
 int		sc_switch_scr(sc_softc_t *sc, u_int next_scr);
 void		sc_alloc_scr_buffer(scr_stat *scp, int wait, int discard);
 int		sc_init_emulator(scr_stat *scp, char *name);
 void		sc_paste(scr_stat *scp, u_char *p, int count);
 void		sc_bell(scr_stat *scp, int pitch, int duration);
+void		sc_font_scale(scr_stat *scp, int max_cols, int max_rows);
 
 /* schistory.c */
 #ifndef SC_NO_HISTORY
@@ -528,6 +548,7 @@ void		sc_hist_save(scr_stat *scp);
 		sc_vtb_append(&(scp)->vtb, (from), (scp)->history, (scp)->xsize)
 int		sc_hist_restore(scr_stat *scp);
 void		sc_hist_home(scr_stat *scp);
+void		sc_hist_getback(scr_stat *scp, int old_ysize);
 void		sc_hist_end(scr_stat *scp);
 int		sc_hist_up_line(scr_stat *scp);
 int		sc_hist_down_line(scr_stat *scp);
@@ -570,6 +591,7 @@ int		sc_vid_ioctl(struct tty *tp, u_long cmd, caddr_t data,
 int		sc_render_add(sc_renderer_t *rndr);
 int		sc_render_remove(sc_renderer_t *rndr);
 sc_rndr_sw_t	*sc_render_match(scr_stat *scp, char *name, int model);
+void		sc_update_render(scr_stat *scp);
 
 /* scvtb.c */
 void		sc_vtb_init(sc_vtb_t *vtb, int type, int cols, int rows, 

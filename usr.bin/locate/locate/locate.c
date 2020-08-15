@@ -98,25 +98,28 @@
 #  include <sys/resource.h>
 #endif
 
-char *path_fcodes;      /* locate database */
-int f_mmap;             /* use mmap */
-int f_icase;            /* ignore case */
-int f_stdin;            /* read database from stdin */
-int f_statistic;        /* print statistic */
-int f_silent;           /* suppress output, show only count of matches */
-int f_limit;            /* limit number of output lines, 0 == infinite */
-u_int counter;          /* counter for matches [-c] */
+static char *path_fcodes; /* locate database */
+static int f_mmap;	/* use mmap */
+static int f_icase;	/* ignore case */
+static int f_stdin;	/* read database from stdin */
+static int f_statistic;	/* print statistic */
+static int f_silent;	/* suppress output, show only count of matches */
+static int f_limit;	/* limit number of output lines, 0 == infinite */
+static u_int counter;	/* counter for matches [-c] */
 
+u_char myctype[UCHAR_MAX + 1];
 
-void    usage(void);
-void    statistic(FILE *, char *);
-void    fastfind(FILE *, char *, char *);
-void    fastfind_icase(FILE *, char *, char *);
-void    fastfind_mmap(char *, caddr_t, int, char *);
-void    fastfind_mmap_icase(char *, caddr_t, int, char *);
-void	search_mmap(char *, char **);
-void	search_fopen(char *, char **);
-unsigned long cputime(void);
+static void    usage(void) __dead2;
+static void    statistic(FILE *, char *);
+static void    fastfind(FILE *, char *, char *);
+static void    fastfind_icase(FILE *, char *, char *);
+static void    fastfind_mmap(char *, caddr_t, int, char *);
+static void    fastfind_mmap_icase(char *, caddr_t, int, char *);
+static void	search_mmap(char *, char **);
+static void	search_fopen(char *, char **);
+#ifdef DEBUG
+static unsigned long cputime(void);
+#endif
 
 extern char     **colon(char **, char*, char*);
 extern void     print_matches(u_int);
@@ -175,7 +178,7 @@ main(int argc, char **argv)
 
         /* no (valid) database as argument */
         if (dbv == NULL || *dbv == NULL) {
-                /* try to read database from enviroment */
+                /* try to read database from environment */
                 if ((path_fcodes = getenv("LOCATE_PATH")) == NULL ||
 		     *path_fcodes == '\0')
                         /* use default database */
@@ -212,7 +215,7 @@ main(int argc, char **argv)
 }
 
 
-void
+static void
 search_fopen(char *db, char **s)
 {
 	FILE *fp;
@@ -260,7 +263,7 @@ search_fopen(char *db, char **s)
 } 
 
 #ifdef MMAP
-void
+static void
 search_mmap(char *db, char **s)
 {
         struct stat sb;
@@ -303,7 +306,7 @@ search_mmap(char *db, char **s)
 #endif /* MMAP */
 
 #ifdef DEBUG
-unsigned long
+static unsigned long
 cputime (void)
 {
 	struct rusage rus;
@@ -313,7 +316,7 @@ cputime (void)
 }
 #endif /* DEBUG */
 
-void
+static void
 usage (void)
 {
         (void)fprintf(stderr,

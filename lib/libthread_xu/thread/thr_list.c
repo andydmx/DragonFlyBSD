@@ -32,8 +32,8 @@
 #include <string.h>
 #include <pthread.h>
 
-#include "thr_private.h"
 #include "libc_private.h"
+#include "thr_private.h"
 
 /* #define DEBUG_THREAD_LIST */
 #ifdef DEBUG_THREAD_LIST
@@ -165,7 +165,7 @@ _thr_alloc(struct pthread *curthread)
 		}
 	}
 	if (thread == NULL) {
-		thread = malloc(sizeof(struct pthread));
+		thread = __malloc(sizeof(struct pthread));
 		if (thread == NULL)
 			return (NULL);
 	}
@@ -191,7 +191,7 @@ _thr_free(struct pthread *curthread, struct pthread *thread)
 {
 	DBG_MSG("Freeing thread %p\n", thread);
 	if (thread->name) {
-		free(thread->name);
+		__free(thread->name);
 		thread->name = NULL;
 	}
 	/*
@@ -224,7 +224,7 @@ _thr_free(struct pthread *curthread, struct pthread *thread)
 static void
 thr_destroy(struct pthread *curthread __unused, struct pthread *thread)
 {
-	free(thread);
+	__free(thread);
 }
 
 /*
@@ -343,14 +343,13 @@ _thr_find_thread(struct pthread *curthread __unused, struct pthread *thread,
 	struct pthread *pthread;
 
 	if (thread == NULL)
-		/* Invalid thread: */
 		return (EINVAL);
 
 	pthread = _thr_hash_find(thread);
 	if (pthread) {
 		if (include_dead == 0 && pthread->state == PS_DEAD) {
 			pthread = NULL;
-		}	
+		}
 	}
 
 	/* Return zero if the thread exists: */

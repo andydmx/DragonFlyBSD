@@ -8,8 +8,7 @@ CFLAGS+=	-I${.CURDIR}/../../sys
 DPADD+=		${LIBBLUETOOTH} ${LIBSDP}
 LDADD+=		-lbluetooth -lsdp
 
-# suppress cast-qual errors
 WARNS?=		3
-CFLAGS+=	-Wno-unused-but-set-variable
+NO_STRICT_ALIASING=
 
 .include <bsd.prog.mk>

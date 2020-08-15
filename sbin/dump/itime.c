@@ -44,6 +44,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "dump.h"
 
@@ -52,8 +53,10 @@ struct dumptime {
 	SLIST_ENTRY(dumptime) dt_list;
 };
 SLIST_HEAD(dthead, dumptime) dthead = SLIST_HEAD_INITIALIZER(dthead);
-struct	dumpdates **ddatev = NULL;
-int	nddates = 0;
+int	nddates = 0;		/* number of records (might be zero) */
+struct	dumpdates **ddatev;	/* the arrayfied version */
+const char *dumpdates;		/* name of the file containing dump date info */
+int	lastlevel;		/* dump level of previous dump */
 
 static	void dumprecout(FILE *, struct dumpdates *);
 static	int getrecord(FILE *, struct dumpdates *);

@@ -8,11 +8,11 @@ SUBDIR= 802_11 \
 	accton \
 	acpi \
 	adduser \
-	amd \
-	ancontrol \
 	arp \
 	asf \
 	authpf \
+	autofs \
+	boot0cfg \
 	bootparamd \
 	btconfig \
 	bthcid \
@@ -33,10 +33,14 @@ SUBDIR= 802_11 \
 	dev_mkdb \
 	dntpd \
 	edquota \
-	faithd \
+	efibootmgr \
+	efidp \
+	efisetup \
+	efivar \
 	fdcontrol \
 	fdformat \
 	fdwrite \
+	fstyp \
 	ftp-proxy \
 	fwcontrol \
 	gifconfig \
@@ -44,16 +48,16 @@ SUBDIR= 802_11 \
 	ifmcstat \
 	inetd \
 	iostat \
+	ip6addrctl \
 	jail \
 	jexec \
 	jls \
 	kbdcontrol \
 	kbdmap \
-	kernbb \
 	keyserv \
 	lastlogin \
 	mailwrapper \
-	makewhatis \
+	makefs \
 	manctl \
 	memcontrol \
 	mergemaster \
@@ -62,8 +66,8 @@ SUBDIR= 802_11 \
 	mld6query \
 	mlxcontrol \
 	moused \
+	mpsutil \
 	mptutil \
-	mrouted \
 	mtest \
 	mtree \
 	ndiscvt \
@@ -78,18 +82,14 @@ SUBDIR= 802_11 \
 	powerd \
 	ppp \
 	pppctl \
-	pppd \
-	pppstats \
 	prefix \
 	procctl \
 	pstat \
-	puffs \
 	pw \
 	pwd_mkdb \
 	quot \
 	quotaon \
 	rarpd \
-	rdate \
 	repquota \
 	resident \
 	rip6query \
@@ -104,6 +104,7 @@ SUBDIR= 802_11 \
 	rpcbind \
 	rrenumd \
 	rtadvd \
+	rtadvctl \
 	rtprio \
 	rtsold \
 	rwhod \
@@ -111,7 +112,8 @@ SUBDIR= 802_11 \
 	sdpd \
 	sensorsd \
 	service \
-	setkey \
+	sshd \
+	sshlockout \
 	sliplogin \
 	slstat \
 	spray \
@@ -119,12 +121,13 @@ SUBDIR= 802_11 \
 	sysvipcd \
 	tcpdchk \
 	tcpdmatch \
+	tcpdrop \
 	tcpdump \
-	timed \
 	traceroute \
 	traceroute6 \
 	trpt \
 	tzsetup \
+	uefisign \
 	usbconfig \
 	usbdump \
 	vidcontrol \
@@ -150,34 +153,11 @@ SUBDIR+=lpr
 SUBDIR+=nscd
 .endif
 
-.if !defined(NO_SENDMAIL)
-SUBDIR+=editmap \
-	mailstats \
-	makemap \
-	praliases \
-	sendmail
-.endif
-
-.if ${MACHINE_ARCH} == "i386" || ${MACHINE_ARCH} == "x86_64"
-SUBDIR+=apm \
-	apmd \
-	battd \
-	btxld \
-	kgmon \
+.if ${MACHINE_ARCH} == "x86_64"
+SUBDIR+= \
 	lptcontrol \
 	mptable \
-	rndcontrol \
-	sicontrol
-.endif
-
-.if ${MACHINE_ARCH} == "i386"
-SUBDIR+=kgzip \
-	pnpinfo \
-	stlstats
-.endif
-
-.ifdef BOOT0CFG_SUPPORT
-SUBDIR+=boot0cfg
+	rndcontrol
 .endif
 
 .ifdef WANT_INSTALLER

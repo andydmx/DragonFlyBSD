@@ -64,6 +64,15 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
+/*
+ * XXX profmakx
+ * This is a Frankenstein of FreeBSD's usb4bsd ucom and Dragonfly's old ucom
+ * module. There might be bugs lurking everywhere still
+ *
+ * In particular serial console on ucom is completely untested and likely broken
+ * as well as anyting that requires the modem control lines.
+ */
+
 #include <sys/stdint.h>
 #include <sys/param.h>
 #include <sys/queue.h>
@@ -83,7 +92,7 @@
 #include <sys/serial.h>
 #include <sys/thread2.h>
 #include <sys/conf.h>
- 
+
 #include <bus/u4b/usb.h>
 #include <bus/u4b/usbdi.h>
 #include <bus/u4b/usbdi_util.h>
@@ -95,9 +104,16 @@
 
 #include <bus/u4b/serial/usb_serial.h>
 
-//#include "opt_gdb.h"
+/* #include "opt_gdb.h" */
 
 static SYSCTL_NODE(_hw_usb, OID_AUTO, ucom, CTLFLAG_RW, 0, "USB ucom");
+
+static int ucom_pps_mode;
+
+SYSCTL_INT(_hw_usb_ucom, OID_AUTO, pps_mode, CTLFLAG_RW,
+    &ucom_pps_mode, 0, "pulse capturing mode - 0/1/2 - disabled/CTS/DCD");
+TUNABLE_INT("hw.usb.ucom.pss_mode", &ucom_pps_mode);
+
 
 #ifdef USB_DEBUG
 static int ucom_debug = 0;
@@ -108,10 +124,8 @@ SYSCTL_INT(_hw_usb_ucom, OID_AUTO, debug, CTLFLAG_RW,
 
 #define	UCOM_CONS_BUFSIZE 1024
 
-#if 0
 static uint8_t ucom_cons_rx_buf[UCOM_CONS_BUFSIZE];
 static uint8_t ucom_cons_tx_buf[UCOM_CONS_BUFSIZE];
-#endif
 
 static unsigned int ucom_cons_rx_low = 0;
 static unsigned int ucom_cons_rx_high = 0;
@@ -161,6 +175,11 @@ static void ucom_stop(struct tty *tp, int);
 static int ucom_param(struct tty *tp, struct termios *t);
 static int ucom_modem(struct tty *tp, int sigon, int sigoff);
 
+static int ucom_fromtio(int);
+static int ucom_totio(int);
+
+static void disc_optim(struct tty *, struct termios *, struct ucom_softc *);
+
 static d_open_t ucom_dev_open;
 static d_close_t ucom_dev_close;
 static d_read_t ucom_dev_read;
@@ -178,8 +197,6 @@ static struct dev_ops ucom_ops = {
   .d_revoke =     ttyrevoke
 };
 
-devclass_t ucom_devclass;
-
 static moduledata_t ucom_mod = {
         "ucom",
         NULL,
@@ -190,31 +207,17 @@ DECLARE_MODULE(ucom, ucom_mod, SI_SUB_DRIVERS, SI_ORDER_MIDDLE);
 MODULE_DEPEND(ucom, usb, 1, 1, 1);
 MODULE_VERSION(ucom, UCOM_MODVER);
 
-#if 0 /* XXXDF */
-static tsw_open_t ucom_open;
-static tsw_close_t ucom_close;
-static tsw_ioctl_t ucom_ioctl;
-static tsw_modem_t ucom_modem;
-static tsw_param_t ucom_param;
-static tsw_outwakeup_t ucom_outwakeup;
-static tsw_inwakeup_t ucom_inwakeup;
-static tsw_free_t ucom_free;
-
-static struct ttydevsw ucom_class = {
-	.tsw_flags = TF_INITLOCK | TF_CALLOUT,
-	.tsw_open = ucom_open,
-	.tsw_close = ucom_close,
-	.tsw_outwakeup = ucom_outwakeup,
-	.tsw_inwakeup = ucom_inwakeup,
-	.tsw_ioctl = ucom_ioctl,
-	.tsw_param = ucom_param,
-	.tsw_modem = ucom_modem,
-	.tsw_free = ucom_free,
-};
-#endif
+/* XXXDF */
+#define tty_gone(tp) ((tp->t_state) & (TS_ZOMBIE))
 
 #define	UCOM_UNIT_MAX 		128	/* maximum number of units */
 #define	UCOM_TTY_PREFIX		"ucom"
+
+
+#define CALLOUT_MASK            0x80
+#define CONTROL_MASK            0x60
+#define CONTROL_INIT_STATE      0x20
+#define CONTROL_LOCK_STATE      0x40
 
 static struct unrhdr *ucom_unrhdr;
 static struct lock ucom_lock;
@@ -224,7 +227,6 @@ static void
 ucom_init(void *arg)
 {
 	DPRINTF("\n");
-	kprintf("ucom init\n");
 	ucom_unrhdr = new_unrhdr(0, UCOM_UNIT_MAX - 1, NULL);
 	lockinit(&ucom_lock, "UCOM LOCK", 0, 0);
 }
@@ -369,6 +371,16 @@ ucom_detach(struct ucom_super_softc *ssc, struct ucom_softc *sc)
 	if (!(ssc->sc_flag & UCOM_FLAG_ATTACHED))
 		return;		/* not initialized */
 
+	destroy_dev(sc->sc_cdev);
+	destroy_dev(sc->sc_cdev_init);
+	destroy_dev(sc->sc_cdev_lock);
+	destroy_dev(sc->sc_cdev2);
+	destroy_dev(sc->sc_cdev2_init);
+	destroy_dev(sc->sc_cdev2_lock);
+
+	if (sc->sc_tty)
+		lwkt_gettoken(&sc->sc_tty->t_token);
+
 	if (ssc->sc_sysctl_ttyname != NULL) {
 		sysctl_remove_oid(ssc->sc_sysctl_ttyname, 1, 0);
 		ssc->sc_sysctl_ttyname = NULL;
@@ -399,6 +411,9 @@ ucom_detach(struct ucom_super_softc *ssc, struct ucom_softc *sc)
 
 	/* make sure we don't detach twice */
 	ssc->sc_flag &= ~UCOM_FLAG_ATTACHED;
+
+	if (sc->sc_tty)
+		lwkt_reltoken(&sc->sc_tty->t_token);
 }
 
 void
@@ -429,23 +444,16 @@ ucom_attach_tty(struct ucom_super_softc *ssc, struct ucom_softc *sc)
 {
 	struct tty *tp;
 	char buf[32];			/* temporary TTY device name buffer */
-	cdev_t dev;
 
-	kprintf("attach tty\n");
+	tp = ttymalloc(&sc->sc_tty);
 
-	lwkt_gettoken(&tty_token);
-	
-	kprintf("malloc: ");
-	sc->sc_tty = tp = ttymalloc(sc->sc_tty);
+	lwkt_gettoken(&tp->t_token);
+
+	tp->t_sc = (void *)sc;
 
 	tp->t_oproc = ucom_start;
 	tp->t_param = ucom_param;
 	tp->t_stop = ucom_stop;
-	
-	if (tp == NULL) {
-		lwkt_reltoken(&tty_token);
-		return (ENOMEM);
-	}
 
 	/* Check if the client has a custom TTY name */
 	buf[0] = '\0';
@@ -457,22 +465,46 @@ ucom_attach_tty(struct ucom_super_softc *ssc, struct ucom_softc *sc)
 		/* Use default TTY name */
 		if (ssc->sc_subunits > 1) {
 			/* multiple modems in one */
-			ksnprintf(buf, sizeof(buf), UCOM_TTY_PREFIX "%u.%u",
+			ksnprintf(buf, sizeof(buf), "%u.%u",
 			    ssc->sc_unit, sc->sc_subunit);
 		} else {
 			/* single modem */
-			ksnprintf(buf, sizeof(buf), UCOM_TTY_PREFIX "%u",
+			ksnprintf(buf, sizeof(buf), "%u",
 			    ssc->sc_unit);
 		}
 	}
 
-	dev = make_dev(&ucom_ops, ssc->sc_unit | 0x80, // XXX UCOM_CALLOUT_MASK,
-			UID_UUCP, GID_DIALER, 0660,
-			buf, ssc->sc_unit);
-	dev->si_tty = tp;
+	sc->sc_cdev = make_dev(&ucom_ops, ssc->sc_unit,
+			UID_ROOT, GID_WHEEL, 0600, "ttyU%s", buf);
+	sc->sc_cdev_init = make_dev(&ucom_ops, ssc->sc_unit | CONTROL_INIT_STATE,
+			UID_ROOT, GID_WHEEL, 0600, "ttyiU%s", buf);
+	sc->sc_cdev_lock = make_dev(&ucom_ops, ssc->sc_unit | CONTROL_LOCK_STATE,
+			UID_ROOT, GID_WHEEL, 0600, "ttylU%s", buf);
+	sc->sc_cdev2 = make_dev(&ucom_ops, ssc->sc_unit | CALLOUT_MASK,
+			UID_UUCP, GID_DIALER, 0660, "cuaU%s", buf);
+	sc->sc_cdev2_init = make_dev(&ucom_ops, ssc->sc_unit | CALLOUT_MASK | CONTROL_INIT_STATE,
+			UID_UUCP, GID_DIALER, 0660, "cuaiU%s", buf);
+	sc->sc_cdev2_lock = make_dev(&ucom_ops, ssc->sc_unit | CALLOUT_MASK | CONTROL_LOCK_STATE,
+			UID_UUCP, GID_DIALER, 0660, "cualU%s", buf);
+
+	sc->sc_cdev->si_tty = tp;
+	sc->sc_cdev_init->si_tty = tp;
+	sc->sc_cdev_lock->si_tty = tp;
+
+	sc->sc_cdev->si_drv1 = sc;
+	sc->sc_cdev_init->si_drv1 = sc;
+	sc->sc_cdev_lock->si_drv1 = sc;
+
+	sc->sc_cdev2->si_tty = tp;
+	sc->sc_cdev2_init->si_tty = tp;
+	sc->sc_cdev2_lock->si_tty = tp;
+
+	sc->sc_cdev2->si_drv1 = sc;
+	sc->sc_cdev2_init->si_drv1 = sc;
+	sc->sc_cdev2_lock->si_drv1 = sc;
+
 	sc->sc_tty = tp;
-	dev->si_drv1 = sc;
-	
+
 	DPRINTF("ttycreate: %s\n", buf);
 
 	/* Check if this device should be a console */
@@ -485,9 +517,9 @@ ucom_attach_tty(struct ucom_super_softc *ssc, struct ucom_softc *sc)
 
 		ucom_cons_softc = sc;
 
-		/* XXXDF
+#if 0 /* XXXDF */
 		tty_init_console(tp, ucom_cons_baud);
-		*/
+#endif
 		tp->t_termios.c_ispeed = ucom_cons_baud;
 		tp->t_termios.c_ospeed = ucom_cons_baud;
 
@@ -497,13 +529,13 @@ ucom_attach_tty(struct ucom_super_softc *ssc, struct ucom_softc *sc)
 		ucom_cons_tx_low = 0;
 		ucom_cons_tx_high = 0;
 		sc->sc_flag |= UCOM_FLAG_CONSOLE;
-		
 		ucom_open(ucom_cons_softc);
 		ucom_param(tp, &tp->t_termios);
 		UCOM_MTX_UNLOCK(ucom_cons_softc);
 	}
 
-	lwkt_reltoken(&tty_token);
+	lwkt_reltoken(&tp->t_token);
+
 	return (0);
 }
 
@@ -529,21 +561,18 @@ ucom_detach_tty(struct ucom_super_softc *ssc, struct ucom_softc *sc)
 	sc->sc_flag &= ~(UCOM_FLAG_HL_READY | UCOM_FLAG_LL_READY);
 	UCOM_MTX_UNLOCK(sc);
 
-	if (tp) {
-		lockmgr(&ucom_lock, LK_EXCLUSIVE);
+	if (tp != NULL) {
+		lwkt_gettoken(&tp->t_token);
 		ucom_close_refs++;
-		lockmgr(&ucom_lock, LK_RELEASE);
-
-		/*
-		tty_lock(tp);
-		*/
-
-	  	ucom_close(sc);	/* close, if any */
-
-		/*tty_rel_gone(tp);
-		 */
 
 		UCOM_MTX_LOCK(sc);
+		if (tp->t_state & TS_ISOPEN) {
+			kprintf("device still open, forcing close\n");
+			(*linesw[tp->t_line].l_close)(tp, 0);
+			ttyclose(tp);
+		}
+		ucom_close(sc);	/* close, if any */
+
 		/*
 		 * make sure that read and write transfers are stopped
 		 */
@@ -554,7 +583,13 @@ ucom_detach_tty(struct ucom_super_softc *ssc, struct ucom_softc *sc)
 			(sc->sc_callback->ucom_stop_write) (sc);
 		}
 		UCOM_MTX_UNLOCK(sc);
+		lwkt_reltoken(&tp->t_token);
+	} else {
+		DPRINTF("no tty\n");
 	}
+
+	dev_ops_remove_minor(&ucom_ops,ssc->sc_unit);
+
 	ucom_unref(ssc);
 }
 
@@ -571,7 +606,7 @@ ucom_set_pnpinfo_usb(struct ucom_super_softc *ssc, device_t dev)
 	/* Store the PNP info in the first interface for the device */
 	uaa = device_get_ivars(dev);
 	iface_index = uaa->info.bIfaceIndex;
-    
+
 	if (usbd_set_pnpinfo(uaa->device, iface_index, buf) != 0)
 		device_printf(dev, "Could not set PNP info\n");
 
@@ -750,18 +785,27 @@ ucom_dev_open(struct dev_open_args *ap)
 	cdev_t dev = ap->a_head.a_dev;
 	struct ucom_softc *sc = (struct ucom_softc *)dev->si_drv1;
 	int error;
+	int mynor;
+
+	error = 0;
+	mynor = minor(dev);
 
 	UCOM_MTX_LOCK(sc);
 	error = ucom_open(sc);
 	UCOM_MTX_UNLOCK(sc);
 
-	return error;	
+	return error;
 }
 
 static int
 ucom_open(struct ucom_softc *sc)
 {
 	int error;
+	struct tty *tp;
+
+	int mynor;
+
+	mynor = minor(sc->sc_cdev);
 
 	if (sc->sc_flag & UCOM_FLAG_GONE) {
 		return (ENXIO);
@@ -784,38 +828,77 @@ ucom_open(struct ucom_softc *sc)
 	}
 	sc->sc_flag |= UCOM_FLAG_HL_READY;
 
-	/* Disable transfers */
-	sc->sc_flag &= ~UCOM_FLAG_GP_DATA;
+	tp = sc->sc_tty;
+	lwkt_gettoken(&tp->t_token);
 
-	sc->sc_lsr = 0;
-	sc->sc_msr = 0;
-	sc->sc_mcr = 0;
+	if (!ISSET(tp->t_state, TS_ISOPEN)) {
+		struct termios t;
 
-	/* reset programmed line state */
-	sc->sc_pls_curr = 0;
-	sc->sc_pls_set = 0;
-	sc->sc_pls_clr = 0;
+		tp->t_dev = reference_dev(sc->sc_cdev);
 
-	/* reset jitter buffer */
-	sc->sc_jitterbuf_in = 0;
-	sc->sc_jitterbuf_out = 0;
+		t = mynor & CALLOUT_MASK ? sc->sc_it_out : sc->sc_it_in;
 
-	ucom_queue_command(sc, ucom_cfg_open, NULL,
-	    &sc->sc_open_task[0].hdr,
-	    &sc->sc_open_task[1].hdr);
+		tp->t_ospeed = 0;
+		ucom_param(tp, &t);
+		tp->t_iflag = TTYDEF_IFLAG;
+		tp->t_oflag = TTYDEF_OFLAG;
+		tp->t_lflag = TTYDEF_LFLAG;
+		ttychars(tp);
+		ttsetwater(tp);
 
-	/* Queue transfer enable command last */
-	ucom_queue_command(sc, ucom_cfg_start_transfers, NULL,
-	    &sc->sc_start_task[0].hdr, 
-	    &sc->sc_start_task[1].hdr);
+		/* Disable transfers */
+		sc->sc_flag &= ~UCOM_FLAG_GP_DATA;
 
-	ucom_modem(sc->sc_tty, SER_DTR | SER_RTS, 0);
+		sc->sc_lsr = 0;
+		sc->sc_msr = 0;
+		sc->sc_mcr = 0;
 
-	ucom_ring(sc, 0);
+		/* reset programmed line state */
+		sc->sc_pls_curr = 0;
+		sc->sc_pls_set = 0;
+		sc->sc_pls_clr = 0;
 
-	ucom_break(sc, 0);
+		/* reset jitter buffer */
+		sc->sc_jitterbuf_in = 0;
+		sc->sc_jitterbuf_out = 0;
 
-	ucom_status_change(sc);
+		ucom_queue_command(sc, ucom_cfg_open, NULL,
+				&sc->sc_open_task[0].hdr,
+				&sc->sc_open_task[1].hdr);
+
+		/* Queue transfer enable command last */
+		ucom_queue_command(sc, ucom_cfg_start_transfers, NULL,
+				&sc->sc_start_task[0].hdr, 
+				&sc->sc_start_task[1].hdr);
+
+		ucom_modem(sc->sc_tty, SER_DTR | SER_RTS, 0);
+
+		ucom_ring(sc, 0);
+
+		ucom_break(sc, 0);
+
+		ucom_status_change(sc);
+
+		if (ISSET(sc->sc_msr, SER_DCD)) {
+			(*linesw[tp->t_line].l_modem)(tp, 1);
+		}
+	}
+
+	error = ttyopen(sc->sc_cdev, tp);
+	if (error) {
+		lwkt_reltoken(&tp->t_token);
+		return (error);
+	}
+
+	error = (*linesw[tp->t_line].l_open)(sc->sc_cdev, tp);
+	if (error) {
+		lwkt_reltoken(&tp->t_token);
+		return (error);
+	}
+
+	disc_optim(tp, &tp->t_termios, sc);
+
+	lwkt_reltoken(&tp->t_token);
 
 	return (0);
 }
@@ -855,9 +938,7 @@ ucom_dev_close(struct dev_close_args *ap)
 static int
 ucom_close(struct ucom_softc *sc)
 {
-#ifdef USB_DEBUG
 	struct tty *tp = sc->sc_tty;
-#endif
 	int error = 0;
 
 	DPRINTF("tp=%p\n", tp);
@@ -865,6 +946,9 @@ ucom_close(struct ucom_softc *sc)
 	if (!(sc->sc_flag & UCOM_FLAG_HL_READY)) {
 		DPRINTF("tp=%p already closed\n", tp);
 		return (error);
+	}
+	if (!ISSET(tp->t_state, TS_ISOPEN)) {
+		return(error);
 	}
 	ucom_shutdown(sc);
 
@@ -877,6 +961,18 @@ ucom_close(struct ucom_softc *sc)
 	if (sc->sc_callback->ucom_stop_read) {
 		(sc->sc_callback->ucom_stop_read) (sc);
 	}
+
+	lwkt_gettoken(&tp->t_token);
+	(*linesw[tp->t_line].l_close)(tp, 0); /* XXX: flags */
+	disc_optim(tp, &tp->t_termios, sc);
+	ttyclose(tp);
+
+	if (tp->t_dev) {
+		release_dev(tp->t_dev);
+		tp->t_dev = NULL;
+	}
+	/* XXX: Detach wakeup */
+	lwkt_reltoken(&tp->t_token);
 
 	return (error);
 }
@@ -933,57 +1029,56 @@ static int
 ucom_dev_read(struct dev_read_args *ap)
 {
 	cdev_t dev = ap->a_head.a_dev;
-        struct ucom_softc *sc;
-        struct tty *tp;
-        int error;
+	struct ucom_softc *sc;
+	struct tty *tp;
+	int error;
 
-        sc = devclass_get_softc(ucom_devclass, minor(dev));
-        lwkt_gettoken(&tty_token);
-        tp = sc->sc_tty;
+	sc = NULL;
 
-        DPRINTF("ucomread: tp = %p, flag = 0x%x\n", tp, ap->a_ioflag);
+	tp = dev->si_tty;
+	lwkt_gettoken(&tp->t_token);
+	KKASSERT(tp!=NULL);
+	sc = tp->t_sc;
+	KKASSERT(sc!=NULL);
 
-#if 0 /* XXXDF */
-        if (sc->sc_dying) {
-                lwkt_reltoken(&tty_token);
-                return (EIO);
-        }
-#endif
-        error = (*linesw[tp->t_line].l_read)(tp, ap->a_uio, ap->a_ioflag);
+	DPRINTF("tp = %p, flag = 0x%x\n", tp, ap->a_ioflag);
 
-        DPRINTF("ucomread: error = %d\n", error);
+	/* must not be locked in case it blocks */
+	/*UCOM_MTX_LOCK(sc);*/
+	error = (*linesw[tp->t_line].l_read)(tp, ap->a_uio, ap->a_ioflag);
+	/*UCOM_MTX_UNLOCK(sc);*/
 
-        lwkt_reltoken(&tty_token);
-        return (error);
+	lwkt_reltoken(&tp->t_token);
+	DPRINTF("error = %d\n", error);
+
+	return (error);
 }
 
 static int
 ucom_dev_write(struct dev_write_args *ap)
 {
-        cdev_t dev = ap->a_head.a_dev;
-        struct ucom_softc *sc;
-        struct tty *tp;
-        int error;
+	cdev_t dev = ap->a_head.a_dev;
+	struct ucom_softc *sc;
+	struct tty *tp;
+	int error;
 
-        sc = devclass_get_softc(ucom_devclass, minor(dev));
-        lwkt_gettoken(&tty_token);
-        tp = sc->sc_tty;
+	tp = dev->si_tty;
+	lwkt_gettoken(&tp->t_token);
+	KKASSERT(tp!=NULL);
+	sc = tp->t_sc;
+	KKASSERT(sc!=NULL);
 
-        DPRINTF("ucomwrite: tp = %p, flag = 0x%x\n", tp, ap->a_ioflag);
+	DPRINTF("tp = %p, flag = 0x%x\n", tp, ap->a_ioflag);
 
-#if 0 /* XXXDF */
-        if (sc->sc_dying) {
-                lwkt_reltoken(&tty_token);
-                return (EIO);
-        }
-#endif
+	/* must not be locked in case it blocks */
+	/*UCOM_MTX_LOCK(sc);*/
+	error = (*linesw[tp->t_line].l_write)(tp, ap->a_uio, ap->a_ioflag);
+	/*UCOM_MTX_UNLOCK(sc);*/
 
-        error = (*linesw[tp->t_line].l_write)(tp, ap->a_uio, ap->a_ioflag);
+	lwkt_reltoken(&tp->t_token);
+	DPRINTF("ucomwrite: error = %d\n", error);
 
-        DPRINTF("ucomwrite: error = %d\n", error);
-
-        lwkt_reltoken(&tty_token);
-        return (error);
+	return (error);
 }
 
 static int
@@ -994,41 +1089,91 @@ ucom_dev_ioctl(struct dev_ioctl_args *ap)
 	u_long cmd = ap->a_cmd;
 	caddr_t data = ap->a_data;
 	struct tty *tp = sc->sc_tty;
+	int d;
 	int error;
+	int mynor;
 
 	UCOM_MTX_LOCK(sc);
-	lwkt_gettoken(&tty_token);
+	lwkt_gettoken(&tp->t_token);
+
+	mynor = minor(dev);
 
 	if (!(sc->sc_flag & UCOM_FLAG_HL_READY)) {
-		lwkt_reltoken(&tty_token);
+		lwkt_reltoken(&tp->t_token);
+		UCOM_MTX_UNLOCK(sc);
 		return (EIO);
 	}
 	DPRINTF("cmd = 0x%08lx\n", cmd);
+	if (mynor & CONTROL_MASK) {
+		struct termios *ct;
+
+		switch (mynor & CONTROL_MASK) {
+		case CONTROL_INIT_STATE:
+			ct = mynor & CALLOUT_MASK ? &sc->sc_it_out : &sc->sc_it_in;
+			break;
+		case CONTROL_LOCK_STATE:
+			ct = mynor & CALLOUT_MASK ? &sc->sc_lt_out : &sc->sc_lt_in;
+			break;
+		default:
+			lwkt_reltoken(&tp->t_token);
+			UCOM_MTX_UNLOCK(sc);
+			return (ENODEV);        /* /dev/nodev */
+		}
+		switch (ap->a_cmd) {
+		case TIOCSETA:
+			error = priv_check_cred(ap->a_cred, PRIV_ROOT, 0);
+			if (error != 0) {
+				lwkt_reltoken(&tp->t_token);
+				UCOM_MTX_UNLOCK(sc);
+				return (error);
+			}
+			*ct = *(struct termios *)data;
+			lwkt_reltoken(&tp->t_token);
+			UCOM_MTX_UNLOCK(sc);
+			return (0);
+		case TIOCGETA:
+			*(struct termios *)data = *ct;
+			lwkt_reltoken(&tp->t_token);
+			UCOM_MTX_UNLOCK(sc);
+			return (0);
+		case TIOCGETD:
+			*(int *)data = TTYDISC;
+			lwkt_reltoken(&tp->t_token);
+			UCOM_MTX_UNLOCK(sc);
+			return (0);
+		case TIOCGWINSZ:
+			bzero(data, sizeof(struct winsize));
+			lwkt_reltoken(&tp->t_token);
+			UCOM_MTX_UNLOCK(sc);
+			return (0);
+		default:
+			lwkt_reltoken(&tp->t_token);
+			UCOM_MTX_UNLOCK(sc);
+			return (ENOTTY);
+		}
+	}
 
 	error = (*linesw[tp->t_line].l_ioctl)(tp, ap->a_cmd, ap->a_data,
-                                              ap->a_fflag, ap->a_cred);
+					      ap->a_fflag, ap->a_cred);
 
 	if (error != ENOIOCTL) {
-                DPRINTF("ucomioctl: l_ioctl: error = %d\n", error);
-                lwkt_reltoken(&tty_token);
+		DPRINTF("ucomioctl: l_ioctl: error = %d\n", error);
+		lwkt_reltoken(&tp->t_token);
 		UCOM_MTX_UNLOCK(sc);
-                return (error);
-        }
-
-        crit_enter();
+		return (error);
+	}
 
 	error = ttioctl(tp, ap->a_cmd, ap->a_data, ap->a_fflag);
-        /*disc_optim(tp, &tp->t_termios, sc); */
-        if (error != ENOIOCTL) {
-                crit_exit();
-                DPRINTF("ucomioctl: ttioctl: error = %d\n", error);
-
-                lwkt_reltoken(&tty_token);
+	disc_optim(tp, &tp->t_termios, sc);
+	if (error != ENOIOCTL) {
+		DPRINTF("ucomioctl: ttioctl: error = %d\n", error);
+		lwkt_reltoken(&tp->t_token);
 		UCOM_MTX_UNLOCK(sc);
 
-                return (error);
-        }
+		return (error);
+	}
 
+	error = 0;
 
 	switch (cmd) {
 #if 0 /* XXXDF */
@@ -1049,38 +1194,115 @@ ucom_dev_ioctl(struct dev_ioctl_args *ap)
 		ucom_break(sc, 0);
 		error = 0;
 		break;
+	case TIOCSDTR:
+		ucom_dtr(sc, 1);
+		break;
+	case TIOCCDTR:
+		ucom_dtr(sc, 0);
+		break;
+	case TIOCMSET:
+		d = *(int *)ap->a_data;
+		DPRINTF("ucomioctl: TIOCMSET, 0x%x\n", d);
+		ucom_modem(tp, ucom_fromtio(d), 0);
+		break;
+	case TIOCMGET:
+		d = ucom_modem(tp, 0, 0);
+		DPRINTF("ucomioctl: TIOCMGET, 0x%x\n", d);
+		*(int *)ap->a_data = ucom_totio(d);
+		ucom_status_change(sc);
+		break;
+	case TIOCMBIS:
+		d = *(int *)ap->a_data;
+		ucom_modem(tp, ucom_fromtio(d), 0);
+		break;
+	case TIOCMBIC:
+		d = *(int *)ap->a_data;
+		ucom_modem(tp, 0, ucom_fromtio(d));
+		break;
 	default:
 		if (sc->sc_callback->ucom_ioctl) {
 			error = (sc->sc_callback->ucom_ioctl)
 			    (sc, cmd, data, 0, curthread);
 			if (error>=0) {
-				crit_exit();
-
-				lwkt_reltoken(&tty_token);
+				lwkt_reltoken(&tp->t_token);
 				UCOM_MTX_UNLOCK(sc);
 
-				return(error);	
+				return(error);
 			}
 		} else {
 			error = ENOIOCTL;
 		}
+		if (error == ENOIOCTL)
+			error = pps_ioctl(cmd, data, &sc->sc_pps);
 		break;
 	}
-	crit_exit();
-
-	lwkt_reltoken(&tty_token);
+	lwkt_reltoken(&tp->t_token);
 	UCOM_MTX_UNLOCK(sc);
 
 	return (error);
 }
 
 static int
+ucom_totio(int bits)
+{
+	int rbits = 0;
+
+	SET(bits, TIOCM_LE);
+
+	if (ISSET(bits, SER_DTR)) {
+		SET(rbits, TIOCM_DTR);
+	}
+	if (ISSET(bits, SER_RTS)) {
+		SET(rbits, TIOCM_RTS);
+	}
+	if (ISSET(bits, SER_CTS)) {
+		SET(rbits, TIOCM_CTS);
+	}
+	if (ISSET(bits, SER_DCD)) {
+		SET(rbits, TIOCM_CD);
+	}
+	if (ISSET(bits, SER_DSR)) {
+		SET(rbits, TIOCM_DSR);
+	}
+	if (ISSET(bits, SER_RI)) {
+		SET(rbits, TIOCM_RI);
+	}
+
+	return (rbits);
+}
+
+static int
+ucom_fromtio(int bits)
+{
+	int rbits = 0;
+
+	if (ISSET(bits, TIOCM_DTR)) {
+		SET(rbits, SER_DTR);
+	}
+	if (ISSET(bits, TIOCM_RTS)) {
+		SET(rbits, SER_RTS);
+	}
+	if (ISSET(bits, TIOCM_CTS)) {
+		SET(rbits, SER_CTS);
+	}
+	if (ISSET(bits, TIOCM_CD)) {
+		SET(rbits, SER_DCD);
+	}
+	if (ISSET(bits, TIOCM_DSR)) {
+		SET(rbits, SER_DSR);
+	}
+	if (ISSET(bits, TIOCM_RI)) {
+		SET(rbits, SER_RI);
+	}
+
+	return (rbits);
+}
+
+static int
 ucom_modem(struct tty *tp, int sigon, int sigoff)
 {
-	struct ucom_softc *sc;
+	struct ucom_softc *sc = (struct ucom_softc *)tp->t_sc;
 	uint8_t onoff;
-
-        sc = devclass_get_softc(ucom_devclass, minor(tp->t_dev));
 
 	UCOM_MTX_ASSERT(sc, MA_OWNED);
 
@@ -1274,7 +1496,7 @@ ucom_cfg_status_change(struct usb_proc_msg *_task)
 	struct tty *tp;
 	uint8_t new_msr;
 	uint8_t new_lsr;
-	uint8_t onoff;
+	uint8_t msr_delta;
 	uint8_t lsr_delta;
 
 	tp = sc->sc_tty;
@@ -1298,26 +1520,54 @@ ucom_cfg_status_change(struct usb_proc_msg *_task)
 		/* TTY device closed */
 		return;
 	}
-	onoff = ((sc->sc_msr ^ new_msr) & SER_DCD);
+	msr_delta = (sc->sc_msr ^ new_msr);
 	lsr_delta = (sc->sc_lsr ^ new_lsr);
 
 	sc->sc_msr = new_msr;
 	sc->sc_lsr = new_lsr;
 
-	if (onoff) {
+#if 0	/* missing pps_capture */
+	/*
+	 * Time pulse counting support. Note that both CTS and DCD are
+	 * active-low signals. The status bit is high to indicate that
+	 * the signal on the line is low, which corresponds to a PPS
+	 * clear event.
+	 */
+	switch(ucom_pps_mode) {
+	case 1:
+		if ((sc->sc_pps.ppsparam.mode & PPS_CAPTUREBOTH) &&
+		    (msr_delta & SER_CTS)) {
+			pps_capture(&sc->sc_pps);
+			pps_event(&sc->sc_pps, (sc->sc_msr & SER_CTS) ?
+			    PPS_CAPTURECLEAR : PPS_CAPTUREASSERT);
+		}
+		break;
+	case 2:
+		if ((sc->sc_pps.ppsparam.mode & PPS_CAPTUREBOTH) &&
+		    (msr_delta & SER_DCD)) {
+			pps_capture(&sc->sc_pps);
+			pps_event(&sc->sc_pps, (sc->sc_msr & SER_DCD) ?
+			    PPS_CAPTURECLEAR : PPS_CAPTUREASSERT);
+		}
+		break;
+	default:
+		break;
+	}
+#endif
 
-		onoff = (sc->sc_msr & SER_DCD) ? 1 : 0;
+	if (msr_delta & SER_DCD) {
+
+		int onoff = (sc->sc_msr & SER_DCD) ? 1 : 0;
 
 		DPRINTF("DCD changed to %d\n", onoff);
 
-		/*
-		ttydisc_modem(tp, onoff);
-		*/
+		(*linesw[tp->t_line].l_modem)(tp, onoff);
 	}
 
 	if ((lsr_delta & ULSR_BI) && (sc->sc_lsr & ULSR_BI)) {
 
 		DPRINTF("BREAK detected\n");
+		(*linesw[tp->t_line].l_rint)(0, tp);
 
 		/*
 		ttydisc_rint(tp, 0, TRE_BREAK);
@@ -1328,6 +1578,7 @@ ucom_cfg_status_change(struct usb_proc_msg *_task)
 	if ((lsr_delta & ULSR_FE) && (sc->sc_lsr & ULSR_FE)) {
 
 		DPRINTF("Frame error detected\n");
+		(*linesw[tp->t_line].l_rint)(0, tp);
 
 		/*
 		ttydisc_rint(tp, 0, TRE_FRAMING);
@@ -1338,7 +1589,7 @@ ucom_cfg_status_change(struct usb_proc_msg *_task)
 	if ((lsr_delta & ULSR_PE) && (sc->sc_lsr & ULSR_PE)) {
 
 		DPRINTF("Parity error detected\n");
-
+		(*linesw[tp->t_line].l_rint)(0, tp);
 		/*
 		ttydisc_rint(tp, 0, TRE_PARITY);
 		ttydisc_rint_done(tp);
@@ -1387,13 +1638,11 @@ ucom_cfg_param(struct usb_proc_msg *_task)
 static int
 ucom_param(struct tty *tp, struct termios *t)
 {
-	struct ucom_softc *sc;
+	struct ucom_softc *sc = (struct ucom_softc *)tp->t_sc;
 	uint8_t opened;
 	int error;
 
-	sc = devclass_get_softc(ucom_devclass, minor(tp->t_dev));
-
-	lwkt_gettoken(&tty_token);
+	lwkt_gettoken(&tp->t_token);
 	UCOM_MTX_ASSERT(sc, MA_OWNED);
 
 	opened = 0;
@@ -1459,51 +1708,147 @@ done:
 			ucom_close(sc);
 		}
 	}
+	lwkt_reltoken(&tp->t_token);
 
-	lwkt_reltoken(&tty_token);	
 	return (error);
 }
 
 static void
 ucom_start(struct tty *tp)
 {
-	struct ucom_softc *sc;
+	struct ucom_softc *sc = (struct ucom_softc *)tp->t_sc;
+	int didlock;
 
-	sc = devclass_get_softc(ucom_devclass, minor(tp->t_dev));
-
-	UCOM_MTX_ASSERT(sc, MA_OWNED);
+	/* may be called locked or unlocked */
+	if (lockowned(sc->sc_lock)) {
+		didlock = 0;
+	} else {
+		UCOM_MTX_LOCK(sc);
+		didlock = 1;
+	}
+	/* UCOM_MTX_ASSERT(sc, MA_OWNED); */
 
 	DPRINTF("sc = %p\n", sc);
 
 	if (!(sc->sc_flag & UCOM_FLAG_HL_READY)) {
 		/* The higher layer is not ready */
+		if (didlock)
+			UCOM_MTX_UNLOCK(sc);
 		return;
 	}
+
+	lwkt_gettoken(&tp->t_token);
+
+	if (tp->t_state & TS_TBLOCK) {
+		if (ISSET(sc->sc_mcr, SER_RTS) &&
+		    ISSET(sc->sc_flag, UCOM_FLAG_RTS_IFLOW)) {
+			DPRINTF("ucom_start: clear RTS\n");
+			(void)ucom_modem(tp, 0, SER_RTS);
+		}
+	} else {
+		if (!ISSET(sc->sc_mcr, SER_RTS) &&
+		    tp->t_rawq.c_cc <= tp->t_ilowat &&
+		    ISSET(sc->sc_flag, UCOM_FLAG_RTS_IFLOW)) {
+			DPRINTF("ucom_start: set RTS\n");
+			(void)ucom_modem(tp, SER_RTS, 0);
+		}
+	}
+
+	if (ISSET(tp->t_state, TS_BUSY | TS_TIMEOUT | TS_TTSTOP)) {
+		ttwwakeup(tp);
+		DPRINTF("ucom_start: stopped\n");
+		goto out;
+	}
+
+	if (tp->t_outq.c_cc <= tp->t_olowat) {
+		if (ISSET(tp->t_state, TS_SO_OLOWAT)) {
+			CLR(tp->t_state, TS_SO_OLOWAT);
+			wakeup(TSA_OLOWAT(tp));
+		}
+		KNOTE(&tp->t_wkq.ki_note, 0);
+		if (tp->t_outq.c_cc == 0) {
+			if (ISSET(tp->t_state, TS_BUSY | TS_SO_OCOMPLETE) ==
+					TS_SO_OCOMPLETE && tp->t_outq.c_cc == 0) {
+				CLR(tp->t_state, TS_SO_OCOMPLETE);
+				wakeup(TSA_OCOMPLETE(tp));
+			}
+			goto out;
+		}
+	}
+
+	DPRINTF("about to start write?\n");
 	ucom_start_transfers(sc);
+
+	ttwwakeup(tp);
+
+out:
+	lwkt_reltoken(&tp->t_token);
+	if (didlock)
+		UCOM_MTX_UNLOCK(sc);
 }
 
 static void
-ucom_stop(struct tty *tp, int x)
+ucom_stop(struct tty *tp, int flag)
 {
-	return;
+	struct ucom_softc *sc = (struct ucom_softc *)tp->t_sc;
+
+	DPRINTF("sc = %p, x = 0x%x\n", sc, flag);
+
+	lwkt_gettoken(&tp->t_token);
+	if (flag & FREAD) {
+		/*   
+		 * This is just supposed to flush pending receive data,
+		 * not stop the reception of data entirely!
+		 */
+		DPRINTF("read\n");
+		if (sc->sc_callback->ucom_stop_read) {
+			(sc->sc_callback->ucom_stop_read) (sc);
+		}
+		if (sc->sc_callback->ucom_start_read) {
+			(sc->sc_callback->ucom_start_read) (sc);
+		}
+#if 0
+		ucomstopread(sc);
+		ucomstartread(sc);
+#endif
+	}
+
+	if (flag & FWRITE) {
+		DPRINTF("write\n");
+		if (ISSET(tp->t_state, TS_BUSY)) {
+			/* XXX do what? */
+			if (!ISSET(tp->t_state, TS_TTSTOP))
+				SET(tp->t_state, TS_FLUSH);
+		}
+	}
+
+	DPRINTF("done\n");
+	lwkt_reltoken(&tp->t_token);
 }
 
 /*------------------------------------------------------------------------*
  *	ucom_get_data
+ * Input values:
+ * len: maximum length of data to get
+ * 
+ * Get data from the TTY layer
  *
  * Return values:
  * 0: No data is available.
  * Else: Data is available.
  *------------------------------------------------------------------------*/
+
+/* Copy data from the tty layer to usb */
 uint8_t
 ucom_get_data(struct ucom_softc *sc, struct usb_page_cache *pc,
     uint32_t offset, uint32_t len, uint32_t *actlen)
 {
-#if 0 /* XXX */
 	struct usb_page_search res;
 	struct tty *tp = sc->sc_tty;
 	uint32_t cnt;
 	uint32_t offset_orig;
+
+	DPRINTF("\n");
 
 	UCOM_MTX_ASSERT(sc, MA_OWNED);
 
@@ -1544,19 +1889,37 @@ ucom_get_data(struct ucom_softc *sc, struct usb_page_cache *pc,
 		actlen[0] = 0;
 		return (0);		/* multiport device polling */
 	}
+
 	offset_orig = offset;
 
+	lwkt_gettoken(&tp->t_token);
 	while (len != 0) {
-
 		usbd_get_page(pc, offset, &res);
 
+		/* Buffer bigger than max requested data */
 		if (res.length > len) {
 			res.length = len;
 		}
 		/* copy data directly into USB buffer */
-		/*
-		cnt = ttydisc_getc(tp, res.buffer, res.length);
+		SET(tp->t_state, TS_BUSY);
+		cnt = clist_qtob(&tp->t_outq, res.buffer, len);
+		if (cnt == 0) {
+			DPRINTF("ucom_get_data: cnt == 0\n");
+			CLR(tp->t_state, TS_BUSY);
+			break;
+		}
+
+		CLR(tp->t_state, TS_BUSY);
+
+		/* XXX mp: This breaks avrdude,
+                           does the flush need to happen
+                           elsewhere?
+		if (ISSET(tp->t_state, TS_FLUSH))
+			CLR(tp->t_state, TS_FLUSH);
+		else
+			ndflush(&tp->t_outq,cnt);
 		*/
+
 		offset += cnt;
 		len -= cnt;
 
@@ -1565,6 +1928,7 @@ ucom_get_data(struct ucom_softc *sc, struct usb_page_cache *pc,
 			break;
 		}
 	}
+	lwkt_reltoken(&tp->t_token);
 
 	actlen[0] = offset - offset_orig;
 
@@ -1573,21 +1937,27 @@ ucom_get_data(struct ucom_softc *sc, struct usb_page_cache *pc,
 	if (actlen[0] == 0) {
 		return (0);
 	}
-#endif
 	return (1);
 }
+
+/*
+ * Write data to the tty layer
+ */
 
 void
 ucom_put_data(struct ucom_softc *sc, struct usb_page_cache *pc,
     uint32_t offset, uint32_t len)
 {
-#if 0 /* XXX */
 	struct usb_page_search res;
 	struct tty *tp = sc->sc_tty;
 	char *buf;
 	uint32_t cnt;
+	int lostcc;
+
+	DPRINTF("\n");
 
 	UCOM_MTX_ASSERT(sc, MA_OWNED);
+	lwkt_gettoken(&tp->t_token);
 
 	if (sc->sc_flag & UCOM_FLAG_CONSOLE) {
 		unsigned int temp;
@@ -1614,19 +1984,22 @@ ucom_put_data(struct ucom_softc *sc, struct usb_page_cache *pc,
 		ucom_cons_rx_high += temp;
 		ucom_cons_rx_high %= UCOM_CONS_BUFSIZE;
 
+		lwkt_reltoken(&tp->t_token);
 		return;
 	}
 
-	if (tty_gone(tp))
+	if (tty_gone(tp)) {
+		lwkt_reltoken(&tp->t_token);
 		return;			/* multiport device polling */
-
-	if (len == 0)
+	}
+	if (len == 0) {
+		lwkt_reltoken(&tp->t_token);
 		return;			/* no data */
+	}
 
 	/* set a flag to prevent recursation ? */
 
 	while (len > 0) {
-
 		usbd_get_page(pc, offset, &res);
 
 		if (res.length > len) {
@@ -1642,54 +2015,86 @@ ucom_put_data(struct ucom_softc *sc, struct usb_page_cache *pc,
 
 		/* first check if we can pass the buffer directly */
 
-		if (ttydisc_can_bypass(tp)) {
-
+		if (tp->t_state & TS_CAN_BYPASS_L_RINT) {
 			/* clear any jitter buffer */
 			sc->sc_jitterbuf_in = 0;
 			sc->sc_jitterbuf_out = 0;
 
+			if (tp->t_rawq.c_cc + cnt > tp->t_ihiwat
+			    && (sc->sc_flag & UCOM_FLAG_RTS_IFLOW
+				|| tp->t_iflag & IXOFF)
+			    && !(tp->t_state & TS_TBLOCK))
+			       ttyblock(tp);
+			lostcc = clist_btoq((char *)buf, cnt, &tp->t_rawq);
+			tp->t_rawcc += cnt;
+			if (sc->hotchar) {
+				while (cnt) {
+					if (*buf == sc->hotchar)
+						break;
+					--cnt;
+					++buf;
+				}
+				if (cnt) 
+					setsofttty();
+			}
+			ttwakeup(tp);
+			if (tp->t_state & TS_TTSTOP
+			    && (tp->t_iflag & IXANY
+				|| tp->t_cc[VSTART] == tp->t_cc[VSTOP])) {
+				tp->t_state &= ~TS_TTSTOP;
+				tp->t_lflag &= ~FLUSHO;
+				ucom_start(tp);
+			}
+			if (lostcc > 0)
+				kprintf("lost %d chars\n", lostcc);
+
+			/*
 			if (ttydisc_rint_bypass(tp, buf, cnt) != cnt) {
 				DPRINTF("tp=%p, data lost\n", tp);
 			}
+			*/
 			continue;
-		}
+		} else {
 		/* need to loop */
+			for (cnt = 0; cnt != res.length; cnt++) {
+				if (sc->sc_jitterbuf_in != sc->sc_jitterbuf_out ||
+				    (*linesw[tp->t_line].l_rint)((unsigned char)buf[cnt], tp) == -1) {
+					uint16_t end;
+					uint16_t pos;
 
-		for (cnt = 0; cnt != res.length; cnt++) {
-			if (sc->sc_jitterbuf_in != sc->sc_jitterbuf_out ||
-			    ttydisc_rint(tp, buf[cnt], 0) == -1) {
-				uint16_t end;
-				uint16_t pos;
+					pos = sc->sc_jitterbuf_in;
+					end = sc->sc_jitterbuf_out +
+					    UCOM_JITTERBUF_SIZE - 1;
 
-				pos = sc->sc_jitterbuf_in;
-				end = sc->sc_jitterbuf_out +
-				    UCOM_JITTERBUF_SIZE - 1;
-				if (end >= UCOM_JITTERBUF_SIZE)
-					end -= UCOM_JITTERBUF_SIZE;
+					if (end >= UCOM_JITTERBUF_SIZE)
+						end -= UCOM_JITTERBUF_SIZE;
 
-				for (; cnt != res.length; cnt++) {
-					if (pos == end)
-						break;
-					sc->sc_jitterbuf[pos] = buf[cnt];
-					pos++;
-					if (pos >= UCOM_JITTERBUF_SIZE)
-						pos -= UCOM_JITTERBUF_SIZE;
+					for (; cnt != res.length; cnt++) {
+						if (pos == end)
+							break;
+						sc->sc_jitterbuf[pos] = buf[cnt];
+						pos++;
+						if (pos >= UCOM_JITTERBUF_SIZE)
+							pos -= UCOM_JITTERBUF_SIZE;
+					}
+
+					sc->sc_jitterbuf_in = pos;
+
+					/* set RTS in async fashion */
+					if (sc->sc_flag & UCOM_FLAG_RTS_IFLOW)
+						ucom_rts(sc, 1);
+
+					DPRINTF("tp=%p, lost %d "
+					    "chars\n", tp, res.length - cnt);
+					break;
 				}
-
-				sc->sc_jitterbuf_in = pos;
-
-				/* set RTS in async fashion */
-				if (sc->sc_flag & UCOM_FLAG_RTS_IFLOW)
-					ucom_rts(sc, 1);
-
-				DPRINTF("tp=%p, lost %d "
-				    "chars\n", tp, res.length - cnt);
-				break;
 			}
 		}
 	}
+	lwkt_reltoken(&tp->t_token);
+	/*
 	ttydisc_rint_done(tp);
-#endif
+	*/
 }
 
 #if 0 /* XXX */
@@ -1883,6 +2288,28 @@ ucom_unref(struct ucom_super_softc *ssc)
 		ucom_free_unit(ssc);
 
 	return (retval);
+}
+
+/*
+ * NOTE: Must be called with tp->t_token held.
+ */
+static void
+disc_optim(struct tty *tp, struct termios *t, struct ucom_softc *sc)
+{
+	ASSERT_LWKT_TOKEN_HELD(&tp->t_token);
+	if (!(t->c_iflag & (ICRNL | IGNCR | IMAXBEL | INLCR | ISTRIP | IXON))
+	    && (!(t->c_iflag & BRKINT) || (t->c_iflag & IGNBRK))
+	    && (!(t->c_iflag & PARMRK)
+		|| (t->c_iflag & (IGNPAR | IGNBRK)) == (IGNPAR | IGNBRK))
+	    && !(t->c_lflag & (ECHO | ICANON | IEXTEN | ISIG | PENDIN))
+	    && linesw[tp->t_line].l_rint == ttyinput) {
+		DPRINTF("disc_optim: bypass l_rint\n");
+		tp->t_state |= TS_CAN_BYPASS_L_RINT;
+	} else {
+		DPRINTF("disc_optim: can't bypass l_rint\n");
+		tp->t_state &= ~TS_CAN_BYPASS_L_RINT;
+	}
+	sc->hotchar = linesw[tp->t_line].l_hotchar;
 }
 
 #if defined(GDB)

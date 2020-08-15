@@ -1,4 +1,4 @@
-/* $FreeBSD$ */
+/* $FreeBSD: head/sys/dev/usb/usb_debug.c 267992 2014-06-28 03:56:17Z hselasky $ */
 /*-
  * Copyright (c) 2008 Hans Petter Selasky. All rights reserved.
  *
@@ -32,7 +32,6 @@
 #include <sys/bus.h>
 #include <sys/module.h>
 #include <sys/lock.h>
-#include <sys/mutex.h>
 #include <sys/condvar.h>
 #include <sys/sysctl.h>
 #include <sys/unistd.h>
@@ -162,7 +161,7 @@ usb_dump_queue(struct usb_endpoint *ep)
 	usb_stream_t x;
 
 	kprintf("usb_dump_queue: endpoint=%p xfer: ", ep);
-	for (x=0; x != USB_MAX_EP_STREAMS; x++) {
+	for (x = 0; x != USB_MAX_EP_STREAMS; x++) {
 		TAILQ_FOREACH(xfer, &ep->endpoint_q[x].head, wait_entry) {
 			kprintf(" %p", xfer);
 		}

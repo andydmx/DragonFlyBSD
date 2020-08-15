@@ -1,13 +1,13 @@
 /*
- * Copyright (c) 2004 The DragonFly Project.  All rights reserved.
- * 
+ * Copyright (c) 2004,2014,2019 The DragonFly Project.  All rights reserved.
+ *
  * This code is derived from software contributed to The DragonFly Project
  * by Matthew Dillon <dillon@backplane.com>
- * 
+ *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
  * are met:
- * 
+ *
  * 1. Redistributions of source code must retain the above copyright
  *    notice, this list of conditions and the following disclaimer.
  * 2. Redistributions in binary form must reproduce the above copyright
@@ -17,7 +17,7 @@
  * 3. Neither the name of The DragonFly Project nor the names of its
  *    contributors may be used to endorse or promote products derived
  *    from this software without specific, prior written permission.
- * 
+ *
  * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
  * ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
  * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
@@ -63,26 +63,10 @@
  * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
  * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
- *
- *	From: @(#)kern_clock.c	8.5 (Berkeley) 1/21/94
- * $FreeBSD: src/sys/kern/kern_timeout.c,v 1.59.2.1 2001/11/13 18:24:52 archie Exp $
  */
 /*
- * DRAGONFLY BGL STATUS
- *
- *	All the API functions should be MP safe.
- *
- *	The callback functions will be flagged as being MP safe if the
- *	timeout structure is initialized with callout_init_mp() instead of
- *	callout_init().
- *
- *	The helper threads cannot be made preempt-capable until after we
- *	clean up all the uses of splsoftclock() and related interlocks (which
- *	require the related functions to be MP safe as well).
- */
-/*
- * The callout mechanism is based on the work of Adam M. Costello and 
- * George Varghese, published in a technical report entitled "Redesigning
+ * The original callout mechanism was based on the work of Adam M. Costello
+ * and George Varghese, published in a technical report entitled "Redesigning
  * the BSD Callout and Timer Facilities" and modified slightly for inclusion
  * in FreeBSD by Justin T. Gibbs.  The original work on the data structures
  * used in this implementation was published by G. Varghese and T. Lauck in
@@ -90,50 +74,444 @@
  * the Efficient Implementation of a Timer Facility" in the Proceedings of
  * the 11th ACM Annual Symposium on Operating Systems Principles,
  * Austin, Texas Nov 1987.
- *
- * The per-cpu augmentation was done by Matthew Dillon.
  */
 
 #include <sys/param.h>
 #include <sys/systm.h>
+#include <sys/spinlock.h>
 #include <sys/callout.h>
 #include <sys/kernel.h>
+#include <sys/malloc.h>
 #include <sys/interrupt.h>
 #include <sys/thread.h>
+#include <sys/sysctl.h>
+#ifdef CALLOUT_TYPESTABLE
+#include <sys/typestable.h>
+#endif
+#include <vm/vm_extern.h>
+#include <machine/atomic.h>
 
+#include <sys/spinlock2.h>
 #include <sys/thread2.h>
 #include <sys/mplock2.h>
 
-#ifndef MAX_SOFTCLOCK_STEPS
-#define MAX_SOFTCLOCK_STEPS 100 /* Maximum allowed value of steps. */
-#endif
+TAILQ_HEAD(colist, _callout);
+struct softclock_pcpu;
+struct _callout_mag;
 
+/*
+ * DID_INIT	- Sanity check
+ * SYNC		- Synchronous waiter, request SYNCDONE and wakeup()
+ * CANCEL_RES	- Flags that a cancel/stop prevented a callback
+ * STOP_RES
+ * RESET	- Callout_reset request queued
+ * STOP		- Callout_stop request queued
+ * INPROG	- Softclock_handler thread processing in-progress on callout
+ * SET		- Callout is linked to queue (if INPROG not set)
+ * AUTOLOCK	- Lockmgr cancelable interlock
+ * MPSAFE	- Callout is MPSAFE
+ * CANCEL	- callout_cancel requested queued
+ * ACTIVE	- active/inactive tracking (see documentation).  This is
+ *		  *NOT* the same as whether a callout is queued or not.
+ */
+#define CALLOUT_DID_INIT	0x00000001	/* frontend */
+#define CALLOUT_UNUSED0002	0x00000002
+#define CALLOUT_UNUSED0004	0x00000004
+#define CALLOUT_CANCEL_RES	0x00000008	/* frontend */
+#define CALLOUT_STOP_RES	0x00000010	/* frontend */
+#define CALLOUT_RESET		0x00000020	/* backend */
+#define CALLOUT_STOP		0x00000040	/* backend */
+#define CALLOUT_INPROG		0x00000080	/* backend */
+#define CALLOUT_SET		0x00000100	/* backend */
+#define CALLOUT_AUTOLOCK	0x00000200	/* both */
+#define CALLOUT_MPSAFE		0x00000400	/* both */
+#define CALLOUT_CANCEL		0x00000800	/* backend */
+#define CALLOUT_ACTIVE		0x00001000	/* frontend */
+
+struct wheel {
+	struct spinlock spin;
+	struct colist	list;
+};
 
 struct softclock_pcpu {
-	struct callout_tailq *callwheel;
-	struct callout * volatile next;
-	struct callout *running;/* currently running callout */
-	int softticks;		/* softticks index */
-	int curticks;		/* per-cpu ticks counter */
-	int isrunning;
-	struct thread thread;
-
+	struct wheel	*callwheel;
+	struct _callout *running;
+	struct _callout * volatile next;
+#ifdef CALLOUT_TYPESTABLE
+	struct _callout *quick_obj;
+#endif
+	int		softticks;	/* softticks index */
+	int		curticks;	/* per-cpu ticks counter */
+	int		isrunning;
+	struct thread	thread;
 };
 
 typedef struct softclock_pcpu *softclock_pcpu_t;
 
-/*
- * TODO:
- *	allocate more timeout table slots when table overflows.
- */
-static MALLOC_DEFINE(M_CALLOUT, "callout", "callout structures");
-static int callwheelsize;
-static int callwheelmask;
-static struct softclock_pcpu softclock_pcpu_ary[MAXCPU];
+TAILQ_HEAD(maglist, _callout_mag);
+
+#if 0
+static int callout_debug = 0;
+SYSCTL_INT(_debug, OID_AUTO, callout_debug, CTLFLAG_RW,
+	   &callout_debug, 0, "");
+#endif
+
+#ifdef CALLOUT_TYPESTABLE
+static MALLOC_DEFINE(M_CALLOUT, "callouts", "softclock callouts");
+#endif
+
+static int cwheelsize;
+static int cwheelmask;
+static softclock_pcpu_t softclock_pcpu_ary[MAXCPU];
+#ifdef CALLOUT_TYPESTABLE
+static struct typestable_glob callout_tsg;
+#endif
 
 static void softclock_handler(void *arg);
 static void slotimer_callback(void *arg);
 
+#ifdef CALLOUT_TYPESTABLE
+/*
+ * typestable callback functions.  The init function pre-initializes
+ * the structure in order to allow for reuse without complete
+ * reinitialization (i.e. our spinlock).
+ *
+ * The test function allows us to reject an allocation attempt due
+ * to the object being reassociated out-of-band.
+ */
+static
+void
+_callout_typestable_init(void *obj)
+{
+	struct _callout *c = obj;
+
+	spin_init(&c->spin, "_callout");
+}
+
+/*
+ * Object may have been reassociated out-of-band.
+ *
+ * Return 1 on success with the spin-lock held, allowing reallocation.
+ * Return 0 on failure with no side effects, rejecting reallocation.
+ */
+static
+int
+_callout_typestable_test(void *obj)
+{
+	struct _callout *c = obj;
+
+	if (c->flags & (CALLOUT_SET | CALLOUT_INPROG))
+		return 0;
+	spin_lock(&c->spin);
+	if (c->flags & (CALLOUT_SET | CALLOUT_INPROG)) {
+		spin_unlock(&c->spin);
+		return 0;
+	} else {
+		return 1;
+	}
+}
+
+/*
+ * NOTE: sc might refer to a different cpu.
+ */
+static __inline
+void
+_callout_typestable_free(softclock_pcpu_t sc, void *obj, int tentitive)
+{
+	if (tentitive == 0) {
+		obj = atomic_swap_ptr((void *)&sc->quick_obj, obj);
+		if (obj == NULL)
+			return;
+	}
+	typestable_free(&callout_tsg, obj, tentitive);
+}
+#endif
+
+/*
+ * Post-processing helper for a callout executes any pending request.
+ * This routine handles post-processing from the softclock thread and
+ * also handles request processing from the API.
+ *
+ * This routine does not block in any way.
+ * Caller must hold c->spin.
+ *
+ * INPROG  - Callback is in-processing / in-progress.
+ *
+ * SET     - Assigned to queue or is in-processing.  If INPROG is set,
+ *	     however, the _callout is no longer in the queue.
+ *
+ * RESET   - New timeout was installed.
+ *
+ * STOP    - Stop requested.
+ *
+ * ACTIVE  - Set on callout_reset(), cleared by callout_stop()
+ *	     or callout_cancel().  Starts out cleared.
+ *
+ * NOTE: Flags can be adjusted without holding c->spin, so atomic ops
+ *	 must be used at all times.
+ *
+ * NOTE: The passed-in (sc) might refer to another cpu.
+ */
+static __inline
+int
+_callout_process_spinlocked(struct _callout *c, int fromsoftclock)
+{
+	struct wheel *wheel;
+	int res = -1;
+
+	/*
+	 * If a callback manipulates the callout-in-progress we do
+	 * a partial 'completion' of the operation so the operation
+	 * can be processed synchronously and tell the softclock_handler
+	 * to stop messing with it.
+	 */
+	if (fromsoftclock == 0 && curthread == &c->qsc->thread &&
+	    c->qsc->running == c) {
+		c->qsc->running = NULL;
+		atomic_clear_int(&c->flags, CALLOUT_SET |
+					    CALLOUT_INPROG);
+	}
+
+	/*
+	 * Based on source and state
+	 */
+	if (fromsoftclock) {
+		/*
+		 * From control thread, INPROG is set, handle pending
+		 * request and normal termination.
+		 */
+#ifdef CALLOUT_TYPESTABLE
+		KASSERT(c->verifier->toc == c,
+			("callout corrupt: c=%p %s/%d\n",
+			 c, c->ident, c->lineno));
+#else
+		KASSERT(&c->verifier->toc == c,
+			("callout corrupt: c=%p %s/%d\n",
+			 c, c->ident, c->lineno));
+#endif
+		if (c->flags & CALLOUT_CANCEL) {
+			/*
+			 * CANCEL overrides everything.
+			 *
+			 * If a RESET is pending it counts as canceling a
+			 * running timer.
+			 */
+			if (c->flags & CALLOUT_RESET)
+				atomic_set_int(&c->verifier->flags,
+					       CALLOUT_CANCEL_RES |
+					       CALLOUT_STOP_RES);
+			atomic_clear_int(&c->flags, CALLOUT_SET |
+						    CALLOUT_INPROG |
+						    CALLOUT_STOP |
+						    CALLOUT_CANCEL |
+						    CALLOUT_RESET);
+			if (c->waiters)
+				wakeup(c->verifier);
+			res = 0;
+		} else if (c->flags & CALLOUT_RESET) {
+			/*
+			 * RESET request pending, requeue appropriately.
+			 */
+			atomic_clear_int(&c->flags, CALLOUT_RESET |
+						    CALLOUT_INPROG);
+			atomic_set_int(&c->flags, CALLOUT_SET);
+			c->qsc = c->rsc;
+			c->qarg = c->rarg;
+			c->qfunc = c->rfunc;
+			c->qtick = c->rtick;
+
+			/*
+			 * Do not queue to current or past wheel or the
+			 * callout will be lost for ages.
+			 */
+			wheel = &c->qsc->callwheel[c->qtick & cwheelmask];
+			spin_lock(&wheel->spin);
+			while (c->qtick - c->qsc->softticks <= 0) {
+				c->qtick = c->qsc->softticks + 1;
+				spin_unlock(&wheel->spin);
+				wheel = &c->qsc->callwheel[c->qtick &
+							   cwheelmask];
+				spin_lock(&wheel->spin);
+			}
+			TAILQ_INSERT_TAIL(&wheel->list, c, entry);
+			spin_unlock(&wheel->spin);
+		} else {
+			/*
+			 * STOP request pending or normal termination.  Since
+			 * this is from our control thread the callout has
+			 * already been removed from the queue.
+			 */
+			atomic_clear_int(&c->flags, CALLOUT_SET |
+						    CALLOUT_INPROG |
+						    CALLOUT_STOP);
+			if (c->waiters)
+				wakeup(c->verifier);
+			res = 1;
+		}
+	} else if (c->flags & CALLOUT_SET) {
+		/*
+		 * Process request from an API function.  qtick and ACTIVE
+		 * are stable while we hold c->spin.  Checking INPROG requires
+		 * holding wheel->spin.
+		 *
+		 * If INPROG is set the control thread must handle the request
+		 * for us.
+		 */
+		softclock_pcpu_t sc;
+
+		sc = c->qsc;
+
+		wheel = &sc->callwheel[c->qtick & cwheelmask];
+		spin_lock(&wheel->spin);
+		if (c->flags & CALLOUT_INPROG) {
+			/*
+			 * API requests are deferred if a callback is in
+			 * progress and will be handled after the callback
+			 * returns.
+			 */
+		} else if (c->flags & CALLOUT_CANCEL) {
+			/*
+			 * CANCEL request overrides everything except INPROG
+			 * (for INPROG the CANCEL is handled upon completion).
+			 */
+			if (sc->next == c)
+				sc->next = TAILQ_NEXT(c, entry);
+			TAILQ_REMOVE(&wheel->list, c, entry);
+			atomic_set_int(&c->verifier->flags, CALLOUT_CANCEL_RES |
+							    CALLOUT_STOP_RES);
+			atomic_clear_int(&c->flags, CALLOUT_STOP |
+						    CALLOUT_SET |
+						    CALLOUT_CANCEL |
+						    CALLOUT_RESET);
+			if (c->waiters)
+				wakeup(c->verifier);
+			res = 0;
+		} else if (c->flags & CALLOUT_RESET) {
+			/*
+			 * RESET request pending, requeue appropriately.
+			 *
+			 * (ACTIVE is governed by c->spin so we do not have
+			 *  to clear it prior to releasing wheel->spin).
+			 */
+			if (sc->next == c)
+				sc->next = TAILQ_NEXT(c, entry);
+			TAILQ_REMOVE(&wheel->list, c, entry);
+			spin_unlock(&wheel->spin);
+
+			atomic_clear_int(&c->flags, CALLOUT_RESET);
+			/* remain ACTIVE */
+			sc = c->rsc;
+			c->qsc = sc;
+			c->qarg = c->rarg;
+			c->qfunc = c->rfunc;
+			c->qtick = c->rtick;
+
+			/*
+			 * Do not queue to current or past wheel or the
+			 * callout will be lost for ages.
+			 */
+			wheel = &sc->callwheel[c->qtick & cwheelmask];
+			spin_lock(&wheel->spin);
+			while (c->qtick - sc->softticks <= 0) {
+				c->qtick = sc->softticks + 1;
+				spin_unlock(&wheel->spin);
+				wheel = &sc->callwheel[c->qtick & cwheelmask];
+				spin_lock(&wheel->spin);
+			}
+			TAILQ_INSERT_TAIL(&wheel->list, c, entry);
+		} else if (c->flags & CALLOUT_STOP) {
+			/*
+			 * STOP request
+			 */
+			if (sc->next == c)
+				sc->next = TAILQ_NEXT(c, entry);
+			TAILQ_REMOVE(&wheel->list, c, entry);
+			atomic_set_int(&c->verifier->flags, CALLOUT_STOP_RES);
+			atomic_clear_int(&c->flags, CALLOUT_STOP |
+						    CALLOUT_SET);
+			if (c->waiters)
+				wakeup(c->verifier);
+			res = 1;
+		} else {
+			/*
+			 * No request pending (someone else processed the
+			 * request before we could)
+			 */
+			/* nop */
+		}
+		spin_unlock(&wheel->spin);
+	} else {
+		/*
+		 * Process request from API function.  callout is not
+		 * active so there's nothing for us to remove.
+		 */
+		KKASSERT((c->flags & CALLOUT_INPROG) == 0);
+		if (c->flags & CALLOUT_CANCEL) {
+			/*
+			 * CANCEL request (nothing to cancel)
+			 */
+			if (c->flags & CALLOUT_RESET) {
+				atomic_set_int(&c->verifier->flags,
+					       CALLOUT_CANCEL_RES |
+					       CALLOUT_STOP_RES);
+			}
+			atomic_clear_int(&c->flags, CALLOUT_STOP |
+						    CALLOUT_CANCEL |
+						    CALLOUT_RESET);
+			if (c->waiters)
+				wakeup(c->verifier);
+			res = 0;
+		} else if (c->flags & CALLOUT_RESET) {
+			/*
+			 * RESET request pending, queue appropriately.
+			 * Do not queue to currently-processing tick.
+			 */
+			softclock_pcpu_t sc;
+
+			sc = c->rsc;
+			atomic_clear_int(&c->flags, CALLOUT_RESET);
+			atomic_set_int(&c->flags, CALLOUT_SET);
+			c->qsc = sc;
+			c->qarg = c->rarg;
+			c->qfunc = c->rfunc;
+			c->qtick = c->rtick;
+
+			/*
+			 * Do not queue to current or past wheel or the
+			 * callout will be lost for ages.
+			 */
+			wheel = &sc->callwheel[c->qtick & cwheelmask];
+			spin_lock(&wheel->spin);
+			while (c->qtick - sc->softticks <= 0) {
+				c->qtick = sc->softticks + 1;
+				spin_unlock(&wheel->spin);
+				wheel = &sc->callwheel[c->qtick & cwheelmask];
+				spin_lock(&wheel->spin);
+			}
+			TAILQ_INSERT_TAIL(&wheel->list, c, entry);
+			spin_unlock(&wheel->spin);
+		} else if (c->flags & CALLOUT_STOP) {
+			/*
+			 * STOP request (nothing to stop)
+			 */
+			atomic_clear_int(&c->flags, CALLOUT_STOP);
+			if (c->waiters)
+				wakeup(c->verifier);
+			res = 1;
+		} else {
+			/*
+			 * No request pending (someone else processed the
+			 * request before we could)
+			 */
+			/* nop */
+		}
+	}
+	return res;
+}
+
+/*
+ * System init
+ */
 static void
 swi_softclock_setup(void *arg)
 {
@@ -149,23 +527,38 @@ swi_softclock_setup(void *arg)
 	 */
 	target = ncallout / ncpus + 16;
 
-	callwheelsize = 1;
-	while (callwheelsize < target)
-		callwheelsize <<= 1;
-	callwheelmask = callwheelsize - 1;
+	cwheelsize = 1;
+	while (cwheelsize < target)
+		cwheelsize <<= 1;
+	cwheelmask = cwheelsize - 1;
+
+#ifdef CALLOUT_TYPESTABLE
+	typestable_init_glob(&callout_tsg, M_CALLOUT,
+			     sizeof(struct _callout),
+			     _callout_typestable_test,
+			     _callout_typestable_init);
+#endif
 
 	/*
 	 * Initialize per-cpu data structures.
 	 */
 	for (cpu = 0; cpu < ncpus; ++cpu) {
 		softclock_pcpu_t sc;
+		int wheel_sz;
 
-		sc = &softclock_pcpu_ary[cpu];
+		sc = (void *)kmem_alloc3(&kernel_map, sizeof(*sc),
+					 VM_SUBSYS_GD, KM_CPU(cpu));
+		memset(sc, 0, sizeof(*sc));
+		softclock_pcpu_ary[cpu] = sc;
 
-		sc->callwheel = kmalloc(sizeof(*sc->callwheel) * callwheelsize,
-					M_CALLOUT, M_WAITOK|M_ZERO);
-		for (i = 0; i < callwheelsize; ++i)
-			TAILQ_INIT(&sc->callwheel[i]);
+		wheel_sz = sizeof(*sc->callwheel) * cwheelsize;
+		sc->callwheel = (void *)kmem_alloc3(&kernel_map, wheel_sz,
+						    VM_SUBSYS_GD, KM_CPU(cpu));
+		memset(sc->callwheel, 0, wheel_sz);
+		for (i = 0; i < cwheelsize; ++i) {
+			spin_init(&sc->callwheel[i].spin, "wheel");
+			TAILQ_INIT(&sc->callwheel[i].list);
+		}
 
 		/*
 		 * Mark the softclock handler as being an interrupt thread
@@ -175,8 +568,8 @@ swi_softclock_setup(void *arg)
 		 * Kernel code now assumes that callouts do not preempt
 		 * the cpu they were scheduled on.
 		 */
-		lwkt_create(softclock_handler, sc, NULL,
-			    &sc->thread, TDF_NOSTART | TDF_INTTHREAD,
+		lwkt_create(softclock_handler, sc, NULL, &sc->thread,
+			    TDF_NOSTART | TDF_INTTHREAD,
 			    cpu, "softclock %d", cpu);
 	}
 }
@@ -193,32 +586,36 @@ SYSINIT(softclock_setup, SI_BOOT2_SOFTCLOCK, SI_ORDER_SECOND,
  * It IS NOT NECESSARILY SYNCHRONIZED WITH 'ticks'!  sc->softticks is where
  * the callwheel is currently indexed.
  *
- * WARNING!  The MP lock is not necessarily held on call, nor can it be
- * safely obtained.
- *
  * sc->softticks is adjusted by either this routine or our helper thread
  * depending on whether the helper thread is running or not.
+ *
+ * sc->curticks and sc->softticks are adjusted using atomic ops in order
+ * to ensure that remote cpu callout installation does not race the thread.
  */
 void
 hardclock_softtick(globaldata_t gd)
 {
 	softclock_pcpu_t sc;
+	struct wheel *wheel;
 
-	sc = &softclock_pcpu_ary[gd->gd_cpuid];
-	++sc->curticks;
+	sc = softclock_pcpu_ary[gd->gd_cpuid];
+	atomic_add_int(&sc->curticks, 1);
 	if (sc->isrunning)
 		return;
 	if (sc->softticks == sc->curticks) {
 		/*
-		 * in sync, only wakeup the thread if there is something to
+		 * In sync, only wakeup the thread if there is something to
 		 * do.
 		 */
-		if (TAILQ_FIRST(&sc->callwheel[sc->softticks & callwheelmask]))
-		{
+		wheel = &sc->callwheel[sc->softticks & cwheelmask];
+		spin_lock(&wheel->spin);
+		if (TAILQ_FIRST(&wheel->list)) {
 			sc->isrunning = 1;
+			spin_unlock(&wheel->spin);
 			lwkt_schedule(&sc->thread);
 		} else {
-			++sc->softticks;
+			atomic_add_int(&sc->softticks, 1);
+			spin_unlock(&wheel->spin);
 		}
 	} else {
 		/*
@@ -232,9 +629,7 @@ hardclock_softtick(globaldata_t gd)
 
 /*
  * This procedure is the main loop of our per-cpu helper thread.  The
- * sc->isrunning flag prevents us from racing hardclock_softtick() and
- * a critical section is sufficient to interlock sc->curticks and protect
- * us from remote IPI's / list removal.
+ * sc->isrunning flag prevents us from racing hardclock_softtick().
  *
  * The thread starts with the MP lock released and not in a critical
  * section.  The loop itself is MP safe while individual callbacks
@@ -244,11 +639,9 @@ static void
 softclock_handler(void *arg)
 {
 	softclock_pcpu_t sc;
-	struct callout *c;
-	struct callout_tailq *bucket;
+	struct _callout *c;
+	struct wheel *wheel;
 	struct callout slotimer;
-	void (*c_func)(void *);
-	void *c_arg;
 	int mpsafe = 1;
 
 	/*
@@ -265,52 +658,115 @@ softclock_handler(void *arg)
 	/*lwkt_setpri_self(TDPRI_SOFT_NORM);*/
 
 	sc = arg;
-	crit_enter();
 loop:
 	while (sc->softticks != (int)(sc->curticks + 1)) {
-		bucket = &sc->callwheel[sc->softticks & callwheelmask];
+		wheel = &sc->callwheel[sc->softticks & cwheelmask];
 
-		for (c = TAILQ_FIRST(bucket); c; c = sc->next) {
-			if (c->c_time != sc->softticks) {
-				sc->next = TAILQ_NEXT(c, c_links.tqe);
+		spin_lock(&wheel->spin);
+		sc->next = TAILQ_FIRST(&wheel->list);
+		while ((c = sc->next) != NULL) {
+			int error;
+			int res;
+
+			/*
+			 * Match callouts for this tick.  The wheel spinlock
+			 * is sufficient to set INPROG.  Once set, other
+			 * threads can make only limited changes to (c)
+			 */
+			sc->next = TAILQ_NEXT(c, entry);
+			if (c->qtick != sc->softticks)
 				continue;
-			}
-			if (c->c_flags & CALLOUT_MPSAFE) {
+			TAILQ_REMOVE(&wheel->list, c, entry);
+			atomic_set_int(&c->flags, CALLOUT_INPROG);
+			sc->running = c;
+			spin_unlock(&wheel->spin);
+
+			/*
+			 * legacy mplock support
+			 */
+			if (c->flags & CALLOUT_MPSAFE) {
 				if (mpsafe == 0) {
 					mpsafe = 1;
 					rel_mplock();
 				}
 			} else {
-				/*
-				 * The request might be removed while we 
-				 * are waiting to get the MP lock.  If it
-				 * was removed sc->next will point to the
-				 * next valid request or NULL, loop up.
-				 */
 				if (mpsafe) {
 					mpsafe = 0;
-					sc->next = c;
 					get_mplock();
-					if (c != sc->next)
-						continue;
 				}
 			}
-			sc->next = TAILQ_NEXT(c, c_links.tqe);
-			TAILQ_REMOVE(bucket, c, c_links.tqe);
 
-			sc->running = c;
-			c_func = c->c_func;
-			c_arg = c->c_arg;
-			c->c_func = NULL;
-			KKASSERT(c->c_flags & CALLOUT_DID_INIT);
-			c->c_flags &= ~CALLOUT_PENDING;
-			crit_exit();
-			c_func(c_arg);
-			crit_enter();
-			sc->running = NULL;
-			/* NOTE: list may have changed */
+			/*
+			 * Execute function (protected by INPROG)
+			 */
+			if (c->flags & (CALLOUT_STOP | CALLOUT_CANCEL)) {
+				/*
+				 * Raced a stop or cancel request, do
+				 * not execute.  The processing code
+				 * thinks its a normal completion so
+				 * flag the fact that cancel/stop actually
+				 * prevented a callout here.
+				 */
+				if (c->flags & CALLOUT_CANCEL) {
+					atomic_set_int(&c->verifier->flags,
+						       CALLOUT_CANCEL_RES |
+						       CALLOUT_STOP_RES);
+				} else if (c->flags & CALLOUT_STOP) {
+					atomic_set_int(&c->verifier->flags,
+						       CALLOUT_STOP_RES);
+				}
+			} else if (c->flags & CALLOUT_RESET) {
+				/*
+				 * A RESET raced, make it seem like it
+				 * didn't.  Do nothing here and let the
+				 * process routine requeue us.
+				 */
+			} else if (c->flags & CALLOUT_AUTOLOCK) {
+				/*
+				 * Interlocked cancelable call.  If the
+				 * lock gets canceled we have to flag the
+				 * fact that the cancel/stop actually
+				 * prevented the callout here.
+				 */
+				error = lockmgr(c->lk, LK_EXCLUSIVE |
+						       LK_CANCELABLE);
+				if (error == 0) {
+					c->qfunc(c->qarg);
+					lockmgr(c->lk, LK_RELEASE);
+				} else if (c->flags & CALLOUT_CANCEL) {
+					atomic_set_int(&c->verifier->flags,
+						       CALLOUT_CANCEL_RES |
+						       CALLOUT_STOP_RES);
+				} else if (c->flags & CALLOUT_STOP) {
+					atomic_set_int(&c->verifier->flags,
+						       CALLOUT_STOP_RES);
+				}
+			} else {
+				/*
+				 * Normal call
+				 */
+				c->qfunc(c->qarg);
+			}
+
+			if (sc->running == c) {
+				/*
+				 * We are still INPROG so (c) remains valid, but
+				 * the callout is now governed by its internal
+				 * spin-lock.
+				 */
+				spin_lock(&c->spin);
+				res = _callout_process_spinlocked(c, 1);
+				spin_unlock(&c->spin);
+#ifdef CALLOUT_TYPESTABLE
+				if (res >= 0)
+					_callout_typestable_free(sc, c, res);
+#endif
+			}
+			spin_lock(&wheel->spin);
 		}
-		++sc->softticks;
+		sc->running = NULL;
+		spin_unlock(&wheel->spin);
+		atomic_add_int(&sc->softticks, 1);
 	}
 
 	/*
@@ -320,9 +776,17 @@ loop:
 		mpsafe = 1;
 		rel_mplock();
 	}
-	sc->isrunning = 0;
-	lwkt_deschedule_self(&sc->thread);	/* == curthread */
-	lwkt_switch();
+
+	/*
+	 * Recheck in critical section to interlock against hardlock
+	 */
+	crit_enter();
+	if (sc->softticks == (int)(sc->curticks + 1)) {
+		sc->isrunning = 0;
+		lwkt_deschedule_self(&sc->thread);	/* == curthread */
+		lwkt_switch();
+	}
+	crit_exit();
 	goto loop;
 	/* NOT REACHED */
 }
@@ -341,278 +805,451 @@ slotimer_callback(void *arg)
 }
 
 /*
- * New interface; clients allocate their own callout structures.
- *
- * callout_reset() - establish or change a timeout
- * callout_stop() - disestablish a timeout
- * callout_init() - initialize a callout structure so that it can
- *			safely be passed to callout_reset() and callout_stop()
- * callout_init_mp() - same but any installed functions must be MP safe.
- *
- * <sys/callout.h> defines three convenience macros:
- *
- * callout_active() - returns truth if callout has not been serviced
- * callout_pending() - returns truth if callout is still waiting for timeout
- * callout_deactivate() - marks the callout as having been serviced
+ * API FUNCTIONS
  */
 
 /*
- * Start or restart a timeout.  Install the callout structure in the 
- * callwheel.  Callers may legally pass any value, even if 0 or negative,
- * but since the sc->curticks index may have already been processed a
- * minimum timeout of 1 tick will be enforced.
+ * Prepare a callout structure for use by callout_reset() and/or
+ * callout_stop().
  *
- * The callout is installed on and will be processed on the current cpu's
- * callout wheel.
- *
- * WARNING! This function may be called from any cpu but the caller must
- * serialize callout_stop() and callout_reset() calls on the passed
- * structure regardless of cpu.
- */
-void
-callout_reset(struct callout *c, int to_ticks, void (*ftn)(void *), 
-		void *arg)
-{
-	softclock_pcpu_t sc;
-	globaldata_t gd;
-
-#ifdef INVARIANTS
-        if ((c->c_flags & CALLOUT_DID_INIT) == 0) {
-		callout_init(c);
-		kprintf(
-		    "callout_reset(%p) from %p: callout was not initialized\n",
-		    c, ((int **)&c)[-1]);
-		print_backtrace(-1);
-	}
-#endif
-	gd = mycpu;
-	sc = &softclock_pcpu_ary[gd->gd_cpuid];
-	crit_enter_gd(gd);
-
-	if (c->c_flags & CALLOUT_ACTIVE)
-		callout_stop(c);
-
-	if (to_ticks <= 0)
-		to_ticks = 1;
-
-	c->c_arg = arg;
-	c->c_flags |= (CALLOUT_ACTIVE | CALLOUT_PENDING);
-	c->c_func = ftn;
-	c->c_time = sc->curticks + to_ticks;
-	c->c_gd = gd;
-
-	TAILQ_INSERT_TAIL(&sc->callwheel[c->c_time & callwheelmask], 
-			  c, c_links.tqe);
-	crit_exit_gd(gd);
-}
-
-struct callout_remote_arg {
-	struct callout	*c;
-	void		(*ftn)(void *);
-	void		*arg;
-	int		to_ticks;
-};
-
-static void
-callout_reset_ipi(void *arg)
-{
-	struct callout_remote_arg *rmt = arg;
-
-	callout_reset(rmt->c, rmt->to_ticks, rmt->ftn, rmt->arg);
-}
-
-void
-callout_reset_bycpu(struct callout *c, int to_ticks, void (*ftn)(void *),
-    void *arg, int cpuid)
-{
-	KASSERT(cpuid >= 0 && cpuid < ncpus, ("invalid cpuid %d", cpuid));
-
-	if (cpuid == mycpuid) {
-		callout_reset(c, to_ticks, ftn, arg);
-	} else {
-		struct globaldata *target_gd;
-		struct callout_remote_arg rmt;
-		int seq;
-
-		rmt.c = c;
-		rmt.ftn = ftn;
-		rmt.arg = arg;
-		rmt.to_ticks = to_ticks;
-
-		target_gd = globaldata_find(cpuid);
-
-		seq = lwkt_send_ipiq(target_gd, callout_reset_ipi, &rmt);
-		lwkt_wait_ipiq(target_gd, seq);
-	}
-}
-
-/*
- * Stop a running timer.  WARNING!  If called on a cpu other then the one
- * the callout was started on this function will liveloop on its IPI to
- * the target cpu to process the request.  It is possible for the callout
- * to execute in that case.
- *
- * WARNING! This function may be called from any cpu but the caller must
- * serialize callout_stop() and callout_reset() calls on the passed
- * structure regardless of cpu.
- *
- * WARNING! This routine may be called from an IPI
- *
- * WARNING! This function can return while it's c_func is still running
- *	    in the callout thread, a secondary check may be needed.
- *	    Use callout_stop_sync() to wait for any callout function to
- *	    complete before returning, being sure that no deadlock is
- *	    possible if you do.
- */
-int
-callout_stop(struct callout *c)
-{
-	globaldata_t gd = mycpu;
-	globaldata_t tgd;
-	softclock_pcpu_t sc;
-
-#ifdef INVARIANTS
-        if ((c->c_flags & CALLOUT_DID_INIT) == 0) {
-		callout_init(c);
-		kprintf(
-		    "callout_stop(%p) from %p: callout was not initialized\n",
-		    c, ((int **)&c)[-1]);
-		print_backtrace(-1);
-	}
-#endif
-	crit_enter_gd(gd);
-
-	/*
-	 * Don't attempt to delete a callout that's not on the queue.  The
-	 * callout may not have a cpu assigned to it.  Callers do not have
-	 * to be on the issuing cpu but must still serialize access to the
-	 * callout structure.
-	 *
-	 * We are not cpu-localized here and cannot safely modify the
-	 * flags field in the callout structure.  Note that most of the
-	 * time CALLOUT_ACTIVE will be 0 if CALLOUT_PENDING is also 0.
-	 *
-	 * If we race another cpu's dispatch of this callout it is possible
-	 * for CALLOUT_ACTIVE to be set with CALLOUT_PENDING unset.  This
-	 * will cause us to fall through and synchronize with the other
-	 * cpu.
-	 */
-	if ((c->c_flags & CALLOUT_PENDING) == 0) {
-		if ((c->c_flags & CALLOUT_ACTIVE) == 0) {
-			crit_exit_gd(gd);
-			return (0);
-		}
-		if (c->c_gd == NULL || c->c_gd == gd) {
-			c->c_flags &= ~CALLOUT_ACTIVE;
-			crit_exit_gd(gd);
-			return (0);
-		}
-	}
-	if ((tgd = c->c_gd) != gd) {
-		/*
-		 * If the callout is owned by a different CPU we have to
-		 * execute the function synchronously on the target cpu.
-		 */
-		int seq;
-
-		cpu_ccfence();	/* don't let tgd alias c_gd */
-		seq = lwkt_send_ipiq(tgd, (void *)callout_stop, c);
-		lwkt_wait_ipiq(tgd, seq);
-	} else {
-		/*
-		 * If the callout is owned by the same CPU we can
-		 * process it directly, but if we are racing our helper
-		 * thread (sc->next), we have to adjust sc->next.  The
-		 * race is interlocked by a critical section.
-		 */
-		sc = &softclock_pcpu_ary[gd->gd_cpuid];
-
-		c->c_flags &= ~(CALLOUT_ACTIVE | CALLOUT_PENDING);
-		if (sc->next == c)
-			sc->next = TAILQ_NEXT(c, c_links.tqe);
-
-		TAILQ_REMOVE(&sc->callwheel[c->c_time & callwheelmask], 
-				c, c_links.tqe);
-		c->c_func = NULL;
-	}
-	crit_exit_gd(gd);
-	return (1);
-}
-
-/*
- * Issue a callout_stop() and ensure that any callout race completes
- * before returning.  Does NOT de-initialized the callout.
- */
-void
-callout_stop_sync(struct callout *c)
-{
-	softclock_pcpu_t sc;
-
-	while (c->c_flags & CALLOUT_DID_INIT) {
-		callout_stop(c);
-		if (c->c_gd) {
-			sc = &softclock_pcpu_ary[c->c_gd->gd_cpuid];
-			if (sc->running == c) {
-				while (sc->running == c)
-					tsleep(&sc->running, 0, "crace", 1);
-			}
-		}
-		if ((c->c_flags & (CALLOUT_PENDING | CALLOUT_ACTIVE)) == 0)
-			break;
-		kprintf("Warning: %s: callout race\n", curthread->td_comm);
-	}
-}
-
-/*
- * Terminate a callout
- *
- * This function will stop any pending callout and also block while the
- * callout's function is running.  It should only be used in cases where
- * no deadlock is possible (due to the callout function acquiring locks
- * that the current caller of callout_terminate() already holds), when
- * the caller is ready to destroy the callout structure.
- *
- * This function clears the CALLOUT_DID_INIT flag.
- *
- * lwkt_token locks are ok.
- */
-void
-callout_terminate(struct callout *c)
-{
-	softclock_pcpu_t sc;
-
-	if (c->c_flags & CALLOUT_DID_INIT) {
-		callout_stop(c);
-		if (c->c_gd) {
-			sc = &softclock_pcpu_ary[c->c_gd->gd_cpuid];
-			if (sc->running == c) {
-				while (sc->running == c)
-					tsleep(&sc->running, 0, "crace", 1);
-			}
-		}
-		KKASSERT((c->c_flags & (CALLOUT_PENDING|CALLOUT_ACTIVE)) == 0);
-		c->c_flags &= ~CALLOUT_DID_INIT;
-	}
-}
-
-/*
- * Prepare a callout structure for use by callout_reset() and/or 
- * callout_stop().  The MP version of this routine requires that the callback
+ * The MP version of this routine requires that the callback
  * function installed by callout_reset() be MP safe.
+ *
+ * The LK version of this routine is also MPsafe and will automatically
+ * acquire the specified lock for the duration of the function call,
+ * and release it after the function returns.  In addition, when autolocking
+ * is used, callout_stop() becomes synchronous if the caller owns the lock.
+ * callout_reset(), callout_stop(), and callout_cancel() will block
+ * normally instead of spinning when a cpu race occurs.  Lock cancelation
+ * is used to avoid deadlocks against the callout ring dispatch.
  *
  * The init functions can be called from any cpu and do not have to be
  * called from the cpu that the timer will eventually run on.
  */
-void
-callout_init(struct callout *c)
+static __inline void
+_callout_setup(struct callout *cc, int flags CALLOUT_DEBUG_ARGS)
 {
-	bzero(c, sizeof *c);
-	c->c_flags = CALLOUT_DID_INIT;
+	bzero(cc, sizeof(*cc));
+	cc->flags = flags;		/* frontend flags */
+#ifdef CALLOUT_DEBUG
+#ifdef CALLOUT_TYPESTABLE
+	cc->ident = ident;
+	cc->lineno = lineno;
+#else
+	cc->toc.verifier = cc;		/* corruption detector */
+	cc->toc.ident = ident;
+	cc->toc.lineno = lineno;
+	cc->toc.flags = flags;		/* backend flags */
+#endif
+#endif
+}
+
+/*
+ * Associate an internal _callout with the external callout and
+ * verify that the type-stable structure is still applicable (inactive
+ * type-stable _callouts might have been reused for a different callout).
+ * If not, a new internal structure will be allocated.
+ *
+ * Returns the _callout already spin-locked.
+ */
+static __inline
+struct _callout *
+_callout_gettoc(struct callout *cc)
+{
+	struct _callout *c;
+#ifdef CALLOUT_TYPESTABLE
+	softclock_pcpu_t sc;
+
+	KKASSERT(cc->flags & CALLOUT_DID_INIT);
+	for (;;) {
+		c = cc->toc;
+		cpu_ccfence();
+		if (c == NULL) {
+			sc = softclock_pcpu_ary[mycpu->gd_cpuid];
+			c = atomic_swap_ptr((void *)&sc->quick_obj, NULL);
+			if (c == NULL || _callout_typestable_test(c) == 0)
+				c = typestable_alloc(&callout_tsg);
+			/* returns spin-locked */
+			c->verifier = cc;
+			c->flags = cc->flags;
+			c->lk = cc->lk;
+			c->ident = cc->ident;
+			c->lineno = cc->lineno;
+			if (atomic_cmpset_ptr(&cc->toc, NULL, c)) {
+				break;
+			}
+			c->verifier = NULL;
+			spin_unlock(&c->spin);
+			_callout_typestable_free(sc, c, 0);
+		} else {
+			spin_lock(&c->spin);
+			if (c->verifier == cc)
+				break;
+			spin_unlock(&c->spin);
+			/* ok if atomic op fails */
+			(void)atomic_cmpset_ptr(&cc->toc, c, NULL);
+		}
+	}
+#else
+	c = &cc->toc;
+	spin_lock(&c->spin);
+#endif
+	/* returns with spin-lock held */
+	return c;
+}
+
+/*
+ * Macrod in sys/callout.h for debugging
+ *
+ * WARNING! tsleep() assumes this will not block
+ */
+void
+_callout_init(struct callout *cc CALLOUT_DEBUG_ARGS)
+{
+	_callout_setup(cc, CALLOUT_DID_INIT
+			CALLOUT_DEBUG_PASSTHRU);
 }
 
 void
-callout_init_mp(struct callout *c)
+_callout_init_mp(struct callout *cc CALLOUT_DEBUG_ARGS)
 {
-	callout_init(c);
-	c->c_flags |= CALLOUT_MPSAFE;
+	_callout_setup(cc, CALLOUT_DID_INIT | CALLOUT_MPSAFE
+			CALLOUT_DEBUG_PASSTHRU);
+}
+
+void
+_callout_init_lk(struct callout *cc, struct lock *lk CALLOUT_DEBUG_ARGS)
+{
+	_callout_setup(cc, CALLOUT_DID_INIT | CALLOUT_MPSAFE |
+			   CALLOUT_AUTOLOCK
+			CALLOUT_DEBUG_PASSTHRU);
+#ifdef CALLOUT_TYPESTABLE
+	cc->lk = lk;
+#else
+	cc->toc.lk = lk;
+#endif
+}
+
+/*
+ * Start or restart a timeout.  New timeouts can be installed while the
+ * current one is running.
+ *
+ * Start or restart a timeout.  Installs the callout structure on the
+ * callwheel of the current cpu.  Callers may legally pass any value, even
+ * if 0 or negative, but since the sc->curticks index may have already
+ * been processed a minimum timeout of 1 tick will be enforced.
+ *
+ * This function will not deadlock against a running call.
+ *
+ * WARNING! tsleep() assumes this will not block
+ */
+void
+callout_reset(struct callout *cc, int to_ticks, void (*ftn)(void *), void *arg)
+{
+	softclock_pcpu_t sc;
+	struct _callout *c;
+	int res;
+
+	atomic_set_int(&cc->flags, CALLOUT_ACTIVE);
+	c = _callout_gettoc(cc);
+
+	/*
+	 * Set RESET.  Do not clear STOP here (let the process code do it).
+	 */
+	atomic_set_int(&c->flags, CALLOUT_RESET);
+	sc = softclock_pcpu_ary[mycpu->gd_cpuid];
+	c->rsc = sc;
+	c->rtick = sc->curticks + to_ticks;
+	c->rfunc = ftn;
+	c->rarg = arg;
+#ifdef CALLOUT_TYPESTABLE
+	cc->arg = arg;	/* only used by callout_arg() */
+#endif
+	res = _callout_process_spinlocked(c, 0);
+	spin_unlock(&c->spin);
+#ifdef CALLOUT_TYPESTABLE
+	if (res >= 0)
+		_callout_typestable_free(sc, c, res);
+#endif
+}
+
+/*
+ * Same as callout_reset() but the timeout will run on a particular cpu.
+ */
+void
+callout_reset_bycpu(struct callout *cc, int to_ticks, void (*ftn)(void *),
+		    void *arg, int cpuid)
+{
+	softclock_pcpu_t sc;
+	struct _callout *c;
+	int res;
+
+	atomic_set_int(&cc->flags, CALLOUT_ACTIVE);
+	c = _callout_gettoc(cc);
+
+	/*
+	 * Set RESET.  Do not clear STOP here (let the process code do it).
+	 */
+	atomic_set_int(&c->flags, CALLOUT_RESET);
+
+	sc = softclock_pcpu_ary[cpuid];
+	c->rsc = sc;
+	c->rtick = sc->curticks + to_ticks;
+	c->rfunc = ftn;
+	c->rarg = arg;
+#ifdef CALLOUT_TYPESTABLE
+	cc->arg = arg;	/* only used by callout_arg() */
+#endif
+	res = _callout_process_spinlocked(c, 0);
+	spin_unlock(&c->spin);
+#ifdef CALLOUT_TYPESTABLE
+	if (res >= 0)
+		_callout_typestable_free(sc, c, res);
+#endif
+}
+
+static __inline
+void
+_callout_cancel_or_stop(struct callout *cc, uint32_t flags)
+{
+	struct _callout *c;
+	softclock_pcpu_t sc;
+	int res;
+
+#ifdef CALLOUT_TYPESTABLE
+	if (cc->toc == NULL || cc->toc->verifier != cc)
+		return;
+#else
+	KKASSERT(cc->toc.verifier == cc);
+#endif
+	/*
+	 * Setup for synchronous
+	 */
+	atomic_clear_int(&cc->flags, CALLOUT_ACTIVE);
+	c = _callout_gettoc(cc);
+
+	/*
+	 * Set STOP or CANCEL request.  If this is a STOP, clear a queued
+	 * RESET now.
+	 */
+	atomic_set_int(&c->flags, flags);
+	if (flags & CALLOUT_STOP) {
+		if (c->flags & CALLOUT_RESET) {
+			atomic_set_int(&cc->flags, CALLOUT_STOP_RES);
+			atomic_clear_int(&c->flags, CALLOUT_RESET);
+		}
+	}
+	sc = softclock_pcpu_ary[mycpu->gd_cpuid];
+	res = _callout_process_spinlocked(c, 0);
+	spin_unlock(&c->spin);
+#ifdef CALLOUT_TYPESTABLE
+	if (res >= 0)
+		_callout_typestable_free(sc, c, res);
+#endif
+
+	/*
+	 * Wait for the CANCEL or STOP to finish.
+	 *
+	 * WARNING! (c) can go stale now, so do not use (c) after this
+	 *	    point. XXX
+	 */
+	if (c->flags & flags) {
+		atomic_add_int(&c->waiters, 1);
+#ifdef CALLOUT_TYPESTABLE
+		if (cc->flags & CALLOUT_AUTOLOCK)
+			lockmgr(cc->lk, LK_CANCEL_BEG);
+#else
+		if (cc->flags & CALLOUT_AUTOLOCK)
+			lockmgr(c->lk, LK_CANCEL_BEG);
+#endif
+		for (;;) {
+			tsleep_interlock(cc, 0);
+			if ((atomic_fetchadd_int(&c->flags, 0) & flags) == 0)
+				break;
+			tsleep(cc, PINTERLOCKED, "costp", 0);
+		}
+#ifdef CALLOUT_TYPESTABLE
+		if (cc->flags & CALLOUT_AUTOLOCK)
+			lockmgr(cc->lk, LK_CANCEL_END);
+#else
+		if (cc->flags & CALLOUT_AUTOLOCK)
+			lockmgr(c->lk, LK_CANCEL_END);
+#endif
+		atomic_add_int(&c->waiters, -1);
+	}
+	KKASSERT(cc->toc.verifier == cc);
+}
+
+/*
+ * This is a synchronous STOP which cancels the callout.  If AUTOLOCK
+ * then a CANCEL will be issued to the lock holder.  Unlike STOP, the
+ * cancel function prevents any new callout_reset()s from being issued
+ * in addition to canceling the lock.  The lock will also be deactivated.
+ *
+ * Returns 0 if the callout was not active (or was active and completed,
+ *	     but didn't try to start a new timeout).
+ * Returns 1 if the cancel is responsible for stopping the callout.
+ */
+int
+callout_cancel(struct callout *cc)
+{
+	atomic_clear_int(&cc->flags, CALLOUT_CANCEL_RES);
+	_callout_cancel_or_stop(cc, CALLOUT_CANCEL);
+
+	return ((cc->flags & CALLOUT_CANCEL_RES) ? 1 : 0);
+}
+
+/*
+ * Currently the same as callout_cancel.  Ultimately we may wish the
+ * drain function to allow a pending callout to proceed, but for now
+ * we will attempt to to cancel it.
+ *
+ * Returns 0 if the callout was not active (or was active and completed,
+ *	     but didn't try to start a new timeout).
+ * Returns 1 if the drain is responsible for stopping the callout.
+ */
+int
+callout_drain(struct callout *cc)
+{
+	atomic_clear_int(&cc->flags, CALLOUT_CANCEL_RES);
+	_callout_cancel_or_stop(cc, CALLOUT_CANCEL);
+
+	return ((cc->flags & CALLOUT_CANCEL_RES) ? 1 : 0);
+}
+
+/*
+ * Stops a callout if it is pending or queued, does not block.
+ * This function does not interlock against a callout that is in-progress.
+ *
+ * Returns whether the STOP operation was responsible for removing a
+ * queued or pending callout.
+ */
+int
+callout_stop_async(struct callout *cc)
+{
+	softclock_pcpu_t sc;
+	struct _callout *c;
+	uint32_t flags;
+	int res;
+
+	atomic_clear_int(&cc->flags, CALLOUT_STOP_RES | CALLOUT_ACTIVE);
+#ifdef CALLOUT_TYPESTABLE
+	if (cc->toc == NULL || cc->toc->verifier != cc)
+		return 0;
+#else
+	KKASSERT(cc->toc.verifier == cc);
+#endif
+	c = _callout_gettoc(cc);
+
+	/*
+	 * Set STOP or CANCEL request.  If this is a STOP, clear a queued
+	 * RESET now.
+	 */
+	atomic_set_int(&c->flags, CALLOUT_STOP);
+	if (c->flags & CALLOUT_RESET) {
+		atomic_set_int(&cc->flags, CALLOUT_STOP_RES);
+		atomic_clear_int(&c->flags, CALLOUT_RESET);
+	}
+	sc = softclock_pcpu_ary[mycpu->gd_cpuid];
+	res = _callout_process_spinlocked(c, 0);
+	flags = cc->flags;
+	spin_unlock(&c->spin);
+#ifdef CALLOUT_TYPESTABLE
+	if (res >= 0)
+		_callout_typestable_free(sc, c, res);
+#endif
+
+	return ((flags & CALLOUT_STOP_RES) ? 1 : 0);
+}
+
+/*
+ * Callout deactivate merely clears the CALLOUT_ACTIVE bit
+ * Stops a callout if it is pending or queued, does not block.
+ * This function does not interlock against a callout that is in-progress.
+ */
+void
+callout_deactivate(struct callout *cc)
+{
+	atomic_clear_int(&cc->flags, CALLOUT_ACTIVE);
+}
+
+/*
+ * lock-aided callouts are STOPped synchronously using STOP semantics
+ * (meaning that another thread can start the callout again before we
+ * return).
+ *
+ * non-lock-aided callouts
+ *
+ * Stops a callout if it is pending or queued, does not block.
+ * This function does not interlock against a callout that is in-progress.
+ */
+int
+callout_stop(struct callout *cc)
+{
+	if (cc->flags & CALLOUT_AUTOLOCK) {
+		atomic_clear_int(&cc->flags, CALLOUT_STOP_RES);
+		_callout_cancel_or_stop(cc, CALLOUT_STOP);
+		return ((cc->flags & CALLOUT_STOP_RES) ? 1 : 0);
+	} else {
+		return callout_stop_async(cc);
+	}
+}
+
+/*
+ * Terminates a callout by canceling operations and then clears the
+ * INIT bit.  Upon return, the callout structure must not be used.
+ */
+void
+callout_terminate(struct callout *cc)
+{
+	_callout_cancel_or_stop(cc, CALLOUT_CANCEL);
+	atomic_clear_int(&cc->flags, CALLOUT_DID_INIT);
+#ifdef CALLOUT_TYPESTABLE
+	atomic_swap_ptr((void *)&cc->toc, NULL);
+#else
+	cc->toc.verifier = NULL;
+#endif
+}
+
+/*
+ * Returns whether a callout is queued and the time has not yet
+ * arrived (the callout is not yet in-progress).
+ */
+int
+callout_pending(struct callout *cc)
+{
+	struct _callout *c;
+	int res = 0;
+
+	/*
+	 * Don't instantiate toc to test pending
+	 */
+#ifdef CALLOUT_TYPESTABLE
+	if ((c = cc->toc) != NULL) {
+#else
+	c = &cc->toc;
+	KKASSERT(c->verifier == cc);
+	{
+#endif
+		spin_lock(&c->spin);
+		if (c->verifier == cc) {
+			res = ((c->flags & (CALLOUT_SET|CALLOUT_INPROG)) ==
+			       CALLOUT_SET);
+		}
+		spin_unlock(&c->spin);
+	}
+	return res;
+}
+
+/*
+ * Returns whether a callout is active or not.  A callout is active when
+ * a timeout is set and remains active upon normal termination, even if
+ * it does not issue a new timeout.  A callout is inactive if a timeout has
+ * never been set or if the callout has been stopped or canceled.  The next
+ * timeout that is set will re-set the active state.
+ */
+int
+callout_active(struct callout *cc)
+{
+	return ((cc->flags & CALLOUT_ACTIVE) ? 1 : 0);
 }

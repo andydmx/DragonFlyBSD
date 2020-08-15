@@ -15,20 +15,25 @@ SRCS+=	lstAppend.c lstAtEnd.c lstAtFront.c lstClose.c lstConcat.c \
 SRCS += lstPrev.c
 
 SRCS+=	stresep.c
-SRCS+=	meta.c
+SRCS+=	meta.c metachar.c
 
 # you can use this Makefile if you have an earlier version of bmake.
 srcdir= ${.CURDIR}/../../contrib/bmake
 
 # Base version on src date
-MAKE_VERSION= 20131001
+MAKE_VERSION= 20200710
 .if defined(BOOTSTRAPPING)
 DEFAULT_SYS_PATH = ${.CURDIR}/../../share/mk
 .else
 DEFAULT_SYS_PATH = /usr/share/mk:.../share/mk
 .endif
 
-WARNS?= 	4
+# move vital dports information to bmake for performance reasons
+DFLYVERSION!=	awk '/^\#define[[:blank:]]__DragonFly_version/ {print $$3}' \
+		< ${.CURDIR}/../../sys/sys/param.h
+OSREL!=		echo ${DFLYVERSION} | \
+		awk '{a=int($$1/100000); b=int(($$1-(a*100000))/100); \
+			print a "." b}'
 
 CPPFLAGS+=	-DUSE_EMALLOC
 CPPFLAGS+=	-DUSE_META
@@ -39,6 +44,9 @@ CFLAGS+=	-I${.CURDIR}
 CFLAGS+=	-I${.OBJDIR}
 CFLAGS+=	-I${srcdir}
 CFLAGS+=	-DHAVE_CONFIG_H
+CFLAGS+=	-DCCVER=\"${CCVER}\"
+CFLAGS+=	-DDFVER=\"${DFLYVERSION}\" -DOSREL=\"${OSREL}\"
+CFLAGS+=	-DNO_PWD_OVERRIDE
 CFLAGS+=	${XDEFS}
 CFLAGS+=	${CFLAGS_${.TARGET:T}} 
 CFLAGS+=	${COPTS.${.ALLSRC:M*.c:T}}
@@ -48,8 +56,10 @@ COPTS.job.c=	-Wno-format-nonliteral
 COPTS.parse.c=	-Wno-format-nonliteral
 COPTS.var.c=	-Wno-format-nonliteral
 
-DPADD=		${LIBUTIL}
-LDADD=		-lutil
+# XXX pending bmake update
+.if !defined(WARNS_AUDIT)
+WARNS=	1
+.endif
 
 .PATH:	${srcdir}
 .PATH:	${srcdir}/lst.lib

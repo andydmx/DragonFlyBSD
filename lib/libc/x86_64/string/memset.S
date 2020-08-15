@@ -1,59 +1,47 @@
 /*
- * Written by J.T. Conklin <jtc@NetBSD.org>.
- * Public domain.
- * Adapted for NetBSD/x86_64 by Frank van der Linden <fvdl@wasabisystems.com>
+ * Copyright (c) 2018 The DragonFly Project.  All rights reserved.
  *
- * $NetBSD: memset.S,v 1.3 2004/02/26 20:50:06 drochner Exp $
- * $FreeBSD: src/lib/libc/amd64/string/memset.S,v 1.2 2008/11/02 01:10:54 peter Exp $
+ * This code is derived from software contributed to The DragonFly Project
+ * by Matthew Dillon <dillon@backplane.com>
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in
+ *    the documentation and/or other materials provided with the
+ *    distribution.
+ * 3. Neither the name of The DragonFly Project nor the names of its
+ *    contributors may be used to endorse or promote products derived
+ *    from this software without specific, prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+ * ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+ * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
+ * FOR A PARTICULAR PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE
+ * COPYRIGHT HOLDERS OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+ * INCIDENTAL, SPECIAL, EXEMPLARY OR CONSEQUENTIAL DAMAGES (INCLUDING,
+ * BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED
+ * AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+ * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT
+ * OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+ * SUCH DAMAGE.
  */
-
 #include <machine/asm.h>
+#include <machine/asm_mjgmacros.h>
 
+/*
+ * %rdi:ptr %rsi:data %rdx:bytes
+ */
 ENTRY(memset)
-	movq	%rsi,%rax
-	andq	$0xff,%rax
-	movq	%rdx,%rcx
-	movq	%rdi,%r11
-
-	cld				/* set fill direction forward */
-
-	/*
-	 * if the string is too short, it's really not worth the overhead
-	 * of aligning to word boundries, etc.  So we jump to a plain
-	 * unaligned set.
-	 */
-	cmpq	$0x0f,%rcx
-	jle	L1
-
-	movb	%al,%ah			/* copy char to all bytes in word */
-	movl	%eax,%edx
-	sall	$16,%eax
-	orl	%edx,%eax
-
-	movl	%eax,%edx
-	salq	$32,%rax
-	orq	%rdx,%rax
-
-	movq	%rdi,%rdx		/* compute misalignment */
-	negq	%rdx
-	andq	$7,%rdx
-	movq	%rcx,%r8
-	subq	%rdx,%r8
-
-	movq	%rdx,%rcx		/* set until word aligned */
-	rep
-	stosb
-
-	movq	%r8,%rcx
-	shrq	$3,%rcx			/* set by words */
-	rep
-	stosq
-
-	movq	%r8,%rcx		/* set remainder by bytes */
-	andq	$7,%rcx
-L1:	rep
-	stosb
-	movq	%r11,%rax
-
-	ret
+	movzbq	%sil,%r8
+	movabs	$0x0101010101010101,%r10
+	imulq	%r8,%r10
+	MEMSET	erms=0 end=ret
 END(memset)
+
+	.section .note.GNU-stack,"",%progbits

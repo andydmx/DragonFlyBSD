@@ -68,9 +68,10 @@
 #include <bus/cam/cam.h>
 #include <bus/cam/cam_ccb.h>
 #include <bus/cam/cam_sim.h>
+#include <bus/cam/cam_xpt.h>
 #include <bus/cam/cam_xpt_sim.h>
+#include <bus/cam/cam_xpt_periph.h>
 #include <bus/cam/cam_debug.h>
-
 #include <bus/cam/scsi/scsi_all.h>
 #include <bus/cam/scsi/scsi_message.h>
 
@@ -813,17 +814,19 @@ amdsetsync(struct amd_softc *amd, u_int target, u_int clockrate,
 		if (xpt_create_path(&path, /*periph*/NULL,
 				    cam_sim_path(amd->psim), target,
 				    CAM_LUN_WILDCARD) == CAM_REQ_CMP) {
-			struct ccb_trans_settings neg;
-			struct ccb_trans_settings_spi *spi =
-			    &neg.xport_specific.spi;
-			xpt_setup_ccb(&neg.ccb_h, path, /*priority*/1);
-			memset(&neg, 0, sizeof (neg));
+			struct ccb_trans_settings *neg;
+			struct ccb_trans_settings_spi *spi;
+
+			neg = &xpt_alloc_ccb()->cts;
+			spi = &neg->xport_specific.spi;
+			xpt_setup_ccb(&neg->ccb_h, path, /*priority*/1);
 			spi->sync_period = period;
 			spi->sync_offset = offset;
 			spi->valid = CTS_SPI_VALID_SYNC_RATE
 				  | CTS_SPI_VALID_SYNC_OFFSET;
-			xpt_async(AC_TRANSFER_NEG, path, &neg);
+			xpt_async(AC_TRANSFER_NEG, path, neg);
 			xpt_free_path(path);	
+			xpt_free_ccb(&neg->ccb_h);
 		}
 	}
 	if ((type & AMD_TRANS_GOAL) != 0) {
@@ -912,7 +915,6 @@ amdstart(struct amd_softc *amd, struct amd_srb *pSRB)
 	u_int command;
 	u_int target;
 	u_int lun;
-	int tagged;
 
 	pccb = pSRB->pccb;
 	pcsio = &pccb->csio;
@@ -937,7 +939,6 @@ amdstart(struct amd_softc *amd, struct amd_srb *pSRB)
 		identify_msg |= MSG_IDENTIFY_DISCFLAG;
 
 	amd_write8(amd, SCSIFIFOREG, identify_msg);
-	tagged = 0;
 	if ((targ_info->disc_tag & AMD_CUR_TAGENB) == 0
 	  || (identify_msg & MSG_IDENTIFY_DISCFLAG) == 0)
 		pccb->ccb_h.flags &= ~CAM_TAG_ACTION_VALID;
@@ -951,7 +952,6 @@ amdstart(struct amd_softc *amd, struct amd_srb *pSRB)
 		pSRB->SRBState = SRB_START;
 		amd_write8(amd, SCSIFIFOREG, pcsio->tag_action);
 		amd_write8(amd, SCSIFIFOREG, pSRB->TagNumber);
-		tagged++;
 	} else {
 		command = SEL_W_ATN;
 		pSRB->SRBState = SRB_START;
@@ -1474,17 +1474,21 @@ amdhandlemsgreject(struct amd_softc *amd)
 		       amd->unit, amd->cur_target);
 	} else if ((srb != NULL)
 		&& (srb->pccb->ccb_h.flags & CAM_TAG_ACTION_VALID) != 0) {
-		struct  ccb_trans_settings neg;
-		struct ccb_trans_settings_scsi *scsi = &neg.proto_specific.scsi;
+		struct ccb_trans_settings *neg;
+		struct ccb_trans_settings_scsi *scsi;
 
 		kprintf("amd%d:%d: refuses tagged commands.  Performing "
 		       "non-tagged I/O\n", amd->unit, amd->cur_target);
 
+		neg = &xpt_alloc_ccb()->cts;
+		scsi = &neg->proto_specific.scsi;
 		amdsettags(amd, amd->cur_target, FALSE);
-		memset(&neg, 0, sizeof (neg));
 		scsi->valid = CTS_SCSI_VALID_TQ;
-		xpt_setup_ccb(&neg.ccb_h, srb->pccb->ccb_h.path, /*priority*/1);
-		xpt_async(AC_TRANSFER_NEG, srb->pccb->ccb_h.path, &neg);
+		xpt_setup_ccb(&neg->ccb_h, srb->pccb->ccb_h.path, /*pri*/1);
+		xpt_async(AC_TRANSFER_NEG, srb->pccb->ccb_h.path, neg);
+		xpt_free_ccb(&neg->ccb_h);
+		neg = NULL; /* safety */
+		scsi = NULL; /* safety */
 
 		/*
 		 * Resend the identify for this CCB as the target
@@ -2127,7 +2131,7 @@ amd_linkSRB(struct amd_softc *amd)
 	}
 }
 
-void
+static void
 amd_EnDisableCE(struct amd_softc *amd, int mode, int *regval)
 {
 	if (mode == ENABLE_CE) {
@@ -2142,7 +2146,7 @@ amd_EnDisableCE(struct amd_softc *amd, int mode, int *regval)
 	DELAY(160);
 }
 
-void
+static void
 amd_EEpromOutDI(struct amd_softc *amd, int *regval, int Carry)
 {
 	u_int bval;

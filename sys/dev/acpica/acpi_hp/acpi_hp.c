@@ -312,7 +312,7 @@ static d_read_t	acpi_hp_hpcmi_read;
 
 /* handler /dev/hpcmi device */
 static struct dev_ops hpcmi_ops = {
-	{ .name = "hpcmi" },
+	{ "hpcmi", 0, D_MPSAFE },
 	.d_open = acpi_hp_hpcmi_open,
 	.d_close = acpi_hp_hpcmi_close,
 	.d_read = acpi_hp_hpcmi_read,
@@ -471,6 +471,7 @@ acpi_hp_attach(device_t dev)
 	struct acpi_softc	*acpi_sc;
 	int			arg;
 
+	ACPI_SERIAL_INIT(hp);
 	ACPI_FUNCTION_TRACE((char *)(uintptr_t) __func__);
 
 	sc = device_get_softc(dev);
@@ -590,6 +591,7 @@ acpi_hp_detach(device_t dev)
 			ACPI_WMI_REMOVE_EVENT_HANDLER(dev,
 			    ACPI_HP_WMI_EVENT_GUID);
 		}
+		sysctl_ctx_free(&sc->sysctl_ctx);
 		if (sc->hpcmi_bufptr != -1) {
 			sbuf_delete(&sc->hpcmi_sbuf);
 			sc->hpcmi_bufptr = -1;
@@ -907,6 +909,7 @@ acpi_hp_get_cmi_block(device_t wmi_dev, const char* guid, UINT8 instance,
 	char		string_buffer[size];
 	int		enumbase;
 
+	*sequence = 0;	/* whack gcc warning */
 	outlen = 0;
 	outbuf[0] = 0;	
 	if (ACPI_FAILURE(ACPI_WMI_GET_BLOCK(wmi_dev, guid, instance, &out))) {
@@ -1043,7 +1046,7 @@ acpi_hp_hex_decode(char* buffer)
 	UINT8	*uin;
 	UINT8	uout;
 
-	if (((int)length/2)*2 == length || length < 10) return;
+	if (rounddown((int)length, 2) == length || length < 10) return;
 
 	for (i = 0; i<length; ++i) {
 		if (!((i+1)%3)) {

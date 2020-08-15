@@ -60,7 +60,6 @@
  *	@(#)raw_ip.c	8.2 (Berkeley) 1/4/94
  */
 
-#include "opt_ipsec.h"
 #include "opt_inet6.h"
 
 #include <sys/param.h>
@@ -99,16 +98,6 @@
 #endif
 #include <netinet6/raw_ip6.h>
 
-#ifdef IPSEC
-#include <netinet6/ipsec.h>
-#include <netinet6/ipsec6.h>
-#endif /*IPSEC*/
-
-#ifdef FAST_IPSEC
-#include <netproto/ipsec/ipsec.h>
-#include <netproto/ipsec/ipsec6.h>
-#endif /* FAST_IPSEC */
-
 #include <machine/stdarg.h>
 
 #define	satosin6(sa)	((struct sockaddr_in6 *)(sa))
@@ -141,18 +130,12 @@ rip6_input(struct mbuf **mp, int *offp, int proto)
 
 	rip6stat.rip6s_ipackets++;
 
-	if (faithprefix_p != NULL && (*faithprefix_p)(&ip6->ip6_dst)) {
-		/* XXX send icmp6 host/port unreach? */
-		m_freem(m);
-		return IPPROTO_DONE;
-	}
-
 	init_sin6(&rip6src, m); /* general init */
 
 	LIST_FOREACH(in6p, &ripcbinfo.pcblisthead, inp_list) {
 		if (in6p->in6p_flags & INP_PLACEMARKER)
 			continue;
-		if (!(in6p->in6p_vflag & INP_IPV6))
+		if (!INP_ISIPV6(in6p))
 			continue;
 		if (in6p->in6p_ip6_nxt &&
 		    in6p->in6p_ip6_nxt != proto)
@@ -174,25 +157,6 @@ rip6_input(struct mbuf **mp, int *offp, int proto)
 		if (last) {
 			struct mbuf *n = m_copy(m, 0, (int)M_COPYALL);
 
-#ifdef IPSEC
-			/*
-			 * Check AH/ESP integrity.
-			 */
-			if (n && ipsec6_in_reject_so(n, last->inp_socket)) {
-				m_freem(n);
-				ipsec6stat.in_polvio++;
-				/* do not inject data into pcb */
-			} else
-#endif /*IPSEC*/
-#ifdef FAST_IPSEC
-			/*
-			 * Check AH/ESP integrity.
-			 */
-			if (n && ipsec6_in_reject(n, last)) {
-				m_freem(n);
-				/* do not inject data into pcb */
-			} else
-#endif /*FAST_IPSEC*/
 			if (n) {
 				struct socket *so;
 
@@ -211,6 +175,7 @@ rip6_input(struct mbuf **mp, int *offp, int proto)
 					if (opts)
 						m_freem(opts);
 					rip6stat.rip6s_fullsock++;
+					soroverflow(so);
 				} else {
 					sorwakeup(so);
 				}
@@ -220,27 +185,6 @@ rip6_input(struct mbuf **mp, int *offp, int proto)
 		}
 		last = in6p;
 	}
-#ifdef IPSEC
-	/*
-	 * Check AH/ESP integrity.
-	 */
-	if (last && ipsec6_in_reject_so(m, last->inp_socket)) {
-		m_freem(m);
-		ipsec6stat.in_polvio++;
-		ip6stat.ip6s_delivered--;
-		/* do not inject data into pcb */
-	} else
-#endif /*IPSEC*/
-#ifdef FAST_IPSEC
-	/*
-	 * Check AH/ESP integrity.
-	 */
-	if (last && ipsec6_in_reject(m, last)) {
-		m_freem(m);
-		ip6stat.ip6s_delivered--;
-		/* do not inject data into pcb */
-	} else
-#endif /*FAST_IPSEC*/
 	if (last) {
 		struct socket *so;
 
@@ -258,6 +202,7 @@ rip6_input(struct mbuf **mp, int *offp, int proto)
 			if (opts)
 				m_freem(opts);
 			rip6stat.rip6s_fullsock++;
+			soroverflow(so);
 		} else {
 			sorwakeup(so);
 		}
@@ -287,7 +232,7 @@ rip6_ctlinput(netmsg_t msg)
 	void *d = msg->ctlinput.nm_extra;
 	struct ip6ctlparam *ip6cp = NULL;
 	const struct sockaddr_in6 *sa6_src = NULL;
-	void (*notify) (struct inpcb *, int) = in6_rtchange;
+	inp_notify_t notify = in6_rtchange;
 
 	if (sa->sa_family != AF_INET6 ||
 	    sa->sa_len != sizeof(struct sockaddr_in6))
@@ -341,6 +286,11 @@ rip6_output(struct mbuf *m, struct socket *so, ...)
 	control = __va_arg(ap, struct mbuf *);
 	__va_end(ap);
 
+	if (IN6_IS_ADDR_V4MAPPED(&dstsock->sin6_addr)) {
+		error = EADDRNOTAVAIL;
+		goto bad;
+	}
+
 	in6p = so->so_pcb;
 
 	priv = 0;
@@ -372,7 +322,7 @@ rip6_output(struct mbuf *m, struct socket *so, ...)
 		code = icmp6->icmp6_code;
 	}
 
-	M_PREPEND(m, sizeof(*ip6), MB_WAIT);
+	M_PREPEND(m, sizeof(*ip6), M_WAITOK);
 	ip6 = mtod(m, struct ip6_hdr *);
 
 	/*
@@ -403,13 +353,13 @@ rip6_output(struct mbuf *m, struct socket *so, ...)
 			ip6->ip6_dst.s6_addr16[1] = htons(oifp->if_index);
 		} else if (dstsock->sin6_scope_id) {
 			/* boundary check */
-			if (dstsock->sin6_scope_id < 0
-			 || if_index < dstsock->sin6_scope_id) {
+			if (dstsock->sin6_scope_id < 0 ||
+			    if_index < dstsock->sin6_scope_id) {
 				error = ENXIO;  /* XXX EINVAL? */
 				goto bad;
 			}
-			ip6->ip6_dst.s6_addr16[1]
-				= htons(dstsock->sin6_scope_id & 0xffff);/*XXX*/
+			ip6->ip6_dst.s6_addr16[1] =
+			    htons(dstsock->sin6_scope_id & 0xffff); /* XXX */
 		}
 	}
 
@@ -419,11 +369,9 @@ rip6_output(struct mbuf *m, struct socket *so, ...)
 	{
 		struct in6_addr *in6a;
 
-		if ((in6a = in6_selectsrc(dstsock, optp,
-					  in6p->in6p_moptions,
-					  &in6p->in6p_route,
-					  &in6p->in6p_laddr,
-					  &error, NULL)) == NULL) {
+		if ((in6a = in6_selectsrc(dstsock, optp, in6p->in6p_moptions,
+		    &in6p->in6p_route, &in6p->in6p_laddr, &error, NULL))
+		    == NULL) {
 			if (error == 0)
 				error = EADDRNOTAVAIL;
 			goto bad;
@@ -591,7 +539,6 @@ rip6_attach(netmsg_t msg)
 	if (error)
 		goto out;
 	inp = (struct inpcb *)so->so_pcb;
-	inp->inp_vflag |= INP_IPV6;
 	inp->in6p_ip6_nxt = (long)proto;
 	inp->in6p_hops = -1;	/* use kernel default */
 	inp->in6p_cksum = -1;
@@ -667,8 +614,11 @@ rip6_bind(netmsg_t msg)
 		error = EINVAL;
 		goto out;
 	}
-
-	if (TAILQ_EMPTY(&ifnet) || addr->sin6_family != AF_INET6) {
+	if (ifnet_array_isempty() || addr->sin6_family != AF_INET6) {
+		error = EADDRNOTAVAIL;
+		goto out;
+	}
+	if (IN6_IS_ADDR_V4MAPPED(&addr->sin6_addr)) {
 		error = EADDRNOTAVAIL;
 		goto out;
 	}
@@ -712,12 +662,16 @@ rip6_connect(netmsg_t msg)
 		error = EINVAL;
 		goto out;
 	}
-	if (TAILQ_EMPTY(&ifnet)) {
+	if (ifnet_array_isempty()) {
 		error = EADDRNOTAVAIL;
 		goto out;
 	}
 	if (addr->sin6_family != AF_INET6) {
 		error = EAFNOSUPPORT;
+		goto out;
+	}
+	if (IN6_IS_ADDR_V4MAPPED(&addr->sin6_addr)) {
+		error = EADDRNOTAVAIL;
 		goto out;
 	}
 #ifdef ENABLE_DEFAULT_SCOPE

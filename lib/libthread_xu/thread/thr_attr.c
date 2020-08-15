@@ -32,8 +32,9 @@
  */
 
 #include "namespace.h"
+#include <sys/types.h>
+#include <sys/sysctl.h>
 #include <machine/tls.h>
-
 #include <errno.h>
 #include <pthread.h>
 #include <stdlib.h>
@@ -43,30 +44,18 @@
 
 #include "thr_private.h"
 
-/* Default thread attributes. */
-struct pthread_attr _pthread_attr_default = {
-	.sched_policy = SCHED_OTHER,
-	.sched_inherit = 0,
-	.prio = THR_DEFAULT_PRIORITY,
-	.suspend = THR_CREATE_RUNNING,
-	.flags = 0,
-	.stackaddr_attr = NULL,
-	.stacksize_attr = THR_STACK_DEFAULT,
-	.guardsize_attr = 0
-};
-
 int
 _pthread_attr_destroy(pthread_attr_t *attr)
 {
 	int	ret;
 
 	/* Check for invalid arguments: */
-	if (attr == NULL || *attr == NULL)
+	if (attr == NULL || *attr == NULL) {
 		/* Invalid argument: */
 		ret = EINVAL;
-	else {
+	} else {
 		/* Free the memory allocated to the attribute object: */
-		free(*attr);
+		__free(*attr);
 
 		/*
 		 * Leave the attribute pointer NULL now that the memory
@@ -105,6 +94,39 @@ _pthread_attr_get_np(pthread_t pid, pthread_attr_t *dst)
 __strong_reference(_pthread_attr_get_np, pthread_attr_get_np);
 
 int
+_pthread_attr_getaffinity_np(const pthread_attr_t *attr, size_t cpusetsize,
+    cpu_set_t *mask)
+{
+	const cpu_set_t *ret;
+	cpu_set_t mask1;
+
+	if (attr == NULL || *attr == NULL || mask == NULL)
+		return (EINVAL);
+
+	if (((*attr)->flags & THR_CPUMASK) == 0) {
+		size_t len;
+
+		len = sizeof(mask1);
+		if (sysctlbyname("machdep.smp_active", &mask1, &len,
+		    NULL, 0) < 0)
+			return (errno);
+		ret = &mask1;
+	} else {
+		ret = &(*attr)->cpumask;
+	}
+
+	if (cpusetsize > sizeof(*ret)) {
+		memset(mask, 0, cpusetsize);
+		memcpy(mask, ret, sizeof(*ret));
+	} else {
+		memcpy(mask, ret, cpusetsize);
+	}
+	return (0);
+}
+
+__strong_reference(_pthread_attr_getaffinity_np, pthread_attr_getaffinity_np);
+
+int
 _pthread_attr_getdetachstate(const pthread_attr_t *attr, int *detachstate)
 {
 	int	ret;
@@ -128,7 +150,8 @@ _pthread_attr_getdetachstate(const pthread_attr_t *attr, int *detachstate)
 __strong_reference(_pthread_attr_getdetachstate, pthread_attr_getdetachstate);
 
 int
-_pthread_attr_getguardsize(const pthread_attr_t *attr, size_t *guardsize)
+_pthread_attr_getguardsize(const pthread_attr_t * __restrict attr,
+    size_t * __restrict guardsize)
 {
 	int	ret;
 
@@ -146,7 +169,8 @@ _pthread_attr_getguardsize(const pthread_attr_t *attr, size_t *guardsize)
 __strong_reference(_pthread_attr_getguardsize, pthread_attr_getguardsize);
 
 int
-_pthread_attr_getinheritsched(const pthread_attr_t *attr, int *sched_inherit)
+_pthread_attr_getinheritsched(const pthread_attr_t * __restrict attr,
+    int * __restrict sched_inherit)
 {
 	int ret = 0;
 
@@ -161,7 +185,8 @@ _pthread_attr_getinheritsched(const pthread_attr_t *attr, int *sched_inherit)
 __strong_reference(_pthread_attr_getinheritsched, pthread_attr_getinheritsched);
 
 int
-_pthread_attr_getschedparam(const pthread_attr_t *attr, struct sched_param *param)
+_pthread_attr_getschedparam(const pthread_attr_t * __restrict attr,
+    struct sched_param * __restrict param)
 {
 	int ret = 0;
 
@@ -176,7 +201,8 @@ _pthread_attr_getschedparam(const pthread_attr_t *attr, struct sched_param *para
 __strong_reference(_pthread_attr_getschedparam, pthread_attr_getschedparam);
 
 int
-_pthread_attr_getschedpolicy(const pthread_attr_t *attr, int *policy)
+_pthread_attr_getschedpolicy(const pthread_attr_t * __restrict attr,
+    int * __restrict policy)
 {
 	int ret = 0;
 
@@ -191,7 +217,8 @@ _pthread_attr_getschedpolicy(const pthread_attr_t *attr, int *policy)
 __strong_reference(_pthread_attr_getschedpolicy, pthread_attr_getschedpolicy);
 
 int
-_pthread_attr_getscope(const pthread_attr_t *attr, int *contentionscope)
+_pthread_attr_getscope(const pthread_attr_t * __restrict attr,
+    int * __restrict contentionscope)
 {
 	int ret = 0;
 
@@ -200,7 +227,7 @@ _pthread_attr_getscope(const pthread_attr_t *attr, int *contentionscope)
 		ret = EINVAL;
 
 	else
-		*contentionscope = (*attr)->flags & PTHREAD_SCOPE_SYSTEM ?
+		*contentionscope = ((*attr)->flags & PTHREAD_SCOPE_SYSTEM) ?
 		    PTHREAD_SCOPE_SYSTEM : PTHREAD_SCOPE_PROCESS;
 
 	return(ret);
@@ -210,8 +237,8 @@ __strong_reference(_pthread_attr_getscope, pthread_attr_getscope);
 
 int
 _pthread_attr_getstack(const pthread_attr_t * __restrict attr,
-                        void ** __restrict stackaddr,
-                        size_t * __restrict stacksize)
+		       void ** __restrict stackaddr,
+		       size_t * __restrict stacksize)
 {
 	int     ret;
 
@@ -249,7 +276,8 @@ _pthread_attr_getstackaddr(const pthread_attr_t *attr, void **stackaddr)
 __strong_reference(_pthread_attr_getstackaddr, pthread_attr_getstackaddr);
 
 int
-_pthread_attr_getstacksize(const pthread_attr_t *attr, size_t *stacksize)
+_pthread_attr_getstacksize(const pthread_attr_t * __restrict attr,
+    size_t * __restrict stacksize)
 {
 	int	ret;
 
@@ -273,10 +301,11 @@ _pthread_attr_init(pthread_attr_t *attr)
 	pthread_attr_t	pattr;
 
 	/* Allocate memory for the attribute object: */
-	if ((pattr = (pthread_attr_t) malloc(sizeof(struct pthread_attr))) == NULL)
+	pattr = __malloc(sizeof(struct pthread_attr));
+	if (pattr == NULL) {
 		/* Insufficient memory: */
 		ret = ENOMEM;
-	else {
+	} else {
 		/* Initialise the attribute object with the defaults: */
 		memcpy(pattr, &_pthread_attr_default,
 		    sizeof(struct pthread_attr));
@@ -289,6 +318,36 @@ _pthread_attr_init(pthread_attr_t *attr)
 }
 
 __strong_reference(_pthread_attr_init, pthread_attr_init);
+
+int
+_pthread_attr_setaffinity_np(pthread_attr_t *attr, size_t cpusetsize,
+    const cpu_set_t *mask)
+{
+	cpu_set_t active, mask1;
+	size_t len, cplen = cpusetsize;
+
+	if (attr == NULL || *attr == NULL || mask == NULL)
+		return (EINVAL);
+
+	if (cplen > sizeof(mask1))
+		cplen = sizeof(mask1);
+	CPU_ZERO(&mask1);
+	memcpy(&mask1, mask, cplen);
+
+	len = sizeof(active);
+	if (sysctlbyname("machdep.smp_active", &active, &len, NULL, 0) < 0)
+		return (errno);
+
+	CPUMASK_ANDMASK(mask1, active);
+	if (CPUMASK_TESTZERO(mask1))
+		return (EPERM);
+
+	(*attr)->cpumask = mask1;
+	(*attr)->flags |= THR_CPUMASK;
+	return (0);
+}
+
+__strong_reference(_pthread_attr_setaffinity_np, pthread_attr_setaffinity_np);
 
 int
 _pthread_attr_setcreatesuspend_np(pthread_attr_t *attr)
@@ -368,41 +427,47 @@ _pthread_attr_setinheritsched(pthread_attr_t *attr, int sched_inherit)
 __strong_reference(_pthread_attr_setinheritsched, pthread_attr_setinheritsched);
 
 int
-_pthread_attr_setschedparam(pthread_attr_t *attr, const struct sched_param *param)
+_pthread_attr_setschedparam(pthread_attr_t * __restrict attr,
+    const struct sched_param * __restrict param)
 {
-	int ret = 0;
+	int policy;
 
 	if ((attr == NULL) || (*attr == NULL))
-		ret = EINVAL;
-	else if (param == NULL) {
-		ret = ENOTSUP;
-	} else {
-		int minv = sched_get_priority_min((*attr)->sched_policy);
-		int maxv = sched_get_priority_max((*attr)->sched_policy);
+		return (EINVAL);
+
+	if (param == NULL)
+		return (ENOTSUP);
+
+	policy = (*attr)->sched_policy;
+
+	{
+		int minv = sched_get_priority_min(policy);
+		int maxv = sched_get_priority_max(policy);
 		if (minv == -1 || maxv == -1 ||
 		    param->sched_priority < minv ||
 		    param->sched_priority > maxv) {
-			ret = ENOTSUP;
-		} else {
-			(*attr)->prio = param->sched_priority;
+			return (ENOTSUP);
 		}
 	}
-	return(ret);
+
+	(*attr)->prio = param->sched_priority;
+
+	return (0);
 }
 
 __strong_reference(_pthread_attr_setschedparam, pthread_attr_setschedparam);
 
 int
-_pthread_attr_setschedpolicy(pthread_attr_t *attr, int policy)
+_pthread_attr_setschedpolicy(pthread_attr_t *attr, int pol)
 {
 	int ret = 0;
 
 	if ((attr == NULL) || (*attr == NULL))
 		ret = EINVAL;
-	else if ((policy < SCHED_FIFO) || (policy > SCHED_RR)) {
-		ret = ENOTSUP;
-	} else
-		(*attr)->sched_policy = policy;
+	else if (pol != SCHED_FIFO && pol != SCHED_OTHER && pol != SCHED_RR)
+		ret = EINVAL;
+	else
+		(*attr)->sched_policy = pol;
 
 	return(ret);
 }
@@ -432,7 +497,7 @@ __strong_reference(_pthread_attr_setscope, pthread_attr_setscope);
 
 int
 _pthread_attr_setstack(pthread_attr_t *attr, void *stackaddr,
-                        size_t stacksize)
+		       size_t stacksize)
 {
 	int     ret;
 
@@ -486,4 +551,3 @@ _pthread_attr_setstacksize(pthread_attr_t *attr, size_t stacksize)
 }
 
 __strong_reference(_pthread_attr_setstacksize, pthread_attr_setstacksize);
-

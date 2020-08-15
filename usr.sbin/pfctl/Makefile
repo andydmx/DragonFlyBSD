@@ -5,14 +5,20 @@ SRCS=	pfctl.c parse.y pfctl_parser.c pf_print_state.c pfctl_altq.c
 SRCS+=	pfctl_osfp.c pfctl_radix.c pfctl_table.c pfctl_qstats.c
 SRCS+=	pfctl_optimize.c pf_ruleset.c
 CFLAGS+= -I${.CURDIR}
-MAN=	pfctl.8 pf.conf.5 pf.os.5
+#CFLAGS+=-DPFDEBUG
+MAN=	pfctl.8
 
 # Ruleset and Anchor handling
 .PATH: ${.CURDIR}/../../sys/net/pf
 
-LDADD+=	-lmd -lm
-DPADD+=	${LIBMD} ${LIBM}
+LDADD=	-lm
+DPADD=	${LIBM}
 
 WARNS?=	2
+
+CFLAGS+=	${PRIVATELIB_CFLAGS}
+DPADD+=		${LIBCRYPTO}
+LDADD+=		-lprivate_crypto
+LDFLAGS+=	${PRIVATELIB_LDFLAGS}
 
 .include <bsd.prog.mk>

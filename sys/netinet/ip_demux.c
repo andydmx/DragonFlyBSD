@@ -59,6 +59,11 @@
 #include <netinet/udp.h>
 #include <netinet/udp_var.h>
 
+struct initport_index {
+	uint32_t	port_index;
+} __cachealign;
+static struct initport_index	initport_indices[MAXCPU];
+
 /*
  * Toeplitz hash functions - the idea is to match the hardware.
  */
@@ -66,6 +71,14 @@ static __inline int
 INP_MPORT_HASH_UDP(in_addr_t faddr, in_addr_t laddr,
 		   in_port_t fport, in_port_t lport)
 {
+	/*
+	 * NOTE: laddr could be multicast, since UDP socket could be
+	 * bound to multicast address.
+	 */
+	if (IN_MULTICAST(ntohl(faddr)) || IN_MULTICAST(ntohl(laddr))) {
+		/* XXX handle multicast on CPU0 for now */
+		return 0;
+	}
 	return toeplitz_hash(toeplitz_rawhash_addr(faddr, laddr));
 }
 
@@ -75,6 +88,21 @@ INP_MPORT_HASH_TCP(in_addr_t faddr, in_addr_t laddr,
 {
 	return toeplitz_hash(
 	       toeplitz_rawhash_addrport(faddr, laddr, fport, lport));
+}
+
+/*
+ * Hash for the network address.
+ */
+int
+tcp_addrhash(in_addr_t faddr, in_port_t fport, in_addr_t laddr, in_port_t lport)
+{
+	return (INP_MPORT_HASH_TCP(faddr, laddr, fport, lport));
+}
+
+int
+udp_addrhash(in_addr_t faddr, in_port_t fport, in_addr_t laddr, in_port_t lport)
+{
+	return (INP_MPORT_HASH_UDP(faddr, laddr, fport, lport));
 }
 
 /*
@@ -89,14 +117,6 @@ tcp_addrcpu(in_addr_t faddr, in_port_t fport, in_addr_t laddr, in_port_t lport)
 int
 udp_addrcpu(in_addr_t faddr, in_port_t fport, in_addr_t laddr, in_port_t lport)
 {
-	/*
-	 * NOTE: laddr could be multicast, since UDP socket could be
-	 * bound to multicast address.
-	 */
-	if (IN_MULTICAST(ntohl(faddr)) || IN_MULTICAST(ntohl(laddr))) {
-		/* XXX handle multicast on CPU0 for now */
-		return 0;
-	}
 	return (netisr_hashcpu(INP_MPORT_HASH_UDP(faddr, laddr, fport, lport)));
 }
 
@@ -263,7 +283,7 @@ fail:
  * This function can blow away the mbuf if the packet is malformed.
  */
 void
-ip_hashfn(struct mbuf **mptr, int hoff, int dir)
+ip_hashfn(struct mbuf **mptr, int hoff)
 {
 	struct ip *ip;
 	int iphlen;
@@ -272,8 +292,10 @@ ip_hashfn(struct mbuf **mptr, int hoff, int dir)
 	struct mbuf *m;
 	int hash;
 
-	if (!ip_lengthcheck(mptr, hoff))
-		return;
+	if (((*mptr)->m_flags & M_LENCHECKED) == 0) {
+		if (!ip_lengthcheck(mptr, hoff))
+			return;
+	}
 
 	m = *mptr;
 	ip = mtodoff(m, struct ip *, hoff);
@@ -293,11 +315,6 @@ ip_hashfn(struct mbuf **mptr, int hoff, int dir)
 		break;
 
 	case IPPROTO_UDP:
-		if (IN_MULTICAST(ntohl(ip->ip_dst.s_addr))) {
-			/* XXX handle multicast on CPU0 for now */
-			hash = 0;
-			break;
-		}
 		uh = (struct udphdr *)((caddr_t)ip + iphlen);
 		hash = INP_MPORT_HASH_UDP(ip->ip_src.s_addr, ip->ip_dst.s_addr,
 		    uh->uh_sport, uh->uh_dport);
@@ -308,14 +325,7 @@ ip_hashfn(struct mbuf **mptr, int hoff, int dir)
 		break;
 	}
 back:
-	m->m_flags |= M_HASH;
-	m->m_pkthdr.hash = hash;
-}
-
-void
-ip_hashfn_in(struct mbuf **mptr, int hoff)
-{
-	ip_hashfn(mptr, hoff, IP_MPORT_IN);
+	m_sethash(m, hash);
 }
 
 /*
@@ -331,14 +341,6 @@ void
 ip_hashcheck(struct mbuf *m, const struct pktinfo *pi)
 {
 	KASSERT((m->m_flags & M_HASH), ("no valid packet hash"));
-
-	/*
-	 * XXX generic packet handling defrag on CPU 0 for now.
-	 */
-	if (pi->pi_flags & PKTINFO_FLAG_FRAG) {
-		m->m_pkthdr.hash = 0;
-		return;
-	}
 
 	switch (pi->pi_l3proto) {
 	case IPPROTO_TCP:
@@ -369,18 +371,20 @@ tcp_soport(struct socket *so, struct sockaddr *nam,
  * operation.
  */
 lwkt_port_t
-tcp_ctlport(int cmd, struct sockaddr *sa, void *vip)
+tcp_ctlport(int cmd, struct sockaddr *sa, void *vip, int *cpuid)
 {
 	struct ip *ip = vip;
-	struct tcphdr *th;
-	struct in_addr faddr;
-	int cpu;
+	inp_notify_t notify;
+	int arg;
 
-	faddr = ((struct sockaddr_in *)sa)->sin_addr;
-	if (sa->sa_family != AF_INET || faddr.s_addr == INADDR_ANY)
-		return(NULL);
-	if (ip == NULL || PRC_IS_REDIRECT(cmd) || cmd == PRC_HOSTDEAD) {
+	notify = tcp_get_inpnotify(cmd, sa, &arg, &ip, cpuid);
+	if (notify == NULL)
+		return NULL;
+
+	if (*cpuid == netisr_ncpus) {
 		/*
+		 * Go through all effective netisr CPUs.
+		 *
 		 * A new message will be allocated later to save necessary
 		 * information and will be forwarded to all network protocol
 		 * threads in the following way:
@@ -401,13 +405,10 @@ tcp_ctlport(int cmd, struct sockaddr *sa, void *vip)
 		 * netisr0 ---------> netisr1 ---------> netisrN
 		 *                                       [msg is kfree()ed]
 		 */
-		return cpu0_ctlport(cmd, sa, vip);
+		return netisr_cpuport(0);
 	} else {
-		th = (struct tcphdr *)((caddr_t)ip + (ip->ip_hl << 2));
-		cpu = tcp_addrcpu(faddr.s_addr, th->th_dport,
-				  ip->ip_src.s_addr, th->th_sport);
+		return netisr_cpuport(*cpuid);
 	}
-	return(netisr_cpuport(cpu));
 }
 
 lwkt_port_t
@@ -433,38 +434,49 @@ udp_addrport(in_addr_t faddr, in_port_t fport, in_addr_t laddr, in_port_t lport)
  * operation.
  */
 lwkt_port_t
-udp_ctlport(int cmd, struct sockaddr *sa, void *vip)
+udp_ctlport(int cmd, struct sockaddr *sa, void *vip, int *cpuid)
 {
 	struct ip *ip = vip;
-	struct udphdr *uh;
-	struct in_addr faddr;
-	int cpu;
+	inp_notify_t notify;
 
-	faddr = ((struct sockaddr_in *)sa)->sin_addr;
-	if (sa->sa_family != AF_INET || faddr.s_addr == INADDR_ANY)
-		return(NULL);
-	if (ip == NULL || PRC_IS_REDIRECT(cmd) || cmd == PRC_HOSTDEAD) {
+	notify = udp_get_inpnotify(cmd, sa, &ip, cpuid);
+	if (notify == NULL)
+		return NULL;
+
+	if (*cpuid == netisr_ncpus) {
 		/*
+		 * Go through all effective netisr CPUs.
+		 *
 		 * See the comment in tcp_ctlport.
 		 */
-		return cpu0_ctlport(cmd, sa, vip);
+		return netisr_cpuport(0);
 	} else {
-		uh = (struct udphdr *)((caddr_t)ip + (ip->ip_hl << 2));
-
-		cpu = udp_addrcpu(faddr.s_addr, ip->ip_src.s_addr,
-				  uh->uh_dport, uh->uh_sport);
+		return netisr_cpuport(*cpuid);
 	}
-	return (netisr_cpuport(cpu));
+}
+
+static __inline struct lwkt_port *
+inp_initport(void)
+{
+	int cpu = mycpuid;
+
+	if (cpu < netisr_ncpus) {
+		return netisr_cpuport(cpu);
+	} else {
+		return netisr_cpuport(
+		    ((initport_indices[cpu].port_index++) + (uint32_t)cpu) %
+		    netisr_ncpus);
+	}
 }
 
 struct lwkt_port *
 tcp_initport(void)
 {
-	return netisr_cpuport(mycpuid & ncpus2_mask);
+	return inp_initport();
 }
 
 struct lwkt_port *
 udp_initport(void)
 {
-	return netisr_cpuport(mycpuid & ncpus2_mask);
+	return inp_initport();
 }

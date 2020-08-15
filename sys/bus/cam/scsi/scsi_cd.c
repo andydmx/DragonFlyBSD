@@ -67,8 +67,6 @@
 #include <sys/udev.h>
 
 #include <sys/buf2.h>
-#include <sys/thread2.h>
-#include <sys/mplock2.h>
 
 #include "../cam.h"
 #include "../cam_ccb.h"
@@ -111,10 +109,12 @@ typedef enum {
 	CD_FLAG_VALID_MEDIA	= 0x0400,
 	CD_FLAG_VALID_TOC	= 0x0800,
 	CD_FLAG_SCTX_INIT	= 0x1000,
-	CD_FLAG_OPEN		= 0x2000
+	CD_FLAG_OPEN		= 0x2000,
+	CD_FLAG_CAP_MUTE	= 0x4000
 } cd_flags;
 
 typedef enum {
+	CD_CCB_POLLED		= 0x00,
 	CD_CCB_PROBE		= 0x01,
 	CD_CCB_BUFFER_IO	= 0x02,
 	CD_CCB_WAITING		= 0x03,
@@ -586,10 +586,8 @@ cdsysctlinit(void *context, int pending)
 	struct cd_softc *softc;
 	char tmpstr[80], tmpstr2[80];
 
-	get_mplock();
 	periph = (struct cam_periph *)context;
 	if (cam_periph_acquire(periph) != CAM_REQ_CMP) {
-		rel_mplock();
 		return;
 	}
 
@@ -609,7 +607,6 @@ cdsysctlinit(void *context, int pending)
 	if (softc->sysctl_tree == NULL) {
 		kprintf("cdsysctlinit: unable to allocate sysctl tree\n");
 		cam_periph_release(periph);
-		rel_mplock();
 		return;
 	}
 
@@ -623,7 +620,6 @@ cdsysctlinit(void *context, int pending)
 			"Minimum CDB size");
 
 	cam_periph_release(periph);
-	rel_mplock();
 }
 
 /*
@@ -667,7 +663,7 @@ static cam_status
 cdregister(struct cam_periph *periph, void *arg)
 {
 	struct cd_softc *softc;
-	struct ccb_pathinq cpi;
+	struct ccb_pathinq *cpi;
 	struct ccb_getdev *cgd;
 	char tmpstr[80];
 	caddr_t match;
@@ -712,11 +708,13 @@ cdregister(struct cam_periph *periph, void *arg)
 		softc->quirks = CD_Q_NONE;
 
 	/* Check if the SIM does not want 6 byte commands */
-	xpt_setup_ccb(&cpi.ccb_h, periph->path, /*priority*/1);
-	cpi.ccb_h.func_code = XPT_PATH_INQ;
-	xpt_action((union ccb *)&cpi);
-	if (cpi.ccb_h.status == CAM_REQ_CMP && (cpi.hba_misc & PIM_NO_6_BYTE))
+	cpi = &xpt_alloc_ccb()->cpi;
+	xpt_setup_ccb(&cpi->ccb_h, periph->path, /*priority*/1);
+	cpi->ccb_h.func_code = XPT_PATH_INQ;
+	xpt_action((union ccb *)cpi);
+	if (cpi->ccb_h.status == CAM_REQ_CMP && (cpi->hba_misc & PIM_NO_6_BYTE))
 		softc->quirks |= CD_Q_10_BYTE_ONLY;
+	xpt_free_ccb(&cpi->ccb_h);
 
 	TASK_INIT(&softc->sysctl_task, 0, cdsysctlinit, periph);
 
@@ -889,8 +887,10 @@ cdregister(struct cam_periph *periph, void *arg)
 		else {
 			nchanger = kmalloc(sizeof(struct cdchanger),
 					M_DEVBUF, M_INTWAIT | M_ZERO);
-			callout_init(&nchanger->short_handle);
-			callout_init(&nchanger->long_handle);
+			callout_init_lk(&nchanger->short_handle,
+					periph->sim->lock);
+			callout_init_lk(&nchanger->long_handle,
+					periph->sim->lock);
 			if (camq_init(&nchanger->devq, 1) != 0) {
 				softc->flags &= ~CD_FLAG_CHANGER;
 				kprintf("cdregister: changer support "
@@ -906,8 +906,10 @@ cdregister(struct cam_periph *periph, void *arg)
 
 			STAILQ_INIT(&nchanger->chluns);
 
-			callout_init(&nchanger->long_handle);
-			callout_init(&nchanger->short_handle);
+			callout_init_lk(&nchanger->long_handle,
+					periph->sim->lock);
+			callout_init_lk(&nchanger->short_handle,
+					periph->sim->lock);
 
 			lockmgr(&changerq_lock, LK_EXCLUSIVE);
 			num_changers++;
@@ -1038,6 +1040,12 @@ cdopen(struct dev_open_args *ap)
 	 * code work well with media changing underneath it.
 	 */
 	error = cdcheckmedia(periph);
+
+	if (error) {
+		softc->flags |= CD_FLAG_CAP_MUTE;
+	} else {
+		softc->flags &= ~CD_FLAG_CAP_MUTE;
+	}
 
 	cdprevent(periph, PR_PREVENT);
 	CAM_DEBUG(periph->path, CAM_DEBUG_TRACE, ("leaving cdopen\n"));
@@ -1366,6 +1374,7 @@ static union ccb *
 cdgetccb(struct cam_periph *periph, u_int32_t priority)
 {
 	struct cd_softc *softc;
+	static union ccb *ccb;
 
 	softc = (struct cd_softc *)periph->softc;
 
@@ -1396,7 +1405,10 @@ cdgetccb(struct cam_periph *periph, u_int32_t priority)
 					       periph->sim->lock);
 		}
 	}
-	return(cam_periph_getccb(periph, priority));
+	ccb = cam_periph_getccb(periph, priority);
+	ccb->ccb_h.ccb_state = CD_CCB_POLLED;
+
+	return ccb;
 }
 
 /*
@@ -1513,9 +1525,7 @@ cdstart(struct cam_periph *periph, union ccb *start_ccb)
 			scsi_read_write(&start_ccb->csio,
 					/*retries*/4,
 					/* cbfcnp */ cddone,
-					(bp->b_flags & B_ORDERED) != 0 ?
-					    MSG_ORDERED_Q_TAG : 
-					    MSG_SIMPLE_Q_TAG,
+					MSG_SIMPLE_Q_TAG,
 					/* read */(bp->b_cmd == BUF_CMD_READ),
 					/* byte2 */ 0,
 					/* minimum_cmd_size */ 10,
@@ -1672,6 +1682,7 @@ cddone(struct cam_periph *periph, union ccb *done_ccb)
 		struct	disk_info info;
 		char	announce_buf[120];
 		struct	cd_params *cdp;
+		int doinfo = 0;
 
 		cdp = &softc->params;
 		bzero(&info, sizeof(info));
@@ -1691,7 +1702,7 @@ cddone(struct cam_periph *periph, union ccb *done_ccb)
 				  cdp->disksize, (u_long)cdp->blksize);
 			info.d_media_blksize = cdp->blksize;
 			info.d_media_blocks = cdp->disksize;
-			disk_setdiskinfo(&softc->disk, &info);
+			doinfo = 1;
 		} else {
 			int	error;
 
@@ -1713,7 +1724,7 @@ cddone(struct cam_periph *periph, union ccb *done_ccb)
 				int sense_key, error_code;
 				int have_sense;
 				cam_status status;
-				struct ccb_getdev cgd;
+				struct ccb_getdev *cgd;
 
 				/* Don't wedge this device's queue */
 				cam_release_devq(done_ccb->ccb_h.path,
@@ -1724,11 +1735,12 @@ cddone(struct cam_periph *periph, union ccb *done_ccb)
 
 				status = done_ccb->ccb_h.status;
 
-				xpt_setup_ccb(&cgd.ccb_h, 
+				cgd = &xpt_alloc_ccb()->cgd;
+				xpt_setup_ccb(&cgd->ccb_h,
 					      done_ccb->ccb_h.path,
 					      /* priority */ 1);
-				cgd.ccb_h.func_code = XPT_GDEV_TYPE;
-				xpt_action((union ccb *)&cgd);
+				cgd->ccb_h.func_code = XPT_GDEV_TYPE;
+				xpt_action((union ccb *)cgd);
 
 				if (((csio->ccb_h.flags & CAM_SENSE_PHYS) != 0)
 				 || ((csio->ccb_h.flags & CAM_SENSE_PTR) != 0)
@@ -1755,7 +1767,7 @@ cddone(struct cam_periph *periph, union ccb *done_ccb)
 					const char *asc_desc;
 
 					scsi_sense_desc(sense_key, asc, ascq,
-							&cgd.inq_data,
+							&cgd->inq_data,
 							&sense_key_desc,
 							&asc_desc);
 					ksnprintf(announce_buf,
@@ -1765,8 +1777,8 @@ cddone(struct cam_periph *periph, union ccb *done_ccb)
 						sense_key_desc,
 						asc_desc);
 					info.d_media_blksize = 2048;
-					disk_setdiskinfo(&softc->disk, &info);
-				} else if (SID_TYPE(&cgd.inq_data) == T_CDROM) {
+					doinfo = 1;
+				} else if (SID_TYPE(&cgd->inq_data) == T_CDROM) {
 					/*
 					 * We only print out an error for
 					 * CDROM type devices.  For WORM
@@ -1808,6 +1820,7 @@ cddone(struct cam_periph *periph, union ccb *done_ccb)
 					cam_periph_invalidate(periph);
 					announce_buf[0] = '\0';
 				}
+				xpt_free_ccb(&cgd->ccb_h);
 			}
 		}
 		kfree(rdcap, M_SCSICD);
@@ -1833,6 +1846,9 @@ cddone(struct cam_periph *periph, union ccb *done_ccb)
 		 */
 		xpt_release_ccb(done_ccb);
 		cam_periph_unhold(periph, 0);
+		if (doinfo) {
+			disk_setdiskinfo(&softc->disk, &info);
+		}
 		return;
 	}
 	case CD_CCB_WAITING:
@@ -1844,6 +1860,10 @@ cddone(struct cam_periph *periph, union ccb *done_ccb)
 		wakeup(&done_ccb->ccb_h.cbfcnp);
 		return;
 	}
+	case CD_CCB_POLLED:
+		/* Caller releases CCB */
+		wakeup(&done_ccb->ccb_h.cbfcnp);
+		return;
 	default:
 		break;
 	}
@@ -2787,13 +2807,13 @@ cdprevent(struct cam_periph *periph, int action)
 	}
 }
 
-int
+static int
 cdcheckmedia(struct cam_periph *periph)
 {
 	struct cd_softc *softc;
 	struct ioc_toc_header *toch;
 	struct cd_toc_single leadout;
-	struct ccb_getdev cgd;
+	struct ccb_getdev *cgd;
 	u_int32_t size, toclen;
 	int error, num_entries, cdindex;
 	int first_track_audio;
@@ -2818,16 +2838,19 @@ cdcheckmedia(struct cam_periph *periph)
 	 * Grab the inquiry data to get the vendor and product names.
 	 * Put them in the typename and packname for the label.
 	 */
-	xpt_setup_ccb(&cgd.ccb_h, periph->path, /*priority*/ 1);
-	cgd.ccb_h.func_code = XPT_GDEV_TYPE;
-	xpt_action((union ccb *)&cgd);
+	cgd = &xpt_alloc_ccb()->cgd;
+	xpt_setup_ccb(&cgd->ccb_h, periph->path, /*priority*/ 1);
+	cgd->ccb_h.func_code = XPT_GDEV_TYPE;
+	xpt_action((union ccb *)cgd);
 
 #if 0
-	strncpy(label->d_typename, cgd.inq_data.vendor,
+	strncpy(label->d_typename, cgd->inq_data.vendor,
 		min(SID_VENDOR_SIZE, sizeof(label->d_typename)));
-	strncpy(label->d_packname, cgd.inq_data.product,
+	strncpy(label->d_packname, cgd->inq_data.product,
 		min(SID_PRODUCT_SIZE, sizeof(label->d_packname)));
 #endif
+	xpt_free_ccb(&cgd->ccb_h);
+
 	/*
 	 * Clear the valid media and TOC flags until we've verified that we
 	 * have both.
@@ -3016,6 +3039,9 @@ cdsize(struct cam_periph *periph, u_int32_t *size)
 			   rcap_buf,
 			   SSD_FULL_SIZE,
 			   /* timeout */20000);
+
+	if (softc->flags & CD_FLAG_CAP_MUTE)
+		ccb->ccb_h.flags |= CAM_QUIET;
 
 	error = cdrunccb(ccb, cderror, /*cam_flags*/CAM_RETRY_SELTO,
 			 /*sense_flags*/SF_RETRY_UA|SF_NO_PRINT);

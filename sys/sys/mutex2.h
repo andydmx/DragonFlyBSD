@@ -50,25 +50,59 @@
  * Initialize a new mutex, placing it in an unlocked state with no refs.
  */
 static __inline void
-mtx_init(mtx_t mtx)
+mtx_init(mtx_t *mtx, const char *ident)
 {
 	mtx->mtx_lock = 0;
-	mtx->mtx_refs = 0;
+	mtx->mtx_flags = 0;
 	mtx->mtx_owner = NULL;
-	mtx->mtx_link = NULL;
+	mtx->mtx_exlink = NULL;
+	mtx->mtx_shlink = NULL;
+	mtx->mtx_ident = ident;
 }
 
 static __inline void
-mtx_link_init(mtx_link_t link)
+mtx_init_flags(mtx_t *mtx, const char *ident, uint32_t flags)
+{
+	mtx->mtx_lock = 0;
+	mtx->mtx_flags = flags;
+	mtx->mtx_owner = NULL;
+	mtx->mtx_exlink = NULL;
+	mtx->mtx_shlink = NULL;
+	mtx->mtx_ident = ident;
+}
+
+/*
+ * Initialize a mtx link structure for deeper control over the mutex
+ * operation.
+ */
+static __inline void
+mtx_link_init(mtx_link_t *link)
 {
 	link->state = MTX_LINK_IDLE;
+	link->callback = NULL;
+	link->arg = NULL;
+}
+
+/*
+ * A link structure initialized this way causes mutex operations to not block,
+ * caller must specify a callback.  Caller may still abort the mutex via
+ * the link.
+ */
+static __inline void
+mtx_link_init_async(mtx_link_t *link,
+		    void (*callback)(mtx_link_t *link, void *arg, int error),
+		    void *arg)
+{
+	link->state = MTX_LINK_IDLE;
+	link->callback = callback;
+	link->arg = arg;
 }
 
 /*
  * Deinitialize a mutex
  */
 static __inline void
-mtx_uninit(mtx_t mtx)
+mtx_uninit(mtx_t *mtx)
 {
 	/* empty */
 }
@@ -79,30 +113,31 @@ mtx_uninit(mtx_t mtx)
  *
  * This version of the function allows the mtx_link to be passed in, thus
  * giving the caller visibility for the link structure which is required
- * when calling mtx_abort_ex_link().
+ * when calling mtx_abort_ex_link() or when requesting an asynchronous lock.
  *
  * The mutex may be aborted at any time while the passed link structure
  * is valid.
  */
 static __inline int
-mtx_lock_ex_link(mtx_t mtx, struct mtx_link *link,
-                 const char *ident, int flags, int to)
+mtx_lock_ex_link(mtx_t *mtx, mtx_link_t *link, int flags, int to)
 {
 	if (atomic_cmpset_int(&mtx->mtx_lock, 0, MTX_EXCLUSIVE | 1) == 0)
-		return(_mtx_lock_ex_link(mtx, link, ident, flags, to));
+		return(_mtx_lock_ex_link(mtx, link, flags, to));
 	mtx->mtx_owner = curthread;
+	link->state = MTX_LINK_ACQUIRED;
+
 	return(0);
 }
 
 /*
  * Short-form exclusive-lock a mutex, block until acquired.  Recursion is
- * allowed.  This is equivalent to mtx_lock_ex(mtx, "mtxex", 0, 0).
+ * allowed.  This is equivalent to mtx_lock_ex(mtx, 0, 0).
  */
 static __inline void
-mtx_lock(mtx_t mtx)
+mtx_lock(mtx_t *mtx)
 {
 	if (atomic_cmpset_int(&mtx->mtx_lock, 0, MTX_EXCLUSIVE | 1) == 0) {
-		_mtx_lock_ex(mtx, "mtxex", 0, 0);
+		_mtx_lock_ex(mtx, 0, 0);
 		return;
 	}
 	mtx->mtx_owner = curthread;
@@ -115,20 +150,29 @@ mtx_lock(mtx_t mtx)
  * An error can only be returned if PCATCH is specified in the flags.
  */
 static __inline int
-mtx_lock_ex(mtx_t mtx, const char *ident, int flags, int to)
+mtx_lock_ex(mtx_t *mtx, int flags, int to)
 {
 	if (atomic_cmpset_int(&mtx->mtx_lock, 0, MTX_EXCLUSIVE | 1) == 0)
-		return(_mtx_lock_ex(mtx, ident, flags, to));
+		return(_mtx_lock_ex(mtx, flags, to));
 	mtx->mtx_owner = curthread;
 	return(0);
 }
 
 static __inline int
-mtx_lock_ex_quick(mtx_t mtx, const char *ident)
+mtx_lock_ex_quick(mtx_t *mtx)
 {
 	if (atomic_cmpset_int(&mtx->mtx_lock, 0, MTX_EXCLUSIVE | 1) == 0)
-		return(_mtx_lock_ex_quick(mtx, ident));
+		return(_mtx_lock_ex_quick(mtx));
 	mtx->mtx_owner = curthread;
+	return(0);
+}
+
+static __inline int
+mtx_lock_sh_link(mtx_t *mtx, mtx_link_t *link, int flags, int to)
+{
+	if (atomic_cmpset_int(&mtx->mtx_lock, 0, 1) == 0)
+		return(_mtx_lock_sh_link(mtx, link, flags, to));
+	link->state = MTX_LINK_ACQUIRED;
 	return(0);
 }
 
@@ -139,19 +183,31 @@ mtx_lock_ex_quick(mtx_t mtx, const char *ident)
  * An error can only be returned if PCATCH is specified in the flags.
  */
 static __inline int
-mtx_lock_sh(mtx_t mtx, const char *ident, int flags, int to)
+mtx_lock_sh(mtx_t *mtx, int flags, int to)
 {
 	if (atomic_cmpset_int(&mtx->mtx_lock, 0, 1) == 0)
-		return(_mtx_lock_sh(mtx, ident, flags, to));
+		return(_mtx_lock_sh(mtx, flags, to));
 	return(0);
 }
 
 static __inline int
-mtx_lock_sh_quick(mtx_t mtx, const char *ident)
+mtx_lock_sh_quick(mtx_t *mtx)
 {
 	if (atomic_cmpset_int(&mtx->mtx_lock, 0, 1) == 0)
-		return(_mtx_lock_sh_quick(mtx, ident));
+		return(_mtx_lock_sh_quick(mtx));
 	return(0);
+}
+
+/*
+ * Adds a shared lock reference to a lock already locked shared,
+ * does not block on pending exclusive request.
+ */
+static __inline void
+mtx_lock_sh_again(mtx_t *mtx)
+{
+	KKASSERT((mtx->mtx_lock & MTX_EXCLUSIVE) == 0 &&
+		 (mtx->mtx_lock & MTX_MASK) > 0);
+	atomic_add_int(&mtx->mtx_lock, 1);
 }
 
 /*
@@ -159,16 +215,16 @@ mtx_lock_sh_quick(mtx_t mtx, const char *ident)
  * mtx_spinunlock().
  */
 static __inline void
-mtx_spinlock(mtx_t mtx)
+mtx_spinlock(mtx_t *mtx)
 {
 	globaldata_t gd = mycpu;
 
 	/*
 	 * Predispose a hard critical section
 	 */
-	++gd->gd_curthread->td_critcount;
-	cpu_ccfence();
+	crit_enter_quick(gd->gd_curthread);
 	++gd->gd_spinlocks;
+	cpu_ccfence();
 
 	/*
 	 * If we cannot get it trivially get it the hard way.
@@ -183,16 +239,16 @@ mtx_spinlock(mtx_t mtx)
 }
 
 static __inline int
-mtx_spinlock_try(mtx_t mtx)
+mtx_spinlock_try(mtx_t *mtx)
 {
 	globaldata_t gd = mycpu;
 
 	/*
 	 * Predispose a hard critical section
 	 */
-	++gd->gd_curthread->td_critcount;
-	cpu_ccfence();
+	crit_enter_quick(gd->gd_curthread);
 	++gd->gd_spinlocks;
+	cpu_ccfence();
 
 	/*
 	 * If we cannot get it trivially call _mtx_spinlock_try().  This
@@ -212,7 +268,7 @@ mtx_spinlock_try(mtx_t mtx)
  * EAGAIN on failure.
  */
 static __inline int
-mtx_lock_ex_try(mtx_t mtx)
+mtx_lock_ex_try(mtx_t *mtx)
 {
 	if (atomic_cmpset_int(&mtx->mtx_lock, 0, MTX_EXCLUSIVE | 1) == 0)
 		return (_mtx_lock_ex_try(mtx));
@@ -225,7 +281,7 @@ mtx_lock_ex_try(mtx_t mtx)
  * EAGAIN on failure.
  */
 static __inline int
-mtx_lock_sh_try(mtx_t mtx)
+mtx_lock_sh_try(mtx_t *mtx)
 {
 	if (atomic_cmpset_int(&mtx->mtx_lock, 0, 1) == 0)
 		return (_mtx_lock_sh_try(mtx));
@@ -240,10 +296,14 @@ mtx_lock_sh_try(mtx_t mtx)
  * The exclusive count is converted to a shared count.
  */
 static __inline void
-mtx_downgrade(mtx_t mtx)
+mtx_downgrade(mtx_t *mtx)
 {
+	globaldata_t gd __debugvar = mycpu;
+
+	KKASSERT((mtx->mtx_lock & MTX_EXCLUSIVE) &&
+		  mtx->mtx_owner == gd->gd_curthread);
 	mtx->mtx_owner = NULL;
-	if (atomic_cmpset_int(&mtx->mtx_lock, MTX_EXCLUSIVE | 1, 0) == 0)
+	if (atomic_cmpset_int(&mtx->mtx_lock, MTX_EXCLUSIVE | 1, 1) == 0)
 		_mtx_downgrade(mtx);
 }
 
@@ -259,10 +319,12 @@ mtx_downgrade(mtx_t mtx)
  * Returns 0 on success, EDEADLK on failure.
  */
 static __inline int
-mtx_upgrade_try(mtx_t mtx)
+mtx_upgrade_try(mtx_t *mtx)
 {
-	if (atomic_cmpset_int(&mtx->mtx_lock, 1, MTX_EXCLUSIVE | 1))
+	if (atomic_cmpset_int(&mtx->mtx_lock, 1, MTX_EXCLUSIVE | 1)) {
+		mtx->mtx_owner = curthread;
 		return(0);
+	}
 	return (_mtx_upgrade_try(mtx));
 }
 
@@ -278,10 +340,13 @@ mtx_upgrade_try(mtx_t mtx)
  *	 or mtx_spinlock() to lock it should also use mtx_unlock() to unlock.
  */
 static __inline void
-mtx_unlock(mtx_t mtx)
+mtx_unlock(mtx_t *mtx)
 {
+	globaldata_t gd __debugvar = mycpu;
 	u_int lock = mtx->mtx_lock;
 
+	KKASSERT((mtx->mtx_lock & MTX_EXCLUSIVE) == 0 ||
+		 mtx->mtx_owner == gd->gd_curthread);
 	if (lock == (MTX_EXCLUSIVE | 1)) {
 		mtx->mtx_owner = NULL;
 		if (atomic_cmpset_int(&mtx->mtx_lock, lock, 0) == 0)
@@ -295,10 +360,13 @@ mtx_unlock(mtx_t mtx)
 }
 
 static __inline void
-mtx_unlock_ex(mtx_t mtx)
+mtx_unlock_ex(mtx_t *mtx)
 {
+	globaldata_t gd __debugvar = mycpu;
 	u_int lock = mtx->mtx_lock;
 
+	KKASSERT((mtx->mtx_lock & MTX_EXCLUSIVE) == 0 ||
+		 mtx->mtx_owner == gd->gd_curthread);
 	if (lock == (MTX_EXCLUSIVE | 1)) {
 		mtx->mtx_owner = NULL;
 		if (atomic_cmpset_int(&mtx->mtx_lock, lock, 0) == 0)
@@ -309,7 +377,7 @@ mtx_unlock_ex(mtx_t mtx)
 }
 
 static __inline void
-mtx_unlock_sh(mtx_t mtx)
+mtx_unlock_sh(mtx_t *mtx)
 {
 	if (atomic_cmpset_int(&mtx->mtx_lock, 1, 0) == 0)
 		_mtx_unlock(mtx);
@@ -319,15 +387,15 @@ mtx_unlock_sh(mtx_t mtx)
  * NOTE: spinlocks are exclusive-only
  */
 static __inline void
-mtx_spinunlock(mtx_t mtx)
+mtx_spinunlock(mtx_t *mtx)
 {
 	globaldata_t gd = mycpu;
 
 	mtx_unlock(mtx);
 
-	--gd->gd_spinlocks;
 	cpu_ccfence();
-	--gd->gd_curthread->td_critcount;
+	--gd->gd_spinlocks;
+	crit_exit_quick(gd->gd_curthread);
 }
 
 /*
@@ -335,19 +403,21 @@ mtx_spinunlock(mtx_t mtx)
  * anyone, including the owner.
  */
 static __inline int
-mtx_islocked(mtx_t mtx)
+mtx_islocked(mtx_t *mtx)
 {
 	return(mtx->mtx_lock != 0);
 }
 
 /*
  * Return TRUE (non-zero) if the mutex is locked exclusively by anyone,
- * including the owner.
+ * including the owner.  Returns FALSE (0) if the mutex is unlocked or
+ * if it is locked shared by one or more entities.
  *
- * The mutex may in an unlocked or shared lock state.
+ * A caller wishing to check whether a lock is owned exclusively by it
+ * should use mtx_owned().
  */
 static __inline int
-mtx_islocked_ex(mtx_t mtx)
+mtx_islocked_ex(mtx_t *mtx)
 {
 	return((mtx->mtx_lock & MTX_EXCLUSIVE) != 0);
 }
@@ -356,7 +426,7 @@ mtx_islocked_ex(mtx_t mtx)
  * Return TRUE (non-zero) if the mutex is not locked.
  */
 static __inline int
-mtx_notlocked(mtx_t mtx)
+mtx_notlocked(mtx_t *mtx)
 {
 	return(mtx->mtx_lock == 0);
 }
@@ -366,7 +436,7 @@ mtx_notlocked(mtx_t mtx)
  * The mutex may in an unlocked or shared lock state.
  */
 static __inline int
-mtx_notlocked_ex(mtx_t mtx)
+mtx_notlocked_ex(mtx_t *mtx)
 {
 	return((mtx->mtx_lock & MTX_EXCLUSIVE) != 0);
 }
@@ -376,7 +446,7 @@ mtx_notlocked_ex(mtx_t mtx)
  * the caller.
  */
 static __inline int
-mtx_owned(mtx_t mtx)
+mtx_owned(mtx_t *mtx)
 {
 	return((mtx->mtx_lock & MTX_EXCLUSIVE) && mtx->mtx_owner == curthread);
 }
@@ -386,7 +456,7 @@ mtx_owned(mtx_t mtx)
  * the caller.
  */
 static __inline int
-mtx_notowned(mtx_t mtx)
+mtx_notowned(mtx_t *mtx)
 {
 	return((mtx->mtx_lock & MTX_EXCLUSIVE) == 0 ||
 	       mtx->mtx_owner != curthread);
@@ -399,31 +469,42 @@ mtx_notowned(mtx_t mtx)
  * NOTE: If the mutex is held exclusively by someone other then the
  *	 caller the lock count for the other owner is still returned.
  */
-static __inline int
-mtx_lockrefs(mtx_t mtx)
+static __inline
+int
+mtx_lockrefs(mtx_t *mtx)
 {
 	return(mtx->mtx_lock & MTX_MASK);
 }
 
 /*
- * Bump the lock's ref count.  This field is independent of the lock.
+ * Lock must held and will be released on return.  Returns state
+ * which can be passed to mtx_lock_temp_restore() to return the
+ * lock to its previous state.
  */
-static __inline void
-mtx_hold(mtx_t mtx)
+static __inline
+mtx_state_t
+mtx_lock_temp_release(mtx_t *mtx)
 {
-	atomic_add_acq_int(&mtx->mtx_refs, 1);
+	mtx_state_t state;
+
+	state = (mtx->mtx_lock & MTX_EXCLUSIVE);
+	mtx_unlock(mtx);
+
+	return state;
 }
 
 /*
- * Drop the lock's ref count.  This field is independent of the lock.
- *
- * Returns the previous ref count, interlocked so testing against
- * 1 means you won the 1->0 transition
+ * Restore the previous state of a lock released with
+ * mtx_lock_temp_release() or mtx_lock_upgrade().
  */
-static __inline int
-mtx_drop(mtx_t mtx)
+static __inline
+void
+mtx_lock_temp_restore(mtx_t *mtx, mtx_state_t state)
 {
-	return (atomic_fetchadd_int(&mtx->mtx_refs, -1));
+	if (state & MTX_EXCLUSIVE)
+		mtx_lock_ex_quick(mtx);
+	else
+		mtx_lock_sh_quick(mtx);
 }
 
 #endif

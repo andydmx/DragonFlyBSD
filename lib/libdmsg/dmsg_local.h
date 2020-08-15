@@ -36,7 +36,6 @@
 #include <sys/queue.h>
 #include <sys/tree.h>
 #include <sys/endian.h>
-#include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/socket.h>
 #include <sys/dmsg.h>
@@ -49,6 +48,7 @@
 #include <arpa/inet.h>
 
 #include <assert.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <libutil.h>
 
@@ -67,3 +67,10 @@
 #include <machine/atomic.h>
 
 #include "dmsg.h"
+
+/*
+ * Define prototypes here to prevent conflict with hammer2.h.
+ * The real problem is that there is no userspace header for these two.
+ */
+uint32_t iscsi_crc32(const void *buf, size_t size);
+uint32_t iscsi_crc32_ext(const void *buf, size_t size, uint32_t ocrc);

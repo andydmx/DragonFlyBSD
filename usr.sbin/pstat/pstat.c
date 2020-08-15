@@ -43,14 +43,12 @@
 #include <sys/mount.h>
 #include <sys/uio.h>
 #include <sys/namei.h>
-#include <vfs/union/union.h>
 #include <sys/stat.h>
-#include <nfs/rpcv2.h>
-#include <nfs/nfsproto.h>
-#include <nfs/nfs.h>
-#include <nfs/nfsnode.h>
+#include <vfs/nfs/rpcv2.h>
+#include <vfs/nfs/nfsproto.h>
+#include <vfs/nfs/nfs.h>
+#include <vfs/nfs/nfsnode.h>
 #include <sys/ioctl.h>
-#include <sys/ioctl_compat.h>	/* XXX NTTYDISC is too well hidden */
 #include <sys/tty.h>
 #include <sys/conf.h>
 #include <sys/blist.h>
@@ -66,12 +64,20 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <libutil.h>
 
 #ifdef USE_KCORE
 #  define KCORE_KINFO_WRAPPER
 #  include <kcore.h>
 #else
 #  include <kinfo.h>
+#endif
+
+/*
+ * Backoff to DECIMAL mode if humanize_number does not have FRACTIONAL mode.
+ */
+#ifndef HN_FRACTIONAL
+#define HN_FRACTIONAL	HN_DECIMAL
 #endif
 
 enum {
@@ -102,6 +108,9 @@ struct nlist nl[] = {
 int	usenumflag;
 int	totalflag;
 int	swapflag;
+int	humanflag;
+long	pagesize;
+long	blocksize;
 char	*nlistf	= NULL;
 char	*memf	= NULL;
 kvm_t	*kd;
@@ -117,7 +126,6 @@ struct {
 	{ MNT_NOEXEC, "noexec" },
 	{ MNT_NOSUID, "nosuid" },
 	{ MNT_NODEV, "nodev" },
-	{ MNT_UNION, "union" },
 	{ MNT_ASYNC, "async" },
 	{ MNT_SUIDDIR, "suiddir" },
 	{ MNT_SOFTDEP, "softdep" },
@@ -181,12 +189,13 @@ void	ttyprt(struct tty *, int);
 void	ttytype(struct tty *, const char *, int, int, int);
 void	ufs_header(void);
 int	ufs_print(struct vnode *);
-void	union_header(void);
-int	union_print(struct vnode *);
 static void usage(void);
 void	vnode_header(void);
 void	vnode_print(struct vnode *, struct vnode *);
 void	vnodemode(void);
+
+static void Output(const char *name, int hlen,
+			struct kvm_swap *kswap, int flags);
 
 int
 main(int argc, char **argv)
@@ -207,13 +216,13 @@ main(int argc, char **argv)
 	if (!strcmp(opts,"swapinfo")) {
 		swapflag = 1;
 		opts = "ghkmM:N:";
-		usagestr = "swapinfo [-gkm] [-M core] [-N system]";
+		usagestr = "swapinfo [-ghkm] [-M core] [-N system]";
 	} else {
 		opts = "TM:N:fhiknstv";
-		usagestr = "pstat [-Tfknst] [-M core] [-N system]";
+		usagestr = "pstat [-Tfhknst] [-M core] [-N system]";
 	}
 
-	while ((ch = getopt(argc, argv, opts)) != -1)
+	while ((ch = getopt(argc, argv, opts)) != -1) {
 		switch (ch) {
 		case 'f':
 			fileflag = 1;
@@ -229,6 +238,9 @@ main(int argc, char **argv)
 		case 'm':
 			if (setenv("BLOCKSIZE", "1M", 1) == -1)
 				warn("setenv: cannot set BLOCKSIZE=1K");
+			break;
+		case 'h':
+			humanflag = 1;
 			break;
 		case 'M':
 			memf = optarg;
@@ -258,6 +270,7 @@ main(int argc, char **argv)
 		default:
 			usage();
 		}
+	}
 	argc -= optind;
 	argv += optind;
 
@@ -349,8 +362,6 @@ vnodemode(void)
 				ufs_header();
 			else if (!strcmp(ST.f_fstypename, "nfs"))
 				nfs_header();
-			else if (!strcmp(ST.f_fstypename, "union"))
-				union_header();
 			printf("\n");
 		}
 		vnode_print(evp->avnode, vp);
@@ -359,8 +370,6 @@ vnodemode(void)
 			ufs_print(vp);
 		else if (!strcmp(ST.f_fstypename, "nfs"))
 			nfs_print(vp);
-		else if (!strcmp(ST.f_fstypename, "union"))
-			union_print(vp);
 		printf("\n");
 	}
 	free(e_vnodebase);
@@ -563,24 +572,6 @@ nfs_print(struct vnode *vp)
 	return (0);
 }
 
-void
-union_header(void)
-{
-	printf("    UPPER    LOWER");
-}
-
-int
-union_print(struct vnode *vp)
-{
-	struct union_node unode, *up = &unode;
-
-	KGETRET(VTOUNION(vp), &unode, sizeof(unode), "vnode's unode");
-
-	printf(" %8lx %8lx", (u_long)(void *)up->un_uppervp,
-	    (u_long)(void *)up->un_lowervp);
-	return (0);
-}
-	
 /*
  * Given a pointer to a mount structure in kernel space,
  * read it in and return a usable pointer to it.
@@ -854,9 +845,6 @@ ttyprt(struct tty *tp, int line)
 	case TTYDISC:
 		printf("term\n");
 		break;
-	case NTTYDISC:
-		printf("ntty\n");
-		break;
 	case SLIPDISC:
 		printf("slip\n");
 		break;
@@ -934,63 +922,107 @@ swapmode(void)
 	struct kvm_swap kswap[16];
 	int i;
 	int n;
-	int pagesize = getpagesize();
 	const char *header;
 	int hlen;
-	long blocksize;
 
+	pagesize = getpagesize();
 	n = kvm_getswapinfo(
 	    kd, 
 	    kswap,
-	    sizeof(kswap)/sizeof(kswap[0]),
+	    NELEM(kswap),
 	    ((swapflag > 1) ? SWIF_DUMP_TREE : 0) | SWIF_DEV_PREFIX
 	);
 
-#define CONVERT(v)	((int)((quad_t)(v) * pagesize / blocksize))
+#define CONVERT(v)	((long)((quad_t)(v) * pagesize / blocksize))
+#define CONVERTB(v)	((long)((quad_t)(v) * pagesize))
 
-	header = getbsize(&hlen, &blocksize);
+	if (humanflag) {
+		hlen = 9;
+		header = "   Blocks";
+	} else {
+		header = getbsize(&hlen, &blocksize);
+	}
+
 	if (totalflag == 0) {
 		printf("%-15s %*s %8s %8s %8s  %s\n",
 		    "Device", hlen, header,
 		    "Used", "Avail", "Capacity", "Type");
 
 		for (i = 0; i < n; ++i) {
-			printf(
-			    "%-15s %*d ",
-			    kswap[i].ksw_devname,
-			    hlen,
-			    CONVERT(kswap[i].ksw_total)
-			);
-			printf(
-			    "%8d %8d %5.0f%%    %s\n",
-			    CONVERT(kswap[i].ksw_used),
-			    CONVERT(kswap[i].ksw_total - kswap[i].ksw_used),
-			    (double)kswap[i].ksw_used * 100.0 /
-				(double)kswap[i].ksw_total,
-			    (kswap[i].ksw_flags & SW_SEQUENTIAL) ?
-				"Sequential" : "Interleaved"
-			);
+			Output(kswap[i].ksw_devname, hlen, &kswap[i], 1);
 		}
 	}
 
 	if (totalflag) {
-		blocksize = 1024 * 1024;
-
-		printf(
-		    "%dM/%dM swap space\n", 
-		    CONVERT(kswap[n].ksw_used),
-		    CONVERT(kswap[n].ksw_total)
-		);
+		if (humanflag) {
+			char buf1[6];
+			char buf2[6];
+			humanize_number(buf1, sizeof(buf1),
+					CONVERTB(kswap[n].ksw_used),
+					"",
+					HN_AUTOSCALE, HN_NOSPACE |
+						      HN_FRACTIONAL);
+			humanize_number(buf2, sizeof(buf2),
+					CONVERTB(kswap[n].ksw_total),
+					"",
+					HN_AUTOSCALE, HN_NOSPACE |
+						      HN_FRACTIONAL);
+			printf("%s/%s swap space\n", buf1, buf2);
+		} else {
+			blocksize = 1024 * 1024;
+			printf("%ldM/%ldM swap space\n",
+			       CONVERT(kswap[n].ksw_used),
+			       CONVERT(kswap[n].ksw_total));
+		}
 	} else if (n > 1) {
-		printf(
-		    "%-15s %*d %8d %8d %5.0f%%\n",
-		    "Total",
-		    hlen, 
-		    CONVERT(kswap[n].ksw_total),
-		    CONVERT(kswap[n].ksw_used),
-		    CONVERT(kswap[n].ksw_total - kswap[n].ksw_used),
-		    (double)kswap[n].ksw_used * 100.0 /
-			(double)kswap[n].ksw_total
-		);
+		Output("Total", hlen, &kswap[n], 0);
 	}
+}
+
+static
+void
+Output(const char *name, int hlen, struct kvm_swap *kswap, int flags)
+{
+	char buf1[32];
+	char buf2[32];
+	char buf3[32];
+
+	if (humanflag) {
+		humanize_number(buf1, 6,
+				CONVERTB(kswap->ksw_total),
+				"",
+				HN_AUTOSCALE,
+				HN_NOSPACE | HN_FRACTIONAL);
+		humanize_number(buf2, 6,
+				CONVERTB(kswap->ksw_used),
+				"",
+				HN_AUTOSCALE,
+				HN_NOSPACE | HN_FRACTIONAL);
+		humanize_number(buf3, 6,
+				CONVERTB(kswap->ksw_total -
+					 kswap->ksw_used),
+				"",
+				HN_AUTOSCALE,
+				HN_NOSPACE | HN_FRACTIONAL);
+	} else {
+		snprintf(buf1, sizeof(buf1), "%*ld",
+			 hlen,
+			 CONVERT(kswap->ksw_total));
+		snprintf(buf2, sizeof(buf2), "%8ld",
+			 CONVERT(kswap->ksw_used));
+		snprintf(buf3, sizeof(buf2), "%8ld",
+			 CONVERT(kswap->ksw_total -
+				 kswap->ksw_used));
+	}
+	printf("%-15s %*s ", name, hlen, buf1);
+	printf("%8s %8s %5.0f%%",
+	       buf2,
+	       buf3,
+	       (double)kswap->ksw_used * 100.0 / (double)kswap->ksw_total);
+	if (flags) {
+		printf("    %s",
+		       ((kswap->ksw_flags & SW_SEQUENTIAL) ?
+			"Sequential" : "Interleaved"));
+	}
+	printf("\n");
 }

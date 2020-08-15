@@ -27,9 +27,8 @@
 .\"
 .\"     @(#)stat.2	8.4 (Berkeley) 5/1/95
 .\" $FreeBSD: src/lib/libc/sys/stat.2,v 1.16.2.7 2001/12/14 18:34:01 ru Exp $
-.\" $DragonFly: src/lib/libc/sys/stat.2,v 1.6 2008/09/28 16:33:35 swildner Exp $
 .\"
-.Dd August 1, 2009
+.Dd April 4, 2020
 .Dt STAT 2
 .Os
 .Sh NAME
@@ -130,30 +129,25 @@ as defined by
 and into which information is placed concerning the file.
 .Bd -literal
 struct stat {
-    dev_t     st_dev;               /* inode's device */
     ino_t     st_ino;               /* inode's number */
-    mode_t    st_mode;              /* inode protection mode */
     nlink_t   st_nlink;             /* number of hard links */
+    dev_t     st_dev;               /* inode's device */
+    mode_t    st_mode;              /* inode protection mode */
+    uint16_t  st_padding1;
     uid_t     st_uid;               /* user ID of the file's owner */
     gid_t     st_gid;               /* group ID of the file's group */
     dev_t     st_rdev;              /* device type */
-#ifndef _POSIX_SOURCE
-    struct timespec st_atimespec;  /* time of last access */
-    struct timespec st_mtimespec;  /* time of last data modification */
-    struct timespec st_ctimespec;  /* time of last file status change */
-#else
-    time_t    st_atime;             /* time of last access */
-    long      st_atimensec;         /* nsec of last access */
-    time_t    st_mtime;             /* time of last data modification */
-    long      st_mtimensec;         /* nsec of last data modification */
-    time_t    st_ctime;             /* time of last file status change */
-    long      st_ctimensec;         /* nsec of last file status change */
-#endif
+    struct timespec st_atim;        /* time of last access */
+    struct timespec st_mtim;        /* time of last data modification */
+    struct timespec st_ctim;        /* time of last file status change */
     off_t     st_size;              /* file size, in bytes */
-    int64_t   st_blocks;            /* blocks allocated for file */
-    u_int32_t st_blksize;           /* optimal blocksize for I/O */
+    blkcnt_t  st_blocks;            /* blocks allocated for file */
+    u_int32_t __old_st_blksize;     /* (for old ABI compat only, do not use) */
     u_int32_t st_flags;             /* user defined flags for file */
     u_int32_t st_gen;               /* file generation number */
+    int32_t   st_lspare;
+    blksize_t st_blksize;	    /* optimal blocksize for I/O */
+    int64_t   st_qspare2;           /* (placeholder for future, do not use) */
 };
 .Ed
 .Pp
@@ -161,7 +155,7 @@ The time-related fields of
 .Vt struct stat
 are as follows:
 .Bl -tag -width ".Fa st_mtime"
-.It Fa st_atime
+.It Fa st_atim
 Time when file data last accessed.
 Changed by the
 .Xr execve 2 ,
@@ -171,7 +165,7 @@ Changed by the
 and
 .Xr utimes 2
 system calls.
-.It Fa st_mtime
+.It Fa st_mtim
 Time when file data last modified.
 Changed by the
 .Xr mknod 2 ,
@@ -179,7 +173,7 @@ Changed by the
 and
 .Xr write 2
 system calls.
-.It Fa st_ctime
+.It Fa st_ctim
 Time when file status was last changed (inode data modification).
 Changed by the
 .Xr chmod 2 ,
@@ -194,15 +188,13 @@ and
 system calls.
 .El
 .Pp
-If
-.Dv _POSIX_SOURCE
-is not defined, the time-related fields are defined as:
+For compatibility with earlier versions of the
+.Tn POSIX
+standard, the following macros are defined:
 .Bd -literal
-#ifndef _POSIX_SOURCE
-#define st_atime st_atimespec.tv_sec
-#define st_mtime st_mtimespec.tv_sec
-#define st_ctime st_ctimespec.tv_sec
-#endif
+#define st_atime st_atim.tv_sec
+#define st_mtime st_mtim.tv_sec
+#define st_ctime st_ctim.tv_sec
 .Ed
 .Pp
 The size-related fields of the
@@ -221,21 +213,21 @@ The status information word
 .Fa st_mode
 has the following bits:
 .Bd -literal
-#define S_IFMT 0170000           /* type of file */
-#define        S_IFIFO  0010000  /* named pipe (fifo) */
-#define        S_IFCHR  0020000  /* character special */
-#define        S_IFDIR  0040000  /* directory */
-#define        S_IFBLK  0060000  /* block special */
-#define        S_IFREG  0100000  /* regular */
-#define        S_IFLNK  0120000  /* symbolic link */
-#define        S_IFSOCK 0140000  /* socket */
-#define        S_IFWHT  0160000  /* whiteout */
-#define S_ISUID 0004000  /* set user id on execution */
-#define S_ISGID 0002000  /* set group id on execution */
-#define S_ISVTX 0001000  /* save swapped text even after use */
-#define S_IRUSR 0000400  /* read permission, owner */
-#define S_IWUSR 0000200  /* write permission, owner */
-#define S_IXUSR 0000100  /* execute/search permission, owner */
+#define S_IFMT   0170000  /* type of file */
+#define S_IFIFO  0010000  /* named pipe (fifo) */
+#define S_IFCHR  0020000  /* character special */
+#define S_IFDIR  0040000  /* directory */
+#define S_IFBLK  0060000  /* block special */
+#define S_IFREG  0100000  /* regular */
+#define S_IFLNK  0120000  /* symbolic link */
+#define S_IFSOCK 0140000  /* socket */
+#define S_IFWHT  0160000  /* whiteout */
+#define S_ISUID  0004000  /* set user id on execution */
+#define S_ISGID  0002000  /* set group id on execution */
+#define S_ISVTX  0001000  /* save swapped text even after use */
+#define S_IRUSR  0000400  /* read permission, owner */
+#define S_IWUSR  0000200  /* write permission, owner */
+#define S_IXUSR  0000100  /* execute/search permission, owner */
 .Ed
 .Pp
 For a list of access modes, see

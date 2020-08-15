@@ -45,13 +45,6 @@
 #include "nscache.h"
 #endif
 
-extern int _ht_getnetbyname(void *, void *, va_list);
-extern int _dns_getnetbyname(void *, void *, va_list);
-extern int _nis_getnetbyname(void *, void *, va_list);
-extern int _ht_getnetbyaddr(void *, void *, va_list);
-extern int _dns_getnetbyaddr(void *, void *, va_list);
-extern int _nis_getnetbyaddr(void *, void *, va_list);
-
 /* Network lookup order if nsswitch.conf is broken or nonexistant */
 static const ns_src default_src[] = {
 	{ NSSRC_FILES, NS_SUCCESS },
@@ -125,12 +118,12 @@ static int
 net_marshal_func(char *buffer, size_t *buffer_size, void *retval __unused,
 		 va_list ap, void *cache_mdata)
 {
-	char *name;
-	uint32_t net;
-	int type;
+	char *name __unused;
+	uint32_t net __unused;
+	int type __unused;
 	struct netent *ne;
-	char *orig_buf;
-	size_t orig_buf_size;
+	char *orig_buf __unused;
+	size_t orig_buf_size __unused;
 
 	struct netent new_ne;
 	size_t desired_size, size, aliases_size;
@@ -214,9 +207,9 @@ static int
 net_unmarshal_func(char *buffer, size_t buffer_size, void *retval, va_list ap,
 		   void *cache_mdata)
 {
-	char *name;
-	uint32_t net;
-	int type;
+	char *name __unused;
+	uint32_t net __unused;
+	int type __unused;
 	struct netent *ne;
 	char *orig_buf;
 	size_t orig_buf_size;
@@ -342,7 +335,7 @@ __copy_netent(struct netent *ne, struct netent *nptr, char *buf, size_t buflen)
 
 int
 getnetbyname_r(const char *name, struct netent *ne, char *buffer,
-	       size_t buflen, struct netent **result, int *h_errorp)
+	       size_t buflen, struct netent **result, int *h_errnop)
 {
 #ifdef NS_CACHING
 	static const nss_cache_info cache_info =
@@ -363,14 +356,14 @@ getnetbyname_r(const char *name, struct netent *ne, char *buffer,
 
 	rval = _nsdispatch((void *)result, dtab, NSDB_NETWORKS,
 	    "getnetbyname_r", default_src, name, ne, buffer, buflen,
-	    &ret_errno, h_errorp);
+	    &ret_errno, h_errnop);
 
 	return ((rval == NS_SUCCESS) ? 0 : -1);
 }
 
 int
 getnetbyaddr_r(uint32_t addr, int af, struct netent *ne, char *buffer,
-	       size_t buflen, struct netent **result, int *h_errorp)
+	       size_t buflen, struct netent **result, int *h_errnop)
 {
 #ifdef NS_CACHING
 	static const nss_cache_info cache_info =
@@ -391,7 +384,7 @@ getnetbyaddr_r(uint32_t addr, int af, struct netent *ne, char *buffer,
 
 	rval = _nsdispatch((void *)result, dtab, NSDB_NETWORKS,
 	    "getnetbyaddr_r", default_src, addr, af, ne, buffer, buflen,
-	    &ret_errno, h_errorp);
+	    &ret_errno, h_errnop);
 
 	return ((rval == NS_SUCCESS) ? 0 : -1);
 }

@@ -1,6 +1,6 @@
 /******************************************************************************
 
-  Copyright (c) 2001-2012, Intel Corporation 
+  Copyright (c) 2001-2016, Intel Corporation
   All rights reserved.
   
   Redistribution and use in source and binary forms, with or without 
@@ -30,7 +30,7 @@
   POSSIBILITY OF SUCH DAMAGE.
 
 ******************************************************************************/
-/*$FreeBSD:$*/
+/*$FreeBSD$*/
 
 #include "e1000_api.h"
 
@@ -333,11 +333,7 @@ static void e1000_standby_nvm(struct e1000_hw *hw)
  *
  *  Terminates the current command by inverting the EEPROM's chip select pin.
  **/
-#ifdef NO_82542_SUPPORT
-static void e1000_stop_nvm(struct e1000_hw *hw)
-#else
 void e1000_stop_nvm(struct e1000_hw *hw)
-#endif
 {
 	u32 eecd;
 
@@ -586,6 +582,9 @@ s32 e1000_read_nvm_eerd(struct e1000_hw *hw, u16 offset, u16 words, u16 *data)
 			   E1000_NVM_RW_REG_DATA);
 	}
 
+	if (ret_val)
+		DEBUGOUT1("NVM read error: %d\n", ret_val);
+
 	return ret_val;
 }
 
@@ -776,6 +775,12 @@ s32 e1000_read_pba_string_generic(struct e1000_hw *hw, u8 *pba_num,
 
 	DEBUGFUNC("e1000_read_pba_string_generic");
 
+	if ((hw->mac.type >= e1000_i210) &&
+	    !e1000_get_flash_presence_i210(hw)) {
+		DEBUGOUT("Flashless no PBA string\n");
+		return -E1000_ERR_NVM_PBA_SECTION;
+	}
+
 	if (pba_num == NULL) {
 		DEBUGOUT("PBA string buffer was null\n");
 		return -E1000_ERR_INVALID_ARGUMENT;
@@ -925,40 +930,6 @@ s32 e1000_read_pba_length_generic(struct e1000_hw *hw, u32 *pba_num_size)
 	return E1000_SUCCESS;
 }
 
-/**
- *  e1000_read_pba_num_generic - Read device part number
- *  @hw: pointer to the HW structure
- *  @pba_num: pointer to device part number
- *
- *  Reads the product board assembly (PBA) number from the EEPROM and stores
- *  the value in pba_num.
- **/
-s32 e1000_read_pba_num_generic(struct e1000_hw *hw, u32 *pba_num)
-{
-	s32 ret_val;
-	u16 nvm_data;
-
-	DEBUGFUNC("e1000_read_pba_num_generic");
-
-	ret_val = hw->nvm.ops.read(hw, NVM_PBA_OFFSET_0, 1, &nvm_data);
-	if (ret_val) {
-		DEBUGOUT("NVM Read Error\n");
-		return ret_val;
-	} else if (nvm_data == NVM_PBA_PTR_GUARD) {
-		DEBUGOUT("NVM Not Supported\n");
-		return -E1000_NOT_IMPLEMENTED;
-	}
-	*pba_num = (u32)(nvm_data << 16);
-
-	ret_val = hw->nvm.ops.read(hw, NVM_PBA_OFFSET_1, 1, &nvm_data);
-	if (ret_val) {
-		DEBUGOUT("NVM Read Error\n");
-		return ret_val;
-	}
-	*pba_num |= nvm_data;
-
-	return E1000_SUCCESS;
-}
 
 /**
  *  e1000_read_pba_raw
@@ -1017,7 +988,7 @@ s32 e1000_read_pba_raw(struct e1000_hw *hw, u16 *eeprom_buf,
 				return ret_val;
 		} else {
 			if (eeprom_buf_size > (u32)(pba->word[1] +
-					      pba->pba_block[0])) {
+					      pba_block_size)) {
 				memcpy(pba->pba_block,
 				       &eeprom_buf[pba->word[1]],
 				       pba_block_size * sizeof(u16));
@@ -1279,7 +1250,6 @@ void e1000_get_fw_version(struct e1000_hw *hw, struct e1000_fw_version *fw_vers)
 	/* basic eeprom version numbers, bits used vary by part and by tool
 	 * used to create the nvm images */
 	/* Check which data format we have */
-	hw->nvm.ops.read(hw, NVM_ETRACK_HIWORD, 1, &etrack_test);
 	switch (hw->mac.type) {
 	case e1000_i211:
 		e1000_read_invm_version(hw, fw_vers);
@@ -1287,6 +1257,8 @@ void e1000_get_fw_version(struct e1000_hw *hw, struct e1000_fw_version *fw_vers)
 	case e1000_82575:
 	case e1000_82576:
 	case e1000_82580:
+	case e1000_i354:
+		hw->nvm.ops.read(hw, NVM_ETRACK_HIWORD, 1, &etrack_test);
 		/* Use this format, unless EETRACK ID exists,
 		 * then use alternate format
 		 */
@@ -1301,7 +1273,13 @@ void e1000_get_fw_version(struct e1000_hw *hw, struct e1000_fw_version *fw_vers)
 		}
 		break;
 	case e1000_i210:
+		if (!(e1000_get_flash_presence_i210(hw))) {
+			e1000_read_invm_version(hw, fw_vers);
+			return;
+		}
+		/* fall through */
 	case e1000_i350:
+		hw->nvm.ops.read(hw, NVM_ETRACK_HIWORD, 1, &etrack_test);
 		/* find combo image version */
 		hw->nvm.ops.read(hw, NVM_COMB_VER_PTR, 1, &comb_offset);
 		if ((comb_offset != 0x0) &&
@@ -1329,6 +1307,7 @@ void e1000_get_fw_version(struct e1000_hw *hw, struct e1000_fw_version *fw_vers)
 		}
 		break;
 	default:
+		hw->nvm.ops.read(hw, NVM_ETRACK_HIWORD, 1, &etrack_test);
 		return;
 	}
 	hw->nvm.ops.read(hw, NVM_VERSION, 1, &fw_version);
@@ -1357,8 +1336,11 @@ etrack_id:
 		hw->nvm.ops.read(hw, (NVM_ETRACK_WORD + 1), 1, &eeprom_verh);
 		fw_vers->etrack_id = (eeprom_verh << NVM_ETRACK_SHIFT)
 			| eeprom_verl;
+	} else if ((etrack_test & NVM_ETRACK_VALID) == 0) {
+		hw->nvm.ops.read(hw, NVM_ETRACK_WORD, 1, &eeprom_verh);
+		hw->nvm.ops.read(hw, (NVM_ETRACK_WORD + 1), 1, &eeprom_verl);
+		fw_vers->etrack_id = (eeprom_verh << NVM_ETRACK_SHIFT) |
+				     eeprom_verl;
 	}
-	return;
 }
-
 

@@ -445,14 +445,14 @@ phashinit_ext(int elements, size_t size, struct malloc_type *type,
  * MPSAFE
  */
 int
-iovec_copyin(struct iovec *uiov, struct iovec **kiov, struct iovec *siov,
-	     size_t iov_cnt, size_t *iov_len)
+iovec_copyin(const struct iovec *uiov, struct iovec **kiov, struct iovec *siov,
+	     int iov_cnt, size_t *iov_len)
 {
 	struct iovec *iovp;
 	int error, i;
 	size_t len;
 
-	if (iov_cnt > UIO_MAXIOV)
+	if ((u_int)iov_cnt > UIO_MAXIOV)
 		return EMSGSIZE;
 	if (iov_cnt > UIO_SMALLIOV) {
 		*kiov = kmalloc(sizeof(struct iovec) * iov_cnt, M_IOV,
@@ -512,7 +512,7 @@ iovec_copyin(struct iovec *uiov, struct iovec **kiov, struct iovec *siov,
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *

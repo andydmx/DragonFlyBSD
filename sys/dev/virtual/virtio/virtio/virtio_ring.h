@@ -39,6 +39,8 @@
 #define VRING_DESC_F_NEXT       1
 /* This marks a buffer as write-only (otherwise read-only). */
 #define VRING_DESC_F_WRITE      2
+/* This means the buffer contains a list of buffer descriptors. */
+#define VRING_DESC_F_INDIRECT	4
 
 /* The Host uses this in used->flags to advise the Guest: don't kick me
  * when you add a buffer.  It's unreliable, so it's simply an
@@ -130,7 +132,7 @@ vring_size(unsigned int num, unsigned long align)
 
 	size = num * sizeof(struct vring_desc);
 	size += sizeof(struct vring_avail) + (num * sizeof(uint16_t));
-	size = (size + align - 1) & ~(align - 1);
+	size = roundup2(size, align);
 	size += sizeof(struct vring_used) +
 	    (num * sizeof(struct vring_used_elem));
 	return (size);
@@ -144,8 +146,8 @@ vring_init(struct vring *vr, unsigned int num, uint8_t *p,
         vr->desc = (struct vring_desc *) p;
         vr->avail = (struct vring_avail *) (p +
 	    num * sizeof(struct vring_desc));
-        vr->used = (void *)
-	    (((unsigned long) &vr->avail->ring[num] + align-1) & ~(align-1));
+        vr->used =
+	    (void *)roundup2((unsigned long)&vr->avail->ring[num], align);
 }
 
 /*

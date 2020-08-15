@@ -31,7 +31,7 @@
 .\"
 .\" $FreeBSD: src/share/man/man4/mxge.4,v 1.7.4.2.4.1 2009/04/15 03:14:26 kensmith Exp $
 .\"
-.Dd October 27, 2013
+.Dd May 25, 2017
 .Dt MXGE 4
 .Os
 .Sh NAME
@@ -43,6 +43,7 @@ place the following lines in your
 kernel configuration file:
 .Bd -ragged -offset indent
 .Cd "device mxge"
+.Cd "device mxgefw"
 .Ed
 .Pp
 Alternatively, to load the driver as a
@@ -77,6 +78,27 @@ All hardware requirements listed apply to use with
 For further hardware information, see
 .Pa http://www.myricom.com .
 .Pp
+The
+.Nm
+driver supports the following media options:
+.Bl -tag -width ".Cm forcepause"
+.It Cm rxpause
+Enable flow control PAUSE reception.
+Due to hardware limitation,
+this will also enable PAUSE transmission.
+.It Cm txpause
+Enable flow control PAUSE transmission.
+Due to hardware limitation,
+this will also enable PAUSE reception.
+.It Cm forcepause
+Force flow control PAUSE operation as configured by
+.Cm rxpause
+and
+.Cm txpause
+media options.
+This media option can't be turned off.
+.El
+.Pp
 For more information on configuring this device, see
 .Xr ifconfig 8 .
 The
@@ -106,12 +128,6 @@ By default,
 the driver will use MSI-X
 if it is supported.
 This behaviour can be turned off by setting this tunable to 0.
-.It Va hw.mxgeX.msix.offset
-If more than 1 slices are enabled,
-this tunable specifies the leading target CPU for slice's
-transmission and reception queues processing.
-The value specificed must be aligned to the number of slices enabled and
-must be less than the power of 2 number of CPUs.
 .It Va hw.mxge.msi.enable Va hw.mxgeX.msi.enable
 If MSI-X is disabled and MSI is supported,
 the driver will use MSI.
@@ -131,7 +147,7 @@ except the first slice,
 could be disabled.
 The default value is 0.
 .It Va hw.mxge.multi_tx Va hw.mxgeX.multi_tx
-If more then 1 slices are enabled,
+If more than 1 slice is enabled,
 this tunable controls whether the tranmission queue of each
 slice should be enabled.
 Setting this tunable to 0 will only enable the transmission queue
@@ -147,17 +163,20 @@ The default value is 0.
 This value delays the generation of all interrupts in units of
 1 microsecond.
 The default value is 150.
-.It Va hw.mxge.flow_control_enabled
-Whether or not hardware flow control is enabled on the adapter.
-The default value is 1.
+.It Va hw.mxge.flow_ctrl
+The default flow control settings.
+Supported values are:
+force-full (forcefully enable PAUSE reception and transmission).
+force-none (forcefully disable flow control PAUSE operation).
+Default is force-none.
 .El
 .Sh MIB Variables
 A number of per-interface variables are implemented in the
-.Va hw.mxge Ns Em X
+.Va dev.mxge. Ns Em X
 branch of the
 .Xr sysctl 3
 MIB.
-.Bl -tag -width "flow_control_enabled"
+.Bl -tag -width "firmware_version"
 .It Va firmware_version
 The version string of firmware that is currently loaded by the driver.
 It is read-only.
@@ -168,9 +187,6 @@ Flipping its value will cause chip reinitialization.
 .It Va intr_coal_delay
 See tunable
 .Va hw.mxge.intr_coal_delay .
-.It Va flow_control_enabled
-See tunable
-.Va hw.mxge.flow_control_enabled .
 .El
 .Sh SUPPORT
 For general information and support,

@@ -15,11 +15,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -37,7 +33,6 @@
  *
  *	@(#)buf.h	8.9 (Berkeley) 3/30/95
  * $FreeBSD: src/sys/sys/buf.h,v 1.88.2.10 2003/01/25 19:02:23 dillon Exp $
- * $DragonFly: src/sys/sys/buf2.h,v 1.21 2008/01/28 07:19:06 nth Exp $
  */
 
 #ifndef _SYS_BUF2_H_
@@ -46,16 +41,7 @@
 #ifdef _KERNEL
 
 #ifndef _SYS_BUF_H_
-#include <sys/buf.h>		/* crit_*() functions */
-#endif
-#ifndef _SYS_GLOBALDATA_H_
-#include <sys/globaldata.h>	/* curthread */
-#endif
-#ifndef _SYS_THREAD2_H_
-#include <sys/thread2.h>	/* crit_*() functions */
-#endif
-#ifndef _SYS_SPINLOCK2_H_
-#include <sys/spinlock2.h>	/* crit_*() functions */
+#include <sys/buf.h>
 #endif
 #ifndef _SYS_MOUNT_H_
 #include <sys/mount.h>
@@ -71,7 +57,7 @@
  * Initialize a lock.
  */
 #define BUF_LOCKINIT(bp) \
-	lockinit(&(bp)->b_lock, buf_wmesg, 0, 0)
+	lockinit(&(bp)->b_lock, buf_wmesg, 0, LK_NOCOLLSTATS)
 
 /*
  *
@@ -129,22 +115,16 @@ BUF_KERNPROC(struct buf *bp)
  * where the buffer is expected to be owned or otherwise data stable.
  */
 static __inline int
-BUF_REFCNT(struct buf *bp)
+BUF_LOCKINUSE(struct buf *bp)
 {
-	return (lockcount(&(bp)->b_lock));
-}
-
-static __inline int
-BUF_REFCNTNB(struct buf *bp)
-{
-	return (lockcountnb(&(bp)->b_lock));
+	return (lockinuse(&(bp)->b_lock));
 }
 
 /*
  * Free a buffer lock.
  */
 #define BUF_LOCKFREE(bp) 			\
-	if (BUF_REFCNTNB(bp) > 0)		\
+	if (BUF_LOCKINUSE(bp))			\
 		panic("free locked buf")
 
 static __inline void
@@ -244,7 +224,9 @@ buf_deallocate(struct buf *bp)
 }
 
 /*
- * MPSAFE
+ * This callback is made from flushbufqueues() which uses BUF_LOCK().
+ * Since it isn't going through a normal buffer aquisition mechanic
+ * and calling the filesystem back enforce the vnode's KVABIO support.
  */
 static __inline int
 buf_countdeps(struct buf *bp, int n)
@@ -252,10 +234,13 @@ buf_countdeps(struct buf *bp, int n)
 	struct bio_ops *ops = bp->b_ops;
 	int r;
 
-	if (ops)
+	if (ops) {
+		if (bp->b_vp == NULL || (bp->b_vp->v_flag & VKVABIO) == 0)
+			bkvasync_all(bp);
 		r = ops->io_countdeps(bp, n);
-	else
+	} else {
 		r = 0;
+	}
 	return(r);
 }
 
@@ -325,15 +310,20 @@ buf_checkread(struct buf *bp)
 }
 
 /*
- * MPSAFE
+ * This callback is made from flushbufqueues() which uses BUF_LOCK().
+ * Since it isn't going through a normal buffer aquisition mechanic
+ * and calling the filesystem back enforce the vnode's KVABIO support.
  */
 static __inline int
 buf_checkwrite(struct buf *bp)
 {
 	struct bio_ops *ops = bp->b_ops;
 
-	if (ops)
+	if (ops) {
+		if (bp->b_vp == NULL || (bp->b_vp->v_flag & VKVABIO) == 0)
+			bkvasync_all(bp);
 		return(ops->io_checkwrite(bp));
+	}
 	return(0);
 }
 
@@ -357,16 +347,25 @@ static __inline int
 bread(struct vnode *vp, off_t loffset, int size, struct buf **bpp)
 {
 	*bpp = NULL;
-	return(breadnx(vp, loffset, size, NULL, NULL, 0, bpp));
+	return(breadnx(vp, loffset, size, B_NOTMETA,
+		       NULL, NULL, 0, bpp));
 }
 
+static __inline int
+bread_kvabio(struct vnode *vp, off_t loffset, int size, struct buf **bpp)
+{
+	*bpp = NULL;
+	return(breadnx(vp, loffset, size, B_NOTMETA | B_KVABIO,
+		       NULL, NULL, 0, bpp));
+}
 
 static __inline int
 breadn(struct vnode *vp, off_t loffset, int size, off_t *raoffset,
-      int *rabsize, int cnt, struct buf **bpp)
+       int *rabsize, int cnt, struct buf **bpp)
 {
 	*bpp = NULL;
-	return(breadnx(vp, loffset, size, raoffset, rabsize, cnt, bpp));
+	return(breadnx(vp, loffset, size, B_NOTMETA, raoffset,
+		       rabsize, cnt, bpp));
 }
 
 static __inline int
@@ -374,8 +373,18 @@ cluster_read(struct vnode *vp, off_t filesize, off_t loffset,
              int blksize, size_t minreq, size_t maxreq, struct buf **bpp)
 {
 	*bpp = NULL;
-	return(cluster_readx(vp, filesize, loffset, blksize, minreq,
-			     maxreq, bpp));
+	return(cluster_readx(vp, filesize, loffset, blksize, B_NOTMETA,
+			     minreq, maxreq, bpp));
+}
+
+static __inline int
+cluster_read_kvabio(struct vnode *vp, off_t filesize, off_t loffset,
+             int blksize, size_t minreq, size_t maxreq, struct buf **bpp)
+{
+	*bpp = NULL;
+	return(cluster_readx(vp, filesize, loffset, blksize,
+			     B_NOTMETA | B_KVABIO,
+			     minreq, maxreq, bpp));
 }
 
 #endif /* _KERNEL */

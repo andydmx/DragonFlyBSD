@@ -39,7 +39,6 @@
 #include <sys/serialize.h>
 #include <sys/bus.h>
 #include <sys/rman.h>
-#include <sys/thread2.h>
 #include <sys/interrupt.h>
 
 #include <net/if.h>
@@ -249,7 +248,7 @@ sbsh_attach(device_t dev)
 	init_card(sc);
 	/* generate ethernet MAC address */
 	*(u_int32_t *)sc->arpcom.ac_enaddr = htonl(0x00ff0192);
-	read_random_unlimited(sc->arpcom.ac_enaddr + 4, 2);
+	read_random(sc->arpcom.ac_enaddr + 4, 2, 1);
 
 	ifp = &sc->arpcom.ac_if;
 	ifp->if_softc = sc;
@@ -681,7 +680,7 @@ repack(struct sbsh_softc *sc, struct mbuf *m)
 {
 	struct mbuf  *m_new;
 
-	MGETHDR(m_new, MB_DONTWAIT, MT_DATA);
+	MGETHDR(m_new, M_NOWAIT, MT_DATA);
 	if (!m_new) {
 		if_printf (&sc->arpcom.ac_if,
 			   "unable to get mbuf.\n");
@@ -689,7 +688,7 @@ repack(struct sbsh_softc *sc, struct mbuf *m)
 	}
 
 	if (m->m_pkthdr.len > MHLEN) {
-		MCLGET(m_new, MB_DONTWAIT);
+		MCLGET(m_new, M_NOWAIT);
 		if (!(m_new->m_flags & M_EXT)) {
 			m_freem(m_new);
 			if_printf (&sc->arpcom.ac_if,
@@ -738,7 +737,7 @@ alloc_rx_buffers(struct sbsh_softc *sc)
 	struct mbuf	*m;
 
 	while (sc->tail_rq != ((sc->head_rq - 1) & (RQLEN - 1))) {
-		MGETHDR(m, MB_DONTWAIT, MT_DATA);
+		MGETHDR(m, M_NOWAIT, MT_DATA);
 		if (!m) {
 			if_printf (&sc->arpcom.ac_if,
 				   "unable to get mbuf.\n");
@@ -746,7 +745,7 @@ alloc_rx_buffers(struct sbsh_softc *sc)
 		}
 
 		if (SBNI16_MAX_FRAME > MHLEN) {
-			MCLGET(m, MB_DONTWAIT);
+			MCLGET(m, M_NOWAIT);
 			if (!(m->m_flags & M_EXT)) {
 				m_freem(m);
 				if_printf (&sc->arpcom.ac_if,

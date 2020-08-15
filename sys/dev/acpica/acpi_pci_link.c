@@ -39,7 +39,7 @@
 #include <dev/acpica/acpi_pcibvar.h>
 #include <dev/acpica/acpi_sci_var.h>
 
-#include <bus/pci/i386/pci_cfgreg.h>
+#include <bus/pci/pci_cfgreg.h>
 #include <bus/pci/pcireg.h>
 #include <bus/pci/pcivar.h>
 #include "pcib_if.h"
@@ -1113,6 +1113,7 @@ static driver_t acpi_pci_link_driver = {
 	"pci_link",
 	acpi_pci_link_methods,
 	sizeof(struct acpi_pci_link_softc),
+	.gpri = KOBJ_GPRI_ACPI
 };
 
 static devclass_t pci_link_devclass;

@@ -38,7 +38,7 @@ __targets= \
 	maninstall realinstall	\
 	lint manlint regress \
 	buildfiles buildincludes installfiles installincludes
-__targets+=	mandiff # XXX temporary target
+#__targets+=	mandiff # XXX temporary target
 
 .for __target in ${__targets}
 
@@ -46,9 +46,12 @@ __targets+=	mandiff # XXX temporary target
 
 _SUBDIR_${__target}: ${SUBDIR:S/^/_SUBDIR_${__target}_/}
 
+# order subdirectories for each target, set up dependency
+#
+.ORDER: ${SUBDIR_ORDERED:S/^/_SUBDIR_${__target}_/}
+
 # Now create the command set for each subdirectory and target
 #
-
 .for entry in ${SUBDIR}
 _SUBDIR_${__target}_${entry}:
 		@(if test -d ${.CURDIR}/${entry}.${MACHINE_ARCH}; then \
@@ -61,21 +64,18 @@ _SUBDIR_${__target}_${entry}:
 			cd ${.CURDIR}/$${edir}; \
 		fi; \
 		${MAKE} ${__target:realinstall=install} \
-		    DIRPRFX=${DIRPRFX}$$edir/;)
+			DIRPRFX=${DIRPRFX}$$edir/;)
+		@${ECHODIR} "<=== ${DIRPRFX}${entry}"
 
 .endfor
 
-# order subdirectories for each target, set up dependency
-#
-.ORDER: ${SUBDIR_ORDERED:S/^/_SUBDIR_${__target}_/}
-
-.else
+.else  # defined(SUBDIR)
 
 _SUBDIR_${__target}: .USE
 
-.endif
+.endif  # defined(SUBDIR)
 
-.endfor
+.endfor  # ${__targets}
 
 ${SUBDIR}: .PHONY
 	@if test -d ${.TARGET}.${MACHINE_ARCH}; then \

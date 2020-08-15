@@ -32,7 +32,6 @@
  */
 
 #include <sys/param.h>
-#include <sys/file.h>
 #include <sys/socket.h>
 #include <sys/ioctl.h>
 #include <sys/sysctl.h>
@@ -46,11 +45,14 @@
 #include <arpa/inet.h>
 #include <netdb.h>
 
+#include <netproto/802_11/ieee80211_dragonfly.h>
 #include <netproto/mpls/mpls.h>
 
 #include <ctype.h>
 #include <err.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <inttypes.h>
 #include <paths.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -60,7 +62,6 @@
 #include <ifaddrs.h>
 
 #include "extern.h"
-#include "keywords.h"
 
 union	sockunion {
 	struct	sockaddr sa;
@@ -80,7 +81,15 @@ typedef union sockunion *sup;
 int	nflag, wflag;
 int	cpuflag = -1;
 
-static struct ortentry route;
+static struct keytab {
+	const char	*kt_cp;
+	int	kt_i;
+} const keywords[] = {
+#include "keywords.h"
+	{0, 0}
+};
+
+static struct sockaddr_in so_gate_tried;
 static struct rt_metrics rt_metrics;
 static int	pid, rtm_addrs;
 static int	s;
@@ -93,10 +102,10 @@ static uid_t	uid;
 
 static void	 flushroutes(int, char **);
 static void	 set_metric(char *, int);
-static void	 newroute(int, char **);
+static void	 newroute(int, char **) __dead2;
 static void	 inet_makenetandmask(u_long, struct sockaddr_in *, u_long);
 static void	 interfaces(void);
-static void	 monitor(void);
+static void	 monitor(void) __dead2;
 static void	 sockaddr(const char *, struct sockaddr *);
 static void	 sodump(sup, const char *);
 static void	 bprintf(FILE *, int, u_char *);
@@ -112,12 +121,16 @@ static int	 prefixlen(const char *);
 static int	 inet6_makenetandmask(struct sockaddr_in6 *, const char *);
 #endif
 
+#define	PRIETHER	"02x:%02x:%02x:%02x:%02x:%02x"
+#define	PRIETHER_ARGS(__enaddr)	(__enaddr)[0], (__enaddr)[1], (__enaddr)[2], \
+				(__enaddr)[3], (__enaddr)[4], (__enaddr)[5]
+
 void
 usage(const char *cp)
 {
 	if (cp != NULL)
 		warnx("bad keyword: %s", cp);
-	fprintf(stderr, "usage: route [-dnqtv] command [[modifiers] args]\n");
+	fprintf(stderr, "usage: route [-dnqtvw] [-c cpu] command [[modifiers] args]\n");
 	exit(EX_USAGE);
 	/* NOTREACHED */
 }
@@ -164,8 +177,15 @@ main(int argc, char **argv)
 	uid = geteuid();
 	if (tflag)
 		s = open(_PATH_DEVNULL, O_WRONLY, 0);
-	else
+	else {
+
 		s = socket(PF_ROUTE, SOCK_RAW, 0);
+#ifdef SO_RERROR
+		int on = 1;
+		if (setsockopt(s, SOL_SOCKET, SO_RERROR, &on, sizeof(on)) == -1)
+			warn("SO_RERROR");
+#endif
+	}
 	if (s < 0)
 		err(EX_OSERR, "socket");
 	if (*argv != NULL)
@@ -807,6 +827,7 @@ newroute(int argc, char **argv)
 			break;
 		if (af == AF_INET && *gateway != '\0' &&
 		    hp != NULL && hp->h_addr_list[1] != NULL) {
+			so_gate_tried = so_gate.sin;
 			hp->h_addr_list++;
 			memmove(&so_gate.sin.sin_addr,
 				hp->h_addr_list[0],
@@ -822,9 +843,10 @@ newroute(int argc, char **argv)
 		printf("%s %s %s", cmd, ishost? "host" : "net", dest);
 		if (*gateway != '\0') {
 			printf(": gateway %s", gateway);
-			if (attempts > 1 && ret == 0 && af == AF_INET)
-			    printf(" (%s)",
-				inet_ntoa(((struct sockaddr_in *)&route.rt_gateway)->sin_addr));
+			if (attempts > 1 && ret == 0 && af == AF_INET) {
+				printf(" (%s)",
+				    inet_ntoa(so_gate_tried.sin_addr));
+			}
 		}
 		if (ret == 0) {
 			printf("\n");
@@ -1158,7 +1180,7 @@ prefixlen(const char *len_str)
 	int max;
 	char *p;
 
-	rtm_addrs |= RTA_NETMASK;	
+	rtm_addrs |= RTA_NETMASK;
 	switch (af) {
 #ifdef INET6
 	case AF_INET6:
@@ -1180,7 +1202,7 @@ prefixlen(const char *len_str)
 		fprintf(stderr, "%s: bad value\n", len_str);
 		exit(1);
 	}
-	
+
 	q = len >> 3;
 	r = len & 7;
 	so_mask.sa.sa_family = af;
@@ -1226,18 +1248,25 @@ interfaces(void)
 static void
 monitor(void)
 {
-	int n;
+	int n, error;
 	char msg[2048];
+	time_t now;
 
 	verbose = 1;
 	if (debugonly) {
 		interfaces();
 		exit(0);
 	}
+
 	for (;;) {
-		time_t now;
-		n = read(s, msg, 2048);
+		n = read(s, msg, sizeof(msg));
+		error = errno;
 		now = time(NULL);
+		if (n == -1) {
+			printf("\nsocket error %d on %s %s\n",
+			    error, ctime(&now), strerror(errno));
+			continue;
+		}
 		printf("\ngot message of size %d on %s", n, ctime(&now));
 		print_rtmsg((struct rt_msghdr *)msg, n);
 	}
@@ -1359,8 +1388,8 @@ const char *msgtypes[] = {
 	"RTM_REDIRECT: Told to use different route",
 	"RTM_MISS: Lookup failed on this address",
 	"RTM_LOCK: fix specified metrics",
-	"RTM_OLDADD: caused by SIOCADDRT",
-	"RTM_OLDDEL: caused by SIOCDELRT",
+	"0x9: unused",
+	"0xa: unused",
 	"RTM_RESOLVE: Route created by cloning",
 	"RTM_NEWADDR: address being added to iface",
 	"RTM_DELADDR: address being removed from iface",
@@ -1368,6 +1397,7 @@ const char *msgtypes[] = {
 	"RTM_NEWMADDR: new multicast group membership on iface",
 	"RTM_DELMADDR: multicast group membership removed from iface",
 	"RTM_IFANNOUNCE: interface arrival/departure",
+	"RTM_IEEE80211: IEEE80211 wireless event",
 	0,
 };
 
@@ -1387,6 +1417,25 @@ char addrnames[] =
 "\1DST\2GATEWAY\3NETMASK\4GENMASK\5IFP\6IFA\7AUTHOR\010BRD"
 "\011MPLS1\012MPLS2\013MPLS3";
 
+static const char *
+linkstate(struct if_msghdr *ifm)
+{
+	static char buf[64];
+
+	switch (ifm->ifm_data.ifi_link_state) {
+	case LINK_STATE_UNKNOWN:
+		return "carrier: unknown";
+	case LINK_STATE_DOWN:
+		return "carrier: no carrier";
+	case LINK_STATE_UP:
+		return "carrier: active";
+	default:
+		(void)snprintf(buf, sizeof(buf), "carrier: 0x%lx",
+		    ifm->ifm_data.ifi_link_state);
+		return buf;
+	}
+}
+
 static void
 print_rtmsg(struct rt_msghdr *rtm, int msglen __unused)
 {
@@ -1396,6 +1445,13 @@ print_rtmsg(struct rt_msghdr *rtm, int msglen __unused)
 	struct ifma_msghdr *ifmam;
 #endif
 	struct if_announcemsghdr *ifan;
+	union {
+		struct ieee80211_join_event join;
+		struct ieee80211_leave_event leave;
+		struct ieee80211_replay_event replay;
+		struct ieee80211_michael_event michael;
+	} ev;
+	size_t evlen = 0;
 
 	if (verbose == 0)
 		return;
@@ -1412,7 +1468,7 @@ print_rtmsg(struct rt_msghdr *rtm, int msglen __unused)
 	switch (rtm->rtm_type) {
 	case RTM_IFINFO:
 		ifm = (struct if_msghdr *)rtm;
-		printf("if# %d, flags:", ifm->ifm_index);
+		printf("if# %d, %s, flags:", ifm->ifm_index, linkstate(ifm));
 		bprintf(stdout, ifm->ifm_flags, ifnetflags);
 		pmsg_addrs((char *)(ifm + 1), ifm->ifm_addrs);
 		break;
@@ -1430,6 +1486,73 @@ print_rtmsg(struct rt_msghdr *rtm, int msglen __unused)
 		pmsg_addrs((char *)(ifmam + 1), ifmam->ifmam_addrs);
 		break;
 #endif
+	case RTM_IEEE80211:
+		ifan = (struct if_announcemsghdr *)rtm;
+		(void)printf("if# %d, what: ", ifan->ifan_index);
+		switch (ifan->ifan_what) {
+		case RTM_IEEE80211_ASSOC:
+			printf("associate");
+			break;
+		case RTM_IEEE80211_REASSOC:
+			printf("re-associate");
+			break;
+		case RTM_IEEE80211_DISASSOC:
+			printf("disassociate");
+			break;
+		case RTM_IEEE80211_SCAN:
+			printf("scan complete");
+			break;
+		case RTM_IEEE80211_JOIN:
+			evlen = sizeof(ev.join);
+			printf("join");
+			break;
+		case RTM_IEEE80211_LEAVE:
+			evlen = sizeof(ev.leave);
+			printf("leave");
+			break;
+		case RTM_IEEE80211_MICHAEL:
+			evlen = sizeof(ev.michael);
+			printf("michael");
+			break;
+		case RTM_IEEE80211_REPLAY:
+			evlen = sizeof(ev.replay);
+			printf("replay");
+			break;
+		default:
+			evlen = 0;
+			printf("#%d", ifan->ifan_what);
+			break;
+		}
+		if (sizeof(*ifan) + evlen > ifan->ifan_msglen) {
+			printf(" (truncated)\n");
+			break;
+		}
+		(void)memcpy(&ev, (ifan + 1), evlen);
+		switch (ifan->ifan_what) {
+		case RTM_IEEE80211_JOIN:
+		case RTM_IEEE80211_LEAVE:
+			printf(" mac %" PRIETHER,
+			    PRIETHER_ARGS(ev.join.iev_addr));
+			break;
+		case RTM_IEEE80211_REPLAY:
+		case RTM_IEEE80211_MICHAEL:
+			printf(" src %" PRIETHER " dst %" PRIETHER
+			       " cipher %" PRIu8 " keyix %" PRIu8,
+			       PRIETHER_ARGS(ev.replay.iev_src),
+			       PRIETHER_ARGS(ev.replay.iev_dst),
+			       ev.replay.iev_cipher,
+			       ev.replay.iev_keyix);
+			if (ifan->ifan_what == RTM_IEEE80211_REPLAY) {
+				printf(" key rsc %#" PRIx64
+				       " frame rsc %#" PRIx64,
+				       ev.replay.iev_keyrsc, ev.replay.iev_rsc);
+			}
+			break;
+		default:
+			break;
+		}
+		printf("\n");
+		break;
 	case RTM_IFANNOUNCE:
 		ifan = (struct if_announcemsghdr *)rtm;
 		printf("if# %d, what: ", ifan->ifan_index);
@@ -1617,7 +1740,7 @@ bprintf(FILE *fp, int b, u_char *str)
 int
 keyword(const char *cp)
 {
-	struct keytab *kt = keywords;
+	const struct keytab *kt = keywords;
 
 	while (kt->kt_cp != NULL && strcmp(kt->kt_cp, cp) != 0)
 		kt++;

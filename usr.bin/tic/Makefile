@@ -16,10 +16,12 @@ CFLAGS+=	-I${.CURDIR}/../../lib/libncurses/include
 CFLAGS+=	-I${.CURDIR}
 CFLAGS+=	-I${.OBJDIR}
 
-# Ideally this should be -lncursesw
+# Ideally this should be -lprivate_ncursesw
 # Wide version can be used when DragonFly 3.3 branch is created
 DPADD=		${LIBNCURSES}
-LDADD=		-lncurses
+LDADD=		-lprivate_ncurses
+CFLAGS+=	-I${_SHLIBDIRPREFIX}/usr/include/priv/ncurses
+LDFLAGS+=	${PRIVATELIB_LDFLAGS}
 
 ncurses_def.h:
 	AWK=awk sh ${NCURSESDIR}/include/MKncurses_def.sh \
@@ -29,8 +31,9 @@ parametrized.h:
 	AWK=awk sh ${NCURSESDIR}/include/MKparametrized.sh \
 	  ${TERMINFO_CAPS} > ${.TARGET}
 
-# Hack: It's really termsort.c, but bootstrap stage chokes on it
-termsort.h:
+beforedepend:	termsort.c
+
+termsort.c:
 	sh ${PROGSDIR}/MKtermsort.sh awk ${TERMINFO_CAPS} > termsort.c
 
 tic.o: ${PROGSDIR}/tic.c
@@ -39,12 +42,12 @@ tic.o: ${PROGSDIR}/tic.c
 transform.o: ${PROGSDIR}/transform.c
 	${CC} ${CFLAGS} -c ${PROGSDIR}/transform.c -o ${.TARGET}
 
-dump_entry.o: ${PROGSDIR}/dump_entry.c termsort.h
+dump_entry.o: ${PROGSDIR}/dump_entry.c termsort.c
 	${CC} ${CFLAGS} -c ${PROGSDIR}/dump_entry.c -o ${.TARGET}
 
 CLEANFILES=	ncurses_def.h parametrized.h termsort.c
 
-SRCS=	ncurses_def.h parametrized.h termsort.h
-SRCS+=	tic.c dump_entry.c transform.c
+SRCS=	ncurses_def.h parametrized.h
+SRCS+=	tic.c dump_entry.c tparm_type.c transform.c
 
 .include <bsd.prog.mk>

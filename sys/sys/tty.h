@@ -15,11 +15,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -37,21 +33,10 @@
  *
  *	@(#)tty.h	8.6 (Berkeley) 1/21/94
  * $FreeBSD: src/sys/sys/tty.h,v 1.53.2.1 2001/02/26 04:23:21 jlemon Exp $
- * $DragonFly: src/sys/sys/tty.h,v 1.12 2006/09/10 01:26:40 dillon Exp $
  */
 
 #ifndef _SYS_TTY_H_
 #define	_SYS_TTY_H_
-
-#ifndef _SYS_TERMIOS_H_
-#include <sys/termios.h>
-#endif
-#ifndef _SYS_EVENT_H_
-#include <sys/event.h>
-#endif
-#ifdef _KERNEL
-#include <sys/device.h>
-#endif
 
 /*
  * Clists are character lists, which is a variable length linked list
@@ -59,17 +44,23 @@
  */
 struct clist {
 	int	c_cc;		/* Number of characters in the clist. */
-	int	c_cbcount;	/* Number of cblocks. */
-	int	c_cbmax;	/* Max # cblocks allowed for this clist. */
-	int	c_cbreserved;	/* # cblocks reserved for this clist. */
-	char	*c_cf;		/* Pointer to the first cblock. */
-	char	*c_cl;		/* Pointer to the last cblock. */
+	int	c_ccmax;	/* Max # chars for this clist. */
+	int	c_cchead;	/* First char */
+	int	c_unused01;
+	short	*c_data;	/* linear data buffer (no longer chained) */
 };
 
 #if defined(_KERNEL) || defined(_KERNEL_STRUCTURES)
 
-#ifndef _SYS_QUEUE_H_
+#include <sys/_termios.h>
+#include <sys/event.h>
 #include <sys/queue.h>
+#include <sys/ttycom.h>
+#ifdef _KERNEL
+#include <sys/device.h>
+#endif
+#ifndef _SYS_THREAD_H_
+#include <sys/thread.h>
 #endif
 
 /*
@@ -80,6 +71,7 @@ struct clist {
  * (low, high, timeout).
  */
 struct tty {
+	struct lwkt_token t_token;
 	struct	clist t_rawq;		/* Device raw input queue. */
 	long	t_rawcc;		/* Raw input queue statistics. */
 	struct	clist t_canq;		/* Device canonical queue. */
@@ -105,7 +97,8 @@ struct tty {
 					/* Set hardware state. */
 	int	(*t_param) (struct tty *, struct termios *);
 	void	(*t_unhold) (struct tty *); /* callback to pty after unhold */
-	void	*t_sc;			/* XXX: net/if_sl.c:sl_softc. */
+	void	*t_sc;			/* generic driver (u4b com) */
+	void	*t_slsc;		/* if_sl.c, ppp_tty.c (disc) */
 	int	t_column;		/* Tty output column. */
 	int	t_rocount, t_rocol;	/* Tty. */
 	int	t_ififosize;		/* Total size of upstream fifos. */
@@ -137,16 +130,16 @@ struct tty {
  * and from clists.  The buffers are on the stack so their sizes must be
  * fairly small.
  */
-#define	IBUFSIZ	384			/* Should be >= max value of MIN. */
-#define	OBUFSIZ	100
+#define	IBUFSIZ		384		/* Should be >= max value of MIN. */
+#define	OBUFSIZ		100
 
 #ifndef TTYHOG
-#define	TTYHOG	1024
+#define	TTYHOG		1024
 #endif
 
 #ifdef _KERNEL
-#define	TTMAXHIWAT	roundup(2048, CBSIZE)
-#define	TTMINHIWAT	roundup(100, CBSIZE)
+#define	TTMAXHIWAT	2048
+#define	TTMINHIWAT	100
 #define	TTMAXLOWAT	256
 #define	TTMINLOWAT	32
 #endif
@@ -211,8 +204,8 @@ struct speedtab {
 #define	DMGET		3
 
 /* Flags on a character passed to ttyinput. */
-#define	TTY_CHARMASK	0x000000ff	/* Character mask */
-#define	TTY_QUOTE	0x00000100	/* Character quoted */
+#define	TTY_CHARMASK	0x00ff		/* Character mask */
+#define	TTY_QUOTE	0x0100		/* Character quoted */
 #define	TTY_ERRORMASK	0xff000000	/* Error mask */
 #define	TTY_FE		0x01000000	/* Framing error */
 #define	TTY_PE		0x02000000	/* Parity error */
@@ -229,40 +222,37 @@ struct speedtab {
 
 /* Unique sleep addresses. */
 #define	TSA_CARR_ON(tp)		((void *)&(tp)->t_rawq)
-#define	TSA_HUP_OR_INPUT(tp)	((void *)&(tp)->t_rawq.c_cf)
-#define	TSA_OCOMPLETE(tp)	((void *)&(tp)->t_outq.c_cl)
+#define	TSA_HUP_OR_INPUT(tp)	((void *)&(tp)->t_rawq.c_cchead)
+#define	TSA_OCOMPLETE(tp)	((void *)&(tp)->t_outq.c_ccmax)
 #define	TSA_OLOWAT(tp)		((void *)&(tp)->t_outq)
-#define	TSA_PTC_READ(tp)	((void *)&(tp)->t_outq.c_cf)
-#define	TSA_PTC_WRITE(tp)	((void *)&(tp)->t_rawq.c_cl)
+#define	TSA_PTC_READ(tp)	((void *)&(tp)->t_outq.c_cchead)
+#define	TSA_PTC_WRITE(tp)	((void *)&(tp)->t_rawq.c_ccmax)
 #define	TSA_PTS_READ(tp)	((void *)&(tp)->t_canq)
 
 #ifdef _KERNEL
 
-#ifndef _SYS_MALLOC_H_
-#include <sys/malloc.h>
-#endif
-
+#ifdef MALLOC_DECLARE
 MALLOC_DECLARE(M_TTYS);
+#endif
 
 extern	struct tty *constty;	/* Temporary virtual console. */
 
-int	 b_to_q (char *cp, int cc, struct clist *q);
-void	 catq (struct clist *from, struct clist *to);
-void	 clist_alloc_cblocks (struct clist *q, int ccmax, int ccres);
+int	 clist_btoq (char *cp, int cc, struct clist *q);
+void	 clist_catq (struct clist *from, struct clist *to);
+void	 clist_alloc_cblocks (struct clist *q, int ccmax);
 void	 clist_free_cblocks (struct clist *q);
 int	 clist_getc (struct clist *q);
 int	 clist_unputc (struct clist *q);
 void	 ndflush (struct clist *q, int cc);
-char	*nextc (struct clist *q, char *cp, int *c);
+void	*clist_nextc (struct clist *q, void *cp, int *c);
 void	 nottystop (struct tty *tp, int rw);
 int	 clist_putc (int c, struct clist *q);
-int	 q_to_b (struct clist *q, char *cp, int cc);
+int	 clist_qtob (struct clist *q, char *cp, int cc);
 void	 termioschars (struct termios *t);
 int	 tputchar (int c, struct tty *tp);
 int	 ttcompat (struct tty *tp, u_long com, caddr_t data, int flag);
 int	 ttioctl (struct tty *tp, u_long com, void *data, int flag);
 int	 ttread (struct tty *tp, struct uio *uio, int flag);
-void	 ttrstrt (void *tp);
 int	 ttsetcompat (struct tty *tp, u_long *com, caddr_t data,
 	    struct termios *term);
 void	 ttsetwater (struct tty *tp);
@@ -283,12 +273,13 @@ void	 ttyunhold (struct tty *tp);
 void	 ttyinfo (struct tty *tp);
 int	 ttyinput (int c, struct tty *tp);
 int	 ttylclose (struct tty *tp, int flag);
-struct tty *ttymalloc (struct tty *tp);
+struct tty *ttymalloc (struct tty **tpp);
 int	 ttymodem (struct tty *tp, int flag);
 int	 ttyopen (cdev_t device, struct tty *tp);
 int	 ttykqfilter (struct dev_kqfilter_args *);
 int	 ttyread (struct dev_read_args *);
 void	 ttyregister (struct tty *tp);
+void	 ttyinit (struct tty *tp);
 void	 ttyunregister (struct tty *tp);
 int	 ttysleep (struct tty *tp, void *chan, int slpflags, char *wmesg,
 	    int timeout);

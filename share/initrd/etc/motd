@@ -1,5 +1,0 @@
-use ifconfig to list available interfaces
-
- wifi example - dowpa ath0 ssid password
- ethernet     - dhclient em0
-

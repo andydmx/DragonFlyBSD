@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 1998 - 2006 Søren Schmidt <sos@FreeBSD.org>
+ * Copyright (c) 1998 - 2008 Søren Schmidt <sos@FreeBSD.org>
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -36,7 +36,6 @@
 #include <sys/objcache.h>
 #include <sys/queue.h>
 #include <sys/rman.h>
-#include <sys/spinlock.h>
 #include <sys/systm.h>
 #include <sys/taskqueue.h>
 
@@ -94,7 +93,6 @@
 
 #define ATA_CTLOFFSET                   0x206   /* control register offset */
 #define ATA_PCCARD_CTLOFFSET            0x0e    /* do for PCCARD devices */
-#define ATA_PC98_CTLOFFSET              0x10c   /* do for PC98 devices */
 #define         ATA_A_IDS               0x02    /* disable interrupts */
 #define         ATA_A_RESET             0x04    /* RESET controller */
 #define         ATA_A_4BIT              0x08    /* 4 head bits */
@@ -171,7 +169,7 @@
 #define ATA_AHCI_GHC                    0x04
 #define         ATA_AHCI_GHC_AE         0x80000000
 #define         ATA_AHCI_GHC_IE         0x00000002
-#define         ATA_AHCI_GHC_HR         0x80000001
+#define         ATA_AHCI_GHC_HR         0x00000001
 
 #define ATA_AHCI_IS                     0x08
 #define ATA_AHCI_PI                     0x0c
@@ -223,11 +221,7 @@
 #define         ATA_AHCI_P_CMD_DLAE     0x02000000
 #define         ATA_AHCI_P_CMD_ALPE     0x04000000
 #define         ATA_AHCI_P_CMD_ASP      0x08000000
-#define         ATA_AHCI_P_CMD_ICC_MASK 0xf0000000
-#define         ATA_AHCI_P_CMD_NOOP     0x00000000
 #define         ATA_AHCI_P_CMD_ACTIVE   0x10000000
-#define         ATA_AHCI_P_CMD_PARTIAL  0x20000000
-#define         ATA_AHCI_P_CMD_SLUMPER  0x60000000
 
 #define ATA_AHCI_P_TFD                  0x120
 #define ATA_AHCI_P_SIG                  0x124
@@ -245,26 +239,32 @@
 #define ATA_AHCI_CT_SIZE                256
 
 struct ata_ahci_dma_prd {
-    u_int64_t			dba;
-    u_int32_t			reserved;
-    u_int32_t			dbc;		/* 0 based */
-#define ATA_AHCI_PRD_MASK	0x003fffff	/* max 4MB */
-#define ATA_AHCI_PRD_IPC	(1<<31)
+    u_int64_t                   dba;
+    u_int32_t                   reserved;
+    u_int32_t                   dbc;            /* 0 based */
+#define ATA_AHCI_PRD_MASK       0x003fffff      /* max 4MB */
+#define ATA_AHCI_PRD_IPC        (1<<31)
 } __packed;
 
 struct ata_ahci_cmd_tab {
-    u_int8_t			cfis[64];
-    u_int8_t			acmd[32];
-    u_int8_t			reserved[32];
-    struct ata_ahci_dma_prd	prd_tab[16];
+    u_int8_t                    cfis[64];
+    u_int8_t                    acmd[32];
+    u_int8_t                    reserved[32];
+#define ATA_AHCI_DMA_ENTRIES            64
+    struct ata_ahci_dma_prd     prd_tab[ATA_AHCI_DMA_ENTRIES];
 } __packed;
 
 struct ata_ahci_cmd_list {
-    u_int16_t			cmd_flags;
-    u_int16_t			prd_length;	/* PRD entries */
-    u_int32_t			bytecount;
-    u_int64_t			cmd_table_phys;	/* 128byte aligned */
+    u_int16_t                   cmd_flags;
+#define ATA_AHCI_CMD_ATAPI		0x0020
+#define ATA_AHCI_CMD_WRITE		0x0040
+#define ATA_AHCI_CMD_PREFETCH		0x0080
+
+    u_int16_t                   prd_length;     /* PRD entries */
+    u_int32_t                   bytecount;
+    u_int64_t                   cmd_table_phys; /* 128byte aligned */
 } __packed;
+
 
 /* DMA register defines */
 #define ATA_DMA_ENTRIES                 256
@@ -294,19 +294,14 @@ struct ata_ahci_cmd_list {
 /* misc defines */
 #define ATA_PRIMARY                     0x1f0
 #define ATA_SECONDARY                   0x170
-#define ATA_PC98_BANK                   0x432
 #define ATA_IOSIZE                      0x08
-#define ATA_PC98_IOSIZE                 0x10
 #define ATA_CTLIOSIZE                   0x01
 #define ATA_BMIOSIZE                    0x08
-#define ATA_PC98_BANKIOSIZE             0x01
 #define ATA_IOADDR_RID                  0
 #define ATA_CTLADDR_RID                 1
 #define ATA_BMADDR_RID                  0x20
-#define ATA_PC98_CTLADDR_RID            8
-#define ATA_PC98_BANKADDR_RID           9
 #define ATA_IRQ_RID                     0
-#define ATA_DEV(device)                 ((device == ATA_MASTER) ? 0 : 1)
+#define ATA_DEV(unit)                   ((unit > 0) ? 0x10 : 0)
 #define ATA_CFA_MAGIC1                  0x844A
 #define ATA_CFA_MAGIC2                  0x848A
 #define ATA_CFA_MAGIC3                  0x8400
@@ -323,10 +318,13 @@ struct ata_ahci_cmd_list {
 #define ATA_OP_FINISHED                 1
 #define ATA_MAX_28BIT_LBA               268435455UL
 
+/* Dragonfly: Default request timeout increased from 5 to 10 */
+#define ATA_DEFAULT_TIMEOUT		10
+
 /* structure used for composite atomic operations */
 #define MAX_COMPOSITES          32              /* u_int32_t bits */
 struct ata_composite {
-    struct spinlock     lock;                   /* control lock */
+    struct lock		lock;                   /* control lock */
     u_int32_t           rd_needed;              /* needed read subdisks */
     u_int32_t           rd_done;                /* done read subdisks */
     u_int32_t           wr_needed;              /* needed write subdisks */
@@ -386,7 +384,7 @@ struct ata_request {
     u_int32_t                   donecount;      /* bytes transferred */
     int                         result;         /* result error code */
     void                        (*callback)(struct ata_request *request);
-    struct spinlock             done;           /* request done sema */
+    struct lock			done;           /* request done sema */
     int                         retries;        /* retry count */
     int                         timeout;        /* timeout for this cmd */
     int				unused01;
@@ -417,11 +415,15 @@ struct ata_device {
     device_t                    dev;            /* device handle */
     int                         unit;           /* physical unit */
 #define         ATA_MASTER              0x00
-#define         ATA_SLAVE               0x10
+#define         ATA_SLAVE               0x01
+#define         ATA_PM                  0x0f
 
     struct ata_params           param;          /* ata param structure */
     int                         mode;           /* current transfermode */
     u_int32_t                   max_iosize;     /* max IO size */
+    int                         spindown;       /* idle spindown timeout */
+    struct callout              spindown_timer;
+    int                         spindown_state;
     int                         flags;
 #define         ATA_D_USE_CHS           0x0001
 #define         ATA_D_MEDIA_CHANGED     0x0002
@@ -462,7 +464,7 @@ struct ata_dma {
     u_int32_t                   segsize;        /* DMA SG list segment size */
     u_int32_t                   max_iosize;     /* DMA data max IO size */
     u_int32_t                   cur_iosize;     /* DMA data current IO size */
-    u_int64_t			max_address;	/* highest DMA'able address */
+    u_int64_t                   max_address;    /* highest DMA'able address */
     int                         flags;
 #define ATA_DMA_READ                    0x01    /* transaction is a read */
 #define ATA_DMA_LOADED                  0x02    /* DMA tables etc loaded */
@@ -480,10 +482,13 @@ struct ata_dma {
 
 /* structure holding lowlevel functions */
 struct ata_lowlevel {
+    u_int32_t (*softreset)(device_t dev, int pmport);
     int (*status)(device_t dev);
     int (*begin_transaction)(struct ata_request *request);
     int (*end_transaction)(struct ata_request *request);
     int (*command)(struct ata_request *request);
+    void (*tf_read)(struct ata_request *request);
+    void (*tf_write)(struct ata_request *request);
 };
 
 /* structure holding resources for an ATA channel */
@@ -509,19 +514,19 @@ struct ata_channel {
 #define         ATA_ALWAYS_DMASTAT      0x10
 
     int                         devices;        /* what is present */
-#define         ATA_ATA_MASTER          0x01
-#define         ATA_ATA_SLAVE           0x02
-#define         ATA_ATAPI_MASTER        0x04
-#define         ATA_ATAPI_SLAVE         0x08
-#define		ATA_PORTMULTIPLIER	0x10
+#define         ATA_ATA_MASTER          0x00000001
+#define         ATA_ATA_SLAVE           0x00000002
+#define         ATA_PORTMULTIPLIER      0x00008000
+#define         ATA_ATAPI_MASTER        0x00010000
+#define         ATA_ATAPI_SLAVE         0x00020000
 
-    struct spinlock             state_mtx;      /* state lock */
+    struct lock			state_mtx;      /* state lock */
     int                         state;          /* ATA channel state */
 #define         ATA_IDLE                0x0000
 #define         ATA_ACTIVE              0x0001
 #define         ATA_STALL_QUEUE         0x0002
 
-    struct spinlock             queue_mtx;      /* queue lock */
+    struct lock			queue_mtx;      /* queue lock */
     TAILQ_HEAD(, ata_request)   ata_queue;      /* head of ATA queue */
     int				reorder;	/* limit sort reordering */
     struct ata_request		*transition;
@@ -539,7 +544,7 @@ struct ata_channel {
 extern int (*ata_raid_ioctl_func)(u_long cmd, caddr_t data);
 extern devclass_t ata_devclass;
 extern int ata_wc;
- 
+
 /* public prototypes */
 /* ata-all.c: */
 int ata_probe(device_t dev);
@@ -554,7 +559,10 @@ int ata_identify(device_t dev);
 void ata_default_registers(device_t dev);
 void ata_modify_if_48bit(struct ata_request *request);
 void ata_udelay(int interval);
-char *ata_mode2str(int mode);
+const char *ata_unit2str(struct ata_device *atadev);
+const char *ata_mode2str(int mode);
+void ata_print_cable(device_t dev, u_int8_t *who);
+int ata_atapi(device_t dev);
 int ata_pmode(struct ata_params *ap);
 int ata_wmode(struct ata_params *ap);
 int ata_umode(struct ata_params *ap);
@@ -571,7 +579,7 @@ void ata_finish(struct ata_request *request);
 void ata_timeout(struct ata_request *);
 void ata_catch_inflight(device_t dev);
 void ata_fail_requests(device_t dev);
-char *ata_cmd2str(struct ata_request *request);
+const char *ata_cmd2str(struct ata_request *request);
 
 /* ata-lowlevel.c: */
 void ata_generic_hw(device_t dev);
@@ -579,6 +587,16 @@ int ata_begin_transaction(struct ata_request *);
 int ata_end_transaction(struct ata_request *);
 void ata_generic_reset(device_t dev);
 int ata_generic_command(struct ata_request *request);
+
+/* ata-dma.c: */
+void ata_dmainit(device_t);
+
+/* ata-sata.c: */
+void ata_sata_phy_check_events(device_t dev);
+void ata_sata_phy_event(void *context, int dummy);
+int ata_sata_phy_reset(device_t dev);
+void ata_sata_setmode(device_t dev, int mode);
+int ata_request2fis_h2d(struct ata_request *request, u_int8_t *fis);
 
 /* macros for alloc/free of struct ata_request */
 extern struct objcache *ata_request_cache;
@@ -698,7 +716,3 @@ MALLOC_DECLARE(M_ATA);
 
 #define ATA_IDX_OUTSL_STRM(ch, idx, addr, count) \
 	ATA_OUTSL_STRM(ch->r_io[idx].res, ch->r_io[idx].offset, addr, count)
-
-/* Dragonfly: Default request timeout increased from 5 to 10 */
-#define ATA_DEFAULT_TIMEOUT	10
-

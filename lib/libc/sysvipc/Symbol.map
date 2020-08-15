@@ -1,17 +1,27 @@
-DF308.0 {
+DF404.0 {
     connect_to_daemon;
+    daemon_fd;
+    get_hash_size;
+    get_shmdata;
     handle_new_connection;
     init_socket;
     is_sysvinit;
+    lock_resources;
+    lock_undo;
+    msginfo;
     receive_fd;
     receive_message;
     receive_msg_with_cred;
     receive_type_message;
     send_fd;
+    send_message;
     send_msg_with_cred;
     set_shmdata_access;
-    shm_data;
+    shmaddrs;
     shmchild;
+    shmres;
+    sysv_cond_wait;
+    sysv_cond_signal;
     sysv_mutex_init;
     sysv_mutex_lock;
     sysv_mutex_unlock;
@@ -34,7 +44,7 @@ DF308.0 {
     sysvipc_shmctl;
     sysvipc_shmdt;
     sysvipc_shmget;
-    sysvipc_userland;
+    undos;
 };
 
 DFprivate_1.0 {
@@ -45,8 +55,4 @@ DFprivate_1.0 {
     _hash_insert;
     _hash_lookup;
     _hash_remove;
-    _sysv_umtx_init;
-    _sysv_umtx_lock;
-    _sysv_umtx_unlock;
-    _shmget;
 };

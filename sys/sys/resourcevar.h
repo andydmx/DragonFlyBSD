@@ -10,11 +10,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -82,37 +78,66 @@ struct krate {
  * is moderately large but changes infrequently, it is normally
  * shared copy-on-write after forks.
  *
- * Threaded programs force p_exclusive (set it to 2) to prevent the
- * proc->p_limit pointer from changing out from under threaded access.
+ * Threaded programs cache p_limit in the thread structure, allowing
+ * lockless read access.
+ *
+ * p_refcnt can change often, don't force cache mastership changes for
+ * the rest of the (usually read only) data structure.  Place p_refcnt
+ * in its own cache line.  The rest of the structure is stable as long
+ * as the caller has a ref.
  */
 struct plimit {
 	struct	rlimit pl_rlimit[RLIM_NLIMITS];
-	int	p_refcnt;		/* number of references */
-	int	p_exclusive;		/* exclusive to proc due to lwp's */
 	rlim_t	p_cpulimit;		/* current cpu limit in usec */
-	struct spinlock p_spin;
-};
+	struct {
+		struct spinlock p_spin;	/* protect modifications */
+		uint32_t p_refcnt;	/* refs & exclusivity */
+	} __cachealign;
+} __cachealign;
+
+#define PLIMITF_EXCLUSIVE	0x80000000U
+#define PLIMITF_MASK		0x7FFFFFFFU
 
 #define PLIMIT_TESTCPU_OK	0
 #define PLIMIT_TESTCPU_XCPU	1
 #define PLIMIT_TESTCPU_KILL	2
 
 /*
+ * Per-cpu tracking structure attached to uidinfo.  These counts are only
+ * synchronized with the uidinfo rollup fields at +/-32.  Resource limits
+ * only check against the ui_posixlocks and ui_openfiles so some slop
+ * is possible (checking against the pcpu structures would be cause cache
+ * line ping-ponging)
+ */
+struct uidcount {
+	int	pu_posixlocks;
+	int	pu_openfiles;
+} __cachealign;
+
+#define PUP_LIMIT	32	/* +/-32 rollup */
+
+/*
  * Per uid resource consumption
+ *
+ * There typically aren't too many uidinfo's, so shove the ref count
+ * out of the way with a __cachealign.
  */
 struct uidinfo {
 	/*
 	 * Protects access to ui_sbsize, ui_proccnt, ui_posixlocks
 	 */
-	struct spinlock ui_lock;
 	LIST_ENTRY(uidinfo) ui_hash;
 	rlim_t	ui_sbsize;		/* socket buffer space consumed */
 	long	ui_proccnt;		/* number of processes */
 	uid_t	ui_uid;			/* uid */
-	int	ui_ref;			/* reference count */
-	int	ui_posixlocks;		/* number of POSIX locks */
-	int	ui_openfiles;		/* number of open files */
+	int	ui_posixlocks;		/* (rollup) number of POSIX locks */
+	int	ui_openfiles;		/* (rollup) number of open files */
 	struct varsymset ui_varsymset;	/* variant symlinks */
+	struct uidcount *ui_pcpu;
+	struct {
+		struct spinlock ui_lock;/* not currently used (FUTURE) */
+		int	ui_ref;		/* reference count */
+	} __cachealign;
 };
 
 #endif
@@ -130,6 +155,7 @@ int	chgproccnt (struct uidinfo *uip, int diff, int max);
 int	chgsbsize (struct uidinfo *uip, u_long *hiwat, u_long to, rlim_t max);
 void	ruadd (struct rusage *ru, struct rusage *ru2);
 struct uidinfo *uifind (uid_t uid);
+struct uidinfo *uicreate(uid_t uid);
 void	uihold (struct uidinfo *uip);
 void	uidrop (struct uidinfo *uip);
 void	uireplace (struct uidinfo **puip, struct uidinfo *nuip);
@@ -137,10 +163,11 @@ void	uihashinit (void);
 
 void plimit_init0(struct plimit *);
 struct plimit *plimit_fork(struct proc *);
+u_int64_t plimit_getadjvalue(int i);
 void plimit_lwp_fork(struct proc *);
-int plimit_testcpulimit(struct plimit *, u_int64_t);
+int plimit_testcpulimit(struct proc *, u_int64_t);
 void plimit_modify(struct proc *, int, struct rlimit *);
-void plimit_free(struct proc *);
+void plimit_free(struct plimit *);
 
 #endif
 

@@ -1,12 +1,29 @@
+LIBARCHIVE 3.4.3
+================
+
 Original source can be downloaded from:
 http://www.libarchive.org/
 
+file = libarchive-3.4.3.tar.xz
+date = 20 May 2020
+size = 4811508
+sha1 = 53f1400ac71778d14615a66f89e04403548fae76
+
 A list of deleted files is in README.DELETED.
 
-configure hint:
-./configure --without-nettle --without-openssl --without-xml2
+Use "git diff vendor/LIBARCHIVE contrib/libarchive" to see local
+modifications.
 
 This source is used in:
 	lib/libarchive
+	usr.bin/bsdcat
 	usr.bin/cpio
 	usr.bin/tar
+
+Configured with
+===============
+./configure --without-nettle --with-openssl --without-xml2 --without-zstd \
+	    --without-lz4 --without-lzo2 \
+	    ac_cv_lib_md_MD5Init=no ac_cv_lzma_has_mt=no
+
+NOTE: test_read_disk_directory_traversals is expected to fail atime restore

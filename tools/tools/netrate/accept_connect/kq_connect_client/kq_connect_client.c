@@ -5,6 +5,7 @@
 #include <sys/socket.h>
 #include <sys/sysctl.h>
 #include <sys/time.h>
+#include <sys/usched.h>
 #include <sys/wait.h>
 
 #include <arpa/inet.h>
@@ -19,13 +20,16 @@
 #include <unistd.h>
 
 static void	mainloop(const struct sockaddr_in *, int, int, long, u_long *,
-		    int);
+		    int, int);
+
+static int	bindcpu;
+static int	cpucnt;
 
 static void
 usage(const char *cmd)
 {
 	fprintf(stderr, "%s -4 inet4 [-4 inet4_1] -p port "
-	    "[-i n_instance] [-c conn_max] [-l duration] [-u]\n", cmd);
+	    "[-i n_instance] [-c conn_max] [-l duration] [-u] [-B]\n", cmd);
 	exit(1);
 }
 
@@ -39,9 +43,10 @@ main(int argc, char *argv[])
 	u_short port;
 	size_t prm_len;
 
-	prm_len = sizeof(ninst);
-	if (sysctlbyname("hw.ncpu", &ninst, &prm_len, NULL, 0) != 0)
+	prm_len = sizeof(cpucnt);
+	if (sysctlbyname("hw.ncpu", &cpucnt, &prm_len, NULL, 0) != 0)
 		err(2, "sysctl hw.ncpu failed");
+	ninst = cpucnt;
 
 	nconn = 8;
 	dur = 10;
@@ -54,7 +59,7 @@ main(int argc, char *argv[])
 		err(1, "calloc failed");
 	in_cnt = 0;
 
-	while ((opt = getopt(argc, argv, "4:p:i:l:c:u")) != -1) {
+	while ((opt = getopt(argc, argv, "4:Bc:i:l:p:u")) != -1) {
 		switch (opt) {
 		case '4':
 			if (in_cnt >= in_max) {
@@ -80,20 +85,24 @@ main(int argc, char *argv[])
 			++in_cnt;
 			break;
 
-		case 'p':
-			port = htons(atoi(optarg));
-			break;
-
-		case 'i':
-			ninst = atoi(optarg);
+		case 'B':
+			bindcpu = 1;
 			break;
 
 		case 'c':
 			nconn = atoi(optarg);
 			break;
 
+		case 'i':
+			ninst = atoi(optarg);
+			break;
+
 		case 'l':
 			dur = strtol(optarg, NULL, 10);
+			break;
+
+		case 'p':
+			port = htons(atoi(optarg));
 			break;
 
 		case 'u':
@@ -125,7 +134,7 @@ main(int argc, char *argv[])
 
 		pid = fork();
 		if (pid == 0) {
-			mainloop(in, in_cnt, nconn, dur, &result[i], do_udp);
+			mainloop(in, in_cnt, nconn, dur, &result[i], do_udp, i);
 			exit(0);
 		} else if (pid < 0) {
 			err(1, "fork failed");
@@ -143,7 +152,7 @@ main(int argc, char *argv[])
 	sum = 0;
 	for (i = 0; i < ninst; ++i)
 		sum += result[i];
-	printf("%.2f\n", (double)sum / (double)dur);
+	printf("%lu\n", sum);
 
 	exit(0);
 }
@@ -172,13 +181,23 @@ done:
 
 static void
 mainloop(const struct sockaddr_in *in, int in_cnt, int nconn_max,
-    long dur, u_long *res, int do_udp)
+    long dur, u_long *res, int do_udp, int inst)
 {
+	struct timespec start, end;
 	struct kevent *evt_change0, *evt;
 	int kq, nchange = 0, nconn = 0, nevt_max;
 	u_long count = 0;
+	double time_us;
 	u_int in_idx = 0;
+#ifndef SOCK_NONBLOCK
 	int nblock = 1;
+#endif
+
+	if (bindcpu) {
+		int cpu = inst % cpucnt;
+
+		usched_set(getpid(), USCHED_SET_CPU, &cpu, sizeof(cpu));
+	}
 
 	kq = kqueue();
 	if (kq < 0)
@@ -198,6 +217,7 @@ mainloop(const struct sockaddr_in *in, int in_cnt, int nconn_max,
 	    dur * 1000L, NULL);
 	nchange = 1;
 
+	clock_gettime(CLOCK_MONOTONIC_PRECISE, &start);
 	for (;;) {
 		struct kevent *evt_change = NULL;
 		int n, i, done = 0;
@@ -212,12 +232,18 @@ mainloop(const struct sockaddr_in *in, int in_cnt, int nconn_max,
 			if (do_udp)
 				udp_send(tmp);
 
+#ifndef SOCK_NONBLOCK
 			s = socket(AF_INET, SOCK_STREAM, 0);
 			if (s < 0)
 				err(1, "socket failed");
 
 			if (ioctl(s, FIONBIO, &nblock, sizeof(nblock)) < 0)
 				err(1, "ioctl failed");
+#else
+			s = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+			if (s < 0)
+				err(1, "socket failed");
+#endif
 
 			n = connect(s, (const struct sockaddr *)tmp,
 			    sizeof(*tmp));
@@ -270,5 +296,11 @@ mainloop(const struct sockaddr_in *in, int in_cnt, int nconn_max,
 		if (done)
 			break;
 	}
-	*res = count;
+	clock_gettime(CLOCK_MONOTONIC_PRECISE, &end);
+
+	timespecsub(&end, &start, &end);
+	time_us = ((double)end.tv_sec * 1000000.0) +
+	    ((double)end.tv_nsec / 1000.0);
+
+	*res = ((double)count * 1000000.0) / time_us;
 }

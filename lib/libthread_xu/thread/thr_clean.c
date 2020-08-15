@@ -10,10 +10,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by John Birrell.
- * 4. Neither the name of the author nor the names of any co-contributors
+ * 3. Neither the name of the author nor the names of any co-contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -30,12 +27,10 @@
  * SUCH DAMAGE.
  *
  * $FreeBSD: src/lib/libpthread/thread/thr_clean.c,v 1.9 2004/12/18 18:07:37 deischen Exp $
- * $DragonFly: src/lib/libthread_xu/thread/thr_clean.c,v 1.4 2006/04/06 13:03:09 davidxu Exp $
  */
 
 #include "namespace.h"
 #include <machine/tls.h>
-
 #include <errno.h>
 #include <stdlib.h>
 #include <pthread.h>
@@ -49,8 +44,8 @@ _pthread_cleanup_push(void (*routine) (void *), void *routine_arg)
 	struct pthread	*curthread = tls_get_curthread();
 	struct pthread_cleanup *new;
 
-	if ((new = (struct pthread_cleanup *)
-	    malloc(sizeof(struct pthread_cleanup))) != NULL) {
+	new = __malloc(sizeof(struct pthread_cleanup));
+	if (new != NULL) {
 		new->routine = routine;
 		new->routine_arg = routine_arg;
 		new->onstack = 0;
@@ -72,10 +67,9 @@ _pthread_cleanup_pop(int execute)
 			old->routine(old->routine_arg);
 		}
 		if (old->onstack == 0)
-			free(old);
+			__free(old);
 	}
 }
 
 __strong_reference(_pthread_cleanup_push, pthread_cleanup_push);
 __strong_reference(_pthread_cleanup_pop, pthread_cleanup_pop);
-

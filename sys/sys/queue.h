@@ -10,7 +10,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -482,8 +482,10 @@ struct {								\
 } while (0)
 
 #define	QMD_TAILQ_CHECK_TAIL(head, field) do {				\
-	if (*(head)->tqh_last != NULL)					\
-		panic("Bad tailq NEXT(%p->tqh_last) != NULL", (head));	\
+	if (*(head)->tqh_last != NULL) {				\
+		panic("Bad tailq NEXT(%p->tqh_last) != NULL, last %p",	\
+		    (head), *(head)->tqh_last);				\
+	}								\
 } while (0)
 
 #define	QMD_TAILQ_CHECK_NEXT(elm, field) do {				\

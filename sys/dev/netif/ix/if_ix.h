@@ -44,14 +44,17 @@
  * RX ring count
  */
 #define IX_MAX_RXRING		16
+#define IX_MAX_RXRING_X550	64
 #define IX_MIN_RXRING_RSS	2
 
 /*
  * TX ring count
  */
+#define IX_MAX_TXRING		16
 #define IX_MAX_TXRING_82598	32
 #define IX_MAX_TXRING_82599	64
 #define IX_MAX_TXRING_X540	64
+#define IX_MAX_TXRING_X550	64
 
 /*
  * Default number of segments received before writing to RX related registers
@@ -93,7 +96,10 @@
 /* Alignment for rings */
 #define IX_DBA_ALIGN		128
 
-#define IX_MAX_FRAME_SIZE	0x3F00
+#define IX_MAX_FRAME_SIZE	9728
+#define IX_MTU_HDR		(ETHER_HDR_LEN + ETHER_CRC_LEN + EVL_ENCAPLEN)
+#define IX_MAX_MTU		(IX_MAX_FRAME_SIZE - IX_MTU_HDR)
+
 
 /* Flow control constants */
 #define IX_FC_PAUSE		0xFFFF
@@ -110,7 +116,11 @@
 				 key[(i) * IX_RSSRK_SIZE + 2] << 16 | \
 				 key[(i) * IX_RSSRK_SIZE + 3] << 24)
 #define IX_NRETA		32
+#define IX_NRETA_X550		128
+#define IX_NRETA_MAX		128
 #define IX_RETA_SIZE		4
+
+#define IX_RDRTABLE_SIZE	(IX_NRETA_MAX * IX_RETA_SIZE)
 
 /*
  * EITR
@@ -184,6 +194,11 @@ struct ix_i2c_req {
 	uint8_t		data[8];
 };
 
+struct ix_mc_addr {
+	uint8_t		addr[IXGBE_ETH_LENGTH_OF_ADDRESS];
+	uint32_t	vmdq;
+};
+
 struct ix_tx_buf {
 	struct mbuf	*m_head;
 	bus_dmamap_t	map;
@@ -209,9 +224,12 @@ struct ix_tx_ring {
 	union ixgbe_adv_tx_desc	*tx_base;
 	struct ix_tx_buf	*tx_buf;
 	bus_dma_tag_t		tx_tag;
-	uint16_t		tx_flags;
+	int8_t			tx_running;
+#define IX_TX_RUNNING		100
+#define IX_TX_RUNNING_DEC	25
+	uint8_t			tx_flags;
 #define IX_TXFLAG_ENABLED	0x1
-	uint16_t		tx_pad;
+	uint16_t		tx_nmbuf;
 	uint32_t		tx_idx;
 	uint16_t		tx_avail;
 	uint16_t		tx_next_avail;
@@ -225,6 +243,9 @@ struct ix_tx_ring {
 	uint32_t		tx_eims;
 	uint32_t		tx_eims_val;
 	struct ifsubq_watchdog	tx_watchdog;
+	struct callout		tx_gc_timer;
+
+	u_long			tx_gc;
 
 	bus_dma_tag_t		tx_base_dtag;
 	bus_dmamap_t		tx_base_map;
@@ -302,11 +323,23 @@ struct ix_softc {
 	struct callout		timer;
 	int			timer_cpuid;
 
-	uint32_t		optics;
-	uint32_t		fc;		/* local flow ctrl setting */
+	int			ifm_media;	/* IFM_ */
 	uint32_t		link_speed;
 	bool			link_up;
-	boolean_t		sfp_probe;	/* plyggable optics */
+	boolean_t		sfp_probe;	/* pluggable optics */
+	uint32_t		phy_layer;
+
+	uint16_t		caps;		/* IX_CAP_ */
+#define IX_CAP_DETECT_FANFAIL	0x0001
+#define IX_CAP_TEMP_SENSOR	0x0002
+#define IX_CAP_EEE		0x0004
+#define IX_CAP_LEGACY_INTR	0x0008
+#define IX_CAP_FW_RECOVERY	0x0010
+
+	uint16_t		flags;		/* IX_FLAG_ */
+#define IX_FLAG_FW_RECOVERY	0x0001
+
+	struct callout		fw_timer;
 
 	struct ixgbe_hw_stats 	stats;
 
@@ -319,10 +352,6 @@ struct ix_softc {
 	int			intr_type;
 	int			intr_cnt;
 	struct ix_intr_data	*intr_data;
-
-	/* sysctl tree glue */
-	struct sysctl_ctx_list	sysctl_ctx;
-	struct sysctl_oid	*sysctl_tree;
 
 	device_t		dev;
 	bus_dma_tag_t		parent_tag;
@@ -337,16 +366,24 @@ struct ix_softc {
 	int			nserialize;
 	struct lwkt_serialize	**serializes;
 
-	uint8_t			*mta;		/* Multicast array memory */
+	struct ix_mc_addr	*mta;		/* Multicast array memory */
 
 	int			if_flags;
 	int			advspeed;	/* advertised link speeds */
+	uint32_t		wufc;		/* power management */
+	uint16_t		dmac;		/* DMA coalescing */
 	uint16_t		max_frame_size;
 	int16_t			sts_msix_vec;	/* status MSI-X vector */
 
-	int			rx_npoll_off;
-	int			tx_npoll_off;
+	struct if_ringmap	*tx_rmap;
+	struct if_ringmap	*tx_rmap_intr;
+	struct if_ringmap	*rx_rmap;
+	struct if_ringmap	*rx_rmap_intr;
 
+	int			rdr_table[IX_RDRTABLE_SIZE];
+
+	struct task		wdog_task;
+	int			direct_input;
 #ifdef IX_RSS_DEBUG
 	int			rss_debug;
 #endif

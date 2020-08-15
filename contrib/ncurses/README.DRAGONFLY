@@ -4,10 +4,10 @@ GNU NCURSES 5.9
 Original source can be downloaded from:
 http://ftp.gnu.org/pub/gnu/ncurses
 
-file = ncurses-5.9.tar.gz
-date = 5 April 2011
-size = 2826473
-sha1 = 3e042e5f2c7223bffdaac9646a533b8c758b65b5
+file = ncurses-6.0-20160305.tgz
+date = 6 March 2016
+size = 3153972
+sha1 = dbbaff96c4e447148243a9b5a8babb014f5b4bdc
 
 A list of files and directories removed is in README.DELETED
 
@@ -22,9 +22,16 @@ The .h files copied into base where created using configure opts:
 	--with-terminfo-dirs=/usr/share/terminfo
 
 The following files have been modified:
+	ncurses/base/Mklib_gen.sh
 	ncurses/tinfo/comp_scan.c
 	misc/terminfo.src [1]
+	progs/dump_entry.c [2]
+	progs/tic.c [2]
 
 [1] smcup and rmcup were removed from xterm-basic to disable the
     restoration of the console after less, more, man, and other
     utilities are executed.  It was rendering them useless.
+
+[2] tic can't be built with ncurses 5.9 headers.  Since it is a
+    bootstrap tool, it had to be modified so that it can be, but
+    only during the bootstrap tool building phase.

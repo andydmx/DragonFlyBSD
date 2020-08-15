@@ -13,11 +13,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -43,6 +39,7 @@
 #include <sys/cdefs.h>
 #include <sys/_null.h>
 #include <sys/types.h>
+#include <machine/stdarg.h> /* for __va_list */
 
 typedef	__off_t		fpos_t;
 
@@ -51,7 +48,14 @@ typedef	__size_t	size_t;
 #define	_SIZE_T_DECLARED
 #endif
 
-#if __BSD_VISIBLE || __POSIX_VISIBLE >= 200809
+#if __EXT1_VISIBLE
+#ifndef _RSIZE_T_DECLARED
+#define	_RSIZE_T_DECLARED
+typedef	size_t		rsize_t;
+#endif
+#endif
+
+#if __POSIX_VISIBLE >= 200809
 #ifndef _OFF_T_DECLARED
 #define	_OFF_T_DECLARED
 typedef	__off_t		off_t;
@@ -62,10 +66,15 @@ typedef	__ssize_t	ssize_t;
 #endif
 #endif
 
-#if __BSD_VISIBLE || __POSIX_VISIBLE >= 200112 || __XSI_VISIBLE
+#if __POSIX_VISIBLE >= 200809 || __XSI_VISIBLE
+#ifdef __GNUC__
 #ifndef _VA_LIST_DECLARED
-typedef	__va_list	va_list;
 #define	_VA_LIST_DECLARED
+typedef	__va_list	va_list;
+/* __gnuc_va_list is not needed, provided by <machine/stdarg.h> */
+#endif
+#else
+#include <stdarg.h>
 #endif
 #endif
 
@@ -91,7 +100,10 @@ typedef	__va_list	va_list;
  *
  * WARNING: Do not change the order of the fields in __FILE_public!
  */
+#ifndef _STDFILE_DECLARED
+#define	_STDFILE_DECLARED
 typedef struct __FILE FILE;
+#endif
 
 struct __FILE_public {
 	unsigned char	*_p;		/* current position in (some) buffer */
@@ -163,6 +175,7 @@ __END_DECLS
 #define	L_tmpnam	1024	/* XXX must be == PATH_MAX */
 #define	TMP_MAX		308915776
 
+/* Always ensure that these are consistent with <fcntl.h> and <unistd.h>! */
 #ifndef SEEK_SET
 #define	SEEK_SET	0	/* set file offset to offset */
 #endif
@@ -177,7 +190,19 @@ __END_DECLS
 #define	stdout	__stdoutp
 #define	stderr	__stderrp
 
+#if __BSD_VISIBLE
+/* fparseln(3) */
+#define	FPARSELN_UNESCESC	0x01
+#define	FPARSELN_UNESCCONT	0x02
+#define	FPARSELN_UNESCCOMM	0x04
+#define	FPARSELN_UNESCREST	0x08
+#define	FPARSELN_UNESCALL	0x0f
+#endif
+
 __BEGIN_DECLS
+#ifdef _XLOCALE_H_
+#include <xlocale/_stdio.h>
+#endif
 /*
  * Functions defined in ANSI C standard.
  */
@@ -190,13 +215,15 @@ int	 fgetc(FILE *);
 int	 fgetpos(FILE * __restrict, fpos_t * __restrict);
 char	*fgets(char * __restrict, int, FILE * __restrict);
 FILE	*fopen(const char * __restrict, const char * __restrict);
-int	 fprintf(FILE * __restrict, const char * __restrict, ...);
+int	 fprintf(FILE * __restrict, const char * __restrict, ...)
+	     __printflike(2, 3);
 int	 fputc(int, FILE *);
 int	 fputs(const char * __restrict, FILE * __restrict);
 size_t	 fread(void * __restrict, size_t, size_t, FILE * __restrict);
 FILE	*freopen(const char * __restrict, const char * __restrict,
 		 FILE * __restrict);
-int	 fscanf(FILE * __restrict, const char * __restrict, ...);
+int	 fscanf(FILE * __restrict, const char * __restrict, ...)
+	     __scanflike(2, 3);
 int	 fseek(FILE *, long, int);
 int	 fsetpos(FILE *, const fpos_t *);
 long	 ftell(FILE *);
@@ -204,25 +231,32 @@ size_t	 fwrite(const void * __restrict, size_t, size_t, FILE * __restrict);
 int	 getc(FILE *);
 int	 getchar(void);
 char	*gets(char *);
+#if __EXT1_VISIBLE
+char	*gets_s(char *, rsize_t);
+#endif
 void	 perror(const char *);
-int	 printf(const char * __restrict, ...);
+int	 printf(const char * __restrict, ...) __printflike(1, 2);
 int	 putc(int, FILE *);
 int	 putchar(int);
 int	 puts(const char *);
 int	 remove(const char *);
 int	 rename(const char *, const char *);
 void	 rewind(FILE *);
-int	 scanf(const char * __restrict, ...);
+int	 scanf(const char * __restrict, ...) __scanflike(1, 2);
 void	 setbuf(FILE * __restrict, char * __restrict);
 int	 setvbuf(FILE * __restrict, char * __restrict, int, size_t);
-int	 sprintf(char * __restrict, const char * __restrict, ...);
-int	 sscanf(const char * __restrict, const char * __restrict, ...);
+int	 sprintf(char * __restrict, const char * __restrict, ...)
+	     __printflike(2, 3);
+int	 sscanf(const char * __restrict, const char * __restrict, ...)
+	     __scanflike(2, 3);
 FILE	*tmpfile(void);
 char	*tmpnam(char *);
 int	 ungetc(int, FILE *);
-int	 vfprintf(FILE * __restrict, const char * __restrict, __va_list);
-int	 vprintf(const char * __restrict, __va_list);
-int	 vsprintf(char * __restrict, const char * __restrict, __va_list);
+int	 vfprintf(FILE * __restrict, const char * __restrict, __va_list)
+	     __printflike(2, 0);
+int	 vprintf(const char * __restrict, __va_list) __printflike(1, 0);
+int	 vsprintf(char * __restrict, const char * __restrict, __va_list)
+	     __printflike(2, 0);
 
 #if __ISO_C_VISIBLE >= 1999 || __XSI_VISIBLE >= 500
 int	 snprintf(char * __restrict, size_t, const char * __restrict, ...)
@@ -241,9 +275,8 @@ int	 vsscanf(const char * __restrict, const char * __restrict, __va_list)
 /*
  * Functions defined in all versions of POSIX 1003.1.
  */
-#if __BSD_VISIBLE || __POSIX_VISIBLE <= 199506
-/* size for cuserid(3); UT_NAMESIZE + 1, see <utmp.h> */
-#define	L_cuserid	17	/* legacy */
+#if __BSD_VISIBLE || (__POSIX_VISIBLE && __POSIX_VISIBLE < 200112)
+#define	L_cuserid	17	/* size for cuserid(3); MAXLOGNAME, legacy */
 #endif
 
 #if __POSIX_VISIBLE
@@ -280,12 +313,12 @@ int	 ferror_unlocked(FILE *);
 int	 fileno_unlocked(FILE *);
 #endif
 
-#if __POSIX_VISIBLE >= 200112
+#if __XSI_VISIBLE >= 500 || __POSIX_VISIBLE >= 200112
 int	 fseeko(FILE *, __off_t, int);
 __off_t	 ftello(FILE *);
 #endif
 
-#if __BSD_VISIBLE || __XSI_VISIBLE > 0 && __XSI_VISIBLE < 600
+#if __BSD_VISIBLE || (__XSI_VISIBLE && __XSI_VISIBLE < 600)
 int	 getw(FILE *);
 int	 putw(int, FILE *);
 #endif /* BSD or X/Open before issue 6 */
@@ -294,52 +327,16 @@ int	 putw(int, FILE *);
 char	*tempnam(const char *, const char *);
 #endif
 
-#if __BSD_VISIBLE || __POSIX_VISIBLE >= 200809
+#if __POSIX_VISIBLE >= 200809
+FILE 	*fmemopen(void *__restrict, size_t, const char *__restrict);
 ssize_t	 getdelim(char ** __restrict, size_t * __restrict, int,
 		  FILE * __restrict);
+FILE	*open_memstream(char **, size_t *);
 int	 renameat(int, const char *, int, const char *);
 int	 vdprintf(int, const char * __restrict, __va_list) __printflike(2, 0);
-FILE 	*fmemopen(void *__restrict, size_t, const char *__restrict);
-FILE	*open_memstream(char **, size_t *);
-
-/*
- * Every programmer and his dog wrote functions called getline() and dprintf()
- * before POSIX.1-2008 came along and decided to usurp the names, so we
- * don't prototype them by default unless one of the following is true:
- *   a) the app has requested them specifically by defining _WITH_GETLINE or
- *      _WITH_DPRINTF, respectively
- *   b) the app has requested a POSIX.1-2008 environment via _POSIX_C_SOURCE
- *   c) the app defines a GNUism such as _BSD_SOURCE or _GNU_SOURCE
- */
-#ifndef _WITH_GETLINE
-#if defined(_BSD_SOURCE) || defined(_GNU_SOURCE)
-#define	_WITH_GETLINE
-#elif defined(_POSIX_C_SOURCE)
-#if _POSIX_C_SOURCE >= 200809
-#define	_WITH_GETLINE
-#endif
-#endif
-#endif
-
-#ifdef _WITH_GETLINE
-ssize_t	 getline(char ** __restrict, size_t * __restrict, FILE * __restrict);
-#endif
-
-#ifndef _WITH_DPRINTF
-#if defined(_BSD_SOURCE) || defined(_GNU_SOURCE)
-#define	_WITH_DPRINTF
-#elif defined(_POSIX_C_SOURCE)
-#if _POSIX_C_SOURCE >= 200809
-#define	_WITH_DPRINTF
-#endif
-#endif
-#endif
-
-#ifdef _WITH_DPRINTF
 int	 dprintf(int, const char * __restrict, ...) __printflike(2, 3);
-#endif
-
-#endif /* __BSD_VISIBLE || __POSIX_VISIBLE >= 200809 */
+ssize_t	 getline(char ** __restrict, size_t * __restrict, FILE * __restrict);
+#endif /* __POSIX_VISIBLE >= 200809 */
 
 /*
  * Routines that are purely local.
@@ -351,6 +348,7 @@ void	 fcloseall(void);
 void	*fcookie(FILE *);
 char	*fgetln(FILE *, size_t *);
 const char *fmtcheck(const char *, const char *) __format_arg(2);
+char	*fparseln(FILE *, size_t *, size_t *, const char[3], int);
 __ssize_t __fpending(const FILE *);
 int	 fpurge(FILE *);
 void	 setbuffer(FILE *, char *, int);
@@ -373,26 +371,6 @@ FILE	*funopen(const void *, int (*)(void *, char *, int),
 		 fpos_t (*)(void *, fpos_t, int), int (*)(void *));
 #define	fropen(cookie, fn) funopen(cookie, fn, 0, 0, 0)
 #define	fwopen(cookie, fn) funopen(cookie, 0, fn, 0, 0)
-
-/*
- * Portability hacks.  See <sys/types.h>.
- */
-#ifndef _FTRUNCATE_DECLARED
-#define	_FTRUNCATE_DECLARED
-int	 ftruncate(int, __off_t);
-#endif
-#ifndef _LSEEK_DECLARED
-#define	_LSEEK_DECLARED
-__off_t	 lseek(int, __off_t, int);
-#endif
-#ifndef _MMAP_DECLARED
-#define	_MMAP_DECLARED
-void	*mmap(void *, size_t, int, int, int, __off_t);
-#endif
-#ifndef _TRUNCATE_DECLARED
-#define	_TRUNCATE_DECLARED
-int	 truncate(const char *, __off_t);
-#endif
 #endif /* __BSD_VISIBLE */
 
 /*
@@ -405,7 +383,7 @@ int	__swbuf(int, FILE *);
  * The __sfoo functions are here so that we can
  * define real function versions in the C library.
  */
-static __inline int
+static __inline __always_inline int
 __sgetc(FILE *_fp)
 {
 	struct __FILE_public *_p = (struct __FILE_public *)_fp;
@@ -416,7 +394,7 @@ __sgetc(FILE *_fp)
 		return (*_p->_p++);
 }
 
-static __inline int
+static __inline __always_inline int
 __sputc(int _c, FILE *_fp)
 {
 	struct __FILE_public *_p = (struct __FILE_public *)_fp;
@@ -427,7 +405,7 @@ __sputc(int _c, FILE *_fp)
 		return (__swbuf(_c, _fp));
 }
 
-static __inline int
+static __inline __always_inline int
 __sfeof(FILE *_fp)
 {
 	struct __FILE_public *_p = (struct __FILE_public *)_fp;
@@ -435,7 +413,7 @@ __sfeof(FILE *_fp)
 	return ((_p->_flags & __SEOF) != 0);
 }
 
-static __inline int
+static __inline __always_inline int
 __sferror(FILE *_fp)
 {
 	struct __FILE_public *_p = (struct __FILE_public *)_fp;
@@ -443,7 +421,7 @@ __sferror(FILE *_fp)
 	return ((_p->_flags & __SERR) != 0);
 }
 
-static __inline void
+static __inline __always_inline void
 __sclearerr(FILE *_fp)
 {
 	struct __FILE_public *_p = (struct __FILE_public *)_fp;
@@ -451,7 +429,7 @@ __sclearerr(FILE *_fp)
 	_p->_flags &= ~(__SERR|__SEOF);
 }
 
-static __inline int
+static __inline __always_inline int
 __sfileno(FILE *_fp)
 {
 	struct __FILE_public *_p = (struct __FILE_public *)_fp;
@@ -459,8 +437,12 @@ __sfileno(FILE *_fp)
 	return (_p->_fileno);
 }
 
+#ifndef __LIBC_ISTHREADED_DECLARED
+#define __LIBC_ISTHREADED_DECLARED
 extern int __isthreaded;
+#endif
 
+#ifndef __cplusplus
 #define	feof(p)		(!__isthreaded ? __sfeof(p) : (feof)(p))
 #define	ferror(p)	(!__isthreaded ? __sferror(p) : (ferror)(p))
 #define	clearerr(p)	(!__isthreaded ? __sclearerr(p) : (clearerr)(p))
@@ -492,6 +474,7 @@ extern int __isthreaded;
 #define	getchar_unlocked()	getc_unlocked(stdin)
 #define	putchar_unlocked(x)	putc_unlocked(x, stdout)
 #endif
+#endif /* __cplusplus */
 
 __END_DECLS
 #endif /* !_STDIO_H_ */

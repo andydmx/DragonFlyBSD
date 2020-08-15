@@ -46,9 +46,18 @@
 
 enum ig4_op { IG4_IDLE, IG4_READ, IG4_WRITE };
 
+enum ig4_vers {
+	IG4_HASWELL = 0,
+	IG4_ATOM,	/* Bay Trail, Braswell, Cherryview */
+	IG4_SKYLAKE,	/* Skylake-U/Y and Kaby Lake-U/Y */
+	IG4_APL,
+	IG4_CANNONLAKE
+};
+
 struct ig4iic_softc {
 	device_t	dev;
 	device_t	smb;
+	device_t	acpismb;
 	struct resource	*regs_res;
 	int		regs_rid;
 	bus_space_tag_t regs_t;
@@ -57,11 +66,13 @@ struct ig4iic_softc {
 	int		intr_rid;
 	void		*intr_handle;
 	int		intr_type;
+	enum ig4_vers	version;
 	enum ig4_op	op;
 	int		cmd;
 	int		rnext;
 	int		rpos;
 	char		rbuf[IG4_RBUFSIZE];
+	uint32_t	intr_mask;
 	int		error;
 	uint8_t		last_slave;
 	int		pci_attached : 1;
@@ -70,7 +81,7 @@ struct ig4iic_softc {
 	int		slave_valid : 1;
 	int		read_started : 1;
 	int		write_started : 1;
-	struct lock	lk;
+	struct lwkt_serialize slz;
 };
 
 typedef struct ig4iic_softc ig4iic_softc_t;

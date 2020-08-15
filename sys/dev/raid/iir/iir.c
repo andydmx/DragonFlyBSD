@@ -1299,8 +1299,8 @@ gdtexecuteccb(void *arg, bus_dma_segment_t *dm_segs, int nseg, int error)
 
     ccb->ccb_h.status |= CAM_SIM_QUEUED;
     /* timeout handling */
-    callout_reset(&ccb->ccb_h.timeout_ch, (ccb->ccb_h.timeout * hz) / 1000,
-        iir_timeout, gccb);
+    callout_reset(ccb->ccb_h.timeout_ch, (ccb->ccb_h.timeout * hz) / 1000,
+		  iir_timeout, gccb);
 
     gdt->sc_copy_cmd(gdt, gccb);
     crit_exit();
@@ -1647,7 +1647,7 @@ iir_intr(void *arg)
     }
 }
 
-int
+static int
 gdt_async_event(struct gdt_softc *gdt, int service)
 {
     struct gdt_ccb *gccb;
@@ -1706,7 +1706,7 @@ gdt_async_event(struct gdt_softc *gdt, int service)
     return (0);
 }
 
-int
+static int
 gdt_sync_event(struct gdt_softc *gdt, int service,
                u_int8_t index, struct gdt_ccb *gccb)
 {
@@ -1804,7 +1804,7 @@ gdt_sync_event(struct gdt_softc *gdt, int service,
         kprintf("\n");
         return (0);
     } else {
-        callout_stop(&ccb->ccb_h.timeout_ch);
+        callout_stop(ccb->ccb_h.timeout_ch);
         if (gdt->sc_status == GDT_S_BSY) {
             GDT_DPRINTF(GDT_D_DEBUG, ("gdt_sync_event(%p) gccb %p busy\n",
                                       gdt, gccb));

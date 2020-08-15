@@ -29,6 +29,7 @@
  */
 
 #include <sys/cdefs.h>
+__FBSDID("$FreeBSD$");
 
 /*
  * AHB bus front-end for the Atheros Wireless LAN controller driver.
@@ -42,9 +43,14 @@
 #include <sys/module.h>
 #include <sys/kernel.h>
 #include <sys/lock.h>
-#include <sys/mutex.h>
 #include <sys/errno.h>
 
+#if defined(__DragonFly__)
+/* empty */
+#else
+#include <machine/bus.h>
+#include <machine/resource.h>
+#endif
 #include <sys/bus.h>
 #include <sys/rman.h>
 
@@ -59,12 +65,12 @@
 
 #include <dev/netif/ath/ath/if_athvar.h>
 
-#define MIPS_KSEG1_START                ((intptr_t)(int32_t)0xa0000000)
-#define MIPS_PHYS_TO_KSEG1(x)           ((uintptr_t)(x) | MIPS_KSEG1_START)
-
-#include <dev/netif/ath/ath_hal/ar71xx/ar71xxreg.h>
-#include <dev/netif/ath/ath_hal/ar91xx/ar91xxreg.h>
-#include <dev/netif/ath/ath_hal/ar71xx/ar71xx_cpudef.h>
+#if defined(__DragonFly__)
+#else
+#include <mips/atheros/ar71xxreg.h>
+#include <mips/atheros/ar91xxreg.h>
+#include <mips/atheros/ar71xx_cpudef.h>
+#endif
 
 /*
  * bus glue.
@@ -117,6 +123,20 @@ ath_ahb_probe(device_t dev)
 	return ENXIO;
 }
 
+#if defined(__DragonFly__)
+/* empty */
+#else
+
+static void
+ath_ahb_intr(void *arg)
+{
+	/* XXX TODO: check if its ours! */
+	ar71xx_device_flush_ddr(AR71XX_CPU_DDR_FLUSH_WMAC);
+	ath_intr(arg);
+}
+
+#endif
+
 static int
 ath_ahb_attach(device_t dev)
 {
@@ -153,19 +173,30 @@ ath_ahb_attach(device_t dev)
 		eepromsize = ATH_EEPROM_DATA_SIZE * 2;
 	}
 
-
 	rid = 0;
 	device_printf(sc->sc_dev, "eeprom @ %p (%d bytes)\n",
 	    (void *) eepromaddr, eepromsize);
-	psc->sc_eeprom = bus_alloc_resource(dev, SYS_RES_MEMORY, &rid, (uintptr_t) eepromaddr,
+	/*
+	 * XXX this assumes that the parent device is the nexus
+	 * and will just pass through requests for all of memory.
+	 *
+	 * Later on, when this has to attach off of the actual
+	 * AHB, this won't work.
+	 *
+	 * Ideally this would be done in machdep code in mips/atheros/
+	 * and it'd expose the EEPROM via the firmware interface,
+	 * so the ath/ath_ahb drivers can be loaded as modules
+	 * after boot-time.
+	 */
+	psc->sc_eeprom = bus_alloc_resource(dev, SYS_RES_MEMORY,
+	     &rid, (uintptr_t) eepromaddr,
 	  (uintptr_t) eepromaddr + (uintptr_t) (eepromsize - 1), 0, RF_ACTIVE);
 	if (psc->sc_eeprom == NULL) {
 		device_printf(dev, "cannot map eeprom space\n");
 		goto bad0;
 	}
 
-	/* XXX uintptr_t is a bandaid for ia64; to be fixed */
-	sc->sc_st = (HAL_BUS_TAG)(uintptr_t) rman_get_bustag(psc->sc_sr);
+	sc->sc_st = (HAL_BUS_TAG) rman_get_bustag(psc->sc_sr);
 	sc->sc_sh = (HAL_BUS_HANDLE) rman_get_bushandle(psc->sc_sr);
 	/*
 	 * Mark device invalid so any interrupts (shared or otherwise)
@@ -199,19 +230,33 @@ ath_ahb_attach(device_t dev)
 		device_printf(dev, "could not map interrupt\n");
 		goto bad1;
 	}
+
+#if defined(__DragonFly__)
 	if (bus_setup_intr(dev, psc->sc_irq,
-			   INTR_MPSAFE, ath_intr,
-			   sc, &psc->sc_ih,
+			   INTR_MPSAFE,
+			   ath_intr, sc, &psc->sc_ih,
 			   &wlan_global_serializer)) {
 		device_printf(dev, "could not establish interrupt\n");
 		goto bad2;
 	}
+#else
+	if (bus_setup_intr(dev, psc->sc_irq,
+			   INTR_TYPE_NET | INTR_MPSAFE,
+			   NULL, ath_ahb_intr, sc, &psc->sc_ih)) {
+		device_printf(dev, "could not establish interrupt\n");
+		goto bad2;
+	}
+#endif
 
 	/*
 	 * Setup DMA descriptor area.
 	 */
 	if (bus_dma_tag_create(bus_get_dma_tag(dev),	/* parent */
-			       4, 0,			/* alignment, bounds */
+#if defined(__DragonFly__)
+			       16, 0,			/* alignment, bounds */
+#else
+			       1, 0,			/* alignment, bounds */
+#endif
 			       BUS_SPACE_MAXADDR_32BIT,	/* lowaddr */
 			       BUS_SPACE_MAXADDR,	/* highaddr */
 			       NULL, NULL,		/* filter, filterarg */
@@ -219,6 +264,11 @@ ath_ahb_attach(device_t dev)
 			       ATH_MAX_SCATTER,		/* nsegments */
 			       0x3ffff,			/* maxsegsize XXX */
 			       BUS_DMA_ALLOCNOW,	/* flags */
+#if defined(__DragonFly__)
+#else
+			       NULL,			/* lockfunc */
+			       NULL,			/* lockarg */
+#endif
 			       &sc->sc_dmat)) {
 		device_printf(dev, "cannot allocate DMA tag\n");
 		goto bad3;
@@ -241,19 +291,15 @@ ath_ahb_attach(device_t dev)
 	ATH_PCU_LOCK_INIT(sc);
 	ATH_RX_LOCK_INIT(sc);
 	ATH_TX_LOCK_INIT(sc);
-	ATH_TX_IC_LOCK_INIT(sc);
 	ATH_TXSTATUS_LOCK_INIT(sc);
 
-	wlan_serialize_enter();
 	error = ath_attach(device_id, sc);
-	wlan_serialize_exit();
 	if (error == 0)					/* success */
 		return 0;
 
 	ATH_TXSTATUS_LOCK_DESTROY(sc);
 	ATH_RX_LOCK_DESTROY(sc);
 	ATH_TX_LOCK_DESTROY(sc);
-	ATH_TX_IC_LOCK_DESTROY(sc);
 	ATH_PCU_LOCK_DESTROY(sc);
 	ATH_LOCK_DESTROY(sc);
 	bus_dma_tag_destroy(sc->sc_dmat);
@@ -297,7 +343,6 @@ ath_ahb_detach(device_t dev)
 	ATH_TXSTATUS_LOCK_DESTROY(sc);
 	ATH_RX_LOCK_DESTROY(sc);
 	ATH_TX_LOCK_DESTROY(sc);
-	ATH_TX_IC_LOCK_DESTROY(sc);
 	ATH_PCU_LOCK_DESTROY(sc);
 	ATH_LOCK_DESTROY(sc);
 
@@ -350,10 +395,11 @@ static driver_t ath_ahb_driver = {
 	sizeof (struct ath_ahb_softc)
 };
 static	devclass_t ath_devclass;
-DRIVER_MODULE(ath_ahb, nexus, ath_ahb_driver, ath_devclass, NULL, NULL);
-MODULE_VERSION(ath_ahb, 1);
-MODULE_DEPEND(ath_ahb, wlan, 1, 1, 1);          /* 802.11 media layer */
-MODULE_DEPEND(ath_ahb, if_ath, 1, 1, 1);        /* if_ath driver */
-MODULE_DEPEND(ath_ahb, ath_hal, 1, 1, 1);       /* Atheros HAL */
-MODULE_DEPEND(ath_ahb, ath_rate, 1, 1, 1);      /* rate control alg */
-MODULE_DEPEND(ath_ahb, ath_dfs, 1, 1, 1);	/* wtf */
+DRIVER_MODULE(ath, nexus, ath_ahb_driver, ath_devclass, NULL, NULL);
+#if defined(__DragonFly__)
+#else
+DRIVER_MODULE(ath, apb, ath_ahb_driver, ath_devclass, 0, 0);
+#endif
+MODULE_VERSION(ath, 1);
+MODULE_DEPEND(ath, wlan, 1, 1, 1);		/* 802.11 media layer */
+MODULE_DEPEND(ath, if_ath, 1, 1, 1);		/* if_ath driver */

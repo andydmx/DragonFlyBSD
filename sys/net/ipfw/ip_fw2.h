@@ -28,10 +28,6 @@
 #ifndef _IPFW2_H
 #define _IPFW2_H
 
-#ifdef _KERNEL
-#include <net/netisr2.h>
-#endif
-
 /*
  * The kernel representation of ipfw rules is made of a list of
  * 'instructions' (for all practical purposes equivalent to BPF
@@ -90,20 +86,18 @@ enum ipfw_opcodes {		/* arguments (4 byte each)	*/
 	O_TCPWIN,		/* arg1 = desired win		*/
 	O_TCPSEQ,		/* u32 = desired seq.		*/
 	O_TCPACK,		/* u32 = desired seq.		*/
-	O_ICMPTYPE,		/* u32 = icmp bitmap		*/
+	O_ICMPTYPE,		/* 1*u32 = icmp type bitmap	*/
 	O_TCPOPTS,		/* arg1 = 2*u8 bitmap		*/
 
+	/* States. */
 	O_PROBE_STATE,		/* none				*/
 	O_KEEP_STATE,		/* none				*/
 	O_LIMIT,		/* ipfw_insn_limit		*/
 	O_LIMIT_PARENT,		/* dyn_type, not an opcode.	*/
-	/*
-	 * these are really 'actions', and must be last in the list.
-	 */
 
+	/* Actions. */
 	O_LOG,			/* ipfw_insn_log		*/
 	O_PROB,			/* u32 = match probability	*/
-
 	O_CHECK_STATE,		/* none				*/
 	O_ACCEPT,		/* none				*/
 	O_DENY,			/* none 			*/
@@ -116,8 +110,30 @@ enum ipfw_opcodes {		/* arguments (4 byte each)	*/
 	O_TEE,			/* arg1=port number		*/
 	O_FORWARD_IP,		/* fwd sockaddr			*/
 	O_FORWARD_MAC,		/* fwd mac			*/
+
+	/* Table based filters. */
+	O_IP_SRC_TABLE,		/* arg1 = tableid		*/
+	O_IP_DST_TABLE,		/* arg1 = tableid		*/
+
+	/* Action. */
+	O_DEFRAG,		/* none				*/
+
+	/* Filters. */
+	O_IPFRAG,		/* none				*/
+	O_IP_SRC_IFIP,		/* ipfw_insn_ifip		*/
+	O_IP_DST_IFIP,		/* ipfw_insn_ifip		*/
+
+	/* Translates. */
+	O_REDIRECT,		/* ipfw_insn_rdr		*/
+	O_RESERVED1,		/* reserved for NAT		*/
+
+	O_ICMPCODE,		/* 1*u32 = icmp code bitmap	*/
+
 	O_LAST_OPCODE		/* not an opcode!		*/
 };
+#ifdef _KERNEL
+CTASSERT(O_LAST_OPCODE <= 256);
+#endif
 
 /*
  * Template for instructions.
@@ -156,6 +172,8 @@ typedef struct	_ipfw_insn {	/* template for instructions */
 
 	uint16_t	arg1;
 } ipfw_insn;
+
+#define IPFW_INSN_SIZE_MAX	63	/* unit: uint32_t */
 
 /*
  * The F_INSN_SIZE(type) computes the size, in 4-byte words, of
@@ -252,12 +270,30 @@ typedef struct  _ipfw_insn_log {
 	uint32_t log_left;	/* how many left to log 	*/
 } ipfw_insn_log;
 
-#ifdef _KERNEL
+/*
+ * This is used by O_IP_{SRC,DST}_IFIP.
+ */
+typedef struct _ipfw_insn_ifip {
+	ipfw_insn o;		/* arg1 & 0x1, addr is valid */
+#define IPFW_IFIP_VALID		0x0001
+#define IPFW_IFIP_NET		0x0002
+#define IPFW_IFIP_SETTINGS	IPFW_IFIP_NET
+	char ifname[IFNAMSIZ];
+	struct in_addr addr;
+	struct in_addr mask;
+} ipfw_insn_ifip;
 
-struct ip_fw;
-struct ip_fw_stub {
-	struct ip_fw	*rule[1];
-};
+/*
+ * This is used by O_REDIRECT.
+ */
+typedef struct _ipfw_insn_rdr {
+	ipfw_insn o;
+	struct in_addr addr;
+	uint16_t port;		/* network byte order, 0 = same port */
+	uint16_t set;		/* reserved for set, 0xffff */
+} ipfw_insn_rdr;
+
+#ifdef _KERNEL
 
 /*
  * Here we have the structure representing an ipfw rule.
@@ -298,18 +334,25 @@ struct ip_fw {
 	uint64_t	bcnt;		/* Byte counter			*/
 	uint32_t	timestamp;	/* tv_sec of last match		*/
 
-	struct ip_fw_stub *stub;	/* back pointers to clones	*/
-	struct ip_fw	*sibling;	/* clone on next cpu		*/
 	int		cpuid;		/* owner cpu			*/
+	struct ip_fw	*sibling;	/* clone on next cpu		*/
+
+	struct ip_fw	**cross_rules;	/* cross referenced rules	*/
+	volatile uint64_t cross_refs;	/* cross references		*/
 
 	uint32_t	refcnt;		/* Ref count for transit pkts	*/
 	uint32_t	rule_flags;	/* IPFW_RULE_F_			*/
+	uintptr_t	track_ruleid;	/* ruleid for src/dst tracks	*/
 
 	ipfw_insn	cmd[1];		/* storage for commands		*/
 };
 
 #define IPFW_RULE_F_INVALID	0x1
-#define IPFW_RULE_F_STATE	0x2
+/* unused			0x2 */
+#define IPFW_RULE_F_GENSTATE	0x4
+#define IPFW_RULE_F_GENTRACK	0x8
+#define IPFW_RULE_F_CROSSREF	0x10
+#define IPFW_RULE_F_DYNIFADDR	0x20
 
 #define RULESIZE(rule)	(sizeof(struct ip_fw) + (rule)->cmd_len * 4 - 4)
 
@@ -318,41 +361,12 @@ struct ip_fw {
  * parts of the code.
  */
 struct ipfw_flow_id {
-	uint32_t	dst_ip;
-	uint32_t	src_ip;
-	uint16_t	dst_port;
-	uint16_t	src_port;
+	uint32_t	dst_ip;		/* host byte order */
+	uint32_t	src_ip;		/* host byte order */
+	uint16_t	dst_port;	/* host byte order */
+	uint16_t	src_port;	/* host byte order */
 	uint8_t		proto;
-	uint8_t		flags;	/* protocol-specific flags */
-};
-
-/*
- * dynamic ipfw rule
- */
-typedef struct _ipfw_dyn_rule ipfw_dyn_rule;
-
-struct _ipfw_dyn_rule {
-	ipfw_dyn_rule	*next;		/* linked list of rules.	*/
-	struct ipfw_flow_id id;		/* (masked) flow id		*/
-#ifdef notyet
-	struct ip_fw *rule;		/* pointer to rule		*/
-#else
-	const struct ip_fw_stub *stub;	/* pointer to rule's stub	*/
-#endif
-	ipfw_dyn_rule *parent;		/* pointer to parent rule	*/
-	uint32_t	expire;		/* expire time			*/
-	uint64_t	pcnt;		/* packet match counter		*/
-	uint64_t	bcnt;		/* byte match counter		*/
-	uint32_t	bucket;		/* which bucket in hash table	*/
-	uint32_t	state;		/* state of this rule (typically a
-					 * combination of TCP flags)
-					 */
-	uint32_t	ack_fwd;	/* most recent ACKs in forward	*/
-	uint32_t	ack_rev;	/* and reverse directions (used	*/
-					/* to generate keepalives)	*/
-	uint16_t	dyn_type;	/* rule type			*/
-	uint16_t	count;		/* refcount			*/
-	time_t		keep_alive;	/* last keep-alive sending time */
+	uint8_t		flags;		/* protocol-specific flags */
 };
 
 /*
@@ -360,11 +374,12 @@ struct _ipfw_dyn_rule {
  */
 
 /* ipfw_chk/ip_fw_chk_ptr return values */
-#define IP_FW_PASS	0
-#define IP_FW_DENY	1
-#define IP_FW_DIVERT	2
-#define IP_FW_TEE	3
-#define IP_FW_DUMMYNET	4
+#define IP_FW_PASS		0
+#define IP_FW_DENY		1
+#define IP_FW_DIVERT		2
+#define IP_FW_TEE		3
+#define IP_FW_DUMMYNET		4
+#define IP_FW_REDISPATCH	6
 
 /*
  * arguments for calling ipfw_chk() and dummynet_io(). We put them
@@ -375,9 +390,14 @@ struct ip_fw_args {
 	struct mbuf	*m;		/* the mbuf chain		*/
 	struct ifnet	*oif;		/* output interface		*/
 	struct ip_fw	*rule;		/* matching rule		*/
+	struct ipfw_xlat *xlat;		/* matching xlate		*/
 	struct ether_header *eh;	/* for bridged packets		*/
 
 	struct ipfw_flow_id f_id;	/* grabbed from IP header	*/
+	uint8_t		flags;
+#define IP_FWARG_F_CONT		0x01
+#define IP_FWARG_F_XLATINS	0x02
+#define IP_FWARG_F_XLATFWD	0x04
 
 	/*
 	 * Depend on the return value of ipfw_chk/ip_fw_chk_ptr
@@ -403,7 +423,8 @@ struct dn_flow_set;
 
 typedef int	ip_fw_chk_t(struct ip_fw_args *);
 typedef int	ip_fw_ctl_t(struct sockopt *);
-typedef void	ip_fw_dn_io_t(struct mbuf *, int, int, struct ip_fw_args *);
+typedef struct mbuf
+		*ip_fw_dn_io_t(struct mbuf *, int, int, struct ip_fw_args *);
 
 extern ip_fw_chk_t	*ip_fw_chk_ptr;
 extern ip_fw_ctl_t	*ip_fw_ctl_ptr;
@@ -414,11 +435,6 @@ extern int fw_enable;
 
 extern int ip_fw_loaded;
 #define	IPFW_LOADED	(ip_fw_loaded)
-
-#define IPFW_CFGCPUID	0
-#define IPFW_CFGPORT	netisr_cpuport(IPFW_CFGCPUID)
-#define IPFW_ASSERT_CFGPORT(msgport)	\
-	KASSERT((msgport) == IPFW_CFGPORT, ("not IPFW CFGPORT"))
 
 #endif /* _KERNEL */
 
@@ -459,10 +475,10 @@ struct ipfw_ioc_flowid {
 	uint16_t	pad;
 	union {
 		struct {
-			uint32_t dst_ip;
-			uint32_t src_ip;
-			uint16_t dst_port;
-			uint16_t src_port;
+			uint32_t dst_ip;	/* host byte order */
+			uint32_t src_ip;	/* host byte order */
+			uint16_t dst_port;	/* host byte order */
+			uint16_t src_port;	/* host byte order */
 			uint8_t proto;
 		} ip;
 		uint8_t pad[64];
@@ -477,10 +493,10 @@ struct ipfw_ioc_state {
 	uint16_t	dyn_type;	/* rule type			*/
 	uint16_t	count;		/* refcount			*/
 
-	uint16_t	rulenum;
-	uint16_t	pad;
+	uint16_t	rulenum;	/* rule number			*/
 
-	int		cpu;		/* reserved			*/
+	uint16_t	xlat_port;	/* xlate port, host byte order	*/
+	uint32_t	xlat_addr;	/* xlate addr, host byte order	*/
 
 	struct ipfw_ioc_flowid id;	/* (masked) flow id		*/
 	uint8_t		reserved[16];
@@ -504,5 +520,56 @@ struct ipfw_ioc_state {
 #define	IP_FW_TCPOPT_CC		0x10
 
 #define	ICMP_REJECT_RST		0x100	/* fake ICMP code (send a TCP RST) */
+
+/*
+ * IP_FW_TBL_CREATE, tableid >= 0.
+ * IP_FW_TBL_FLUSH, tableid >= 0.
+ * IP_FW_TBL_FLUSH, tableid < 0, flush all tables.
+ * IP_FW_TBL_DESTROY, tableid >= 0.
+ * IP_FW_TBL_ZERO, tableid >= 0.
+ * IP_FW_TBL_ZERO, tableid < 0, zero all tables' counters.
+ */
+struct ipfw_ioc_table {
+	int		tableid;
+};
+
+struct ipfw_ioc_tblent {
+	struct sockaddr_in key;
+	struct sockaddr_in netmask;
+	u_long		use;
+	time_t		last_used;
+	long		unused[2];
+};
+
+/*
+ * IP_FW_TBL_GET, tableid < 0, list of all tables.
+ */
+struct ipfw_ioc_tbllist {
+	int		tableid;	/* MUST be the first field */
+	int		tablecnt;
+	uint16_t	tables[];
+};
+
+/*
+ * IP_FW_TBL_GET, tableid >= 0, entries in the table.
+ * IP_FW_TBL_ADD, tableid >= 0, entcnt == 1.
+ * IP_FW_TBL_DEL, tableid >= 0, entcnt == 1.
+ */
+struct ipfw_ioc_tblcont {
+	int		tableid;	/* MUST be the first field */
+	int		entcnt;
+	struct ipfw_ioc_tblent ent[1];
+};
+
+/*
+ * IP_FW_TBL_EXPIRE, tableid < 0, expire all tables.
+ * IP_FW_TBL_EXPIRE, tableid >= 0.
+ */
+struct ipfw_ioc_tblexp {
+	int		tableid;
+	int		expcnt;
+	time_t		expire;
+	u_long		unused1[2];
+};
 
 #endif /* _IPFW2_H */

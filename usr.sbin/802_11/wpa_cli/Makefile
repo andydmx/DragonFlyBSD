@@ -2,18 +2,15 @@
 
 .include "${.CURDIR}/../Makefile.inc"
 
-.PATH.c:	${.CURDIR}/..  \
-		${WPA_DISTDIR}/wpa_supplicant
+.PATH.c:	${WPA_DISTDIR}/wpa_supplicant
+
 PROG=	wpa_cli
-SRCS=	common.c edit.c eloop.c os_unix.c wpa_cli.c wpa_ctrl.c wpa_debug.c
+SRCS=	common.c cli.c edit_simple.c eloop.c os_unix.c wpa_cli.c wpa_ctrl.c \
+	wpa_debug.c
 
 MAN=	wpa_cli.8
 
 CFLAGS+= -DCONFIG_CTRL_IFACE
 CFLAGS+= -DCONFIG_CTRL_IFACE_UNIX
-CFLAGS+= -DCONFIG_READLINE
-
-LDADD+= -ledit -ltermcap
-DPADD+= ${LIBEDIT} ${LIBTERMCAP}
 
 .include <bsd.prog.mk>

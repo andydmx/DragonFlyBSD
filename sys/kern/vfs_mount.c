@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2004,2013 The DragonFly Project.  All rights reserved.
+ * Copyright (c) 2004,2013-2019 The DragonFly Project.  All rights reserved.
  * 
  * This code is derived from software contributed to The DragonFly Project
  * by Matthew Dillon <dillon@backplane.com>
@@ -75,16 +75,12 @@
 #include <sys/mount.h>
 #include <sys/proc.h>
 #include <sys/vnode.h>
-#include <sys/buf.h>
+#include <sys/spinlock2.h>
 #include <sys/eventhandler.h>
 #include <sys/kthread.h>
 #include <sys/sysctl.h>
 
 #include <machine/limits.h>
-
-#include <sys/buf2.h>
-#include <sys/thread2.h>
-#include <sys/sysref2.h>
 
 #include <vm/vm.h>
 #include <vm/vm_object.h>
@@ -104,6 +100,40 @@ struct vnlru_info {
 	int	pass;
 };
 
+static int
+mount_cmp(struct mount *mnt1, struct mount *mnt2)
+{
+	if (mnt1->mnt_stat.f_fsid.val[0] < mnt2->mnt_stat.f_fsid.val[0])
+		return -1;
+	if (mnt1->mnt_stat.f_fsid.val[0] > mnt2->mnt_stat.f_fsid.val[0])
+		return 1;
+	if (mnt1->mnt_stat.f_fsid.val[1] < mnt2->mnt_stat.f_fsid.val[1])
+		return -1;
+	if (mnt1->mnt_stat.f_fsid.val[1] > mnt2->mnt_stat.f_fsid.val[1])
+		return 1;
+	return 0;
+}
+
+static int
+mount_fsid_cmp(fsid_t *fsid, struct mount *mnt)
+{
+	if (fsid->val[0] < mnt->mnt_stat.f_fsid.val[0])
+		return -1;
+	if (fsid->val[0] > mnt->mnt_stat.f_fsid.val[0])
+		return 1;
+	if (fsid->val[1] < mnt->mnt_stat.f_fsid.val[1])
+		return -1;
+	if (fsid->val[1] > mnt->mnt_stat.f_fsid.val[1])
+		return 1;
+	return 0;
+}
+
+RB_HEAD(mount_rb_tree, mount);
+RB_PROTOTYPEX(mount_rb_tree, FSID, mount, mnt_node, mount_cmp, fsid_t *);
+RB_GENERATE(mount_rb_tree, mount, mnt_node, mount_cmp);
+RB_GENERATE_XLOOKUP(mount_rb_tree, FSID, mount, mnt_node,
+			mount_fsid_cmp, fsid_t *);
+
 static int vnlru_nowhere = 0;
 SYSCTL_INT(_debug, OID_AUTO, vnlru_nowhere, CTLFLAG_RD,
 	    &vnlru_nowhere, 0,
@@ -115,6 +145,7 @@ static struct mount dummymount;
 
 /* note: mountlist exported to pstat */
 struct mntlist mountlist = TAILQ_HEAD_INITIALIZER(mountlist);
+struct mount_rb_tree mounttree = RB_INITIALIZER(dev_tree_mounttree);
 static TAILQ_HEAD(,mountscan_info) mountscan_list;
 static struct lwkt_token mountlist_token;
 
@@ -129,7 +160,7 @@ vfs_mount_init(void)
 	lwkt_token_init(&mountlist_token, "mntlist");
 	lwkt_token_init(&mntid_token, "mntid");
 	TAILQ_INIT(&mountscan_list);
-	mount_init(&dummymount);
+	mount_init(&dummymount, NULL);
 	dummymount.mnt_flag |= MNT_RDONLY;
 	dummymount.mnt_kern_flag |= MNTK_ALL_MPSAFE;
 }
@@ -159,7 +190,9 @@ vremovevnodemnt(struct vnode *vp)
  *
  * A VX locked and refd vnode is returned.  The caller should setup the
  * remaining fields and vx_put() or, if he wishes to leave a vref,
- * vx_unlock() the vnode.
+ * vx_unlock() the vnode.  Or if he wishes to return a normal locked
+ * vnode, call vx_downgrade(vp); to downgrade the VX lock to a normal
+ * VN lock.
  */
 int
 getnewvnode(enum vtagtype tag, struct mount *mp,
@@ -178,6 +211,7 @@ getnewvnode(enum vtagtype tag, struct mount *mp,
 	 * operations vector.
 	 */
 	vp->v_ops = &mp->mnt_vn_use_ops;
+	vp->v_pbuf_count = nswbuf_kva / NSWBUF_SPLIT;
 
 	/*
 	 * Placing the vnode on the mount point's queue makes it visible.
@@ -252,11 +286,15 @@ vfs_busy(struct mount *mp, int flags)
 		}
 		/* XXX not MP safe */
 		mp->mnt_kern_flag |= MNTK_MWAIT;
+
 		/*
 		 * Since all busy locks are shared except the exclusive
 		 * lock granted when unmounting, the only place that a
 		 * wakeup needs to be done is at the release of the
 		 * exclusive lock at the end of dounmount.
+		 *
+		 * WARNING! mp can potentially go away once we release
+		 *	    our ref.
 		 */
 		tsleep((caddr_t)mp, 0, "vfs_busy", 0);
 		lwkt_reltoken(&mp->mnt_token);
@@ -273,14 +311,19 @@ vfs_busy(struct mount *mp, int flags)
 /*
  * Free a busy filesystem.
  *
- * Decrement refs before releasing the lock so e.g. a pending umount
- * doesn't give us an unexpected busy error.
+ * Once refs is decremented the mount point can potentially get ripped
+ * out from under us, but we want to clean up our refs before unlocking
+ * so do a hold/drop around the whole mess.
+ *
+ * This is not in the critical path (I hope).
  */
 void
 vfs_unbusy(struct mount *mp)
 {
+	mount_hold(mp);
 	atomic_add_int(&mp->mnt_refs, -1);
 	lockmgr(&mp->mnt_lock, LK_RELEASE);
+	mount_drop(mp);
 }
 
 /*
@@ -302,19 +345,27 @@ vfs_rootmountalloc(char *fstypename, char *devname, struct mount **mpp)
 	if (vfsp == NULL)
 		return (ENODEV);
 	mp = kmalloc(sizeof(struct mount), M_MOUNT, M_WAITOK | M_ZERO);
-	mount_init(mp);
+	mount_init(mp, vfsp->vfc_vfsops);
 	lockinit(&mp->mnt_lock, "vfslock", VLKTIMEOUT, 0);
 
 	vfs_busy(mp, 0);
 	mp->mnt_vfc = vfsp;
-	mp->mnt_op = vfsp->vfc_vfsops;
+	mp->mnt_pbuf_count = nswbuf_kva / NSWBUF_SPLIT;
 	vfsp->vfc_refcount++;
 	mp->mnt_stat.f_type = vfsp->vfc_typenum;
 	mp->mnt_flag |= MNT_RDONLY;
 	mp->mnt_flag |= vfsp->vfc_flags & MNT_VISFLAGMASK;
 	strncpy(mp->mnt_stat.f_fstypename, vfsp->vfc_name, MFSNAMELEN);
 	copystr(devname, mp->mnt_stat.f_mntfromname, MNAMELEN - 1, 0);
+
+	/*
+	 * Pre-set MPSAFE flags for VFS_MOUNT() call.
+	 */
+	if (vfsp->vfc_flags & VFCF_MPSAFE)
+		mp->mnt_kern_flag |= MNTK_ALL_MPSAFE;
+
 	*mpp = mp;
+
 	return (0);
 }
 
@@ -322,7 +373,7 @@ vfs_rootmountalloc(char *fstypename, char *devname, struct mount **mpp)
  * Basic mount structure initialization
  */
 void
-mount_init(struct mount *mp)
+mount_init(struct mount *mp, struct vfsops *ops)
 {
 	lockinit(&mp->mnt_lock, "vfslock", hz*5, 0);
 	lwkt_token_init(&mp->mnt_token, "permnt");
@@ -333,82 +384,113 @@ mount_init(struct mount *mp)
 	TAILQ_INIT(&mp->mnt_jlist);
 	mp->mnt_nvnodelistsize = 0;
 	mp->mnt_flag = 0;
+	mp->mnt_hold = 1;		/* hold for umount last drop */
 	mp->mnt_iosize_max = MAXPHYS;
-	vn_syncer_thr_create(mp);
+	mp->mnt_op = ops;
+	if (ops == NULL || (ops->vfs_flags & VFSOPSF_NOSYNCERTHR) == 0)
+		vn_syncer_thr_create(mp);
+}
+
+void
+mount_hold(struct mount *mp)
+{
+	atomic_add_int(&mp->mnt_hold, 1);
+}
+
+void
+mount_drop(struct mount *mp)
+{
+	if (atomic_fetchadd_int(&mp->mnt_hold, -1) == 1) {
+		KKASSERT(mp->mnt_refs == 0);
+		kfree(mp, M_MOUNT);
+	}
 }
 
 /*
  * Lookup a mount point by filesystem identifier.
+ *
+ * If not NULL, the returned mp is held and the caller is expected to drop
+ * it via mount_drop().
  */
 struct mount *
 vfs_getvfs(fsid_t *fsid)
 {
 	struct mount *mp;
 
-	lwkt_gettoken(&mountlist_token);
-	TAILQ_FOREACH(mp, &mountlist, mnt_list) {
-		if (mp->mnt_stat.f_fsid.val[0] == fsid->val[0] &&
-		    mp->mnt_stat.f_fsid.val[1] == fsid->val[1]) {
-			break;
-		}
-	}
+	lwkt_gettoken_shared(&mountlist_token);
+	mp = mount_rb_tree_RB_LOOKUP_FSID(&mounttree, fsid);
+	if (mp)
+		mount_hold(mp);
 	lwkt_reltoken(&mountlist_token);
 	return (mp);
 }
 
 /*
+ * Generate a FSID based on the mountpt.  The FSID will be adjusted to avoid
+ * collisions when the mount is added to mountlist.
+ *
+ * May only be called prior to the mount succeeding.
+ *
+ * OLD:
+ *
  * Get a new unique fsid.  Try to make its val[0] unique, since this value
  * will be used to create fake device numbers for stat().  Also try (but
  * not so hard) make its val[0] unique mod 2^16, since some emulators only
  * support 16-bit device numbers.  We end up with unique val[0]'s for the
  * first 2^16 calls and unique val[0]'s mod 2^16 for the first 2^8 calls.
- *
- * Keep in mind that several mounts may be running in parallel.  Starting
- * the search one past where the previous search terminated is both a
- * micro-optimization and a defense against returning the same fsid to
- * different mounts.
  */
 void
 vfs_getnewfsid(struct mount *mp)
 {
-	static u_int16_t mntid_base;
 	fsid_t tfsid;
 	int mtype;
+	int error;
+	char *retbuf;
+	char *freebuf;
 
-	lwkt_gettoken(&mntid_token);
 	mtype = mp->mnt_vfc->vfc_typenum;
 	tfsid.val[1] = mtype;
-	mtype = (mtype & 0xFF) << 24;
-	for (;;) {
+	error = cache_fullpath(NULL, &mp->mnt_ncmounton, NULL,
+			       &retbuf, &freebuf, 0);
+	if (error) {
+		tfsid.val[0] = makeudev(255, 0);
+	} else {
 		tfsid.val[0] = makeudev(255,
-		    mtype | ((mntid_base & 0xFF00) << 8) | (mntid_base & 0xFF));
-		mntid_base++;
-		if (vfs_getvfs(&tfsid) == NULL)
-			break;
+					iscsi_crc32(retbuf, strlen(retbuf)) &
+					~makeudev(255, 0));
+		kfree(freebuf, M_TEMP);
 	}
 	mp->mnt_stat.f_fsid.val[0] = tfsid.val[0];
 	mp->mnt_stat.f_fsid.val[1] = tfsid.val[1];
-	lwkt_reltoken(&mntid_token);
 }
 
 /*
- * Set the FSID for a new mount point to the template.  Adjust
- * the FSID to avoid collisions.
+ * Set the FSID for a new mount point to the template.
+ *
+ * The FSID will be adjusted to avoid collisions when the mount is
+ * added to mountlist.
+ *
+ * May only be called prior to the mount succeeding.
  */
-int
+void
 vfs_setfsid(struct mount *mp, fsid_t *template)
 {
-	int didmunge = 0;
-
 	bzero(&mp->mnt_stat.f_fsid, sizeof(mp->mnt_stat.f_fsid));
+
+#if 0
+	struct mount *mptmp;
+
+	lwkt_gettoken(&mntid_token);
 	for (;;) {
-		if (vfs_getvfs(template) == NULL)
+		mptmp = vfs_getvfs(template);
+		if (mptmp == NULL)
 			break;
-		didmunge = 1;
+		mount_drop(mptmp);
 		++template->val[1];
 	}
+	lwkt_reltoken(&mntid_token);
+#endif
 	mp->mnt_stat.f_fsid = *template;
-	return(didmunge);
 }
 
 /*
@@ -443,6 +525,8 @@ vnlru_proc(void)
 			      SHUTDOWN_PRI_FIRST);
 
 	for (;;) {
+		int ncachedandinactive;
+
 		kproc_suspend_loop();
 
 		/*
@@ -452,12 +536,14 @@ vnlru_proc(void)
 		 *
 		 * (long) -> deal with 64 bit machines, intermediate overflow
 		 */
-		if (numvnodes >= desiredvnodes * 9 / 10 &&
-		    cachedvnodes + inactivevnodes >= desiredvnodes * 5 / 10) {
-			int count = numvnodes - desiredvnodes * 9 / 10;
+		synchronizevnodecount();
+		ncachedandinactive = countcachedandinactivevnodes();
+		if (numvnodes >= maxvnodes * 9 / 10 &&
+		    ncachedandinactive >= maxvnodes * 5 / 10) {
+			int count = numvnodes - maxvnodes * 9 / 10;
 
-			if (count > (cachedvnodes + inactivevnodes) / 100)
-				count = (cachedvnodes + inactivevnodes) / 100;
+			if (count > (ncachedandinactive) / 100)
+				count = (ncachedandinactive) / 100;
 			if (count < 5)
 				count = 5;
 			freesomevnodes(count);
@@ -474,8 +560,10 @@ vnlru_proc(void)
 		 * Nothing to do if most of our vnodes are already on
 		 * the free list.
 		 */
-		if (numvnodes <= desiredvnodes * 9 / 10 ||
-		    cachedvnodes + inactivevnodes <= desiredvnodes * 5 / 10) {
+		synchronizevnodecount();
+		ncachedandinactive = countcachedandinactivevnodes();
+		if (numvnodes <= maxvnodes * 9 / 10 ||
+		    ncachedandinactive <= maxvnodes * 5 / 10) {
 			tsleep(vnlruthread, 0, "vlruwt", hz);
 			continue;
 		}
@@ -489,16 +577,38 @@ vnlru_proc(void)
 /*
  * mountlist_insert (MP SAFE)
  *
- * Add a new mount point to the mount list.
+ * Add a new mount point to the mount list.  Filesystem should attempt to
+ * supply a unique fsid but if a duplicate occurs adjust the fsid to ensure
+ * uniqueness.
  */
 void
 mountlist_insert(struct mount *mp, int how)
 {
+	int lim = 0x01000000;
+
 	lwkt_gettoken(&mountlist_token);
 	if (how == MNTINS_FIRST)
-	    TAILQ_INSERT_HEAD(&mountlist, mp, mnt_list);
+		TAILQ_INSERT_HEAD(&mountlist, mp, mnt_list);
 	else
-	    TAILQ_INSERT_TAIL(&mountlist, mp, mnt_list);
+		TAILQ_INSERT_TAIL(&mountlist, mp, mnt_list);
+	while (mount_rb_tree_RB_INSERT(&mounttree, mp)) {
+		int32_t val;
+
+		/*
+		 * minor device mask: 0xFFFF00FF
+		 */
+		val = mp->mnt_stat.f_fsid.val[0];
+		val = ((val & 0xFFFF0000) >> 8) | (val & 0x000000FF);
+		++val;
+		val = ((val << 8) & 0xFFFF0000) | (val & 0x000000FF);
+		mp->mnt_stat.f_fsid.val[0] = val;
+		if (--lim == 0) {
+			lim = 0x01000000;
+			mp->mnt_stat.f_fsid.val[1] += 0x0100;
+			kprintf("mountlist_insert: fsid collision, "
+				"too many mounts\n");
+		}
+	}
 	lwkt_reltoken(&mountlist_token);
 }
 
@@ -508,6 +618,8 @@ mountlist_insert(struct mount *mp, int how)
  * Execute the specified interlock function with the mountlist token
  * held.  The function will be called in a serialized fashion verses
  * other functions called through this mechanism.
+ *
+ * The function is expected to be very short-lived.
  */
 int
 mountlist_interlock(int (*callback)(struct mount *), struct mount *mp)
@@ -553,10 +665,12 @@ mountlist_remove(struct mount *mp)
 			if (msi->msi_how & MNTSCAN_FORWARD)
 				msi->msi_node = TAILQ_NEXT(mp, mnt_list);
 			else
-				msi->msi_node = TAILQ_PREV(mp, mntlist, mnt_list);
+				msi->msi_node = TAILQ_PREV(mp, mntlist,
+							   mnt_list);
 		}
 	}
 	TAILQ_REMOVE(&mountlist, mp, mnt_list);
+	mount_rb_tree_RB_REMOVE(&mounttree, mp);
 	lwkt_reltoken(&mountlist_token);
 }
 
@@ -576,7 +690,7 @@ mountlist_exists(struct mount *mp)
 	int node_exists = 0;
 	struct mount* lmp;
 
-	lwkt_gettoken(&mountlist_token);
+	lwkt_gettoken_shared(&mountlist_token);
 	TAILQ_FOREACH(lmp, &mountlist, mnt_list) {
 		if (lmp == mp) {
 			node_exists = 1;
@@ -584,16 +698,20 @@ mountlist_exists(struct mount *mp)
 		}
 	}
 	lwkt_reltoken(&mountlist_token);
+
 	return(node_exists);
 }
 
 /*
- * mountlist_scan (MP SAFE)
+ * mountlist_scan
  *
- * Safely scan the mount points on the mount list.  Unless otherwise 
- * specified each mount point will be busied prior to the callback and
- * unbusied afterwords.  The callback may safely remove any mount point
- * without interfering with the scan.  If the current callback
+ * Safely scan the mount points on the mount list.  Each mountpoint
+ * is held across the callback.  The callback is responsible for
+ * acquiring any further tokens or locks.
+ *
+ * Unless otherwise specified each mount point will be busied prior to the
+ * callback and unbusied afterwords.  The callback may safely remove any
+ * mount point without interfering with the scan.  If the current callback
  * mount is removed the scanner will not attempt to unbusy it.
  *
  * If a mount node cannot be busied it is silently skipped.
@@ -605,6 +723,9 @@ mountlist_exists(struct mount *mp)
  * MNTSCAN_REVERSE	- the mountlist is scanned in reverse
  * MNTSCAN_NOBUSY	- the scanner will make the callback without busying
  *			  the mount node.
+ * MNTSCAN_NOUNLOCK	- Do not unlock mountlist_token across callback
+ *
+ * NOTE: mountlist_token is not held across the callback.
  */
 int
 mountlist_scan(int (*callback)(struct mount *, void *), void *data, int how)
@@ -613,27 +734,39 @@ mountlist_scan(int (*callback)(struct mount *, void *), void *data, int how)
 	struct mount *mp;
 	int count;
 	int res;
+	int dounlock = ((how & MNTSCAN_NOUNLOCK) == 0);
 
 	lwkt_gettoken(&mountlist_token);
-
 	info.msi_how = how;
 	info.msi_node = NULL;	/* paranoia */
 	TAILQ_INSERT_TAIL(&mountscan_list, &info, msi_entry);
+	lwkt_reltoken(&mountlist_token);
 
 	res = 0;
+	lwkt_gettoken_shared(&mountlist_token);
 
 	if (how & MNTSCAN_FORWARD) {
 		info.msi_node = TAILQ_FIRST(&mountlist);
 		while ((mp = info.msi_node) != NULL) {
+			mount_hold(mp);
 			if (how & MNTSCAN_NOBUSY) {
+				if (dounlock)
+					lwkt_reltoken(&mountlist_token);
 				count = callback(mp, data);
+				if (dounlock)
+					lwkt_gettoken_shared(&mountlist_token);
 			} else if (vfs_busy(mp, LK_NOWAIT) == 0) {
+				if (dounlock)
+					lwkt_reltoken(&mountlist_token);
 				count = callback(mp, data);
+				if (dounlock)
+					lwkt_gettoken_shared(&mountlist_token);
 				if (mp == info.msi_node)
 					vfs_unbusy(mp);
 			} else {
 				count = 0;
 			}
+			mount_drop(mp);
 			if (count < 0)
 				break;
 			res += count;
@@ -643,24 +776,39 @@ mountlist_scan(int (*callback)(struct mount *, void *), void *data, int how)
 	} else if (how & MNTSCAN_REVERSE) {
 		info.msi_node = TAILQ_LAST(&mountlist, mntlist);
 		while ((mp = info.msi_node) != NULL) {
+			mount_hold(mp);
 			if (how & MNTSCAN_NOBUSY) {
+				if (dounlock)
+					lwkt_reltoken(&mountlist_token);
 				count = callback(mp, data);
+				if (dounlock)
+					lwkt_gettoken_shared(&mountlist_token);
 			} else if (vfs_busy(mp, LK_NOWAIT) == 0) {
+				if (dounlock)
+					lwkt_reltoken(&mountlist_token);
 				count = callback(mp, data);
+				if (dounlock)
+					lwkt_gettoken_shared(&mountlist_token);
 				if (mp == info.msi_node)
 					vfs_unbusy(mp);
 			} else {
 				count = 0;
 			}
+			mount_drop(mp);
 			if (count < 0)
 				break;
 			res += count;
 			if (mp == info.msi_node)
-				info.msi_node = TAILQ_PREV(mp, mntlist, mnt_list);
+				info.msi_node = TAILQ_PREV(mp, mntlist,
+							   mnt_list);
 		}
 	}
+	lwkt_reltoken(&mountlist_token);
+
+	lwkt_gettoken(&mountlist_token);
 	TAILQ_REMOVE(&mountscan_list, &info, msi_entry);
 	lwkt_reltoken(&mountlist_token);
+
 	return(res);
 }
 
@@ -673,7 +821,7 @@ static struct kproc_desc vnlru_kp = {
 	vnlru_proc,
 	&vnlruthread
 };
-SYSINIT(vnlru, SI_SUB_KTHREAD_UPDATE, SI_ORDER_FIRST, kproc_start, &vnlru_kp)
+SYSINIT(vnlru, SI_SUB_KTHREAD_UPDATE, SI_ORDER_FIRST, kproc_start, &vnlru_kp);
 
 /*
  * Move a vnode from one mount queue to another.
@@ -902,10 +1050,8 @@ next:
  * If the SKIPSYSTEM or WRITECLOSE flags are specified, rootrefs must
  * be zero.
  */
-#ifdef DIAGNOSTIC
-static int busyprt = 0;		/* print out busy vnodes */
-SYSCTL_INT(_debug, OID_AUTO, busyprt, CTLFLAG_RW, &busyprt, 0, "");
-#endif
+static int debug_busyprt = 0;		/* print out busy vnodes */
+SYSCTL_INT(_vfs, OID_AUTO, debug_busyprt, CTLFLAG_RW, &debug_busyprt, 0, "");
 
 static int vflush_scan(struct mount *mp, struct vnode *vp, void *data);
 
@@ -1031,10 +1177,15 @@ vflush_scan(struct mount *mp, struct vnode *vp, void *data)
 	}
 	if (vp->v_type == VCHR || vp->v_type == VBLK)
 		kprintf("vflush: Warning, cannot destroy busy device vnode\n");
-#ifdef DIAGNOSTIC
-	if (busyprt)
-		vprint("vflush: busy vnode", vp);
-#endif
+	if (debug_busyprt) {
+		const char *filename;
+
+		spin_lock(&vp->v_spin);
+		filename = TAILQ_FIRST(&vp->v_namecache) ?
+			   TAILQ_FIRST(&vp->v_namecache)->nc_name : "?";
+		spin_unlock(&vp->v_spin);
+		kprintf("vflush: busy vnode (%p) %s\n", vp, filename);
+	}
 	++info->busy;
 	return(0);
 }
@@ -1081,12 +1232,13 @@ mount_get_by_nc(struct namecache *ncp)
 {
 	struct mount *mp = NULL;
 
-	lwkt_gettoken(&mountlist_token);
+	lwkt_gettoken_shared(&mountlist_token);
 	TAILQ_FOREACH(mp, &mountlist, mnt_list) {
 		if (ncp == mp->mnt_ncmountpt.ncp)
 			break;
 	}
 	lwkt_reltoken(&mountlist_token);
+
 	return (mp);
 }
 

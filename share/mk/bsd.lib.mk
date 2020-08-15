@@ -23,18 +23,30 @@ SONAME?=	${SHLIB_NAME}
 
 .if defined(DEBUG_FLAGS)
 CFLAGS+= ${DEBUG_FLAGS}
-.endif
-
-.if !defined(DEBUG_FLAGS)
+.else
 STRIP?=	-s
 .endif
 
 .include <bsd.libnames.mk>
 
+.if !defined(PRIVATELIB)
 TARGET_LIBDIR?=		${LIBDIR}
 TARGET_DEBUGLIBDIR?=	${DEBUGLIBDIR}
 TARGET_PROFLIBDIR?=	${PROFLIBDIR}
 TARGET_SHLIBDIR?=	${SHLIBDIR}
+.else
+TARGET_LIBDIR?=		${LIBDIR}/priv
+TARGET_DEBUGLIBDIR?=	${DEBUGLIBDIR:S!/debug$!/priv/debug!}
+TARGET_PROFLIBDIR?=	${PROFLIBDIR:S!/profile$!/priv/profile!}
+.if !empty(PRIVATELIB) && ${PRIVATELIB} == "shpub"
+TARGET_SHLIBDIR?=	${SHLIBDIR}
+. else
+TARGET_SHLIBDIR?=	${SHLIBDIR}/priv
+. endif
+.endif
+
+PRIVATELIB_CFLAGS?=	-I${_SHLIBDIRPREFIX}/usr/include/priv
+PRIVATELIB_LDFLAGS?=	-rpath /lib/priv -L ${_SHLIBDIRPREFIX}/usr/lib/priv
 
 # prefer .s to a .c, add .po, remove stuff not used in the BSD libraries
 # .So used for PIC object files
@@ -118,31 +130,37 @@ ${SHLIB_NAME}:	${VERSION_MAP}
 LDFLAGS+=	-Wl,--version-script=${VERSION_MAP}
 .endif
 
-.include <bsd.patch.mk>
-
 .if defined(LIB) && !empty(LIB) || defined(SHLIB_NAME)
-OBJS+=  ${SRCS:N*.h:N*.patch:R:S/$/.o/g}
+. if !empty(SRCS)
+OBJS+=  ${SRCS:N*.h:R:S/$/.o/g}
+. endif
 .endif
 
 .if defined(LIB) && !empty(LIB)
 _LIBS=		lib${LIB}.a
 
+. if ! target(lib${LIB}.a)
 lib${LIB}.a: ${OBJS} ${STATICOBJS}
 	@${ECHO} building static ${LIB} library
 	rm -f ${.TARGET}
 	${AR} cq ${.TARGET} `lorder ${OBJS} ${STATICOBJS} | tsort -q` ${ARADD}
 	${RANLIB} ${.TARGET}
+. endif
 .endif
 
-.if !defined(INTERNALLIB) && !defined(NOPROFILE) && defined(LIB) && !empty(LIB)
+.if !defined(INTERNALLIB) || defined(INTERNALLIBPROF)
+. if !defined(NOPROFILE) && defined(LIB) && !empty(LIB)
 _LIBS+=		lib${LIB}_p.a
 POBJS+=		${OBJS:.o=.po} ${STATICOBJS:.o=.po}
 
+.  if ! target(lib${LIB}_p.a)
 lib${LIB}_p.a: ${POBJS}
 	@${ECHO} building profiled ${LIB} library
 	rm -f ${.TARGET}
 	${AR} cq ${.TARGET} `lorder ${POBJS} | tsort -q` ${ARADD}
 	${RANLIB} ${.TARGET}
+.  endif
+. endif
 .endif
 
 .if !defined(INTERNALLIB) && defined(SHLIB_NAME) || \
@@ -181,10 +199,12 @@ all: _manpages
 .endif
 
 _EXTRADEPEND:
+.if !defined(NOIMPLICITDEPEND)
 	@TMP=_depend$$$$; \
 	sed -e 's/^\([^\.]*\).o[ ]*:/\1.o \1.po \1.So:/' < ${DEPENDFILE} \
 	    > $$TMP; \
 	mv $$TMP ${DEPENDFILE}
+.endif
 .if !defined(NOEXTRADEPEND) && defined(SHLIB_NAME)
 .if defined(DPADD) && !empty(DPADD)
 	echo ${SHLIB_NAME}: ${DPADD} >> ${DEPENDFILE}
@@ -223,8 +243,8 @@ _libinstall:
 	    ${_INSTALLFLAGS} ${_SHLINSTALLFLAGS} \
 	    ${SHLIB_NAME} ${DESTDIR}${TARGET_SHLIBDIR}
 .if defined(SHLIB_LINK)
-.if ${SHLIBDIR} == ${LIBDIR}
-	${LN} -fs ${SHLIB_NAME} ${DESTDIR}${TARGET_SHLIBDIR}/${SHLIB_LINK}
+.if ${TARGET_SHLIBDIR} == ${TARGET_LIBDIR}
+	${LN} -fs ${SHLIB_NAME} ${DESTDIR}${TARGET_LIBDIR}/${SHLIB_LINK}
 .else
 	${LN} -fs ${_SHLIBDIRPREFIX}${TARGET_SHLIBDIR}/${SHLIB_NAME} \
 	    ${DESTDIR}${TARGET_LIBDIR}/${SHLIB_LINK}
@@ -277,10 +297,12 @@ clean:
     defined(INSTALL_PIC_ARCHIVE) && defined(LIB) && !empty(LIB)
 	rm -f ${SOBJS} ${SOBJS:.So=.so} ${SOBJS:S/$/.tmp/}
 .endif
-.if !defined(INTERNALLIB)
+.if !defined(INTERNALLIB) || defined(INTERNALLIBPROF)
 .if !defined(NOPROFILE) && defined(LIB) && !empty(LIB)
 	rm -f ${POBJS} ${POBJS:S/$/.tmp/}
 .endif
+.endif # !defined(INTERNALLIB) || defined(INTERNALLIBPROF)
+.if !defined(INTERNALLIB)
 .if defined(SHLIB_NAME)
 .if defined(SHLIB_LINK)
 	rm -f ${SHLIB_LINK}

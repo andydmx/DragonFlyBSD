@@ -47,13 +47,6 @@
 #include "nscache.h"
 #endif
 
-extern int _ht_gethostbyname(void *, void *, va_list);
-extern int _dns_gethostbyname(void *, void *, va_list);
-extern int _nis_gethostbyname(void *, void *, va_list);
-extern int _ht_gethostbyaddr(void *, void *, va_list);
-extern int _dns_gethostbyaddr(void *, void *, va_list);
-extern int _nis_gethostbyaddr(void *, void *, va_list);
-
 static int gethostbyname_internal(const char *, int, struct hostent *, char *,
     size_t, struct hostent **, int *, res_state);
 
@@ -262,10 +255,10 @@ static int
 host_marshal_func(char *buffer, size_t *buffer_size, void *retval __unused,
 		  va_list ap, void *cache_mdata)
 {
-	char *str;
-	void *addr;
-	socklen_t len;
-	int type;
+	char *str __unused;
+	void *addr __unused;
+	socklen_t len __unused;
+	int type __unused;
 	struct hostent *ht;
 
 	struct hostent new_ht;
@@ -368,10 +361,10 @@ static int
 host_unmarshal_func(char *buffer, size_t buffer_size, void *retval, va_list ap,
 		    void *cache_mdata)
 {
-	char *str;
-	void *addr;
-	socklen_t len;
-	int type;
+	char *str __unused;
+	void *addr __unused;
+	socklen_t len __unused;
+	int type __unused;
 	struct hostent *ht;
 
 	char *p;
@@ -522,7 +515,7 @@ gethostbyname2_r(const char *name, int af, struct hostent *he, char *buffer,
 	    h_errnop, statp));
 }
 
-int
+static int
 gethostbyname_internal(const char *name, int af, struct hostent *hp, char *buf,
 		       size_t buflen, struct hostent **result, int *h_errnop,
 		       res_state statp)

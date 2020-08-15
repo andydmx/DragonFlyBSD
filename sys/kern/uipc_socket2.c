@@ -29,7 +29,6 @@
  *
  *	@(#)uipc_socket2.c	8.1 (Berkeley) 6/10/93
  * $FreeBSD: src/sys/kern/uipc_socket2.c,v 1.55.2.17 2002/08/31 19:04:55 dwmalone Exp $
- * $DragonFly: src/sys/kern/uipc_socket2.c,v 1.33 2008/09/02 16:17:52 dillon Exp $
  */
 
 #include "opt_param.h"
@@ -38,6 +37,7 @@
 #include <sys/domain.h>
 #include <sys/file.h>	/* for maxfiles */
 #include <sys/kernel.h>
+#include <sys/ktr.h>
 #include <sys/proc.h>
 #include <sys/malloc.h>
 #include <sys/mbuf.h>
@@ -51,11 +51,20 @@
 #include <sys/sysctl.h>
 #include <sys/event.h>
 
-#include <sys/thread2.h>
 #include <sys/msgport2.h>
 #include <sys/socketvar2.h>
 
 #include <net/netisr2.h>
+
+#ifndef KTR_SOWAKEUP
+#define KTR_SOWAKEUP	KTR_ALL
+#endif
+KTR_INFO_MASTER(sowakeup);
+KTR_INFO(KTR_SOWAKEUP, sowakeup, nconn_start, 0, "newconn sorwakeup start");
+KTR_INFO(KTR_SOWAKEUP, sowakeup, nconn_end, 1, "newconn sorwakeup end");
+KTR_INFO(KTR_SOWAKEUP, sowakeup, nconn_wakeupstart, 2, "newconn wakeup start");
+KTR_INFO(KTR_SOWAKEUP, sowakeup, nconn_wakeupend, 3, "newconn wakeup end");
+#define logsowakeup(name)	KTR_LOG(sowakeup_ ## name)
 
 int	maxsockets;
 
@@ -68,6 +77,16 @@ u_long	sb_max_adj =
     SB_MAX * MCLBYTES / (MSIZE + MCLBYTES); /* adjusted sb_max */
 
 static	u_long sb_efficiency = 8;	/* parameter for sbreserve() */
+
+SYSCTL_NODE(_kern, KERN_IPC, ipc, CTLFLAG_RW, 0, "IPC");
+
+/*
+ * soacceptreuse allows bind() a local port (e.g. for listen() purposes)
+ * to ignore any connections still accepted from a prior listen().
+ */
+static int soacceptreuse = 1;
+SYSCTL_INT(_kern_ipc, OID_AUTO, soaccept_reuse, CTLFLAG_RW,
+    &soacceptreuse, 0, "Allow quick reuse of local port");
 
 /************************************************************************
  * signalsockbuf procedures						*
@@ -244,6 +263,7 @@ soisconnected(struct socket *so)
 		/*
 		 * Listen socket are not per-cpu.
 		 */
+		KKASSERT((so->so_state & (SS_COMP | SS_INCOMP)) == SS_INCOMP);
 		TAILQ_REMOVE(&head->so_incomp, so, so_list);
 		head->so_incqlen--;
 		TAILQ_INSERT_TAIL(&head->so_comp, so, so_list);
@@ -326,7 +346,7 @@ sosetport(struct socket *so, lwkt_port_t port)
  */
 struct socket *
 sonewconn_faddr(struct socket *head, int connstatus,
-    const struct sockaddr *faddr)
+    const struct sockaddr *faddr, boolean_t keep_ref)
 {
 	struct socket *so;
 	struct socket *sp;
@@ -382,7 +402,13 @@ sonewconn_faddr(struct socket *head, int connstatus,
 	    so->so_refs == 2) ||	/* attach + our base ref */
 	   ((so->so_proto->pr_flags & PR_ASYNC_RCVD) &&
 	    so->so_refs == 3));		/* + async rcvd ref */
-	sofree(so);
+	if (keep_ref) {
+		/*
+		 * Keep the reference; caller will free it.
+		 */
+	} else {
+		sofree(so);
+	}
 	KKASSERT(so->so_port != NULL);
 	so->so_rcv.ssb_lowat = head->so_rcv.ssb_lowat;
 	so->so_snd.ssb_lowat = head->so_snd.ssb_lowat;
@@ -418,40 +444,59 @@ sonewconn_faddr(struct socket *head, int connstatus,
 
 	lwkt_getpooltoken(head);
 	if (connstatus) {
+		KKASSERT((so->so_state & (SS_INCOMP | SS_COMP)) == 0);
 		TAILQ_INSERT_TAIL(&head->so_comp, so, so_list);
-		sosetstate(so, SS_COMP);
 		head->so_qlen++;
+		/*
+		 * Set connstatus within head token, so that the accepted
+		 * socket will have connstatus (SS_ISCONNECTED) set.
+		 */
+		if (soacceptreuse)
+			connstatus |= SS_ACCEPTMECH;
+		sosetstate(so, SS_COMP | connstatus);
 	} else {
 		if (head->so_incqlen > head->so_qlimit) {
 			sp = TAILQ_FIRST(&head->so_incomp);
+			KKASSERT((sp->so_state & (SS_INCOMP | SS_COMP)) ==
+			    SS_INCOMP);
 			TAILQ_REMOVE(&head->so_incomp, sp, so_list);
 			head->so_incqlen--;
 			soclrstate(sp, SS_INCOMP);
-			sp->so_head = NULL;
-			soabort_async(sp);
+			soabort_async(sp, TRUE);
 		}
+		KKASSERT((so->so_state & (SS_INCOMP | SS_COMP)) == 0);
 		TAILQ_INSERT_TAIL(&head->so_incomp, so, so_list);
-		sosetstate(so, SS_INCOMP);
 		head->so_incqlen++;
+		sosetstate(so, SS_INCOMP | SS_ACCEPTMECH);
 	}
+	/*
+	 * Clear SS_ASSERTINPROG within head token, so that it will not
+	 * race against accept-close or abort for "synchronous" sockets,
+	 * e.g. unix socket, on other CPUs.
+	 */
+	soclrstate(so, SS_ASSERTINPROG);
 	lwkt_relpooltoken(head);
+
 	if (connstatus) {
 		/*
 		 * XXX head may be on a different protocol thread.
 		 *     sorwakeup()->sowakeup() is hacked atm.
 		 */
+		logsowakeup(nconn_start);
 		sorwakeup(head);
+		logsowakeup(nconn_end);
+
+		logsowakeup(nconn_wakeupstart);
 		wakeup((caddr_t)&head->so_timeo);
-		sosetstate(so, connstatus);
+		logsowakeup(nconn_wakeupend);
 	}
-	soclrstate(so, SS_ASSERTINPROG);
 	return (so);
 }
 
 struct socket *
 sonewconn(struct socket *head, int connstatus)
 {
-	return sonewconn_faddr(head, connstatus, NULL);
+	return sonewconn_faddr(head, connstatus, NULL, FALSE /* don't ref */);
 }
 
 /*
@@ -478,6 +523,19 @@ socantrcvmore(struct socket *so)
 }
 
 /*
+ * soroverflow(): indicates that data was attempted to be sent
+ * but the receiving buffer overflowed.
+ */
+void
+soroverflow(struct socket *so)
+{
+	if (so->so_options & SO_RERROR) {
+		so->so_rerror = ENOBUFS;
+		sorwakeup(so);
+	}
+}
+
+/*
  * Wakeup processes waiting on a socket buffer.  Do asynchronous notification
  * via SIGIO if the socket has the SS_ASYNC flag set.
  *
@@ -493,7 +551,6 @@ socantrcvmore(struct socket *so)
 void
 sowakeup(struct socket *so, struct signalsockbuf *ssb)
 {
-	struct kqinfo *kqinfo = &ssb->ssb_kq;
 	uint32_t flags;
 
 	/*
@@ -544,12 +601,12 @@ sowakeup(struct socket *so, struct signalsockbuf *ssb)
 	if ((so->so_state & SS_ASYNC) && so->so_sigio != NULL)
 		pgsigio(so->so_sigio, SIGIO, 0);
 	if (ssb->ssb_flags & SSB_UPCALL)
-		(*so->so_upcall)(so, so->so_upcallarg, MB_DONTWAIT);
-	KNOTE(&kqinfo->ki_note, 0);
+		(*so->so_upcall)(so, so->so_upcallarg, M_NOWAIT);
+	KNOTE(&ssb->ssb_kq.ki_note, 0);
 
 	/*
 	 * This is a bit of a hack.  Multiple threads can wind up scanning
-	 * ki_mlist concurrently due to the fact that this function can be
+	 * ssb_mlist concurrently due to the fact that this function can be
 	 * called on a foreign socket, so we can't afford to block here.
 	 *
 	 * We need the pool token for (so) (likely the listne socket if
@@ -560,14 +617,14 @@ sowakeup(struct socket *so, struct signalsockbuf *ssb)
 		struct netmsg_so_notify *msg, *nmsg;
 
 		lwkt_getpooltoken(so);
-		TAILQ_FOREACH_MUTABLE(msg, &kqinfo->ki_mlist, nm_list, nmsg) {
+		TAILQ_FOREACH_MUTABLE(msg, &ssb->ssb_mlist, nm_list, nmsg) {
 			if (msg->nm_predicate(msg)) {
-				TAILQ_REMOVE(&kqinfo->ki_mlist, msg, nm_list);
+				TAILQ_REMOVE(&ssb->ssb_mlist, msg, nm_list);
 				lwkt_replymsg(&msg->base.lmsg,
 					      msg->base.lmsg.ms_error);
 			}
 		}
-		if (TAILQ_EMPTY(&ssb->ssb_kq.ki_mlist))
+		if (TAILQ_EMPTY(&ssb->ssb_mlist))
 			atomic_clear_int(&ssb->ssb_flags, SSB_MEVENT);
 		lwkt_relpooltoken(so);
 	}
@@ -789,12 +846,6 @@ sotoxsocket(struct socket *so, struct xsocket *xso)
 	ssbtoxsockbuf(&so->so_rcv, &xso->so_rcv);
 	xso->so_uid = so->so_cred->cr_uid;
 }
-
-/*
- * Here is the definition of some of the basic objects in the kern.ipc
- * branch of the MIB.
- */
-SYSCTL_NODE(_kern, KERN_IPC, ipc, CTLFLAG_RW, 0, "IPC");
 
 /*
  * This takes the place of kern.maxsockbuf, which moved to kern.ipc.

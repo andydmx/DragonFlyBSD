@@ -27,7 +27,7 @@
 .\" ARISING IN ANY WAY  OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 .\" POSSIBILITY OF SUCH DAMAGE.
 .\"
-.Dd February 27, 2009
+.Dd October 4, 2018
 .Dt IOCTL 9
 .Os
 .Sh NAME
@@ -38,10 +38,7 @@
 .Nm _IOWR
 .Nd "how to implement a new ioctl call to access device drivers"
 .Sh SYNOPSIS
-.In sys/ioctl.h
 .In sys/ioccom.h
-.Ft int
-.Fn ioctl "int d" "unsigned long request" "..."
 .Fn _IO "g" "t"
 .Fn _IOR "g" "n" "t"
 .Fn _IOW "g" "n" "t"
@@ -69,7 +66,7 @@ ioctl(fd, MYDEVIOCTL, ...)
 .It Fn fun
 A macro which can be one of:
 .Bl -tag -width ".Fn _IOWR"
-.It Fn  _IO
+.It Fn _IO
 The call is a simple message to the kernel by itself.
 It does not copy anything into the kernel, nor does it want anything back.
 .It Fn _IOR
@@ -88,8 +85,6 @@ This integer describes to which subsystem the ioctl applies.
 Here are some examples:
 .Pp
 .Bl -tag -width xxxxx -compact
-.It '5'
-.Xr perfmon 4
 .It '8'
 .Xr aac 4
 .It 'a'
@@ -97,11 +92,15 @@ Here are some examples:
 .It 'B'
 .Xr bpf 4
 .It 'C'
+.Xr cam 4
+.It 'C'
 .Xr ciss 4
 .It 'd'
 .Xr disklabel 5
 .It 'd'
 diskslice
+.It 'd'
+.Xr drm 4
 .It 'f'
 generic file-descriptor
 .It 'F'
@@ -124,10 +123,11 @@ and
 .Pa /dev/midi
 .It 'm'
 .Xr mtio 4
+.It 'M'
+.Xr sound 4
+mixer
 .It 'n'
 .Xr smb 4
-.It 'n'
-NetWare volume mount
 .It 'p'
 .Pa /dev/dsp
 and
@@ -136,16 +136,14 @@ and
 .Xr pci 4
 .It 'p'
 .Xr ppbus 4
-.It 'P'
-.Xr apm 4
+.It 'p'
+.Xr procfs 5
 .It 'q'
 .Pa /dev/sequencer
 .It 'r'
 random number generator
 .It 't'
 .Xr tty 4
-.It 't'
-.Xr ppp 4
 .It 't'
 .Xr tap 4
 .It 't'
@@ -154,8 +152,6 @@ random number generator
 SLIP ttys
 .It 'T'
 .Xr snp 4
-.\".It 'V'
-.\"VMware
 .El
 .It Fa n
 This number uniquely identifies the ioctl within the group.

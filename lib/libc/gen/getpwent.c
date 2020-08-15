@@ -256,11 +256,11 @@ static int
 pwd_marshal_func(char *buffer, size_t *buffer_size, void *retval __unused,
     va_list ap, void *cache_mdata)
 {
-	char *name;
-	uid_t uid;
+	char *name __unused;
+	uid_t uid __unused;
 	struct passwd *pwd;
-	char *orig_buf;
-	size_t orig_buf_size;
+	char *orig_buf __unused;
+	size_t orig_buf_size __unused;
 
 	struct passwd new_pwd;
 	size_t desired_size, size;
@@ -360,8 +360,8 @@ static int
 pwd_unmarshal_func(char *buffer, size_t buffer_size, void *retval, va_list ap,
     void *cache_mdata)
 {
-	char *name;
-	uid_t uid;
+	char *name __unused;
+	uid_t uid __unused;
 	struct passwd *pwd;
 	char *orig_buf;
 	size_t orig_buf_size;
@@ -745,8 +745,7 @@ pwdbopen(int *version)
 		*version = *(unsigned char *)entry.data;
 	else
 		*version = 3;
-	if (*version < 3 ||
-	    *version >= sizeof(pwdb_versions)/sizeof(pwdb_versions[0])) {
+	if (*version < 3 || *version >= NELEM(pwdb_versions)) {
 		syslog(LOG_CRIT, "Unsupported password database version %d",
 		    *version);
 		res->close(res);
@@ -1085,7 +1084,7 @@ dns_endstate(void *p)
 
 
 static int
-dns_setpwent(void *retval, void *mdata, va_list ap)
+dns_setpwent(void *retval __unused, void *mdata __unused, va_list ap __unused)
 {
 	struct dns_state	*st;
 	int			 rv;
@@ -1605,7 +1604,7 @@ compat_redispatch(struct compat_state *st, enum nss_lookup_type how,
 	void		*discard;
 	int		 rv, e, i;
 
-	for (i = 0; i < sizeof(dtab)/sizeof(dtab[0]) - 1; i++)
+	for (i = 0; i < NELEM(dtab) - 1; i++)
 		dtab[i].mdata = (void *)lookup_how;
 more:
 	pwd_init(pwd);

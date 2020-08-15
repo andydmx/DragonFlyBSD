@@ -88,6 +88,8 @@
 
 #include <net/if.h>
 #include <net/route.h>
+#include <net/netisr2.h>
+#include <net/netmsg2.h>
 #include <netinet/in.h>
 #include <netinet/ip_var.h>
 #include <netinet/in_var.h>
@@ -96,14 +98,21 @@
 #include <netinet6/ip6_var.h>
 
 #include <netinet/icmp6.h>
+#include <netinet6/nd6.h>
 
 #include <netinet/tcp.h>
 #include <netinet/tcp_seq.h>
 #include <netinet/tcp_timer.h>
 #include <netinet/tcp_var.h>
 
-static struct callout	in6_rtqtimo_ch[MAXCPU];
-static struct callout	in6_mtutimo_ch[MAXCPU];
+struct in6_rttimo_ctx {
+	struct callout		timo_ch;
+	struct netmsg_base	timo_nmsg;
+	struct radix_node_head	*timo_rnh;
+} __cachealign;
+
+static struct in6_rttimo_ctx	in6_rtqtimo_ctx[MAXCPU];
+static struct in6_rttimo_ctx	in6_mtutimo_ctx[MAXCPU];
 
 extern int	in6_inithead (void **head, int off);
 
@@ -154,7 +163,7 @@ in6_addroute(char *key, char *mask, struct radix_node_head *head,
 
 	if (!rt->rt_rmx.rmx_mtu && !(rt->rt_rmx.rmx_locks & RTV_MTU) &&
 	    rt->rt_ifp != NULL)
-		rt->rt_rmx.rmx_mtu = rt->rt_ifp->if_mtu;
+		rt->rt_rmx.rmx_mtu = IN6_LINKMTU(rt->rt_ifp);
 
 	ret = rn_addroute(key, mask, head, treenodes);
 	if (ret == NULL && rt->rt_flags & RTF_HOST) {
@@ -234,17 +243,17 @@ static int rtq_reallyold = 60*60;
 	/* one hour is ``really old'' */
 SYSCTL_INT(_net_inet6_ip6, IPV6CTL_RTEXPIRE, rtexpire,
     CTLFLAG_RW, &rtq_reallyold , 0, "Default expiration time on cloned routes");
-				
+
 static int rtq_minreallyold = 10;
 	/* never automatically crank down to less */
 SYSCTL_INT(_net_inet6_ip6, IPV6CTL_RTMINEXPIRE, rtminexpire, CTLFLAG_RW,
     &rtq_minreallyold , 0, "Minimum time to attempt to hold onto cloned routes");
-				
+
 static int rtq_toomany = 128;
 	/* 128 cached routes is ``too many'' */
 SYSCTL_INT(_net_inet6_ip6, IPV6CTL_RTMAXCACHE, rtmaxcache,
     CTLFLAG_RW, &rtq_toomany , 0, "Upper limit on cloned routes");
-				
+
 
 /*
  * On last reference drop, mark the route as belong to us so that it can be
@@ -336,20 +345,38 @@ in6_rtqkill(struct radix_node *rn, void *rock)
 static int rtq_timeout = RTQ_TIMEOUT;
 
 static void
-in6_rtqtimo(void *rock)
+in6_rtqtimo(void *arg __unused)
 {
-	struct radix_node_head *rnh = rock;
+	int cpuid = mycpuid;
+	struct lwkt_msg *lmsg = &in6_rtqtimo_ctx[cpuid].timo_nmsg.lmsg;
+
+	crit_enter();
+	if (lmsg->ms_flags & MSGF_DONE)
+		lwkt_sendmsg_oncpu(netisr_cpuport(cpuid), lmsg);
+	crit_exit();
+}
+
+static void
+in6_rtqtimo_dispatch(netmsg_t nmsg)
+{
+	struct in6_rttimo_ctx *ctx = &in6_rtqtimo_ctx[mycpuid];
+	struct radix_node_head *rnh = ctx->timo_rnh;
 	struct rtqk_arg arg;
 	struct timeval atv;
 	static time_t last_adjusted_timeout = 0;
+
+	ASSERT_NETISR_NCPUS(mycpuid);
+
+	/* Reply ASAP */
+	crit_enter();
+	lwkt_replymsg(&nmsg->lmsg, 0);
+	crit_exit();
 
 	arg.found = arg.killed = 0;
 	arg.rnh = rnh;
 	arg.nextstop = time_uptime + rtq_timeout;
 	arg.draining = arg.updating = 0;
-	crit_enter();
 	rnh->rnh_walktree(rnh, in6_rtqkill, &arg);
-	crit_exit();
 
 	/*
 	 * Attempt to be somewhat dynamic about this:
@@ -374,9 +401,7 @@ in6_rtqtimo(void *rock)
 #endif
 		arg.found = arg.killed = 0;
 		arg.updating = 1;
-		crit_enter();
 		rnh->rnh_walktree(rnh, in6_rtqkill, &arg);
-		crit_exit();
 	}
 
 	atv.tv_usec = 0;
@@ -389,8 +414,7 @@ in6_rtqtimo(void *rock)
 		atv.tv_sec = rtq_timeout;
 		arg.nextstop = time_uptime + atv.tv_sec;
 	}
-	callout_reset(&in6_rtqtimo_ch[mycpuid], tvtohz_high(&atv),
-		      in6_rtqtimo, rock);
+	callout_reset(&ctx->timo_ch, tvtohz_high(&atv), in6_rtqtimo, NULL);
 }
 
 /*
@@ -426,17 +450,35 @@ in6_mtuexpire(struct radix_node *rn, void *rock)
 #define	MTUTIMO_DEFAULT	(60*1)
 
 static void
-in6_mtutimo(void *rock)
+in6_mtutimo(void *arg __unused)
 {
-	struct radix_node_head *rnh = rock;
+	int cpuid = mycpuid;
+	struct lwkt_msg *lmsg = &in6_mtutimo_ctx[cpuid].timo_nmsg.lmsg;
+
+	crit_enter();
+	if (lmsg->ms_flags & MSGF_DONE)
+		lwkt_sendmsg_oncpu(netisr_cpuport(cpuid), lmsg);
+	crit_exit();
+}
+
+static void
+in6_mtutimo_dispatch(netmsg_t nmsg)
+{
+	struct in6_rttimo_ctx *ctx = &in6_mtutimo_ctx[mycpuid];
+	struct radix_node_head *rnh = ctx->timo_rnh;
 	struct mtuex_arg arg;
 	struct timeval atv;
 
+	ASSERT_NETISR_NCPUS(mycpuid);
+
+	/* Reply ASAP */
+	crit_enter();
+	lwkt_replymsg(&nmsg->lmsg, 0);
+	crit_exit();
+
 	arg.rnh = rnh;
 	arg.nextstop = time_uptime + MTUTIMO_DEFAULT;
-	crit_enter();
 	rnh->rnh_walktree(rnh, in6_mtuexpire, &arg);
-	crit_exit();
 
 	atv.tv_usec = 0;
 	atv.tv_sec = arg.nextstop - time_uptime;
@@ -448,8 +490,7 @@ in6_mtutimo(void *rock)
 		atv.tv_sec = rtq_timeout;
 		arg.nextstop = time_uptime + atv.tv_sec;
 	}
-	callout_reset(&in6_mtutimo_ch[mycpuid], tvtohz_high(&atv),
-		      in6_mtutimo, rock);
+	callout_reset(&ctx->timo_ch, tvtohz_high(&atv), in6_mtutimo, NULL);
 }
 
 #if 0
@@ -477,20 +518,33 @@ int
 in6_inithead(void **head, int off)
 {
 	struct radix_node_head *rnh;
+	struct in6_rttimo_ctx *ctx;
+	int cpuid = mycpuid;
 
-	if (!rn_inithead(head, rn_cpumaskhead(mycpuid), off))
+	KKASSERT(head == (void **)&rt_tables[cpuid][AF_INET6]);
+
+	if (!rn_inithead(head, rn_cpumaskhead(cpuid), off))
 		return 0;
-
-	if (head != (void **)&rt_tables[mycpuid][AF_INET6]) /* BOGUS! */
-		return 1;	/* only do this for the real routing table */
 
 	rnh = *head;
 	rnh->rnh_addaddr = in6_addroute;
 	rnh->rnh_matchaddr = in6_matchroute;
 	rnh->rnh_close = in6_clsroute;
-	callout_init(&in6_mtutimo_ch[mycpuid]);
-	callout_init(&in6_rtqtimo_ch[mycpuid]);
-	in6_rtqtimo(rnh);	/* kick off timeout first time */
-	in6_mtutimo(rnh);	/* kick off timeout first time */
+
+	ctx = &in6_rtqtimo_ctx[cpuid];
+	ctx->timo_rnh = rnh;
+	callout_init_mp(&ctx->timo_ch);
+	netmsg_init(&ctx->timo_nmsg, NULL, &netisr_adone_rport, MSGF_PRIORITY,
+	    in6_rtqtimo_dispatch);
+
+	ctx = &in6_mtutimo_ctx[cpuid];
+	ctx->timo_rnh = rnh;
+	callout_init_mp(&ctx->timo_ch);
+	netmsg_init(&ctx->timo_nmsg, NULL, &netisr_adone_rport, MSGF_PRIORITY,
+	    in6_mtutimo_dispatch);
+
+	in6_rtqtimo(NULL);	/* kick off timeout first time */
+	in6_mtutimo(NULL);	/* kick off timeout first time */
+
 	return 1;
 }

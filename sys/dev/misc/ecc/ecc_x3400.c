@@ -41,7 +41,6 @@
 
 #include <bus/pci/pcivar.h>
 #include <bus/pci/pcireg.h>
-#include <bus/pci/pcibus.h>
 #include <bus/pci/pci_cfgreg.h>
 #include <bus/pci/pcib_private.h>
 
@@ -85,10 +84,13 @@ struct ecc_x3400_softc {
 
 static int	ecc_x3400_probe(device_t);
 static int	ecc_x3400_attach(device_t);
+static int	ecc_x3400_detach(device_t);
+static void	ecc_x3400_shutdown(device_t);
 
 static void	ecc_x3400_status(struct ecc_x3400_softc *);
 static void	ecc_x3400_status_ch(struct ecc_x3400_softc *, int, int);
 static void	ecc_x3400_callout(void *);
+static void	ecc_x3400_stop(device_t);
 
 static const struct ecc_x3400_memctrl ecc_memctrls[] = {
 	{ 0x8086, 0xd130, "Intel X3400 memory controller" },
@@ -96,13 +98,14 @@ static const struct ecc_x3400_memctrl ecc_memctrls[] = {
 };
 
 static device_method_t ecc_x3400_methods[] = {
-        /* Device interface */
-        DEVMETHOD(device_probe,		ecc_x3400_probe),
-        DEVMETHOD(device_attach,	ecc_x3400_attach),
-        DEVMETHOD(device_shutdown,	bus_generic_shutdown),
-        DEVMETHOD(device_suspend,	bus_generic_suspend),
-        DEVMETHOD(device_resume,	bus_generic_resume),
-        DEVMETHOD_END
+	/* Device interface */
+	DEVMETHOD(device_probe,		ecc_x3400_probe),
+	DEVMETHOD(device_attach,	ecc_x3400_attach),
+	DEVMETHOD(device_detach,	ecc_x3400_detach),
+	DEVMETHOD(device_shutdown,	ecc_x3400_shutdown),
+	DEVMETHOD(device_suspend,	bus_generic_suspend),
+	DEVMETHOD(device_resume,	bus_generic_resume),
+	DEVMETHOD_END
 };
 
 static driver_t ecc_x3400_driver = {
@@ -113,6 +116,7 @@ static driver_t ecc_x3400_driver = {
 static devclass_t ecc_devclass;
 DRIVER_MODULE(ecc_x3400, hostb, ecc_x3400_driver, ecc_devclass, NULL, NULL);
 MODULE_DEPEND(ecc_x3400, pci, 1, 1, 1);
+MODULE_VERSION(ecc_x3400, 1);
 
 static int
 ecc_x3400_probe(device_t dev)
@@ -150,6 +154,8 @@ ecc_x3400_attach(device_t dev)
 	struct ecc_x3400_softc *sc = device_get_softc(dev);
 	uint32_t val, dimms;
 
+	callout_init_mp(&sc->ecc_callout);
+
 	val = MC_READ_4(PCI_X3400UC_MC_CTRL);
 	if ((val & PCI_X3400UC_MC_CTRL_ECCEN) == 0) {
 		device_printf(dev, "ECC checking is not enabled\n");
@@ -167,7 +173,6 @@ ecc_x3400_attach(device_t dev)
 	sc->ecc_dimms = dimms + 1;
 	device_printf(dev, "max dimms %d\n", sc->ecc_dimms);
 
-	callout_init_mp(&sc->ecc_callout);
 	callout_reset(&sc->ecc_callout, hz, ecc_x3400_callout, sc);
 
 	return 0;
@@ -266,4 +271,25 @@ ecc_x3400_status_ch(struct ecc_x3400_softc *sc, int ofs, int idx)
 	}
 
 	MCT2_WRITE_4(ofs, 0);
+}
+
+static void
+ecc_x3400_stop(device_t dev)
+{
+	struct ecc_x3400_softc *sc = device_get_softc(dev);
+
+	callout_cancel(&sc->ecc_callout);
+}
+
+static int
+ecc_x3400_detach(device_t dev)
+{
+	ecc_x3400_stop(dev);
+	return 0;
+}
+
+static void
+ecc_x3400_shutdown(device_t dev)
+{
+	ecc_x3400_stop(dev);
 }

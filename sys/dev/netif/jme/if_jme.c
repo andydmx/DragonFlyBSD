@@ -52,6 +52,7 @@
 #include <net/if_media.h>
 #include <net/if_poll.h>
 #include <net/ifq_var.h>
+#include <net/if_ringmap.h>
 #include <net/toeplitz.h>
 #include <net/toeplitz2.h>
 #include <net/vlan/if_vlan_var.h>
@@ -182,10 +183,6 @@ static int	jme_sysctl_tx_coal_to(SYSCTL_HANDLER_ARGS);
 static int	jme_sysctl_tx_coal_pkt(SYSCTL_HANDLER_ARGS);
 static int	jme_sysctl_rx_coal_to(SYSCTL_HANDLER_ARGS);
 static int	jme_sysctl_rx_coal_pkt(SYSCTL_HANDLER_ARGS);
-#ifdef IFPOLL_ENABLE
-static int	jme_sysctl_npoll_rxoff(SYSCTL_HANDLER_ARGS);
-static int	jme_sysctl_npoll_txoff(SYSCTL_HANDLER_ARGS);
-#endif
 
 /*
  * Devices supported by this driver.
@@ -678,11 +675,8 @@ jme_attach(device_t dev)
 	uint32_t reg;
 	uint16_t did;
 	uint8_t pcie_ptr, rev;
-	int error = 0, i, j, rx_desc_cnt, coal_max;
+	int error = 0, i, j, rx_desc_cnt, coal_max, ring_cnt;
 	uint8_t eaddr[ETHER_ADDR_LEN];
-#ifdef IFPOLL_ENABLE
-	int offset, offset_def;
-#endif
 
 	/*
 	 * Initialize serializers
@@ -714,12 +708,22 @@ jme_attach(device_t dev)
 		sc->jme_cdata.jme_tx_data.jme_tx_desc_cnt = JME_NDESC_MAX;
 
 	/*
-	 * Get # of RX rings
+	 * Create TX/RX ring maps.
 	 */
-	sc->jme_cdata.jme_rx_ring_cnt = device_getenv_int(dev, "rx_ring_count",
-	    jme_rx_ring_count);
-	sc->jme_cdata.jme_rx_ring_cnt =
-	    if_ring_count2(sc->jme_cdata.jme_rx_ring_cnt, JME_NRXRING_MAX);
+	ring_cnt = device_getenv_int(dev, "rx_ring_count", jme_rx_ring_count);
+	/* Require power-of-2 ring count. */
+	sc->jme_rx_rmap = if_ringmap_alloc2(dev, ring_cnt, JME_NRXRING_MAX);
+	sc->jme_cdata.jme_rx_ring_cnt = if_ringmap_count(sc->jme_rx_rmap);
+
+	/* Only one TX ring is supported. */
+	sc->jme_tx_rmap = if_ringmap_alloc(dev, 1, 1);
+
+	/*
+	 * NOTE:
+	 * There is _no_ need to align or match TX/RX ring maps,
+	 * since TX/RX rings are completely indepedent in this
+	 * driver.
+	 */
 
 	/*
 	 * Initialize serializer array
@@ -766,7 +770,7 @@ jme_attach(device_t dev)
 
 	if_initname(ifp, device_get_name(dev), device_get_unit(dev));
 
-	callout_init(&sc->jme_tick_ch);
+	callout_init_mp(&sc->jme_tick_ch);
 
 #ifndef BURN_BRIDGES
 	if (pci_get_powerstate(dev) != PCI_POWERSTATE_D0) {
@@ -945,38 +949,6 @@ jme_attach(device_t dev)
 		sc->jme_caps |= JME_CAP_PMCAP;
 #endif
 
-#ifdef IFPOLL_ENABLE
-	/*
-	 * NPOLLING RX CPU offset
-	 */
-	if (sc->jme_cdata.jme_rx_ring_cnt == ncpus2) {
-		offset = 0;
-	} else {
-		offset_def = (sc->jme_cdata.jme_rx_ring_cnt *
-		    device_get_unit(dev)) % ncpus2;
-		offset = device_getenv_int(dev, "npoll.rxoff", offset_def);
-		if (offset >= ncpus2 ||
-		    offset % sc->jme_cdata.jme_rx_ring_cnt != 0) {
-			device_printf(dev, "invalid npoll.rxoff %d, use %d\n",
-			    offset, offset_def);
-			offset = offset_def;
-		}
-	}
-	sc->jme_npoll_rxoff = offset;
-
-	/*
-	 * NPOLLING TX CPU offset
-	 */
-	offset_def = sc->jme_npoll_rxoff;
-	offset = device_getenv_int(dev, "npoll.txoff", offset_def);
-	if (offset >= ncpus2) {
-		device_printf(dev, "invalid npoll.txoff %d, use %d\n",
-		    offset, offset_def);
-		offset = offset_def;
-	}
-	sc->jme_npoll_txoff = offset;
-#endif
-
 	/*
 	 * Set default coalesce valves
 	 */
@@ -1027,6 +999,8 @@ jme_attach(device_t dev)
 #ifdef INVARIANTS
 	ifp->if_serialize_assert = jme_serialize_assert;
 #endif
+	ifp->if_nmbclusters = sc->jme_cdata.jme_rx_ring_cnt *
+	    sc->jme_cdata.jme_rx_data[0].jme_rx_desc_cnt;
 	ifq_set_maxlen(&ifp->if_snd,
 	    sc->jme_cdata.jme_tx_data.jme_tx_desc_cnt - JME_TXD_RSVD);
 	ifq_set_ready(&ifp->if_snd);
@@ -1123,9 +1097,6 @@ jme_detach(device_t dev)
 		ether_ifdetach(ifp);
 	}
 
-	if (sc->jme_sysctl_tree != NULL)
-		sysctl_ctx_free(&sc->jme_sysctl_ctx);
-
 	if (sc->jme_miibus != NULL)
 		device_delete_child(dev, sc->jme_miibus);
 	bus_generic_detach(dev);
@@ -1139,70 +1110,82 @@ jme_detach(device_t dev)
 
 	jme_dma_free(sc);
 
+	if (sc->jme_rx_rmap != NULL)
+		if_ringmap_free(sc->jme_rx_rmap);
+	if (sc->jme_tx_rmap != NULL)
+		if_ringmap_free(sc->jme_tx_rmap);
+
 	return (0);
 }
 
 static void
 jme_sysctl_node(struct jme_softc *sc)
 {
+	struct sysctl_ctx_list *ctx;
+	struct sysctl_oid *tree;
 #ifdef JME_RSS_DEBUG
 	int r;
 #endif
 
-	sysctl_ctx_init(&sc->jme_sysctl_ctx);
-	sc->jme_sysctl_tree = SYSCTL_ADD_NODE(&sc->jme_sysctl_ctx,
-				SYSCTL_STATIC_CHILDREN(_hw), OID_AUTO,
-				device_get_nameunit(sc->jme_dev),
-				CTLFLAG_RD, 0, "");
-	if (sc->jme_sysctl_tree == NULL) {
-		device_printf(sc->jme_dev, "can't add sysctl node\n");
-		return;
-	}
-
-	SYSCTL_ADD_PROC(&sc->jme_sysctl_ctx,
-	    SYSCTL_CHILDREN(sc->jme_sysctl_tree), OID_AUTO,
+	ctx = device_get_sysctl_ctx(sc->jme_dev);
+	tree = device_get_sysctl_tree(sc->jme_dev);
+	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
 	    "tx_coal_to", CTLTYPE_INT | CTLFLAG_RW,
 	    sc, 0, jme_sysctl_tx_coal_to, "I", "jme tx coalescing timeout");
 
-	SYSCTL_ADD_PROC(&sc->jme_sysctl_ctx,
-	    SYSCTL_CHILDREN(sc->jme_sysctl_tree), OID_AUTO,
+	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
 	    "tx_coal_pkt", CTLTYPE_INT | CTLFLAG_RW,
 	    sc, 0, jme_sysctl_tx_coal_pkt, "I", "jme tx coalescing packet");
 
-	SYSCTL_ADD_PROC(&sc->jme_sysctl_ctx,
-	    SYSCTL_CHILDREN(sc->jme_sysctl_tree), OID_AUTO,
+	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
 	    "rx_coal_to", CTLTYPE_INT | CTLFLAG_RW,
 	    sc, 0, jme_sysctl_rx_coal_to, "I", "jme rx coalescing timeout");
 
-	SYSCTL_ADD_PROC(&sc->jme_sysctl_ctx,
-	    SYSCTL_CHILDREN(sc->jme_sysctl_tree), OID_AUTO,
+	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
 	    "rx_coal_pkt", CTLTYPE_INT | CTLFLAG_RW,
 	    sc, 0, jme_sysctl_rx_coal_pkt, "I", "jme rx coalescing packet");
 
-	SYSCTL_ADD_INT(&sc->jme_sysctl_ctx,
-		       SYSCTL_CHILDREN(sc->jme_sysctl_tree), OID_AUTO,
+	SYSCTL_ADD_INT(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
 		       "rx_desc_count", CTLFLAG_RD,
 		       &sc->jme_cdata.jme_rx_data[0].jme_rx_desc_cnt,
 		       0, "RX desc count");
-	SYSCTL_ADD_INT(&sc->jme_sysctl_ctx,
-		       SYSCTL_CHILDREN(sc->jme_sysctl_tree), OID_AUTO,
+	SYSCTL_ADD_INT(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
 		       "tx_desc_count", CTLFLAG_RD,
 		       &sc->jme_cdata.jme_tx_data.jme_tx_desc_cnt,
 		       0, "TX desc count");
-	SYSCTL_ADD_INT(&sc->jme_sysctl_ctx,
-		       SYSCTL_CHILDREN(sc->jme_sysctl_tree), OID_AUTO,
+	SYSCTL_ADD_INT(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
 		       "rx_ring_count", CTLFLAG_RD,
 		       &sc->jme_cdata.jme_rx_ring_cnt,
 		       0, "RX ring count");
-	SYSCTL_ADD_INT(&sc->jme_sysctl_ctx,
-		       SYSCTL_CHILDREN(sc->jme_sysctl_tree), OID_AUTO,
+	SYSCTL_ADD_INT(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
 		       "tx_wreg", CTLFLAG_RW,
 		       &sc->jme_cdata.jme_tx_data.jme_tx_wreg, 0,
 		       "# of segments before writing to hardware register");
 
+	if (sc->jme_irq_type == PCI_INTR_TYPE_MSIX) {
+		SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
+		    "tx_cpumap", CTLTYPE_OPAQUE | CTLFLAG_RD,
+		    sc->jme_tx_rmap, 0, if_ringmap_cpumap_sysctl, "I",
+		    "TX ring CPU map");
+		SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
+		    "rx_cpumap", CTLTYPE_OPAQUE | CTLFLAG_RD,
+		    sc->jme_rx_rmap, 0, if_ringmap_cpumap_sysctl, "I",
+		    "RX ring CPU map");
+	} else {
+#ifdef IFPOLL_ENABLE
+		SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
+		    "tx_poll_cpumap", CTLTYPE_OPAQUE | CTLFLAG_RD,
+		    sc->jme_tx_rmap, 0, if_ringmap_cpumap_sysctl, "I",
+		    "TX poll CPU map");
+		SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
+		    "rx_poll_cpumap", CTLTYPE_OPAQUE | CTLFLAG_RD,
+		    sc->jme_rx_rmap, 0, if_ringmap_cpumap_sysctl, "I",
+		    "RX poll CPU map");
+#endif
+	}
+
 #ifdef JME_RSS_DEBUG
-	SYSCTL_ADD_INT(&sc->jme_sysctl_ctx,
-		       SYSCTL_CHILDREN(sc->jme_sysctl_tree), OID_AUTO,
+	SYSCTL_ADD_INT(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
 		       "rss_debug", CTLFLAG_RW, &sc->jme_rss_debug,
 		       0, "RSS debug level");
 	for (r = 0; r < sc->jme_cdata.jme_rx_ring_cnt; ++r) {
@@ -1210,30 +1193,17 @@ jme_sysctl_node(struct jme_softc *sc)
 
 		ksnprintf(rx_ring_desc, sizeof(rx_ring_desc),
 		    "rx_ring%d_pkt", r);
-		SYSCTL_ADD_ULONG(&sc->jme_sysctl_ctx,
-		    SYSCTL_CHILDREN(sc->jme_sysctl_tree), OID_AUTO,
+		SYSCTL_ADD_ULONG(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
 		    rx_ring_desc, CTLFLAG_RW,
 		    &sc->jme_cdata.jme_rx_data[r].jme_rx_pkt, "RXed packets");
 
 		ksnprintf(rx_ring_desc, sizeof(rx_ring_desc),
 		    "rx_ring%d_emp", r);
-		SYSCTL_ADD_ULONG(&sc->jme_sysctl_ctx,
-		    SYSCTL_CHILDREN(sc->jme_sysctl_tree), OID_AUTO,
+		SYSCTL_ADD_ULONG(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
 		    rx_ring_desc, CTLFLAG_RW,
 		    &sc->jme_cdata.jme_rx_data[r].jme_rx_emp,
 		    "# of time RX ring empty");
 	}
-#endif
-
-#ifdef IFPOLL_ENABLE
-	SYSCTL_ADD_PROC(&sc->jme_sysctl_ctx,
-	    SYSCTL_CHILDREN(sc->jme_sysctl_tree), OID_AUTO,
-	    "npoll_rxoff", CTLTYPE_INT|CTLFLAG_RW, sc, 0,
-	    jme_sysctl_npoll_rxoff, "I", "NPOLLING RX cpu offset");
-	SYSCTL_ADD_PROC(&sc->jme_sysctl_ctx,
-	    SYSCTL_CHILDREN(sc->jme_sysctl_tree), OID_AUTO,
-	    "npoll_txoff", CTLTYPE_INT|CTLFLAG_RW, sc, 0,
-	    jme_sysctl_npoll_txoff, "I", "NPOLLING TX cpu offset");
 #endif
 }
 
@@ -1247,16 +1217,16 @@ jme_dma_alloc(struct jme_softc *sc)
 
 	asize = __VM_CACHELINE_ALIGN(
 	    tdata->jme_tx_desc_cnt * sizeof(struct jme_txdesc));
-	tdata->jme_txdesc = kmalloc_cachealign(asize, M_DEVBUF,
-	    M_WAITOK | M_ZERO);
+	tdata->jme_txdesc = kmalloc(asize, M_DEVBUF,
+				    M_WAITOK | M_ZERO | M_CACHEALIGN);
 
 	for (i = 0; i < sc->jme_cdata.jme_rx_ring_cnt; ++i) {
 		struct jme_rxdata *rdata = &sc->jme_cdata.jme_rx_data[i];
 
 		asize = __VM_CACHELINE_ALIGN(
 		    rdata->jme_rx_desc_cnt * sizeof(struct jme_rxdesc));
-		rdata->jme_rxdesc = kmalloc_cachealign(asize, M_DEVBUF,
-		    M_WAITOK | M_ZERO);
+		rdata->jme_rxdesc = kmalloc(asize, M_DEVBUF,
+					    M_WAITOK | M_ZERO | M_CACHEALIGN);
 	}
 
 	/* Create parent ring tag. */
@@ -2382,8 +2352,8 @@ jme_rxpkt(struct jme_rxdata *rdata, int cpuid)
 		IFNET_STAT_INC(ifp, ierrors, 1);
 		jme_discard_rxbufs(rdata, cons, nsegs);
 #ifdef JME_SHOW_ERRORS
-		if_printf(ifp, "%s : receive error = 0x%b\n",
-		    __func__, JME_RX_ERR(status), JME_RX_ERR_BITS);
+		if_printf(ifp, "%s : receive error = 0x%pb%i\n",
+		    __func__, JME_RX_ERR_BITS, JME_RX_ERR(status));
 #endif
 		rdata->jme_rx_cons += nsegs;
 		rdata->jme_rx_cons %= rdata->jme_rx_desc_cnt;
@@ -2489,8 +2459,8 @@ jme_rxpkt(struct jme_rxdata *rdata, int cpuid)
 			if (pi != NULL &&
 			    (hashinfo & JME_RD_HASH_FN_MASK) ==
 			    JME_RD_HASH_FN_TOEPLITZ) {
-				m->m_flags |= (M_HASH | M_CKHASH);
-				m->m_pkthdr.hash = toeplitz_hash(hash);
+				m_sethash(m, toeplitz_hash(hash));
+				m->m_flags |= M_CKHASH;
 			}
 
 #ifdef JME_RSS_DEBUG
@@ -3091,7 +3061,7 @@ jme_newbuf(struct jme_rxdata *rdata, struct jme_rxdesc *rxd, int init)
 	bus_dmamap_t map;
 	int error, nsegs;
 
-	m = m_getcl(init ? MB_WAIT : MB_DONTWAIT, MT_DATA, M_PKTHDR);
+	m = m_getcl(init ? M_WAITOK : M_NOWAIT, MT_DATA, M_PKTHDR);
 	if (m == NULL)
 		return ENOBUFS;
 	/*
@@ -3394,28 +3364,28 @@ jme_npoll(struct ifnet *ifp, struct ifpoll_info *info)
 	ASSERT_IFNET_SERIALIZED_ALL(ifp);
 
 	if (info) {
-		int i, off;
+		int i, cpu;
 
 		info->ifpi_status.status_func = jme_npoll_status;
 		info->ifpi_status.serializer = &sc->jme_serialize;
 
-		off = sc->jme_npoll_txoff;
-		KKASSERT(off <= ncpus2);
-		info->ifpi_tx[off].poll_func = jme_npoll_tx;
-		info->ifpi_tx[off].arg = &sc->jme_cdata.jme_tx_data;
-		info->ifpi_tx[off].serializer =
+		cpu = if_ringmap_cpumap(sc->jme_tx_rmap, 0);
+		KKASSERT(cpu <= netisr_ncpus);
+		info->ifpi_tx[cpu].poll_func = jme_npoll_tx;
+		info->ifpi_tx[cpu].arg = &sc->jme_cdata.jme_tx_data;
+		info->ifpi_tx[cpu].serializer =
 		    &sc->jme_cdata.jme_tx_data.jme_tx_serialize;
-		ifq_set_cpuid(&ifp->if_snd, sc->jme_npoll_txoff);
+		ifq_set_cpuid(&ifp->if_snd, cpu);
 
-		off = sc->jme_npoll_rxoff;
 		for (i = 0; i < sc->jme_cdata.jme_rx_ring_cnt; ++i) {
 			struct jme_rxdata *rdata =
 			    &sc->jme_cdata.jme_rx_data[i];
-			int idx = i + off;
 
-			info->ifpi_rx[idx].poll_func = jme_npoll_rx;
-			info->ifpi_rx[idx].arg = rdata;
-			info->ifpi_rx[idx].serializer =
+			cpu = if_ringmap_cpumap(sc->jme_rx_rmap, i);
+			KKASSERT(cpu <= netisr_ncpus);
+			info->ifpi_rx[cpu].poll_func = jme_npoll_rx;
+			info->ifpi_rx[cpu].arg = rdata;
+			info->ifpi_rx[cpu].serializer =
 			    &rdata->jme_rx_serialize;
 		}
 
@@ -3426,58 +3396,6 @@ jme_npoll(struct ifnet *ifp, struct ifpoll_info *info)
 		if (ifp->if_flags & IFF_RUNNING)
 			jme_enable_intr(sc);
 	}
-}
-
-static int
-jme_sysctl_npoll_rxoff(SYSCTL_HANDLER_ARGS)
-{
-	struct jme_softc *sc = (void *)arg1;
-	struct ifnet *ifp = &sc->arpcom.ac_if;
-	int error, off;
-
-	off = sc->jme_npoll_rxoff;
-	error = sysctl_handle_int(oidp, &off, 0, req);
-	if (error || req->newptr == NULL)
-		return error;
-	if (off < 0)
-		return EINVAL;
-
-	ifnet_serialize_all(ifp);
-	if (off >= ncpus2 || off % sc->jme_cdata.jme_rx_ring_cnt != 0) {
-		error = EINVAL;
-	} else {
-		error = 0;
-		sc->jme_npoll_rxoff = off;
-	}
-	ifnet_deserialize_all(ifp);
-
-	return error;
-}
-
-static int
-jme_sysctl_npoll_txoff(SYSCTL_HANDLER_ARGS)
-{
-	struct jme_softc *sc = (void *)arg1;
-	struct ifnet *ifp = &sc->arpcom.ac_if;
-	int error, off;
-
-	off = sc->jme_npoll_txoff;
-	error = sysctl_handle_int(oidp, &off, 0, req);
-	if (error || req->newptr == NULL)
-		return error;
-	if (off < 0)
-		return EINVAL;
-
-	ifnet_serialize_all(ifp);
-	if (off >= ncpus2) {
-		error = EINVAL;
-	} else {
-		error = 0;
-		sc->jme_npoll_txoff = off;
-	}
-	ifnet_deserialize_all(ifp);
-
-	return error;
 }
 
 #endif	/* IFPOLL_ENABLE */
@@ -3608,20 +3526,15 @@ jme_rx_intr(struct jme_softc *sc, uint32_t status)
 static void
 jme_enable_rss(struct jme_softc *sc)
 {
-	uint32_t rssc, ind;
 	uint8_t key[RSSKEY_NREGS * RSSKEY_REGSIZE];
-	int i;
+	uint32_t rssc;
+	int j, i, r;
 
 	KASSERT(sc->jme_cdata.jme_rx_ring_cnt == JME_NRXRING_2 ||
 		sc->jme_cdata.jme_rx_ring_cnt == JME_NRXRING_4,
 		("%s: invalid # of RX rings (%d)",
 		 sc->arpcom.ac_if.if_xname, sc->jme_cdata.jme_rx_ring_cnt));
-
-	rssc = RSSC_HASH_64_ENTRY;
-	rssc |= RSSC_HASH_IPV4 | RSSC_HASH_IPV4_TCP;
-	rssc |= sc->jme_cdata.jme_rx_ring_cnt >> 1;
-	JME_RSS_DPRINTF(sc, 1, "rssc 0x%08x\n", rssc);
-	CSR_WRITE_4(sc, JME_RSSC, rssc);
+	jme_disable_rss(sc);
 
 	toeplitz_get_key(key, sizeof(key));
 	for (i = 0; i < RSSKEY_NREGS; ++i) {
@@ -3635,20 +3548,34 @@ jme_enable_rss(struct jme_softc *sc)
 	}
 
 	/*
-	 * Create redirect table in following fashion:
-	 * (hash & ring_cnt_mask) == rdr_table[(hash & rdr_table_mask)]
+	 * Fill redirect table.
 	 */
-	ind = 0;
-	for (i = 0; i < RSSTBL_REGSIZE; ++i) {
-		int q;
+	if_ringmap_rdrtable(sc->jme_rx_rmap, sc->jme_rdrtable,
+	    JME_RDRTABLE_SIZE);
 
-		q = i % sc->jme_cdata.jme_rx_ring_cnt;
-		ind |= q << (i * 8);
+	r = 0;
+	for (j = 0; j < RSSTBL_NREGS; ++j) {
+		uint32_t ind = 0;
+
+		for (i = 0; i < RSSTBL_REGSIZE; ++i) {
+			int q;
+
+			q = sc->jme_rdrtable[r];
+			ind |= q << (i * 8);
+			++r;
+		}
+		JME_RSS_DPRINTF(sc, 1, "ind 0x%08x\n", ind);
+		CSR_WRITE_4(sc, RSSTBL_REG(j), ind);
 	}
-	JME_RSS_DPRINTF(sc, 1, "ind 0x%08x\n", ind);
 
-	for (i = 0; i < RSSTBL_NREGS; ++i)
-		CSR_WRITE_4(sc, RSSTBL_REG(i), ind);
+	/*
+	 * Enable RSS.
+	 */
+	rssc = RSSC_HASH_128_ENTRY;
+	rssc |= RSSC_HASH_IPV4 | RSSC_HASH_IPV4_TCP;
+	rssc |= sc->jme_cdata.jme_rx_ring_cnt >> 1;
+	JME_RSS_DPRINTF(sc, 1, "rssc 0x%08x\n", rssc);
+	CSR_WRITE_4(sc, JME_RSSC, rssc);
 }
 
 static void
@@ -3704,7 +3631,6 @@ jme_msix_try_alloc(device_t dev)
 	struct jme_softc *sc = device_get_softc(dev);
 	struct jme_msix_data *msix;
 	int error, i, r, msix_enable, msix_count;
-	int offset, offset_def;
 
 	msix_count = JME_MSIXCNT(sc->jme_cdata.jme_rx_ring_cnt);
 	KKASSERT(msix_count <= JME_NMSIX);
@@ -3726,7 +3652,6 @@ jme_msix_try_alloc(device_t dev)
 	/*
 	 * Setup status MSI-X
 	 */
-
 	msix = &sc->jme_msix[i++];
 	msix->jme_msix_cpuid = 0;
 	msix->jme_msix_arg = sc;
@@ -3742,17 +3667,8 @@ jme_msix_try_alloc(device_t dev)
 	/*
 	 * Setup TX MSI-X
 	 */
-
-	offset_def = device_get_unit(dev) % ncpus2;
-	offset = device_getenv_int(dev, "msix.txoff", offset_def);
-	if (offset >= ncpus2) {
-		device_printf(dev, "invalid msix.txoff %d, use %d\n",
-		    offset, offset_def);
-		offset = offset_def;
-	}
-
 	msix = &sc->jme_msix[i++];
-	msix->jme_msix_cpuid = offset;
+	msix->jme_msix_cpuid = if_ringmap_cpumap(sc->jme_tx_rmap, 0);
 	sc->jme_tx_cpuid = msix->jme_msix_cpuid;
 	msix->jme_msix_arg = &sc->jme_cdata.jme_tx_data;
 	msix->jme_msix_func = jme_msix_tx;
@@ -3764,28 +3680,12 @@ jme_msix_try_alloc(device_t dev)
 	/*
 	 * Setup RX MSI-X
 	 */
-
-	if (sc->jme_cdata.jme_rx_ring_cnt == ncpus2) {
-		offset = 0;
-	} else {
-		offset_def = (sc->jme_cdata.jme_rx_ring_cnt *
-		    device_get_unit(dev)) % ncpus2;
-
-		offset = device_getenv_int(dev, "msix.rxoff", offset_def);
-		if (offset >= ncpus2 ||
-		    offset % sc->jme_cdata.jme_rx_ring_cnt != 0) {
-			device_printf(dev, "invalid msix.rxoff %d, use %d\n",
-			    offset, offset_def);
-			offset = offset_def;
-		}
-	}
-
 	for (r = 0; r < sc->jme_cdata.jme_rx_ring_cnt; ++r) {
 		struct jme_rxdata *rdata = &sc->jme_cdata.jme_rx_data[r];
 
 		msix = &sc->jme_msix[i++];
-		msix->jme_msix_cpuid = r + offset;
-		KKASSERT(msix->jme_msix_cpuid < ncpus2);
+		msix->jme_msix_cpuid = if_ringmap_cpumap(sc->jme_rx_rmap, r);
+		KKASSERT(msix->jme_msix_cpuid < netisr_ncpus);
 		msix->jme_msix_arg = rdata;
 		msix->jme_msix_func = jme_msix_rx;
 		msix->jme_msix_intrs = rdata->jme_rx_coal;

@@ -45,7 +45,6 @@
 #include <sys/interrupt.h>
 #include <sys/bus.h>
 #include <sys/rman.h>
-#include <sys/thread2.h>
 
 #include <machine/smp.h>
 #include <machine/segments.h>
@@ -457,6 +456,9 @@ static inthand_t *ioapic_intr[IOAPIC_HWI_VECTORS] = {
 
 #define IOAPIC_HWI_SYSCALL	(IDT_OFFSET_SYSCALL - IDT_OFFSET)
 
+/*
+ * NOTE: Initialized before VM so cannot use kmalloc() for this array.
+ */
 static struct ioapic_irqmap {
 	int			im_type;	/* IOAPIC_IMT_ */
 	enum intr_trigger	im_trig;
@@ -518,7 +520,8 @@ static void	ioapic_abi_initmap(void);
 static void	ioapic_abi_rman_setup(struct rman *);
 
 static int	ioapic_abi_gsi_cpuid(int, int);
-static int	ioapic_find_unused_irqmap(int);
+static int	ioapic_unused_legacy_irqmap(void);
+static int	ioapic_is_legacy_irqmap_used(int);
 
 struct machintr_abi MachIntrABI_IOAPIC = {
 	MACHINTR_IOAPIC,
@@ -765,17 +768,30 @@ ioapic_abi_initmap(void)
 	}
 }
 
+/*
+ * Only one CPU can have the legacy IRQ map.
+ */
 static int
-ioapic_find_unused_irqmap(int gsi)
+ioapic_is_legacy_irqmap_used(int irq)
 {
-	int cpuid, i;
+	int cpu;
 
-	cpuid = ioapic_abi_gsi_cpuid(-1, gsi);
+	for (cpu = 0; cpu < ncpus; ++cpu) {
+		if (ioapic_irqmaps[cpu][irq].im_type != IOAPIC_IMT_UNUSED)
+			return 1;
+	}
+	return 0;
+}
+
+static int
+ioapic_unused_legacy_irqmap(void)
+{
+	int i;
 
 	for (i = ISA_IRQ_CNT; i < IOAPIC_HWI_VECTORS; ++i) {
 		if (i == acpi_sci_irqno())
 			continue;
-		if (ioapic_irqmaps[cpuid][i].im_type == IOAPIC_IMT_UNUSED)
+		if (!ioapic_is_legacy_irqmap_used(i))
 			return i;
 	}
 	return -1;
@@ -800,7 +816,7 @@ ioapic_set_legacy_irqmap(int irq, int gsi, enum intr_trigger trig,
 		 * could be used, while we limit the available IDT
 		 * vectors to 192; find an unused IRQ for this GSI.
 		 */
-		irq = ioapic_find_unused_irqmap(gsi);
+		irq = ioapic_unused_legacy_irqmap();
 		if (irq < 0) {
 			kprintf("failed to find unused irq for gsi %d, "
 			    "overflow\n", gsi);
@@ -809,15 +825,12 @@ ioapic_set_legacy_irqmap(int irq, int gsi, enum intr_trigger trig,
 	}
 	KKASSERT(irq < IOAPIC_HWI_VECTORS);
 
-	cpuid = ioapic_abi_gsi_cpuid(irq, gsi);
-	map = &ioapic_irqmaps[cpuid][irq];
-
-	if (map->im_type != IOAPIC_IMT_UNUSED) {
+	if (ioapic_is_legacy_irqmap_used(irq)) {
 		/*
 		 * There are so many IOAPICs, that 1:1 mapping
 		 * of GSI and IRQ hits SYSCALL entry.
 		 */
-		irq = ioapic_find_unused_irqmap(gsi);
+		irq = ioapic_unused_legacy_irqmap();
 		if (irq < 0) {
 			kprintf("failed to find unused irq for gsi %d, "
 			    "conflict\n", gsi);
@@ -825,9 +838,9 @@ ioapic_set_legacy_irqmap(int irq, int gsi, enum intr_trigger trig,
 		}
 		KKASSERT(irq < IOAPIC_HWI_VECTORS);
 
-		cpuid = ioapic_abi_gsi_cpuid(irq, gsi);
-		map = &ioapic_irqmaps[cpuid][irq];
 	}
+	cpuid = ioapic_abi_gsi_cpuid(irq, gsi);
+	map = &ioapic_irqmaps[cpuid][irq];
 
 	if (irq > ioapic_abi_legacy_irq_max)
 		ioapic_abi_legacy_irq_max = irq;
@@ -1241,8 +1254,7 @@ ioapic_abi_msi_alloc_intern(int type, const char *desc,
 	    ("invalid cpuid %d", cpuid));
 
 	KASSERT(count > 0 && count <= 32, ("invalid count %d", count));
-	KASSERT((count & (count - 1)) == 0,
-	    ("count %d is not power of 2", count));
+	KASSERT(powerof2(count), ("count %d is not power of 2", count));
 
 	lwkt_gettoken(&ioapic_irqmap_tok);
 

@@ -53,6 +53,7 @@
 #include <sys/malloc.h>
 
 #include <net/if.h>
+#include <net/if_var.h>
 #include <net/if_media.h>
 
 /*
@@ -62,7 +63,7 @@
  *	Useful for debugging newly-ported  drivers.
  */
 
-static struct ifmedia_entry *ifmedia_match (struct ifmedia *ifm,
+static struct ifmedia_entry *ifmedia_match(struct ifmedia *ifm,
     int flags, int mask);
 
 #ifdef IFMEDIA_DEBUG
@@ -80,7 +81,7 @@ ifmedia_init(struct ifmedia *ifm, int dontcare_mask,
 
 	LIST_INIT(&ifm->ifm_list);
 	ifm->ifm_cur = NULL;
-	ifm->ifm_media = 0;
+	ifm->ifm_media = IFM_NONE;
 	ifm->ifm_mask = dontcare_mask;		/* IF don't-care bits */
 	ifm->ifm_change = change_callback;
 	ifm->ifm_status = status_callback;
@@ -91,11 +92,12 @@ ifmedia_removeall(struct ifmedia *ifm)
 {
 	struct ifmedia_entry *entry;
 
-	for (entry = LIST_FIRST(&ifm->ifm_list); entry;
-	     entry = LIST_FIRST(&ifm->ifm_list)) {
+	while ((entry = LIST_FIRST(&ifm->ifm_list)) != NULL) {
 		LIST_REMOVE(entry, ifm_list);
 		kfree(entry, M_IFADDR);
 	}
+	ifm->ifm_cur = NULL;
+	ifm->ifm_media = IFM_NONE;
 }
 
 /*
@@ -126,6 +128,18 @@ ifmedia_add(struct ifmedia *ifm, int mword, int data, void *aux)
 	LIST_INSERT_HEAD(&ifm->ifm_list, entry, ifm_list);
 }
 
+int
+ifmedia_add_nodup(struct ifmedia *ifm, int mword, int data, void *aux)
+{
+	struct ifmedia_entry *match;
+
+	match = ifmedia_match(ifm, mword, ifm->ifm_mask);
+	if (match != NULL)
+		return EEXIST;
+	ifmedia_add(ifm, mword, data, aux);
+	return 0;
+}
+
 /*
  * Add an array of media configurations to the list of
  * supported media for a specific interface instance.
@@ -154,13 +168,13 @@ ifmedia_set(struct ifmedia *ifm, int target)
 	struct ifmedia_entry *match;
 
 	match = ifmedia_match(ifm, target, ifm->ifm_mask);
-
 	if (match == NULL) {
 		kprintf("ifmedia_set: no match for 0x%x/0x%x\n",
 		    target, ~ifm->ifm_mask);
 		panic("ifmedia_set");
 	}
 	ifm->ifm_cur = match;
+	ifm->ifm_media = target;
 
 #ifdef IFMEDIA_DEBUG
 	if (ifmedia_debug) {
@@ -170,6 +184,18 @@ ifmedia_set(struct ifmedia *ifm, int target)
 		ifmedia_printword(ifm->ifm_cur->ifm_media);
 	}
 #endif
+}
+
+int
+ifmedia_tryset(struct ifmedia *ifm, int target)
+{
+	struct ifmedia_entry *match;
+
+	match = ifmedia_match(ifm, target, ifm->ifm_mask);
+	if (match == NULL)
+		return ENOENT;
+	ifmedia_set(ifm, target);
+	return 0;
 }
 
 /*
@@ -257,8 +283,14 @@ ifmedia_ioctl(struct ifnet *ifp, struct ifreq *ifr,
 
 		kptr = NULL;		/* XXX gcc */
 
+		/*
+		 * NOTE:
+		 * ifm_cur may not contain certain media options, e.g.
+		 * flow control options, so ifm_media should be used
+		 * instead.
+		 */
 		ifmr->ifm_active = ifmr->ifm_current = ifm->ifm_cur ?
-		    ifm->ifm_cur->ifm_media : IFM_NONE;
+		    ifm->ifm_media : IFM_NONE;
 		ifmr->ifm_mask = ifm->ifm_mask;
 		ifmr->ifm_status = 0;
 		(*ifm->ifm_status)(ifp, ifmr);
@@ -375,6 +407,28 @@ ifmedia_baudrate(int mword)
 
 	/* Not known. */
 	return (0);
+}
+
+int
+ifmedia_str2ethfc(const char *str)
+{
+	if (strcmp(str, IFM_ETH_FC_FULL) == 0)
+		return (IFM_ETH_RXPAUSE | IFM_ETH_TXPAUSE);
+	if (strcmp(str, IFM_ETH_FC_RXPAUSE) == 0)
+		return IFM_ETH_RXPAUSE;
+	if (strcmp(str, IFM_ETH_FC_TXPAUSE) == 0)
+		return IFM_ETH_TXPAUSE;
+
+	if (strcmp(str, IFM_ETH_FC_FORCE_FULL) == 0)
+		return (IFM_ETH_RXPAUSE | IFM_ETH_TXPAUSE | IFM_ETH_FORCEPAUSE);
+	if (strcmp(str, IFM_ETH_FC_FORCE_RXPAUSE) == 0)
+		return (IFM_ETH_RXPAUSE | IFM_ETH_FORCEPAUSE);
+	if (strcmp(str, IFM_ETH_FC_FORCE_TXPAUSE) == 0)
+		return (IFM_ETH_TXPAUSE | IFM_ETH_FORCEPAUSE);
+	if (strcmp(str, IFM_ETH_FC_FORCE_NONE) == 0)
+		return IFM_ETH_FORCEPAUSE;
+
+	return 0;
 }
 
 #ifdef IFMEDIA_DEBUG

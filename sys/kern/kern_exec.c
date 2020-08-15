@@ -28,7 +28,7 @@
 
 #include <sys/param.h>
 #include <sys/systm.h>
-#include <sys/sysproto.h>
+#include <sys/sysmsg.h>
 #include <sys/kernel.h>
 #include <sys/mount.h>
 #include <sys/filedesc.h>
@@ -67,12 +67,11 @@
 #include <vm/vnode_pager.h>
 #include <vm/vm_pager.h>
 
-#include <sys/user.h>
 #include <sys/reg.h>
 
+#include <sys/objcache.h>
 #include <sys/refcount.h>
 #include <sys/thread2.h>
-#include <sys/mplock2.h>
 #include <vm/vm_page2.h>
 
 MALLOC_DEFINE(M_PARGS, "proc-args", "Process arguments");
@@ -81,32 +80,32 @@ MALLOC_DEFINE(M_EXECARGS, "exec-args", "Exec arguments");
 static register_t *exec_copyout_strings (struct image_params *);
 
 /* XXX This should be vm_size_t. */
-static u_long ps_strings = PS_STRINGS;
+__read_mostly static u_long ps_strings = PS_STRINGS;
 SYSCTL_ULONG(_kern, KERN_PS_STRINGS, ps_strings, CTLFLAG_RD, &ps_strings, 0, "");
 
 /* XXX This should be vm_size_t. */
-static u_long usrstack = USRSTACK;
+__read_mostly static u_long usrstack = USRSTACK;
 SYSCTL_ULONG(_kern, KERN_USRSTACK, usrstack, CTLFLAG_RD, &usrstack, 0, "");
 
-u_long ps_arg_cache_limit = PAGE_SIZE / 16;
+__read_mostly u_long ps_arg_cache_limit = PAGE_SIZE / 16;
 SYSCTL_LONG(_kern, OID_AUTO, ps_arg_cache_limit, CTLFLAG_RW, 
     &ps_arg_cache_limit, 0, "");
 
-int ps_argsopen = 1;
+__read_mostly int ps_argsopen = 1;
 SYSCTL_INT(_kern, OID_AUTO, ps_argsopen, CTLFLAG_RW, &ps_argsopen, 0, "");
 
-static int ktrace_suid = 0;
+__read_mostly static int ktrace_suid = 0;
 SYSCTL_INT(_kern, OID_AUTO, ktrace_suid, CTLFLAG_RW, &ktrace_suid, 0, "");
 
 void print_execve_args(struct image_args *args);
-int debug_execve_args = 0;
+__read_mostly int debug_execve_args = 0;
 SYSCTL_INT(_kern, OID_AUTO, debug_execve_args, CTLFLAG_RW, &debug_execve_args,
     0, "");
 
 /*
  * Exec arguments object cache
  */
-static struct objcache *exec_objcache;
+__read_mostly static struct objcache *exec_objcache;
 
 static
 void
@@ -139,7 +138,8 @@ SYSINIT(exec_objcache, SI_BOOT2_MACHDEP, SI_ORDER_ANY, exec_objcache_init, 0);
  * to it.  It must be a power of 2.  If non-zero, the stack gap will be 
  * calculated as: ALIGN(karc4random() & (stackgap_random - 1)).
  */
-static int stackgap_random = 1024;
+__read_mostly static int stackgap_random = 1024;
+
 static int
 sysctl_kern_stackgap(SYSCTL_HANDLER_ARGS)
 {
@@ -158,7 +158,7 @@ sysctl_kern_stackgap(SYSCTL_HANDLER_ARGS)
 SYSCTL_PROC(_kern, OID_AUTO, stackgap_random, CTLFLAG_RW|CTLTYPE_INT,
 	0, 0, sysctl_kern_stackgap, "I",
 	"Max random stack gap (power of 2), static gap if negative");
-	
+
 void
 print_execve_args(struct image_args *args)
 {
@@ -180,7 +180,7 @@ print_execve_args(struct image_args *args)
  * Each of the items is a pointer to a `const struct execsw', hence the
  * double pointer here.
  */
-static const struct execsw **execsw;
+__read_mostly static const struct execsw **execsw;
 
 /*
  * Replace current vmspace with a new binary.
@@ -201,7 +201,7 @@ kern_execve(struct nlookupdata *nd, struct image_args *args)
 	struct sigacts *nps;
 	int error, len, i;
 	struct image_params image_params, *imgp;
-	struct vattr attr;
+	struct vattr_lite lva;
 	int (*img_first) (struct image_params *);
 
 	if (debug_execve_args) {
@@ -226,7 +226,7 @@ kern_execve(struct nlookupdata *nd, struct image_args *args)
 	 */
 	imgp->proc = p;
 	imgp->args = args;
-	imgp->attr = &attr;
+	imgp->lvap = &lva;
 	imgp->entry_addr = 0;
 	imgp->resident = 0;
 	imgp->vmspace_destroyed = 0;
@@ -359,7 +359,7 @@ interpret:
 	if (p->p_sysent->sv_fixup && imgp->resident == 0)
 		(*p->p_sysent->sv_fixup)(&stack_base, imgp);
 	else
-		suword(--stack_base, imgp->args->argc);
+		suword64(--stack_base, imgp->args->argc);
 
 	/*
 	 * For security and other reasons, the file descriptor table cannot
@@ -391,6 +391,15 @@ interpret:
 			ops = NULL;
 		}
 	}
+
+	/*
+	 * Clean up shared pages, the new program will allocate fresh
+	 * copies as needed.  This is also for security purposes and
+	 * to ensure (for example) that things like sys_lpmap->blockallsigs
+	 * state is properly reset on exec.
+	 */
+	lwp_userunmap(lp);
+	proc_userunmap(p);
 
 	/*
 	 * For security and other reasons virtual kernels cannot be
@@ -425,7 +434,7 @@ interpret:
 	p->p_flags |= P_EXEC;
 	if (p->p_pptr && (p->p_flags & P_PPWAIT)) {
 		if (p->p_pptr->p_upmap)
-			p->p_pptr->p_upmap->invfork = 0;
+			atomic_add_int(&p->p_pptr->p_upmap->invfork, -1);
 		atomic_clear_int(&p->p_flags, P_PPWAIT);
 		wakeup(p->p_pptr);
 	}
@@ -436,8 +445,8 @@ interpret:
 	 * Don't honor setuid/setgid if the filesystem prohibits it or if
 	 * the process is being traced.
 	 */
-	if ((((attr.va_mode & VSUID) && p->p_ucred->cr_uid != attr.va_uid) ||
-	     ((attr.va_mode & VSGID) && p->p_ucred->cr_gid != attr.va_gid)) &&
+	if ((((lva.va_mode & VSUID) && p->p_ucred->cr_uid != lva.va_uid) ||
+	     ((lva.va_mode & VSGID) && p->p_ucred->cr_gid != lva.va_gid)) &&
 	    (imgp->vp->v_mount->mnt_flag & MNT_NOSUID) == 0 &&
 	    (p->p_flags & P_TRACED) == 0) {
 		/*
@@ -461,10 +470,10 @@ interpret:
 		 * Set the new credentials.
 		 */
 		cratom_proc(p);
-		if (attr.va_mode & VSUID)
-			change_euid(attr.va_uid);
-		if (attr.va_mode & VSGID)
-			p->p_ucred->cr_gid = attr.va_gid;
+		if (lva.va_mode & VSUID)
+			change_euid(lva.va_uid);
+		if (lva.va_mode & VSGID)
+			p->p_ucred->cr_gid = lva.va_gid;
 
 		/*
 		 * Clear local varsym variables
@@ -606,7 +615,7 @@ exec_fail:
  * execve() system call.
  */
 int
-sys_execve(struct execve_args *uap)
+sys_execve(struct sysmsg *sysmsg, const struct execve_args *uap)
 {
 	struct nlookupdata nd;
 	struct image_args args;
@@ -636,7 +645,7 @@ sys_execve(struct execve_args *uap)
 	 * sure to set it to 0.  XXX
 	 */
 	if (error == 0)
-		uap->sysmsg_result64 = 0;
+		sysmsg->sysmsg_result64 = 0;
 
 	return (error);
 }
@@ -775,6 +784,7 @@ exec_new_vmspace(struct image_params *imgp, struct vmspace *vmcopy)
 {
 	struct vmspace *vmspace = imgp->proc->p_vmspace;
 	vm_offset_t stack_addr = USRSTACK - maxssiz;
+	struct lwp *lp;
 	struct proc *p;
 	vm_map_t map;
 	int error;
@@ -789,7 +799,8 @@ exec_new_vmspace(struct image_params *imgp, struct vmspace *vmcopy)
 	 * want since another thread is patiently waiting for us to exit
 	 * in that case.
 	 */
-	p = curproc;
+	lp = curthread->td_lwp;
+	p = lp->lwp_proc;
 	imgp->vmspace_destroyed = 1;
 
 	if (curthread->td_proc->p_nthreads > 1) {
@@ -842,17 +853,39 @@ exec_new_vmspace(struct image_params *imgp, struct vmspace *vmcopy)
 		map = &vmspace->vm_map;
 	}
 
-	/* Allocate a new stack */
-	error = vm_map_stack(&vmspace->vm_map, stack_addr, (vm_size_t)maxssiz,
-			     0, VM_PROT_ALL, VM_PROT_ALL, 0);
+	/*
+	 * Really make sure lwp-specific and process-specific mappings
+	 * are gone.
+	 *
+	 * Once we've done that, and because we are the only LWP left, with
+	 * no TID-dependent mappings, we can reset the TID to 1 (the RB tree
+	 * will remain consistent since it has only one entry).  This way
+	 * the exec'd program gets a nice deterministic tid of 1.
+	 */
+	lwp_userunmap(lp);
+	proc_userunmap(p);
+	lp->lwp_tid = 1;
+	p->p_lasttid = 1;
+
+	/*
+	 * Allocate a new stack, generally make the stack non-executable
+	 * but allow the program to adjust that (the program may desire to
+	 * use areas of the stack for executable code).
+	 */
+	error = vm_map_stack(&vmspace->vm_map, &stack_addr, (vm_size_t)maxssiz,
+			     0,
+			     VM_PROT_READ|VM_PROT_WRITE,
+			     VM_PROT_READ|VM_PROT_WRITE|VM_PROT_EXECUTE,
+			     0);
 	if (error)
 		return (error);
 
-	/* vm_ssize and vm_maxsaddr are somewhat antiquated concepts in the
+	/*
+	 * vm_ssize and vm_maxsaddr are somewhat antiquated concepts in the
 	 * VM_STACK case, but they are still used to monitor the size of the
 	 * process stack so we can check the stack rlimit.
 	 */
-	vmspace->vm_ssize = sgrowsiz >> PAGE_SHIFT;
+	vmspace->vm_ssize = sgrowsiz;		/* in bytes */
 	vmspace->vm_maxsaddr = (char *)USRSTACK - maxssiz;
 
 	return(0);
@@ -902,7 +935,8 @@ exec_copyin_args(struct image_args *args, char *fname,
 	if (argv == NULL)
 		error = EFAULT;
 	if (error == 0) {
-		while ((argp = (caddr_t)(intptr_t)fuword(argv++)) != NULL) {
+		while ((argp = (caddr_t)(intptr_t)
+			       fuword64((uintptr_t *)argv++)) != NULL) {
 			if (argp == (caddr_t)-1) {
 				error = EFAULT;
 				break;
@@ -937,7 +971,8 @@ exec_copyin_args(struct image_args *args, char *fname,
 	 * extract environment strings.  envv may be NULL.
 	 */
 	if (envv && error == 0) {
-		while ((envp = (caddr_t) (intptr_t) fuword(envv++))) {
+		while ((envp = (caddr_t)(intptr_t)
+			       fuword64((uintptr_t *)envv++))) {
 			if (envp == (caddr_t) -1) {
 				error = EFAULT;
 				break;
@@ -981,18 +1016,18 @@ exec_free_args(struct image_args *args)
  *	[sgap]
  *	[SPARE_USRSPACE]
  *	[execpath]
- *	[szsigcode]
- *	[ps_strings]			top of user stack
+ *	[szsigcode]   RO|NX
+ *	[ps_strings]  RO|NX		Top of user stack
  *
  */
-register_t *
+static register_t *
 exec_copyout_strings(struct image_params *imgp)
 {
 	int argc, envc, sgap;
 	int gap;
 	int argsenvspace;
 	char **vectp;
-	char *stringp, *destp;
+	char *stringp, *destp, *szsigbase;
 	register_t *stack_base;
 	struct ps_strings *arginfo;
 	size_t execpath_len;
@@ -1024,8 +1059,10 @@ exec_copyout_strings(struct image_params *imgp)
 	/*
 	 * Calculate destp, which points to [args & env] and above.
 	 */
-	destp = (caddr_t)arginfo -
-		szsigcode -
+	szsigbase = (char *)(intptr_t)
+		    trunc_page64((intptr_t)arginfo - szsigcode);
+	szsigbase -= SZSIGCODE_EXTRA_BYTES;
+	destp = szsigbase -
 		roundup(execpath_len, sizeof(char *)) -
 		SPARE_USRSPACE -
 		sgap -
@@ -1034,18 +1071,15 @@ exec_copyout_strings(struct image_params *imgp)
 	/*
 	 * install sigcode
 	 */
-	if (szsigcode) {
-		copyout(imgp->proc->p_sysent->sv_sigcode,
-			((caddr_t)arginfo - szsigcode), szsigcode);
-	}
+	if (szsigcode)
+		copyout(imgp->proc->p_sysent->sv_sigcode, szsigbase, szsigcode);
 
 	/*
 	 * Copy the image path for the rtld
 	 */
 	if (execpath_len) {
-		imgp->execpathp = (uintptr_t)arginfo
-				  - szsigcode
-				  - roundup(execpath_len, sizeof(char *));
+		imgp->execpathp = (uintptr_t)szsigbase -
+				  roundup(execpath_len, sizeof(char *));
 		copyout(imgp->execpath, (void *)imgp->execpathp, execpath_len);
 	}
 
@@ -1069,37 +1103,45 @@ exec_copyout_strings(struct image_params *imgp)
 	/*
 	 * Fill in "ps_strings" struct for ps, w, etc.
 	 */
-	suword(&arginfo->ps_argvstr, (long)(intptr_t)vectp);
-	suword32(&arginfo->ps_nargvstr, argc);
+	suword64((void *)&arginfo->ps_argvstr, (uint64_t)(intptr_t)vectp);
+	suword32((void *)&arginfo->ps_nargvstr, argc);
 
 	/*
 	 * Fill in argument portion of vector table.
 	 */
 	for (; argc > 0; --argc) {
-		suword(vectp++, (long)(intptr_t)destp);
+		suword64((void *)vectp++, (uintptr_t)destp);
 		while (*stringp++ != 0)
 			destp++;
 		destp++;
 	}
 
 	/* a null vector table pointer separates the argp's from the envp's */
-	suword(vectp++, 0);
+	suword64((void *)vectp++, 0);
 
-	suword(&arginfo->ps_envstr, (long)(intptr_t)vectp);
-	suword32(&arginfo->ps_nenvstr, envc);
+	suword64((void *)&arginfo->ps_envstr, (uintptr_t)vectp);
+	suword32((void *)&arginfo->ps_nenvstr, envc);
 
 	/*
 	 * Fill in environment portion of vector table.
 	 */
 	for (; envc > 0; --envc) {
-		suword(vectp++, (long)(intptr_t)destp);
+		suword64((void *)vectp++, (uintptr_t)destp);
 		while (*stringp++ != 0)
 			destp++;
 		destp++;
 	}
 
 	/* end of vector table is a null pointer */
-	suword(vectp, 0);
+	suword64((void *)vectp, 0);
+
+	/*
+	 * Make the signal trampoline executable and read-only.
+	 */
+	vm_map_protect(&imgp->proc->p_vmspace->vm_map,
+		       (vm_offset_t)szsigbase,
+		       (vm_offset_t)szsigbase + PAGE_SIZE,
+		       VM_PROT_READ|VM_PROT_EXECUTE, FALSE);
 
 	return (stack_base);
 }
@@ -1113,11 +1155,11 @@ exec_check_permissions(struct image_params *imgp, struct mount *topmnt)
 {
 	struct proc *p = imgp->proc;
 	struct vnode *vp = imgp->vp;
-	struct vattr *attr = imgp->attr;
+	struct vattr_lite *lvap = imgp->lvap;
 	int error;
 
 	/* Get file attributes */
-	error = VOP_GETATTR(vp, attr);
+	error = VOP_GETATTR_LITE(vp, lvap);
 	if (error)
 		return (error);
 
@@ -1131,15 +1173,15 @@ exec_check_permissions(struct image_params *imgp, struct mount *topmnt)
 	 */
 	if ((vp->v_mount->mnt_flag & MNT_NOEXEC) ||
 	    ((topmnt != NULL) && (topmnt->mnt_flag & MNT_NOEXEC)) ||
-	    ((attr->va_mode & 0111) == 0) ||
-	    (attr->va_type != VREG)) {
+	    ((lvap->va_mode & 0111) == 0) ||
+	    (lvap->va_type != VREG)) {
 		return (EACCES);
 	}
 
 	/*
 	 * Zero length files can't be exec'd
 	 */
-	if (attr->va_size == 0)
+	if (lvap->va_size == 0)
 		return (ENOEXEC);
 
 	/*

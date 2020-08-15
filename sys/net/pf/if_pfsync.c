@@ -29,6 +29,7 @@
 #include "opt_inet.h"
 #include "opt_inet6.h"
 #include "opt_carp.h"
+#include "use_bpf.h"
 
 #include <sys/param.h>
 #include <sys/endian.h>
@@ -91,7 +92,7 @@ struct pfsyncstats	 pfsyncstats;
 
 void	pfsyncattach(int);
 static int	pfsync_clone_destroy(struct ifnet *);
-static int	pfsync_clone_create(struct if_clone *, int, caddr_t);
+static int	pfsync_clone_create(struct if_clone *, int, caddr_t, caddr_t);
 void	pfsync_setmtu(struct pfsync_softc *, int);
 int	pfsync_alloc_scrub_memory(struct pfsync_state_peer *,
 	    struct pf_state_peer *);
@@ -120,21 +121,25 @@ int	pfsync_sync_ok;
 struct if_clone	pfsync_cloner =
     IF_CLONE_INITIALIZER("pfsync", pfsync_clone_create, pfsync_clone_destroy, 1 ,1);
 
+
 void
 pfsyncattach(int npfsync)
 {
 	if_clone_attach(&pfsync_cloner);
 }
+
 static int
-pfsync_clone_create(struct if_clone *ifc, int unit, caddr_t param __unused)
+pfsync_clone_create(struct if_clone *ifc, int unit,
+		    caddr_t params __unused, caddr_t data __unused)
 {
 	struct pfsync_softc *sc;
 	struct ifnet *ifp;
 
 	lwkt_gettoken(&pf_token);
 
-	sc = kmalloc(sizeof(*sc), M_PFSYNC, M_WAITOK | M_ZERO);
 	pfsync_sync_ok = 1;
+
+	sc = kmalloc(sizeof(*sc), M_PFSYNC, M_WAITOK | M_ZERO);
 	sc->sc_mbuf = NULL;
 	sc->sc_mbuf_net = NULL;
 	sc->sc_mbuf_tdb = NULL;
@@ -152,8 +157,8 @@ pfsync_clone_create(struct if_clone *ifc, int unit, caddr_t param __unused)
 	sc->sc_bulk_terminator_cpu = 0;
 	sc->sc_imo.imo_max_memberships = IP_MAX_MEMBERSHIPS;
 	lwkt_reltoken(&pf_token);
+
 	ifp = &sc->sc_if;
-	ksnprintf(ifp->if_xname, sizeof ifp->if_xname, "pfsync%d", unit);
 	if_initname(ifp, ifc->ifc_name, unit);
 	ifp->if_ioctl = pfsyncioctl;
 	ifp->if_output = pfsyncoutput;
@@ -163,32 +168,34 @@ pfsync_clone_create(struct if_clone *ifc, int unit, caddr_t param __unused)
 	ifp->if_hdrlen = PFSYNC_HDRLEN;
 	ifp->if_baudrate = IF_Mbps(100);
 	ifp->if_softc = sc;
+
 	pfsync_setmtu(sc, MCLBYTES);
 	callout_init(&sc->sc_tmo);
 	/* callout_init(&sc->sc_tdb_tmo); XXX we don't support tdb (yet) */
 	callout_init(&sc->sc_bulk_tmo);
 	callout_init(&sc->sc_bulkfail_tmo);
+
 	if_attach(ifp, NULL);
+#if NBPF > 0
+	bpfattach(&sc->sc_if, DLT_PFSYNC, PFSYNC_HDRLEN);
+#endif
 
-	LIST_INSERT_HEAD(&pfsync_list, sc, sc_next);
-
-
-#if NCARP > 0
+#ifdef CARP
 	if_addgroup(ifp, "carp");
 #endif
 
-#if NBPFILTER > 0
-	bpfattach(&sc->sc_if, DLT_PFSYNC, PFSYNC_HDRLEN);
-#endif
 	lwkt_gettoken(&pf_token);
-
+	LIST_INSERT_HEAD(&pfsync_list, sc, sc_next);
 	lwkt_reltoken(&pf_token);
+
 	return (0);
 }
 
 static int
 pfsync_clone_destroy(struct ifnet *ifp)
 {
+	struct netmsg_base msg;
+
 	lwkt_gettoken(&pf_token);
 	lwkt_reltoken(&pf_token);
 
@@ -197,11 +204,16 @@ pfsync_clone_destroy(struct ifnet *ifp)
 	/* callout_stop(&sc->sc_tdb_tmo); XXX we don't support tdb (yet) */
 	callout_stop(&sc->sc_bulk_tmo);
 	callout_stop(&sc->sc_bulkfail_tmo);
-#if NCARP > 0
+#ifdef CARP
 	if (!pfsync_sync_ok)
 		carp_group_demote_adj(&sc->sc_if, -1);
 #endif
-#if NBPFILTER > 0
+
+	/* Unpend async sendouts. */
+	netmsg_init(&msg, NULL, &curthread->td_msgport, 0, netmsg_sync_handler);
+	netisr_domsg(&msg, 0);
+
+#if NBPF > 0
 	bpfdetach(ifp);
 #endif
 	if_detach(ifp);
@@ -209,7 +221,6 @@ pfsync_clone_destroy(struct ifnet *ifp)
 	LIST_REMOVE(sc, sc_next);
 	kfree(sc, M_PFSYNC);
 	lwkt_reltoken(&pf_token);
-
 
 	return 0;
 }
@@ -463,9 +474,6 @@ pfsync_input(struct mbuf *m, ...)
 	struct pfsync_state_clr *cp;
 	struct pfsync_state_upd_req *rup;
 	struct pfsync_state_bus *bus;
-#ifdef IPSEC
-	struct pfsync_tdb *pt;
-#endif
 	struct in_addr src;
 	struct mbuf *mp;
 	int iplen, action, error, i, count, offp, sfail, stale = 0;
@@ -971,7 +979,7 @@ pfsync_input(struct mbuf *m, ...)
 				lwkt_reltoken(&pf_token);
 				callout_stop(&sc->sc_bulkfail_tmo);
 				lwkt_gettoken(&pf_token);
-#if NCARP > 0
+#ifdef CARP
 				if (!pfsync_sync_ok) {
 					lwkt_reltoken(&pf_token);
 					carp_group_demote_adj(&sc->sc_if, -1);
@@ -990,20 +998,6 @@ pfsync_input(struct mbuf *m, ...)
 			break;
 		}
 		break;
-#ifdef IPSEC
-	case PFSYNC_ACT_TDB_UPD:
-		if ((mp = m_pulldown(m, iplen + sizeof(*ph),
-		    count * sizeof(*pt), &offp)) == NULL) {
-			pfsyncstats.pfsyncs_badlen++;
-			return;
-		}
-		crit_enter();
-		for (i = 0, pt = (struct pfsync_tdb *)(mp->m_data + offp);
-		    i < count; i++, pt++)
-			pfsync_update_net_tdb(pt);
-		crit_exit();
-		break;
-#endif
 	}
 
 done:
@@ -1106,7 +1100,16 @@ pfsyncioctl(struct ifnet *ifp, u_long cmd, caddr_t data, struct ucred *cr)
 			break;
 		}
 
-		if ((sifp = ifunit(pfsyncr.pfsyncr_syncdev)) == NULL) {
+		/*
+		 * XXX not that MPSAFE; pfsync needs serious rework
+		 */
+		ifnet_deserialize_all(ifp);
+		ifnet_lock();
+		sifp = ifunit(pfsyncr.pfsyncr_syncdev);
+		ifnet_unlock();
+		ifnet_serialize_all(ifp);
+
+		if (sifp == NULL) {
 			lwkt_reltoken(&pf_token);
 			return (EINVAL);
 		}
@@ -1152,7 +1155,7 @@ pfsyncioctl(struct ifnet *ifp, u_long cmd, caddr_t data, struct ucred *cr)
 		    sc->sc_sendaddr.s_addr != INADDR_PFSYNC_GROUP) {
 			/* Request a full state table update. */
 			sc->sc_ureq_sent = mycpu->gd_time_seconds;
-#if NCARP > 0
+#ifdef CARP
 			if (pfsync_sync_ok)
 				carp_group_demote_adj(&sc->sc_if, 1);
 #endif
@@ -1255,7 +1258,7 @@ pfsync_get_mbuf(struct pfsync_softc *sc, u_int8_t action, void **sp)
 			IFNET_STAT_INC(&sc->sc_if, oerrors, 1);
 			return (NULL);
 		}
-		m->m_data += (MCLBYTES - len) &~ (sizeof(long) - 1);
+		m->m_data += rounddown2(MCLBYTES - len, sizeof(long));
 	} else
 		MH_ALIGN(m, len);
 
@@ -1643,7 +1646,7 @@ pfsync_bulkfail(void *v)
 		/* Pretend like the transfer was ok */
 		sc->sc_ureq_sent = 0;
 		sc->sc_bulk_tries = 0;
-#if NCARP > 0
+#ifdef CARP
 		if (!pfsync_sync_ok)
 			carp_group_demote_adj(&sc->sc_if, -1);
 #endif
@@ -1657,14 +1660,22 @@ pfsync_bulkfail(void *v)
 	}
 }
 
-/* This must be called in splnet() */
+static void
+pfsync_sendout_handler(netmsg_t nmsg)
+{
+	struct netmsg_genpkt *msg = (struct netmsg_genpkt *)nmsg;
+
+	pfsync_sendout_mbuf(msg->arg1, msg->m);
+}
+
 int
 pfsync_sendout(struct pfsync_softc *sc)
 {
-#if NBPFILTER > 0
+#if NBPF > 0
 	struct ifnet *ifp = &sc->sc_if;
 #endif
 	struct mbuf *m;
+	struct netmsg_genpkt *msg;
 
 	ASSERT_LWKT_TOKEN_HELD(&pf_token);
 
@@ -1678,11 +1689,11 @@ pfsync_sendout(struct pfsync_softc *sc)
 	sc->sc_mbuf = NULL;
 	sc->sc_statep.s = NULL;
 
-#if NBPFILTER > 0
+#if NBPF > 0
 	if (ifp->if_bpf) {
 		bpf_gettoken();
 		if (ifp->if_bpf)
-			bpf_mtap(ifp->if_bpf, m, BPF_DIRECTION_OUT);
+			bpf_mtap(ifp->if_bpf, m);
 		bpf_reltoken();
 	}
 #endif
@@ -1694,7 +1705,14 @@ pfsync_sendout(struct pfsync_softc *sc)
 		sc->sc_statep_net.s = NULL;
 	}
 
-	return pfsync_sendout_mbuf(sc, m);
+	msg = &m->m_hdr.mh_genmsg;
+	netmsg_init(&msg->base, NULL, &netisr_apanic_rport, 0,
+	    pfsync_sendout_handler);
+	msg->m = m;
+	msg->arg1 = sc;
+	netisr_sendmsg(&msg->base, 0);
+
+	return (0);
 }
 
 int
@@ -1785,6 +1803,7 @@ static moduledata_t pfsync_mod = {
 
 DECLARE_MODULE(pfsync, pfsync_mod, SI_SUB_PSEUDO, SI_ORDER_ANY);
 MODULE_VERSION(pfsync, PFSYNC_MODVER);
+MODULE_DEPEND(pfsync, pf, PF_MODVER, PF_MODVER, PF_MODVER);
 
 static void
 pfsync_in_addmulti_dispatch(netmsg_t nmsg)

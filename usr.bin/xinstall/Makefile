@@ -7,8 +7,11 @@ SRCS=		xinstall.c
 MAN=		install.1
 
 .if defined(BOOTSTRAPPING)
-.PATH: ${.CURDIR}/../../lib/libc/gen
-SRCS+=		strtofflags.c
+CFLAGS+=	-DBOOTSTRAPPING
+.else
+.PATH:          ${.CURDIR}/../../usr.sbin/mtree
+SRCS+=		getid.c
+CFLAGS+=        -DHAVE_NETDB_H -I${.CURDIR}/../../usr.sbin/mtree
 .endif
 
 .include <bsd.prog.mk>

@@ -23,7 +23,7 @@
  * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
  *
- * $FreeBSD: head/sys/sys/iconv.h 235711 2012-05-21 02:30:22Z kevlo $
+ * $FreeBSD: head/sys/sys/iconv.h 298981 2016-05-03 15:14:17Z pfg $
  */
 #ifndef _SYS_ICONV_H_
 #define _SYS_ICONV_H_
@@ -65,7 +65,7 @@ struct iconv_cspair_info {
 };
 
 /*
- * Paramters for 'add' sysctl
+ * Parameters for 'add' sysctl
  */
 #define	ICONV_ADD_VER	1
 
@@ -135,7 +135,7 @@ struct iconv_cspair {
 	"iconv_"#name, iconv_converter_handler,		\
 	(void*)&iconv_ ## name ## _class		\
     };							\
-    DECLARE_MODULE(iconv_ ## name, iconv_ ## name ## _mod, SI_SUB_DRIVERS, SI_ORDER_ANY);
+    DECLARE_MODULE(iconv_ ## name, iconv_ ## name ## _mod, SI_SUB_DRIVERS, SI_ORDER_ANY)
 
 #define	KICONV_CES(name,size)				\
     static DEFINE_CLASS(iconv_ces_ ## name, iconv_ces_ ## name ## _methods, (size)); \
@@ -143,7 +143,7 @@ struct iconv_cspair {
 	"iconv_ces_"#name, iconv_cesmod_handler,	\
 	(void*)&iconv_ces_ ## name ## _class		\
     };							\
-    DECLARE_MODULE(iconv_ces_ ## name, iconv_ces_ ## name ## _mod, SI_SUB_DRIVERS, SI_ORDER_ANY);
+    DECLARE_MODULE(iconv_ces_ ## name, iconv_ces_ ## name ## _mod, SI_SUB_DRIVERS, SI_ORDER_ANY)
 
 #ifdef MALLOC_DECLARE
 MALLOC_DECLARE(M_ICONV);

@@ -30,8 +30,6 @@
  * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT
  * OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
- *
- * $DragonFly: src/sys/platform/vkernel/include/md_var.h,v 1.24 2008/03/20 02:14:54 dillon Exp $
  */
 
 #ifndef _MACHINE_MD_VAR_H_
@@ -51,6 +49,8 @@
 #define VKDISK_MAX	16
 #define	SERNOLEN        30
 
+#define	pagezero(addr)	bzero((addr), PAGE_SIZE)
+
 struct vknetif_info {
 	int		tap_fd;
 	int		tap_unit;
@@ -62,6 +62,8 @@ struct vknetif_info {
 struct vkdisk_info {
         int fd;
         int unit;
+	int flags;
+	int reserved01;
 	enum vkdisk_type { VKD_EMPTY, VKD_DISK, VKD_CD } type;
 	char fname[MAXPATHLEN];
 	char *serno;
@@ -73,9 +75,11 @@ extern	vpte_t	*KernelPTA;	/* NOTE: Offset for direct VA translation */
 extern	vpte_t	*KernelPTD;
 extern	vm_offset_t crashdumpmap;
 extern  int	cpu_fxsr;
+extern  pthread_t ap_tids[MAXCPU];
 
-extern  char    cpu_vendor[];	/* XXX belongs in i386 */
-extern  u_int   cpu_id;		/* XXX belongs in i386 */
+extern  char    cpu_vendor[];	/* XXX belongs in pc64 */
+extern  u_int   cpu_vendor_id;	/* XXX belongs in pc64 */
+extern  u_int   cpu_id;		/* XXX belongs in pc64 */
 
 extern struct vkdisk_info DiskInfo[VKDISK_MAX];
 extern int	DiskNum;
@@ -114,14 +118,13 @@ void vcons_set_mode(int);
 int npxdna(struct trapframe *);
 void npxpush(struct __mcontext *mctx);
 void npxpop(struct __mcontext *mctx);
+void kqueue_intr(struct intrframe *);
+void vktimer_intr(struct intrframe *);
 
 void signalintr(int intr);
 
 struct kqueue_info;
 struct kqueue_info *kqueue_add(int, void (*)(void *, struct intrframe *), void *);
 void kqueue_del(struct kqueue_info *);
-struct kqueue_info *kqueue_add_timer(void (*func)(void *, struct intrframe *), void *data);
-void kqueue_reload_timer(struct kqueue_info *info, int ms);
-
 
 #endif

@@ -29,6 +29,8 @@
  * SUCH DAMAGE.
  */
 
+#define _KERNEL_STRUCTURES
+
 #include <sys/param.h>
 #include <sys/stat.h>
 #include <sys/time.h>
@@ -36,11 +38,10 @@
 #include <kvm.h>
 #include <stdio.h>
 
-#define _KERNEL_STRUCTURES
 #include <sys/vnode.h>
 #include <sys/mount.h>
+#include <stddef.h>
 #include <vfs/hammer/hammer.h>
-#undef _KERNEL_STRUCTURES
 
 #include "fstat.h"
 
@@ -61,11 +62,11 @@ hammer_filestat(struct vnode *vp, struct filestat *fsp)
 		    " at %p for pid %d\n", (void *)ino.pfsm, Pid);
 		return 0;
 	}
-	fsp->fsid = pfsm.fsid_udev ^ (u_int32_t)ino.obj_asof ^
-	    (u_int32_t)(ino.obj_asof >> 32);
+	fsp->fsid = pfsm.fsid_udev ^ (uint32_t)ino.obj_asof ^
+	    (uint32_t)(ino.obj_asof >> 32);
 	fsp->mode = ino.ino_data.mode | mtrans(vp->v_type);
 	fsp->fileid = (long)ino.ino_leaf.base.obj_id;
 	fsp->size = ino.ino_data.size;
-	fsp->rdev = dev2udev(vp->v_rdev);
+	fsp->rdev = fstat_dev2udev(vp->v_rdev);
 	return 1;
 }

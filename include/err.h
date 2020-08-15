@@ -10,11 +10,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -38,11 +34,10 @@
 #define	_ERR_H_
 
 /*
- * Don't use va_list in the err/warn prototypes.   Va_list is typedef'd in two
- * places (<machine/varargs.h> and <machine/stdarg.h>), so if we include one
- * of them here we may collide with the utility's includes.  It's unreasonable
- * for utilities to have to include one of them to include err.h, so we get
- * __va_list from <machine/stdint.h> and use it.
+ * Don't use va_list in the err()/warn() prototypes. Va_list is typedef'd in
+ * <stdarg.h>, so if we include it here we may collide with the utility's
+ * includes. It's unreasonable for utilities to have to include it to
+ * include err.h, so we get __va_list from <machine/stdarg.h> and use it.
  */
 #include <sys/cdefs.h>
 #include <machine/stdint.h>
@@ -63,7 +58,7 @@ void	vwarn (const char *, __va_list) __printf0like(1, 0);
 void	warnc (int, const char *, ...) __printf0like(2, 3);
 void	vwarnc (int, const char *, __va_list) __printf0like(2, 0);
 void	warnx (const char *, ...) __printflike(1, 2);
-void	vwarnx (const char *, __va_list) __printflike(1, 0);
+void	vwarnx (const char *, __va_list) __printf0like(1, 0);
 void	err_set_file (void *);
 void	err_set_exit (void (*)(int));
 __END_DECLS

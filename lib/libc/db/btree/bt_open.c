@@ -44,6 +44,7 @@
 #include "namespace.h"
 #include <sys/param.h>
 #include <sys/stat.h>
+#include <sys/file.h>
 
 #include <errno.h>
 #include <fcntl.h>
@@ -194,7 +195,7 @@ __bt_open(const char *fname, int flags, mode_t mode, const BTREEINFO *openinfo,
 			goto einval;
 		}
 
-		if ((t->bt_fd = _open(fname, flags, mode)) < 0)
+		if ((t->bt_fd = _open(fname, flags | O_CLOEXEC, mode)) < 0)
 			goto err;
 
 	} else {
@@ -250,9 +251,13 @@ __bt_open(const char *fname, int flags, mode_t mode, const BTREEINFO *openinfo,
 		/*
 		 * Set the page size to the best value for I/O to this file.
 		 * Don't overflow the page offset type.
+		 *
+		 * Stop using st_blksize, its meaningless on a modern system
+		 * and can cause db to operate inefficiently.  Instead we
+		 * use NOMPSIZE.
 		 */
 		if (b.psize == 0) {
-			b.psize = sb.st_blksize;
+			b.psize = NOMPSIZE;
 			if (b.psize < MINPSIZE)
 				b.psize = MINPSIZE;
 			if (b.psize > MAX_PAGE_OFFSET + 1)
@@ -403,8 +408,8 @@ tmp(void)
 
 	sigfillset(&set);
 	_sigprocmask(SIG_BLOCK, &set, &oset);
-	if ((fd = mkstemp(path)) != -1)
-		unlink(path);
+	if ((fd = mkostemp(path, O_CLOEXEC)) != -1)
+		_unlink(path);
 	_sigprocmask(SIG_SETMASK, &oset, NULL);
 	return(fd);
 }

@@ -30,8 +30,11 @@
  * SUCH DAMAGE.
  *
  * $FreeBSD: src/sys/netsmb/smb_conn.h,v 1.1.2.3 2002/04/23 03:45:01 bp Exp $
- * $DragonFly: src/sys/netproto/smb/smb_conn.h,v 1.8 2006/07/28 02:17:41 dillon Exp $
  */
+
+#ifndef _NETPROTO_SMB_SMB_CONN_H_
+#define	_NETPROTO_SMB_SMB_CONN_H_
+
 #ifndef _NETINET_IN_H_
 #include <netinet/in.h>
 #endif
@@ -271,6 +274,9 @@ struct smb_vc {
 	int		vc_txmax;	/* max tx/rx packet size */
 	struct smbiod *	vc_iod;
 	struct smb_slock vc_stlock;
+	u_int32_t	vc_seqno;	/* my next sequence number */
+	u_int8_t	*vc_mackey;	/* MAC key */
+	int		vc_mackeylen;	/* length of MAC key */
 };
 
 #define vc_maxmux	vc_sopt.sv_maxmux
@@ -454,3 +460,5 @@ int  smb_iod_waitrq(struct smb_rq *rqp);
 int  smb_iod_removerq(struct smb_rq *rqp);
 
 #endif /* _KERNEL */
+
+#endif /* !_NETPROTO_SMB_SMB_CONN_H_ */

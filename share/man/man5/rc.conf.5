@@ -24,7 +24,7 @@
 .\"
 .\" $FreeBSD: src/share/man/man5/rc.conf.5,v 1.197 2003/07/28 13:56:00 mbr Exp $
 .\"
-.Dd August 29, 2014
+.Dd June 4, 2020
 .Dt RC.CONF 5
 .Os
 .Sh NAME
@@ -137,42 +137,19 @@ The
 driver is needed for a swapfile and will be loaded if it is not
 already compiled into the kernel or loaded via
 .Xr loader.conf 5 .
-.It Va apm_enable
+.It Ao Ar module Ac Ns Ar _load
 .Pq Vt bool
 If set to
-.Dq Li YES ,
-enable support for Automatic Power Management with the
-.Xr apm 8
-command.
-.It Va apmd_enable
-.Pq Vt bool
-Run
-.Xr apmd 8
-to handle APM event from userland.
-This also enables support for APM.
-.It Va apmd_flags
+.Dq YES ,
+that kernel module will be loaded.
+If no
+.Ao Ar module Ac Ns Ar _name
+is defined (see below), the
+module's name is taken to be
+.Aq Ar module .
+.It Ao Ar module Ac Ns Ar _name
 .Pq Vt str
-If
-.Va apmd_enable
-is set to
-.Dq Li YES ,
-these are the flags to pass to the
-.Xr apmd 8
-daemon.
-.It Va battd_enable
-Enable
-.Xr battd 8
-to monitor the status of batteries present in the system.
-This also enables support for APM.
-.It Va battd_flags
-.Pq Vt str
-If
-.Va battd_enable
-is set to
-.Dq Li YES ,
-these are the flags to pass to the
-.Xr battd 8
-daemon.
+Defines the name of the module.
 .It Va devd_enable
 .Pq Vt bool
 Run
@@ -197,6 +174,16 @@ Setting this to
 enables
 .Xr powerd 8 ,
 a CPU speed control daemon.
+.It Va powerd_flags
+.Pq Vt str
+Empty by default.
+Additional flags passed to the
+.Xr powerd 8
+program.
+.Pp
+If you are running a serial port at 115200 baud we recommend setting
+the flags to "-l 1500" as lower frequencies will cause characters to
+drop.
 .It Va sensorsd_enable
 .Pq Vt bool
 Set to
@@ -222,7 +209,8 @@ Setting this to
 .Dq Li YES
 enables
 .Xr sysvipcd 8 ,
-a sensors monitoring and logging daemon.
+a daemon needed for the userspace implementation of the XSI Interprocess
+Communication functions.
 .It Va sysvipcd_flags
 .Pq Vt str
 Empty by default.
@@ -256,16 +244,14 @@ for a fixed address or
 for a DHCP client).
 .It Va pccard_ether_delay
 .Pq Vt str
-Set the delay before starting
-.Xr dhclient 8
+Set the delay before starting the DHCP client (configured with
+.Va dhcp_client )
 in the
 .Pa /etc/pccard_ether
 script.
-This defaults to 5 seconds to work around a bug in the
-.Xr ed 4
-driver which can lead to system hangs when using some newer
-.Xr ed 4
-based cards.
+This defaults to
+.Dq Li 5
+seconds.
 .It Va removable_interfaces
 .Pq Vt str
 List of removable network interfaces to be supported by
@@ -280,21 +266,12 @@ into individual filenames.
 The default is a space.
 It is not necessary to change this unless there are startup scripts with names
 containing spaces.
-.It Va hostapd_enable
-.Pq Vt bool
-Set to
-.Dq Li YES
-to start
-.Xr hostapd 8
-at system boot time.
 .It Va hostname
 .Pq Vt str
 The fully qualified domain name (FQDN) of this host on the network.
 This should almost certainly be set to something meaningful, even if
 there is no network connection.
-If
-.Xr dhclient 8
-is used to set the hostname via DHCP,
+If DHCP is used to set the hostname,
 this variable should be set to an empty string.
 .It Va ipv6_enable
 .Pq Vt bool
@@ -306,14 +283,47 @@ Note that this requires that the kernel have been compiled with
 The NIS domain name of this host, or
 .Dq Li NO
 if NIS is not used.
+.It Va dhcp_client
+.Pq Vt str
+Set the rc script that is called to start the DHCP client.
+This can be set to
+.Dq Li dhclient
+(default) or
+.Dq Li dhcpcd .
 .It Va dhclient_program
 .Pq Vt str
-Path to the DHCP client program
-(default
+Path to the
+.Xr dhclient 8
+program (default
 .Pa /sbin/dhclient ) .
 .It Va dhclient_flags
 .Pq Vt str
-Additional flags to pass to the DHCP client program.
+Additional flags to pass to the
+.Xr dhclient 8
+program.
+.It Va dhcpcd_enable
+.Pq Vt bool
+Set to
+.Dq Li YES
+to run
+.Xr dhcpcd 8
+in master mode (i.e., configure all available Ethernet interfaces) at startup.
+.It Va dhcpcd_program
+.Pq Vt str
+Path to the
+.Xr dhcpcd 8
+program (default
+.Pa /sbin/dhcpcd ) .
+.It Va dhcpcd_flags
+.Pq Vt str
+Additional flags to pass to the
+.Xr dhcpcd 8
+program.
+The default value is
+.Fl b ,
+i.e., tell
+.Xr dhcpcd 8
+to go to background immediately.
 .It Va pf_enable
 .Pq Vt bool
 Set to
@@ -495,6 +505,27 @@ specifies a filename.
 .Pq Vt str
 The IPv6 equivalent of
 .Va firewall_flags .
+.It Va ipfw3_enable
+.Pq Vt bool
+Set to
+.Dq Li YES
+to enable
+.Xr ipfw3 8 .
+.It Va ipfw3_program
+.Pq Vt str
+Path to
+.Xr ipfw3 8 .
+.It Va ipfw3_script
+.Pq Vt str
+The full path to the shell script to run to set up the ipfw3
+firewall rules (default
+.Pa /etc/ipfw3.rules ) .
+.It Va ipfw3_modules
+.Pq Vt str
+List of ipfw3 modules to be loaded before executing the above
+.Va ipfw3_script .
+(default
+.Dq Li ipfw3 ipfw3_basic ) .
 .It Va natd_program
 .Pq Vt str
 Path to
@@ -744,6 +775,8 @@ This will start
 See
 .Xr wpa_supplicant.conf 5
 for configuring authentication information.
+But see also
+.Va wpa_supplicant_enable .
 .Pp
 Finally, you can add
 .Xr ifconfig 8
@@ -796,6 +829,14 @@ It is possible to rename interface by doing:
 ifconfig_ed0_name="net0"
 ifconfig_net0="inet 10.0.0.1 netmask 0xffff0000"
 .Ed
+.It Va netif_enable
+.Pq Vt bool
+Set to
+.Dq Li YES
+by default.
+Setting to
+.Dq Li NO
+will disable the configuration of network interfaces.
 .It Va network_interfaces
 .Pq Vt str
 The list of network interfaces to configure on this host,
@@ -807,9 +848,9 @@ to configure all network interfaces
 For example, if the only network devices to be configured are the loopback device
 .Pq Li lo0
 and a NIC using the
-.Xr ed 4
+.Xr em 4
 driver, this could be set to
-.Dq Li "lo0 ed0" .
+.Dq Li "lo0 em0" .
 An
 .Va ifconfig_ Ns Aq Ar interface
 variable is assumed to exist for each value of
@@ -846,6 +887,59 @@ If not set to
 .Dq Li NO ,
 this is the default output interface for scoped addresses.
 Now this works only for IPv6 link local multicast addresses.
+.It Va ip6addrctl_enable
+.Pq Vt bool
+This variable is to enable configuring the default address selection policy table
+.Pq RFC 3484 .
+The default value is
+.Dq Li YES ,
+and the policy table to be installed is specified by the
+.Va ip6addrctl_policy
+variable below.
+.It Va ip6addrctl_policy
+.Pq Vt str
+This variable specifies the policy table to be installed,
+and can be one of the following keywords:
+.Dq Li ipv4_prefer ,
+.Dq Li ipv6_prefer ,
+or
+.Dq Li AUTO
+(default).
+.Pp
+If
+.Dq Li ipv4_prefer
+or
+.Dq Li ipv6_prefer
+is specified,
+.Xr ip6addrctl 8
+installs a pre-defined policy table described in Section 2.1
+.Pq IPv6-preferred
+or 10.3
+.Pq IPv4-preferred
+of RFC 3484.
+.Pp
+If
+.Dq Li AUTO
+is specified, it attempts to read a file
+.Pa /etc/ip6addrctl.conf
+first.
+If this file is found,
+.Xr ip6addrctl 8
+reads and installs it.
+If not found, a policy is automatically set
+according to
+.Va ipv6_enable
+variable; if the variable is set to
+.Dq Li YES
+the IPv6-preferred one is used.
+Otherwise IPv4-preferred.
+.It Va ip6addrctl_verbose
+.Pq Vt bool
+If set to
+.Dq Li YES ,
+print the installed policy table after configuring.
+The default value is
+.Dq Li NO .
 .It Va cloned_interfaces
 .Pq Vt str
 Set to the list of clonable network interfaces to create on this host.
@@ -994,6 +1088,23 @@ rules that will be applied by
 .Xr devfsctl 8
 in the order in which they are specified and must include the full path
 to the file.
+.It Va tmpfs_var_run
+.Pq Vt bool
+If set to
+.Dq Li YES ,
+a
+.Xr tmpfs 5
+will be mounted at
+.Pa /var/run .
+Necessary directories under there will be automatically created.
+.It Va tmpfs_tmp
+.Pq Vt bool
+If set to
+.Dq Li YES ,
+a
+.Xr tmpfs 5
+will be mounted at
+.Pa /tmp .
 .It Va syslogd_enable
 .Pq Vt bool
 If set to
@@ -1050,37 +1161,6 @@ If
 is set to
 .Dq Li YES ,
 these are the flags to pass to it.
-.It Va amd_enable
-.Pq Vt bool
-If set to
-.Dq Li YES ,
-run the
-.Xr amd 8
-daemon at boot time.
-.It Va amd_flags
-.Pq Vt str
-If
-.Va amd_enable
-is set to
-.Dq Li YES ,
-these are the flags to pass to it.
-See the
-.Xr amd 8
-manpage for more information.
-.It Va amd_map_program
-.Pq Vt str
-If set, the specified program is run to get the list of
-.Xr amd 8
-maps.
-For example, if the
-.Xr amd 8
-maps are stored in NIS, one can set this to run
-.Xr ypcat 1
-to get a list of
-.Xr amd 8
-maps from the
-.Pa amd.master
-NIS map.
 .It Va update_motd
 .Pq Vt bool
 If set to
@@ -1288,27 +1368,6 @@ This is mandatory when
 .Va pppoed_enable
 is set to
 .Dq Li YES .
-.It Va timed_enable
-.Pq Vt bool
-If set to
-.Dq Li YES ,
-run the
-.Xr timed 8
-service at boot time.
-This command is intended for networks of machines where a consistent
-.Dq "network time"
-for all hosts must be established.
-This is often useful in large NFS environments where time stamps on
-files are expected to be consistent network-wide.
-.It Va timed_flags
-.Pq Vt str
-If
-.Va timed_enable
-is set to
-.Dq Li YES ,
-these are the flags to pass to the
-.Xr timed 8
-service.
 .It Va dntpd_enable
 .Pq Vt bool
 If set to
@@ -1582,52 +1641,6 @@ these are the flags to pass to the routing daemon.
 .Pq Vt str
 The IPv6 equivalent of
 .Va router_flags .
-.It Va mrouted_enable
-.Pq Vt bool
-If set to
-.Dq Li YES ,
-run the multicast routing daemon,
-.Xr mrouted 8 .
-.It Va mroute6d_enable
-.Pq Vt bool
-The IPv6 equivalent of
-.Va mrouted_enable .
-If set to
-.Dq Li YES ,
-run the IPv6 multicast routing daemon.
-Note that no IPv6 multicast routing daemon is included in the
-.Dx
-base system but
-.Xr pim6dd 8
-can be installed from the
-.Xr dports 7
-collection
-.Pa ( net/mcast-tools ) .
-.It Va mrouted_flags
-.Pq Vt str
-If
-.Va mrouted_enable
-is set to
-.Dq Li YES ,
-these are the flags to pass to the
-.Xr mrouted 8
-daemon.
-.It Va mroute6d_flags
-.Pq Vt str
-The IPv6 equivalent of
-.Va mrouted_flags .
-If
-.Va mroute6d_enable
-is set to
-.Dq Li YES ,
-these are the flags passed to the IPv6 multicast routing daemon.
-.It Va mroute6d_program
-.Pq Vt str
-If
-.Va mroute6d_enable
-is set to
-.Dq Li YES ,
-this is the path to the IPv6 multicast routing daemon.
 .It Va rtadvd_enable
 .Pq Vt bool
 If set to
@@ -1709,6 +1722,28 @@ is set to
 these are the flags to pass to the
 .Xr rarpd 8
 daemon.
+.It Va wpa_supplicant_enable
+.Pq Vt bool
+If set to
+.Dq Li YES ,
+run the
+.Xr wpa_supplicant 8
+daemon in
+.Dq interface matching mode
+at system boot time.
+.It Va wpa_supplicant_program
+.Pq Vt str
+Path to
+.Xr wpa_supplicant 8 .
+.It Va wpa_supplicant_flags
+.Pq Vt str
+If
+.Va wpa_supplicant_enable
+is set to
+.Dq Li YES ,
+these are the flags to pass to the
+.Xr wpa_supplicant 8
+daemon.
 .It Va bootparamd_enable
 .Pq Vt bool
 If set to
@@ -1745,20 +1780,6 @@ This can be set to
 .Pq Vt str
 IPv6 Site Level Aggregator for
 .Xr stf 4 .
-.It Va ipv6_faith_prefix
-.Pq Vt str
-If not set to
-.Dq Li NO ,
-this is the faith prefix to enable a FAITH IPv6-to-IPv4 TCP translator.
-You also need
-.Xr faithd 8
-setup.
-.It Va ipv6_ipv4mapping
-.Pq Vt bool
-If set to
-.Dq Li YES
-this enables IPv4 mapped IPv6 address communication (like
-.Li ::ffff:a.b.c.d ) .
 .It Va keybell
 .Pq Vt str
 The keyboard bell sound.
@@ -1874,28 +1895,31 @@ the
 daemon is started for doing cut/paste selection on the console.
 .It Va moused_type
 .Pq Vt str
-This is the protocol type of the mouse connected to this host.
-This variable must be set if
+If
 .Va moused_enable
 is set to
-.Dq Li YES .
+.Dq Li YES ,
+this is the protocol type of the mouse connected to this host.
+The default type is
+.Dq Li auto .
 The
 .Xr moused 8
 daemon
 is able to detect the appropriate mouse type automatically in many cases.
-Set this variable to
+Leave this variable at the default
 .Dq Li auto
 to let the daemon detect it, or
 select one from the following list if the automatic detection fails.
 .Pp
-If the mouse is attached to the PS/2 mouse port, choose
+If the mouse is attached to the PS/2 mouse port, leave the variable at the
+default
 .Dq Li auto
-or
+or set it to
 .Dq Li ps/2 ,
 regardless of the brand and model of the mouse.
-Likewise, if the mouse is attached to the bus mouse port, choose
+Likewise, if the mouse is attached to the bus mouse port, leave it at
 .Dq Li auto
-or
+or set it to
 .Dq Li busmouse .
 All other protocols are for serial mice and will not work with
 the PS/2 and bus mice.
@@ -2162,11 +2186,6 @@ Set to
 to enable system accounting through the
 .Xr accton 8
 facility.
-.It Va linux_enable
-.Pq Vt bool
-Set to
-.Dq Li YES
-to enable Linux/ELF binary emulation at system initial boot time.
 .\" ----- cleanvar_enable setting--------------------------------
 .It Va cleanvar_enable
 .Pq Vt bool
@@ -2271,8 +2290,6 @@ If set to
 start the
 .Xr watchdogd 8
 daemon at boot time.
-This requires that the kernel have been compiled with
-.Cd "options WATCHDOG" .
 .It Va jail_enable
 .Pq Vt bool
 If set to
@@ -2323,19 +2340,6 @@ When set to
 .Dq Li YES ,
 sets
 .Va jail_ Ns Ao Ar jname Ac Ns Va _mount_enable
-to
-.Dq Li YES
-by default for every jail in
-.Va jail_list .
-.It Va jail_fdesc_enable
-.Pq Vt bool
-Set to
-.Dq Li NO
-by default.
-When set to
-.Dq Li YES ,
-sets
-.Va jail_ Ns Ao Ar jname Ac Ns Va _fdesc_enable
 to
 .Dq Li YES
 by default for every jail in
@@ -2423,16 +2427,6 @@ When set to
 mount all file systems from
 .Va jail_ Ns Ao Ar jname Ac Ns Va _fstab
 at jail startup.
-.It Va jail_ Ns Ao Ar jname Ac Ns Va _fdesc_enable
-.Pq Vt bool
-Set to
-.Dq Li NO
-by default.
-When set to
-.Dq Li YES ,
-mount the file-descriptor file system inside jail
-.Ar jname
-at jail startup.
 .It Va jail_ Ns Ao Ar jname Ac Ns Va _procfs_enable
 .Pq Vt bool
 Set to
@@ -2465,23 +2459,33 @@ Set to
 .Dq Li /bin/sh /etc/rc.shutdown
 by default.
 This is the command executed at jail shutdown.
-.It Va jail_set_hostname_allow
+.It Va jail_default_set_hostname_allow
 .Pq Vt bool
 If set to
 .Dq Li NO ,
 do not allow the root user in a jail to set its hostname.
-.It Va jail_socket_unixiproute_only
+.It Va jail_default_socket_unixiproute_only
 .Pq Vt bool
 If set to
 .Dq Li YES ,
 do not allow any sockets,
 besides UNIX/IP/route sockets,
 to be used within a jail.
-.It Va jail_sysvipc_allow
+.It Va jail_default_sysvipc_allow
 .Pq Vt bool
 If set to
 .Dq Li YES ,
 allow applications within a jail to use System V IPC.
+.It Va jail_default_chflags_allow
+.Pq Vt bool
+If set to
+.Dq Li YES ,
+allow applications within a jail to alter system file flags.
+.It Va jail_default_raw_sockets_allow
+.Pq Vt bool
+If set to
+.Dq Li YES ,
+allow applications within a jail to user raw sockets.
 .It Va lvm_enable
 .Pq Vt bool
 If set to
@@ -2549,19 +2553,6 @@ should be large enough to fill as many of the entropy pools in the kernel
 CSPRNG as possible.
 By default, it is set to 16384, which should be able to seed all 32 entropy
 pools in the Fortuna CSPRNG.
-.It Va ipsec_enable
-.Pq Vt bool
-Set to
-.Dq Li YES
-to run
-.Xr setkey 8
-on
-.Va ipsec_file
-at boot time.
-.It Va ipsec_file
-.Pq Vt str
-Configuration file for
-.Xr setkey 8 .
 .It Va dmesg_enable
 .Pq Vt bool
 Set to
@@ -2606,7 +2597,8 @@ vfs quota rc.d scripts will be run on boot.
 .It Va vfs_quota_sync
 .Pq Vt str
 List of mount points whose counters are to be synchronized with on-disk
-usage during system startup. See also
+usage during system startup.
+See also
 .Xr vquota 8 .
 .It Va vknetd_enable
 .Pq Vt bool
@@ -2630,7 +2622,8 @@ any configured vkernels will not be started.
 .It Va vkernel_kill_timeout
 .Pq Vt int
 This defines the default number of seconds that we will wait for the
-vkernel to shut down on it's own. If after this time it's still alive,
+vkernel to shut down on its own.
+If after this time it's still alive,
 it will be killed with SIGKILL.
 .It Va vkernel_bin
 .Pq Vt str
@@ -2647,19 +2640,73 @@ Assuming that the vkernel in question was named
 you would have the following dependent variables
 (filled with reference values in this text):
 .Bd -literal
-vkernel_example_bin="/usr/obj/usr/src/sys/VKERNEL/kernel.debug"
+vkernel_example_bin="/usr/obj/usr/src/sys/VKERNEL64/kernel.debug"
 vkernel_example_memsize="64m"
 vkernel_example_rootimg_list="/var/vkernel/rootimg.01"
+vkernel_example_memimg="/var/vkernel/memimg.000001"
+vkernel_example_user="myuser"
 vkernel_example_iface_list="auto:bridge0"
 vkernel_example_logfile="/dev/null"
 vkernel_example_flags="-U"
 vkernel_example_kill_timeout="45"
 .Ed
 .Pp
-The last five are optional.
+The last six are optional.
 They default to an empty string if not set, except for logfile which defaults to
 .Pa /dev/null
 if it is not set.
+.Pp
+Note that in case
+.Va vkernel_memimg
+is not set, the
+.Pa rc.d
+script will create
+.Pa /var/vkernel ,
+which is the vkernel's default directory for memory images,
+with permissions of 1777, i.e. world writable with the sticky bit set
+(see
+.Xr sticky 8 ) .
+.It Va autofs_enable
+.Pq Vt bool
+If set to
+.Dq Li YES ,
+start the
+.Xr automount 8
+utility and the
+.Xr automountd 8
+and
+.Xr autounmountd 8
+daemons at boot time.
+.It Va automount_flags
+.Pq Vt str
+If
+.Va autofs_enable
+is set to
+.Dq Li YES ,
+these are the flags to pass to the
+.Xr automount 8
+program.
+By default no flags are passed.
+.It Va automountd_flags
+.Pq Vt str
+If
+.Va autofs_enable
+is set to
+.Dq Li YES ,
+these are the flags to pass to the
+.Xr automountd 8
+daemon.
+By default no flags are passed.
+.It Va autounmountd_flags
+.Pq Vt str
+If
+.Va autofs_enable
+is set to
+.Dq Li YES ,
+these are the flags to pass to the
+.Xr autounmountd 8
+daemon.
+By default no flags are passed.
 .El
 .Sh FILES
 .Bl -tag -width ".Pa /etc/start_if. Ns Aq Ar interface" -compact
@@ -2669,7 +2716,6 @@ if it is not set.
 .It Pa /etc/start_if. Ns Aq Ar interface
 .El
 .Sh SEE ALSO
-.Xr catman 1 ,
 .Xr gdb 1 ,
 .Xr info 1 ,
 .Xr kbdcontrol 1 ,
@@ -2682,30 +2728,33 @@ if it is not set.
 .Xr tcp 4 ,
 .Xr udp 4 ,
 .Xr vlan 4 ,
+.Xr autofs 5 ,
+.Xr auto_master 5 ,
 .Xr exports 5 ,
 .Xr motd 5 ,
 .Xr resident.conf 5 ,
 .Xr varsym.conf 5 ,
 .Xr accton 8 ,
-.Xr amd 8 ,
-.Xr apm 8 ,
+.Xr automount 8 ,
+.Xr automountd 8 ,
+.Xr autounmountd 8 ,
 .Xr btconfig 8 ,
 .Xr bthcid 8 ,
 .Xr cron 8 ,
 .Xr devd 8 ,
 .Xr dhclient 8 ,
+.Xr dhcpcd 8 ,
 .Xr dntpd 8 ,
 .Xr ftpd 8 ,
 .Xr ifconfig 8 ,
 .Xr inetd 8 ,
+.Xr ip6addrctl 8 ,
 .Xr jail 8 ,
 .Xr lpd 8 ,
 .Xr makewhatis 8 ,
 .Xr mixer 8 ,
 .Xr mountd 8 ,
 .Xr moused 8 ,
-.Xr mrouted 8 ,
-.Xr named 8 ,
 .Xr nfsd 8 ,
 .Xr pcnfsd 8 ,
 .Xr pfctl 8 ,
@@ -2732,8 +2781,8 @@ if it is not set.
 .Xr sysctl 8 ,
 .Xr syslogd 8 ,
 .Xr sysvipcd 8 ,
-.Xr timed 8 ,
 .Xr vinum 8 ,
+.Xr wpa_supplicant 8 ,
 .Xr yp 8 ,
 .Xr ypbind 8 ,
 .Xr ypserv 8 ,

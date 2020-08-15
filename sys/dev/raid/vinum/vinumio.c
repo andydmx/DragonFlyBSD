@@ -123,7 +123,7 @@ set_drive_parms(struct drive *drive)
     bcopy(hostname, drive->label.sysname, VINUMHOSTNAMELEN); /* put in host name */
     getmicrotime(&drive->label.date_of_birth);		    /* and current time */
     drive->label.drive_size = drive->partinfo.media_size;
-#if VINUMDEBUG
+#ifdef VINUMDEBUG
     if (debug & DEBUG_BIGDRIVE)				    /* pretend we're 100 times as big */
 	drive->label.drive_size *= 100;
 #endif
@@ -279,7 +279,8 @@ driveio(struct drive *drive, char *buf, size_t length, off_t offset, buf_cmd_t c
     while (length) {					    /* divide into small enough blocks */
 	int len = umin(length, MAXBSIZE);		    /* maximum block device transfer is MAXBSIZE */
 
-	bp = geteblk(len);				    /* get a buffer header */
+	bp = getpbuf_kva(NULL);				    /* get a buffer header */
+	KKASSERT(len <= bp->b_bufsize);
 	bp->b_cmd = cmd;
 	bp->b_bio1.bio_offset = offset;			    /* disk offset */
 	bp->b_bio1.bio_done = biodone_sync;
@@ -292,7 +293,7 @@ driveio(struct drive *drive, char *buf, size_t length, off_t offset, buf_cmd_t c
 	bp->b_data = saveaddr;
 	bp->b_flags |= B_INVAL | B_AGE;
 	bp->b_flags &= ~B_ERROR;
-	brelse(bp);
+	relpbuf(bp, NULL);
 	if (error)
 	    break;
 	length -= len;					    /* update pointers */
@@ -548,7 +549,7 @@ format_config(char *config, int len)
 }
 
 /*
- * issue a save config request to the dæmon.  The actual work
+ * issue a save config request to the daemon.  The actual work
  * is done in process context by daemon_save_config
  */
 void
@@ -561,7 +562,7 @@ save_config(void)
 
 /*
  * Write the configuration to all vinum slices.  This
- * is performed by the dæmon only
+ * is performed by the daemon only
  */
 void
 daemon_save_config(void)
@@ -695,11 +696,8 @@ vinum_scandisk(char *devicename[], int drives)
     for (driveno = 0; driveno < drives; driveno++) {
 	char part, has_part = 0;			    /* UNIX partition */
 	int slice;
-	int founddrive;					    /* flag when we find a vinum drive */
 	int has_slice = -1;
 	char *tmp;
-
-	founddrive = 0;					    /* no vinum drive found yet on this spindle */
 
 	/*
 	 * If the device path contains a slice we do not try to tack on
@@ -741,7 +739,6 @@ vinum_scandisk(char *devicename[], int drives)
 		    drivelist[gooddrives] = drive->driveno;	/* keep the drive index */
 		    drive->flags &= ~VF_NEWBORN;	    /* which is no longer newly born */
 		    gooddrives++;
-		    founddrive++;
 		}
 	    }
 	}
@@ -841,7 +838,7 @@ vinum_scandisk(char *devicename[], int drives)
  * Return 1 if a < b, 0 if a == b, 01 if a > b: in other
  * words, sort backwards.
  */
-int
+static int
 drivecmp(const void *va, const void *vb)
 {
     const struct drive *a = &DRIVE[*(const int *) va];

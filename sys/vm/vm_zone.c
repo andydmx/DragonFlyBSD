@@ -1,8 +1,5 @@
 /*
- * (MPSAFE)
- *
- * Copyright (c) 1997, 1998 John S. Dyson
- * All rights reserved.
+ * Copyright (c) 1997, 1998 John S. Dyson.  All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -14,6 +11,38 @@
  *	John S. Dyson.
  *
  * $FreeBSD: src/sys/vm/vm_zone.c,v 1.30.2.6 2002/10/10 19:50:16 dillon Exp $
+ *
+ * Copyright (c) 2003-2017,2019 The DragonFly Project.  All rights reserved.
+ *
+ * This code is derived from software contributed to The DragonFly Project
+ * by Matthew Dillon <dillon@backplane.com>
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in
+ *    the documentation and/or other materials provided with the
+ *    distribution.
+ * 3. Neither the name of The DragonFly Project nor the names of its
+ *    contributors may be used to endorse or promote products derived
+ *    from this software without specific, prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+ * ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+ * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
+ * FOR A PARTICULAR PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE
+ * COPYRIGHT HOLDERS OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+ * INCIDENTAL, SPECIAL, EXEMPLARY OR CONSEQUENTIAL DAMAGES (INCLUDING,
+ * BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED
+ * AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+ * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT
+ * OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+ * SUCH DAMAGE.
  */
 
 #include <sys/param.h>
@@ -46,9 +75,9 @@ static MALLOC_DEFINE(M_ZONE, "ZONE", "Zone header");
 
 #define	ZENTRY_FREE	0x12342378
 
-int zone_burst = 32;
+long zone_burst = 128;
 
-static void *zget(vm_zone_t z);
+static void *zget(vm_zone_t z, int *tryagainp);
 
 /*
  * Return an item from the specified zone.   This function is non-blocking for
@@ -60,21 +89,24 @@ void *
 zalloc(vm_zone_t z)
 {
 	globaldata_t gd = mycpu;
+	vm_zpcpu_t *zpcpu;
 	void *item;
-	int n;
+	int tryagain;
+	long n;
 
 #ifdef INVARIANTS
 	if (z == NULL)
 		zerror(ZONE_ERROR_INVALID);
 #endif
+	zpcpu = &z->zpcpu[gd->gd_cpuid];
 retry:
 	/*
 	 * Avoid spinlock contention by allocating from a per-cpu queue
 	 */
-	if (z->zfreecnt_pcpu[gd->gd_cpuid] > 0) {
+	if (zpcpu->zfreecnt > 0) {
 		crit_enter_gd(gd);
-		if (z->zfreecnt_pcpu[gd->gd_cpuid] > 0) {
-			item = z->zitems_pcpu[gd->gd_cpuid];
+		if (zpcpu->zfreecnt > 0) {
+			item = zpcpu->zitems;
 #ifdef INVARIANTS
 			KASSERT(item != NULL,
 				("zitems_pcpu unexpectedly NULL"));
@@ -82,10 +114,11 @@ retry:
 				zerror(ZONE_ERROR_NOTFREE);
 			((void **)item)[1] = NULL;
 #endif
-			z->zitems_pcpu[gd->gd_cpuid] = ((void **) item)[0];
-			--z->zfreecnt_pcpu[gd->gd_cpuid];
-			z->znalloc++;
+			zpcpu->zitems = ((void **) item)[0];
+			--zpcpu->zfreecnt;
+			++zpcpu->znalloc;
 			crit_exit_gd(gd);
+
 			return item;
 		}
 		crit_exit_gd(gd);
@@ -95,7 +128,7 @@ retry:
 	 * Per-zone spinlock for the remainder.  Always load at least one
 	 * item.
 	 */
-	spin_lock(&z->zlock);
+	spin_lock(&z->zspin);
 	if (z->zfreecnt > z->zfreemin) {
 		n = zone_burst;
 		do {
@@ -106,16 +139,20 @@ retry:
 				zerror(ZONE_ERROR_NOTFREE);
 #endif
 			z->zitems = ((void **)item)[0];
-			z->zfreecnt--;
-			((void **)item)[0] = z->zitems_pcpu[gd->gd_cpuid];
-			z->zitems_pcpu[gd->gd_cpuid] = item;
-			++z->zfreecnt_pcpu[gd->gd_cpuid];
+			--z->zfreecnt;
+			((void **)item)[0] = zpcpu->zitems;
+			zpcpu->zitems = item;
+			++zpcpu->zfreecnt;
 		} while (--n > 0 && z->zfreecnt > z->zfreemin);
-		spin_unlock(&z->zlock);
+		spin_unlock(&z->zspin);
 		goto retry;
 	} else {
-		spin_unlock(&z->zlock);
-		item = zget(z);
+		spin_unlock(&z->zspin);
+		tryagain = 0;
+		item = zget(z, &tryagain);
+		if (tryagain)
+			goto retry;
+
 		/*
 		 * PANICFAIL allows the caller to assume that the zalloc()
 		 * will always succeed.  If it doesn't, we panic here.
@@ -135,43 +172,67 @@ void
 zfree(vm_zone_t z, void *item)
 {
 	globaldata_t gd = mycpu;
-	int zmax;
+	vm_zpcpu_t *zpcpu;
+	void *tail_item;
+	long count;
+	long zmax;
+
+	zpcpu = &z->zpcpu[gd->gd_cpuid];
 
 	/*
 	 * Avoid spinlock contention by freeing into a per-cpu queue
 	 */
-	if ((zmax = z->zmax) != 0)
-		zmax = zmax / ncpus / 16;
-	if (zmax < 64)
-		zmax = 64;
-
-	if (z->zfreecnt_pcpu[gd->gd_cpuid] < zmax) {
-		crit_enter_gd(gd);
-		((void **)item)[0] = z->zitems_pcpu[gd->gd_cpuid];
-#ifdef INVARIANTS
-		if (((void **)item)[1] == (void *)ZENTRY_FREE)
-			zerror(ZONE_ERROR_ALREADYFREE);
-		((void **)item)[1] = (void *)ZENTRY_FREE;
-#endif
-		z->zitems_pcpu[gd->gd_cpuid] = item;
-		++z->zfreecnt_pcpu[gd->gd_cpuid];
-		crit_exit_gd(gd);
-		return;
-	}
+	zmax = z->zmax_pcpu;
+	if (zmax < 1024)
+		zmax = 1024;
 
 	/*
-	 * Per-zone spinlock for the remainder.
+	 * Add to pcpu cache
 	 */
-	spin_lock(&z->zlock);
-	((void **)item)[0] = z->zitems;
+	crit_enter_gd(gd);
+	((void **)item)[0] = zpcpu->zitems;
 #ifdef INVARIANTS
 	if (((void **)item)[1] == (void *)ZENTRY_FREE)
 		zerror(ZONE_ERROR_ALREADYFREE);
 	((void **)item)[1] = (void *)ZENTRY_FREE;
 #endif
+	zpcpu->zitems = item;
+	++zpcpu->zfreecnt;
+
+	if (zpcpu->zfreecnt < zmax) {
+		crit_exit_gd(gd);
+		return;
+	}
+
+	/*
+	 * Hystereis, move (zmax) (calculated below) items to the pool.
+	 */
+	zmax = zmax / 2;
+	if (zmax > zone_burst)
+		zmax = zone_burst;
+	tail_item = item;
+	count = 1;
+
+	while (count < zmax) {
+		tail_item = ((void **)tail_item)[0];
+		++count;
+	}
+	zpcpu->zitems = ((void **)tail_item)[0];
+	zpcpu->zfreecnt -= count;
+
+	/*
+	 * Per-zone spinlock for the remainder.
+	 *
+	 * Also implement hysteresis by freeing a number of pcpu
+	 * entries.
+	 */
+	spin_lock(&z->zspin);
+	((void **)tail_item)[0] = z->zitems;
 	z->zitems = item;
-	z->zfreecnt++;
-	spin_unlock(&z->zlock);
+	z->zfreecnt += count;
+	spin_unlock(&z->zspin);
+
+	crit_exit_gd(gd);
 }
 
 /*
@@ -192,7 +253,7 @@ zfree(vm_zone_t z, void *item)
 
 LIST_HEAD(zlist, vm_zone) zlist = LIST_HEAD_INITIALIZER(zlist);
 static int sysctl_vm_zone(SYSCTL_HANDLER_ARGS);
-static int zone_kmem_pages, zone_kern_pages;
+static vm_pindex_t zone_kmem_pages, zone_kern_pages;
 static long zone_kmem_kvaspace;
 
 /*
@@ -220,8 +281,7 @@ static long zone_kmem_kvaspace;
  * No requirements.
  */
 int
-zinitna(vm_zone_t z, vm_object_t obj, char *name, int size,
-	int nentries, int flags, int zalloc)
+zinitna(vm_zone_t z, char *name, size_t size, long nentries, uint32_t flags)
 {
 	size_t totsize;
 
@@ -236,21 +296,21 @@ zinitna(vm_zone_t z, vm_object_t obj, char *name, int size,
 	 * 	 use zbootinit().
 	 */
 	if ((z->zflags & ZONE_BOOT) == 0) {
-		z->zsize = (size + ZONE_ROUNDING - 1) & ~(ZONE_ROUNDING - 1);
-		spin_init(&z->zlock, "zinitna");
+		z->zsize = roundup2(size, ZONE_ROUNDING);
+		spin_init(&z->zspin, "zinitna");
+		lockinit(&z->zgetlk, "zgetlk", 0, LK_CANRECURSE);
+
 		z->zfreecnt = 0;
 		z->ztotal = 0;
 		z->zmax = 0;
 		z->zname = name;
-		z->znalloc = 0;
 		z->zitems = NULL;
 
 		lwkt_gettoken(&vm_token);
 		LIST_INSERT_HEAD(&zlist, z, zlink);
 		lwkt_reltoken(&vm_token);
 
-		bzero(z->zitems_pcpu, sizeof(z->zitems_pcpu));
-		bzero(z->zfreecnt_pcpu, sizeof(z->zfreecnt_pcpu));
+		bzero(z->zpcpu, sizeof(z->zpcpu));
 	}
 
 	z->zkmvec = NULL;
@@ -268,26 +328,35 @@ zinitna(vm_zone_t z, vm_object_t obj, char *name, int size,
 		totsize = round_page((size_t)z->zsize * nentries);
 		atomic_add_long(&zone_kmem_kvaspace, totsize);
 
-		z->zkva = kmem_alloc_pageable(&kernel_map, totsize);
+		z->zkva = kmem_alloc_pageable(&kernel_map, totsize,
+					      VM_SUBSYS_ZALLOC);
 		if (z->zkva == 0) {
 			LIST_REMOVE(z, zlink);
 			return 0;
 		}
 
 		z->zpagemax = totsize / PAGE_SIZE;
-		if (obj == NULL) {
-			z->zobj = vm_object_allocate(OBJT_DEFAULT, z->zpagemax);
-		} else {
-			z->zobj = obj;
-			_vm_object_allocate(OBJT_DEFAULT, z->zpagemax, obj);
-			vm_object_drop(obj);
-		}
 		z->zallocflag = VM_ALLOC_SYSTEM | VM_ALLOC_INTERRUPT |
 				VM_ALLOC_NORMAL | VM_ALLOC_RETRY;
 		z->zmax += nentries;
+
+		/*
+		 * Set reasonable pcpu cache bounds.  Low-memory systems
+		 * might try to cache too little, large-memory systems
+		 * might try to cache more than necessarsy.
+		 *
+		 * In particular, pvzone can wind up being excessive and
+		 * waste memory unnecessarily.
+		 */
+		z->zmax_pcpu = z->zmax / ncpus / 64;
+		if (z->zmax_pcpu < 1024)
+			z->zmax_pcpu = 1024;
+		if (z->zmax_pcpu * z->zsize > 16*1024*1024)
+			z->zmax_pcpu = 16*1024*1024 / z->zsize;
 	} else {
 		z->zallocflag = VM_ALLOC_NORMAL | VM_ALLOC_SYSTEM;
 		z->zmax = 0;
+		z->zmax_pcpu = 8192;
 	}
 
 
@@ -297,10 +366,11 @@ zinitna(vm_zone_t z, vm_object_t obj, char *name, int size,
 		z->zfreemin = PAGE_SIZE / z->zsize;
 
 	z->zpagecount = 0;
-	if (zalloc)
-		z->zalloc = zalloc;
-	else
-		z->zalloc = 1;
+
+	/*
+	 * Reduce kernel_map spam by allocating in chunks.
+	 */
+	z->zalloc = ZONE_MAXPGLOAD;
 
 	/*
 	 * Populate the interrrupt zone at creation time rather than
@@ -309,8 +379,9 @@ zinitna(vm_zone_t z, vm_object_t obj, char *name, int size,
 	if (z->zflags & ZONE_INTERRUPT) {
 		void *buf;
 
-		buf = zget(z);
-		zfree(z, buf);
+		buf = zget(z, NULL);
+		if (buf)
+			zfree(z, buf);
 	}
 
 	return 1;
@@ -326,7 +397,7 @@ zinitna(vm_zone_t z, vm_object_t obj, char *name, int size,
  * No requirements.
  */
 vm_zone_t
-zinit(char *name, int size, int nentries, int flags, int zalloc)
+zinit(char *name, size_t size, long nentries, uint32_t flags)
 {
 	vm_zone_t z;
 
@@ -335,8 +406,7 @@ zinit(char *name, int size, int nentries, int flags, int zalloc)
 		return NULL;
 
 	z->zflags = 0;
-	if (zinitna(z, NULL, name, size, nentries,
-	            flags & ~ZONE_DESTROYABLE, zalloc) == 0) {
+	if (zinitna(z, name, size, nentries, flags & ~ZONE_DESTROYABLE) == 0) {
 		kfree(z, M_ZONE);
 		return NULL;
 	}
@@ -354,24 +424,21 @@ zinit(char *name, int size, int nentries, int flags, int zalloc)
  * Called from the low level boot code only.
  */
 void
-zbootinit(vm_zone_t z, char *name, int size, void *item, int nitems)
+zbootinit(vm_zone_t z, char *name, size_t size, void *item, long nitems)
 {
-	int i;
+	long i;
 
-	bzero(z->zitems_pcpu, sizeof(z->zitems_pcpu));
-	bzero(z->zfreecnt_pcpu, sizeof(z->zfreecnt_pcpu));
-
+	spin_init(&z->zspin, "zbootinit");
+	lockinit(&z->zgetlk, "zgetlk", 0, LK_CANRECURSE);
+	bzero(z->zpcpu, sizeof(z->zpcpu));
 	z->zname = name;
 	z->zsize = size;
 	z->zpagemax = 0;
-	z->zobj = NULL;
 	z->zflags = ZONE_BOOT;
 	z->zfreemin = 0;
 	z->zallocflag = 0;
 	z->zpagecount = 0;
 	z->zalloc = 0;
-	z->znalloc = 0;
-	spin_init(&z->zlock, "zbootinit");
 
 	bzero(item, (size_t)nitems * z->zsize);
 	z->zitems = NULL;
@@ -400,8 +467,7 @@ zbootinit(vm_zone_t z, char *name, int size, void *item, int nitems)
 void
 zdestroy(vm_zone_t z)
 {
-	vm_page_t m;
-	int i;
+	vm_pindex_t i;
 
 	if (z == NULL)
 		panic("zdestroy: null zone");
@@ -415,45 +481,16 @@ zdestroy(vm_zone_t z)
 	/*
 	 * Release virtual mappings, physical memory and update sysctl stats.
 	 */
-	if (z->zflags & ZONE_INTERRUPT) {
-		/*
-		 * Pages mapped via pmap_kenter() must be removed from the
-		 * kernel_pmap() before calling kmem_free() to avoid issues
-		 * with kernel_pmap.pm_stats.resident_count.
-		 */
-		pmap_qremove(z->zkva, z->zpagemax);
-		vm_object_hold(z->zobj);
-		for (i = 0; i < z->zpagecount; ++i) {
-			m = vm_page_lookup_busy_wait(z->zobj, i, TRUE, "vmzd");
-			vm_page_unwire(m, 0);
-			vm_page_free(m);
-		}
-
-		/*
-		 * Free the mapping.
-		 */
-		kmem_free(&kernel_map, z->zkva,
-			  (size_t)z->zpagemax * PAGE_SIZE);
-		atomic_subtract_long(&zone_kmem_kvaspace,
-				     (size_t)z->zpagemax * PAGE_SIZE);
-
-		/*
-		 * Free the backing object and physical pages.
-		 */
-		vm_object_deallocate(z->zobj);
-		vm_object_drop(z->zobj);
-		atomic_subtract_int(&zone_kmem_pages, z->zpagecount);
-	} else {
-		for (i=0; i < z->zkmcur; i++) {
-			kmem_free(&kernel_map, z->zkmvec[i],
-				  (size_t)z->zalloc * PAGE_SIZE);
-			atomic_subtract_int(&zone_kern_pages, z->zalloc);
-		}
-		if (z->zkmvec != NULL)
-			kfree(z->zkmvec, M_ZONE);
+	KKASSERT((z->zflags & ZONE_INTERRUPT) == 0);
+	for (i = 0; i < z->zkmcur; i++) {
+		kmem_free(&kernel_map, z->zkmvec[i],
+			  (size_t)z->zalloc * PAGE_SIZE);
+		atomic_subtract_long(&zone_kern_pages, z->zalloc);
 	}
+	if (z->zkmvec != NULL)
+		kfree(z->zkmvec, M_ZONE);
 
-	spin_uninit(&z->zlock);
+	spin_uninit(&z->zspin);
 	kfree(z, M_ZONE);
 }
 
@@ -471,56 +508,103 @@ zdestroy(vm_zone_t z)
 /*
  * Internal zone routine.  Not to be called from external (non vm_zone) code.
  *
+ * This function may return NULL.
+ *
  * No requirements.
  */
 static void *
-zget(vm_zone_t z)
+zget(vm_zone_t z, int *tryagainp)
 {
-	int i;
+	vm_page_t pgs[ZONE_MAXPGLOAD];
 	vm_page_t m;
-	int nitems;
-	int npages;
-	int savezpc;
+	long nitems;
+	long savezpc;
 	size_t nbytes;
 	size_t noffset;
 	void *item;
+	vm_pindex_t npages;
+	vm_pindex_t nalloc;
+	vm_pindex_t i;
 
 	if (z == NULL)
 		panic("zget: null zone");
+
+	/*
+	 * We need an encompassing per-zone lock for zget() refills.
+	 *
+	 * Without this we wind up locking on the vm_map inside kmem_alloc*()
+	 * prior to any entries actually being added to the zone, potentially
+	 * exhausting the per-cpu cache of vm_map_entry's when multiple threads
+	 * are blocked on the same lock on the same cpu.
+	 */
+	if ((z->zflags & ZONE_INTERRUPT) == 0) {
+		if (lockmgr(&z->zgetlk, LK_EXCLUSIVE | LK_SLEEPFAIL)) {
+			*tryagainp = 1;
+			return NULL;
+		}
+	}
 
 	if (z->zflags & ZONE_INTERRUPT) {
 		/*
 		 * Interrupt zones do not mess with the kernel_map, they
 		 * simply populate an existing mapping.
 		 *
-		 * First reserve the required space.
+		 * First allocate as many pages as we can, stopping at
+		 * our limit or if the page allocation fails.  Try to
+		 * avoid exhausting the interrupt free minimum by backing
+		 * off to normal page allocations after a certain point.
 		 */
-		vm_object_hold(z->zobj);
+		for (i = 0; i < ZONE_MAXPGLOAD && i < z->zalloc; ++i) {
+			if (i < 4) {
+				m = vm_page_alloc(NULL,
+						  mycpu->gd_rand_incr++,
+						  z->zallocflag);
+			} else {
+				m = vm_page_alloc(NULL,
+						  mycpu->gd_rand_incr++,
+						  VM_ALLOC_NORMAL |
+						  VM_ALLOC_SYSTEM);
+			}
+			if (m == NULL)
+				break;
+			pgs[i] = m;
+		}
+		nalloc = i;
+
+		/*
+		 * Account for the pages.
+		 *
+		 * NOTE! Do not allow overlap with a prior page as it
+		 *	 may still be undergoing allocation on another
+		 *	 cpu.
+		 */
+		spin_lock(&z->zspin);
 		noffset = (size_t)z->zpagecount * PAGE_SIZE;
-		noffset -= noffset % z->zsize;
+		/* noffset -= noffset % z->zsize; */
 		savezpc = z->zpagecount;
-		if (z->zpagecount + z->zalloc > z->zpagemax)
+
+		/*
+		 * Track total memory use and kmem offset.
+		 */
+		if (z->zpagecount + nalloc > z->zpagemax)
 			z->zpagecount = z->zpagemax;
 		else
-			z->zpagecount += z->zalloc;
+			z->zpagecount += nalloc;
+
 		item = (char *)z->zkva + noffset;
 		npages = z->zpagecount - savezpc;
 		nitems = ((size_t)(savezpc + npages) * PAGE_SIZE - noffset) /
 			 z->zsize;
-		atomic_add_int(&zone_kmem_pages, npages);
+		atomic_add_long(&zone_kmem_pages, npages);
+		spin_unlock(&z->zspin);
 
 		/*
-		 * Now allocate the pages.  Note that we can block in the
-		 * loop, so we've already done all the necessary calculations
-		 * and reservations above.
+		 * Enter the pages into the reserved KVA space.
 		 */
 		for (i = 0; i < npages; ++i) {
 			vm_offset_t zkva;
 
-			m = vm_page_alloc(z->zobj, savezpc + i, z->zallocflag);
-			KKASSERT(m != NULL);
-			/* note: z might be modified due to blocking */
-
+			m = pgs[i];
 			KKASSERT(m->queue == PQ_NONE);
 			m->valid = VM_PAGE_BITS_ALL;
 			vm_page_wire(m);
@@ -530,7 +614,10 @@ zget(vm_zone_t z)
 			pmap_kenter(zkva, VM_PAGE_TO_PHYS(m));
 			bzero((void *)zkva, PAGE_SIZE);
 		}
-		vm_object_drop(z->zobj);
+		for (i = npages; i < nalloc; ++i) {
+			m = pgs[i];
+			vm_page_free(m);
+		}
 	} else if (z->zflags & ZONE_SPECIAL) {
 		/*
 		 * The special zone is the one used for vm_map_entry_t's.
@@ -540,12 +627,14 @@ zget(vm_zone_t z)
 		 * by vm_map_entry_reserve_cpu_init().
 		 */
 		nbytes = (size_t)z->zalloc * PAGE_SIZE;
+		z->zpagecount += z->zalloc;	/* Track total memory use */
 
-		item = (void *)kmem_alloc3(&kernel_map, nbytes, KM_KRESERVE);
+		item = (void *)kmem_alloc3(&kernel_map, nbytes,
+					   VM_SUBSYS_ZALLOC, KM_KRESERVE);
 
 		/* note: z might be modified due to blocking */
 		if (item != NULL) {
-			zone_kern_pages += z->zalloc;	/* not MP-safe XXX */
+			atomic_add_long(&zone_kern_pages, z->zalloc);
 			bzero(item, nbytes);
 		} else {
 			nbytes = 0;
@@ -556,12 +645,14 @@ zget(vm_zone_t z)
 		 * Otherwise allocate KVA from the kernel_map.
 		 */
 		nbytes = (size_t)z->zalloc * PAGE_SIZE;
+		z->zpagecount += z->zalloc;	/* Track total memory use */
 
-		item = (void *)kmem_alloc3(&kernel_map, nbytes, 0);
+		item = (void *)kmem_alloc3(&kernel_map, nbytes,
+					   VM_SUBSYS_ZALLOC, 0);
 
 		/* note: z might be modified due to blocking */
 		if (item != NULL) {
-			zone_kern_pages += z->zalloc;	/* not MP-safe XXX */
+			atomic_add_long(&zone_kern_pages, z->zalloc);
 			bzero(item, nbytes);
 
 			if (z->zflags & ZONE_DESTROYABLE) {
@@ -580,12 +671,46 @@ zget(vm_zone_t z)
 		nitems = nbytes / z->zsize;
 	}
 
-	spin_lock(&z->zlock);
-	z->ztotal += nitems;
 	/*
-	 * Save one for immediate allocation
+	 * Enter any new pages into the pool, reserving one, or get the
+	 * item from the existing pool.
 	 */
+	spin_lock(&z->zspin);
+	z->ztotal += nitems;
+
+	/*
+	 * The zone code may need to allocate kernel memory, which can
+	 * recurse zget() infinitely if we do not handle it properly.
+	 * We deal with this by directly repopulating the pcpu vm_map_entry
+	 * cache.
+	 */
+	if (nitems > 1 && (z->zflags & ZONE_SPECIAL)) {
+		struct globaldata *gd = mycpu;
+		vm_map_entry_t entry;
+
+		/*
+		 * Make sure we have enough structures in gd_vme_base to handle
+		 * the reservation request.
+		 *
+		 * The critical section protects access to the per-cpu gd.
+		 */
+		crit_enter();
+		while (gd->gd_vme_avail < 2 && nitems > 1) {
+			entry = item;
+			MAPENT_FREELIST(entry) = gd->gd_vme_base;
+			gd->gd_vme_base = entry;
+			atomic_add_int(&gd->gd_vme_avail, 1);
+			item = (uint8_t *)item + z->zsize;
+			--nitems;
+		}
+		crit_exit();
+	}
+
 	if (nitems != 0) {
+		/*
+		 * Enter pages into the pool saving one for immediate
+		 * allocation.
+		 */
 		nitems -= 1;
 		for (i = 0; i < nitems; i++) {
 			((void **)item)[0] = z->zitems;
@@ -596,8 +721,11 @@ zget(vm_zone_t z)
 			item = (uint8_t *)item + z->zsize;
 		}
 		z->zfreecnt += nitems;
-		z->znalloc++;
+		++z->znalloc;
 	} else if (z->zfreecnt > 0) {
+		/*
+		 * Get an item from the existing pool.
+		 */
 		item = z->zitems;
 		z->zitems = ((void **)item)[0];
 #ifdef INVARIANTS
@@ -605,20 +733,25 @@ zget(vm_zone_t z)
 			zerror(ZONE_ERROR_NOTFREE);
 		((void **) item)[1] = NULL;
 #endif
-		z->zfreecnt--;
-		z->znalloc++;
+		--z->zfreecnt;
+		++z->znalloc;
 	} else {
+		/*
+		 * No items available.
+		 */
 		item = NULL;
 	}
-	spin_unlock(&z->zlock);
+	spin_unlock(&z->zspin);
 
 	/*
-	 * A special zone may have used a kernel-reserved vm_map_entry.  If
-	 * so we have to be sure to recover our reserve so we don't run out.
-	 * We will panic if we run out.
+	 * Release the per-zone global lock after the items have been
+	 * added.  Any other threads blocked in zget()'s zgetlk will
+	 * then retry rather than potentially exhaust the per-cpu cache
+	 * of vm_map_entry structures doing their own kmem_alloc() calls,
+	 * or allocating excessive amounts of space unnecessarily.
 	 */
-	if (z->zflags & ZONE_SPECIAL)
-		vm_map_entry_reserve(0);
+	if ((z->zflags & ZONE_INTERRUPT) == 0)
+		lockmgr(&z->zgetlk, LK_RELEASE);
 
 	return item;
 }
@@ -629,10 +762,10 @@ zget(vm_zone_t z)
 static int
 sysctl_vm_zone(SYSCTL_HANDLER_ARGS)
 {
-	int error=0;
 	vm_zone_t curzone;
 	char tmpbuf[128];
 	char tmpname[14];
+	int error = 0;
 
 	ksnprintf(tmpbuf, sizeof(tmpbuf),
 	    "\nITEM            SIZE     LIMIT    USED    FREE  REQUESTS\n");
@@ -642,11 +775,12 @@ sysctl_vm_zone(SYSCTL_HANDLER_ARGS)
 
 	lwkt_gettoken(&vm_token);
 	LIST_FOREACH(curzone, &zlist, zlink) {
-		int i;
-		int n;
-		int len;
+		size_t i;
+		size_t len;
 		int offset;
-		int freecnt;
+		long freecnt;
+		long znalloc;
+		int n;
 
 		len = strlen(curzone->zname);
 		if (len >= (sizeof(tmpname) - 1))
@@ -662,14 +796,17 @@ sysctl_vm_zone(SYSCTL_HANDLER_ARGS)
 			tmpbuf[0] = '\n';
 		}
 		freecnt = curzone->zfreecnt;
-		for (n = 0; n < ncpus; ++n)
-			freecnt += curzone->zfreecnt_pcpu[n];
+		znalloc = curzone->znalloc;
+		for (n = 0; n < ncpus; ++n) {
+			freecnt += curzone->zpcpu[n].zfreecnt;
+			znalloc += curzone->zpcpu[n].znalloc;
+		}
 
 		ksnprintf(tmpbuf + offset, sizeof(tmpbuf) - offset,
-			"%s %6.6u, %8.8u, %6.6u, %6.6u, %8.8u\n",
+			"%s %6.6lu, %8.8lu, %6.6lu, %6.6lu, %8.8lu\n",
 			tmpname, curzone->zsize, curzone->zmax,
 			(curzone->ztotal - freecnt),
-			freecnt, curzone->znalloc);
+			freecnt, znalloc);
 
 		len = strlen((char *)tmpbuf);
 		if (LIST_NEXT(curzone, zlink) == NULL)
@@ -715,11 +852,11 @@ zerror(int error)
 SYSCTL_OID(_vm, OID_AUTO, zone, CTLTYPE_STRING|CTLFLAG_RD, \
 	NULL, 0, sysctl_vm_zone, "A", "Zone Info");
 
-SYSCTL_INT(_vm, OID_AUTO, zone_kmem_pages,
+SYSCTL_LONG(_vm, OID_AUTO, zone_kmem_pages,
 	CTLFLAG_RD, &zone_kmem_pages, 0, "Number of interrupt safe pages allocated by zone");
-SYSCTL_INT(_vm, OID_AUTO, zone_burst,
+SYSCTL_LONG(_vm, OID_AUTO, zone_burst,
 	CTLFLAG_RW, &zone_burst, 0, "Burst from depot to pcpu cache");
 SYSCTL_LONG(_vm, OID_AUTO, zone_kmem_kvaspace,
 	CTLFLAG_RD, &zone_kmem_kvaspace, 0, "KVA space allocated by zone");
-SYSCTL_INT(_vm, OID_AUTO, zone_kern_pages,
+SYSCTL_LONG(_vm, OID_AUTO, zone_kern_pages,
 	CTLFLAG_RD, &zone_kern_pages, 0, "Number of non-interrupt safe pages allocated by zone");

@@ -1,22 +1,25 @@
 # NETBSD's libedit (BSD replacement for GNU readline)
 .include	"../Makefile.inc"
 
-LIB=		edit
-SHLIB_MAJOR=	5  		# NetBSD designates SHLIB_MAJOR as 3
+LIB=		private_edit
+SHLIB_MAJOR=	6
 SHLIBDIR?=	/lib
+PRIVATELIB=	shpub
 
 SRCDIR= 	${BASEDIR}/src
 .PATH:		${SRCDIR}
 
 CFLAGS+=	-I${SRCDIR} -I${.CURDIR} -I${.OBJDIR}
 
+CFLAGS+=	-I${_SHLIBDIRPREFIX}/usr/include/priv/ncurses
 DPADD=		${LIBNCURSES}
-LDADD=		-lncurses
+LDADD=		-lprivate_ncurses
+LDFLAGS+=	${PRIVATELIB_LDFLAGS}
 
 WARNS?=		2
 
-.if defined(RELEASE36)
-SHLIB_MAJOR=	6
+# DO NOT ENABLE
+.if 0
 VERSION_DEF=	${.CURDIR}/Versions.def
 SYMBOL_MAPS=	${.CURDIR}/Symbol.map
 .endif
@@ -38,65 +41,23 @@ SRCS+=		chared.c \
 		terminal.c \
 		tty.c \
 		vi.c \
-		fgetln.c \
-		strlcat.c \
-		strlcpy.c \
-		unvis.c \
-		vis.c \
-		wcsdup.c \
 		tokenizer.c \
 		history.c \
 		filecomplete.c \
 		readline.c \
+		literal.c \
 		eln.c
 
-SRCS+=		common.h emacs.h fcns.h help.h vi.h
-SRCS+=  	fcns.c help.c tokenizern.c historyn.c
+SRCS+=		tokenizern.c historyn.c
 
-MAN=		editline.3 editrc.5
+SRCS+=		common.h emacs.h fcns.h func.h help.h vi.h
 
-MLINKS= 	editline.3 el_init.3 \
-		editline.3 el_end.3 \
-		editline.3 el_reset.3 \
-		editline.3 el_gets.3 \
-		editline.3 el_getc.3 \
-		editline.3 el_push.3 \
-		editline.3 el_parse.3 \
-		editline.3 el_set.3 \
-		editline.3 el_get.3 \
-		editline.3 el_source.3 \
-		editline.3 el_resize.3 \
-		editline.3 el_line.3 \
-		editline.3 el_insertstr.3 \
-		editline.3 el_deletestr.3 \
-		editline.3 history_init.3 \
-		editline.3 history_end.3 \
-		editline.3 history.3 \
-		editline.3 tok_init.3 \
-		editline.3 tok_end.3 \
-		editline.3 tok_reset.3 \
-		editline.3 tok_line.3 \
-		editline.3 tok_str.3
+INCS=		histedit.h
+INCSDIR=	${INCLUDEDIR}/priv
 
-MLINKS+=	editline.3 el_wgets.3 \
-		editline.3 el_wgetc.3 \
-		editline.3 el_wpush.3 \
-		editline.3 el_wparse.3 \
-		editline.3 el_wset.3 \
-		editline.3 el_wget.3 \
-		editline.3 el_wline.3 \
-		editline.3 el_winsertstr.3 \
-		editline.3 el_wdeletestr.3 \
-		editline.3 history_winit.3 \
-		editline.3 history_wend.3 \
-		editline.3 history_w.3 \
-		editline.3 tok_winit.3 \
-		editline.3 tok_wend.3 \
-		editline.3 tok_wreset.3 \
-		editline.3 tok_wline.3 \
-		editline.3 tok_wstr.3
+MAN=		editrc.5
 
-CLEANFILES+=	common.h emacs.h fcns.c fcns.h help.c help.h vi.h editline.c
+CLEANFILES+=	common.h emacs.h fcns.h func.h help.h vi.h
 AHDR=		vi.h emacs.h common.h
 ASRC=		${SRCDIR}/vi.c ${SRCDIR}/emacs.c ${SRCDIR}/common.c
 
@@ -112,19 +73,10 @@ common.h:
 fcns.h: ${AHDR}
 	AWK=awk sh ${SRCDIR}/makelist -fh ${AHDR} > ${.TARGET}
 
-help.h:
-	AWK=awk sh ${SRCDIR}/makelist -bh ${ASRC} > ${.TARGET}
-
-fcns.c: ${AHDR}
+func.h: ${AHDR}
 	AWK=awk sh ${SRCDIR}/makelist -fc ${AHDR} > ${.TARGET}
 
-help.c: ${ASRC}
-	AWK=awk sh ${SRCDIR}/makelist -bc ${ASRC} > ${.TARGET}
-
-tokenizern.c: tokenizer.c
-	AWK=awk sh ${SRCDIR}/makelist -n ${.ALLSRC} > ${.TARGET}
-
-historyn.c: history.c
-	AWK=awk sh ${SRCDIR}/makelist -n ${.ALLSRC} > ${.TARGET}
+help.h:
+	AWK=awk sh ${SRCDIR}/makelist -bh ${ASRC} > ${.TARGET}
 
 .include <bsd.lib.mk>

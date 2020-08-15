@@ -1,6 +1,5 @@
 /*	$NetBSD: lance.c,v 1.34 2005/12/24 20:27:30 perry Exp $	*/
 /*	$FreeBSD: src/sys/dev/le/lance.c,v 1.2 2006/05/16 21:04:01 marius Exp $	*/
-/*	$DragonFly: src/sys/dev/netif/lnc/lance.c,v 1.7 2008/05/14 11:59:20 sephe Exp $	*/
 
 
 /*-
@@ -78,6 +77,7 @@
 #include <sys/bus.h>
 #include <sys/endian.h>
 #include <sys/lock.h>
+#include <sys/malloc.h>	/* for M_NOWAIT */
 #include <sys/mbuf.h>
 #include <sys/socket.h>
 #include <sys/sockio.h>
@@ -346,7 +346,7 @@ lance_get(struct lance_softc *sc, int boff, int totlen)
 	}
 
 	do {
-		newm = m_getl(totlen, MB_DONTWAIT, MT_DATA,
+		newm = m_getl(totlen, M_NOWAIT, MT_DATA,
 			      m0 == NULL ? M_PKTHDR : 0, &mlen);
 		if (newm == NULL)
 			goto bad;

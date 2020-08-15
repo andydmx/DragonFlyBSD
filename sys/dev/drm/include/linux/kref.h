@@ -2,7 +2,7 @@
  * Copyright (c) 2010 Isilon Systems, Inc.
  * Copyright (c) 2010 iX Systems, Inc.
  * Copyright (c) 2010 Panasas, Inc.
- * Copyright (c) 2013 François Tigeot
+ * Copyright (c) 2013-2020 François Tigeot <ftigeot@wolfpond.org>
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -29,6 +29,10 @@
 #ifndef _LINUX_KREF_H_
 #define _LINUX_KREF_H_
 
+#include <linux/spinlock.h>
+
+#include <linux/mutex.h>
+
 #include <sys/refcount.h>
 
 struct kref {
@@ -40,6 +44,12 @@ kref_init(struct kref *kref)
 {
 
 	refcount_init(&kref->refcount.counter, 1);
+}
+
+static inline unsigned int
+kref_read(const struct kref *kref)
+{
+	return atomic_read(&kref->refcount);
 }
 
 static inline void
@@ -77,6 +87,23 @@ kref_sub(struct kref *kref, unsigned int count,
 static inline int __must_check kref_get_unless_zero(struct kref *kref)
 {
 	return atomic_add_unless(&kref->refcount, 1, 0);
+}
+
+static inline int kref_put_mutex(struct kref *kref,
+				 void (*release)(struct kref *kref),
+				 struct lock *lock)
+{
+	if (!atomic_add_unless(&kref->refcount, -1, 1)) {
+		mutex_lock(lock);
+		if (likely(atomic_dec_and_test(&kref->refcount))) {
+			release(kref);
+			return 1;
+		}
+		mutex_unlock(lock);
+		return 0;
+	}
+
+	return 0;
 }
 
 #endif /* _LINUX_KREF_H_ */

@@ -1,16 +1,23 @@
 # $FreeBSD: src/usr.sbin/keyserv/Makefile,v 1.5.2.1 2001/04/25 12:09:50 ru Exp $
-# $DragonFly: src/usr.sbin/keyserv/Makefile,v 1.5 2008/11/03 00:25:45 pavalos Exp $
 
 PROG=	keyserv
 SRCS=	keyserv.c setkey.c crypt_svc.c crypt_server.c crypt.h
-WARNS?=	1
+WARNS?=	2
 
 MAN=	keyserv.8
 
+# DO NOT USE -static, dlopen() for _des_crypt symbol
+# XXX .undef NOSHARED
+
 CFLAGS+= -DKEYSERV_RANDOM -DBROKEN_DES -I.
 
-DPADD=	${LIBCRYPTO} ${LIBRPCSVC}
-LDADD=	-lcrypto -lrpcsvc
+DPADD=	${LIBRPCSVC}
+LDADD=	-lrpcsvc
+
+DPADD+=		${LIBCRYPTO}
+LDADD+=		-lprivate_crypto
+LDFLAGS+=	${PRIVATELIB_LDFLAGS}
+CFLAGS+=	-I${.CURDIR}/../../crypto/libressl/include
 
 RPCDIR=	${DESTDIR}/usr/include/rpcsvc
 

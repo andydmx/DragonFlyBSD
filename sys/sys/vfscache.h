@@ -43,11 +43,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -108,11 +104,11 @@ enum vtype	{ VNON, VREG, VDIR, VBLK, VCHR, VLNK, VSOCK, VFIFO, VBAD,
  * and should NEVER be inspected by the kernel.
  */
 enum vtagtype	{
-	VT_NON, VT_UFS, VT_NFS, VT_MFS, VT_PC, VT_LFS, VT_LOFS, VT_FDESC,
-	VT_PORTAL, VT_NULL, VT_UNUSED10, VT_KERNFS, VT_PROCFS, VT_AFS,
-	VT_ISOFS, VT_UNION, VT_MSDOSFS, VT_TFS, VT_VFS, VT_CODA, VT_NTFS,
-	VT_HPFS, VT_SMBFS, VT_UDF, VT_EXT2FS, VT_SYNTH,
-	VT_HAMMER, VT_HAMMER2, VT_DEVFS, VT_TMPFS
+	VT_NON, VT_UFS, VT_NFS, VT_MFS, VT_UNUSED4, VT_UNUSED5, VT_UNUSED6,
+	VT_UNUSED7, VT_UNUSED8, VT_NULL, VT_UNUSED10, VT_UNUSED11, VT_PROCFS,
+	VT_UNUSED13, VT_ISOFS, VT_UNUSED15, VT_MSDOSFS, VT_UNUSED17, VT_VFS,
+	VT_UNUSED19, VT_NTFS, VT_HPFS, VT_SMBFS, VT_UDF, VT_EXT2FS, VT_SYNTH,
+	VT_HAMMER, VT_HAMMER2, VT_DEVFS, VT_TMPFS, VT_AUTOFS, VT_FUSE
 };
 
 /*
@@ -127,7 +123,7 @@ struct vattr {
 	u_short		va_mode;	/* files access mode and type */
 	uid_t		va_uid;		/* owner user id */
 	gid_t		va_gid;		/* owner group id */
-	udev_t		va_fsid;	/* file system id */
+	dev_t		va_fsid;	/* file system id */
 	ino_t		va_fileid;	/* file id */
 	u_quad_t	va_size;	/* file size in bytes */
 	long		va_blocksize;	/* blocksize preferred for i/o */
@@ -142,10 +138,27 @@ struct vattr {
 	u_quad_t	va_filerev;	/* file modification number */
 	u_int		va_vaflags;	/* operations flags, see below */
 	long		va_spare;	/* remain quad aligned */
-	int64_t		va_unused01;
+	uint32_t	va_fuseflags;	/* used by FUSE */
+	uint32_t	va_unused01;
 	uuid_t		va_uid_uuid;	/* native uuids if available */
 	uuid_t		va_gid_uuid;
 	uuid_t		va_fsid_uuid;
+};
+
+/*
+ * A light version of vattr used by the fast-path GETATTR_LITE()
+ *
+ * NOTE: If adjusting fields in this structure, also adjust in
+ *	 vop_stdgetattr_lite() and kern_futimes().
+ */
+struct vattr_lite {
+	enum vtype	va_type;	/* vnode type (for create) */
+	u_int64_t	va_nlink;	/* number of references to file */
+	u_short		va_mode;	/* files access mode and type */
+	uid_t		va_uid;		/* owner user id */
+	gid_t		va_gid;		/* owner group id */
+	u_quad_t	va_size;	/* file size in bytes */
+	u_long		va_flags;	/* flags defined for file */
 };
 
 /*

@@ -10,7 +10,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -28,17 +28,14 @@
  *
  *	@(#)syslimits.h	8.1 (Berkeley) 6/2/93
  * $FreeBSD: src/sys/sys/syslimits.h,v 1.23 2007/05/29 15:14:46 cognet Exp $
- * $DragonFly: src/sys/sys/syslimits.h,v 1.4 2005/08/23 17:44:22 dillon Exp $
  */
 
 #ifndef _SYS_SYSLIMITS_H_
 #define _SYS_SYSLIMITS_H_
 
 #if !defined(_KERNEL) && !defined(_LIMITS_H_) && !defined(_SYS_PARAM_H_)
-#ifndef _SYS_CDEFS_H_
-#error this file needs sys/cdefs.h as a prerequisite
-#endif
-#ifdef __CC_SUPPORTS_WARNING
+#include <sys/cdefs.h>
+#if __GNUC_PREREQ__(3, 0)
 #warning "No user-serviceable parts inside."
 #endif
 #endif

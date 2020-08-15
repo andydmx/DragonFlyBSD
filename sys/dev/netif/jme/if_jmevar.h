@@ -25,7 +25,6 @@
  * SUCH DAMAGE.
  *
  * $FreeBSD: src/sys/dev/jme/if_jmevar.h,v 1.1 2008/05/27 01:42:01 yongari Exp $
- * $DragonFly: src/sys/dev/netif/jme/if_jmevar.h,v 1.8 2008/11/26 11:55:18 sephe Exp $
  */
 
 #ifndef	_IF_JMEVAR_H
@@ -231,6 +230,8 @@ struct jme_msix_data {
     (sizeof(struct jme_desc) * (rdata)->jme_rx_desc_cnt)
 #define	JME_SSB_SIZE		sizeof(struct jme_ssb)
 
+#define JME_RDRTABLE_SIZE	(RSSTBL_REGSIZE * RSSTBL_NREGS)
+
 /*
  * Software state per device.
  */
@@ -251,9 +252,9 @@ struct jme_softc {
 	int			jme_msix_cnt;
 	uint32_t		jme_msinum[JME_MSINUM_CNT];
 	int			jme_tx_cpuid;
+	struct if_ringmap	*jme_rx_rmap;
+	struct if_ringmap	*jme_tx_rmap;
 
-	int			jme_npoll_rxoff;
-	int			jme_npoll_txoff;
 
 	device_t		jme_miibus;
 	int			jme_phyaddr;
@@ -291,8 +292,7 @@ struct jme_softc {
 	uint32_t		jme_txcsr;
 	uint32_t		jme_rxcsr;
 
-	struct sysctl_ctx_list	jme_sysctl_ctx;
-	struct sysctl_oid	*jme_sysctl_tree;
+	int			jme_rdrtable[JME_RDRTABLE_SIZE];
 
 	/*
 	 * Sysctl variables

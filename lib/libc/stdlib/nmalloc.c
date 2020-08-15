@@ -1,10 +1,11 @@
 /*
  * NMALLOC.C	- New Malloc (ported from kernel slab allocator)
  *
- * Copyright (c) 2003,2004,2009,2010 The DragonFly Project. All rights reserved.
+ * Copyright (c) 2003,2004,2009,2010-2019 The DragonFly Project,
+ * All rights reserved.
  *
  * This code is derived from software contributed to The DragonFly Project
- * by Matthew Dillon <dillon@backplane.com> and by 
+ * by Matthew Dillon <dillon@backplane.com> and by
  * Venkatesh Srinivas <me@endeavour.zapto.org>.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -63,7 +64,7 @@
  *	8192-16383	1024		8
  *	16384-32767	2048		8
  *
- *	Allocations >= ZoneLimit (16K) go directly to mmap and a hash table
+ *	Allocations >= ZoneLimit go directly to mmap and a hash table
  *	is used to locate for free.  One and Two-page allocations use the
  *	zone mechanic to avoid excessive mmap()/munmap() calls.
  *
@@ -81,8 +82,14 @@
  * Multithreaded enhancements for small allocations introduced August 2010.
  * These are in the spirit of 'libumem'. See:
  *	Bonwick, J.; Adams, J. (2001). "Magazines and Vmem: Extending the
- *	slab allocator to many CPUs and arbitrary resources". In Proc. 2001 
- * 	USENIX Technical Conference. USENIX Association.
+ *	slab allocator to many CPUs and arbitrary resources". In Proc. 2001
+ *	USENIX Technical Conference. USENIX Association.
+ *
+ * Oversized allocations employ the BIGCACHE mechanic whereby large
+ * allocations may be handed significantly larger buffers, allowing them
+ * to avoid mmap/munmap operations even through significant realloc()s.
+ * The excess space is only trimmed if too many large allocations have been
+ * given this treatment.
  *
  * TUNING
  *
@@ -90,7 +97,7 @@
  * containing various flags to tune nmalloc.
  *
  * 'U'   / ['u']	Generate / do not generate utrace entries for ktrace(1)
- *			This will generate utrace events for all malloc, 
+ *			This will generate utrace events for all malloc,
  *			realloc, and free calls. There are tools (mtrplay) to
  *			replay and allocation pattern or to graph heap structure
  *			(mtrgraph) which can interpret these logs.
@@ -99,18 +106,16 @@
  *			reallocf will be initialized to 0. This is intended for
  *			debugging and will affect performance negatively.
  * 'H'	/  ['h']	Pass a hint to the kernel about pages unused by the
- *			allocation functions. 
+ *			allocation functions.
  */
 
 /* cc -shared -fPIC -g -O -I/usr/src/lib/libc/include -o nmalloc.so nmalloc.c */
 
-#include "libc_private.h"
-
+#include "namespace.h"
 #include <sys/param.h>
 #include <sys/types.h>
 #include <sys/mman.h>
 #include <sys/queue.h>
-#include <sys/uio.h>
 #include <sys/ktrace.h>
 #include <stdio.h>
 #include <stdint.h>
@@ -122,9 +127,18 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <pthread.h>
-
-#include "spinlock.h"
+#include <machine/atomic.h>
 #include "un-namespace.h"
+
+#include "libc_private.h"
+#include "spinlock.h"
+
+void __free(void *);
+void *__malloc(size_t);
+void *__calloc(size_t, size_t);
+void *__realloc(void *, size_t);
+void *__aligned_alloc(size_t, size_t);
+int __posix_memalign(void **, size_t, size_t);
 
 /*
  * Linked list of large allocations
@@ -132,6 +146,7 @@
 typedef struct bigalloc {
 	struct bigalloc *next;	/* hash link */
 	void	*base;		/* base pointer */
+	u_long	active;		/* bytes active */
 	u_long	bytes;		/* bytes allocated */
 } *bigalloc_t;
 
@@ -139,12 +154,10 @@ typedef struct bigalloc {
  * Note that any allocations which are exact multiples of PAGE_SIZE, or
  * which are >= ZALLOC_ZONE_LIMIT, will fall through to the kmem subsystem.
  */
+#define MAX_SLAB_PAGEALIGN	(2 * PAGE_SIZE)	/* max slab for PAGE_SIZE*n */
 #define ZALLOC_ZONE_LIMIT	(16 * 1024)	/* max slab-managed alloc */
-#define ZALLOC_MIN_ZONE_SIZE	(32 * 1024)	/* minimum zone size */
-#define ZALLOC_MAX_ZONE_SIZE	(128 * 1024)	/* maximum zone size */
-#define ZALLOC_ZONE_SIZE	(64 * 1024)
+#define ZALLOC_ZONE_SIZE	(64 * 1024)	/* zone size */
 #define ZALLOC_SLAB_MAGIC	0x736c6162	/* magic sanity */
-#define ZALLOC_SLAB_SLIDE	20		/* L1-cache skip */
 
 #if ZALLOC_ZONE_LIMIT == 16384
 #define NZONES			72
@@ -179,15 +192,11 @@ typedef struct slzone {
 	int		z_ZoneIndex;
 	int		z_Flags;
 	struct slchunk *z_PageAry[ZALLOC_ZONE_SIZE / PAGE_SIZE];
-#if defined(INVARIANTS)
-	__uint32_t	z_Bitmap[];	/* bitmap of free chunks / sanity */
-#endif
 } *slzone_t;
 
 typedef struct slglobaldata {
 	spinlock_t	Spinlock;
 	slzone_t	ZoneAry[NZONES];/* linked list of zones NFree > 0 */
-	int		JunkIndex;
 } *slglobaldata_t;
 
 #define SLZF_UNOTZEROD		0x0001
@@ -204,25 +213,33 @@ typedef struct slglobaldata {
 #define IN_SAME_PAGE_MASK	(~(intptr_t)PAGE_MASK | MIN_CHUNK_MASK)
 
 /*
- * The WEIRD_ADDR is used as known text to copy into free objects to
- * try to create deterministic failure cases if the data is accessed after
- * free.
- *
  * WARNING: A limited number of spinlocks are available, BIGXSIZE should
  *	    not be larger then 64.
  */
-#define WEIRD_ADDR      0xdeadc0de
-#define MAX_COPY        sizeof(weirdary)
-#define ZERO_LENGTH_PTR	((void *)&malloc_dummy_pointer)
-
 #define BIGHSHIFT	10			/* bigalloc hash table */
 #define BIGHSIZE	(1 << BIGHSHIFT)
 #define BIGHMASK	(BIGHSIZE - 1)
 #define BIGXSIZE	(BIGHSIZE / 16)		/* bigalloc lock table */
 #define BIGXMASK	(BIGXSIZE - 1)
 
+/*
+ * BIGCACHE caches oversized allocations.  Note that a linear search is
+ * performed, so do not make the cache too large.
+ *
+ * BIGCACHE will garbage-collect excess space when the excess exceeds the
+ * specified value.  A relatively large number should be used here because
+ * garbage collection is expensive.
+ */
+#define BIGCACHE	16
+#define BIGCACHE_MASK	(BIGCACHE - 1)
+#define BIGCACHE_LIMIT	(1024 * 1024)		/* size limit */
+#define BIGCACHE_EXCESS	(16 * 1024 * 1024)	/* garbage collect */
+
+#define CACHE_CHUNKS	32
+
 #define SAFLAG_ZERO	0x0001
 #define SAFLAG_PASSIVE	0x0002
+#define SAFLAG_MAGS	0x0004
 
 /*
  * Thread control
@@ -230,45 +247,53 @@ typedef struct slglobaldata {
 
 #define arysize(ary)	(sizeof(ary)/sizeof((ary)[0]))
 
-#define MASSERT(exp)	do { if (__predict_false(!(exp)))	\
-				_mpanic("assertion: %s in %s",	\
-				#exp, __func__);		\
-			    } while (0)
+/*
+ * The assertion macros try to pretty-print assertion failures
+ * which can be caused by corruption.  If a lock is held, we
+ * provide a macro that attempts to release it before asserting
+ * in order to prevent (e.g.) a reentrant SIGABRT calling malloc
+ * and deadlocking, resulting in the program freezing up.
+ */
+#define MASSERT(exp)				\
+	do { if (__predict_false(!(exp)))	\
+	    _mpanic("assertion: %s in %s",	\
+		    #exp, __func__);		\
+	} while (0)
+
+#define MASSERT_WTHUNLK(exp, unlk)		\
+	do { if (__predict_false(!(exp))) {	\
+	    unlk;				\
+	    _mpanic("assertion: %s in %s",	\
+		    #exp, __func__);		\
+	  }					\
+	} while (0)
 
 /*
- * Magazines 
+ * Magazines, arrange so the structure is roughly 4KB.
  */
-
-#define M_MAX_ROUNDS	64
-#define M_ZONE_ROUNDS	64
-#define M_LOW_ROUNDS	32
-#define M_INIT_ROUNDS	8
-#define M_BURST_FACTOR  8
-#define M_BURST_NSCALE	2
-
-#define M_BURST		0x0001
-#define M_BURST_EARLY	0x0002
+#define M_MAX_ROUNDS		(512 - 3)
+#define M_MIN_ROUNDS		16
+#define M_ZONE_INIT_ROUNDS	64
+#define M_ZONE_HYSTERESIS	32
 
 struct magazine {
 	SLIST_ENTRY(magazine) nextmagazine;
 
 	int		flags;
-	int 		capacity;	/* Max rounds in this magazine */
-	int 		rounds;		/* Current number of free rounds */ 
-	int		burst_factor;	/* Number of blocks to prefill with */
-	int 		low_factor;	/* Free till low_factor from full mag */
+	int		capacity;	/* Max rounds in this magazine */
+	int		rounds;		/* Current number of free rounds */
+	int		unused01;
 	void		*objects[M_MAX_ROUNDS];
 };
 
 SLIST_HEAD(magazinelist, magazine);
 
 static spinlock_t zone_mag_lock;
+static spinlock_t depot_spinlock;
 static struct magazine zone_magazine = {
-	.flags = M_BURST | M_BURST_EARLY,
-	.capacity = M_ZONE_ROUNDS,
+	.flags = 0,
+	.capacity = M_ZONE_INIT_ROUNDS,
 	.rounds = 0,
-	.burst_factor = M_BURST_FACTOR,
-	.low_factor = M_LOW_ROUNDS
 };
 
 #define MAGAZINE_FULL(mp)	(mp->rounds == mp->capacity)
@@ -276,9 +301,11 @@ static struct magazine zone_magazine = {
 #define MAGAZINE_EMPTY(mp)	(mp->rounds == 0)
 #define MAGAZINE_NOTEMPTY(mp)	(mp->rounds != 0)
 
-/* Each thread will have a pair of magazines per size-class (NZONES)
+/*
+ * Each thread will have a pair of magazines per size-class (NZONES)
  * The loaded magazine will support immediate allocations, the previous
- * magazine will either be full or empty and can be swapped at need */
+ * magazine will either be full or empty and can be swapped at need
+ */
 typedef struct magazine_pair {
 	struct magazine	*loaded;
 	struct magazine	*prev;
@@ -297,18 +324,6 @@ typedef struct thr_mags {
 	int		init;
 } thr_mags;
 
-/*
- * With this attribute set, do not require a function call for accessing
- * this variable when the code is compiled -fPIC. Empty for libc_rtld
- * (like __thread).
- */
-#ifdef __LIBC_RTLD
-#define TLS_ATTRIBUTE
-#else
-#define TLS_ATTRIBUTE __attribute__ ((tls_model ("initial-exec")))
-#endif
-
-static int mtmagazine_free_live;
 static __thread thr_mags thread_mags TLS_ATTRIBUTE;
 static pthread_key_t thread_mags_key;
 static pthread_once_t thread_mags_once = PTHREAD_ONCE_INIT;
@@ -325,27 +340,24 @@ static const int ZoneMask = ZALLOC_ZONE_SIZE - 1;
 static int opt_madvise = 0;
 static int opt_utrace = 0;
 static int g_malloc_flags = 0;
-static struct slglobaldata	SLGlobalData;
+static struct slglobaldata SLGlobalData;
 static bigalloc_t bigalloc_array[BIGHSIZE];
 static spinlock_t bigspin_array[BIGXSIZE];
+static volatile void *bigcache_array[BIGCACHE];		/* atomic swap */
+static volatile size_t bigcache_size_array[BIGCACHE];	/* SMP races ok */
+static volatile int bigcache_index;			/* SMP races ok */
 static int malloc_panic;
-static int malloc_dummy_pointer;
-
-static const int32_t weirdary[16] = {
-	WEIRD_ADDR, WEIRD_ADDR, WEIRD_ADDR, WEIRD_ADDR,
-	WEIRD_ADDR, WEIRD_ADDR, WEIRD_ADDR, WEIRD_ADDR,
-	WEIRD_ADDR, WEIRD_ADDR, WEIRD_ADDR, WEIRD_ADDR,
-	WEIRD_ADDR, WEIRD_ADDR, WEIRD_ADDR, WEIRD_ADDR
-};
+static size_t excess_alloc;				/* excess big allocs */
 
 static void *_slaballoc(size_t size, int flags);
 static void *_slabrealloc(void *ptr, size_t size);
 static void _slabfree(void *ptr, int, bigalloc_t *);
+static int _slabmemalign(void **memptr, size_t alignment, size_t size);
 static void *_vmem_alloc(size_t bytes, size_t align, int flags);
 static void _vmem_free(void *ptr, size_t bytes);
-static void *magazine_alloc(struct magazine *, int *);
+static void *magazine_alloc(struct magazine *);
 static int magazine_free(struct magazine *, void *);
-static void *mtmagazine_alloc(int zi);
+static void *mtmagazine_alloc(int zi, int flags);
 static int mtmagazine_free(int zi, void *);
 static void mtmagazine_init(void);
 static void mtmagazine_destructor(void *);
@@ -353,10 +365,6 @@ static slzone_t zone_alloc(int flags);
 static void zone_free(void *z);
 static void _mpanic(const char *ctl, ...) __printflike(1, 2);
 static void malloc_init(void) __constructor(101);
-#if defined(INVARIANTS)
-static void chunk_mark_allocated(slzone_t z, void *chunk);
-static void chunk_mark_free(slzone_t z, void *chunk);
-#endif
 
 struct nmalloc_utrace {
 	void *p;
@@ -374,19 +382,12 @@ struct nmalloc_utrace {
 		utrace(&ut, sizeof(ut));			\
 	}
 
-#ifdef INVARIANTS
-/*
- * If enabled any memory allocated without M_ZERO is initialized to -1.
- */
-static int  use_malloc_pattern;
-#endif
-
 static void
 malloc_init(void)
 {
 	const char *p = NULL;
 
-	if (issetugid() == 0) 
+	if (issetugid() == 0)
 		p = getenv("MALLOC_OPTIONS");
 
 	for (; p != NULL && *p != '\0'; p++) {
@@ -396,7 +397,7 @@ malloc_init(void)
 		case 'h':	opt_madvise = 0; break;
 		case 'H':	opt_madvise = 1; break;
 		case 'z':	g_malloc_flags = 0; break;
-		case 'Z': 	g_malloc_flags = SAFLAG_ZERO; break;
+		case 'Z':	g_malloc_flags = SAFLAG_ZERO; break;
 		default:
 			break;
 		}
@@ -425,12 +426,58 @@ _nmalloc_thr_init(void)
 	tp = &thread_mags;
 	tp->init = -1;
 
-	if (mtmagazine_free_live == 0) {
-		mtmagazine_free_live = 1;
-		pthread_once(&thread_mags_once, mtmagazine_init);
-	}
-	pthread_setspecific(thread_mags_key, tp);
+	_pthread_once(&thread_mags_once, mtmagazine_init);
+	_pthread_setspecific(thread_mags_key, tp);
 	tp->init = 1;
+}
+
+void
+_nmalloc_thr_prepfork(void)
+{
+	if (__isthreaded) {
+		_SPINLOCK(&zone_mag_lock);
+		_SPINLOCK(&depot_spinlock);
+	}
+}
+
+void
+_nmalloc_thr_parentfork(void)
+{
+	if (__isthreaded) {
+		_SPINUNLOCK(&depot_spinlock);
+		_SPINUNLOCK(&zone_mag_lock);
+	}
+}
+
+void
+_nmalloc_thr_childfork(void)
+{
+	if (__isthreaded) {
+		_SPINUNLOCK(&depot_spinlock);
+		_SPINUNLOCK(&zone_mag_lock);
+	}
+}
+
+/*
+ * Handle signal reentrancy safely whether we are threaded or not.
+ * This improves the stability for mono and will probably improve
+ * stability for other high-level languages which are becoming increasingly
+ * sophisticated.
+ *
+ * The sigblockall()/sigunblockall() implementation uses a counter on
+ * a per-thread shared user/kernel page, avoids system calls, and is thus
+ *  very fast.
+ */
+static __inline void
+nmalloc_sigblockall(void)
+{
+	sigblockall();
+}
+
+static __inline void
+nmalloc_sigunblockall(void)
+{
+	sigunblockall();
 }
 
 /*
@@ -451,17 +498,17 @@ slgd_unlock(slglobaldata_t slgd)
 }
 
 static __inline void
-depot_lock(magazine_depot *dp) 
+depot_lock(magazine_depot *dp __unused)
 {
 	if (__isthreaded)
-		_SPINLOCK(&dp->lock);
+		_SPINLOCK(&depot_spinlock);
 }
 
 static __inline void
-depot_unlock(magazine_depot *dp)
+depot_unlock(magazine_depot *dp __unused)
 {
 	if (__isthreaded)
-		_SPINUNLOCK(&dp->lock);
+		_SPINUNLOCK(&depot_spinlock);
 }
 
 static __inline void
@@ -553,6 +600,95 @@ bigalloc_unlock(void *ptr)
 }
 
 /*
+ * Find a bigcache entry that might work for the allocation.  SMP races are
+ * ok here except for the swap (that is, it is ok if bigcache_size_array[i]
+ * is wrong or if a NULL or too-small big is returned).
+ *
+ * Generally speaking it is ok to find a large entry even if the bytes
+ * requested are relatively small (but still oversized), because we really
+ * don't know *what* the application is going to do with the buffer.
+ */
+static __inline
+bigalloc_t
+bigcache_find_alloc(size_t bytes)
+{
+	bigalloc_t big = NULL;
+	size_t test;
+	int i;
+
+	for (i = 0; i < BIGCACHE; ++i) {
+		test = bigcache_size_array[i];
+		if (bytes <= test) {
+			bigcache_size_array[i] = 0;
+			big = atomic_swap_ptr(&bigcache_array[i], NULL);
+			break;
+		}
+	}
+	return big;
+}
+
+/*
+ * Free a bigcache entry, possibly returning one that the caller really must
+ * free.  This is used to cache recent oversized memory blocks.  Only
+ * big blocks smaller than BIGCACHE_LIMIT will be cached this way, so try
+ * to collect the biggest ones we can that are under the limit.
+ */
+static __inline
+bigalloc_t
+bigcache_find_free(bigalloc_t big)
+{
+	int i;
+	int j;
+	int b;
+
+	b = ++bigcache_index;
+	for (i = 0; i < BIGCACHE; ++i) {
+		j = (b + i) & BIGCACHE_MASK;
+		if (bigcache_size_array[j] < big->bytes) {
+			bigcache_size_array[j] = big->bytes;
+			big = atomic_swap_ptr(&bigcache_array[j], big);
+			break;
+		}
+	}
+	return big;
+}
+
+static __inline
+void
+handle_excess_big(void)
+{
+	int i;
+	bigalloc_t big;
+	bigalloc_t *bigp;
+
+	if (excess_alloc <= BIGCACHE_EXCESS)
+		return;
+
+	for (i = 0; i < BIGHSIZE; ++i) {
+		bigp = &bigalloc_array[i];
+		if (*bigp == NULL)
+			continue;
+		if (__isthreaded)
+			_SPINLOCK(&bigspin_array[i & BIGXMASK]);
+		for (big = *bigp; big; big = big->next) {
+			if (big->active < big->bytes) {
+				MASSERT_WTHUNLK((big->active & PAGE_MASK) == 0,
+				    _SPINUNLOCK(&bigspin_array[i & BIGXMASK]));
+				MASSERT_WTHUNLK((big->bytes & PAGE_MASK) == 0,
+				    _SPINUNLOCK(&bigspin_array[i & BIGXMASK]));
+				munmap((char *)big->base + big->active,
+				       big->bytes - big->active);
+				atomic_add_long(&excess_alloc,
+						big->active - big->bytes);
+				big->bytes = big->active;
+			}
+		}
+		if (__isthreaded)
+			_SPINUNLOCK(&bigspin_array[i & BIGXMASK]);
+	}
+}
+
+/*
  * Calculate the zone index for the allocation request size and set the
  * allocation request size to that particular zone's chunk size.
  */
@@ -560,10 +696,28 @@ static __inline int
 zoneindex(size_t *bytes, size_t *chunking)
 {
 	size_t n = (unsigned int)*bytes;	/* unsigned for shift opt */
-	if (n < 128) {
+
+	/*
+	 * This used to be 8-byte chunks and 16 zones for n < 128.
+	 * However some instructions may require 16-byte alignment
+	 * (aka SIMD) and programs might not request an aligned size
+	 * (aka GCC-7), so change this as follows:
+	 *
+	 * 0-15 bytes	8-byte alignment in two zones	(0-1)
+	 * 16-127 bytes	16-byte alignment in four zones	(3-10)
+	 * zone index 2 and 11-15 are currently unused.
+	 */
+	if (n < 16) {
 		*bytes = n = (n + 7) & ~7;
 		*chunking = 8;
-		return(n / 8 - 1);		/* 8 byte chunks, 16 zones */
+		return(n / 8 - 1);		/* 8 byte chunks, 2 zones */
+		/* zones 0,1, zone 2 is unused */
+	}
+	if (n < 128) {
+		*bytes = n = (n + 15) & ~15;
+		*chunking = 16;
+		return(n / 16 + 2);		/* 16 byte chunks, 8 zones */
+		/* zones 3-10, zones 11-15 unused */
 	}
 	if (n < 256) {
 		*bytes = n = (n + 15) & ~15;
@@ -614,18 +768,35 @@ zoneindex(size_t *bytes, size_t *chunking)
 }
 
 /*
+ * We want large magazines for small allocations
+ */
+static __inline int
+zonecapacity(int zi)
+{
+	int cap;
+
+	cap = (NZONES - zi) * (M_MAX_ROUNDS - M_MIN_ROUNDS) / NZONES +
+	      M_MIN_ROUNDS;
+
+	return cap;
+}
+
+/*
  * malloc() - call internal slab allocator
  */
 void *
-malloc(size_t size)
+__malloc(size_t size)
 {
 	void *ptr;
 
+	nmalloc_sigblockall();
 	ptr = _slaballoc(size, 0);
 	if (ptr == NULL)
 		errno = ENOMEM;
 	else
 		UTRACE(0, size, ptr);
+	nmalloc_sigunblockall();
+
 	return(ptr);
 }
 
@@ -635,7 +806,7 @@ malloc(size_t size)
  * calloc() - call internal slab allocator
  */
 void *
-calloc(size_t number, size_t size)
+__calloc(size_t number, size_t size)
 {
 	void *ptr;
 
@@ -645,11 +816,14 @@ calloc(size_t number, size_t size)
 		return(NULL);
 	}
 
+	nmalloc_sigblockall();
 	ptr = _slaballoc(number * size, SAFLAG_ZERO);
 	if (ptr == NULL)
 		errno = ENOMEM;
 	else
 		UTRACE(0, number * size, ptr);
+	nmalloc_sigunblockall();
+
 	return(ptr);
 }
 
@@ -661,15 +835,40 @@ calloc(size_t number, size_t size)
  * zone.
  */
 void *
-realloc(void *ptr, size_t size)
+__realloc(void *ptr, size_t size)
 {
 	void *ret;
+
+	nmalloc_sigblockall();
 	ret = _slabrealloc(ptr, size);
 	if (ret == NULL)
 		errno = ENOMEM;
 	else
 		UTRACE(ptr, size, ret);
+	nmalloc_sigunblockall();
+
 	return(ret);
+}
+
+/*
+ * aligned_alloc()
+ *
+ * Allocate (size) bytes with a alignment of (alignment).
+ */
+void *
+__aligned_alloc(size_t alignment, size_t size)
+{
+	void *ptr;
+	int rc;
+
+	nmalloc_sigblockall();
+	ptr = NULL;
+	rc = _slabmemalign(&ptr, alignment, size);
+	if (rc)
+		errno = rc;
+	nmalloc_sigunblockall();
+
+	return (ptr);
 }
 
 /*
@@ -677,27 +876,49 @@ realloc(void *ptr, size_t size)
  *
  * Allocate (size) bytes with a alignment of (alignment), where (alignment)
  * is a power of 2 >= sizeof(void *).
- *
+ */
+int
+__posix_memalign(void **memptr, size_t alignment, size_t size)
+{
+	int rc;
+
+	/*
+	 * OpenGroup spec issue 6 check
+	 */
+	if (alignment < sizeof(void *)) {
+		*memptr = NULL;
+		return(EINVAL);
+	}
+
+	nmalloc_sigblockall();
+	rc = _slabmemalign(memptr, alignment, size);
+	nmalloc_sigunblockall();
+
+	return (rc);
+}
+
+/*
  * The slab allocator will allocate on power-of-2 boundaries up to
  * at least PAGE_SIZE.  We use the zoneindex mechanic to find a
  * zone matching the requirements, and _vmem_alloc() otherwise.
  */
-int
-posix_memalign(void **memptr, size_t alignment, size_t size)
+static int
+_slabmemalign(void **memptr, size_t alignment, size_t size)
 {
 	bigalloc_t *bigp;
 	bigalloc_t big;
 	size_t chunking;
-	int zi;
+	int zi __unused;
+
+	if (alignment < 1) {
+		*memptr = NULL;
+		return(EINVAL);
+	}
 
 	/*
 	 * OpenGroup spec issue 6 checks
 	 */
 	if ((alignment | (alignment - 1)) + 1 != (alignment << 1)) {
-		*memptr = NULL;
-		return(EINVAL);
-	}
-	if (alignment < sizeof(void *)) {
 		*memptr = NULL;
 		return(EINVAL);
 	}
@@ -713,7 +934,21 @@ posix_memalign(void **memptr, size_t alignment, size_t size)
 		size = alignment;
 	else
 		size = (size + alignment - 1) & ~(size_t)(alignment - 1);
-	if (size < PAGE_SIZE && (size | (size - 1)) + 1 == (size << 1)) {
+
+	/*
+	 * If we have overflowed above when rounding to the nearest alignment
+	 * boundary, just return ENOMEM, size should be == N * sizeof(void *).
+	 *
+	 * Power-of-2 allocations up to 8KB will be aligned to the allocation
+	 * size and _slaballoc() can simply be used.  Please see line 1082
+	 * for this special case: 'Align the storage in the zone based on
+	 * the chunking' has a special case for powers of 2.
+	 */
+	if (size == 0)
+		return(ENOMEM);
+
+	if (size <= MAX_SLAB_PAGEALIGN &&
+	    (size | (size - 1)) + 1 == (size << 1)) {
 		*memptr = _slaballoc(size, 0);
 		return(*memptr ? 0 : ENOMEM);
 	}
@@ -759,6 +994,27 @@ posix_memalign(void **memptr, size_t alignment, size_t size)
 	if (size < alignment)
 		size = alignment;
 	size = (size + PAGE_MASK) & ~(size_t)PAGE_MASK;
+	if (alignment == PAGE_SIZE && size <= BIGCACHE_LIMIT) {
+		big = bigcache_find_alloc(size);
+		if (big && big->bytes < size) {
+			_slabfree(big->base, FASTSLABREALLOC, &big);
+			big = NULL;
+		}
+		if (big) {
+			*memptr = big->base;
+			big->active = size;
+			if (big->active < big->bytes) {
+				atomic_add_long(&excess_alloc,
+						big->bytes - big->active);
+			}
+			bigp = bigalloc_lock(*memptr);
+			big->next = *bigp;
+			*bigp = big;
+			bigalloc_unlock(*memptr);
+			handle_excess_big();
+			return(0);
+		}
+	}
 	*memptr = _vmem_alloc(size, alignment, 0);
 	if (*memptr == NULL)
 		return(ENOMEM);
@@ -771,7 +1027,8 @@ posix_memalign(void **memptr, size_t alignment, size_t size)
 	}
 	bigp = bigalloc_lock(*memptr);
 	big->base = *memptr;
-	big->bytes = size;
+	big->active = size;
+	big->bytes = size;		/* no excess */
 	big->next = *bigp;
 	*bigp = big;
 	bigalloc_unlock(*memptr);
@@ -783,10 +1040,13 @@ posix_memalign(void **memptr, size_t alignment, size_t size)
  * free() (SLAB ALLOCATOR) - do the obvious
  */
 void
-free(void *ptr)
+__free(void *ptr)
 {
 	UTRACE(ptr, 0, 0);
+
+	nmalloc_sigblockall();
 	_slabfree(ptr, 0, NULL);
+	nmalloc_sigunblockall();
 }
 
 /*
@@ -803,10 +1063,10 @@ _slaballoc(size_t size, int flags)
 	slchunk_t chunk;
 	slglobaldata_t slgd;
 	size_t chunking;
+	thr_mags *tp;
+	struct magazine *mp;
+	int count;
 	int zi;
-#ifdef INVARIANTS
-	int i;
-#endif
 	int off;
 	void *obj;
 
@@ -818,21 +1078,26 @@ _slaballoc(size_t size, int flags)
 	 * also realloc() later on.  Joy.
 	 */
 	if (size == 0)
-		return(ZERO_LENGTH_PTR);
+		size = 1;
 
 	/* Capture global flags */
 	flags |= g_malloc_flags;
 
 	/*
-	 * Handle large allocations directly.  There should not be very many
-	 * of these so performance is not a big issue.
+	 * Handle large allocations directly, with a separate bigmem cache.
 	 *
 	 * The backend allocator is pretty nasty on a SMP system.   Use the
 	 * slab allocator for one and two page-sized chunks even though we
 	 * lose some efficiency.
+	 *
+	 * NOTE: Please see _slabmemalign(), which assumes that power-of-2
+	 *	 allocations up to an including MAX_SLAB_PAGEALIGN
+	 *	 can use _slaballoc() and be aligned to the same.  The
+	 *	 zone cache can be used for this case, bigalloc does not
+	 *	 have to be used.
 	 */
 	if (size >= ZoneLimit ||
-	    ((size & PAGE_MASK) == 0 && size > PAGE_SIZE*2)) {
+	    ((size & PAGE_MASK) == 0 && size > MAX_SLAB_PAGEALIGN)) {
 		bigalloc_t big;
 		bigalloc_t *bigp;
 
@@ -840,26 +1105,69 @@ _slaballoc(size_t size, int flags)
 		 * Page-align and cache-color in case of virtually indexed
 		 * physically tagged L1 caches (aka SandyBridge).  No sweat
 		 * otherwise, so just do it.
+		 *
+		 * (don't count as excess).
 		 */
 		size = (size + PAGE_MASK) & ~(size_t)PAGE_MASK;
-		if ((size & 8191) == 0)
-			size += 4096;
 
-		chunk = _vmem_alloc(size, PAGE_SIZE, flags);
-		if (chunk == NULL)
-			return(NULL);
+		/*
+		 * If we have overflowed above when rounding to the page
+		 * boundary, something has passed us (size_t)[-PAGE_MASK..-1]
+		 * so just return NULL, size at this point should be >= 0.
+		 */
+		if (size == 0)
+			return (NULL);
 
-		big = _slaballoc(sizeof(struct bigalloc), 0);
-		if (big == NULL) {
-			_vmem_free(chunk, size);
-			return(NULL);
+		/*
+		 * Force an additional page offset for 8KB-aligned requests
+		 * (i.e. 8KB, 16KB, etc) that helps spread data across the
+		 * CPU caches at the cost of some dead space in the memory
+		 * map.
+		 */
+		if ((size & (PAGE_SIZE * 2 - 1)) == 0)
+			size += PAGE_SIZE;
+
+		/*
+		 * Try to reuse a cached big block to avoid mmap'ing.  If it
+		 * turns out not to fit our requirements we throw it away
+		 * and allocate normally.
+		 */
+		big = NULL;
+		if (size <= BIGCACHE_LIMIT) {
+			big = bigcache_find_alloc(size);
+			if (big && big->bytes < size) {
+				_slabfree(big->base, FASTSLABREALLOC, &big);
+				big = NULL;
+			}
 		}
+		if (big) {
+			chunk = big->base;
+			if (flags & SAFLAG_ZERO)
+				bzero(chunk, size);
+		} else {
+			chunk = _vmem_alloc(size, PAGE_SIZE, flags);
+			if (chunk == NULL)
+				return(NULL);
+
+			big = _slaballoc(sizeof(struct bigalloc), 0);
+			if (big == NULL) {
+				_vmem_free(chunk, size);
+				return(NULL);
+			}
+			big->base = chunk;
+			big->bytes = size;
+		}
+		big->active = size;
+
 		bigp = bigalloc_lock(chunk);
-		big->base = chunk;
-		big->bytes = size;
+		if (big->active < big->bytes) {
+			atomic_add_long(&excess_alloc,
+					big->bytes - big->active);
+		}
 		big->next = *bigp;
 		*bigp = big;
 		bigalloc_unlock(chunk);
+		handle_excess_big();
 
 		return(chunk);
 	}
@@ -868,21 +1176,21 @@ _slaballoc(size_t size, int flags)
 	zi = zoneindex(&size, &chunking);
 	MASSERT(zi < NZONES);
 
-	obj = mtmagazine_alloc(zi);
+	obj = mtmagazine_alloc(zi, flags);
 	if (obj != NULL) {
 		if (flags & SAFLAG_ZERO)
 			bzero(obj, size);
 		return (obj);
 	}
 
-	slgd = &SLGlobalData;
-	slgd_lock(slgd);
-
 	/*
-	 * Attempt to allocate out of an existing zone.  If all zones are
-	 * exhausted pull one off the free list or allocate a new one.
+	 * Attempt to allocate out of an existing global zone.  If all zones
+	 * are exhausted pull one off the free list or allocate a new one.
 	 */
-	if ((z = slgd->ZoneAry[zi]) == NULL) {
+	slgd = &SLGlobalData;
+
+again:
+	if (slgd->ZoneAry[zi] == NULL) {
 		z = zone_alloc(flags);
 		if (z == NULL)
 			goto fail;
@@ -890,18 +1198,7 @@ _slaballoc(size_t size, int flags)
 		/*
 		 * How big is the base structure?
 		 */
-#if defined(INVARIANTS)
-		/*
-		 * Make room for z_Bitmap.  An exact calculation is
-		 * somewhat more complicated so don't make an exact
-		 * calculation.
-		 */
-		off = offsetof(struct slzone,
-				z_Bitmap[(ZoneSize / size + 31) / 32]);
-		bzero(z->z_Bitmap, (ZoneSize / size + 31) / 8);
-#else
 		off = sizeof(struct slzone);
-#endif
 
 		/*
 		 * Align the storage in the zone based on the chunking.
@@ -916,11 +1213,22 @@ _slaballoc(size_t size, int flags)
 		 * Set initial conditions for UIndex near the zone header
 		 * to reduce unecessary page faults, vs semi-randomization
 		 * to improve L1 cache saturation.
+		 *
+		 * NOTE: Please see _slabmemalign(), which assumes that
+		 *	 power-of-2 allocations up to an including
+		 *	 MAX_SLAB_PAGEALIGN can use _slaballoc()
+		 *	 and be aligned to the same.  The zone cache can be
+		 *	 used for this case, bigalloc does not have to be
+		 *	 used.
+		 *
+		 *	 ALL power-of-2 requests that fall through to this
+		 *	 code use this rule (conditionals above limit this
+		 *	 to <= MAX_SLAB_PAGEALIGN).
 		 */
 		if ((size | (size - 1)) + 1 == (size << 1))
-			off = (off + size - 1) & ~(size - 1);
+			off = roundup2(off, size);
 		else
-			off = (off + chunking - 1) & ~(chunking - 1);
+			off = roundup2(off, chunking);
 		z->z_Magic = ZALLOC_SLAB_MAGIC;
 		z->z_ZoneIndex = zi;
 		z->z_NMax = (ZoneSize - off) / size;
@@ -929,8 +1237,6 @@ _slaballoc(size_t size, int flags)
 		z->z_UIndex = z->z_UEndIndex = 0;
 		z->z_ChunkSize = size;
 		z->z_FirstFreePg = ZonePageCount;
-		z->z_Next = slgd->ZoneAry[zi];
-		slgd->ZoneAry[zi] = z;
 		if ((z->z_Flags & SLZF_UNOTZEROD) == 0) {
 			flags &= ~SAFLAG_ZERO;	/* already zero'd */
 			flags |= SAFLAG_PASSIVE;
@@ -941,20 +1247,36 @@ _slaballoc(size_t size, int flags)
 		 * next zone we create so we do not over-weight the lower
 		 * part of the cpu memory caches.
 		 */
-		slgd->JunkIndex = (slgd->JunkIndex + ZALLOC_SLAB_SLIDE)
-					& (ZALLOC_MAX_ZONE_SIZE - 1);
+		slgd_lock(slgd);
+		z->z_Next = slgd->ZoneAry[zi];
+		slgd->ZoneAry[zi] = z;
+	} else {
+		slgd_lock(slgd);
+		z = slgd->ZoneAry[zi];
+		if (z == NULL) {
+			slgd_unlock(slgd);
+			goto again;
+		}
 	}
 
 	/*
 	 * Ok, we have a zone from which at least one chunk is available.
-	 *
-	 * Remove us from the ZoneAry[] when we become empty
 	 */
-	MASSERT(z->z_NFree > 0);
+	MASSERT_WTHUNLK(z->z_NFree > 0, slgd_unlock(slgd));
 
-	if (--z->z_NFree == 0) {
-		slgd->ZoneAry[zi] = z->z_Next;
-		z->z_Next = NULL;
+	/*
+	 * Try to cache <count> chunks, up to CACHE_CHUNKS (32 typ)
+	 * to avoid unnecessary global lock contention.
+	 */
+	tp = &thread_mags;
+	mp = tp->mags[zi].loaded;
+	count = 0;
+	if (mp && tp->init >= 0) {
+		count = mp->capacity - mp->rounds;
+		if (count >= z->z_NFree)
+			count = z->z_NFree - 1;
+		if (count > CACHE_CHUNKS)
+			count = CACHE_CHUNKS;
 	}
 
 	/*
@@ -964,20 +1286,18 @@ _slaballoc(size_t size, int flags)
 	 */
 	while (z->z_FirstFreePg < ZonePageCount) {
 		if ((chunk = z->z_PageAry[z->z_FirstFreePg]) != NULL) {
-#ifdef DIAGNOSTIC
-			/*
-			 * Diagnostic: c_Next is not total garbage.
-			 */
-			MASSERT(chunk->c_Next == NULL ||
-			    ((intptr_t)chunk->c_Next & IN_SAME_PAGE_MASK) ==
-			    ((intptr_t)chunk & IN_SAME_PAGE_MASK));
-#endif
-#ifdef INVARIANTS
-			chunk_mark_allocated(z, chunk);
-#endif
-			MASSERT((uintptr_t)chunk & ZoneMask);
+			if (((uintptr_t)chunk & ZoneMask) == 0) {
+				slgd_unlock(slgd);
+				_mpanic("assertion: corrupt malloc zone");
+			}
 			z->z_PageAry[z->z_FirstFreePg] = chunk->c_Next;
-			goto done;
+			--z->z_NFree;
+
+			if (count == 0)
+				goto done;
+			mp->objects[mp->rounds++] = chunk;
+			--count;
+			continue;
 		}
 		++z->z_FirstFreePg;
 	}
@@ -989,41 +1309,42 @@ _slaballoc(size_t size, int flags)
 	 * serious if our zone got corrupted so we use an explicit
 	 * panic rather then a KASSERT.
 	 */
-	chunk = (slchunk_t)(z->z_BasePtr + z->z_UIndex * size);
-
-	if (++z->z_UIndex == z->z_NMax)
-		z->z_UIndex = 0;
-	if (z->z_UIndex == z->z_UEndIndex) {
-		if (z->z_NFree != 0)
-			_mpanic("slaballoc: corrupted zone");
+	for (;;) {
+		chunk = (slchunk_t)(z->z_BasePtr + z->z_UIndex * size);
+		--z->z_NFree;
+		if (++z->z_UIndex == z->z_NMax)
+			z->z_UIndex = 0;
+		if (z->z_UIndex == z->z_UEndIndex) {
+			if (z->z_NFree != 0) {
+				slgd_unlock(slgd);
+				_mpanic("slaballoc: corrupted zone");
+			}
+		}
+		if (count == 0)
+			break;
+		mp->objects[mp->rounds++] = chunk;
+		--count;
 	}
 
 	if ((z->z_Flags & SLZF_UNOTZEROD) == 0) {
 		flags &= ~SAFLAG_ZERO;
 		flags |= SAFLAG_PASSIVE;
 	}
-#if defined(INVARIANTS)
-	chunk_mark_allocated(z, chunk);
-#endif
 
 done:
-	slgd_unlock(slgd);
-	if (flags & SAFLAG_ZERO) {
-		bzero(chunk, size);
-#ifdef INVARIANTS
-	} else if ((flags & (SAFLAG_ZERO|SAFLAG_PASSIVE)) == 0) {
-		if (use_malloc_pattern) {
-			for (i = 0; i < size; i += sizeof(int)) {
-				*(int *)((char *)chunk + i) = -1;
-			}
-		}
-		/* avoid accidental double-free check */
-		chunk->c_Next = (void *)-1;
-#endif
+	/*
+	 * Remove us from the ZoneAry[] when we become empty
+	 */
+	if (z->z_NFree == 0) {
+		slgd->ZoneAry[zi] = z->z_Next;
+		z->z_Next = NULL;
 	}
+	slgd_unlock(slgd);
+	if (flags & SAFLAG_ZERO)
+		bzero(chunk, size);
+
 	return(chunk);
 fail:
-	slgd_unlock(slgd);
 	return(NULL);
 }
 
@@ -1038,17 +1359,15 @@ _slabrealloc(void *ptr, size_t size)
 	slzone_t z;
 	size_t chunking;
 
-	if (ptr == NULL || ptr == ZERO_LENGTH_PTR) {
+	if (ptr == NULL) {
 		return(_slaballoc(size, 0));
 	}
 
-	if (size == 0) {
-		free(ptr);
-		return(ZERO_LENGTH_PTR);
-	}
+	if (size == 0)
+		size = 1;
 
 	/*
-	 * Handle oversized allocations. 
+	 * Handle oversized allocations.
 	 */
 	if ((bigp = bigalloc_check_and_lock(ptr)) != NULL) {
 		bigalloc_t big;
@@ -1058,10 +1377,78 @@ _slabrealloc(void *ptr, size_t size)
 			if (big->base == ptr) {
 				size = (size + PAGE_MASK) & ~(size_t)PAGE_MASK;
 				bigbytes = big->bytes;
-				if (bigbytes == size) {
+
+				/*
+				 * If it already fits determine if it makes
+				 * sense to shrink/reallocate.  Try to optimize
+				 * programs which stupidly make incremental
+				 * reallocations larger or smaller by scaling
+				 * the allocation.  Also deal with potential
+				 * coloring.
+				 */
+				if (size >= (bigbytes >> 1) &&
+				    size <= bigbytes) {
+					if (big->active != size) {
+						atomic_add_long(&excess_alloc,
+								big->active -
+								size);
+					}
+					big->active = size;
 					bigalloc_unlock(ptr);
 					return(ptr);
 				}
+
+				/*
+				 * For large reallocations, allocate more space
+				 * than we need to try to avoid excessive
+				 * reallocations later on.
+				 */
+				chunking = size + (size >> 3);
+				chunking = (chunking + PAGE_MASK) &
+					   ~(size_t)PAGE_MASK;
+
+				/*
+				 * Try to allocate adjacently in case the
+				 * program is idiotically realloc()ing a
+				 * huge memory block just slightly bigger.
+				 * (llvm's llc tends to do this a lot).
+				 *
+				 * (MAP_TRYFIXED forces mmap to fail if there
+				 *  is already something at the address).
+				 */
+				if (chunking > bigbytes) {
+					char *addr;
+					int errno_save = errno;
+
+					addr = mmap((char *)ptr + bigbytes,
+						    chunking - bigbytes,
+						    PROT_READ|PROT_WRITE,
+						    MAP_PRIVATE|MAP_ANON|
+						    MAP_TRYFIXED,
+						    -1, 0);
+					errno = errno_save;
+					if (addr == (char *)ptr + bigbytes) {
+						atomic_add_long(&excess_alloc,
+								big->active -
+								big->bytes +
+								chunking -
+								size);
+						big->bytes = chunking;
+						big->active = size;
+						bigalloc_unlock(ptr);
+
+						return(ptr);
+					}
+					MASSERT_WTHUNLK(
+						(void *)addr == MAP_FAILED,
+						bigalloc_unlock(ptr));
+				}
+
+				/*
+				 * Failed, unlink big and allocate fresh.
+				 * (note that we have to leave (big) intact
+				 * in case the slaballoc fails).
+				 */
 				*bigp = big->next;
 				bigalloc_unlock(ptr);
 				if ((nptr = _slaballoc(size, 0)) == NULL) {
@@ -1075,12 +1462,16 @@ _slabrealloc(void *ptr, size_t size)
 				if (size > bigbytes)
 					size = bigbytes;
 				bcopy(ptr, nptr, size);
+				atomic_add_long(&excess_alloc, big->active -
+							       big->bytes);
 				_slabfree(ptr, FASTSLABREALLOC, &big);
+
 				return(nptr);
 			}
 			bigp = &big->next;
 		}
 		bigalloc_unlock(ptr);
+		handle_excess_big();
 	}
 
 	/*
@@ -1154,8 +1545,6 @@ _slabfree(void *ptr, int flags, bigalloc_t *rbigp)
 	 */
 	if (ptr == NULL)
 		return;
-	if (ptr == ZERO_LENGTH_PTR)
-		return;
 
 	/*
 	 * Handle oversized allocations.
@@ -1164,20 +1553,31 @@ _slabfree(void *ptr, int flags, bigalloc_t *rbigp)
 		while ((big = *bigp) != NULL) {
 			if (big->base == ptr) {
 				*bigp = big->next;
+				atomic_add_long(&excess_alloc, big->active -
+							       big->bytes);
 				bigalloc_unlock(ptr);
+
+				/*
+				 * Try to stash the block we are freeing,
+				 * potentially receiving another block in
+				 * return which must be freed.
+				 */
 fastslabrealloc:
+				if (big->bytes <= BIGCACHE_LIMIT) {
+					big = bigcache_find_free(big);
+					if (big == NULL)
+						return;
+				}
+				ptr = big->base;	/* reload */
 				size = big->bytes;
 				_slabfree(big, 0, NULL);
-#ifdef INVARIANTS
-				MASSERT(sizeof(weirdary) <= size);
-				bcopy(weirdary, ptr, sizeof(weirdary));
-#endif
 				_vmem_free(ptr, size);
 				return;
 			}
 			bigp = &big->next;
 		}
 		bigalloc_unlock(ptr);
+		handle_excess_big();
 	}
 
 	/*
@@ -1198,41 +1598,14 @@ fastslabrealloc:
 
 	pgno = ((char *)ptr - (char *)z) >> PAGE_SHIFT;
 	chunk = ptr;
-	slgd = &SLGlobalData;
-	slgd_lock(slgd);
-
-#ifdef INVARIANTS
-	/*
-	 * Attempt to detect a double-free.  To reduce overhead we only check
-	 * if there appears to be link pointer at the base of the data.
-	 */
-	if (((intptr_t)chunk->c_Next - (intptr_t)z) >> PAGE_SHIFT == pgno) {
-		slchunk_t scan;
-
-		for (scan = z->z_PageAry[pgno]; scan; scan = scan->c_Next) {
-			if (scan == chunk)
-				_mpanic("Double free at %p", chunk);
-		}
-	}
-	chunk_mark_free(z, chunk);
-#endif
-
-	/*
-	 * Put weird data into the memory to detect modifications after
-	 * freeing, illegal pointer use after freeing (we should fault on
-	 * the odd address), and so forth.
-	 */
-#ifdef INVARIANTS
-	if (z->z_ChunkSize < sizeof(weirdary))
-		bcopy(weirdary, chunk, z->z_ChunkSize);
-	else
-		bcopy(weirdary, chunk, sizeof(weirdary));
-#endif
 
 	/*
 	 * Add this free non-zero'd chunk to a linked list for reuse, adjust
 	 * z_FirstFreePg.
 	 */
+	slgd = &SLGlobalData;
+	slgd_lock(slgd);
+
 	chunk->c_Next = z->z_PageAry[pgno];
 	z->z_PageAry[pgno] = chunk;
 	if (z->z_FirstFreePg > pgno)
@@ -1248,7 +1621,7 @@ fastslabrealloc:
 	}
 
 	/*
-	 * If the zone becomes totally free then release it.
+	 * If the zone becomes totally free we get rid of it.
 	 */
 	if (z->z_NFree == z->z_NMax) {
 		slzone_t *pz;
@@ -1259,80 +1632,28 @@ fastslabrealloc:
 		*pz = z->z_Next;
 		z->z_Magic = -1;
 		z->z_Next = NULL;
+		slgd_unlock(slgd);
 		zone_free(z);
-		/* slgd lock released */
-		return;
+	} else {
+		slgd_unlock(slgd);
 	}
-	slgd_unlock(slgd);
 }
-
-#if defined(INVARIANTS)
-/*
- * Helper routines for sanity checks
- */
-static
-void
-chunk_mark_allocated(slzone_t z, void *chunk)
-{
-	int bitdex = ((char *)chunk - (char *)z->z_BasePtr) / z->z_ChunkSize;
-	__uint32_t *bitptr;
-
-	MASSERT(bitdex >= 0 && bitdex < z->z_NMax);
-	bitptr = &z->z_Bitmap[bitdex >> 5];
-	bitdex &= 31;
-	MASSERT((*bitptr & (1 << bitdex)) == 0);
-	*bitptr |= 1 << bitdex;
-}
-
-static
-void
-chunk_mark_free(slzone_t z, void *chunk)
-{
-	int bitdex = ((char *)chunk - (char *)z->z_BasePtr) / z->z_ChunkSize;
-	__uint32_t *bitptr;
-
-	MASSERT(bitdex >= 0 && bitdex < z->z_NMax);
-	bitptr = &z->z_Bitmap[bitdex >> 5];
-	bitdex &= 31;
-	MASSERT((*bitptr & (1 << bitdex)) != 0);
-	*bitptr &= ~(1 << bitdex);
-}
-
-#endif
 
 /*
- * Allocate and return a magazine.  NULL is returned and *burst is adjusted
- * if the magazine is empty.
+ * Allocate and return a magazine.  Return NULL if no magazines are
+ * available.
  */
 static __inline void *
-magazine_alloc(struct magazine *mp, int *burst)
+magazine_alloc(struct magazine *mp)
 {
 	void *obj;
 
-	if (mp == NULL)
-		return(NULL);
-	if (MAGAZINE_NOTEMPTY(mp)) {
+	if (mp && MAGAZINE_NOTEMPTY(mp)) {
 		obj = mp->objects[--mp->rounds];
-		return(obj);
+	} else {
+		obj = NULL;
 	}
-
-	/*
-	 * Return burst factor to caller along with NULL
-	 */
-	if ((mp->flags & M_BURST) && (burst != NULL)) {
-		*burst = mp->burst_factor;
-	}
-	/* Reduce burst factor by NSCALE; if it hits 1, disable BURST */
-	if ((mp->flags & M_BURST) && (mp->flags & M_BURST_EARLY) &&
-	    (burst != NULL)) {
-		mp->burst_factor -= M_BURST_NSCALE;
-		if (mp->burst_factor <= 1) {
-			mp->burst_factor = 1;
-			mp->flags &= ~(M_BURST);
-			mp->flags &= ~(M_BURST_EARLY);
-		}
-	}
-	return (NULL);
+	return (obj);
 }
 
 static __inline int
@@ -1347,7 +1668,7 @@ magazine_free(struct magazine *mp, void *p)
 }
 
 static void *
-mtmagazine_alloc(int zi)
+mtmagazine_alloc(int zi, int flags)
 {
 	thr_mags *tp;
 	struct magazine *mp, *emptymag;
@@ -1367,16 +1688,34 @@ mtmagazine_alloc(int zi)
 	 */
 	for (;;) {
 		/*
+		 * Make sure we have a magazine available for use.
+		 */
+		if (tp->newmag == NULL && (flags & SAFLAG_MAGS) == 0) {
+			mp = _slaballoc(sizeof(struct magazine),
+					SAFLAG_ZERO | SAFLAG_MAGS);
+			if (mp == NULL) {
+				obj = NULL;
+				break;
+			}
+			if (tp->newmag) {
+				_slabfree(mp, 0, NULL);
+			} else {
+				tp->newmag = mp;
+			}
+		}
+
+		/*
 		 * If the loaded magazine has rounds, allocate and return
 		 */
 		mp = tp->mags[zi].loaded;
-		obj = magazine_alloc(mp, NULL);
+		obj = magazine_alloc(mp);
 		if (obj)
 			break;
 
 		/*
-		 * If the prev magazine is full, swap with the loaded
-		 * magazine and retry.
+		 * The prev magazine can only be completely empty or completely
+		 * full.  If it is full, swap it with the loaded magazine
+		 * and retry.
 		 */
 		mp = tp->mags[zi].prev;
 		if (mp && MAGAZINE_FULL(mp)) {
@@ -1386,30 +1725,45 @@ mtmagazine_alloc(int zi)
 		}
 
 		/*
-		 * Try to get a full magazine from the depot.  Cycle
-		 * through depot(full)->loaded->prev->depot(empty).
-		 * Retry if a full magazine was available from the depot.
-		 *
-		 * Return NULL (caller will fall through) if no magazines
-		 * can be found anywhere.
+		 * If the depot has no loaded magazines ensure that tp->loaded
+		 * is not NULL and return NULL.  This will allow _slaballoc()
+		 * to cache referals to SLGlobalData in a magazine.
 		 */
 		d = &depots[zi];
+		if (SLIST_EMPTY(&d->full)) {	/* UNLOCKED TEST IS SAFE */
+			mp = tp->mags[zi].loaded;
+			if (mp == NULL && tp->newmag) {
+				mp = tp->newmag;
+				tp->newmag = NULL;
+				mp->capacity = zonecapacity(zi);
+				mp->rounds = 0;
+				mp->flags = 0;
+				tp->mags[zi].loaded = mp;
+			}
+			break;
+		}
+
+		/*
+		 * Cycle: depot(loaded) -> loaded -> prev -> depot(empty)
+		 *
+		 * If we race and the depot has no full magazines, retry.
+		 */
 		depot_lock(d);
-		emptymag = tp->mags[zi].prev;
-		if (emptymag)
-			SLIST_INSERT_HEAD(&d->empty, emptymag, nextmagazine);
-		tp->mags[zi].prev = tp->mags[zi].loaded;
-		mp = SLIST_FIRST(&d->full);	/* loaded magazine */
-		tp->mags[zi].loaded = mp;
+		mp = SLIST_FIRST(&d->full);
 		if (mp) {
 			SLIST_REMOVE_HEAD(&d->full, nextmagazine);
+			emptymag = tp->mags[zi].prev;
+			if (emptymag) {
+				SLIST_INSERT_HEAD(&d->empty, emptymag,
+						  nextmagazine);
+			}
+			tp->mags[zi].prev = tp->mags[zi].loaded;
+			tp->mags[zi].loaded = mp;
 			MASSERT(MAGAZINE_NOTEMPTY(mp));
-			depot_unlock(d);
-			continue;
 		}
 		depot_unlock(d);
-		break;
-	} 
+		continue;
+	}
 
 	return (obj);
 }
@@ -1443,12 +1797,17 @@ mtmagazine_free(int zi, void *ptr)
 		 * allocation to avoid reentrancy and/or to avoid a
 		 * stack overflow if the [zi] happens to be the same that
 		 * would be used to allocate the new magazine.
+		 *
+		 * WARNING! Calling _slaballoc() can indirectly modify
+		 *	    tp->newmag.
 		 */
 		if (tp->newmag == NULL) {
-			tp->init = -1;
-			tp->newmag = _slaballoc(sizeof(struct magazine),
-						SAFLAG_ZERO);
-			tp->init = 1;
+			mp = _slaballoc(sizeof(struct magazine),
+					SAFLAG_ZERO | SAFLAG_MAGS);
+			if (tp->newmag && mp)
+				_slabfree(mp, 0, NULL);
+			else
+				tp->newmag = mp;
 			if (tp->newmag == NULL) {
 				rc = -1;
 				break;
@@ -1463,8 +1822,9 @@ mtmagazine_free(int zi, void *ptr)
 			break;
 
 		/*
-		 * If the prev magazine is empty, swap with the loaded
-		 * magazine and retry.
+		 * The prev magazine can only be completely empty or completely
+		 * full.  If it is empty, swap it with the loaded magazine
+		 * and retry.
 		 */
 		mp = tp->mags[zi].prev;
 		if (mp && MAGAZINE_EMPTY(mp)) {
@@ -1488,27 +1848,28 @@ mtmagazine_free(int zi, void *ptr)
 		if (mp) {
 			tp->mags[zi].loaded = mp;
 			SLIST_REMOVE_HEAD(&d->empty, nextmagazine);
+			depot_unlock(d);
 			MASSERT(MAGAZINE_NOTFULL(mp));
 		} else {
 			mp = tp->newmag;
 			tp->newmag = NULL;
-			mp->capacity = M_MAX_ROUNDS;
+			mp->capacity = zonecapacity(zi);
 			mp->rounds = 0;
 			mp->flags = 0;
 			tp->mags[zi].loaded = mp;
+			depot_unlock(d);
 		}
-		depot_unlock(d);
-	} 
+	}
 
 	return rc;
 }
 
-static void 
+static void
 mtmagazine_init(void)
 {
 	int error;
 
-	error = pthread_key_create(&thread_mags_key, mtmagazine_destructor);
+	error = _pthread_key_create(&thread_mags_key, mtmagazine_destructor);
 	if (error)
 		abort();
 }
@@ -1521,17 +1882,19 @@ mtmagazine_drain(struct magazine *mp)
 {
 	void *obj;
 
+	nmalloc_sigblockall();
 	while (MAGAZINE_NOTEMPTY(mp)) {
-		obj = magazine_alloc(mp, NULL);
+		obj = magazine_alloc(mp);
 		_slabfree(obj, 0, NULL);
 	}
+	nmalloc_sigunblockall();
 }
 
-/* 
+/*
  * mtmagazine_destructor()
  *
  * When a thread exits, we reclaim all its resources; all its magazines are
- * drained and the structures are freed. 
+ * drained and the structures are freed.
  *
  * WARNING!  The destructor can be called multiple times if the larger user
  *	     program has its own destructors which run after ours which
@@ -1544,6 +1907,9 @@ mtmagazine_destructor(void *thrp)
 	struct magazine *mp;
 	int i;
 
+	if (__isexiting)
+		return;
+
 	/*
 	 * Prevent further use of mtmagazines while we are destructing
 	 * them, as well as for any destructors which are run after us
@@ -1551,6 +1917,7 @@ mtmagazine_destructor(void *thrp)
 	 */
 	tp->init = -1;
 
+	nmalloc_sigblockall();
 	for (i = 0; i < NZONES; i++) {
 		mp = tp->mags[i].loaded;
 		tp->mags[i].loaded = NULL;
@@ -1568,68 +1935,48 @@ mtmagazine_destructor(void *thrp)
 			_slabfree(mp, 0, NULL);
 		}
 	}
-
 	if (tp->newmag) {
 		mp = tp->newmag;
 		tp->newmag = NULL;
 		_slabfree(mp, 0, NULL);
 	}
+	nmalloc_sigunblockall();
 }
 
 /*
  * zone_alloc()
  *
- * Attempt to allocate a zone from the zone magazine; the zone magazine has
- * M_BURST_EARLY enabled, so honor the burst request from the magazine.
+ * Attempt to allocate a zone from the zone magazine.
  */
 static slzone_t
-zone_alloc(int flags) 
+zone_alloc(int flags)
 {
-	slglobaldata_t slgd = &SLGlobalData;
-	int burst = 1;
-	int i, j;
 	slzone_t z;
 
 	zone_magazine_lock();
-	slgd_unlock(slgd);
 
-	z = magazine_alloc(&zone_magazine, &burst);
-	if (z == NULL && burst == 1) {
+	z = magazine_alloc(&zone_magazine);
+	if (z == NULL) {
 		zone_magazine_unlock();
-		z = _vmem_alloc(ZoneSize * burst, ZoneSize, flags);
-	} else if (z == NULL) {
-		z = _vmem_alloc(ZoneSize * burst, ZoneSize, flags);
-		if (z) {
-			for (i = 1; i < burst; i++) {
-				j = magazine_free(&zone_magazine,
-						  (char *) z + (ZoneSize * i));
-				MASSERT(j == 0);
-			}
-		}
-		zone_magazine_unlock();
+		z = _vmem_alloc(ZoneSize, ZoneSize, flags);
 	} else {
 		z->z_Flags |= SLZF_UNOTZEROD;
 		zone_magazine_unlock();
 	}
-	slgd_lock(slgd);
 	return z;
 }
 
 /*
- * zone_free()
- *
- * Release a zone and unlock the slgd lock.
+ * Free a zone.
  */
 static void
 zone_free(void *z)
 {
-	slglobaldata_t slgd = &SLGlobalData;
-	void *excess[M_ZONE_ROUNDS - M_LOW_ROUNDS] = {};
-	int i, j;
+	void *excess[M_ZONE_HYSTERESIS];
+	int i;
 
 	zone_magazine_lock();
-	slgd_unlock(slgd);
-	
+
 	bzero(z, sizeof(struct slzone));
 
 	if (opt_madvise)
@@ -1643,17 +1990,15 @@ zone_free(void *z)
 	 * BURST mode for the magazine.
 	 */
 	if (i == -1) {
-		j = zone_magazine.rounds - zone_magazine.low_factor;
-		for (i = 0; i < j; i++) {
-			excess[i] = magazine_alloc(&zone_magazine, NULL);
-			MASSERT(excess[i] !=  NULL);
+		for (i = 0; i < M_ZONE_HYSTERESIS; ++i) {
+			excess[i] = magazine_alloc(&zone_magazine);
+			MASSERT_WTHUNLK(excess[i] != NULL,
+					zone_magazine_unlock());
 		}
-
 		zone_magazine_unlock();
 
-		for (i = 0; i < j; i++) 
+		for (i = 0; i < M_ZONE_HYSTERESIS; ++i)
 			_vmem_free(excess[i], ZoneSize);
-
 		_vmem_free(z, ZoneSize);
 	} else {
 		zone_magazine_unlock();
@@ -1673,39 +2018,52 @@ zone_free(void *z)
 static void *
 _vmem_alloc(size_t size, size_t align, int flags)
 {
+	static char *addr_hint;
+	static int reset_hint = 16;
 	char *addr;
 	char *save;
-	size_t excess;
+
+	if (--reset_hint <= 0) {
+		addr_hint = NULL;
+		reset_hint = 16;
+	}
 
 	/*
 	 * Map anonymous private memory.
 	 */
-	addr = mmap(NULL, size, PROT_READ|PROT_WRITE,
+	save = mmap(addr_hint, size, PROT_READ|PROT_WRITE,
 		    MAP_PRIVATE|MAP_ANON, -1, 0);
-	if (addr == MAP_FAILED)
-		return(NULL);
+	if (save == MAP_FAILED)
+		goto worst_case;
+	if (((uintptr_t)save & (align - 1)) == 0)
+		return((void *)save);
 
-	/*
-	 * Check alignment.  The misaligned offset is also the excess
-	 * amount.  If misaligned unmap the excess so we have a chance of
-	 * mapping at the next alignment point and recursively try again.
-	 *
-	 * BBBBBBBBBBB BBBBBBBBBBB BBBBBBBBBBB	block alignment
-	 *   aaaaaaaaa aaaaaaaaaaa aa		mis-aligned allocation
-	 *   xxxxxxxxx				final excess calculation
-	 *   ^ returned address
-	 */
-	excess = (uintptr_t)addr & (align - 1);
+	addr_hint = (char *)(((size_t)save + (align - 1)) & ~(align - 1));
+	munmap(save, size);
 
-	if (excess) {
-		excess = align - excess;
-		save = addr;
+	save = mmap(addr_hint, size, PROT_READ|PROT_WRITE,
+		    MAP_PRIVATE|MAP_ANON, -1, 0);
+	if (save == MAP_FAILED)
+		goto worst_case;
+	if (((size_t)save & (align - 1)) == 0)
+		return((void *)save);
+	munmap(save, size);
 
-		munmap(save + excess, size - excess);
-		addr = _vmem_alloc(size, align, flags);
-		munmap(save, excess);
-	}
-	return((void *)addr);
+worst_case:
+	save = mmap(NULL, size + align, PROT_READ|PROT_WRITE,
+		    MAP_PRIVATE|MAP_ANON, -1, 0);
+	if (save == MAP_FAILED)
+		return NULL;
+
+	addr = (char *)(((size_t)save + (align - 1)) & ~(align - 1));
+	if (save != addr)
+		munmap(save, addr - save);
+	if (addr + size != save + size + align)
+		munmap(addr + size, save + align - addr);
+
+	addr_hint = addr + size;
+
+	return ((void *)addr);
 }
 
 /*
@@ -1737,3 +2095,10 @@ _mpanic(const char *ctl, ...)
 	}
 	abort();
 }
+
+__weak_reference(__aligned_alloc, aligned_alloc);
+__weak_reference(__malloc, malloc);
+__weak_reference(__calloc, calloc);
+__weak_reference(__posix_memalign, posix_memalign);
+__weak_reference(__realloc, realloc);
+__weak_reference(__free, free);

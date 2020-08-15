@@ -1,4 +1,3 @@
-# $FreeBSD: src/lib/libpthread/pthread.map,v 1.13 2010/10/23 $
 
 LIBTHREAD_1_0 {
 global:
@@ -12,6 +11,7 @@ global:
 	__nanosleep;
 	__open;
 	__poll;
+	__ppoll;
 	__pthread_cond_timedwait;
 	__pthread_cond_wait;
 	__pthread_cxa_finalize;
@@ -47,6 +47,7 @@ global:
 	_pthread_attr_default;
 	_pthread_attr_destroy;
 	_pthread_attr_get_np;
+	_pthread_attr_getaffinity_np;
 	_pthread_attr_getdetachstate;
 	_pthread_attr_getguardsize;
 	_pthread_attr_getinheritsched;
@@ -57,6 +58,7 @@ global:
 	_pthread_attr_getstackaddr;
 	_pthread_attr_getstacksize;
 	_pthread_attr_init;
+	_pthread_attr_setaffinity_np;
 	_pthread_attr_setcreatesuspend_np;
 	_pthread_attr_setdetachstate;
 	_pthread_attr_setguardsize;
@@ -85,8 +87,10 @@ global:
 	_pthread_condattr_setpshared;
 	_pthread_create;
 	_pthread_detach;
+	_pthread_distribute_static_tls;
 	_pthread_equal;
 	_pthread_exit;
+	_pthread_getaffinity_np;
 	_pthread_getconcurrency;
 	_pthread_getprio;
 	_pthread_getschedparam;
@@ -135,7 +139,9 @@ global:
 	_pthread_rwlockattr_init;
 	_pthread_rwlockattr_setpshared;
 	_pthread_self;
+	_pthread_get_name_np;
 	_pthread_set_name_np;
+	_pthread_setaffinity_np;
 	_pthread_setcancelstate;
 	_pthread_setcanceltype;
 	_pthread_setconcurrency;
@@ -207,6 +213,7 @@ global:
 	pthread_barrierattr_setpshared;
 	pthread_attr_destroy;
 	pthread_attr_get_np;
+	pthread_attr_getaffinity_np;
 	pthread_attr_getdetachstate;
 	pthread_attr_getguardsize;
 	pthread_attr_getinheritsched;
@@ -217,6 +224,7 @@ global:
 	pthread_attr_getstackaddr;
 	pthread_attr_getstacksize;
 	pthread_attr_init;
+	pthread_attr_setaffinity_np;
 	pthread_attr_setcreatesuspend_np;
 	pthread_attr_setdetachstate;
 	pthread_attr_setguardsize;
@@ -246,6 +254,7 @@ global:
 	pthread_detach;
 	pthread_equal;
 	pthread_exit;
+	pthread_getaffinity_np;
 	pthread_getconcurrency;
 	pthread_getprio;
 	pthread_getschedparam;
@@ -293,7 +302,9 @@ global:
 	pthread_rwlockattr_init;
 	pthread_rwlockattr_setpshared;
 	pthread_self;
+	pthread_get_name_np;
 	pthread_set_name_np;
+	pthread_setaffinity_np;
 	pthread_setcancelstate;
 	pthread_setcanceltype;
 	pthread_setconcurrency;
@@ -376,4 +387,17 @@ global:
 	_thread_state_zoombie;
 local:
 	*;
+};
+
+LIBTHREAD_1_1 {
+global:
+	ppoll;
+};
+
+LIBTHREAD_1_2 {
+global:
+	_pthread_getcpuclockid;
+	_pthread_getthreadid_np;
+	pthread_getcpuclockid;
+	pthread_getthreadid_np;
 };

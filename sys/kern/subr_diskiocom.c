@@ -55,9 +55,7 @@
 #include <sys/dmsg.h>
 
 #include <sys/buf2.h>
-#include <sys/mplock2.h>
 #include <sys/msgport2.h>
-#include <sys/thread2.h>
 
 struct dios_open {
 	int	openrd;
@@ -67,9 +65,14 @@ struct dios_open {
 struct dios_io {
 	int	count;
 	int	eof;
+	kdmsg_data_t data;
 };
 
 static MALLOC_DEFINE(M_DMSG_DISK, "dmsg_disk", "disk dmsg");
+
+static int blk_active;
+SYSCTL_INT(_debug, OID_AUTO, blk_active, CTLFLAG_RW, &blk_active, 0,
+           "Number of active iocom IOs");
 
 static int disk_iocom_reconnect(struct disk *dp, struct file *fp);
 static int disk_rcvdmsg(kdmsg_msg_t *msg);
@@ -103,7 +106,7 @@ disk_iocom_uninit(struct disk *dp)
 }
 
 int
-disk_iocom_ioctl(struct disk *dp, int cmd, void *data)
+disk_iocom_ioctl(struct disk *dp, u_long cmd, void *data)
 {
 	struct file *fp;
 	struct disk_ioc_recluster *recl;
@@ -112,7 +115,7 @@ disk_iocom_ioctl(struct disk *dp, int cmd, void *data)
 	switch(cmd) {
 	case DIOCRECLUSTER:
 		recl = data;
-		fp = holdfp(curproc->p_fd, recl->fd, -1);
+		fp = holdfp(curthread, recl->fd, -1);
 		if (fp) {
 			error = disk_iocom_reconnect(dp, fp);
 		} else {
@@ -137,34 +140,47 @@ disk_iocom_reconnect(struct disk *dp, struct file *fp)
 
 	kdmsg_iocom_reconnect(&dp->d_iocom, fp, devname);
 
-	dp->d_iocom.auto_lnk_conn.pfs_type = DMSG_PFSTYPE_SERVER;
 	dp->d_iocom.auto_lnk_conn.proto_version = DMSG_SPAN_PROTO_1;
 	dp->d_iocom.auto_lnk_conn.peer_type = DMSG_PEER_BLOCK;
 	dp->d_iocom.auto_lnk_conn.peer_mask = 1LLU << DMSG_PEER_BLOCK;
-	dp->d_iocom.auto_lnk_conn.pfs_mask = (uint64_t)-1;
-	ksnprintf(dp->d_iocom.auto_lnk_conn.cl_label,
-		  sizeof(dp->d_iocom.auto_lnk_conn.cl_label),
-		  "%s/%s", hostname, devname);
+	dp->d_iocom.auto_lnk_conn.peer_mask = (uint64_t)-1;
+#if 0
 	if (dp->d_info.d_serialno) {
-		ksnprintf(dp->d_iocom.auto_lnk_conn.fs_label,
-			  sizeof(dp->d_iocom.auto_lnk_conn.fs_label),
-			  "%s", dp->d_info.d_serialno);
+		ksnprintf(dp->d_iocom.auto_lnk_conn.peer_label,
+			  sizeof(dp->d_iocom.auto_lnk_conn.peer_label),
+			  "%s/%s", hostname, dp->d_info.d_serialno);
+	} else {
+		ksnprintf(dp->d_iocom.auto_lnk_conn.peer_label,
+			  sizeof(dp->d_iocom.auto_lnk_conn.peer_label),
+			  "%s/%s", hostname, devname);
 	}
+#endif
+	ksnprintf(dp->d_iocom.auto_lnk_conn.peer_label,
+		  sizeof(dp->d_iocom.auto_lnk_conn.peer_label),
+		  "%s/%s", hostname, devname);
 
-	dp->d_iocom.auto_lnk_span.pfs_type = DMSG_PFSTYPE_SERVER;
 	dp->d_iocom.auto_lnk_span.proto_version = DMSG_SPAN_PROTO_1;
 	dp->d_iocom.auto_lnk_span.peer_type = DMSG_PEER_BLOCK;
 	dp->d_iocom.auto_lnk_span.media.block.bytes =
 						dp->d_info.d_media_size;
 	dp->d_iocom.auto_lnk_span.media.block.blksize =
 						dp->d_info.d_media_blksize;
-	ksnprintf(dp->d_iocom.auto_lnk_span.cl_label,
-		  sizeof(dp->d_iocom.auto_lnk_span.cl_label),
-		  "%s/%s", hostname, devname);
+	ksnprintf(dp->d_iocom.auto_lnk_span.peer_label,
+		  sizeof(dp->d_iocom.auto_lnk_span.peer_label),
+		  "%s", dp->d_iocom.auto_lnk_conn.peer_label);
 	if (dp->d_info.d_serialno) {
-		ksnprintf(dp->d_iocom.auto_lnk_span.fs_label,
-			  sizeof(dp->d_iocom.auto_lnk_span.fs_label),
+		ksnprintf(dp->d_iocom.auto_lnk_span.pfs_label,
+			  sizeof(dp->d_iocom.auto_lnk_span.pfs_label),
 			  "%s", dp->d_info.d_serialno);
+	} else {
+		/* 
+		 * If no serial number is available generate a dummy serial
+		 * number from the host and device name and pray.  This will
+		 * allow e.g. /dev/vn* to look meaningful on a remote machine.
+		 */
+		ksnprintf(dp->d_iocom.auto_lnk_span.pfs_label,
+			  sizeof(dp->d_iocom.auto_lnk_span.pfs_label),
+			  "%s.%s", hostname, devname);
 	}
 
 	kdmsg_iocom_autoinitiate(&dp->d_iocom, NULL);
@@ -172,7 +188,7 @@ disk_iocom_reconnect(struct disk *dp, struct file *fp)
 	return (0);
 }
 
-int
+static int
 disk_rcvdmsg(kdmsg_msg_t *msg)
 {
 	struct disk *dp = msg->state->iocom->handle;
@@ -196,7 +212,11 @@ disk_rcvdmsg(kdmsg_msg_t *msg)
 	}
 
 	/*
-	 * All remaining messages must be in a transaction
+	 * All remaining messages must be in a transaction. 
+	 *
+	 * NOTE!  We currently don't care if the transaction is just
+	 *	  the span transaction (for disk probes) or if it is the
+	 *	  BLK_OPEN transaction.
 	 *
 	 * NOTE!  We are switching on the first message's command.  The
 	 *	  actual message command within the transaction may be
@@ -212,6 +232,9 @@ disk_rcvdmsg(kdmsg_msg_t *msg)
 		disk_blk_open(dp, msg);
 		break;
 	case DMSG_BLK_READ:
+		/*
+		 * not reached normally but leave in for completeness
+		 */
 		disk_blk_read(dp, msg);
 		break;
 	case DMSG_BLK_WRITE:
@@ -255,7 +278,7 @@ disk_blk_open(struct disk *dp, kdmsg_msg_t *msg)
 			fflags = FREAD;
 		if (msg->any.blk_open.modes & DMSG_BLKOPEN_WR)
 			fflags |= FWRITE;
-		error = dev_dopen(dp->d_rawdev, fflags, S_IFCHR, proc0.p_ucred, NULL);
+		error = dev_dopen(dp->d_rawdev, fflags, S_IFCHR, proc0.p_ucred, NULL, NULL);
 		if (error) {
 			error = DMSG_ERR_IO;
 		} else {
@@ -338,7 +361,8 @@ disk_blk_read(struct disk *dp, kdmsg_msg_t *msg)
 			msg->state->any.any = iost;
 		}
 		reterr = 0;
-		bp = geteblk(msg->any.blk_read.bytes);
+		bp = getpbuf_mem(NULL);
+		KKASSERT(msg->any.blk_read.bytes <= bp->b_bufsize);
 		bio = &bp->b_bio1;
 		bp->b_cmd = BUF_CMD_READ;
 		bp->b_bcount = msg->any.blk_read.bytes;
@@ -346,8 +370,9 @@ disk_blk_read(struct disk *dp, kdmsg_msg_t *msg)
 		bio->bio_offset = msg->any.blk_read.offset;
 		bio->bio_caller_info1.ptr = msg->state;
 		bio->bio_done = diskiodone;
-		/* kdmsg_state_hold(msg->state); */
 
+		/* kdmsg_state_hold(msg->state); */
+		atomic_add_int(&blk_active, 1);
 		atomic_add_int(&iost->count, 1);
 		if (msg->any.head.cmd & DMSGF_DELETE)
 			iost->eof = 1;
@@ -403,23 +428,27 @@ disk_blk_write(struct disk *dp, kdmsg_msg_t *msg)
 		if (msg->aux_size >= msg->any.blk_write.bytes)
 			bp = getpbuf(NULL);
 		else
-			bp = geteblk(msg->any.blk_write.bytes);
+			bp = getpbuf_mem(NULL);
+		KKASSERT(msg->any.blk_write.bytes <= bp->b_bufsize);
 		bio = &bp->b_bio1;
 		bp->b_cmd = BUF_CMD_WRITE;
 		bp->b_bcount = msg->any.blk_write.bytes;
 		bp->b_resid = bp->b_bcount;
 		if (msg->aux_size >= msg->any.blk_write.bytes) {
 			bp->b_data = msg->aux_data;
+			kdmsg_detach_aux_data(msg, &iost->data);
 		} else {
 			bcopy(msg->aux_data, bp->b_data, msg->aux_size);
 			bzero(bp->b_data + msg->aux_size,
 			      msg->any.blk_write.bytes - msg->aux_size);
+			bzero(&iost->data, sizeof(iost->data));
 		}
 		bio->bio_offset = msg->any.blk_write.offset;
 		bio->bio_caller_info1.ptr = msg->state;
 		bio->bio_done = diskiodone;
-		/* kdmsg_state_hold(msg->state); */
 
+		/* kdmsg_state_hold(msg->state); */
+		atomic_add_int(&blk_active, 1);
 		atomic_add_int(&iost->count, 1);
 		if (msg->any.head.cmd & DMSGF_DELETE)
 			iost->eof = 1;
@@ -469,8 +498,9 @@ disk_blk_flush(struct disk *dp, kdmsg_msg_t *msg)
 		bio->bio_offset = msg->any.blk_flush.offset;
 		bio->bio_caller_info1.ptr = msg->state;
 		bio->bio_done = diskiodone;
-		/* kdmsg_state_hold(msg->state); */
 
+		/* kdmsg_state_hold(msg->state); */
+		atomic_add_int(&blk_active, 1);
 		atomic_add_int(&iost->count, 1);
 		if (msg->any.head.cmd & DMSGF_DELETE)
 			iost->eof = 1;
@@ -519,8 +549,9 @@ disk_blk_freeblks(struct disk *dp, kdmsg_msg_t *msg)
 		bio->bio_offset = msg->any.blk_freeblks.offset;
 		bio->bio_caller_info1.ptr = msg->state;
 		bio->bio_done = diskiodone;
-		/* kdmsg_state_hold(msg->state); */
 
+		/* kdmsg_state_hold(msg->state); */
+		atomic_add_int(&blk_active, 1);
 		atomic_add_int(&iost->count, 1);
 		if (msg->any.head.cmd & DMSGF_DELETE)
 			iost->eof = 1;
@@ -571,6 +602,7 @@ diskiodone(struct bio *bio)
 			error = 0;
 			resid = bp->b_resid;
 		}
+		kdmsg_free_aux_data(&iost->data);
 		break;
 	case BUF_CMD_FLUSH:
 	case BUF_CMD_FREEBLKS:
@@ -607,6 +639,7 @@ diskiodone(struct bio *bio)
 	} else {
 		atomic_add_int(&iost->count, -1);
 	}
+	atomic_add_int(&blk_active, -1);
 	cmd |= DMSGF_REPLY;
 
 	/*
@@ -627,9 +660,9 @@ diskiodone(struct bio *bio)
 	/* kdmsg_state_drop(state); */
 	kdmsg_msg_write(rmsg);
 	if (bp->b_flags & B_PAGING) {
-		relpbuf(bio->bio_buf, NULL);
+		relpbuf(bp, NULL);
 	} else {
 		bp->b_flags |= B_INVAL | B_AGE;
-		brelse(bp);
+		relpbuf(bp, NULL);
 	}
 }

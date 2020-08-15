@@ -180,7 +180,7 @@ enum cxm_mailbox_name { cxm_unknown_mailbox,
  * that the size of each piece must be a multiple of
  * 256 and less than 64k.
  */
-#define CXM_SG_SEGMENT  (0xff00 & ~(PAGE_SIZE - 1))
+#define CXM_SG_SEGMENT  rounddown2(0xff00, PAGE_SIZE)
 
 struct cxm_sg_entry {
 	uint32_t	src;
@@ -305,8 +305,8 @@ struct cxm_iic_softc {
 /*
  * Decoder / encoder firmware
  */
-extern const char cxm_dec_fw[];
-extern const char cxm_enc_fw[];
+extern const uint8_t cxm_dec_fw[] __aligned(4);
+extern const uint8_t cxm_enc_fw[] __aligned(4);
 
 #define CXM_FW_SIZE (256 * 1024)
 

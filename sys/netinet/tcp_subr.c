@@ -63,10 +63,8 @@
  * $FreeBSD: src/sys/netinet/tcp_subr.c,v 1.73.2.31 2003/01/24 05:11:34 sam Exp $
  */
 
-#include "opt_compat.h"
 #include "opt_inet.h"
 #include "opt_inet6.h"
-#include "opt_ipsec.h"
 #include "opt_tcpdebug.h"
 
 #include <sys/param.h>
@@ -121,27 +119,10 @@
 #endif
 #include <netinet6/ip6protosw.h>
 
-#ifdef IPSEC
-#include <netinet6/ipsec.h>
-#include <netproto/key/key.h>
-#ifdef INET6
-#include <netinet6/ipsec6.h>
-#endif
-#endif
-
-#ifdef FAST_IPSEC
-#include <netproto/ipsec/ipsec.h>
-#ifdef INET6
-#include <netproto/ipsec/ipsec6.h>
-#endif
-#define	IPSEC
-#endif
-
 #include <sys/md5.h>
 #include <machine/smp.h>
 
 #include <sys/msgport2.h>
-#include <sys/mplock2.h>
 #include <net/netmsg2.h>
 
 #if !defined(KTR_TCP)
@@ -156,10 +137,16 @@ KTR_INFO(KTR_TCP, tcp, delayed, 2, "tcp execute delayed ops", 0);
 */
 
 #define TCP_IW_MAXSEGS_DFLT	4
-#define TCP_IW_CAPSEGS_DFLT	3
+#define TCP_IW_CAPSEGS_DFLT	4
+
+struct tcp_reass_pcpu {
+	int			draining;
+	struct netmsg_base	drain_nmsg;
+} __cachealign;
 
 struct inpcbinfo tcbinfo[MAXCPU];
-struct tcpcbackqhead tcpcbackq[MAXCPU];
+struct tcpcbackq tcpcbackq[MAXCPU];
+struct tcp_reass_pcpu tcp_reassq[MAXCPU];
 
 int tcp_mssdflt = TCP_MSS;
 SYSCTL_INT(_net_inet_tcp, TCPCTL_MSSDFLT, mssdflt, CTLFLAG_RW,
@@ -205,7 +192,14 @@ static int icmp_may_rst = 1;
 SYSCTL_INT(_net_inet_tcp, OID_AUTO, icmp_may_rst, CTLFLAG_RW, &icmp_may_rst, 0,
     "Certain ICMP unreachable messages may abort connections in SYN_SENT");
 
-static int tcp_isn_reseed_interval = 0;
+/*
+ * Recommend 20 (6 times in two minutes)
+ *
+ * Lower values may cause the sequence space to cycle too quickly and lose
+ * its signed monotonically-increasing nature within the 2-minute TIMEDWAIT
+ * window.
+ */
+static int tcp_isn_reseed_interval = 20;
 SYSCTL_INT(_net_inet_tcp, OID_AUTO, isn_reseed_interval, CTLFLAG_RW,
     &tcp_isn_reseed_interval, 0, "Seconds between reseeding of ISN secret");
 
@@ -230,6 +224,17 @@ SYSCTL_INT(_net_inet_tcp, OID_AUTO, inflight_enable, CTLFLAG_RW,
 static int tcp_inflight_debug = 0;
 SYSCTL_INT(_net_inet_tcp, OID_AUTO, inflight_debug, CTLFLAG_RW,
     &tcp_inflight_debug, 0, "Debug TCP inflight calculations");
+
+/*
+ * NOTE: tcp_inflight_start is essentially the starting receive window
+ *	 for a connection.  If set too low then fetches over tcp
+ *	 connections will take noticably longer to ramp-up over
+ *	 high-latency connections.  6144 is too low for a default,
+ *	 use something more reasonable.
+ */
+static int tcp_inflight_start = 33792;
+SYSCTL_INT(_net_inet_tcp, OID_AUTO, inflight_start, CTLFLAG_RW,
+    &tcp_inflight_start, 0, "Start value for TCP inflight window");
 
 static int tcp_inflight_min = 6144;
 SYSCTL_INT(_net_inet_tcp, OID_AUTO, inflight_min, CTLFLAG_RW,
@@ -268,6 +273,11 @@ static int tcp_do_ncr = 1;
 SYSCTL_INT(_net_inet_tcp, OID_AUTO, ncr, CTLFLAG_RW,
     &tcp_do_ncr, 0, "Non-Congestion Robustness (RFC 4653)");
 
+int tcp_ncr_linklocal = 0;
+SYSCTL_INT(_net_inet_tcp, OID_AUTO, ncr_linklocal, CTLFLAG_RW,
+    &tcp_ncr_linklocal, 0,
+    "Enable Non-Congestion Robustness (RFC 4653) on link local network");
+
 int tcp_ncr_rxtthresh_max = 16;
 SYSCTL_INT(_net_inet_tcp, OID_AUTO, ncr_rxtthresh_max, CTLFLAG_RW,
     &tcp_ncr_rxtthresh_max, 0,
@@ -280,8 +290,8 @@ static void tcp_willblock(void);
 static void tcp_notify (struct inpcb *, int);
 
 struct tcp_stats tcpstats_percpu[MAXCPU] __cachealign;
+struct tcp_state_count tcpstate_count[MAXCPU] __cachealign;
 
-static struct netmsg_base tcp_drain_netmsg[MAXCPU];
 static void	tcp_drain_dispatch(netmsg_t nmsg);
 
 static int
@@ -289,7 +299,7 @@ sysctl_tcpstats(SYSCTL_HANDLER_ARGS)
 {
 	int cpu, error = 0;
 
-	for (cpu = 0; cpu < ncpus2; ++cpu) {
+	for (cpu = 0; cpu < netisr_ncpus; ++cpu) {
 		if ((error = SYSCTL_OUT(req, &tcpstats_percpu[cpu],
 					sizeof(struct tcp_stats))))
 			break;
@@ -312,6 +322,7 @@ SYSCTL_PROC(_net_inet_tcp, TCPCTL_STATS, stats, (CTLTYPE_OPAQUE | CTLFLAG_RW),
 #ifndef TCBHASHSIZE
 #define	TCBHASHSIZE	512
 #endif
+CTASSERT(powerof2(TCBHASHSIZE));
 
 /*
  * This is the actual shape of what we allocate using the zone
@@ -348,7 +359,7 @@ tcp_init(void)
 {
 	struct inpcbportinfo *portinfo;
 	struct inpcbinfo *ticb;
-	int hashsize = TCBHASHSIZE;
+	int hashsize = TCBHASHSIZE, portinfo_hsize;
 	int cpu;
 
 	/*
@@ -365,32 +376,37 @@ tcp_init(void)
 	tcp_maxpersistidle = TCPTV_KEEP_IDLE;
 	tcp_msl = TCPTV_MSL;
 	tcp_rexmit_min = TCPTV_MIN;
+	if (tcp_rexmit_min < 1) /* if kern.hz is too low */
+		tcp_rexmit_min = 1;
 	tcp_rexmit_slop = TCPTV_CPU_VAR;
 
 	TUNABLE_INT_FETCH("net.inet.tcp.tcbhashsize", &hashsize);
 	if (!powerof2(hashsize)) {
 		kprintf("WARNING: TCB hash size not a power of 2\n");
-		hashsize = 512; /* safe default */
+		hashsize = TCBHASHSIZE; /* safe default */
 	}
 	tcp_tcbhashsize = hashsize;
 
-	portinfo = kmalloc_cachealign(sizeof(*portinfo) * ncpus2, M_PCB,
-	    M_WAITOK);
+	portinfo_hsize = 65536 / netisr_ncpus;
+	if (portinfo_hsize > hashsize)
+		portinfo_hsize = hashsize;
 
-	for (cpu = 0; cpu < ncpus2; cpu++) {
+	portinfo = kmalloc(sizeof(*portinfo) * netisr_ncpus, M_PCB,
+			   M_WAITOK | M_CACHEALIGN);
+
+	for (cpu = 0; cpu < netisr_ncpus; cpu++) {
 		ticb = &tcbinfo[cpu];
 		in_pcbinfo_init(ticb, cpu, FALSE);
 		ticb->hashbase = hashinit(hashsize, M_PCB,
 					  &ticb->hashmask);
-		in_pcbportinfo_init(&portinfo[cpu], hashsize, TRUE, cpu);
-		ticb->portinfo = portinfo;
-		ticb->portinfo_mask = ncpus2_mask;
+		in_pcbportinfo_init(&portinfo[cpu], portinfo_hsize, cpu);
+		in_pcbportinfo_set(ticb, portinfo, netisr_ncpus);
 		ticb->wildcardhashbase = hashinit(hashsize, M_PCB,
 						  &ticb->wildcardhashmask);
 		ticb->localgrphashbase = hashinit(hashsize, M_PCB,
 						  &ticb->localgrphashmask);
 		ticb->ipi_size = sizeof(struct inp_tp);
-		TAILQ_INIT(&tcpcbackq[cpu]);
+		TAILQ_INIT(&tcpcbackq[cpu].head);
 	}
 
 	tcp_reass_maxseg = nmbclusters / 16;
@@ -410,15 +426,15 @@ tcp_init(void)
 	/*
 	 * Initialize TCP statistics counters for each CPU.
 	 */
-	for (cpu = 0; cpu < ncpus2; ++cpu)
+	for (cpu = 0; cpu < netisr_ncpus; ++cpu)
 		bzero(&tcpstats_percpu[cpu], sizeof(struct tcp_stats));
 
 	/*
 	 * Initialize netmsgs for TCP drain
 	 */
-	for (cpu = 0; cpu < ncpus2; ++cpu) {
-		netmsg_init(&tcp_drain_netmsg[cpu], NULL, &netisr_adone_rport,
-		    MSGF_PRIORITY, tcp_drain_dispatch);
+	for (cpu = 0; cpu < netisr_ncpus; ++cpu) {
+		netmsg_init(&tcp_reassq[cpu].drain_nmsg, NULL,
+		    &netisr_adone_rport, MSGF_PRIORITY, tcp_drain_dispatch);
 	}
 
 	syncache_init();
@@ -429,12 +445,12 @@ static void
 tcp_willblock(void)
 {
 	struct tcpcb *tp;
-	int cpu = mycpu->gd_cpuid;
+	int cpu = mycpuid;
 
-	while ((tp = TAILQ_FIRST(&tcpcbackq[cpu])) != NULL) {
+	while ((tp = TAILQ_FIRST(&tcpcbackq[cpu].head)) != NULL) {
 		KKASSERT(tp->t_flags & TF_ONOUTPUTQ);
 		tp->t_flags &= ~TF_ONOUTPUTQ;
-		TAILQ_REMOVE(&tcpcbackq[cpu], tp, t_outputq);
+		TAILQ_REMOVE(&tcpcbackq[cpu].head, tp, t_outputq);
 		tcp_output(tp);
 	}
 }
@@ -451,7 +467,7 @@ tcp_fillheaders(struct tcpcb *tp, void *ip_ptr, void *tcp_ptr, boolean_t tso)
 	struct tcphdr *tcp_hdr = (struct tcphdr *)tcp_ptr;
 
 #ifdef INET6
-	if (inp->inp_vflag & INP_IPV6) {
+	if (INP_ISIPV6(inp)) {
 		struct ip6_hdr *ip6;
 
 		ip6 = (struct ip6_hdr *)ip_ptr;
@@ -550,6 +566,7 @@ tcp_respond(struct tcpcb *tp, void *ipgen, struct tcphdr *th, struct mbuf *m,
 	struct route_in6 *ro6 = NULL;
 	struct route_in6 sro6;
 	struct ip6_hdr *ip6 = ipgen;
+	struct inpcb *inp = NULL;
 	boolean_t use_tmpro = TRUE;
 #ifdef INET6
 	boolean_t isipv6 = (IP_VHL_V(ip->ip_vhl) == 6);
@@ -558,8 +575,9 @@ tcp_respond(struct tcpcb *tp, void *ipgen, struct tcphdr *th, struct mbuf *m,
 #endif
 
 	if (tp != NULL) {
+		inp = tp->t_inpcb;
 		if (!(flags & TH_RST)) {
-			win = ssb_space(&tp->t_inpcb->inp_socket->so_rcv);
+			win = ssb_space(&inp->inp_socket->so_rcv);
 			if (win < 0)
 				win = 0;
 			if (win > (long)TCP_MAXWIN << tp->rcv_scale)
@@ -571,9 +589,9 @@ tcp_respond(struct tcpcb *tp, void *ipgen, struct tcphdr *th, struct mbuf *m,
 		 */
 		if (tp->t_state != TCPS_LISTEN) {
 			if (isipv6)
-				ro6 = &tp->t_inpcb->in6p_route;
+				ro6 = &inp->in6p_route;
 			else
-				ro = &tp->t_inpcb->inp_route;
+				ro = &inp->inp_route;
 			use_tmpro = FALSE;
 		}
 	}
@@ -587,7 +605,7 @@ tcp_respond(struct tcpcb *tp, void *ipgen, struct tcphdr *th, struct mbuf *m,
 		}
 	}
 	if (m == NULL) {
-		m = m_gethdr(MB_DONTWAIT, MT_HEADER);
+		m = m_gethdr(M_NOWAIT, MT_HEADER);
 		if (m == NULL)
 			return;
 		tlen = 0;
@@ -658,9 +676,8 @@ tcp_respond(struct tcpcb *tp, void *ipgen, struct tcphdr *th, struct mbuf *m,
 		nth->th_sum = in6_cksum(m, IPPROTO_TCP,
 					sizeof(struct ip6_hdr),
 					tlen - sizeof(struct ip6_hdr));
-		ip6->ip6_hlim = in6_selecthlim(tp ? tp->t_inpcb : NULL,
-					       (ro6 && ro6->ro_rt) ?
-						ro6->ro_rt->rt_ifp : NULL);
+		ip6->ip6_hlim = in6_selecthlim(inp,
+		    (ro6 && ro6->ro_rt) ? ro6->ro_rt->rt_ifp : NULL);
 	} else {
 		nth->th_sum = in_pseudo(ip->ip_src.s_addr, ip->ip_dst.s_addr,
 		    htons((u_short)(tlen - sizeof(struct ip) + ip->ip_p)));
@@ -669,19 +686,20 @@ tcp_respond(struct tcpcb *tp, void *ipgen, struct tcphdr *th, struct mbuf *m,
 		m->m_pkthdr.csum_thlen = sizeof(struct tcphdr);
 	}
 #ifdef TCPDEBUG
-	if (tp == NULL || (tp->t_inpcb->inp_socket->so_options & SO_DEBUG))
+	if (tp == NULL || (inp->inp_socket->so_options & SO_DEBUG))
 		tcp_trace(TA_OUTPUT, 0, tp, mtod(m, void *), th, 0);
 #endif
 	if (isipv6) {
-		ip6_output(m, NULL, ro6, ipflags, NULL, NULL,
-			   tp ? tp->t_inpcb : NULL);
+		ip6_output(m, NULL, ro6, ipflags, NULL, NULL, inp);
 		if ((ro6 == &sro6) && (ro6->ro_rt != NULL)) {
 			RTFREE(ro6->ro_rt);
 			ro6->ro_rt = NULL;
 		}
 	} else {
+		if (inp != NULL && (inp->inp_flags & INP_HASH))
+			m_sethash(m, inp->inp_hashval);
 		ipflags |= IP_DEBUGROUTE;
-		ip_output(m, NULL, ro, ipflags, NULL, tp ? tp->t_inpcb : NULL);
+		ip_output(m, NULL, ro, ipflags, NULL, inp);
 		if ((ro == &sro) && (ro->ro_rt != NULL)) {
 			RTFREE(ro->ro_rt);
 			ro->ro_rt = NULL;
@@ -695,13 +713,13 @@ tcp_respond(struct tcpcb *tp, void *ipgen, struct tcphdr *th, struct mbuf *m,
  * protocol control block.  The `inp' parameter must have
  * come from the zone allocator set up in tcp_init().
  */
-struct tcpcb *
+void
 tcp_newtcpcb(struct inpcb *inp)
 {
 	struct inp_tp *it;
 	struct tcpcb *tp;
 #ifdef INET6
-	boolean_t isipv6 = ((inp->inp_vflag & INP_IPV6) != 0);
+	boolean_t isipv6 = INP_ISIPV6(inp);
 #else
 	const boolean_t isipv6 = FALSE;
 #endif
@@ -741,7 +759,7 @@ tcp_newtcpcb(struct inpcb *inp)
 		tp->t_flags |= (TF_REQ_SCALE | TF_REQ_TSTMP);
 
 	tp->t_inpcb = inp;	/* XXX */
-	tp->t_state = TCPS_CLOSED;
+	TCP_STATE_INIT(tp);
 	/*
 	 * Init srtt to TCPTV_SRTTBASE (0), so we can tell that we have no
 	 * rtt estimate.  Set rttvar so that srtt + 4 * rttvar gives
@@ -768,8 +786,6 @@ tcp_newtcpcb(struct inpcb *inp)
 
 	tp->tt_sndmore = &it->inp_tp_sndmore;
 	tcp_output_init(tp);
-
-	return (tp);		/* XXX */
 }
 
 /*
@@ -782,7 +798,7 @@ tcp_drop(struct tcpcb *tp, int error)
 	struct socket *so = tp->t_inpcb->inp_socket;
 
 	if (TCPS_HAVERCVDSYN(tp->t_state)) {
-		tp->t_state = TCPS_CLOSED;
+		TCP_STATE_CHANGE(tp, TCPS_CLOSED);
 		tcp_output(tp);
 		tcpstat.tcps_drops++;
 	} else
@@ -806,13 +822,15 @@ tcp_listen_detach_handler(netmsg_t msg)
 	struct tcpcb *tp = nmsg->nm_tp;
 	int cpu = mycpuid, nextcpu;
 
-	if (tp->t_flags & TF_LISTEN)
+	if (tp->t_flags & TF_LISTEN) {
 		syncache_destroy(tp, nmsg->nm_tp_inh);
+		tcp_pcbport_merge_oncpu(tp);
+	}
 
 	in_pcbremwildcardhash_oncpu(tp->t_inpcb, &tcbinfo[cpu]);
 
 	nextcpu = cpu + 1;
-	if (nextcpu < ncpus2)
+	if (nextcpu < netisr_ncpus)
 		lwkt_forwardmsg(netisr_cpuport(nextcpu), &nmsg->base.lmsg);
 	else
 		lwkt_replymsg(&nmsg->base.lmsg, 0);
@@ -835,8 +853,7 @@ tcp_close(struct tcpcb *tp)
 	struct rtentry *rt;
 	boolean_t dosavessthresh;
 #ifdef INET6
-	boolean_t isipv6 = ((inp->inp_vflag & INP_IPV6) != 0);
-	boolean_t isafinet6 = (INP_CHECK_SOCKAF(so, AF_INET6) != 0);
+	boolean_t isipv6 = INP_ISIPV6(inp);
 #else
 	const boolean_t isipv6 = FALSE;
 #endif
@@ -854,8 +871,7 @@ tcp_close(struct tcpcb *tp)
 		 * Currently the inheritance could only happen on the
 		 * listen(2) sockets w/ SO_REUSEPORT set.
 		 */
-		KASSERT(&curthread->td_msgport == netisr_cpuport(0),
-		    ("listen socket close not in netisr0"));
+		ASSERT_NETISR0;
 		inp_inh = in_pcblocalgroup_last(&tcbinfo[0], inp);
 		if (inp_inh != NULL)
 			tp_inh = intotcpcb(inp_inh);
@@ -879,11 +895,11 @@ tcp_close(struct tcpcb *tp)
 	 * no longer be available to the rest of the protocol threads, so we
 	 * are safe to whack the inp in the following code.
 	 */
-	if ((inp->inp_flags & INP_WILDCARD) && ncpus2 > 1) {
+	if ((inp->inp_flags & INP_WILDCARD) && netisr_ncpus > 1) {
 		struct netmsg_listen_detach nmsg;
 
 		KKASSERT(so->so_port == netisr_cpuport(0));
-		KKASSERT(&curthread->td_msgport == netisr_cpuport(0));
+		ASSERT_NETISR0;
 		KKASSERT(inp->inp_pcbinfo == &tcbinfo[0]);
 
 		netmsg_init(&nmsg.base, NULL, &curthread->td_msgport,
@@ -893,8 +909,7 @@ tcp_close(struct tcpcb *tp)
 		lwkt_domsg(netisr_cpuport(1), &nmsg.base.lmsg, 0);
 	}
 
-	KKASSERT(tp->t_state != TCPS_TERMINATING);
-	tp->t_state = TCPS_TERMINATING;
+	TCP_STATE_TERM(tp);
 
 	/*
 	 * Make sure that all of our timers are stopped before we
@@ -903,16 +918,16 @@ tcp_close(struct tcpcb *tp)
 	 * (tp->tt_msg->tt_tcb == NULL), timers are never used too.
 	 */
 	if (tp->tt_msg != NULL && tp->tt_msg->tt_tcb != NULL) {
-		tcp_callout_stop(tp, tp->tt_rexmt);
-		tcp_callout_stop(tp, tp->tt_persist);
-		tcp_callout_stop(tp, tp->tt_keep);
-		tcp_callout_stop(tp, tp->tt_2msl);
-		tcp_callout_stop(tp, tp->tt_delack);
+		tcp_callout_terminate(tp, tp->tt_rexmt);
+		tcp_callout_terminate(tp, tp->tt_persist);
+		tcp_callout_terminate(tp, tp->tt_keep);
+		tcp_callout_terminate(tp, tp->tt_2msl);
+		tcp_callout_terminate(tp, tp->tt_delack);
 	}
 
 	if (tp->t_flags & TF_ONOUTPUTQ) {
 		KKASSERT(tp->tt_cpu == mycpu->gd_cpuid);
-		TAILQ_REMOVE(&tcpcbackq[tp->tt_cpu], tp, t_outputq);
+		TAILQ_REMOVE(&tcpcbackq[tp->tt_cpu].head, tp, t_outputq);
 		tp->t_flags &= ~TF_ONOUTPUTQ;
 	}
 
@@ -1032,6 +1047,8 @@ no_valid_rt:
 
 	if (tp->t_flags & TF_LISTEN) {
 		syncache_destroy(tp, tp_inh);
+		tcp_pcbport_merge_oncpu(tp);
+		tcp_pcbport_destroy(tp);
 		if (inp_inh != NULL && inp_inh->inp_socket != NULL) {
 			/*
 			 * Pending sockets inheritance only needs
@@ -1041,6 +1058,7 @@ no_valid_rt:
 			soinherit(so, inp_inh->inp_socket);
 		}
 	}
+	KASSERT(tp->t_pcbport == NULL, ("tcpcb port cache is not destroyed"));
 
 	so_async_rcvd_drop(so);
 	/* Drop the reference for the asynchronized pru_rcvd */
@@ -1048,10 +1066,13 @@ no_valid_rt:
 
 	/*
 	 * NOTE:
-	 * pcbdetach removes any wildcard hash entry on the current CPU.
+	 * - Remove self from listen tcpcb per-cpu port cache _before_
+	 *   pcbdetach.
+	 * - pcbdetach removes any wildcard hash entry on the current CPU.
 	 */
+	tcp_pcbport_remove(inp);
 #ifdef INET6
-	if (isafinet6)
+	if (isipv6)
 		in6_pcbdetach(inp);
 	else
 #endif
@@ -1061,7 +1082,11 @@ no_valid_rt:
 	return (NULL);
 }
 
-static __inline void
+/*
+ * Walk the tcpbs, if existing, and flush the reassembly queue,
+ * if there is one...
+ */
+static void
 tcp_drain_oncpu(struct inpcbinfo *pcbinfo)
 {
 	struct inpcbhead *head = &pcbinfo->pcblisthead;
@@ -1072,16 +1097,19 @@ tcp_drain_oncpu(struct inpcbinfo *pcbinfo)
 	 * we block during the inpcb list iteration, i.e.
 	 * we don't need to use inpcb marker here.
 	 */
-	KASSERT(&curthread->td_msgport == netisr_cpuport(pcbinfo->cpu),
-	    ("not in correct netisr"));
+	ASSERT_NETISR_NCPUS(pcbinfo->cpu);
 
 	LIST_FOREACH(inpb, head, inp_list) {
 		struct tcpcb *tcpb;
 		struct tseg_qent *te;
 
-		if ((inpb->inp_flags & INP_PLACEMARKER) == 0 &&
-		    (tcpb = intotcpcb(inpb)) != NULL &&
-		    (te = TAILQ_FIRST(&tcpb->t_segq)) != NULL) {
+		if (inpb->inp_flags & INP_PLACEMARKER)
+			continue;
+
+		tcpb = intotcpcb(inpb);
+		KASSERT(tcpb != NULL, ("tcp_drain_oncpu: tcpb is NULL"));
+
+		if ((te = TAILQ_FIRST(&tcpb->t_segq)) != NULL) {
 			TAILQ_REMOVE(&tcpb->t_segq, te, tqe_q);
 			if (te->tqe_th->th_flags & TH_FIN)
 				tcpb->t_flags &= ~TF_QUEDFIN;
@@ -1101,13 +1129,14 @@ tcp_drain_dispatch(netmsg_t nmsg)
 	crit_exit();
 
 	tcp_drain_oncpu(&tcbinfo[mycpuid]);
+	tcp_reassq[mycpuid].draining = 0;
 }
 
 static void
 tcp_drain_ipi(void *arg __unused)
 {
 	int cpu = mycpuid;
-	struct lwkt_msg *msg = &tcp_drain_netmsg[cpu].lmsg;
+	struct lwkt_msg *msg = &tcp_reassq[cpu].drain_nmsg.lmsg;
 
 	crit_enter();
 	if (msg->ms_flags & MSGF_DONE)
@@ -1119,23 +1148,40 @@ void
 tcp_drain(void)
 {
 	cpumask_t mask;
+	int cpu;
 
 	if (!do_tcpdrain)
 		return;
 
-	/*
-	 * Walk the tcpbs, if existing, and flush the reassembly queue,
-	 * if there is one...
-	 * XXX: The "Net/3" implementation doesn't imply that the TCP
-	 *	reassembly queue should be flushed, but in a situation
-	 *	where we're really low on mbufs, this is potentially
-	 *	useful.
-	 * YYY: We may consider run tcp_drain_oncpu directly here,
-	 *      however, that will require M_WAITOK memory allocation
-	 *      for the inpcb marker.
-	 */
-	CPUMASK_ASSBMASK(mask, ncpus2);
+	if (tcp_reass_qsize == 0)
+		return;
+
+	CPUMASK_ASSBMASK(mask, netisr_ncpus);
 	CPUMASK_ANDMASK(mask, smp_active_mask);
+
+	cpu = mycpuid;
+	if (IN_NETISR_NCPUS(cpu)) {
+		tcp_drain_oncpu(&tcbinfo[cpu]);
+		CPUMASK_NANDBIT(mask, cpu);
+	}
+
+	if (tcp_reass_qsize < netisr_ncpus) {
+		/* Does not worth the trouble. */
+		return;
+	}
+
+	for (cpu = 0; cpu < netisr_ncpus; ++cpu) {
+		if (!CPUMASK_TESTBIT(mask, cpu))
+			continue;
+
+		if (tcp_reassq[cpu].draining) {
+			/* Draining; skip this cpu. */
+			CPUMASK_NANDBIT(mask, cpu);
+			continue;
+		}
+		tcp_reassq[cpu].draining = 1;
+	}
+
 	if (CPUMASK_TESTNZERO(mask))
 		lwkt_send_ipiq_mask(mask, tcp_drain_ipi, NULL);
 }
@@ -1192,7 +1238,7 @@ tcp_pcblist(SYSCTL_HANDLER_ARGS)
 	 * resource-intensive to repeat twice on every request.
 	 */
 	if (req->oldptr == NULL) {
-		for (ccpu = 0; ccpu < ncpus2; ++ccpu)
+		for (ccpu = 0; ccpu < netisr_ncpus; ++ccpu)
 			n += tcbinfo[ccpu].ipi_count;
 		req->oldidx = (n + n/8 + 10) * sizeof(struct xtcpcb);
 		return (0);
@@ -1212,7 +1258,7 @@ tcp_pcblist(SYSCTL_HANDLER_ARGS)
 	 * cpu to avoid races).
 	 */
 	origcpu = mycpu->gd_cpuid;
-	for (ccpu = 0; ccpu < ncpus2 && error == 0; ++ccpu) {
+	for (ccpu = 0; ccpu < netisr_ncpus && error == 0; ++ccpu) {
 		caddr_t inp_ppcb;
 		struct xtcpcb xt;
 
@@ -1323,7 +1369,6 @@ tcp6_getcred(SYSCTL_HANDLER_ARGS)
 	struct sockaddr_in6 addrs[2];
 	struct inpcb *inp;
 	int error;
-	boolean_t mapped = FALSE;
 
 	error = priv_check(req->td, PRIV_ROOT);
 	if (error != 0)
@@ -1331,26 +1376,10 @@ tcp6_getcred(SYSCTL_HANDLER_ARGS)
 	error = SYSCTL_IN(req, addrs, sizeof addrs);
 	if (error != 0)
 		return (error);
-	if (IN6_IS_ADDR_V4MAPPED(&addrs[0].sin6_addr)) {
-		if (IN6_IS_ADDR_V4MAPPED(&addrs[1].sin6_addr))
-			mapped = TRUE;
-		else
-			return (EINVAL);
-	}
 	crit_enter();
-	if (mapped) {
-		inp = in_pcblookup_hash(&tcbinfo[0],
-		    *(struct in_addr *)&addrs[1].sin6_addr.s6_addr[12],
-		    addrs[1].sin6_port,
-		    *(struct in_addr *)&addrs[0].sin6_addr.s6_addr[12],
-		    addrs[0].sin6_port,
-		    0, NULL);
-	} else {
-		inp = in6_pcblookup_hash(&tcbinfo[0],
-		    &addrs[1].sin6_addr, addrs[1].sin6_port,
-		    &addrs[0].sin6_addr, addrs[0].sin6_port,
-		    0, NULL);
-	}
+	inp = in6_pcblookup_hash(&tcbinfo[0],
+	    &addrs[1].sin6_addr, addrs[1].sin6_port,
+	    &addrs[0].sin6_addr, addrs[0].sin6_port, 0, NULL);
 	if (inp == NULL || inp->inp_socket == NULL) {
 		error = ENOENT;
 		goto out;
@@ -1368,7 +1397,7 @@ SYSCTL_PROC(_net_inet6_tcp6, OID_AUTO, getcred, (CTLTYPE_OPAQUE | CTLFLAG_RW),
 
 struct netmsg_tcp_notify {
 	struct netmsg_base base;
-	void		(*nm_notify)(struct inpcb *, int);
+	inp_notify_t	nm_notify;
 	struct in_addr	nm_faddr;
 	int		nm_arg;
 };
@@ -1379,35 +1408,31 @@ tcp_notifyall_oncpu(netmsg_t msg)
 	struct netmsg_tcp_notify *nm = (struct netmsg_tcp_notify *)msg;
 	int nextcpu;
 
+	ASSERT_NETISR_NCPUS(mycpuid);
+
 	in_pcbnotifyall(&tcbinfo[mycpuid], nm->nm_faddr,
 			nm->nm_arg, nm->nm_notify);
 
 	nextcpu = mycpuid + 1;
-	if (nextcpu < ncpus2)
+	if (nextcpu < netisr_ncpus)
 		lwkt_forwardmsg(netisr_cpuport(nextcpu), &nm->base.lmsg);
 	else
 		lwkt_replymsg(&nm->base.lmsg, 0);
 }
 
-void
-tcp_ctlinput(netmsg_t msg)
+inp_notify_t
+tcp_get_inpnotify(int cmd, const struct sockaddr *sa,
+    int *arg, struct ip **ip0, int *cpuid)
 {
-	int cmd = msg->ctlinput.nm_cmd;
-	struct sockaddr *sa = msg->ctlinput.nm_arg;
-	struct ip *ip = msg->ctlinput.nm_extra;
-	struct tcphdr *th;
+	struct ip *ip = *ip0;
 	struct in_addr faddr;
-	struct inpcb *inp;
-	struct tcpcb *tp;
-	void (*notify)(struct inpcb *, int) = tcp_notify;
-	tcp_seq icmpseq;
-	int arg, cpu;
+	inp_notify_t notify = tcp_notify;
 
-	faddr = ((struct sockaddr_in *)sa)->sin_addr;
+	faddr = ((const struct sockaddr_in *)sa)->sin_addr;
 	if (sa->sa_family != AF_INET || faddr.s_addr == INADDR_ANY)
-		goto done;
+		return NULL;
 
-	arg = inetctlerrmap[cmd];
+	*arg = inetctlerrmap[cmd];
 	if (cmd == PRC_QUENCH) {
 		notify = tcp_quench;
 	} else if (icmp_may_rst &&
@@ -1420,7 +1445,7 @@ tcp_ctlinput(netmsg_t msg)
 		const struct icmp *icmp = (const struct icmp *)
 		    ((caddr_t)ip - offsetof(struct icmp, icmp_ip));
 
-		arg = ntohs(icmp->icmp_nextmtu);
+		*arg = ntohs(icmp->icmp_nextmtu);
 		notify = tcp_mtudisc;
 	} else if (PRC_IS_REDIRECT(cmd)) {
 		ip = NULL;
@@ -1428,19 +1453,59 @@ tcp_ctlinput(netmsg_t msg)
 	} else if (cmd == PRC_HOSTDEAD) {
 		ip = NULL;
 	} else if ((unsigned)cmd >= PRC_NCMDS || inetctlerrmap[cmd] == 0) {
-		goto done;
+		return NULL;
 	}
 
+	if (cpuid != NULL) {
+		if (ip == NULL) {
+			/* Go through all effective netisr CPUs. */
+			*cpuid = netisr_ncpus;
+		} else {
+			const struct tcphdr *th;
+
+			th = (const struct tcphdr *)
+			    ((caddr_t)ip + (IP_VHL_HL(ip->ip_vhl) << 2));
+			*cpuid = tcp_addrcpu(faddr.s_addr, th->th_dport,
+			    ip->ip_src.s_addr, th->th_sport);
+		}
+	}
+
+	*ip0 = ip;
+	return notify;
+}
+
+void
+tcp_ctlinput(netmsg_t msg)
+{
+	int cmd = msg->ctlinput.nm_cmd;
+	struct sockaddr *sa = msg->ctlinput.nm_arg;
+	struct ip *ip = msg->ctlinput.nm_extra;
+	struct in_addr faddr;
+	inp_notify_t notify;
+	int arg, cpuid;
+
+	ASSERT_NETISR_NCPUS(mycpuid);
+
+	notify = tcp_get_inpnotify(cmd, sa, &arg, &ip, &cpuid);
+	if (notify == NULL)
+		goto done;
+
+	faddr = ((struct sockaddr_in *)sa)->sin_addr;
 	if (ip != NULL) {
-		th = (struct tcphdr *)((caddr_t)ip +
-				       (IP_VHL_HL(ip->ip_vhl) << 2));
-		cpu = tcp_addrcpu(faddr.s_addr, th->th_dport,
-				  ip->ip_src.s_addr, th->th_sport);
-		inp = in_pcblookup_hash(&tcbinfo[cpu], faddr, th->th_dport,
+		const struct tcphdr *th;
+		struct inpcb *inp;
+
+		if (cpuid != mycpuid)
+			goto done;
+
+		th = (const struct tcphdr *)
+		    ((caddr_t)ip + (IP_VHL_HL(ip->ip_vhl) << 2));
+		inp = in_pcblookup_hash(&tcbinfo[mycpuid], faddr, th->th_dport,
 					ip->ip_src, th->th_sport, 0, NULL);
 		if (inp != NULL && inp->inp_socket != NULL) {
-			icmpseq = htonl(th->th_seq);
-			tp = intotcpcb(inp);
+			tcp_seq icmpseq = htonl(th->th_seq);
+			struct tcpcb *tp = intotcpcb(inp);
+
 			if (SEQ_GEQ(icmpseq, tp->snd_una) &&
 			    SEQ_LT(icmpseq, tp->snd_max))
 				notify(inp, arg);
@@ -1456,10 +1521,15 @@ tcp_ctlinput(netmsg_t msg)
 #endif
 			syncache_unreach(&inc, th);
 		}
+	} else if (msg->ctlinput.nm_direct) {
+		if (cpuid != netisr_ncpus && cpuid != mycpuid)
+			goto done;
+
+		in_pcbnotifyall(&tcbinfo[mycpuid], faddr, arg, notify);
 	} else {
 		struct netmsg_tcp_notify *nm;
 
-		KKASSERT(&curthread->td_msgport == netisr_cpuport(0));
+		ASSERT_NETISR0;
 		nm = kmalloc(sizeof(*nm), M_LWKTMSG, M_INTWAIT);
 		netmsg_init(&nm->base, NULL, &netisr_afree_rport,
 			    0, tcp_notifyall_oncpu);
@@ -1482,7 +1552,7 @@ tcp6_ctlinput(netmsg_t msg)
 	struct sockaddr *sa = msg->ctlinput.nm_arg;
 	void *d = msg->ctlinput.nm_extra;
 	struct tcphdr th;
-	void (*notify) (struct inpcb *, int) = tcp_notify;
+	inp_notify_t notify = tcp_notify;
 	struct ip6_hdr *ip6;
 	struct mbuf *m;
 	struct ip6ctlparam *ip6cp = NULL;
@@ -1579,59 +1649,85 @@ out:
  *
  * Implementation details:
  *
- * Time is based off the system timer, and is corrected so that it
- * increases by one megabyte per second.  This allows for proper
- * recycling on high speed LANs while still leaving over an hour
- * before rollover.
- *
  * net.inet.tcp.isn_reseed_interval controls the number of seconds
- * between seeding of isn_secret.  This is normally set to zero,
- * as reseeding should not be necessary.
- *
+ * between the seeding of isn_secret.  On every reseed we jump the
+ * ISN by a lot.
  */
+struct tcp_isn {
+	u_char	secret[16];
+	MD5_CTX ctx;
+	int	last_reseed;
+	int	last_offset;
+} __cachealign;
 
-#define	ISN_BYTES_PER_SECOND 1048576
-
-u_char isn_secret[32];
-int isn_last_reseed;
-MD5_CTX isn_ctx;
+struct tcp_isn tcp_isn_ary[MAXCPU];
 
 tcp_seq
 tcp_new_isn(struct tcpcb *tp)
 {
-	u_int32_t md5_buffer[4];
+	struct tcp_isn *isn;
 	tcp_seq new_isn;
+	tcp_seq digest[16 / sizeof(tcp_seq)];
+	int n;
 
-	/* Seed if this is the first use, reseed if requested. */
-	if ((isn_last_reseed == 0) || ((tcp_isn_reseed_interval > 0) &&
-	     (((u_int)isn_last_reseed + (u_int)tcp_isn_reseed_interval*hz)
-		< (u_int)ticks))) {
-		read_random_unlimited(&isn_secret, sizeof isn_secret);
-		isn_last_reseed = ticks;
+	isn = &tcp_isn_ary[mycpuid];
+
+	/*
+	 * Reseed every 20 seconds.  6 reseeds per 2-minute interval in
+	 * order to retain our monotonic offset.
+	 *
+	 * The initial seed randomizes last_offset with all 32 bits.
+	 *
+	 * Note that the md5 digest is masked with 0x0FFFFFFF, so we must
+	 * add 1/16 of our full range (1/8 of our signed range) to ensure
+	 * monotonic operation.
+	 */
+	if (isn->last_reseed == 0 ||
+	    (u_int)(ticks - isn->last_reseed) > tcp_isn_reseed_interval * hz) {
+		if (isn->last_reseed == 0) {
+			read_random(&isn->last_offset,
+				    sizeof(isn->last_offset), 1);
+		}
+		read_random(&isn->secret, sizeof(isn->secret), 1);
+		isn->last_reseed = ticks;
+		isn->last_offset += 0x10000000;
 	}
 
-	/* Compute the md5 hash and return the ISN. */
-	MD5Init(&isn_ctx);
-	MD5Update(&isn_ctx, (u_char *)&tp->t_inpcb->inp_fport, sizeof(u_short));
-	MD5Update(&isn_ctx, (u_char *)&tp->t_inpcb->inp_lport, sizeof(u_short));
+	/*
+	 * Compute the md5 hash, giving us a deterministic result for the
+	 * port/address pair for any given secret.
+	 */
+	MD5Init(&isn->ctx);
+	MD5Update(&isn->ctx, isn->secret, sizeof(isn->secret));
+	MD5Update(&isn->ctx, (u_char *)&tp->t_inpcb->inp_fport, 2);
+	MD5Update(&isn->ctx, (u_char *)&tp->t_inpcb->inp_lport, 2);
 #ifdef INET6
-	if (tp->t_inpcb->inp_vflag & INP_IPV6) {
-		MD5Update(&isn_ctx, (u_char *) &tp->t_inpcb->in6p_faddr,
+	if (INP_ISIPV6(tp->t_inpcb)) {
+		MD5Update(&isn->ctx, (u_char *)&tp->t_inpcb->in6p_faddr,
 			  sizeof(struct in6_addr));
-		MD5Update(&isn_ctx, (u_char *) &tp->t_inpcb->in6p_laddr,
+		MD5Update(&isn->ctx, (u_char *)&tp->t_inpcb->in6p_laddr,
 			  sizeof(struct in6_addr));
 	} else
 #endif
 	{
-		MD5Update(&isn_ctx, (u_char *) &tp->t_inpcb->inp_faddr,
+		MD5Update(&isn->ctx, (u_char *)&tp->t_inpcb->inp_faddr,
 			  sizeof(struct in_addr));
-		MD5Update(&isn_ctx, (u_char *) &tp->t_inpcb->inp_laddr,
+		MD5Update(&isn->ctx, (u_char *)&tp->t_inpcb->inp_laddr,
 			  sizeof(struct in_addr));
 	}
-	MD5Update(&isn_ctx, (u_char *) &isn_secret, sizeof(isn_secret));
-	MD5Final((u_char *) &md5_buffer, &isn_ctx);
-	new_isn = (tcp_seq) md5_buffer[0];
-	new_isn += ticks * (ISN_BYTES_PER_SECOND / hz);
+	MD5Final((char *)digest, &isn->ctx);
+
+	/*
+	 * Add a random component 0-1048575 plus advance by 1048576.
+	 *
+	 * The sequence space is simply too small, in modern times we also
+	 * must depend on the receive-side being a bit smarter when recycling
+	 * ports in TIME_WAIT.
+	 */
+	read_random(&n, sizeof(n), 1);
+	isn->last_offset += (n & 0x000FFFFF) + 0x00100000;
+	new_isn = (digest[0] & 0x0FFFFFFF) + isn->last_offset;
+
 	return (new_isn);
 }
 
@@ -1644,10 +1740,9 @@ tcp_quench(struct inpcb *inp, int error)
 {
 	struct tcpcb *tp = intotcpcb(inp);
 
-	if (tp != NULL) {
-		tp->snd_cwnd = tp->t_maxseg;
-		tp->snd_wacked = 0;
-	}
+	KASSERT(tp != NULL, ("tcp_quench: tp is NULL"));
+	tp->snd_cwnd = tp->t_maxseg;
+	tp->snd_wacked = 0;
 }
 
 /*
@@ -1660,7 +1755,8 @@ tcp_drop_syn_sent(struct inpcb *inp, int error)
 {
 	struct tcpcb *tp = intotcpcb(inp);
 
-	if ((tp != NULL) && (tp->t_state == TCPS_SYN_SENT))
+	KASSERT(tp != NULL, ("tcp_drop_syn_sent: tp is NULL"));
+	if (tp->t_state == TCPS_SYN_SENT)
 		tcp_drop(tp, error);
 }
 
@@ -1678,13 +1774,12 @@ tcp_mtudisc(struct inpcb *inp, int mtu)
 	struct socket *so = inp->inp_socket;
 	int maxopd, mss;
 #ifdef INET6
-	boolean_t isipv6 = ((tp->t_inpcb->inp_vflag & INP_IPV6) != 0);
+	boolean_t isipv6 = INP_ISIPV6(inp);
 #else
 	const boolean_t isipv6 = FALSE;
 #endif
 
-	if (tp == NULL)
-		return;
+	KASSERT(tp != NULL, ("tcp_mtudisc: tp is NULL"));
 
 	/*
 	 * If no MTU is provided in the ICMP message, use the
@@ -1753,7 +1848,7 @@ tcp_mtudisc(struct inpcb *inp, int mtu)
 		mss &= ~(MCLBYTES - 1);	
 #else
 	if (mss > MCLBYTES)
-		mss = (mss / MCLBYTES) * MCLBYTES;
+		mss = rounddown(mss, MCLBYTES);
 #endif
 
 	if (so->so_snd.ssb_hiwat < mss)
@@ -1816,47 +1911,6 @@ tcp_rtlookup6(struct in_conninfo *inc)
 		}
 	}
 	return (ro6->ro_rt);
-}
-#endif
-
-#ifdef IPSEC
-/* compute ESP/AH header size for TCP, including outer IP header. */
-size_t
-ipsec_hdrsiz_tcp(struct tcpcb *tp)
-{
-	struct inpcb *inp;
-	struct mbuf *m;
-	size_t hdrsiz;
-	struct ip *ip;
-	struct tcphdr *th;
-
-	if ((tp == NULL) || ((inp = tp->t_inpcb) == NULL))
-		return (0);
-	MGETHDR(m, MB_DONTWAIT, MT_DATA);
-	if (!m)
-		return (0);
-
-#ifdef INET6
-	if (inp->inp_vflag & INP_IPV6) {
-		struct ip6_hdr *ip6 = mtod(m, struct ip6_hdr *);
-
-		th = (struct tcphdr *)(ip6 + 1);
-		m->m_pkthdr.len = m->m_len =
-		    sizeof(struct ip6_hdr) + sizeof(struct tcphdr);
-		tcp_fillheaders(tp, ip6, th, FALSE);
-		hdrsiz = ipsec6_hdrsiz(m, IPSEC_DIR_OUTBOUND, inp);
-	} else
-#endif
-	{
-		ip = mtod(m, struct ip *);
-		th = (struct tcphdr *)(ip + 1);
-		m->m_pkthdr.len = m->m_len = sizeof(struct tcpiphdr);
-		tcp_fillheaders(tp, ip, th, FALSE);
-		hdrsiz = ipsec4_hdrsiz(m, IPSEC_DIR_OUTBOUND, inp);
-	}
-
-	m_free(m);
-	return (hdrsiz);
 }
 #endif
 
@@ -1939,7 +1993,7 @@ tcp_xmit_bandwidth_limit(struct tcpcb *tp, tcp_seq ack_seq)
 		tp->t_bw_rtttime = save_ticks;
 		tp->t_bw_rtseq = ack_seq;
 		if (tp->snd_bandwidth == 0)
-			tp->snd_bandwidth = tcp_inflight_min;
+			tp->snd_bandwidth = tcp_inflight_start;
 		return;
 	}
 
@@ -2037,7 +2091,7 @@ tcp_rmx_iwsegs(struct tcpcb *tp, u_long *maxsegs, u_long *capsegs)
 	struct rtentry *rt;
 	struct inpcb *inp = tp->t_inpcb;
 #ifdef INET6
-	boolean_t isipv6 = ((inp->inp_vflag & INP_IPV6) ? TRUE : FALSE);
+	boolean_t isipv6 = INP_ISIPV6(inp);
 #else
 	const boolean_t isipv6 = FALSE;
 #endif
@@ -2272,3 +2326,222 @@ tcpsignature_apply(void *fstate, void *data, unsigned int len)
 	return (0);
 }
 #endif /* TCP_SIGNATURE */
+
+static void
+tcp_drop_sysctl_dispatch(netmsg_t nmsg)
+{
+	struct lwkt_msg *lmsg = &nmsg->lmsg;
+	/* addrs[0] is a foreign socket, addrs[1] is a local one. */
+	struct sockaddr_storage *addrs = lmsg->u.ms_resultp;
+	int error;
+	struct sockaddr_in *fin, *lin;
+#ifdef INET6
+	struct sockaddr_in6 *fin6, *lin6;
+	struct in6_addr f6, l6;
+#endif
+	struct inpcb *inp;
+
+	switch (addrs[0].ss_family) {
+#ifdef INET6
+	case AF_INET6:
+		fin6 = (struct sockaddr_in6 *)&addrs[0];
+		lin6 = (struct sockaddr_in6 *)&addrs[1];
+		error = in6_embedscope(&f6, fin6, NULL, NULL);
+		if (error)
+			goto done;
+		error = in6_embedscope(&l6, lin6, NULL, NULL);
+		if (error)
+			goto done;
+		inp = in6_pcblookup_hash(&tcbinfo[mycpuid], &f6,
+		    fin6->sin6_port, &l6, lin6->sin6_port, FALSE, NULL);
+		break;
+#endif
+#ifdef INET
+	case AF_INET:
+		fin = (struct sockaddr_in *)&addrs[0];
+		lin = (struct sockaddr_in *)&addrs[1];
+		inp = in_pcblookup_hash(&tcbinfo[mycpuid], fin->sin_addr,
+		    fin->sin_port, lin->sin_addr, lin->sin_port, FALSE, NULL);
+		break;
+#endif
+	default:
+		/*
+		 * Must not reach here, since the address family was
+		 * checked in sysctl handler.
+		 */
+		panic("unknown address family %d", addrs[0].ss_family);
+	}
+	if (inp != NULL) {
+		struct tcpcb *tp = intotcpcb(inp);
+
+		KASSERT((inp->inp_flags & INP_WILDCARD) == 0,
+		    ("in wildcard hash"));
+		KASSERT(tp != NULL, ("tcp_drop_sysctl_dispatch: tp is NULL"));
+		KASSERT((tp->t_flags & TF_LISTEN) == 0, ("listen socket"));
+		tcp_drop(tp, ECONNABORTED);
+		error = 0;
+	} else {
+		error = ESRCH;
+	}
+#ifdef INET6
+done:
+#endif
+	lwkt_replymsg(lmsg, error);
+}
+
+static int
+sysctl_tcp_drop(SYSCTL_HANDLER_ARGS)
+{
+	/* addrs[0] is a foreign socket, addrs[1] is a local one. */
+	struct sockaddr_storage addrs[2];
+	struct sockaddr_in *fin, *lin;
+#ifdef INET6
+	struct sockaddr_in6 *fin6, *lin6;
+#endif
+	struct netmsg_base nmsg;
+	struct lwkt_msg *lmsg = &nmsg.lmsg;
+	struct lwkt_port *port = NULL;
+	int error;
+
+	fin = lin = NULL;
+#ifdef INET6
+	fin6 = lin6 = NULL;
+#endif
+	error = 0;
+
+	if (req->oldptr != NULL || req->oldlen != 0)
+		return (EINVAL);
+	if (req->newptr == NULL)
+		return (EPERM);
+	if (req->newlen < sizeof(addrs))
+		return (ENOMEM);
+	error = SYSCTL_IN(req, &addrs, sizeof(addrs));
+	if (error)
+		return (error);
+
+	switch (addrs[0].ss_family) {
+#ifdef INET6
+	case AF_INET6:
+		fin6 = (struct sockaddr_in6 *)&addrs[0];
+		lin6 = (struct sockaddr_in6 *)&addrs[1];
+		if (fin6->sin6_len != sizeof(struct sockaddr_in6) ||
+		    lin6->sin6_len != sizeof(struct sockaddr_in6))
+			return (EINVAL);
+		if (IN6_IS_ADDR_V4MAPPED(&fin6->sin6_addr) ||
+		    IN6_IS_ADDR_V4MAPPED(&lin6->sin6_addr))
+			return (EADDRNOTAVAIL);
+#if 0
+		error = sa6_embedscope(fin6, V_ip6_use_defzone);
+		if (error)
+			return (error);
+		error = sa6_embedscope(lin6, V_ip6_use_defzone);
+		if (error)
+			return (error);
+#endif
+		port = tcp6_addrport();
+		break;
+#endif
+#ifdef INET
+	case AF_INET:
+		fin = (struct sockaddr_in *)&addrs[0];
+		lin = (struct sockaddr_in *)&addrs[1];
+		if (fin->sin_len != sizeof(struct sockaddr_in) ||
+		    lin->sin_len != sizeof(struct sockaddr_in))
+			return (EINVAL);
+		port = tcp_addrport(fin->sin_addr.s_addr, fin->sin_port,
+		    lin->sin_addr.s_addr, lin->sin_port);
+		break;
+#endif
+	default:
+		return (EINVAL);
+	}
+
+	netmsg_init(&nmsg, NULL, &curthread->td_msgport, 0,
+	    tcp_drop_sysctl_dispatch);
+	lmsg->u.ms_resultp = addrs;
+	return lwkt_domsg(port, lmsg, 0);
+}
+
+SYSCTL_PROC(_net_inet_tcp, OID_AUTO, drop,
+    CTLTYPE_STRUCT | CTLFLAG_WR | CTLFLAG_SKIP, NULL,
+    0, sysctl_tcp_drop, "", "Drop TCP connection");
+
+static int
+sysctl_tcps_count(SYSCTL_HANDLER_ARGS)
+{
+	u_long state_count[TCP_NSTATES];
+	int cpu;
+
+	memset(state_count, 0, sizeof(state_count));
+	for (cpu = 0; cpu < netisr_ncpus; ++cpu) {
+		int i;
+
+		for (i = 0; i < TCP_NSTATES; ++i)
+			state_count[i] += tcpstate_count[cpu].tcps_count[i];
+	}
+
+	return sysctl_handle_opaque(oidp, state_count, sizeof(state_count), req);
+}
+SYSCTL_PROC(_net_inet_tcp, OID_AUTO, state_count,
+    CTLTYPE_OPAQUE | CTLFLAG_RD, NULL, 0,
+    sysctl_tcps_count, "LU", "TCP connection counts by state");
+
+void
+tcp_pcbport_create(struct tcpcb *tp)
+{
+	int cpu;
+
+	KASSERT((tp->t_flags & TF_LISTEN) && tp->t_state == TCPS_LISTEN,
+	    ("not a listen tcpcb"));
+
+	KASSERT(tp->t_pcbport == NULL, ("tcpcb port cache was created"));
+	tp->t_pcbport =
+		kmalloc(sizeof(struct tcp_pcbport) * netisr_ncpus,
+			M_PCB,
+			M_WAITOK | M_CACHEALIGN);
+
+	for (cpu = 0; cpu < netisr_ncpus; ++cpu) {
+		struct inpcbport *phd;
+
+		phd = &tp->t_pcbport[cpu].t_phd;
+		LIST_INIT(&phd->phd_pcblist);
+		/* Though, not used ... */
+		phd->phd_port = tp->t_inpcb->inp_lport;
+	}
+}
+
+void
+tcp_pcbport_merge_oncpu(struct tcpcb *tp)
+{
+	struct inpcbport *phd;
+	struct inpcb *inp;
+	int cpu = mycpuid;
+
+	KASSERT(cpu < netisr_ncpus, ("invalid cpu%d", cpu));
+	phd = &tp->t_pcbport[cpu].t_phd;
+
+	while ((inp = LIST_FIRST(&phd->phd_pcblist)) != NULL) {
+		KASSERT(inp->inp_phd == phd && inp->inp_porthash == NULL,
+		    ("not on tcpcb port cache"));
+		LIST_REMOVE(inp, inp_portlist);
+		in_pcbinsporthash_lport(inp);
+		KASSERT(inp->inp_phd == tp->t_inpcb->inp_phd &&
+		    inp->inp_porthash == tp->t_inpcb->inp_porthash,
+		    ("tcpcb port cache merge failed"));
+	}
+}
+
+void
+tcp_pcbport_destroy(struct tcpcb *tp)
+{
+#ifdef INVARIANTS
+	int cpu;
+
+	for (cpu = 0; cpu < netisr_ncpus; ++cpu) {
+		KASSERT(LIST_EMPTY(&tp->t_pcbport[cpu].t_phd.phd_pcblist),
+		    ("tcpcb port cache is not empty"));
+	}
+#endif
+	kfree(tp->t_pcbport, M_PCB);
+	tp->t_pcbport = NULL;
+}

@@ -184,13 +184,13 @@ outputpcb(int proto, const char *name, struct inpcb *inp, struct xsocket *so, st
 	if (so->xso_protocol != (int)proto)
 		return;
 
-	if ((af == AF_INET && (inp->inp_vflag & INP_IPV4) == 0)
+	if ((af == AF_INET && !INP_ISIPV4(inp))
 #ifdef INET6
-	    || (af == AF_INET6 && (inp->inp_vflag & INP_IPV6) == 0)
+	    || (af == AF_INET6 && !INP_ISIPV6(inp))
 #endif /* INET6 */
-	    || (af == AF_UNSPEC && ((inp->inp_vflag & INP_IPV4) == 0
+	    || (af == AF_UNSPEC && (!INP_ISIPV4(inp)
 #ifdef INET6
-		&& (inp->inp_vflag & INP_IPV6) == 0
+		&& !INP_ISIPV6(inp)
 #endif /* INET6 */
 		))
 	    ) {
@@ -202,10 +202,10 @@ outputpcb(int proto, const char *name, struct inpcb *inp, struct xsocket *so, st
 #ifdef INET6
 	    || (af == AF_INET6 && IN6_IS_ADDR_UNSPECIFIED(&inp->in6p_laddr))
 #endif /* INET6 */
-	    || (af == AF_UNSPEC && (((inp->inp_vflag & INP_IPV4) != 0 &&
+	    || (af == AF_UNSPEC && ((INP_ISIPV4(inp) &&
 		inet_lnaof(inp->inp_laddr) == INADDR_ANY)
 #ifdef INET6
-	    || ((inp->inp_vflag & INP_IPV6) != 0 &&
+	    || (INP_ISIPV6(inp) &&
 		IN6_IS_ADDR_UNSPECIFIED(&inp->in6p_laddr))
 #endif
 		  ))
@@ -265,17 +265,17 @@ outputpcb(int proto, const char *name, struct inpcb *inp, struct xsocket *so, st
 		}
 	}
 #ifdef INET6
-	if ((inp->inp_vflag & INP_IPV6) != 0)
-		vchar = ((inp->inp_vflag & INP_IPV4) != 0) ? "46" : "6 ";
+	if (INP_ISIPV6(inp))
+		vchar = "6 ";
 	else
 #endif
-		vchar = ((inp->inp_vflag & INP_IPV4) != 0) ? "4 " : "  ";
+		vchar = INP_ISIPV4(inp) ? "4 " : "  ";
 
 	printf("%-3.3s%-2.2s ", name, vchar);
 	if (Lflag) {
 		char buf[15];
 
-		snprintf(buf, sizeof(buf), "%d/%d/%d", so->so_qlen,
+		snprintf(buf, sizeof(buf), "%hd/%hd/%hd", so->so_qlen,
 			 so->so_incqlen, so->so_qlimit);
 		printf("%-13.13s ", buf);
 	} else if (Bflag) {
@@ -288,7 +288,7 @@ outputpcb(int proto, const char *name, struct inpcb *inp, struct xsocket *so, st
 		       so->so_snd.sb_cc);
 	}
 	if (numeric_port) {
-		if (inp->inp_vflag & INP_IPV4) {
+		if (INP_ISIPV4(inp)) {
 			inetprint(&inp->inp_laddr, (int)inp->inp_lport,
 				  name, 1);
 			if (!Lflag)
@@ -296,7 +296,7 @@ outputpcb(int proto, const char *name, struct inpcb *inp, struct xsocket *so, st
 					  (int)inp->inp_fport, name, 1);
 		}
 #ifdef INET6
-		else if (inp->inp_vflag & INP_IPV6) {
+		else if (INP_ISIPV6(inp)) {
 			inet6print(&inp->in6p_laddr,
 				   (int)inp->inp_lport, name, 1);
 			if (!Lflag)
@@ -305,7 +305,7 @@ outputpcb(int proto, const char *name, struct inpcb *inp, struct xsocket *so, st
 		} /* else nothing printed now */
 #endif /* INET6 */
 	} else if (inp->inp_flags & INP_ANONPORT) {
-		if (inp->inp_vflag & INP_IPV4) {
+		if (INP_ISIPV4(inp)) {
 			inetprint(&inp->inp_laddr, (int)inp->inp_lport,
 				  name, 1);
 			if (!Lflag)
@@ -313,7 +313,7 @@ outputpcb(int proto, const char *name, struct inpcb *inp, struct xsocket *so, st
 					  (int)inp->inp_fport, name, 0);
 		}
 #ifdef INET6
-		else if (inp->inp_vflag & INP_IPV6) {
+		else if (INP_ISIPV6(inp)) {
 			inet6print(&inp->in6p_laddr,
 				   (int)inp->inp_lport, name, 1);
 			if (!Lflag)
@@ -322,7 +322,7 @@ outputpcb(int proto, const char *name, struct inpcb *inp, struct xsocket *so, st
 		} /* else nothing printed now */
 #endif /* INET6 */
 	} else {
-		if (inp->inp_vflag & INP_IPV4) {
+		if (INP_ISIPV4(inp)) {
 			inetprint(&inp->inp_laddr, (int)inp->inp_lport,
 				  name, 0);
 			if (!Lflag)
@@ -332,7 +332,7 @@ outputpcb(int proto, const char *name, struct inpcb *inp, struct xsocket *so, st
 						inp->inp_fport);
 		}
 #ifdef INET6
-		else if (inp->inp_vflag & INP_IPV6) {
+		else if (INP_ISIPV6(inp)) {
 			inet6print(&inp->in6p_laddr,
 				   (int)inp->inp_lport, name, 0);
 			if (!Lflag)
@@ -392,6 +392,7 @@ CPU_STATS_FUNC(udp, struct udpstat);
 void
 tcp_stats(u_long off __unused, const char *name, int af1 __unused)
 {
+	u_long state_count[TCP_NSTATES];
 	struct tcp_stats tcpstat, *stattmp;
 	struct tcp_stats zerostat[SMP_MAXCPU];
 	size_t len = sizeof(struct tcp_stats) * SMP_MAXCPU;
@@ -546,6 +547,16 @@ tcp_stats(u_long off __unused, const char *name, int af1 __unused)
 #undef p2
 #undef p2a
 #undef p3
+
+	len = sizeof(state_count);
+	if (sysctlbyname("net.inet.tcp.state_count", state_count, &len, NULL, 0) == 0) {
+		int s;
+
+		for (s = TCPS_TERMINATING + 1; s < TCP_NSTATES; ++s) {
+			printf("\t%lu connection%s in %s state\n", state_count[s],
+			    state_count[s] == 1 ? "" : "s", tcpstates[s]);
+		}
+	}
 }
 
 /*
@@ -654,7 +665,7 @@ carp_stats(u_long off __unused, const char *name, int af1 __unused)
        p(carps_opackets, "\t%ju packet%s sent (IPv4)\n");
        p(carps_opackets6, "\t%ju packet%s sent (IPv6)\n");
        p2(carps_onomem, "\t\t%ju send failed due to mbuf memory error\n");
-#if notyet
+#if 0 /* not yet */
        p(carps_ostates, "\t\t%s state update%s sent\n");
 #endif
 #undef p

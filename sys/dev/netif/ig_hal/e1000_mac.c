@@ -1,6 +1,6 @@
 /******************************************************************************
 
-  Copyright (c) 2001-2012, Intel Corporation 
+  Copyright (c) 2001-2016, Intel Corporation
   All rights reserved.
   
   Redistribution and use in source and binary forms, with or without 
@@ -30,14 +30,14 @@
   POSSIBILITY OF SUCH DAMAGE.
 
 ******************************************************************************/
-/*$FreeBSD:$*/
+/*$FreeBSD$*/
 
 #include "e1000_api.h"
 
 static s32 e1000_validate_mdi_setting_generic(struct e1000_hw *hw);
 static void e1000_set_lan_id_multi_port_pcie(struct e1000_hw *hw);
 static void e1000_config_collision_dist_generic(struct e1000_hw *hw);
-static void e1000_rar_set_generic(struct e1000_hw *hw, u8 *addr, u32 index);
+static int e1000_rar_set_generic(struct e1000_hw *hw, u8 *addr, u32 index);
 
 /**
  *  e1000_init_mac_ops_generic - Initialize MAC function pointers
@@ -145,14 +145,14 @@ void e1000_null_write_vfta(struct e1000_hw E1000_UNUSEDARG *hw,
 }
 
 /**
- *  e1000_null_rar_set - No-op function, return void
+ *  e1000_null_rar_set - No-op function, return 0
  *  @hw: pointer to the HW structure
  **/
-void e1000_null_rar_set(struct e1000_hw E1000_UNUSEDARG *hw,
+int e1000_null_rar_set(struct e1000_hw E1000_UNUSEDARG *hw,
 			u8 E1000_UNUSEDARG *h, u32 E1000_UNUSEDARG a)
 {
 	DEBUGFUNC("e1000_null_rar_set");
-	return;
+	return E1000_SUCCESS;
 }
 
 /**
@@ -410,19 +410,13 @@ s32 e1000_check_alt_mac_addr_generic(struct e1000_hw *hw)
 	if (ret_val)
 		return ret_val;
 
-#if !defined(NO_82542_SUPPORT) || !defined(NO_82543_SUPPORT) || !defined(NO_82540_SUPPORT) || !defined(NO_82541_SUPPORT)
-	/* not supported on older hardware or 82573 */
-	if ((hw->mac.type < e1000_82571) || (hw->mac.type == e1000_82573))
-#else
-	/* not supported on 82573 */
-	if (hw->mac.type == e1000_82573)
-#endif
-		return E1000_SUCCESS;
-
-	/* Alternate MAC address is handled by the option ROM for 82580
+	/* not supported on older hardware or 82573.
+	 *
+	 * Alternate MAC address is handled by the option ROM for 82580
 	 * and newer. SW support not required.
 	 */
-	if (hw->mac.type >= e1000_82580)
+	if ((hw->mac.type < e1000_82571) || (hw->mac.type == e1000_82573) ||
+	    hw->mac.type >= e1000_82580)
 		return E1000_SUCCESS;
 
 	ret_val = hw->nvm.ops.read(hw, NVM_ALT_MAC_ADDR_PTR, 1,
@@ -480,7 +474,7 @@ s32 e1000_check_alt_mac_addr_generic(struct e1000_hw *hw)
  *  Sets the receive address array register at index to the address passed
  *  in by addr.
  **/
-static void e1000_rar_set_generic(struct e1000_hw *hw, u8 *addr, u32 index)
+static int e1000_rar_set_generic(struct e1000_hw *hw, u8 *addr, u32 index)
 {
 	u32 rar_low, rar_high;
 
@@ -506,6 +500,8 @@ static void e1000_rar_set_generic(struct e1000_hw *hw, u8 *addr, u32 index)
 	E1000_WRITE_FLUSH(hw);
 	E1000_WRITE_REG(hw, E1000_RAH(index), rar_high);
 	E1000_WRITE_FLUSH(hw);
+
+	return E1000_SUCCESS;
 }
 
 /**
@@ -947,14 +943,11 @@ s32 e1000_check_for_serdes_link_generic(struct e1000_hw *hw)
  *  Read the EEPROM for the default values for flow control and store the
  *  values.
  **/
-#ifdef NO_82542_SUPPORT
-static s32 e1000_set_default_fc_generic(struct e1000_hw *hw)
-#else
 s32 e1000_set_default_fc_generic(struct e1000_hw *hw)
-#endif
 {
 	s32 ret_val;
 	u16 nvm_data;
+	u16 nvm_offset = 0;
 
 	DEBUGFUNC("e1000_set_default_fc_generic");
 
@@ -966,7 +959,18 @@ s32 e1000_set_default_fc_generic(struct e1000_hw *hw)
 	 * control setting, then the variable hw->fc will
 	 * be initialized based on a value in the EEPROM.
 	 */
-	ret_val = hw->nvm.ops.read(hw, NVM_INIT_CONTROL2_REG, 1, &nvm_data);
+	if (hw->mac.type == e1000_i350) {
+		nvm_offset = NVM_82580_LAN_FUNC_OFFSET(hw->bus.func);
+		ret_val = hw->nvm.ops.read(hw,
+					   NVM_INIT_CONTROL2_REG +
+					   nvm_offset,
+					   1, &nvm_data);
+	} else {
+		ret_val = hw->nvm.ops.read(hw,
+					   NVM_INIT_CONTROL2_REG,
+					   1, &nvm_data);
+	}
+
 
 	if (ret_val) {
 		DEBUGOUT("NVM Read Error\n");
@@ -2093,7 +2097,8 @@ s32 e1000_disable_pcie_master_generic(struct e1000_hw *hw)
 
 	while (timeout) {
 		if (!(E1000_READ_REG(hw, E1000_STATUS) &
-		      E1000_STATUS_GIO_MASTER_ENABLE))
+		      E1000_STATUS_GIO_MASTER_ENABLE) ||
+				E1000_REMOVED(hw->hw_addr))
 			break;
 		usec_delay(100);
 		timeout--;

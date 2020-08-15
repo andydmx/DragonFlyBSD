@@ -32,7 +32,9 @@
  * runtime from ld-elf.so.1.
  */
 
+#include <sys/param.h>
 #include <sys/tls.h>
+#include <sys/mman.h>
 
 #include <machine/tls.h>
 
@@ -45,18 +47,9 @@
 
 #include "libc_private.h"
 
-__weak_reference(__libc_allocate_tls, _rtld_allocate_tls);
-__weak_reference(__libc_free_tls, _rtld_free_tls);
-__weak_reference(__libc_call_init, _rtld_call_init);
-#ifdef __i386__
-__weak_reference(___libc_tls_get_addr, ___tls_get_addr);
-#endif
-__weak_reference(__libc_tls_get_addr, __tls_get_addr);
-__weak_reference(__libc_tls_get_addr_tcb, __tls_get_addr_tcb);
-__weak_reference(_libc_init_tls, _init_tls);
-
 struct tls_tcb *__libc_allocate_tls(void);
 void __libc_free_tls(struct tls_tcb *tcb);
+void __libc_call_init(void);
 
 #if !defined(RTLD_STATIC_TLS_VARIANT_II)
 #error "Unsupported TLS layout"
@@ -64,28 +57,10 @@ void __libc_free_tls(struct tls_tcb *tcb);
 
 #ifndef PIC
 
-#define round(size, align) \
-	(((size) + (align) - 1) & ~((align) - 1))
-
 static size_t tls_static_space;
 static size_t tls_init_size;
 static void *tls_init;
 static struct tls_tcb *initial_tcb;
-#endif
-
-#ifdef __i386__
-
-/* GNU ABI */
-
-void *___libc_tls_get_addr(void *ti) __attribute__((__regparm__(1)));
-
-__attribute__((__regparm__(1)))
-void *
-___libc_tls_get_addr(void *ti __unused)
-{
-	return (0);
-}
-
 #endif
 
 void *__libc_tls_get_addr(void *ti);
@@ -117,7 +92,7 @@ __libc_free_tls(struct tls_tcb *tcb)
 		    ~RTLD_STATIC_TLS_ALIGN_MASK;
 
 	if (tcb == initial_tcb) {
-		/* initial_tcb was allocated with sbrk(), cannot call free() */
+		/* initial_tcb was allocated with mmap(), cannot call free() */
 	} else {
 		free((char *)tcb - data_size);
 	}
@@ -141,12 +116,22 @@ __libc_allocate_tls(void)
 
 	/*
 	 * Allocate space.  malloc() may require a working TLS segment
-	 * so we use sbrk() for main's TLS.
+	 * so we use sbrk() for main's TLS.  Oops, but in order to be
+	 * compatible with older kernels we cannot use sbrk() because it
+	 * will generate an errno (which needs the TLS), so use mmap().
 	 */
-	if (initial_tcb == NULL)
-		tcb = sbrk(data_size + sizeof(*tcb) + 3 * sizeof(*dtv));
-	else
+	if (initial_tcb == NULL) {
+		size_t bytes;
+
+		bytes = data_size + sizeof(*tcb) + 3 * sizeof(*dtv);
+		bytes = (bytes + PAGE_MASK) & ~(size_t)PAGE_MASK;
+		tcb = mmap((void *)1, bytes,
+			   PROT_READ | PROT_WRITE,
+			   MAP_PRIVATE | MAP_ANON,
+			   -1, 0);
+	} else {
 		tcb = malloc(data_size + sizeof(*tcb) + 3 * sizeof(*dtv));
+	}
 
 	tcb = (struct tls_tcb *)((char *)tcb + data_size);
 	dtv = (Elf_Addr *)(tcb + 1);
@@ -247,7 +232,7 @@ _libc_init_tls(void)
 
 	for (i = 0; (unsigned)i < phnum; i++) {
 		if (phdr[i].p_type == PT_TLS) {
-			tls_static_space = round(phdr[i].p_memsz,
+			tls_static_space = roundup2(phdr[i].p_memsz,
 			    phdr[i].p_align);
 			tls_init_size = phdr[i].p_filesz;
 			tls_init = (void*) phdr[i].p_vaddr;
@@ -281,19 +266,12 @@ _libc_allocate_tls(void)
 	struct tls_tcb *tcb;
 
 	tcb = _rtld_allocate_tls();
-
-#if 0
-#if defined(__thread)
-	/* non-TLS libc */
-	tcb->tcb_errno_p = &errno;
-#elif defined(PIC)
-	/* TLS libc dynamically linked */
-	tcb->tcb_errno_p = __tls_get_addr_tcb(tcb, __get_errno_GOT_ptr());
-#else
-	/* TLS libc (threaded or unthreaded) */
-	tcb->tcb_errno_p = (void *)((char *)tcb + __get_errno_GS_offset());
-#endif
-#endif
 	return(tcb);
 }
 
+__weak_reference(__libc_allocate_tls, _rtld_allocate_tls);
+__weak_reference(__libc_free_tls, _rtld_free_tls);
+__weak_reference(__libc_call_init, _rtld_call_init);
+__weak_reference(__libc_tls_get_addr, __tls_get_addr);
+__weak_reference(__libc_tls_get_addr_tcb, __tls_get_addr_tcb);
+__weak_reference(_libc_init_tls, _init_tls);

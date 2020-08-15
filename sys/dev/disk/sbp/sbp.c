@@ -52,6 +52,7 @@
 #include <bus/cam/cam_debug.h>
 #include <bus/cam/cam_periph.h>
 #include <bus/cam/scsi/scsi_all.h>
+#include <bus/cam/cam_xpt_periph.h>
 
 #include <bus/firewire/firewire.h>
 #include <bus/firewire/firewirereg.h>
@@ -136,11 +137,8 @@ TUNABLE_INT("hw.firewire.sbp.tags", &sbp_tags);
 #define NEED_RESPONSE 0
 
 #define SBP_SEG_MAX rounddown(0xffff, PAGE_SIZE)
-#ifdef __sparc64__ /* iommu */
-#define SBP_IND_MAX howmany(SBP_MAXPHYS, SBP_SEG_MAX)
-#else
 #define SBP_IND_MAX howmany(SBP_MAXPHYS, PAGE_SIZE)
-#endif
+
 struct sbp_ocb {
 	STAILQ_ENTRY(sbp_ocb)	ocb;
 	union ccb	*ccb;
@@ -952,7 +950,7 @@ END_DEBUG
 	}
 	sdev = sbp_next_dev(target, sdev->lun_id + 1);
 	if (sdev == NULL) {
-		kfree(ccb, M_SBP);
+		xpt_free_ccb(&ccb->ccb_h);
 		return;
 	}
 	/* reuse ccb */
@@ -980,7 +978,7 @@ SBP_DEBUG(0)
 	sbp_show_sdev_info(sdev, 2);
 	kprintf("sbp_cam_scan_target\n");
 END_DEBUG
-	ccb = kmalloc(sizeof(union ccb), M_SBP, M_WAITOK | M_ZERO);
+	ccb = xpt_alloc_ccb();
 	xpt_setup_ccb(&ccb->ccb_h, sdev->path, SCAN_PRI);
 	ccb->ccb_h.func_code = XPT_SCAN_LUN;
 	ccb->ccb_h.cbfcnp = sbp_cam_scan_lun;
@@ -2587,7 +2585,7 @@ END_DEBUG
 			/* found */
 			STAILQ_REMOVE(&sdev->ocbs, ocb, sbp_ocb, ocb);
 			if (ocb->ccb != NULL)
-				callout_stop(&ocb->ccb->ccb_h.timeout_ch);
+				callout_stop(ocb->ccb->ccb_h.timeout_ch);
 			if (ntohl(ocb->orb[4]) & 0xffff) {
 				bus_dmamap_sync(sdev->target->sbp->dmat,
 					ocb->dmamap,
@@ -2638,8 +2636,9 @@ END_DEBUG
 	STAILQ_INSERT_TAIL(&sdev->ocbs, ocb, ocb);
 
 	if (ocb->ccb != NULL)
-		callout_reset(&ocb->ccb->ccb_h.timeout_ch,
-		    (ocb->ccb->ccb_h.timeout * hz) / 1000, sbp_timeout, ocb);
+		callout_reset(ocb->ccb->ccb_h.timeout_ch,
+			      (ocb->ccb->ccb_h.timeout * hz) / 1000,
+			      sbp_timeout, ocb);
 
 	if (prev != NULL) {
 SBP_DEBUG(2)
@@ -2701,7 +2700,7 @@ END_DEBUG
 		bus_dmamap_unload(sdev->target->sbp->dmat, ocb->dmamap);
 	}
 	if (ocb->ccb != NULL) {
-		callout_stop(&ocb->ccb->ccb_h.timeout_ch);
+		callout_stop(ocb->ccb->ccb_h.timeout_ch);
 		ocb->ccb->ccb_h.status = status;
 		xpt_done(ocb->ccb);
 	}

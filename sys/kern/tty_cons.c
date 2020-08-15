@@ -68,7 +68,7 @@ static int cnintercept(struct dev_generic_args *ap);
 
 #define	CDEV_MAJOR	0
 static struct dev_ops cn_ops = {
-	{ "console", 0, D_TTY },
+	{ "console", 0, D_TTY | D_MPSAFE },
 	.d_open =	cnopen,
 	.d_close =	cnclose,
 	.d_read =	cnread,
@@ -78,7 +78,7 @@ static struct dev_ops cn_ops = {
 };
 
 static struct dev_ops cn_iops = {
-	{ "intercept", 0, D_TTY },
+	{ "intercept", 0, D_TTY | D_MPSAFE },
 	.d_default =    cnintercept
 };
 
@@ -94,7 +94,7 @@ SYSCTL_OPAQUE(_machdep, CPU_CONSDEV, consdev, CTLFLAG_RD,
 static int cn_mute;
 
 #ifdef BREAK_TO_DEBUGGER
-int	break_to_debugger = 1;
+int	break_to_debugger = 1;		/* CTL-ALT-ESC on system keyboard */
 #else
 int	break_to_debugger = 0;
 #endif
@@ -103,7 +103,7 @@ SYSCTL_INT(_kern, OID_AUTO, break_to_debugger, CTLFLAG_RW,
 	&break_to_debugger, 0, "");
 
 #ifdef ALT_BREAK_TO_DEBUGGER
-int	alt_break_to_debugger = 1;
+int	alt_break_to_debugger = 1;	/* CR ~ ^B on serial port */
 #else
 int	alt_break_to_debugger = 0;
 #endif
@@ -129,8 +129,11 @@ struct consdev *cn_tab;		/* physical console device info */
 struct consdev *gdb_tab;	/* physical gdb debugger device info */
 
 SYSCTL_INT(_kern, OID_AUTO, sysbeep_enable, CTLFLAG_RW, &sysbeep_enable, 0, "");
+static uint32_t console_rdev;
+SYSCTL_INT(_kern, OID_AUTO, console_rdev, CTLFLAG_RW,
+	&console_rdev, 0, "");
 
-CONS_DRIVER(cons, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+CONS_DRIVER(cons, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
 SET_DECLARE(cons_set, struct consdev);
 
 void
@@ -146,6 +149,7 @@ cninit(void)
 	 * its init.
 	 */
 	lwkt_gettoken(&tty_token);
+	lwkt_gettoken(&vga_token);
 
 	/*
 	 * Check if we should mute the console (for security reasons perhaps)
@@ -156,8 +160,7 @@ cninit(void)
 	cn_mute = ((boothowto & (RB_MUTE
 			|RB_SINGLE
 			|RB_VERBOSE
-			|RB_ASKNAME
-			|RB_CONFIG)) == RB_MUTE);
+			|RB_ASKNAME)) == RB_MUTE);
 
 	/*
 	 * Find the first console with the highest priority.
@@ -172,7 +175,6 @@ cninit(void)
 		    (best_cp == NULL || cp->cn_pri > best_cp->cn_pri))
 			best_cp = cp;
 	}
-
 	
 	/*
 	 * If no console, give up.
@@ -203,6 +205,7 @@ done:
 	 * Also assert that the mpcount is still correct or otherwise
 	 * the SMP/AP boot will blow up on us.
 	 */
+	lwkt_reltoken(&vga_token);
 	lwkt_reltoken(&tty_token);
 }
 
@@ -225,6 +228,13 @@ cninit_finish(void)
 
 	cn_fwd_ops = dev_ops_intercept(cn_tab->cn_dev, &cn_iops);
 	cn_dev = cn_tab->cn_dev;
+	if (cn_dev) {
+		console_rdev = makeudev(cn_dev->si_umajor,
+					(cn_dev->si_uminor == 255 ?
+					    0 : cn_dev->si_uminor));
+	} else {
+		console_rdev = 0;
+	}
 	console_pausing = 0;
 }
 
@@ -262,7 +272,7 @@ sysctl_kern_consmute(SYSCTL_HANDLER_ARGS)
 			if (cn_is_open) {
 				/* XXX curproc is not what we want really */
 				error = dev_dopen(cn_dev, openflag,
-						openmode, curproc->p_ucred, NULL);
+						openmode, curproc->p_ucred, NULL, NULL);
 			}
 			/* if it failed, back it out */
 			if ( error != 0) cnuninit();
@@ -514,6 +524,15 @@ cncheckc(void)
 }
 
 void
+cnpoll(int on)
+{
+	if ((cn_tab == NULL) || cn_mute)
+		return;
+	if (cn_tab->cn_poll)
+		((*cn_tab->cn_poll)(cn_tab->cn_private, on));
+}
+
+void
 cnputc(int c)
 {
 	char *cp;
@@ -563,4 +582,4 @@ cn_drvinit(void *unused)
 					  0600, "console");
 }
 
-SYSINIT(cndev,SI_SUB_DRIVERS,SI_ORDER_MIDDLE+CDEV_MAJOR,cn_drvinit,NULL)
+SYSINIT(cndev, SI_SUB_DRIVERS, SI_ORDER_MIDDLE + CDEV_MAJOR, cn_drvinit, NULL);

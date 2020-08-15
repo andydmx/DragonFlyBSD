@@ -349,11 +349,6 @@ mountfs(const char *vfstype, const char *spec, const char *name, int flags,
 	int argc, i, status;
 	char *optbuf, execname[MAXPATHLEN + 1], mntpath[MAXPATHLEN];
 
-#if __GNUC__
-	(void)&optbuf;
-	(void)&name;
-#endif
-
 	/* resolve the mountpoint with realpath(3) */
 	checkpath(name, mntpath);
 	name = mntpath;
@@ -719,7 +714,6 @@ flags2opts(int flags)
 	if (flags & MNT_NOEXEC)		res = catopt(res, "noexec");
 	if (flags & MNT_NOSUID)		res = catopt(res, "nosuid");
 	if (flags & MNT_NODEV)		res = catopt(res, "nodev");
-	if (flags & MNT_UNION)		res = catopt(res, "union");
 	if (flags & MNT_ASYNC)		res = catopt(res, "async");
 	if (flags & MNT_NOATIME)	res = catopt(res, "noatime");
 	if (flags & MNT_NOCLUSTERR)	res = catopt(res, "noclusterr");

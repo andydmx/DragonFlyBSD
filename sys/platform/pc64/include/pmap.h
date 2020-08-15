@@ -16,11 +16,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -79,9 +75,14 @@
 	((unsigned long)(l1) << PAGE_SHIFT))
 
 /*
+ * NKPML4E is the number of PML4E slots used for KVM.  Each slot represents
+ * 512GB of KVM.  A number between 1 and 128 may be specified.  To support
+ * the maximum machine configuration of 64TB we recommend around
+ * 16 slots (8TB of KVM).
+ *
  * NOTE: We no longer hardwire NKPT, it is calculated in create_pagetables()
  */
-#define NKPML4E		1		/* number of kernel PML4 slots */
+#define NKPML4E		16
 /* NKPDPE defined in vmparam.h */
 
 /*
@@ -101,14 +102,11 @@
 #define NUPTE_USER	((vm_pindex_t)NPTEPG * NPDEPG * NPDPEPG * NUPDP_USER)
 
 /*
- * Number of 512G dmap PML4 slots (max ~254 or so but don't go over 64,
- * which gives us 32TB of ram).  Because we cache free, empty pmaps the
- * initialization overhead is minimal.
- *
- * It should be possible to bump this up to 255 (but not 256), which would
- * be able to address a maximum of ~127TB of physical ram.
+ * Number of 512G dmap PML4 slots.  There are 512 slots of which 256 are
+ * used by the kernel.  Of those 256 we allow up to 128 to be used by the
+ * DMAP (for 64TB of ram), leaving 128 for the kernel and other incidentals.
  */
-#define	NDMPML4E	64
+#define	NDMPML4E	128
 
 /*
  * The *PML4I values control the layout of virtual memory.  Each PML4
@@ -116,8 +114,16 @@
  */
 #define	PML4PML4I	(NPML4EPG/2)	/* Index of recursive pml4 mapping */
 
-#define	KPML4I		(NPML4EPG-1)	/* Top 512GB for KVM */
+#define	KPML4I		(NPML4EPG-NKPML4E) /* Start of KVM */
 #define	DMPML4I		(KPML4I-NDMPML4E) /* Next 512GBxN down for dmap */
+
+/*
+ * Make sure the kernel map and DMAP don't overflow the 256 PDP entries
+ * we have available.  Minus one for the PML4PML4I.
+ */
+#if NKPML4E + NDMPML4E >= 255
+#error "NKPML4E or NDMPML4E is too large"
+#endif
 
 /*
  * The location of KERNBASE in the last PD of the kernel's KVM (KPML4I)
@@ -132,7 +138,7 @@
  * in the future or 16MB of space.  Each PD represents 2MB so
  * use NPDEPG-8 to place the per-CPU data.
  */
-#define	MPPML4I		KPML4I
+#define	MPPML4I		(KPML4I + NKPML4E - 1)
 #define	MPPDPI		KPDPI
 #define	MPPTDI		(NPDEPG-8)
 
@@ -146,6 +152,9 @@
 
 #ifndef _SYS_TYPES_H_
 #include <sys/types.h>
+#endif
+#ifndef _SYS_CPUMASK_H_
+#include <sys/cpumask.h>
 #endif
 #ifndef _SYS_QUEUE_H_
 #include <sys/queue.h>
@@ -198,14 +207,6 @@ extern int pmap_fast_kernel_cpusync;
 
 #define	pte_load_clear(pte)	atomic_readandclear_long(pte)
 
-static __inline void
-pte_store(pt_entry_t *ptep, pt_entry_t pte)
-{
-	*ptep = pte;
-}
-
-#define	pde_store(pdep, pde)	pte_store((pdep), (pde))
-
 /*
  * Pmap stuff
  */
@@ -215,13 +216,33 @@ struct vm_page;
 struct vm_object;
 struct vmspace;
 
-TAILQ_HEAD(md_page_pv_list, pv_entry);
+#define PMAP_ADVANCED
+
 /*
- * vm_page structures embed a list of related pv_entry's
+ * vm_page structure extension for pmap.  Track the number of pmap mappings
+ * for a managed page.  Unmanaged pages do not use this field.
  */
 struct md_page {
-	struct md_page_pv_list	pv_list;
+#ifdef PMAP_ADVANCED
+	long interlock_count;
+	long writeable_count_unused;
+#else
+	long pmap_count;
+	long writeable_count;
+#endif
 };
+
+#ifdef PMAP_ADVANCED
+
+#define MD_PAGE_FREEABLE(m)	\
+	(((m)->flags & (PG_MAPPED | PG_WRITEABLE)) == 0)
+
+#else
+
+#define MD_PAGE_FREEABLE(m)	\
+	((m)->md.pmap_count == 0 && (m)->md.writeable_count == 0)
+
+#endif
 
 /*
  * vm_object's representing large mappings can contain embedded pmaps
@@ -229,8 +250,7 @@ struct md_page {
  * PROT_READ|PROT_WRITE maps.
  */
 struct md_object {
-	struct pmap *pmap_rw;
-	struct pmap *pmap_ro;
+	void *dummy_unused;
 };
 
 /*
@@ -267,46 +287,66 @@ RB_PROTOTYPE2(pv_entry_rb_tree, pv_entry, pv_entry,
 #define	PG_G_IDX		7
 #define	PG_W_IDX		8
 #define	PG_MANAGED_IDX		9
-#define	PG_DEVICE_IDX		10
+#define	PG_UNUSED10_IDX		10
 #define	PG_N_IDX		11
-#define	PG_BITS_SIZE		12
+#define	PG_NX_IDX		12
+#define	PG_BITS_SIZE		13
 
 #define PROTECTION_CODES_SIZE	8
-#define PAT_INDEX_SIZE  8
+#define PAT_INDEX_SIZE  	8
+
+#define PM_PLACEMARKS		64		/* 16 @ 4 zones */
+#define PM_NOPLACEMARK		((vm_pindex_t)-1)
+#define PM_PLACEMARK_WAKEUP	((vm_pindex_t)0x8000000000000000LLU)
 
 struct pmap {
 	pml4_entry_t		*pm_pml4;	/* KVA of level 4 page table */
+	pml4_entry_t		*pm_pml4_iso;	/* (isolated version) */
 	struct pv_entry		*pm_pmlpv;	/* PV entry for pml4 */
+	struct pv_entry		*pm_pmlpv_iso;	/* (isolated version) */
 	TAILQ_ENTRY(pmap)	pm_pmnode;	/* list of pmaps */
 	RB_HEAD(pv_entry_rb_tree, pv_entry) pm_pvroot;
 	int			pm_count;	/* reference count */
 	cpulock_t		pm_active_lock; /* interlock */
 	cpumask_t		pm_active;	/* active on cpus */
 	int			pm_flags;
+	uint32_t		pm_softhold;
 	struct pmap_statistics	pm_stats;	/* pmap statistics */
-	struct pv_entry		*pm_pvhint;	/* pv_entry lookup hint */
-	int			pm_generation;	/* detect pvlist deletions */
 	struct spinlock		pm_spin;
-	struct lwkt_token	pm_token;
+	struct pv_entry		*pm_pvhint_pt;	/* pv_entry lookup hint */
+	struct pv_entry		*pm_pvhint_unused;
+	vm_pindex_t		pm_placemarks[PM_PLACEMARKS];
 	long			pm_invgen;
 	uint64_t		pmap_bits[PG_BITS_SIZE];
-	int			protection_codes[PROTECTION_CODES_SIZE];
-	pt_entry_t		pmap_cache_bits[PAT_INDEX_SIZE];
-	pt_entry_t		pmap_cache_mask;
+	uint64_t		protection_codes[PROTECTION_CODES_SIZE];
+	pt_entry_t		pmap_cache_bits_pte[PAT_INDEX_SIZE];
+	pt_entry_t		pmap_cache_bits_pde[PAT_INDEX_SIZE];
+	pt_entry_t		pmap_cache_mask_pte;
+	pt_entry_t		pmap_cache_mask_pde;
 	int (*copyinstr)(const void *, void *, size_t, size_t *);
 	int (*copyin)(const void *, void *, size_t);
 	int (*copyout)(const void *, void *, size_t);
-	int (*fubyte)(const void *);
-	int (*subyte)(void *, int);
-	long (*fuword)(const void *);
-	int (*suword)(void *, long);
-	int (*suword32)(void *, int);
+	int (*fubyte)(const uint8_t *);		/* returns int for -1 err */
+	int (*subyte)(uint8_t *, uint8_t);
+	int32_t (*fuword32)(const uint32_t *);
+	int64_t (*fuword64)(const uint64_t *);
+	int (*suword64)(uint64_t *, uint64_t);
+	int (*suword32)(uint32_t *, int);
+	uint32_t (*swapu32)(volatile uint32_t *, uint32_t v);
+	uint64_t (*swapu64)(volatile uint64_t *, uint64_t v);
+	uint32_t (*fuwordadd32)(volatile uint32_t *, uint32_t v);
+	uint64_t (*fuwordadd64)(volatile uint64_t *, uint64_t v);
 };
 
 #define PMAP_FLAG_SIMPLE	0x00000001
 #define PMAP_EMULATE_AD_BITS	0x00000002
+#define PMAP_HVM		0x00000004
+#define PMAP_SEGSHARED		0x00000008	/* segment shared opt */
+#define PMAP_MULTI		0x00000010	/* multi-threaded use */
 
-#define pmap_resident_count(pmap) (pmap)->pm_stats.resident_count
+#define pmap_resident_count(pmap) ((pmap)->pm_stats.resident_count)
+#define pmap_resident_tlnw_count(pmap) ((pmap)->pm_stats.resident_count - \
+					(pmap)->pm_stats.wired_count)
 
 typedef struct pmap	*pmap_t;
 
@@ -315,20 +355,21 @@ extern struct pmap	kernel_pmap;
 #endif
 
 /*
- * For each vm_page_t, there is a list of all currently valid virtual
- * mappings of that page.  An entry is a pv_entry_t, the list is pv_table.
+ * The pv_entry structure is used to track higher levels of the page table.
+ * The leaf PTE is no longer tracked with this structure.
  */
 typedef struct pv_entry {
 	pmap_t		pv_pmap;	/* pmap where mapping lies */
 	vm_pindex_t	pv_pindex;	/* PTE, PT, PD, PDP, or PML4 */
-	TAILQ_ENTRY(pv_entry)	pv_list;
-	RB_ENTRY(pv_entry)	pv_entry;
+	RB_ENTRY(pv_entry) pv_entry;
 	struct vm_page	*pv_m;		/* page being mapped */
 	u_int		pv_hold;	/* interlock action */
 	u_int		pv_flags;
 #ifdef PMAP_DEBUG
 	const char	*pv_func;
 	int		pv_line;
+	const char	*pv_func_lastfree;
+	int		pv_line_lastfree;
 #endif
 } *pv_entry_t;
 
@@ -337,13 +378,13 @@ typedef struct pv_entry {
 #define PV_HOLD_UNUSED2000	0x20000000U
 #define PV_HOLD_MASK		0x1FFFFFFFU
 
-#define PV_FLAG_VMOBJECT	0x00000001U	/* shared pt in VM obj */
+#define PV_FLAG_UNUSED01	0x00000001U
+#define PV_FLAG_UNUSED02	0x00000002U
 
 #ifdef	_KERNEL
 
 extern caddr_t	CADDR1;
 extern pt_entry_t *CMAP1;
-extern vm_paddr_t dump_avail[];
 extern vm_paddr_t avail_end;
 extern vm_paddr_t avail_start;
 extern vm_offset_t clean_eva;
@@ -371,14 +412,51 @@ void	pmap_unmapdev (vm_offset_t, vm_size_t);
 struct vm_page *pmap_use_pt (pmap_t, vm_offset_t);
 void	pmap_set_opt (void);
 void	pmap_init_pat(void);
-vm_paddr_t pmap_kextract(vm_offset_t);
-void	pmap_invalidate_range(pmap_t, vm_offset_t, vm_offset_t);
 void	pmap_invalidate_cache_pages(vm_page_t *pages, int count);
 void	pmap_invalidate_cache_range(vm_offset_t sva, vm_offset_t eva);
 
 static __inline int
 pmap_emulate_ad_bits(pmap_t pmap) {
 	return pmap->pm_flags & PMAP_EMULATE_AD_BITS;
+}
+
+/* Return various clipped indexes for a given VA */
+
+/*
+ * Returns the index of a PTE in a PT, representing a terminal
+ * page.
+ */
+static __inline vm_pindex_t
+pmap_pte_index(vm_offset_t va)
+{
+	return ((va >> PAGE_SHIFT) & ((1ul << NPTEPGSHIFT) - 1));
+}
+
+/*
+ * Returns the index of a PT in a PD
+ */
+static __inline vm_pindex_t
+pmap_pde_index(vm_offset_t va)
+{
+	return ((va >> PDRSHIFT) & ((1ul << NPDEPGSHIFT) - 1));
+}
+
+/*
+ * Returns the index of a PD in a PDP
+ */
+static __inline vm_pindex_t
+pmap_pdpe_index(vm_offset_t va)
+{
+	return ((va >> PDPSHIFT) & ((1ul << NPDPEPGSHIFT) - 1));
+}
+
+/*
+ * Returns the index of a PDP in the PML4
+ */
+static __inline vm_pindex_t
+pmap_pml4e_index(vm_offset_t va)
+{
+	return ((va >> PML4SHIFT) & ((1ul << NPML4EPGSHIFT) - 1));
 }
 
 #endif /* _KERNEL */

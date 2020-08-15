@@ -61,7 +61,6 @@
 #include <netdb.h>
 #include <pwd.h>
 #include <grp.h>
-#include <opie.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -81,7 +80,6 @@
 
 #include "pathnames.h"
 #include "extern.h"
-#include "pidfile.h"
 
 #include <stdarg.h>
 
@@ -115,7 +113,7 @@ int	assumeutf8 = 0;   /* Assume that server file names are in UTF-8 */
 int	guest;
 int	dochroot;
 char	*chrootdir;
-int	dowtmp = 1;
+int	dowtmpx = 1;
 int	stats;
 int	statfd = -1;
 int	type;
@@ -167,8 +165,6 @@ static int	auth_pam(struct passwd**, const char*);
 pam_handle_t	*pamh = NULL;
 #endif
 
-static struct opie	opiedata;
-static char		opieprompt[OPIE_CHALLENGE_MAX+1];
 static int		pwok;
 
 char	*pid_file = NULL; /* means default location to pidfile(3) */
@@ -178,7 +174,6 @@ char	*pid_file = NULL; /* means default location to pidfile(3) */
  * A limit of 0 indicates the number of pathnames is unlimited.
  */
 #define MAXGLOBARGS	16384
-#
 
 /*
  * Timeout intervals for retrying connections
@@ -392,7 +387,7 @@ main(int argc, char *argv[])
 			break;
 
 		case 'W':
-			dowtmp = 0;
+			dowtmpx = 0;
 			break;
 
 		default:
@@ -1039,20 +1034,8 @@ user(char *name)
 	if (logging)
 		strncpy(curname, name, sizeof(curname)-1);
 
-	pwok = 0;
-#ifdef USE_PAM
-	/* XXX Kluge! The conversation mechanism needs to be fixed. */
-#endif
-	if (opiechallenge(&opiedata, name, opieprompt) == 0) {
-		pwok = (pw != NULL) &&
-		       opieaccessfile(remotehost) &&
-		       opiealways(pw->pw_dir);
-		reply(331, "Response to %s %s for %s.",
-		      opieprompt, pwok ? "requested" : "required", name);
-	} else {
-		pwok = 1;
-		reply(331, "Password required for %s.", name);
-	}
+	pwok = 1;
+	reply(331, "Password required for %s.", name);
 	askpasswd = 1;
 	/*
 	 * Delay before reading passwd after first failed
@@ -1159,8 +1142,8 @@ end_login(void)
 #endif
 
 	seteuid(0);
-	if (logged_in && dowtmp)
-		ftpd_logwtmp(ttyline, "", NULL);
+	if (logged_in && dowtmpx)
+		ftpd_logwtmpx(ttyline, "", NULL);
 	pw = NULL;
 #ifdef	LOGIN_CAP
 	/* XXX Missing LOGIN_SETMAC */
@@ -1363,14 +1346,10 @@ pass(char *passwd)
 		}
 #ifdef USE_PAM
 		rval = auth_pam(&pw, passwd);
-		if (rval >= 0) {
-			opieunlock();
+		if (rval >= 0)
 			goto skip;
-		}
 #endif
-		if (opieverify(&opiedata, passwd) == 0)
-			xpasswd = pw->pw_passwd;
-		else if (pwok) {
+		if (pwok) {
 			xpasswd = crypt(passwd, pw->pw_passwd);
 			if (passwd[0] == '\0' && pw->pw_passwd[0] != '\0')
 				xpasswd = ":";
@@ -1456,9 +1435,9 @@ skip:
 	}
 #endif
 
-	/* open wtmp before chroot */
-	if (dowtmp)
-		ftpd_logwtmp(ttyline, pw->pw_name,
+	/* open wtmpx before chroot */
+	if (dowtmpx)
+		ftpd_logwtmpx(ttyline, pw->pw_name,
 		    (struct sockaddr *)&his_addr);
 	logged_in = 1;
 
@@ -2705,16 +2684,16 @@ dolog(struct sockaddr *who)
 }
 
 /*
- * Record logout in wtmp file
+ * Record logout in wtmpx file
  * and exit with supplied status.
  */
 void
 dologout(int status)
 {
 
-	if (logged_in && dowtmp) {
+	if (logged_in && dowtmpx) {
 		seteuid(0);
-		ftpd_logwtmp(ttyline, "", NULL);
+		ftpd_logwtmpx(ttyline, "", NULL);
 	}
 	/* beware of flushing buffers after a SIGPIPE */
 	_exit(status);
@@ -2778,7 +2757,7 @@ myoob(void)
 		return (0);
 	}
 	cp = tmpline;
-	ret = getline(cp, 7, stdin);
+	ret = get_line(cp, 7, stdin);
 	if (ret == -1) {
 		reply(221, "You could at least say goodbye.");
 		dologout(0);

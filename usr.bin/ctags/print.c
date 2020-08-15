@@ -27,8 +27,7 @@
  * SUCH DAMAGE.
  *
  * @(#)print.c	8.3 (Berkeley) 4/2/94
- * $FreeBSD: src/usr.bin/ctags/print.c,v 1.3.6.2 2002/07/30 00:55:07 tjr Exp $
- * $DragonFly: src/usr.bin/ctags/print.c,v 1.2 2003/06/17 04:29:25 dillon Exp $
+ * $FreeBSD: head/usr.bin/ctags/print.c 299355 2016-05-10 11:11:23Z bapt $
  */
 
 #include <limits.h>
@@ -38,12 +37,12 @@
 #include "ctags.h"
 
 /*
- * getline --
+ * get_line --
  *	get the line the token of interest occurred on,
  *	prepare it for printing.
  */
 void
-getline(void)
+get_line(void)
 {
 	long	saveftell;
 	int	c;
@@ -51,7 +50,7 @@ getline(void)
 	char	*cp;
 
 	saveftell = ftell(inf);
-	(void)fseek(inf, lineftell, L_SET);
+	fseek(inf, lineftell, L_SET);
 	if (xflag)
 		for (cp = lbuf; GETC(!=, EOF) && c != '\n'; *cp++ = c)
 			continue;
@@ -81,7 +80,7 @@ getline(void)
 			*cp++ = c;
 	}
 	*cp = EOS;
-	(void)fseek(inf, saveftell, L_SET);
+	fseek(inf, saveftell, L_SET);
 }
 
 /*

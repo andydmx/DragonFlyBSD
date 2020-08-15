@@ -28,12 +28,12 @@ SUBDIR=	UI \
 	tty \
 	vjc
 
-.if !defined(NO_CRYPT) && exists(${.CURDIR}/../crypto/rc4/rc4.c)
+.if exists(${.CURDIR}/../crypto/rc4/rc4.c)
 SUBDIR+=	mppc
 .endif
 
-.if ${MACHINE_ARCH} == "i386"
-SUBDIR+=	sync_ar sync_sr
-.endif
+# empty to allow concurrent building
+#
+SUBDIR_ORDERED=
 
 .include <bsd.subdir.mk>

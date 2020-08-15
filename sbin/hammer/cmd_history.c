@@ -36,9 +36,19 @@
 
 #include "hammer.h"
 
-static void hammer_do_history(const char *path, off_t off, int len);
-static void dumpat(const char *path, off_t off, int len);
-static const char *timestr32(u_int32_t time32);
+typedef struct cmd_attr {
+	char *path;
+	int64_t offset;
+	long length;
+} cmd_attr_t;
+
+static void hammer_do_history(const char *path, off_t off, long len);
+static int parse_attr(const char *s, cmd_attr_t *ca);
+static int parse_attr_path(const char *s, cmd_attr_t *ca);
+static void dumpat(const char *path, off_t off, long len);
+static const char *timestr32(uint32_t time32);
+static __inline int test_strtol(int res, long val);
+static __inline int test_strtoll(int res, long long val);
 
 /*
  * history <file1> ... <fileN>
@@ -46,26 +56,28 @@ static const char *timestr32(u_int32_t time32);
 void
 hammer_cmd_history(const char *offset_str, char **av, int ac)
 {
-	off_t off;
 	int i;
-	int len;
-	char *rptr;
+	int old_behavior = 0;
+	cmd_attr_t ca;
 
-	len = 32;
-	if (*offset_str == '@') {
-		off = strtoll(offset_str + 1, &rptr, 0);
-		if (*rptr == ',')
-			len = strtol(rptr + 1, NULL, 0);
-	} else {
-		off = -1;
+	bzero(&ca, sizeof(ca));
+	if (parse_attr(offset_str, &ca) == 0)
+		old_behavior = 1;
+
+	for (i = 0; i < ac; ++i) {
+		if (!old_behavior)
+			parse_attr_path(av[i], &ca);
+		if (ca.path == NULL)
+			ca.path = strdup(av[i]);
+		hammer_do_history(ca.path, ca.offset, ca.length);
+		free(ca.path);
+		ca.path = NULL;
 	}
-
-	for (i = 0; i < ac; ++i)
-		hammer_do_history(av[i], off, len);
 }
 
-static void
-hammer_do_history(const char *path, off_t off, int len)
+static
+void
+hammer_do_history(const char *path, off_t off, long len)
 {
 	struct hammer_ioc_history hist;
 	const char *status;
@@ -132,8 +144,72 @@ hammer_do_history(const char *path, off_t off, int len)
 	close(fd);
 }
 
-static void
-dumpat(const char *path, off_t off, int len)
+static
+int
+parse_attr(const char *s, cmd_attr_t *ca)
+{
+	long long offset;
+	long length;
+	char *rptr;
+
+	ca->offset = -1;  /* Don't use offset as a key */
+	ca->length = 32;  /* Default dump size */
+
+	if (*s != '@')
+		return(-1);  /* not parsed */
+
+	errno = 0;  /* clear */
+	offset = strtoll(s + 1, &rptr, 0);
+	if (test_strtoll(errno, offset)) {
+		*rptr = '\0';  /* side effect */
+		err(1, "%s", s);
+		/* not reached */
+	}
+	ca->offset = offset;
+
+	if (*rptr == ',') {
+		errno = 0;  /* clear */
+		length = strtol(rptr + 1, NULL, 0);
+		if (test_strtol(errno, length)) {
+			err(1, "%s", rptr);
+			/* not reached */
+		}
+		if (length >= 0)
+			ca->length = length;
+	}
+
+	return(0);
+}
+
+static
+int
+parse_attr_path(const char *s, cmd_attr_t *ca)
+{
+	int length, ret;
+	char *p;
+	struct stat st;
+
+	ca->path = NULL;
+
+	if (stat(s, &st) == 0)
+		return(-1);  /* real path */
+
+	p = strstr(s, "@");
+	if (p == NULL || p == s)
+		return(-1);  /* no attr specified */
+
+	ret = parse_attr(p, ca);
+
+	length = p - s + 1;
+	ca->path = calloc(1, length);
+	strncpy(ca->path, s, length - 1);
+
+	return(ret);
+}
+
+static
+void
+dumpat(const char *path, off_t off, long len)
 {
 	char buf[1024];
 	int fd;
@@ -157,13 +233,15 @@ dumpat(const char *path, off_t off, int len)
 				putc('.', stdout);
 		}
 	}
+	close(fd);
 }
 
 /*
  * Return a human-readable timestamp
  */
-static const char *
-timestr32(u_int32_t time32)
+static
+const char *
+timestr32(uint32_t time32)
 {
 	static char timebuf[64];
 	time_t t = (time_t)time32;
@@ -174,3 +252,19 @@ timestr32(u_int32_t time32)
 	return(timebuf);
 }
 
+/*
+ * Return non-zero on either overflow or underflow
+ */
+static __inline
+int
+test_strtol(int res, long val)
+{
+	return(res == ERANGE && (val == LONG_MIN || val == LONG_MAX));
+}
+
+static __inline
+int
+test_strtoll(int res, long long val)
+{
+	return(res == ERANGE && (val == LLONG_MIN || val == LLONG_MAX));
+}

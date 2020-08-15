@@ -1,6 +1,6 @@
 /*
  * Copyright (c) 2004 Joerg Sonnenberger <joerg@bec.de>.  All rights reserved.
- * Copyright (c) 2006 Matthew Dillon <dillon@backplane.com>.  All rights reserved.
+ * Copyright (c) 2006-2018 Matthew Dillon <dillon@backplane.com>.  All rights reserved.
  *
  * Copyright (c) 1982, 1986, 1989, 1993
  *	The Regents of the University of California.  All rights reserved.
@@ -55,15 +55,18 @@
 
 #include <sys/spinlock2.h>
 
-#ifdef INVARIANTS
-int lf_global_counter = 0;
-#endif
+struct lf_pcpu {
+	struct lockf_range *free1;
+	struct lockf_range *free2;
+} __cachealign;
+
+static struct lf_pcpu	*lf_pcpu_array;
 
 #ifdef LOCKF_DEBUG
 int lf_print_ranges = 0;
 
 static void _lf_print_lock(const struct lockf *);
-static void _lf_printf(const char *, ...);
+static void _lf_printf(const char *, ...) __printflike(1, 2);
 
 #define lf_print_lock(lock) if (lf_print_ranges) _lf_print_lock(lock)
 #define lf_printf(ctl, args...)	if (lf_print_ranges) _lf_printf(ctl, args)
@@ -127,21 +130,27 @@ void
 lf_count_adjust(struct proc *p, int increase)
 {
 	struct uidinfo *uip;
+	struct uidcount *pup;
+	int n;
 
 	KKASSERT(p != NULL);
 
 	uip = p->p_ucred->cr_uidinfo;
-	spin_lock(&uip->ui_lock);
+	pup = &uip->ui_pcpu[mycpuid];
 
-	if (increase)
-		uip->ui_posixlocks += p->p_numposixlocks;
-	else
-		uip->ui_posixlocks -= p->p_numposixlocks;
+	if (increase) {
+		for (n = 0; n < ncpus; ++n)
+			pup->pu_posixlocks += p->p_uidpcpu[n].pu_posixlocks;
+	} else {
+		for (n = 0; n < ncpus; ++n)
+			pup->pu_posixlocks -= p->p_uidpcpu[n].pu_posixlocks;
+	}
 
-	KASSERT(uip->ui_posixlocks >= 0,
-		("Negative number of POSIX locks held by %s user: %d.",
-		 increase ? "new" : "old", uip->ui_posixlocks));
-	spin_unlock(&uip->ui_lock);
+	if (pup->pu_posixlocks < -PUP_LIMIT ||
+	    pup->pu_posixlocks > PUP_LIMIT) {
+		atomic_add_int(&uip->ui_posixlocks, pup->pu_posixlocks);
+		pup->pu_posixlocks = 0;
+	}
 }
 
 static int
@@ -159,22 +168,23 @@ lf_count_change(struct proc *owner, int diff)
 	max = MIN(owner->p_rlimit[RLIMIT_POSIXLOCKS].rlim_cur,
 		  maxposixlocksperuid);
 
-	spin_lock(&uip->ui_lock);
 	if (diff > 0 && owner->p_ucred->cr_uid != 0 && max != -1 &&
 	    uip->ui_posixlocks >= max ) {
 		ret = 1;
 	} else {
-		uip->ui_posixlocks += diff;
-		owner->p_numposixlocks += diff;
-		KASSERT(uip->ui_posixlocks >= 0,
-			("Negative number of POSIX locks held by user: %d.",
-			 uip->ui_posixlocks));
-		KASSERT(owner->p_numposixlocks >= 0,
-			("Negative number of POSIX locks held by proc: %d.",
-			 uip->ui_posixlocks));
+		struct uidcount *pup;
+		int cpu = mycpuid;
+
+		pup = &uip->ui_pcpu[cpu];
+		pup->pu_posixlocks += diff;
+		if (pup->pu_posixlocks < -PUP_LIMIT ||
+		    pup->pu_posixlocks > PUP_LIMIT) {
+			atomic_add_int(&uip->ui_posixlocks, pup->pu_posixlocks);
+			pup->pu_posixlocks = 0;
+		}
+		owner->p_uidpcpu[cpu].pu_posixlocks += diff;
 		ret = 0;
 	}
-	spin_unlock(&uip->ui_lock);
 	return ret;
 }
 
@@ -253,15 +263,22 @@ lf_advlock(struct vop_advlock_args *ap, struct lockf *lock, u_quad_t size)
 		 * then before.
 		 */
 		error = lf_setlock(lock, owner, type, flags, start, end);
-		vsetflags(ap->a_vp, VMAYHAVELOCKS);
+		if ((ap->a_vp->v_flag & VMAYHAVELOCKS) == 0)
+			vsetflags(ap->a_vp, VMAYHAVELOCKS);
 		break;
 
 	case F_UNLCK:
 		error = lf_setlock(lock, owner, type, flags, start, end);
+#if 0
+		/*
+		 * XXX REMOVED. don't bother doing this in the critical path.
+		 * close() overhead is minimal.
+		 */
 		if (TAILQ_EMPTY(&lock->lf_range) &&
 		    TAILQ_EMPTY(&lock->lf_blocked)) {
 			vclrflags(ap->a_vp, VMAYHAVELOCKS);
 		}
+#endif
 		break;
 
 	case F_GETLK:
@@ -421,7 +438,7 @@ restart:
 		 */
 		if (brange->lf_flags == 0)
 			TAILQ_REMOVE(&lock->lf_blocked, brange, lf_link);
-		if (count == 2)
+		if (error == 0 && count == 2)
 			tsleep(brange, 0, "lockfz", 2);
 		else
 			++count;
@@ -802,17 +819,28 @@ lf_wakeup(struct lockf *lock, off_t start, off_t end)
 /*
  * Allocate a range structure and initialize it sufficiently such that
  * lf_destroy_range() does not barf.
+ *
+ * Most use cases are temporary, implement a small 2-entry-per-cpu
+ * cache.
  */
 static struct lockf_range *
 lf_alloc_range(void)
 {
 	struct lockf_range *range;
+	struct lf_pcpu *lfpc;
 
-#ifdef INVARIANTS
-	atomic_add_int(&lf_global_counter, 1);
-#endif
+	lfpc = &lf_pcpu_array[mycpuid];
+	if ((range = lfpc->free1) != NULL) {
+		lfpc->free1 = NULL;
+		return range;
+	}
+	if ((range = lfpc->free2) != NULL) {
+		lfpc->free2 = NULL;
+		return range;
+	}
 	range = kmalloc(sizeof(struct lockf_range), M_LOCKF, M_WAITOK);
 	range->lf_owner = NULL;
+
 	return(range);
 }
 
@@ -839,20 +867,30 @@ lf_create_range(struct lockf_range *range, struct proc *owner, int type,
 	range->lf_end = end;
 	range->lf_owner = owner;
 
-	lf_printf("lf_create_range: %lld..%lld\n",
-			range->lf_start, range->lf_end);
+	lf_printf("lf_create_range: %ju..%ju\n",
+	    (uintmax_t)range->lf_start, (uintmax_t)range->lf_end);
 }
 
 static void
 lf_destroy_range(struct lockf_range *range)
 {
-	lf_printf("lf_destroy_range: %lld..%lld\n",
-		  range->lf_start, range->lf_end);
+	struct lf_pcpu *lfpc;
+
+	lf_printf("lf_destroy_range: %ju..%ju\n",
+		  (uintmax_t)range->lf_start, (uintmax_t)range->lf_end);
+
+	lfpc = &lf_pcpu_array[mycpuid];
+	if (lfpc->free1 == NULL) {
+		range->lf_owner = NULL;
+		lfpc->free1 = range;
+		return;
+	}
+	if (lfpc->free2 == NULL) {
+		range->lf_owner = NULL;
+		lfpc->free2 = range;
+		return;
+	}
 	kfree(range, M_LOCKF);
-#ifdef INVARIANTS
-	atomic_add_int(&lf_global_counter, -1);
-	KKASSERT(lf_global_counter >= 0);
-#endif
 }
 
 #ifdef LOCKF_DEBUG
@@ -901,3 +939,12 @@ _lf_print_lock(const struct lockf *lock)
 		       range);
 }
 #endif /* LOCKF_DEBUG */
+
+static void
+lf_init(void *dummy __unused)
+{
+	lf_pcpu_array = kmalloc(sizeof(*lf_pcpu_array) * ncpus,
+				M_LOCKF, M_WAITOK | M_ZERO);
+}
+
+SYSINIT(lockf, SI_BOOT2_MACHDEP, SI_ORDER_ANY, lf_init, NULL);

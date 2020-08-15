@@ -10,11 +10,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -57,7 +53,7 @@ struct image_params {
 	struct proc *proc;	/* our process struct */
 	struct image_args *args;	/* syscall arguments */
 	struct vnode *vp;	/* pointer to vnode of file to exec */
-	struct vattr *attr;	/* attributes of file */
+	struct vattr_lite *lvap; /* attributes of file */
 	const char *image_header; /* head of file to exec */
 	unsigned long entry_addr; /* entry address of target executable */
 	char resident;		/* flag - resident image */

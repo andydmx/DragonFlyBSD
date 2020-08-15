@@ -26,7 +26,7 @@
 .\"
 .\" $FreeBSD: src/usr.sbin/adduser/adduser.8,v 1.62 2008/03/16 21:36:05 brueffer Exp $
 .\"
-.Dd October 31, 2011
+.Dd September 10, 2019
 .Dt ADDUSER 8
 .Os
 .Sh NAME
@@ -77,14 +77,6 @@ Given that people have traditionally wanted to break this
 limit for aesthetic reasons, it has never been of great importance to break
 such a basic fundamental parameter in
 .Ux .
-You can change
-.Dv UT_NAMESIZE
-in
-.In utmp.h
-and recompile the
-world; people have done this and it works, but you will have problems
-with any precompiled programs, or source that assumes the 8-character
-name limit, such as NIS.
 The NIS protocol mandates an 8-character username.
 If you need a longer login name for e-mail addresses,
 you can define an alias in
@@ -437,7 +429,6 @@ logfile for
 .Xr login.conf 5 ,
 .Xr passwd 5 ,
 .Xr shells 5 ,
-.Xr adding_user 8 ,
 .Xr pw 8 ,
 .Xr pwd_mkdb 8 ,
 .Xr rmuser 8 ,

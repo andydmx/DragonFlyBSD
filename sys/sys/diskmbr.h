@@ -10,11 +10,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -31,19 +27,12 @@
  * SUCH DAMAGE.
  *
  *	@(#)disklabel.h	8.2 (Berkeley) 7/10/94
- * $FreeBSD$
- * $DragonFly: src/sys/sys/diskmbr.h,v 1.4 2007/06/17 03:51:11 dillon Exp $
  */
 
 #ifndef _SYS_DISKMBR_H_
 #define	_SYS_DISKMBR_H_
 
-#ifndef _SYS_TYPES_H_
 #include <sys/types.h>
-#endif
-#ifndef _SYS_IOCCOM_H_
-#include <sys/ioccom.h>
-#endif
 
 #define	DOSBBSECTOR	0	/* DOS boot block relative sector number */
 #define	DOSPARTOFF	446
@@ -53,13 +42,18 @@
 #define	DOSMAGICOFFSET	510
 #define	DOSMAGIC	0xAA55
 
+/*
+ * NOTE: DragonFly BSD had been using 0xA5 forever but after many years
+ *	 we're finally shifting to our own as A5 causes conflicts in grub.
+ */
+#define	DOSPTYP_DFLYBSD	0x6c	/* DragonFly BSD partition type */
 #define	DOSPTYP_386BSD	0xa5	/* 386BSD partition type */
 #define	DOSPTYP_OPENBSD	0xa6	/* OpenBSD partition type */
 #define	DOSPTYP_NETBSD	0xa9	/* NetBSD partition type */
 #define	DOSPTYP_LINSWP	0x82	/* Linux swap partition */
 #define	DOSPTYP_LINUX	0x83	/* Linux partition */
 #define	DOSPTYP_PMBR	0xee	/* GPT Protective MBR */
-#define	DOSPTYP_GPT	0xef	/* GPT Native EFI */
+#define	DOSPTYP_EFI	0xef	/* EFI system partition */
 #define	DOSPTYP_EXT	5	/* DOS extended partition */
 #define	DOSPTYP_EXTLBA	15	/* DOS extended partition */
 
@@ -77,16 +71,19 @@ struct dos_partition {
 	unsigned char	dp_ehd;		/* end head */
 	unsigned char	dp_esect;	/* end sector */
 	unsigned char	dp_ecyl;	/* end cylinder */
-	u_int32_t	dp_start;	/* absolute starting sector number */
-	u_int32_t	dp_size;	/* partition size in sectors */
+	uint32_t	dp_start;	/* absolute starting sector number */
+	uint32_t	dp_size;	/* partition size in sectors */
 };
-#ifdef CTASSERT
-CTASSERT(sizeof (struct dos_partition) == DOSPARTSIZE);
+
+#ifndef CTASSERT
+#define CTASSERT(x)		_CTASSERT(x, __LINE__)
+#define _CTASSERT(x, y)		__CTASSERT(x, y)
+#define __CTASSERT(x, y)	typedef char __assert_ ## y [(x) ? 1 : -1]
 #endif
+
+CTASSERT(sizeof (struct dos_partition) == DOSPARTSIZE);
 
 #define	DPSECT(s) ((s) & 0x3f)		/* isolate relevant bits of sector */
 #define	DPCYL(c, s) ((c) + (((s) & 0xc0)<<2)) /* and those that are cylinder */
-
-#define DIOCSMBR 	_IOW('M', 129, u_char[512])
 
 #endif /* !_SYS_DISKMBR_H_ */

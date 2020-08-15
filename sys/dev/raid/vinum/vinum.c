@@ -42,7 +42,7 @@
 #define STATIC static					    /* nothing while we're testing XXX */
 
 #include "vinumhdr.h"
-#include <sys/sysproto.h>				    /* for sync(2) */
+#include <sys/sysmsg.h>					    /* for sync(2) */
 #include <sys/poll.h>					    /* XXX: poll ops used in kq filters */
 #include <sys/event.h>
 #include <sys/udev.h>
@@ -85,7 +85,7 @@ cdev_t	vinum_daemon_dev;
  * to do is allocate enough space for devices to be configured later, and
  * add devsw entries.
  */
-void
+static void
 vinumattach(void *dummy)
 {
     char *cp, *cp1, *cp2, **drives;
@@ -261,7 +261,7 @@ free_vinum(int cleardrive)
 STATIC void
 vinum_initconf(void)
 {
-    vinum_conf.physbufs = nswbuf / 2 + 1;
+    vinum_conf.physbufs = nswbuf_kva / 2 + 1;
 
     /* allocate space: drives... */
     DRIVE = (struct drive *) Malloc(sizeof(struct drive) * INITIAL_DRIVES);
@@ -303,7 +303,7 @@ vinum_modevent(module_t mod, modeventtype_t type, void *unused)
 	if (!vinum_inactive(1))				    /* is anything open? */
 	    return EBUSY;				    /* yes, we can't do it */
 	vinum_conf.flags |= VF_STOPPING;		    /* note that we want to stop */
-	sys_sync(NULL);			    /* write out buffers */
+	sys_sync(NULL, NULL);			    /* write out buffers */
 	free_vinum(0);					    /* clean up */
 
 	if (vinum_super_dev) {
@@ -364,6 +364,7 @@ moduledata_t vinum_mod =
     0
 };
 DECLARE_MODULE(vinum, vinum_mod, SI_SUB_RAID, SI_ORDER_MIDDLE);
+MODULE_VERSION(vinum, 1);
 
 /* ARGSUSED */
 /* Open a vinum object */

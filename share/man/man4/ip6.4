@@ -1,7 +1,6 @@
 .\"	$KAME: ip6.4,v 1.23 2005/01/11 05:56:25 itojun Exp $
 .\"	$OpenBSD: ip6.4,v 1.21 2005/01/06 03:50:46 itojun Exp $
 .\"	$FreeBSD: src/share/man/man4/ip6.4,v 1.18 2005/01/23 16:02:48 gnn Exp $
-.\"	$DragonFly: src/share/man/man4/ip6.4,v 1.3 2005/01/23 17:03:13 hrs Exp $
 .\"
 .\" Copyright (c) 1983, 1991, 1993
 .\"	The Regents of the University of California.  All rights reserved.
@@ -29,7 +28,8 @@
 .\" LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
 .\" OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
 .\" SUCH DAMAGE.
-.Dd December 29, 2004
+.\"
+.Dd December 31, 2019
 .Dt IP6 4
 .Os
 .Sh NAME
@@ -178,7 +178,7 @@ the destination group and if multicast loopback (see below) has not been
 disabled on the sending socket.
 Multicast datagrams with a hop limit greater than 1 may be forwarded to
 the other networks if a multicast router (such as
-.Xr mrouted 8 )
+.Xr mrouted 8 Pq Pa net/mrouted )
 is attached to the local network.
 .It Dv IPV6_MULTICAST_LOOP Fa "u_int *"
 Get or set the status of whether multicast datagrams will be looped back
@@ -376,30 +376,14 @@ turned off.
 .It Dv IPV6_V6ONLY Fa "int *"
 Get or set whether only IPv6 connections can be made to this socket.
 For wildcard sockets, this can restrict connections to IPv6 only.
-.\"With
-.\".Ox
-.\"IPv6 sockets are always IPv6-only, so the socket option is read-only
-.\"(not modifiable).
-.It Dv IPV6_FAITH Fa "int *"
-Get or set the status of whether
-.Xr faith 4
-connections can be made to this socket.
+With
+.Dx ,
+the socket option cannot be set to 0 (which will result in returning
+.Er EOPNOTSUPP ) .
 .It Dv IPV6_USE_MIN_MTU Fa "int *"
 Get or set whether the minimal IPv6 maximum transmission unit (MTU) size
 will be used to avoid fragmentation from occurring for subsequent
 outgoing datagrams.
-.It Dv IPV6_AUTH_LEVEL Fa "int *"
-Get or set the
-.Xr ipsec 4
-authentication level.
-.It Dv IPV6_ESP_TRANS_LEVEL Fa "int *"
-Get or set the ESP transport level.
-.It Dv IPV6_ESP_NETWORK_LEVEL Fa "int *"
-Get or set the ESP encapsulation level.
-.It Dv IPV6_IPCOMP_LEVEL Fa "int *"
-Get or set the
-.Xr ipcomp 4
-level.
 .El
 .Pp
 The
@@ -419,7 +403,7 @@ set to
 and
 .Va cmsg_type
 set to respective option name value (e.g.,
-.Dv IPV6_HOPTLIMIT ) .
+.Dv IPV6_HOPLIMIT ) .
 These options may also be used directly as ancillary
 .Va cmsg_type
 values in

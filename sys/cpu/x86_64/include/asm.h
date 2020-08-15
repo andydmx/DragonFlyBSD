@@ -13,11 +13,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -44,11 +40,33 @@
 
 #ifdef PIC
 #define	PIC_PLT(x)	x@PLT
+#if defined(__x86_64__)
 #define	PIC_GOT(x)	x@GOTPCREL(%rip)
 #else
+#define	PIC_PROLOGUE	\
+	pushl	%ebx;	\
+	call	1f;	\
+1:			\
+	popl	%ebx;	\
+	addl	$_GLOBAL_OFFSET_TABLE_+[.-1b],%ebx
+#define	PIC_EPILOGUE	\
+	popl	%ebx
+#define	PIC_GOT(x)	x@GOT(%ebx)
+#define	PIC_GOTOFF(x)	x@GOTOFF(%ebx)
+#endif
+#else
+#if !defined(__x86_64__)
+#define	PIC_PROLOGUE
+#define	PIC_EPILOGUE
+#define	PIC_GOTOFF(x)	x
+#endif
 #define	PIC_PLT(x)	x
 #define	PIC_GOT(x)	x
 #endif
+
+#define ALIGN_DATA	.p2align 3      /* 8 byte alignment, zero filled */
+#define ALIGN_TEXT	.p2align 4,0x90 /* 16-byte alignment, nop filled */
+#define SUPERALIGN_TEXT	.p2align 4,0x90 /* 16-byte alignment, nop filled */
 
 /*
  * CNAME and HIDENAME manage the relationship between symbol names in C
@@ -60,23 +78,17 @@
 #define CNAME(csym)		csym
 #define HIDENAME(asmsym)	.asmsym
 
+#if defined(__x86_64__)
+#define _START_ENTRY	.text; .p2align 4,0x90
+#else
 /* XXX should use .p2align 4,0x90 for -m486. */
 #define _START_ENTRY	.text; .p2align 2,0x90
+#endif
 
 #define _ENTRY(x)	_START_ENTRY; \
 			.globl CNAME(x); .type CNAME(x),@function; CNAME(x):
-
-#ifdef PROF
-#define	ALTENTRY(x)	_ENTRY(x); \
-			call PIC_PLT(HIDENAME(mcount)); \
-			jmp 9f
-#define	ENTRY(x)	_ENTRY(x); \
-			call PIC_PLT(HIDENAME(mcount)); \
-			9:
-#else
 #define	ALTENTRY(x)	_ENTRY(x)
 #define	ENTRY(x)	_ENTRY(x)
-#endif
 
 #define	END(x)		.size x, . - x
 

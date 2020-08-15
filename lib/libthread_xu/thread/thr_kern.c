@@ -27,7 +27,9 @@
 #include <sys/types.h>
 #include <sys/signalvar.h>
 #include <sys/rtprio.h>
+#include <sys/lwp.h>
 #include <pthread.h>
+
 #include "thr_private.h"
 
 /*#define DEBUG_THREAD_KERN */
@@ -40,20 +42,22 @@
 /*
  * This is called when the first thread (other than the initial
  * thread) is created.
+ *
+ * NOTE: we no longer call _thrd_rtld_fini here.
  */
 int
 _thr_setthreaded(int threaded)
 {
 	if (((threaded == 0) ^ (__isthreaded == 0)) == 0)
 		return (0);
-
 	__isthreaded = threaded;
+	_rtld_setthreaded(threaded);
 #if 0
-	if (threaded != 0) {
-		_thr_rtld_init();
-	} else {
-		_thr_rtld_fini();
-	}
+	/* save for later. */
+	if (threaded != 0)
+		/* blah */ ;
+	else
+		/* blah */ ;
 #endif
 	return (0);
 }
@@ -62,7 +66,7 @@ void
 _thr_signal_block(struct pthread *curthread)
 {
 	sigset_t set;
-	
+
 	if (curthread->sigblock > 0) {
 		curthread->sigblock++;
 		return;
@@ -119,8 +123,8 @@ _thr_set_sched_other_prio(struct pthread *pth __unused, int prio)
 	 * case 0: need initialization
 	 * case 1: initialization successful
 	 * case 2: initialization failed. can't happen, but if
-	 * 	   it does, accept all and hope for the best.
-	 * 	   It's not like we use it anyway.
+	 *	   it does, accept all and hope for the best.
+	 *	   It's not like we use it anyway.
 	 */
 	if (!init_status) {
 		int tmp = errno;

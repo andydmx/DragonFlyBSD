@@ -36,9 +36,13 @@
 
 #if defined(_KERNEL) || defined(_KERNEL_STRUCTURES)
 
+#ifndef _SYS_TYPES_H_
+#include <sys/types.h>
+#endif
 #ifndef _SYS_QUEUE_H_
 #include <sys/queue.h>
 #endif
+#ifdef _KERNEL
 #ifndef _SYS_LOCK_H_
 #include <sys/lock.h>
 #endif
@@ -48,15 +52,18 @@
 #ifndef _SYS_MSGPORT_H_
 #include <sys/msgport.h>
 #endif
+#endif	/* _KERNEL */
 #ifndef _SYS_DIRENT_H_
 #include <sys/dirent.h>
 #endif
 #ifndef _SYS_DEVICE_H_
 #include <sys/device.h>
 #endif
+#ifdef _KERNEL
 #ifndef _SYS_UCRED_H_
 #include <sys/ucred.h>
 #endif
+#endif	/* _KERNEL */
 
 
 typedef enum {
@@ -90,7 +97,7 @@ struct devfs_node {
 	struct devfs_node *parent;	/* parent of this node */
 	devfs_nodetype	node_type;	/* devfs node type */
 
-	u_int64_t	refs;		/* number of open references */
+	u_int64_t	refs;		/* currently unused */
 	size_t		nchildren;	/* number of children of a parent */
 	u_int64_t	cookie_jar;	/* cookie pool for children */
 	u_int64_t	cookie;		/* directory entry cookie for readdir */
@@ -114,6 +121,7 @@ struct devfs_node {
 	TAILQ_HEAD(, devfs_node) list;	/* linked list of children */
 };
 
+#ifdef _KERNEL
 struct devfs_orphan {
 	struct devfs_node *node;
 	TAILQ_ENTRY(devfs_orphan) link;
@@ -179,7 +187,7 @@ typedef struct devfs_msg {
 			void *resp;
 		} __m_resp;
 		struct {
-			udev_t	udev;
+			dev_t	udev;
 		} __m_udev;
 		struct {
 			cdev_t	cdev;
@@ -251,7 +259,9 @@ typedef void* (devfs_iterate_callback_t)(struct devfs_node *, void *);
 #define DEVFS_MNTDATA(x)	((struct devfs_mnt_data *)((x)->mnt_data))
 #define DEVFS_ORPHANLIST(x)	(&(DEVFS_MNTDATA(x)->orphan_list))
 #define DEVFS_DENODE_HEAD(x)	(&((x)->list))
+#if 0
 #define DEVFS_ISDIGIT(x)	((x >= '0') && (x <= '9'))
+#endif
 
 /*
  * -rwxr-xr-x
@@ -283,7 +293,7 @@ typedef void* (devfs_iterate_callback_t)(struct devfs_node *, void *);
 #define DEVFS_DESTROY_DEV_BY_OPS	0x08
 #define DEVFS_CHANDLER_ADD		0x09
 #define DEVFS_CHANDLER_DEL		0x0A
-#define DEVFS_FIND_DEVICE_BY_UDEV	0x0B
+#define DEVFS_FIND_DEVICE_BY_DEVID	0x0B
 #define DEVFS_FIND_DEVICE_BY_NAME	0x0C
 #define DEVFS_MAKE_ALIAS		0x0D
 #define DEVFS_DESTROY_ALIAS		0x0E
@@ -308,34 +318,39 @@ typedef void* (devfs_iterate_callback_t)(struct devfs_node *, void *);
 #define DEVFS_HIDDEN			0x010	/* Makes node inaccessible */
 #define DEVFS_INVISIBLE			0x020	/* Makes node invisible */
 #define	DEVFS_PTY			0x040	/* PTY device */
-#define DEVFS_DESTROYED			0x080	/* Sanity check */
+#define DEVFS_DESTROYED			0x080	/* Destroy attempt */
 #define DEVFS_RULE_CREATED		0x100	/* Node was rule-created */
 #define DEVFS_RULE_HIDDEN		0x200	/* Node was hidden by a rule */
+#define DEVFS_NLINKSWAIT		0x400	/* NLinks final */
 
 /*
  * Clone helper stuff
  */
 #define DEVFS_BITMAP_INITIAL_SIZE	1
 #define DEVFS_CLONE_BITMAP(name)	devfs_ ## name ## _clone_bitmap
+#define DEVFS_DEFINE_CLONE_BITMAP(name) \
+			struct devfs_bitmap DEVFS_CLONE_BITMAP(name)
 #define DEVFS_DECLARE_CLONE_BITMAP(name) \
-				struct devfs_bitmap DEVFS_CLONE_BITMAP(name)
+			extern struct devfs_bitmap DEVFS_CLONE_BITMAP(name)
 
 struct devfs_bitmap {
 	int		chunks;
 	unsigned long	*bitmap;
 };
+#endif /* _KERNEL */
 
+#if 0
 struct devfs_unit_hash {
         struct devfs_unit_hash *next;
         int		unit_no;
 	cdev_t		dev;
 };
+#endif
 
+#ifdef _KERNEL
 void devfs_clone_bitmap_init(struct devfs_bitmap *);
 void devfs_clone_bitmap_uninit(struct devfs_bitmap *);
-void devfs_clone_bitmap_resize(struct devfs_bitmap *, int);
-int devfs_clone_bitmap_fff(struct devfs_bitmap *);
-void devfs_clone_bitmap_set(struct devfs_bitmap *, int);
+int devfs_clone_bitmap_set(struct devfs_bitmap *, int);
 int devfs_clone_bitmap_get(struct devfs_bitmap *, int);
 int devfs_clone_bitmap_chk(struct devfs_bitmap *, int);
 void devfs_clone_bitmap_put(struct devfs_bitmap *, int);
@@ -350,9 +365,8 @@ struct devfs_node *devfs_allocp(devfs_nodetype, char *, struct devfs_node *,
 int devfs_allocvp(struct mount *, struct vnode **, devfs_nodetype, char *,
 				struct devfs_node *, cdev_t);
 
-int devfs_freep(struct devfs_node *);
-
-int devfs_unlinkp(struct devfs_node *);
+void devfs_freep(struct devfs_node *);
+void devfs_unlinkp(struct devfs_node *);
 
 void devfs_tracer_add_orphan(struct devfs_node *);
 void devfs_tracer_del_orphan(struct devfs_node *);
@@ -364,7 +378,7 @@ int devfs_gc(struct devfs_node *);
 int devfs_create_dev(cdev_t, uid_t, gid_t, int);
 int devfs_destroy_dev(cdev_t);
 
-devfs_msg_t devfs_msg_send_sync(uint32_t, devfs_msg_t);
+int  devfs_msg_send_sync(uint32_t, devfs_msg_t);
 void devfs_msg_send(uint32_t, devfs_msg_t);
 void devfs_msg_send_dev(uint32_t, cdev_t dev, uid_t, gid_t, int);
 void devfs_msg_send_mount(uint32_t, struct devfs_mnt_data *);
@@ -385,8 +399,8 @@ int devfs_create_all_dev(struct devfs_node *);
 struct devfs_node *devfs_resolve_or_create_path(
 				struct devfs_node *, char *, int);
 int devfs_resolve_name_path(char *, char *, char **, char **);
-struct devfs_node *devfs_create_device_node(struct devfs_node *, cdev_t,
-		      char *, char *, ...) __printf0like(4, 5);
+struct devfs_node *devfs_create_device_node(struct devfs_node *, cdev_t, int *,
+		      char *, char *, ...) __printf0like(5, 6);
 
 int devfs_destroy_device_node(struct devfs_node *, cdev_t);
 int devfs_destroy_node(struct devfs_node *, char *);
@@ -397,8 +411,8 @@ struct devfs_node *devfs_find_device_node_by_name(struct devfs_node *, char *);
 cdev_t devfs_new_cdev(struct dev_ops *, int, struct dev_ops *);
 void devfs_assume_knotes(cdev_t dev, struct kqinfo *kqi);
 
-cdev_t devfs_find_device_by_name(const char *, ...) __printflike(1, 2);
-cdev_t devfs_find_device_by_udev(udev_t);
+cdev_t devfs_find_device_by_name(const char *, ...) __printf0like(1, 2);
+cdev_t devfs_find_device_by_devid(dev_t);
 
 struct vnode *devfs_inode_to_vnode(struct mount *, ino_t);
 
@@ -422,9 +436,6 @@ int devfs_clr_related_flag(cdev_t, uint32_t);
 int devfs_destroy_related_without_flag(cdev_t, uint32_t);
 int devfs_node_is_accessible(struct devfs_node *);
 
-int devfs_reference_ops(struct dev_ops *);
-void devfs_release_ops(struct dev_ops *);
-
 void devfs_config(void);
 
 void *devfs_iterate_topology(struct devfs_node *node,
@@ -439,8 +450,9 @@ void devfs_clear_cdevpriv(struct file *file);
 
 int devfs_WildCmp(const char *w, const char *s);
 int devfs_WildCaseCmp(const char *w, const char *s);
+#endif	/* _KERNEL */
 
-#endif /* KERNEL */
+#endif /* KERNEL || _KERNEL_STRUCTURES */
 
 #define DEVFS_MNT_RULESET	0x01
 #define DEVFS_MNT_JAIL		0x02

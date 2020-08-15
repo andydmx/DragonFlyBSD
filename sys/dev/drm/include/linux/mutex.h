@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2014 François Tigeot
+ * Copyright (c) 2014-2020 François Tigeot <ftigeot@wolfpond.org>
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -27,8 +27,56 @@
 #ifndef _LINUX_MUTEX_H_
 #define _LINUX_MUTEX_H_
 
-#include <sys/lock.h>
+#include <asm/current.h>
+#include <linux/list.h>
+#include <linux/lockdep.h>
+#include <linux/atomic.h>
+#include <asm/processor.h>
 
-#define mutex_is_locked(lock) (lockcount(lock) != 0)
+#define mutex_is_locked(lock)	(lockinuse(lock))
+
+#define mutex_lock(lock)	lockmgr(lock, LK_EXCLUSIVE)
+#define mutex_unlock(lock)	lockmgr(lock, LK_RELEASE)
+
+#define mutex_trylock(lock)	lockmgr_try(lock, LK_EXCLUSIVE)
+
+static inline int
+mutex_lock_interruptible(struct lock *lock)
+{
+	if (lockmgr(lock, LK_EXCLUSIVE|LK_SLEEPFAIL|LK_PCATCH))
+		return -EINTR;
+
+	return 0;
+}
+
+#define DEFINE_MUTEX(mutex)	\
+	struct lock mutex;	\
+	LOCK_SYSINIT(mutex, &mutex, "lmutex", LK_CANRECURSE)
+
+static inline void
+mutex_destroy(struct lock *mutex)
+{
+	lockuninit(mutex);
+}
+
+#define mutex_lock_nested(lock, unused)	mutex_lock(lock)
+
+enum mutex_trylock_recursive_enum {
+	MUTEX_TRYLOCK_FAILED    = 0,
+	MUTEX_TRYLOCK_SUCCESS   = 1,
+	MUTEX_TRYLOCK_RECURSIVE,
+};
+
+static inline enum mutex_trylock_recursive_enum
+mutex_trylock_recursive(struct lock *lock)
+{
+	if (lockowned(lock))
+		return MUTEX_TRYLOCK_RECURSIVE;
+
+	if (mutex_trylock(lock))
+		return MUTEX_TRYLOCK_SUCCESS;
+
+	return MUTEX_TRYLOCK_FAILED;
+}
 
 #endif	/* _LINUX_MUTEX_H_ */

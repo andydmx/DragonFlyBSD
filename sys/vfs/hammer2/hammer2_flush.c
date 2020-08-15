@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2011-2014 The DragonFly Project.  All rights reserved.
+ * Copyright (c) 2011-2018 The DragonFly Project.  All rights reserved.
  *
  * This code is derived from software contributed to The DragonFly Project
  * by Matthew Dillon <dillon@dragonflybsd.org>
@@ -38,10 +38,6 @@
  * Deceptively simple but actually fairly difficult to implement properly is
  * how I would describe it.
  *
- * The biggest issue is that each PFS may belong to a cluster so its media
- * modify_tid and mirror_tid fields are in a completely different domain
- * than the topology related to the super-root.
- *
  * Flushing generally occurs bottom-up but requires a top-down scan to
  * locate chains with MODIFIED and/or UPDATE bits set.  The ONFLUSH flag
  * tells how to recurse downward to find these chains.
@@ -58,7 +54,7 @@
 
 #define FLUSH_DEBUG 0
 
-#define HAMMER2_FLUSH_DEPTH_LIMIT       10      /* stack recursion limit */
+#define HAMMER2_FLUSH_DEPTH_LIMIT	60      /* stack recursion limit */
 
 
 /*
@@ -70,302 +66,306 @@
  */
 struct hammer2_flush_info {
 	hammer2_chain_t *parent;
-	hammer2_trans_t	*trans;
 	int		depth;
-	int		diddeferral;
-	int		cache_index;
-	struct h2_flush_list flushq;
-	hammer2_xid_t	sync_xid;	/* memory synchronization point */
+	int		error;			/* cumulative error */
+	int		flags;
+#ifdef HAMMER2_SCAN_DEBUG
+	long		scan_count;
+	long		scan_mod_count;
+	long		scan_upd_count;
+	long		scan_onf_count;
+	long		scan_del_count;
+	long		scan_btype[7];
+#endif
 	hammer2_chain_t	*debug;
 };
 
 typedef struct hammer2_flush_info hammer2_flush_info_t;
 
-static void hammer2_flush_core(hammer2_flush_info_t *info,
-				hammer2_chain_t *chain, int deleting);
+static int hammer2_flush_core(hammer2_flush_info_t *info,
+				hammer2_chain_t *chain, int flags);
 static int hammer2_flush_recurse(hammer2_chain_t *child, void *data);
 
 /*
- * For now use a global transaction manager.  What we ultimately want to do
- * is give each non-overlapping hmp/pmp group its own transaction manager.
- *
- * Transactions govern XID tracking on the physical media (the hmp), but they
- * also govern TID tracking which is per-PFS and thus might cross multiple
- * hmp's.  So we can't just stuff tmanage into hammer2_mount or
- * hammer2_pfsmount.
+ * Any per-pfs transaction initialization goes here.
  */
-static hammer2_trans_manage_t	tmanage;
-
 void
-hammer2_trans_manage_init(void)
+hammer2_trans_manage_init(hammer2_pfs_t *pmp)
 {
-	lockinit(&tmanage.translk, "h2trans", 0, 0);
-	TAILQ_INIT(&tmanage.transq);
-	tmanage.flush_xid = 1;
-	tmanage.alloc_xid = tmanage.flush_xid + 1;
-}
-
-hammer2_xid_t
-hammer2_trans_newxid(hammer2_pfsmount_t *pmp __unused)
-{
-	hammer2_xid_t xid;
-
-	for (;;) {
-		xid = atomic_fetchadd_int(&tmanage.alloc_xid, 1);
-		if (xid)
-			break;
-	}
-	return xid;
 }
 
 /*
- * Transaction support functions for writing to the filesystem.
+ * Transaction support for any modifying operation.  Transactions are used
+ * in the pmp layer by the frontend and in the spmp layer by the backend.
+ *
+ * 0			- Normal transaction.  Interlocks against just the
+ *			  COPYQ portion of an ISFLUSH transaction.
+ *
+ * TRANS_ISFLUSH	- Flush transaction.  Interlocks against other flush
+ *			  transactions.
+ *
+ *			  When COPYQ is also specified, waits for the count
+ *			  to drop to 1.
+ *
+ * TRANS_BUFCACHE	- Buffer cache transaction.  No interlock.
+ *
+ * TRANS_SIDEQ		- Run the sideq (only tested in trans_done())
  *
  * Initializing a new transaction allocates a transaction ID.  Typically
  * passed a pmp (hmp passed as NULL), indicating a cluster transaction.  Can
  * be passed a NULL pmp and non-NULL hmp to indicate a transaction on a single
  * media target.  The latter mode is used by the recovery code.
- *
- * TWO TRANSACTION IDs can run concurrently, where one is a flush and the
- * other is a set of any number of concurrent filesystem operations.  We
- * can either have <running_fs_ops> + <waiting_flush> + <blocked_fs_ops>
- * or we can have <running_flush> + <concurrent_fs_ops>.
- *
- * During a flush, new fs_ops are only blocked until the fs_ops prior to
- * the flush complete.  The new fs_ops can then run concurrent with the flush.
- *
- * Buffer-cache transactions operate as fs_ops but never block.  A
- * buffer-cache flush will run either before or after the current pending
- * flush depending on its state.
  */
 void
-hammer2_trans_init(hammer2_trans_t *trans, hammer2_pfsmount_t *pmp, int flags)
+hammer2_trans_init(hammer2_pfs_t *pmp, uint32_t flags)
 {
-	hammer2_trans_manage_t *tman;
-	hammer2_trans_t *head;
+	uint32_t oflags;
+	uint32_t nflags;
+	int dowait;
 
-	tman = &tmanage;
+	for (;;) {
+		oflags = pmp->trans.flags;
+		cpu_ccfence();
+		dowait = 0;
 
-	bzero(trans, sizeof(*trans));
-	trans->pmp = pmp;
-	trans->flags = flags;
-	trans->td = curthread;
-
-	lockmgr(&tman->translk, LK_EXCLUSIVE);
-
-	if (flags & HAMMER2_TRANS_ISFLUSH) {
-		/*
-		 * If multiple flushes are trying to run we have to
-		 * wait until it is our turn.  All flushes are serialized.
-		 *
-		 * We queue ourselves and then wait to become the head
-		 * of the queue, allowing all prior flushes to complete.
-		 *
-		 * Multiple normal transactions can share the current
-		 * transaction id but a flush transaction needs its own
-		 * unique TID for proper block table update accounting.
-		 */
-		++tman->flushcnt;
-		++pmp->alloc_tid;
-		pmp->flush_tid = pmp->alloc_tid;
-		tman->flush_xid = hammer2_trans_newxid(pmp);
-		trans->sync_xid = tman->flush_xid;
-		++pmp->alloc_tid;
-		TAILQ_INSERT_TAIL(&tman->transq, trans, entry);
-		if (TAILQ_FIRST(&tman->transq) != trans) {
-			trans->blocked = 1;
-			while (trans->blocked) {
-				lksleep(&trans->sync_xid, &tman->translk,
-					0, "h2multf", hz);
-			}
-		}
-	} else if (tman->flushcnt == 0) {
-		/*
-		 * No flushes are pending, we can go.  Use prior flush_xid + 1.
-		 *
-		 * WARNING!  Also see hammer2_chain_setflush()
-		 */
-		TAILQ_INSERT_TAIL(&tman->transq, trans, entry);
-		trans->sync_xid = tman->flush_xid + 1;
-
-		/* XXX improve/optimize inode allocation */
-	} else if (trans->flags & HAMMER2_TRANS_BUFCACHE) {
-		/*
-		 * A buffer cache transaction is requested while a flush
-		 * is in progress.  The flush's PREFLUSH flag must be set
-		 * in this situation.
-		 *
-		 * The buffer cache flush takes on the main flush's
-		 * transaction id.
-		 */
-		TAILQ_FOREACH(head, &tman->transq, entry) {
-			if (head->flags & HAMMER2_TRANS_ISFLUSH)
-				break;
-		}
-		KKASSERT(head);
-		KKASSERT(head->flags & HAMMER2_TRANS_PREFLUSH);
-		trans->flags |= HAMMER2_TRANS_PREFLUSH;
-		TAILQ_INSERT_AFTER(&tman->transq, head, trans, entry);
-		trans->sync_xid = head->sync_xid;
-		trans->flags |= HAMMER2_TRANS_CONCURRENT;
-		/* not allowed to block */
-	} else {
-		/*
-		 * A normal transaction is requested while a flush is in
-		 * progress.  We insert after the current flush and may
-		 * block.
-		 *
-		 * WARNING!  Also see hammer2_chain_setflush()
-		 */
-		TAILQ_FOREACH(head, &tman->transq, entry) {
-			if (head->flags & HAMMER2_TRANS_ISFLUSH)
-				break;
-		}
-		KKASSERT(head);
-		TAILQ_INSERT_AFTER(&tman->transq, head, trans, entry);
-		trans->sync_xid = head->sync_xid + 1;
-		trans->flags |= HAMMER2_TRANS_CONCURRENT;
-
-		/*
-		 * XXX for now we must block new transactions, synchronous
-		 * flush mode is on by default.
-		 *
-		 * If synchronous flush mode is enabled concurrent
-		 * frontend transactions during the flush are not
-		 * allowed (except we don't have a choice for buffer
-		 * cache ops).
-		 */
-		if (hammer2_synchronous_flush > 0 ||
-		    TAILQ_FIRST(&tman->transq) != head) {
-			trans->blocked = 1;
-			while (trans->blocked) {
-				lksleep(&trans->sync_xid,
-					&tman->translk, 0,
-					"h2multf", hz);
-			}
-		}
-	}
-	if (flags & HAMMER2_TRANS_NEWINODE) {
-		if (pmp->spmp_hmp) {
+		if (flags & HAMMER2_TRANS_ISFLUSH) {
 			/*
-			 * Super-root transaction, all new inodes have an
-			 * inode number of 1.  Normal pfs inode cache
-			 * semantics are not used.
+			 * Interlock against other flush transactions.
 			 */
-			trans->inode_tid = 1;
+			if (oflags & HAMMER2_TRANS_ISFLUSH) {
+				nflags = oflags | HAMMER2_TRANS_WAITING;
+				dowait = 1;
+			} else {
+				nflags = (oflags | flags) + 1;
+			}
+		} else if (flags & HAMMER2_TRANS_BUFCACHE) {
+			/*
+			 * Requesting strategy transaction from buffer-cache,
+			 * or a VM getpages/putpages through the buffer cache.
+			 * We must allow such transactions in all situations
+			 * to avoid deadlocks.
+			 */
+			nflags = (oflags | flags) + 1;
 		} else {
 			/*
-			 * Normal transaction
+			 * Normal transaction.  We do not interlock against
+			 * BUFCACHE or ISFLUSH.
+			 *
+			 * Note that vnode locks may be held going into
+			 * this call.
+			 *
+			 * NOTE: Remember that non-modifying operations
+			 *	 such as read, stat, readdir, etc, do
+			 *	 not use transactions.
 			 */
-			if (pmp->inode_tid < HAMMER2_INODE_START)
-				pmp->inode_tid = HAMMER2_INODE_START;
-			trans->inode_tid = pmp->inode_tid++;
+			nflags = (oflags | flags) + 1;
 		}
+		if (dowait)
+			tsleep_interlock(&pmp->trans.sync_wait, 0);
+		if (atomic_cmpset_int(&pmp->trans.flags, oflags, nflags)) {
+			if (dowait == 0)
+				break;
+			tsleep(&pmp->trans.sync_wait, PINTERLOCKED,
+			       "h2trans", hz);
+			/* retry */
+		} else {
+			cpu_pause();
+			/* retry */
+		}
+		/* retry */
 	}
 
-	lockmgr(&tman->translk, LK_RELEASE);
+#if 0
+	/*
+	 * When entering a FLUSH transaction with COPYQ set, wait for the
+	 * transaction count to drop to 1 (our flush transaction only)
+	 * before proceeding.
+	 *
+	 * This waits for all non-flush transactions to complete and blocks
+	 * new non-flush transactions from starting until COPYQ is cleared.
+	 * (the flush will then proceed after clearing COPYQ).  This should
+	 * be a very short stall on modifying operations.
+	 */
+	while ((flags & HAMMER2_TRANS_ISFLUSH) &&
+	       (flags & HAMMER2_TRANS_COPYQ)) {
+		oflags = pmp->trans.flags;
+		cpu_ccfence();
+		if ((oflags & HAMMER2_TRANS_MASK) == 1)
+			break;
+		nflags = oflags | HAMMER2_TRANS_WAITING;
+		tsleep_interlock(&pmp->trans.sync_wait, 0);
+		if (atomic_cmpset_int(&pmp->trans.flags, oflags, nflags)) {
+			tsleep(&pmp->trans.sync_wait, PINTERLOCKED,
+			       "h2trans2", hz);
+		}
+	}
+#endif
 }
 
 /*
- * This may only be called while in a flush transaction.  It's a bit of a
- * hack but after flushing a PFS we need to flush each volume root as part
- * of the same transaction.
+ * Start a sub-transaction, there is no 'subdone' function.  This will
+ * issue a new modify_tid (mtid) for the current transaction, which is a
+ * CLC (cluster level change) id and not a per-node id.
+ *
+ * This function must be called for each XOP when multiple XOPs are run in
+ * sequence within a transaction.
+ *
+ * Callers typically update the inode with the transaction mtid manually
+ * to enforce sequencing.
  */
-void
-hammer2_trans_spmp(hammer2_trans_t *trans, hammer2_pfsmount_t *spmp)
+hammer2_tid_t
+hammer2_trans_sub(hammer2_pfs_t *pmp)
 {
-	++spmp->alloc_tid;
-	spmp->flush_tid = spmp->alloc_tid;
-	++spmp->alloc_tid;
-	trans->pmp = spmp;
+	hammer2_tid_t mtid;
+
+	mtid = atomic_fetchadd_64(&pmp->modify_tid, 1);
+
+	return (mtid);
 }
 
+void
+hammer2_trans_setflags(hammer2_pfs_t *pmp, uint32_t flags)
+{
+	atomic_set_int(&pmp->trans.flags, flags);
+}
+
+/*
+ * Typically used to clear trans flags asynchronously.  If TRANS_WAITING
+ * is in the mask, and was previously set, this function will wake up
+ * any waiters.
+ */
+void
+hammer2_trans_clearflags(hammer2_pfs_t *pmp, uint32_t flags)
+{
+	uint32_t oflags;
+	uint32_t nflags;
+
+	for (;;) {
+		oflags = pmp->trans.flags;
+		cpu_ccfence();
+		nflags = oflags & ~flags;
+		if (atomic_cmpset_int(&pmp->trans.flags, oflags, nflags)) {
+			if ((oflags ^ nflags) & HAMMER2_TRANS_WAITING)
+				wakeup(&pmp->trans.sync_wait);
+			break;
+		}
+		cpu_pause();
+		/* retry */
+	}
+}
 
 void
-hammer2_trans_done(hammer2_trans_t *trans)
+hammer2_trans_done(hammer2_pfs_t *pmp, uint32_t flags)
 {
-	hammer2_trans_manage_t *tman;
-	hammer2_trans_t *head;
-	hammer2_trans_t *scan;
+	uint32_t oflags;
+	uint32_t nflags;
 
-	tman = &tmanage;
-
+#if 0
 	/*
-	 * Remove.
+	 * Modifying ops on the front-end can cause dirty inodes to
+	 * build up in the sideq.  We don't flush these on inactive/reclaim
+	 * due to potential deadlocks, so we have to deal with them from
+	 * inside other nominal modifying front-end transactions.
 	 */
-	lockmgr(&tman->translk, LK_EXCLUSIVE);
-	TAILQ_REMOVE(&tman->transq, trans, entry);
-	head = TAILQ_FIRST(&tman->transq);
-
-	/*
-	 * Adjust flushcnt if this was a flush, clear TRANS_CONCURRENT
-	 * up through the next flush.  (If the head is a flush then we
-	 * stop there, unlike the unblock code following this section).
-	 */
-	if (trans->flags & HAMMER2_TRANS_ISFLUSH) {
-		--tman->flushcnt;
-		scan = head;
-		while (scan && (scan->flags & HAMMER2_TRANS_ISFLUSH) == 0) {
-			atomic_clear_int(&scan->flags,
-					 HAMMER2_TRANS_CONCURRENT);
-			scan = TAILQ_NEXT(scan, entry);
-		}
+	if ((flags & HAMMER2_TRANS_SIDEQ) &&
+	    pmp->sideq_count > hammer2_limit_dirty_inodes / 2 &&
+	    pmp->sideq_count > (pmp->inum_count >> 3) &&
+	    pmp->mp) {
+		speedup_syncer(pmp->mp);
 	}
+#endif
 
 	/*
-	 * Unblock the head of the queue and any additional transactions
-	 * up to the next flush.  The head can be a flush and it will be
-	 * unblocked along with the non-flush transactions following it
-	 * (which are allowed to run concurrently with it).
-	 *
-	 * In synchronous flush mode we stop if the head transaction is
-	 * a flush.
+	 * Clean-up the transaction.  Wakeup any waiters when finishing
+	 * a flush transaction or transitioning the non-flush transaction
+	 * count from 2->1 while a flush transaction is pending.
 	 */
-	if (head && head->blocked) {
-		head->blocked = 0;
-		wakeup(&head->sync_xid);
+	for (;;) {
+		oflags = pmp->trans.flags;
+		cpu_ccfence();
+		KKASSERT(oflags & HAMMER2_TRANS_MASK);
 
-		if (hammer2_synchronous_flush > 0)
-			scan = head;
-		else
-			scan = TAILQ_NEXT(head, entry);
-		while (scan && (scan->flags & HAMMER2_TRANS_ISFLUSH) == 0) {
-			if (scan->blocked) {
-				scan->blocked = 0;
-				wakeup(&scan->sync_xid);
-			}
-			scan = TAILQ_NEXT(scan, entry);
+		nflags = (oflags - 1) & ~flags;
+		if (flags & HAMMER2_TRANS_ISFLUSH) {
+			nflags &= ~HAMMER2_TRANS_WAITING;
 		}
+		if ((oflags & (HAMMER2_TRANS_ISFLUSH|HAMMER2_TRANS_MASK)) ==
+		    (HAMMER2_TRANS_ISFLUSH|2)) {
+			nflags &= ~HAMMER2_TRANS_WAITING;
+		}
+		if (atomic_cmpset_int(&pmp->trans.flags, oflags, nflags)) {
+			if ((oflags ^ nflags) & HAMMER2_TRANS_WAITING)
+				wakeup(&pmp->trans.sync_wait);
+			break;
+		}
+		cpu_pause();
+		/* retry */
 	}
-	lockmgr(&tman->translk, LK_RELEASE);
+}
+
+/*
+ * Obtain new, unique inode number (not serialized by caller).
+ */
+hammer2_tid_t
+hammer2_trans_newinum(hammer2_pfs_t *pmp)
+{
+	hammer2_tid_t tid;
+
+	tid = atomic_fetchadd_64(&pmp->inode_tid, 1);
+
+	return tid;
+}
+
+/*
+ * Assert that a strategy call is ok here.  Currently we allow strategy
+ * calls in all situations, including during flushes.  Previously:
+ *	(old) (1) In a normal transaction.
+ *	(old) (2) In a flush transaction only if PREFLUSH is also set.
+ */
+void
+hammer2_trans_assert_strategy(hammer2_pfs_t *pmp)
+{
+#if 0
+	KKASSERT((pmp->trans.flags & HAMMER2_TRANS_ISFLUSH) == 0 ||
+		 (pmp->trans.flags & HAMMER2_TRANS_PREFLUSH));
+#endif
 }
 
 /*
  * Flush the chain and all modified sub-chains through the specified
- * synchronization point, propagating parent chain modifications and
- * mirror_tid updates back up as needed.
+ * synchronization point, propagating blockref updates back up.  As
+ * part of this propagation, mirror_tid and inode/data usage statistics
+ * propagates back upward.
  *
- * Caller must have interlocked against any non-flush-related modifying
- * operations in progress whos XXX values are less than or equal
- * to the passed sync_xid.
+ * Returns a HAMMER2 error code, 0 if no error.  Note that I/O errors from
+ * buffers dirtied during the flush operation can occur later.
  *
- * Caller must have already vetted synchronization points to ensure they
- * are properly flushed.  Only snapshots and cluster flushes can create
- * these sorts of synchronization points.
+ * modify_tid (clc - cluster level change) is not propagated.
+ *
+ * update_tid (clc) is used for validation and is not propagated by this
+ * function.
  *
  * This routine can be called from several places but the most important
- * is from VFS_SYNC.
+ * is from VFS_SYNC (frontend) via hammer2_xop_inode_flush (backend).
  *
  * chain is locked on call and will remain locked on return.  The chain's
  * UPDATE flag indicates that its parent's block table (which is not yet
- * part of the flush) should be updated.  The chain may be replaced by
- * the call if it was modified.
+ * part of the flush) should be updated.
+ *
+ * flags:
+ *	HAMMER2_FLUSH_TOP	Indicates that this is the top of the flush.
+ *				Is cleared for the recursion.
+ *
+ *	HAMMER2_FLUSH_ALL	Recurse everything
+ *
+ *	HAMMER2_FLUSH_INODE_STOP
+ *				Stop at PFS inode or normal inode boundary
  */
-void
-hammer2_flush(hammer2_trans_t *trans, hammer2_chain_t *chain)
+int
+hammer2_flush(hammer2_chain_t *chain, int flags)
 {
-	hammer2_chain_t *scan;
 	hammer2_flush_info_t info;
+	hammer2_dev_t *hmp;
 	int loops;
 
 	/*
@@ -377,10 +377,7 @@ hammer2_flush(hammer2_trans_t *trans, hammer2_chain_t *chain)
 	 * for re-execution after the stack has been popped.
 	 */
 	bzero(&info, sizeof(info));
-	TAILQ_INIT(&info.flushq);
-	info.trans = trans;
-	info.sync_xid = trans->sync_xid;
-	info.cache_index = -1;
+	info.flags = flags & ~HAMMER2_FLUSH_TOP;
 
 	/*
 	 * Calculate parent (can be NULL), if not NULL the flush core
@@ -395,43 +392,25 @@ hammer2_flush(hammer2_trans_t *trans, hammer2_chain_t *chain)
 	 * chain.
 	 */
 	hammer2_chain_ref(chain);
+	hmp = chain->hmp;
 	loops = 0;
 
 	for (;;) {
 		/*
-		 * Unwind deep recursions which had been deferred.  This
-		 * can leave the FLUSH_* bits set for these chains, which
-		 * will be handled when we [re]flush chain after the unwind.
+		 * [re]flush chain as the deep recursion may have generated
+		 * additional modifications.
 		 */
-		while ((scan = TAILQ_FIRST(&info.flushq)) != NULL) {
-			KKASSERT(scan->flags & HAMMER2_CHAIN_DEFERRED);
-			TAILQ_REMOVE(&info.flushq, scan, flush_node);
-			atomic_clear_int(&scan->flags, HAMMER2_CHAIN_DEFERRED);
-
-			/*
-			 * Now that we've popped back up we can do a secondary
-			 * recursion on the deferred elements.
-			 *
-			 * NOTE: hammer2_flush() may replace scan.
-			 */
-			if (hammer2_debug & 0x0040)
-				kprintf("deferred flush %p\n", scan);
-			hammer2_chain_lock(scan, HAMMER2_RESOLVE_MAYBE);
-			hammer2_chain_drop(scan);	/* ref from deferral */
-			hammer2_flush(trans, scan);
-			hammer2_chain_unlock(scan);
+		if (info.parent != chain->parent) {
+			if (hammer2_debug & 0x0040) {
+				kprintf("LOST CHILD4 %p->%p "
+					"(actual parent %p)\n",
+					info.parent, chain, chain->parent);
+			}
+			hammer2_chain_drop(info.parent);
+			info.parent = chain->parent;
+			hammer2_chain_ref(info.parent);
 		}
-
-		/*
-		 * [re]flush chain.
-		 */
-		info.diddeferral = 0;
-		hammer2_flush_core(&info, chain, 0);
-
-		/*
-		 * Only loop if deep recursions have been deferred.
-		 */
-		if (TAILQ_EMPTY(&info.flushq))
+		if (hammer2_flush_core(&info, chain, flags) == 0)
 			break;
 
 		if (++loops % 1000 == 0) {
@@ -441,16 +420,39 @@ hammer2_flush(hammer2_trans_t *trans, hammer2_chain_t *chain)
 				Debugger("hell4");
 		}
 	}
+#ifdef HAMMER2_SCAN_DEBUG
+	if (info.scan_count >= 10)
+	kprintf("hammer2_flush: scan_count %ld (%ld,%ld,%ld,%ld) "
+		"bt(%ld,%ld,%ld,%ld,%ld,%ld)\n",
+		info.scan_count,
+		info.scan_mod_count,
+		info.scan_upd_count,
+		info.scan_onf_count,
+		info.scan_del_count,
+		info.scan_btype[1],
+		info.scan_btype[2],
+		info.scan_btype[3],
+		info.scan_btype[4],
+		info.scan_btype[5],
+		info.scan_btype[6]);
+#endif
 	hammer2_chain_drop(chain);
 	if (info.parent)
 		hammer2_chain_drop(info.parent);
+	return (info.error);
 }
 
 /*
  * This is the core of the chain flushing code.  The chain is locked by the
  * caller and must also have an extra ref on it by the caller, and remains
- * locked and will have an extra ref on return.  Upon return, the caller can
- * test the UPDATE bit on the child to determine if the parent needs updating.
+ * locked and will have an extra ref on return.  info.parent is referenced
+ * but not locked.
+ *
+ * Upon return, the caller can test the UPDATE bit on the chain to determine
+ * if the parent needs updating.
+ *
+ * If non-zero is returned, the chain's parent changed during the flush and
+ * the caller must retry the operation.
  *
  * (1) Determine if this node is a candidate for the flush, return if it is
  *     not.  fchain and vchain are always candidates for the flush.
@@ -471,24 +473,29 @@ hammer2_flush(hammer2_trans_t *trans, hammer2_chain_t *chain)
  *     Deleted-but-open inodes can still be individually flushed via the
  *     filesystem syncer.
  *
- * (5) Note that an unmodified child may still need the block table in its
+ * (5) Delete parents on the way back up if they are normal indirect blocks
+ *     and have no children.
+ *
+ * (6) Note that an unmodified child may still need the block table in its
  *     parent updated (e.g. rename/move).  The child will have UPDATE set
  *     in this case.
  *
  *			WARNING ON BREF MODIFY_TID/MIRROR_TID
  *
- * blockref.modify_tid and blockref.mirror_tid are consistent only within a
- * PFS.  This is why we cannot cache sync_tid in the transaction structure.
- * Instead we access it from the pmp.
+ * blockref.modify_tid is consistent only within a PFS, and will not be
+ * consistent during synchronization.  mirror_tid is consistent across the
+ * block device regardless of the PFS.
  */
-static void
+static int
 hammer2_flush_core(hammer2_flush_info_t *info, hammer2_chain_t *chain,
-		   int deleting)
+		   int flags)
 {
 	hammer2_chain_t *parent;
-	hammer2_mount_t *hmp;
-	hammer2_pfsmount_t *pmp;
-	int diddeferral;
+	hammer2_dev_t *hmp;
+	int save_error;
+	int retry;
+
+	retry = 0;
 
 	/*
 	 * (1) Optimize downward recursion to locate nodes needing action.
@@ -499,60 +506,200 @@ hammer2_flush_core(hammer2_flush_info_t *info, hammer2_chain_t *chain,
 			if (info->debug == NULL)
 				info->debug = chain;
 		} else {
-			return;
+			return 0;
 		}
 	}
 
 	hmp = chain->hmp;
-	pmp = chain->pmp;		/* can be NULL */
-	diddeferral = info->diddeferral;
-	parent = info->parent;		/* can be NULL */
 
 	/*
-	 * mirror_tid should not be forward-indexed
+	 * NOTE: parent can be NULL, usually due to destroy races.
 	 */
-	KKASSERT(pmp == NULL || chain->bref.mirror_tid <= pmp->flush_tid);
+	parent = info->parent;
+	KKASSERT(chain->parent == parent);
 
 	/*
 	 * Downward search recursion
+	 *
+	 * We must be careful on cold stops, which often occur on inode
+	 * boundaries due to the way hammer2_vfs_sync() sequences the flush.
+	 * Be sure to issue an appropriate chain_setflush()
 	 */
-	if (chain->flags & HAMMER2_CHAIN_DEFERRED) {
+	if ((chain->flags & HAMMER2_CHAIN_PFSBOUNDARY) &&
+	    (flags & HAMMER2_FLUSH_ALL) == 0 &&
+	    (flags & HAMMER2_FLUSH_TOP) == 0 &&
+	    chain->pmp && chain->pmp->mp) {
 		/*
-		 * Already deferred.
+		 * If FLUSH_ALL is not specified the caller does not want
+		 * to recurse through PFS roots that have been mounted.
+		 *
+		 * (If the PFS has not been mounted there may not be
+		 *  anything monitoring its chains and its up to us
+		 *  to flush it).
+		 *
+		 * The typical sequence is to flush dirty PFS's starting at
+		 * their root downward, then flush the device root (vchain).
+		 * It is this second flush that typically leaves out the
+		 * ALL flag.
+		 *
+		 * However we must still process the PFSROOT chains for block
+		 * table updates in their parent (which IS part of our flush).
+		 *
+		 * NOTE: The volume root, vchain, does not set PFSBOUNDARY.
+		 *
+		 * NOTE: We must re-set ONFLUSH in the parent to retain if
+		 *	 this chain (that we are skipping) requires work.
 		 */
-		++info->diddeferral;
+		if (chain->flags & (HAMMER2_CHAIN_ONFLUSH |
+				    HAMMER2_CHAIN_DESTROY |
+				    HAMMER2_CHAIN_MODIFIED)) {
+			hammer2_chain_setflush(parent);
+		}
+		goto done;
+	} else if (chain->bref.type == HAMMER2_BREF_TYPE_INODE &&
+		   (flags & HAMMER2_FLUSH_INODE_STOP) &&
+		   (flags & HAMMER2_FLUSH_ALL) == 0 &&
+		   (flags & HAMMER2_FLUSH_TOP) == 0 &&
+		   chain->pmp && chain->pmp->mp) {
+		/*
+		 * When FLUSH_INODE_STOP is specified we are being asked not
+		 * to include any inode changes for inodes we encounter,
+		 * with the exception of the inode that the flush began with.
+		 * So: INODE, INODE_STOP, and TOP==0 basically.
+		 *
+		 * Dirty inodes are flushed based on the hammer2_inode
+		 * in-memory structure, issuing a chain_setflush() here
+		 * will only cause unnecessary traversals of the topology.
+		 */
+		goto done;
+#if 0
+		/*
+		 * If FLUSH_INODE_STOP is specified and both ALL and TOP
+		 * are clear, we must not flush the chain.  The chain should
+		 * have already been flushed and any further ONFLUSH/UPDATE
+		 * setting will be related to the next flush.
+		 *
+		 * This features allows us to flush inodes independently of
+		 * each other and meta-data above the inodes separately.
+		 */
+		if (chain->flags & (HAMMER2_CHAIN_ONFLUSH |
+				    HAMMER2_CHAIN_DESTROY |
+				    HAMMER2_CHAIN_MODIFIED)) {
+			if (parent)
+				hammer2_chain_setflush(parent);
+		}
+#endif
 	} else if (info->depth == HAMMER2_FLUSH_DEPTH_LIMIT) {
 		/*
 		 * Recursion depth reached.
 		 */
-		hammer2_chain_ref(chain);
-		TAILQ_INSERT_TAIL(&info->flushq, chain, flush_node);
-		atomic_set_int(&chain->flags, HAMMER2_CHAIN_DEFERRED);
-		++info->diddeferral;
-	} else if (chain->flags & HAMMER2_CHAIN_ONFLUSH) {
+		panic("hammer2: flush depth limit");
+	} else if (chain->flags & (HAMMER2_CHAIN_ONFLUSH |
+				   HAMMER2_CHAIN_DESTROY)) {
 		/*
 		 * Downward recursion search (actual flush occurs bottom-up).
-		 * pre-clear ONFLUSH.  It can get set again due to races,
-		 * which we want so the scan finds us again in the next flush.
+		 * pre-clear ONFLUSH.  It can get set again due to races or
+		 * flush errors, which we want so the scan finds us again in
+		 * the next flush.
+		 *
+		 * We must also recurse if DESTROY is set so we can finally
+		 * get rid of the related children, otherwise the node will
+		 * just get re-flushed on lastdrop.
+		 *
+		 * WARNING!  The recursion will unlock/relock info->parent
+		 *	     (which is 'chain'), potentially allowing it
+		 *	     to be ripped up.
 		 */
 		atomic_clear_int(&chain->flags, HAMMER2_CHAIN_ONFLUSH);
+		save_error = info->error;
+		info->error = 0;
 		info->parent = chain;
-		spin_lock(&chain->core.cst.spin);
+
+		/*
+		 * We may have to do this twice to catch any indirect
+		 * block maintenance that occurs.
+		 */
+		hammer2_spin_ex(&chain->core.spin);
 		RB_SCAN(hammer2_chain_tree, &chain->core.rbtree,
 			NULL, hammer2_flush_recurse, info);
-		spin_unlock(&chain->core.cst.spin);
+		if (chain->flags & HAMMER2_CHAIN_ONFLUSH) {
+			atomic_clear_int(&chain->flags, HAMMER2_CHAIN_ONFLUSH);
+			RB_SCAN(hammer2_chain_tree, &chain->core.rbtree,
+				NULL, hammer2_flush_recurse, info);
+		}
+		hammer2_spin_unex(&chain->core.spin);
 		info->parent = parent;
-		if (info->diddeferral)
-			hammer2_chain_setflush(info->trans, chain);
+
+		/*
+		 * Re-set the flush bits if the flush was incomplete or
+		 * an error occurred.  If an error occurs it is typically
+		 * an allocation error.  Errors do not cause deferrals.
+		 */
+		if (info->error)
+			hammer2_chain_setflush(chain);
+		info->error |= save_error;
+
+		/*
+		 * If we lost the parent->chain association we have to
+		 * stop processing this chain because it is no longer
+		 * in this recursion.  If it moved, it will be handled
+		 * by the ONFLUSH flag elsewhere.
+		 */
+		if (chain->parent != parent) {
+			kprintf("LOST CHILD2 %p->%p (actual parent %p)\n",
+				parent, chain, chain->parent);
+			goto done;
+		}
 	}
 
 	/*
 	 * Now we are in the bottom-up part of the recursion.
 	 *
-	 * Do not update chain if lower layers were deferred.
+	 * We continue to try to update the chain on lower-level errors, but
+	 * the flush code may decide not to flush the volume root.
+	 *
+	 * XXX should we continue to try to update the chain if an error
+	 *     occurred?
 	 */
-	if (info->diddeferral)
+
+	/*
+	 * Both parent and chain must be locked in order to flush chain,
+	 * in order to properly update the parent under certain conditions.
+	 *
+	 * In addition, we can't safely unlock/relock the chain once we
+	 * start flushing the chain itself, which we would have to do later
+	 * on in order to lock the parent if we didn't do that now.
+	 */
+	hammer2_chain_ref_hold(chain);
+	hammer2_chain_unlock(chain);
+	if (parent)
+		hammer2_chain_lock(parent, HAMMER2_RESOLVE_ALWAYS);
+	hammer2_chain_lock(chain, HAMMER2_RESOLVE_MAYBE);
+	hammer2_chain_drop_unhold(chain);
+
+	/*
+	 * Can't process if we can't access their content.
+	 */
+	if ((parent && parent->error) || chain->error) {
+		kprintf("hammer2: chain error during flush\n");
+		info->error |= chain->error;
+		if (parent) {
+			info->error |= parent->error;
+			hammer2_chain_unlock(parent);
+		}
 		goto done;
+	}
+
+	if (chain->parent != parent) {
+		if (hammer2_debug & 0x0040) {
+			kprintf("LOST CHILD3 %p->%p (actual parent %p)\n",
+				parent, chain, chain->parent);
+		}
+		KKASSERT(parent != NULL);
+		hammer2_chain_unlock(parent);
+		retry = 1;
+		goto done;
+	}
 
 	/*
 	 * Propagate the DESTROY flag downwards.  This dummies up the flush
@@ -563,54 +710,36 @@ hammer2_flush_core(hammer2_flush_info_t *info, hammer2_chain_t *chain,
 		atomic_set_int(&chain->flags, HAMMER2_CHAIN_DESTROY);
 
 	/*
-	 * Chain was already modified or has become modified, flush it out.
+	 * Dispose of the modified bit.
+	 *
+	 * If parent is present, the UPDATE bit should already be set.
+	 * UPDATE should already be set.
+	 * bref.mirror_tid should already be set.
 	 */
-again:
-	if ((hammer2_debug & 0x200) &&
-	    info->debug &&
-	    (chain->flags & (HAMMER2_CHAIN_MODIFIED | HAMMER2_CHAIN_UPDATE))) {
-		hammer2_chain_t *scan = chain;
-
-		kprintf("DISCONNECTED FLUSH %p->%p\n", info->debug, chain);
-		while (scan) {
-			kprintf("    chain %p [%08x] bref=%016jx:%02x\n",
-				scan, scan->flags,
-				scan->bref.key, scan->bref.type);
-			if (scan == info->debug)
-				break;
-			scan = scan->parent;
-		}
-	}
-
 	if (chain->flags & HAMMER2_CHAIN_MODIFIED) {
-		/*
-		 * Dispose of the modified bit.  UPDATE should already be
-		 * set.
-		 */
 		KKASSERT((chain->flags & HAMMER2_CHAIN_UPDATE) ||
-			 chain == &hmp->vchain);
+			 chain->parent == NULL);
 		atomic_clear_int(&chain->flags, HAMMER2_CHAIN_MODIFIED);
-		if (pmp) {
-			hammer2_pfs_memory_wakeup(pmp);
-			chain->bref.mirror_tid = pmp->flush_tid;
-		}
+		atomic_add_long(&hammer2_count_modified_chains, -1);
 
-		if ((chain->flags & HAMMER2_CHAIN_UPDATE) ||
-		    chain == &hmp->vchain ||
-		    chain == &hmp->fchain) {
+		/*
+		 * Manage threads waiting for excessive dirty memory to
+		 * be retired.
+		 */
+		if (chain->pmp)
+			hammer2_pfs_memory_wakeup(chain->pmp, -1);
+
+#if 0
+		if ((chain->flags & HAMMER2_CHAIN_UPDATE) == 0 &&
+		    chain != &hmp->vchain &&
+		    chain != &hmp->fchain) {
 			/*
-			 * Drop the ref from the MODIFIED bit we cleared,
-			 * net -1 ref.
-			 */
-			hammer2_chain_drop(chain);
-		} else {
-			/*
-			 * Drop the ref from the MODIFIED bit we cleared and
-			 * set a ref for the UPDATE bit we are setting.  Net
-			 * 0 refs.
+			 * Set UPDATE bit indicating that the parent block
+			 * table requires updating.
 			 */
 			atomic_set_int(&chain->flags, HAMMER2_CHAIN_UPDATE);
 		}
+#endif
 
 		/*
 		 * Issue the flush.  This is indirect via the DIO.
@@ -623,16 +752,13 @@ again:
 		 *	 flush and must be set dirty if we are going to make
 		 *	 further modifications to the buffer.  Chains with
 		 *	 embedded data don't need this.
-		 *
-		 * Update bref.mirror_tid, clear MODIFIED, and set UPDATE.
 		 */
 		if (hammer2_debug & 0x1000) {
-			kprintf("Flush %p.%d %016jx/%d sync_xid=%08x "
-				"data=%016jx\n",
+			kprintf("Flush %p.%d %016jx/%d data=%016jx\n",
 				chain, chain->bref.type,
-				chain->bref.key, chain->bref.keybits,
-				info->sync_xid,
-				chain->bref.data_off);
+				(uintmax_t)chain->bref.key,
+				chain->bref.keybits,
+				(uintmax_t)chain->bref.data_off);
 		}
 		if (hammer2_debug & 0x2000) {
 			Debugger("Flush hell");
@@ -647,31 +773,65 @@ again:
 		switch(chain->bref.type) {
 		case HAMMER2_BREF_TYPE_FREEMAP:
 			/*
-			 * (note: embedded data, do not call setdirty)
-			 */
-			KKASSERT(hmp->vchain.flags & HAMMER2_CHAIN_MODIFIED);
-			hmp->voldata.freemap_tid = hmp->fchain.bref.mirror_tid;
-			break;
-		case HAMMER2_BREF_TYPE_VOLUME:
-			/*
-			 * The free block table is flushed by hammer2_vfs_sync()
-			 * before it flushes vchain.  We must still hold fchain
-			 * locked while copying voldata to volsync, however.
+			 * Update the volume header's freemap_tid to the
+			 * freemap's flushing mirror_tid.
 			 *
 			 * (note: embedded data, do not call setdirty)
 			 */
-			hammer2_voldata_lock(hmp);
+			KKASSERT(hmp->vchain.flags & HAMMER2_CHAIN_MODIFIED);
+			KKASSERT(chain == &hmp->fchain);
+			hmp->voldata.freemap_tid = chain->bref.mirror_tid;
+			if (hammer2_debug & 0x8000) {
+				/* debug only, avoid syslogd loop */
+				kprintf("sync freemap mirror_tid %08jx\n",
+					(intmax_t)chain->bref.mirror_tid);
+			}
+
+			/*
+			 * The freemap can be flushed independently of the
+			 * main topology, but for the case where it is
+			 * flushed in the same transaction, and flushed
+			 * before vchain (a case we want to allow for
+			 * performance reasons), make sure modifications
+			 * made during the flush under vchain use a new
+			 * transaction id.
+			 *
+			 * Otherwise the mount recovery code will get confused.
+			 */
+			++hmp->voldata.mirror_tid;
+			break;
+		case HAMMER2_BREF_TYPE_VOLUME:
+			/*
+			 * The free block table is flushed by
+			 * hammer2_vfs_sync() before it flushes vchain.
+			 * We must still hold fchain locked while copying
+			 * voldata to volsync, however.
+			 *
+			 * These do not error per-say since their data does
+			 * not need to be re-read from media on lock.
+			 *
+			 * (note: embedded data, do not call setdirty)
+			 */
 			hammer2_chain_lock(&hmp->fchain,
 					   HAMMER2_RESOLVE_ALWAYS);
+			hammer2_voldata_lock(hmp);
+			if (hammer2_debug & 0x8000) {
+				/* debug only, avoid syslogd loop */
+				kprintf("sync volume  mirror_tid %08jx\n",
+					(intmax_t)chain->bref.mirror_tid);
+			}
+
 			/*
-			 * There is no parent to our root vchain and fchain to
-			 * synchronize the bref to, their updated mirror_tid's
-			 * must be synchronized to the volume header.
+			 * Update the volume header's mirror_tid to the
+			 * main topology's flushing mirror_tid.  It is
+			 * possible that voldata.mirror_tid is already
+			 * beyond bref.mirror_tid due to the bump we made
+			 * above in BREF_TYPE_FREEMAP.
 			 */
-			hmp->voldata.mirror_tid = chain->bref.mirror_tid;
-			hmp->voldata.freemap_tid = hmp->fchain.bref.mirror_tid;
-			kprintf("mirror_tid %08jx\n",
-				(intmax_t)chain->bref.mirror_tid);
+			if (hmp->voldata.mirror_tid < chain->bref.mirror_tid) {
+				hmp->voldata.mirror_tid =
+					chain->bref.mirror_tid;
+			}
 
 			/*
 			 * The volume header is flushed manually by the
@@ -696,10 +856,17 @@ again:
 					(char *)&hmp->voldata +
 					 HAMMER2_VOLUME_ICRCVH_OFF,
 					HAMMER2_VOLUME_ICRCVH_SIZE);
+
+			if (hammer2_debug & 0x8000) {
+				/* debug only, avoid syslogd loop */
+				kprintf("syncvolhdr %016jx %016jx\n",
+					hmp->voldata.mirror_tid,
+					hmp->vchain.bref.mirror_tid);
+			}
 			hmp->volsync = hmp->voldata;
 			atomic_set_int(&chain->flags, HAMMER2_CHAIN_VOLUMESYNC);
-			hammer2_chain_unlock(&hmp->fchain);
 			hammer2_voldata_unlock(hmp);
+			hammer2_chain_unlock(&hmp->fchain);
 			break;
 		case HAMMER2_BREF_TYPE_DATA:
 			/*
@@ -722,13 +889,23 @@ again:
 			KKASSERT((chain->flags & HAMMER2_CHAIN_EMBEDDED) == 0);
 			hammer2_chain_setcheck(chain, chain->data);
 			break;
+		case HAMMER2_BREF_TYPE_DIRENT:
+			/*
+			 * A directory entry can use the check area to store
+			 * the filename for filenames <= 64 bytes, don't blow
+			 * it up!
+			 */
+			KKASSERT((chain->flags & HAMMER2_CHAIN_EMBEDDED) == 0);
+			if (chain->bytes)
+				hammer2_chain_setcheck(chain, chain->data);
+			break;
 		case HAMMER2_BREF_TYPE_INODE:
 			/*
 			 * NOTE: We must call io_setdirty() to make any late
 			 *	 changes to the inode data, the system might
 			 *	 have already flushed the buffer.
 			 */
-			if (chain->data->ipdata.op_flags &
+			if (chain->data->ipdata.meta.op_flags &
 			    HAMMER2_OPFLAG_PFSROOT) {
 				/*
 				 * non-NULL pmp if mounted as a PFS.  We must
@@ -738,27 +915,14 @@ again:
 
 				hammer2_io_setdirty(chain->dio);
 				ipdata = &chain->data->ipdata;
-				if (pmp)
-					ipdata->pfs_inum = pmp->inode_tid;
+				if (chain->pmp) {
+					ipdata->meta.pfs_inum =
+						chain->pmp->inode_tid;
+				}
 			} else {
 				/* can't be mounted as a PFS */
 			}
 
-			/*
-			 * Update inode statistics.  Pending stats in chain
-			 * are cleared out on UPDATE so expect that bit to
-			 * be set here too or the statistics will not be
-			 * rolled-up properly.
-			 */
-			if (chain->data_count || chain->inode_count) {
-				hammer2_inode_data_t *ipdata;
-
-				KKASSERT(chain->flags & HAMMER2_CHAIN_UPDATE);
-				hammer2_io_setdirty(chain->dio);
-				ipdata = &chain->data->ipdata;
-				ipdata->data_count += chain->data_count;
-				ipdata->inode_count += chain->inode_count;
-			}
 			KKASSERT((chain->flags & HAMMER2_CHAIN_EMBEDDED) == 0);
 			hammer2_chain_setcheck(chain, chain->data);
 			break;
@@ -771,74 +935,155 @@ again:
 		}
 
 		/*
-		 * If the chain was destroyed try to avoid unnecessary I/O.
-		 * (this only really works if the DIO system buffer is the
-		 * same size as chain->bytes).
+		 * If the chain was destroyed try to avoid unnecessary I/O
+		 * that might not have yet occurred.  Remove the data range
+		 * from dedup candidacy and attempt to invalidation that
+		 * potentially dirty portion of the I/O buffer.
 		 */
-		if ((chain->flags & HAMMER2_CHAIN_DESTROY) && chain->dio) {
-			hammer2_io_setinval(chain->dio, chain->bytes);
+		if (chain->flags & HAMMER2_CHAIN_DESTROY) {
+			hammer2_io_dedup_delete(hmp,
+						chain->bref.type,
+						chain->bref.data_off,
+						chain->bytes);
+#if 0
+			hammer2_io_t *dio;
+			if (chain->dio) {
+				hammer2_io_inval(chain->dio,
+						 chain->bref.data_off,
+						 chain->bytes);
+			} else if ((dio = hammer2_io_getquick(hmp,
+						  chain->bref.data_off,
+						  chain->bytes,
+						  1)) != NULL) {
+				hammer2_io_inval(dio,
+						 chain->bref.data_off,
+						 chain->bytes);
+				hammer2_io_putblk(&dio);
+			}
+#endif
 		}
 	}
 
 	/*
 	 * If UPDATE is set the parent block table may need to be updated.
+	 * This can fail if the hammer2_chain_modify() fails.
 	 *
 	 * NOTE: UPDATE may be set on vchain or fchain in which case
-	 *	 parent could be NULL.  It's easiest to allow the case
-	 *	 and test for NULL.  parent can also wind up being NULL
-	 *	 due to a deletion so we need to handle the case anyway.
+	 *	 parent could be NULL, or on an inode that has not yet
+	 *	 been inserted into the radix tree.  It's easiest to allow
+	 *	 the case and test for NULL.  parent can also wind up being
+	 *	 NULL due to a deletion so we need to handle the case anyway.
+	 *
+	 * NOTE: UPDATE can be set when chains are renamed into or out of
+	 *	 an indirect block, without the chain itself being flagged
+	 *	 MODIFIED.
 	 *
 	 * If no parent exists we can just clear the UPDATE bit.  If the
 	 * chain gets reattached later on the bit will simply get set
 	 * again.
 	 */
-	if ((chain->flags & HAMMER2_CHAIN_UPDATE) && parent == NULL) {
+	if ((chain->flags & HAMMER2_CHAIN_UPDATE) && parent == NULL)
 		atomic_clear_int(&chain->flags, HAMMER2_CHAIN_UPDATE);
-		hammer2_chain_drop(chain);
-	}
 
 	/*
-	 * The chain may need its blockrefs updated in the parent.  This
-	 * requires some fancy footwork.
+	 * When flushing an inode outside of a FLUSH_FSSYNC we must NOT
+	 * update the parent block table to point at the flushed inode.
+	 * The block table should only ever be updated by the filesystem
+	 * sync code.  If we do, inode<->inode dependencies (such as
+	 * directory entries vs inode nlink count) can wind up not being
+	 * flushed together and result in a broken topology if a crash/reboot
+	 * occurs at the wrong time.
+	 */
+	if (chain->bref.type == HAMMER2_BREF_TYPE_INODE &&
+	    (flags & HAMMER2_FLUSH_INODE_STOP) &&
+	    (flags & HAMMER2_FLUSH_FSSYNC) == 0 &&
+	    (flags & HAMMER2_FLUSH_ALL) == 0 &&
+	    chain->pmp && chain->pmp->mp) {
+#ifdef HAMMER2_DEBUG_SYNC
+		kprintf("inum %ld do not update parent, non-fssync\n",
+			(long)chain->bref.key);
+#endif
+		goto skipupdate;
+	}
+#ifdef HAMMER2_DEBUG_SYNC
+	if (chain->bref.type == HAMMER2_BREF_TYPE_INODE)
+		kprintf("inum %ld update parent\n", (long)chain->bref.key);
+#endif
+
+	/*
+	 * The chain may need its blockrefs updated in the parent, normal
+	 * path.
 	 */
 	if (chain->flags & HAMMER2_CHAIN_UPDATE) {
 		hammer2_blockref_t *base;
 		int count;
 
 		/*
-		 * Both parent and chain must be locked.  This requires
-		 * temporarily unlocking the chain.  We have to deal with
-		 * the case where the chain might be reparented or modified
-		 * while it was unlocked.
+		 * Clear UPDATE flag, mark parent modified, update its
+		 * modify_tid if necessary, and adjust the parent blockmap.
 		 */
-		hammer2_chain_unlock(chain);
-		hammer2_chain_lock(parent, HAMMER2_RESOLVE_ALWAYS);
-		hammer2_chain_lock(chain, HAMMER2_RESOLVE_MAYBE);
-		if (chain->parent != parent) {
-			kprintf("PARENT MISMATCH ch=%p p=%p/%p\n", chain, chain->parent, parent);
-			hammer2_chain_unlock(parent);
-			goto done;
+		atomic_clear_int(&chain->flags, HAMMER2_CHAIN_UPDATE);
+
+		/*
+		 * (optional code)
+		 *
+		 * Avoid actually modifying and updating the parent if it
+		 * was flagged for destruction.  This can greatly reduce
+		 * disk I/O in large tree removals because the
+		 * hammer2_io_setinval() call in the upward recursion
+		 * (see MODIFIED code above) can only handle a few cases.
+		 */
+		if (parent->flags & HAMMER2_CHAIN_DESTROY) {
+			if (parent->bref.modify_tid < chain->bref.modify_tid) {
+				parent->bref.modify_tid =
+					chain->bref.modify_tid;
+			}
+			atomic_clear_int(&chain->flags, HAMMER2_CHAIN_BMAPPED |
+							HAMMER2_CHAIN_BMAPUPD);
+			goto skipupdate;
 		}
 
 		/*
-		 * Check race condition.  If someone got in and modified
-		 * it again while it was unlocked, we have to loop up.
+		 * The flusher is responsible for deleting empty indirect
+		 * blocks at this point.  If we don't do this, no major harm
+		 * will be done but the empty indirect blocks will stay in
+		 * the topology and make it a messy and inefficient.
+		 *
+		 * The flusher is also responsible for collapsing the
+		 * content of an indirect block into its parent whenever
+		 * possible (with some hysteresis).  Not doing this will also
+		 * not harm the topology, but would make it messy and
+		 * inefficient.
 		 */
-		if (chain->flags & HAMMER2_CHAIN_MODIFIED) {
-			hammer2_chain_unlock(parent);
-			kprintf("hammer2_flush: chain %p flush-mod race\n",
-				chain);
-			goto again;
+		if (chain->bref.type == HAMMER2_BREF_TYPE_INDIRECT) {
+			if (hammer2_chain_indirect_maintenance(parent, chain))
+				goto skipupdate;
 		}
 
 		/*
-		 * Clear UPDATE flag
+		 * We are updating the parent's blockmap, the parent must
+		 * be set modified.  If this fails we re-set the UPDATE flag
+		 * in the child.
+		 *
+		 * NOTE! A modification error can be ENOSPC.  We still want
+		 *	 to flush modified chains recursively, not break out,
+		 *	 so we just skip the update in this situation and
+		 *	 continue.  That is, we still need to try to clean
+		 *	 out dirty chains and buffers.
+		 *
+		 *	 This may not help bulkfree though. XXX
 		 */
-		if (chain->flags & HAMMER2_CHAIN_UPDATE) {
-			atomic_clear_int(&chain->flags, HAMMER2_CHAIN_UPDATE);
-			hammer2_chain_drop(chain);
+		save_error = hammer2_chain_modify(parent, 0, 0, 0);
+		if (save_error) {
+			info->error |= save_error;
+			kprintf("hammer2_flush: %016jx.%02x error=%08x\n",
+				parent->bref.data_off, parent->bref.type,
+				save_error);
+			atomic_set_int(&chain->flags, HAMMER2_CHAIN_UPDATE);
+			goto skipupdate;
 		}
-		hammer2_chain_modify(info->trans, parent, 0);
+		if (parent->bref.modify_tid < chain->bref.modify_tid)
+			parent->bref.modify_tid = chain->bref.modify_tid;
 
 		/*
 		 * Calculate blockmap pointer
@@ -850,7 +1095,7 @@ again:
 			 * no block array if the inode is flagged DIRECTDATA.
 			 */
 			if (parent->data &&
-			    (parent->data->ipdata.op_flags &
+			    (parent->data->ipdata.meta.op_flags &
 			     HAMMER2_OPFLAG_DIRECTDATA) == 0) {
 				base = &parent->data->
 					ipdata.u.blockset.blockref[0];
@@ -892,9 +1137,10 @@ again:
 		 */
 		if (base && (chain->flags & HAMMER2_CHAIN_BMAPUPD)) {
 			if (chain->flags & HAMMER2_CHAIN_BMAPPED) {
-				hammer2_base_delete(info->trans, parent,
-						    base, count,
-						    &info->cache_index, chain);
+				hammer2_spin_ex(&parent->core.spin);
+				hammer2_base_delete(parent, base, count, chain,
+						    NULL);
+				hammer2_spin_unex(&parent->core.spin);
 				/* base_delete clears both bits */
 			} else {
 				atomic_clear_int(&chain->flags,
@@ -902,61 +1148,58 @@ again:
 			}
 		}
 		if (base && (chain->flags & HAMMER2_CHAIN_BMAPPED) == 0) {
-			parent->data_count += chain->data_count +
-					      chain->data_count_up;
-			parent->inode_count += chain->inode_count +
-					       chain->inode_count_up;
-			chain->data_count = 0;
-			chain->inode_count = 0;
-			chain->data_count_up = 0;
-			chain->inode_count_up = 0;
-			hammer2_base_insert(info->trans, parent,
-					    base, count,
-					    &info->cache_index, chain);
+			hammer2_spin_ex(&parent->core.spin);
+			hammer2_base_insert(parent, base, count,
+					    chain, &chain->bref);
+			hammer2_spin_unex(&parent->core.spin);
 			/* base_insert sets BMAPPED */
 		}
-		hammer2_chain_unlock(parent);
 	}
+skipupdate:
+	if (parent)
+		hammer2_chain_unlock(parent);
 
 	/*
 	 * Final cleanup after flush
 	 */
 done:
-	KKASSERT(chain->refs > 1);
-	KKASSERT(pmp == NULL ||
-		 chain->bref.mirror_tid <= chain->pmp->flush_tid);
+	KKASSERT(chain->refs > 0);
 	if (hammer2_debug & 0x200) {
 		if (info->debug == chain)
 			info->debug = NULL;
 	}
+	return retry;
 }
 
 /*
  * Flush recursion helper, called from flush_core, calls flush_core.
  *
  * Flushes the children of the caller's chain (info->parent), restricted
- * by sync_tid.  Set info->domodify if the child's blockref must propagate
- * back up to the parent.
+ * by sync_tid.
  *
- * Ripouts can move child from rbtree to dbtree or dbq but the caller's
- * flush scan order prevents any chains from being lost.  A child can be
- * executes more than once.
+ * This function may set info->error as a side effect.
  *
  * WARNING! If we do not call hammer2_flush_core() we must update
  *	    bref.mirror_tid ourselves to indicate that the flush has
  *	    processed the child.
  *
  * WARNING! parent->core spinlock is held on entry and return.
- *
- * WARNING! Flushes do not cross PFS boundaries.  Specifically, a flush must
- *	    not cross a pfs-root boundary.
  */
 static int
 hammer2_flush_recurse(hammer2_chain_t *child, void *data)
 {
 	hammer2_flush_info_t *info = data;
-	/*hammer2_trans_t *trans = info->trans;*/
 	hammer2_chain_t *parent = info->parent;
+
+#ifdef HAMMER2_SCAN_DEBUG
+	++info->scan_count;
+	if (child->flags & HAMMER2_CHAIN_MODIFIED)
+		++info->scan_mod_count;
+	if (child->flags & HAMMER2_CHAIN_UPDATE)
+		++info->scan_upd_count;
+	if (child->flags & HAMMER2_CHAIN_ONFLUSH)
+		++info->scan_onf_count;
+#endif
 
 	/*
 	 * (child can never be fchain or vchain so a special check isn't
@@ -965,44 +1208,358 @@ hammer2_flush_recurse(hammer2_chain_t *child, void *data)
 	 * We must ref the child before unlocking the spinlock.
 	 *
 	 * The caller has added a ref to the parent so we can temporarily
-	 * unlock it in order to lock the child.
+	 * unlock it in order to lock the child.  However, if it no longer
+	 * winds up being the child of the parent we must skip this child.
+	 *
+	 * NOTE! chain locking errors are fatal.  They are never out-of-space
+	 *	 errors.
 	 */
 	hammer2_chain_ref(child);
-	spin_unlock(&parent->core.cst.spin);
+	hammer2_spin_unex(&parent->core.spin);
 
+	hammer2_chain_ref_hold(parent);
 	hammer2_chain_unlock(parent);
 	hammer2_chain_lock(child, HAMMER2_RESOLVE_MAYBE);
+	if (child->parent != parent) {
+		kprintf("LOST CHILD1 %p->%p (actual parent %p)\n",
+			parent, child, child->parent);
+		goto done;
+	}
+	if (child->error) {
+		kprintf("CHILD ERROR DURING FLUSH LOCK %p->%p\n",
+			parent, child);
+		info->error |= child->error;
+		goto done;
+	}
 
 	/*
-	 * Never recurse across a mounted PFS boundary.
-	 *
-	 * Recurse and collect deferral data.
+	 * Must propagate the DESTROY flag downwards, otherwise the
+	 * parent could end up never being removed because it will
+	 * be requeued to the flusher if it survives this run due to
+	 * the flag.
 	 */
-	if ((child->flags & HAMMER2_CHAIN_PFSBOUNDARY) == 0 ||
-	    child->pmp == NULL) {
-		if (child->flags & HAMMER2_CHAIN_FLUSH_MASK) {
-			++info->depth;
-			hammer2_flush_core(info, child, 0); /* XXX deleting */
-			--info->depth;
-		} else if (hammer2_debug & 0x200) {
-			if (info->debug == NULL)
-				info->debug = child;
-			++info->depth;
-			hammer2_flush_core(info, child, 0); /* XXX deleting */
-			--info->depth;
-			if (info->debug == child)
-				info->debug = NULL;
+	if (parent && (parent->flags & HAMMER2_CHAIN_DESTROY))
+		atomic_set_int(&child->flags, HAMMER2_CHAIN_DESTROY);
+#ifdef HAMMER2_SCAN_DEBUG
+	if (child->flags & HAMMER2_CHAIN_DESTROY)
+		++info->scan_del_count;
+#endif
+	/*
+	 * Special handling of the root inode.  Because the root inode
+	 * contains an index of all the inodes in the PFS in addition to
+	 * its normal directory entries, any flush that is not part of a
+	 * filesystem sync must only flush the directory entries, and not
+	 * anything else.
+	 *
+	 * The child might be an indirect block, but H2 guarantees that
+	 * the key-range will fully partition the inode index from the
+	 * directory entries so the case just works naturally.
+	 */
+	if ((parent->bref.flags & HAMMER2_BREF_FLAG_PFSROOT) &&
+	    (child->flags & HAMMER2_CHAIN_DESTROY) == 0 &&
+	    parent->bref.type == HAMMER2_BREF_TYPE_INODE &&
+	    (info->flags & HAMMER2_FLUSH_FSSYNC) == 0) {
+		if ((child->bref.key & HAMMER2_DIRHASH_VISIBLE) == 0) {
+			if (child->flags & HAMMER2_CHAIN_FLUSH_MASK) {
+				hammer2_chain_setflush(parent);
+			}
+			goto done;
 		}
 	}
 
 	/*
-	 * Relock to continue the loop
+	 * Recurse and collect deferral data.  We're in the media flush,
+	 * this can cross PFS boundaries.
+	 */
+	if (child->flags & HAMMER2_CHAIN_FLUSH_MASK) {
+#ifdef HAMMER2_SCAN_DEBUG
+		if (child->bref.type < 7)
+			++info->scan_btype[child->bref.type];
+#endif
+		++info->depth;
+		hammer2_flush_core(info, child, info->flags);
+		--info->depth;
+	} else if (hammer2_debug & 0x200) {
+		if (info->debug == NULL)
+			info->debug = child;
+		++info->depth;
+		hammer2_flush_core(info, child, info->flags);
+		--info->depth;
+		if (info->debug == child)
+			info->debug = NULL;
+	}
+
+done:
+	/*
+	 * Relock to continue the loop.
 	 */
 	hammer2_chain_unlock(child);
 	hammer2_chain_lock(parent, HAMMER2_RESOLVE_MAYBE);
+	hammer2_chain_drop_unhold(parent);
+	if (parent->error) {
+		kprintf("PARENT ERROR DURING FLUSH LOCK %p->%p\n",
+			parent, child);
+		info->error |= parent->error;
+	}
 	hammer2_chain_drop(child);
 	KKASSERT(info->parent == parent);
-	spin_lock(&parent->core.cst.spin);
+	hammer2_spin_ex(&parent->core.spin);
 
 	return (0);
+}
+
+/*
+ * flush helper (backend threaded)
+ *
+ * Flushes chain topology for the specified inode.
+ *
+ * HAMMER2_XOP_INODE_STOP	The flush recursion stops at inode boundaries.
+ *				Inodes belonging to the same flush are flushed
+ *				separately.
+ *
+ * chain->parent can be NULL, usually due to destroy races or detached inodes.
+ *
+ * Primarily called from vfs_sync().
+ */
+void
+hammer2_xop_inode_flush(hammer2_xop_t *arg, void *scratch __unused, int clindex)
+{
+	hammer2_xop_flush_t *xop = &arg->xop_flush;
+	hammer2_chain_t *chain;
+	hammer2_inode_t *ip;
+	hammer2_dev_t *hmp;
+	hammer2_pfs_t *pmp;
+	int flush_error = 0;
+	int fsync_error = 0;
+	int total_error = 0;
+	int j;
+	int xflags;
+	int ispfsroot = 0;
+
+	xflags = HAMMER2_FLUSH_TOP;
+	if (xop->head.flags & HAMMER2_XOP_INODE_STOP)
+		xflags |= HAMMER2_FLUSH_INODE_STOP;
+	if (xop->head.flags & HAMMER2_XOP_FSSYNC)
+		xflags |= HAMMER2_FLUSH_FSSYNC;
+
+	/*
+	 * Flush core chains
+	 */
+	ip = xop->head.ip1;
+	pmp = ip->pmp;
+	chain = hammer2_inode_chain(ip, clindex, HAMMER2_RESOLVE_ALWAYS);
+	if (chain) {
+		hmp = chain->hmp;
+		if (chain->flags & HAMMER2_CHAIN_FLUSH_MASK) {
+			/*
+			 * Due to flush partitioning the chain topology
+			 * above the inode's chain may no longer be flagged.
+			 * When asked to flush an inode, remark the topology
+			 * leading to that inode.
+			 */
+			if (chain->parent)
+				hammer2_chain_setflush(chain->parent);
+			hammer2_flush(chain, xflags);
+
+			/* XXX cluster */
+			if (ip == pmp->iroot && pmp != hmp->spmp) {
+				hammer2_spin_ex(&pmp->inum_spin);
+				pmp->pfs_iroot_blocksets[clindex] =
+					chain->data->ipdata.u.blockset;
+				hammer2_spin_unex(&pmp->inum_spin);
+			}
+
+#if 0
+			/*
+			 * Propogate upwards but only cross an inode boundary
+			 * for inodes associated with the current filesystem
+			 * sync.
+			 */
+			if ((xop->head.flags & HAMMER2_XOP_PARENTONFLUSH) ||
+			    chain->bref.type != HAMMER2_BREF_TYPE_INODE) {
+				parent = chain->parent;
+				if (parent)
+					hammer2_chain_setflush(parent);
+			}
+#endif
+		}
+		if (chain->flags & HAMMER2_CHAIN_PFSBOUNDARY)
+			ispfsroot = 1;
+		hammer2_chain_unlock(chain);
+		hammer2_chain_drop(chain);
+		chain = NULL;
+	} else {
+		hmp = NULL;
+	}
+
+	/*
+	 * Only flush the volume header if asked to, plus the inode must also
+	 * be the PFS root.
+	 */
+	if ((xop->head.flags & HAMMER2_XOP_VOLHDR) == 0)
+		goto skip;
+	if (ispfsroot == 0)
+		goto skip;
+
+	/*
+	 * Flush volume roots.  Avoid replication, we only want to
+	 * flush each hammer2_dev (hmp) once.
+	 */
+	for (j = clindex - 1; j >= 0; --j) {
+		if ((chain = ip->cluster.array[j].chain) != NULL) {
+			if (chain->hmp == hmp) {
+				chain = NULL;	/* safety */
+				goto skip;
+			}
+		}
+	}
+	chain = NULL;	/* safety */
+
+	/*
+	 * spmp transaction.  The super-root is never directly mounted so
+	 * there shouldn't be any vnodes, let alone any dirty vnodes
+	 * associated with it, so we shouldn't have to mess around with any
+	 * vnode flushes here.
+	 */
+	hammer2_trans_init(hmp->spmp, HAMMER2_TRANS_ISFLUSH);
+
+	/*
+	 * We must flush the superroot down to the PFS iroot.  Remember
+	 * that hammer2_chain_setflush() stops at inode boundaries, so
+	 * the pmp->iroot has been flushed and flagged down to the superroot,
+	 * but the volume root (vchain) probably has not yet been flagged.
+	 */
+	if (hmp->spmp->iroot) {
+		chain = hmp->spmp->iroot->cluster.array[0].chain;
+		if (chain) {
+			hammer2_chain_ref(chain);
+			hammer2_chain_lock(chain, HAMMER2_RESOLVE_ALWAYS);
+			flush_error |=
+				hammer2_flush(chain,
+					      HAMMER2_FLUSH_TOP |
+					      HAMMER2_FLUSH_INODE_STOP |
+					      HAMMER2_FLUSH_FSSYNC);
+			hammer2_chain_unlock(chain);
+			hammer2_chain_drop(chain);
+		}
+	}
+
+	/*
+	 * Media mounts have two 'roots', vchain for the topology
+	 * and fchain for the free block table.  Flush both.
+	 *
+	 * Note that the topology and free block table are handled
+	 * independently, so the free block table can wind up being
+	 * ahead of the topology.  We depend on the bulk free scan
+	 * code to deal with any loose ends.
+	 *
+	 * vchain and fchain do not error on-lock since their data does
+	 * not have to be re-read from media.
+	 */
+	hammer2_chain_ref(&hmp->vchain);
+	hammer2_chain_lock(&hmp->vchain, HAMMER2_RESOLVE_ALWAYS);
+	hammer2_chain_ref(&hmp->fchain);
+	hammer2_chain_lock(&hmp->fchain, HAMMER2_RESOLVE_ALWAYS);
+	if (hmp->fchain.flags & HAMMER2_CHAIN_FLUSH_MASK) {
+		/*
+		 * This will also modify vchain as a side effect,
+		 * mark vchain as modified now.
+		 */
+		hammer2_voldata_modify(hmp);
+		chain = &hmp->fchain;
+		flush_error |= hammer2_flush(chain, HAMMER2_FLUSH_TOP);
+		KKASSERT(chain == &hmp->fchain);
+	}
+	hammer2_chain_unlock(&hmp->fchain);
+	hammer2_chain_unlock(&hmp->vchain);
+	hammer2_chain_drop(&hmp->fchain);
+	/* vchain dropped down below */
+
+	hammer2_chain_lock(&hmp->vchain, HAMMER2_RESOLVE_ALWAYS);
+	if (hmp->vchain.flags & HAMMER2_CHAIN_FLUSH_MASK) {
+		chain = &hmp->vchain;
+		flush_error |= hammer2_flush(chain, HAMMER2_FLUSH_TOP);
+		KKASSERT(chain == &hmp->vchain);
+	}
+	hammer2_chain_unlock(&hmp->vchain);
+	hammer2_chain_drop(&hmp->vchain);
+
+	/*
+	 * We can't safely flush the volume header until we have
+	 * flushed any device buffers which have built up.
+	 *
+	 * XXX this isn't being incremental
+	 */
+	vn_lock(hmp->devvp, LK_EXCLUSIVE | LK_RETRY);
+	fsync_error = VOP_FSYNC(hmp->devvp, MNT_WAIT, 0);
+	vn_unlock(hmp->devvp);
+	if (fsync_error || flush_error) {
+		kprintf("hammer2: sync error fsync=%d h2flush=0x%04x dev=%s\n",
+			fsync_error, flush_error, hmp->devrepname);
+	}
+
+	/*
+	 * The flush code sets CHAIN_VOLUMESYNC to indicate that the
+	 * volume header needs synchronization via hmp->volsync.
+	 *
+	 * XXX synchronize the flag & data with only this flush XXX
+	 */
+	if (fsync_error == 0 && flush_error == 0 &&
+	    (hmp->vchain.flags & HAMMER2_CHAIN_VOLUMESYNC)) {
+		struct buf *bp;
+		int vol_error = 0;
+
+		/*
+		 * Synchronize the disk before flushing the volume
+		 * header.
+		 */
+		bp = getpbuf(NULL);
+		bp->b_bio1.bio_offset = 0;
+		bp->b_bufsize = 0;
+		bp->b_bcount = 0;
+		bp->b_cmd = BUF_CMD_FLUSH;
+		bp->b_bio1.bio_done = biodone_sync;
+		bp->b_bio1.bio_flags |= BIO_SYNC;
+		vn_strategy(hmp->devvp, &bp->b_bio1);
+		fsync_error = biowait(&bp->b_bio1, "h2vol");
+		relpbuf(bp, NULL);
+
+		/*
+		 * Then we can safely flush the version of the
+		 * volume header synchronized by the flush code.
+		 */
+		j = hmp->volhdrno + 1;
+		if (j < 0)
+			j = 0;
+		if (j >= HAMMER2_NUM_VOLHDRS)
+			j = 0;
+		if (j * HAMMER2_ZONE_BYTES64 + HAMMER2_SEGSIZE >
+		    hmp->volsync.volu_size) {
+			j = 0;
+		}
+		if (hammer2_debug & 0x8000) {
+			/* debug only, avoid syslogd loop */
+			kprintf("sync volhdr %d %jd\n",
+				j, (intmax_t)hmp->volsync.volu_size);
+		}
+		bp = getblk(hmp->devvp, j * HAMMER2_ZONE_BYTES64,
+			    HAMMER2_PBUFSIZE, GETBLK_KVABIO, 0);
+		atomic_clear_int(&hmp->vchain.flags,
+				 HAMMER2_CHAIN_VOLUMESYNC);
+		bkvasync(bp);
+		bcopy(&hmp->volsync, bp->b_data, HAMMER2_PBUFSIZE);
+		vol_error = bwrite(bp);
+		hmp->volhdrno = j;
+		if (vol_error)
+			fsync_error = vol_error;
+	}
+	if (flush_error)
+		total_error = flush_error;
+	if (fsync_error)
+		total_error = hammer2_errno_to_error(fsync_error);
+
+	/* spmp trans */
+	hammer2_trans_done(hmp->spmp, HAMMER2_TRANS_ISFLUSH);
+skip:
+	hammer2_xop_feed(&xop->head, NULL, clindex, total_error);
 }

@@ -13,11 +13,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -85,6 +81,7 @@ extern int vm_pages_needed;	/* should be some "event" structure */
 extern int vm_pageout_pages_needed;
 extern int vm_pageout_deficit;
 extern int vm_page_free_hysteresis;
+extern int vm_pageout_memuse_mode;
 
 #define VM_PAGEOUT_ASYNC 0
 #define VM_PAGEOUT_SYNC 1
@@ -109,9 +106,13 @@ extern void vm_wait (int timo);
 extern void vm_wait_pfault (void);
 
 #ifdef _KERNEL
-void vm_pageout_page (vm_page_t, vm_object_t);
+
+struct vm_map;
+
 void vm_pageout_cluster (vm_page_t, vm_object_t);
 int vm_pageout_flush (vm_page_t *, int, int);
+int vm_pageout_clean (vm_page_t);
+void vm_pageout_map_deactivate_pages(struct vm_map *map, vm_pindex_t limit);
 
 #endif
 

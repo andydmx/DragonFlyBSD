@@ -85,8 +85,6 @@
 #include <vm/vm_zone.h>
 
 #include <sys/buf2.h>
-#include <sys/thread2.h>
-#include <sys/sysref2.h>
 #include <vm/vm_page2.h>
 
 static int nvtruncbuf_bp_trunc_cmp(struct buf *bp, void *data);
@@ -129,7 +127,7 @@ struct truncbuf_info {
 };
 
 int
-nvtruncbuf(struct vnode *vp, off_t length, int blksize, int boff, int trivial)
+nvtruncbuf(struct vnode *vp, off_t length, int blksize, int boff, int flags)
 {
 	struct truncbuf_info info;
 	off_t truncboffset;
@@ -175,13 +173,14 @@ nvtruncbuf(struct vnode *vp, off_t length, int blksize, int boff, int trivial)
 	 *
 	 * The VFS is responsible for dealing with the actual truncation.
 	 *
-	 * Only do this if trivial is zero, otherwise it is up to the
-	 * VFS to handle the block straddling the EOF.
+	 * Only do this if NVEXTF_TRIVIAL is not set, otherwise it is up to
+	 * the VFS to handle the block straddling the EOF.
 	 */
-	if (boff && trivial == 0) {
+	if (boff && (flags & NVEXTF_TRIVIAL) == 0) {
 		truncboffset = length - boff;
-		error = bread(vp, truncboffset, blksize, &bp);
+		error = bread_kvabio(vp, truncboffset, blksize, &bp);
 		if (error == 0) {
+			bkvasync(bp);
 			bzero(bp->b_data + boff, blksize - boff);
 			if (bp->b_flags & B_DELWRI) {
 				if (bp->b_dirtyoff > boff)
@@ -190,7 +189,15 @@ nvtruncbuf(struct vnode *vp, off_t length, int blksize, int boff, int trivial)
 					bp->b_dirtyend = boff;
 			}
 			bp->b_bio2.bio_offset = NOOFFSET;
-			bdwrite(bp);
+			if (flags & NVEXTF_BUWRITE)
+				buwrite(bp);
+			else
+				bdwrite(bp);
+		} else {
+			kprintf("nvtruncbuf: bread error %d @0x%016jx\n",
+				error, truncboffset);
+			bp->b_flags |= B_INVAL | B_RELBUF;
+			brelse(bp);
 		}
 	} else {
 		error = 0;
@@ -350,7 +357,7 @@ nvtruncbuf_bp_metasync(struct buf *bp, void *data)
  * corruption if the filesystem and vp get desynchronized somehow.
  *
  * If the caller intends to immediately write into the newly extended
- * space pass trivial == 1.  If trivial is 0 the original buffer will be
+ * space pass NVEXTF_TRIVIAL.  If not set, the original buffer will be
  * zero-filled as necessary to clean out any junk in the extended space.
  * If non-zero the original buffer (straddling EOF) is not touched.
  *
@@ -368,7 +375,7 @@ nvtruncbuf_bp_metasync(struct buf *bp, void *data)
  */
 int
 nvextendbuf(struct vnode *vp, off_t olength, off_t nlength,
-	    int oblksize, int nblksize, int oboff, int nboff, int trivial)
+	    int oblksize, int nblksize, int oboff, int nboff, int flags)
 {
 	off_t truncboffset;
 	struct buf *bp;
@@ -376,17 +383,27 @@ nvextendbuf(struct vnode *vp, off_t olength, off_t nlength,
 
 	error = 0;
 	nvnode_pager_setsize(vp, nlength, nblksize, nboff);
-	if (trivial == 0) {
+	if ((flags & NVEXTF_TRIVIAL) == 0) {
 		if (oboff < 0)
 			oboff = (int)(olength % oblksize);
 		truncboffset = olength - oboff;
 
 		if (oboff) {
-			error = bread(vp, truncboffset, oblksize, &bp);
+			error = bread_kvabio(vp, truncboffset, oblksize, &bp);
 			if (error == 0) {
+				bkvasync(bp);
 				bzero(bp->b_data + oboff, oblksize - oboff);
 				bp->b_bio2.bio_offset = NOOFFSET;
-				bdwrite(bp);
+				if (flags & NVEXTF_BUWRITE)
+					buwrite(bp);
+				else
+					bdwrite(bp);
+			} else {
+				kprintf("nvextendbuf: bread EOF @ %016jx "
+					"error %d\n",
+					truncboffset, error);
+				bp->b_flags |= B_INVAL | B_RELBUF;
+				brelse(bp);
 			}
 		}
 	}

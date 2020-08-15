@@ -4,14 +4,13 @@
  *
  *	$NetBSD: search.h,v 1.12 1999/02/22 10:34:28 christos Exp $
  * $FreeBSD: src/include/search.h,v 1.10 2002/10/16 14:29:23 robert Exp $
- * $DragonFly: src/include/search.h,v 1.6 2008/05/19 10:05:18 corecode Exp $
  */
 
 #ifndef _SEARCH_H_
-#define _SEARCH_H_
+#define	_SEARCH_H_
 
 #include <sys/cdefs.h>
-#include <sys/types.h>
+#include <machine/stdint.h>
 
 #ifndef _SIZE_T_DECLARED
 typedef	__size_t	size_t;

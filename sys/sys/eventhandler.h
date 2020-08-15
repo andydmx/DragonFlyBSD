@@ -26,8 +26,6 @@
  * $FreeBSD: src/sys/sys/eventhandler.h,v 1.5 2000/01/16 06:11:33 bde Exp $
  */
 
-#include <sys/queue.h>
-
 #ifndef _SYS_EVENTHANDLER_H_
 #define _SYS_EVENTHANDLER_H_
 
@@ -36,6 +34,8 @@
 #error "This file should not be included by userland programs."
 
 #else
+
+#include <sys/queue.h>
 
 struct eventhandler_entry 
 {
@@ -138,14 +138,12 @@ do {							\
 
 
 #ifdef _KERNEL
-extern eventhandler_tag	eventhandler_register(struct eventhandler_list *list, 
-					      const char *name,
-					      void *func, 
-					      void *arg, 
-					      int priority);
-extern void		eventhandler_deregister(struct eventhandler_list *list,
-						eventhandler_tag tag);
-extern struct eventhandler_list	*eventhandler_find_list(const char *name);
+eventhandler_tag	eventhandler_register(struct eventhandler_list *,
+					      const char *, void *, void *,
+					      int);
+void			eventhandler_deregister(struct eventhandler_list *,
+						eventhandler_tag);
+struct eventhandler_list *eventhandler_find_list(const char *);
 #endif /* _KERNEL */
 
 /*
@@ -156,12 +154,6 @@ extern struct eventhandler_list	*eventhandler_find_list(const char *name);
 #define	EVENTHANDLER_PRI_FIRST	0
 #define	EVENTHANDLER_PRI_ANY	10000
 #define	EVENTHANDLER_PRI_LAST	20000
-
-/* BPF attach/detach events */
-struct ifnet;
-typedef void (*bpf_track_fn)(void *, struct ifnet *, int /* dlt */,
-    int /* 1 =>'s attach */);
-EVENTHANDLER_DECLARE(bpf_track, bpf_track_fn);
 
 struct image_params;
 struct proc;
@@ -181,8 +173,6 @@ typedef void (*exit_list_fn)(void *, struct proc *);
 EVENTHANDLER_DECLARE(shutdown_pre_sync, shutdown_fn);	/* before fs sync */
 EVENTHANDLER_DECLARE(shutdown_post_sync, shutdown_fn);	/* after fs sync */
 EVENTHANDLER_DECLARE(shutdown_final, shutdown_fn);
-EVENTHANDLER_DECLARE(process_exec, execlist_fn);
-EVENTHANDLER_DECLARE(process_exit, exit_list_fn);
 
 #endif	/* _KERNEL || _KERNEL_STRUCTURES */
 #endif	/* !_SYS_EVENTHANDLER_H_ */

@@ -10,11 +10,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -32,7 +28,6 @@
  *
  *	@(#)hexdump.h	8.1 (Berkeley) 6/6/93
  * $FreeBSD: src/usr.bin/hexdump/hexdump.h,v 1.2.6.1 2002/07/23 14:27:06 tjr Exp $
- * $DragonFly: src/usr.bin/hexdump/hexdump.h,v 1.3 2005/02/05 01:05:12 cpressey Exp $
  */
 
 typedef struct _pr {
@@ -84,10 +79,10 @@ extern int exitval;
 
 void	 add(const char *);
 void	 addfile(char *);
-void	 badcnt(char *);
-void	 badconv(char *);
-void	 badfmt(const char *);
-void	 badsfmt(void);
+void	 badcnt(char *) __dead2;
+void	 badconv(char *) __dead2;
+void	 badfmt(const char *) __dead2;
+void	 badsfmt(void) __dead2;
 void	 bpad(PR *);
 void	 conv_c(PR *, u_char *);
 void	 conv_u(PR *, u_char *);
@@ -101,4 +96,4 @@ void	 nomem(void);
 void	 oldsyntax(int, char ***);
 void	 rewrite(FS *);
 int	 size(FS *);
-void	 usage(void);
+void	 usage(void) __dead2;

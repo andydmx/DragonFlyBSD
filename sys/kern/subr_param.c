@@ -50,18 +50,18 @@
  * System parameter formulae.
  */
 
-#ifndef HZ
-#define	HZ 100
+#ifndef HZ_DEFAULT
+#define	HZ_DEFAULT	100
 #endif
-#define	NPROC (20 + 16 * maxusers)
+#define	NPROC		(20 + 16 * maxusers)
 #ifndef NBUF
-#define NBUF 0
+#define NBUF		0
 #endif
 #ifndef MAXFILES
-#define	MAXFILES (maxproc * 16)
+#define	MAXFILES	(maxproc * 16)
 #endif
 #ifndef MAXPOSIXLOCKSPERUID
-#define MAXPOSIXLOCKSPERUID (maxusers * 64) /* Should be a safe value */
+#define MAXPOSIXLOCKSPERUID (maxproc * 4)
 #endif
 
 static int sysctl_kern_vmm_guest(SYSCTL_HANDLER_ARGS);
@@ -83,7 +83,9 @@ int	maxposixlocksperuid;		/* max # POSIX locks per uid */
 int	ncallout;			/* maximum # of timer events */
 int	mbuf_wait = 32;			/* mbuf sleep time in ticks */
 long	nbuf;
-long	nswbuf;
+long	nswbuf_mem;
+long	nswbuf_kva;
+long	nswbuf_raw;
 long	maxswzone;			/* max swmeta KVA storage */
 long	maxbcache;			/* max buffer cache KVA storage */
 enum vmm_guest_type vmm_guest = VMM_GUEST_NONE;	/* Running as VM guest? */
@@ -93,17 +95,24 @@ u_quad_t	maxdsiz;			/* max data size */
 u_quad_t	dflssiz;			/* initial stack size limit */
 u_quad_t	maxssiz;			/* max stack size */
 u_quad_t	sgrowsiz;			/* amount to grow stack */
+u_quad_t	maxthrssiz;			/* thread stack area */
 
 SYSCTL_PROC(_kern, OID_AUTO, vmm_guest, CTLFLAG_RD | CTLTYPE_STRING,
-    NULL, 0, sysctl_kern_vmm_guest, "A",
-    "Virtual machine guest type");
+	    NULL, 0, sysctl_kern_vmm_guest, "A",
+	    "Virtual machine guest type");
+SYSCTL_QUAD(_kern, OID_AUTO, maxssiz, CTLFLAG_RD, &maxssiz, 0,
+	    "Maximum user stack size");
+SYSCTL_QUAD(_kern, OID_AUTO, maxthrssiz, CTLFLAG_RD, &maxthrssiz, 0,
+	    "Nominal threading stack area");
 
 /*
  * These have to be allocated somewhere; allocating
  * them here forces loader errors if this file is omitted
  * (if they've been externed everywhere else; hah!).
  */
-struct	buf *swbuf;
+struct	buf *swbuf_mem;
+struct	buf *swbuf_kva;
+struct	buf *swbuf_raw;
 
 struct vmm_bname {
 	const char *str;
@@ -122,7 +131,7 @@ static struct vmm_bname vmm_bnames[] = {
 
 static struct vmm_bname vmm_pnames[] = {
 	{ "VMware Virtual Platform",	VMM_GUEST_VMWARE },	/* VMWare VM */
-	{ "Virtual Machine",		VMM_GUEST_VPC },	/* M$ VirtualPC */
+	{ "Virtual Machine",		VMM_GUEST_HYPERV },	/* MS Hyper-V */
 	{ "VirtualBox",			VMM_GUEST_VBOX },	/* Sun VirtualBox */
 	{ "Parallels Virtual Platform",	VMM_GUEST_PARALLELS },	/* Parallels VM */
 	{ "KVM",			VMM_GUEST_KVM },	/* KVM */
@@ -138,7 +147,7 @@ static const char *const vmm_guest_sysctl_names[] = {
 	"bhyve",
 	"kvm",
 	"vmware",
-	"vpc",
+	"hyperv",
 	"vbox",
 	"parallels",
 	"vkernel",
@@ -146,6 +155,10 @@ static const char *const vmm_guest_sysctl_names[] = {
 	NULL
 };
 CTASSERT(NELEM(vmm_guest_sysctl_names) - 1 == VMM_GUEST_LAST);
+
+char		vmm_vendor[16];
+SYSCTL_STRING(_kern, OID_AUTO, vmm_vendor, CTLFLAG_RD, vmm_vendor, 0,
+    "Virtual machine vendor");
 
 /*
  * Detect known Virtual Machine hosts by inspecting the emulated BIOS.
@@ -183,9 +196,10 @@ detect_virtual(void)
 void
 init_param1(void)
 {
-	hz = HZ;
+	hz = HZ_DEFAULT;
 	TUNABLE_INT_FETCH("kern.hz", &hz);
-	stathz = hz * 128 / 100;
+	stathz = hz + 1;
+	TUNABLE_INT_FETCH("kern.stathz", &stathz);
 	profhz = stathz;
 	ustick = 1000000 / hz;
 	nstick = 1000000000 / hz;
@@ -212,6 +226,8 @@ init_param1(void)
 	TUNABLE_QUAD_FETCH("kern.maxssiz", &maxssiz);
 	sgrowsiz = SGROWSIZ;
 	TUNABLE_QUAD_FETCH("kern.sgrowsiz", &sgrowsiz);
+	maxthrssiz = MAXTHRSSIZ;
+	TUNABLE_QUAD_FETCH("kern.maxthrssiz", &maxthrssiz);
 }
 
 /*
@@ -223,11 +239,15 @@ init_param2(int physpages)
 	size_t limsize;
 
 	/*
-	 * Calculate manually becaus the VM page queues / system is not set up yet
+	 * Calculate manually becaus the VM page queues / system is not set
+	 * up yet.
 	 */
 	limsize = (size_t)physpages * PAGE_SIZE;
 	if (limsize > KvaSize)
 		limsize = KvaSize;
+	if (maxswzone > limsize / 2)	/* maxswzone size (1/2 of phys mem) */
+		maxswzone = limsize / 2;
+
 	limsize /= 1024 * 1024;		/* smaller of KVM or physmem in MB */
 
 	/* Base parameters */
@@ -242,17 +262,18 @@ init_param2(int physpages)
 
 	/*
 	 * The following can be overridden after boot via sysctl.  Note:
-	 * unless overriden, these macros are ultimately based on maxusers.
+	 * unless overridden, these macros are ultimately based on maxusers.
 	 *
 	 * Limit maxproc so that kmap entries cannot be exhausted by
-	 * processes.
+	 * processes.  This limitation can be a bit problematic because
+	 * processes can have a wide range of complexity.
 	 */
 	maxproc = NPROC;
 	TUNABLE_INT_FETCH("kern.maxproc", &maxproc);
 	if (maxproc < 32)
 		maxproc = 32;
-	if (maxproc > limsize * 21)
-		maxproc = limsize * 21;
+	if (maxproc > limsize * 40)
+		maxproc = limsize * 40;
 
 	/*
 	 * Maximum number of open files
@@ -293,12 +314,19 @@ init_param2(int physpages)
 	TUNABLE_INT_FETCH("kern.maxposixlocksperuid", &maxposixlocksperuid);
 
 	/*
-	 * Unless overriden, NBUF is typically 0 (auto-sized later).
+	 * Unless overridden, NBUF is typically 0 (auto-sized later).
 	 */
 	nbuf = NBUF;
 	TUNABLE_LONG_FETCH("kern.nbuf", &nbuf);
 
+	/*
+	 * Calculate the size of the callout wheel.  Limit to approximately
+	 * 5 minutes worth of table (maxproc would have to be pretty huge),
+	 * as more is not likely to gain us anything.
+	 */
 	ncallout = 16 + maxproc + maxfiles;
+	if (ncallout > 5*60*hz)
+		ncallout = 5*60*hz;
 	TUNABLE_INT_FETCH("kern.ncallout", &ncallout);
 }
 

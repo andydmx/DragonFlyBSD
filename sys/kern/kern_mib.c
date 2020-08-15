@@ -43,6 +43,8 @@
 #include <sys/proc.h>
 #include <sys/lockf.h>
 #include <sys/jail.h>
+#include <sys/unistd.h>
+#include <machine/tls.h>
 #include <machine/smp.h>
 
 SYSCTL_NODE(, 0,	  sysctl, CTLFLAG_RW, 0,
@@ -75,23 +77,27 @@ SYSCTL_NODE(, OID_AUTO,  compat, CTLFLAG_RW, 0,
 SYSCTL_NODE(, OID_AUTO,  security,   CTLFLAG_RW, 0,
 	"Security");
 
-SYSCTL_STRING(_kern, OID_AUTO, ident, CTLFLAG_RD,
+SYSCTL_STRING(_kern, OID_AUTO, ident, CTLFLAG_RD | CTLFLAG_NOLOCK,
     kern_ident, 0, "Kernel identifier");
 
-SYSCTL_STRING(_kern, KERN_OSRELEASE, osrelease, CTLFLAG_RD, 
+SYSCTL_STRING(_kern, KERN_OSRELEASE, osrelease, CTLFLAG_RD | CTLFLAG_NOLOCK,
     osrelease, 0, "Operating system type");
 
 SYSCTL_INT(_kern, KERN_OSREV, osrevision, CTLFLAG_RD, 
-    0, BSD, "Operating system revision");
+    0, __DragonFly_version, "Operating system revision");
 
-SYSCTL_STRING(_kern, KERN_VERSION, version, CTLFLAG_RD, 
+SYSCTL_STRING(_kern, KERN_VERSION, version, CTLFLAG_RD | CTLFLAG_NOLOCK,
     version, 0, "Kernel version");
 
-SYSCTL_STRING(_kern, KERN_OSTYPE, ostype, CTLFLAG_RD, 
+SYSCTL_STRING(_kern, KERN_OSTYPE, ostype, CTLFLAG_RD | CTLFLAG_NOLOCK,
     ostype, 0, "Operating system type");
 
-SYSCTL_INT(_kern, KERN_OSRELDATE, osreldate, CTLFLAG_RD, 
+SYSCTL_INT(_kern, KERN_OSRELDATE, osreldate, CTLFLAG_RD,
     &osreldate, 0, "Operating system release date");
+
+static int tls_extra = RTLD_STATIC_TLS_EXTRA_DEFAULT;
+SYSCTL_INT(_kern, KERN_STATIC_TLS_EXTRA, tls_extra, CTLFLAG_RW | CTLFLAG_NOLOCK,
+    &tls_extra, 0, "Extra static tls space for libraries");
 
 SYSCTL_INT(_kern, KERN_MAXPROC, maxproc, CTLFLAG_RD, 
     &maxproc, 0, "Maximum number of processes");
@@ -109,7 +115,7 @@ SYSCTL_INT(_kern, KERN_ARGMAX, argmax, CTLFLAG_RD,
     0, ARG_MAX, "Maximum bytes of argument to execve(2)");
 
 SYSCTL_INT(_kern, KERN_POSIX1, posix1version, CTLFLAG_RD, 
-    0, _KPOSIX_VERSION, "Version of POSIX attempting to comply to");
+    0, _POSIX_VERSION, "Version of POSIX attempting to comply to");
 
 SYSCTL_INT(_kern, KERN_NGROUPS, ngroups, CTLFLAG_RD, 
     0, NGROUPS_MAX, "Maximum number of groups a user can belong to");
@@ -140,37 +146,56 @@ SYSCTL_INT(_hw, HW_PAGESIZE, pagesize, CTLFLAG_RD,
     0, PAGE_SIZE, "System memory page size");
 
 static char	platform[] = MACHINE_PLATFORM;
-SYSCTL_STRING(_hw, HW_MACHINE_PLATFORM, platform, CTLFLAG_RD,
+SYSCTL_STRING(_hw, HW_MACHINE_PLATFORM, platform, CTLFLAG_RD | CTLFLAG_NOLOCK,
     platform, 0, "Platform architecture");
 
 static char	machine_arch[] = MACHINE_ARCH;
-SYSCTL_STRING(_hw, HW_MACHINE_ARCH, machine_arch, CTLFLAG_RD,
+SYSCTL_STRING(_hw, HW_MACHINE_ARCH, machine_arch, CTLFLAG_RD | CTLFLAG_NOLOCK,
     machine_arch, 0, "Cpu architecture");
 
 char hostname[MAXHOSTNAMELEN];
 
+/*
+ * Hostname sysctl handler.  We use CTLFLAG_NOLOCK to avoid acquiring
+ * the per-oid lock.  The per-cpu SLOCK is still acquired, so to interlock
+ * against setting the hostname we relock with XLOCK.  The result is
+ * that the critical path (just reading the hostname) gets one less lock
+ * and will have improved performance.
+ */
 static int
 sysctl_hostname(SYSCTL_HANDLER_ARGS)
 {
 	struct thread *td = req->td;
 	struct proc *p = td ? td->td_proc : NULL;
+	struct prison *pr;
 	int error;
 
-	if (p && p->p_ucred->cr_prison) {
-		if (!jail_set_hostname_allowed && req->newptr)
+	if (req->newptr) {
+		SYSCTL_SUNLOCK();
+		SYSCTL_XLOCK();
+	}
+	if (p)
+		pr = p->p_ucred->cr_prison;
+	if (p && pr) {
+		if (!PRISON_CAP_ISSET(pr->pr_caps,
+			PRISON_CAP_SYS_SET_HOSTNAME) && req->newptr)
 			return(EPERM);
-		error = sysctl_handle_string(oidp, 
+		error = sysctl_handle_string(oidp,
 		    p->p_ucred->cr_prison->pr_host,
 		    sizeof p->p_ucred->cr_prison->pr_host, req);
 	} else {
-		error = sysctl_handle_string(oidp, 
+		error = sysctl_handle_string(oidp,
 		    hostname, sizeof hostname, req);
+	}
+	if (req->newptr) {
+		SYSCTL_XUNLOCK();
+		SYSCTL_SLOCK();
 	}
 	return (error);
 }
 
-SYSCTL_PROC(_kern, KERN_HOSTNAME, hostname, 
-       CTLTYPE_STRING|CTLFLAG_RW|CTLFLAG_PRISON,
+SYSCTL_PROC(_kern, KERN_HOSTNAME, hostname,
+       CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_PRISON | CTLFLAG_NOLOCK,
        0, 0, sysctl_hostname, "A", "Hostname");
 
 int securelevel = -1;

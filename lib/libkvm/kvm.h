@@ -10,11 +10,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -32,7 +28,6 @@
  *
  *	@(#)kvm.h	8.1 (Berkeley) 6/2/93
  * $FreeBSD: src/lib/libkvm/kvm.h,v 1.11 1999/08/27 23:44:50 peter Exp $
- * $DragonFly: src/lib/libkvm/kvm.h,v 1.7 2007/02/01 10:33:25 corecode Exp $
  */
 
 #ifndef _KVM_H_
@@ -48,43 +43,51 @@
 
 typedef struct __kvm kvm_t;
 
+struct kinfo_file;
 struct kinfo_proc;
-struct proc;
 struct nchstats;
+struct proc;
+struct vm_map;
+struct vm_map_entry;
 
 struct kvm_swap {
-	char	ksw_devname[32];
-	int	ksw_used;
-	int	ksw_total;
+	char	ksw_devname[64];
+	u_int	ksw_used;
+	u_int	ksw_total;
 	int	ksw_flags;
-	int	ksw_reserved1;
-	int	ksw_reserved2;
+	u_int	ksw_reserved1;
+	u_int	ksw_reserved2;
 };
 
 #define SWIF_DUMP_TREE	0x0001
 #define SWIF_DEV_PREFIX	0x0002
 
 __BEGIN_DECLS
-void kvm_nch_cpuagg(struct nchstats *, struct nchstats *, int);
 int	  kvm_close (kvm_t *);
 char	**kvm_getargv (kvm_t *, const struct kinfo_proc *, int);
 char	**kvm_getenvv (kvm_t *, const struct kinfo_proc *, int);
 char	 *kvm_geterr (kvm_t *);
-char	 *kvm_getfiles (kvm_t *, int, int, int *);
+struct kinfo_file *
+	  kvm_getfiles (kvm_t *, int, int, int *);
 int	  kvm_getloadavg (kvm_t *, double [], int);
 struct kinfo_proc *
 	  kvm_getprocs (kvm_t *, int, int, int *);
 int	  kvm_getswapinfo (kvm_t *, struct kvm_swap *, int, int);
+void	  kvm_nch_cpuagg (struct nchstats *, struct nchstats *, int);
 int	  kvm_nlist (kvm_t *, struct nlist *);
-kvm_t	 *kvm_open
-	    (const char *, const char *, const char *, int, const char *);
-kvm_t	 *kvm_openfiles
-	    (const char *, const char *, const char *, int, char *);
-__ssize_t	  kvm_read (kvm_t *, unsigned long, void *, __size_t);
-char	 *kvm_readstr(kvm_t *, u_long, char *, size_t *);
-__ssize_t	  kvm_uread
-	    (kvm_t *, pid_t, unsigned long, char *, __size_t);
-__ssize_t	  kvm_write (kvm_t *, unsigned long, const void *, __size_t);
+kvm_t	 *kvm_open (const char *, const char *, const char *, int,
+		    const char *);
+kvm_t	 *kvm_openfiles (const char *, const char *, const char *, int, char *);
+__ssize_t kvm_read (kvm_t *, unsigned long, void *, __size_t);
+char	 *kvm_readstr (kvm_t *, u_long, char *, size_t *);
+__ssize_t kvm_uread (kvm_t *, pid_t, unsigned long, char *, __size_t);
+__ssize_t kvm_write (kvm_t *, unsigned long, const void *, __size_t);
+struct vm_map_entry *
+	  kvm_vm_map_entry_first (kvm_t *, struct vm_map *,
+				  struct vm_map_entry *);
+struct vm_map_entry *
+	  kvm_vm_map_entry_next (kvm_t *, struct vm_map_entry *,
+				 struct vm_map_entry *);
 __END_DECLS
 
 #endif /* !_KVM_H_ */

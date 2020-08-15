@@ -63,7 +63,6 @@
  * OF SUCH DAMAGE.
  *
  * $FreeBSD: src/sys/netgraph/ng_gif.c,v 1.19 2005/06/10 16:49:21 brooks Exp $
- * $DragonFly: src/sys/netgraph7/ng_gif.c,v 1.2 2008/06/26 23:05:35 dillon Exp $
  */
 
 /*
@@ -311,7 +310,7 @@ ng_gif_glue_af(struct mbuf **mp, int af)
 	 * hopefully everything after that will not
 	 * need one. So let's just use M_PREPEND.
 	 */
-	M_PREPEND(m, sizeof (tmp_af), MB_DONTWAIT);
+	M_PREPEND(m, sizeof (tmp_af), M_NOWAIT);
 	if (m == NULL) {
 		error = ENOBUFS;
 		goto done;
@@ -561,12 +560,12 @@ ng_gif_mod_event(module_t mod, int event, void *data)
 		ng_gif_input_orphan_p = ng_gif_input_orphan;
 
 		/* Create nodes for any already-existing gif interfaces */
-		IFNET_RLOCK();
-		TAILQ_FOREACH(ifp, &ifnet, if_link) {
+		ifnet_lock();
+		TAILQ_FOREACH(ifp, &ifnetlist, if_link) {
 			if (ifp->if_type == IFT_GIF)
 				ng_gif_attach(ifp);
 		}
-		IFNET_RUNLOCK();
+		ifnet_unlock();
 		break;
 
 	case MOD_UNLOAD:

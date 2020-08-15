@@ -4,13 +4,17 @@ LDNS
 Original source can be downloaded from:
 http://www.nlnetlabs.nl/downloads/ldns/
 
-file = ldns-1.6.16.tar.gz
-date = 13 November 2012
-size = 1109941
-sha1 = 5b4fc6c5c3078cd061905c47178478cb1015c62a
+file = ldns-1.7.1.tar.gz
+date = 26 July 2019
+size = 1244394
+sha1 = d075a08972c0f573101fb4a6250471daaa53cb3e
 
 A list of files and directories removed is in README.DELETED
 
-The following files have been patched:
+Use "git diff vendor/LDNS contrib/ldns" to see local modifications.
 
-dnssec_verify.c - to silence -Winit-self and not have to lower WARNS
+Configured with
+===============
+./configure --prefix=/usr --disable-rpath --disable-dane-ta-usage --with-drill \
+	    --with-trust-anchor=/usr/local/etc/unbound/root.key \
+	    ac_cv_header_dlfcn_h=no

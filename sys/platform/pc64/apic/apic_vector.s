@@ -34,8 +34,8 @@
 
 #define MPLOCKED     lock ;
 
-#define APIC_PUSH_FRAME							\
-	PUSH_FRAME ;		/* 15 regs + space for 5 extras */	\
+#define APIC_PUSH_FRAME_TFRIP						\
+	PUSH_FRAME_TFRIP ;	/* 15 regs + space for 5 extras */	\
 	movq $0,TF_XFLAGS(%rsp) ;					\
 	movq $0,TF_TRAPNO(%rsp) ;					\
 	movq $0,TF_ADDR(%rsp) ;						\
@@ -48,8 +48,8 @@
  * segment register being changed (e.g. by procfs), which is why syscalls
  * have to use doreti.
  */
-#define APIC_POP_FRAME							\
-	POP_FRAME ;							\
+#define APIC_POP_FRAME(lastinsn)					\
+	POP_FRAME(lastinsn) 						\
 
 #define IOAPICADDR(irq_num) \
 	CNAME(ioapic_irqs) + IOAPIC_IRQI_SIZE * (irq_num) + IOAPIC_IRQI_ADDR
@@ -118,11 +118,11 @@
 	.text ;								\
 	SUPERALIGN_TEXT ;						\
 IDTVEC(ioapic_intr##irq_num) ;						\
-	APIC_PUSH_FRAME ;						\
+	APIC_PUSH_FRAME_TFRIP ;						\
 	FAKE_MCOUNT(TF_RIP(%rsp)) ;					\
 	MASK_LEVEL_IRQ(irq_num) ;					\
-	movq	lapic, %rax ;						\
-	movl	$0, LA_EOI(%rax) ;					\
+	movq	lapic_eoi, %rax ;					\
+	callq	*%rax ;							\
 	movq	PCPU(curthread),%rbx ;					\
 	testl	$-1,TD_NEST_COUNT(%rbx) ;				\
 	jne	1f ;							\
@@ -149,6 +149,7 @@ IDTVEC(ioapic_intr##irq_num) ;						\
 	incl	TD_CRITCOUNT(%rbx) ;					\
 	sti ;								\
 	call	ithread_fast_handler ;	/* returns 0 to unmask */	\
+	cli ;				/* interlock avoid stacking */	\
 	decl	TD_CRITCOUNT(%rbx) ;					\
 	addq	$8, %rsp ;		/* intrframe -> trapframe */	\
 	UNMASK_IRQ(irq_num) ;						\
@@ -171,12 +172,11 @@ IDTVEC(ioapic_intr##irq_num) ;						\
 	SUPERALIGN_TEXT
 	.globl Xspuriousint
 Xspuriousint:
-	APIC_PUSH_FRAME
+	APIC_PUSH_FRAME_TFRIP
 	/* No EOI cycle used here */
 	FAKE_MCOUNT(TF_RIP(%rsp))
 	MEXITCOUNT
-	APIC_POP_FRAME
-	jmp	doreti_iret
+	APIC_POP_FRAME(jmp doreti_iret)
 
 /*
  * Handle TLB shootdowns.
@@ -187,17 +187,40 @@ Xspuriousint:
 	SUPERALIGN_TEXT
 	.globl	Xinvltlb
 Xinvltlb:
-	APIC_PUSH_FRAME
-	movq	lapic, %rax
-	movl	$0, LA_EOI(%rax)	/* End Of Interrupt to APIC */
+	APIC_PUSH_FRAME_TFRIP
+	movq	lapic_eoi, %rax
+	callq	*%rax			/* End Of Interrupt to APIC */
 	FAKE_MCOUNT(TF_RIP(%rsp))
+	incl    PCPU(cnt) + V_IPI
+	movq	PCPU(curthread),%rbx
+	incl    PCPU(intr_nesting_level)
+	incl    TD_CRITCOUNT(%rbx)
 	subq	$8,%rsp			/* make same as interrupt frame */
 	movq	%rsp,%rdi		/* pass frame by reference */
-	call	smp_invltlb_intr
+	call	smp_inval_intr		/* called w/interrupts disabled */
 	addq	$8,%rsp			/* turn into trapframe */
+	decl	TD_CRITCOUNT(%rbx)
+	decl	PCPU(intr_nesting_level)
 	MEXITCOUNT
-	APIC_POP_FRAME
-	jmp	doreti_iret
+	/*APIC_POP_FRAME*/
+	jmp	doreti			/* doreti b/c intrs enabled */
+
+/*
+ * Handle sniffs - sniff %rip and %rsp.
+ */
+	.text
+	SUPERALIGN_TEXT
+	.globl	Xsniff
+Xsniff:
+	APIC_PUSH_FRAME_TFRIP
+	movq	lapic_eoi, %rax
+	callq	*%rax			/* End Of Interrupt to APIC */
+	FAKE_MCOUNT(TF_RIP(%rsp))
+	incl    PCPU(cnt) + V_IPI
+	movq	%rsp,%rdi
+	call	CNAME(hard_sniff)	/* systat -pv and flame sniff */
+	MEXITCOUNT
+	APIC_POP_FRAME(jmp doreti_iret)
 
 /*
  * Executed by a CPU when it receives an Xcpustop IPI from another CPU,
@@ -213,9 +236,9 @@ Xinvltlb:
 	SUPERALIGN_TEXT
 	.globl Xcpustop
 Xcpustop:
-	APIC_PUSH_FRAME
-	movq	lapic, %rax
-	movl	$0, LA_EOI(%rax)	/* End Of Interrupt to APIC */
+	APIC_PUSH_FRAME_TFRIP
+	movq	lapic_eoi, %rax
+	callq	*%rax			/* End Of Interrupt to APIC */
 
 	movl	PCPU(cpuid), %eax
 	imull	$PCB_SIZE, %eax
@@ -242,6 +265,10 @@ Xcpustop:
 	MPLOCKED orq %rax, stopped_cpus+16
 	movq	PCPU(cpumask)+24,%rax
 	MPLOCKED orq %rax, stopped_cpus+24
+
+	movq	PCPU(curthread),%rbx
+	incl    PCPU(intr_nesting_level)
+	incl    TD_CRITCOUNT(%rbx)
 	sti
 1:
 	andl	$~RQF_IPIQ,PCPU(reqflags)
@@ -292,9 +319,11 @@ Xcpustop:
 
 	call	*%rax
 2:
+	decl	TD_CRITCOUNT(%rbx)
+	decl	PCPU(intr_nesting_level)
 	MEXITCOUNT
-	APIC_POP_FRAME
-	jmp	doreti_iret
+	/*APIC_POP_FRAME*/
+	jmp	doreti
 
 	/*
 	 * For now just have one ipiq IPI, but what we really want is
@@ -305,9 +334,9 @@ Xcpustop:
 	SUPERALIGN_TEXT
 	.globl Xipiq
 Xipiq:
-	APIC_PUSH_FRAME
-	movq	lapic, %rax
-	movl	$0, LA_EOI(%rax)	/* End Of Interrupt to APIC */
+	APIC_PUSH_FRAME_TFRIP
+	movq	lapic_eoi, %rax
+	callq	*%rax			/* End Of Interrupt to APIC */
 	FAKE_MCOUNT(TF_RIP(%rsp))
 
 	incl    PCPU(cnt) + V_IPI
@@ -318,8 +347,11 @@ Xipiq:
 	movq	%rsp,%rdi		/* pass frame by reference */
 	incl	PCPU(intr_nesting_level)
 	incl	TD_CRITCOUNT(%rbx)
+	subq	%rax,%rax
 	sti
+	xchgl	%eax,PCPU(npoll)	/* (atomic op) allow another Xipi */
 	call	lwkt_process_ipiq_frame
+	cli 				/* interlock avoid stacking */
 	decl	TD_CRITCOUNT(%rbx)
 	decl	PCPU(intr_nesting_level)
 	addq	$8,%rsp			/* turn into trapframe */
@@ -328,21 +360,20 @@ Xipiq:
 1:
 	orl	$RQF_IPIQ,PCPU(reqflags)
 	MEXITCOUNT
-	APIC_POP_FRAME
-	jmp	doreti_iret
+	APIC_POP_FRAME(jmp doreti_iret)
 
 	.text
 	SUPERALIGN_TEXT
 	.globl Xtimer
 Xtimer:
-	APIC_PUSH_FRAME
-	movq	lapic, %rax
-	movl	$0, LA_EOI(%rax)	/* End Of Interrupt to APIC */
+	APIC_PUSH_FRAME_TFRIP
+	movq	lapic_eoi, %rax
+	callq	*%rax			/* End Of Interrupt to APIC */
 	FAKE_MCOUNT(TF_RIP(%rsp))
 
 	subq	$8,%rsp			/* make same as interrupt frame */
 	movq	%rsp,%rdi		/* pass frame by reference */
-	call	lapic_timer_always
+	call	pcpu_timer_always
 	addq	$8,%rsp			/* turn into trapframe */
 
 	incl    PCPU(cnt) + V_TIMER
@@ -358,7 +389,8 @@ Xtimer:
 	incl	PCPU(intr_nesting_level)
 	incl	TD_CRITCOUNT(%rbx)
 	sti
-	call	lapic_timer_process_frame
+	call	pcpu_timer_process_frame
+	cli 				/* interlock avoid stacking */
 	decl	TD_CRITCOUNT(%rbx)
 	decl	PCPU(intr_nesting_level)
 	addq	$8,%rsp			/* turn into trapframe */
@@ -367,8 +399,7 @@ Xtimer:
 1:
 	orl	$RQF_TIMER,PCPU(reqflags)
 	MEXITCOUNT
-	APIC_POP_FRAME
-	jmp	doreti_iret
+	APIC_POP_FRAME(jmp doreti_iret)
 
 MCOUNT_LABEL(bintr)
 	INTR_HANDLER(0)

@@ -28,7 +28,7 @@
 .\"     @(#)pstat.8	8.5 (Berkeley) 5/13/94
 .\" $FreeBSD: src/usr.sbin/pstat/pstat.8,v 1.19.2.10 2002/07/12 09:12:49 des Exp $
 .\"
-.Dd November 27, 2013
+.Dd December 10, 2014
 .Dt PSTAT 8
 .Os
 .Sh NAME
@@ -37,14 +37,12 @@
 .Nd display system data structures
 .Sh SYNOPSIS
 .Nm
-.Op Fl Tfknst
+.Op Fl Tfhknst
 .Op Fl M Ar core
 .Op Fl N Ar system
 .Pp
 .Nm swapinfo
-.Op Fl g
-.Op Fl k
-.Op Fl m
+.Op Fl ghkm
 .Op Fl M Ar core
 .Op Fl N Ar system
 .Sh DESCRIPTION
@@ -57,15 +55,19 @@ If invoked as
 the
 .Fl s
 option is implied, and only the
-.Fl k , m ,
+.Fl h , k , m , g , M
 and
-.Fl g
+.Fl N
 options are legal.
 .Pp
 The following options are available:
 .Bl -tag -width indent
 .It Fl n
 Print devices out by major/minor instead of name.
+.It Fl h
+Print sizes with human-readable scaling.
+.Ev BLOCKSIZE
+is ignored.
 .It Fl k
 Print sizes in kilobytes, regardless of the setting of the
 .Ev BLOCKSIZE

@@ -29,7 +29,6 @@
  * @(#) Copyright (c) 1983, 1992, 1993 The Regents of the University of California.  All rights reserved.
  * @(#)dumpfs.c	8.5 (Berkeley) 4/29/95
  * $FreeBSD: src/sbin/dumpfs/dumpfs.c,v 1.13.2.1 2001/01/22 18:10:11 iedowse Exp $
- * $DragonFly: src/sbin/dumpfs/dumpfs.c,v 1.10 2008/08/07 11:15:45 swildner Exp $
  */
 
 #include <sys/param.h>
@@ -46,25 +45,25 @@
 #include <string.h>
 #include <unistd.h>
 
-union {
+static union {
 	struct fs fs;
 	char pad[MAXBSIZE];
 } fsun;
 #define	afs	fsun.fs
 
-union {
+static union {
 	struct cg cg;
 	char pad[MAXBSIZE];
 } cgun;
 #define	acg	cgun.cg
 
-long	dev_bsize = 1;
+static long	dev_bsize = 1;
 
-int	dumpfs(char *);
-int	dumpcg(char *, int, int);
-int	marshal(const char*);
-void	pbits(void *, int);
-void	usage(void);
+static int	dumpfs(char *);
+static int	dumpcg(char *, int, int);
+static int	marshal(const char*);
+static void	pbits(void *, int);
+static void	usage(void) __dead2;
 
 int
 main(int argc, char **argv)
@@ -103,11 +102,12 @@ main(int argc, char **argv)
 	exit(eval);
 }
 
-int
+static int
 dumpfs(char *name)
 {
 	ssize_t n;
 	int fd, c, i, j, k, size;
+	time_t fs_time;
 
 	if ((fd = open(name, O_RDONLY, 0)) < 0)
 		goto err;
@@ -131,8 +131,8 @@ dumpfs(char *name)
 	if (afs.fs_postblformat == FS_42POSTBLFMT)
 		afs.fs_nrpos = 8;
 	dev_bsize = afs.fs_fsize / fsbtodb(&afs, 1);
-	printf("magic\t%x\ttime\t%s", afs.fs_magic,
-	    ctime((time_t *)&afs.fs_time));
+	fs_time = afs.fs_time;
+	printf("magic\t%x\ttime\t%s", afs.fs_magic, ctime(&fs_time));
 	printf("id\t[ %x %x ]\n", afs.fs_id[0], afs.fs_id[1]);
 	printf("cylgrp\t%s\tinodes\t%s\n",
 	    afs.fs_postblformat == FS_42POSTBLFMT ? "static" : "dynamic",
@@ -162,7 +162,7 @@ dumpfs(char *name)
 	    afs.fs_contigsumsize);
 	printf("nindir\t%d\tinopb\t%d\tnspf\t%d\tmaxfilesize\t%ju\n",
 	    afs.fs_nindir, afs.fs_inopb, afs.fs_nspf,
-	    (intmax_t)afs.fs_maxfilesize);
+	    (uintmax_t)afs.fs_maxfilesize);
 	printf("sblkno\t%d\tcblkno\t%d\tiblkno\t%d\tdblkno\t%d\n",
 	    afs.fs_sblkno, afs.fs_cblkno, afs.fs_iblkno, afs.fs_dblkno);
 	printf("sbsize\t%d\tcgsize\t%d\tcgoffset %d\tcgmask\t0x%08x\n",
@@ -242,11 +242,12 @@ err:	if (fd != -1)
 	return (1);
 };
 
-int
+static int
 dumpcg(char *name, int fd, int c)
 {
 	off_t cur;
 	int i, j;
+	time_t cg_time;
 
 	printf("\ncg %d:\n", c);
 	if ((cur = lseek(fd, (off_t)(fsbtodb(&afs, cgtod(&afs, c))) *
@@ -256,10 +257,11 @@ dumpcg(char *name, int fd, int c)
 		warnx("%s: error reading cg", name);
 		return (1);
 	}
+	cg_time = acg.cg_time;
 	printf("magic\t%x\ttell\t%jx\ttime\t%s",
 	    afs.fs_postblformat == FS_42POSTBLFMT ?
 	    ((struct ocg *)&acg)->cg_magic : acg.cg_magic,
-	    (intmax_t)cur, ctime((time_t *)&acg.cg_time));
+	    (uintmax_t)cur, ctime(&cg_time));
 	printf("cgx\t%d\tncyl\t%d\tniblk\t%d\tndblk\t%d\n",
 	    acg.cg_cgx, acg.cg_ncyl, acg.cg_niblk, acg.cg_ndblk);
 	printf("nbfree\t%d\tndir\t%d\tnifree\t%d\tnffree\t%d\n",
@@ -307,7 +309,7 @@ dumpcg(char *name, int fd, int c)
 	return (0);
 };
 
-int
+static int
 marshal(const char *name)
 {
 	ssize_t n;
@@ -381,7 +383,7 @@ err:    if (fd != -1)
 
 }
 
-void
+static void
 pbits(void *vp, int max)
 {
 	int i;
@@ -403,7 +405,7 @@ pbits(void *vp, int max)
 	printf("\n");
 }
 
-void
+static void
 usage(void)
 {
 	fprintf(stderr, "usage: dumpfs filesys | device\n");

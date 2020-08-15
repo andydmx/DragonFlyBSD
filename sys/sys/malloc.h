@@ -10,11 +10,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -44,29 +40,23 @@
 #include <machine/types.h>	/* vm_paddr_t and __* types */
 #endif
 
-#ifndef _MACHINE_PARAM_H_
-#include <machine/param.h>	/* for SMP_MAXCPU */
-#endif
-
-#if defined(_KERNEL) || defined(_KERNEL_STRUCTURES)
-
-#endif	/* _KERNEL */
-
 /*
  * flags to malloc.
  */
-#define	M_RNOWAIT     	0x0001	/* do not block */
-#define	M_WAITOK     	0x0002	/* wait for resources / alloc from cache */
-#define	M_ZERO       	0x0100	/* bzero() the allocation */
+#define	M_RNOWAIT	0x0001	/* do not block */
+#define	M_WAITOK	0x0002	/* wait for resources / alloc from cache */
+#define	M_ZERO		0x0100	/* bzero() the allocation */
 #define	M_USE_RESERVE	0x0200	/* can eat into free list reserve */
 #define	M_NULLOK	0x0400	/* ok to return NULL */
-#define M_PASSIVE_ZERO	0x0800	/* (internal to the slab code only) */
-#define M_USE_INTERRUPT_RESERVE \
+#define	M_PASSIVE_ZERO	0x0800	/* (internal to the slab code only) */
+#define	M_USE_INTERRUPT_RESERVE \
 			0x1000	/* can exhaust free list entirely */
-#define M_POWEROF2	0x2000	/* roundup size to the nearest power of 2 */
+#define	M_POWEROF2	0x2000	/* roundup size to the nearest power of 2 */
+#define	M_CACHEALIGN	0x4000	/* force CPU cache line alignment */
+/* GFP_DMA32 0x10000 reserved for drm layer (not handled by kmalloc) */
 
 /*
- * M_NOWAIT has to be a set of flags for equivalence to prior use. 
+ * M_NOWAIT has to be a set of flags for equivalence to prior use.
  *
  * M_SYSALLOC should be used for any critical infrastructure allocations
  * made by the kernel proper.
@@ -77,7 +67,7 @@
  *
  * NOTE ON DRAGONFLY USE OF M_NOWAIT.  In FreeBSD M_NOWAIT allocations
  * almost always succeed.  In DragonFly, however, there is a good chance
- * that an allocation will fail.  M_NOWAIT should only be used when 
+ * that an allocation will fail.  M_NOWAIT should only be used when
  * allocations can fail without any serious detriment to the system.
  *
  * Note that allocations made from (preempted) interrupts will attempt to
@@ -96,53 +86,30 @@
 
 #define	M_MAGIC		877983977	/* time when first defined :-) */
 
-/*
- * The malloc tracking structure.  Note that per-cpu entries must be
- * aggregated for accurate statistics, they do not actually break the
- * stats down by cpu (e.g. the cpu freeing memory will subtract from
- * its slot, not the originating cpu's slot).
- *
- * SMP_MAXCPU is used so modules which use malloc remain compatible
- * between UP and SMP.
- */
-struct malloc_type {
-	struct malloc_type *ks_next;	/* next in list */
-	size_t 	ks_memuse[SMP_MAXCPU];	/* total memory held in bytes */
-	size_t	ks_loosememuse;		/* (inaccurate) aggregate memuse */
-	size_t	ks_limit;	/* most that are allowed to exist */
-	long	ks_size;	/* sizes of this thing that are allocated */
-	size_t	ks_inuse[SMP_MAXCPU]; /* # of allocs currently in use */
-	__int64_t ks_calls;	/* total packets of this type ever allocated */
-	long	ks_maxused;	/* maximum number ever used */
-	__uint32_t ks_magic;	/* if it's not magic, don't touch it */
-	const char *ks_shortdesc;	/* short description */
-	__uint16_t ks_limblocks; /* number of times blocked for hitting limit */
-	__uint16_t ks_mapblocks; /* number of times blocked for kernel map */
-	long	ks_reserved[4];	/* future use (module compatibility) */
-};
-
-typedef struct malloc_type	*malloc_type_t;
-
 #if defined(_KERNEL) || defined(_KERNEL_STRUCTURES)
-
-#define	MALLOC_DEFINE(type, shortdesc, longdesc)	\
-	struct malloc_type type[1] = { 			\
-	    { NULL, { 0 }, 0, 0, 0, { 0 }, 0, 0, M_MAGIC, shortdesc, 0, 0, { 0 } } \
-	}; 								    \
-	SYSINIT(type##_init, SI_BOOT1_KMALLOC, SI_ORDER_ANY, malloc_init, type); \
-	SYSUNINIT(type##_uninit, SI_BOOT1_KMALLOC, SI_ORDER_ANY, malloc_uninit, type)
-
-#else
-
-#define	MALLOC_DEFINE(type, shortdesc, longdesc)	\
-	struct malloc_type type[1] = { 			\
-	    { NULL, { 0 }, 0, 0, 0, { 0 }, 0, 0, M_MAGIC, shortdesc, 0, 0 } \
-	};
-
+#include <sys/_malloc.h>		/* struct malloc_type */
+#ifndef NULL
+#include <sys/_null.h>			/* ensure NULL is defined */
+#endif
 #endif
 
-#define	MALLOC_DECLARE(type) \
-	extern struct malloc_type type[1]
+#if defined(_KERNEL) || defined(_KERNEL_STRUCTURES)
+#define	MALLOC_DEFINE(type, shortdesc, longdesc)			\
+	struct malloc_type type[1] = {					\
+	    { NULL, 0, 0, 0, 0, M_MAGIC, shortdesc, 0,			\
+	      &type[0].ks_use0, { 0, 0, 0, 0 } }			\
+	};								\
+	SYSINIT(type##_init, SI_BOOT1_KMALLOC, SI_ORDER_ANY,		\
+	    malloc_init, type);						\
+	SYSUNINIT(type##_uninit, SI_BOOT1_KMALLOC, SI_ORDER_ANY,	\
+	    malloc_uninit, type)
+#else
+#define	MALLOC_DEFINE(type, shortdesc, longdesc)			\
+	struct malloc_type type[1] = {					\
+	    { NULL, 0, 0, 0, 0, M_MAGIC, shortdesc, 0,			\
+	      &type[0].ks_use0, { 0, 0, 0, 0 } 				\
+	}
+#endif
 
 #ifdef _KERNEL
 
@@ -159,59 +126,113 @@ MALLOC_DECLARE(M_IP6NDP); /* for INET6 */
 
 #define	MINALLOCSIZE	sizeof(void *)
 
-/*
- * XXX this should be declared in <sys/uio.h>, but that tends to fail
- * because <sys/uio.h> is included in a header before the source file
- * has a chance to include <sys/malloc.h> to get MALLOC_DECLARE() defined.
- */
-MALLOC_DECLARE(M_IOV);
-
 /* XXX struct malloc_type is unused for contig*(). */
 size_t  kmem_lim_size(void);
 void	contigfree(void *addr, unsigned long size, struct malloc_type *type)
 	    __nonnull(1);
-void	*contigmalloc (unsigned long size, struct malloc_type *type,
-			   int flags, vm_paddr_t low, vm_paddr_t high,
-			   unsigned long alignment, unsigned long boundary)
-	    __heedresult;
-void	malloc_init (void *);
-void	malloc_uninit (void *);
+void	*contigmalloc(unsigned long size, struct malloc_type *type, int flags,
+		      vm_paddr_t low, vm_paddr_t high, unsigned long alignment,
+		      unsigned long boundary) __malloclike __heedresult
+		      __alloc_size(1) __alloc_align(6);
+void	malloc_init(void *);
+void	malloc_uninit(void *);
+void	malloc_reinit_ncpus(void);
 void	kmalloc_raise_limit(struct malloc_type *type, size_t bytes);
+void	kmalloc_set_unlimited(struct malloc_type *type);
 void	kmalloc_create(struct malloc_type **typep, const char *descr);
 void	kmalloc_destroy(struct malloc_type **typep);
 
+/*
+ * Debug and non-debug kmalloc() prototypes.
+ *
+ * The kmalloc() macro allows M_ZERO to be optimized external to
+ * the kmalloc() function.  When combined with the use a builtin
+ * for bzero() this can get rid of a considerable amount of overhead
+ * for M_ZERO based kmalloc() calls.
+ */
 #ifdef SLAB_DEBUG
-void	*kmalloc_debug (unsigned long size, struct malloc_type *type, int flags,
-			const char *file, int line) __heedresult;
-void	*krealloc_debug (void *addr, unsigned long size,
+void	*kmalloc_debug(unsigned long size, struct malloc_type *type, int flags,
+			const char *file, int line) __malloclike __heedresult
+			__alloc_size(1);
+void	*krealloc_debug(void *addr, unsigned long size,
 			struct malloc_type *type, int flags,
-			const char *file, int line) __heedresult;
-char	*kstrdup_debug (const char *, struct malloc_type *,
-			const char *file, int line) __heedresult;
-#define kmalloc(size, type, flags)		\
-	kmalloc_debug(size, type, flags, __FILE__, __LINE__)
+			const char *file, int line) __heedresult __alloc_size(2);
+char	*kstrdup_debug(const char *, struct malloc_type *,
+			const char *file, int line) __malloclike __heedresult;
+char	*kstrndup_debug(const char *, size_t maxlen, struct malloc_type *,
+			const char *file, int line) __malloclike __heedresult;
+#if 1
+#define _kmalloc(size, type, flags) ({					\
+	void *_malloc_item;						\
+	size_t _size = (size);						\
+									\
+	if (__builtin_constant_p(size) &&				\
+	    __builtin_constant_p(flags) &&				\
+	    ((flags) & M_ZERO)) {					\
+		_malloc_item = kmalloc_debug(_size, type,		\
+					    (flags) & ~M_ZERO,		\
+					    __FILE__, __LINE__);	\
+		if (((flags) & (M_WAITOK|M_NULLOK)) == M_WAITOK ||	\
+		    __predict_true(_malloc_item != NULL)) {		\
+			__builtin_memset(_malloc_item, 0, _size);	\
+		}							\
+	} else {							\
+	    _malloc_item = kmalloc_debug(_size, type, flags,		\
+				   __FILE__, __LINE__);			\
+	}								\
+	_malloc_item;							\
+})
+#else
+#define _kmalloc(size, type, flags)	\
+	kmalloc_debug(_size, type, flags, __FILE__, __LINE__);
+#endif
+#define kmalloc(size, type, flags)	_kmalloc(size, type, flags)
 #define krealloc(addr, size, type, flags)	\
 	krealloc_debug(addr, size, type, flags, __FILE__, __LINE__)
 #define kstrdup(str, type)			\
 	kstrdup_debug(str, type, __FILE__, __LINE__)
-#else
-void	*kmalloc (unsigned long size, struct malloc_type *type, int flags)
-	    __heedresult;
-void	*krealloc (void *addr, unsigned long size,
-		      struct malloc_type *type, int flags) __heedresult;
-char	*kstrdup (const char *, struct malloc_type *) __heedresult;
+#define kstrndup(str, maxlen, type)			\
+	kstrndup_debug(str, maxlen, type, __FILE__, __LINE__)
+
+#else	/* !SLAB_DEBUG */
+
+void	*kmalloc(unsigned long size, struct malloc_type *type, int flags)
+		 __malloclike __heedresult __alloc_size(1);
+static __inline __always_inline void *
+_kmalloc(size_t _size, struct malloc_type *_type, int _flags)
+{
+#if 1
+	if (__builtin_constant_p(_size) && __builtin_constant_p(_flags) &&
+	    (_flags & M_ZERO)) {
+		void *_malloc_item;
+		_malloc_item = kmalloc(_size, _type, _flags & ~M_ZERO);
+		if ((_flags & (M_WAITOK|M_NULLOK)) == M_WAITOK ||
+		    __predict_true(_malloc_item != NULL)) {
+			__builtin_memset(_malloc_item, 0, _size);
+		}
+		return _malloc_item;
+	}
+#endif
+	return (kmalloc(_size, _type, _flags));
+}
+#define kmalloc(size, type, flags)	_kmalloc((size), (type), (flags))
+void	*krealloc(void *addr, unsigned long size, struct malloc_type *type,
+		  int flags) __heedresult __alloc_size(2);
+char	*kstrdup(const char *, struct malloc_type *)
+		 __malloclike __heedresult;
+char	*kstrndup(const char *, size_t maxlen, struct malloc_type *)
+		  __malloclike __heedresult;
 #define kmalloc_debug(size, type, flags, file, line)		\
 	kmalloc(size, type, flags)
 #define krealloc_debug(addr, size, type, flags, file, line)	\
 	krealloc(addr, size, type, flags)
 #define kstrdup_debug(str, type, file, line)			\
 	kstrdup(str, type)
+#define kstrndup_debug(str, maxlen, type, file, line)		\
+	kstrndup(str, maxlen, type)
 #endif
-void	*kmalloc_cachealign (unsigned long size, struct malloc_type *type,
-			   int flags) __heedresult;
-void	kfree(void *addr, struct malloc_type *type)
-	    __nonnull(1) __nonnull(2);
-long	kmalloc_limit (struct malloc_type *type);
+void	kfree(void *addr, struct malloc_type *type) __nonnull(2);
+long	kmalloc_limit(struct malloc_type *type);
 void	slab_cleanup(void);
 
 #endif /* _KERNEL */

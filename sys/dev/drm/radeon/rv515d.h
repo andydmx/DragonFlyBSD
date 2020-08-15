@@ -24,8 +24,6 @@
  * Authors: Dave Airlie
  *          Alex Deucher
  *          Jerome Glisse
- *
- * $FreeBSD: head/sys/dev/drm2/radeon/rv515d.h 254885 2013-08-25 19:37:15Z dumbbell $
  */
 #ifndef __RV515D_H__
 #define __RV515D_H__
@@ -206,17 +204,6 @@
 #define PACKET3(op, n)	(CP_PACKET3 |					\
 			 REG_SET(PACKET3_IT_OPCODE, (op)) |		\
 			 REG_SET(PACKET3_COUNT, (n)))
-
-#define	PACKET_TYPE0	0
-#define	PACKET_TYPE1	1
-#define	PACKET_TYPE2	2
-#define	PACKET_TYPE3	3
-
-#define CP_PACKET_GET_TYPE(h) (((h) >> 30) & 3)
-#define CP_PACKET_GET_COUNT(h) (((h) >> 16) & 0x3FFF)
-#define CP_PACKET0_GET_REG(h) (((h) & 0x1FFF) << 2)
-#define CP_PACKET0_GET_ONE_REG_WR(h) (((h) >> 15) & 1)
-#define CP_PACKET3_GET_OPCODE(h) (((h) >> 8) & 0xFF)
 
 /* Registers */
 #define R_0000F0_RBBM_SOFT_RESET                     0x0000F0

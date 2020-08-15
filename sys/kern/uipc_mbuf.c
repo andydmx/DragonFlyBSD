@@ -80,9 +80,9 @@
 #include <sys/protosw.h>
 #include <sys/uio.h>
 #include <sys/thread.h>
+#include <sys/proc.h>
 #include <sys/globaldata.h>
 
-#include <sys/thread2.h>
 #include <sys/spinlock2.h>
 
 #include <machine/atomic.h>
@@ -230,7 +230,7 @@ SYSCTL_PROC(_kern_ipc, OID_AUTO, showmbufs, CTLFLAG_RD|CTLTYPE_STRING,
 #endif
 
 static void mbinit(void *);
-SYSINIT(mbuf, SI_BOOT2_MACHDEP, SI_ORDER_FIRST, mbinit, NULL)
+SYSINIT(mbuf, SI_BOOT2_MACHDEP, SI_ORDER_FIRST, mbinit, NULL);
 
 struct mbtypes_stat {
 	u_long	stats[MT_NTYPES];
@@ -255,6 +255,8 @@ struct objcache *mbuf_cache, *mbufphdr_cache;
 struct objcache *mclmeta_cache, *mjclmeta_cache;
 struct objcache *mbufcluster_cache, *mbufphdrcluster_cache;
 struct objcache *mbufjcluster_cache, *mbufphdrjcluster_cache;
+
+struct lock	mbupdate_lk = LOCK_INITIALIZER("mbupdate", 0, LK_CANRECURSE);
 
 int		nmbclusters;
 static int	nmbjclusters;
@@ -295,8 +297,7 @@ do_mbstat(SYSCTL_HANDLER_ARGS)
 	bzero(&mbstat_total, sizeof(mbstat_total));
 	mbstat_totalp = &mbstat_total;
 
-	for (i = 0; i < ncpus; i++)
-	{
+	for (i = 0; i < ncpus; i++) {
 		mbstat_total.m_mbufs += mbstat[i].m_mbufs;	
 		mbstat_total.m_clusters += mbstat[i].m_clusters;	
 		mbstat_total.m_jclusters += mbstat[i].m_jclusters;	
@@ -330,8 +331,7 @@ do_mbtypes(SYSCTL_HANDLER_ARGS)
 	for (i = 0; i < MT_NTYPES; i++)
 		totals[i] = 0;
 
-	for (i = 0; i < ncpus; i++)
-	{
+	for (i = 0; i < ncpus; i++) {
 		for (j = 0; j < MT_NTYPES; j++)
 			totals[j] += mbtypes[i].stats[j];
 	}
@@ -340,16 +340,24 @@ do_mbtypes(SYSCTL_HANDLER_ARGS)
 }
 
 /*
- * These are read-only because we do not currently have any code
- * to adjust the objcache limits after the fact.  The variables
- * may only be set as boot-time tunables.
+ * The variables may be set as boot-time tunables or live.  Setting these
+ * values too low can deadlock your network.  Network interfaces may also
+ * adjust nmbclusters and/or nmbjclusters to account for preloading the
+ * hardware rings.
  */
-SYSCTL_INT(_kern_ipc, KIPC_NMBCLUSTERS, nmbclusters, CTLFLAG_RD,
-	   &nmbclusters, 0, "Maximum number of mbuf clusters available");
-SYSCTL_INT(_kern_ipc, OID_AUTO, nmbufs, CTLFLAG_RD, &nmbufs, 0,
-	   "Maximum number of mbufs available");
-SYSCTL_INT(_kern_ipc, OID_AUTO, nmbjclusters, CTLFLAG_RD, &nmbjclusters, 0,
+static int sysctl_nmbclusters(SYSCTL_HANDLER_ARGS);
+static int sysctl_nmbjclusters(SYSCTL_HANDLER_ARGS);
+static int sysctl_nmbufs(SYSCTL_HANDLER_ARGS);
+SYSCTL_PROC(_kern_ipc, KIPC_NMBCLUSTERS, nmbclusters, CTLTYPE_INT | CTLFLAG_RW,
+	   0, 0, sysctl_nmbclusters, "I",
+	   "Maximum number of mbuf clusters available");
+SYSCTL_PROC(_kern_ipc, OID_AUTO, nmbjclusters, CTLTYPE_INT | CTLFLAG_RW,
+	   0, 0, sysctl_nmbjclusters, "I",
 	   "Maximum number of mbuf jclusters available");
+SYSCTL_PROC(_kern_ipc, OID_AUTO, nmbufs, CTLTYPE_INT | CTLFLAG_RW,
+	   0, 0, sysctl_nmbufs, "I",
+	   "Maximum number of mbufs available");
+
 SYSCTL_INT(_kern_ipc, OID_AUTO, mjclph_cachefrac, CTLFLAG_RD,
 	   &mjclph_cachefrac, 0,
 	   "Fraction of cacheable mbuf jclusters w/ pkthdr");
@@ -384,31 +392,42 @@ static void m_mclref(void *arg);
 static void m_mclfree(void *arg);
 static void m_mjclfree(void *arg);
 
+static void mbupdatelimits(void);
+
 /*
+ * Generally scale default mbufs to maxproc.
+ *
  * NOTE: Default NMBUFS must take into account a possible DOS attack
  *	 using fd passing on unix domain sockets.
  */
 #ifndef NMBCLUSTERS
-#define NMBCLUSTERS	(512 + maxusers * 16)
+#define NMBCLUSTERS	(512 + maxproc * 4)
+#endif
+#ifndef BASE_CACHEFRAC
+#define BASE_CACHEFRAC	16
 #endif
 #ifndef MJCLPH_CACHEFRAC
-#define MJCLPH_CACHEFRAC 16
+#define MJCLPH_CACHEFRAC (BASE_CACHEFRAC * 2)
 #endif
 #ifndef MJCL_CACHEFRAC
-#define MJCL_CACHEFRAC	4
+#define MJCL_CACHEFRAC	(BASE_CACHEFRAC * 2)
 #endif
 #ifndef MCLPH_CACHEFRAC
-#define MCLPH_CACHEFRAC	16
+#define MCLPH_CACHEFRAC	(BASE_CACHEFRAC * 2)
 #endif
 #ifndef MCL_CACHEFRAC
-#define MCL_CACHEFRAC	4
+#define MCL_CACHEFRAC	(BASE_CACHEFRAC * 2)
 #endif
 #ifndef NMBJCLUSTERS
-#define NMBJCLUSTERS	(NMBCLUSTERS / 2)
+#define NMBJCLUSTERS	(NMBCLUSTERS / 4)
 #endif
 #ifndef NMBUFS
-#define NMBUFS		(nmbclusters * 2 + maxfiles)
+#define NMBUFS		(nmbclusters / 2 + maxfiles)
 #endif
+
+#define NMBCLUSTERS_MIN	(NMBCLUSTERS / 2)
+#define NMBJCLUSTERS_MIN (NMBJCLUSTERS / 2)
+#define NMBUFS_MIN	(NMBUFS / 2)
 
 /*
  * Perform sanity checks of tunables declared above.
@@ -456,6 +475,91 @@ tunable_mbinit(void *dummy)
 SYSINIT(tunable_mbinit, SI_BOOT1_TUNABLES, SI_ORDER_ANY,
 	tunable_mbinit, NULL);
 
+static void
+mbinclimit(int *limit, int inc, int minlim)
+{
+	int new_limit;
+
+	lockmgr(&mbupdate_lk, LK_EXCLUSIVE);
+
+	new_limit = *limit + inc;
+	if (new_limit < minlim)
+		new_limit = minlim;
+
+	if (*limit != new_limit) {
+		*limit = new_limit;
+		mbupdatelimits();
+	}
+
+	lockmgr(&mbupdate_lk, LK_RELEASE);
+}
+
+static int
+mbsetlimit(int *limit, int new_limit, int minlim)
+{
+	if (new_limit < minlim)
+		return EINVAL;
+
+	lockmgr(&mbupdate_lk, LK_EXCLUSIVE);
+	mbinclimit(limit, new_limit - *limit, minlim);
+	lockmgr(&mbupdate_lk, LK_RELEASE);
+	return 0;
+}
+
+static int
+sysctl_mblimit(SYSCTL_HANDLER_ARGS, int *limit, int minlim)
+{
+	int error, value;
+
+	value = *limit;
+	error = sysctl_handle_int(oidp, &value, 0, req);
+	if (error || req->newptr == NULL)
+		return error;
+
+	return mbsetlimit(limit, value, minlim);
+}
+
+/*
+ * Sysctl support to update nmbclusters, nmbjclusters, and nmbufs.
+ */
+static int
+sysctl_nmbclusters(SYSCTL_HANDLER_ARGS)
+{
+	return sysctl_mblimit(oidp, arg1, arg2, req, &nmbclusters,
+	    NMBCLUSTERS_MIN);
+}
+
+static int
+sysctl_nmbjclusters(SYSCTL_HANDLER_ARGS)
+{
+	return sysctl_mblimit(oidp, arg1, arg2, req, &nmbjclusters,
+	    NMBJCLUSTERS_MIN);
+}
+
+static int
+sysctl_nmbufs(SYSCTL_HANDLER_ARGS)
+{
+	return sysctl_mblimit(oidp, arg1, arg2, req, &nmbufs, NMBUFS_MIN);
+}
+
+void
+mcl_inclimit(int inc)
+{
+	mbinclimit(&nmbclusters, inc, NMBCLUSTERS_MIN);
+}
+
+void
+mjcl_inclimit(int inc)
+{
+	mbinclimit(&nmbjclusters, inc, NMBJCLUSTERS_MIN);
+}
+
+void
+mb_inclimit(int inc)
+{
+	mbinclimit(&nmbufs, inc, NMBUFS_MIN);
+}
+
 /* "number of clusters of pages" */
 #define NCL_INIT	1
 
@@ -467,7 +571,6 @@ SYSINIT(tunable_mbinit, SI_BOOT1_TUNABLES, SI_ORDER_ANY,
  * particular, m_len and m_pkthdr.len are uninitialized.  It is the
  * responsibility of the caller to initialize those fields before use.
  */
-
 static __inline boolean_t
 mbuf_ctor(void *obj, void *private, int ocflags)
 {
@@ -692,7 +795,7 @@ mbinit(void *dummy)
 	}
 
 	/*
-	 * Create objtect caches and save cluster limits, which will
+	 * Create object caches and save cluster limits, which will
 	 * be used to adjust backing kmalloc pools' limit later.
 	 */
 
@@ -700,55 +803,55 @@ mbinit(void *dummy)
 
 	limit = nmbufs;
 	mbuf_cache = objcache_create("mbuf",
-	    limit, nmbufs / 4,
+	    limit, nmbufs / BASE_CACHEFRAC,
 	    mbuf_ctor, NULL, NULL,
 	    objcache_malloc_alloc, objcache_malloc_free, &mbuf_malloc_args);
 	mb_limit += limit;
 
 	limit = nmbufs;
-	mbufphdr_cache = objcache_create("mbuf pkt hdr",
-	    limit, nmbufs / 4,
+	mbufphdr_cache = objcache_create("mbuf pkthdr",
+	    limit, nmbufs / BASE_CACHEFRAC,
 	    mbufphdr_ctor, NULL, NULL,
 	    objcache_malloc_alloc, objcache_malloc_free, &mbuf_malloc_args);
 	mb_limit += limit;
 
 	ncl_limit = nmbclusters;
-	mclmeta_cache = objcache_create("cluster mbuf",
-	    ncl_limit, nmbclusters / 4,
+	mclmeta_cache = objcache_create("mbuf cluster",
+	    ncl_limit, nmbclusters / BASE_CACHEFRAC,
 	    mclmeta_ctor, mclmeta_dtor, NULL,
 	    objcache_malloc_alloc, objcache_malloc_free, &mclmeta_malloc_args);
 	cl_limit += ncl_limit;
 
 	jcl_limit = nmbjclusters;
-	mjclmeta_cache = objcache_create("jcluster mbuf",
-	    jcl_limit, nmbjclusters / 4,
+	mjclmeta_cache = objcache_create("mbuf jcluster",
+	    jcl_limit, nmbjclusters / BASE_CACHEFRAC,
 	    mjclmeta_ctor, mclmeta_dtor, NULL,
 	    objcache_malloc_alloc, objcache_malloc_free, &mclmeta_malloc_args);
 	cl_limit += jcl_limit;
 
 	limit = nmbclusters;
-	mbufcluster_cache = objcache_create("mbuf + cluster",
+	mbufcluster_cache = objcache_create("mbuf+cl",
 	    limit, nmbclusters / mcl_cachefrac,
 	    mbufcluster_ctor, mbufcluster_dtor, NULL,
 	    objcache_malloc_alloc, objcache_malloc_free, &mbuf_malloc_args);
 	mb_limit += limit;
 
 	limit = nmbclusters;
-	mbufphdrcluster_cache = objcache_create("mbuf pkt hdr + cluster",
+	mbufphdrcluster_cache = objcache_create("mbuf pkthdr+cl",
 	    limit, nmbclusters / mclph_cachefrac,
 	    mbufphdrcluster_ctor, mbufcluster_dtor, NULL,
 	    objcache_malloc_alloc, objcache_malloc_free, &mbuf_malloc_args);
 	mb_limit += limit;
 
 	limit = nmbjclusters;
-	mbufjcluster_cache = objcache_create("mbuf + jcluster",
+	mbufjcluster_cache = objcache_create("mbuf+jcl",
 	    limit, nmbjclusters / mjcl_cachefrac,
 	    mbufjcluster_ctor, mbufcluster_dtor, NULL,
 	    objcache_malloc_alloc, objcache_malloc_free, &mbuf_malloc_args);
 	mb_limit += limit;
 
 	limit = nmbjclusters;
-	mbufphdrjcluster_cache = objcache_create("mbuf pkt hdr + jcluster",
+	mbufphdrjcluster_cache = objcache_create("mbuf pkthdr+jcl",
 	    limit, nmbjclusters / mjclph_cachefrac,
 	    mbufphdrjcluster_ctor, mbufcluster_dtor, NULL,
 	    objcache_malloc_alloc, objcache_malloc_free, &mbuf_malloc_args);
@@ -767,6 +870,75 @@ mbinit(void *dummy)
 			    (MCLBYTES * (size_t)ncl_limit) +
 			    (MJUMPAGESIZE * (size_t)jcl_limit));
 
+	mb_limit += mb_limit / 8;
+	kmalloc_raise_limit(mbuf_malloc_args.mtype,
+			    mbuf_malloc_args.objsize * (size_t)mb_limit);
+}
+
+/*
+ * Adjust mbuf limits after changes have been made
+ *
+ * Caller must hold mbupdate_lk
+ */
+static void
+mbupdatelimits(void)
+{
+	int mb_limit, cl_limit, ncl_limit, jcl_limit;
+	int limit;
+
+	KASSERT(lockstatus(&mbupdate_lk, curthread) != 0,
+	    ("mbupdate_lk is not held"));
+
+	/*
+	 * Figure out adjustments to object caches after nmbufs, nmbclusters,
+	 * or nmbjclusters has been modified.
+	 */
+	mb_limit = cl_limit = 0;
+
+	limit = nmbufs;
+	objcache_set_cluster_limit(mbuf_cache, limit);
+	mb_limit += limit;
+
+	limit = nmbufs;
+	objcache_set_cluster_limit(mbufphdr_cache, limit);
+	mb_limit += limit;
+
+	ncl_limit = nmbclusters;
+	objcache_set_cluster_limit(mclmeta_cache, ncl_limit);
+	cl_limit += ncl_limit;
+
+	jcl_limit = nmbjclusters;
+	objcache_set_cluster_limit(mjclmeta_cache, jcl_limit);
+	cl_limit += jcl_limit;
+
+	limit = nmbclusters;
+	objcache_set_cluster_limit(mbufcluster_cache, limit);
+	mb_limit += limit;
+
+	limit = nmbclusters;
+	objcache_set_cluster_limit(mbufphdrcluster_cache, limit);
+	mb_limit += limit;
+
+	limit = nmbjclusters;
+	objcache_set_cluster_limit(mbufjcluster_cache, limit);
+	mb_limit += limit;
+
+	limit = nmbjclusters;
+	objcache_set_cluster_limit(mbufphdrjcluster_cache, limit);
+	mb_limit += limit;
+
+	/*
+	 * Adjust backing kmalloc pools' limit
+	 *
+	 * NOTE: We raise the limit by another 1/8 to take the effect
+	 * of loosememuse into account.
+	 */
+	cl_limit += cl_limit / 8;
+	kmalloc_raise_limit(mclmeta_malloc_args.mtype,
+			    mclmeta_malloc_args.objsize * (size_t)cl_limit);
+	kmalloc_raise_limit(M_MBUFCL,
+			    (MCLBYTES * (size_t)ncl_limit) +
+			    (MJUMPAGESIZE * (size_t)jcl_limit));
 	mb_limit += mb_limit / 8;
 	kmalloc_raise_limit(mbuf_malloc_args.mtype,
 			    mbuf_malloc_args.objsize * (size_t)mb_limit);
@@ -847,14 +1019,14 @@ m_get(int how, int type)
 {
 	struct mbuf *m;
 	int ntries = 0;
-	int ocf = MBTOM(how);
+	int ocf = MB_OCFLAG(how);
 
 retryonce:
 
 	m = objcache_get(mbuf_cache, ocf);
 
 	if (m == NULL) {
-		if ((how & MB_TRYWAIT) && ntries++ == 0) {
+		if ((ocf & M_WAITOK) && ntries++ == 0) {
 			struct objcache *reclaimlist[] = {
 				mbufphdr_cache,
 				mbufcluster_cache,
@@ -884,7 +1056,7 @@ struct mbuf *
 m_gethdr(int how, int type)
 {
 	struct mbuf *m;
-	int ocf = MBTOM(how);
+	int ocf = MB_OCFLAG(how);
 	int ntries = 0;
 
 retryonce:
@@ -892,7 +1064,7 @@ retryonce:
 	m = objcache_get(mbufphdr_cache, ocf);
 
 	if (m == NULL) {
-		if ((how & MB_TRYWAIT) && ntries++ == 0) {
+		if ((ocf & M_WAITOK) && ntries++ == 0) {
 			struct objcache *reclaimlist[] = {
 				mbuf_cache,
 				mbufcluster_cache, mbufphdrcluster_cache,
@@ -937,7 +1109,7 @@ m_getcl_cache(int how, short type, int flags, struct objcache *mbclc,
     struct objcache *mbphclc, u_long *cl_stats)
 {
 	struct mbuf *m = NULL;
-	int ocflags = MBTOM(how);
+	int ocflags = MB_OCFLAG(how);
 	int ntries = 0;
 
 retryonce:
@@ -948,7 +1120,7 @@ retryonce:
 		m = objcache_get(mbclc, ocflags);
 
 	if (m == NULL) {
-		if ((how & MB_TRYWAIT) && ntries++ == 0) {
+		if ((ocflags & M_WAITOK) && ntries++ == 0) {
 			struct objcache *reclaimlist[1];
 
 			if (flags & M_PKTHDR)
@@ -1077,7 +1249,7 @@ m_mclget(struct mbuf *m, int how)
 	struct mbcluster *mcl;
 
 	KKASSERT((m->m_flags & M_EXT) == 0);
-	mcl = objcache_get(mclmeta_cache, MBTOM(how));
+	mcl = objcache_get(mclmeta_cache, MB_OCFLAG(how));
 	if (mcl != NULL) {
 		linkcluster(m, mcl);
 		++mbstat[mycpu->gd_cpuid].m_clusters;
@@ -1363,7 +1535,7 @@ m_prepend(struct mbuf *m, int len, int how)
 /*
  * Make a copy of an mbuf chain starting "off0" bytes from the beginning,
  * continuing for "len" bytes.  If len is M_COPYALL, copy to end of mbuf.
- * The wait parameter is a choice of MB_WAIT/MB_DONTWAIT from caller.
+ * The wait parameter is a choice of M_WAITOK/M_NOWAIT from caller.
  * Note that the copy is read-only, because clusters are not copied,
  * only their reference counts are incremented.
  */
@@ -1601,8 +1773,8 @@ nospace0:
  * copying any mbuf clusters.  This is typically used to realign a data
  * chain by nfs_realign().
  *
- * The original chain is left intact.  how should be MB_WAIT or MB_DONTWAIT
- * and NULL can be returned if MB_DONTWAIT is passed.
+ * The original chain is left intact.  how should be M_WAITOK or M_NOWAIT
+ * and NULL can be returned if M_NOWAIT is passed.
  *
  * Be careful to use cluster mbufs, a large mbuf chain converted to non
  * cluster mbufs can exhaust our supply of mbufs.
@@ -1785,7 +1957,7 @@ m_align(struct mbuf *m, int len)
 		adjust = MHLEN - len;
 	else
 		adjust = MLEN - len;
-	m->m_data += adjust &~ (sizeof(long)-1);
+	m->m_data += rounddown2(adjust, sizeof(long));
 }
 
 /*
@@ -1964,9 +2136,9 @@ m_pullup(struct mbuf *n, int len)
 		if (len > MHLEN)
 			goto bad;
 		if (n->m_flags & M_PKTHDR)
-			m = m_gethdr(MB_DONTWAIT, n->m_type);
+			m = m_gethdr(M_NOWAIT, n->m_type);
 		else
-			m = m_get(MB_DONTWAIT, n->m_type);
+			m = m_get(M_NOWAIT, n->m_type);
 		if (m == NULL)
 			goto bad;
 		m->m_len = 0;
@@ -2074,19 +2246,16 @@ extpacket:
  * Note: "offset" is ill-defined and always called as 0, so ignore it.
  */
 struct mbuf *
-m_devget(char *buf, int len, int offset, struct ifnet *ifp,
-    void (*copy)(volatile const void *from, volatile void *to, size_t length))
+m_devget(char *buf, int len, int offset, struct ifnet *ifp)
 {
 	struct mbuf *m, *mfirst = NULL, **mtail;
 	int nsize, flags;
 
-	if (copy == NULL)
-		copy = bcopy;
 	mtail = &mfirst;
 	flags = M_PKTHDR;
 
 	while (len > 0) {
-		m = m_getl(len, MB_DONTWAIT, MT_DATA, flags, &nsize);
+		m = m_getl(len, M_NOWAIT, MT_DATA, flags, &nsize);
 		if (m == NULL) {
 			m_freem(mfirst);
 			return (NULL);
@@ -2101,7 +2270,7 @@ m_devget(char *buf, int len, int offset, struct ifnet *ifp,
 			flags = 0;
 		}
 
-		copy(buf, m->m_data, (unsigned)m->m_len);
+		bcopy(buf, m->m_data, (unsigned)m->m_len);
 		buf += m->m_len;
 		len -= m->m_len;
 		*mtail = m;
@@ -2141,7 +2310,7 @@ m_devpad(struct mbuf *m, int padto)
 			struct mbuf *n;
 
 			/* Allocate new empty mbuf, pad it.  Compact later. */
-			MGET(n, MB_DONTWAIT, MT_DATA);
+			MGET(n, M_NOWAIT, MT_DATA);
 			if (n == NULL)
 				return ENOBUFS;
 			n->m_len = 0;
@@ -2177,7 +2346,7 @@ m_copyback(struct mbuf *m0, int off, int len, caddr_t cp)
 		off -= mlen;
 		totlen += mlen;
 		if (m->m_next == NULL) {
-			n = m_getclr(MB_DONTWAIT, m->m_type);
+			n = m_getclr(M_NOWAIT, m->m_type);
 			if (n == NULL)
 				goto out;
 			n->m_len = min(MLEN, len + off);
@@ -2196,7 +2365,7 @@ m_copyback(struct mbuf *m0, int off, int len, caddr_t cp)
 		if (len == 0)
 			break;
 		if (m->m_next == NULL) {
-			n = m_get(MB_DONTWAIT, m->m_type);
+			n = m_get(M_NOWAIT, m->m_type);
 			if (n == NULL)
 				break;
 			n->m_len = min(MLEN, len);
@@ -2240,7 +2409,7 @@ m_append(struct mbuf *m0, int len, c_caddr_t cp)
 		 * Allocate a new mbuf; could check space
 		 * and allocate a cluster instead.
 		 */
-		n = m_get(MB_DONTWAIT, m->m_type);
+		n = m_get(M_NOWAIT, m->m_type);
 		if (n == NULL)
 			break;
 		n->m_len = min(MLEN, remainder);
@@ -2468,7 +2637,7 @@ m_uiomove(struct uio *uio)
 			resid = INT_MAX;
 		else
 			resid = (int)uio->uio_resid;
-		m = m_getl(resid, MB_WAIT, MT_DATA, flags, &nsize);
+		m = m_getl(resid, M_WAITOK, MT_DATA, flags, &nsize);
 		if (flags) {
 			m->m_pkthdr.len = 0;
 			/* Leave room for protocol headers. */

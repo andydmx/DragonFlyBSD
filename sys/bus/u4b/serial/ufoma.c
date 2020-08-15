@@ -44,13 +44,6 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *        This product includes software developed by the NetBSD
- *        Foundation, Inc. and its contributors.
- * 4. Neither the name of The NetBSD Foundation nor the names of its
- *    contributors may be used to endorse or promote products derived
- *    from this software without specific prior written permission.
  *
  * THIS SOFTWARE IS PROVIDED BY THE NETBSD FOUNDATION, INC. AND CONTRIBUTORS
  * ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
@@ -159,7 +152,7 @@ enum {
 
 enum {
 	UFOMA_BULK_ENDPT_WRITE,
-	UFOMA_BULK_ENDPT_READ,	
+	UFOMA_BULK_ENDPT_READ,
 	UFOMA_BULK_ENDPT_MAX,
 };
 
@@ -168,8 +161,6 @@ struct ufoma_softc {
 	struct ucom_softc sc_ucom;
 	struct cv sc_cv;
 	struct lock sc_lock;
-	struct sysctl_ctx_list sc_sysctl_ctx;
-	struct sysctl_oid *sc_sysctl_tree;
 
 	struct usb_xfer *sc_ctrl_xfer[UFOMA_CTRL_ENDPT_MAX];
 	struct usb_xfer *sc_bulk_xfer[UFOMA_BULK_ENDPT_MAX];
@@ -320,15 +311,15 @@ static driver_t ufoma_driver = {
 	.size = sizeof(struct ufoma_softc),
 };
 
-DRIVER_MODULE(ufoma, uhub, ufoma_driver, ufoma_devclass, NULL, NULL);
-MODULE_DEPEND(ufoma, ucom, 1, 1, 1);
-MODULE_DEPEND(ufoma, usb, 1, 1, 1);
-MODULE_VERSION(ufoma, 1);
-
 static const STRUCT_USB_HOST_ID ufoma_devs[] = {
 	{USB_IFACE_CLASS(UICLASS_CDC),
 	 USB_IFACE_SUBCLASS(UISUBCLASS_MCPC),},
 };
+
+DRIVER_MODULE(ufoma, uhub, ufoma_driver, ufoma_devclass, NULL, NULL);
+MODULE_DEPEND(ufoma, ucom, 1, 1, 1);
+MODULE_DEPEND(ufoma, usb, 1, 1, 1);
+MODULE_VERSION(ufoma, 1);
 
 static int
 ufoma_probe(device_t dev)
@@ -371,6 +362,8 @@ ufoma_attach(device_t dev)
 	struct ufoma_softc *sc = device_get_softc(dev);
 	struct usb_config_descriptor *cd;
 	struct usb_interface_descriptor *id;
+	struct sysctl_ctx_list *sctx;
+	struct sysctl_oid *soid;
 
 	usb_mcpc_acm_descriptor *mad;
 	uint8_t elements;
@@ -454,35 +447,21 @@ ufoma_attach(device_t dev)
 	ucom_set_pnpinfo_usb(&sc->sc_super_ucom, dev);
 
 	/*Sysctls*/
-	sysctl_ctx_init(&sc->sc_sysctl_ctx);
-	sc->sc_sysctl_tree = SYSCTL_ADD_NODE(&sc->sc_sysctl_ctx,
-	    SYSCTL_STATIC_CHILDREN(_hw), OID_AUTO,
-	    device_get_nameunit(sc->sc_dev), CTLFLAG_RD, 0, "");
-	if (sc->sc_sysctl_tree == NULL) {
-		DPRINTF("can't add sysctl node\n");
-		goto detach;
-	}
+	sctx = device_get_sysctl_ctx(dev);
+	soid = device_get_sysctl_tree(dev);
 
-	SYSCTL_ADD_PROC(&sc->sc_sysctl_ctx,
-			SYSCTL_CHILDREN(sc->sc_sysctl_tree),
-			OID_AUTO, "supportmode",
+	SYSCTL_ADD_PROC(sctx, SYSCTL_CHILDREN(soid), OID_AUTO, "supportmode",
 			CTLFLAG_RD|CTLTYPE_STRING, sc, 0, ufoma_sysctl_support,
 			"A", "Supporting port role");
 
-	SYSCTL_ADD_PROC(&sc->sc_sysctl_ctx,
-			SYSCTL_CHILDREN(sc->sc_sysctl_tree),
-			OID_AUTO, "currentmode",
+	SYSCTL_ADD_PROC(sctx, SYSCTL_CHILDREN(soid), OID_AUTO, "currentmode",
 			CTLFLAG_RD|CTLTYPE_STRING, sc, 0, ufoma_sysctl_current,
 			"A", "Current port role");
 
-	SYSCTL_ADD_PROC(&sc->sc_sysctl_ctx,
-			SYSCTL_CHILDREN(sc->sc_sysctl_tree),
-			OID_AUTO, "openmode",
+	SYSCTL_ADD_PROC(sctx, SYSCTL_CHILDREN(soid), OID_AUTO, "openmode",
 			CTLFLAG_RW|CTLTYPE_STRING, sc, 0, ufoma_sysctl_open,
 			"A", "Mode to transit when port is opened");
-	SYSCTL_ADD_UINT(&sc->sc_sysctl_ctx,
-			SYSCTL_CHILDREN(sc->sc_sysctl_tree),
-			OID_AUTO, "comunit",
+	SYSCTL_ADD_UINT(sctx, SYSCTL_CHILDREN(soid), OID_AUTO, "comunit",
 			CTLFLAG_RD, &(sc->sc_super_ucom.sc_unit), 0, 
 			"Unit number as USB serial");
 
@@ -507,7 +486,6 @@ ufoma_detach(device_t dev)
 	}
 	lockuninit(&sc->sc_lock);
 	cv_destroy(&sc->sc_cv);
-	sysctl_ctx_free(&sc->sc_sysctl_ctx);
 
 	return (0);
 }
@@ -1210,7 +1188,7 @@ static int ufoma_sysctl_support(SYSCTL_HANDLER_ARGS)
 	sbuf_finish(&sb);
 	sysctl_handle_string(oidp, sbuf_data(&sb), sbuf_len(&sb), req);
 	sbuf_delete(&sb);
-	
+
 	return 0;
 }
 static int ufoma_sysctl_current(SYSCTL_HANDLER_ARGS)
@@ -1224,9 +1202,8 @@ static int ufoma_sysctl_current(SYSCTL_HANDLER_ARGS)
 		ksnprintf(subbuf, sizeof(subbuf), "(%02x)", sc->sc_currentmode);
 	}
 	sysctl_handle_string(oidp, mode, strlen(mode), req);
-	
+
 	return 0;
-	
 }
 static int ufoma_sysctl_open(SYSCTL_HANDLER_ARGS)
 {
@@ -1247,18 +1224,18 @@ static int ufoma_sysctl_open(SYSCTL_HANDLER_ARGS)
 	if(error != 0 || req->newptr == NULL){
 		return error;
 	}
-	
+
 	if((newmode = ufoma_str_to_mode(subbuf)) == -1){
 		return EINVAL;
 	}
-	
+
 	for(i = 1 ; i < sc->sc_modetable[0] ; i++){
 		if(sc->sc_modetable[i] == newmode){
 			sc->sc_modetoactivate = newmode;
 			return 0;
 		}
 	}
-	
+
 	return EINVAL;
 }
 

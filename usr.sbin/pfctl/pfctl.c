@@ -58,7 +58,7 @@
 #include "pfctl_parser.h"
 #include "pfctl.h"
 
-void	 usage(void);
+void	 usage(void) __dead2;
 int	 pfctl_enable(int, int);
 int	 pfctl_disable(int, int);
 int	 pfctl_clear_stats(int, int);
@@ -98,9 +98,6 @@ int	 pfctl_load_ruleset(struct pfctl *, char *,
 		struct pf_ruleset *, int, int);
 int	 pfctl_load_rule(struct pfctl *, char *, struct pf_rule *, int);
 const char	*pfctl_lookup_option(char *, const char **);
-
-struct pf_anchor_global	 pf_anchors;
-struct pf_anchor	 pf_main_anchor;
 
 const char	*clearopt;
 char		*rulesopt;

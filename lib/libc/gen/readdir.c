@@ -10,11 +10,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -31,7 +27,6 @@
  * SUCH DAMAGE.
  *
  * $FreeBSD: src/lib/libc/gen/readdir.c,v 1.5.2.4 2002/02/26 22:53:57 alfred Exp $
- * $DragonFly: src/lib/libc/gen/readdir.c,v 1.10 2008/05/03 22:07:37 dillon Exp $
  *
  * @(#)readdir.c	8.3 (Berkeley) 9/29/94
  */
@@ -43,9 +38,11 @@
 #include <errno.h>
 #include <string.h>
 #include <pthread.h>
+#include <unistd.h>
 #include "un-namespace.h"
 
 #include "libc_private.h"
+#include "gen_private.h"
 
 /*
  * get next entry in a directory.
@@ -90,16 +87,17 @@ readdir(DIR *dirp)
 	struct dirent	*dp;
 
 	if (__isthreaded)
-		_pthread_mutex_lock((pthread_mutex_t *)&dirp->dd_lock);
+		_pthread_mutex_lock(&dirp->dd_lock);
 	dp = _readdir_unlocked(dirp, 1);
 	if (__isthreaded)
-		_pthread_mutex_unlock((pthread_mutex_t *)&dirp->dd_lock);
+		_pthread_mutex_unlock(&dirp->dd_lock);
 
 	return (dp);
 }
 
 int
-readdir_r(DIR *dirp, struct dirent *entry, struct dirent **result)
+readdir_r(DIR * __restrict dirp, struct dirent * __restrict entry,
+    struct dirent ** __restrict result)
 {
 	struct dirent *dp;
 	int saved_errno;
@@ -107,11 +105,11 @@ readdir_r(DIR *dirp, struct dirent *entry, struct dirent **result)
 	saved_errno = errno;
 	errno = 0;
 	if (__isthreaded)
-		_pthread_mutex_lock((pthread_mutex_t *)&dirp->dd_lock);
+		_pthread_mutex_lock(&dirp->dd_lock);
 	if ((dp = _readdir_unlocked(dirp, 1)) != NULL)
 		memcpy(entry, dp, _DIRENT_MINSIZ(dp));
 	if (__isthreaded)
-		_pthread_mutex_unlock((pthread_mutex_t *)&dirp->dd_lock);
+		_pthread_mutex_unlock(&dirp->dd_lock);
 
 	if (errno != 0) {
 		if (dp == NULL) {

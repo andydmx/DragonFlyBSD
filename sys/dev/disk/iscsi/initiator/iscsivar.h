@@ -25,9 +25,12 @@
  *
  * $FreeBSD: src/sys/dev/iscsi/initiator/iscsivar.h,v 1.2 2008/11/25 07:17:11 scottl Exp $
  */
+
 /*
  | $Id: iscsivar.h,v 1.30 2007/04/22 10:12:11 danny Exp danny $
  */
+#include <sys/mutex2.h>
+
 #ifndef ISCSI_INITIATOR_DEBUG
 #define ISCSI_INITIATOR_DEBUG 1
 #endif
@@ -284,7 +287,7 @@ XPT_DONE(struct isc_softc *isp, union ccb *ccb)
 
 #endif /* _CAM_CAM_XPT_SIM_H */
 
-#define iscsi_lock_ex(mtx)	mtx_lock_ex_quick(mtx, __func__)
+#define iscsi_lock_ex(mtx)	mtx_lock_ex_quick(mtx)
 #define iscsi_unlock_ex(mtx)	mtx_unlock(mtx)
 #define issleep(id, mtx, flags, wmesg, to)	\
 				mtxsleep(id, mtx, flags, wmesg, to)

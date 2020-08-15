@@ -74,6 +74,7 @@ static const ns_src defaultsrc[] = {
 	{ NULL, 0 }
 };
 
+int	 __getgroupmembership(const char *, gid_t, gid_t *, int, int *);
 int	 __gr_match_entry(const char *, size_t, enum nss_lookup_type,
 	    const char *, gid_t);
 int	 __gr_parse_entry(char *, size_t, struct group *, char *, size_t,
@@ -206,11 +207,11 @@ static int
 grp_marshal_func(char *buffer, size_t *buffer_size, void *retval __unused,
     va_list ap, void *cache_mdata)
 {
-	char *name;
-	gid_t gid;
+	char *name __unused;
+	gid_t gid __unused;
 	struct group *grp;
-	char *orig_buf;
-	size_t orig_buf_size;
+	char *orig_buf __unused;
+	size_t orig_buf_size __unused;
 
 	struct group new_grp;
 	size_t desired_size, size, mem_size;
@@ -301,8 +302,8 @@ static int
 grp_unmarshal_func(char *buffer, size_t buffer_size, void *retval, va_list ap,
     void *cache_mdata)
 {
-	char *name;
-	gid_t gid;
+	char *name __unused;
+	gid_t gid __unused;
 	struct group *grp;
 	char *orig_buf;
 	size_t orig_buf_size;
@@ -656,7 +657,7 @@ __getgroupmembership(const char *uname, gid_t agroup, gid_t *groups,
 		NS_FALLBACK_CB(getgroupmembership_fallback)
 		{ NULL, NULL, NULL }
 	};
-	int rv;
+	int rv __unused;
 
 	assert(uname != NULL);
 	/* groups may be NULL if just sizing when invoked with maxgrp = 0 */
@@ -918,7 +919,7 @@ dns_endstate(void *p)
 
 
 static int
-dns_setgrent(void *retval, void *cb_data, va_list ap)
+dns_setgrent(void *retval __unused, void *cb_data __unused, va_list ap __unused)
 {
 	struct dns_state	*st;
 	int			 rv;

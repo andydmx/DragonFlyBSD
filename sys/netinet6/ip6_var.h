@@ -1,5 +1,4 @@
 /*	$FreeBSD: src/sys/netinet6/ip6_var.h,v 1.2.2.4 2003/01/23 21:06:47 sam Exp $	*/
-/*	$DragonFly: src/sys/netinet6/ip6_var.h,v 1.13 2008/09/04 09:08:22 hasso Exp $	*/
 /*	$KAME: ip6_var.h,v 1.62 2001/05/03 14:51:48 itojun Exp $	*/
 
 /*
@@ -43,11 +42,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -100,6 +95,7 @@ struct	ip6q {
 #ifdef notyet
 	u_char		*ip6q_nxtp;
 #endif
+	int		ip6q_nfrag;	/* # of fragments */
 };
 
 struct	ip6asfrag {
@@ -296,6 +292,7 @@ struct ip6aux {
 
 extern struct	ip6stat ip6stat;	/* statistics */
 extern u_int32_t ip6_id;		/* fragment identifier */
+extern int	ip6_minhlim;		/* minimum hop limit */
 extern int	ip6_defhlim;		/* default hop limit */
 extern int	ip6_defmcasthlim;	/* default multicast hop limit */
 extern int	ip6_forwarding;		/* act as router? */
@@ -304,15 +301,14 @@ extern int	ip6_gif_hlim;		/* Hop limit for gif encap packet */
 extern int	ip6_use_deprecated;	/* allow deprecated addr as source */
 extern int	ip6_rr_prune;		/* router renumbering prefix
 					 * walk list every 5 sec.    */
-extern int	ip6_v6only;
 
 extern struct socket *ip6_mrouter; 	/* multicast routing daemon */
 extern int	ip6_sendredirects;	/* send IP redirects when forwarding? */
 extern int	ip6_maxfragpackets; /* Maximum packets in reassembly queue */
+extern int	ip6_maxfrags;	/* Maximum fragments in reassembly queue */
 extern int	ip6_sourcecheck;	/* Verify source interface */
 extern int	ip6_sourcecheck_interval; /* Interval between log messages */
 extern int	ip6_accept_rtadv;	/* Acts as a host not a router */
-extern int	ip6_keepfaith;		/* Firewall Aided Internet Translator */
 extern int	ip6_log_interval;
 extern time_t	ip6_log_time;
 extern int	ip6_hdrnestlimit; /* upper limit of # of extension headers */
@@ -374,7 +370,7 @@ int	ip6_output (struct mbuf *, struct ip6_pktopts *,
 			struct ip6_moptions *, struct ifnet **,
 			struct inpcb *);
 void	ip6_ctloutput_dispatch(netmsg_t msg);
-int	ip6_ctloutput (struct socket *, struct sockopt *sopt);
+int	ip6_ctloutput (struct socket *, struct sockopt *);
 int	ip6_raw_ctloutput (struct socket *, struct sockopt *);
 void	init_ip6pktopts (struct ip6_pktopts *);
 int
@@ -388,11 +384,10 @@ int	route6_input (struct mbuf **, int *, int);
 
 void	frag6_init (void);
 int	frag6_input (struct mbuf **, int *, int);
-void	frag6_slowtimo (void);
 void	frag6_drain (void);
 
 void	rip6_init (void);
-int	rip6_input (struct mbuf **mp, int *offp, int proto);
+int	rip6_input (struct mbuf **, int *, int);
 void	rip6_ctlinput (union netmsg *);
 void	rip6_ctloutput (union netmsg *);
 int	rip6_output (struct mbuf *, struct socket *, ...);

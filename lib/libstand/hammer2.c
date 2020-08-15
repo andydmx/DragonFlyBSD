@@ -60,6 +60,7 @@
 #include "stand.h"
 #endif
 
+#include <machine/param.h>	/* for DEV_BSHIFT */
 #include <vfs/hammer2/hammer2_disk.h>
 
 uint32_t iscsi_crc32(const void *buf, size_t size);
@@ -140,7 +141,12 @@ static
 size_t
 blocksize(hammer2_blockref_t *bref)
 {
-	return(1 << (int)(bref->data_off & HAMMER2_OFF_MASK_RADIX));
+	size_t bytes;
+
+	bytes = (size_t)(bref->data_off & HAMMER2_OFF_MASK_RADIX);
+	if (bytes)
+		bytes = (size_t)1 << bytes;
+	return bytes;
 }
 
 static
@@ -224,7 +230,16 @@ h2read(struct hammer2_fs *hfs, void *buf, size_t nbytes, off_t off)
 	if (rc || rlen != nbytes)
 		rc = -1;
 #elif defined(BOOT2)
-	rc = dskread(buf, off >> DEV_BSHIFT, nbytes >> DEV_BSHIFT);
+	/* BIOS interface may barf on 64KB reads */
+	rc = 0;
+	while (nbytes > 16384) {
+		rc = dskread(buf, off >> DEV_BSHIFT, 16384 >> DEV_BSHIFT);
+		nbytes -= 16384;
+		buf = (char *)buf + 16384;
+		off += 16384;
+	}
+	if (nbytes)
+		rc = dskread(buf, off >> DEV_BSHIFT, nbytes >> DEV_BSHIFT);
 	if (rc)
 		rc = -1;
 #else
@@ -274,8 +289,10 @@ h2lookup(struct hammer2_fs *hfs, hammer2_blockref_t *base,
 		saved_base.data_off = (hammer2_off_t)-1;
 		return(0);
 	}
-	if (base->data_off == (hammer2_off_t)-1)
+	if (base->data_off == (hammer2_off_t)-1) {
+		bref_ret->type = 0;
 		return(-1);
+	}
 
 	/*
 	 * Calculate the number of blockrefs to scan
@@ -289,6 +306,9 @@ h2lookup(struct hammer2_fs *hfs, hammer2_blockref_t *base,
 		break;
 	case HAMMER2_BREF_TYPE_INDIRECT:
 		count = blocksize(base) / sizeof(hammer2_blockref_t);
+		break;
+	default:
+		count = 0;
 		break;
 	}
 
@@ -307,8 +327,10 @@ again:
 		 */
 		if (base->type != HAMMER2_BREF_TYPE_VOLUME &&
 		    base->data_off != saved_base.data_off) {
-			if (h2read(hfs, &media,
-				   blocksize(base), blockoff(base))) {
+			if (blocksize(base) && h2read(hfs, &media,
+						      blocksize(base),
+						      blockoff(base))) {
+				bref_ret->type = 0;
 				return(-1);
 			}
 			saved_base = *base;
@@ -318,7 +340,8 @@ again:
 		 * Special case embedded file data
 		 */
 		if (base->type == HAMMER2_BREF_TYPE_INODE) {
-			if (media.ipdata.op_flags & HAMMER2_OPFLAG_DIRECTDATA) {
+			if (media.ipdata.meta.op_flags &
+			    HAMMER2_OPFLAG_DIRECTDATA) {
 				*pptr = media.ipdata.u.data;
 				bref_ret->type = HAMMER2_BREF_TYPE_DATA;
 				bref_ret->key = 0;
@@ -359,6 +382,7 @@ again:
 		/*
 		 * Return 0
 		 */
+		bref_ret->type = 0;
 		rc = 0;
 		break;
 	case HAMMER2_BREF_TYPE_INDIRECT:
@@ -378,18 +402,24 @@ again:
 				goto again;
 		}
 		break;
+	case HAMMER2_BREF_TYPE_DIRENT:
 	case HAMMER2_BREF_TYPE_INODE:
 	case HAMMER2_BREF_TYPE_DATA:
 		/*
 		 * Terminal match.  Leaf elements might not be data-aligned.
 		 */
 		dev_bsize = blocksize(&best);
-		if (dev_bsize < HAMMER2_LBUFSIZE)
-			dev_bsize = HAMMER2_LBUFSIZE;
-		dev_boff = blockoff(&best) -
-			   (blockoff(&best) & ~HAMMER2_LBUFMASK64);
-		if (h2read(hfs, &media, dev_bsize, blockoff(&best) - dev_boff))
-			return(-1);
+		if (dev_bsize) {
+			if (dev_bsize < HAMMER2_LBUFSIZE)
+				dev_bsize = HAMMER2_LBUFSIZE;
+			dev_boff = blockoff(&best) -
+				   (blockoff(&best) & ~HAMMER2_LBUFMASK64);
+			if (h2read(hfs, &media,
+				   dev_bsize,
+				   blockoff(&best) - dev_boff)) {
+				return(-1);
+			}
+		}
 		saved_base.data_off = (hammer2_off_t)-1;
 		*bref_ret = best;
 		*pptr = media.buf + dev_boff;
@@ -407,12 +437,14 @@ h2resolve(struct hammer2_fs *hfs, const char *path,
 	hammer2_blockref_t bres;
 	hammer2_inode_data_t *ino;
 	hammer2_key_t key;
+	void *data;
 	ssize_t bytes;
 	size_t len;
 
 	/*
 	 * Start point (superroot)
 	 */
+	ino = NULL;
 	*bref = hfs->sroot;
 	if (inop)
 		*inop = NULL;
@@ -437,23 +469,64 @@ h2resolve(struct hammer2_fs *hfs, const char *path,
 		for (;;) {
 			bytes = h2lookup(hfs, bref,
 					 key, key | 0xFFFFU,
-					 &bres, (void **)&ino);
-			if (bytes == 0)
+					 &bres, (void **)&data);
+			if (bytes < 0)
 				break;
-			if (len == ino->name_len &&
-			    memcmp(path, ino->filename, len) == 0) {
+			if (bres.type == 0)
+				break;
+			switch (bres.type) {
+			case HAMMER2_BREF_TYPE_DIRENT:
+				if (bres.embed.dirent.namlen != len)
+					break;
+				if (bres.embed.dirent.namlen <=
+				    sizeof(bres.check.buf)) {
+					if (memcmp(path, bres.check.buf, len))
+						break;
+				} else {
+					if (memcmp(path, data, len))
+						break;
+				}
+
+				/*
+				 * Found, resolve inode.  This will set
+				 * ino similarly to HAMMER2_BREF_TYPE_INODE
+				 * and adjust bres, which path continuation
+				 * needs.
+				 */
+				*bref = hfs->sroot;
+				bytes = h2lookup(hfs, bref,
+						 bres.embed.dirent.inum,
+						 bres.embed.dirent.inum,
+						 &bres, (void **)&ino);
 				if (inop)
 					*inop = ino;
+				goto found;
+				break;	/* NOT REACHED */
+			case HAMMER2_BREF_TYPE_INODE:
+				ino = data;
+				if (ino->meta.name_len != len)
+					break;
+				if (memcmp(path, ino->filename, len) == 0) {
+					if (inop)
+						*inop = ino;
+					goto found;
+				}
+				break;
+			}
+			if ((bres.key & 0xFFFF) == 0xFFFF) {
+				bres.type = 0;
 				break;
 			}
 			key = bres.key + 1;
 		}
+found:
 
 		/*
 		 * Lookup failure
 		 */
-		if (bytes == 0) {
+		if (bytes < 0 || bres.type == 0) {
 			bref->data_off = (hammer2_off_t)-1;
+			ino = NULL;
 			break;
 		}
 
@@ -462,7 +535,7 @@ h2resolve(struct hammer2_fs *hfs, const char *path,
 		 * we fail.
 		 */
 		path += len;
-		if (*path && ino->type != HAMMER2_OBJTYPE_DIRECTORY) {
+		if (*path && ino->meta.type != HAMMER2_OBJTYPE_DIRECTORY) {
 			bref->data_off = (hammer2_off_t)-1;
 			break;
 		}
@@ -566,6 +639,7 @@ h2init(struct hammer2_fs *hfs)
 	off_t off;
 	int best;
 	int i;
+	int r;
 
 	/*
 	 * Find the best volume header.
@@ -610,9 +684,21 @@ h2init(struct hammer2_fs *hfs)
 	h2lookup(hfs, NULL, 0, 0, NULL, NULL);
 
 	/*
-	 * Lookup sroot and clear the cache again.
+	 * Lookup sroot/BOOT and clear the cache again.
 	 */
-	h2lookup(hfs, &hfs->sroot, 0, 0, &hfs->sroot, &data);
+	r = h2lookup(hfs, &hfs->sroot,
+		     HAMMER2_SROOT_KEY, HAMMER2_SROOT_KEY,
+		     &hfs->sroot, &data);
+	if (r <= 0)
+		return(-1);
+	h2lookup(hfs, NULL, 0, 0, NULL, NULL);
+	r = h2lookup(hfs, &hfs->sroot,
+		     HAMMER2_BOOT_KEY, HAMMER2_BOOT_KEY,
+		     &hfs->sroot, &data);
+	if (r <= 0) {
+		printf("hammer2: 'BOOT' PFS not found\n");
+		return(-1);
+	}
 	h2lookup(hfs, NULL, 0, 0, NULL, NULL);
 
 	return (0);
@@ -700,8 +786,6 @@ hammer2_get_dtype(uint8_t type)
 		return(DT_BLK);
 	case HAMMER2_OBJTYPE_SOFTLINK:
 		return(DT_LNK);
-	case HAMMER2_OBJTYPE_HARDLINK:
-		return(DT_UNKNOWN);
 	case HAMMER2_OBJTYPE_SOCKET:
 		return(DT_SOCK);
 	default:
@@ -726,8 +810,6 @@ hammer2_get_mode(uint8_t type)
 		return(S_IFBLK);
 	case HAMMER2_OBJTYPE_SOFTLINK:
 		return(S_IFLNK);
-	case HAMMER2_OBJTYPE_HARDLINK:
-		return(0);
 	case HAMMER2_OBJTYPE_SOCKET:
 		return(S_IFSOCK);
 	default:
@@ -762,9 +844,10 @@ hammer2_open(const char *path, struct open_file *f)
 		return(-1);
 	}
 	if (ipdata) {
-		hf->fsize = ipdata->size;
-		hf->type = ipdata->type;
-		hf->mode = ipdata->mode | hammer2_get_mode(ipdata->type);
+		hf->fsize = ipdata->meta.size;
+		hf->type = ipdata->meta.type;
+		hf->mode = ipdata->meta.mode |
+			   hammer2_get_mode(ipdata->meta.type);
 	} else {
 		hf->fsize = 0;
 		hf->type = HAMMER2_OBJTYPE_DIRECTORY;
@@ -844,20 +927,46 @@ hammer2_readdir(struct open_file *f, struct dirent *den)
 	struct hfile *hf = f->f_fsdata;
 	hammer2_blockref_t bres;
 	hammer2_inode_data_t *ipdata;
+	void *data;
 	int bytes;
 
 	for (;;) {
 		bytes = h2lookup(&hf->hfs, &hf->bref,
 				 f->f_offset | HAMMER2_DIRHASH_VISIBLE, 
 				 HAMMER2_KEY_MAX,
-				 &bres, (void **)&ipdata);
-		if (bytes <= 0)
+				 &bres, (void **)&data);
+		if (bytes < 0)
 			break;
-		den->d_namlen = ipdata->name_len;
-		den->d_type = hammer2_get_dtype(ipdata->type);
-		den->d_ino = ipdata->inum;
-		bcopy(ipdata->filename, den->d_name, den->d_namlen);
-		den->d_name[den->d_namlen] = 0;
+		switch (bres.type) {
+		case HAMMER2_BREF_TYPE_INODE:
+			ipdata = data;
+			den->d_namlen = ipdata->meta.name_len;
+			den->d_type = hammer2_get_dtype(ipdata->meta.type);
+			den->d_ino = ipdata->meta.inum;
+			bcopy(ipdata->filename, den->d_name, den->d_namlen);
+			den->d_name[den->d_namlen] = 0;
+			break;
+		case HAMMER2_BREF_TYPE_DIRENT:
+			den->d_namlen = bres.embed.dirent.namlen;
+			den->d_type = hammer2_get_dtype(bres.embed.dirent.type);
+			den->d_ino = bres.embed.dirent.inum;
+			if (den->d_namlen <= sizeof(bres.check.buf)) {
+				bcopy(bres.check.buf,
+				      den->d_name,
+				      den->d_namlen);
+			} else {
+				bcopy(data, den->d_name, den->d_namlen);
+			}
+			den->d_name[den->d_namlen] = 0;
+			break;
+		default:
+			den->d_namlen = 1;
+			den->d_type =
+				hammer2_get_dtype(HAMMER2_OBJTYPE_REGFILE);
+			den->d_name[0] = '?';
+			den->d_name[1] = 0;
+			break;
+		}
 
 		f->f_offset = bres.key + 1;
 

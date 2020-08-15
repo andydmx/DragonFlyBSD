@@ -44,6 +44,8 @@
 
 #include "libc_private.h"
 
+int __cxa_atexit(void (*)(void *), void *, void *);
+
 #define	ATEXIT_FN_EMPTY	0
 #define	ATEXIT_FN_STD	1
 #define	ATEXIT_FN_CXA	2
@@ -148,6 +150,8 @@ __cxa_atexit(void (*func)(void *), void *arg, void *dso)
 #pragma weak __pthread_cxa_finalize
 void __pthread_cxa_finalize(const struct dl_phdr_info *);
 
+static int global_exit;
+
 /*
  * Call all handlers registered with __cxa_atexit for the shared
  * object owning 'dso'.  Note: if 'dso' is NULL, then all remaining
@@ -161,10 +165,12 @@ __cxa_finalize(void *dso)
 	struct atexit_fn fn;
 	int n, has_phdr;
 
-	if (dso != NULL)
+	if (dso != NULL) {
 		has_phdr = _rtld_addr_phdr(dso, &phdr_info);
-	else
+	} else {
 		has_phdr = 0;
+		global_exit = 1;
+	}
 
 	_MUTEX_LOCK(&atexit_mutex);
 	for (p = __atexit; p; p = p->next) {
@@ -174,8 +180,9 @@ __cxa_finalize(void *dso)
 			fn = p->fns[n];
 			if (dso != NULL && dso != fn.fn_dso) {
 				/* wrong DSO ? */
-				if (!has_phdr || !__elf_phdr_match_addr(
-				    &phdr_info, fn.fn_ptr.cxa_func))
+				if (!has_phdr || global_exit ||
+				    !__elf_phdr_match_addr(&phdr_info,
+				    fn.fn_ptr.cxa_func))
 					continue;
 			}
 			/*
@@ -197,6 +204,6 @@ __cxa_finalize(void *dso)
 	if (dso == NULL)
 		_MUTEX_DESTROY(&atexit_mutex);
 
-	if (has_phdr && &__pthread_cxa_finalize != NULL)
+	if (has_phdr && !global_exit && &__pthread_cxa_finalize != NULL)
 		__pthread_cxa_finalize(&phdr_info);
 }

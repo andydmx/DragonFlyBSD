@@ -1,19 +1,19 @@
-#	$Id: SunOS.mk,v 1.5 2010/01/11 23:02:05 sjg Exp $
+#	$Id: SunOS.mk,v 1.11 2020/06/29 14:34:42 sjg Exp $
 
 .if ${.PARSEFILE} == "sys.mk"
 .include <host-target.mk>
 
-OS?=		SunOS.${HOST_OSMAJOR}
-unix?=		We run ${OS}.
+OS ?=		SunOS.${HOST_OSMAJOR}
+unix ?=		We run ${OS}.
 .endif
 
 .if ${HOST_OSMAJOR} > 4
-ROOT_GROUP=	root
+ROOT_GROUP ?=	root
 
-SHLIB_FULLVERSION = ${SHLIB_MAJOR}
+SHLIB_FULLVERSION  ?= ${SHLIB_MAJOR}
 
-# supress the dependency
-LIBCRT0= /dev/null
+# suppress the dependency
+LIBCRT0 ?= /dev/null
 
 .ifndef CC
 # the PATH below may find an ancient gcc
@@ -22,98 +22,94 @@ CC := ${gcc:L:${M_whence}}
 .endif
 
 # the stuff in /usr/xpg4/bin is usually more sane.
-PATH=/usr/xpg4/bin:/usr/sbin:/usr/bin:/usr/ucb:/usr/sfw/bin:/opt/gnu/bin:/usr/ccs/bin:/usr/local/bin
+PATH ?=/usr/xpg4/bin:/usr/sbin:/usr/bin:/usr/ucb:/usr/sfw/bin:/opt/gnu/bin:/usr/ccs/bin:/usr/local/bin
 .export PATH
 
-DSHLIBEXT = .so
-HOST_LIBDIRS = /usr/lib /lib /usr/sfw/lib
+DSHLIBEXT  ?= .so
+HOST_LIBDIRS  ?= /usr/lib /lib /usr/sfw/lib
 
 # no -X
 LD_X=
 LD_x=
-RANLIB=		:
-CPP=		/usr/ccs/lib/cpp
+RANLIB ?=		:
+CPP ?=		/usr/ccs/lib/cpp
 .else
-ROOT_GROUP=	wheel
-RANLIB=		ranlib
-CPP=		cpp
+ROOT_GROUP ?=	wheel
+RANLIB ?=		ranlib
+CPP ?=		cpp
 .endif
 
 # the rest is common
 
-.SUFFIXES: .out .a .ln .o .c .cc .C .F .f .r .y .l .s .S .cl .p .h .sh .m4
+.SUFFIXES: .out .a .ln .o .c ${CXX_SUFFIXES} .F .f .r .y .l .s .S .cl .p .h .sh .m4
 
 .LIBS:		.a
 
-AR=		ar
-ARFLAGS=	rl
+AR ?=		ar
+ARFLAGS ?=	rl
 
-AS=		as
-AS_STDIN=	-
+AS ?=		as
+AS_STDIN ?=	-
 AFLAGS=
-COMPILE.s=	${AS} ${AFLAGS}
-LINK.s=		${CC} ${AFLAGS} ${LDFLAGS}
-COMPILE.S=	${CC} ${AFLAGS} ${CPPFLAGS} -c
-LINK.S=		${CC} ${AFLAGS} ${CPPFLAGS} ${LDFLAGS}
+COMPILE.s ?=	${AS} ${AFLAGS}
+LINK.s ?=		${CC} ${AFLAGS} ${LDFLAGS}
+COMPILE.S ?=	${CC} ${AFLAGS} ${CPPFLAGS} -c
+LINK.S ?=		${CC} ${AFLAGS} ${CPPFLAGS} ${LDFLAGS}
 .if exists(/opt/gnu/bin/gcc) || exists(/usr/local/bin/gcc)
 CC ?=		gcc -pipe
-DBG=		-O -g
-STATIC=		-static
+DBG ?=		-O -g
+STATIC ?=		-static
 .else
 CC ?=             cc
-DBG=         -g
-STATIC=         -Bstatic
+DBG ?=         -g
+STATIC ?=         -Bstatic
 .endif
-CFLAGS=		${DBG}
-COMPILE.c=	${CC} ${CFLAGS} ${CPPFLAGS} -c
-LINK.c=		${CC} ${CFLAGS} ${CPPFLAGS} ${LDFLAGS}
+CFLAGS ?=		${DBG}
+COMPILE.c ?=	${CC} ${CFLAGS} ${CPPFLAGS} -c
+LINK.c ?=		${CC} ${CFLAGS} ${CPPFLAGS} ${LDFLAGS}
 
-CXX=		g++
-CXXFLAGS=	${CFLAGS}
-COMPILE.cc=	${CXX} ${CXXFLAGS} ${CPPFLAGS} -c
-LINK.cc=	${CXX} ${CXXFLAGS} ${CPPFLAGS} ${LDFLAGS}
+CXX ?=		g++
+CXXFLAGS ?=	${CFLAGS}
+COMPILE.cc ?=	${CXX} ${CXXFLAGS} ${CPPFLAGS} -c
+LINK.cc ?=	${CXX} ${CXXFLAGS} ${CPPFLAGS} ${LDFLAGS}
 
 .if defined(DESTDIR)
 CPPFLAGS+=	-nostdinc -idirafter ${DESTDIR}/usr/include
 .endif
 
-MK_DEP=	mkdeps.sh -N
-FC=		f77
-FFLAGS=		-O
+MK_DEP ?=	mkdeps.sh -N
+FC ?=		f77
+FFLAGS ?=		-O
 RFLAGS=
-COMPILE.f=	${FC} ${FFLAGS} -c
-LINK.f=		${FC} ${FFLAGS} ${LDFLAGS}
-COMPILE.F=	${FC} ${FFLAGS} ${CPPFLAGS} -c
-LINK.F=		${FC} ${FFLAGS} ${CPPFLAGS} ${LDFLAGS}
-COMPILE.r=	${FC} ${FFLAGS} ${RFLAGS} -c
-LINK.r=		${FC} ${FFLAGS} ${RFLAGS} ${LDFLAGS}
+COMPILE.f ?=	${FC} ${FFLAGS} -c
+LINK.f ?=		${FC} ${FFLAGS} ${LDFLAGS}
+COMPILE.F ?=	${FC} ${FFLAGS} ${CPPFLAGS} -c
+LINK.F ?=		${FC} ${FFLAGS} ${CPPFLAGS} ${LDFLAGS}
+COMPILE.r ?=	${FC} ${FFLAGS} ${RFLAGS} -c
+LINK.r ?=		${FC} ${FFLAGS} ${RFLAGS} ${LDFLAGS}
 
-LEX=		lex
+LEX ?=		lex
 LFLAGS=
-LEX.l=		${LEX} ${LFLAGS}
+LEX.l ?=		${LEX} ${LFLAGS}
 
-LD=		ld
+LD ?=		ld
 LDFLAGS=
 
-LINT=		lint
-LINTFLAGS=	-chapbx
+LINT ?=		lint
+LINTFLAGS ?=	-chapbx
 
-MAKE=		bmake
-
-PC=		pc
+PC ?=		pc
 PFLAGS=
-COMPILE.p=	${PC} ${PFLAGS} ${CPPFLAGS} -c
-LINK.p=		${PC} ${PFLAGS} ${CPPFLAGS} ${LDFLAGS}
-
-SHELL=		sh
+COMPILE.p ?=	${PC} ${PFLAGS} ${CPPFLAGS} -c
+LINK.p ?=		${PC} ${PFLAGS} ${CPPFLAGS} ${LDFLAGS}
 
 .if exists(/usr/local/bin/bison) || exists(/opt/gnu/bin/bison)
-YACC=		bison -y
+YACC ?=		bison -y
 .else
-YACC=		yacc
+YACC ?=		yacc
 .endif
-YFLAGS=		-d
-YACC.y=		${YACC} ${YFLAGS}
+YFLAGS ?=		-d
+YACC.y ?=		${YACC} ${YFLAGS}
 
 # C
 .c:
@@ -126,20 +122,11 @@ YACC.y=		${YACC} ${YFLAGS}
 	rm -f $*.o
 
 # C++
-.cc:
+${CXX_SUFFIXES}:
 	${LINK.cc} -o ${.TARGET} ${.IMPSRC} ${LDLIBS}
-.cc.o:
+${CXX_SUFFIXES:%=%.o}:
 	${COMPILE.cc} ${.IMPSRC}
-.cc.a:
-	${COMPILE.cc} ${.IMPSRC}
-	${AR} ${ARFLAGS} $@ $*.o
-	rm -f $*.o
-
-.C:
-	${LINK.cc} -o ${.TARGET} ${.IMPSRC} ${LDLIBS}
-.C.o:
-	${COMPILE.cc} ${.IMPSRC}
-.C.a:
+${CXX_SUFFIXES:%=%.a}:
 	${COMPILE.cc} ${.IMPSRC}
 	${AR} ${ARFLAGS} $@ $*.o
 	rm -f $*.o

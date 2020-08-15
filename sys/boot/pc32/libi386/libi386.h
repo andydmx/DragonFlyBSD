@@ -26,6 +26,7 @@
  * $FreeBSD: src/sys/boot/i386/libi386/libi386.h,v 1.16 2003/05/01 03:56:29 peter Exp $
  */
 
+#include <machine/types.h>	/* XXX for vm_offset_t */
 
 /*
  * i386 fully-qualified device descriptor.
@@ -56,6 +57,32 @@ struct i386_devdesc
 	} netif;
     } d_kind;
 };
+
+static __inline u_int
+read_eflags(void)
+{
+	u_int	ef;
+
+	__asm __volatile("pushfl; popl %0" : "=r" (ef));
+	return (ef);
+}
+
+static __inline void
+write_eflags(u_int ef)
+{
+	__asm __volatile("pushl %0; popfl" : : "r" (ef));
+}
+
+/*
+ * Max number of sectors to bounce-buffer if the request crosses a 64k boundary
+ *
+ * Bounce buffers can no longer be malloc()'d because the malloc pool
+ * now uses high memory.  Declare statically.
+ */
+#define BOUNCEBUF_SIZE  8192
+#define BOUNCEBUF_SECTS (BOUNCEBUF_SIZE / BIOSDISK_SECSIZE)
+
+extern char	bounce_base[BOUNCEBUF_SIZE];
 
 int	i386_getdev(void **vdev, const char *devspec, const char **path);
 char	*i386_fmtdev(void *vdev);
@@ -92,12 +119,9 @@ void	bios_getmem(void);
 extern u_int32_t	bios_basemem;				/* base memory in bytes */
 extern u_int32_t	bios_extmem;				/* extended memory in bytes */
 extern vm_offset_t	memtop;
+extern vm_offset_t	heapbase;
 
 void	biosacpi_detect(void);
-
-void	smbios_detect(void);
-
-void	gateA20(void);
 
 int	i386_autoload(void);
 

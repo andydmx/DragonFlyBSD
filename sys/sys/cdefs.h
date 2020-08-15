@@ -13,11 +13,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -43,7 +39,9 @@
 /*
  * Testing against Clang-specific extensions.
  */
-
+#ifndef	__has_attribute
+#define	__has_attribute(x)	0
+#endif
 #ifndef	__has_extension
 #define	__has_extension		__has_feature
 #endif
@@ -61,10 +59,10 @@
  * Macro to test if we are using a specific version of gcc or later.
  */
 #if defined(__GNUC__) && !defined(__INTEL_COMPILER)
-#define __GNUC_PREREQ__(ma, mi)	\
+#define	__GNUC_PREREQ__(ma, mi)	\
         (__GNUC__ > (ma) || __GNUC__ == (ma) && __GNUC_MINOR__ >= (mi))
 #else
-#define __GNUC_PREREQ__(ma, mi) 0
+#define	__GNUC_PREREQ__(ma, mi) 0
 #endif
 
 #if defined(__cplusplus)
@@ -88,12 +86,12 @@
  * If needed, this value can be TUNED.  Suitable values for this macro
  * are 32, 64 and 128 bytes.  The unit of measurement for this macro is
  * bytes.
- * 
+ *
  * XXX: This macro and related macros will eventually move to a MD
  * header, but currently, we do need such a hierarchy.
  */
 #define	__VM_CACHELINE_SIZE	64
-#define __VM_CACHELINE_MASK	(__VM_CACHELINE_SIZE - 1)
+#define	__VM_CACHELINE_MASK	(__VM_CACHELINE_SIZE - 1)
 #define	__VM_CACHELINE_ALIGN(n)	\
 	(((n) + __VM_CACHELINE_MASK) & ~__VM_CACHELINE_MASK)
 
@@ -161,69 +159,125 @@
  * properly (old versions of gcc-2 supported the dead and pure features
  * in a different (wrong) way).
  */
-#ifdef lint
-
-#define __dead2
-#define	__pure
-#define __pure2
-#define __unused
-#define __packed
-#define __aligned(x)
-#define __section(x)
-#define __always_inline
-#define __nonnull(x)
-#define __heedresult
-
-#else
-
-#if !__GNUC_PREREQ__(2, 7)
-#define __dead2
-#define __pure2
-#define __unused
-#endif
-
+#define	__weak_symbol	__attribute__((__weak__))
 #if __GNUC_PREREQ__(2, 7)
-#define __dead2		__attribute__((__noreturn__))
-#define __pure2		__attribute__((__const__))
-#define __unused	__attribute__((__unused__))
-#define __packed        __attribute__((__packed__))
-#define __aligned(x)    __attribute__((__aligned__(x)))
-#define __section(x)    __attribute__((__section__(x)))
+#define	__dead2		__attribute__((__noreturn__))
+#define	__pure2		__attribute__((__const__))
+#define	__unused	__attribute__((__unused__))
+#define	__packed	__attribute__((__packed__))
+#define	__aligned(x)	__attribute__((__aligned__(x)))
+#define	__section(x)	__attribute__((__section__(x)))
+#else
+#define	__dead2
+#define	__pure2
+#define	__unused
 #endif
 
 #if __GNUC_PREREQ__(2, 96)
+#define	__malloclike	__attribute__((__malloc__))
 #define	__pure		__attribute__((__pure__))
 #else
+#define	__malloclike
 #define	__pure		__pure2
 #endif
 
 #if __GNUC_PREREQ__(3, 1)
-#define __always_inline __attribute__((__always_inline__))
+#define	__always_inline	__attribute__((__always_inline__))
 #define	__noinline	__attribute__((__noinline__))
 #else
-#define __always_inline
+#define	__always_inline
 #define	__noinline
 #endif
 
 #if __GNUC_PREREQ__(3, 3)
-#define __heedresult	__attribute__((__warn_unused_result__))
-#define __nonnull(x)    __attribute__((__nonnull__(x)))
+#define	__nonnull(...)	__attribute__((__nonnull__(__VA_ARGS__)))
 #define	__used		__attribute__((__used__))
 #else
-#define __heedresult
-#define __nonnull(x)
-#define __used		__unused
+#define	__nonnull(...)
+#define	__used		__unused
 #endif
 
-#endif	/* LINT */
-
-#if !__GNUC_PREREQ__(2, 7) && __STDC_VERSION < 199901
-#define __func__        NULL
+#if __GNUC_PREREQ__(3, 4)
+#define	__heedresult	__attribute__((__warn_unused_result__))
+#else
+#define	__heedresult
 #endif
 
-#if (__GNUC_PREREQ__(2, 0) && !defined(__STRICT_ANSI)) || \
+#if __GNUC_PREREQ__(4, 1)
+#define	__returns_twice	__attribute__((__returns_twice__))
+#else
+#define	__returns_twice
+#endif
+
+#if __GNUC_PREREQ__(4, 6) || __has_builtin(__builtin_unreachable)
+#define	__unreachable()	__builtin_unreachable()
+#else
+#define	__unreachable()	((void)0)
+#endif
+
+#if __GNUC_PREREQ__(4, 3) || __has_attribute(__alloc_size__)
+#define	__alloc_size(x)		__attribute__((__alloc_size__(x)))
+#define	__alloc_size2(n, x)	__attribute__((__alloc_size__(n, x)))
+#else
+#define	__alloc_size(x)
+#define	__alloc_size2(n, x)
+#endif
+
+#if __GNUC_PREREQ__(4, 9) || __has_attribute(__alloc_align__)
+#define	__alloc_align(x)	__attribute__((__alloc_align__(x)))
+#else
+#define	__alloc_align(x)
+#endif
+
+#if !__GNUC_PREREQ__(2, 7) && __STDC_VERSION__ < 199901
+#define	__func__	NULL
+#endif
+
+#if (__GNUC_PREREQ__(2, 0) && !defined(__STRICT_ANSI__)) || \
     __STDC_VERSION__ >= 199901
 #define	__LONG_LONG_SUPPORTED
+#endif
+
+/* C++11 exposes a load of C99 stuff */
+#if defined(__cplusplus) && __cplusplus >= 201103L
+#define	__LONG_LONG_SUPPORTED
+#ifndef	__STDC_LIMIT_MACROS
+#define	__STDC_LIMIT_MACROS
+#endif
+#ifndef	__STDC_CONSTANT_MACROS
+#define	__STDC_CONSTANT_MACROS
+#endif
+#endif
+
+/*
+ * GCC 2.95 and later provides `__restrict' as an extension to C90 to support
+ * the C99-specific `restrict' type qualifier.  We happen to use `__restrict'
+ * as a way to define the `restrict' type qualifier without disturbing older
+ * software that is unaware of C99 keywords.
+ */
+#if !__GNUC_PREREQ__(2, 95)
+#if __STDC_VERSION__ < 199901
+#define	__restrict
+#else
+#define	__restrict	restrict
+#endif
+#endif
+
+/*
+ * C99 allows to declare arrays as non-overlapping.
+ */
+#if __GNUC_PREREQ__(3, 1) && !defined(__GNUG__)
+#define	__restrict_arr	__restrict
+#else
+#ifdef __GNUC__
+#define	__restrict_arr
+#else
+#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 199901
+#define	__restrict_arr	restrict
+#else
+#define	__restrict_arr
+#endif
+#endif
 #endif
 
 /*
@@ -255,24 +309,28 @@
  *	  larger code.
  */
 #if __GNUC_PREREQ__(2, 96)
-#define __predict_true(exp)     __builtin_expect((exp), 1)
-#define __predict_false(exp)    __builtin_expect((exp), 0)
+#define	__predict_true(exp)     __builtin_expect((exp), 1)
+#define	__predict_false(exp)    __builtin_expect((exp), 0)
 #else
-#define __predict_true(exp)     (exp)
-#define __predict_false(exp)    (exp)
+#define	__predict_true(exp)     (exp)
+#define	__predict_false(exp)    (exp)
 #endif
 
 /*
- * GCC 2.95 and later provides `__restrict' as an extention to C90 to support
- * the C99-specific `restrict' type qualifier.  We happen to use `__restrict'
- * as a way to define the `restrict' type qualifier without disturbing older
- * software that is unaware of C99 keywords.
+ * We define this here since <stddef.h>, <sys/queue.h>, and <sys/types.h>
+ * require it.
  */
-#if !__GNUC_PREREQ__(2, 95)
-#if __STDC_VERSION__ < 199901
-#define	__restrict
+#if __GNUC_PREREQ__(4, 1)
+#define	__offsetof(type, field)	__builtin_offsetof(type, field)
 #else
-#define	__restrict	restrict
+#ifndef __cplusplus
+#define	__offsetof(type, field) \
+	((__size_t)(__uintptr_t)((const volatile void *)&((type *)0)->field))
+#else
+#define	__offsetof(type, field)					\
+	(__offsetof__ (reinterpret_cast <__size_t>		\
+		 (&reinterpret_cast <const volatile char &>	\
+		  (static_cast<type *> (0)->field))))
 #endif
 #endif
 
@@ -320,21 +378,20 @@
 	    __attribute__((__format__ (__strfmon__, fmtarg, firstvararg)))
 #define	__strftimelike(fmtarg, firstvararg) \
 	    __attribute__((__format__ (__strftime__, fmtarg, firstvararg)))
-
 #endif
 
 #if !__GNUC_PREREQ__(3, 0)
-#define __ARRAY_ZERO	0
+#define	__ARRAY_ZERO	0
 #else
-#define __ARRAY_ZERO
+#define	__ARRAY_ZERO
 #endif
 
 #if __GNUC_PREREQ__(4, 0)
-#define __dso_public	__attribute__((__visibility__("default")))
-#define __dso_hidden	__attribute__((__visibility__("hidden")))
+#define	__dso_public	__attribute__((__visibility__("default")))
+#define	__dso_hidden	__attribute__((__visibility__("hidden")))
 #else
-#define __dso_public
-#define __dso_hidden
+#define	__dso_public
+#define	__dso_hidden
 #endif
 
 /*
@@ -342,16 +399,16 @@
  * constructors, provide a compatible interface for both.
  */
 #if __GNUC_PREREQ__(4, 3)
-#define	__constructor(prio) __attribute__((constructor(prio)))
+#define	__constructor(prio)	__attribute__((constructor(prio)))
 #else
-#define	__constructor(prio) __attribute__((constructor))
+#define	__constructor(prio)	__attribute__((constructor))
 #endif
 
 /*
  * Handy GCC based macros:
  *
  * 	__cachealign:
- * 	
+ *
  * 	The __cachealign macro can be used for cache line aligning structures
  * 	of small to medium size.  It aligns the particular structure or
  * 	storage type to a system default cache line alignment, thus giving us
@@ -359,7 +416,7 @@
  * 	its best burst speeds.
  *
  * 	__usereg:
- * 	
+ *
  * 	The __usereg macro can/should be used when a function contains
  * 	arguments not more than 3.  It can be very useful to us due to the
  * 	message-passing nature of the kernel.
@@ -378,22 +435,28 @@
  */
 #ifdef __GNUC__
 #define	__cachealign	__attribute__((__aligned__(__VM_CACHELINE_SIZE)))
-#define	__usereg     	__attribute__((__regparm__(3)))
+#define	__usereg	__attribute__((__regparm__(3)))
 #else
 #define	__cachealign
 #define	__usereg
 #endif
 
 #ifdef __GNUC__
-#define __strong_reference(sym,aliassym)	\
-	extern __typeof (sym) aliassym __attribute__ ((__alias__ (#sym)));
-#define	__weak_reference(sym,alias)	\
+#define	__strong_reference(sym,aliassym)	\
+	extern __typeof (sym) aliassym __attribute__ ((__alias__ (#sym)))
+#define	__weak_reference(sym,aliassym)	\
+	__strong_reference(sym,aliassym) __attribute__ ((__weak__))
+#define	__weak_reference_asm(sym,alias)	\
 	__asm__(".weak " #alias);	\
 	__asm__(".equ "  #alias ", " #sym)
 #define	__warn_references(sym,msg)	\
 	__asm__(".section .gnu.warning." #sym);	\
 	__asm__(".asciz \"" msg "\"");	\
 	__asm__(".previous")
+#define	__sym_compat(sym,impl,verid)	\
+	__asm__(".symver " #impl ", " #sym "@" #verid)
+#define	__sym_default(sym,impl,verid)	\
+	__asm__(".symver " #impl ", " #sym "@@@" #verid)
 #endif	/* __GNUC__ */
 
 #if defined(__GNUC__)
@@ -401,27 +464,35 @@
 #endif
 
 #ifndef	__RCSID
-#define	__RCSID(s)	__IDSTRING(rcsid,s)
+#define	__RCSID(s)		struct __hack
 #endif
 
 #ifndef	__RCSID_SOURCE
-#define	__RCSID_SOURCE(s) __IDSTRING(rcsid_source,s)
+#define	__RCSID_SOURCE(s)	struct __hack
+#endif
+
+#ifndef	__SCCSID
+#define	__SCCSID(s)		struct __hack
+#endif
+
+#ifndef	__FBSDID
+#define	__FBSDID(s)		struct __hack
 #endif
 
 #ifndef	__COPYRIGHT
-#define	__COPYRIGHT(s)	__IDSTRING(copyright,s)
+#define	__COPYRIGHT(s)  	struct __hack
 #endif
 
 #ifndef	__DECONST
-#define	__DECONST(type, var)	((type)(uintptr_t)(const void *)(var))
+#define	__DECONST(type, var)	((type)(__uintptr_t)(const void *)(var))
 #endif
 
 #ifndef	__DEVOLATILE
-#define	__DEVOLATILE(type, var)	((type)(uintptr_t)(volatile void *)(var))
+#define	__DEVOLATILE(type, var)	((type)(__uintptr_t)(volatile void *)(var))
 #endif
 
 #ifndef	__DEQUALIFY
-#define	__DEQUALIFY(type, var)	((type)(uintptr_t)(const volatile void *)(var))
+#define	__DEQUALIFY(type, var)	((type)(__uintptr_t)(const volatile void *)(var))
 #endif
 
 /*
@@ -431,10 +502,6 @@
 #if !__GNUC_PREREQ__(2, 95)
 #define	__alignof(x)	__offsetof(struct { char __a; x __b; }, __b)
 #endif
-
-/*
- * Keywords added in C11.
- */
 
 #if !defined(__STDC_VERSION__) || __STDC_VERSION__ < 201112L
 
@@ -454,7 +521,9 @@
 #define	_Alignof(x)		__alignof(x)
 #endif
 
+#if !defined(_Noreturn)
 #define	_Noreturn		__dead2
+#endif
 
 #if !__has_extension(c_static_assert)
 #if (defined(__cplusplus) && __cplusplus >= 201103L) || \
@@ -466,6 +535,18 @@
 #define	CTASSERT(x)		_CTASSERT(x, __LINE__)
 #define	_CTASSERT(x, y)		__CTASSERT(x, y)
 #define	__CTASSERT(x, y)	typedef char __assert ## y[(x) ? 1 : -1]
+#endif
+#endif
+
+/*
+ * GCC 4.7 has -std=c++11 but does not support thread_local.
+ */
+#if !__has_extension(c_thread_local)
+#if (defined(__cplusplus) && __cplusplus >= 201103L && __GNUC_PREREQ__(4, 8)) || \
+    __has_extension(cxx_thread_local)
+#define	_Thread_local		thread_local
+#else
+#define	_Thread_local		__thread
 #endif
 #endif
 #endif
@@ -496,8 +577,6 @@
 #endif
 
 /*-
- * The following definitions are an extension of the behavior originally
- * implemented in <sys/_posix.h>, but with a different level of granularity.
  * POSIX.1 requires that the macros we test be defined before any standard
  * header file is included.
  *
@@ -517,18 +596,6 @@
  *
  * Our macros begin with two underscores to avoid namespace screwage.
  */
-
-/*
- * If no special macro was specified, make the DragonFly extensions
- * available. Also make them available when requested so.
- */
-#if (!defined(_POSIX_C_SOURCE) && !defined(_XOPEN_SOURCE) && \
-    !defined(_ANSI_SOURCE) && !defined(_C99_SOURCE)) || \
-    defined(_DRAGONFLY_SOURCE) || defined(_NETBSD_SOURCE)
-#define __DF_VISIBLE	1
-#else
-#define __DF_VISIBLE	0
-#endif
 
 /* Deal with IEEE Std. 1003.1-1990, in which _POSIX_C_SOURCE == 1. */
 #if defined(_POSIX_C_SOURCE) && (_POSIX_C_SOURCE - 0) == 1
@@ -602,27 +669,48 @@
  * _POSIX_C_SOURCE, we will assume that it wants the broader compilation
  * environment (and in fact we will never get here).
  */
-#ifdef _ANSI_SOURCE		/* Hide almost everything. */
+#if defined(_ANSI_SOURCE)	/* Hide almost everything. */
 #define	__POSIX_VISIBLE		0
 #define	__XSI_VISIBLE		0
 #define	__BSD_VISIBLE		0
 #define	__ISO_C_VISIBLE		1990
+#define	__EXT1_VISIBLE		0
 #elif defined(_C99_SOURCE)	/* Localism to specify strict C99 env. */
 #define	__POSIX_VISIBLE		0
 #define	__XSI_VISIBLE		0
 #define	__BSD_VISIBLE		0
 #define	__ISO_C_VISIBLE		1999
+#define	__EXT1_VISIBLE		0
 #elif defined(_C11_SOURCE)	/* Localism to specify strict C11 env. */
 #define	__POSIX_VISIBLE		0
 #define	__XSI_VISIBLE		0
 #define	__BSD_VISIBLE		0
 #define	__ISO_C_VISIBLE		2011
+#define	__EXT1_VISIBLE		0
 #else				/* Default environment: show everything. */
 #define	__POSIX_VISIBLE		200809
 #define	__XSI_VISIBLE		700
 #define	__BSD_VISIBLE		1
 #define	__ISO_C_VISIBLE		2011
+#define	__EXT1_VISIBLE		1
 #endif
+#endif
+
+/* User override __EXT1_VISIBLE */
+#if defined(__STDC_WANT_LIB_EXT1__)
+#undef	__EXT1_VISIBLE
+#if __STDC_WANT_LIB_EXT1__
+#define	__EXT1_VISIBLE		1
+#else
+#define	__EXT1_VISIBLE		0
+#endif
+#endif /* __STDC_WANT_LIB_EXT1__ */
+
+#ifndef __BSD_VISIBLE
+#define	__BSD_VISIBLE		0
+#endif
+#ifndef __EXT1_VISIBLE
+#define	__EXT1_VISIBLE		0
 #endif
 
 /*
@@ -632,29 +720,5 @@
 
 #define	__GLOBL1(sym)	__asm__(".globl " #sym)
 #define	__GLOBL(sym)	__GLOBL1(sym)
-
-/*
- * Ignore the rcs id of a source file.
- */
-
-#ifndef __FBSDID
-#define __FBSDID(s)	struct __hack
-#endif
-
-#ifndef __RCSID
-#define __RCSID(s)	struct __hack
-#endif
-
-#ifndef __RCSID_SOURCE
-#define __RCSID_SOURCE(s)	struct __hack
-#endif
-
-#ifndef __SCCSID
-#define __SCCSID(s)	struct __hack
-#endif
-
-#ifndef __COPYRIGHT
-#define __COPYRIGHT(s)  struct __hack
-#endif
 
 #endif /* !_SYS_CDEFS_H_ */

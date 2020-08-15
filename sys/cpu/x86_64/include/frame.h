@@ -1,7 +1,7 @@
 /*-
  * Copyright (c) 2003 Peter Wemm.
  * Copyright (c) 1990 The Regents of the University of California.
- * Copyright (c) 2008 The DragonFly Project.
+ * Copyright (c) 2008-2018 The DragonFly Project.
  * All rights reserved.
  *
  * This code is derived from software contributed to Berkeley by
@@ -15,11 +15,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -85,7 +81,7 @@ struct trapframe {
 #define tf_sp tf_rsp
 	register_t	tf_rsp;
 	register_t	tf_ss;
-};
+} __packed;
 
 /* Interrupt stack frame */
 
@@ -120,7 +116,39 @@ struct intrframe {
 	register_t	if_rflags;
 	register_t	if_rsp;
 	register_t	if_ss;
-};
+} __packed;
+
+/*
+ * The trampframe is placed at the top of the trampoline page and
+ * contains all the information needed to trampoline into and out
+ * of the isolated user pmap.
+ */
+struct trampframe {
+	register_t	tr_cr2;
+	register_t	tr_rax;
+	register_t	tr_rcx;
+	register_t	tr_rdx;
+	register_t	tr_err;
+	register_t	tr_rip;
+	register_t	tr_cs;
+	register_t	tr_rflags;
+	register_t	tr_rsp;
+	register_t	tr_ss;
+
+	/*
+	 * Top of hw stack in TSS is &tr_pcb_rsp (first push is tr_ss).
+	 * Make sure this is at least 16-byte aligned, so be sure the
+	 * fields below are in multiples of 16 bytes.
+	 */
+	register_t	tr_pcb_rsp;	/* hw frame tramp top of stack */
+	register_t	tr_pcb_flags;	/* copy of pcb control flags */
+	register_t	tr_pcb_cr3_iso;	/* copy of isolated pml4e */
+	register_t	tr_pcb_cr3;	/* copy of primary pml4e */
+	uint32_t	tr_pcb_spec_ctrl[2];/* SPEC_CTRL + ficticious flags */
+	register_t	tr_pcb_gs_kernel; /* (used by nmi, dbg) */
+	register_t	tr_pcb_gs_saved;  /* (used by nmi) */
+	register_t	tr_pcb_cr3_saved; /* (used by nmi) */
+} __packed;
 
 int	kdb_trap(int, int, struct trapframe *);
 

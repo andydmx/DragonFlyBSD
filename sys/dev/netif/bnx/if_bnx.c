@@ -62,6 +62,7 @@
 #include <net/if_poll.h>
 #include <net/if_types.h>
 #include <net/ifq_var.h>
+#include <net/if_ringmap.h>
 #include <net/toeplitz.h>
 #include <net/toeplitz2.h>
 #include <net/vlan/if_vlan_var.h>
@@ -307,11 +308,6 @@ static int	bnx_sysctl_rx_coal_bds_int(SYSCTL_HANDLER_ARGS);
 static int	bnx_sysctl_tx_coal_bds_int(SYSCTL_HANDLER_ARGS);
 static int	bnx_sysctl_coal_chg(SYSCTL_HANDLER_ARGS, uint32_t *,
 		    int, int, uint32_t);
-#ifdef IFPOLL_ENABLE
-static int	bnx_sysctl_npoll_offset(SYSCTL_HANDLER_ARGS);
-static int	bnx_sysctl_npoll_rxoff(SYSCTL_HANDLER_ARGS);
-static int	bnx_sysctl_npoll_txoff(SYSCTL_HANDLER_ARGS);
-#endif
 static int	bnx_sysctl_std_refill(SYSCTL_HANDLER_ARGS);
 
 static void	bnx_sig_post_reset(struct bnx_softc *, int);
@@ -359,6 +355,7 @@ static DEFINE_CLASS_0(bnx, bnx_driver, bnx_methods, sizeof(struct bnx_softc));
 static devclass_t bnx_devclass;
 
 DECLARE_DUMMY_MODULE(if_bnx);
+MODULE_DEPEND(if_bnx, miibus, 1, 1, 1);
 DRIVER_MODULE(if_bnx, pci, bnx_driver, bnx_devclass, NULL, NULL);
 DRIVER_MODULE(miibus, bnx, miibus_driver, miibus_devclass, NULL, NULL);
 
@@ -810,7 +807,7 @@ bnx_newbuf_std(struct bnx_rx_ret_ring *ret, int i, int init)
 	rb = &ret->bnx_std->bnx_rx_std_buf[i];
 	KASSERT(!rb->bnx_rx_refilled, ("RX buf %dth has been refilled", i));
 
-	m_new = m_getcl(init ? MB_WAIT : MB_DONTWAIT, MT_DATA, M_PKTHDR);
+	m_new = m_getcl(init ? M_WAITOK : M_NOWAIT, MT_DATA, M_PKTHDR);
 	if (m_new == NULL) {
 		error = ENOBUFS;
 		goto back;
@@ -882,7 +879,7 @@ bnx_newbuf_jumbo(struct bnx_softc *sc, int i, int init)
 	bus_addr_t paddr;
 
 	/* Allocate the mbuf. */
-	MGETHDR(m_new, init ? MB_WAIT : MB_DONTWAIT, MT_DATA);
+	MGETHDR(m_new, init ? M_WAITOK : M_NOWAIT, MT_DATA);
 	if (m_new == NULL)
 		return ENOBUFS;
 
@@ -1836,6 +1833,8 @@ bnx_attach(device_t dev)
 	struct ifnet *ifp;
 	struct bnx_softc *sc;
 	struct bnx_rx_std_ring *std;
+	struct sysctl_ctx_list *ctx;
+	struct sysctl_oid_list *tree;
 	uint32_t hwcfg = 0;
 	int error = 0, rid, capmask, i, std_cpuid, std_cpuid_def;
 	uint8_t ether_addr[ETHER_ADDR_LEN];
@@ -1843,9 +1842,6 @@ bnx_attach(device_t dev)
 	uintptr_t mii_priv = 0;
 #if defined(BNX_TSO_DEBUG) || defined(BNX_RSS_DEBUG) || defined(BNX_TSS_DEBUG)
 	char desc[32];
-#endif
-#ifdef IFPOLL_ENABLE
-	int offset, offset_def;
 #endif
 
 	sc = device_get_softc(dev);
@@ -2105,61 +2101,6 @@ bnx_attach(device_t dev)
 	if (error)
 		goto fail;
 
-#ifdef IFPOLL_ENABLE
-	if (sc->bnx_flags & BNX_FLAG_RXTX_BUNDLE) {
-		/*
-		 * NPOLLING RX/TX CPU offset
-		 */
-		if (sc->bnx_rx_retcnt == ncpus2) {
-			offset = 0;
-		} else {
-			offset_def =
-			(sc->bnx_rx_retcnt * device_get_unit(dev)) % ncpus2;
-			offset = device_getenv_int(dev, "npoll.offset",
-			    offset_def);
-			if (offset >= ncpus2 ||
-			    offset % sc->bnx_rx_retcnt != 0) {
-				device_printf(dev, "invalid npoll.offset %d, "
-				    "use %d\n", offset, offset_def);
-				offset = offset_def;
-			}
-		}
-		sc->bnx_npoll_rxoff = offset;
-		sc->bnx_npoll_txoff = offset;
-	} else {
-		/*
-		 * NPOLLING RX CPU offset
-		 */
-		if (sc->bnx_rx_retcnt == ncpus2) {
-			offset = 0;
-		} else {
-			offset_def =
-			(sc->bnx_rx_retcnt * device_get_unit(dev)) % ncpus2;
-			offset = device_getenv_int(dev, "npoll.rxoff",
-			    offset_def);
-			if (offset >= ncpus2 ||
-			    offset % sc->bnx_rx_retcnt != 0) {
-				device_printf(dev, "invalid npoll.rxoff %d, "
-				    "use %d\n", offset, offset_def);
-				offset = offset_def;
-			}
-		}
-		sc->bnx_npoll_rxoff = offset;
-
-		/*
-		 * NPOLLING TX CPU offset
-		 */
-		offset_def = device_get_unit(dev) % ncpus2;
-		offset = device_getenv_int(dev, "npoll.txoff", offset_def);
-		if (offset >= ncpus2) {
-			device_printf(dev, "invalid npoll.txoff %d, use %d\n",
-			    offset, offset_def);
-			offset = offset_def;
-		}
-		sc->bnx_npoll_txoff = offset;
-	}
-#endif	/* IFPOLL_ENABLE */
-
 	/*
 	 * Allocate interrupt
 	 */
@@ -2208,13 +2149,15 @@ bnx_attach(device_t dev)
 		ifp->if_capabilities |= IFCAP_RSS;
 	ifp->if_capenable = ifp->if_capabilities;
 
+	ifp->if_nmbclusters = BGE_STD_RX_RING_CNT;
+
 	ifq_set_maxlen(&ifp->if_snd, BGE_TX_RING_CNT - 1);
 	ifq_set_ready(&ifp->if_snd);
 	ifq_set_subq_cnt(&ifp->if_snd, sc->bnx_tx_ringcnt);
 
 	if (sc->bnx_tx_ringcnt > 1) {
-		ifp->if_mapsubq = ifq_mapsubq_mask;
-		ifq_set_subq_mask(&ifp->if_snd, sc->bnx_tx_ringcnt - 1);
+		ifp->if_mapsubq = ifq_mapsubq_modulo;
+		ifq_set_subq_divisor(&ifp->if_snd, sc->bnx_tx_ringcnt);
 	}
 
 	/*
@@ -2325,61 +2268,35 @@ bnx_attach(device_t dev)
 		}
 	}
 
-	/*
-	 * Create sysctl nodes.
-	 */
-	sysctl_ctx_init(&sc->bnx_sysctl_ctx);
-	sc->bnx_sysctl_tree = SYSCTL_ADD_NODE(&sc->bnx_sysctl_ctx,
-					      SYSCTL_STATIC_CHILDREN(_hw),
-					      OID_AUTO,
-					      device_get_nameunit(dev),
-					      CTLFLAG_RD, 0, "");
-	if (sc->bnx_sysctl_tree == NULL) {
-		device_printf(dev, "can't add sysctl node\n");
-		error = ENXIO;
-		goto fail;
-	}
+	ctx = device_get_sysctl_ctx(sc->bnx_dev);
+	tree = SYSCTL_CHILDREN(device_get_sysctl_tree(sc->bnx_dev));
 
-	SYSCTL_ADD_INT(&sc->bnx_sysctl_ctx,
-	    SYSCTL_CHILDREN(sc->bnx_sysctl_tree), OID_AUTO,
+	SYSCTL_ADD_INT(ctx, tree, OID_AUTO,
 	    "rx_rings", CTLFLAG_RD, &sc->bnx_rx_retcnt, 0, "# of RX rings");
-	SYSCTL_ADD_INT(&sc->bnx_sysctl_ctx,
-	    SYSCTL_CHILDREN(sc->bnx_sysctl_tree), OID_AUTO,
+	SYSCTL_ADD_INT(ctx, tree, OID_AUTO,
 	    "tx_rings", CTLFLAG_RD, &sc->bnx_tx_ringcnt, 0, "# of TX rings");
 
-	SYSCTL_ADD_PROC(&sc->bnx_sysctl_ctx,
-			SYSCTL_CHILDREN(sc->bnx_sysctl_tree),
-			OID_AUTO, "rx_coal_ticks",
+	SYSCTL_ADD_PROC(ctx, tree, OID_AUTO, "rx_coal_ticks",
 			CTLTYPE_INT | CTLFLAG_RW,
 			sc, 0, bnx_sysctl_rx_coal_ticks, "I",
 			"Receive coalescing ticks (usec).");
-	SYSCTL_ADD_PROC(&sc->bnx_sysctl_ctx,
-			SYSCTL_CHILDREN(sc->bnx_sysctl_tree),
-			OID_AUTO, "tx_coal_ticks",
+	SYSCTL_ADD_PROC(ctx, tree, OID_AUTO, "tx_coal_ticks",
 			CTLTYPE_INT | CTLFLAG_RW,
 			sc, 0, bnx_sysctl_tx_coal_ticks, "I",
 			"Transmit coalescing ticks (usec).");
-	SYSCTL_ADD_PROC(&sc->bnx_sysctl_ctx,
-			SYSCTL_CHILDREN(sc->bnx_sysctl_tree),
-			OID_AUTO, "rx_coal_bds",
+	SYSCTL_ADD_PROC(ctx, tree, OID_AUTO, "rx_coal_bds",
 			CTLTYPE_INT | CTLFLAG_RW,
 			sc, 0, bnx_sysctl_rx_coal_bds, "I",
 			"Receive max coalesced BD count.");
-	SYSCTL_ADD_PROC(&sc->bnx_sysctl_ctx,
-			SYSCTL_CHILDREN(sc->bnx_sysctl_tree),
-			OID_AUTO, "rx_coal_bds_poll",
+	SYSCTL_ADD_PROC(ctx, tree, OID_AUTO, "rx_coal_bds_poll",
 			CTLTYPE_INT | CTLFLAG_RW,
 			sc, 0, bnx_sysctl_rx_coal_bds_poll, "I",
 			"Receive max coalesced BD count in polling.");
-	SYSCTL_ADD_PROC(&sc->bnx_sysctl_ctx,
-			SYSCTL_CHILDREN(sc->bnx_sysctl_tree),
-			OID_AUTO, "tx_coal_bds",
+	SYSCTL_ADD_PROC(ctx, tree, OID_AUTO, "tx_coal_bds",
 			CTLTYPE_INT | CTLFLAG_RW,
 			sc, 0, bnx_sysctl_tx_coal_bds, "I",
 			"Transmit max coalesced BD count.");
-	SYSCTL_ADD_PROC(&sc->bnx_sysctl_ctx,
-			SYSCTL_CHILDREN(sc->bnx_sysctl_tree),
-			OID_AUTO, "tx_coal_bds_poll",
+	SYSCTL_ADD_PROC(ctx, tree, OID_AUTO, "tx_coal_bds_poll",
 			CTLTYPE_INT | CTLFLAG_RW,
 			sc, 0, bnx_sysctl_tx_coal_bds_poll, "I",
 			"Transmit max coalesced BD count in polling.");
@@ -2399,77 +2316,68 @@ bnx_attach(device_t dev)
 	 * consumes a lot of CPU cycles, so leave it off by
 	 * default.
 	 */
-	SYSCTL_ADD_PROC(&sc->bnx_sysctl_ctx,
-	    SYSCTL_CHILDREN(sc->bnx_sysctl_tree), OID_AUTO,
+	SYSCTL_ADD_PROC(ctx, tree, OID_AUTO,
 	    "force_defrag", CTLTYPE_INT | CTLFLAG_RW,
 	    sc, 0, bnx_sysctl_force_defrag, "I",
 	    "Force defragment on TX path");
 
-	SYSCTL_ADD_PROC(&sc->bnx_sysctl_ctx,
-	    SYSCTL_CHILDREN(sc->bnx_sysctl_tree), OID_AUTO,
+	SYSCTL_ADD_PROC(ctx, tree, OID_AUTO,
 	    "tx_wreg", CTLTYPE_INT | CTLFLAG_RW,
 	    sc, 0, bnx_sysctl_tx_wreg, "I",
 	    "# of segments before writing to hardware register");
 
-	SYSCTL_ADD_PROC(&sc->bnx_sysctl_ctx,
-	    SYSCTL_CHILDREN(sc->bnx_sysctl_tree), OID_AUTO,
+	SYSCTL_ADD_PROC(ctx, tree, OID_AUTO,
 	    "std_refill", CTLTYPE_INT | CTLFLAG_RW,
 	    sc, 0, bnx_sysctl_std_refill, "I",
 	    "# of packets received before scheduling standard refilling");
 
-	SYSCTL_ADD_PROC(&sc->bnx_sysctl_ctx,
-	    SYSCTL_CHILDREN(sc->bnx_sysctl_tree), OID_AUTO,
+	SYSCTL_ADD_PROC(ctx, tree, OID_AUTO,
 	    "rx_coal_bds_int", CTLTYPE_INT | CTLFLAG_RW,
 	    sc, 0, bnx_sysctl_rx_coal_bds_int, "I",
 	    "Receive max coalesced BD count during interrupt.");
-	SYSCTL_ADD_PROC(&sc->bnx_sysctl_ctx,
-	    SYSCTL_CHILDREN(sc->bnx_sysctl_tree), OID_AUTO,
+	SYSCTL_ADD_PROC(ctx, tree, OID_AUTO,
 	    "tx_coal_bds_int", CTLTYPE_INT | CTLFLAG_RW,
 	    sc, 0, bnx_sysctl_tx_coal_bds_int, "I",
 	    "Transmit max coalesced BD count during interrupt.");
 
-#ifdef IFPOLL_ENABLE
-	if (sc->bnx_flags & BNX_FLAG_RXTX_BUNDLE) {
-		SYSCTL_ADD_PROC(&sc->bnx_sysctl_ctx,
-		    SYSCTL_CHILDREN(sc->bnx_sysctl_tree), OID_AUTO,
-		    "npoll_offset", CTLTYPE_INT | CTLFLAG_RW,
-		    sc, 0, bnx_sysctl_npoll_offset, "I",
-		    "NPOLLING cpu offset");
+	if (sc->bnx_intr_type == PCI_INTR_TYPE_MSIX) {
+		SYSCTL_ADD_PROC(ctx, tree, OID_AUTO, "tx_cpumap",
+		    CTLTYPE_OPAQUE | CTLFLAG_RD,
+		    sc->bnx_tx_rmap, 0, if_ringmap_cpumap_sysctl, "I",
+		    "TX ring CPU map");
+		SYSCTL_ADD_PROC(ctx, tree, OID_AUTO, "rx_cpumap",
+		    CTLTYPE_OPAQUE | CTLFLAG_RD,
+		    sc->bnx_rx_rmap, 0, if_ringmap_cpumap_sysctl, "I",
+		    "RX ring CPU map");
 	} else {
-		SYSCTL_ADD_PROC(&sc->bnx_sysctl_ctx,
-		    SYSCTL_CHILDREN(sc->bnx_sysctl_tree), OID_AUTO,
-		    "npoll_rxoff", CTLTYPE_INT | CTLFLAG_RW,
-		    sc, 0, bnx_sysctl_npoll_rxoff, "I",
-		    "NPOLLING RX cpu offset");
-		SYSCTL_ADD_PROC(&sc->bnx_sysctl_ctx,
-		    SYSCTL_CHILDREN(sc->bnx_sysctl_tree), OID_AUTO,
-		    "npoll_txoff", CTLTYPE_INT | CTLFLAG_RW,
-		    sc, 0, bnx_sysctl_npoll_txoff, "I",
-		    "NPOLLING TX cpu offset");
-	}
+#ifdef IFPOLL_ENABLE
+		SYSCTL_ADD_PROC(ctx, tree, OID_AUTO, "tx_poll_cpumap",
+		    CTLTYPE_OPAQUE | CTLFLAG_RD,
+		    sc->bnx_tx_rmap, 0, if_ringmap_cpumap_sysctl, "I",
+		    "TX poll CPU map");
+		SYSCTL_ADD_PROC(ctx, tree, OID_AUTO, "rx_poll_cpumap",
+		    CTLTYPE_OPAQUE | CTLFLAG_RD,
+		    sc->bnx_rx_rmap, 0, if_ringmap_cpumap_sysctl, "I",
+		    "RX poll CPU map");
 #endif
+	}
 
 #ifdef BNX_RSS_DEBUG
-	SYSCTL_ADD_INT(&sc->bnx_sysctl_ctx,
-	    SYSCTL_CHILDREN(sc->bnx_sysctl_tree), OID_AUTO,
+	SYSCTL_ADD_INT(ctx, tree, OID_AUTO,
 	    "std_refill_mask", CTLFLAG_RD,
 	    &sc->bnx_rx_std_ring.bnx_rx_std_refill, 0, "");
-	SYSCTL_ADD_INT(&sc->bnx_sysctl_ctx,
-	    SYSCTL_CHILDREN(sc->bnx_sysctl_tree), OID_AUTO,
+	SYSCTL_ADD_INT(ctx, tree, OID_AUTO,
 	    "std_used", CTLFLAG_RD,
 	    &sc->bnx_rx_std_ring.bnx_rx_std_used, 0, "");
-	SYSCTL_ADD_INT(&sc->bnx_sysctl_ctx,
-	    SYSCTL_CHILDREN(sc->bnx_sysctl_tree), OID_AUTO,
+	SYSCTL_ADD_INT(ctx, tree, OID_AUTO,
 	    "rss_debug", CTLFLAG_RW, &sc->bnx_rss_debug, 0, "");
 	for (i = 0; i < sc->bnx_rx_retcnt; ++i) {
 		ksnprintf(desc, sizeof(desc), "rx_pkt%d", i);
-		SYSCTL_ADD_ULONG(&sc->bnx_sysctl_ctx,
-		    SYSCTL_CHILDREN(sc->bnx_sysctl_tree), OID_AUTO,
+		SYSCTL_ADD_ULONG(ctx, tree, OID_AUTO,
 		    desc, CTLFLAG_RW, &sc->bnx_rx_ret_ring[i].bnx_rx_pkt, "");
 
 		ksnprintf(desc, sizeof(desc), "rx_force_sched%d", i);
-		SYSCTL_ADD_ULONG(&sc->bnx_sysctl_ctx,
-		    SYSCTL_CHILDREN(sc->bnx_sysctl_tree), OID_AUTO,
+		SYSCTL_ADD_ULONG(ctx, tree, OID_AUTO,
 		    desc, CTLFLAG_RW,
 		    &sc->bnx_rx_ret_ring[i].bnx_rx_force_sched, "");
 	}
@@ -2477,25 +2385,21 @@ bnx_attach(device_t dev)
 #ifdef BNX_TSS_DEBUG
 	for (i = 0; i < sc->bnx_tx_ringcnt; ++i) {
 		ksnprintf(desc, sizeof(desc), "tx_pkt%d", i);
-		SYSCTL_ADD_ULONG(&sc->bnx_sysctl_ctx,
-		    SYSCTL_CHILDREN(sc->bnx_sysctl_tree), OID_AUTO,
+		SYSCTL_ADD_ULONG(ctx, tree, OID_AUTO,
 		    desc, CTLFLAG_RW, &sc->bnx_tx_ring[i].bnx_tx_pkt, "");
 	}
 #endif
 
-	SYSCTL_ADD_ULONG(&sc->bnx_sysctl_ctx,
-	    SYSCTL_CHILDREN(sc->bnx_sysctl_tree), OID_AUTO,
+	SYSCTL_ADD_ULONG(ctx, tree, OID_AUTO,
 	    "norxbds", CTLFLAG_RW, &sc->bnx_norxbds, "");
 
-	SYSCTL_ADD_ULONG(&sc->bnx_sysctl_ctx,
-	    SYSCTL_CHILDREN(sc->bnx_sysctl_tree), OID_AUTO,
+	SYSCTL_ADD_ULONG(ctx, tree, OID_AUTO,
 	    "errors", CTLFLAG_RW, &sc->bnx_errors, "");
 
 #ifdef BNX_TSO_DEBUG
 	for (i = 0; i < BNX_TSO_NSTATS; ++i) {
 		ksnprintf(desc, sizeof(desc), "tso%d", i + 1);
-		SYSCTL_ADD_ULONG(&sc->bnx_sysctl_ctx,
-		    SYSCTL_CHILDREN(sc->bnx_sysctl_tree), OID_AUTO,
+		SYSCTL_ADD_ULONG(ctx, tree, OID_AUTO,
 		    desc, CTLFLAG_RW, &sc->bnx_tsosegs[i], "");
 	}
 #endif
@@ -2533,7 +2437,7 @@ bnx_attach(device_t dev)
 	/*
 	 * Create RX standard ring refilling thread
 	 */
-	std_cpuid_def = device_get_unit(dev) % ncpus;
+	std_cpuid_def = if_ringmap_cpumap(sc->bnx_rx_rmap, 0);
 	std_cpuid = device_getenv_int(dev, "std.cpuid", std_cpuid_def);
 	if (std_cpuid < 0 || std_cpuid >= ncpus) {
 		device_printf(dev, "invalid std.cpuid %d, use %d\n",
@@ -2542,12 +2446,11 @@ bnx_attach(device_t dev)
 	}
 
 	std = &sc->bnx_rx_std_ring;
-	lwkt_create(bnx_rx_std_refill_ithread, std, NULL,
-	    &std->bnx_rx_std_ithread, TDF_NOSTART | TDF_INTTHREAD, std_cpuid,
+	lwkt_create(bnx_rx_std_refill_ithread, std, &std->bnx_rx_std_ithread,
+	    NULL, TDF_NOSTART | TDF_INTTHREAD, std_cpuid,
 	    "%s std", device_get_nameunit(dev));
-	lwkt_setpri(&std->bnx_rx_std_ithread, TDPRI_INT_MED);
-	std->bnx_rx_std_ithread.td_preemptable = lwkt_preempt;
-	sc->bnx_flags |= BNX_FLAG_STD_THREAD;
+	lwkt_setpri(std->bnx_rx_std_ithread, TDPRI_INT_MED);
+	std->bnx_rx_std_ithread->td_preemptable = lwkt_preempt;
 
 	return(0);
 fail:
@@ -2559,6 +2462,7 @@ static int
 bnx_detach(device_t dev)
 {
 	struct bnx_softc *sc = device_get_softc(dev);
+	struct bnx_rx_std_ring *std = &sc->bnx_rx_std_ring;
 
 	if (device_is_attached(dev)) {
 		struct ifnet *ifp = &sc->arpcom.ac_if;
@@ -2571,15 +2475,13 @@ bnx_detach(device_t dev)
 		ether_ifdetach(ifp);
 	}
 
-	if (sc->bnx_flags & BNX_FLAG_STD_THREAD) {
-		struct bnx_rx_std_ring *std = &sc->bnx_rx_std_ring;
-
+	if (std->bnx_rx_std_ithread != NULL) {
 		tsleep_interlock(std, 0);
 
-		if (std->bnx_rx_std_ithread.td_gd == mycpu) {
+		if (std->bnx_rx_std_ithread->td_gd == mycpu) {
 			bnx_rx_std_refill_stop(std);
 		} else {
-			lwkt_send_ipiq(std->bnx_rx_std_ithread.td_gd,
+			lwkt_send_ipiq(std->bnx_rx_std_ithread->td_gd,
 			    bnx_rx_std_refill_stop, std);
 		}
 
@@ -2611,13 +2513,15 @@ bnx_detach(device_t dev)
 		    PCIR_BAR(2), sc->bnx_res2);
 	}
 
-	if (sc->bnx_sysctl_tree != NULL)
-		sysctl_ctx_free(&sc->bnx_sysctl_ctx);
-
 	bnx_dma_free(sc);
 
 	if (sc->bnx_serialize != NULL)
 		kfree(sc->bnx_serialize, M_DEVBUF);
+
+	if (sc->bnx_rx_rmap != NULL)
+		if_ringmap_free(sc->bnx_rx_rmap);
+	if (sc->bnx_tx_rmap != NULL)
+		if_ringmap_free(sc->bnx_tx_rmap);
 
 	return 0;
 }
@@ -2899,11 +2803,8 @@ bnx_rxeof(struct bnx_rx_ret_ring *ret, uint16_t rx_prod, int count)
 		if (ifp->if_capenable & IFCAP_RSS) {
 			pi = bnx_rss_info(&pi0, cur_rx);
 			if (pi != NULL &&
-			    (cur_rx->bge_flags & BGE_RXBDFLAG_RSS_HASH)) {
-				m->m_flags |= M_HASH;
-				m->m_pkthdr.hash =
-				    toeplitz_hash(cur_rx->bge_hash);
-			}
+			    (cur_rx->bge_flags & BGE_RXBDFLAG_RSS_HASH))
+				m_sethash(m, toeplitz_hash(cur_rx->bge_hash));
 		}
 
 		/*
@@ -3124,28 +3025,28 @@ bnx_npoll(struct ifnet *ifp, struct ifpoll_info *info)
 
 		for (i = 0; i < sc->bnx_tx_ringcnt; ++i) {
 			struct bnx_tx_ring *txr = &sc->bnx_tx_ring[i];
-			int idx = i + sc->bnx_npoll_txoff;
+			int cpu = if_ringmap_cpumap(sc->bnx_tx_rmap, i);
 
-			KKASSERT(idx < ncpus2);
+			KKASSERT(cpu < netisr_ncpus);
 			if (sc->bnx_flags & BNX_FLAG_RXTX_BUNDLE) {
-				info->ifpi_tx[idx].poll_func =
+				info->ifpi_tx[cpu].poll_func =
 				    bnx_npoll_tx_notag;
 			} else {
-				info->ifpi_tx[idx].poll_func = bnx_npoll_tx;
+				info->ifpi_tx[cpu].poll_func = bnx_npoll_tx;
 			}
-			info->ifpi_tx[idx].arg = txr;
-			info->ifpi_tx[idx].serializer = &txr->bnx_tx_serialize;
-			ifsq_set_cpuid(txr->bnx_ifsq, idx);
+			info->ifpi_tx[cpu].arg = txr;
+			info->ifpi_tx[cpu].serializer = &txr->bnx_tx_serialize;
+			ifsq_set_cpuid(txr->bnx_ifsq, cpu);
 		}
 
 		for (i = 0; i < sc->bnx_rx_retcnt; ++i) {
 			struct bnx_rx_ret_ring *ret = &sc->bnx_rx_ret_ring[i];
-			int idx = i + sc->bnx_npoll_rxoff;
+			int cpu = if_ringmap_cpumap(sc->bnx_rx_rmap, i);
 
-			KKASSERT(idx < ncpus2);
-			info->ifpi_rx[idx].poll_func = bnx_npoll_rx;
-			info->ifpi_rx[idx].arg = ret;
-			info->ifpi_rx[idx].serializer =
+			KKASSERT(cpu < netisr_ncpus);
+			info->ifpi_rx[cpu].poll_func = bnx_npoll_rx;
+			info->ifpi_rx[cpu].arg = ret;
+			info->ifpi_rx[cpu].serializer =
 			    &ret->bnx_rx_ret_serialize;
 		}
 
@@ -3490,7 +3391,7 @@ bnx_encap(struct bnx_tx_ring *txr, struct mbuf **m_head0, uint32_t *txidx,
 		 * DMA read operation.  If it fails, keep moving on using
 		 * the original mbuf chain.
 		 */
-		m_new = m_defrag(m_head, MB_DONTWAIT);
+		m_new = m_defrag(m_head, M_NOWAIT);
 		if (m_new != NULL)
 			*m_head0 = m_head = m_new;
 	}
@@ -4267,9 +4168,10 @@ bnx_dma_alloc(device_t dev)
 	 * Create RX return rings
 	 */
 	mbx = BGE_MBX_RX_CONS0_LO;
-	sc->bnx_rx_ret_ring = kmalloc_cachealign(
-	    sizeof(struct bnx_rx_ret_ring) * sc->bnx_rx_retcnt, M_DEVBUF,
-	    M_WAITOK | M_ZERO);
+	sc->bnx_rx_ret_ring =
+		kmalloc(sizeof(struct bnx_rx_ret_ring) * sc->bnx_rx_retcnt,
+			M_DEVBUF,
+			M_WAITOK | M_ZERO | M_CACHEALIGN);
 	for (i = 0; i < sc->bnx_rx_retcnt; ++i) {
 		struct bnx_rx_ret_ring *ret = &sc->bnx_rx_ret_ring[i];
 		struct bnx_intr_data *intr;
@@ -4318,9 +4220,10 @@ bnx_dma_alloc(device_t dev)
 	/*
 	 * Create TX rings
 	 */
-	sc->bnx_tx_ring = kmalloc_cachealign(
-	    sizeof(struct bnx_tx_ring) * sc->bnx_tx_ringcnt, M_DEVBUF,
-	    M_WAITOK | M_ZERO);
+	sc->bnx_tx_ring =
+		kmalloc(sizeof(struct bnx_tx_ring) * sc->bnx_tx_ringcnt,
+			M_DEVBUF,
+			M_WAITOK | M_ZERO | M_CACHEALIGN);
 	for (i = 0; i < sc->bnx_tx_ringcnt; ++i) {
 		struct bnx_tx_ring *txr = &sc->bnx_tx_ring[i];
 		struct bnx_intr_data *intr;
@@ -5057,7 +4960,7 @@ bnx_get_eaddr(struct bnx_softc *sc, uint8_t eaddr[])
 /*
  * NOTE: 'm' is not freed upon failure
  */
-struct mbuf *
+static struct mbuf *
 bnx_defrag_shortdma(struct mbuf *m)
 {
 	struct mbuf *n;
@@ -5082,7 +4985,7 @@ bnx_defrag_shortdma(struct mbuf *m)
 	}
 
 	if (found > 1)
-		n = m_defrag(m, MB_DONTWAIT);
+		n = m_defrag(m, M_NOWAIT);
 	else
 		n = m;
 	return n;
@@ -5577,89 +5480,6 @@ bnx_serialize_assert(struct ifnet *ifp, enum ifnet_serialize slz,
 
 #endif	/* INVARIANTS */
 
-#ifdef IFPOLL_ENABLE
-
-static int
-bnx_sysctl_npoll_offset(SYSCTL_HANDLER_ARGS)
-{
-	struct bnx_softc *sc = (void *)arg1;
-	struct ifnet *ifp = &sc->arpcom.ac_if;
-	int error, off;
-
-	off = sc->bnx_npoll_rxoff;
-	error = sysctl_handle_int(oidp, &off, 0, req);
-	if (error || req->newptr == NULL)
-		return error;
-	if (off < 0)
-		return EINVAL;
-
-	ifnet_serialize_all(ifp);
-	if (off >= ncpus2 || off % sc->bnx_rx_retcnt != 0) {
-		error = EINVAL;
-	} else {
-		error = 0;
-		sc->bnx_npoll_txoff = off;
-		sc->bnx_npoll_rxoff = off;
-	}
-	ifnet_deserialize_all(ifp);
-
-	return error;
-}
-
-static int
-bnx_sysctl_npoll_rxoff(SYSCTL_HANDLER_ARGS)
-{
-	struct bnx_softc *sc = (void *)arg1;
-	struct ifnet *ifp = &sc->arpcom.ac_if;
-	int error, off;
-
-	off = sc->bnx_npoll_rxoff;
-	error = sysctl_handle_int(oidp, &off, 0, req);
-	if (error || req->newptr == NULL)
-		return error;
-	if (off < 0)
-		return EINVAL;
-
-	ifnet_serialize_all(ifp);
-	if (off >= ncpus2 || off % sc->bnx_rx_retcnt != 0) {
-		error = EINVAL;
-	} else {
-		error = 0;
-		sc->bnx_npoll_rxoff = off;
-	}
-	ifnet_deserialize_all(ifp);
-
-	return error;
-}
-
-static int
-bnx_sysctl_npoll_txoff(SYSCTL_HANDLER_ARGS)
-{
-	struct bnx_softc *sc = (void *)arg1;
-	struct ifnet *ifp = &sc->arpcom.ac_if;
-	int error, off;
-
-	off = sc->bnx_npoll_txoff;
-	error = sysctl_handle_int(oidp, &off, 0, req);
-	if (error || req->newptr == NULL)
-		return error;
-	if (off < 0)
-		return EINVAL;
-
-	ifnet_serialize_all(ifp);
-	if (off >= ncpus2) {
-		error = EINVAL;
-	} else {
-		error = 0;
-		sc->bnx_npoll_txoff = off;
-	}
-	ifnet_deserialize_all(ifp);
-
-	return error;
-}
-
-#endif	/* IFPOLL_ENABLE */
-
 static void
 bnx_set_tick_cpuid(struct bnx_softc *sc, boolean_t polling)
 {
@@ -5803,9 +5623,10 @@ bnx_init_rss(struct bnx_softc *sc)
 	KKASSERT(BNX_RSS_ENABLED(sc));
 
 	/*
-	 * Configure RSS redirect table in following fashion:
-	 * (hash & ring_cnt_mask) == rdr_table[(hash & rdr_table_mask)]
+	 * Configure RSS redirect table.
 	 */
+	if_ringmap_rdrtable(sc->bnx_rx_rmap, sc->bnx_rdr_table,
+	    BNX_RDRTABLE_SIZE);
 	r = 0;
 	for (j = 0; j < BGE_RSS_INDIR_TBL_CNT; ++j) {
 		uint32_t tbl = 0;
@@ -5813,7 +5634,7 @@ bnx_init_rss(struct bnx_softc *sc)
 		for (i = 0; i < BGE_RSS_INDIR_TBLENT_CNT; ++i) {
 			uint32_t q;
 
-			q = r % sc->bnx_rx_retcnt;
+			q = sc->bnx_rdr_table[r];
 			tbl |= q << (BGE_RSS_INDIR_TBLENT_SHIFT *
 			    (BGE_RSS_INDIR_TBLENT_CNT - i - 1));
 			++r;
@@ -5837,67 +5658,43 @@ bnx_init_rss(struct bnx_softc *sc)
 static void
 bnx_setup_ring_cnt(struct bnx_softc *sc)
 {
-	int msix_enable, i, msix_cnt, msix_cnt2, ring_max;
+	int msix_enable, msix_cnt, msix_ring, ring_max, ring_cnt;
 
-	sc->bnx_tx_ringcnt = 1;
-	sc->bnx_rx_retcnt = 1;
-	sc->bnx_intr_cnt = 1;
+	/* One RX ring. */
+	sc->bnx_rx_rmap = if_ringmap_alloc(sc->bnx_dev, 1, 1);
+
+	if (netisr_ncpus == 1)
+		goto skip_rx;
 
 	msix_enable = device_getenv_int(sc->bnx_dev, "msix.enable",
 	    bnx_msix_enable);
 	if (!msix_enable)
-		return;
-
-	if (ncpus2 == 1)
-		return;
-
-	msix_cnt = pci_msix_count(sc->bnx_dev);
-	if (msix_cnt <= 1)
-		return;
-
-	i = 0;
-	while ((1 << (i + 1)) <= msix_cnt)
-		++i;
-	msix_cnt2 = 1 << i;
+		goto skip_rx;
 
 	/*
 	 * One MSI-X vector is dedicated to status or single TX queue,
 	 * so make sure that there are enough MSI-X vectors.
 	 */
-	if (msix_cnt == msix_cnt2) {
-		/*
-		 * XXX
-		 * This probably will not happen; 57785/5718 families
-		 * come with at least 5 MSI-X vectors.
-		 */
-		msix_cnt2 >>= 1;
-		if (msix_cnt2 <= 1) {
-			device_printf(sc->bnx_dev,
-			    "MSI-X count %d could not be used\n", msix_cnt);
-			return;
-		}
-		device_printf(sc->bnx_dev, "MSI-X count %d is power of 2\n",
-		    msix_cnt);
-	}
+	msix_cnt = pci_msix_count(sc->bnx_dev);
+	if (msix_cnt <= 1)
+		goto skip_rx;
+	if (bootverbose)
+		device_printf(sc->bnx_dev, "MSI-X count %d\n", msix_cnt);
+	msix_ring = msix_cnt - 1;
 
 	/*
 	 * Setup RX ring count
 	 */
 	ring_max = BNX_RX_RING_MAX;
-	if (ring_max > msix_cnt2)
-		ring_max = msix_cnt2;
-	sc->bnx_rx_retcnt = device_getenv_int(sc->bnx_dev, "rx_rings",
-	    bnx_rx_rings);
-	sc->bnx_rx_retcnt = if_ring_count2(sc->bnx_rx_retcnt, ring_max);
+	if (ring_max > msix_ring)
+		ring_max = msix_ring;
+	ring_cnt = device_getenv_int(sc->bnx_dev, "rx_rings", bnx_rx_rings);
 
-	if (sc->bnx_rx_retcnt == 1)
-		return;
+	if_ringmap_free(sc->bnx_rx_rmap);
+	sc->bnx_rx_rmap = if_ringmap_alloc(sc->bnx_dev, ring_cnt, ring_max);
 
-	/*
-	 * We need one extra MSI-X vector for link status or
-	 * TX ring (if only one TX ring is enabled).
-	 */
-	sc->bnx_intr_cnt = sc->bnx_rx_retcnt + 1;
+skip_rx:
+	sc->bnx_rx_retcnt = if_ringmap_count(sc->bnx_rx_rmap);
 
 	/*
 	 * Setup TX ring count
@@ -5908,14 +5705,40 @@ bnx_setup_ring_cnt(struct bnx_softc *sc)
 	if (sc->bnx_asicrev == BGE_ASICREV_BCM5719 ||
 	    sc->bnx_asicrev == BGE_ASICREV_BCM5720) {
 		ring_max = BNX_TX_RING_MAX;
-		if (ring_max > msix_cnt2)
-			ring_max = msix_cnt2;
 		if (ring_max > sc->bnx_rx_retcnt)
 			ring_max = sc->bnx_rx_retcnt;
-		sc->bnx_tx_ringcnt = device_getenv_int(sc->bnx_dev, "tx_rings",
+		ring_cnt = device_getenv_int(sc->bnx_dev, "tx_rings",
 		    bnx_tx_rings);
-		sc->bnx_tx_ringcnt = if_ring_count2(sc->bnx_tx_ringcnt,
-		    ring_max);
+	} else {
+		ring_max = 1;
+		ring_cnt = 1;
+	}
+	sc->bnx_tx_rmap = if_ringmap_alloc(sc->bnx_dev, ring_cnt, ring_max);
+	if_ringmap_align(sc->bnx_dev, sc->bnx_rx_rmap, sc->bnx_tx_rmap);
+
+	sc->bnx_tx_ringcnt = if_ringmap_count(sc->bnx_tx_rmap);
+	KASSERT(sc->bnx_tx_ringcnt <= sc->bnx_rx_retcnt,
+	    ("invalid TX ring count %d and RX ring count %d",
+	     sc->bnx_tx_ringcnt, sc->bnx_rx_retcnt));
+
+	/*
+	 * Setup interrupt count.
+	 */
+	if (sc->bnx_rx_retcnt == 1) {
+		sc->bnx_intr_cnt = 1;
+	} else {
+		/*
+		 * We need one extra MSI-X vector for link status or
+		 * TX ring (if only one TX ring is enabled).
+		 */
+		sc->bnx_intr_cnt = sc->bnx_rx_retcnt + 1;
+	}
+	KKASSERT(sc->bnx_intr_cnt <= BNX_INTR_MAX);
+
+	if (bootverbose) {
+		device_printf(sc->bnx_dev, "intr count %d, "
+		    "RX ring %d, TX ring %d\n", sc->bnx_intr_cnt,
+		    sc->bnx_rx_retcnt, sc->bnx_tx_ringcnt);
 	}
 }
 
@@ -5924,7 +5747,7 @@ bnx_alloc_msix(struct bnx_softc *sc)
 {
 	struct bnx_intr_data *intr;
 	boolean_t setup = FALSE;
-	int error, i, offset, offset_def;
+	int error, i;
 
 	KKASSERT(sc->bnx_intr_cnt > 1);
 	KKASSERT(sc->bnx_intr_cnt == sc->bnx_rx_retcnt + 1);
@@ -5949,23 +5772,6 @@ bnx_alloc_msix(struct bnx_softc *sc)
 		/*
 		 * RX/TX rings
 		 */
-		if (sc->bnx_rx_retcnt == ncpus2) {
-			offset = 0;
-		} else {
-			offset_def = (sc->bnx_rx_retcnt *
-			    device_get_unit(sc->bnx_dev)) % ncpus2;
-
-			offset = device_getenv_int(sc->bnx_dev,
-			    "msix.offset", offset_def);
-			if (offset >= ncpus2 ||
-			    offset % sc->bnx_rx_retcnt != 0) {
-				device_printf(sc->bnx_dev,
-				    "invalid msix.offset %d, use %d\n",
-				    offset, offset_def);
-				offset = offset_def;
-			}
-		}
-
 		for (i = 1; i < sc->bnx_intr_cnt; ++i) {
 			int idx = i - 1;
 
@@ -5984,8 +5790,9 @@ bnx_alloc_msix(struct bnx_softc *sc)
 			    &intr->bnx_ret->bnx_saved_status_tag;
 
 			intr->bnx_intr_arg = intr->bnx_ret;
-			KKASSERT(idx + offset < ncpus2);
-			intr->bnx_intr_cpuid = idx + offset;
+			intr->bnx_intr_cpuid =
+			    if_ringmap_cpumap(sc->bnx_rx_rmap, idx);
+			KKASSERT(intr->bnx_intr_cpuid < netisr_ncpus);
 
 			if (intr->bnx_txr == NULL) {
 				intr->bnx_intr_check = bnx_check_intr_rx;
@@ -5994,12 +5801,23 @@ bnx_alloc_msix(struct bnx_softc *sc)
 				    sizeof(intr->bnx_intr_desc0), "%s rx%d",
 				    device_get_nameunit(sc->bnx_dev), idx);
 			} else {
+#ifdef INVARIANTS
+				int tx_cpuid;
+#endif
+
 				intr->bnx_intr_check = bnx_check_intr_rxtx;
 				intr->bnx_intr_func = bnx_msix_rxtx;
 				ksnprintf(intr->bnx_intr_desc0,
 				    sizeof(intr->bnx_intr_desc0), "%s rxtx%d",
 				    device_get_nameunit(sc->bnx_dev), idx);
 
+#ifdef INVARIANTS
+				tx_cpuid = if_ringmap_cpumap(sc->bnx_tx_rmap,
+				    idx);
+				KASSERT(intr->bnx_intr_cpuid == tx_cpuid,
+				    ("RX intr cpu%d, TX intr cpu%d, mismatch",
+				     intr->bnx_intr_cpuid, tx_cpuid));
+#endif
 				intr->bnx_txr->bnx_tx_cpuid =
 				    intr->bnx_intr_cpuid;
 			}
@@ -6009,18 +5827,8 @@ bnx_alloc_msix(struct bnx_softc *sc)
 		}
 	} else {
 		/*
-		 * TX ring and link status
+		 * TX ring0 and link status
 		 */
-		offset_def = device_get_unit(sc->bnx_dev) % ncpus2;
-		offset = device_getenv_int(sc->bnx_dev, "msix.txoff",
-		    offset_def);
-		if (offset >= ncpus2) {
-			device_printf(sc->bnx_dev,
-			    "invalid msix.txoff %d, use %d\n",
-			    offset, offset_def);
-			offset = offset_def;
-		}
-
 		intr = &sc->bnx_intr_data[0];
 
 		intr->bnx_txr = &sc->bnx_tx_ring[0];
@@ -6031,7 +5839,8 @@ bnx_alloc_msix(struct bnx_softc *sc)
 
 		intr->bnx_intr_func = bnx_msix_tx_status;
 		intr->bnx_intr_arg = intr->bnx_txr;
-		intr->bnx_intr_cpuid = offset;
+		intr->bnx_intr_cpuid = if_ringmap_cpumap(sc->bnx_tx_rmap, 0);
+		KKASSERT(intr->bnx_intr_cpuid < netisr_ncpus);
 
 		ksnprintf(intr->bnx_intr_desc0, sizeof(intr->bnx_intr_desc0),
 		    "%s ststx", device_get_nameunit(sc->bnx_dev));
@@ -6042,23 +5851,6 @@ bnx_alloc_msix(struct bnx_softc *sc)
 		/*
 		 * RX rings
 		 */
-		if (sc->bnx_rx_retcnt == ncpus2) {
-			offset = 0;
-		} else {
-			offset_def = (sc->bnx_rx_retcnt *
-			    device_get_unit(sc->bnx_dev)) % ncpus2;
-
-			offset = device_getenv_int(sc->bnx_dev,
-			    "msix.rxoff", offset_def);
-			if (offset >= ncpus2 ||
-			    offset % sc->bnx_rx_retcnt != 0) {
-				device_printf(sc->bnx_dev,
-				    "invalid msix.rxoff %d, use %d\n",
-				    offset, offset_def);
-				offset = offset_def;
-			}
-		}
-
 		for (i = 1; i < sc->bnx_intr_cnt; ++i) {
 			int idx = i - 1;
 
@@ -6074,8 +5866,9 @@ bnx_alloc_msix(struct bnx_softc *sc)
 
 			intr->bnx_intr_func = bnx_msix_rx;
 			intr->bnx_intr_arg = intr->bnx_ret;
-			KKASSERT(idx + offset < ncpus2);
-			intr->bnx_intr_cpuid = idx + offset;
+			intr->bnx_intr_cpuid =
+			    if_ringmap_cpumap(sc->bnx_rx_rmap, idx);
+			KKASSERT(intr->bnx_intr_cpuid < netisr_ncpus);
 
 			ksnprintf(intr->bnx_intr_desc0,
 			    sizeof(intr->bnx_intr_desc0), "%s rx%d",
@@ -6176,8 +5969,8 @@ bnx_rx_std_refill_sched_ipi(void *xret)
 	atomic_set_int(&std->bnx_rx_std_refill, ret->bnx_rx_mask);
 	cpu_sfence();
 
-	KKASSERT(std->bnx_rx_std_ithread.td_gd == gd);
-	lwkt_schedule(&std->bnx_rx_std_ithread);
+	KKASSERT(std->bnx_rx_std_ithread->td_gd == gd);
+	lwkt_schedule(std->bnx_rx_std_ithread);
 
 	crit_exit_gd(gd);
 }
@@ -6193,8 +5986,8 @@ bnx_rx_std_refill_stop(void *xstd)
 	std->bnx_rx_std_stop = 1;
 	cpu_sfence();
 
-	KKASSERT(std->bnx_rx_std_ithread.td_gd == gd);
-	lwkt_schedule(&std->bnx_rx_std_ithread);
+	KKASSERT(std->bnx_rx_std_ithread->td_gd == gd);
+	lwkt_schedule(std->bnx_rx_std_ithread);
 
 	crit_exit_gd(gd);
 }
@@ -6227,11 +6020,10 @@ bnx_rx_std_refill_sched(struct bnx_rx_ret_ring *ret,
 	atomic_set_int(&std->bnx_rx_std_refill, ret->bnx_rx_mask);
 	cpu_sfence();
 	if (atomic_poll_acquire_int(&std->bnx_rx_std_running)) {
-		if (std->bnx_rx_std_ithread.td_gd == gd) {
-			lwkt_schedule(&std->bnx_rx_std_ithread);
+		if (std->bnx_rx_std_ithread->td_gd == gd) {
+			lwkt_schedule(std->bnx_rx_std_ithread);
 		} else {
-			lwkt_send_ipiq(
-			    std->bnx_rx_std_ithread.td_gd,
+			lwkt_send_ipiq(std->bnx_rx_std_ithread->td_gd,
 			    bnx_rx_std_refill_sched_ipi, ret);
 		}
 	}

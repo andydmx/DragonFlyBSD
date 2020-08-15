@@ -39,11 +39,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -61,6 +57,9 @@
  *
  *	@(#)stand.h	8.1 (Berkeley) 6/11/93
  */
+
+#ifndef _STAND_H_
+#define	_STAND_H_
 
 #include <machine/stdarg.h>	/* __va_list */
 #include <sys/types.h>
@@ -120,7 +119,6 @@ extern struct fs_ops tftp_fsops;
 extern struct fs_ops nfs_fsops;
 extern struct fs_ops cd9660_fsops;
 extern struct fs_ops gzipfs_fsops;
-extern struct fs_ops zipfs_fsops;
 extern struct fs_ops bzipfs_fsops;
 extern struct fs_ops dosfs_fsops;
 extern struct fs_ops ext2fs_fsops;
@@ -174,7 +172,7 @@ extern struct open_file files[];
 #define	F_READ		0x0001	/* file opened for reading */
 #define	F_WRITE		0x0002	/* file opened for writing */
 #define	F_RAW		0x0004	/* raw device open - no file system */
-#define F_NODEV		0x0008	/* network open - no device */
+#define F_DEVDESC	0x0008	/* generic devdesc, else specific */
 
 #define isascii(c)	(((c) & ~0x7F) == 0)
 
@@ -235,7 +233,7 @@ tolower(int c)
 /* sbrk emulation */
 extern void	setheap(void *, void *);
 extern char	*getheap(size_t *sizep);
-extern char	*sbrk(int);
+extern char	*sbrk(intptr_t);
 
 /* Matt Dillon's zalloc/zmalloc */
 extern void	*malloc(size_t);
@@ -267,6 +265,7 @@ extern int	open(const char *, int);
 #define O_RDWR		0x2
 extern int	close(int);
 extern void	closeall(void);
+extern off_t	lseek(int, off_t, int);
 extern ssize_t	read(int, void *, size_t);
 extern ssize_t	write(int, void *, size_t);
 extern struct	dirent *readdirfd(int);
@@ -274,10 +273,9 @@ extern struct	dirent *readdirfd(int);
 extern void	srandom(u_long);
 extern u_long	random(void);
 
-extern void	exit(int);
-    
 /* imports from stdlib, locally modified */
 extern long	strtol(const char *, char **, int);
+extern unsigned long strtoul(const char *, char **, int);
 extern char	*optarg;			/* getopt(3) external variables */
 extern int	optind, opterr, optopt, optreset;
 extern int	getopt(int, char * const [], const char *);
@@ -374,11 +372,13 @@ extern int	null_readdir(struct open_file *, struct dirent *);
  * Machine dependent functions and data, must be provided or stubbed by 
  * the consumer 
  */
+extern void		exit(int); /* should be __dead2 */
 extern int		getchar(void);
 extern int		ischar(void);
 extern void		putchar(int);
 extern int		devopen(struct open_file *, const char *, const char **);
 extern int		devclose(struct open_file *);
+extern void		devreplace(struct open_file *, void *devdata);
 extern void		panic(const char *, ...) __dead2 __printflike(1, 2);
 extern struct fs_ops	*file_system[];
 extern struct devsw	*devsw[];
@@ -406,3 +406,5 @@ free_debug(void *p, const char *file, int line)
 #define free(x)		free_debug(x, __FILE__, __LINE__)
 
 #endif
+
+#endif /* !_STAND_H_ */

@@ -41,7 +41,6 @@
 
 #include <bus/pci/pcivar.h>
 #include <bus/pci/pcireg.h>
-#include <bus/pci/pcibus.h>
 #include <bus/pci/pci_cfgreg.h>
 #include <bus/pci/pcib_private.h>
 
@@ -54,17 +53,20 @@ struct ecc_amd8000_memctrl {
 };
 
 struct ecc_amd8000_softc {
-	device_t	ecc_device;
-	device_t	ecc_mydev;
+	device_t	ecc_dev;
 	struct callout	ecc_callout;
 };
 
 #define ecc_printf(sc, fmt, arg...) \
-	device_printf((sc)->ecc_mydev, fmt , ##arg)
+	device_printf((sc)->ecc_dev, fmt , ##arg)
 
 static void	ecc_amd8000_callout(void *);
+static void	ecc_amd8000_stop(device_t);
+
 static int	ecc_amd8000_probe(device_t);
 static int	ecc_amd8000_attach(device_t);
+static int	ecc_amd8000_detach(device_t);
+static void	ecc_amd8000_shutdown(device_t);
 
 static const struct ecc_amd8000_memctrl ecc_memctrls[] = {
 	{ 0x1022, 0x1100, "AMD 8000 memory controller" },
@@ -76,7 +78,8 @@ static device_method_t ecc_amd8000_methods[] = {
         /* Device interface */
 	DEVMETHOD(device_probe,		ecc_amd8000_probe),
 	DEVMETHOD(device_attach,	ecc_amd8000_attach),
-	DEVMETHOD(device_shutdown,	bus_generic_shutdown),
+	DEVMETHOD(device_detach,	ecc_amd8000_detach),
+	DEVMETHOD(device_shutdown,	ecc_amd8000_shutdown),
 	DEVMETHOD(device_suspend,	bus_generic_suspend),
 	DEVMETHOD(device_resume,	bus_generic_resume),
 	DEVMETHOD_END
@@ -88,8 +91,9 @@ static driver_t ecc_amd8000_driver = {
 	sizeof(struct ecc_amd8000_softc)
 };
 static devclass_t ecc_devclass;
-DRIVER_MODULE(ecc_amd8000, hostb, ecc_amd8000_driver, ecc_devclass, NULL, NULL);
+DRIVER_MODULE(ecc_amd8000, pci, ecc_amd8000_driver, ecc_devclass, NULL, NULL);
 MODULE_DEPEND(ecc_amd8000, pci, 1, 1, 1);
+MODULE_VERSION(ecc_amd8000, 1);
 
 static int
 ecc_amd8000_probe(device_t dev)
@@ -102,11 +106,7 @@ ecc_amd8000_probe(device_t dev)
 
 	for (mc = ecc_memctrls; mc->desc != NULL; ++mc) {
 		if (mc->vid == vid && mc->did == did) {
-			struct ecc_amd8000_softc *sc = device_get_softc(dev);
-
 			device_set_desc(dev, mc->desc);
-			sc->ecc_mydev = dev;
-			sc->ecc_device = device_get_parent(dev);
 			return (0);
 		}
 	}
@@ -120,7 +120,8 @@ ecc_amd8000_attach(device_t dev)
 	uint32_t draminfo, eccinfo;
 	int bus, slot, poll = 0;
 
-	dev = sc->ecc_device; /* XXX */
+	callout_init_mp(&sc->ecc_callout);
+	sc->ecc_dev = dev;
 
 	bus = pci_get_bus(dev);
 	slot = pci_get_slot(dev);
@@ -167,7 +168,6 @@ ecc_amd8000_attach(device_t dev)
 		v32 &= 0x7F801EFC;
 		pcib_write_config(dev, bus, slot, 3, 0x4C, v32, 4);
 
-		callout_init_mp(&sc->ecc_callout);
 		callout_reset(&sc->ecc_callout, hz, ecc_amd8000_callout, sc);
 	}
 	return (0);
@@ -177,7 +177,7 @@ static void
 ecc_amd8000_callout(void *xsc)
 {
 	struct ecc_amd8000_softc *sc = xsc;
-	device_t dev = sc->ecc_device;
+	device_t dev = sc->ecc_dev;
 	uint32_t v32, addr;
 	int bus, slot;
 
@@ -199,4 +199,25 @@ ecc_amd8000_callout(void *xsc)
 		pcib_write_config(dev, bus, slot, 3, 0x4C, v32 & 0x7F801EFC, 4);
 	}
 	callout_reset(&sc->ecc_callout, hz, ecc_amd8000_callout, sc);
+}
+
+static void
+ecc_amd8000_stop(device_t dev)
+{
+	struct ecc_amd8000_softc *sc = device_get_softc(dev);
+
+	callout_cancel(&sc->ecc_callout);
+}
+
+static int
+ecc_amd8000_detach(device_t dev)
+{
+	ecc_amd8000_stop(dev);
+	return 0;
+}
+
+static void
+ecc_amd8000_shutdown(device_t dev)
+{
+	ecc_amd8000_stop(dev);
 }

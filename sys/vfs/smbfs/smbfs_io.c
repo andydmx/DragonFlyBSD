@@ -34,12 +34,12 @@
 
 #include <sys/param.h>
 #include <sys/systm.h>
+#include <sys/uio.h>
 #include <sys/resourcevar.h>	/* defines plimit structure in proc struct */
 #include <sys/kernel.h>
 #include <sys/proc.h>
 #include <sys/fcntl.h>
 #include <sys/mount.h>
-#include <sys/namei.h>
 #include <sys/vnode.h>
 #include <sys/dirent.h>
 #include <sys/signalvar.h>
@@ -481,8 +481,6 @@ smbfs_getpages(struct vop_getpages_args *ap)
 		nextoff = toff + PAGE_SIZE;
 		m = pages[i];
 
-		m->flags &= ~PG_ZERO;
-
 		/*
 		 * NOTE: pmap dirty bit should have already been cleared.
 		 *	 We do not clear it here.
@@ -491,8 +489,8 @@ smbfs_getpages(struct vop_getpages_args *ap)
 			m->valid = VM_PAGE_BITS_ALL;
 			m->dirty = 0;
 		} else {
-			int nvalid = ((size + DEV_BSIZE - 1) - toff) &
-				      ~(DEV_BSIZE - 1);
+			int nvalid = rounddown2((size + DEV_BSIZE - 1) - toff,
+			    DEV_BSIZE);
 			vm_page_set_validclean(m, 0, nvalid);
 		}
 		
@@ -530,7 +528,7 @@ smbfs_getpages(struct vop_getpages_args *ap)
  * Note that vop_close always invalidate pages before close, so it's
  * not necessary to open vnode.
  *
- * smbfs_putpages(struct vnode *a_vp, vm_page_t *a_m, int a_count, int a_sync,
+ * smbfs_putpages(struct vnode *a_vp, vm_page_t *a_m, int a_count, int a_flags,
  *		  int *a_rtvals, vm_ooffset_t a_offset)
  */
 int

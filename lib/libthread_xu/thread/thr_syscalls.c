@@ -3,7 +3,7 @@
  * Copyright (c) 2003 Daniel Eischen <deischen@freebsd.org>.
  * Copyright (C) 2000 Jason Evans <jasone@freebsd.org>.
  * All rights reserved.
- * 
+ *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
  * are met:
@@ -15,7 +15,7 @@
  *    notice(s), this list of conditions and the following disclaimer in
  *    the documentation and/or other materials provided with the
  *    distribution.
- * 
+ *
  * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDER(S) ``AS IS'' AND ANY
  * EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
  * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
@@ -27,8 +27,6 @@
  * WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE
  * OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE,
  * EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- *
- * $DragonFly: src/lib/libthread_xu/thread/thr_syscalls.c,v 1.8 2008/01/10 22:30:27 nth Exp $
  */
 
 /*
@@ -43,10 +41,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by John Birrell.
- * 4. Neither the name of the author nor the names of any co-contributors
+ * 3. Neither the name of the author nor the names of any co-contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -64,6 +59,8 @@
  *
  */
 
+
+#include "namespace.h"
 #include <sys/types.h>
 #include <sys/mman.h>
 #include <sys/param.h>
@@ -74,9 +71,7 @@
 #include <sys/time.h>
 #include <sys/uio.h>
 #include <sys/wait.h>
-
 #include <machine/tls.h>
-
 #include <aio.h>
 #include <dirent.h>
 #include <errno.h>
@@ -90,6 +85,7 @@
 #include <termios.h>
 #include <unistd.h>
 #include <pthread.h>
+#include "un-namespace.h"
 
 #include "thr_private.h"
 
@@ -110,6 +106,8 @@ extern int	__sys_connect(int, const struct sockaddr *, socklen_t);
 extern int	__sys_fsync(int);
 extern int	__sys_msync(void *, size_t, int);
 extern int	__sys_poll(struct pollfd *, unsigned, int);
+extern int	__sys_ppoll(struct pollfd *, unsigned, const struct timespec *,
+			const sigset_t *);
 extern ssize_t	__sys_recv(int, void *, size_t, int);
 extern ssize_t	__sys_recvfrom(int, void *, size_t, int, struct sockaddr *, socklen_t *);
 extern ssize_t	__sys_recvmsg(int, struct msghdr *, int);
@@ -134,6 +132,8 @@ int	__nanosleep(const struct timespec *, struct timespec *);
 int	__open(const char *, int,...);
 int	__openat(int fd, const char *, int,...);
 int	__poll(struct pollfd *, unsigned int, int);
+int	__ppoll(struct pollfd *, unsigned int, const struct timespec *,
+		const sigset_t *);
 ssize_t	__read(int, void *buf, size_t);
 ssize_t	__readv(int, const struct iovec *, int);
 ssize_t	__recvfrom(int, void *, size_t, int f, struct sockaddr *, socklen_t *);
@@ -154,9 +154,10 @@ int	_raise(int);
 unsigned	_sleep(unsigned);
 int	_system(const char *);
 int	_tcdrain(int);
+#if 0
 int	_vfork(void);
+#endif
 pid_t	_wait(int *);
-pid_t	_waitpid(pid_t wpid, int *status, int options);
 
 int
 __accept(int s, struct sockaddr *addr, socklen_t *addrlen)
@@ -170,7 +171,7 @@ __accept(int s, struct sockaddr *addr, socklen_t *addrlen)
 	ret = __sys_accept(s, addr, addrlen);
 	_thr_cancel_leave(curthread, oldcancel);
 
- 	return (ret);
+	return (ret);
 }
 
 __strong_reference(__accept, accept);
@@ -202,7 +203,7 @@ __close(int fd)
 	oldcancel = _thr_cancel_enter(curthread);
 	ret = __sys_close(fd);
 	_thr_cancel_leave(curthread, oldcancel);
-	
+
 	return (ret);
 }
 
@@ -219,7 +220,7 @@ __connect(int fd, const struct sockaddr *name, socklen_t namelen)
 	ret = __sys_connect(fd, name, namelen);
 	_thr_cancel_leave(curthread, oldcancel);
 
- 	return (ret);
+	return (ret);
 }
 
 __strong_reference(__connect, connect);
@@ -234,7 +235,7 @@ ___creat(const char *path, mode_t mode)
 	oldcancel = _thr_cancel_enter(curthread);
 	ret = __creat(path, mode);
 	_thr_cancel_leave(curthread, oldcancel);
-	
+
 	return ret;
 }
 
@@ -247,7 +248,7 @@ __fcntl(int fd, int cmd,...)
 	int	oldcancel;
 	int	ret;
 	va_list	ap;
-	
+
 	oldcancel = _thr_cancel_enter(curthread);
 
 	va_start(ap, cmd);
@@ -334,7 +335,7 @@ __open(const char *path, int flags,...)
 	va_list	ap;
 
 	oldcancel = _thr_cancel_enter(curthread);
-	
+
 	/* Check if the file is being created: */
 	if (flags & O_CREAT) {
 		/* Get the creation mode: */
@@ -342,7 +343,7 @@ __open(const char *path, int flags,...)
 		mode = va_arg(ap, int);
 		va_end(ap);
 	}
-	
+
 	ret = __sys_open(path, flags, mode);
 
 	_thr_cancel_leave(curthread, oldcancel);
@@ -362,7 +363,7 @@ __openat(int fd, const char *path, int flags,...)
 	va_list	ap;
 
 	oldcancel = _thr_cancel_enter(curthread);
-	
+
 	/* Check if the file is being created: */
 	if (flags & O_CREAT) {
 		/* Get the creation mode: */
@@ -370,7 +371,7 @@ __openat(int fd, const char *path, int flags,...)
 		mode = va_arg(ap, int);
 		va_end(ap);
 	}
-	
+
 	ret = __sys_openat(fd, path, flags, mode);
 
 	_thr_cancel_leave(curthread, oldcancel);
@@ -390,7 +391,7 @@ _pause(void)
 	oldcancel = _thr_cancel_enter(curthread);
 	ret = __pause();
 	_thr_cancel_leave(curthread, oldcancel);
-	
+
 	return ret;
 }
 
@@ -412,7 +413,24 @@ __poll(struct pollfd *fds, unsigned int nfds, int timeout)
 
 __strong_reference(__poll, poll);
 
-int 
+int
+__ppoll(struct pollfd *fds, unsigned int nfds, const struct timespec *ts,
+	const sigset_t *mask)
+{
+	struct pthread *curthread = tls_get_curthread();
+	int oldcancel;
+	int ret;
+
+	oldcancel = _thr_cancel_enter(curthread);
+	ret = __sys_ppoll(fds, nfds, ts, mask);
+	_thr_cancel_leave(curthread, oldcancel);
+
+	return ret;
+}
+
+__strong_reference(__ppoll, ppoll);
+
+int
 __pselect(int count, fd_set *rfds, fd_set *wfds, fd_set *efds,
 	const struct timespec *timo, const sigset_t *mask)
 {
@@ -453,7 +471,6 @@ __read(int fd, void *buf, size_t nbytes)
 	oldcancel = _thr_cancel_enter(curthread);
 	ret = __sys_read(fd, buf, nbytes);
 	_thr_cancel_leave(curthread, oldcancel);
-
 	return ret;
 }
 
@@ -469,7 +486,6 @@ __readv(int fd, const struct iovec *iov, int iovcnt)
 	oldcancel = _thr_cancel_enter(curthread);
 	ret = __sys_readv(fd, iov, iovcnt);
 	_thr_cancel_leave(curthread, oldcancel);
-
 	return ret;
 }
 
@@ -506,7 +522,7 @@ __recvmsg(int s, struct msghdr *m, int f)
 
 __strong_reference(__recvmsg, recvmsg);
 
-int 
+int
 __select(int numfds, fd_set *readfds, fd_set *writefds, fd_set *exceptfds,
 	struct timeval *timeout)
 {
@@ -563,9 +579,10 @@ _sleep(unsigned int seconds)
 	oldcancel = _thr_cancel_enter(curthread);
 	ret = __sleep(seconds);
 	_thr_cancel_leave(curthread, oldcancel);
-	
 	return (ret);
 }
+
+__strong_reference(_sleep, sleep);
 
 int
 _system(const char *string)
@@ -577,7 +594,6 @@ _system(const char *string)
 	oldcancel = _thr_cancel_enter(curthread);
 	ret = __system(string);
 	_thr_cancel_leave(curthread, oldcancel);
-	
 	return ret;
 }
 
@@ -589,11 +605,10 @@ _tcdrain(int fd)
 	struct pthread *curthread = tls_get_curthread();
 	int	oldcancel;
 	int	ret;
-	
+
 	oldcancel = _thr_cancel_enter(curthread);
 	ret = __tcdrain(fd);
 	_thr_cancel_leave(curthread, oldcancel);
-
 	return (ret);
 }
 
@@ -609,12 +624,16 @@ ___usleep(unsigned int useconds)
 	oldcancel = _thr_cancel_enter(curthread);
 	ret = __usleep(useconds);
 	_thr_cancel_leave(curthread, oldcancel);
-	
 	return (ret);
 }
 
 __strong_reference(___usleep, usleep);
 
+#if 0
+/*
+ * REMOVED - vfork() works as per normal.  In a threaded environment vfork()
+ *	     blocks the calling thread only and not other threads.
+ */
 int
 _vfork(void)
 {
@@ -622,6 +641,7 @@ _vfork(void)
 }
 
 __strong_reference(_vfork, vfork);
+#endif
 
 pid_t
 _wait(int *istat)
@@ -633,7 +653,6 @@ _wait(int *istat)
 	oldcancel = _thr_cancel_enter(curthread);
 	ret = __wait(istat);
 	_thr_cancel_leave(curthread, oldcancel);
-
 	return ret;
 }
 
@@ -649,7 +668,6 @@ __wait4(pid_t pid, int *istat, int options, struct rusage *rusage)
 	oldcancel = _thr_cancel_enter(curthread);
 	ret = __sys_wait4(pid, istat, options, rusage);
 	_thr_cancel_leave(curthread, oldcancel);
-
 	return ret;
 }
 
@@ -665,7 +683,6 @@ _waitpid(pid_t wpid, int *status, int options)
 	oldcancel = _thr_cancel_enter(curthread);
 	ret = __waitpid(wpid, status, options);
 	_thr_cancel_leave(curthread, oldcancel);
-	
 	return ret;
 }
 
@@ -681,7 +698,6 @@ __write(int fd, const void *buf, size_t nbytes)
 	oldcancel = _thr_cancel_enter(curthread);
 	ret = __sys_write(fd, buf, nbytes);
 	_thr_cancel_leave(curthread, oldcancel);
-
 	return ret;
 }
 
@@ -697,9 +713,7 @@ __writev(int fd, const struct iovec *iov, int iovcnt)
 	oldcancel = _thr_cancel_enter(curthread);
 	ret = __sys_writev(fd, iov, iovcnt);
 	_thr_cancel_leave(curthread, oldcancel);
-
 	return ret;
 }
 
 __strong_reference(__writev, writev);
-

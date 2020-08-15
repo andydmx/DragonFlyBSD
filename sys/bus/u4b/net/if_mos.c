@@ -414,7 +414,7 @@ mos_write_mcast(struct mos_softc *sc, u_char *hashtbl)
 }
 
 static int
-mos_miibus_readreg(struct device *dev, int phy, int reg)
+mos_miibus_readreg(device_t dev, int phy, int reg)
 {
 	struct mos_softc *sc = device_get_softc(dev);
 	uWord val;
@@ -608,7 +608,7 @@ mos_setmulti(struct usb_ether *ue)
 		}
 		h = ether_crc32_be(LLADDR((struct sockaddr_dl *)
 		    ifma->ifma_addr), ETHER_ADDR_LEN) >> 26;
-		hashtbl[h / 8] |= 1 << (h % 8);
+		setbit(hashtbl, h);
 	}
 
 	/* now program new ones */
@@ -738,7 +738,7 @@ mos_attach_post(struct usb_ether *ue)
 {
 	struct mos_softc *sc = uether_getsc(ue);
 	int err;
-#if USB_DEBUG
+#ifdef USB_DEBUG
 	char ethstr[ETHER_ADDRSTRLEN + 1];
 #endif
 

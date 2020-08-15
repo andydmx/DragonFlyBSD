@@ -33,11 +33,9 @@
  *
  * @(#)tape.c	8.9 (Berkeley) 5/1/95
  * $FreeBSD: src/sbin/restore/tape.c,v 1.16.2.8 2002/06/30 22:57:52 iedowse Exp $
- * $DragonFly: src/sbin/restore/tape.c,v 1.9 2005/11/06 12:49:25 swildner Exp $
  */
 
 #include <sys/param.h>
-#include <sys/file.h>
 #include <sys/mtio.h>
 #include <sys/stat.h>
 #include <sys/time.h>
@@ -46,6 +44,7 @@
 #include <protocols/dumprestore.h>
 
 #include <errno.h>
+#include <fcntl.h>
 #include <paths.h>
 #include <setjmp.h>
 #include <stdio.h>
@@ -77,7 +76,9 @@ static char	*map;
 static char	lnkbuf[MAXPATHLEN + 1];
 static int	pathlen;
 
+union u_spcl	u_spcl;		/* describes next file available on the tape */
 int		oldinofmt;	/* old inode format conversion required */
+struct context	curfile;	/* describes next file available on the tape */
 int		Bcvt;		/* Swap Bytes (for CCI or sun) */
 static int	Qcvt;		/* Swap quads (for sun) */
 
@@ -94,12 +95,12 @@ static u_long	 swabl(u_long);
 static u_char	*swablong(u_char *, int);
 static u_char	*swabshort(u_char *, int);
 static void	 terminateinput(void);
-static void	 xtrfile(char *, long);
-static void	 xtrlnkfile(char *, long);
-static void	 xtrlnkskip(char *, long);
-static void	 xtrmap(char *, long);
-static void	 xtrmapskip(char *, long);
-static void	 xtrskip(char *, long);
+static void	 xtrfile(char *, size_t);
+static void	 xtrlnkfile(char *, size_t);
+static void	 xtrlnkskip(char *, size_t);
+static void	 xtrmap(char *, size_t);
+static void	 xtrmapskip(char *, size_t);
+static void	 xtrskip(char *, size_t);
 
 static int readmapflag;
 
@@ -272,7 +273,7 @@ setup(void)
 	 * extracted.
 	 */
 	if (oldinofmt == 0)
-		SETINO(WINO, dumpmap);
+		SETINO(UFS_WINO, dumpmap);
 	/* 'r' restores don't call getvol() for tape 1, so mark it as read. */
 	if (command == 'r')
 		tapesread = 1;
@@ -674,11 +675,11 @@ skipfile(void)
  * to the skip function.
  */
 void
-getfile(void (*fill) (char *, long), void (*skip) (char *, long))
+getfile(void (*fill)(char *, size_t), void (*skip)(char *, size_t))
 {
 	int i;
-	int curblk = 0;
-	quad_t size = spcl.c_dinode.di_size;
+	volatile int curblk = 0;	/* avoid -Wclobbered */
+	volatile quad_t size = spcl.c_dinode.di_size;
 	static char clearedbuf[MAXBSIZE];
 	char buf[MAXBSIZE / TP_BSIZE][TP_BSIZE];
 	char junk[TP_BSIZE];
@@ -733,15 +734,15 @@ loop:
  * Write out the next block of a file.
  */
 static void
-xtrfile(char *buf, long size)
+xtrfile(char *buf, size_t size)
 {
 
 	if (Nflag)
 		return;
 	if (write(ofile, buf, (int) size) == -1) {
 		fprintf(stderr,
-		    "write error extracting inode %d, name %s\nwrite: %s\n",
-			curfile.ino, curfile.name, strerror(errno));
+		    "write error extracting inode %ju, name %s\nwrite: %s\n",
+		    (uintmax_t)curfile.ino, curfile.name, strerror(errno));
 	}
 }
 
@@ -750,13 +751,13 @@ xtrfile(char *buf, long size)
  */
 /* ARGSUSED */
 static void
-xtrskip(char *buf, long size)
+xtrskip(char *buf __unused, size_t size)
 {
 
 	if (lseek(ofile, size, SEEK_CUR) == -1) {
 		fprintf(stderr,
-		    "seek error extracting inode %d, name %s\nlseek: %s\n",
-			curfile.ino, curfile.name, strerror(errno));
+		    "seek error extracting inode %ju, name %s\nlseek: %s\n",
+		    (uintmax_t)curfile.ino, curfile.name, strerror(errno));
 		done(1);
 	}
 }
@@ -765,7 +766,7 @@ xtrskip(char *buf, long size)
  * Collect the next block of a symbolic link.
  */
 static void
-xtrlnkfile(char *buf, long size)
+xtrlnkfile(char *buf, size_t size)
 {
 
 	pathlen += size;
@@ -782,7 +783,7 @@ xtrlnkfile(char *buf, long size)
  */
 /* ARGSUSED */
 static void
-xtrlnkskip(char *buf, long size)
+xtrlnkskip(char *buf __unused, size_t size __unused)
 {
 
 	fprintf(stderr, "unallocated block in symbolic link %s\n",
@@ -794,7 +795,7 @@ xtrlnkskip(char *buf, long size)
  * Collect the next block of a bit map.
  */
 static void
-xtrmap(char *buf, long size)
+xtrmap(char *buf, size_t size)
 {
 
 	memmove(map, buf, size);
@@ -806,7 +807,7 @@ xtrmap(char *buf, long size)
  */
 /* ARGSUSED */
 static void
-xtrmapskip(char *buf, long size)
+xtrmapskip(char *buf __unused, size_t size)
 {
 
 	panic("hole in map\n");
@@ -818,7 +819,7 @@ xtrmapskip(char *buf, long size)
  */
 /* ARGSUSED */
 void
-xtrnull(char *buf, long size)
+xtrnull(char *buf __unused, size_t size __unused)
 {
 
 	return;
@@ -900,8 +901,8 @@ getmore:
 			fprintf(stderr, "restoring %s\n", curfile.name);
 			break;
 		case SKIP:
-			fprintf(stderr, "skipping over inode %d\n",
-				curfile.ino);
+			fprintf(stderr, "skipping over inode %ju\n",
+			    (uintmax_t)curfile.ino);
 			break;
 		}
 		if (!yflag && !reply("continue"))
@@ -935,7 +936,7 @@ getmore:
 			return;
 		}
 		if (rd % TP_BSIZE != 0)
-			panic("partial block read: %d should be %d\n",
+			panic("partial block read: %ld should be %ld\n",
 				rd, ntrec * TP_BSIZE);
 		terminateinput();
 		memmove(&tapebuf[rd], &endoftapemark, (long)TP_BSIZE);
@@ -1044,9 +1045,9 @@ gethead(struct s_spcl *buf)
 		if (checksum((int *)buf) == FAIL)
 			return (FAIL);
 		if (Bcvt) {
-			swabst((u_char *)"8l4s31l", (u_char *)buf);
-			swabst((u_char *)"l",(u_char *) &buf->c_level);
-			swabst((u_char *)"2l",(u_char *) &buf->c_flags);
+			swabst("8l4s31l", (u_char *)buf);
+			swabst("l",(u_char *) &buf->c_level);
+			swabst("2l",(u_char *) &buf->c_flags);
 		}
 		goto good;
 	}
@@ -1105,7 +1106,7 @@ good:
 		buf->c_dinode.di_size = buf->c_count * TP_BSIZE;
 		if (buf->c_count > TP_NINDIR)
 			readmapflag = 1;
-		else 
+		else
 			for (i = 0; i < buf->c_count; i++)
 				buf->c_addr[i]++;
 		break;
@@ -1259,10 +1260,12 @@ findinode(struct s_spcl *header)
 		case TS_TAPE:
 			panic("unexpected tape header\n");
 			/* NOTREACHED */
+			exit(1); /* hint for a compiler */
 
 		default:
 			panic("unknown tape header type %d\n", spcl.c_type);
 			/* NOTREACHED */
+			exit(1); /* hint for a compiler */
 
 		}
 	} while (htype == TS_ADDR);
@@ -1338,7 +1341,7 @@ swablong(u_char *sp, int n)
 }
 
 void
-swabst(u_char *cp, u_char *sp)
+swabst(const char *cp, u_char *sp)
 {
 	int n = 0;
 
@@ -1375,6 +1378,6 @@ swabst(u_char *cp, u_char *sp)
 static u_long
 swabl(u_long x)
 {
-	swabst((u_char *)"l", (u_char *)&x);
+	swabst("l", (u_char *)&x);
 	return (x);
 }

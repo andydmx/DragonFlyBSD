@@ -105,9 +105,7 @@
 #include <sys/uuid.h>
 
 #include <sys/buf2.h>
-#include <sys/mplock2.h>
 #include <sys/msgport2.h>
-#include <sys/thread2.h>
 
 static MALLOC_DEFINE(M_DISK, "disk", "disk data");
 static int disk_debug_enable = 0;
@@ -132,9 +130,23 @@ static d_dump_t diskdump;
 
 static LIST_HEAD(, disk) disklist = LIST_HEAD_INITIALIZER(&disklist);
 static struct lwkt_token disklist_token;
+static struct lwkt_token ds_token;
 
-static struct dev_ops disk_ops = {
-	{ "disk", 0, D_DISK | D_MPSAFE | D_TRACKCLOSE },
+static struct dev_ops disk1_ops = {
+	{ "disk", 0, D_DISK | D_MPSAFE | D_TRACKCLOSE | D_KVABIO },
+	.d_open = diskopen,
+	.d_close = diskclose,
+	.d_read = physread,
+	.d_write = physwrite,
+	.d_ioctl = diskioctl,
+	.d_strategy = diskstrategy,
+	.d_dump = diskdump,
+	.d_psize = diskpsize,
+};
+
+static struct dev_ops disk2_ops = {
+	{ "disk", 0, D_DISK | D_MPSAFE | D_TRACKCLOSE | D_KVABIO |
+		     D_NOEMERGPGR },
 	.d_open = diskopen,
 	.d_close = diskclose,
 	.d_read = physread,
@@ -172,6 +184,7 @@ disk_probe_slice(struct disk *dp, cdev_t dev, int slice, int reprobe)
 	struct disk_info *info = &dp->d_info;
 	struct diskslice *sp = &dp->d_slice->dss_slices[slice];
 	disklabel_ops_t ops;
+	struct dev_ops *dops;
 	struct partinfo part;
 	const char *msg;
 	char uuid_buf[128];
@@ -183,6 +196,8 @@ disk_probe_slice(struct disk *dp, cdev_t dev, int slice, int reprobe)
 		   dev->si_name, dp->d_cdev->si_name);
 
 	sno = slice ? slice - 1 : 0;
+	dops = (dp->d_rawdev->si_ops->head.flags & D_NOEMERGPGR) ?
+		&disk2_ops : &disk1_ops;
 
 	ops = &disklabel32_ops;
 	msg = ops->op_readdisklabel(dev, sp, &sp->ds_label, info);
@@ -192,14 +207,23 @@ disk_probe_slice(struct disk *dp, cdev_t dev, int slice, int reprobe)
 	}
 
 	if (msg == NULL) {
+		char packname[DISKLABEL_MAXPACKNAME];
+
 		if (slice != WHOLE_DISK_SLICE)
 			ops->op_adjust_label_reserved(dp->d_slice, slice, sp);
 		else
 			sp->ds_reserved = 0;
 
+		ops->op_getpackname(sp->ds_label, packname, sizeof(packname));
+
+		destroy_dev_alias(dev, "by-label/*");
+		if (packname[0])
+			make_dev_alias(dev, "by-label/%s", packname);
+
 		sp->ds_ops = ops;
 		for (i = 0; i < ops->op_getnumparts(sp->ds_label); i++) {
 			ops->op_loadpartinfo(sp->ds_label, i, &part);
+
 			if (part.fstype) {
 				if (reprobe &&
 				    (ndev = devfs_find_device_by_name("%s%c",
@@ -214,7 +238,10 @@ disk_probe_slice(struct disk *dp, cdev_t dev, int slice, int reprobe)
 					/*
 					 * Destroy old UUID alias
 					 */
-					destroy_dev_alias(ndev, "part-by-uuid/*");
+					destroy_dev_alias(ndev,
+							  "part-by-uuid/*");
+					destroy_dev_alias(ndev,
+							  "part-by-label/*");
 
 					/* Create UUID alias */
 					if (!kuuid_is_nil(&part.storage_uuid)) {
@@ -226,8 +253,14 @@ disk_probe_slice(struct disk *dp, cdev_t dev, int slice, int reprobe)
 						    uuid_buf);
 						udev_dict_set_cstr(ndev, "uuid", uuid_buf);
 					}
+					if (packname[0]) {
+						make_dev_alias(ndev,
+						    "part-by-label/%s.%c",
+						    packname, 'a' + i);
+					}
 				} else {
-					ndev = make_dev_covering(&disk_ops, dp->d_rawdev->si_ops,
+					ndev = make_dev_covering(dops,
+						dp->d_rawdev->si_ops,
 						dkmakeminor(dkunit(dp->d_cdev),
 							    slice, i),
 						UID_ROOT, GID_OPERATOR, 0640,
@@ -260,6 +293,11 @@ disk_probe_slice(struct disk *dp, cdev_t dev, int slice, int reprobe)
 						    uuid_buf);
 						udev_dict_set_cstr(ndev, "uuid", uuid_buf);
 					}
+					if (packname[0]) {
+						make_dev_alias(ndev,
+						    "part-by-label/%s.%c",
+						    packname, 'a' + i);
+					}
 					ndev->si_flags |= SI_REPROBE_TEST;
 				}
 			}
@@ -274,7 +312,8 @@ disk_probe_slice(struct disk *dp, cdev_t dev, int slice, int reprobe)
 	} else {
 		if (sp->ds_type == DOSPTYP_386BSD || /* XXX */
 		    sp->ds_type == DOSPTYP_NETBSD ||
-		    sp->ds_type == DOSPTYP_OPENBSD) {
+		    sp->ds_type == DOSPTYP_OPENBSD ||
+		    sp->ds_type == DOSPTYP_DFLYBSD) {
 			log(LOG_WARNING, "%s: cannot find label (%s)\n",
 			    dev->si_name, msg);
 		}
@@ -311,9 +350,15 @@ disk_probe(struct disk *dp, int reprobe)
 	int error, i, sno;
 	struct diskslices *osp;
 	struct diskslice *sp;
+	struct dev_ops *dops;
 	char uuid_buf[128];
 
-	KKASSERT (info->d_media_blksize != 0);
+	/*
+	 * d_media_blksize can be 0 for non-disk storage devices such
+	 * as audio CDs.
+	 */
+	if (info->d_media_blksize == 0)
+		return;
 
 	osp = dp->d_slice;
 	dp->d_slice = dsmakeslicestruct(BASE_SLICE, info);
@@ -324,6 +369,9 @@ disk_probe(struct disk *dp, int reprobe)
 		dsgone(&osp);
 		return;
 	}
+
+	dops = (dp->d_rawdev->si_ops->head.flags & D_NOEMERGPGR) ?
+		&disk2_ops : &disk1_ops;
 
 	for (i = 0; i < dp->d_slice->dss_nslices; i++) {
 		/*
@@ -391,7 +439,7 @@ disk_probe(struct disk *dp, int reprobe)
 			/*
 			 * Else create new device
 			 */
-			ndev = make_dev_covering(&disk_ops, dp->d_rawdev->si_ops,
+			ndev = make_dev_covering(dops, dp->d_rawdev->si_ops,
 					dkmakewholeslice(dkunit(dev), i),
 					UID_ROOT, GID_OPERATOR, 0640,
 					(info->d_dsflags & DSO_DEVICEMAPPER)?
@@ -433,6 +481,7 @@ disk_probe(struct disk *dp, int reprobe)
 		if (sp->ds_type == DOSPTYP_386BSD ||
 		    sp->ds_type == DOSPTYP_NETBSD ||
 		    sp->ds_type == DOSPTYP_OPENBSD ||
+		    sp->ds_type == DOSPTYP_DFLYBSD ||
 		    sp->ds_type == 0 ||
 		    sp->ds_type == 1) {
 			if (dp->d_slice->dss_first_bsd_slice == 0)
@@ -458,7 +507,7 @@ disk_msg_core(void *arg)
 	wakeup(curthread);	/* synchronous startup */
 	lwkt_reltoken(&disklist_token);
 
-	get_mplock();	/* not mpsafe yet? */
+	lwkt_gettoken(&ds_token);
 	run = 1;
 
 	while (run) {
@@ -484,16 +533,14 @@ disk_msg_core(void *arg)
 			 * Interlock against struct disk enumerations.
 			 * Wait for enumerations to complete then remove
 			 * the dp from the list before tearing it down.
-			 *
-			 * This avoids races against e.g.
-			 * dsched_thread_io_alloc().
+			 * This avoids numerous races.
 			 */
 			lwkt_gettoken(&disklist_token);
 			while (dp->d_refs)
 				tsleep(&dp->d_refs, 0, "diskdel", hz / 10);
 			LIST_REMOVE(dp, d_list);
 
-			dsched_disk_destroy_callback(dp);
+			dsched_disk_destroy(dp);
 			devfs_destroy_related(dp->d_cdev);
 			destroy_dev(dp->d_cdev);
 			destroy_only_dev(dp->d_rawdev);
@@ -546,6 +593,7 @@ disk_msg_core(void *arg)
 		}
 		lwkt_replymsg(&msg->hdr, 0);
 	}
+	lwkt_reltoken(&ds_token);
 	lwkt_exit();
 }
 
@@ -596,8 +644,7 @@ disk_msg_send_sync(uint32_t cmd, void *load, void *load2)
 	disk_msg->load = load;
 	disk_msg->load2 = load2;
 
-	lwkt_sendmsg(port, &disk_msg->hdr);
-	lwkt_waitmsg(&disk_msg->hdr, 0);
+	lwkt_domsg(port, &disk_msg->hdr, 0);
 	objcache_put(disk_msg_cache, disk_msg);
 }
 
@@ -643,6 +690,7 @@ _disk_create_named(const char *name, int unit, struct disk *dp,
 		   struct dev_ops *raw_ops, int clone)
 {
 	cdev_t rawdev;
+	struct dev_ops *dops;
 
 	disk_debug(1, "disk_create (begin): %s%d\n", name, unit);
 
@@ -657,20 +705,22 @@ _disk_create_named(const char *name, int unit, struct disk *dp,
 
 	bzero(dp, sizeof(*dp));
 
+	dops = (raw_ops->head.flags & D_NOEMERGPGR) ? &disk2_ops : &disk1_ops;
+
 	dp->d_rawdev = rawdev;
 	dp->d_raw_ops = raw_ops;
-	dp->d_dev_ops = &disk_ops;
+	dp->d_dev_ops = dops;
 
 	if (name) {
 		if (clone) {
 			dp->d_cdev = make_only_dev_covering(
-					&disk_ops, dp->d_rawdev->si_ops,
+					dops, dp->d_rawdev->si_ops,
 					dkmakewholedisk(unit),
 					UID_ROOT, GID_OPERATOR, 0640,
 					"%s", name);
 		} else {
 			dp->d_cdev = make_dev_covering(
-					&disk_ops, dp->d_rawdev->si_ops,
+					dops, dp->d_rawdev->si_ops,
 					dkmakewholedisk(unit),
 					UID_ROOT, GID_OPERATOR, 0640,
 					"%s", name);
@@ -678,13 +728,13 @@ _disk_create_named(const char *name, int unit, struct disk *dp,
 	} else {
 		if (clone) {
 			dp->d_cdev = make_only_dev_covering(
-					&disk_ops, dp->d_rawdev->si_ops,
+					dops, dp->d_rawdev->si_ops,
 					dkmakewholedisk(unit),
 					UID_ROOT, GID_OPERATOR, 0640,
 					"%s%d", raw_ops->head.name, unit);
 		} else {
 			dp->d_cdev = make_dev_covering(
-					&disk_ops, dp->d_rawdev->si_ops,
+					dops, dp->d_rawdev->si_ops,
 					dkmakewholedisk(unit),
 					UID_ROOT, GID_OPERATOR, 0640,
 					"%s%d", raw_ops->head.name, unit);
@@ -695,9 +745,9 @@ _disk_create_named(const char *name, int unit, struct disk *dp,
 	dp->d_cdev->si_disk = dp;
 
 	if (name)
-		dsched_disk_create_callback(dp, name, unit);
+		dsched_disk_create(dp, name, unit);
 	else
-		dsched_disk_create_callback(dp, raw_ops->head.name, unit);
+		dsched_disk_create(dp, raw_ops->head.name, unit);
 
 	lwkt_gettoken(&disklist_token);
 	LIST_INSERT_HEAD(&disklist, dp, d_list);
@@ -759,7 +809,7 @@ _setdiskinfo(struct disk *disk, struct disk_info *info)
 	if (oldserialno)
 		kfree(oldserialno, M_TEMP);
 
-	dsched_disk_update_callback(disk, info);
+	dsched_disk_update(disk, info);
 
 	/*
 	 * The caller may set d_media_size or d_media_blocks and we
@@ -834,7 +884,12 @@ disk_dumpcheck(cdev_t dev, u_int64_t *size,
 	struct partinfo pinfo;
 	int error;
 
+	if (size)
+		*size = 0;	/* avoid gcc warnings */
+	if (secsize)
+		*secsize = 512;	/* avoid gcc warnings */
 	bzero(&pinfo, sizeof(pinfo));
+
 	error = dev_dioctl(dev, DIOCGPART, (void *)&pinfo, 0,
 			   proc0.p_ucred, NULL, NULL);
 	if (error)
@@ -1013,12 +1068,12 @@ diskopen(struct dev_open_args *ap)
 	/*
 	 * Deal with open races
 	 */
-	get_mplock();
+	lwkt_gettoken(&ds_token);
 	while (dp->d_flags & DISKFLAG_LOCK) {
 		dp->d_flags |= DISKFLAG_WANTED;
 		error = tsleep(dp, PCATCH, "diskopen", hz);
 		if (error) {
-			rel_mplock();
+			lwkt_reltoken(&ds_token);
 			return (error);
 		}
 	}
@@ -1033,7 +1088,7 @@ diskopen(struct dev_open_args *ap)
 			pdev->si_iosize_max = dev->si_iosize_max;
 #endif
 		error = dev_dopen(dp->d_rawdev, ap->a_oflags,
-				  ap->a_devtype, ap->a_cred, NULL);
+				  ap->a_devtype, ap->a_cred, NULL, NULL);
 	}
 
 	if (error)
@@ -1049,7 +1104,7 @@ out:
 		dp->d_flags &= ~DISKFLAG_WANTED;
 		wakeup(dp);
 	}
-	rel_mplock();
+	lwkt_reltoken(&ds_token);
 
 	KKASSERT(dp->d_opencount >= 0);
 	/* If the open was successful, bump open count */
@@ -1085,12 +1140,13 @@ diskclose(struct dev_close_args *ap)
 	KKASSERT(dp->d_opencount >= 1);
 	lcount = atomic_fetchadd_int(&dp->d_opencount, -1);
 
-	get_mplock();
+	lwkt_gettoken(&ds_token);
 	dsclose(dev, ap->a_devtype, dp->d_slice);
 	if (lcount <= 1 && !dsisopen(dp->d_slice)) {
 		error = dev_dclose(dp->d_rawdev, ap->a_fflag, ap->a_devtype, NULL);
 	}
-	rel_mplock();
+	lwkt_reltoken(&ds_token);
+
 	return (error);
 }
 
@@ -1133,10 +1189,10 @@ diskioctl(struct dev_ioctl_args *ap)
 	     dkslice(dev) == WHOLE_DISK_SLICE)) {
 		error = ENOIOCTL;
 	} else {
-		get_mplock();
+		lwkt_gettoken(&ds_token);
 		error = dsioctl(dev, ap->a_cmd, ap->a_data, ap->a_fflag,
 				&dp->d_slice, &dp->d_info);
-		rel_mplock();
+		lwkt_reltoken(&ds_token);
 	}
 
 	if (error == ENOIOCTL) {
@@ -1148,6 +1204,9 @@ diskioctl(struct dev_ioctl_args *ap)
 
 /*
  * Execute strategy routine
+ *
+ * WARNING! We are using the KVABIO API and must not access memory
+ *         through bp->b_data without first calling bkvasync(bp).
  */
 static
 int
@@ -1176,7 +1235,7 @@ diskstrategy(struct dev_strategy_args *ap)
 	 * or error due to being beyond the device size).
 	 */
 	if ((nbio = dscheck(dev, bio, dp->d_slice)) != NULL) {
-		dsched_queue(dp, nbio);
+		dev_dstrategy(dp->d_rawdev, nbio);
 	} else {
 		biodone(bio);
 	}
@@ -1207,7 +1266,7 @@ diskpsize(struct dev_psize_args *ap)
 	return(0);
 }
 
-int
+static int
 diskdump(struct dev_dump_args *ap)
 {
 	cdev_t dev = ap->a_head.a_dev;
@@ -1284,6 +1343,7 @@ SYSCTL_INT(_kern, OID_AUTO, bioq_reorder_minor_bytes,
 void
 bioqdisksort(struct bio_queue_head *bioq, struct bio *bio)
 {
+#if 0
 	/*
 	 * The BIO wants to be ordered.  Adding to the tail also
 	 * causes transition to be set to NULL, forcing the ordering
@@ -1293,6 +1353,7 @@ bioqdisksort(struct bio_queue_head *bioq, struct bio *bio)
 		bioq_insert_tail(bioq, bio);
 		return;
 	}
+#endif
 
 	switch(bio->bio_buf->b_cmd) {
 	case BUF_CMD_READ:
@@ -1478,6 +1539,7 @@ disk_init(void)
 					 &disk_msg_malloc_args);
 
 	lwkt_token_init(&disklist_token, "disks");
+	lwkt_token_init(&ds_token, "ds");
 
 	/*
 	 * Initialize the reply-only port which acts as a message drain

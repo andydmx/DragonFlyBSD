@@ -2,8 +2,7 @@
 /*
  * Copyright is disclaimed as to the contents of this file.
  *
- * $FreeBSD: src/usr.bin/getconf/confstr.gperf,v 1.4.2.1 2002/10/27 04:18:40 wollman Exp $
- * $DragonFly: src/usr.bin/getconf/confstr.gperf,v 1.2 2003/06/17 04:29:27 dillon Exp $
+ * $FreeBSD: head/usr.bin/getconf/confstr.gperf 119312 2003-08-22 17:32:07Z markm $
  */
 
 #include <sys/types.h>
@@ -16,7 +15,7 @@
 /*
  * Override gperf's built-in external scope.
  */
-static const struct map *in_word_set(const char *str, unsigned int len);
+static const struct map *in_word_set(const char *str);
 
 /*
  * The Standard seems a bit ambiguous over whether the POSIX_V6_*
@@ -53,13 +52,26 @@ _POSIX_V6_LPBIG_OFFBIG_CFLAGS, _CS_POSIX_V6_LPBIG_OFFBIG_CFLAGS
 _POSIX_V6_LPBIG_OFFBIG_LDFLAGS, _CS_POSIX_V6_LPBIG_OFFBIG_LDFLAGS
 _POSIX_V6_LPBIG_OFFBIG_LIBS, _CS_POSIX_V6_LPBIG_OFFBIG_LIBS
 _POSIX_V6_WIDTH_RESTRICTED_ENVS, _CS_POSIX_V6_WIDTH_RESTRICTED_ENVS
+POSIX_V7_ILP32_OFF32_CFLAGS, _CS_POSIX_V7_ILP32_OFF32_CFLAGS
+POSIX_V7_ILP32_OFF32_LDFLAGS, _CS_POSIX_V7_ILP32_OFF32_LDFLAGS
+POSIX_V7_ILP32_OFF32_LIBS, _CS_POSIX_V7_ILP32_OFF32_LIBS
+POSIX_V7_ILP32_OFFBIG_CFLAGS, _CS_POSIX_V7_ILP32_OFFBIG_CFLAGS
+POSIX_V7_ILP32_OFFBIG_LDFLAGS, _CS_POSIX_V7_ILP32_OFFBIG_LDFLAGS
+POSIX_V7_ILP32_OFFBIG_LIBS, _CS_POSIX_V7_ILP32_OFFBIG_LIBS
+POSIX_V7_LP64_OFF64_CFLAGS, _CS_POSIX_V7_LP64_OFF64_CFLAGS
+POSIX_V7_LP64_OFF64_LDFLAGS, _CS_POSIX_V7_LP64_OFF64_LDFLAGS
+POSIX_V7_LP64_OFF64_LIBS, _CS_POSIX_V7_LP64_OFF64_LIBS
+POSIX_V7_LPBIG_OFFBIG_CFLAGS, _CS_POSIX_V7_LPBIG_OFFBIG_CFLAGS
+POSIX_V7_LPBIG_OFFBIG_LDFLAGS, _CS_POSIX_V7_LPBIG_OFFBIG_LDFLAGS
+POSIX_V7_LPBIG_OFFBIG_LIBS, _CS_POSIX_V7_LPBIG_OFFBIG_LIBS
+POSIX_V7_WIDTH_RESTRICTED_ENVS, _CS_POSIX_V7_WIDTH_RESTRICTED_ENVS
 %%
 int
 find_confstr(const char *name, int *key)
 {
 	const struct map *rv;
 
-	rv = in_word_set(name, strlen(name));
+	rv = in_word_set(name);
 	if (rv != NULL) {
 		if (rv->valid) {
 			*key = rv->key;

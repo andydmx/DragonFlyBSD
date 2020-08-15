@@ -1,6 +1,6 @@
 /*-
  * Copyright (c) 2002-2003 Networks Associates Technology, Inc.
- * Copyright (c) 2004-2011 Dag-Erling Smørgrav
+ * Copyright (c) 2004-2015 Dag-Erling Smørgrav
  * All rights reserved.
  *
  * This software was developed for the FreeBSD Project by ThinkSec AS and
@@ -32,7 +32,7 @@
  * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
  *
- * $Id: openpam.h 605 2012-04-20 11:05:10Z des $
+ * $OpenPAM: openpam.h 938 2017-04-30 21:34:42Z des $
  */
 
 #ifndef SECURITY_OPENPAM_H_INCLUDED
@@ -97,8 +97,7 @@ int
 pam_get_authtok(pam_handle_t *_pamh,
 	int _item,
 	const char **_authtok,
-	const char *_prompt)
-	OPENPAM_NONNULL((1,3));
+	const char *_prompt);
 
 int
 pam_info(const pam_handle_t *_pamh,
@@ -120,8 +119,7 @@ int
 pam_setenv(pam_handle_t *_pamh,
 	const char *_name,
 	const char *_value,
-	int _overwrite)
-	OPENPAM_NONNULL((1,2,3));
+	int _overwrite);
 
 int
 pam_vinfo(const pam_handle_t *_pamh,
@@ -186,6 +184,7 @@ enum {
 	OPENPAM_VERIFY_POLICY_FILE,
 	OPENPAM_RESTRICT_MODULE_NAME,
 	OPENPAM_VERIFY_MODULE_FILE,
+	OPENPAM_FALLBACK_TO_OTHER,
 	OPENPAM_NUM_FEATURES
 };
 

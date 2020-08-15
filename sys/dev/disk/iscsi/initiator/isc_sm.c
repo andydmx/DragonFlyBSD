@@ -53,7 +53,6 @@
 #include <sys/bus.h>
 #include <sys/eventhandler.h>
 
-#include <sys/thread2.h>
 #include <sys/mutex2.h>
 #include <sys/mplock2.h>
 
@@ -792,12 +791,12 @@ ism_start(isc_session_t *sp)
      TAILQ_INIT(&sp->wsnd);
      TAILQ_INIT(&sp->hld);
 
-     mtx_init(&sp->rsv_mtx);
-     mtx_init(&sp->rsp_mtx);
-     mtx_init(&sp->snd_mtx);
-     mtx_init(&sp->hld_mtx);
+     mtx_init(&sp->rsv_mtx, "irsv");
+     mtx_init(&sp->rsp_mtx, "irsp");
+     mtx_init(&sp->snd_mtx, "isnd");
+     mtx_init(&sp->hld_mtx, "ihld");
 
-     mtx_init(&sp->io_mtx);
+     mtx_init(&sp->io_mtx, "isio");
 
      isc_add_sysctls(sp);
 

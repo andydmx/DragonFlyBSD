@@ -2,8 +2,6 @@
  * SYS/USCHED.H
  *
  *	Userland scheduler API
- * 
- * $DragonFly: src/sys/sys/usched.h,v 1.15 2008/04/21 15:24:47 dillon Exp $
  */
 
 #ifndef _SYS_USCHED_H_
@@ -13,6 +11,9 @@
 
 #ifndef _SYS_TYPES_H_
 #include <sys/types.h>
+#endif
+#ifndef _SYS_CPUMASK_H_
+#include <sys/cpumask.h>
 #endif
 #ifndef _SYS_QUEUE_H_
 #include <sys/queue.h>
@@ -49,7 +50,7 @@ struct usched {
 
 union usched_data {
     /*
-     * BSD4 scheduler. 
+     * BSD4 scheduler.
      */
     struct {
 	short	priority;	/* lower is better */
@@ -91,6 +92,8 @@ union usched_data {
 #define USCHED_ADD_CPU		2
 #define USCHED_DEL_CPU		3
 #define USCHED_GET_CPU		4
+#define USCHED_GET_CPUMASK	5	/* since DragonFly 4.5 */
+#define USCHED_SET_CPUMASK	6	/* since DragonFly 4.7 */
 
 /*
  * Kernel variables and procedures, or user system calls.
@@ -100,6 +103,7 @@ union usched_data {
 extern struct usched	usched_bsd4;
 extern struct usched	usched_dfly;
 extern struct usched	usched_dummy;
+void dfly_acquire_curproc(struct lwp *);
 extern cpumask_t usched_mastermask;
 extern int sched_ticks; /* From sys/kern/kern_clock.c */
 

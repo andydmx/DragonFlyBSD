@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2011, Intel Corporation 
+ * Copyright (c) 2001-2013, Intel Corporation 
  * All rights reserved.
  * 
  * Redistribution and use in source and binary forms, with or without 
@@ -55,6 +55,7 @@
 #include <net/if_dl.h>
 #include <net/if_media.h>
 #include <net/ifq_var.h>
+#include <net/if_ringmap.h>
 #include <net/toeplitz.h>
 #include <net/toeplitz2.h>
 #include <net/vlan/if_vlan_var.h>
@@ -70,6 +71,7 @@
 
 #include <dev/netif/ig_hal/e1000_api.h>
 #include <dev/netif/ig_hal/e1000_82575.h>
+#include <dev/netif/ig_hal/e1000_dragonfly.h>
 #include <dev/netif/igb/if_igb.h>
 
 #ifdef IGB_RSS_DEBUG
@@ -129,6 +131,7 @@ static struct igb_device {
 	IGB_DEVICE(I210_SGMII),
 	IGB_DEVICE(I211_COPPER),
 	IGB_DEVICE(I354_BACKPLANE_1GBPS),
+	IGB_DEVICE(I354_BACKPLANE_2_5GBPS),
 	IGB_DEVICE(I354_SGMII),
 
 	/* required last entry */
@@ -148,8 +151,9 @@ static boolean_t igb_txcsum_ctx(struct igb_tx_ring *, struct mbuf *);
 static int	igb_tso_pullup(struct igb_tx_ring *, struct mbuf **);
 static void	igb_tso_ctx(struct igb_tx_ring *, struct mbuf *, uint32_t *);
 static void	igb_add_sysctl(struct igb_softc *);
+static void	igb_add_intr_rate_sysctl(struct igb_softc *, int,
+		    const char *, const char *);
 static int	igb_sysctl_intr_rate(SYSCTL_HANDLER_ARGS);
-static int	igb_sysctl_msix_rate(SYSCTL_HANDLER_ARGS);
 static int	igb_sysctl_tx_intr_nsegs(SYSCTL_HANDLER_ARGS);
 static int	igb_sysctl_tx_wreg_nsegs(SYSCTL_HANDLER_ARGS);
 static int	igb_sysctl_rx_wreg_nsegs(SYSCTL_HANDLER_ARGS);
@@ -157,24 +161,26 @@ static void	igb_set_ring_inuse(struct igb_softc *, boolean_t);
 static int	igb_get_rxring_inuse(const struct igb_softc *, boolean_t);
 static int	igb_get_txring_inuse(const struct igb_softc *, boolean_t);
 static void	igb_set_timer_cpuid(struct igb_softc *, boolean_t);
-#ifdef IFPOLL_ENABLE
-static int	igb_sysctl_npoll_rxoff(SYSCTL_HANDLER_ARGS);
-static int	igb_sysctl_npoll_txoff(SYSCTL_HANDLER_ARGS);
-#endif
 
 static void	igb_vf_init_stats(struct igb_softc *);
-static void	igb_reset(struct igb_softc *);
+static void	igb_reset(struct igb_softc *, boolean_t);
 static void	igb_update_stats_counters(struct igb_softc *);
 static void	igb_update_vf_stats_counters(struct igb_softc *);
 static void	igb_update_link_status(struct igb_softc *);
 static void	igb_init_tx_unit(struct igb_softc *);
-static void	igb_init_rx_unit(struct igb_softc *);
+static void	igb_init_rx_unit(struct igb_softc *, boolean_t);
+static void	igb_init_dmac(struct igb_softc *, uint32_t);
+static void	igb_reg_dump(struct igb_softc *);
+static int	igb_sysctl_reg_dump(SYSCTL_HANDLER_ARGS);
 
 static void	igb_set_vlan(struct igb_softc *);
 static void	igb_set_multi(struct igb_softc *);
 static void	igb_set_promisc(struct igb_softc *);
 static void	igb_disable_promisc(struct igb_softc *);
 
+static int	igb_get_ring_max(const struct igb_softc *);
+static void	igb_get_rxring_cnt(const struct igb_softc *, int *, int *);
+static void	igb_get_txring_cnt(const struct igb_softc *, int *, int *);
 static int	igb_alloc_rings(struct igb_softc *);
 static void	igb_free_rings(struct igb_softc *);
 static int	igb_create_tx_ring(struct igb_tx_ring *);
@@ -188,7 +194,7 @@ static int	igb_init_rx_ring(struct igb_rx_ring *);
 static int	igb_newbuf(struct igb_rx_ring *, int, boolean_t);
 static int	igb_encap(struct igb_tx_ring *, struct mbuf **, int *, int *);
 static void	igb_rx_refresh(struct igb_rx_ring *, int);
-static void	igb_setup_serializer(struct igb_softc *);
+static void	igb_setup_serialize(struct igb_softc *);
 
 static void	igb_stop(struct igb_softc *);
 static void	igb_init(void *);
@@ -215,7 +221,9 @@ static void	igb_serialize_assert(struct ifnet *, enum ifnet_serialize,
 static void	igb_intr(void *);
 static void	igb_intr_shared(void *);
 static void	igb_rxeof(struct igb_rx_ring *, int);
-static void	igb_txeof(struct igb_tx_ring *);
+static void	igb_txeof(struct igb_tx_ring *, int);
+static void	igb_txgc(struct igb_tx_ring *);
+static void	igb_txgc_timer(void *);
 static void	igb_set_eitr(struct igb_softc *, int, int);
 static void	igb_enable_intr(struct igb_softc *);
 static void	igb_disable_intr(struct igb_softc *);
@@ -227,13 +235,9 @@ static void	igb_set_rxintr_mask(struct igb_rx_ring *, int *, int);
 static void	igb_set_intr_mask(struct igb_softc *);
 static int	igb_alloc_intr(struct igb_softc *);
 static void	igb_free_intr(struct igb_softc *);
-static void	igb_teardown_intr(struct igb_softc *);
-static void	igb_msix_try_alloc(struct igb_softc *);
-static void	igb_msix_rx_conf(struct igb_softc *, int, int *, int);
-static void	igb_msix_tx_conf(struct igb_softc *, int, int *, int);
-static void	igb_msix_free(struct igb_softc *, boolean_t);
-static int	igb_msix_setup(struct igb_softc *);
-static void	igb_msix_teardown(struct igb_softc *, int);
+static void	igb_teardown_intr(struct igb_softc *, int);
+static void	igb_alloc_msix(struct igb_softc *);
+static void	igb_free_msix(struct igb_softc *, boolean_t);
 static void	igb_msix_rx(void *);
 static void	igb_msix_tx(void *);
 static void	igb_msix_status(void *);
@@ -244,7 +248,8 @@ static void	igb_get_mgmt(struct igb_softc *);
 static void	igb_rel_mgmt(struct igb_softc *);
 static void	igb_get_hw_control(struct igb_softc *);
 static void	igb_rel_hw_control(struct igb_softc *);
-static void	igb_enable_wol(device_t);
+static void	igb_enable_wol(struct igb_softc *);
+static int	igb_enable_phy_wol(struct igb_softc *);
 
 static device_method_t igb_methods[] = {
 	/* Device interface */
@@ -276,7 +281,8 @@ static int	igb_txr = 0;
 static int	igb_msi_enable = 1;
 static int	igb_msix_enable = 1;
 static int	igb_eee_disabled = 1;	/* Energy Efficient Ethernet */
-static int	igb_fc_setting = e1000_fc_full;
+
+static char	igb_flowctrl[IFM_ETH_FC_STRLEN] = IFM_ETH_FC_NONE;
 
 /*
  * DMA Coalescing, only for i350 - default to off,
@@ -290,11 +296,71 @@ TUNABLE_INT("hw.igb.rxr", &igb_rxr);
 TUNABLE_INT("hw.igb.txr", &igb_txr);
 TUNABLE_INT("hw.igb.msi.enable", &igb_msi_enable);
 TUNABLE_INT("hw.igb.msix.enable", &igb_msix_enable);
-TUNABLE_INT("hw.igb.fc_setting", &igb_fc_setting);
+TUNABLE_STR("hw.igb.flow_ctrl", igb_flowctrl, sizeof(igb_flowctrl));
 
 /* i350 specific */
 TUNABLE_INT("hw.igb.eee_disabled", &igb_eee_disabled);
 TUNABLE_INT("hw.igb.dma_coalesce", &igb_dma_coalesce);
+
+static __inline void
+igb_tx_intr(struct igb_tx_ring *txr, int hdr)
+{
+
+	igb_txeof(txr, hdr);
+	if (!ifsq_is_empty(txr->ifsq))
+		ifsq_devstart(txr->ifsq);
+}
+
+static __inline void
+igb_try_txgc(struct igb_tx_ring *txr, int16_t dec)
+{
+
+	if (txr->tx_running > 0) {
+		txr->tx_running -= dec;
+		if (txr->tx_running <= 0 && txr->tx_nmbuf &&
+		    txr->tx_avail < txr->num_tx_desc &&
+		    txr->tx_avail + txr->intr_nsegs > txr->num_tx_desc)
+			igb_txgc(txr);
+	}
+}
+
+static void
+igb_txgc_timer(void *xtxr)
+{
+	struct igb_tx_ring *txr = xtxr;
+	struct ifnet *ifp = &txr->sc->arpcom.ac_if;
+
+	if ((ifp->if_flags & (IFF_RUNNING | IFF_UP | IFF_NPOLLING)) !=
+	    (IFF_RUNNING | IFF_UP))
+		return;
+
+	if (!lwkt_serialize_try(&txr->tx_serialize))
+		goto done;
+
+	if ((ifp->if_flags & (IFF_RUNNING | IFF_UP | IFF_NPOLLING)) !=
+	    (IFF_RUNNING | IFF_UP)) {
+		lwkt_serialize_exit(&txr->tx_serialize);
+		return;
+	}
+	igb_try_txgc(txr, IGB_TX_RUNNING_DEC);
+
+	lwkt_serialize_exit(&txr->tx_serialize);
+done:
+	callout_reset(&txr->tx_gc_timer, 1, igb_txgc_timer, txr);
+}
+
+static __inline void
+igb_free_txbuf(struct igb_tx_ring *txr, struct igb_tx_buf *txbuf)
+{
+
+	KKASSERT(txbuf->m_head != NULL);
+	KKASSERT(txr->tx_nmbuf > 0);
+	txr->tx_nmbuf--;
+
+	bus_dmamap_unload(txr->tx_tag, txbuf->map);
+	m_freem(txbuf->m_head);
+	txbuf->m_head = NULL;
+}
 
 static __inline void
 igb_rxcsum(uint32_t staterr, struct mbuf *mp)
@@ -344,9 +410,55 @@ igb_rssinfo(struct mbuf *m, struct pktinfo *pi,
 		return NULL;
 	}
 
-	m->m_flags |= M_HASH;
-	m->m_pkthdr.hash = toeplitz_hash(hash);
+	m_sethash(m, toeplitz_hash(hash));
 	return pi;
+}
+
+static int
+igb_get_ring_max(const struct igb_softc *sc)
+{
+
+	switch (sc->hw.mac.type) {
+	case e1000_82575:
+		return (IGB_MAX_RING_82575);
+
+	case e1000_82576:
+		return (IGB_MAX_RING_82576);
+
+	case e1000_82580:
+		return (IGB_MAX_RING_82580);
+
+	case e1000_i350:
+		return (IGB_MAX_RING_I350);
+
+	case e1000_i354:
+		return (IGB_MAX_RING_I354);
+
+	case e1000_i210:
+		return (IGB_MAX_RING_I210);
+
+	case e1000_i211:
+		return (IGB_MAX_RING_I211);
+
+	default:
+		return (IGB_MIN_RING);
+	}
+}
+
+static void
+igb_get_rxring_cnt(const struct igb_softc *sc, int *ring_cnt, int *ring_max)
+{
+
+	*ring_max = igb_get_ring_max(sc);
+	*ring_cnt = device_getenv_int(sc->dev, "rxr", igb_rxr);
+}
+
+static void
+igb_get_txring_cnt(const struct igb_softc *sc, int *ring_cnt, int *ring_max)
+{
+
+	*ring_max = igb_get_ring_max(sc);
+	*ring_cnt = device_getenv_int(sc->dev, "txr", igb_txr);
 }
 
 static int
@@ -372,10 +484,8 @@ igb_attach(device_t dev)
 {
 	struct igb_softc *sc = device_get_softc(dev);
 	uint16_t eeprom_data;
-	int error = 0, ring_max;
-#ifdef IFPOLL_ENABLE
-	int offset, offset_def;
-#endif
+	int error = 0, ring_max, ring_cnt;
+	char flowctrl[IFM_ETH_FC_STRLEN];
 
 #ifdef notyet
 	/* SYSCTL stuff */
@@ -383,18 +493,19 @@ igb_attach(device_t dev)
 	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)),
 	    OID_AUTO, "nvm", CTLTYPE_INT|CTLFLAG_RW, adapter, 0,
 	    igb_sysctl_nvm_info, "I", "NVM Information");
-	SYSCTL_ADD_PROC(device_get_sysctl_ctx(dev),
-	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)),
-	    OID_AUTO, "flow_control", CTLTYPE_INT|CTLFLAG_RW,
-	    adapter, 0, igb_set_flowcntl, "I", "Flow Control");
 #endif
 
+	ifmedia_init(&sc->media, IFM_IMASK | IFM_ETH_FCMASK,
+	    igb_media_change, igb_media_status);
 	callout_init_mp(&sc->timer);
 	lwkt_serialize_init(&sc->main_serialize);
 
 	if_initname(&sc->arpcom.ac_if, device_get_name(dev),
 	    device_get_unit(dev));
 	sc->dev = sc->osdep.dev = dev;
+
+	/* Enable bus mastering */
+	pci_enable_busmaster(dev);
 
 	/*
 	 * Determine hardware and mac type
@@ -418,56 +529,21 @@ igb_attach(device_t dev)
 	/*
 	 * Configure total supported RX/TX ring count
 	 */
-	switch (sc->hw.mac.type) {
-	case e1000_82575:
-		ring_max = IGB_MAX_RING_82575;
-		break;
+	igb_get_rxring_cnt(sc, &ring_cnt, &ring_max);
+	sc->rx_rmap = if_ringmap_alloc(dev, ring_cnt, ring_max);
+	igb_get_txring_cnt(sc, &ring_cnt, &ring_max);
+	sc->tx_rmap = if_ringmap_alloc(dev, ring_cnt, ring_max);
+	if_ringmap_match(dev, sc->rx_rmap, sc->tx_rmap);
 
-	case e1000_82576:
-		ring_max = IGB_MAX_RING_82576;
-		break;
-
-	case e1000_82580:
-		ring_max = IGB_MAX_RING_82580;
-		break;
-
-	case e1000_i350:
-		ring_max = IGB_MAX_RING_I350;
-		break;
-
-	case e1000_i354:
-		ring_max = IGB_MAX_RING_I354;
-		break;
-
-	case e1000_i210:
-		ring_max = IGB_MAX_RING_I210;
-		break;
-
-	case e1000_i211:
-		ring_max = IGB_MAX_RING_I211;
-		break;
-
-	default:
-		ring_max = IGB_MIN_RING;
-		break;
-	}
-
-	sc->rx_ring_cnt = device_getenv_int(dev, "rxr", igb_rxr);
-	sc->rx_ring_cnt = if_ring_count2(sc->rx_ring_cnt, ring_max);
-#ifdef IGB_RSS_DEBUG
-	sc->rx_ring_cnt = device_getenv_int(dev, "rxr_debug", sc->rx_ring_cnt);
-#endif
+	sc->rx_ring_cnt = if_ringmap_count(sc->rx_rmap);
 	sc->rx_ring_inuse = sc->rx_ring_cnt;
-
-	sc->tx_ring_cnt = device_getenv_int(dev, "txr", igb_txr);
-	sc->tx_ring_cnt = if_ring_count2(sc->tx_ring_cnt, ring_max);
-#ifdef IGB_TSS_DEBUG
-	sc->tx_ring_cnt = device_getenv_int(dev, "txr_debug", sc->tx_ring_cnt);
-#endif
+	sc->tx_ring_cnt = if_ringmap_count(sc->tx_rmap);
 	sc->tx_ring_inuse = sc->tx_ring_cnt;
 
-	/* Enable bus mastering */
-	pci_enable_busmaster(dev);
+	/* Setup flow control. */
+	device_getenv_string(dev, "flow_ctrl", flowctrl, sizeof(flowctrl),
+	    igb_flowctrl);
+	sc->ifm_flowctrl = ifmedia_str2ethfc(flowctrl);
 
 	/*
 	 * Allocate IO memory
@@ -517,49 +593,13 @@ igb_attach(device_t dev)
 	if (error)
 		goto failed;
 
-#ifdef IFPOLL_ENABLE
-	/*
-	 * NPOLLING RX CPU offset
-	 */
-	if (sc->rx_ring_cnt == ncpus2) {
-		offset = 0;
-	} else {
-		offset_def = (sc->rx_ring_cnt * device_get_unit(dev)) % ncpus2;
-		offset = device_getenv_int(dev, "npoll.rxoff", offset_def);
-		if (offset >= ncpus2 ||
-		    offset % sc->rx_ring_cnt != 0) {
-			device_printf(dev, "invalid npoll.rxoff %d, use %d\n",
-			    offset, offset_def);
-			offset = offset_def;
-		}
-	}
-	sc->rx_npoll_off = offset;
-
-	/*
-	 * NPOLLING TX CPU offset
-	 */
-	if (sc->tx_ring_cnt == ncpus2) {
-		offset = 0;
-	} else {
-		offset_def = (sc->tx_ring_cnt * device_get_unit(dev)) % ncpus2;
-		offset = device_getenv_int(dev, "npoll.txoff", offset_def);
-		if (offset >= ncpus2 ||
-		    offset % sc->tx_ring_cnt != 0) {
-			device_printf(dev, "invalid npoll.txoff %d, use %d\n",
-			    offset, offset_def);
-			offset = offset_def;
-		}
-	}
-	sc->tx_npoll_off = offset;
-#endif
-
 	/* Allocate interrupt */
 	error = igb_alloc_intr(sc);
 	if (error)
 		goto failed;
 
-	/* Setup serializers */
-	igb_setup_serializer(sc);
+	/* Setup serializes */
+	igb_setup_serialize(sc);
 
 	/* Allocate the appropriate stats memory */
 	if (sc->vf_ifp) {
@@ -591,9 +631,9 @@ igb_attach(device_t dev)
 #endif
 		if (sc->hw.phy.media_type == e1000_media_type_copper) {
                         if (sc->hw.mac.type == e1000_i354)
-				e1000_set_eee_i354(&sc->hw);
+				e1000_set_eee_i354(&sc->hw, TRUE, TRUE);
 			else
-				e1000_set_eee_i350(&sc->hw);
+				e1000_set_eee_i350(&sc->hw, TRUE, TRUE);
 		}
 	}
 
@@ -639,7 +679,7 @@ igb_attach(device_t dev)
 	igb_add_sysctl(sc);
 
 	/* Now get a good starting state */
-	igb_reset(sc);
+	igb_reset(sc, FALSE);
 
 	/* Initialize statistics */
 	igb_update_stats_counters(sc);
@@ -662,10 +702,11 @@ igb_attach(device_t dev)
 	 */
 	/* APME bit in EEPROM is mapped to WUC.APME */
 	eeprom_data = E1000_READ_REG(&sc->hw, E1000_WUC) & E1000_WUC_APME;
-	if (eeprom_data)
-		sc->wol = E1000_WUFC_MAG;
-	/* XXX disable WOL */
-	sc->wol = 0; 
+	if (eeprom_data) {
+		/* XXX E1000_WUFC_MC always be cleared from E1000_WUC. */
+		sc->wol = E1000_WUFC_MAG | E1000_WUFC_MC;
+		device_printf(dev, "has WOL\n");
+	}
 
 #ifdef notyet
 	/* Register for VLAN events */
@@ -715,14 +756,9 @@ igb_detach(device_t dev)
 		/* Give control back to firmware */
 		igb_rel_mgmt(sc);
 		igb_rel_hw_control(sc);
+		igb_enable_wol(sc);
 
-		if (sc->wol) {
-			E1000_WRITE_REG(&sc->hw, E1000_WUC, E1000_WUC_PME_EN);
-			E1000_WRITE_REG(&sc->hw, E1000_WUFC, sc->wol);
-			igb_enable_wol(dev);
-		}
-
-		igb_teardown_intr(sc);
+		igb_teardown_intr(sc, sc->intr_cnt);
 
 		ifnet_deserialize_all(ifp);
 
@@ -730,10 +766,9 @@ igb_detach(device_t dev)
 	} else if (sc->mem_res != NULL) {
 		igb_rel_hw_control(sc);
 	}
-	bus_generic_detach(dev);
 
-	if (sc->sysctl_tree != NULL)
-		sysctl_ctx_free(&sc->sysctl_ctx);
+	ifmedia_removeall(&sc->media);
+	bus_generic_detach(dev);
 
 	igb_free_intr(sc);
 
@@ -754,6 +789,14 @@ igb_detach(device_t dev)
 		kfree(sc->stats, M_DEVBUF);
 	if (sc->serializes != NULL)
 		kfree(sc->serializes, M_DEVBUF);
+	if (sc->rx_rmap != NULL)
+		if_ringmap_free(sc->rx_rmap);
+	if (sc->rx_rmap_intr != NULL)
+		if_ringmap_free(sc->rx_rmap_intr);
+	if (sc->tx_rmap != NULL)
+		if_ringmap_free(sc->tx_rmap);
+	if (sc->tx_rmap_intr != NULL)
+		if_ringmap_free(sc->tx_rmap_intr);
 
 	return 0;
 }
@@ -776,12 +819,7 @@ igb_suspend(device_t dev)
 
 	igb_rel_mgmt(sc);
 	igb_rel_hw_control(sc);
-
-	if (sc->wol) {
-		E1000_WRITE_REG(&sc->hw, E1000_WUC, E1000_WUC_PME_EN);
-		E1000_WRITE_REG(&sc->hw, E1000_WUFC, sc->wol);
-		igb_enable_wol(dev);
-	}
+	igb_enable_wol(sc);
 
 	ifnet_deserialize_all(ifp);
 
@@ -933,10 +971,13 @@ igb_init(void *xsc)
 	/* Put the address into the Receive Address Array */
 	e1000_rar_set(&sc->hw, sc->hw.mac.addr, 0);
 
-	igb_reset(sc);
+	igb_reset(sc, FALSE);
 	igb_update_link_status(sc);
 
 	E1000_WRITE_REG(&sc->hw, E1000_VET, ETHERTYPE_VLAN);
+
+	/* Clear bad data from Rx FIFOs */
+	e1000_rx_fifo_flush_82575(&sc->hw);
 
 	/* Configure for OS presence */
 	igb_get_mgmt(sc);
@@ -949,7 +990,7 @@ igb_init(void *xsc)
 
 	/* Configured used RX/TX rings */
 	igb_set_ring_inuse(sc, polling);
-	ifq_set_subq_mask(&ifp->if_snd, sc->tx_ring_inuse - 1);
+	ifq_set_subq_divisor(&ifp->if_snd, sc->tx_ring_inuse);
 
 	/* Initialize interrupt */
 	igb_init_intr(sc);
@@ -986,7 +1027,7 @@ igb_init(void *xsc)
 			return;
 		}
 	}
-	igb_init_rx_unit(sc);
+	igb_init_rx_unit(sc, polling);
 
 	/* Enable VLAN support */
 	if (ifp->if_capenable & IFCAP_VLAN_HWTAGGING)
@@ -995,14 +1036,7 @@ igb_init(void *xsc)
 	/* Don't lose promiscuous settings */
 	igb_set_promisc(sc);
 
-	ifp->if_flags |= IFF_RUNNING;
-	for (i = 0; i < sc->tx_ring_inuse; ++i) {
-		ifsq_clr_oactive(sc->tx_rings[i].ifsq);
-		ifsq_watchdog_start(&sc->tx_rings[i].tx_watchdog);
-	}
-
-	igb_set_timer_cpuid(sc, polling);
-	callout_reset_bycpu(&sc->timer, hz, igb_timer, sc, sc->timer_cpuid);
+	/* Clear counters */
 	e1000_clear_hw_cntrs_base_generic(&sc->hw);
 
 	/* This clears any pending interrupts */
@@ -1022,10 +1056,26 @@ igb_init(void *xsc)
 	/* Set Energy Efficient Ethernet */
 	if (sc->hw.phy.media_type == e1000_media_type_copper) {
 		if (sc->hw.mac.type == e1000_i354)
-			e1000_set_eee_i354(&sc->hw);
+			e1000_set_eee_i354(&sc->hw, TRUE, TRUE);
 		else
-			e1000_set_eee_i350(&sc->hw);
+			e1000_set_eee_i350(&sc->hw, TRUE, TRUE);
 	}
+
+	ifp->if_flags |= IFF_RUNNING;
+	for (i = 0; i < sc->tx_ring_inuse; ++i) {
+		struct igb_tx_ring *txr = &sc->tx_rings[i];
+
+		ifsq_clr_oactive(txr->ifsq);
+		ifsq_watchdog_start(&txr->tx_watchdog);
+
+		if (!polling) {
+			callout_reset_bycpu(&txr->tx_gc_timer, 1,
+			    igb_txgc_timer, txr, txr->tx_intr_cpuid);
+                }
+	}
+
+	igb_set_timer_cpuid(sc, polling);
+	callout_reset_bycpu(&sc->timer, hz, igb_timer, sc, sc->timer_cpuid);
 }
 
 static void
@@ -1042,10 +1092,17 @@ igb_media_status(struct ifnet *ifp, struct ifmediareq *ifmr)
 	ifmr->ifm_status = IFM_AVALID;
 	ifmr->ifm_active = IFM_ETHER;
 
-	if (!sc->link_active)
+	if (!sc->link_active) {
+		if (sc->hw.mac.autoneg)
+			ifmr->ifm_active |= IFM_NONE;
+		else
+			ifmr->ifm_active |= sc->media.ifm_media;
 		return;
+	}
 
 	ifmr->ifm_status |= IFM_ACTIVE;
+	if (sc->ifm_flowctrl & IFM_ETH_FORCEPAUSE)
+		ifmr->ifm_active |= sc->ifm_flowctrl;
 
 	switch (sc->link_speed) {
 	case 10:
@@ -1057,14 +1114,23 @@ igb_media_status(struct ifnet *ifp, struct ifmediareq *ifmr)
 		 * Support for 100Mb SFP - these are Fiber 
 		 * but the media type appears as serdes
 		 */
-		if (sc->hw.phy.media_type == e1000_media_type_internal_serdes)
+		if (sc->hw.phy.media_type == e1000_media_type_fiber ||
+		    sc->hw.phy.media_type == e1000_media_type_internal_serdes)
 			ifmr->ifm_active |= IFM_100_FX;
 		else
 			ifmr->ifm_active |= IFM_100_TX;
 		break;
 
 	case 1000:
-		ifmr->ifm_active |= IFM_1000_T;
+		if (sc->hw.phy.media_type == e1000_media_type_fiber ||
+		    sc->hw.phy.media_type == e1000_media_type_internal_serdes)
+			ifmr->ifm_active |= IFM_1000_SX;
+		else
+			ifmr->ifm_active |= IFM_1000_T;
+		break;
+
+	case 2500:
+		ifmr->ifm_active |= IFM_2500_SX;
 		break;
 	}
 
@@ -1072,6 +1138,9 @@ igb_media_status(struct ifnet *ifp, struct ifmediareq *ifmr)
 		ifmr->ifm_active |= IFM_FDX;
 	else
 		ifmr->ifm_active |= IFM_HDX;
+
+	if (sc->link_duplex == FULL_DUPLEX)
+		ifmr->ifm_active |= e1000_fc2ifmedia(sc->hw.fc.current_mode);
 }
 
 static int
@@ -1091,7 +1160,6 @@ igb_media_change(struct ifnet *ifp)
 		sc->hw.phy.autoneg_advertised = AUTONEG_ADV_DEFAULT;
 		break;
 
-	case IFM_1000_LX:
 	case IFM_1000_SX:
 	case IFM_1000_T:
 		sc->hw.mac.autoneg = DO_AUTO_NEG;
@@ -1099,29 +1167,52 @@ igb_media_change(struct ifnet *ifp)
 		break;
 
 	case IFM_100_TX:
+		if (IFM_OPTIONS(ifm->ifm_media) & IFM_FDX) {
+			sc->hw.mac.forced_speed_duplex = ADVERTISE_100_FULL;
+		} else {
+			if (IFM_OPTIONS(ifm->ifm_media) &
+			    (IFM_ETH_RXPAUSE | IFM_ETH_TXPAUSE)) {
+				if (bootverbose) {
+					if_printf(ifp, "Flow control is not "
+					    "allowed for half-duplex\n");
+				}
+				return EINVAL;
+			}
+			sc->hw.mac.forced_speed_duplex = ADVERTISE_100_HALF;
+		}
 		sc->hw.mac.autoneg = FALSE;
 		sc->hw.phy.autoneg_advertised = 0;
-		if ((ifm->ifm_media & IFM_GMASK) == IFM_FDX)
-			sc->hw.mac.forced_speed_duplex = ADVERTISE_100_FULL;
-		else
-			sc->hw.mac.forced_speed_duplex = ADVERTISE_100_HALF;
 		break;
 
 	case IFM_10_T:
+		if (IFM_OPTIONS(ifm->ifm_media) & IFM_FDX) {
+			sc->hw.mac.forced_speed_duplex = ADVERTISE_10_FULL;
+		} else {
+			if (IFM_OPTIONS(ifm->ifm_media) &
+			    (IFM_ETH_RXPAUSE | IFM_ETH_TXPAUSE)) {
+				if (bootverbose) {
+					if_printf(ifp, "Flow control is not "
+					    "allowed for half-duplex\n");
+				}
+				return EINVAL;
+			}
+			sc->hw.mac.forced_speed_duplex = ADVERTISE_10_HALF;
+		}
 		sc->hw.mac.autoneg = FALSE;
 		sc->hw.phy.autoneg_advertised = 0;
-		if ((ifm->ifm_media & IFM_GMASK) == IFM_FDX)
-			sc->hw.mac.forced_speed_duplex = ADVERTISE_10_FULL;
-		else
-			sc->hw.mac.forced_speed_duplex = ADVERTISE_10_HALF;
 		break;
 
 	default:
-		if_printf(ifp, "Unsupported media type\n");
-		break;
+		if (bootverbose) {
+			if_printf(ifp, "Unsupported media type %d\n",
+			    IFM_SUBTYPE(ifm->ifm_media));
+		}
+		return EINVAL;
 	}
+	sc->ifm_flowctrl = ifm->ifm_media & IFM_ETH_FCMASK;
 
-	igb_init(sc);
+	if (ifp->if_flags & IFF_RUNNING)
+		igb_init(sc);
 
 	return 0;
 }
@@ -1280,34 +1371,21 @@ igb_update_link_status(struct igb_softc *sc)
 		e1000_get_speed_and_duplex(hw, 
 		    &sc->link_speed, &sc->link_duplex);
 		if (bootverbose) {
-			const char *flowctl;
+			char flowctrl[IFM_ETH_FC_STRLEN];
 
 			/* Get the flow control for display */
-			switch (hw->fc.current_mode) {
-			case e1000_fc_rx_pause:
-				flowctl = "RX";
-				break;
-
-			case e1000_fc_tx_pause:
-				flowctl = "TX";
-				break;
-
-			case e1000_fc_full:
-				flowctl = "Full";
-				break;
-
-			default:
-				flowctl = "None";
-				break;
-			}
+			e1000_fc2str(hw->fc.current_mode, flowctrl,
+			    sizeof(flowctrl));
 
 			if_printf(ifp, "Link is up %d Mbps %s, "
 			    "Flow control: %s\n",
 			    sc->link_speed,
 			    sc->link_duplex == FULL_DUPLEX ?
 			    "Full Duplex" : "Half Duplex",
-			    flowctl);
+			    flowctrl);
 		}
+		if (sc->ifm_flowctrl & IFM_ETH_FORCEPAUSE)
+			e1000_force_flowctrl(hw, sc->ifm_flowctrl);
 		sc->link_active = 1;
 
 		ifp->if_baudrate = sc->link_speed * 1000000;
@@ -1319,6 +1397,14 @@ igb_update_link_status(struct igb_softc *sc)
 		     hw->mac.type == e1000_i211) &&
 		    hw->phy.id == I210_I_PHY_ID)
 			msec_delay(IGB_I210_LINK_DELAY);
+		/*
+		 * Reset if the media type changed.
+		 * Support AutoMediaDetect for Marvell M88 PHY in i354.
+		 */
+		if (hw->dev_spec._82575.media_changed) {
+			hw->dev_spec._82575.media_changed = FALSE;
+			igb_reset(sc, TRUE);
+		}
 		/* This can sleep */
 		ifp->if_link_state = LINK_STATE_UP;
 		if_link_state_change(ifp);
@@ -1351,9 +1437,14 @@ igb_stop(struct igb_softc *sc)
 
 	ifp->if_flags &= ~IFF_RUNNING;
 	for (i = 0; i < sc->tx_ring_cnt; ++i) {
-		ifsq_clr_oactive(sc->tx_rings[i].ifsq);
-		ifsq_watchdog_stop(&sc->tx_rings[i].tx_watchdog);
-		sc->tx_rings[i].tx_flags &= ~IGB_TXFLAG_ENABLED;
+		struct igb_tx_ring *txr = &sc->tx_rings[i];
+
+		ifsq_clr_oactive(txr->ifsq);
+		ifsq_watchdog_stop(&txr->tx_watchdog);
+		txr->tx_flags &= ~IGB_TXFLAG_ENABLED;
+
+		txr->tx_running = 0;
+		callout_stop(&txr->tx_gc_timer);
 	}
 
 	e1000_reset_hw(&sc->hw);
@@ -1369,7 +1460,7 @@ igb_stop(struct igb_softc *sc)
 }
 
 static void
-igb_reset(struct igb_softc *sc)
+igb_reset(struct igb_softc *sc, boolean_t media_reset)
 {
 	struct ifnet *ifp = &sc->arpcom.ac_if;
 	struct e1000_hw *hw = &sc->hw;
@@ -1461,79 +1552,24 @@ igb_reset(struct igb_softc *sc)
 	}
 	fc->pause_time = IGB_FC_PAUSE_TIME;
 	fc->send_xon = TRUE;
-	fc->requested_mode = e1000_fc_default;
+	fc->requested_mode = e1000_ifmedia2fc(sc->ifm_flowctrl);
 
 	/* Issue a global reset */
 	e1000_reset_hw(hw);
 	E1000_WRITE_REG(hw, E1000_WUC, 0);
 
+	/* Reset for AutoMediaDetect */
+	if (media_reset) {
+		e1000_setup_init_funcs(hw, TRUE);
+		e1000_get_bus_info(hw);
+	}
+
 	if (e1000_init_hw(hw) < 0)
 		if_printf(ifp, "Hardware Initialization Failed\n");
 
 	/* Setup DMA Coalescing */
-	if (hw->mac.type > e1000_82580 && hw->mac.type != e1000_i211) {
-		uint32_t dmac;
-		uint32_t reg;
+	igb_init_dmac(sc, pba);
 
-		if (sc->dma_coalesce == 0) {
-			/*
-			 * Disabled
-			 */
-			reg = E1000_READ_REG(hw, E1000_DMACR);
-			reg &= ~E1000_DMACR_DMAC_EN;
-			E1000_WRITE_REG(hw, E1000_DMACR, reg);
-			goto reset_out;
-		}
-
-		/* Set starting thresholds */
-		E1000_WRITE_REG(hw, E1000_DMCTXTH, 0);
-		E1000_WRITE_REG(hw, E1000_DMCRTRH, 0);
-
-		hwm = 64 * pba - sc->max_frame_size / 16;
-		if (hwm < 64 * (pba - 6))
-			hwm = 64 * (pba - 6);
-		reg = E1000_READ_REG(hw, E1000_FCRTC);
-		reg &= ~E1000_FCRTC_RTH_COAL_MASK;
-		reg |= ((hwm << E1000_FCRTC_RTH_COAL_SHIFT)
-		    & E1000_FCRTC_RTH_COAL_MASK);
-		E1000_WRITE_REG(hw, E1000_FCRTC, reg);
-
-		dmac = pba - sc->max_frame_size / 512;
-		if (dmac < pba - 10)
-			dmac = pba - 10;
-		reg = E1000_READ_REG(hw, E1000_DMACR);
-		reg &= ~E1000_DMACR_DMACTHR_MASK;
-		reg = ((dmac << E1000_DMACR_DMACTHR_SHIFT)
-		    & E1000_DMACR_DMACTHR_MASK);
-		/* Transition to L0x or L1 if available.. */
-		reg |= (E1000_DMACR_DMAC_EN | E1000_DMACR_DMAC_LX_MASK);
-		/* timer = value in sc->dma_coalesce in 32usec intervals */
-		reg |= (sc->dma_coalesce >> 5);
-		E1000_WRITE_REG(hw, E1000_DMACR, reg);
-
-		/* Set the interval before transition */
-		reg = E1000_READ_REG(hw, E1000_DMCTLX);
-		reg |= 0x80000004;
-		E1000_WRITE_REG(hw, E1000_DMCTLX, reg);
-
-		/* Free space in tx packet buffer to wake from DMA coal */
-		E1000_WRITE_REG(hw, E1000_DMCTXTH,
-		    (20480 - (2 * sc->max_frame_size)) >> 6);
-
-		/* Make low power state decision controlled by DMA coal */
-		reg = E1000_READ_REG(hw, E1000_PCIEMISC);
-		reg &= ~E1000_PCIEMISC_LX_DECISION;
-		E1000_WRITE_REG(hw, E1000_PCIEMISC, reg);
-		if_printf(ifp, "DMA Coalescing enabled\n");
-	} else if (hw->mac.type == e1000_82580) {
-		uint32_t reg = E1000_READ_REG(hw, E1000_PCIEMISC);
-
-		E1000_WRITE_REG(hw, E1000_DMACR, 0);
-		E1000_WRITE_REG(hw, E1000_PCIEMISC,
-		    reg & ~E1000_PCIEMISC_LX_DECISION);
-	}
-
-reset_out:
 	E1000_WRITE_REG(&sc->hw, E1000_VET, ETHERTYPE_VLAN);
 	e1000_get_phy_info(hw);
 	e1000_check_for_link(hw);
@@ -1560,12 +1596,14 @@ igb_setup_ifp(struct igb_softc *sc)
 	ifp->if_npoll = igb_npoll;
 #endif
 
+	ifp->if_nmbclusters = sc->rx_ring_cnt * sc->rx_rings[0].num_rx_desc;
+
 	ifq_set_maxlen(&ifp->if_snd, sc->tx_rings[0].num_tx_desc - 1);
 	ifq_set_ready(&ifp->if_snd);
 	ifq_set_subq_cnt(&ifp->if_snd, sc->tx_ring_cnt);
 
-	ifp->if_mapsubq = ifq_mapsubq_mask;
-	ifq_set_subq_mask(&ifp->if_snd, 0);
+	ifp->if_mapsubq = ifq_mapsubq_modulo;
+	ifq_set_subq_divisor(&ifp->if_snd, 1);
 
 	ether_ifattach(ifp, sc->hw.mac.addr, NULL);
 
@@ -1598,12 +1636,10 @@ igb_setup_ifp(struct igb_softc *sc)
 	 * Specify the media types supported by this adapter and register
 	 * callbacks to update media and link information
 	 */
-	ifmedia_init(&sc->media, IFM_IMASK, igb_media_change, igb_media_status);
 	if (sc->hw.phy.media_type == e1000_media_type_fiber ||
 	    sc->hw.phy.media_type == e1000_media_type_internal_serdes) {
 		ifmedia_add(&sc->media, IFM_ETHER | IFM_1000_SX | IFM_FDX,
 		    0, NULL);
-		ifmedia_add(&sc->media, IFM_ETHER | IFM_1000_SX, 0, NULL);
 	} else {
 		ifmedia_add(&sc->media, IFM_ETHER | IFM_10_T, 0, NULL);
 		ifmedia_add(&sc->media, IFM_ETHER | IFM_10_T | IFM_FDX,
@@ -1614,107 +1650,119 @@ igb_setup_ifp(struct igb_softc *sc)
 		if (sc->hw.phy.type != e1000_phy_ife) {
 			ifmedia_add(&sc->media,
 			    IFM_ETHER | IFM_1000_T | IFM_FDX, 0, NULL);
-			ifmedia_add(&sc->media,
-			    IFM_ETHER | IFM_1000_T, 0, NULL);
 		}
 	}
 	ifmedia_add(&sc->media, IFM_ETHER | IFM_AUTO, 0, NULL);
-	ifmedia_set(&sc->media, IFM_ETHER | IFM_AUTO);
+	ifmedia_set(&sc->media, IFM_ETHER | IFM_AUTO | sc->ifm_flowctrl);
 }
 
 static void
 igb_add_sysctl(struct igb_softc *sc)
 {
+	struct sysctl_ctx_list *ctx;
+	struct sysctl_oid *tree;
 	char node[32];
 	int i;
 
-	sysctl_ctx_init(&sc->sysctl_ctx);
-	sc->sysctl_tree = SYSCTL_ADD_NODE(&sc->sysctl_ctx,
-	    SYSCTL_STATIC_CHILDREN(_hw), OID_AUTO,
-	    device_get_nameunit(sc->dev), CTLFLAG_RD, 0, "");
-	if (sc->sysctl_tree == NULL) {
-		device_printf(sc->dev, "can't add sysctl node\n");
-		return;
-	}
-
-	SYSCTL_ADD_INT(&sc->sysctl_ctx, SYSCTL_CHILDREN(sc->sysctl_tree),
+	ctx = device_get_sysctl_ctx(sc->dev);
+	tree = device_get_sysctl_tree(sc->dev);
+	SYSCTL_ADD_INT(ctx, SYSCTL_CHILDREN(tree),
 	    OID_AUTO, "rxr", CTLFLAG_RD, &sc->rx_ring_cnt, 0, "# of RX rings");
-	SYSCTL_ADD_INT(&sc->sysctl_ctx, SYSCTL_CHILDREN(sc->sysctl_tree),
+	SYSCTL_ADD_INT(ctx, SYSCTL_CHILDREN(tree),
 	    OID_AUTO, "rxr_inuse", CTLFLAG_RD, &sc->rx_ring_inuse, 0,
 	    "# of RX rings used");
-	SYSCTL_ADD_INT(&sc->sysctl_ctx, SYSCTL_CHILDREN(sc->sysctl_tree),
+	SYSCTL_ADD_INT(ctx, SYSCTL_CHILDREN(tree),
 	    OID_AUTO, "txr", CTLFLAG_RD, &sc->tx_ring_cnt, 0, "# of TX rings");
-	SYSCTL_ADD_INT(&sc->sysctl_ctx, SYSCTL_CHILDREN(sc->sysctl_tree),
+	SYSCTL_ADD_INT(ctx, SYSCTL_CHILDREN(tree),
 	    OID_AUTO, "txr_inuse", CTLFLAG_RD, &sc->tx_ring_inuse, 0,
 	    "# of TX rings used");
-	SYSCTL_ADD_INT(&sc->sysctl_ctx, SYSCTL_CHILDREN(sc->sysctl_tree),
+	SYSCTL_ADD_INT(ctx, SYSCTL_CHILDREN(tree),
 	    OID_AUTO, "rxd", CTLFLAG_RD, &sc->rx_rings[0].num_rx_desc, 0,
 	    "# of RX descs");
-	SYSCTL_ADD_INT(&sc->sysctl_ctx, SYSCTL_CHILDREN(sc->sysctl_tree),
+	SYSCTL_ADD_INT(ctx, SYSCTL_CHILDREN(tree),
 	    OID_AUTO, "txd", CTLFLAG_RD, &sc->tx_rings[0].num_tx_desc, 0,
 	    "# of TX descs");
 
-	if (sc->intr_type != PCI_INTR_TYPE_MSIX) {
-		SYSCTL_ADD_PROC(&sc->sysctl_ctx,
-		    SYSCTL_CHILDREN(sc->sysctl_tree),
-		    OID_AUTO, "intr_rate", CTLTYPE_INT | CTLFLAG_RW,
-		    sc, 0, igb_sysctl_intr_rate, "I", "interrupt rate");
-	} else {
-		for (i = 0; i < sc->msix_cnt; ++i) {
-			struct igb_msix_data *msix = &sc->msix_data[i];
+#define IGB_ADD_INTR_RATE_SYSCTL(sc, use, name) \
+do { \
+	igb_add_intr_rate_sysctl(sc, IGB_INTR_USE_##use, #name "_intr_rate", \
+	    #use " interrupt rate"); \
+} while (0)
 
-			ksnprintf(node, sizeof(node), "msix%d_rate", i);
-			SYSCTL_ADD_PROC(&sc->sysctl_ctx,
-			    SYSCTL_CHILDREN(sc->sysctl_tree),
-			    OID_AUTO, node, CTLTYPE_INT | CTLFLAG_RW,
-			    msix, 0, igb_sysctl_msix_rate, "I",
-			    msix->msix_rate_desc);
-		}
-	}
+	IGB_ADD_INTR_RATE_SYSCTL(sc, RXTX, rxtx);
+	IGB_ADD_INTR_RATE_SYSCTL(sc, RX, rx);
+	IGB_ADD_INTR_RATE_SYSCTL(sc, TX, tx);
+	IGB_ADD_INTR_RATE_SYSCTL(sc, STATUS, sts);
 
-	SYSCTL_ADD_PROC(&sc->sysctl_ctx, SYSCTL_CHILDREN(sc->sysctl_tree),
+#undef IGB_ADD_INTR_RATE_SYSCTL
+
+	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree),
 	    OID_AUTO, "tx_intr_nsegs", CTLTYPE_INT | CTLFLAG_RW,
 	    sc, 0, igb_sysctl_tx_intr_nsegs, "I",
 	    "# of segments per TX interrupt");
 
-	SYSCTL_ADD_PROC(&sc->sysctl_ctx, SYSCTL_CHILDREN(sc->sysctl_tree),
+	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree),
 	    OID_AUTO, "tx_wreg_nsegs", CTLTYPE_INT | CTLFLAG_RW,
 	    sc, 0, igb_sysctl_tx_wreg_nsegs, "I",
 	    "# of segments sent before write to hardware register");
 
-	SYSCTL_ADD_PROC(&sc->sysctl_ctx, SYSCTL_CHILDREN(sc->sysctl_tree),
+	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree),
 	    OID_AUTO, "rx_wreg_nsegs", CTLTYPE_INT | CTLFLAG_RW,
 	    sc, 0, igb_sysctl_rx_wreg_nsegs, "I",
 	    "# of segments received before write to hardware register");
 
+	if (sc->intr_type == PCI_INTR_TYPE_MSIX) {
+		SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree),
+		    OID_AUTO, "tx_msix_cpumap", CTLTYPE_OPAQUE | CTLFLAG_RD,
+		    sc->tx_rmap_intr, 0, if_ringmap_cpumap_sysctl, "I",
+		    "TX MSI-X CPU map");
+		SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree),
+		    OID_AUTO, "rx_msix_cpumap", CTLTYPE_OPAQUE | CTLFLAG_RD,
+		    sc->rx_rmap_intr, 0, if_ringmap_cpumap_sysctl, "I",
+		    "RX MSI-X CPU map");
+	}
 #ifdef IFPOLL_ENABLE
-	SYSCTL_ADD_PROC(&sc->sysctl_ctx, SYSCTL_CHILDREN(sc->sysctl_tree),
-	    OID_AUTO, "npoll_rxoff", CTLTYPE_INT|CTLFLAG_RW,
-	    sc, 0, igb_sysctl_npoll_rxoff, "I", "NPOLLING RX cpu offset");
-	SYSCTL_ADD_PROC(&sc->sysctl_ctx, SYSCTL_CHILDREN(sc->sysctl_tree),
-	    OID_AUTO, "npoll_txoff", CTLTYPE_INT|CTLFLAG_RW,
-	    sc, 0, igb_sysctl_npoll_txoff, "I", "NPOLLING TX cpu offset");
+	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree),
+	    OID_AUTO, "tx_poll_cpumap", CTLTYPE_OPAQUE | CTLFLAG_RD,
+	    sc->tx_rmap, 0, if_ringmap_cpumap_sysctl, "I",
+	    "TX polling CPU map");
+	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree),
+	    OID_AUTO, "rx_poll_cpumap", CTLTYPE_OPAQUE | CTLFLAG_RD,
+	    sc->rx_rmap, 0, if_ringmap_cpumap_sysctl, "I",
+	    "RX polling CPU map");
 #endif
 
 #ifdef IGB_RSS_DEBUG
-	SYSCTL_ADD_INT(&sc->sysctl_ctx, SYSCTL_CHILDREN(sc->sysctl_tree),
+	SYSCTL_ADD_INT(ctx, SYSCTL_CHILDREN(tree),
 	    OID_AUTO, "rss_debug", CTLFLAG_RW, &sc->rss_debug, 0,
 	    "RSS debug level");
 	for (i = 0; i < sc->rx_ring_cnt; ++i) {
 		ksnprintf(node, sizeof(node), "rx%d_pkt", i);
-		SYSCTL_ADD_ULONG(&sc->sysctl_ctx,
-		    SYSCTL_CHILDREN(sc->sysctl_tree), OID_AUTO, node,
+		SYSCTL_ADD_ULONG(ctx,
+		    SYSCTL_CHILDREN(tree), OID_AUTO, node,
 		    CTLFLAG_RW, &sc->rx_rings[i].rx_packets, "RXed packets");
 	}
 #endif
-#ifdef IGB_TSS_DEBUG
 	for  (i = 0; i < sc->tx_ring_cnt; ++i) {
+		struct igb_tx_ring *txr = &sc->tx_rings[i];
+
+#ifdef IGB_TSS_DEBUG
 		ksnprintf(node, sizeof(node), "tx%d_pkt", i);
-		SYSCTL_ADD_ULONG(&sc->sysctl_ctx,
-		    SYSCTL_CHILDREN(sc->sysctl_tree), OID_AUTO, node,
-		    CTLFLAG_RW, &sc->tx_rings[i].tx_packets, "TXed packets");
-	}
+		SYSCTL_ADD_ULONG(ctx, SYSCTL_CHILDREN(tree), OID_AUTO, node,
+		    CTLFLAG_RW, &txr->tx_packets, "TXed packets");
 #endif
+		ksnprintf(node, sizeof(node), "tx%d_nmbuf", i);
+		SYSCTL_ADD_INT(ctx, SYSCTL_CHILDREN(tree), OID_AUTO, node,
+		    CTLFLAG_RD, &txr->tx_nmbuf, 0, "# of pending TX mbufs");
+
+		ksnprintf(node, sizeof(node), "tx%d_gc", i);
+		SYSCTL_ADD_ULONG(ctx, SYSCTL_CHILDREN(tree), OID_AUTO, node,
+		    CTLFLAG_RW, &txr->tx_gc, "# of TX desc GC");
+	}
+
+	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree),
+	    OID_AUTO, "dumpreg", CTLTYPE_INT | CTLFLAG_RW,
+	    sc, 0, igb_sysctl_reg_dump, "I", "dump registers");
 }
 
 static int
@@ -1737,16 +1785,18 @@ igb_alloc_rings(struct igb_softc *sc)
 	/*
 	 * Allocate TX descriptor rings and buffers
 	 */
-	sc->tx_rings = kmalloc_cachealign(
-	    sizeof(struct igb_tx_ring) * sc->tx_ring_cnt,
-	    M_DEVBUF, M_WAITOK | M_ZERO);
+	sc->tx_rings = kmalloc(sizeof(struct igb_tx_ring) * sc->tx_ring_cnt,
+			       M_DEVBUF,
+			       M_WAITOK | M_ZERO | M_CACHEALIGN);
 	for (i = 0; i < sc->tx_ring_cnt; ++i) {
 		struct igb_tx_ring *txr = &sc->tx_rings[i];
 
 		/* Set up some basics */
 		txr->sc = sc;
 		txr->me = i;
+		txr->tx_intr_cpuid = -1;
 		lwkt_serialize_init(&txr->tx_serialize);
+		callout_init_mp(&txr->tx_gc_timer);
 
 		error = igb_create_tx_ring(txr);
 		if (error)
@@ -1756,9 +1806,9 @@ igb_alloc_rings(struct igb_softc *sc)
 	/*
 	 * Allocate RX descriptor rings and buffers
 	 */ 
-	sc->rx_rings = kmalloc_cachealign(
-	    sizeof(struct igb_rx_ring) * sc->rx_ring_cnt,
-	    M_DEVBUF, M_WAITOK | M_ZERO);
+	sc->rx_rings = kmalloc(sizeof(struct igb_rx_ring) * sc->rx_ring_cnt,
+			       M_DEVBUF,
+			       M_WAITOK | M_ZERO | M_CACHEALIGN);
 	for (i = 0; i < sc->rx_ring_cnt; ++i) {
 		struct igb_rx_ring *rxr = &sc->rx_rings[i];
 
@@ -1837,7 +1887,8 @@ igb_create_tx_ring(struct igb_tx_ring *txr)
 
 	tsize = __VM_CACHELINE_ALIGN(
 	    sizeof(struct igb_tx_buf) * txr->num_tx_desc);
-	txr->tx_buf = kmalloc_cachealign(tsize, M_DEVBUF, M_WAITOK | M_ZERO);
+	txr->tx_buf = kmalloc(tsize, M_DEVBUF,
+			      M_WAITOK | M_ZERO | M_CACHEALIGN);
 
 	/*
 	 * Allocate TX head write-back buffer
@@ -1894,15 +1945,17 @@ igb_create_tx_ring(struct igb_tx_ring *txr)
 	/*
 	 * Initialize various watermark
 	 */
-	txr->spare_desc = IGB_TX_SPARE;
-	txr->intr_nsegs = txr->num_tx_desc / 16;
+	if (txr->sc->hw.mac.type == e1000_82575) {
+		/*
+		 * There no ways to GC pending TX mbufs in 'header
+		 * write back' mode with reduced # of RS TX descs,
+		 * since TDH does _not_ move for 82575.
+		 */
+		txr->intr_nsegs = 1;
+	} else {
+		txr->intr_nsegs = txr->num_tx_desc / 16;
+	}
 	txr->wreg_nsegs = IGB_DEF_TXWREG_NSEGS;
-	txr->oact_hi_desc = txr->num_tx_desc / 2;
-	txr->oact_lo_desc = txr->num_tx_desc / 8;
-	if (txr->oact_lo_desc > IGB_TX_OACTIVE_MAX)
-		txr->oact_lo_desc = IGB_TX_OACTIVE_MAX;
-	if (txr->oact_lo_desc < txr->spare_desc + IGB_TX_RESERVED)
-		txr->oact_lo_desc = txr->spare_desc + IGB_TX_RESERVED;
 
 	return 0;
 }
@@ -1915,11 +1968,8 @@ igb_free_tx_ring(struct igb_tx_ring *txr)
 	for (i = 0; i < txr->num_tx_desc; ++i) {
 		struct igb_tx_buf *txbuf = &txr->tx_buf[i];
 
-		if (txbuf->m_head != NULL) {
-			bus_dmamap_unload(txr->tx_tag, txbuf->map);
-			m_freem(txbuf->m_head);
-			txbuf->m_head = NULL;
-		}
+		if (txbuf->m_head != NULL)
+			igb_free_txbuf(txr, txbuf);
 	}
 }
 
@@ -1973,6 +2023,8 @@ igb_init_tx_ring(struct igb_tx_ring *txr)
 	txr->next_avail_desc = 0;
 	txr->next_to_clean = 0;
 	txr->tx_nsegs = 0;
+	txr->tx_running = 0;
+	txr->tx_nmbuf = 0;
 
 	/* Set number of descriptors available */
 	txr->tx_avail = txr->num_tx_desc;
@@ -2120,17 +2172,14 @@ igb_txcsum_ctx(struct igb_tx_ring *txr, struct mbuf *mp)
 }
 
 static void
-igb_txeof(struct igb_tx_ring *txr)
+igb_txeof(struct igb_tx_ring *txr, int hdr)
 {
-	struct ifnet *ifp = &txr->sc->arpcom.ac_if;
-	int first, hdr, avail;
+	int first, avail;
 
 	if (txr->tx_avail == txr->num_tx_desc)
 		return;
 
 	first = txr->next_to_clean;
-	hdr = *(txr->tx_hdr);
-
 	if (first == hdr)
 		return;
 
@@ -2138,13 +2187,12 @@ igb_txeof(struct igb_tx_ring *txr)
 	while (first != hdr) {
 		struct igb_tx_buf *txbuf = &txr->tx_buf[first];
 
+		KKASSERT(avail < txr->num_tx_desc);
 		++avail;
-		if (txbuf->m_head) {
-			bus_dmamap_unload(txr->tx_tag, txbuf->map);
-			m_freem(txbuf->m_head);
-			txbuf->m_head = NULL;
-			IFNET_STAT_INC(ifp, opackets, 1);
-		}
+
+		if (txbuf->m_head)
+			igb_free_txbuf(txr, txbuf);
+
 		if (++first == txr->num_tx_desc)
 			first = 0;
 	}
@@ -2155,7 +2203,7 @@ igb_txeof(struct igb_tx_ring *txr)
 	 * If we have a minimum free, clear OACTIVE
 	 * to tell the stack that it is OK to send packets.
 	 */
-	if (IGB_IS_NOT_OACTIVE(txr)) {
+	if (txr->tx_avail > IGB_MAX_SCATTER + IGB_TX_RESERVED) {
 		ifsq_clr_oactive(txr->ifsq);
 
 		/*
@@ -2166,6 +2214,45 @@ igb_txeof(struct igb_tx_ring *txr)
 		 */
 		txr->tx_watchdog.wd_timer = 0;
 	}
+	txr->tx_running = IGB_TX_RUNNING;
+}
+
+static void
+igb_txgc(struct igb_tx_ring *txr)
+{
+	int first, hdr;
+#ifdef INVARIANTS
+	int avail;
+#endif
+
+	if (txr->tx_avail == txr->num_tx_desc)
+		return;
+
+	hdr = E1000_READ_REG(&txr->sc->hw, E1000_TDH(txr->me)),
+	first = txr->next_to_clean;
+	if (first == hdr)
+		goto done;
+	txr->tx_gc++;
+
+#ifdef INVARIANTS
+	avail = txr->tx_avail;
+#endif
+	while (first != hdr) {
+		struct igb_tx_buf *txbuf = &txr->tx_buf[first];
+
+#ifdef INVARIANTS
+		KKASSERT(avail < txr->num_tx_desc);
+		++avail;
+#endif
+		if (txbuf->m_head)
+			igb_free_txbuf(txr, txbuf);
+
+		if (++first == txr->num_tx_desc)
+			first = 0;
+	}
+done:
+	if (txr->tx_nmbuf)
+		txr->tx_running = IGB_TX_RUNNING;
 }
 
 static int
@@ -2207,7 +2294,8 @@ igb_create_rx_ring(struct igb_rx_ring *rxr)
 
 	rsize = __VM_CACHELINE_ALIGN(
 	    sizeof(struct igb_rx_buf) * rxr->num_rx_desc);
-	rxr->rx_buf = kmalloc_cachealign(rsize, M_DEVBUF, M_WAITOK | M_ZERO);
+	rxr->rx_buf = kmalloc(rsize, M_DEVBUF,
+			      M_WAITOK | M_ZERO | M_CACHEALIGN);
 
 	/*
 	 * Create DMA tag for RX buffers
@@ -2334,7 +2422,7 @@ igb_newbuf(struct igb_rx_ring *rxr, int i, boolean_t wait)
 	struct igb_rx_buf *rxbuf;
 	int error, nseg;
 
-	m = m_getcl(wait ? MB_WAIT : MB_DONTWAIT, MT_DATA, M_PKTHDR);
+	m = m_getcl(wait ? M_WAITOK : M_NOWAIT, MT_DATA, M_PKTHDR);
 	if (m == NULL) {
 		if (wait) {
 			if_printf(&rxr->sc->arpcom.ac_if,
@@ -2402,7 +2490,7 @@ igb_init_rx_ring(struct igb_rx_ring *rxr)
 }
 
 static void
-igb_init_rx_unit(struct igb_softc *sc)
+igb_init_rx_unit(struct igb_softc *sc, boolean_t polling)
 {
 	struct ifnet *ifp = &sc->arpcom.ac_if;
 	struct e1000_hw *hw = &sc->hw;
@@ -2457,6 +2545,20 @@ igb_init_rx_unit(struct igb_softc *sc)
 		rctl |= E1000_RCTL_SZ_2048;
 	}
 
+	/*
+	 * If TX flow control is disabled and more the 1 RX rings
+	 * are enabled, enable DROP.
+	 *
+	 * This drops frames rather than hanging the RX MAC for all
+	 * RX rings.
+	 */
+	if (sc->rx_ring_inuse > 1 &&
+	    (sc->ifm_flowctrl & IFM_ETH_TXPAUSE) == 0) {
+		srrctl |= E1000_SRRCTL_DROP_EN;
+		if (bootverbose)
+			if_printf(ifp, "enable RX drop\n");
+	}
+
 	/* Setup the Base and Length of the Rx Descriptor Rings */
 	for (i = 0; i < sc->rx_ring_inuse; ++i) {
 		struct igb_rx_ring *rxr = &sc->rx_rings[i];
@@ -2508,8 +2610,9 @@ igb_init_rx_unit(struct igb_softc *sc)
 	}
 	E1000_WRITE_REG(&sc->hw, E1000_RXCSUM, rxcsum);
 
-	if (IGB_ENABLE_HWRSS(sc)) {
+	if (sc->rx_ring_inuse > 1) {
 		uint8_t key[IGB_NRSSRK * IGB_RSSRK_SIZE];
+		const struct if_ringmap *rm;
 		uint32_t reta_shift;
 		int j, r;
 
@@ -2534,9 +2637,14 @@ igb_init_rx_unit(struct igb_softc *sc)
 		}
 
 		/*
-		 * Configure RSS redirect table in following fashion:
-	 	 * (hash & ring_cnt_mask) == rdr_table[(hash & rdr_table_mask)]
+		 * Configure RSS redirect table
 		 */
+		if (polling)
+			rm = sc->rx_rmap;
+		else
+			rm = sc->rx_rmap_intr;
+		if_ringmap_rdrtable(rm, sc->rdr_table, IGB_RDRTABLE_SIZE);
+
 		reta_shift = IGB_RETA_SHIFT;
 		if (hw->mac.type == e1000_82575)
 			reta_shift = IGB_RETA_SHIFT_82575;
@@ -2548,7 +2656,7 @@ igb_init_rx_unit(struct igb_softc *sc)
 			for (i = 0; i < IGB_RETA_SIZE; ++i) {
 				uint32_t q;
 
-				q = (r % sc->rx_ring_inuse) << reta_shift;
+				q = sc->rdr_table[r] << reta_shift;
 				reta |= q << (8 * i);
 				++r;
 			}
@@ -2788,16 +2896,10 @@ igb_set_vlan(struct igb_softc *sc)
 static void
 igb_enable_intr(struct igb_softc *sc)
 {
-	if (sc->intr_type != PCI_INTR_TYPE_MSIX) {
-		lwkt_serialize_handler_enable(&sc->main_serialize);
-	} else {
-		int i;
+	int i;
 
-		for (i = 0; i < sc->msix_cnt; ++i) {
-			lwkt_serialize_handler_enable(
-			    sc->msix_data[i].msix_serialize);
-		}
-	}
+	for (i = 0; i < sc->intr_cnt; ++i)
+		lwkt_serialize_handler_enable(sc->intr_data[i].intr_serialize);
 
 	if ((sc->flags & IGB_FLAG_SHARED_INTR) == 0) {
 		if (sc->intr_type == PCI_INTR_TYPE_MSIX)
@@ -2816,6 +2918,8 @@ igb_enable_intr(struct igb_softc *sc)
 static void
 igb_disable_intr(struct igb_softc *sc)
 {
+	int i;
+
 	if ((sc->flags & IGB_FLAG_SHARED_INTR) == 0) {
 		E1000_WRITE_REG(&sc->hw, E1000_EIMC, 0xffffffff);
 		E1000_WRITE_REG(&sc->hw, E1000_EIAC, 0);
@@ -2823,16 +2927,8 @@ igb_disable_intr(struct igb_softc *sc)
 	E1000_WRITE_REG(&sc->hw, E1000_IMC, 0xffffffff);
 	E1000_WRITE_FLUSH(&sc->hw);
 
-	if (sc->intr_type != PCI_INTR_TYPE_MSIX) {
-		lwkt_serialize_handler_disable(&sc->main_serialize);
-	} else {
-		int i;
-
-		for (i = 0; i < sc->msix_cnt; ++i) {
-			lwkt_serialize_handler_disable(
-			    sc->msix_data[i].msix_serialize);
-		}
-	}
+	for (i = 0; i < sc->intr_cnt; ++i)
+		lwkt_serialize_handler_disable(sc->intr_data[i].intr_serialize);
 }
 
 /*
@@ -2931,27 +3027,134 @@ igb_is_valid_ether_addr(const uint8_t *addr)
  * Enable PCI Wake On Lan capability
  */
 static void
-igb_enable_wol(device_t dev)
+igb_enable_wol(struct igb_softc *sc)
 {
-	uint16_t cap, status;
-	uint8_t id;
+	device_t dev = sc->dev;
+	int error = 0;
+	uint32_t pmc, ctrl;
+	uint16_t status;
 
-	/* First find the capabilities pointer*/
-	cap = pci_read_config(dev, PCIR_CAP_PTR, 2);
-
-	/* Read the PM Capabilities */
-	id = pci_read_config(dev, cap, 1);
-	if (id != PCIY_PMG)     /* Something wrong */
+	if (pci_find_extcap(dev, PCIY_PMG, &pmc) != 0) {
+		device_printf(dev, "no PMG\n");
 		return;
+	}
 
 	/*
-	 * OK, we have the power capabilities,
-	 * so now get the status register
+	 * Set the type of wakeup.
 	 */
-	cap += PCIR_POWER_STATUS;
-	status = pci_read_config(dev, cap, 2);
-	status |= PCIM_PSTAT_PME | PCIM_PSTAT_PMEENABLE;
-	pci_write_config(dev, cap, status, 2);
+	sc->wol &= ~(E1000_WUFC_EX | E1000_WUFC_MC);
+	if ((sc->wol & (E1000_WUFC_EX | E1000_WUFC_MAG | E1000_WUFC_MC)) == 0)
+		goto pme;
+
+	/*
+	 * Advertise the wakeup capabilities.
+	 */
+	ctrl = E1000_READ_REG(&sc->hw, E1000_CTRL);
+	ctrl |= (E1000_CTRL_SWDPIN2 | E1000_CTRL_SWDPIN3);
+	E1000_WRITE_REG(&sc->hw, E1000_CTRL, ctrl);
+
+	/*
+	 * Keep the laser running on Fiber adapters.
+	 */
+	if (sc->hw.phy.media_type == e1000_media_type_fiber ||
+	    sc->hw.phy.media_type == e1000_media_type_internal_serdes) {
+		uint32_t ctrl_ext;
+
+		ctrl_ext = E1000_READ_REG(&sc->hw, E1000_CTRL_EXT);
+		ctrl_ext |= E1000_CTRL_EXT_SDP3_DATA;
+		E1000_WRITE_REG(&sc->hw, E1000_CTRL_EXT, ctrl_ext);
+	}
+
+	error = igb_enable_phy_wol(sc);
+	if (error)
+		goto pme;
+
+	/* XXX will this happen? ich/pch specific. */
+	if (sc->hw.phy.type == e1000_phy_igp_3)
+		e1000_igp3_phy_powerdown_workaround_ich8lan(&sc->hw);
+
+pme:
+	status = pci_read_config(dev, pmc + PCIR_POWER_STATUS, 2);
+	status &= ~(PCIM_PSTAT_PME | PCIM_PSTAT_PMEENABLE);
+	if (!error)
+		status |= PCIM_PSTAT_PME | PCIM_PSTAT_PMEENABLE;
+	pci_write_config(dev, pmc + PCIR_POWER_STATUS, status, 2);
+}
+
+/*
+ * WOL in the newer chipset interfaces (pchlan)
+ * require thing to be copied into the phy
+ */
+static int
+igb_enable_phy_wol(struct igb_softc *sc)
+{
+	struct e1000_hw *hw = &sc->hw;
+	uint32_t mreg;
+	uint16_t preg;
+	int ret = 0, i;
+
+	/* Copy MAC RARs to PHY RARs */
+	e1000_copy_rx_addrs_to_phy_ich8lan(hw);
+
+	/* Copy MAC MTA to PHY MTA */
+	for (i = 0; i < hw->mac.mta_reg_count; i++) {
+		mreg = E1000_READ_REG_ARRAY(hw, E1000_MTA, i);
+		e1000_write_phy_reg(hw, BM_MTA(i), (uint16_t)(mreg & 0xFFFF));
+		e1000_write_phy_reg(hw, BM_MTA(i) + 1,
+		    (uint16_t)((mreg >> 16) & 0xFFFF));
+	}
+
+	/* Configure PHY Rx Control register */
+	e1000_read_phy_reg(hw, BM_RCTL, &preg);
+	mreg = E1000_READ_REG(hw, E1000_RCTL);
+	if (mreg & E1000_RCTL_UPE)
+		preg |= BM_RCTL_UPE;
+	if (mreg & E1000_RCTL_MPE)
+		preg |= BM_RCTL_MPE;
+	preg &= ~(BM_RCTL_MO_MASK);
+	if (mreg & E1000_RCTL_MO_3) {
+		preg |= (((mreg & E1000_RCTL_MO_3) >> E1000_RCTL_MO_SHIFT)
+				<< BM_RCTL_MO_SHIFT);
+	}
+	if (mreg & E1000_RCTL_BAM)
+		preg |= BM_RCTL_BAM;
+	if (mreg & E1000_RCTL_PMCF)
+		preg |= BM_RCTL_PMCF;
+	mreg = E1000_READ_REG(hw, E1000_CTRL);
+	if (mreg & E1000_CTRL_RFCE)
+		preg |= BM_RCTL_RFCE;
+	e1000_write_phy_reg(&sc->hw, BM_RCTL, preg);
+
+	/* Enable PHY wakeup in MAC register. */
+	E1000_WRITE_REG(hw, E1000_WUC,
+	    E1000_WUC_PHY_WAKE | E1000_WUC_PME_EN | E1000_WUC_APME);
+	E1000_WRITE_REG(hw, E1000_WUFC, sc->wol);
+
+	/* Configure and enable PHY wakeup in PHY registers */
+	e1000_write_phy_reg(hw, BM_WUFC, sc->wol);
+	e1000_write_phy_reg(hw, BM_WUC, E1000_WUC_PME_EN);
+	/* Activate PHY wakeup */
+	ret = hw->phy.ops.acquire(hw);
+	if (ret) {
+		if_printf(&sc->arpcom.ac_if, "Could not acquire PHY\n");
+		return ret;
+	}
+	e1000_write_phy_reg_mdic(hw, IGP01E1000_PHY_PAGE_SELECT,
+	                         (BM_WUC_ENABLE_PAGE << IGP_PAGE_SHIFT));
+	ret = e1000_read_phy_reg_mdic(hw, BM_WUC_ENABLE_REG, &preg);
+	if (ret) {
+		if_printf(&sc->arpcom.ac_if, "Could not read PHY page 769\n");
+		goto out;
+	}
+	preg |= BM_WUC_ENABLE_BIT | BM_WUC_HOST_WU_BIT;
+	ret = e1000_write_phy_reg_mdic(hw, BM_WUC_ENABLE_REG, preg);
+	if (ret) {
+		if_printf(&sc->arpcom.ac_if,
+		    "Could not set PHY Host Wakeup bit\n");
+	}
+out:
+	hw->phy.ops.release(hw);
+	return ret;
 }
 
 static void
@@ -3025,8 +3228,14 @@ igb_update_stats_counters(struct igb_softc *sc)
 	stats->roc += E1000_READ_REG(hw, E1000_ROC);
 	stats->rjc += E1000_READ_REG(hw, E1000_RJC);
 
-	stats->tor += E1000_READ_REG(hw, E1000_TORH);
-	stats->tot += E1000_READ_REG(hw, E1000_TOTH);
+	stats->mgprc += E1000_READ_REG(hw, E1000_MGTPRC);
+	stats->mgpdc += E1000_READ_REG(hw, E1000_MGTPDC);
+	stats->mgptc += E1000_READ_REG(hw, E1000_MGTPTC);
+
+	stats->tor += E1000_READ_REG(hw, E1000_TORL) +
+	    ((uint64_t)E1000_READ_REG(hw, E1000_TORH) << 32);
+	stats->tot += E1000_READ_REG(hw, E1000_TOTL) +
+	    ((uint64_t)E1000_READ_REG(hw, E1000_TOTH) << 32);
 
 	stats->tpr += E1000_READ_REG(hw, E1000_TPR);
 	stats->tpt += E1000_READ_REG(hw, E1000_TPT);
@@ -3151,10 +3360,8 @@ igb_npoll_tx(struct ifnet *ifp, void *arg, int cycle __unused)
 	struct igb_tx_ring *txr = arg;
 
 	ASSERT_SERIALIZED(&txr->tx_serialize);
-
-	igb_txeof(txr);
-	if (!ifsq_is_empty(txr->ifsq))
-		ifsq_devstart(txr->ifsq);
+	igb_tx_intr(txr, *(txr->tx_hdr));
+	igb_try_txgc(txr, 1);
 }
 
 static void
@@ -3176,44 +3383,32 @@ igb_npoll(struct ifnet *ifp, struct ifpoll_info *info)
 	ASSERT_IFNET_SERIALIZED_ALL(ifp);
 
 	if (info) {
-		int off;
+		int cpu;
 
 		info->ifpi_status.status_func = igb_npoll_status;
 		info->ifpi_status.serializer = &sc->main_serialize;
 
 		txr_cnt = igb_get_txring_inuse(sc, TRUE);
-		off = sc->tx_npoll_off;
 		for (i = 0; i < txr_cnt; ++i) {
 			struct igb_tx_ring *txr = &sc->tx_rings[i];
-			int idx = i + off;
 
-			KKASSERT(idx < ncpus2);
-			info->ifpi_tx[idx].poll_func = igb_npoll_tx;
-			info->ifpi_tx[idx].arg = txr;
-			info->ifpi_tx[idx].serializer = &txr->tx_serialize;
-			ifsq_set_cpuid(txr->ifsq, idx);
+			cpu = if_ringmap_cpumap(sc->tx_rmap, i);
+			KKASSERT(cpu < netisr_ncpus);
+			info->ifpi_tx[cpu].poll_func = igb_npoll_tx;
+			info->ifpi_tx[cpu].arg = txr;
+			info->ifpi_tx[cpu].serializer = &txr->tx_serialize;
+			ifsq_set_cpuid(txr->ifsq, cpu);
 		}
 
 		rxr_cnt = igb_get_rxring_inuse(sc, TRUE);
-		off = sc->rx_npoll_off;
 		for (i = 0; i < rxr_cnt; ++i) {
 			struct igb_rx_ring *rxr = &sc->rx_rings[i];
-			int idx = i + off;
 
-			KKASSERT(idx < ncpus2);
-			info->ifpi_rx[idx].poll_func = igb_npoll_rx;
-			info->ifpi_rx[idx].arg = rxr;
-			info->ifpi_rx[idx].serializer = &rxr->rx_serialize;
-		}
-
-		if (ifp->if_flags & IFF_RUNNING) {
-			if (rxr_cnt == sc->rx_ring_inuse &&
-			    txr_cnt == sc->tx_ring_inuse) {
-				igb_set_timer_cpuid(sc, TRUE);
-				igb_disable_intr(sc);
-			} else {
-				igb_init(sc);
-			}
+			cpu = if_ringmap_cpumap(sc->rx_rmap, i);
+			KKASSERT(cpu < netisr_ncpus);
+			info->ifpi_rx[cpu].poll_func = igb_npoll_rx;
+			info->ifpi_rx[cpu].arg = rxr;
+			info->ifpi_rx[cpu].serializer = &rxr->rx_serialize;
 		}
 	} else {
 		for (i = 0; i < sc->tx_ring_cnt; ++i) {
@@ -3221,20 +3416,9 @@ igb_npoll(struct ifnet *ifp, struct ifpoll_info *info)
 
 			ifsq_set_cpuid(txr->ifsq, txr->tx_intr_cpuid);
 		}
-
-		if (ifp->if_flags & IFF_RUNNING) {
-			txr_cnt = igb_get_txring_inuse(sc, FALSE);
-			rxr_cnt = igb_get_rxring_inuse(sc, FALSE);
-
-			if (rxr_cnt == sc->rx_ring_inuse &&
-			    txr_cnt == sc->tx_ring_inuse) {
-				igb_set_timer_cpuid(sc, FALSE);
-				igb_enable_intr(sc);
-			} else {
-				igb_init(sc);
-			}
-		}
 	}
+	if (ifp->if_flags & IFF_RUNNING)
+		igb_init(sc);
 }
 
 #endif /* IFPOLL_ENABLE */
@@ -3269,9 +3453,7 @@ igb_intr(void *xsc)
 
 		if (eicr & txr->tx_intr_mask) {
 			lwkt_serialize_enter(&txr->tx_serialize);
-			igb_txeof(txr);
-			if (!ifsq_is_empty(txr->ifsq))
-				ifsq_devstart(txr->ifsq);
+			igb_tx_intr(txr, *(txr->tx_hdr));
 			lwkt_serialize_exit(&txr->tx_serialize);
 		}
 	}
@@ -3333,9 +3515,7 @@ igb_intr_shared(void *xsc)
 			struct igb_tx_ring *txr = &sc->tx_rings[0];
 
 			lwkt_serialize_enter(&txr->tx_serialize);
-			igb_txeof(txr);
-			if (!ifsq_is_empty(txr->ifsq))
-				ifsq_devstart(txr->ifsq);
+			igb_tx_intr(txr, *(txr->tx_hdr));
 			lwkt_serialize_exit(&txr->tx_serialize);
 		}
 	}
@@ -3384,7 +3564,6 @@ igb_encap(struct igb_tx_ring *txr, struct mbuf **m_headp,
 	map = tx_buf->map;
 
 	maxsegs = txr->tx_avail - IGB_TX_RESERVED;
-	KASSERT(maxsegs >= txr->spare_desc, ("not enough spare TX desc\n"));
 	if (maxsegs > IGB_MAX_SCATTER)
 		maxsegs = IGB_MAX_SCATTER;
 
@@ -3472,6 +3651,7 @@ igb_encap(struct igb_tx_ring *txr, struct mbuf **m_headp,
 	KASSERT(txr->tx_avail > nsegs, ("invalid avail TX desc\n"));
 	txr->next_avail_desc = i;
 	txr->tx_avail -= nsegs;
+	txr->tx_nmbuf++;
 
 	tx_buf->m_head = m_head;
 	tx_buf_mapped->map = tx_buf->map;
@@ -3512,11 +3692,8 @@ igb_start(struct ifnet *ifp, struct ifaltq_subque *ifsq)
 		return;
 	}
 
-	if (!IGB_IS_NOT_OACTIVE(txr))
-		igb_txeof(txr);
-
 	while (!ifsq_is_empty(ifsq)) {
-		if (IGB_IS_OACTIVE(txr)) {
+		if (txr->tx_avail <= IGB_MAX_SCATTER + IGB_TX_RESERVED) {
 			ifsq_set_oactive(ifsq);
 			/* Set watchdog on */
 			txr->tx_watchdog.wd_timer = 5;
@@ -3532,6 +3709,14 @@ igb_start(struct ifnet *ifp, struct ifaltq_subque *ifsq)
 			continue;
 		}
 
+		/*
+		 * TX interrupt are aggressively aggregated, so increasing
+		 * opackets at TX interrupt time will make the opackets
+		 * statistics vastly inaccurate; we do the opackets increment
+		 * now.
+		 */
+		IFNET_STAT_INC(ifp, opackets, 1);
+
 		if (nsegs >= txr->wreg_nsegs) {
 			E1000_WRITE_REG(&txr->sc->hw, E1000_TDT(txr->me), idx);
 			idx = -1;
@@ -3543,6 +3728,7 @@ igb_start(struct ifnet *ifp, struct ifaltq_subque *ifsq)
 	}
 	if (idx >= 0)
 		E1000_WRITE_REG(&txr->sc->hw, E1000_TDT(txr->me), idx);
+	txr->tx_running = IGB_TX_RUNNING;
 }
 
 static void
@@ -3614,63 +3800,61 @@ igb_set_eitr(struct igb_softc *sc, int idx, int rate)
 	E1000_WRITE_REG(&sc->hw, E1000_EITR(idx), eitr);
 }
 
+static void
+igb_add_intr_rate_sysctl(struct igb_softc *sc, int use,
+    const char *name, const char *desc)
+{
+	int i;
+
+	for (i = 0; i < sc->intr_cnt; ++i) {
+		if (sc->intr_data[i].intr_use == use) {
+			SYSCTL_ADD_PROC(device_get_sysctl_ctx(sc->dev),
+			    SYSCTL_CHILDREN(device_get_sysctl_tree(sc->dev)),
+			    OID_AUTO, name, CTLTYPE_INT | CTLFLAG_RW,
+			    sc, use, igb_sysctl_intr_rate, "I", desc);
+			break;
+		}
+	}
+}
+
 static int
 igb_sysctl_intr_rate(SYSCTL_HANDLER_ARGS)
 {
 	struct igb_softc *sc = (void *)arg1;
+	int use = arg2;
 	struct ifnet *ifp = &sc->arpcom.ac_if;
-	int error, intr_rate;
+	int error, rate, i;
+	struct igb_intr_data *intr;
 
-	intr_rate = sc->intr_rate;
-	error = sysctl_handle_int(oidp, &intr_rate, 0, req);
+	rate = 0;
+	for (i = 0; i < sc->intr_cnt; ++i) {
+		intr = &sc->intr_data[i];
+		if (intr->intr_use == use) {
+			rate = intr->intr_rate;
+			break;
+		}
+	}
+
+	error = sysctl_handle_int(oidp, &rate, 0, req);
 	if (error || req->newptr == NULL)
 		return error;
-	if (intr_rate < 0)
+	if (rate <= 0)
 		return EINVAL;
 
 	ifnet_serialize_all(ifp);
 
-	sc->intr_rate = intr_rate;
-	if (ifp->if_flags & IFF_RUNNING)
-		igb_set_eitr(sc, 0, sc->intr_rate);
-
-	if (bootverbose)
-		if_printf(ifp, "interrupt rate set to %d/sec\n", sc->intr_rate);
+	for (i = 0; i < sc->intr_cnt; ++i) {
+		intr = &sc->intr_data[i];
+		if (intr->intr_use == use && intr->intr_rate != rate) {
+			intr->intr_rate = rate;
+			if (ifp->if_flags & IFF_RUNNING)
+				igb_set_eitr(sc, i, rate);
+		}
+	}
 
 	ifnet_deserialize_all(ifp);
 
-	return 0;
-}
-
-static int
-igb_sysctl_msix_rate(SYSCTL_HANDLER_ARGS)
-{
-	struct igb_msix_data *msix = (void *)arg1;
-	struct igb_softc *sc = msix->msix_sc;
-	struct ifnet *ifp = &sc->arpcom.ac_if;
-	int error, msix_rate;
-
-	msix_rate = msix->msix_rate;
-	error = sysctl_handle_int(oidp, &msix_rate, 0, req);
-	if (error || req->newptr == NULL)
-		return error;
-	if (msix_rate < 0)
-		return EINVAL;
-
-	lwkt_serialize_enter(msix->msix_serialize);
-
-	msix->msix_rate = msix_rate;
-	if (ifp->if_flags & IFF_RUNNING)
-		igb_set_eitr(sc, msix->msix_vector, msix->msix_rate);
-
-	if (bootverbose) {
-		if_printf(ifp, "%s set to %d/sec\n", msix->msix_rate_desc,
-		    msix->msix_rate);
-	}
-
-	lwkt_serialize_exit(msix->msix_serialize);
-
-	return 0;
+	return error;
 }
 
 static int
@@ -3690,8 +3874,7 @@ igb_sysctl_tx_intr_nsegs(SYSCTL_HANDLER_ARGS)
 
 	ifnet_serialize_all(ifp);
 
-	if (nsegs >= txr->num_tx_desc - txr->oact_lo_desc ||
-	    nsegs >= txr->oact_hi_desc - IGB_MAX_SCATTER) {
+	if (nsegs >= txr->num_tx_desc - IGB_MAX_SCATTER - IGB_TX_RESERVED) {
 		error = EINVAL;
 	} else {
 		int i;
@@ -3720,7 +3903,7 @@ igb_sysctl_rx_wreg_nsegs(SYSCTL_HANDLER_ARGS)
 
 	ifnet_serialize_all(ifp);
 	for (i = 0; i < sc->rx_ring_cnt; ++i)
-		sc->rx_rings[i].wreg_nsegs =nsegs;
+		sc->rx_rings[i].wreg_nsegs = nsegs;
 	ifnet_deserialize_all(ifp);
 
 	return 0;
@@ -3740,84 +3923,24 @@ igb_sysctl_tx_wreg_nsegs(SYSCTL_HANDLER_ARGS)
 
 	ifnet_serialize_all(ifp);
 	for (i = 0; i < sc->tx_ring_cnt; ++i)
-		sc->tx_rings[i].wreg_nsegs =nsegs;
+		sc->tx_rings[i].wreg_nsegs = nsegs;
 	ifnet_deserialize_all(ifp);
 
 	return 0;
 }
 
-#ifdef IFPOLL_ENABLE
-
-static int
-igb_sysctl_npoll_rxoff(SYSCTL_HANDLER_ARGS)
-{
-	struct igb_softc *sc = (void *)arg1;
-	struct ifnet *ifp = &sc->arpcom.ac_if;
-	int error, off;
-
-	off = sc->rx_npoll_off;
-	error = sysctl_handle_int(oidp, &off, 0, req);
-	if (error || req->newptr == NULL)
-		return error;
-	if (off < 0)
-		return EINVAL;
-
-	ifnet_serialize_all(ifp);
-	if (off >= ncpus2 || off % sc->rx_ring_cnt != 0) {
-		error = EINVAL;
-	} else {
-		error = 0;
-		sc->rx_npoll_off = off;
-	}
-	ifnet_deserialize_all(ifp);
-
-	return error;
-}
-
-static int
-igb_sysctl_npoll_txoff(SYSCTL_HANDLER_ARGS)
-{
-	struct igb_softc *sc = (void *)arg1;
-	struct ifnet *ifp = &sc->arpcom.ac_if;
-	int error, off;
-
-	off = sc->tx_npoll_off;
-	error = sysctl_handle_int(oidp, &off, 0, req);
-	if (error || req->newptr == NULL)
-		return error;
-	if (off < 0)
-		return EINVAL;
-
-	ifnet_serialize_all(ifp);
-	if (off >= ncpus2 || off % sc->tx_ring_cnt != 0) {
-		error = EINVAL;
-	} else {
-		error = 0;
-		sc->tx_npoll_off = off;
-	}
-	ifnet_deserialize_all(ifp);
-
-	return error;
-}
-
-#endif	/* IFPOLL_ENABLE */
-
 static void
 igb_init_intr(struct igb_softc *sc)
 {
+	int i;
+
 	igb_set_intr_mask(sc);
 
 	if ((sc->flags & IGB_FLAG_SHARED_INTR) == 0)
 		igb_init_unshared_intr(sc);
 
-	if (sc->intr_type != PCI_INTR_TYPE_MSIX) {
-		igb_set_eitr(sc, 0, sc->intr_rate);
-	} else {
-		int i;
-
-		for (i = 0; i < sc->msix_cnt; ++i)
-			igb_set_eitr(sc, i, sc->msix_data[i].msix_rate);
-	}
+	for (i = 0; i < sc->intr_cnt; ++i)
+		igb_set_eitr(sc, i, sc->intr_data[i].intr_rate);
 }
 
 static void
@@ -3914,11 +4037,11 @@ igb_init_unshared_intr(struct igb_softc *sc)
 			if (i & 1) {
 				ivar &= 0xff00ffff;
 				ivar |=
-				(rxr->rx_intr_bit | E1000_IVAR_VALID) << 16;
+				(rxr->rx_intr_vec | E1000_IVAR_VALID) << 16;
 			} else {
 				ivar &= 0xffffff00;
 				ivar |=
-				(rxr->rx_intr_bit | E1000_IVAR_VALID);
+				(rxr->rx_intr_vec | E1000_IVAR_VALID);
 			}
 			E1000_WRITE_REG_ARRAY(hw, E1000_IVAR0, index, ivar);
 		}
@@ -3932,16 +4055,16 @@ igb_init_unshared_intr(struct igb_softc *sc)
 			if (i & 1) {
 				ivar &= 0x00ffffff;
 				ivar |=
-				(txr->tx_intr_bit | E1000_IVAR_VALID) << 24;
+				(txr->tx_intr_vec | E1000_IVAR_VALID) << 24;
 			} else {
 				ivar &= 0xffff00ff;
 				ivar |=
-				(txr->tx_intr_bit | E1000_IVAR_VALID) << 8;
+				(txr->tx_intr_vec | E1000_IVAR_VALID) << 8;
 			}
 			E1000_WRITE_REG_ARRAY(hw, E1000_IVAR0, index, ivar);
 		}
 		if (sc->intr_type == PCI_INTR_TYPE_MSIX) {
-			ivar = (sc->sts_intr_bit | E1000_IVAR_VALID) << 8;
+			ivar = (sc->sts_msix_vec | E1000_IVAR_VALID) << 8;
 			E1000_WRITE_REG(hw, E1000_IVAR_MISC, ivar);
 		}
 		break;
@@ -3957,11 +4080,11 @@ igb_init_unshared_intr(struct igb_softc *sc)
 			if (i < 8) {
 				ivar &= 0xffffff00;
 				ivar |=
-				(rxr->rx_intr_bit | E1000_IVAR_VALID);
+				(rxr->rx_intr_vec | E1000_IVAR_VALID);
 			} else {
 				ivar &= 0xff00ffff;
 				ivar |=
-				(rxr->rx_intr_bit | E1000_IVAR_VALID) << 16;
+				(rxr->rx_intr_vec | E1000_IVAR_VALID) << 16;
 			}
 			E1000_WRITE_REG_ARRAY(hw, E1000_IVAR0, index, ivar);
 		}
@@ -3975,16 +4098,16 @@ igb_init_unshared_intr(struct igb_softc *sc)
 			if (i < 8) {
 				ivar &= 0xffff00ff;
 				ivar |=
-				(txr->tx_intr_bit | E1000_IVAR_VALID) << 8;
+				(txr->tx_intr_vec | E1000_IVAR_VALID) << 8;
 			} else {
 				ivar &= 0x00ffffff;
 				ivar |=
-				(txr->tx_intr_bit | E1000_IVAR_VALID) << 24;
+				(txr->tx_intr_vec | E1000_IVAR_VALID) << 24;
 			}
 			E1000_WRITE_REG_ARRAY(hw, E1000_IVAR0, index, ivar);
 		}
 		if (sc->intr_type == PCI_INTR_TYPE_MSIX) {
-			ivar = (sc->sts_intr_bit | E1000_IVAR_VALID) << 8;
+			ivar = (sc->sts_msix_vec | E1000_IVAR_VALID) << 8;
 			E1000_WRITE_REG(hw, E1000_IVAR_MISC, ivar);
 		}
 		break;
@@ -4012,26 +4135,29 @@ igb_init_unshared_intr(struct igb_softc *sc)
 static int
 igb_setup_intr(struct igb_softc *sc)
 {
-	int error;
+	int i;
 
-	if (sc->intr_type == PCI_INTR_TYPE_MSIX)
-		return igb_msix_setup(sc);
+	for (i = 0; i < sc->intr_cnt; ++i) {
+		struct igb_intr_data *intr = &sc->intr_data[i];
+		int error;
 
-	error = bus_setup_intr(sc->dev, sc->intr_res, INTR_MPSAFE,
-	    (sc->flags & IGB_FLAG_SHARED_INTR) ? igb_intr_shared : igb_intr,
-	    sc, &sc->intr_tag, &sc->main_serialize);
-	if (error) {
-		device_printf(sc->dev, "Failed to register interrupt handler");
-		return error;
+		error = bus_setup_intr_descr(sc->dev, intr->intr_res,
+		    INTR_MPSAFE, intr->intr_func, intr->intr_funcarg,
+		    &intr->intr_hand, intr->intr_serialize, intr->intr_desc);
+		if (error) {
+			device_printf(sc->dev, "can't setup %dth intr\n", i);
+			igb_teardown_intr(sc, i);
+			return error;
+		}
 	}
 	return 0;
 }
 
 static void
-igb_set_txintr_mask(struct igb_tx_ring *txr, int *intr_bit0, int intr_bitmax)
+igb_set_txintr_mask(struct igb_tx_ring *txr, int *intr_vec0, int intr_vecmax)
 {
 	if (txr->sc->hw.mac.type == e1000_82575) {
-		txr->tx_intr_bit = 0;	/* unused */
+		txr->tx_intr_vec = 0;	/* unused */
 		switch (txr->me) {
 		case 0:
 			txr->tx_intr_mask = E1000_EICR_TX_QUEUE0;
@@ -4049,20 +4175,20 @@ igb_set_txintr_mask(struct igb_tx_ring *txr, int *intr_bit0, int intr_bitmax)
 			panic("unsupported # of TX ring, %d\n", txr->me);
 		}
 	} else {
-		int intr_bit = *intr_bit0;
+		int intr_vec = *intr_vec0;
 
-		txr->tx_intr_bit = intr_bit % intr_bitmax;
-		txr->tx_intr_mask = 1 << txr->tx_intr_bit;
+		txr->tx_intr_vec = intr_vec % intr_vecmax;
+		txr->tx_intr_mask = 1 << txr->tx_intr_vec;
 
-		*intr_bit0 = intr_bit + 1;
+		*intr_vec0 = intr_vec + 1;
 	}
 }
 
 static void
-igb_set_rxintr_mask(struct igb_rx_ring *rxr, int *intr_bit0, int intr_bitmax)
+igb_set_rxintr_mask(struct igb_rx_ring *rxr, int *intr_vec0, int intr_vecmax)
 {
 	if (rxr->sc->hw.mac.type == e1000_82575) {
-		rxr->rx_intr_bit = 0;	/* unused */
+		rxr->rx_intr_vec = 0;	/* unused */
 		switch (rxr->me) {
 		case 0:
 			rxr->rx_intr_mask = E1000_EICR_RX_QUEUE0;
@@ -4080,12 +4206,12 @@ igb_set_rxintr_mask(struct igb_rx_ring *rxr, int *intr_bit0, int intr_bitmax)
 			panic("unsupported # of RX ring, %d\n", rxr->me);
 		}
 	} else {
-		int intr_bit = *intr_bit0;
+		int intr_vec = *intr_vec0;
 
-		rxr->rx_intr_bit = intr_bit % intr_bitmax;
-		rxr->rx_intr_mask = 1 << rxr->rx_intr_bit;
+		rxr->rx_intr_vec = intr_vec % intr_vecmax;
+		rxr->rx_intr_mask = 1 << rxr->rx_intr_vec;
 
-		*intr_bit0 = intr_bit + 1;
+		*intr_vec0 = intr_vec + 1;
 	}
 }
 
@@ -4147,18 +4273,56 @@ igb_set_intr_mask(struct igb_softc *sc)
 static int
 igb_alloc_intr(struct igb_softc *sc)
 {
-	int i, intr_bit, intr_bitmax;
+	struct igb_tx_ring *txr;
+	struct igb_intr_data *intr;
+	int i, intr_vec, intr_vecmax;
 	u_int intr_flags;
 
-	igb_msix_try_alloc(sc);
-	if (sc->intr_type == PCI_INTR_TYPE_MSIX)
+	igb_alloc_msix(sc);
+	if (sc->intr_type == PCI_INTR_TYPE_MSIX) {
+		igb_set_ring_inuse(sc, FALSE);
 		goto done;
+	}
+
+	/*
+	 * Reset some settings changed by igb_alloc_msix().
+	 */
+	if (sc->rx_rmap_intr != NULL) {
+		if_ringmap_free(sc->rx_rmap_intr);
+		sc->rx_rmap_intr = NULL;
+	}
+	if (sc->tx_rmap_intr != NULL) {
+		if_ringmap_free(sc->tx_rmap_intr);
+		sc->tx_rmap_intr = NULL;
+	}
+	if (sc->intr_data != NULL) {
+		kfree(sc->intr_data, M_DEVBUF);
+		sc->intr_data = NULL;
+	}
+	for (i = 0; i < sc->tx_ring_cnt; ++i) {
+		txr = &sc->tx_rings[i];
+		txr->tx_intr_vec = 0;
+		txr->tx_intr_mask = 0;
+		txr->tx_intr_cpuid = -1;
+	}
+	for (i = 0; i < sc->rx_ring_cnt; ++i) {
+		struct igb_rx_ring *rxr = &sc->rx_rings[i];
+
+		rxr->rx_intr_vec = 0;
+		rxr->rx_intr_mask = 0;
+		rxr->rx_txr = NULL;
+	}
+
+	sc->intr_cnt = 1;
+	sc->intr_data = kmalloc(sizeof(struct igb_intr_data), M_DEVBUF,
+	    M_WAITOK | M_ZERO);
+	intr = &sc->intr_data[0];
 
 	/*
 	 * Allocate MSI/legacy interrupt resource
 	 */
 	sc->intr_type = pci_alloc_1intr(sc->dev, igb_msi_enable,
-	    &sc->intr_rid, &intr_flags);
+	    &intr->intr_rid, &intr_flags);
 
 	if (sc->intr_type == PCI_INTR_TYPE_LEGACY) {
 		int unshared;
@@ -4175,101 +4339,134 @@ igb_alloc_intr(struct igb_softc *sc)
 		}
 	}
 
-	sc->intr_res = bus_alloc_resource_any(sc->dev, SYS_RES_IRQ,
-	    &sc->intr_rid, intr_flags);
-	if (sc->intr_res == NULL) {
+	intr->intr_res = bus_alloc_resource_any(sc->dev, SYS_RES_IRQ,
+	    &intr->intr_rid, intr_flags);
+	if (intr->intr_res == NULL) {
 		device_printf(sc->dev, "Unable to allocate bus resource: "
 		    "interrupt\n");
 		return ENXIO;
 	}
 
-	for (i = 0; i < sc->tx_ring_cnt; ++i)
-		sc->tx_rings[i].tx_intr_cpuid = rman_get_cpuid(sc->intr_res);
+	intr->intr_serialize = &sc->main_serialize;
+	intr->intr_cpuid = rman_get_cpuid(intr->intr_res);
+	intr->intr_func = (sc->flags & IGB_FLAG_SHARED_INTR) ?
+	    igb_intr_shared : igb_intr;
+	intr->intr_funcarg = sc;
+	intr->intr_rate = IGB_INTR_RATE;
+	intr->intr_use = IGB_INTR_USE_RXTX;
+
+	sc->tx_rings[0].tx_intr_cpuid = intr->intr_cpuid;
 
 	/*
 	 * Setup MSI/legacy interrupt mask
 	 */
 	switch (sc->hw.mac.type) {
 	case e1000_82575:
-		intr_bitmax = IGB_MAX_TXRXINT_82575;
+		intr_vecmax = IGB_MAX_TXRXINT_82575;
 		break;
 
 	case e1000_82576:
-		intr_bitmax = IGB_MAX_TXRXINT_82576;
+		intr_vecmax = IGB_MAX_TXRXINT_82576;
 		break;
 
 	case e1000_82580:
-		intr_bitmax = IGB_MAX_TXRXINT_82580;
+		intr_vecmax = IGB_MAX_TXRXINT_82580;
 		break;
 
 	case e1000_i350:
-		intr_bitmax = IGB_MAX_TXRXINT_I350;
+		intr_vecmax = IGB_MAX_TXRXINT_I350;
 		break;
 
 	case e1000_i354:
-		intr_bitmax = IGB_MAX_TXRXINT_I354;
+		intr_vecmax = IGB_MAX_TXRXINT_I354;
 		break;
 
 	case e1000_i210:
-		intr_bitmax = IGB_MAX_TXRXINT_I210;
+		intr_vecmax = IGB_MAX_TXRXINT_I210;
 		break;
 
 	case e1000_i211:
-		intr_bitmax = IGB_MAX_TXRXINT_I211;
+		intr_vecmax = IGB_MAX_TXRXINT_I211;
 		break;
 
 	default:
-		intr_bitmax = IGB_MIN_TXRXINT;
+		intr_vecmax = IGB_MIN_TXRXINT;
 		break;
 	}
-	intr_bit = 0;
+	intr_vec = 0;
 	for (i = 0; i < sc->tx_ring_cnt; ++i)
-		igb_set_txintr_mask(&sc->tx_rings[i], &intr_bit, intr_bitmax);
+		igb_set_txintr_mask(&sc->tx_rings[i], &intr_vec, intr_vecmax);
 	for (i = 0; i < sc->rx_ring_cnt; ++i)
-		igb_set_rxintr_mask(&sc->rx_rings[i], &intr_bit, intr_bitmax);
-	sc->sts_intr_bit = 0;
+		igb_set_rxintr_mask(&sc->rx_rings[i], &intr_vec, intr_vecmax);
 	sc->sts_intr_mask = E1000_EICR_OTHER;
 
-	/* Initialize interrupt rate */
-	sc->intr_rate = IGB_INTR_RATE;
-done:
 	igb_set_ring_inuse(sc, FALSE);
+	KKASSERT(sc->rx_ring_inuse <= IGB_MIN_RING_RSS);
+	if (sc->rx_ring_inuse == IGB_MIN_RING_RSS) {
+		/*
+		 * Allocate RX ring map for RSS setup.
+		 */
+		sc->rx_rmap_intr = if_ringmap_alloc(sc->dev,
+		    IGB_MIN_RING_RSS, IGB_MIN_RING_RSS);
+		KASSERT(if_ringmap_count(sc->rx_rmap_intr) ==
+		    sc->rx_ring_inuse, ("RX ring inuse mismatch"));
+	}
+done:
 	igb_set_intr_mask(sc);
+	for (i = 0; i < sc->tx_ring_cnt; ++i) {
+		txr = &sc->tx_rings[i];
+		if (txr->tx_intr_cpuid < 0)
+			txr->tx_intr_cpuid = 0;
+	}
 	return 0;
 }
 
 static void
 igb_free_intr(struct igb_softc *sc)
 {
+	if (sc->intr_data == NULL)
+		return;
+
 	if (sc->intr_type != PCI_INTR_TYPE_MSIX) {
-		if (sc->intr_res != NULL) {
-			bus_release_resource(sc->dev, SYS_RES_IRQ, sc->intr_rid,
-			    sc->intr_res);
+		struct igb_intr_data *intr = &sc->intr_data[0];
+
+		KKASSERT(sc->intr_cnt == 1);
+		if (intr->intr_res != NULL) {
+			bus_release_resource(sc->dev, SYS_RES_IRQ,
+			    intr->intr_rid, intr->intr_res);
 		}
 		if (sc->intr_type == PCI_INTR_TYPE_MSI)
 			pci_release_msi(sc->dev);
+
+		kfree(sc->intr_data, M_DEVBUF);
 	} else {
-		igb_msix_free(sc, TRUE);
+		igb_free_msix(sc, TRUE);
 	}
 }
 
 static void
-igb_teardown_intr(struct igb_softc *sc)
+igb_teardown_intr(struct igb_softc *sc, int intr_cnt)
 {
-	if (sc->intr_type != PCI_INTR_TYPE_MSIX)
-		bus_teardown_intr(sc->dev, sc->intr_res, sc->intr_tag);
-	else
-		igb_msix_teardown(sc, sc->msix_cnt);
+	int i;
+
+	if (sc->intr_data == NULL)
+		return;
+
+	for (i = 0; i < intr_cnt; ++i) {
+		struct igb_intr_data *intr = &sc->intr_data[i];
+
+		bus_teardown_intr(sc->dev, intr->intr_res, intr->intr_hand);
+	}
 }
 
 static void
-igb_msix_try_alloc(struct igb_softc *sc)
+igb_alloc_msix(struct igb_softc *sc)
 {
-	int msix_enable, msix_cnt, msix_cnt2, alloc_cnt;
+	int msix_enable, msix_cnt, msix_ring, alloc_cnt;
 	int i, x, error;
-	int offset, offset_def;
-	struct igb_msix_data *msix;
-	boolean_t aggregate, setup = FALSE;
+	int ring_cnt, ring_cntmax;
+	struct igb_intr_data *intr;
+	boolean_t setup = FALSE;
 
 	/*
 	 * Don't enable MSI-X on 82575, see:
@@ -4292,71 +4489,47 @@ igb_msix_try_alloc(struct igb_softc *sc)
 	msix_cnt = device_getenv_int(sc->dev, "msix.count", msix_cnt);
 #endif
 	if (msix_cnt <= 1) {
-		/* One MSI-X model does not make sense */
+		/* One MSI-X model does not make sense. */
 		return;
 	}
+	if (bootverbose)
+		device_printf(sc->dev, "MSI-X count %d\n", msix_cnt);
+	msix_ring = msix_cnt - 1; /* -1 for status */
 
-	i = 0;
-	while ((1 << (i + 1)) <= msix_cnt)
-		++i;
-	msix_cnt2 = 1 << i;
+	/*
+	 * Configure # of RX/TX rings usable by MSI-X.
+	 */
+	igb_get_rxring_cnt(sc, &ring_cnt, &ring_cntmax);
+	if (ring_cntmax > msix_ring)
+		ring_cntmax = msix_ring;
+	sc->rx_rmap_intr = if_ringmap_alloc(sc->dev, ring_cnt, ring_cntmax);
 
-	if (bootverbose) {
-		device_printf(sc->dev, "MSI-X count %d/%d\n",
-		    msix_cnt2, msix_cnt);
-	}
+	igb_get_txring_cnt(sc, &ring_cnt, &ring_cntmax);
+	if (ring_cntmax > msix_ring)
+		ring_cntmax = msix_ring;
+	sc->tx_rmap_intr = if_ringmap_alloc(sc->dev, ring_cnt, ring_cntmax);
 
-	KKASSERT(msix_cnt2 <= msix_cnt);
-	if (msix_cnt == msix_cnt2) {
-		/* We need at least one MSI-X for link status */
-		msix_cnt2 >>= 1;
-		if (msix_cnt2 <= 1) {
-			/* One MSI-X for RX/TX does not make sense */
-			device_printf(sc->dev, "not enough MSI-X for TX/RX, "
-			    "MSI-X count %d/%d\n", msix_cnt2, msix_cnt);
-			return;
-		}
-		KKASSERT(msix_cnt > msix_cnt2);
+	if_ringmap_match(sc->dev, sc->rx_rmap_intr, sc->tx_rmap_intr);
+	sc->rx_ring_msix = if_ringmap_count(sc->rx_rmap_intr);
+	KASSERT(sc->rx_ring_msix <= sc->rx_ring_cnt,
+	    ("total RX ring count %d, MSI-X RX ring count %d",
+	     sc->rx_ring_cnt, sc->rx_ring_msix));
+	sc->tx_ring_msix = if_ringmap_count(sc->tx_rmap_intr);
+	KASSERT(sc->tx_ring_msix <= sc->tx_ring_cnt,
+	    ("total TX ring count %d, MSI-X TX ring count %d",
+	     sc->tx_ring_cnt, sc->tx_ring_msix));
 
-		if (bootverbose) {
-			device_printf(sc->dev, "MSI-X count fixup %d/%d\n",
-			    msix_cnt2, msix_cnt);
-		}
-	}
+	/*
+	 * Aggregate TX/RX MSI-X
+	 */
+	ring_cntmax = sc->rx_ring_msix;
+	if (ring_cntmax < sc->tx_ring_msix)
+		ring_cntmax = sc->tx_ring_msix;
+	KASSERT(ring_cntmax <= msix_ring,
+	    ("invalid ring count max %d, MSI-X count for rings %d",
+	     ring_cntmax, msix_ring));
 
-	sc->rx_ring_msix = sc->rx_ring_cnt;
-	if (sc->rx_ring_msix > msix_cnt2)
-		sc->rx_ring_msix = msix_cnt2;
-
-	sc->tx_ring_msix = sc->tx_ring_cnt;
-	if (sc->tx_ring_msix > msix_cnt2)
-		sc->tx_ring_msix = msix_cnt2;
-
-	if (msix_cnt >= sc->tx_ring_msix + sc->rx_ring_msix + 1) {
-		/*
-		 * Independent TX/RX MSI-X
-		 */
-		aggregate = FALSE;
-		if (bootverbose)
-			device_printf(sc->dev, "independent TX/RX MSI-X\n");
-		alloc_cnt = sc->tx_ring_msix + sc->rx_ring_msix;
-	} else {
-		/*
-		 * Aggregate TX/RX MSI-X
-		 */
-		aggregate = TRUE;
-		if (bootverbose)
-			device_printf(sc->dev, "aggregate TX/RX MSI-X\n");
-		alloc_cnt = msix_cnt2;
-		if (alloc_cnt > ncpus2)
-			alloc_cnt = ncpus2;
-		if (sc->rx_ring_msix > alloc_cnt)
-			sc->rx_ring_msix = alloc_cnt;
-		if (sc->tx_ring_msix > alloc_cnt)
-			sc->tx_ring_msix = alloc_cnt;
-	}
-	++alloc_cnt;	/* For link status */
-
+	alloc_cnt = ring_cntmax + 1; /* +1 for status */
 	if (bootverbose) {
 		device_printf(sc->dev, "MSI-X alloc %d, "
 		    "RX ring %d, TX ring %d\n", alloc_cnt,
@@ -4376,147 +4549,113 @@ igb_msix_try_alloc(struct igb_softc *sc)
 		}
 	}
 
-	sc->msix_cnt = alloc_cnt;
-	sc->msix_data = kmalloc_cachealign(
-	    sizeof(struct igb_msix_data) * sc->msix_cnt,
+	sc->intr_cnt = alloc_cnt;
+	sc->intr_data = kmalloc(sizeof(struct igb_intr_data) * sc->intr_cnt,
 	    M_DEVBUF, M_WAITOK | M_ZERO);
-	for (x = 0; x < sc->msix_cnt; ++x) {
-		msix = &sc->msix_data[x];
-
-		lwkt_serialize_init(&msix->msix_serialize0);
-		msix->msix_sc = sc;
-		msix->msix_rid = -1;
-		msix->msix_vector = x;
-		msix->msix_mask = 1 << msix->msix_vector;
-		msix->msix_rate = IGB_INTR_RATE;
+	for (x = 0; x < sc->intr_cnt; ++x) {
+		intr = &sc->intr_data[x];
+		intr->intr_rid = -1;
+		intr->intr_rate = IGB_INTR_RATE;
 	}
 
 	x = 0;
-	if (!aggregate) {
-		/*
-		 * RX rings
-		 */
-		if (sc->rx_ring_msix == ncpus2) {
-			offset = 0;
-		} else {
-			offset_def = (sc->rx_ring_msix *
-			    device_get_unit(sc->dev)) % ncpus2;
+	for (i = 0; i < sc->rx_ring_msix; ++i) {
+		struct igb_rx_ring *rxr = &sc->rx_rings[i];
+		struct igb_tx_ring *txr = NULL;
+		int cpuid, j;
 
-			offset = device_getenv_int(sc->dev,
-			    "msix.rxoff", offset_def);
-			if (offset >= ncpus2 ||
-			    offset % sc->rx_ring_msix != 0) {
-				device_printf(sc->dev,
-				    "invalid msix.rxoff %d, use %d\n",
-				    offset, offset_def);
-				offset = offset_def;
-			}
-		}
-		igb_msix_rx_conf(sc, 0, &x, offset);
+		KKASSERT(x < sc->intr_cnt);
+		rxr->rx_intr_vec = x;
+		rxr->rx_intr_mask = 1 << rxr->rx_intr_vec;
+
+		cpuid = if_ringmap_cpumap(sc->rx_rmap_intr, i);
 
 		/*
-		 * TX rings
+		 * Try finding TX ring to piggyback.
 		 */
-		if (sc->tx_ring_msix == ncpus2) {
-			offset = 0;
-		} else {
-			offset_def = (sc->tx_ring_msix *
-			    device_get_unit(sc->dev)) % ncpus2;
-
-			offset = device_getenv_int(sc->dev,
-			    "msix.txoff", offset_def);
-			if (offset >= ncpus2 ||
-			    offset % sc->tx_ring_msix != 0) {
-				device_printf(sc->dev,
-				    "invalid msix.txoff %d, use %d\n",
-				    offset, offset_def);
-				offset = offset_def;
+		for (j = 0; j < sc->tx_ring_msix; ++j) {
+			if (cpuid ==
+			    if_ringmap_cpumap(sc->tx_rmap_intr, j)) {
+				txr = &sc->tx_rings[j];
+				KKASSERT(txr->tx_intr_cpuid < 0);
+				break;
 			}
 		}
-		igb_msix_tx_conf(sc, 0, &x, offset);
-	} else {
-		int ring_agg, ring_max;
+		rxr->rx_txr = txr;
 
-		ring_agg = sc->rx_ring_msix;
-		if (ring_agg > sc->tx_ring_msix)
-			ring_agg = sc->tx_ring_msix;
+		intr = &sc->intr_data[x++];
+		intr->intr_serialize = &rxr->rx_serialize;
+		intr->intr_cpuid = cpuid;
+		KKASSERT(intr->intr_cpuid < netisr_ncpus);
+		intr->intr_funcarg = rxr;
+		if (txr != NULL) {
+			intr->intr_func = igb_msix_rxtx;
+			intr->intr_use = IGB_INTR_USE_RXTX;
+			ksnprintf(intr->intr_desc0, sizeof(intr->intr_desc0),
+			    "%s rx%dtx%d", device_get_nameunit(sc->dev),
+			    i, txr->me);
 
-		ring_max = sc->rx_ring_msix;
-		if (ring_max < sc->tx_ring_msix)
-			ring_max = sc->tx_ring_msix;
-
-		if (ring_max == ncpus2) {
-			offset = 0;
+			txr->tx_intr_vec = rxr->rx_intr_vec;
+			txr->tx_intr_mask = rxr->rx_intr_mask;
+			txr->tx_intr_cpuid = intr->intr_cpuid;
 		} else {
-			offset_def = (ring_max * device_get_unit(sc->dev)) %
-			    ncpus2;
+			intr->intr_func = igb_msix_rx;
+			intr->intr_rate = IGB_MSIX_RX_RATE;
+			intr->intr_use = IGB_INTR_USE_RX;
 
-			offset = device_getenv_int(sc->dev, "msix.off",
-			    offset_def);
-			if (offset >= ncpus2 || offset % ring_max != 0) {
-				device_printf(sc->dev,
-				    "invalid msix.off %d, use %d\n",
-				    offset, offset_def);
-				offset = offset_def;
-			}
+			ksnprintf(intr->intr_desc0, sizeof(intr->intr_desc0),
+			    "%s rx%d", device_get_nameunit(sc->dev), i);
+		}
+		intr->intr_desc = intr->intr_desc0;
+	}
+
+	for (i = 0; i < sc->tx_ring_msix; ++i) {
+		struct igb_tx_ring *txr = &sc->tx_rings[i];
+
+		if (txr->tx_intr_cpuid >= 0) {
+			/* Piggybacked by RX ring. */
+			continue;
 		}
 
-		for (i = 0; i < ring_agg; ++i) {
-			struct igb_tx_ring *txr = &sc->tx_rings[i];
-			struct igb_rx_ring *rxr = &sc->rx_rings[i];
+		KKASSERT(x < sc->intr_cnt);
+		txr->tx_intr_vec = x;
+		txr->tx_intr_mask = 1 << txr->tx_intr_vec;
 
-			KKASSERT(x < sc->msix_cnt);
-			msix = &sc->msix_data[x++];
+		intr = &sc->intr_data[x++];
+		intr->intr_serialize = &txr->tx_serialize;
+		intr->intr_func = igb_msix_tx;
+		intr->intr_funcarg = txr;
+		intr->intr_rate = IGB_MSIX_TX_RATE;
+		intr->intr_use = IGB_INTR_USE_TX;
 
-			txr->tx_intr_bit = msix->msix_vector;
-			txr->tx_intr_mask = msix->msix_mask;
-			rxr->rx_intr_bit = msix->msix_vector;
-			rxr->rx_intr_mask = msix->msix_mask;
+		intr->intr_cpuid = if_ringmap_cpumap(sc->tx_rmap_intr, i);
+		KKASSERT(intr->intr_cpuid < netisr_ncpus);
+		txr->tx_intr_cpuid = intr->intr_cpuid;
 
-			msix->msix_serialize = &msix->msix_serialize0;
-			msix->msix_func = igb_msix_rxtx;
-			msix->msix_arg = msix;
-			msix->msix_rx = rxr;
-			msix->msix_tx = txr;
-
-			msix->msix_cpuid = i + offset;
-			KKASSERT(msix->msix_cpuid < ncpus2);
-			txr->tx_intr_cpuid = msix->msix_cpuid;
-
-			ksnprintf(msix->msix_desc, sizeof(msix->msix_desc),
-			    "%s rxtx%d", device_get_nameunit(sc->dev), i);
-			msix->msix_rate = IGB_MSIX_RX_RATE;
-			ksnprintf(msix->msix_rate_desc,
-			    sizeof(msix->msix_rate_desc),
-			    "RXTX%d interrupt rate", i);
-		}
-
-		if (ring_agg != ring_max) {
-			if (ring_max == sc->tx_ring_msix)
-				igb_msix_tx_conf(sc, i, &x, offset);
-			else
-				igb_msix_rx_conf(sc, i, &x, offset);
-		}
+		ksnprintf(intr->intr_desc0, sizeof(intr->intr_desc0), "%s tx%d",
+		    device_get_nameunit(sc->dev), i);
+		intr->intr_desc = intr->intr_desc0;
 	}
 
 	/*
 	 * Link status
 	 */
-	KKASSERT(x < sc->msix_cnt);
-	msix = &sc->msix_data[x++];
-	sc->sts_intr_bit = msix->msix_vector;
-	sc->sts_intr_mask = msix->msix_mask;
+	KKASSERT(x < sc->intr_cnt);
+	sc->sts_msix_vec = x;
+	sc->sts_intr_mask = 1 << sc->sts_msix_vec;
 
-	msix->msix_serialize = &sc->main_serialize;
-	msix->msix_func = igb_msix_status;
-	msix->msix_arg = sc;
-	msix->msix_cpuid = 0;
-	ksnprintf(msix->msix_desc, sizeof(msix->msix_desc), "%s sts",
+	intr = &sc->intr_data[x++];
+	intr->intr_serialize = &sc->main_serialize;
+	intr->intr_func = igb_msix_status;
+	intr->intr_funcarg = sc;
+	intr->intr_cpuid = 0;
+	intr->intr_use = IGB_INTR_USE_STATUS;
+
+	ksnprintf(intr->intr_desc0, sizeof(intr->intr_desc0), "%s sts",
 	    device_get_nameunit(sc->dev));
-	ksnprintf(msix->msix_rate_desc, sizeof(msix->msix_rate_desc),
-	    "status interrupt rate");
+	intr->intr_desc = intr->intr_desc0;
 
-	KKASSERT(x == sc->msix_cnt);
+	KKASSERT(x == sc->intr_cnt);
 
 	error = pci_setup_msix(sc->dev);
 	if (error) {
@@ -4525,24 +4664,23 @@ igb_msix_try_alloc(struct igb_softc *sc)
 	}
 	setup = TRUE;
 
-	for (i = 0; i < sc->msix_cnt; ++i) {
-		msix = &sc->msix_data[i];
+	for (i = 0; i < sc->intr_cnt; ++i) {
+		intr = &sc->intr_data[i];
 
-		error = pci_alloc_msix_vector(sc->dev, msix->msix_vector,
-		    &msix->msix_rid, msix->msix_cpuid);
+		error = pci_alloc_msix_vector(sc->dev, i, &intr->intr_rid,
+		    intr->intr_cpuid);
 		if (error) {
 			device_printf(sc->dev,
-			    "Unable to allocate MSI-X %d on cpu%d\n",
-			    msix->msix_vector, msix->msix_cpuid);
+			    "Unable to allocate MSI-X %d on cpu%d\n", i,
+			    intr->intr_cpuid);
 			goto back;
 		}
 
-		msix->msix_res = bus_alloc_resource_any(sc->dev, SYS_RES_IRQ,
-		    &msix->msix_rid, RF_ACTIVE);
-		if (msix->msix_res == NULL) {
+		intr->intr_res = bus_alloc_resource_any(sc->dev, SYS_RES_IRQ,
+		    &intr->intr_rid, RF_ACTIVE);
+		if (intr->intr_res == NULL) {
 			device_printf(sc->dev,
-			    "Unable to allocate MSI-X %d resource\n",
-			    msix->msix_vector);
+			    "Unable to allocate MSI-X %d resource\n", i);
 			error = ENOMEM;
 			goto back;
 		}
@@ -4552,66 +4690,32 @@ igb_msix_try_alloc(struct igb_softc *sc)
 	sc->intr_type = PCI_INTR_TYPE_MSIX;
 back:
 	if (error)
-		igb_msix_free(sc, setup);
+		igb_free_msix(sc, setup);
 }
 
 static void
-igb_msix_free(struct igb_softc *sc, boolean_t setup)
+igb_free_msix(struct igb_softc *sc, boolean_t setup)
 {
 	int i;
 
-	KKASSERT(sc->msix_cnt > 1);
+	KKASSERT(sc->intr_cnt > 1);
 
-	for (i = 0; i < sc->msix_cnt; ++i) {
-		struct igb_msix_data *msix = &sc->msix_data[i];
+	for (i = 0; i < sc->intr_cnt; ++i) {
+		struct igb_intr_data *intr = &sc->intr_data[i];
 
-		if (msix->msix_res != NULL) {
+		if (intr->intr_res != NULL) {
 			bus_release_resource(sc->dev, SYS_RES_IRQ,
-			    msix->msix_rid, msix->msix_res);
+			    intr->intr_rid, intr->intr_res);
 		}
-		if (msix->msix_rid >= 0)
-			pci_release_msix_vector(sc->dev, msix->msix_rid);
+		if (intr->intr_rid >= 0)
+			pci_release_msix_vector(sc->dev, intr->intr_rid);
 	}
 	if (setup)
 		pci_teardown_msix(sc->dev);
 
-	sc->msix_cnt = 0;
-	kfree(sc->msix_data, M_DEVBUF);
-	sc->msix_data = NULL;
-}
-
-static int
-igb_msix_setup(struct igb_softc *sc)
-{
-	int i;
-
-	for (i = 0; i < sc->msix_cnt; ++i) {
-		struct igb_msix_data *msix = &sc->msix_data[i];
-		int error;
-
-		error = bus_setup_intr_descr(sc->dev, msix->msix_res,
-		    INTR_MPSAFE, msix->msix_func, msix->msix_arg,
-		    &msix->msix_handle, msix->msix_serialize, msix->msix_desc);
-		if (error) {
-			device_printf(sc->dev, "could not set up %s "
-			    "interrupt handler.\n", msix->msix_desc);
-			igb_msix_teardown(sc, i);
-			return error;
-		}
-	}
-	return 0;
-}
-
-static void
-igb_msix_teardown(struct igb_softc *sc, int msix_cnt)
-{
-	int i;
-
-	for (i = 0; i < msix_cnt; ++i) {
-		struct igb_msix_data *msix = &sc->msix_data[i];
-
-		bus_teardown_intr(sc->dev, msix->msix_res, msix->msix_handle);
-	}
+	sc->intr_cnt = 0;
+	kfree(sc->intr_data, M_DEVBUF);
+	sc->intr_data = NULL;
 }
 
 static void
@@ -4632,10 +4736,7 @@ igb_msix_tx(void *arg)
 
 	ASSERT_SERIALIZED(&txr->tx_serialize);
 
-	igb_txeof(txr);
-	if (!ifsq_is_empty(txr->ifsq))
-		ifsq_devstart(txr->ifsq);
-
+	igb_tx_intr(txr, *(txr->tx_hdr));
 	E1000_WRITE_REG(&txr->sc->hw, E1000_EIMS, txr->tx_intr_mask);
 }
 
@@ -4786,46 +4887,28 @@ igb_tso_ctx(struct igb_tx_ring *txr, struct mbuf *m, uint32_t *hlen)
 }
 
 static void
-igb_setup_serializer(struct igb_softc *sc)
+igb_setup_serialize(struct igb_softc *sc)
 {
-	const struct igb_msix_data *msix;
-	int i, j;
+	int i = 0, j;
 
-	/*
-	 * Allocate serializer array
-	 */
-
-	/* Main + TX + RX */
-	sc->serialize_cnt = 1 + sc->tx_ring_cnt + sc->rx_ring_cnt;
-
-	/* Aggregate TX/RX MSI-X */
-	for (i = 0; i < sc->msix_cnt; ++i) {
-		msix = &sc->msix_data[i];
-		if (msix->msix_serialize == &msix->msix_serialize0)
-			sc->serialize_cnt++;
-	}
-
+	/* Main + RX + TX */
+	sc->serialize_cnt = 1 + sc->rx_ring_cnt + sc->tx_ring_cnt;
 	sc->serializes =
 	    kmalloc(sc->serialize_cnt * sizeof(struct lwkt_serialize *),
 	        M_DEVBUF, M_WAITOK | M_ZERO);
 
 	/*
-	 * Setup serializers
+	 * Setup serializes
 	 *
 	 * NOTE: Order is critical
 	 */
 
-	i = 0;
-
 	KKASSERT(i < sc->serialize_cnt);
 	sc->serializes[i++] = &sc->main_serialize;
 
-	for (j = 0; j < sc->msix_cnt; ++j) {
-		msix = &sc->msix_data[j];
-		if (msix->msix_serialize == &msix->msix_serialize0) {
-			KKASSERT(i < sc->serialize_cnt);
-			sc->serializes[i++] = msix->msix_serialize;
-		}
+	for (j = 0; j < sc->rx_ring_cnt; ++j) {
+		KKASSERT(i < sc->serialize_cnt);
+		sc->serializes[i++] = &sc->rx_rings[j].rx_serialize;
 	}
 
 	for (j = 0; j < sc->tx_ring_cnt; ++j) {
@@ -4833,99 +4916,35 @@ igb_setup_serializer(struct igb_softc *sc)
 		sc->serializes[i++] = &sc->tx_rings[j].tx_serialize;
 	}
 
-	for (j = 0; j < sc->rx_ring_cnt; ++j) {
-		KKASSERT(i < sc->serialize_cnt);
-		sc->serializes[i++] = &sc->rx_rings[j].rx_serialize;
-	}
-
 	KKASSERT(i == sc->serialize_cnt);
-}
-
-static void
-igb_msix_rx_conf(struct igb_softc *sc, int i, int *x0, int offset)
-{
-	int x = *x0;
-
-	for (; i < sc->rx_ring_msix; ++i) {
-		struct igb_rx_ring *rxr = &sc->rx_rings[i];
-		struct igb_msix_data *msix;
-
-		KKASSERT(x < sc->msix_cnt);
-		msix = &sc->msix_data[x++];
-
-		rxr->rx_intr_bit = msix->msix_vector;
-		rxr->rx_intr_mask = msix->msix_mask;
-
-		msix->msix_serialize = &rxr->rx_serialize;
-		msix->msix_func = igb_msix_rx;
-		msix->msix_arg = rxr;
-
-		msix->msix_cpuid = i + offset;
-		KKASSERT(msix->msix_cpuid < ncpus2);
-
-		ksnprintf(msix->msix_desc, sizeof(msix->msix_desc), "%s rx%d",
-		    device_get_nameunit(sc->dev), i);
-
-		msix->msix_rate = IGB_MSIX_RX_RATE;
-		ksnprintf(msix->msix_rate_desc, sizeof(msix->msix_rate_desc),
-		    "RX%d interrupt rate", i);
-	}
-	*x0 = x;
-}
-
-static void
-igb_msix_tx_conf(struct igb_softc *sc, int i, int *x0, int offset)
-{
-	int x = *x0;
-
-	for (; i < sc->tx_ring_msix; ++i) {
-		struct igb_tx_ring *txr = &sc->tx_rings[i];
-		struct igb_msix_data *msix;
-
-		KKASSERT(x < sc->msix_cnt);
-		msix = &sc->msix_data[x++];
-
-		txr->tx_intr_bit = msix->msix_vector;
-		txr->tx_intr_mask = msix->msix_mask;
-
-		msix->msix_serialize = &txr->tx_serialize;
-		msix->msix_func = igb_msix_tx;
-		msix->msix_arg = txr;
-
-		msix->msix_cpuid = i + offset;
-		KKASSERT(msix->msix_cpuid < ncpus2);
-		txr->tx_intr_cpuid = msix->msix_cpuid;
-
-		ksnprintf(msix->msix_desc, sizeof(msix->msix_desc), "%s tx%d",
-		    device_get_nameunit(sc->dev), i);
-
-		msix->msix_rate = IGB_MSIX_TX_RATE;
-		ksnprintf(msix->msix_rate_desc, sizeof(msix->msix_rate_desc),
-		    "TX%d interrupt rate", i);
-	}
-	*x0 = x;
 }
 
 static void
 igb_msix_rxtx(void *arg)
 {
-	struct igb_msix_data *msix = arg;
-	struct igb_rx_ring *rxr = msix->msix_rx;
-	struct igb_tx_ring *txr = msix->msix_tx;
+	struct igb_rx_ring *rxr = arg;
+	struct igb_tx_ring *txr;
+	int hdr;
 
-	ASSERT_SERIALIZED(&msix->msix_serialize0);
+	ASSERT_SERIALIZED(&rxr->rx_serialize);
 
-	lwkt_serialize_enter(&rxr->rx_serialize);
 	igb_rxeof(rxr, -1);
-	lwkt_serialize_exit(&rxr->rx_serialize);
 
-	lwkt_serialize_enter(&txr->tx_serialize);
-	igb_txeof(txr);
-	if (!ifsq_is_empty(txr->ifsq))
-		ifsq_devstart(txr->ifsq);
-	lwkt_serialize_exit(&txr->tx_serialize);
+	/*
+	 * NOTE:
+	 * Since next_to_clean is only changed by igb_txeof(),
+	 * which is called only in interrupt handler, the
+	 * check w/o holding tx serializer is MPSAFE.
+	 */
+	txr = rxr->rx_txr;
+	hdr = *(txr->tx_hdr);
+	if (hdr != txr->next_to_clean) {
+		lwkt_serialize_enter(&txr->tx_serialize);
+		igb_tx_intr(txr, hdr);
+		lwkt_serialize_exit(&txr->tx_serialize);
+	}
 
-	E1000_WRITE_REG(&msix->msix_sc->hw, E1000_EIMS, msix->msix_mask);
+	E1000_WRITE_REG(&rxr->sc->hw, E1000_EIMS, rxr->rx_intr_mask);
 }
 
 static void
@@ -4934,5 +4953,398 @@ igb_set_timer_cpuid(struct igb_softc *sc, boolean_t polling)
 	if (polling || sc->intr_type == PCI_INTR_TYPE_MSIX)
 		sc->timer_cpuid = 0; /* XXX fixed */
 	else
-		sc->timer_cpuid = rman_get_cpuid(sc->intr_res);
+		sc->timer_cpuid = rman_get_cpuid(sc->intr_data[0].intr_res);
+}
+
+static void
+igb_init_dmac(struct igb_softc *sc, uint32_t pba)
+{
+	struct e1000_hw *hw = &sc->hw;
+	uint32_t reg;
+
+	if (hw->mac.type == e1000_i211)
+		return;
+
+	if (hw->mac.type > e1000_82580) {
+		uint32_t dmac;
+		uint16_t hwm;
+
+		if (sc->dma_coalesce == 0) { /* Disabling it */
+			reg = ~E1000_DMACR_DMAC_EN;
+			E1000_WRITE_REG(hw, E1000_DMACR, reg);
+			return;
+		} else {
+			if_printf(&sc->arpcom.ac_if,
+			    "DMA Coalescing enabled\n");
+		}
+
+		/* Set starting threshold */
+		E1000_WRITE_REG(hw, E1000_DMCTXTH, 0);
+
+		hwm = 64 * pba - sc->max_frame_size / 16;
+		if (hwm < 64 * (pba - 6))
+			hwm = 64 * (pba - 6);
+		reg = E1000_READ_REG(hw, E1000_FCRTC);
+		reg &= ~E1000_FCRTC_RTH_COAL_MASK;
+		reg |= ((hwm << E1000_FCRTC_RTH_COAL_SHIFT)
+		    & E1000_FCRTC_RTH_COAL_MASK);
+		E1000_WRITE_REG(hw, E1000_FCRTC, reg);
+
+		dmac = pba - sc->max_frame_size / 512;
+		if (dmac < pba - 10)
+			dmac = pba - 10;
+		reg = E1000_READ_REG(hw, E1000_DMACR);
+		reg &= ~E1000_DMACR_DMACTHR_MASK;
+		reg |= ((dmac << E1000_DMACR_DMACTHR_SHIFT)
+		    & E1000_DMACR_DMACTHR_MASK);
+
+		/* transition to L0x or L1 if available..*/
+		reg |= (E1000_DMACR_DMAC_EN | E1000_DMACR_DMAC_LX_MASK);
+
+		/*
+		 * Check if status is 2.5Gb backplane connection
+		 * before configuration of watchdog timer, which
+		 * is in msec values in 12.8usec intervals watchdog
+		 * timer = msec values in 32usec intervals for non
+		 * 2.5Gb connection.
+		 */
+		if (hw->mac.type == e1000_i354) {
+			int status = E1000_READ_REG(hw, E1000_STATUS);
+
+			if ((status & E1000_STATUS_2P5_SKU) &&
+			    !(status & E1000_STATUS_2P5_SKU_OVER))
+				reg |= ((sc->dma_coalesce * 5) >> 6);
+			else
+				reg |= (sc->dma_coalesce >> 5);
+		} else {
+			reg |= (sc->dma_coalesce >> 5);
+		}
+
+		E1000_WRITE_REG(hw, E1000_DMACR, reg);
+
+		E1000_WRITE_REG(hw, E1000_DMCRTRH, 0);
+
+		/* Set the interval before transition */
+		reg = E1000_READ_REG(hw, E1000_DMCTLX);
+		if (hw->mac.type == e1000_i350)
+			reg |= IGB_DMCTLX_DCFLUSH_DIS;
+		/*
+		 * In 2.5Gb connection, TTLX unit is 0.4 usec, which
+		 * is 0x4*2 = 0xA.  But delay is still 4 usec.
+		 */
+		if (hw->mac.type == e1000_i354) {
+			int status = E1000_READ_REG(hw, E1000_STATUS);
+
+			if ((status & E1000_STATUS_2P5_SKU) &&
+			    !(status & E1000_STATUS_2P5_SKU_OVER))
+				reg |= 0xA;
+			else
+				reg |= 0x4;
+		} else {
+			reg |= 0x4;
+		}
+		E1000_WRITE_REG(hw, E1000_DMCTLX, reg);
+
+		/* Free space in tx packet buffer to wake from DMA coal */
+		E1000_WRITE_REG(hw, E1000_DMCTXTH,
+		    (IGB_TXPBSIZE - (2 * sc->max_frame_size)) >> 6);
+
+		/* Make low power state decision controlled by DMA coal */
+		reg = E1000_READ_REG(hw, E1000_PCIEMISC);
+		reg &= ~E1000_PCIEMISC_LX_DECISION;
+		E1000_WRITE_REG(hw, E1000_PCIEMISC, reg);
+	} else if (hw->mac.type == e1000_82580) {
+		reg = E1000_READ_REG(hw, E1000_PCIEMISC);
+		E1000_WRITE_REG(hw, E1000_PCIEMISC,
+		    reg & ~E1000_PCIEMISC_LX_DECISION);
+		E1000_WRITE_REG(hw, E1000_DMACR, 0);
+	}
+}
+
+static void
+igb_reg_dump(struct igb_softc *sc)
+{
+	device_t dev = sc->dev;
+	int col = 0;
+
+#define DUMPREG(regno)	\
+	kprintf(" %13s=%08x", #regno + 6, E1000_READ_REG(&sc->hw, regno));\
+	if (++col == 3) {		\
+		kprintf("\n");		\
+		col = 0;		\
+	}				\
+
+	device_printf(dev, "REGISTER DUMP\n");
+	DUMPREG(E1000_CTRL);
+	DUMPREG(E1000_STATUS);
+	DUMPREG(E1000_EECD);
+	DUMPREG(E1000_EERD);
+	DUMPREG(E1000_CTRL_EXT);
+	DUMPREG(E1000_FLA);
+	DUMPREG(E1000_MDIC);
+	DUMPREG(E1000_SCTL);
+	DUMPREG(E1000_FCAL);
+	DUMPREG(E1000_FCAH);
+	DUMPREG(E1000_FCT);
+	DUMPREG(E1000_CONNSW);
+	DUMPREG(E1000_VET);
+	DUMPREG(E1000_ICR);
+	DUMPREG(E1000_ITR);
+	DUMPREG(E1000_IMS);
+	DUMPREG(E1000_IVAR);
+	DUMPREG(E1000_SVCR);
+	DUMPREG(E1000_SVT);
+	DUMPREG(E1000_LPIC);
+	DUMPREG(E1000_RCTL);
+	DUMPREG(E1000_FCTTV);
+	DUMPREG(E1000_TXCW);
+	DUMPREG(E1000_RXCW);
+	DUMPREG(E1000_EIMS);
+	DUMPREG(E1000_EIAC);
+	DUMPREG(E1000_EIAM);
+	DUMPREG(E1000_GPIE);
+	DUMPREG(E1000_IVAR0);
+	DUMPREG(E1000_IVAR_MISC);
+	DUMPREG(E1000_TCTL);
+	DUMPREG(E1000_TCTL_EXT);
+	DUMPREG(E1000_TIPG);
+	DUMPREG(E1000_TBT);
+	DUMPREG(E1000_AIT);
+	DUMPREG(E1000_LEDCTL);
+	DUMPREG(E1000_EXTCNF_CTRL);
+	DUMPREG(E1000_EXTCNF_SIZE);
+	DUMPREG(E1000_PHY_CTRL);
+	DUMPREG(E1000_PBA);
+	DUMPREG(E1000_PBS);
+	DUMPREG(E1000_PBECCSTS);
+	DUMPREG(E1000_EEMNGCTL);
+	DUMPREG(E1000_EEARBC);
+	DUMPREG(E1000_FLASHT);
+	DUMPREG(E1000_EEARBC_I210);
+	DUMPREG(E1000_EEWR);
+	DUMPREG(E1000_FLSWCTL);
+	DUMPREG(E1000_FLSWDATA);
+	DUMPREG(E1000_FLSWCNT);
+	DUMPREG(E1000_FLOP);
+	DUMPREG(E1000_I2CCMD);
+	DUMPREG(E1000_I2CPARAMS);
+	DUMPREG(E1000_WDSTP);
+	DUMPREG(E1000_SWDSTS);
+	DUMPREG(E1000_FRTIMER);
+	DUMPREG(E1000_TCPTIMER);
+	DUMPREG(E1000_VPDDIAG);
+	DUMPREG(E1000_IMS_V2);
+	DUMPREG(E1000_IAM_V2);
+	DUMPREG(E1000_ERT);
+	DUMPREG(E1000_FCRTL);
+	DUMPREG(E1000_FCRTH);
+	DUMPREG(E1000_PSRCTL);
+	DUMPREG(E1000_RDFH);
+	DUMPREG(E1000_RDFT);
+	DUMPREG(E1000_RDFHS);
+	DUMPREG(E1000_RDFTS);
+	DUMPREG(E1000_RDFPC);
+	DUMPREG(E1000_PBRTH);
+	DUMPREG(E1000_FCRTV);
+	DUMPREG(E1000_RDPUMB);
+	DUMPREG(E1000_RDPUAD);
+	DUMPREG(E1000_RDPUWD);
+	DUMPREG(E1000_RDPURD);
+	DUMPREG(E1000_RDPUCTL);
+	DUMPREG(E1000_PBDIAG);
+	DUMPREG(E1000_RXPBS);
+	DUMPREG(E1000_IRPBS);
+	DUMPREG(E1000_PBRWAC);
+	DUMPREG(E1000_RDTR);
+	DUMPREG(E1000_RADV);
+	DUMPREG(E1000_SRWR);
+	DUMPREG(E1000_I210_FLMNGCTL);
+	DUMPREG(E1000_I210_FLMNGDATA);
+	DUMPREG(E1000_I210_FLMNGCNT);
+	DUMPREG(E1000_I210_FLSWCTL);
+	DUMPREG(E1000_I210_FLSWDATA);
+	DUMPREG(E1000_I210_FLSWCNT);
+	DUMPREG(E1000_I210_FLA);
+	DUMPREG(E1000_INVM_SIZE);
+	DUMPREG(E1000_I210_TQAVCTRL);
+	DUMPREG(E1000_RSRPD);
+	DUMPREG(E1000_RAID);
+	DUMPREG(E1000_TXDMAC);
+	DUMPREG(E1000_KABGTXD);
+	DUMPREG(E1000_PBSLAC);
+	DUMPREG(E1000_TXPBS);
+	DUMPREG(E1000_ITPBS);
+	DUMPREG(E1000_TDFH);
+	DUMPREG(E1000_TDFT);
+	DUMPREG(E1000_TDFHS);
+	DUMPREG(E1000_TDFTS);
+	DUMPREG(E1000_TDFPC);
+	DUMPREG(E1000_TDPUMB);
+	DUMPREG(E1000_TDPUAD);
+	DUMPREG(E1000_TDPUWD);
+	DUMPREG(E1000_TDPURD);
+	DUMPREG(E1000_TDPUCTL);
+	DUMPREG(E1000_DTXCTL);
+	DUMPREG(E1000_DTXTCPFLGL);
+	DUMPREG(E1000_DTXTCPFLGH);
+	DUMPREG(E1000_DTXMXSZRQ);
+	DUMPREG(E1000_TIDV);
+	DUMPREG(E1000_TADV);
+	DUMPREG(E1000_TSPMT);
+	DUMPREG(E1000_VFGPRC);
+	DUMPREG(E1000_VFGORC);
+	DUMPREG(E1000_VFMPRC);
+	DUMPREG(E1000_VFGPTC);
+	DUMPREG(E1000_VFGOTC);
+	DUMPREG(E1000_VFGOTLBC);
+	DUMPREG(E1000_VFGPTLBC);
+	DUMPREG(E1000_VFGORLBC);
+	DUMPREG(E1000_VFGPRLBC);
+	DUMPREG(E1000_LSECTXCAP);
+	DUMPREG(E1000_LSECRXCAP);
+	DUMPREG(E1000_LSECTXCTRL);
+	DUMPREG(E1000_LSECRXCTRL);
+	DUMPREG(E1000_LSECTXSCL);
+	DUMPREG(E1000_LSECTXSCH);
+	DUMPREG(E1000_LSECTXSA);
+	DUMPREG(E1000_LSECTXPN0);
+	DUMPREG(E1000_LSECTXPN1);
+	DUMPREG(E1000_LSECRXSCL);
+	DUMPREG(E1000_LSECRXSCH);
+	DUMPREG(E1000_IPSCTRL);
+	DUMPREG(E1000_IPSRXCMD);
+	DUMPREG(E1000_IPSRXIDX);
+	DUMPREG(E1000_IPSRXSALT);
+	DUMPREG(E1000_IPSRXSPI);
+	DUMPREG(E1000_IPSTXSALT);
+	DUMPREG(E1000_IPSTXIDX);
+	DUMPREG(E1000_PCS_CFG0);
+	DUMPREG(E1000_PCS_LCTL);
+	DUMPREG(E1000_PCS_LSTAT);
+	DUMPREG(E1000_PCS_ANADV);
+	DUMPREG(E1000_PCS_LPAB);
+	DUMPREG(E1000_PCS_NPTX);
+	DUMPREG(E1000_PCS_LPABNP);
+	DUMPREG(E1000_RXCSUM);
+	DUMPREG(E1000_RLPML);
+	DUMPREG(E1000_RFCTL);
+	DUMPREG(E1000_MTA);
+	DUMPREG(E1000_RA);
+	DUMPREG(E1000_RA2);
+	DUMPREG(E1000_VFTA);
+	DUMPREG(E1000_VT_CTL);
+	DUMPREG(E1000_CIAA);
+	DUMPREG(E1000_CIAD);
+	DUMPREG(E1000_VFQA0);
+	DUMPREG(E1000_VFQA1);
+	DUMPREG(E1000_WUC);
+	DUMPREG(E1000_WUFC);
+	DUMPREG(E1000_WUS);
+	DUMPREG(E1000_MANC);
+	DUMPREG(E1000_IPAV);
+	DUMPREG(E1000_IP4AT);
+	DUMPREG(E1000_IP6AT);
+	DUMPREG(E1000_WUPL);
+	DUMPREG(E1000_WUPM);
+	DUMPREG(E1000_PBACL);
+	DUMPREG(E1000_FFLT);
+	DUMPREG(E1000_HOST_IF);
+	DUMPREG(E1000_HIBBA);
+	DUMPREG(E1000_KMRNCTRLSTA);
+	DUMPREG(E1000_MANC2H);
+	DUMPREG(E1000_CCMCTL);
+	DUMPREG(E1000_GIOCTL);
+	DUMPREG(E1000_SCCTL);
+
+#define E1000_WCS	0x558C
+	DUMPREG(E1000_WCS);
+#define E1000_GCR_EXT	0x586C
+	DUMPREG(E1000_GCR_EXT);
+	DUMPREG(E1000_GCR);
+	DUMPREG(E1000_GCR2);
+	DUMPREG(E1000_FACTPS);
+	DUMPREG(E1000_DCA_ID);
+	DUMPREG(E1000_DCA_CTRL);
+	DUMPREG(E1000_UFUSE);
+	DUMPREG(E1000_FFLT_DBG);
+	DUMPREG(E1000_HICR);
+	DUMPREG(E1000_FWSTS);
+	DUMPREG(E1000_CPUVEC);
+	DUMPREG(E1000_MRQC);
+	DUMPREG(E1000_SWPBS);
+	DUMPREG(E1000_MBVFICR);
+	DUMPREG(E1000_MBVFIMR);
+	DUMPREG(E1000_VFLRE);
+	DUMPREG(E1000_VFRE);
+	DUMPREG(E1000_VFTE);
+	DUMPREG(E1000_QDE);
+	DUMPREG(E1000_DTXSWC);
+	DUMPREG(E1000_WVBR);
+	DUMPREG(E1000_RPLOLR);
+	DUMPREG(E1000_UTA);
+	DUMPREG(E1000_IOVTCL);
+	DUMPREG(E1000_VMRCTL);
+	DUMPREG(E1000_VMRVLAN);
+	DUMPREG(E1000_VMRVM);
+	DUMPREG(E1000_LVMMC);
+	DUMPREG(E1000_TXSWC);
+	DUMPREG(E1000_SCCRL);
+	DUMPREG(E1000_BSCTRH);
+	DUMPREG(E1000_MSCTRH);
+	DUMPREG(E1000_RXSTMPL);
+	DUMPREG(E1000_RXSTMPH);
+	DUMPREG(E1000_RXSATRL);
+	DUMPREG(E1000_RXSATRH);
+	DUMPREG(E1000_TXSTMPL);
+	DUMPREG(E1000_TXSTMPH);
+	DUMPREG(E1000_TIMINCA);
+	DUMPREG(E1000_TIMADJL);
+	DUMPREG(E1000_TIMADJH);
+	DUMPREG(E1000_TSAUXC);
+	DUMPREG(E1000_SYSSTMPL);
+	DUMPREG(E1000_SYSSTMPH);
+	DUMPREG(E1000_PLTSTMPL);
+	DUMPREG(E1000_PLTSTMPH);
+	DUMPREG(E1000_RXMTRL);
+	DUMPREG(E1000_RXUDP);
+	DUMPREG(E1000_SYSTIMR);
+	DUMPREG(E1000_TSICR);
+	DUMPREG(E1000_TSIM);
+	DUMPREG(E1000_DMACR);
+	DUMPREG(E1000_DMCTXTH);
+	DUMPREG(E1000_DMCTLX);
+	DUMPREG(E1000_DMCRTRH);
+	DUMPREG(E1000_DMCCNT);
+	DUMPREG(E1000_FCRTC);
+	DUMPREG(E1000_PCIEMISC);
+	DUMPREG(E1000_PCIEERRSTS);
+	DUMPREG(E1000_IPCNFG);
+	DUMPREG(E1000_LTRC);
+	DUMPREG(E1000_EEER);
+	DUMPREG(E1000_EEE_SU);
+	DUMPREG(E1000_TLPIC);
+	DUMPREG(E1000_RLPIC);
+	if (++col != 1)
+		kprintf("\n");
+	kprintf("\n");
+}
+
+static int
+igb_sysctl_reg_dump(SYSCTL_HANDLER_ARGS)
+{
+	struct igb_softc *sc = (void *)arg1;
+	struct ifnet *ifp = &sc->arpcom.ac_if;
+	int error, dump = 0;
+
+	error = sysctl_handle_int(oidp, &dump, 0, req);
+	if (error || req->newptr == NULL)
+		return error;
+	if (dump <= 0)
+		return EINVAL;
+
+	ifnet_serialize_all(ifp);
+	igb_reg_dump(sc);
+	ifnet_deserialize_all(ifp);
+
+	return error;
 }

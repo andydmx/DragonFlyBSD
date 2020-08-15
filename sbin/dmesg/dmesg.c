@@ -45,7 +45,7 @@
 #include <vis.h>
 #include <sys/syslog.h>
 
-struct nlist nl[] = {
+static struct nlist nl[] = {
 #define	X_MSGBUF	0
 	{ "_msgbufp",	0, 0, 0, 0 },
 	{ NULL,		0, 0, 0, 0 },
@@ -53,14 +53,14 @@ struct nlist nl[] = {
 
 static void dumpbuf(char *bp, size_t bufpos, size_t buflen,
 		    int *newl, int *skip, int *pri);
-void usage(void);
+static void usage(void) __dead2;
 
 #define	KREAD(addr, var) \
 	kvm_read(kd, addr, &var, sizeof(var)) != sizeof(var)
 
 #define INCRBUFSIZE	65536
 
-int all_opt;
+static int all_opt;
 
 int
 main(int argc, char **argv)
@@ -73,12 +73,12 @@ main(int argc, char **argv)
 	int clear = 0;
 	int pri = 0;
 	int tailmode = 0;
-	unsigned int rindex;
+	int kno;
 	size_t buflen, bufpos;
 
 	setlocale(LC_CTYPE, "");
 	memf = nlistf = NULL;
-	while ((ch = getopt(argc, argv, "acfM:N:")) != -1) {
+	while ((ch = getopt(argc, argv, "acfM:N:n:")) != -1) {
 		switch(ch) {
 		case 'a':
 			all_opt++;
@@ -95,6 +95,11 @@ main(int argc, char **argv)
 		case 'N':
 			nlistf = optarg;
 			break;
+		case 'n':
+			kno = strtol(optarg, NULL, 0);
+			asprintf(&memf, "/var/crash/vmcore.%d", kno);
+			asprintf(&nlistf, "/var/crash/kern.%d", kno);
+			break;
 		case '?':
 		default:
 			usage();
@@ -103,15 +108,18 @@ main(int argc, char **argv)
 	argc -= optind;
 	argv += optind;
 
-	newl = 0;
+	newl = 1;
 	skip = 0;
 	pri = 0;
 
 	if (memf == NULL && nlistf == NULL && tailmode == 0) {
 		/* Running kernel. Use sysctl. */
+		buflen = 0;
 		if (sysctlbyname("kern.msgbuf", NULL, &buflen, NULL, 0) == -1)
 			err(1, "sysctl kern.msgbuf");
-		buflen += 4096;		/* add some slop */
+		if (buflen == 0)	/* can happen if msgbuf was cleared */
+			buflen = 1;
+
 		if ((bp = malloc(buflen)) == NULL)
 			errx(1, "malloc failed");
 		if (sysctlbyname("kern.msgbuf", bp, &buflen, NULL, 0) == -1)
@@ -120,6 +128,12 @@ main(int argc, char **argv)
 		bufpos = 0;
 		dumpbuf(bp, bufpos, buflen, &newl, &skip, &pri);
 	} else {
+		u_int rindex;
+		u_int xindex;
+		u_int ri;
+		u_int xi;
+		u_int n;
+
 		/* Read in kernel message buffer, do sanity checks. */
 		kd = kvm_open(nlistf, memf, NULL, O_RDONLY, "dmesg");
 		if (kd == NULL)
@@ -136,38 +150,51 @@ main(int argc, char **argv)
 			errx(1, "kvm_read: %s", kvm_geterr(kd));
 		if (KREAD((long)bufp, cur))
 			errx(1, "kvm_read: %s", kvm_geterr(kd));
-		if (cur.msg_magic != MSG_MAGIC)
+		if (cur.msg_magic != MSG_MAGIC && cur.msg_magic != MSG_OMAGIC)
 			errx(1, "kernel message buffer has different magic "
 			    "number");
 
 		/*
-		 * Start point.  Use rindex == bufx as our end-of-buffer
-		 * indication but for the initial rindex from the kernel
-		 * this means the buffer has cycled and is 100% full.
+		 * NOTE: current algorithm is compatible with both old and
+		 *	 new msgbuf structures.  The new structure doesn't
+		 *	 modulo the indexes (so we do), and adds a separate
+		 *	 log index which we don't access here.
 		 */
+
 		rindex = cur.msg_bufr;
-		if (rindex == cur.msg_bufx) {
-			if (++rindex >= cur.msg_size)
-				rindex = 0;
-		}
 
 		for (;;) {
-			if (cur.msg_bufx >= rindex)
-				buflen = cur.msg_bufx - rindex;
+			/*
+			 * Calculate index for dump and do sanity clipping.
+			 */
+			xindex = cur.msg_bufx;
+			n = xindex - rindex;
+			if (n > cur.msg_size - 1024) {
+				rindex = xindex - cur.msg_size + 2048;
+				n = xindex - rindex;
+			}
+			ri = rindex % cur.msg_size;
+			xi = xindex % cur.msg_size;
+
+			if (ri < xi)
+				buflen = xi - ri;
 			else
-				buflen = cur.msg_size - rindex;
+				buflen = cur.msg_size - ri;
+			if (buflen > n)
+				buflen = n;
 			if (buflen > INCRBUFSIZE)
 				buflen = INCRBUFSIZE;
-			if (kvm_read(kd, (long)cur.msg_ptr + rindex,
+
+			if (kvm_read(kd, (long)cur.msg_ptr + ri,
 				     bp, buflen) != (ssize_t)buflen) {
 				errx(1, "kvm_read: %s", kvm_geterr(kd));
 			}
 			if (buflen)
 				dumpbuf(bp, 0, buflen, &newl, &skip, &pri);
+			ri = (ri + buflen) % cur.msg_size;
+			n = n - buflen;
 			rindex += buflen;
-			if (rindex >= cur.msg_size)
-				rindex = 0;
-			if (rindex == cur.msg_bufx) {
+			if ((int)n <= 0) {
 				if (tailmode == 0)
 					break;
 				fflush(stdout);
@@ -218,7 +245,7 @@ dumpbuf(char *bp, size_t bufpos, size_t buflen,
 				*skip = 0;
 				*newl = 1;
 			} if (ch == '>') {
-				if (LOG_FAC(*pri) == LOG_KERN || all_opt)
+				if (LOG_FAC(*pri) == LOG_KERN)
 					*newl = *skip = 0;
 			} else if (ch >= '0' && ch <= '9') {
 				*pri *= 10;
@@ -226,15 +253,15 @@ dumpbuf(char *bp, size_t bufpos, size_t buflen,
 			}
 			continue;
 		}
-		if (*newl && ch == '<') {
+		if (*newl && ch == '<' && all_opt == 0) {
 			*pri = 0;
 			*skip = 1;
 			continue;
 		}
 		if (ch == '\0')
 			continue;
-		*newl = ch == '\n';
-		vis(buf, ch, 0, 0);
+		*newl = (ch == '\n');
+		vis(buf, ch, VIS_NOSLASH, 0);
 		if (buf[1] == 0)
 			putchar(buf[0]);
 		else
@@ -242,7 +269,7 @@ dumpbuf(char *bp, size_t bufpos, size_t buflen,
 	} while (++p != ep);
 }
 
-void
+static void
 usage(void)
 {
 	fprintf(stderr, "usage: dmesg [-ac] [-M core] [-N system]\n");

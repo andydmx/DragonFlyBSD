@@ -37,8 +37,6 @@
 .Os
 .Sh NAME
 .Nm mount_std ,
-.Nm mount_fdesc ,
-.Nm mount_linprocfs ,
 .Nm mount_procfs
 .Nd mount
 .Dq standard
@@ -54,11 +52,9 @@ The
 command is a generic mechanism for attaching ``standard'' filesystems to
 the filesystem.  The
 .Nm
-command currently supports the following filesystems:
-.Nm fdesc ,
-.Nm linprocfs
-and
-.Nm procfs .
+command currently supports the
+.Nm procfs
+filesystem.
 A ``standard'' filesystem is one which:
 .Bl -enum -offset indent
 .It
@@ -70,9 +66,8 @@ options
 .Dq rw ,
 .Dq nodev ,
 .Dq noexec ,
-.Dq nosuid ,
 and
-.Dq union .
+.Dq nosuid .
 .It
 has a kernel filesystem module name the same as its user-visible name.
 .It
@@ -112,12 +107,9 @@ for that specific
 .Nm mount_ Ns Ar fsname
 command.
 .Pp
-Refer to the following manual pages for detailed information
-on these file system:
-.Xr fdesc 5 ,
-.Xr linprocfs 5
-and
-.Xr procfs 5 .
+Refer to the
+.Xr procfs 5
+manual page for detailed information on this file system.
 .Sh DIAGNOSTICS
 .Bl -diag
 .It argv[0] must end in _fsname
@@ -136,9 +128,7 @@ loadable module for it was found.
 .Xr mount 2 ,
 .Xr unmount 2 ,
 .Xr getvfsbyname 3 ,
-.Xr fdesc 5 ,
 .Xr fstab 5 ,
-.Xr linprocfs 5 ,
 .Xr procfs 5 ,
 .Xr mount 8
 .Sh HISTORY
@@ -149,14 +139,8 @@ utility first appeared in
 Loadable filesystem modules first appeared in
 .Fx 2.0 .
 The
-.Dq fdesc
-and
 .Dq procfs
-filesystem types first appeared in
-.Fx 2.0 ;
-the
-.Dq linprocfs
 filesystem type first appeared in
-.Fx 4.0 .
+.Fx 2.0 .
 .Sh CAVEATS
 None of the ``standard'' filesystems may be NFS-exported.

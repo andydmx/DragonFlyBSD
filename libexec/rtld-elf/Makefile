@@ -5,24 +5,31 @@ SRCS=		rtld_start.S \
 		reloc.c rtld.c rtld_lock.c rtld_printf.c map_object.c \
 		malloc.c xmalloc.c debug.c libmap.c
 MAN=		rtld.1
-CSTD?=		gnu99
 BINDIR=		/libexec
 SYMLINKS=	${BINDIR}/${PROG} /usr/libexec/${PROG}
 WARNS?=		2
 
+# DO NOT USE -static, this is a special case
+.undef NOSHARED
+
 # To activate LD_DEBUG functionality, define ENABLE_DEBUG
 # e.g. make -DENABLE_DEBUG
+
+# for now do not let the use of -flto
+.if ${CFLAGS:M-flto}
+CFLAGS+=	-fno-lto
+LDFLAGS+=	-flto
+.endif
 
 CFLAGS+=	-DIN_RTLD
 CFLAGS+=	-I${.CURDIR}/${MACHINE_ARCH} -I${.CURDIR} -D__thread=
 CFLAGS+=	-I${.CURDIR}/../../lib/csu/common
-LDFLAGS+=	-nostdlib -e .rtld_start -Wl,--no-undefined
+LDFLAGS+=	-nostdlib -Wl,-e.rtld_start,--no-undefined
 INSTALLFLAGS=	-C -b
 .ifndef NOFSCHG
 INSTALLFLAGS+=	-fschg
 .endif
-MLINKS=		rtld.1 ld-elf.so.1.1
-MLINKS+=	rtld.1 ld-elf.so.2.1
+MLINKS=		rtld.1 ld-elf.so.2.1
 MLINKS+=	rtld.1 _rtld_functrace.3
 
 .if !defined(NO_SYMVER)
@@ -50,6 +57,12 @@ LDADD=		-L${.OBJDIR}/../../lib/libc_rtld -lc_rtld_pic
 .ifdef ENABLE_DEBUG
 CFLAGS+=	-DDEBUG
 .endif
+
+# The gcc80 -O2 tends to wrap malloc() + bzero() back to local calloc() by
+# emitting calloc: imul %rsi,%rdi; mov $0x1,%esi; jmpq 0xfoo <calloc>
+FLAGS_GROUPS=	calloc
+calloc_FLAGS=	-fno-builtin-malloc
+calloc_FLAGS_FILES= malloc.c
 
 # Since moving rtld-elf to /libexec, we need to create a symlink.
 # Fixup the existing binary that's there so we can symlink over it.

@@ -42,7 +42,7 @@
 #define _CTYPE_H_
 
 #include <sys/cdefs.h>
-#include <sys/types.h>
+#include <machine/stdint.h>
 
 #define	_CTYPE_A	0x00000100L		/* Alpha */
 #define	_CTYPE_C	0x00000200L		/* Control */
@@ -58,6 +58,7 @@
 #define	_CTYPE_I	0x00080000L		/* Ideogram */
 #define	_CTYPE_T	0x00100000L		/* Special */
 #define	_CTYPE_Q	0x00200000L		/* Phonogram */
+#define	_CTYPE_N	0x00400000L		/* Number (superset of digit) */
 #define	_CTYPE_SW0	0x20000000L		/* 0 width character */
 #define	_CTYPE_SW1	0x40000000L		/* 1 width character */
 #define	_CTYPE_SW2	0x80000000L		/* 2 width character */
@@ -65,7 +66,23 @@
 #define	_CTYPE_SWM	0xe0000000L		/* Mask for screen width data */
 #define	_CTYPE_SWS	30			/* Bits to shift to get width */
 
-/* See comments in <sys/_types.h> about __ct_rune_t. */
+/*
+ * rune_t is declared to be an ``int'' instead of the more natural
+ * ``unsigned long'' or ``long''.  Two things are happening here.  It is not
+ * unsigned so that EOF (-1) can be naturally assigned to it and used.  Also,
+ * it looks like 10646 will be a 31 bit standard.  This means that if your
+ * ints cannot hold 32 bits, you will be in trouble.  The reason an int was
+ * chosen over a long is that the is*() and to*() routines take ints (says
+ * ANSI C), but they use __ct_rune_t instead of int.
+ *
+ * NOTE: rune_t is not covered by ANSI nor other standards, and should not
+ * be instantiated outside of lib/libc/locale.  Use wchar_t.
+ */
+#ifndef ___CT_RUNE_T_DECLARED
+typedef	int	__ct_rune_t;			/* Arg type for ctype funcs */
+#define	___CT_RUNE_T_DECLARED
+#endif
+
 __BEGIN_DECLS
 unsigned long	___runetype(__ct_rune_t) __pure;
 __ct_rune_t	___tolower(__ct_rune_t) __pure;
@@ -79,7 +96,10 @@ __END_DECLS
 #ifdef _EXTERNALIZE_CTYPE_INLINES_
 #define	_USE_CTYPE_INLINE_
 #define	static
+#undef	__inline
 #define	__inline
+#undef	__always_inline
+#define	__always_inline
 #endif
 
 extern int __mb_sb_limit;
@@ -92,68 +112,68 @@ extern int __mb_sb_limit;
 
 #include <runetype.h>
 
-static __inline int
+static __inline __always_inline int
 __maskrune(__ct_rune_t _c, unsigned long _f)
 {
 	return ((_c < 0 || _c >= _CACHED_RUNES) ? ___runetype(_c) :
 		_CurrentRuneLocale->__runetype[_c]) & _f;
 }
 
-static __inline int
+static __inline __always_inline int
 __sbmaskrune(__ct_rune_t _c, unsigned long _f)
 {
 	return (_c < 0 || _c >= __mb_sb_limit) ? 0 :
 	       _CurrentRuneLocale->__runetype[_c] & _f;
 }
 
-static __inline int
+static __inline __always_inline int
 __istype(__ct_rune_t _c, unsigned long _f)
 {
 	return (!!__maskrune(_c, _f));
 }
 
-static __inline int
+static __inline __always_inline int
 __sbistype(__ct_rune_t _c, unsigned long _f)
 {
 	return (!!__sbmaskrune(_c, _f));
 }
 
-static __inline int
+static __inline __always_inline int
 __isctype(__ct_rune_t _c, unsigned long _f)
 {
 	return (_c < 0 || _c >= 128) ? 0 :
 	       !!(_DefaultRuneLocale.__runetype[_c] & _f);
 }
 
-static __inline __ct_rune_t
+static __inline __always_inline __ct_rune_t
 __toupper(__ct_rune_t _c)
 {
 	return (_c < 0 || _c >= _CACHED_RUNES) ? ___toupper(_c) :
 	       _CurrentRuneLocale->__mapupper[_c];
 }
 
-static __inline __ct_rune_t
+static __inline __always_inline __ct_rune_t
 __sbtoupper(__ct_rune_t _c)
 {
 	return (_c < 0 || _c >= __mb_sb_limit) ? _c :
 	       _CurrentRuneLocale->__mapupper[_c];
 }
 
-static __inline __ct_rune_t
+static __inline __always_inline __ct_rune_t
 __tolower(__ct_rune_t _c)
 {
 	return (_c < 0 || _c >= _CACHED_RUNES) ? ___tolower(_c) :
 	       _CurrentRuneLocale->__maplower[_c];
 }
 
-static __inline __ct_rune_t
+static __inline __always_inline __ct_rune_t
 __sbtolower(__ct_rune_t _c)
 {
 	return (_c < 0 || _c >= __mb_sb_limit) ? _c :
 	       _CurrentRuneLocale->__maplower[_c];
 }
 
-static __inline int
+static __inline __always_inline int
 __wcwidth(__ct_rune_t _c)
 {
 	unsigned int _x;
@@ -223,17 +243,17 @@ int	isspecial(int);
 __END_DECLS
 
 #ifndef __cplusplus
-#define	isalnum(c)	__sbistype((c), _CTYPE_A|_CTYPE_D)
+#define	isalnum(c)	__sbistype((c), _CTYPE_A|_CTYPE_D|_CTYPE_N)
 #define	isalpha(c)	__sbistype((c), _CTYPE_A)
 #define	iscntrl(c)	__sbistype((c), _CTYPE_C)
-#define	isdigit(c)	__isctype((c), _CTYPE_D) /* ANSI -- locale independent */
+#define	isdigit(c)	__sbistype((c), _CTYPE_D)
 #define	isgraph(c)	__sbistype((c), _CTYPE_G)
 #define	islower(c)	__sbistype((c), _CTYPE_L)
 #define	isprint(c)	__sbistype((c), _CTYPE_R)
 #define	ispunct(c)	__sbistype((c), _CTYPE_P)
 #define	isspace(c)	__sbistype((c), _CTYPE_S)
 #define	isupper(c)	__sbistype((c), _CTYPE_U)
-#define	isxdigit(c)	__isctype((c), _CTYPE_X) /* ANSI -- locale independent */
+#define	isxdigit(c)	__sbistype((c), _CTYPE_X)
 #define	tolower(c)	__sbtolower(c)
 #define	toupper(c)	__sbtoupper(c)
 #endif /* !__cplusplus */
@@ -264,7 +284,7 @@ __END_DECLS
 #define	digittoint(c)	__sbmaskrune((c), 0xFF)
 #define	ishexnumber(c)	__sbistype((c), _CTYPE_X)
 #define	isideogram(c)	__sbistype((c), _CTYPE_I)
-#define	isnumber(c)	__sbistype((c), _CTYPE_D)
+#define	isnumber(c)	__sbistype((c), _CTYPE_D|_CTYPE_N)
 #define	isphonogram(c)	__sbistype((c), _CTYPE_Q)
 #define	isrune(c)	__sbistype((c), 0xFFFFFF00L)
 #define	isspecial(c)	__sbistype((c), _CTYPE_T)

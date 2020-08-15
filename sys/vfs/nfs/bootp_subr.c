@@ -57,6 +57,7 @@
 #include <sys/fcntl.h>
 
 #include <net/if.h>
+#include <net/if_var.h>
 #include <net/route.h>
 
 #include <netinet/in.h>
@@ -393,7 +394,8 @@ bootpboot_p_iflist(void)
 	struct ifaddr_container *ifac;
 	
 	kprintf("Interface list:\n");
-	TAILQ_FOREACH(ifp, &ifnet, if_link) {
+	ifnet_lock();
+	TAILQ_FOREACH(ifp, &ifnetlist, if_link) {
 		TAILQ_FOREACH(ifac, &ifp->if_addrheads[mycpuid], ifa_link) {
 			struct ifaddr *ifa = ifac->ifa;
 
@@ -401,6 +403,7 @@ bootpboot_p_iflist(void)
 				bootpboot_p_if(ifp, ifa);
 		}
 	}
+	ifnet_unlock();
 }
 #endif /* defined(BOOTP_DEBUG) */
 
@@ -1545,7 +1548,9 @@ bootpc_init(void)
 	       __XSTRING(BOOTP_WIRED_TO));
 #endif
 	bzero(&ifctx->ireq, sizeof(ifctx->ireq));
-	TAILQ_FOREACH(ifp, &ifnet, if_link) {
+	/* XXX ALMOST MPSAFE */
+	ifnet_lock();
+	TAILQ_FOREACH(ifp, &ifnetlist, if_link) {
 		strlcpy(ifctx->ireq.ifr_name, ifp->if_xname,
 			 sizeof(ifctx->ireq.ifr_name));
 #ifdef BOOTP_WIRED_TO
@@ -1566,6 +1571,7 @@ bootpc_init(void)
 		gctx->lastinterface = ifctx;
 		ifctx = allocifctx(gctx);
 	}
+	ifnet_unlock();
 	kfree(ifctx, M_TEMP);
 	
 	if (gctx->interfaces == NULL) {

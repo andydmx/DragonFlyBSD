@@ -93,6 +93,7 @@
 #include <bus/cam/cam_xpt_sim.h>
 #include <bus/cam/scsi/scsi_all.h>
 #include <bus/cam/scsi/scsi_message.h>
+#include <bus/cam/cam_xpt_periph.h>
 
 #include <machine/endian.h>
 #include <sys/rman.h>
@@ -559,12 +560,8 @@ ciss_shutdown(device_t dev)
 static void
 ciss_init_sysctl(struct ciss_softc *sc)
 {
-    sysctl_ctx_init(&sc->ciss_sysctl_ctx);
-    sc->ciss_sysctl_tree = SYSCTL_ADD_NODE(&sc->ciss_sysctl_ctx,
-	SYSCTL_STATIC_CHILDREN(_hw), OID_AUTO,
-	device_get_nameunit(sc->ciss_dev), CTLFLAG_RD, 0, "");
-    SYSCTL_ADD_INT(&sc->ciss_sysctl_ctx,
-	SYSCTL_CHILDREN(sc->ciss_sysctl_tree),
+    SYSCTL_ADD_INT(device_get_sysctl_ctx(sc->ciss_dev),
+	SYSCTL_CHILDREN(device_get_sysctl_tree(sc->ciss_dev)),
 	OID_AUTO, "soft_reset", CTLFLAG_RW, &sc->ciss_soft_reset, 0, "");
 }
 
@@ -716,10 +713,6 @@ setup:
     sc->ciss_cfg->command_physlimit = 0;
     sc->ciss_cfg->interrupt_coalesce_delay = CISS_INTERRUPT_COALESCE_DELAY;
     sc->ciss_cfg->interrupt_coalesce_count = CISS_INTERRUPT_COALESCE_COUNT;
-
-#ifdef __i386__
-    sc->ciss_cfg->host_driver |= CISS_DRIVER_SCSI_PREFETCH;
-#endif
 
     if (ciss_update_config(sc)) {
 	ciss_printf(sc, "adapter refuses to accept config update (IDBR 0x%x)\n",
@@ -1221,11 +1214,12 @@ ciss_identify_adapter(struct ciss_softc *sc)
 
 	ciss_printf(sc, "  signature '%.4s'\n", sc->ciss_cfg->signature);
 	ciss_printf(sc, "  valence %d\n", sc->ciss_cfg->valence);
-	ciss_printf(sc, "  supported I/O methods 0x%b\n",
-		    sc->ciss_cfg->supported_methods,
-		    "\20\1READY\2simple\3performant\4MEMQ\n");
-	ciss_printf(sc, "  active I/O method 0x%b\n",
-		    sc->ciss_cfg->active_method, "\20\2simple\3performant\4MEMQ\n");
+	ciss_printf(sc, "  supported I/O methods 0x%pb%i\n",
+		    "\20\1READY\2simple\3performant\4MEMQ\n",
+		    sc->ciss_cfg->supported_methods);
+	ciss_printf(sc, "  active I/O method 0x%pb%i\n",
+		    "\20\2simple\3performant\4MEMQ\n",
+		    sc->ciss_cfg->active_method);
 	ciss_printf(sc, "  4G page base 0x%08x\n",
 		    sc->ciss_cfg->command_physlimit);
 	ciss_printf(sc, "  interrupt coalesce delay %dus\n",
@@ -1234,8 +1228,9 @@ ciss_identify_adapter(struct ciss_softc *sc)
 		    sc->ciss_cfg->interrupt_coalesce_count);
 	ciss_printf(sc, "  max outstanding commands %d\n",
 		    sc->ciss_cfg->max_outstanding_commands);
-	ciss_printf(sc, "  bus types 0x%b\n", sc->ciss_cfg->bus_types,
-		    "\20\1ultra2\2ultra3\10fibre1\11fibre2\n");
+	ciss_printf(sc, "  bus types 0x%pb%i\n",
+		    "\20\1ultra2\2ultra3\10fibre1\11fibre2\n",
+		    sc->ciss_cfg->bus_types);
 	ciss_printf(sc, "  server name '%.16s'\n", sc->ciss_cfg->server_name);
 	ciss_printf(sc, "  heartbeat 0x%x\n", sc->ciss_cfg->heartbeat);
     }
@@ -1913,7 +1908,7 @@ ciss_free(struct ciss_softc *sc)
 	destroy_dev(sc->ciss_dev_t);
 
     /* Final cleanup of the callout. */
-    callout_stop_sync(&sc->ciss_periodic);
+    callout_terminate(&sc->ciss_periodic);
     lockuninit(&sc->ciss_lock);
 
     /* free the controller data */
@@ -1979,8 +1974,6 @@ ciss_free(struct ciss_softc *sc)
 
     if (sc->ciss_controllers)
 	kfree(sc->ciss_controllers, CISS_MALLOC_CLASS);
-
-    sysctl_ctx_free(&sc->ciss_sysctl_ctx);
 }
 
 /************************************************************************
@@ -2482,6 +2475,7 @@ ciss_get_bmic_request(struct ciss_softc *sc, struct ciss_request **crp,
 
     debug_called(2);
 
+    *crp = NULL;	/* avoid gcc warnings */
     cr = NULL;
     buf = NULL;
 
@@ -2851,17 +2845,17 @@ ciss_cam_init(struct ciss_softc *sc)
 static void
 ciss_cam_rescan_target(struct ciss_softc *sc, int bus, int target)
 {
-    union ccb		*ccb;
+    union ccb *ccb;
 
     debug_called(1);
 
-    ccb = kmalloc(sizeof(union ccb), M_TEMP, M_WAITOK | M_ZERO);
+    ccb = xpt_alloc_ccb();
 
     if (xpt_create_path(&ccb->ccb_h.path, xpt_periph,
 	    cam_sim_path(sc->ciss_cam_sim[bus]),
 	    target, CAM_LUN_WILDCARD) != CAM_REQ_CMP) {
 	ciss_printf(sc, "rescan failed (can't create path)\n");
-	kfree(ccb, M_TEMP);
+	xpt_free_ccb(&ccb->ccb_h);
 	return;
     }
 
@@ -2892,7 +2886,7 @@ static void
 ciss_cam_rescan_callback(struct cam_periph *periph, union ccb *ccb)
 {
     xpt_free_path(ccb->ccb_h.path);
-    kfree(ccb, M_TEMP);
+    xpt_free_ccb(&ccb->ccb_h);
 }
 
 /************************************************************************
@@ -3947,12 +3941,12 @@ ciss_notify_logical(struct ciss_softc *sc, struct ciss_notify *cn)
 	switch (cn->detail) {
 	case 0:
 	    ciss_name_device(sc, bus, target);
-	    ciss_printf(sc, "logical drive %d (%s) changed status %s->%s, spare status 0x%b\n",
+	    ciss_printf(sc, "logical drive %d (%s) changed status %s->%s, spare status 0x%pb%i\n",
 			cn->data.logical_status.logical_drive, ld->cl_name,
 			ciss_name_ldrive_status(cn->data.logical_status.previous_state),
 			ciss_name_ldrive_status(cn->data.logical_status.new_state),
-			cn->data.logical_status.spare_state,
-			"\20\1configured\2rebuilding\3failed\4in use\5available\n");
+			"\20\1configured\2rebuilding\3failed\4in use\5available\n",
+			cn->data.logical_status.spare_state);
 
 	    /*
 	     * Update our idea of the drive's status.
@@ -4161,9 +4155,9 @@ ciss_print_request(struct ciss_request *cr)
     cc = cr->cr_cc;
 
     ciss_printf(sc, "REQUEST @ %p\n", cr);
-    ciss_printf(sc, "  data %p/%d  tag %d  flags %b\n",
-	      cr->cr_data, cr->cr_length, cr->cr_tag, cr->cr_flags,
-	      "\20\1mapped\2sleep\3poll\4dataout\5datain\n");
+    ciss_printf(sc, "  data %p/%d  tag %d  flags %pb%i\n",
+	      cr->cr_data, cr->cr_length, cr->cr_tag,
+	      "\20\1mapped\2sleep\3poll\4dataout\5datain\n", cr->cr_flags);
     ciss_printf(sc, "  sg list/total %d/%d  host tag 0x%x\n",
 		cc->header.sg_in_list, cc->header.sg_total, cc->header.host_tag);
     switch(cc->header.address.mode.mode) {
@@ -4288,8 +4282,9 @@ ciss_print_adapter(struct ciss_softc *sc)
 	    sc->ciss_qstat[i].q_max);
     }
     ciss_printf(sc, "max_requests %d\n", sc->ciss_max_requests);
-    ciss_printf(sc, "flags %b\n", sc->ciss_flags,
-	"\20\1notify_ok\2control_open\3aborting\4running\21fake_synch\22bmic_abort\n");
+    ciss_printf(sc, "flags %pb%i\n",
+	"\20\1notify_ok\2control_open\3aborting\4running\21fake_synch\22bmic_abort\n",
+	sc->ciss_flags);
 
     for (i = 0; i < sc->ciss_max_logical_bus; i++) {
 	for (j = 0; j < CISS_MAX_LOGICAL; j++) {

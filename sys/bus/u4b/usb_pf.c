@@ -42,6 +42,7 @@
 #include <sys/socket.h>
 #include <sys/sockio.h>
 #include <net/if.h>
+#include <net/if_var.h>
 #include <net/if_clone.h>
 #include <net/if_types.h>
 #include <net/ifq_var.h>
@@ -65,7 +66,7 @@
 static void usbpf_init(void *);
 static void usbpf_uninit(void *);
 static int usbpf_ioctl(struct ifnet *, u_long, caddr_t, struct ucred *);
-static int usbpf_clone_create(struct if_clone *, int, caddr_t);
+static int usbpf_clone_create(struct if_clone *, int, caddr_t, caddr_t);
 static int usbpf_clone_destroy(struct ifnet *);
 static struct usb_bus *usbpf_ifname2ubus(int unit);
 static uint32_t usbpf_aggregate_xferflags(struct usb_xfer_flags *);
@@ -101,7 +102,7 @@ usbpf_uninit(void *arg)
 	struct usb_bus *ubus;
 	int error;
 	int i;
-	
+
 	if_clone_detach(&usbpf_cloner);
 
 	dc = devclass_find(usbusname);
@@ -121,7 +122,6 @@ usbpf_uninit(void *arg)
 static int
 usbpf_ioctl(struct ifnet *ifp, u_long cmd, caddr_t data, struct ucred *cr)
 {
-	
 	/* No configuration allowed. */
 	return (EINVAL);
 }
@@ -143,7 +143,8 @@ usbpf_ifname2ubus(int unit)
 }
 
 static int
-usbpf_clone_create(struct if_clone *ifc, int unit, caddr_t params)
+usbpf_clone_create(struct if_clone *ifc, int unit, caddr_t params,
+		   caddr_t data __unused)
 {
 	struct ifnet *ifp;
 	struct usb_bus *ubus;
@@ -191,7 +192,7 @@ usbpf_clone_destroy(struct ifnet *ifp)
 	bpfdetach(ifp);
 	if_detach(ifp);
 	if_free(ifp);
-	
+
 	return (0);
 }
 
@@ -360,10 +361,10 @@ usbpf_xfertap(struct usb_xfer *xfer, int type)
 	/* sanity checks */
 	if (bus->ifp == NULL)
 		return;
-	/* XXX this is not needed on dragonfly 
+#if 0 /* XXX this is not needed on dragonfly */
 	if (!bpf_peers_present(bus->ifp->if_bpf))
 		return;
-	*/
+#endif
 	totlen = usbpf_xfer_precompute_size(xfer, type);
 
 	if (type == USBPF_XFERTAP_SUBMIT)

@@ -30,7 +30,7 @@
 .\" OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
 .\" SUCH DAMAGE.
 .\"
-.Dd March 13, 2014
+.Dd December 31, 2017
 .Dt HAMMER 8
 .Os
 .Sh NAME
@@ -40,7 +40,7 @@
 .Nm
 .Fl h
 .Nm
-.Op Fl 2BFqrvXy
+.Op Fl 2ABFqrvXy
 .Op Fl b Ar bandwidth
 .Op Fl C Ar cachesize Ns Op Ns Cm \&: Ns Ar readahead
 .Op Fl R Ar restrictcmd
@@ -76,6 +76,23 @@ automatic negotiation of transaction id ranges.
 This option is automatically enabled by the
 .Cm mirror-copy
 command.
+.It Fl A
+Make per PFS commands perform on all PFSs if possible.
+If the command supports this option, it targets all PFSs of the
+.Nm HAMMER
+filesystem that the
+.Ar filesystem
+argument (of that command) belongs to.
+Currently
+.Cm rebalance ,
+.Cm reblock ,
+.Cm reblock-btree ,
+.Cm reblock-inodes ,
+.Cm reblock-dirs
+and
+.Cm reblock-data
+commands support this option.
+If the command does not support this option, it does nothing.
 .It Fl B
 Bulk transfer.
 .Cm Mirror-stream
@@ -123,8 +140,8 @@ This option is typically only used with diagnostic commands
 as kernel-supported commands will use the kernel's buffer cache.
 .It Fl R Ar restrictcmd
 This option is used by hammer ssh-remote to restrict the command later
-on in the argument list.  Multiple commands may be specified, separated
-by a comma (all one argument).
+on in the argument list.
+Multiple commands may be specified, separated by a comma (all one argument).
 .It Fl T Ar restrictpath
 This option is used by hammer ssh-remote to restrict the filesystem path
 specified later on in the argument list.
@@ -288,8 +305,19 @@ Pause
 .Ar interval
 seconds between each display.
 The default interval is one second.
+.\" ==== stats ====
+.It Cm stats Op Ar interval
+Output
+.Nm HAMMER
+B-Tree and
+.Tn I/O
+statistics until interrupted.
+Pause
+.Ar interval
+seconds between each display.
+The default interval is one second.
 .\" ==== history ====
-.It Cm history Ns Oo Cm @ Ns Ar offset Ns Oo Cm \&, Ns Ar length Oc Oc Ar path ...
+.It Cm history Ns Oo Cm @ Ns Ar offset Ns Oo Cm \&, Ns Ar length Oc Oc Ar path Ns Oo Cm @ Ns Ar offset Ns Oo Cm \&, Ns Ar length Oc Oc Ar ...
 Show the modification history for inode and data of
 .Nm HAMMER
 files.
@@ -311,6 +339,19 @@ and for each object version it shows transaction id and time stamp.
 Files has to exist for this directive to be applicable,
 to track inodes which has been deleted or renamed see
 .Xr undo 1 .
+.Pp
+Different
+.Ar offset
+and
+.Ar length
+can be used for each
+.Ar path
+by specifying
+.Ar offset
+and
+.Ar length
+for each
+.Ar path .
 .\" ==== blockmap ====
 .It Cm blockmap
 Dump the blockmap for the file system.
@@ -347,15 +388,15 @@ option.
 .It Cm checkmap
 Check the blockmap allocation count.
 .Nm
-will scan the B-Tree, collect allocation information, and
-construct a blockmap in-memory.
+will scan the freemap, B-Tree, UNDO/REDO FIFO, then collect allocation information,
+and construct a blockmap in-memory.
 It will then check that blockmap against the on-disk blockmap.
 .Pp
 This command needs the
 .Fl f Ar blkdevs
 option.
 .\" ==== show ====
-.It Cm show Op Ar localization Ns Op Cm \&: Ns Ar object_id
+.It Cm show Op Ar localization Ns Op Cm \&: Ns Ar object_id Ns Op Cm \&: Ns Ar rec_type Ns Op Cm \&: Ns Ar key Ns Op Cm \&: Ns Ar create_tid
 Dump the B-Tree.
 By default this command will validate all B-Tree
 linkages and CRCs, including data CRCs, and will report the most verbose
@@ -369,12 +410,18 @@ If you specify
 .Ar localization
 or
 .Ar localization Ns Cm \&: Ns Ar object_id
+or
+.Ar localization Ns Cm \&: Ns Ar object_id Ns Cm \&: Ns Ar rec_type
+or
+.Ar localization Ns Cm \&: Ns Ar object_id Ns Cm \&: Ns Ar rec_type Ns Cm \&: Ns Ar key
+or
+.Ar localization Ns Cm \&: Ns Ar object_id Ns Cm \&: Ns Ar rec_type Ns Cm \&: Ns Ar key Ns Cm \&: Ns Ar create_tid
 the dump will
 search for the key printing nodes as it recurses down, and then
 will iterate forwards.
 These fields are specified in HEX.
-Note that the pfsid is the top 16 bits of the 32-bit localization
-field so PFS #1 would be 00010000.
+Note that the PFS id is the top 16 bits of the 32-bit localization
+field so PFS#1 would be 00010000.
 .Pp
 If you use
 .Fl q
@@ -423,7 +470,7 @@ or
 .Fl f
 options to be passed in.
 .\" ==== recover ====
-.It Cm recover Ar targetdir
+.It Cm recover Ar targetdir Op Cm full|quick
 Recover data from a corrupted
 .Nm HAMMER
 filesystem.
@@ -441,6 +488,43 @@ considerably amount of memory while operating.
 .Pp
 This command is literally the last line of defense when it comes to
 recovering data from a dead filesystem.
+.Pp
+If the
+.Cm full
+keyword is specified, this command scans all the big-blocks within the
+entire image, regardless of whether big-blocks contain active data or meta-data.
+By default, it linearly scans only up to the last big-block that contains
+active data or meta-data, if such big-block is detectable.
+.Pp
+If the
+.Cm quick
+keyword is specified, this command only scans big-blocks that contain
+B-Tree nodes and associated records, without linearly scanning the entire image.
+This may speed up the recovery process provided that big-blocks for
+B-Tree nodes are not corrupted.
+.Pp
+This command needs the
+.Fl f Ar blkdevs
+option.
+.\" ==== strip ====
+.It Cm strip
+Strip
+.Nm HAMMER
+filesystem volume header and other meta-data by overwriting them with irrelevant data.
+.Nm HAMMER
+volumes need to be unmounted.
+.Pp
+This is a fast way to make
+.Nm HAMMER
+filesystem unmountable and unrecoverable.
+After running this command,
+.Nm HAMMER
+filesystem data is no longer recoverable using
+.Cm recover
+command, although the data still exists within the volumes.
+As safety measure the
+.Fl y
+flag have no effect on this directive.
 .Pp
 This command needs the
 .Fl f Ar blkdevs
@@ -468,9 +552,12 @@ Generate the top 32 bits of a
 64 bit directory hash for the specified file name.
 .\" ==== info ====
 .It Cm info Ar dirpath ...
-Show extended information about
+Show extended information about all
 .Nm HAMMER
-file systems.
+file systems mounted in the system or the one mounted in
+.Ar dirpath
+when this argument is specified.
+.Pp
 The information is divided into sections:
 .Bl -tag -width indent
 .It Volume identification
@@ -479,8 +566,8 @@ General information, like the label of the
 filesystem, the number of volumes it contains, the FSID, and the
 .Nm HAMMER
 version being used.
-.It Big block information
-Big block statistics, such as total, used, reserved and free big blocks.
+.It Big-block information
+Big-block statistics, such as total, used, reserved and free big-blocks.
 .It Space information
 Information about space used on the filesystem.
 Currently total size, used, reserved and free space are displayed.
@@ -548,7 +635,7 @@ Defaults are:
 snapshots  1d 60d  # 0d 0d  for PFS /tmp, /var/tmp, /usr/obj
 prune      1d 5m
 rebalance  1d 5m
-dedup      1d 5m
+#dedup      1d 5m  # not enabled by default
 reblock    1d 5m
 recopy     30d 10m
 .Ed
@@ -617,9 +704,9 @@ By default prune, dedup and rebalance operations are time limited to 5 minutes,
 and reblock operations to a bit over 5 minutes,
 and recopy operations to a bit over 10 minutes.
 Reblocking and recopy runs are each broken down into four separate functions:
-btree, inodes, dirs and data.
+B-Tree, inodes, dirs and data.
 Each function is time limited to the time given in the configuration file,
-but the btree, inodes and dirs functions usually does not take very long time,
+but the B-Tree, inodes and dirs functions usually does not take very long time,
 full defragmentation is always used for these three functions.
 Also note that this directive will by default disable snapshots on
 the following PFS's:
@@ -644,6 +731,11 @@ Work on this command is still in progress.
 Expected additions:
 An ability to remove snapshots dynamically as the
 file system becomes full.
+.\" ==== abort-cleanup ====
+.It Cm abort-cleanup
+This command will terminate all active
+.Cm cleanup
+processes.
 .\" ==== config ====
 .It Cm config Op Ar filesystem Op Ar configfile
 .Nm ( HAMMER
@@ -654,7 +746,8 @@ If zero or one arguments are specified this function dumps the current
 configuration file to stdout.
 Zero arguments specifies the PFS containing the current directory.
 This configuration file is stored in file system meta-data.
-If two arguments are specified this function installs a new config file.
+If two arguments are specified this function installs a new configuration file
+.Ar configfile .
 .Pp
 In
 .Nm HAMMER
@@ -735,10 +828,32 @@ in
 .Pa /boot/loader.conf ,
 see
 .Xr loader 8 .
+.Pp
+It is not possible to remove the
+.Ar root-volume
+as it contains
+.Ar filesystem
+meta data such as
+.Nm HAMMER Ns 's
+layer1 blockmap and UNDO/REDO FIFO.
+.Pp
+This command may
+.Cm reblock
+filesystem before it attempts to remove the volume if the volume is not empty.
 .\" ==== volume-list ====
 .It Cm volume-list Ar filesystem
 List the volumes that make up
 .Ar filesystem .
+If -v is specified the command shows volume number for each volume as well as
+.Ar root-volume
+information.
+.\" ==== volume-blkdevs ====
+.It Cm volume-blkdevs Ar filesystem
+List the volumes that make up
+.Ar filesystem
+in
+.Ar blkdevs
+format.
 .\" ==== snapshot ====
 .It Cm snapshot Oo Ar filesystem Oc Ar snapshot-dir
 .It Cm snapshot Ar filesystem Ar snapshot-dir Op Ar note
@@ -1014,7 +1129,7 @@ dedup space savings.
 Remember that this is an estimated number, in
 practice real dedup ratio will be slightly smaller because of
 .Nm HAMMER
-bigblock underflows, B-Tree locking issues and other factors.
+big-block underflows, B-Tree locking issues and other factors.
 .Pp
 Note that deduplication currently works only on bulk data so if you
 try to run
@@ -1093,19 +1208,18 @@ A PFS can only be truly destroyed with the
 directive.
 Removing the softlink will not destroy the underlying PFS.
 .Pp
-A PFS can only be created in the root PFS (PFS# 0),
+A PFS can only be created in the root PFS,
 not in a PFS created by
 .Cm pfs-master
 or
-.Cm pfs-slave
-(PFS# >0).
+.Cm pfs-slave .
 .Pp
 It is recommended that
 .Ar dirpath
 is of the form
 .Pa <fs>/pfs/<name>
 (i.e.\& located in
-.Pa pfs
+.Pa PFS
 directory at root of
 .Nm HAMMER
 file system).
@@ -1145,19 +1259,18 @@ A PFS can only be truly destroyed with the
 directive.
 Removing the softlink will not destroy the underlying PFS.
 .Pp
-A PFS can only be created in the root PFS (PFS# 0),
+A PFS can only be created in the root PFS,
 not in a PFS created by
 .Cm pfs-master
 or
-.Cm pfs-slave
-(PFS# >0).
+.Cm pfs-slave .
 .Pp
 It is recommended that
 .Ar dirpath
 is of the form
 .Pa <fs>/pfs/<name>
 (i.e.\& located in
-.Pa pfs
+.Pa PFS
 directory at root of
 .Nm HAMMER
 file system).
@@ -1484,6 +1597,12 @@ Deduplication support.
 Directory hash ALG1.
 Tends to maintain inode number / directory name entry ordering better
 for files after minor renaming.
+.It 7
+.Dx 4.8 .
+Use the ISCSI crc32 algorithm instead of our custom polynomial.
+This makes it easier to use faster cpu implementation of the crc algorithm.
+CPU
+overhead is reduced but performance is unlikely to be impacted a whole lot.
 .El
 .El
 .Sh PSEUDO-FILESYSTEM (PFS) NOTES
@@ -1518,6 +1637,16 @@ The
 directive requires that the target be configured as a slave and that the
 .Cm shared-uuid
 field of the mirroring source and target match.
+The
+.Cm pfs-master
+and
+.Cm pfs-slave
+directives require that the PFS softlink be created under the main
+.Nm
+filesystem mount.
+You may only access PFS softlinks via the main
+.Nm
+filesystem mount.
 .Sh DOUBLE_BUFFER MODE
 There is a limit to the number of vnodes the kernel can cache, and because
 file buffers are associated with a vnode the related data cache can get
@@ -1533,7 +1662,8 @@ node
 to 1
 .Nm HAMMER
 will cache file data via the block device and copy it into the per-file
-buffers as needed.  The data will be double-cached at least until the
+buffers as needed.
+The data will be double-cached at least until the
 buffer cache throws away the file buffer.
 This mode is typically used in conjunction with
 .Xr swapcache 8
@@ -1546,14 +1676,16 @@ The swapcache will save the cached VM pages related to
 block
 device (which doesn't recycle unless you umount the filesystem) instead
 of the cached VM pages backing the file vnodes.
-.\".Pp
-.\"Double buffering should also be turned on if live dedup is enabled via
-.\"Va vfs.hammer.live_dedup .
-.\"This is because the live dedup must validate the contents of a potential
-.\"duplicate file block and it must run through the block device to do that
-.\"and not the file vnode.
-.\"If double buffering is not enabled then live dedup will create extra disk
-.\"reads to validate potential data duplicates.
+.Pp
+Double buffering is normally desirable when working with large filesystems,
+particularly when swapcache is used.
+The swapcache can only back active VM objects, including the block device,
+and large filesystems often have far more inodes than the kernel can support.
+In addition, when using this mode, you may wish to reduce the
+.Va kern.maxvnodes
+setting for the system to force the system to do less caching of logical
+file buffers and more caching of device buffers, since the device buffers
+are backing the logical file buffers.
 .Sh UPGRADE INSTRUCTIONS HAMMER V1 TO V2
 This upgrade changes the way directory entries are stored.
 It is possible to upgrade a V1 file system to V2 in place, but
@@ -1665,7 +1797,9 @@ required for a flush sequence.
 Version 4 also implements the REDO log (see
 .Sx FSYNC FLUSH MODES
 below) which is capable
-of fsync()ing with either one disk flush or zero disk flushes.
+of
+.Fn fsync Ns ing
+with either one disk flush or zero disk flushes.
 .Sh UPGRADE INSTRUCTIONS HAMMER V4 TO V5
 This upgrade brings in deduplication support.
 It is possible to upgrade a V4 file system to V5 in place.
@@ -1675,6 +1809,12 @@ field a signed value instead of unsigned, allowing it to go negative.
 A version 5 filesystem is required for dedup operation.
 .Sh UPGRADE INSTRUCTIONS HAMMER V5 TO V6
 It is possible to upgrade a V5 file system to V6 in place.
+.Sh UPGRADE INSTRUCTIONS HAMMER V6 TO V7
+It is possible to upgrade a V6 file system to V7 in place.
+After upgrading any new files will use the new, faster CRC.
+You can convert all existing files to use the new CRC by issuing
+a full reblock via 'hammer reblock <fs>'.
+You only have to do this once.
 .Sh FSYNC FLUSH MODES
 .Nm HAMMER
 implements five different fsync flush modes via the
@@ -1792,7 +1932,7 @@ data must be copied separately.
 At last the PFS can be upgraded to master using
 .Cm pfs-upgrade .
 .Pp
-It is not possible to restore the root PFS (PFS# 0) by using mirroring,
+It is not possible to restore the root PFS by using mirroring,
 as the root PFS is always a master PFS.
 A normal copy (e.g.\& using
 .Xr cpdup 1 )
@@ -1819,7 +1959,7 @@ mirror-stream commands instead of the default command, which is
 The program will be invoked via
 .Xr execvp 3
 using a typical
-.Xr rsh 1
+.Xr rsh 1 Pq Pa net/bsdrcmds
 style
 .Cm -l user host <remote-command>
 command line.

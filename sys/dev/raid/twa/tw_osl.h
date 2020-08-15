@@ -173,9 +173,6 @@ struct twa_softc {
 	TW_INT32		irq_type;	/* interrupt type */
 	TW_VOID			*intr_handle;	/* interrupt handle */
 
-	struct sysctl_ctx_list	sysctl_ctxt;	/* sysctl context */
-	struct sysctl_oid	*sysctl_tree;	/* sysctl oid */
-
 	struct cam_sim		*sim;	/* sim for this controller */
 	struct cam_path		*path;	/* peripheral, path, tgt, lun
 					associated with this controller */
@@ -300,8 +297,8 @@ extern TW_INT32	TW_DEBUG_LEVEL_FOR_OSL;
 
 #else /* TW_OSL_DEBUG */
 
-#define tw_osli_dbg_dprintf(dbg_level, sc, fmt, args...)
-#define tw_osli_dbg_printf(dbg_level, fmt, args...)
+#define tw_osli_dbg_dprintf(dbg_level, sc, fmt, args...) do { } while (0)
+#define tw_osli_dbg_printf(dbg_level, fmt, args...)	do { } while (0)
 
 #endif /* TW_OSL_DEBUG */
 

@@ -37,6 +37,7 @@
 #include <sys/sysctl.h>
 
 #include <net/if.h>
+#include <net/if_var.h>
 #include <net/if_mib.h>
 
 /*
@@ -80,18 +81,23 @@ sysctl_ifdata(SYSCTL_HANDLER_ARGS) /* XXX bad syntax! */
 	if (namelen != 2)
 		return EINVAL;
 
-	crit_enter();
+	/*
+	 * Hold the ifnet lock while we are accessing the ifp
+	 * obtained through ifindex2ifnet.
+	 */
+	ifnet_lock();
+
 	if (name[0] <= 0 || name[0] > if_index ||
 	    ifindex2ifnet[name[0]] == NULL) {
-		crit_exit();
+		ifnet_unlock();
 		return ENOENT;
 	}
 
 	ifp = ifindex2ifnet[name[0]];
-	crit_exit();
 
 	switch(name[1]) {
 	default:
+		ifnet_unlock();
 		return ENOENT;
 
 	case IFDATA_GENERAL:
@@ -115,6 +121,7 @@ sysctl_ifdata(SYSCTL_HANDLER_ARGS) /* XXX bad syntax! */
 		COPY_DATA(omcasts);
 		COPY_DATA(iqdrops);
 		COPY_DATA(noproto);
+		COPY_DATA(oqdrops);
 #undef COPY_DATA
 
 		ifmd.ifmd_snd_maxlen = ifp->if_snd.altq_maxlen;
@@ -124,12 +131,16 @@ sysctl_ifdata(SYSCTL_HANDLER_ARGS) /* XXX bad syntax! */
 #endif
 
 		error = SYSCTL_OUT(req, &ifmd, sizeof ifmd);
-		if (error || !req->newptr)
+		if (error || !req->newptr) {
+			ifnet_unlock();
 			return error;
+		}
 
 		error = SYSCTL_IN(req, &ifmd, sizeof ifmd);
-		if (error)
+		if (error) {
+			ifnet_unlock();
 			return error;
+		}
 
 #define DONTCOPY(fld) ifmd.ifmd_data.ifi_##fld = ifp->if_data.ifi_##fld
 		DONTCOPY(type);
@@ -155,6 +166,7 @@ sysctl_ifdata(SYSCTL_HANDLER_ARGS) /* XXX bad syntax! */
 		COPY_DATA(omcasts);
 		COPY_DATA(iqdrops);
 		COPY_DATA(noproto);
+		COPY_DATA(oqdrops);
 #undef COPY_DATA
 
 #ifdef notyet
@@ -165,14 +177,19 @@ sysctl_ifdata(SYSCTL_HANDLER_ARGS) /* XXX bad syntax! */
 
 	case IFDATA_LINKSPECIFIC:
 		error = SYSCTL_OUT(req, ifp->if_linkmib, ifp->if_linkmiblen);
-		if (error || !req->newptr)
+		if (error || !req->newptr) {
+			ifnet_unlock();
 			return error;
+		}
 
 		error = SYSCTL_IN(req, ifp->if_linkmib, ifp->if_linkmiblen);
-		if (error)
+		if (error) {
+			ifnet_unlock();
 			return error;
-		
+		}
 	}
+
+	ifnet_unlock();
 	return 0;
 }
 

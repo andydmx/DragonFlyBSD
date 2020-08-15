@@ -21,83 +21,53 @@
  */
 
 #include <sys/param.h>
-#include <sys/systm.h>
-#include <sys/buf.h>
-#include <sys/sysproto.h>
-#include <sys/filedesc.h>
-#include <sys/kernel.h>
-#include <sys/fcntl.h>
-#include <sys/file.h>
-#include <sys/lock.h>
-#include <sys/unistd.h>
-#include <sys/proc.h>
-#include <sys/resourcevar.h>
-#include <sys/signalvar.h>
-#include <sys/protosw.h>
-#include <sys/socketvar.h>
-#include <sys/sysctl.h>
-#include <sys/vnode.h>
-#include <sys/conf.h>
+#include <sys/sysmsg.h>
 #include <sys/event.h>
-#include <sys/objcache.h>
-
-#include <vm/vm.h>
-#include <vm/vm_extern.h>
-#include <vm/pmap.h>
-#include <vm/vm_map.h>
-#include <sys/aio.h>
-
-#include <sys/file2.h>
-#include <sys/buf2.h>
-#include <sys/sysref2.h>
-#include <sys/thread2.h>
-
-#include <machine/limits.h>
 
 int
-sys_aio_return(struct aio_return_args *uap)
+sys_aio_return(struct sysmsg *sysmsg, const struct aio_return_args *uap)
 {
 	return ENOSYS;
 }
 
 int
-sys_aio_suspend(struct aio_suspend_args *uap)
+sys_aio_suspend(struct sysmsg *sysmsg, const struct aio_suspend_args *uap)
 {
 	return ENOSYS;
 }
 
 int
-sys_aio_cancel(struct aio_cancel_args *uap)
+sys_aio_cancel(struct sysmsg *sysmsg, const struct aio_cancel_args *uap)
 {
 	return ENOSYS;
 }
 
 int
-sys_aio_error(struct aio_error_args *uap)
+sys_aio_error(struct sysmsg *sysmsg, const struct aio_error_args *uap)
 {
 	return ENOSYS;
 }
 
 int
-sys_aio_read(struct aio_read_args *uap)
+sys_aio_read(struct sysmsg *sysmsg, const struct aio_read_args *uap)
 {
 	return ENOSYS;
 }
 
 int
-sys_aio_write(struct aio_write_args *uap)
+sys_aio_write(struct sysmsg *sysmsg, const struct aio_write_args *uap)
 {
 	return ENOSYS;
 }
 
 int
-sys_lio_listio(struct lio_listio_args *uap)
+sys_lio_listio(struct sysmsg *sysmsg, const struct lio_listio_args *uap)
 {
 	return ENOSYS;
 }
 
 int
-sys_aio_waitcomplete(struct aio_waitcomplete_args *uap)
+sys_aio_waitcomplete(struct sysmsg *sysmsg, const struct aio_waitcomplete_args *uap)
 {
 	return ENOSYS;
 }
@@ -105,9 +75,8 @@ sys_aio_waitcomplete(struct aio_waitcomplete_args *uap)
 static int
 filt_aioattach(struct knote *kn)
 {
-
 	return ENXIO;
 }
 
 struct filterops aio_filtops =
-	{ 0, filt_aioattach, NULL, NULL };
+	{ FILTEROP_MPSAFE, filt_aioattach, NULL, NULL };

@@ -1,8 +1,9 @@
-/*-
+/*
  * Copyright (c) 2010 Isilon Systems, Inc.
  * Copyright (c) 2010 iX Systems, Inc.
  * Copyright (c) 2010 Panasas, Inc.
- * Copyright (c) 2014 François Tigeot
+ * Copyright (c) 2013-2016 Mellanox Technologies, Ltd.
+ * Copyright (c) 2014-2020 François Tigeot <ftigeot@wolfpond.org>
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -29,124 +30,34 @@
 #ifndef	_LINUX_KERNEL_H_
 #define	_LINUX_KERNEL_H_
 
+#include <sys/stdarg.h>
+#include <linux/stddef.h>
+#include <linux/types.h>
+#include <linux/compiler.h>
+#include <linux/bitops.h>
+#include <linux/log2.h>
+#include <linux/typecheck.h>
+#include <linux/printk.h>
+
 #include <sys/systm.h>
 #include <sys/param.h>
 #include <sys/libkern.h>
 #include <sys/stat.h>
+#include <sys/endian.h>
 
-#include <linux/bitops.h>
-#include <linux/compiler.h>
-#include <linux/types.h>
+#define U8_MAX		((u8)~0U)
+#define U32_MAX		((u32)~0U)
+#define U64_MAX		((u64)~0ULL)
 
-#define KERN_CONT       ""
-#define	KERN_EMERG	"<0>"
-#define	KERN_ALERT	"<1>"
-#define	KERN_CRIT	"<2>"
-#define	KERN_ERR	"<3>"
-#define	KERN_WARNING	"<4>"
-#define	KERN_NOTICE	"<5>"
-#define	KERN_INFO	"<6>"
-#define	KERN_DEBUG	"<7>"
-
-#define BUG()	do				\
-{						\
-	panic("BUG in %s at %s:%u",		\
-		__func__, __FILE__, __LINE__);	\
-} while (0)
-
-#define BUG_ON(condition)	do { if (condition) BUG(); } while(0)
-
-#define _WARN_STR(x) #x
-
-#define WARN_ON(condition) ({						\
-	int __ret = !!(condition);					\
-	if (__ret)							\
-		kprintf("WARNING %s failed at %s:%d\n",			\
-		    _WARN_STR(condition), __FILE__, __LINE__);			\
-	unlikely(__ret);						\
-})
-
-#define WARN_ON_ONCE(condition) ({					\
-	static int __warned;						\
-	int __ret = !!(condition);					\
-	if (__ret && !__warned) {					\
-		kprintf("WARNING %s failed at %s:%d\n",			\
-		    _WARN_STR(condition), __FILE__, __LINE__);		\
-		__warned = 1;						\
-	}								\
-	unlikely(__ret);						\
-})
+#include <machine/limits.h>	/* LONG_MAX etc... */
 
 #undef	ALIGN
 #define	ALIGN(x, y)		roundup2((x), (y))
+#define	IS_ALIGNED(x, y)	(((x) & ((y) - 1)) == 0)
 #define	DIV_ROUND_UP		howmany
+#define DIV_ROUND_UP_ULL(X, N)	DIV_ROUND_UP((unsigned long long)(X), (N))
 
-#define	printk(X...)		kprintf(X)
-#define	pr_debug(fmt, ...)	printk(KERN_DEBUG # fmt, ##__VA_ARGS__)
 #define udelay(t)       	DELAY(t)
-
-#ifndef pr_fmt
-#define pr_fmt(fmt) fmt
-#endif
-
-/*
- * Print a one-time message (analogous to WARN_ONCE() et al):
- */
-#define printk_once(x...) ({                    \
-        static bool __print_once;               \
-                                                \
-        if (!__print_once) {                    \
-                __print_once = true;            \
-                printk(x);                      \
-        }                                       \
-})
-
-
-
-#define pr_emerg(fmt, ...) \
-        printk(KERN_EMERG pr_fmt(fmt), ##__VA_ARGS__)
-#define pr_alert(fmt, ...) \
-        printk(KERN_ALERT pr_fmt(fmt), ##__VA_ARGS__)
-#define pr_crit(fmt, ...) \
-        printk(KERN_CRIT pr_fmt(fmt), ##__VA_ARGS__)
-#define pr_err(fmt, ...) \
-        kprintf(KERN_ERR pr_fmt(fmt), ##__VA_ARGS__)
-#define pr_warning(fmt, ...) \
-        printk(KERN_WARNING pr_fmt(fmt), ##__VA_ARGS__)
-#define pr_warn pr_warning
-#define pr_notice(fmt, ...) \
-        printk(KERN_NOTICE pr_fmt(fmt), ##__VA_ARGS__)
-#define pr_info(fmt, ...) \
-        printk(KERN_INFO pr_fmt(fmt), ##__VA_ARGS__)
-#define pr_cont(fmt, ...) \
-        printk(KERN_CONT fmt, ##__VA_ARGS__)
-
-/* pr_devel() should produce zero code unless DEBUG is defined */
-#ifdef DEBUG
-#define pr_devel(fmt, ...) \
-        printk(KERN_DEBUG pr_fmt(fmt), ##__VA_ARGS__)
-#else
-#define pr_devel(fmt, ...) \
-        ({ if (0) printk(KERN_DEBUG pr_fmt(fmt), ##__VA_ARGS__); 0; })
-#endif
-
-#ifndef WARN
-#define WARN(condition, format...) ({                                   \
-        int __ret_warn_on = !!(condition);                              \
-        if (unlikely(__ret_warn_on))                                    \
-                pr_warning(format);                                     \
-        unlikely(__ret_warn_on);                                        \
-})
-#endif
-
-#define WARN_ONCE(condition, format...)	({	\
-	static bool __warned_once;		\
-						\
-	if ((condition) && !__warned_once) {	\
-		WARN(condition, format);	\
-		__warned_once = true;		\
-	}					\
-})
 
 #define container_of(ptr, type, member)				\
 ({								\
@@ -159,10 +70,18 @@
 #define	simple_strtoul	strtoul
 #define	simple_strtol	strtol
 
-#define min(x, y)	(x < y ? x : y)
-#define max(x, y)	(x > y ? x : y)
-#define min_t(type, _x, _y)	(type)(_x) < (type)(_y) ? (type)(_x) : (_y)
-#define max_t(type, _x, _y)	(type)(_x) > (type)(_y) ? (type)(_x) : (_y)
+#define min(x, y)			((x) < (y) ? (x) : (y))
+#define max(x, y)			((x) > (y) ? (x) : (y))
+
+#define min3(a, b, c)			min(a, min(b,c))
+#define max3(a, b, c)			max(a, max(b,c))
+
+#define min_t(type, _x, _y)		((type)(_x) < (type)(_y) ? (type)(_x) : (type)(_y))
+#define max_t(type, _x, _y)		((type)(_x) > (type)(_y) ? (type)(_x) : (type)(_y))
+
+#define clamp_t(type, _x, min, max)	min_t(type, max_t(type, _x, min), max)
+#define clamp(x, lo, hi)		min( max(x,lo), hi)
+#define clamp_val(val, lo, hi)		clamp_t(typeof(val), val, lo, hi)
 
 /*
  * This looks more complex than it should be. But we need to
@@ -187,5 +106,136 @@ typedef struct pm_message {
 	a = b;				\
 	b = _swap_tmp;			\
 })
+
+#define DIV_ROUND_CLOSEST(x, divisor)	(((x) + ((divisor) /2)) / (divisor))
+
+static inline uintmax_t
+mult_frac(uintmax_t x, uintmax_t multiplier, uintmax_t divisor)
+{
+	uintmax_t q = (x / divisor);
+	uintmax_t r = (x % divisor);
+
+	return ((q * multiplier) + ((r * multiplier) / divisor));
+}
+
+static inline int64_t abs64(int64_t x)
+{
+	return (x < 0 ? -x : x);
+}
+
+#define DIV_ROUND_CLOSEST_ULL(ll, d)	\
+ ({ unsigned long long _tmp = (ll)+(d)/2; do_div(_tmp, d); _tmp; })
+
+#define	upper_32_bits(n)	((u32)(((n) >> 16) >> 16))
+#define	lower_32_bits(n)	((u32)(n))
+
+/* Byteorder compat layer */
+#if _BYTE_ORDER == _BIG_ENDIAN
+#define	__BIG_ENDIAN 4321
+#else
+#define	__LITTLE_ENDIAN 1234
+#endif
+
+#define	cpu_to_le16(x)	htole16(x)
+#define	le16_to_cpu(x)	le16toh(x)
+#define	cpu_to_le32(x)	htole32(x)
+#define	le32_to_cpu(x)	le32toh(x)
+#define	le32_to_cpup(x)	le32toh(*x)
+
+#define	cpu_to_be16(x)	htobe16(x)
+#define	be16_to_cpu(x)	be16toh(x)
+#define	cpu_to_be32(x)	htobe32(x)
+#define	be32_to_cpu(x)	be32toh(x)
+#define	be32_to_cpup(x)	be32toh(*x)
+
+static inline int __must_check
+kstrtouint(const char *s, unsigned int base, unsigned int *res)
+{
+	*(res) = strtol(s,0,base);
+
+	return 0;
+}
+
+char *kvasprintf(int flags, const char *format, va_list ap);
+char *kasprintf(int flags, const char *format, ...);
+
+static inline void __user *
+u64_to_user_ptr(u64 address)
+{
+	return (void __user *)(uintptr_t)address;
+}
+
+static inline void
+might_sleep(void)
+{
+}
+
+#define might_sleep_if(cond)
+
+#define snprintf	ksnprintf
+#define sprintf		ksprintf
+
+static inline int __printf(3, 0)
+vsnprintf(char *buf, size_t size, const char *fmt, va_list args)
+{
+	return kvsnprintf(buf, size, fmt, args);
+}
+
+static inline int __printf(3, 0)
+vscnprintf(char *buf, size_t size, const char *fmt, va_list args)
+{
+	int ret;
+
+	if (size == 0)
+		return 0;
+
+	ret = vsnprintf(buf, size, fmt, args);
+	if (ret < size)
+		return ret;
+
+	return size - 1;
+}
+
+static inline int __printf(3, 4)
+scnprintf(char *buf, size_t size, const char *fmt, ...)
+{
+	va_list args;
+	int i;
+
+	va_start(args, fmt);
+	i = vscnprintf(buf, size, fmt, args);
+	va_end(args);
+
+	return (i);
+}
+
+static inline int
+kstrtol(const char *cp, unsigned int base, long *res)
+{
+	char *end;
+
+	*res = strtol(cp, &end, base);
+
+	/* skip newline character, if any */
+	if (*end == '\n')
+		end++;
+	if (*cp == 0 || *end != 0)
+		return (-EINVAL);
+	return (0);
+}
+
+#define oops_in_progress	(panicstr != NULL)
+
+enum lockdep_ok {
+	LOCKDEP_STILL_OK,
+	LOCKDEP_NOW_UNRELIABLE
+};
+
+#define TAINT_MACHINE_CHECK	4
+
+static inline void
+add_taint(unsigned flag, enum lockdep_ok lo)
+{
+}
 
 #endif	/* _LINUX_KERNEL_H_ */

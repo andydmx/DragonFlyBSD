@@ -27,7 +27,6 @@
  * SUCH DAMAGE.
  *
  * $FreeBSD: src/sys/cam/cam_periph.c,v 1.70 2008/02/12 11:07:33 raj Exp $
- * $DragonFly: src/sys/bus/cam/cam_periph.c,v 1.41 2008/07/18 00:07:21 dillon Exp $
  */
 
 #include <sys/param.h>
@@ -42,8 +41,6 @@
 #include <sys/bus.h>
 #include <vm/vm.h>
 #include <vm/vm_extern.h>
-
-#include <sys/thread2.h>
 
 #include "cam.h"
 #include "cam_ccb.h"
@@ -95,6 +92,40 @@ TUNABLE_INT("kern.cam.periph_noresrc_delay", &periph_noresrc_delay);
 static int periph_busy_delay = 500;
 TUNABLE_INT("kern.cam.periph_busy_delay", &periph_busy_delay);
 
+/*
+ * This is a horrible hack.  The CAM code was just bulk-copying the ccb
+ * to 'restore' it from the saved version.  This completely destroys list
+ * linkages and such, so hack the hack to not copy-over fields that cannot
+ * be safely copied over.
+ *
+ * This fixes list races when scsi errors occur simultaneously on multiple
+ * requests.
+ */
+#define RESTORE_CCB(saved, ccbh, field)	\
+	bcopy(&(saved)->field, &(ccbh)->field, sizeof((ccbh)->field))
+
+#define saved_ccb_ptr ppriv_ptr0
+
+static void
+restore_ccb(struct ccb_hdr *ccb_h)
+{
+	struct ccb_hdr *saved;
+
+	saved = ccb_h->saved_ccb_ptr;
+	bcopy(saved + 1, ccb_h + 1, sizeof(union ccb) - sizeof(*saved));
+	RESTORE_CCB(saved, ccb_h, retry_count);
+	RESTORE_CCB(saved, ccb_h, cbfcnp);
+	RESTORE_CCB(saved, ccb_h, func_code);
+	RESTORE_CCB(saved, ccb_h, status);
+	RESTORE_CCB(saved, ccb_h, path);
+	RESTORE_CCB(saved, ccb_h, path_id);
+	RESTORE_CCB(saved, ccb_h, target_id);
+	RESTORE_CCB(saved, ccb_h, target_lun);
+	RESTORE_CCB(saved, ccb_h, flags);
+	RESTORE_CCB(saved, ccb_h, periph_priv);
+	RESTORE_CCB(saved, ccb_h, sim_priv);
+	RESTORE_CCB(saved, ccb_h, timeout);
+}
 
 void
 periphdriver_register(void *data)
@@ -180,8 +211,6 @@ cam_periph_alloc(periph_ctor_t *periph_ctor,
 	periph->periph_oninval = periph_oninvalidate;
 	periph->type = type;
 	periph->periph_name = name;
-	periph->unit_number = camperiphunit(*p_drv, sim, path_id,
-					    target_id, lun_id);
 	periph->immediate_priority = CAM_PRIORITY_NONE;
 	periph->refcount = 0;
 	periph->sim = sim;
@@ -193,29 +222,38 @@ cam_periph_alloc(periph_ctor_t *periph_ctor,
 	init_level++;	/* 2 */
 
 	periph->path = path;
+
+	/*
+	 * Finalize with buses locked.  Allocate unit number and add to
+	 * list to reserve the unit number.  Undo later if the XPT fails.
+	 */
+	xpt_lock_buses();
+	periph->unit_number = camperiphunit(*p_drv, sim, path_id,
+					    target_id, lun_id);
+	cur_periph = TAILQ_FIRST(&(*p_drv)->units);
+	while (cur_periph != NULL &&
+	       cur_periph->unit_number < periph->unit_number) {
+		cur_periph = TAILQ_NEXT(cur_periph, unit_links);
+	}
+	if (cur_periph != NULL) {
+		TAILQ_INSERT_BEFORE(cur_periph, periph, unit_links);
+	} else {
+		TAILQ_INSERT_TAIL(&(*p_drv)->units, periph, unit_links);
+		(*p_drv)->generation++;
+	}
+	xpt_unlock_buses();
+
 	status = xpt_add_periph(periph);
 
 	if (status != CAM_REQ_CMP)
 		goto failure;
 
-	cur_periph = TAILQ_FIRST(&(*p_drv)->units);
-	while (cur_periph != NULL
-	    && cur_periph->unit_number < periph->unit_number)
-		cur_periph = TAILQ_NEXT(cur_periph, unit_links);
-
-	if (cur_periph != NULL)
-		TAILQ_INSERT_BEFORE(cur_periph, periph, unit_links);
-	else {
-		TAILQ_INSERT_TAIL(&(*p_drv)->units, periph, unit_links);
-		(*p_drv)->generation++;
-	}
-
-	init_level++;
+	init_level++;	/* 3 */
 
 	status = periph_ctor(periph, arg);
 
 	if (status == CAM_REQ_CMP)
-		init_level++;
+		init_level++; /* 4 */
 
 failure:
 	switch (init_level) {
@@ -224,10 +262,12 @@ failure:
 		CAM_SIM_UNLOCK(sim);
 		break;
 	case 3:
-		TAILQ_REMOVE(&(*p_drv)->units, periph, unit_links);
-		xpt_remove_periph(periph);
-		/* FALLTHROUGH */
 	case 2:
+		xpt_lock_buses();
+		TAILQ_REMOVE(&(*p_drv)->units, periph, unit_links);
+		xpt_unlock_buses();
+		if (init_level == 3)
+			xpt_remove_periph(periph);
 		periph->path = NULL;
 		/* FALLTHROUGH */
 	case 1:
@@ -407,8 +447,7 @@ camperiphnextunit(struct periph_driver *p_drv, u_int newunit, int wired,
 	const char *dname, *strval;
 
 	periph_name = p_drv->driver_name;
-	for (;;newunit++) {
-
+	for (;;) {
 		for (periph = TAILQ_FIRST(&p_drv->units);
 		     periph != NULL && periph->unit_number != newunit;
 		     periph = TAILQ_NEXT(periph, unit_links))
@@ -424,6 +463,7 @@ camperiphnextunit(struct periph_driver *p_drv, u_int newunit, int wired,
 				    target, lun);
 				wired = 0;
 			}
+			++newunit;
 			continue;
 		}
 		if (wired)
@@ -441,13 +481,15 @@ camperiphnextunit(struct periph_driver *p_drv, u_int newunit, int wired,
 			/* if no "target" and no specific scbus, skip */
 			if (resource_int_value(dname, dunit, "target", &val) &&
 			    (resource_string_value(dname, dunit, "at",&strval)||
-			     strcmp(strval, "scbus") == 0))
+			     strcmp(strval, "scbus") == 0)) {
 				continue;
+			}
 			if (newunit == dunit)
 				break;
 		}
 		if (i == -1)
 			break;
+		++newunit;
 	}
 	return (newunit);
 }
@@ -560,21 +602,21 @@ camperiphfree(struct cam_periph *periph)
 	xpt_remove_periph(periph);
 
 	if (periph->flags & CAM_PERIPH_NEW_DEV_FOUND) {
-		union ccb ccb;
+		union ccb *ccb = xpt_alloc_ccb();
 		void *arg;
 
 		switch (periph->deferred_ac) {
 		case AC_FOUND_DEVICE:
-			ccb.ccb_h.func_code = XPT_GDEV_TYPE;
-			xpt_setup_ccb(&ccb.ccb_h, periph->path, /*priority*/ 1);
-			xpt_action(&ccb);
-			arg = &ccb;
+			ccb->ccb_h.func_code = XPT_GDEV_TYPE;
+			xpt_setup_ccb(&ccb->ccb_h, periph->path, /*priority*/1);
+			xpt_action(ccb);
+			arg = ccb;
 			break;
 		case AC_PATH_REGISTERED:
-			ccb.ccb_h.func_code = XPT_PATH_INQ;
-			xpt_setup_ccb(&ccb.ccb_h, periph->path, /*priority*/ 1);
-			xpt_action(&ccb);
-			arg = &ccb;
+			ccb->ccb_h.func_code = XPT_PATH_INQ;
+			xpt_setup_ccb(&ccb->ccb_h, periph->path, /*priority*/1);
+			xpt_action(ccb);
+			arg = ccb;
 			break;
 		default:
 			arg = NULL;
@@ -582,6 +624,7 @@ camperiphfree(struct cam_periph *periph)
 		}
 		periph->deferred_callback(NULL, periph->deferred_ac,
 					  periph->path, arg);
+		xpt_free_ccb(&ccb->ccb_h);
 	}
 	xpt_free_path(periph->path);
 	kfree(periph, M_CAMPERIPH);
@@ -589,8 +632,9 @@ camperiphfree(struct cam_periph *periph)
 }
 
 /*
- * Map user virtual pointers into kernel virtual address space, so we can
- * access the memory.  This won't work on physical pointers, for now it's
+ * We don't map user pointers into KVM, instead we use pbufs.
+ *
+ * This won't work on physical pointers(?OLD), for now it's
  * up to the caller to check for that.  (XXX KDM -- should we do that here
  * instead?)  This also only works for up to MAXPHYS memory.  Since we use
  * buffers to map stuff in and out, we're limited to the buffer size.
@@ -655,16 +699,7 @@ cam_periph_mapmem(union ccb *ccb, struct cam_periph_map_info *mapinfo)
 		 */
 		cmd[i] = BUF_CMD_WRITE;
 
-		/*
-		 * The userland data pointer passed in may not be page
-		 * aligned.  vmapbuf() truncates the address to a page
-		 * boundary, so if the address isn't page aligned, we'll
-		 * need enough space for the given transfer length, plus
-		 * whatever extra space is necessary to make it to the page
-		 * boundary.
-		 */
-		if ((lengths[i] +
-		    (((vm_offset_t)(*data_ptrs[i])) & PAGE_MASK)) > MAXPHYS){
+		if (lengths[i] > MAXPHYS) {
 			kprintf("cam_periph_mapmem: attempt to map %lu bytes, "
 			       "which is greater than MAXPHYS(%d)\n",
 			       (long)(lengths[i] +
@@ -705,7 +740,7 @@ cam_periph_mapmem(union ccb *ccb, struct cam_periph_map_info *mapinfo)
 		/*
 		 * Get the buffer.
 		 */
-		bp = getpbuf_kva(NULL);
+		bp = getpbuf_mem(NULL);
 
 		/* save the original user pointer */
 		mapinfo->saved_ptrs[i] = *data_ptrs[i];
@@ -714,39 +749,11 @@ cam_periph_mapmem(union ccb *ccb, struct cam_periph_map_info *mapinfo)
 		bp->b_cmd = cmd[i];
 
 		/*
-		 * Require 16-byte alignment and bounce if we don't get it.
-		 * (NATA does not realign buffers for DMA).
+		 * Always bounce the I/O through kernel memory.
 		 */
-		if ((intptr_t)*data_ptrs[i] & 15)
-			mapinfo->bounce[i] = 1;
-		else
-			mapinfo->bounce[i] = 0;
-
-		/*
-		 * Map the user buffer into kernel memory.  If the user
-		 * buffer is not aligned we have to allocate a bounce buffer
-		 * and copy.
-		 */
-		if (mapinfo->bounce[i]) {
-			bp->b_data = bp->b_kvabase;
-			bp->b_bcount = lengths[i];
-			vm_hold_load_pages(bp, (vm_offset_t)bp->b_data,
-				       (vm_offset_t)bp->b_data + bp->b_bcount);
-			if (mapinfo->dirs[i] & CAM_DIR_OUT) {
-				error = copyin(*data_ptrs[i], bp->b_data, bp->b_bcount);
-				if (error) {
-					vm_hold_free_pages(bp, (vm_offset_t)bp->b_data, (vm_offset_t)bp->b_data + bp->b_bcount);
-				}
-			} else {
-				error = 0;
-			}
-		} else if (vmapbuf(bp, *data_ptrs[i], lengths[i]) < 0) {
-			kprintf("cam_periph_mapmem: error, "
-				"address %p, length %lu isn't "
-				"user accessible any more\n",
-				(void *)*data_ptrs[i],
-				(u_long)lengths[i]);
-			error = EACCES;
+		bp->b_bcount = lengths[i];
+		if (mapinfo->dirs[i] & CAM_DIR_OUT) {
+			error = copyin(*data_ptrs[i], bp->b_data, bp->b_bcount);
 		} else {
 			error = 0;
 		}
@@ -819,17 +826,9 @@ cam_periph_unmapbufs(struct cam_periph_map_info *mapinfo,
 		/* Set the user's pointer back to the original value */
 		*data_ptrs[i] = mapinfo->saved_ptrs[i];
 
-		/* unmap the buffer */
-		if (mapinfo->bounce[i]) {
-			if (mapinfo->dirs[i] & CAM_DIR_IN) {
-				/* XXX return error */
-				copyout(bp->b_data, *data_ptrs[i],
-					bp->b_bcount);
-			}
-			vm_hold_free_pages(bp, (vm_offset_t)bp->b_data,
-				   (vm_offset_t)bp->b_data + bp->b_bcount);
-		} else {
-			vunmapbuf(bp);
+		if (mapinfo->dirs[i] & CAM_DIR_IN) {
+			/* XXX return error */
+			copyout(bp->b_data, *data_ptrs[i], bp->b_bcount);
 		}
 		relpbuf(bp, NULL);
 		mapinfo->bp[i] = NULL;
@@ -873,7 +872,7 @@ cam_periph_ccbwait(union ccb *ccb)
 }
 
 int
-cam_periph_ioctl(struct cam_periph *periph, int cmd, caddr_t addr,
+cam_periph_ioctl(struct cam_periph *periph, u_long cmd, caddr_t addr,
 		 int (*error_routine)(union ccb *ccb, 
 				      cam_flags camflags,
 				      u_int32_t sense_flags))
@@ -992,12 +991,15 @@ cam_periph_runccb(union ccb *ccb,
 void
 cam_freeze_devq(struct cam_path *path)
 {
-	struct ccb_hdr ccb_h;
+	struct ccb_hdr *ccb_h;
 
-	xpt_setup_ccb(&ccb_h, path, /*priority*/1);
-	ccb_h.func_code = XPT_NOOP;
-	ccb_h.flags = CAM_DEV_QFREEZE;
-	xpt_action((union ccb *)&ccb_h);
+	ccb_h = &xpt_alloc_ccb()->ccb_h;
+	xpt_setup_ccb(ccb_h, path, /*priority*/1);
+	ccb_h->func_code = XPT_NOOP;
+	ccb_h->flags = CAM_DEV_QFREEZE;
+	xpt_action((union ccb *)ccb_h);
+
+	xpt_free_ccb(ccb_h);
 }
 
 u_int32_t
@@ -1005,20 +1007,25 @@ cam_release_devq(struct cam_path *path, u_int32_t relsim_flags,
 		 u_int32_t openings, u_int32_t timeout,
 		 int getcount_only)
 {
-	struct ccb_relsim crs;
+	struct ccb_relsim *crs;
+	uint32_t cnt;
 
-	xpt_setup_ccb(&crs.ccb_h, path,
-		      /*priority*/1);
-	crs.ccb_h.func_code = XPT_REL_SIMQ;
-	crs.ccb_h.flags = getcount_only ? CAM_DEV_QFREEZE : 0;
-	crs.release_flags = relsim_flags;
-	crs.openings = openings;
-	crs.release_timeout = timeout;
-	xpt_action((union ccb *)&crs);
-	return (crs.qfrozen_cnt);
+	crs = &xpt_alloc_ccb()->crs;
+
+	xpt_setup_ccb(&crs->ccb_h, path, /*priority*/1);
+	crs->ccb_h.func_code = XPT_REL_SIMQ;
+	crs->ccb_h.flags = getcount_only ? CAM_DEV_QFREEZE : 0;
+	crs->release_flags = relsim_flags;
+	crs->openings = openings;
+	crs->release_timeout = timeout;
+	xpt_action((union ccb *)crs);
+	cnt = crs->qfrozen_cnt;
+
+	xpt_free_ccb(&crs->ccb_h);
+
+	return cnt;
 }
 
-#define saved_ccb_ptr ppriv_ptr0
 static void
 camperiphdone(struct cam_periph *periph, union ccb *done_ccb)
 {
@@ -1093,8 +1100,7 @@ camperiphdone(struct cam_periph *periph, union ccb *done_ccb)
 				}
 			}
 		}
-		bcopy(done_ccb->ccb_h.saved_ccb_ptr, done_ccb,
-		      sizeof(union ccb));
+		restore_ccb(&done_ccb->ccb_h);
 
 		periph->flags &= ~CAM_PERIPH_RECOVERY_INPROG;
 
@@ -1107,11 +1113,12 @@ camperiphdone(struct cam_periph *periph, union ccb *done_ccb)
 		scsi_cmd = (struct scsi_start_stop_unit *)
 				&done_ccb->csio.cdb_io.cdb_bytes;
 		if (sense != 0) {
-			struct ccb_getdev cgd;
+			struct ccb_getdev *cgd;
 			struct scsi_sense_data *sense;
 			int    error_code, sense_key, asc, ascq;	
 			scsi_sense_action err_action;
 
+			cgd = &xpt_alloc_ccb()->cgd;
 			sense = &done_ccb->csio.sense_data;
 			scsi_extract_sense(sense, &error_code, 
 					   &sense_key, &asc, &ascq);
@@ -1119,12 +1126,14 @@ camperiphdone(struct cam_periph *periph, union ccb *done_ccb)
 			/*
 			 * Grab the inquiry data for this device.
 			 */
-			xpt_setup_ccb(&cgd.ccb_h, done_ccb->ccb_h.path,
+			xpt_setup_ccb(&cgd->ccb_h, done_ccb->ccb_h.path,
 				      /*priority*/ 1);
-			cgd.ccb_h.func_code = XPT_GDEV_TYPE;
-			xpt_action((union ccb *)&cgd);
+			cgd->ccb_h.func_code = XPT_GDEV_TYPE;
+			xpt_action((union ccb *)cgd);
 			err_action = scsi_error_action(&done_ccb->csio,
-						       &cgd.inq_data, 0);
+						       &cgd->inq_data, 0);
+			xpt_free_ccb(&cgd->ccb_h);
+			cgd = NULL;	/* safety */
 
 			/*
 	 		 * If the error is "invalid field in CDB", 
@@ -1179,8 +1188,7 @@ camperiphdone(struct cam_periph *periph, union ccb *done_ccb)
 				 * CCB so that final error processing is
 				 * performed by the owner of the CCB.
 				 */
-				bcopy(done_ccb->ccb_h.saved_ccb_ptr,		
-				      done_ccb, sizeof(union ccb));
+				restore_ccb(&done_ccb->ccb_h);
 
 				periph->flags &= ~CAM_PERIPH_RECOVERY_INPROG;
 
@@ -1193,8 +1201,7 @@ camperiphdone(struct cam_periph *periph, union ccb *done_ccb)
 			 * Fire the CCB again to return it to the
 			 * caller.
 			 */
-			bcopy(done_ccb->ccb_h.saved_ccb_ptr,
-			      done_ccb, sizeof(union ccb));
+			restore_ccb(&done_ccb->ccb_h);
 
 			periph->flags &= ~CAM_PERIPH_RECOVERY_INPROG;
 
@@ -1203,8 +1210,7 @@ camperiphdone(struct cam_periph *periph, union ccb *done_ccb)
 		}
 		break;
 	default:
-		bcopy(done_ccb->ccb_h.saved_ccb_ptr, done_ccb,
-		      sizeof(union ccb));
+		restore_ccb(&done_ccb->ccb_h);
 
 		periph->flags &= ~CAM_PERIPH_RECOVERY_INPROG;
 
@@ -1260,12 +1266,14 @@ cam_periph_async(struct cam_periph *periph, u_int32_t code,
 void
 cam_periph_bus_settle(struct cam_periph *periph, u_int bus_settle)
 {
-	struct ccb_getdevstats cgds;
+	struct ccb_getdevstats *cgds;
 
-	xpt_setup_ccb(&cgds.ccb_h, periph->path, /*priority*/1);
-	cgds.ccb_h.func_code = XPT_GDEV_STATS;
-	xpt_action((union ccb *)&cgds);
-	cam_periph_freeze_after_event(periph, &cgds.last_reset, bus_settle);
+	cgds = &xpt_alloc_ccb()->cgds;
+	xpt_setup_ccb(&cgds->ccb_h, periph->path, /*priority*/1);
+	cgds->ccb_h.func_code = XPT_GDEV_STATS;
+	xpt_action((union ccb *)cgds);
+	cam_periph_freeze_after_event(periph, &cgds->last_reset, bus_settle);
+	xpt_free_ccb(&cgds->ccb_h);
 }
 
 void
@@ -1322,23 +1330,23 @@ camperiphscsistatuserror(union ccb *ccb, cam_flags camflags,
 	case SCSI_STATUS_QUEUE_FULL:
 	{
 		/* no decrement */
-		struct ccb_getdevstats cgds;
+		struct ccb_getdevstats *cgds;
+
+		cgds = &xpt_alloc_ccb()->cgds;
 
 		/*
 		 * First off, find out what the current
 		 * transaction counts are.
 		 */
-		xpt_setup_ccb(&cgds.ccb_h,
-			      ccb->ccb_h.path,
-			      /*priority*/1);
-		cgds.ccb_h.func_code = XPT_GDEV_STATS;
-		xpt_action((union ccb *)&cgds);
+		xpt_setup_ccb(&cgds->ccb_h, ccb->ccb_h.path, /*priority*/1);
+		cgds->ccb_h.func_code = XPT_GDEV_STATS;
+		xpt_action((union ccb *)cgds);
 
 		/*
 		 * If we were the only transaction active, treat
 		 * the QUEUE FULL as if it were a BUSY condition.
 		 */
-		if (cgds.dev_active != 0) {
+		if (cgds->dev_active != 0) {
 			int total_openings;
 
 			/*
@@ -1348,13 +1356,13 @@ camperiphscsistatuserror(union ccb *ccb, cam_flags camflags,
 			 * minimum allowed tag count for this
 			 * device.
 			 */
-			total_openings = cgds.dev_active + cgds.dev_openings;
-			*openings = cgds.dev_active;
-			if (*openings < cgds.mintags)
-				*openings = cgds.mintags;
-			if (*openings < total_openings)
+			total_openings = cgds->dev_active + cgds->dev_openings;
+			*openings = cgds->dev_active;
+			if (*openings < cgds->mintags)
+				*openings = cgds->mintags;
+			if (*openings < total_openings) {
 				*relsim_flags = RELSIM_ADJUST_OPENINGS;
-			else {
+			} else {
 				/*
 				 * Some devices report queue full for
 				 * temporary resource shortages.  For
@@ -1374,8 +1382,10 @@ camperiphscsistatuserror(union ccb *ccb, cam_flags camflags,
 			if (bootverbose) {
 				xpt_print(ccb->ccb_h.path, "Queue Full\n");
 			}
+			xpt_free_ccb(&cgds->ccb_h);
 			break;
 		}
+		xpt_free_ccb(&cgds->ccb_h);
 		/* FALLTHROUGH */
 	}
 	case SCSI_STATUS_BUSY:
@@ -1437,7 +1447,7 @@ camperiphscsisenseerror(union ccb *ccb, cam_flags camflags,
 		error = ERESTART;
 	} else {
 		scsi_sense_action err_action;
-		struct ccb_getdev cgd;
+		struct ccb_getdev *cgd;
 		const char *action_string;
 		union ccb* print_ccb;
 
@@ -1453,13 +1463,14 @@ camperiphscsisenseerror(union ccb *ccb, cam_flags camflags,
 		/*
 		 * Grab the inquiry data for this device.
 		 */
-		xpt_setup_ccb(&cgd.ccb_h, ccb->ccb_h.path, /*priority*/ 1);
-		cgd.ccb_h.func_code = XPT_GDEV_TYPE;
-		xpt_action((union ccb *)&cgd);
+		cgd = &xpt_alloc_ccb()->cgd;
+		xpt_setup_ccb(&cgd->ccb_h, ccb->ccb_h.path, /*priority*/ 1);
+		cgd->ccb_h.func_code = XPT_GDEV_TYPE;
+		xpt_action((union ccb *)cgd);
 
 		if ((ccb->ccb_h.status & CAM_AUTOSNS_VALID) != 0)
 			err_action = scsi_error_action(&ccb->csio,
-						       &cgd.inq_data,
+						       &cgd->inq_data,
 						       sense_flags);
 		else if ((ccb->ccb_h.flags & CAM_DIS_AUTOSENSE) == 0)
 			err_action = SS_REQSENSE;
@@ -1521,7 +1532,7 @@ camperiphscsisenseerror(union ccb *ccb, cam_flags camflags,
 			 * Check for removable media and set
 			 * load/eject flag appropriately.
 			 */
-			if (SID_IS_REMOVABLE(&cgd.inq_data))
+			if (SID_IS_REMOVABLE(&cgd->inq_data))
 				le = TRUE;
 			else
 				le = FALSE;
@@ -1607,14 +1618,22 @@ camperiphscsisenseerror(union ccb *ccb, cam_flags camflags,
 		}
 
 sense_error_done:
-		if ((err_action & SSQ_PRINT_SENSE) != 0
-		 && (ccb->ccb_h.status & CAM_AUTOSNS_VALID) != 0) {
-			cam_error_print(print_ccb, CAM_ESF_ALL, CAM_EPF_ALL);
-			xpt_print_path(ccb->ccb_h.path);
+		if ((err_action & SSQ_PRINT_SENSE) != 0 &&
+		    (ccb->ccb_h.status & CAM_AUTOSNS_VALID) != 0) {
+			if ((ccb->ccb_h.flags & CAM_QUIET) == 0 ||
+			    bootverbose) {
+				cam_error_print(print_ccb,
+						CAM_ESF_ALL, CAM_EPF_ALL);
+				xpt_print_path(ccb->ccb_h.path);
+			}
 			if (bootverbose)
 				scsi_sense_print(&print_ccb->csio);
-			kprintf("%s\n", action_string);
+			if ((ccb->ccb_h.flags & CAM_QUIET) == 0 ||
+			    bootverbose) {
+				kprintf("%s\n", action_string);
+			}
 		}
+		xpt_free_ccb(&cgd->ccb_h);
 	}
 	return (error);
 }
@@ -1833,7 +1852,7 @@ cam_periph_error(union ccb *ccb, cam_flags camflags,
 	 * If we have an error and are booting verbosely, whine
 	 * *unless* this was a non-retryable selection timeout.
 	 */
-	if (error != 0 && bootverbose &&
+	if (error != 0 && bootverbose && (sense_flags & SF_NO_PRINT) == 0 &&
 	    !(status == CAM_SEL_TIMEOUT && (camflags & CAM_RETRY_SELTO) == 0)) {
 
 

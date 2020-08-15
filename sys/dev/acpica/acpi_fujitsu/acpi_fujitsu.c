@@ -216,7 +216,7 @@ static struct {
 
 static devclass_t acpi_fujitsu_devclass;
 DRIVER_MODULE(acpi_fujitsu, acpi, acpi_fujitsu_driver,
-    acpi_fujitsu_devclass, 0, 0);
+    acpi_fujitsu_devclass, NULL, NULL);
 MODULE_DEPEND(acpi_fujitsu, acpi, 1, 1, 1);
 MODULE_VERSION(acpi_fujitsu, 1);
 
@@ -242,6 +242,7 @@ acpi_fujitsu_attach(device_t dev)
 {
 	struct acpi_fujitsu_softc *sc;
 
+	ACPI_SERIAL_INIT(fujitsu);
 	ACPI_FUNCTION_TRACE((char *)(uintptr_t)__func__);
 
 	sc = device_get_softc(dev);
@@ -331,7 +332,7 @@ acpi_fujitsu_notify_handler(ACPI_HANDLE h, uint32_t notify, void *context)
 		    acpi_fujitsu_notify_status_changed, sc);
 		break;
 	default:
-		/* unknown notification value */
+		device_printf(sc->dev, "unknown notify: %#x\n", notify);
 		break;
 	}
 }

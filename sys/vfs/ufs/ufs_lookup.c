@@ -33,7 +33,6 @@
  *
  *	@(#)ufs_lookup.c	8.15 (Berkeley) 6/16/95
  * $FreeBSD: src/sys/ufs/ufs/ufs_lookup.c,v 1.33.2.7 2001/09/22 19:22:13 iedowse Exp $
- * $DragonFly: src/sys/vfs/ufs/ufs_lookup.c,v 1.29 2008/10/15 12:12:51 aggelos Exp $
  */
 
 #include "opt_ufs.h"
@@ -445,7 +444,7 @@ found:
 	 * in the cache as to where the entry was found.
 	 */
 	if (nameiop == NAMEI_LOOKUP)
-		dp->i_diroff = dp->i_offset &~ (DIRBLKSIZ - 1);
+		dp->i_diroff = rounddown2(dp->i_offset, DIRBLKSIZ);
 
 	/*
 	 * If deleting, and at end of pathname, return
@@ -853,7 +852,7 @@ ufs_direnter(struct vnode *dvp, struct vnode *tvp, struct direct *dirp,
 	 * copy in the new entry, and write out the block.
 	 */
 	if (ep->d_ino == 0 ||
-	    (ep->d_ino == WINO &&
+	    (ep->d_ino == UFS_WINO &&
 	     bcmp(ep->d_name, dirp->d_name, dirp->d_namlen) == 0)) {
 		if (spacefree + dsize < newentrysize)
 			panic("ufs_direnter: compact1");
@@ -875,7 +874,7 @@ ufs_direnter(struct vnode *dvp, struct vnode *tvp, struct direct *dirp,
 	if (dp->i_dirhash != NULL)
 		ufsdirhash_checkblock(dp, dirbuf -
 		    (dp->i_offset & (DIRBLKSIZ - 1)),
-		    dp->i_offset & ~(DIRBLKSIZ - 1));
+		    rounddown2(dp->i_offset, DIRBLKSIZ));
 #endif
 
 	if (DOINGSOFTDEP(dvp)) {
@@ -887,7 +886,7 @@ ufs_direnter(struct vnode *dvp, struct vnode *tvp, struct direct *dirp,
 			bdwrite(bp);
 			error = 0;
 		} else {
-			error = bowrite(bp);
+			error = bwrite(bp);
 		}
 	}
 	dp->i_flag |= IN_CHANGE | IN_UPDATE;
@@ -936,12 +935,12 @@ ufs_dirremove(struct vnode *dvp, struct inode *ip, int flags, int isrmdir)
 
 	if (flags & CNP_DOWHITEOUT) {
 		/*
-		 * Whiteout entry: set d_ino to WINO.
+		 * Whiteout entry: set d_ino to UFS_WINO.
 		 */
 		if ((error =
 		    ffs_blkatoff(dvp, (off_t)dp->i_offset, (char **)&ep, &bp)) != 0)
 			return (error);
-		ep->d_ino = WINO;
+		ep->d_ino = UFS_WINO;
 		ep->d_type = DT_WHT;
 		goto out;
 	}
@@ -973,7 +972,7 @@ ufs_dirremove(struct vnode *dvp, struct inode *ip, int flags, int isrmdir)
 	if (dp->i_dirhash != NULL)
 		ufsdirhash_checkblock(dp, (char *)ep -
 		    ((dp->i_offset - dp->i_count) & (DIRBLKSIZ - 1)),
-		    dp->i_offset & ~(DIRBLKSIZ - 1));
+		    rounddown2(dp->i_offset, DIRBLKSIZ));
 #endif
 out:
 	if (DOINGSOFTDEP(dvp)) {
@@ -999,8 +998,9 @@ out:
 		else if (DOINGASYNC(dvp) && dp->i_count != 0) {
 			bdwrite(bp);
 			error = 0;
-		} else
-			error = bowrite(bp);
+		} else {
+			error = bwrite(bp);
+		}
 	}
 	dp->i_flag |= IN_CHANGE | IN_UPDATE;
 	return (error);
@@ -1038,7 +1038,7 @@ ufs_dirrewrite(struct inode *dp, struct inode *oip, ino_t newinum, int newtype,
 			bdwrite(bp);
 			error = 0;
 		} else {
-			error = bowrite(bp);
+			error = bwrite(bp);
 		}
 	}
 	dp->i_flag |= IN_CHANGE | IN_UPDATE;
@@ -1076,7 +1076,7 @@ ufs_dirempty(struct inode *ip, ino_t parentino, struct ucred *cred)
 		if (dp->d_reclen == 0)
 			return (0);
 		/* skip empty entries */
-		if (dp->d_ino == 0 || dp->d_ino == WINO)
+		if (dp->d_ino == 0 || dp->d_ino == UFS_WINO)
 			continue;
 		/* accept only "." and ".." */
 #		if (BYTE_ORDER == LITTLE_ENDIAN)
@@ -1122,7 +1122,7 @@ ufs_checkpath(struct inode *source, struct inode *target, struct ucred *cred)
 		error = EEXIST;
 		goto out;
 	}
-	rootino = ROOTINO;
+	rootino = UFS_ROOTINO;
 	error = 0;
 	if (target->i_number == rootino)
 		goto out;

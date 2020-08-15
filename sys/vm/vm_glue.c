@@ -1,6 +1,4 @@
 /*
- * (MPSAFE)
- *
  * Copyright (c) 1991, 1993
  *	The Regents of the University of California.  All rights reserved.
  *
@@ -83,34 +81,26 @@
 #include <vm/pmap.h>
 #include <vm/vm_map.h>
 #include <vm/vm_page.h>
+#include <vm/vm_page2.h>
 #include <vm/vm_pageout.h>
 #include <vm/vm_kern.h>
 #include <vm/vm_extern.h>
 
-#include <sys/user.h>
-#include <vm/vm_page2.h>
-#include <sys/thread2.h>
-#include <sys/sysref2.h>
-
 /*
  * THIS MUST BE THE LAST INITIALIZATION ITEM!!!
  *
- * Note: run scheduling should be divorced from the vm system.
+ * Process 0 falls into this function, just loop on nothing.
  */
-static void scheduler (void *);
-SYSINIT(scheduler, SI_SUB_RUN_SCHEDULER, SI_ORDER_FIRST, scheduler, NULL)
+
+static void scheduler(void *);
+SYSINIT(scheduler, SI_SUB_RUN_SCHEDULER, SI_ORDER_FIRST, scheduler, NULL);
 
 #ifdef INVARIANTS
 
 static int swap_debug = 0;
-SYSCTL_INT(_vm, OID_AUTO, swap_debug,
-	CTLFLAG_RW, &swap_debug, 0, "");
+SYSCTL_INT(_vm, OID_AUTO, swap_debug, CTLFLAG_RW, &swap_debug, 0, "");
 
 #endif
-
-static int scheduler_notify;
-
-static void swapout (struct proc *);
 
 /*
  * No requirements.
@@ -135,7 +125,7 @@ kernacc(c_caddr_t addr, int len, int rw)
 	/*
 	 * Nominal kernel memory access - check access via kernel_map.
 	 */
-	if ((vm_offset_t)addr + len > kernel_map.max_offset ||
+	if ((vm_offset_t)addr + len > vm_map_max(&kernel_map) ||
 	    (vm_offset_t)addr + len < (vm_offset_t)addr) {
 		return (FALSE);
 	}
@@ -156,7 +146,6 @@ useracc(c_caddr_t addr, int len, int rw)
 	boolean_t rv;
 	vm_prot_t prot;
 	vm_map_t map;
-	vm_map_entry_t save_hint;
 	vm_offset_t wrap;
 	vm_offset_t gpa;
 
@@ -180,14 +169,9 @@ useracc(c_caddr_t addr, int len, int rw)
 	}
 	map = &curproc->p_vmspace->vm_map;
 	vm_map_lock_read(map);
-	/*
-	 * We save the map hint, and restore it.  Useracc appears to distort
-	 * the map hint unnecessarily.
-	 */
-	save_hint = map->hint;
+
 	rv = vm_map_check_protection(map, trunc_page((vm_offset_t)addr),
 				     round_page(wrap), prot, TRUE);
-	map->hint = save_hint;
 	vm_map_unlock_read(map);
 	
 	return (rv == TRUE);
@@ -221,17 +205,28 @@ vsunlock(caddr_t addr, u_int len)
 }
 
 /*
- * Implement fork's actions on an address space.
- * Here we arrange for the address space to be copied or referenced,
- * allocate a user struct (pcb and kernel stack), then call the
- * machine-dependent layer to fill those in and make the new process
- * ready to run.  The new process is set up so that it returns directly
- * to user mode to avoid stack copying and relocation problems.
+ * Implement fork's actions on an address space.  Here we arrange for the
+ * address space to be copied or referenced, allocate a user struct (pcb
+ * and kernel stack), then call the machine-dependent layer to fill those
+ * in and make the new process ready to run.  The new process is set up
+ * so that it returns directly to user mode to avoid stack copying and
+ * relocation problems.
+ *
+ * If p2 is NULL and RFPROC is 0 we are just divorcing parts of the process
+ * from itself.
+ *
+ * Otherwise if p2 is NULL the new vmspace is not to be associated with any
+ * process or thread (so things like /dev/upmap and /dev/lpmap are not
+ * retained).
+ *
+ * Otherwise if p2 is not NULL then process specific mappings will be forked.
+ * If lp2 is not NULL only the thread-specific mappings for lp2 are forked,
+ * otherwise no thread-specific mappings are forked.
  *
  * No requirements.
  */
 void
-vm_fork(struct proc *p1, struct proc *p2, int flags)
+vm_fork(struct proc *p1, struct proc *p2, struct lwp *lp2, int flags)
 {
 	if ((flags & RFPROC) == 0) {
 		/*
@@ -258,7 +253,7 @@ vm_fork(struct proc *p1, struct proc *p2, int flags)
 	}
 
 	if ((flags & RFMEM) == 0) {
-		p2->p_vmspace = vmspace_fork(p1->p_vmspace);
+		p2->p_vmspace = vmspace_fork(p1->p_vmspace, p2, lp2);
 
 		pmap_pinit2(vmspace_pmap(p2->p_vmspace));
 
@@ -297,294 +292,12 @@ vm_init_limits(struct proc *p)
 }
 
 /*
- * Faultin the specified process.  Note that the process can be in any
- * state.  Just clear P_SWAPPEDOUT and call wakeup in case the process is
- * sleeping.
- *
- * No requirements.
+ * process 0 winds up here after all kernel initialization sysinits have
+ * run.
  */
-void
-faultin(struct proc *p)
-{
-	if (p->p_flags & P_SWAPPEDOUT) {
-		/*
-		 * The process is waiting in the kernel to return to user
-		 * mode but cannot until P_SWAPPEDOUT gets cleared.
-		 */
-		lwkt_gettoken(&p->p_token);
-		p->p_flags &= ~(P_SWAPPEDOUT | P_SWAPWAIT);
-#ifdef INVARIANTS
-		if (swap_debug)
-			kprintf("swapping in %d (%s)\n", p->p_pid, p->p_comm);
-#endif
-		wakeup(p);
-		lwkt_reltoken(&p->p_token);
-	}
-}
-
-/*
- * Kernel initialization eventually falls through to this function,
- * which is process 0.
- *
- * This swapin algorithm attempts to swap-in processes only if there
- * is enough space for them.  Of course, if a process waits for a long
- * time, it will be swapped in anyway.
- */
-struct scheduler_info {
-	struct proc *pp;
-	int ppri;
-};
-
-static int scheduler_callback(struct proc *p, void *data);
-
 static void
 scheduler(void *dummy)
 {
-	struct scheduler_info info;
-	struct proc *p;
-
-	KKASSERT(!IN_CRITICAL_SECT(curthread));
-loop:
-	scheduler_notify = 0;
-	/*
-	 * Don't try to swap anything in if we are low on memory.
-	 */
-	if (vm_page_count_severe()) {
-		vm_wait(0);
-		goto loop;
-	}
-
-	/*
-	 * Look for a good candidate to wake up
-	 */
-	info.pp = NULL;
-	info.ppri = INT_MIN;
-	allproc_scan(scheduler_callback, &info);
-
-	/*
-	 * Nothing to do, back to sleep for at least 1/10 of a second.  If
-	 * we are woken up, immediately process the next request.  If
-	 * multiple requests have built up the first is processed 
-	 * immediately and the rest are staggered.
-	 */
-	if ((p = info.pp) == NULL) {
-		tsleep(&proc0, 0, "nowork", hz / 10);
-		if (scheduler_notify == 0)
-			tsleep(&scheduler_notify, 0, "nowork", 0);
-		goto loop;
-	}
-
-	/*
-	 * Fault the selected process in, then wait for a short period of
-	 * time and loop up.
-	 *
-	 * XXX we need a heuristic to get a measure of system stress and
-	 * then adjust our stagger wakeup delay accordingly.
-	 */
-	lwkt_gettoken(&p->p_token);
-	faultin(p);
-	p->p_swtime = 0;
-	lwkt_reltoken(&p->p_token);
-	PRELE(p);
-	tsleep(&proc0, 0, "swapin", hz / 10);
-	goto loop;
+	for (;;)
+		tsleep(&proc0, 0, "idle", 0);
 }
-
-static int
-scheduler_callback(struct proc *p, void *data)
-{
-	struct scheduler_info *info = data;
-	struct lwp *lp;
-	segsz_t pgs;
-	int pri;
-
-	if (p->p_flags & P_SWAPWAIT) {
-		pri = 0;
-		FOREACH_LWP_IN_PROC(lp, p) {
-			/* XXX lwp might need a different metric */
-			pri += lp->lwp_slptime;
-		}
-		pri += p->p_swtime - p->p_nice * 8;
-
-		/*
-		 * The more pages paged out while we were swapped,
-		 * the more work we have to do to get up and running
-		 * again and the lower our wakeup priority.
-		 *
-		 * Each second of sleep time is worth ~1MB
-		 */
-		lwkt_gettoken(&p->p_vmspace->vm_map.token);
-		pgs = vmspace_resident_count(p->p_vmspace);
-		if (pgs < p->p_vmspace->vm_swrss) {
-			pri -= (p->p_vmspace->vm_swrss - pgs) /
-				(1024 * 1024 / PAGE_SIZE);
-		}
-		lwkt_reltoken(&p->p_vmspace->vm_map.token);
-
-		/*
-		 * If this process is higher priority and there is
-		 * enough space, then select this process instead of
-		 * the previous selection.
-		 */
-		if (pri > info->ppri) {
-			if (info->pp)
-				PRELE(info->pp);
-			PHOLD(p);
-			info->pp = p;
-			info->ppri = pri;
-		}
-	}
-	return(0);
-}
-
-/*
- * SMP races ok.
- * No requirements.
- */
-void
-swapin_request(void)
-{
-	if (scheduler_notify == 0) {
-		scheduler_notify = 1;
-		wakeup(&scheduler_notify);
-	}
-}
-
-#ifndef NO_SWAPPING
-
-#define	swappable(p) \
-	(((p)->p_lock == 0) && \
-	((p)->p_flags & (P_TRACED|P_SYSTEM|P_SWAPPEDOUT|P_WEXIT)) == 0)
-
-
-/*
- * Swap_idle_threshold1 is the guaranteed swapped in time for a process
- */
-static int swap_idle_threshold1 = 15;
-SYSCTL_INT(_vm, OID_AUTO, swap_idle_threshold1,
-	CTLFLAG_RW, &swap_idle_threshold1, 0, "Guaranteed process resident time (sec)");
-
-/*
- * Swap_idle_threshold2 is the time that a process can be idle before
- * it will be swapped out, if idle swapping is enabled.  Default is
- * one minute.
- */
-static int swap_idle_threshold2 = 60;
-SYSCTL_INT(_vm, OID_AUTO, swap_idle_threshold2,
-	CTLFLAG_RW, &swap_idle_threshold2, 0, "Time (sec) a process can idle before being swapped");
-
-/*
- * Swapout is driven by the pageout daemon.  Very simple, we find eligible
- * procs and mark them as being swapped out.  This will cause the kernel
- * to prefer to pageout those proc's pages first and the procs in question 
- * will not return to user mode until the swapper tells them they can.
- *
- * If any procs have been sleeping/stopped for at least maxslp seconds,
- * they are swapped.  Else, we swap the longest-sleeping or stopped process,
- * if any, otherwise the longest-resident process.
- */
-
-static int swapout_procs_callback(struct proc *p, void *data);
-
-/*
- * No requirements.
- */
-void
-swapout_procs(int action)
-{
-	allproc_scan(swapout_procs_callback, &action);
-}
-
-static int
-swapout_procs_callback(struct proc *p, void *data)
-{
-	struct lwp *lp;
-	int action = *(int *)data;
-	int minslp = -1;
-
-	if (!swappable(p))
-		return(0);
-
-	lwkt_gettoken(&p->p_token);
-
-	/*
-	 * We only consider active processes.
-	 */
-	if (p->p_stat != SACTIVE && p->p_stat != SSTOP) {
-		lwkt_reltoken(&p->p_token);
-		return(0);
-	}
-
-	FOREACH_LWP_IN_PROC(lp, p) {
-		/*
-		 * do not swap out a realtime process
-		 */
-		if (RTP_PRIO_IS_REALTIME(lp->lwp_rtprio.type)) {
-			lwkt_reltoken(&p->p_token);
-			return(0);
-		}
-
-		/*
-		 * Guarentee swap_idle_threshold time in memory
-		 */
-		if (lp->lwp_slptime < swap_idle_threshold1) {
-			lwkt_reltoken(&p->p_token);
-			return(0);
-		}
-
-		/*
-		 * If the system is under memory stress, or if we
-		 * are swapping idle processes >= swap_idle_threshold2,
-		 * then swap the process out.
-		 */
-		if (((action & VM_SWAP_NORMAL) == 0) &&
-		    (((action & VM_SWAP_IDLE) == 0) ||
-		     (lp->lwp_slptime < swap_idle_threshold2))) {
-			lwkt_reltoken(&p->p_token);
-			return(0);
-		}
-
-		if (minslp == -1 || lp->lwp_slptime < minslp)
-			minslp = lp->lwp_slptime;
-	}
-
-	/*
-	 * If the process has been asleep for awhile, swap
-	 * it out.
-	 */
-	if ((action & VM_SWAP_NORMAL) ||
-	    ((action & VM_SWAP_IDLE) &&
-	     (minslp > swap_idle_threshold2))) {
-		swapout(p);
-	}
-
-	/*
-	 * cleanup our reference
-	 */
-	lwkt_reltoken(&p->p_token);
-
-	return(0);
-}
-
-/*
- * The caller must hold p->p_token
- */
-static void
-swapout(struct proc *p)
-{
-#ifdef INVARIANTS
-	if (swap_debug)
-		kprintf("swapping out %d (%s)\n", p->p_pid, p->p_comm);
-#endif
-	++p->p_ru.ru_nswap;
-
-	/*
-	 * remember the process resident count
-	 */
-	p->p_vmspace->vm_swrss = vmspace_resident_count(p->p_vmspace);
-	p->p_flags |= P_SWAPPEDOUT;
-	p->p_swtime = 0;
-}
-
-#endif /* !NO_SWAPPING */
-

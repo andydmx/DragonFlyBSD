@@ -37,8 +37,8 @@
 .Nd report virtual memory statistics
 .Sh SYNOPSIS
 .Nm
-.\" .Op Fl fimst
-.Op Fl imsvz
+.\" .Op Fl bfimst
+.Op Fl imosuvz
 .Op Fl c Ar count
 .Op Fl M Ar core
 .Op Fl N Ar system
@@ -58,6 +58,9 @@ disk, trap and cpu activity.
 .Pp
 The options are as follows:
 .Bl -tag -width indent
+.It Fl b
+Formatted numbers use a brief format which some may find
+more readable with looped output.
 .It Fl c
 Repeat the display
 .Ar count
@@ -94,6 +97,9 @@ Report on the usage of kernel dynamic memory listed first by size of
 allocation and then by type of usage.
 .It Fl n
 Change the maximum number of disks to display from the default of 2.
+.It Fl o
+Report the usage of kernel object cache.
+It only works on the running system.
 .It Fl p
 Specify which types of devices to display.  There are three different
 categories of devices:
@@ -170,6 +176,10 @@ events which have occurred since system startup.
 .\" .It Fl t
 .\" Report on the number of page in and page reclaims since system startup,
 .\" and the amount of time required by each.
+.It Fl u
+Output unformatted numeric values, suitable for field extraction and
+numeric sorting.
+Columnar output will not be nicely aligned.
 .It Fl v
 If specified together with
 .Fl i ,
@@ -210,10 +220,8 @@ they belong to processes which are running or have run in the last 20
 seconds.
 .Pp
 .Bl -tag -width indent -compact
-.It avm
-active virtual pages
 .It fre
-size of the free list
+Approximate free and easily-freeable memory.
 .El
 .It page
 Information about page faults and paging activity.
@@ -234,8 +242,6 @@ pages paged out
 pages freed per second
 .\" .It de
 .\" anticipated short term memory shortfall
-.It sr
-pages scanned by clock algorithm, per-second
 .El
 .It disks
 Disk operations per second (this field is system dependent).
@@ -263,11 +269,11 @@ and will not randomly select other devices in the system.
 Trap/interrupt rate averages per second over last 5 seconds.
 .Pp
 .Bl -tag -width indent -compact
-.It in
+.It int
 device interrupts per interval (including clock interrupts)
-.It sy
+.It sys
 system calls per interval
-.It cs
+.It ctx
 cpu context switch rate (switches/interval)
 .El
 .It cpu

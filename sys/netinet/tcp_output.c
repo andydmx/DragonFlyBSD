@@ -65,12 +65,12 @@
 
 #include "opt_inet.h"
 #include "opt_inet6.h"
-#include "opt_ipsec.h"
 #include "opt_tcpdebug.h"
 
 #include <sys/param.h>
 #include <sys/systm.h>
 #include <sys/kernel.h>
+#include <sys/malloc.h>	/* for M_NOWAIT */
 #include <sys/sysctl.h>
 #include <sys/mbuf.h>
 #include <sys/domain.h>
@@ -81,6 +81,7 @@
 #include <sys/thread.h>
 #include <sys/globaldata.h>
 
+#include <net/if.h>
 #include <net/if_var.h>
 #include <net/route.h>
 #include <net/netmsg2.h>
@@ -106,20 +107,11 @@
 #include <netinet/tcp_debug.h>
 #endif
 
-#ifdef IPSEC
-#include <netinet6/ipsec.h>
-#endif /*IPSEC*/
-
-#ifdef FAST_IPSEC
-#include <netproto/ipsec/ipsec.h>
-#define	IPSEC
-#endif /*FAST_IPSEC*/
-
 #ifdef notyet
 extern struct mbuf *m_copypack();
 #endif
 
-int path_mtu_discovery = 0;
+int path_mtu_discovery = 1;
 SYSCTL_INT(_net_inet_tcp, OID_AUTO, path_mtu_discovery, CTLFLAG_RW,
 	&path_mtu_discovery, 1, "Enable Path MTU Discovery");
 
@@ -197,7 +189,7 @@ tcp_output(struct tcpcb *tp)
 	boolean_t sendalot;
 	struct ip6_hdr *ip6;
 #ifdef INET6
-	const boolean_t isipv6 = (inp->inp_vflag & INP_IPV6) != 0;
+	const boolean_t isipv6 = INP_ISIPV6(inp);
 #else
 	const boolean_t isipv6 = FALSE;
 #endif
@@ -228,7 +220,7 @@ tcp_output(struct tcpcb *tp)
 		idle_cwv = TRUE;
 
 	/*
-	 * Calculate whether the transmit stream was previously idle 
+	 * Calculate whether the transmit stream was previously idle
 	 * and adjust TF_LASTIDLE for the next time.
 	 */
 	idle = (tp->t_flags & TF_LASTIDLE) || (tp->snd_max == tp->snd_una);
@@ -253,7 +245,6 @@ tcp_output(struct tcpcb *tp)
 	 *   PUSH on the last segment that it creates from the large TCP
 	 *   segment.
 	 */
-#if !defined(IPSEC) && !defined(FAST_IPSEC)
 	if (tcp_do_tso
 #ifdef TCP_SIGNATURE
 	    && (tp->t_flags & TF_SIGNATURE) == 0
@@ -269,7 +260,6 @@ tcp_output(struct tcpcb *tp)
 			}
 		}
 	}
-#endif	/* !IPSEC && !FAST_IPSEC */
 
 again:
 	m = NULL;
@@ -821,9 +811,6 @@ send:
 			ipoptlen = 0;
 		}
 	}
-#ifdef IPSEC
-	ipoptlen += ipsec_hdrsiz_tcp(tp);
-#endif
 
 	if (use_tso) {
 		/* TSO segment length must be multiple of segment size */
@@ -908,9 +895,9 @@ send:
 		m->m_data -= hdrlen;
 #else
 #ifndef INET6
-		m = m_gethdr(MB_DONTWAIT, MT_HEADER);
+		m = m_gethdr(M_NOWAIT, MT_HEADER);
 #else
-		m = m_getl(hdrlen + max_linkhdr, MB_DONTWAIT, MT_HEADER,
+		m = m_getl(hdrlen + max_linkhdr, M_NOWAIT, MT_HEADER,
 			   M_PKTHDR, NULL);
 #endif
 		if (m == NULL) {
@@ -951,7 +938,7 @@ send:
 		else
 			tcpstat.tcps_sndwinup++;
 
-		MGETHDR(m, MB_DONTWAIT, MT_HEADER);
+		MGETHDR(m, M_NOWAIT, MT_HEADER);
 		if (m == NULL) {
 			error = ENOBUFS;
 			goto after_th;
@@ -1158,6 +1145,31 @@ after_th:
 			}
 			tcp_callout_reset(tp, tp->tt_rexmt, tp->t_rxtcur,
 			    tcp_timer_rexmt);
+		} else if (len == 0 && so->so_snd.ssb_cc &&
+			   tp->t_state > TCPS_SYN_RECEIVED &&
+			   !tcp_callout_active(tp, tp->tt_rexmt) &&
+			   !tcp_callout_active(tp, tp->tt_persist)) {
+			/*
+			 * Avoid a situation where we do not set persist timer
+			 * after a zero window condition. For example:
+			 * 1) A -> B: packet with enough data to fill the window
+			 * 2) B -> A: ACK for #1 + new data (0 window
+			 *    advertisement)
+			 * 3) A -> B: ACK for #2, 0 len packet
+			 *
+			 * In this case, A will not activate the persist timer,
+			 * because it chose to send a packet. Unless tcp_output
+			 * is called for some other reason (delayed ack timer,
+			 * another input packet from B, socket syscall), A will
+			 * not send zero window probes.
+			 *
+			 * So, if you send a 0-length packet, but there is data
+			 * in the socket buffer, and neither the rexmt or
+			 * persist timer is already set, then activate the
+			 * persist timer.
+			 */
+			tp->t_rxtshift = 0;
+			tcp_setpersist(tp);
 		}
 	} else {
 		/*
@@ -1211,16 +1223,11 @@ after_th:
 			    NULL, NULL, inp);
 		} else {
 			struct rtentry *rt;
-			ip->ip_len = m->m_pkthdr.len;
-#ifdef INET6
-			if (INP_CHECK_SOCKAF(so, AF_INET6))
-				ip->ip_ttl = in6_selecthlim(inp,
-				    (inp->in6p_route.ro_rt ?
-				     inp->in6p_route.ro_rt->rt_ifp : NULL));
-			else
-#endif
-				ip->ip_ttl = inp->inp_ip_ttl;	/* XXX */
 
+			KASSERT(!INP_CHECK_SOCKAF(so, AF_INET6), ("inet6 pcb"));
+
+			ip->ip_len = m->m_pkthdr.len;
+			ip->ip_ttl = inp->inp_ip_ttl;	/* XXX */
 			ip->ip_tos = inp->inp_ip_tos;	/* XXX */
 			/*
 			 * See if we should do MTU discovery.
@@ -1235,6 +1242,9 @@ after_th:
 			    !(rt->rt_rmx.rmx_locks & RTV_MTU))
 				ip->ip_off |= IP_DF;
 
+			KASSERT(inp->inp_flags & INP_HASH,
+			    ("inpcb has no hash"));
+			m_sethash(m, inp->inp_hashval);
 			error = ip_output(m, inp->inp_options, &inp->inp_route,
 					  (so->so_options & SO_DONTROUTE) |
 					  IP_DEBUGROUTE, NULL, inp);
@@ -1261,24 +1271,10 @@ after_th:
 
 out:
 		if (error == ENOBUFS) {
-			/*
-			 * If we can't send, make sure there is something
-			 * to get us going again later.
-			 *
-			 * The persist timer isn't necessarily allowed in all
-			 * states, use the rexmt timer.
-			 */
-			if (!tcp_callout_active(tp, tp->tt_rexmt) &&
-			    !tcp_callout_active(tp, tp->tt_persist)) {
-				tcp_callout_reset(tp, tp->tt_rexmt,
-						  tp->t_rxtcur,
-						  tcp_timer_rexmt);
-#if 0
-				tp->t_rxtshift = 0;
-				tcp_setpersist(tp);
-#endif
-			}
-			tcp_quench(inp, 0);
+			KASSERT((len == 0 && (flags & (TH_SYN | TH_FIN)) == 0) ||
+			    tcp_callout_active(tp, tp->tt_rexmt) ||
+			    tcp_callout_active(tp, tp->tt_persist),
+			    ("neither rexmt nor persist timer is set"));
 			return (0);
 		}
 		if (error == EMSGSIZE) {
@@ -1412,7 +1408,7 @@ tcp_tso_getsize(struct tcpcb *tp, u_int *segsz, u_int *hlen0)
 {
 	struct inpcb * const inp = tp->t_inpcb;
 #ifdef INET6
-	const boolean_t isipv6 = (inp->inp_vflag & INP_IPV6) != 0;
+	const boolean_t isipv6 = INP_ISIPV6(inp);
 #else
 	const boolean_t isipv6 = FALSE;
 #endif
@@ -1431,9 +1427,6 @@ tcp_tso_getsize(struct tcpcb *tp, u_int *segsz, u_int *hlen0)
 			ipoptlen = 0;
 		}
 	}
-#ifdef IPSEC
-	ipoptlen += ipsec_hdrsiz_tcp(tp);
-#endif
 	hlen += ipoptlen;
 
 	optlen = 0;
@@ -1513,7 +1506,7 @@ tcp_output_sched(struct tcpcb *tp)
  * if others segments and ACKs are queued on to the same hardware transmit
  * queue; thus cause unfairness between senders and suppress receiving
  * performance.
- * 
+ *
  * Fairsend should be performed at the places that do not affect segment
  * sending during congestion control, e.g.
  * - User requested output

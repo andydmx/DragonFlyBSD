@@ -17,27 +17,30 @@ SRCS=	\
 SRCS+=	\
 	cmfsize.c \
 	getopt.c \
-	oslibcfs.c \
 	osunixdir.c \
 	osunixmap.c \
 	osunixxf.c \
 	tbprint.c \
 	tbxfroot.c \
+	utascii.c \
 	utbuffer.c \
 	utdebug.c \
 	utexcep.c \
 	utglobal.c \
+	uthex.c \
 	utmath.c \
-	utprint.c \
+	utnonansi.c \
 	utstring.c \
+	utstrsuppt.c \
+	utstrtoul64.c \
 	utxferror.c
 
 SRCS+=	\
-	osdragonflytbl.c
+	osbsdtbl.c
 
 CFLAGS+= \
 	-DACPI_DUMP_APP \
 	-I${UTILDIR} \
-	-D_FreeBSD
+	-D_DragonFly
 
 .include <bsd.prog.mk>

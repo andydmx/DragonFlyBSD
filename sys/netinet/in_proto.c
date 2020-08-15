@@ -32,9 +32,7 @@
 
 #include "opt_ipdivert.h"
 #include "opt_mrouting.h"
-#include "opt_ipsec.h"
 #include "opt_inet6.h"
-#include "opt_sctp.h"
 #include "opt_carp.h"
 
 #include <sys/param.h>
@@ -51,6 +49,7 @@
 #include <netinet/in.h>
 #include <netinet/in_systm.h>
 #include <netinet/in_pcb.h>
+#include <netinet/in_var.h>
 #include <netinet/ip.h>
 #include <netinet/ip_var.h>
 #include <netinet/ip_icmp.h>
@@ -72,25 +71,6 @@
  * TCP/IP protocol family: IP, ICMP, UDP, TCP.
  */
 
-#ifdef IPSEC
-#include <netinet6/ipsec.h>
-#include <netinet6/ah.h>
-#ifdef IPSEC_ESP
-#include <netinet6/esp.h>
-#endif
-#include <netinet6/ipcomp.h>
-#endif /* IPSEC */
-
-#ifdef FAST_IPSEC
-#include <netproto/ipsec/ipsec.h>
-#endif /* FAST_IPSEC */
-
-#ifdef SCTP
-#include <netinet/sctp_pcb.h>
-#include <netinet/sctp.h>
-#include <netinet/sctp_var.h>
-#endif /* SCTP */
-
 #include <net/netisr.h>		/* for cpu0_soport */
 
 #ifdef CARP
@@ -110,8 +90,6 @@ struct protosw inetsw[] = {
 	.pr_ctlport = NULL,
 
 	.pr_init = ip_init,
-	.pr_fasttimo = NULL,
-	.pr_slowtimo = ip_slowtimo,
 	.pr_drain = ip_drain,
 	.pr_usrreqs = &nousrreqs
     },
@@ -120,7 +98,7 @@ struct protosw inetsw[] = {
 	.pr_domain = &inetdomain,
 	.pr_protocol = IPPROTO_UDP,
 	.pr_flags = PR_ATOMIC|PR_ADDR|PR_MPSAFE|
-	    PR_ASYNC_SEND|PR_ASEND_HOLDTD,
+	    PR_ASYNC_SEND|PR_ASEND_HOLDTD|PR_ACONN_HOLDTD,
 
 	.pr_initport = udp_initport,
 	.pr_input = udp_input,
@@ -143,70 +121,14 @@ struct protosw inetsw[] = {
 	.pr_input = tcp_input,
 	.pr_output = NULL,
 	.pr_ctlinput = tcp_ctlinput,
+	.pr_ctloutmsg = tcp_ctloutmsg,
 	.pr_ctloutput = tcp_ctloutput,
 
 	.pr_ctlport = tcp_ctlport,
 	.pr_init = tcp_init,
-	.pr_fasttimo = NULL,
-	.pr_slowtimo = NULL,
 	.pr_drain = tcp_drain,
 	.pr_usrreqs = &tcp_usrreqs
     },
-#ifdef SCTP
-    /*
-     * Order is very important here, we add the good one in
-     * in this postion so it maps to the right ip_protox[]
-     * postion for SCTP. Don't move the one above below
-     * this one or IPv6/4 compatability will break
-     */
-    {
-	.pr_type = SOCK_DGRAM,
-	.pr_domain = &inetdomain,
-	.pr_protocol = IPPROTO_SCTP,
-	.pr_flags = PR_ADDR_OPT|PR_WANTRCVD,
-
-	.pr_input = sctp_input,
-	.pr_output = NULL,
-	.pr_ctlinput = sctp_ctlinput,
-	.pr_ctloutput = sctp_ctloutput,
-
-	.pr_ctlport = cpu0_ctlport,
-	.pr_init = sctp_init,
-	.pr_drain = sctp_drain,
-	.pr_usrreqs = &sctp_usrreqs
-    },
-    {
-	.pr_type = SOCK_SEQPACKET,
-	.pr_domain = &inetdomain,
-	.pr_protocol = IPPROTO_SCTP,
-	.pr_flags = PR_ADDR_OPT|PR_WANTRCVD,
-
-	.pr_input = sctp_input,
-	.pr_output = NULL,
-	.pr_ctlinput = sctp_ctlinput,
-	.pr_ctloutput = sctp_ctloutput,
-
-	.pr_ctlport = cpu0_ctlport,
-	.pr_drain = sctp_drain,
-	.pr_usrreqs = &sctp_usrreqs
-    },
-
-    {
-	.pr_type = SOCK_STREAM,
-	.pr_domain = &inetdomain,
-	.pr_protocol = IPPROTO_SCTP,
-	.pr_flags = PR_CONNREQUIRED|PR_ADDR_OPT|PR_WANTRCVD,
-
-	.pr_input = sctp_input,
-	.pr_output = NULL,
-	.pr_ctlinput = sctp_ctlinput,
-	.pr_ctloutput = sctp_ctloutput,
-
-	.pr_ctlport = cpu0_ctlport,
-	.pr_drain = sctp_drain,
-	.pr_usrreqs = &sctp_usrreqs
-    },
-#endif /* SCTP */
     {
 	.pr_type = SOCK_RAW,
 	.pr_domain = &inetdomain,
@@ -215,10 +137,10 @@ struct protosw inetsw[] = {
 
 	.pr_input = rip_input,
 	.pr_output = NULL,
-	.pr_ctlinput = rip_ctlinput,
+	.pr_ctlinput = NULL,
 	.pr_ctloutput = rip_ctloutput,
 
-	.pr_ctlport = cpu0_ctlport,
+	.pr_ctlport = NULL,
 	.pr_usrreqs = &rip_usrreqs
     },
     {
@@ -238,7 +160,7 @@ struct protosw inetsw[] = {
 	.pr_type = SOCK_RAW,
 	.pr_domain = &inetdomain,
 	.pr_protocol = IPPROTO_IGMP,
-	.pr_flags = PR_ATOMIC|PR_ADDR|PR_LASTHDR,
+	.pr_flags = PR_ATOMIC|PR_ADDR|PR_LASTHDR|PR_MPSAFE,
 
 	.pr_input = igmp_input,
 	.pr_output = NULL,
@@ -246,8 +168,6 @@ struct protosw inetsw[] = {
 	.pr_ctloutput = rip_ctloutput,
 
 	.pr_init = igmp_init,
-	.pr_fasttimo = igmp_fasttimo,
-	.pr_slowtimo = igmp_slowtimo,
 	.pr_drain = NULL,
 	.pr_usrreqs = &rip_usrreqs
     },
@@ -264,96 +184,6 @@ struct protosw inetsw[] = {
 
 	.pr_usrreqs = &rip_usrreqs
     },
-#ifdef IPSEC
-    {
-	.pr_type = SOCK_RAW,
-	.pr_domain = &inetdomain,
-	.pr_protocol = IPPROTO_AH,
-	.pr_flags = PR_ATOMIC|PR_ADDR,
-
-	.pr_input = ah4_input,
-	.pr_output = NULL,
-	.pr_ctlinput = NULL,
-	.pr_ctloutput = NULL,
-
-	.pr_ctlport = NULL,
-	.pr_usrreqs = &nousrreqs
-    },
-#ifdef IPSEC_ESP
-    {
-	.pr_type = SOCK_RAW,
-	.pr_domain = &inetdomain,
-	.pr_protocol = IPPROTO_ESP,
-	.pr_flags = PR_ATOMIC|PR_ADDR,
-
-	.pr_input = esp4_input,
-	.pr_output = NULL,
-	.pr_ctlinput = NULL,
-	.pr_ctloutput = NULL,
-
-	.pr_ctlport = NULL,
-	.pr_usrreqs = &nousrreqs
-    },
-#endif
-    {
-	.pr_type = SOCK_RAW,
-	.pr_domain = &inetdomain,
-	.pr_protocol = IPPROTO_IPCOMP,
-	.pr_flags = PR_ATOMIC|PR_ADDR,
-
-	.pr_input = ipcomp4_input,
-	.pr_output = 0,
-	.pr_ctlinput = NULL,
-	.pr_ctloutput = NULL,
-
-	.pr_ctlport = NULL,
-	.pr_usrreqs = &nousrreqs
-    },
-#endif /* IPSEC */
-#ifdef FAST_IPSEC
-    {
-	.pr_type = SOCK_RAW,
-	.pr_domain = &inetdomain,
-	.pr_protocol = IPPROTO_AH,
-	.pr_flags = PR_ATOMIC|PR_ADDR,
-
-	.pr_input = ipsec4_common_input,
-	.pr_output = NULL,
-	.pr_ctlinput = NULL,
-	.pr_ctloutput = NULL,
-
-	.pr_ctlport = NULL,
-	.pr_usrreqs = &nousrreqs
-    },
-    {
-	.pr_type = SOCK_RAW,
-	.pr_domain = &inetdomain,
-	.pr_protocol = IPPROTO_ESP,
-	.pr_flags = PR_ATOMIC|PR_ADDR,
-
-	.pr_input = ipsec4_common_input,
-	.pr_output = NULL,
-	.pr_ctlinput = NULL,
-	.pr_ctloutput = NULL,
-
-	.pr_ctlport = NULL,
-	.pr_usrreqs = &nousrreqs
-    },
-    {
-	.pr_type = SOCK_RAW,
-	.pr_domain = &inetdomain,
-	.pr_protocol = IPPROTO_IPCOMP,
-	.pr_flags = PR_ATOMIC|PR_ADDR,
-
-	.pr_input = ipsec4_common_input,
-	.pr_output = NULL,
-	.pr_ctlinput = NULL,
-	.pr_ctloutput = NULL,
-
-	.pr_ctlport = NULL,
-	.pr_usrreqs = &nousrreqs
-    },
-#endif /* FAST_IPSEC */
     {
 	.pr_type = SOCK_RAW,
 	.pr_domain = &inetdomain,
@@ -505,10 +335,21 @@ inetdomain_init(void)
 }
 
 struct domain inetdomain = {
-	AF_INET, "internet", inetdomain_init, NULL, NULL,
-	inetsw, &inetsw[NELEM(inetsw)],
-	SLIST_ENTRY_INITIALIZER,
-	in_inithead, 32, sizeof(struct sockaddr_in),
+	.dom_family		= AF_INET,
+	.dom_name		= "internet",
+	.dom_init		= inetdomain_init,
+	.dom_externalize	= NULL,
+	.dom_dispose		= NULL,
+	.dom_protosw		= inetsw,
+	.dom_protoswNPROTOSW	= &inetsw[NELEM(inetsw)],
+	.dom_next		= SLIST_ENTRY_INITIALIZER,
+	.dom_rtattach		= in_inithead,
+	.dom_rtoffset		= 32,
+	.dom_maxrtkey		= sizeof(struct sockaddr_in),
+	.dom_ifattach		= NULL,
+	.dom_ifdetach		= NULL,
+	.dom_if_up		= NULL,
+	.dom_if_down		= in_if_down
 };
 
 DOMAIN_SET(inet);
@@ -521,18 +362,6 @@ SYSCTL_NODE(_net_inet, IPPROTO_ICMP,	icmp,	CTLFLAG_RW, 0,	"ICMP");
 SYSCTL_NODE(_net_inet, IPPROTO_UDP,	udp,	CTLFLAG_RW, 0,	"UDP");
 SYSCTL_NODE(_net_inet, IPPROTO_TCP,	tcp,	CTLFLAG_RW, 0,	"TCP");
 SYSCTL_NODE(_net_inet, IPPROTO_IGMP,	igmp,	CTLFLAG_RW, 0,	"IGMP");
-#ifdef FAST_IPSEC
-/* XXX no protocol # to use, pick something "reserved" */
-SYSCTL_NODE(_net_inet, 253,		ipsec,	CTLFLAG_RW, 0,	"IPSEC");
-SYSCTL_NODE(_net_inet, IPPROTO_AH,	ah,	CTLFLAG_RW, 0,	"AH");
-SYSCTL_NODE(_net_inet, IPPROTO_ESP,	esp,	CTLFLAG_RW, 0,	"ESP");
-SYSCTL_NODE(_net_inet, IPPROTO_IPCOMP,	ipcomp,	CTLFLAG_RW, 0,	"IPCOMP");
-SYSCTL_NODE(_net_inet, IPPROTO_IPIP,	ipip,	CTLFLAG_RW, 0,	"IPIP");
-#else
-#ifdef IPSEC
-SYSCTL_NODE(_net_inet, IPPROTO_AH,	ipsec,	CTLFLAG_RW, 0,	"IPSEC");
-#endif /* IPSEC */
-#endif /* !FAST_IPSEC */
 SYSCTL_NODE(_net_inet, IPPROTO_RAW,	raw,	CTLFLAG_RW, 0,	"RAW");
 #ifdef IPDIVERT
 SYSCTL_NODE(_net_inet, IPPROTO_DIVERT,	divert,	CTLFLAG_RW, 0,	"DIVERT");

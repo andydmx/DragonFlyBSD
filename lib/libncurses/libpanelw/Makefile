@@ -1,3 +1,12 @@
-ENABLE_WIDEC=
+# Build wide version of panel
+LIB=	private_panelw
+PRIVATELIB=
 
-.include "${.CURDIR}/../libpanel/Makefile"
+SHLIBDIR?=	/lib
+
+ZPANEL=	yes
+
+ENABLE_WIDEC=	yes
+
+.include "${.CURDIR}/../Makefile.sources"
+.include <bsd.lib.mk>

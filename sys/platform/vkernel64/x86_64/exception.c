@@ -42,6 +42,7 @@
 #include <ddb/ddb.h>
 
 #include <sys/thread2.h>
+#include <sys/lwp.h>
 
 #include <machine/trap.h>
 #include <machine/md_var.h>
@@ -76,16 +77,21 @@ ipisig(int nada, siginfo_t *info, void *ctxp)
 {
 	globaldata_t gd = mycpu;
 	thread_t td = gd->gd_curthread;
+	int save;
 
+	save = errno;
 	if (td->td_critcount == 0) {
-		++td->td_critcount;
+		crit_enter_quick(td);
+		++gd->gd_cnt.v_ipi;
 		++gd->gd_intr_nesting_level;
+		atomic_swap_int(&gd->gd_npoll, 0);
 		lwkt_process_ipiq();
 		--gd->gd_intr_nesting_level;
-		--td->td_critcount;
+		crit_exit_quick(td);
 	} else {
 		need_ipiq();
 	}
+	errno = save;
 }
 
 /*
@@ -106,38 +112,90 @@ stopsig(int nada, siginfo_t *info, void *ctxp)
 	globaldata_t gd = mycpu;
 	thread_t td = gd->gd_curthread;
 	sigset_t ss;
+	int save;
 
+	save = errno;
 	sigemptyset(&ss);
 	sigaddset(&ss, SIGALRM);
 	sigaddset(&ss, SIGIO);
+	sigaddset(&ss, SIGURG);
 	sigaddset(&ss, SIGQUIT);
 	sigaddset(&ss, SIGUSR1);
 	sigaddset(&ss, SIGUSR2);
 	sigaddset(&ss, SIGTERM);
 	sigaddset(&ss, SIGWINCH);
 
-	++td->td_critcount;
+	crit_enter_quick(td);
 	++gd->gd_intr_nesting_level;
 	while (CPUMASK_TESTMASK(stopped_cpus, gd->gd_cpumask)) {
 		sigsuspend(&ss);
 	}
 	--gd->gd_intr_nesting_level;
-	--td->td_critcount;
-}
+	crit_exit_quick(td);
 
-#if 0
+	errno = save;
+}
 
 /*
  * SIGIO is used by cothreads to signal back into the virtual kernel.
  */
 static
 void
-iosig(int nada, siginfo_t *info, void *ctxp)
+kqueuesig(int nada, siginfo_t *info, void *ctxp)
 {
-	signalintr(4);
+	globaldata_t gd = mycpu;
+	thread_t td = gd->gd_curthread;
+	int save;
+
+	save = errno;
+	if (td->td_critcount == 0) {
+		crit_enter_quick(td);
+		++gd->gd_intr_nesting_level;
+		cpu_ccfence();
+		kqueue_intr(NULL);
+		cpu_ccfence();
+		--gd->gd_intr_nesting_level;
+		crit_exit_quick(td);
+	} else {
+		need_kqueue();
+	}
+	errno = save;
 }
 
-#endif
+static
+void
+timersig(int nada, siginfo_t *info, void *ctxp)
+{
+	globaldata_t gd = mycpu;
+	thread_t td = gd->gd_curthread;
+	int save;
+
+	save = errno;
+	if (td->td_critcount == 0) {
+		crit_enter_quick(td);
+		++gd->gd_intr_nesting_level;
+		cpu_ccfence();
+		vktimer_intr(NULL);
+		cpu_ccfence();
+		--gd->gd_intr_nesting_level;
+		crit_exit_quick(td);
+	} else {
+		need_timer();
+	}
+	errno = save;
+}
+
+static
+void
+cosig(int nada, siginfo_t *info, void *ctxp)
+{
+	int save;
+
+	save = errno;
+	/* handles critical section checks */
+	signalintr(1);
+	errno = save;
+}
 
 static
 void
@@ -145,12 +203,15 @@ infosig(int nada, siginfo_t *info, void *ctxp)
 {
 	ucontext_t *ctx = ctxp;
 	char buf[256];
+	int save;
 
+	save = errno;
 	snprintf(buf, sizeof(buf), "lwp %d pc=%p sp=%p\n",
-		(int)lwp_gettid(),
+		(lwpid_t)lwp_gettid(),
 		(void *)(intptr_t)ctx->uc_mcontext.mc_rip,
 		(void *)(intptr_t)ctx->uc_mcontext.mc_rsp);
 	write(2, buf, strlen(buf));
+	errno = save;
 }
 
 void
@@ -175,12 +236,19 @@ init_exceptions(void)
 #endif
 	sa.sa_sigaction = ipisig;
 	sigaction(SIGUSR1, &sa, NULL);
+
 	sa.sa_sigaction = stopsig;
 	sigaction(SIGXCPU, &sa, NULL);
-#if 0
-	sa.sa_sigaction = iosig;
+
+	sa.sa_sigaction = kqueuesig;
 	sigaction(SIGIO, &sa, NULL);
-#endif
+
+	sa.sa_sigaction = timersig;
+	sigaction(SIGURG, &sa, NULL);
+
+	sa.sa_sigaction = cosig;
+	sigaction(SIGALRM, &sa, NULL);
+
 	sa.sa_sigaction = infosig;
 	sigaction(SIGINFO, &sa, NULL);
 }
@@ -195,7 +263,9 @@ static void
 exc_segfault(int signo, siginfo_t *info, void *ctxp)
 {
 	ucontext_t *ctx = ctxp;
+	int save;
 
+	save = errno;
 #if 0
 	kprintf("CAUGHT SIG %d RIP %08lx ERR %08lx TRAPNO %ld "
 		"err %ld addr %08lx\n",
@@ -208,6 +278,7 @@ exc_segfault(int signo, siginfo_t *info, void *ctxp)
 #endif
 	kern_trap((struct trapframe *)&ctx->uc_mcontext.mc_rdi);
 	splz();
+	errno = save;
 }
 
 #ifdef DDB
@@ -216,13 +287,16 @@ static void
 exc_debugger(int signo, siginfo_t *info, void *ctxp)
 {
 	ucontext_t *ctx = ctxp;
+	int save;
 
+	save = errno;
 	kprintf("CAUGHT SIG %d RIP %08lx RSP %08lx TD %p\n",
 		signo,
 		ctx->uc_mcontext.mc_rip,
 		ctx->uc_mcontext.mc_rsp,
 		curthread);
 	Debugger("interrupt from console");
+	errno = save;
 }
 
 #endif

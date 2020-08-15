@@ -234,7 +234,7 @@ struct ata_params {
 #define ATA_READ48                      0x24    /* read 48bit LBA */
 #define ATA_READ_DMA48                  0x25    /* read DMA 48bit LBA */
 #define ATA_READ_DMA_QUEUED48           0x26    /* read DMA QUEUED 48bit LBA */
-#define ATA_READ_NATIVE_MAX_ADDDRESS48  0x27    /* read native max addr 48bit */
+#define ATA_READ_NATIVE_MAX_ADDRESS48   0x27    /* read native max addr 48bit */
 #define ATA_READ_MUL48                  0x29    /* read multi 48bit LBA */
 #define ATA_WRITE                       0x30    /* write */
 #define ATA_WRITE48                     0x34    /* write 48bit LBA */
@@ -281,7 +281,7 @@ struct ata_params {
 #define		ATA_SF_ENAB_ACCOUS	0x42	/* enable acoustic mgmt */
 #define		ATA_SF_DIS_ACCOUS	0xc2	/* disable acoustic mgmt */
 #define ATA_SECURITY_FREEE_LOCK         0xf5    /* freeze security config */
-#define ATA_READ_NATIVE_MAX_ADDDRESS    0xf8    /* read native max address */
+#define ATA_READ_NATIVE_MAX_ADDRESS     0xf8    /* read native max address */
 #define ATA_SET_MAX_ADDRESS             0xf9    /* set max address */
 
 
@@ -433,6 +433,9 @@ struct ata_ioc_request {
 #define IOCATAGMODE             _IOR('a', 102, int)
 #define IOCATASMODE             _IOW('a', 103, int)
 
+#define IOCATAGSPINDOWN		_IOR('a', 104, int)
+#define IOCATASSPINDOWN		_IOW('a', 105, int)
+
 
 struct ata_ioc_raid_config {
 	    int                 lun;
@@ -457,10 +460,26 @@ struct ata_ioc_raid_config {
 	    int                 disks[16];
 };
 
+struct ata_ioc_raid_status {
+	    int                 lun;
+	    int                 type;
+	    int                 interleave;
+	    int                 status;
+	    int                 progress;
+	    int                 total_disks;
+	    struct {
+		    int		state;
+#define AR_DISK_ONLINE			0x01
+#define AR_DISK_PRESENT			0x02
+#define AR_DISK_SPARE			0x04
+		    int		lun;
+	    } disks[16];
+};
+
 /* ATA RAID ioctl calls */
 #define IOCATARAIDCREATE        _IOWR('a', 200, struct ata_ioc_raid_config)
 #define IOCATARAIDDELETE        _IOW('a', 201, int)
-#define IOCATARAIDSTATUS        _IOWR('a', 202, struct ata_ioc_raid_config)
+#define IOCATARAIDSTATUS        _IOWR('a', 202, struct ata_ioc_raid_status)
 #define IOCATARAIDADDSPARE      _IOW('a', 203, struct ata_ioc_raid_config)
 #define IOCATARAIDREBUILD       _IOW('a', 204, int)
 

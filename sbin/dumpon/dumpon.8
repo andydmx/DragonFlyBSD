@@ -9,11 +9,7 @@
 .\" 2. Redistributions in binary form must reproduce the above copyright
 .\"    notice, this list of conditions and the following disclaimer in the
 .\"    documentation and/or other materials provided with the distribution.
-.\" 3. All advertising materials mentioning features or use of this software
-.\"    must display the following acknowledgment:
-.\"	This product includes software developed by the University of
-.\"	California, Berkeley and its contributors.
-.\" 4. Neither the name of the University nor the names of its contributors
+.\" 3. Neither the name of the University nor the names of its contributors
 .\"    may be used to endorse or promote products derived from this software
 .\"    without specific prior written permission.
 .\"
@@ -31,21 +27,19 @@
 .\"
 .\"     From: @(#)swapon.8	8.1 (Berkeley) 6/5/93
 .\" $FreeBSD: src/sbin/dumpon/dumpon.8,v 1.11.2.12 2003/01/26 03:12:04 keramida Exp $
-.\" $DragonFly: src/sbin/dumpon/dumpon.8,v 1.5 2007/07/14 21:48:15 swildner Exp $
 .\"
-.Dd May 12, 1995
+.Dd September 23, 2018
 .Dt DUMPON 8
 .Os
 .Sh NAME
-.Nm dumpon
+.Nm dumpon , dumpoff
 .Nd "specify a device for crash dumps"
 .Sh SYNOPSIS
 .Nm
-.Op Fl v
 .Ar special_file
 .Nm
-.Op Fl v
 .Cm off
+.Nm dumpoff
 .Sh DESCRIPTION
 The
 .Nm
@@ -61,18 +55,19 @@ controlled by the
 variable in the boot time configuration file
 .Pa /etc/rc.conf .
 .Pp
+The default type of kernel crash dump is the mini crash dump.
+Mini crash dumps hold only memory pages in use by the kernel.
+Alternatively, full memory dumps can be enabled by setting the
+.Va debug.minidump
+.Xr sysctl 8
+variable to 0.
+.Pp
 For most systems the size of the specified dump device must be at least
 the size of physical memory.
 Even though an additional header is added to the dump,
 the BIOS for a platform typically holds back some memory, so it is not usually
 necessary to size the dump device larger than the actual amount of RAM
 available in the machine.
-.Pp
-The
-.Fl v
-flag causes
-.Nm
-to be verbose about its activity.
 .Sh NOTES
 Since a
 .Xr panic 9
@@ -95,10 +90,16 @@ to the device number of the designated
 .Ar special_file
 or to
 .Dv NODEV
-(meaning that no dumps are to be taken) if
+(meaning that no dumps are to be taken) if the utility is invoked as
+.Nm dumpoff
+or if
 .Ar special_file
 is the text string:
 .Dq Li off .
+.Pp
+In order to change the device for crash dumps, one needs to run the
+.Nm dumpoff
+utility to disable the current dump device before configuring the new one.
 .Pp
 Since
 .Nm
@@ -119,7 +120,6 @@ boot-time system configuration
 .Xr sysctl 3 ,
 .Xr fstab 5 ,
 .Xr rc.conf 5 ,
-.Xr config 8 ,
 .Xr init 8 ,
 .Xr loader 8 ,
 .Xr rc 8 ,
@@ -130,7 +130,11 @@ boot-time system configuration
 The
 .Nm
 utility appeared in
-.Fx 2.1 .
+.Fx 2.0.5 .
+The
+.Nm dumpoff
+utility first appeared in
+.Dx 5.3 .
 .Sh BUGS
 Because the file system layer is already dead by the time a crash dump
 is taken, it is not possible to send crash dumps directly to a file.

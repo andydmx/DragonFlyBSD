@@ -140,7 +140,7 @@ createmonster(int mon)
 		nap(3000);
 		return;
 	}
-	while (monster[mon].genocided && mon < MAXMONST)	/* genocided? */
+	while (mon < MAXMONST && monster[mon].genocided)	/* genocided? */
 		mon++;
 	for (k = rnd(8), i = -8; i < 0; i++, k++) {	/* choose direction, then try all */
 		if (k > 8)	/* wraparound the diroff arrays */
@@ -991,18 +991,25 @@ dirsub(int *x, int *y)
 		switch (getchr()) {
 		case 'b':
 			i++;
+			/* FALLTHROUGH */
 		case 'n':
 			i++;
+			/* FALLTHROUGH */
 		case 'y':
 			i++;
+			/* FALLTHROUGH */
 		case 'u':
 			i++;
+			/* FALLTHROUGH */
 		case 'h':
 			i++;
+			/* FALLTHROUGH */
 		case 'k':
 			i++;
+			/* FALLTHROUGH */
 		case 'l':
 			i++;
+			/* FALLTHROUGH */
 		case 'j':
 			i++;
 			goto out;

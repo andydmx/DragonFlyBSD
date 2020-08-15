@@ -43,7 +43,6 @@
 #include <sys/cpu_topology.h>
 #include <sys/thread2.h>
 #include <sys/spinlock2.h>
-#include <sys/mplock2.h>
 
 #include <sys/ktr.h>
 
@@ -130,7 +129,7 @@ struct usched usched_bsd4 = {
 };
 
 struct usched_bsd4_pcpu {
-	struct thread	helper_thread;
+	struct thread	*helper_thread;
 	short		rrcount;
 	short		upri;
 	struct lwp	*uschedcp;
@@ -265,7 +264,7 @@ KTR_INFO(KTR_USCHED_BSD4, usched, bsd4_setrunqueue_found_best_cpuid, 0,
     "mask %lu, found_cpuid %d, curr_cpuid %d)",
     pid_t pid, int cpuid, unsigned long mask, int found_cpuid, int curr);
 
-KTR_INFO(KTR_USCHED_BSD4, usched, chooseproc, 0,
+KTR_INFO(KTR_USCHED_BSD4, usched, bsd4_chooseproc, 0,
     "USCHED_BSD4(chooseproc: pid %d, old_cpuid %d, curr_cpuid %d)",
     pid_t pid, int old_cpuid, int curr);
 KTR_INFO(KTR_USCHED_BSD4, usched, chooseproc_cc, 0,
@@ -306,7 +305,7 @@ bsd4_rqinit(void *dummy)
 	}
 	ATOMIC_CPUMASK_NANDBIT(bsd4_curprocmask, 0);
 }
-SYSINIT(runqueue, SI_BOOT2_USCHED, SI_ORDER_FIRST, bsd4_rqinit, NULL)
+SYSINIT(runqueue, SI_BOOT2_USCHED, SI_ORDER_FIRST, bsd4_rqinit, NULL);
 
 /*
  * BSD4_ACQUIRE_CURPROC
@@ -379,6 +378,13 @@ bsd4_acquire_curproc(struct lwp *lp)
 		 */
 		lwkt_yield();
 
+		/* This lwp is an outcast; force reschedule. */
+		if (__predict_false(
+		    CPUMASK_TESTBIT(lp->lwp_cpumask, gd->gd_cpuid) == 0)) {
+			bsd4_release_curproc(lp);
+			goto resched;
+		}
+
 		/*
 		 * Become the currently scheduled user thread for this cpu
 		 * if we can do so trivially.
@@ -412,6 +418,7 @@ bsd4_acquire_curproc(struct lwp *lp)
 			bsd4_setrunqueue(olp);
 			*/
 		} else {
+resched:
 			/*
 			 * We cannot become the current lwp, place the lp
 			 * on the bsd4 run-queue and deschedule ourselves.
@@ -554,7 +561,7 @@ bsd4_select_curproc(globaldata_t gd)
 	} else if (bsd4_runqcount && CPUMASK_TESTBIT(bsd4_rdyprocmask, cpuid)) {
 		ATOMIC_CPUMASK_NANDBIT(bsd4_rdyprocmask, cpuid);
 		spin_unlock(&bsd4_spin);
-		lwkt_schedule(&dd->helper_thread);
+		lwkt_schedule(dd->helper_thread);
 	} else {
 		spin_unlock(&bsd4_spin);
 	}
@@ -856,7 +863,9 @@ bsd4_setrunqueue(struct lwp *lp)
 	 * set the user resched flag because
 	 */
 	cpuid = (bsd4_scancpu & 0xFFFF) % ncpus;
-	if (CPUMASK_TESTBIT(usched_global_cpumask, cpuid) == 0)
+	if (CPUMASK_TESTBIT(lp->lwp_cpumask, cpuid) == 0)
+		cpuid = BSFCPUMASK(lp->lwp_cpumask);
+	else if (CPUMASK_TESTBIT(usched_global_cpumask, cpuid) == 0)
 		cpuid = 0;
 	gd = globaldata_find(cpuid);
 	dd = &bsd4_pcpu[cpuid];
@@ -873,7 +882,7 @@ found:
 		spin_unlock(&bsd4_spin);
 		if ((dd->upri & ~PPQMASK) > (lp->lwp_priority & ~PPQMASK)) {
 			if (dd->uschedcp == NULL) {
-				wakeup_mycpu(&dd->helper_thread);
+				wakeup_mycpu(dd->helper_thread);
 			} else {
 				need_user_resched();
 			}
@@ -884,7 +893,7 @@ found:
 		if ((dd->upri & ~PPQMASK) > (lp->lwp_priority & ~PPQMASK))
 			lwkt_send_ipiq(gd, bsd4_need_user_resched_remote, NULL);
 		else
-			wakeup(&dd->helper_thread);
+			wakeup(dd->helper_thread);
 	}
 	crit_exit();
 }
@@ -1036,7 +1045,8 @@ bsd4_recalculate_estcpu(struct lwp *lp)
 		}
 
 		if (usched_bsd4_debug == lp->lwp_proc->p_pid) {
-			kprintf("pid %d lwp %p estcpu %3d %3d bat %d cp %d/%d",
+			kprintf("pid %d lwp %p estcpu %3d %3d bat %d "
+				"cp %ld/%ld",
 				lp->lwp_proc->p_pid, lp,
 				estcpu, lp->lwp_estcpu,
 				lp->lwp_batch,
@@ -1377,7 +1387,7 @@ again:
 		}
 	}
 
-	KTR_COND_LOG(usched_chooseproc,
+	KTR_COND_LOG(usched_bsd4_chooseproc,
 	    lp->lwp_proc->p_pid == usched_bsd4_pid_debug,
 	    lp->lwp_proc->p_pid,
 	    lp->lwp_thread->td_gd->gd_cpuid,
@@ -1600,7 +1610,7 @@ bsd4_kick_helper(struct lwp *lp)
 	if ((dd->upri & ~PPQMASK) > (lp->lwp_priority & ~PPQMASK)) {
 		lwkt_send_ipiq(gd, bsd4_need_user_resched_remote, NULL);
 	} else {
-		wakeup(&dd->helper_thread);
+		wakeup(dd->helper_thread);
 	}
 }
 
@@ -1614,7 +1624,7 @@ bsd4_need_user_resched_remote(void *dummy)
 	need_user_resched();
 
 	/* Call wakeup_mycpu to avoid sending IPIs to other CPUs */
-	wakeup_mycpu(&dd->helper_thread);
+	wakeup_mycpu(dd->helper_thread);
 }
 
 /*
@@ -1757,7 +1767,7 @@ sched_thread(void *dummy)
      */
     lwkt_setpri_self(TDPRI_USER_SCHEDULER);
 
-    tsleep(&dd->helper_thread, 0, "sched_thread_sleep", 0);
+    tsleep(dd->helper_thread, 0, "sched_thread_sleep", 0);
 
     for (;;) {
 	/*
@@ -1766,7 +1776,7 @@ sched_thread(void *dummy)
 	 * manual lwkt_switch() call we make below.
 	 */
 	crit_enter_gd(gd);
-	tsleep_interlock(&dd->helper_thread, 0);
+	tsleep_interlock(dd->helper_thread, 0);
 	spin_lock(&bsd4_spin);
 	ATOMIC_CPUMASK_ORMASK(bsd4_rdyprocmask, mask);
 
@@ -1829,7 +1839,7 @@ sched_thread(void *dummy)
 				tmpdd = &bsd4_pcpu[tmpid];
 				ATOMIC_CPUMASK_NANDBIT(bsd4_rdyprocmask, tmpid);
 				spin_unlock(&bsd4_spin);
-				wakeup(&tmpdd->helper_thread);
+				wakeup(tmpdd->helper_thread);
 			} else {
 				spin_unlock(&bsd4_spin);
 			}
@@ -1850,7 +1860,7 @@ sched_thread(void *dummy)
 	 * for us if interrupts and such are pending.
 	 */
 	crit_exit_gd(gd);
-	tsleep(&dd->helper_thread, PINTERLOCKED, "schslp", 0);
+	tsleep(dd->helper_thread, PINTERLOCKED, "schslp", 0);
     }
 }
 
@@ -1957,7 +1967,7 @@ sched_thread_cpu_init(void)
 			}
 		}
 
-		lwkt_create(sched_thread, NULL, NULL, &dd->helper_thread,
+		lwkt_create(sched_thread, NULL, &dd->helper_thread, NULL,
 			    0, i, "usched %d", i);
 
 		/*
@@ -2047,4 +2057,4 @@ sched_thread_cpu_init(void)
 	}
 }
 SYSINIT(uschedtd, SI_BOOT2_USCHED, SI_ORDER_SECOND,
-	sched_thread_cpu_init, NULL)
+	sched_thread_cpu_init, NULL);

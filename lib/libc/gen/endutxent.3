@@ -27,7 +27,7 @@
 .\" ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 .\" POSSIBILITY OF SUCH DAMAGE.
 .\"
-.Dd December 20, 2010
+.Dd September 10, 2019
 .Dt ENDUTXENT 3
 .Os
 .Sh NAME
@@ -35,6 +35,7 @@
 .Nm getutxent ,
 .Nm getutxid ,
 .Nm getutxline ,
+.Nm getutxuser ,
 .Nm pututxline ,
 .Nm setutxent ,
 .Nm setutxdb
@@ -52,11 +53,13 @@
 .Ft struct utmpx *
 .Fn getutxline "const struct utmpx *"
 .Ft struct utmpx *
+.Fn getutxuser "const char *user"
+.Ft struct utmpx *
 .Fn pututxline "const struct utmpx *"
 .Ft void
 .Fn setutxent void
 .Ft int
-.Fn setutxdb "utx_db_t db" "char *fname"
+.Fn setutxdb "utx_db_t db" "const char *fname"
 .Sh DESCRIPTION
 These functions provide access to the
 .Xr utmpx 5
@@ -90,6 +93,16 @@ entry which has the same name as specified in the
 field, or
 .Dv NULL
 if no match is found.
+.Pp
+.Fn getutxuser
+searches for the next entry in the database whose
+.Fa ut_type
+has a value of
+.Dv USER_PROCESS
+and whose
+.Fa ut_user
+is equal to
+.Fa user .
 .Pp
 .Fn pututxline
 adds the argument
@@ -131,7 +144,7 @@ struct utmpx {
         char ut_line[_UTX_LINESIZE];    /* tty name */
         char ut_host[_UTX_HOSTSIZE];    /* host name */
         uint16_t ut_session;            /* session id used for windowing */
-        uint16_t ut_type;               /* type of this entry */
+        short ut_type;                  /* type of this entry */
         pid_t ut_pid;                   /* process id creating the entry */
         struct {
                 uint16_t e_termination; /* process termination signal */
@@ -191,6 +204,7 @@ variable
 .Va errno
 is set to indicate the error.
 .Sh SEE ALSO
+.Xr wtmpcvt 1 ,
 .Xr logwtmpx 3 ,
 .Xr utmpx 5
 .Sh STANDARDS

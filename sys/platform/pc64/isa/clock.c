@@ -14,11 +14,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -61,11 +57,13 @@
 #include <sys/bus.h>
 #include <sys/sysctl.h>
 #include <sys/cons.h>
+#include <sys/kbio.h>
 #include <sys/systimer.h>
 #include <sys/globaldata.h>
-#include <sys/thread2.h>
 #include <sys/machintr.h>
 #include <sys/interrupt.h>
+
+#include <sys/thread2.h>
 
 #include <machine/clock.h>
 #include <machine/cputypes.h>
@@ -85,6 +83,9 @@
 #include <bus/isa/isa.h>
 #include <bus/isa/rtc.h>
 #include <machine_base/isa/timerreg.h>
+
+SET_DECLARE(timecounter_init_set, const timecounter_init_t);
+TIMECOUNTER_INIT(placeholder, NULL);
 
 static void i8254_restore(void);
 static void resettodr_on_shutdown(void *arg __unused);
@@ -108,14 +109,17 @@ int	disable_rtc_set;	/* disable resettodr() if != 0 */
 int	tsc_present;
 int	tsc_invariant;
 int	tsc_mpsync;
-int64_t	tsc_frequency;
-int	tsc_is_broken;
 int	wall_cmos_clock;	/* wall CMOS clock assumed if != 0 */
 int	timer0_running;
+tsc_uclock_t tsc_frequency;
+tsc_uclock_t tsc_oneus_approx;	/* always at least 1, approx only */
+
 enum tstate { RELEASED, ACQUIRED };
 enum tstate timer0_state;
 enum tstate timer1_state;
 enum tstate timer2_state;
+
+int	i8254_cputimer_disable;	/* No need to initialize i8254 cputimer. */
 
 static	int	beeping = 0;
 static	const u_char daysinmonth[] = {31,28,31,30,31,30,31,31,30,31,30,31};
@@ -123,11 +127,20 @@ static	u_char	rtc_statusa = RTCSA_DIVIDER | RTCSA_NOPROF;
 static	u_char	rtc_statusb = RTCSB_24HR | RTCSB_PINTR;
 static  int	rtc_loaded;
 
-static int i8254_cputimer_div;
+static	sysclock_t i8254_cputimer_div;
 
 static int i8254_nointr;
 static int i8254_intr_disable = 1;
 TUNABLE_INT("hw.i8254.intr_disable", &i8254_intr_disable);
+
+static int calibrate_timers_with_rtc = 0;
+TUNABLE_INT("hw.calibrate_timers_with_rtc", &calibrate_timers_with_rtc);
+
+static int calibrate_tsc_fast = 1;
+TUNABLE_INT("hw.calibrate_tsc_fast", &calibrate_tsc_fast);
+
+static int calibrate_test;
+TUNABLE_INT("hw.tsc_calibrate_test", &calibrate_test);
 
 static struct callout sysbeepstop_ch;
 
@@ -136,34 +149,16 @@ static void i8254_cputimer_construct(struct cputimer *cputimer, sysclock_t last)
 static void i8254_cputimer_destruct(struct cputimer *cputimer);
 
 static struct cputimer	i8254_cputimer = {
-    SLIST_ENTRY_INITIALIZER,
-    "i8254",
-    CPUTIMER_PRI_8254,
-    0,
-    i8254_cputimer_count,
-    cputimer_default_fromhz,
-    cputimer_default_fromus,
-    i8254_cputimer_construct,
-    i8254_cputimer_destruct,
-    TIMER_FREQ,
-    0, 0, 0
-};
-
-static sysclock_t tsc_cputimer_count(void);
-static void tsc_cputimer_construct(struct cputimer *, sysclock_t);
-
-static struct cputimer	tsc_cputimer = {
-    SLIST_ENTRY_INITIALIZER,
-    "TSC",
-    CPUTIMER_PRI_TSC,
-    CPUTIMER_TSC,
-    tsc_cputimer_count,
-    cputimer_default_fromhz,
-    cputimer_default_fromus,
-    tsc_cputimer_construct,
-    cputimer_default_destruct,
-    0,
-    0, 0, 0
+    .next		= SLIST_ENTRY_INITIALIZER,
+    .name		= "i8254",
+    .pri		= CPUTIMER_PRI_8254,
+    .type		= 0,	/* determined later */
+    .count		= i8254_cputimer_count,
+    .fromhz		= cputimer_default_fromhz,
+    .fromus		= cputimer_default_fromus,
+    .construct		= i8254_cputimer_construct,
+    .destruct		= i8254_cputimer_destruct,
+    .freq		= TIMER_FREQ
 };
 
 static void i8254_intr_reload(struct cputimer_intr *, sysclock_t);
@@ -178,12 +173,28 @@ static struct cputimer_intr i8254_cputimer_intr = {
     .restart = cputimer_intr_default_restart,
     .pmfixup = cputimer_intr_default_pmfixup,
     .initclock = i8254_intr_initclock,
+    .pcpuhand = NULL,
     .next = SLIST_ENTRY_INITIALIZER,
     .name = "i8254",
     .type = CPUTIMER_INTR_8254,
     .prio = CPUTIMER_INTR_PRIO_8254,
-    .caps = CPUTIMER_INTR_CAP_PS
+    .caps = CPUTIMER_INTR_CAP_PS,
+    .priv = NULL
 };
+
+/*
+ * Use this to lwkt_switch() when the scheduler clock is not
+ * yet running, otherwise lwkt_switch() won't do anything.
+ * XXX needs cleaning up in lwkt_thread.c
+ */
+static void
+lwkt_force_switch(void)
+{
+	crit_enter();
+	lwkt_schedulerclock(curthread);
+	crit_exit();
+	lwkt_switch();
+}
 
 /*
  * timer0 clock interrupt.  Timer0 is in one-shot mode and has stopped
@@ -275,20 +286,21 @@ static
 sysclock_t
 i8254_cputimer_count(void)
 {
-	static __uint16_t cputimer_last;
-	__uint16_t count;
+	static uint16_t cputimer_last;
+	uint16_t count;
 	sysclock_t ret;
 
 	clock_lock();
 	outb(TIMER_MODE, i8254_walltimer_sel | TIMER_LATCH);
-	count = (__uint8_t)inb(i8254_walltimer_cntr);		/* get countdown */
-	count |= ((__uint8_t)inb(i8254_walltimer_cntr) << 8);
+	count = (uint8_t)inb(i8254_walltimer_cntr);	/* get countdown */
+	count |= ((uint8_t)inb(i8254_walltimer_cntr) << 8);
 	count = -count;					/* -> countup */
 	if (count < cputimer_last)			/* rollover */
-		i8254_cputimer.base += 0x00010000;
+		i8254_cputimer.base += 0x00010000U;
 	ret = i8254_cputimer.base | count;
 	cputimer_last = count;
 	clock_unlock();
+
 	return(ret);
 }
 
@@ -302,8 +314,8 @@ i8254_cputimer_count(void)
 static void
 i8254_intr_config(struct cputimer_intr *cti, const struct cputimer *timer)
 {
-    int freq;
-    int div;
+    sysclock_t freq;
+    sysclock_t div;
 
     /*
      * Will a simple divide do the trick?
@@ -327,33 +339,35 @@ i8254_intr_config(struct cputimer_intr *cti, const struct cputimer *timer)
 static void
 i8254_intr_reload(struct cputimer_intr *cti, sysclock_t reload)
 {
-    __uint16_t count;
+    uint16_t count;
 
+    if ((ssysclock_t)reload < 0)
+	    reload = 1;
     if (i8254_cputimer_div)
 	reload /= i8254_cputimer_div;
     else
-	reload = (int64_t)reload * cti->freq / sys_cputimer->freq;
+	reload = muldivu64(reload, cti->freq, sys_cputimer->freq);
 
-    if ((int)reload < 2)
-	reload = 2;
+    if (reload < 2)
+	reload = 2;		/* minimum count */
+    if (reload > 0xFFFF)
+	reload = 0xFFFF;	/* almost full count (0 is full count) */
 
     clock_lock();
     if (timer0_running) {
 	outb(TIMER_MODE, TIMER_SEL0 | TIMER_LATCH);	/* count-down timer */
-	count = (__uint8_t)inb(TIMER_CNTR0);		/* lsb */
-	count |= ((__uint8_t)inb(TIMER_CNTR0) << 8);	/* msb */
+	count = (uint8_t)inb(TIMER_CNTR0);		/* lsb */
+	count |= ((uint8_t)inb(TIMER_CNTR0) << 8);	/* msb */
 	if (reload < count) {
 	    outb(TIMER_MODE, TIMER_SEL0 | TIMER_SWSTROBE | TIMER_16BIT);
-	    outb(TIMER_CNTR0, (__uint8_t)reload); 	/* lsb */
-	    outb(TIMER_CNTR0, (__uint8_t)(reload >> 8)); /* msb */
+	    outb(TIMER_CNTR0, (uint8_t)reload); 	/* lsb */
+	    outb(TIMER_CNTR0, (uint8_t)(reload >> 8));	/* msb */
 	}
     } else {
 	timer0_running = 1;
-	if (reload > 0xFFFF)
-	    reload = 0;		/* full count */
 	outb(TIMER_MODE, TIMER_SEL0 | TIMER_SWSTROBE | TIMER_16BIT);
-	outb(TIMER_CNTR0, (__uint8_t)reload); 		/* lsb */
-	outb(TIMER_CNTR0, (__uint8_t)(reload >> 8));	/* msb */
+	outb(TIMER_CNTR0, (uint8_t)reload); 		/* lsb */
+	outb(TIMER_CNTR0, (uint8_t)(reload >> 8));	/* msb */
     }
     clock_unlock();
 }
@@ -390,7 +404,7 @@ DODELAY(int n, int doswitch)
 	 * Guard against the timer being uninitialized if we are called
 	 * early for console i/o.
 	 */
-	if (timer0_state == RELEASED)
+	if (timer0_state == RELEASED && i8254_cputimer_disable == 0)
 		i8254_restore();
 
 	/*
@@ -400,8 +414,7 @@ DODELAY(int n, int doswitch)
 	 * number of microseconds.
 	 */
 	prev_tick = sys_cputimer->count();
-	ticks_left = ((u_int)n * (int64_t)sys_cputimer->freq + 999999) /
-		     1000000;
+	ticks_left = muldivu64(n, sys_cputimer->freq + 999999, 1000000);
 
 	/*
 	 * Loop until done.
@@ -447,18 +460,17 @@ CHECKTIMEOUT(TOTALDELAY *tdd)
 	int us;
 
 	if (tdd->started == 0) {
-		if (timer0_state == RELEASED)
+		if (timer0_state == RELEASED && i8254_cputimer_disable == 0)
 			i8254_restore();
 		tdd->last_clock = sys_cputimer->count();
 		tdd->started = 1;
 		return(0);
 	}
 	delta = sys_cputimer->count() - tdd->last_clock;
-	us = (u_int64_t)delta * (u_int64_t)1000000 /
-	     (u_int64_t)sys_cputimer->freq;
-	tdd->last_clock += (u_int64_t)us * (u_int64_t)sys_cputimer->freq /
-			   1000000;
+	us = muldivu64(delta, 1000000, sys_cputimer->freq);
+	tdd->last_clock += muldivu64(us, sys_cputimer->freq, 1000000);
 	tdd->us -= us;
+
 	return (tdd->us < 0);
 }
 
@@ -547,8 +559,8 @@ readrtc(int port)
 static u_int
 calibrate_clocks(void)
 {
-	u_int64_t old_tsc;
-	u_int tot_count;
+	tsc_uclock_t old_tsc;
+	sysclock_t tot_count;
 	sysclock_t count, prev_count;
 	int sec, start_sec, timeout;
 
@@ -604,7 +616,7 @@ calibrate_clocks(void)
 		if (!(rtcin(RTC_STATUSA) & RTCSA_TUP))
 			sec = rtcin(RTC_SEC);
 		count = sys_cputimer->count();
-		tot_count += (int)(count - prev_count);
+		tot_count += (sysclock_t)(count - prev_count);
 		prev_count = count;
 		if (sec != start_sec)
 			break;
@@ -618,18 +630,18 @@ calibrate_clocks(void)
 	 */
 	if (tsc_present) {
 		tsc_frequency = rdtsc() - old_tsc;
+		if (bootverbose) {
+			kprintf("TSC clock: %jd Hz (Method A)\n",
+			    (intmax_t)tsc_frequency);
+		}
 	}
+	tsc_oneus_approx = ((tsc_frequency|1) + 999999) / 1000000;
 
-	if (tsc_present) {
-		kprintf("TSC%s clock: %llu Hz, ",
-		    tsc_invariant ? " invariant" : "",
-		    (long long)tsc_frequency);
-	}
-	kprintf("i8254 clock: %u Hz\n", tot_count);
+	kprintf("i8254 clock: %lu Hz\n", tot_count);
 	return (tot_count);
 
 fail:
-	kprintf("failed, using default i8254 clock of %u Hz\n",
+	kprintf("failed, using default i8254 clock of %lu Hz\n",
 		i8254_cputimer.freq);
 	return (i8254_cputimer.freq);
 }
@@ -692,7 +704,7 @@ i8254_cputimer_construct(struct cputimer *timer, sysclock_t oldclock)
 		break;
 	}
 
-	timer->base = (oldclock + 0xFFFF) & ~0xFFFF;
+	timer->base = (oldclock + 0xFFFF) & 0xFFFFFFFFFFFF0000LU;
 
 	clock_lock();
 	outb(TIMER_MODE, i8254_walltimer_sel | TIMER_RATEGEN | TIMER_16BIT);
@@ -741,9 +753,95 @@ void
 timer_restore(void)
 {
 	crit_enter();
-	i8254_restore();		/* restore timer_freq and hz */
+	if (i8254_cputimer_disable == 0)
+		i8254_restore();	/* restore timer_freq and hz */
 	rtc_restore();			/* reenable RTC interrupts */
 	crit_exit();
+}
+
+#define MAX_MEASURE_RETRIES	100
+
+static u_int64_t
+do_measure(u_int64_t timer_latency, u_int64_t *latency, sysclock_t *time,
+    int *retries)
+{
+	u_int64_t tsc1, tsc2;
+	u_int64_t threshold;
+	sysclock_t val;
+	int cnt = 0;
+
+	do {
+		if (cnt > MAX_MEASURE_RETRIES/2)
+			threshold = timer_latency << 1;
+		else
+			threshold = timer_latency + (timer_latency >> 2);
+
+		cnt++;
+		tsc1 = rdtsc_ordered();
+		val = sys_cputimer->count();
+		tsc2 = rdtsc_ordered();
+	} while (timer_latency > 0 && cnt < MAX_MEASURE_RETRIES &&
+	    tsc2 - tsc1 > threshold);
+
+	*retries = cnt - 1;
+	*latency = tsc2 - tsc1;
+	*time = val;
+	return tsc1;
+}
+
+static u_int64_t
+do_calibrate_cputimer(u_int usecs, u_int64_t timer_latency)
+{
+	if (calibrate_tsc_fast) {
+		u_int64_t old_tsc1, start_lat1, new_tsc1, end_lat1;
+		u_int64_t old_tsc2, start_lat2, new_tsc2, end_lat2;
+		u_int64_t freq1, freq2;
+		sysclock_t start1, end1, start2, end2;
+		int retries1, retries2, retries3, retries4;
+
+		DELAY(1000);
+		old_tsc1 = do_measure(timer_latency, &start_lat1, &start1,
+		    &retries1);
+		DELAY(20000);
+		old_tsc2 = do_measure(timer_latency, &start_lat2, &start2,
+		    &retries2);
+		DELAY(usecs);
+		new_tsc1 = do_measure(timer_latency, &end_lat1, &end1,
+		    &retries3);
+		DELAY(20000);
+		new_tsc2 = do_measure(timer_latency, &end_lat2, &end2,
+		    &retries4);
+
+		old_tsc1 += start_lat1;
+		old_tsc2 += start_lat2;
+		freq1 = (new_tsc1 - old_tsc1) + (start_lat1 + end_lat1) / 2;
+		freq2 = (new_tsc2 - old_tsc2) + (start_lat2 + end_lat2) / 2;
+		end1 -= start1;
+		end2 -= start2;
+		/* This should in practice be safe from overflows. */
+		freq1 = muldivu64(freq1, sys_cputimer->freq, end1);
+		freq2 = muldivu64(freq2, sys_cputimer->freq, end2);
+		if (calibrate_test && (retries1 > 0 || retries2 > 0)) {
+			kprintf("%s: retries: %d, %d, %d, %d\n",
+			    __func__, retries1, retries2, retries3, retries4);
+		}
+		if (calibrate_test) {
+			kprintf("%s: freq1=%ju freq2=%ju avg=%ju\n",
+			    __func__, freq1, freq2, (freq1 + freq2) / 2);
+		}
+		return (freq1 + freq2) / 2;
+	} else {
+		u_int64_t old_tsc, new_tsc;
+		u_int64_t freq;
+
+		old_tsc = rdtsc_ordered();
+		DELAY(usecs);
+		new_tsc = rdtsc();
+		freq = new_tsc - old_tsc;
+		/* This should in practice be safe from overflows. */
+		freq = (freq * 1000 * 1000) / usecs;
+		return freq;
+	}
 }
 
 /*
@@ -752,7 +850,10 @@ timer_restore(void)
 void
 startrtclock(void)
 {
-	u_int delta, freq;
+	const timecounter_init_t **list;
+	sysclock_t delta, freq;
+
+	callout_init_mp(&sysbeepstop_ch);
 
 	/* 
 	 * Can we use the TSC?
@@ -785,6 +886,18 @@ startrtclock(void)
 	writertc(RTC_STATUSA, rtc_statusa);
 	writertc(RTC_STATUSB, RTCSB_24HR);
 
+	SET_FOREACH(list, timecounter_init_set) {
+		if ((*list)->configure != NULL)
+			(*list)->configure();
+	}
+
+	/*
+	 * If tsc_frequency is already initialized now, and a flag is set
+	 * that i8254 timer is unneeded, we are done.
+	 */
+	if (tsc_frequency != 0 && i8254_cputimer_disable != 0)
+		goto done;
+
 	/*
 	 * Set the 8254 timer0 in TIMER_SWSTROBE mode and cause it to 
 	 * generate an interrupt, which we will ignore for now.
@@ -793,14 +906,33 @@ startrtclock(void)
 	 * (so it counts a full 2^16 and repeats).  We will use this timer
 	 * for our counting.
 	 */
-	i8254_restore();
+	if (i8254_cputimer_disable == 0)
+		i8254_restore();
+
+	kprintf("Using cputimer %s for TSC calibration\n", sys_cputimer->name);
+
+	/*
+	 * When booting without verbose messages, it's pointless to run the
+	 * calibrate_clocks() calibration code, when we don't use the
+	 * results in any way. With bootverbose, we are at least printing
+	 *  this information to the kernel log.
+	 */
+	if (i8254_cputimer_disable != 0 ||
+	    (calibrate_timers_with_rtc == 0 && !bootverbose)) {
+		goto skip_rtc_based;
+	}
+
 	freq = calibrate_clocks();
 #ifdef CLK_CALIBRATION_LOOP
 	if (bootverbose) {
-		kprintf(
-		"Press a key on the console to abort clock calibration\n");
-		while (cncheckc() == -1)
+		int c;
+
+		cnpoll(TRUE);
+		kprintf("Press a key on the console to "
+			"abort clock calibration\n");
+		while ((c = cncheckc()) == -1 || c == NOKEY)
 			calibrate_clocks();
+		cnpoll(FALSE);
 	}
 #endif
 
@@ -810,14 +942,13 @@ startrtclock(void)
 	 * frequency.
 	 */
 	delta = freq > i8254_cputimer.freq ? 
-			freq - i8254_cputimer.freq : i8254_cputimer.freq - freq;
+		freq - i8254_cputimer.freq : i8254_cputimer.freq - freq;
 	if (delta < i8254_cputimer.freq / 100) {
-#ifndef CLK_USE_I8254_CALIBRATION
-		if (bootverbose)
+		if (calibrate_timers_with_rtc == 0) {
 			kprintf(
-"CLK_USE_I8254_CALIBRATION not specified - using default frequency\n");
-		freq = i8254_cputimer.freq;
-#endif
+"hw.calibrate_timers_with_rtc not set - using default i8254 frequency\n");
+			freq = i8254_cputimer.freq;
+		}
 		/*
 		 * NOTE:
 		 * Interrupt timer's freq must be adjusted
@@ -827,39 +958,94 @@ startrtclock(void)
 		cputimer_set_frequency(&i8254_cputimer, freq);
 	} else {
 		if (bootverbose)
-			kprintf(
-		    "%d Hz differs from default of %d Hz by more than 1%%\n",
-			       freq, i8254_cputimer.freq);
+			kprintf("%lu Hz differs from default of %lu Hz "
+				"by more than 1%%\n",
+			        freq, i8254_cputimer.freq);
 		tsc_frequency = 0;
 	}
 
-#ifndef CLK_USE_TSC_CALIBRATION
-	if (tsc_frequency != 0) {
-		if (bootverbose)
-			kprintf(
-"CLK_USE_TSC_CALIBRATION not specified - using old calibration method\n");
+	if (tsc_frequency != 0 && calibrate_timers_with_rtc == 0) {
+		kprintf("hw.calibrate_timers_with_rtc not "
+			"set - using old calibration method\n");
 		tsc_frequency = 0;
 	}
-#endif
+
+skip_rtc_based:
 	if (tsc_present && tsc_frequency == 0) {
-		/*
-		 * Calibration of the i586 clock relative to the mc146818A
-		 * clock failed.  Do a less accurate calibration relative
-		 * to the i8254 clock.
-		 */
-		u_int64_t old_tsc = rdtsc();
+		u_int cnt;
+		u_int64_t cputime_latency_tsc = 0, max = 0, min = 0;
+		int i;
 
-		DELAY(1000000);
-		tsc_frequency = rdtsc() - old_tsc;
-#ifdef CLK_USE_TSC_CALIBRATION
-		if (bootverbose) {
-			kprintf("TSC clock: %llu Hz (Method B)\n",
-				tsc_frequency);
+		for (i = 0; i < 10; i++) {
+			/* Warm up */
+			(void)sys_cputimer->count();
 		}
-#endif
+		for (i = 0; i < 100; i++) {
+			u_int64_t old_tsc, new_tsc;
+
+			old_tsc = rdtsc_ordered();
+			(void)sys_cputimer->count();
+			new_tsc = rdtsc_ordered();
+			cputime_latency_tsc += (new_tsc - old_tsc);
+			if (max < (new_tsc - old_tsc))
+				max = new_tsc - old_tsc;
+			if (min == 0 || min > (new_tsc - old_tsc))
+				min = new_tsc - old_tsc;
+		}
+		cputime_latency_tsc /= 100;
+		kprintf(
+		    "Timer latency (in TSC ticks): %lu min=%lu max=%lu\n",
+		    cputime_latency_tsc, min, max);
+		/* XXX Instead of this, properly filter out outliers. */
+		cputime_latency_tsc = min;
+
+		if (calibrate_test > 0) {
+			u_int64_t values[20], avg = 0;
+			for (i = 1; i <= 20; i++) {
+				u_int64_t freq;
+
+				freq = do_calibrate_cputimer(i * 100 * 1000,
+				    cputime_latency_tsc);
+				values[i - 1] = freq;
+			}
+			/* Compute an average TSC for the 1s to 2s delays. */
+			for (i = 10; i < 20; i++)
+				avg += values[i];
+			avg /= 10;
+			for (i = 0; i < 20; i++) {
+				kprintf("%ums: %lu (Diff from average: %ld)\n",
+				    (i + 1) * 100, values[i],
+				    (int64_t)(values[i] - avg));
+			}
+		}
+
+		if (calibrate_tsc_fast > 0) {
+			/* HPET would typically be >10MHz */
+			if (sys_cputimer->freq >= 10000000)
+				cnt = 200000;
+			else
+				cnt = 500000;
+		} else {
+			cnt = 1000000;
+		}
+
+		tsc_frequency = do_calibrate_cputimer(cnt, cputime_latency_tsc);
+		if (bootverbose && calibrate_timers_with_rtc) {
+			kprintf("TSC clock: %jd Hz (Method B)\n",
+			    (intmax_t)tsc_frequency);
+		}
 	}
 
-	EVENTHANDLER_REGISTER(shutdown_post_sync, resettodr_on_shutdown, NULL, SHUTDOWN_PRI_LAST);
+done:
+	if (tsc_present) {
+		kprintf("TSC%s clock: %jd Hz\n",
+		    tsc_invariant ? " invariant" : "",
+		    (intmax_t)tsc_frequency);
+	}
+	tsc_oneus_approx = ((tsc_frequency|1) + 999999) / 1000000;
+
+	EVENTHANDLER_REGISTER(shutdown_post_sync, resettodr_on_shutdown,
+			      NULL, SHUTDOWN_PRI_LAST);
 }
 
 /*
@@ -1019,7 +1205,7 @@ i8254_ioapic_trial(int irq, struct cputimer_intr *cti)
 	 * Following code assumes the 8254 is the cpu timer,
 	 * so make sure it is.
 	 */
-	KKASSERT(sys_cputimer == &i8254_cputimer);
+	/*KKASSERT(sys_cputimer == &i8254_cputimer); (tested by CuteLarva) */
 	KKASSERT(cti == &i8254_cputimer_intr);
 
 	lastcnt = get_interrupt_counter(irq, mycpuid);
@@ -1028,15 +1214,19 @@ i8254_ioapic_trial(int irq, struct cputimer_intr *cti)
 	 * Force an 8254 Timer0 interrupt and wait 1/100s for
 	 * it to happen, then see if we got it.
 	 */
-	kprintf("IOAPIC: testing 8254 interrupt delivery\n");
+	kprintf("IOAPIC: testing 8254 interrupt delivery...");
 
-	i8254_intr_reload(cti, 2);
+	i8254_intr_reload(cti, sys_cputimer->fromus(2));
 	base = sys_cputimer->count();
 	while (sys_cputimer->count() - base < sys_cputimer->freq / 100)
 		; /* nothing */
 
-	if (get_interrupt_counter(irq, mycpuid) - lastcnt == 0)
+	if (get_interrupt_counter(irq, mycpuid) - lastcnt == 0) {
+		kprintf(" failed\n");
 		return ENOENT;
+	} else {
+		kprintf(" success\n");
+	}
 	return 0;
 }
 
@@ -1052,7 +1242,6 @@ i8254_intr_initclock(struct cputimer_intr *cti, boolean_t selected)
 	int irq = 0, mixed_mode = 0, error;
 
 	KKASSERT(mycpuid == 0);
-	callout_init_mp(&sysbeepstop_ch);
 
 	if (!selected && i8254_intr_disable)
 		goto nointr;
@@ -1180,7 +1369,7 @@ static int
 hw_i8254_timestamp(SYSCTL_HANDLER_ARGS)
 {
     sysclock_t count;
-    __uint64_t tscval;
+    uint64_t tscval;
     char buf[32];
 
     crit_enter();
@@ -1193,28 +1382,122 @@ hw_i8254_timestamp(SYSCTL_HANDLER_ARGS)
     else
 	tscval = 0;
     crit_exit();
-    ksnprintf(buf, sizeof(buf), "%08x %016llx", count, (long long)tscval);
+    ksnprintf(buf, sizeof(buf), "%016lx %016lx", count, tscval);
     return(SYSCTL_OUT(req, buf, strlen(buf) + 1));
 }
 
-static uint64_t		tsc_mpsync_target;
+struct tsc_mpsync_info {
+	volatile int		tsc_ready_cnt;
+	volatile int		tsc_done_cnt;
+	volatile int		tsc_command;
+	volatile int		unused01[5];
+	struct {
+		uint64_t	v;
+		uint64_t	unused02;
+	} tsc_saved[MAXCPU];
+} __cachealign;
+
+#if 0
+static void
+tsc_mpsync_test_loop(struct tsc_mpsync_thr *info)
+{
+	struct globaldata *gd = mycpu;
+	tsc_uclock_t test_end, test_begin;
+	u_int i;
+
+	if (bootverbose) {
+		kprintf("cpu%d: TSC testing MP synchronization ...\n",
+		    gd->gd_cpuid);
+	}
+
+	test_begin = rdtsc_ordered();
+	/* Run test for 100ms */
+	test_end = test_begin + (tsc_frequency / 10);
+
+	arg->tsc_mpsync = 1;
+	arg->tsc_target = test_begin;
+
+#define TSC_TEST_TRYMAX		1000000	/* Make sure we could stop */
+#define TSC_TEST_TRYMIN		50000
+
+	for (i = 0; i < TSC_TEST_TRYMAX; ++i) {
+		struct lwkt_cpusync cs;
+
+		crit_enter();
+		lwkt_cpusync_init(&cs, gd->gd_other_cpus,
+		    tsc_mpsync_test_remote, arg);
+		lwkt_cpusync_interlock(&cs);
+		cpu_pause();
+		arg->tsc_target = rdtsc_ordered();
+		cpu_mfence();
+		lwkt_cpusync_deinterlock(&cs);
+		crit_exit();
+		cpu_pause();
+
+		if (!arg->tsc_mpsync) {
+			kprintf("cpu%d: TSC is not MP synchronized @%u\n",
+			    gd->gd_cpuid, i);
+			break;
+		}
+		if (arg->tsc_target > test_end && i >= TSC_TEST_TRYMIN)
+			break;
+	}
+
+#undef TSC_TEST_TRYMIN
+#undef TSC_TEST_TRYMAX
+
+	if (arg->tsc_target == test_begin) {
+		kprintf("cpu%d: TSC does not tick?!\n", gd->gd_cpuid);
+		/* XXX disable TSC? */
+		tsc_invariant = 0;
+		arg->tsc_mpsync = 0;
+		return;
+	}
+
+	if (arg->tsc_mpsync && bootverbose) {
+		kprintf("cpu%d: TSC is MP synchronized after %u tries\n",
+		    gd->gd_cpuid, i);
+	}
+}
+
+#endif
+
+#define TSC_TEST_COUNT		50000
 
 static void
-tsc_mpsync_test_remote(void *arg __unused)
+tsc_mpsync_ap_thread(void *xinfo)
 {
-	uint64_t tsc;
+	struct tsc_mpsync_info *info = xinfo;
+	int cpu = mycpuid;
+	int i;
 
-	tsc = rdtsc();
-	if (tsc < tsc_mpsync_target)
-		tsc_mpsync = 0;
+	/*
+	 * Tell main loop that we are ready and wait for initiation
+	 */
+	atomic_add_int(&info->tsc_ready_cnt, 1);
+	while (info->tsc_command == 0) {
+		lwkt_force_switch();
+	}
+
+	/*
+	 * Run test for 10000 loops or until tsc_done_cnt != 0 (another
+	 * cpu has finished its test), then increment done.
+	 */
+	crit_enter();
+	for (i = 0; i < TSC_TEST_COUNT && info->tsc_done_cnt == 0; ++i) {
+		info->tsc_saved[cpu].v = rdtsc_ordered();
+	}
+	crit_exit();
+	atomic_add_int(&info->tsc_done_cnt, 1);
+
+	lwkt_exit();
 }
 
 static void
 tsc_mpsync_test(void)
 {
-	struct globaldata *gd = mycpu;
-	uint64_t test_end, test_begin;
-	u_int i;
+	int cpu;
+	int try;
 
 	if (!tsc_invariant) {
 		/* Not even invariant TSC */
@@ -1231,114 +1514,117 @@ tsc_mpsync_test(void)
 	 * Forcing can be used w/qemu to reduce contention
 	 */
 	TUNABLE_INT_FETCH("hw.tsc_cputimer_force", &tsc_mpsync);
-	if (tsc_mpsync) {
-		kprintf("TSC as cputimer forced\n");
-		return;
-	}
 
-	if (cpu_vendor_id != CPU_VENDOR_INTEL) {
-		/* XXX only Intel works */
-		return;
-	}
-
-	kprintf("TSC testing MP synchronization ...\n");
-	tsc_mpsync = 1;
-
-	/* Run test for 100ms */
-	test_begin = rdtsc();
-	test_end = test_begin + (tsc_frequency / 10);
-
-#define TSC_TEST_TRYMAX		1000000	/* Make sure we could stop */
-
-	for (i = 0; i < TSC_TEST_TRYMAX; ++i) {
-		struct lwkt_cpusync cs;
-
-		crit_enter();
-		lwkt_cpusync_init(&cs, gd->gd_other_cpus,
-				  tsc_mpsync_test_remote, NULL);
-		lwkt_cpusync_interlock(&cs);
-		tsc_mpsync_target = rdtsc();
-		cpu_mfence();
-		lwkt_cpusync_deinterlock(&cs);
-		crit_exit();
-
-		if (!tsc_mpsync) {
-			kprintf("TSC is not MP synchronized @%u\n", i);
+	if (tsc_mpsync == 0) {
+		switch (cpu_vendor_id) {
+		case CPU_VENDOR_INTEL:
+			/*
+			 * Intel probably works
+			 */
 			break;
-		}
-		if (tsc_mpsync_target > test_end)
+
+		case CPU_VENDOR_AMD:
+			/*
+			 * For AMD 15h and 16h (i.e. The Bulldozer and Jaguar
+			 * architectures) we have to watch out for
+			 * Erratum 778:
+			 *     "Processor Core Time Stamp Counters May
+			 *      Experience Drift"
+			 * This Erratum is only listed for cpus in Family
+			 * 15h < Model 30h and for 16h < Model 30h.
+			 *
+			 * AMD < Bulldozer probably doesn't work
+			 */
+			if (CPUID_TO_FAMILY(cpu_id) == 0x15 ||
+			    CPUID_TO_FAMILY(cpu_id) == 0x16) {
+				if (CPUID_TO_MODEL(cpu_id) < 0x30)
+					return;
+			} else if (CPUID_TO_FAMILY(cpu_id) < 0x17) {
+				return;
+			}
 			break;
-	}
 
-#undef TSC_TEST_TRYMAX
-
-	if (tsc_mpsync) {
-		if (tsc_mpsync_target == test_begin) {
-			kprintf("TSC does not tick?!");
-			/* XXX disable TSC? */
-			tsc_invariant = 0;
-			tsc_mpsync = 0;
+		default:
+			/* probably won't work */
 			return;
 		}
-
-		kprintf("TSC is MP synchronized");
-		if (bootverbose)
-			kprintf(", after %u tries", i);
-		kprintf("\n");
+	} else if (tsc_mpsync < 0) {
+		kprintf("TSC MP synchronization test is disabled\n");
+		tsc_mpsync = 0;
+		return;
 	}
+
+	/*
+	 * Test even if forced to 1 above.  If forced, we will use the TSC
+	 * even if the test fails.  (set forced to -1 to disable entirely).
+	 */
+	kprintf("TSC testing MP synchronization ...\n");
+
+	/*
+	 * Test TSC MP synchronization on APs.  Try up to 4 times.
+	 */
+	for (try = 0; try < 4; ++try) {
+		struct tsc_mpsync_info info;
+		uint64_t last;
+		int64_t xdelta;
+		int64_t delta;
+
+		bzero(&info, sizeof(info));
+
+		for (cpu = 0; cpu < ncpus; ++cpu) {
+			thread_t td;
+			lwkt_create(tsc_mpsync_ap_thread, &info, &td,
+				    NULL, TDF_NOSTART, cpu,
+				    "tsc mpsync %d", cpu);
+			lwkt_setpri_initial(td, curthread->td_pri);
+			lwkt_schedule(td);
+		}
+		while (info.tsc_ready_cnt != ncpus)
+			lwkt_force_switch();
+
+		/*
+		 * All threads are ready, start the test and wait for
+		 * completion.
+		 */
+		info.tsc_command = 1;
+		while (info.tsc_done_cnt != ncpus)
+			lwkt_force_switch();
+
+		/*
+		 * Process results
+		 */
+		last = info.tsc_saved[0].v;
+		delta = 0;
+		for (cpu = 0; cpu < ncpus; ++cpu) {
+			xdelta = (int64_t)(info.tsc_saved[cpu].v - last);
+			last = info.tsc_saved[cpu].v;
+			if (xdelta < 0)
+				xdelta = -xdelta;
+			delta += xdelta;
+
+		}
+
+		/*
+		 * Result from attempt.  If its too wild just stop now.
+		 * Also break out if we succeed, no need to try further.
+		 */
+		kprintf("TSC MPSYNC TEST %jd %d -> %jd (10uS=%jd)\n",
+			delta, ncpus, delta / ncpus,
+			tsc_frequency / 100000);
+		if (delta / ncpus > tsc_frequency / 100)
+			break;
+		if (delta / ncpus < tsc_frequency / 100000) {
+			tsc_mpsync = 1;
+			break;
+		}
+	}
+
+	if (tsc_mpsync)
+		kprintf("TSC is MP synchronized\n");
+	else
+		kprintf("TSC is not MP synchronized\n");
 }
 SYSINIT(tsc_mpsync, SI_BOOT2_FINISH_SMP, SI_ORDER_ANY, tsc_mpsync_test, NULL);
-
-#define TSC_CPUTIMER_FREQMAX	128000000	/* 128Mhz */
-
-static int tsc_cputimer_shift;
-
-static void
-tsc_cputimer_construct(struct cputimer *timer, sysclock_t oldclock)
-{
-	timer->base = 0;
-	timer->base = oldclock - tsc_cputimer_count();
-}
-
-static sysclock_t
-tsc_cputimer_count(void)
-{
-	uint64_t tsc;
-
-	tsc = rdtsc();
-	tsc >>= tsc_cputimer_shift;
-
-	return (tsc + tsc_cputimer.base);
-}
-
-static void
-tsc_cputimer_register(void)
-{
-	uint64_t freq;
-	int enable = 1;
-
-	if (!tsc_mpsync)
-		return;
-
-	TUNABLE_INT_FETCH("hw.tsc_cputimer_enable", &enable);
-	if (!enable)
-		return;
-
-	freq = tsc_frequency;
-	while (freq > TSC_CPUTIMER_FREQMAX) {
-		freq >>= 1;
-		++tsc_cputimer_shift;
-	}
-	kprintf("TSC: cputimer freq %ju, shift %d\n",
-	    (uintmax_t)freq, tsc_cputimer_shift);
-
-	tsc_cputimer.freq = freq;
-
-	cputimer_register(&tsc_cputimer);
-	cputimer_select(&tsc_cputimer, 0);
-}
-SYSINIT(tsc_cputimer_reg, SI_BOOT2_POST_SMP, SI_ORDER_FIRST,
-	tsc_cputimer_register, NULL);
 
 SYSCTL_NODE(_hw, OID_AUTO, i8254, CTLFLAG_RW, 0, "I8254");
 SYSCTL_UINT(_hw_i8254, OID_AUTO, freq, CTLFLAG_RD, &i8254_cputimer.freq, 0,

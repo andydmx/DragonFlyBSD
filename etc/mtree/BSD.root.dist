@@ -12,6 +12,10 @@
         ..
         kernel
         ..
+        modules.local
+        ..
+    ..
+    build
     ..
     compat
         ndis
@@ -21,6 +25,8 @@
     ..
     etc
         X11
+        ..
+        autofs
         ..
         bluetooth
         ..
@@ -34,6 +40,8 @@
         ..
         mtree
         ..
+        pam.d
+        ..
         periodic
             daily
             ..
@@ -43,8 +51,6 @@
             ..
             weekly
             ..
-        ..
-        pam.d
         ..
         ppp
         ..
@@ -58,10 +64,12 @@
         ..
         upgrade
         ..
-        uucp            uname=uucp gname=uucp mode=0770
-        ..
+    ..
+    home
     ..
     lib
+        priv
+        ..
     ..
     libexec
     ..
@@ -69,7 +77,9 @@
     ..
     proc            mode=0555
     ..
-    root
+    rescue
+    ..
+    root            mode=0700
     ..
     sbin
     ..

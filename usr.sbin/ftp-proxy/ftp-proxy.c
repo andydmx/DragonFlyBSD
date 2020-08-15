@@ -98,10 +98,10 @@ void	client_read(struct session *);
 void	client_write(struct session *);
 int	drop_privs(void);
 void	end_session(struct session *);
-int	exit_daemon(void);
-int	getline(char *, size_t *);
+void	exit_daemon(void) __dead2;
+int	get_line(char *, size_t *);
 void	handle_connection(const int);
-void	handle_signal(int);
+void	handle_signal(int) __dead2;
 struct session * init_session(void);
 void	logmsg(int, const char *, ...) __printflike(2, 3);
 u_int16_t parse_port(int);
@@ -112,7 +112,7 @@ void	server_read(struct session *);
 void	server_write(struct session *);
 int	allow_data_connection(struct session *s);
 const char *sock_ntop(struct sockaddr *);
-void	usage(void);
+void	usage(void) __dead2;
 
 char linebuf[MAX_LINE + 1];
 size_t linelen;
@@ -261,7 +261,7 @@ client_read(struct session *s)
 		bread = read(s->client_fd, s->cbuf + s->cbuf_valid, buf_avail);
 		s->cbuf_valid += bread;
 
-		while ((n = getline(s->cbuf, &s->cbuf_valid)) > 0) {
+		while ((n = get_line(s->cbuf, &s->cbuf_valid)) > 0) {
 			logmsg(LOG_DEBUG, "#%d client: %s", s->id, linebuf);
 			if (!client_parse(s)) {
 				end_session(s);
@@ -364,7 +364,7 @@ end_session(struct session *s)
 	session_count--;
 }
 
-int
+void
 exit_daemon(void)
 {
 	struct session *s, *tmp;
@@ -377,13 +377,10 @@ exit_daemon(void)
 		closelog();
 
 	exit(0);
-
-	/* NOTREACHED */
-	return (-1);
 }
 
 int
-getline(char *buf, size_t *valid)
+get_line(char *buf, size_t *valid)
 {
 	size_t i;
 
@@ -1132,7 +1129,7 @@ server_read(struct session *s)
 		bread = read(s->server_fd, s->sbuf + s->sbuf_valid, buf_avail);
 		s->sbuf_valid += bread;
 
-		while ((n = getline(s->sbuf, &s->sbuf_valid)) > 0) {
+		while ((n = get_line(s->sbuf, &s->sbuf_valid)) > 0) {
 			logmsg(LOG_DEBUG, "#%d server: %s", s->id, linebuf);
 			if (!server_parse(s)) {
 				end_session(s);

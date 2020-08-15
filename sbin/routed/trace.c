@@ -10,11 +10,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgment:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -30,6 +26,7 @@
  * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
  *
+ * @(#)trace.c	8.1 (Berkeley) 6/5/93
  * $FreeBSD: src/sbin/routed/trace.c,v 1.5.2.1 2002/11/07 17:19:13 imp Exp $
  */
 
@@ -39,18 +36,6 @@
 #include <sys/stat.h>
 #include <sys/signal.h>
 #include <fcntl.h>
-
-#if !defined(sgi) && !defined(__NetBSD__)
-static char sccsid[] __attribute__((unused)) = "@(#)trace.c	8.1 (Berkeley) 6/5/93";
-#elif defined(__NetBSD__)
-__RCSID("$NetBSD$");
-#endif
-
-
-#ifdef sgi
-/* use *stat64 for files on large filesystems */
-#define stat	stat64
-#endif
 
 #define	NRECORDS	50		/* size of circular trace buffer */
 
@@ -62,7 +47,7 @@ char	inittracename[MAXPATHLEN+1];
 int	file_trace;			/* 1=tracing to file, not stdout */
 
 static void trace_dump(void);
-static void tmsg(const char *, ...) PATTRIB(1,2);
+static void tmsg(const char *, ...) __printflike(1, 2);
 
 
 /* convert string to printable characters
@@ -151,12 +136,8 @@ ts(time_t secs) {
 	static char s[20];
 
 	secs += epoch.tv_sec;
-#ifdef sgi
-	cftime(s, "%T", &secs);
-#else
 	memcpy(s, ctime(&secs)+11, 8);
 	s[8] = '\0';
-#endif
 	return s;
 }
 
@@ -384,7 +365,7 @@ set_tracefile(const char *filename,
 
 /* ARGSUSED */
 void
-sigtrace_on(int s UNUSED)
+sigtrace_on(__unused int s)
 {
 	new_tracelevel++;
 	sigtrace_pat = "SIGUSR1: %s";
@@ -393,7 +374,7 @@ sigtrace_on(int s UNUSED)
 
 /* ARGSUSED */
 void
-sigtrace_off(int s UNUSED)
+sigtrace_off(__unused int s)
 {
 	new_tracelevel--;
 	sigtrace_pat = "SIGUSR2: %s";
@@ -816,8 +797,7 @@ trace_add_del(const char * action, struct rt_entry *rt)
 
 /* ARGSUSED */
 static int
-walk_trace(struct radix_node *rn,
-	   struct walkarg *w UNUSED)
+walk_trace(struct radix_node *rn, __unused struct walkarg *w)
 {
 #define RT ((struct rt_entry *)rn)
 	struct rt_spare *rts;

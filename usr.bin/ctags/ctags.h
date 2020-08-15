@@ -10,11 +10,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -32,9 +28,7 @@
  *
  *	@(#)ctags.h	8.3 (Berkeley) 4/2/94
  *
- * $FreeBSD: src/usr.bin/ctags/ctags.h,v 1.4.2.2 2002/07/30 00:55:07 tjr Exp $
- * $DragonFly: src/usr.bin/ctags/ctags.h,v 1.2 2003/06/17 04:29:25 dillon Exp $
- *
+ * $FreeBSD: head/usr.bin/ctags/ctags.h 299355 2016-05-10 11:11:23Z bapt $
  */
 
 #define	bool	char
@@ -89,7 +83,7 @@ extern char    *lbp;
 extern char	searchar;		/* ex search character */
 
 extern int	cicmp(const char *);
-extern void	getline(void);
+extern void	get_line(void);
 extern void	pfnote(const char *, int);
 extern int	skip_key(int);
 extern void	put_entries(NODE *);

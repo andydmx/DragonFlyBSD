@@ -1,15 +1,15 @@
 /*
  * SYS/SYSTIMER.H
- * 
+ *
  * Copyright (c) 2003,2004 The DragonFly Project.  All rights reserved.
- * 
+ *
  * This code is derived from software contributed to The DragonFly Project
  * by Matthew Dillon <dillon@backplane.com>
- * 
+ *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
  * are met:
- * 
+ *
  * 1. Redistributions of source code must retain the above copyright
  *    notice, this list of conditions and the following disclaimer.
  * 2. Redistributions in binary form must reproduce the above copyright
@@ -19,7 +19,7 @@
  * 3. Neither the name of The DragonFly Project nor the names of its
  *    contributors may be used to endorse or promote products derived
  *    from this software without specific, prior written permission.
- * 
+ *
  * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
  * ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
  * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
@@ -32,8 +32,6 @@
  * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT
  * OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
- * 
- * $DragonFly: src/sys/sys/systimer.h,v 1.13 2007/04/30 06:57:36 dillon Exp $
  */
 
 #ifndef _SYS_SYSTIMER_H_
@@ -48,16 +46,10 @@
 #include <sys/queue.h>
 #endif
 
-/* XXX fix sys/kinfo.h */
-#ifndef __BOOLEAN_T_DEFINED__
-#define __BOOLEAN_T_DEFINED__
-typedef	__boolean_t	boolean_t;
-#endif
-
 struct intrframe;
 
-typedef __uint32_t	sysclock_t;
-typedef int32_t		ssysclock_t;
+typedef __uint64_t	sysclock_t;
+typedef int64_t		ssysclock_t;
 typedef TAILQ_HEAD(systimerq, systimer) *systimerq_t;
 typedef void (*systimer_func_t)(struct systimer *, int, struct intrframe *);
 
@@ -65,11 +57,12 @@ typedef struct systimer {
     TAILQ_ENTRY(systimer)	node;
     systimerq_t			queue;
     sysclock_t			time;		/* absolute time next intr */
-    sysclock_t			periodic;	/* if non-zero */
+    sysclock_t			periodic;	/* non-zero if periodic */
     systimer_func_t		func;
     void			*data;
     int				flags;
-    int				freq;		/* frequency if periodic */
+    int				us;		/* non-zero if one-shot */
+    ssysclock_t			freq;		/* frequency if periodic */
     struct cputimer		*which;		/* which timer was used? */
     struct globaldata		*gd;		/* cpu owning structure */
 } *systimer_t;
@@ -77,29 +70,50 @@ typedef struct systimer {
 #define SYSTF_ONQUEUE		0x0001
 #define SYSTF_IPIRUNNING	0x0002
 #define SYSTF_NONQUEUED		0x0004
+#define SYSTF_MSSYNC		0x0008		/* 1Khz coincident sync */
+#define SYSTF_100KHZSYNC	0x0010		/* 100Khz coincident sync */
+#define SYSTF_FIRST		0x0020		/* order first if coincident */
+#define SYSTF_OFFSET50		0x0040		/* add 1/2 interval offset */
+#define SYSTF_OFFSETCPU		0x0080		/* add cpu*periodic/ncpus */
 
+#ifdef _KERNEL
+void systimer_changed(void);
 void systimer_intr_enable(void);
 void systimer_intr(sysclock_t *, int, struct intrframe *);
 void systimer_add(systimer_t);
 void systimer_del(systimer_t);
-void systimer_init_periodic(systimer_t, systimer_func_t, void *, int);
-void systimer_init_periodic_nq(systimer_t, systimer_func_t, void *, int);
-void systimer_adjust_periodic(systimer_t, int);
-void systimer_init_oneshot(systimer_t, systimer_func_t, void *, int);
+void systimer_init_periodic(systimer_t, systimer_func_t, void *, int64_t);
+void systimer_init_periodic_nq(systimer_t, systimer_func_t, void *, int64_t);
+void systimer_init_periodic_nq1khz(systimer_t, systimer_func_t, void *, int64_t);
+void systimer_init_periodic_nq100khz(systimer_t, systimer_func_t, void *, int64_t);
+void systimer_init_periodic_flags(systimer_t, systimer_func_t, void *,
+			int64_t, int);
+void systimer_adjust_periodic(systimer_t, int64_t);
+void systimer_init_oneshot(systimer_t, systimer_func_t, void *, int64_t);
 
 /*
- * cputimer interface.  This provides a free-running (non-interrupt) 
- * timebase for the system.  The cputimer
+ * The cputimer interface.  This provides a free-running (non-interrupt)
+ * and monotonically increasing timebase for the system.
  *
- * These variables hold the fixed cputimer frequency, determining the
- * granularity of cputimer_count().
+ * The cputimer structure holds the fixed cputimer frequency, determining
+ * the granularity of sys_cputimer->count().
  *
- * Note that cputimer_count() always returns a full-width wrapping counter.
+ * Note that sys_cputimer->count() always returns a full-width wrapping
+ * counter.
  *
- * The 64 bit versions are used for converting count values into uS or nS
- * as follows:
+ * The 64 bit versions of the frequency are used for converting count
+ * values into uS or nS as follows:
  *
- *	usec = (cputimer_freq64_usec * count) >> 32
+ *	usec = (sys_cputimer->freq64_usec * count) >> 32
+ *
+ * NOTE: If count > sys_cputimer->freq, above conversion may overflow.
+ *
+ * REQUIREMENT FOR CPUTIMER IMPLEMENTATION:
+ *
+ * - The values returned by count() must be MP synchronized.
+ * - The values returned by count() must be stable under all situation,
+ *   e.g. when the platform enters power saving mode.
+ * - The values returned by count() must be monotonically increasing.
  */
 
 struct cputimer {
@@ -108,14 +122,15 @@ struct cputimer {
     int		pri;
     int		type;
     sysclock_t	(*count)(void);
-    sysclock_t	(*fromhz)(int freq);
-    sysclock_t	(*fromus)(int us);
+    sysclock_t	(*fromhz)(int64_t freq);
+    sysclock_t	(*fromus)(int64_t us);
     void	(*construct)(struct cputimer *, sysclock_t);
     void	(*destruct)(struct cputimer *);
-    sysclock_t	freq;		/* in Hz */
-    int64_t	freq64_usec;	/* in (1e6 << 32) / timer_freq */
-    int64_t	freq64_nsec;	/* in (1e9 << 32) / timer_freq */
+    sysclock_t	sync_base;	/* periodic synchronization base */
     sysclock_t	base;		/* (implementation dependant) */
+    sysclock_t	freq;		/* in Hz */
+    int64_t	freq64_usec;	/* in (1e6 << 32) / freq */
+    int64_t	freq64_nsec;	/* in (1e9 << 32) / freq */
 };
 
 extern struct cputimer *sys_cputimer;
@@ -129,6 +144,9 @@ extern struct cputimer *sys_cputimer;
 #define CPUTIMER_GEODE		6
 #define CPUTIMER_CS5536		7
 #define CPUTIMER_TSC		8
+#define CPUTIMER_VMM		9
+#define CPUTIMER_VMM1		10
+#define CPUTIMER_VMM2		11
 
 #define CPUTIMER_PRI_DUMMY	-10
 #define CPUTIMER_PRI_8254	0
@@ -138,13 +156,15 @@ extern struct cputimer *sys_cputimer;
 #define CPUTIMER_PRI_GEODE	40
 #define CPUTIMER_PRI_VKERNEL	200
 #define CPUTIMER_PRI_TSC	250
+#define CPUTIMER_PRI_VMM	1000
+#define CPUTIMER_PRI_VMM_HI	2000
 
 void cputimer_select(struct cputimer *, int);
 void cputimer_register(struct cputimer *);
 void cputimer_deregister(struct cputimer *);
 void cputimer_set_frequency(struct cputimer *, sysclock_t);
-sysclock_t cputimer_default_fromhz(int);
-sysclock_t cputimer_default_fromus(int);
+sysclock_t cputimer_default_fromhz(int64_t);
+sysclock_t cputimer_default_fromus(int64_t);
 void cputimer_default_construct(struct cputimer *, sysclock_t);
 void cputimer_default_destruct(struct cputimer *);
 
@@ -173,6 +193,7 @@ void cputimer_default_destruct(struct cputimer *);
  * restart   -- Start the possibly stalled interrupt cputimer immediately.
  *              Do fixup if necessary.
  * pmfixup   -- Called after ACPI power management is enabled.
+ * pcpuhand  -- Per-cpu handler (could be NULL).
  */
 struct cputimer_intr {
 	sysclock_t	freq;
@@ -188,21 +209,26 @@ struct cputimer_intr {
 			(struct cputimer_intr *);
 	void		(*initclock)
 			(struct cputimer_intr *, boolean_t);
+	void		(*pcpuhand)
+			(struct cputimer_intr *);
 	SLIST_ENTRY(cputimer_intr) next;
 	const char	*name;
 	int		type;	/* CPUTIMER_INTR_ */
 	int		prio;	/* CPUTIMER_INTR_PRIO_ */
 	uint32_t	caps;	/* CPUTIMER_INTR_CAP_ */
+	void		*priv;	/* private data */
 };
 
 #define CPUTIMER_INTR_8254		0
 #define CPUTIMER_INTR_LAPIC		1
 #define CPUTIMER_INTR_VKERNEL		2
+#define CPUTIMER_INTR_VMM		3
 
 /* NOTE: Keep the new values less than CPUTIMER_INTR_PRIO_MAX */
 #define CPUTIMER_INTR_PRIO_8254		0
 #define CPUTIMER_INTR_PRIO_LAPIC	10
 #define CPUTIMER_INTR_PRIO_VKERNEL	20
+#define CPUTIMER_INTR_PRIO_VMM		500
 #define CPUTIMER_INTR_PRIO_MAX		1000
 
 #define CPUTIMER_INTR_CAP_NONE		0
@@ -246,6 +272,45 @@ void cputimer_intr_restart(void);
 int  cputimer_intr_select_caps(uint32_t);
 int  cputimer_intr_powersave_addreq(void);
 void cputimer_intr_powersave_remreq(void);
+
+/*
+ * The cpucounter interface.
+ *
+ * REQUIREMENT FOR CPUCOUNTER IMPLEMENTATION:
+ *
+ * - The values returned by count() must be MP synchronized, if
+ *   CPUCOUNTER_FLAG_MPSYNC is set on 'flags'.
+ * - The values returned by count() must be stable under all situation,
+ *   e.g. when the platform enters power saving mode.
+ * - The values returned by count() must be monotonically increasing.
+ */
+struct cpucounter {
+	uint64_t	freq;
+	uint64_t	(*count)(void);
+	uint16_t	flags;		/* CPUCOUNTER_FLAG_ */
+	uint16_t	prio;		/* CPUCOUNTER_PRIO_ */
+	uint16_t	type;		/* CPUCOUNTER_ */
+	uint16_t	reserved;
+	SLIST_ENTRY(cpucounter) link;
+} __cachealign;
+
+#define CPUCOUNTER_FLAG_MPSYNC		0x0001
+
+#define CPUCOUNTER_DUMMY		0
+#define CPUCOUNTER_TSC			1
+#define CPUCOUNTER_VMM			2
+#define CPUCOUNTER_VMM1			3
+#define CPUCOUNTER_VMM2			4
+
+#define CPUCOUNTER_PRIO_DUMMY		0
+#define CPUCOUNTER_PRIO_TSC		50
+#define CPUCOUNTER_PRIO_VMM		100
+#define CPUCOUNTER_PRIO_VMM_HI		150
+
+void cpucounter_register(struct cpucounter *);
+const struct cpucounter *cpucounter_find_pcpu(void);
+const struct cpucounter *cpucounter_find(void);
+#endif	/* _KERNEL */
 
 #endif	/* _KERNEL || _KERNEL_STRUCTURES */
 

@@ -32,21 +32,18 @@
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/sockio.h>
-
-#include <stdlib.h>
-#include <unistd.h>
-
-#include <net/ethernet.h>
 #include <net/if.h>
+#include <net/route.h>
+#include <net/ethernet.h>
 #include <netinet/in.h>
 #include <netinet/ip_carp.h>
-#include <net/route.h>
-
 #include <arpa/inet.h>
 
 #include <ctype.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 #include <err.h>
 #include <errno.h>
 
@@ -86,7 +83,7 @@ carp_status(int s)
 	}
 
 	memset(&ifd, 0, sizeof(ifd));
-	strncpy(ifd.ifd_name, ifr.ifr_name, sizeof(ifd.ifd_name));
+	strlcpy(ifd.ifd_name, ifr.ifr_name, sizeof(ifd.ifd_name));
 	ifd.ifd_cmd = CARPGDEVNAME;
 	ifd.ifd_len = sizeof(devname);
 	ifd.ifd_data = devname;
@@ -187,7 +184,7 @@ getcarp_vhaddr(const char *val, int d, int s, const struct afswtch *afp)
 	int count, i;
 
 	memset(&ifd, 0, sizeof(ifd));
-	strncpy(ifd.ifd_name, ifr.ifr_name, sizeof(ifd.ifd_name));
+	strlcpy(ifd.ifd_name, ifr.ifr_name, sizeof(ifd.ifd_name));
 	ifd.ifd_cmd = CARPGVHADDR;
 	if (ioctl(s, SIOCGDRVSPEC, &ifd) < 0)
 		return;
@@ -250,11 +247,9 @@ static struct afswtch af_carp = {
 static __constructor(101) void
 carp_ctor(void)
 {
-#define	N(a)	(sizeof(a) / sizeof(a[0]))
-	int i;
+	size_t i;
 
-	for (i = 0; i < N(carp_cmds);  i++)
+	for (i = 0; i < nitems(carp_cmds);  i++)
 		cmd_register(&carp_cmds[i]);
 	af_register(&af_carp);
-#undef N
 }

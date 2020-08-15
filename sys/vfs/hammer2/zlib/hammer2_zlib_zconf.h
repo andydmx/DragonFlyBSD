@@ -8,6 +8,9 @@
 #ifndef ZCONF_H
 #define ZCONF_H
 
+/* DRAGONFLY ADDITION - Allows inclusion in conf/files */
+#define Z_PREFIX
+
 /*
  * If you *really* need a unique prefix for all types and library functions,
  * compile with -DZ_PREFIX. The "standard" zlib should be compiled without it.
@@ -205,7 +208,7 @@ typedef uLong FAR uLongf;
 #endif
 
 #if !defined(Z_U4) && defined(STDC)
-#  include <limits.h>
+#  include <sys/limits.h>
 #  if (UINT_MAX == 0xffffffffUL)
 #    define Z_U4 unsigned
 #  elif (ULONG_MAX == 0xffffffffUL)
@@ -230,7 +233,7 @@ typedef uLong FAR uLongf;
 #endif
 
 #if defined(STDC) || defined(Z_HAVE_STDARG_H)
-#    include <stdarg.h>         /* for va_list */
+#    include <sys/stdarg.h>     /* for va_list */
 #endif
 
 /* a little trick to accommodate both "#define _LARGEFILE64_SOURCE" and

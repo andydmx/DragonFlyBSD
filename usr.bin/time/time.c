@@ -29,38 +29,46 @@
  * @(#) Copyright (c) 1987, 1988, 1993 The Regents of the University of California.  All rights reserved.
  * @(#)time.c	8.1 (Berkeley) 6/6/93
  * $FreeBSD: src/usr.bin/time/time.c,v 1.14.2.5 2002/06/28 08:35:15 tjr Exp $
- * $DragonFly: src/usr.bin/time/time.c,v 1.11 2005/03/04 16:54:37 liamfoy Exp $
  */
 
-#include <sys/user.h>
 #include <sys/time.h>
 #include <sys/resource.h>
 #include <sys/signal.h>
-#include <sys/sysctl.h>
 #include <sys/wait.h>
 
 #include <err.h>
 #include <errno.h>
+#ifndef BOOTSTRAPPING
 #include <kinfo.h>
+#endif
 #include <locale.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 static void humantime(FILE *, long, long);
+static void showtime(FILE *, struct timespec *, struct timespec *,
+    struct rusage *);
+static void siginfo(int);
+
 static void usage(void);
 
+static sig_atomic_t siginfo_recvd;
 static char decimal_point;
+struct timespec before_ts;
+static int hflag, pflag;
 
 int
 main(int argc, char **argv)
 {
 	pid_t pid;
-	int aflag, ch, hflag, lflag, status, pflag;
+	int aflag, ch, lflag, status;
 	int exit_on_sig;
-	struct timeval before, after;
+	struct timespec after;
 	struct rusage ru;
 	FILE *out = stderr;
 	const char *ofn = NULL;
@@ -78,7 +86,9 @@ main(int argc, char **argv)
 			hflag = 1;
 			break;
 		case 'l':
+#ifndef BOOTSTRAPPING
 			lflag = 1;
+#endif
 			break;
 		case 'o':
 			ofn = optarg;
@@ -95,13 +105,13 @@ main(int argc, char **argv)
 	argv += optind;
 
 	if (ofn) {
-	        if ((out = fopen(ofn, aflag ? "a" : "w")) == NULL)
+	        if ((out = fopen(ofn, aflag ? "ae" : "we")) == NULL)
 		        err(1, "%s", ofn);
 		setvbuf(out, NULL, _IONBF, (size_t)0);
 	}
 
-	if (gettimeofday(&before, NULL) == -1)
-		err(1, "gettimeofday failed");
+	if (clock_gettime(CLOCK_MONOTONIC, &before_ts) == -1)
+		err(1, "clock_gettime failed");
 	switch (pid = fork()) {
 	case -1:			/* error */
 		err(1, "could not fork");
@@ -113,51 +123,31 @@ main(int argc, char **argv)
 	}
 	/* parent */
 	if (signal(SIGINT, SIG_IGN) == SIG_ERR)
-		err(1, "signal failed");	
+		err(1, "signal failed");
 	if (signal(SIGQUIT, SIG_IGN) == SIG_ERR)
 		err(1, "signal failed");
-	while (wait4(pid, &status, 0, &ru) != pid)		/* XXX use waitpid */
-		;
-	if (gettimeofday(&after, NULL) == -1)
-		err(1, "gettimeofday failed");
+	siginfo_recvd = 0;
+#ifdef SIGINFO
+	if (signal(SIGINFO, siginfo) == SIG_ERR)
+		err(1, "signal failed");
+	siginterrupt(SIGINFO,1 );
+#endif
+	while (wait4(pid, &status, 0, &ru) != pid){
+		if (siginfo_recvd) {
+			siginfo_recvd = 0;
+			if (clock_gettime(CLOCK_MONOTONIC, &after) == -1)
+				err(1, "clock_gettime failed");
+			getrusage(RUSAGE_CHILDREN, &ru);
+			showtime(stdout, &before_ts, &after, &ru);
+		}
+	}
+	if (clock_gettime(CLOCK_MONOTONIC, &after) == -1)
+		err(1, "clock_gettime failed");
 	if (!WIFEXITED(status))
 		warnx("command terminated abnormally");
 	exit_on_sig = WIFSIGNALED(status) ? WTERMSIG(status) : 0;
-	after.tv_sec -= before.tv_sec;
-	after.tv_usec -= before.tv_usec;
-	if (after.tv_usec < 0)
-		after.tv_sec--, after.tv_usec += 1000000;
-	if (pflag) {
-		/* POSIX wants output that must look like
-		"real %f\nuser %f\nsys %f\n" and requires
-		at least two digits after the radix. */
-		fprintf(out, "real %ld%c%02ld\n",
-			after.tv_sec, decimal_point,
-			after.tv_usec / 10000);
-		fprintf(out, "user %ld%c%02ld\n",
-			ru.ru_utime.tv_sec, decimal_point,
-			ru.ru_utime.tv_usec / 10000);
-		fprintf(out, "sys %ld%c%02ld\n",
-			ru.ru_stime.tv_sec, decimal_point,
-			ru.ru_stime.tv_usec / 10000);
-	} else if (hflag) {
-		humantime(out, after.tv_sec, after.tv_usec / 10000);
-		fprintf(out, " real\t");
-		humantime(out, ru.ru_utime.tv_sec, ru.ru_utime.tv_usec / 10000);
-		fprintf(out, " user\t");
-		humantime(out, ru.ru_stime.tv_sec, ru.ru_stime.tv_usec / 10000);
-		fprintf(out, " sys\n");
-	} else {
-		fprintf(out, "%9ld%c%02ld real ",
-			after.tv_sec, decimal_point,
-			after.tv_usec / 10000);
-		fprintf(out, "%9ld%c%02ld user ",
-			ru.ru_utime.tv_sec, decimal_point,
-			ru.ru_utime.tv_usec / 10000);
-		fprintf(out, "%9ld%c%02ld sys\n",
-			ru.ru_stime.tv_sec, decimal_point,
-			ru.ru_stime.tv_usec / 10000);
-	}
+	showtime(out, &before_ts, &after, &ru);
+#ifndef BOOTSTRAPPING
 	if (lflag) {
 		int hz;
 		u_long ticks;
@@ -203,6 +193,7 @@ main(int argc, char **argv)
 		fprintf(out, "%10ld  %s\n",
 			ru.ru_nivcsw, "involuntary context switches");
 	}
+#endif
 	/*
 	 * If the child has exited on a signal, exit on the same
 	 * signal, too, in order to reproduce the child's exit
@@ -246,4 +237,53 @@ humantime(FILE *out, long sec, long usec)
 	if (mins)
 		fprintf(out, "%ldm", mins);
 	fprintf(out, "%ld%c%02lds", sec, decimal_point, usec);
+}
+
+static void
+showtime(FILE *out, struct timespec *before, struct timespec *after,
+    struct rusage *ru)
+{
+
+	after->tv_sec -= before->tv_sec;
+	after->tv_nsec -= before->tv_nsec;
+	if (after->tv_nsec < 0)
+		after->tv_sec--, after->tv_nsec += 1000000000L;
+
+	if (pflag) {
+		/* POSIX wants output that must look like
+		"real %f\nuser %f\nsys %f\n" and requires
+		at least two digits after the radix. */
+		fprintf(out, "real %jd%c%02ld\n",
+			(intmax_t)after->tv_sec, decimal_point,
+			after->tv_nsec/10000000L);
+		fprintf(out, "user %jd%c%02ld\n",
+			(intmax_t)ru->ru_utime.tv_sec, decimal_point,
+			ru->ru_utime.tv_usec/10000);
+		fprintf(out, "sys %jd%c%02ld\n",
+			(intmax_t)ru->ru_stime.tv_sec, decimal_point,
+			ru->ru_stime.tv_usec/10000);
+	} else if (hflag) {
+		humantime(out, after->tv_sec, after->tv_nsec/10000000);
+		fprintf(out, " real\t");
+		humantime(out, ru->ru_utime.tv_sec, ru->ru_utime.tv_usec/10000);
+		fprintf(out, " user\t");
+		humantime(out, ru->ru_stime.tv_sec, ru->ru_stime.tv_usec/10000);
+		fprintf(out, " sys\n");
+	} else {
+		fprintf(out, "%9jd%c%02ld real ",
+			(intmax_t)after->tv_sec, decimal_point,
+			after->tv_nsec/10000000);
+		fprintf(out, "%9jd%c%02ld user ",
+			(intmax_t)ru->ru_utime.tv_sec, decimal_point,
+			ru->ru_utime.tv_usec/10000);
+		fprintf(out, "%9jd%c%02ld sys\n",
+			(intmax_t)ru->ru_stime.tv_sec, decimal_point,
+			ru->ru_stime.tv_usec/10000);
+	}
+}
+
+static void
+siginfo(int sig __unused)
+{
+	siginfo_recvd = 1;
 }

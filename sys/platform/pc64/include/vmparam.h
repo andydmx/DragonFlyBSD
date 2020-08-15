@@ -52,18 +52,21 @@
 /*
  * Virtual memory related constants, all in bytes
  */
-#define	MAXTSIZ		(128UL*1024*1024)	/* max text size */
+#define	MAXTSIZ		(32UL*1024*1024*1024)	/* max text size */
 #ifndef DFLDSIZ
 #define	DFLDSIZ		(128UL*1024*1024)	/* initial data size limit */
 #endif
 #ifndef MAXDSIZ
-#define	MAXDSIZ		(32768UL*1024*1024)	/* max data size */
+#define	MAXDSIZ		(32UL*1024*1024*1024)	/* max data size */
 #endif
 #ifndef	DFLSSIZ
 #define	DFLSSIZ		(8UL*1024*1024)		/* initial stack size limit */
 #endif
 #ifndef	MAXSSIZ
 #define	MAXSSIZ		(512UL*1024*1024)	/* max stack size */
+#endif
+#ifndef	MAXTHRSSIZ
+#define	MAXTHRSSIZ	(128UL*1024*1024*1024)	/* thread stack area */
 #endif
 #ifndef SGROWSIZ
 #define	SGROWSIZ	(128UL*1024)		/* amount to grow stack */
@@ -93,7 +96,7 @@
  * largest physical address that is accessible by ISA DMA is split
  * into two PHYSSEG entries. 
  */
-#define	VM_PHYSSEG_MAX		31
+#define	VM_PHYSSEG_MAX		127
 
 /*
  * Virtual addresses of things.  Derived from the page directory and
@@ -101,38 +104,48 @@
  * Because of the page that is both a PD and PT, it looks a little
  * messy at times, but hey, we'll do anything to save a page :-)
  *
- * The kernel address space can be up to (I think) 511 page directory
- * pages.  Each one represents 1G.  NKPDPE defines the size of the kernel
- * address space, curently set to 128G.
+ * NKPDPE is the number of PD's representing KVM.  Not all are immediately
+ * populated.  There are 512 PD's per PDP and the value is calculated from
+ * NKPML4E (see pmap.h).
  *
  * The ending address is non-inclusive of the per-cpu data array
  * which starts at MPPTDI (-16MB mark).  MPPTDI is the page directory
  * index in the last PD of the kernel address space and is typically
  * set to (NPDEPG - 8) = (512 - 8).
  */
-#define NKPDPE			128
-#define	VM_MIN_KERNEL_ADDRESS	KVADDR(KPML4I, NPDPEPG - NKPDPE, 0, 0)
-#define	VM_MAX_KERNEL_ADDRESS	KVADDR(KPML4I, NPDPEPG - 1, MPPTDI, NPTEPG - 1)
+#define NKPDPE			(NKPML4E*NPDPEPG-1)
+#define	KPDPPHYS_KVA		KVADDR(KPML4I, 0, 0, 0)
+#define	VM_MIN_KERNEL_ADDRESS	KVADDR(KPML4I, NKPML4E*NPDPEPG - NKPDPE, 0, 0)
+#define	VM_MAX_KERNEL_ADDRESS	KVADDR(KPML4I + NKPML4E - 1,		\
+					NPDPEPG - 1, MPPTDI, NPTEPG - 1)
 
 #define	DMAP_MIN_ADDRESS	KVADDR(DMPML4I, 0, 0, 0)
 #define	DMAP_MAX_ADDRESS	KVADDR(DMPML4I+NDMPML4E, 0, 0, 0)
 
-#define	KERNBASE		KVADDR(KPML4I, KPDPI, 0, 0)
+#define	KERNBASE		KVADDR(KPML4I + NKPML4E - 1, KPDPI, 0, 0)
 #define	PTOV_OFFSET		KERNBASE
 
 #define UPT_MAX_ADDRESS		KVADDR(PML4PML4I, PML4PML4I, PML4PML4I, PML4PML4I)
 #define UPT_MIN_ADDRESS		KVADDR(PML4PML4I, 0, 0, 0)
 
+/*
+ * Do not allow the top 2MB of the user stack to be mapped to work around
+ * an AMD bug wherein the cpu can lockup or destabilize if the instruction
+ * prefetcher crosses over into non-canonical address space.  Only the top
+ * 4KB needs to be disallowed, but taking out the whole 2MB allows potential
+ * 2MB PTE optimizations to be retained.
+ */
 #define VM_MIN_USER_ADDRESS	((vm_offset_t)0)
-#define VM_MAX_USER_ADDRESS	UVADDR(NUPDP_USER, 0, 0, 0)
+#define VM_MAX_USER_ADDRESS	UVADDR(NUPDP_USER - 1, NPDPEPG - 1, \
+					NPDEPG - 1, 0)
 
 #define USRSTACK		VM_MAX_USER_ADDRESS
 
 #define VM_MAX_ADDRESS		UPT_MAX_ADDRESS
 #define VM_MIN_ADDRESS		(0)
 
-#define	PHYS_TO_DMAP(x)		((vm_offset_t)(x) | DMAP_MIN_ADDRESS)
-#define	DMAP_TO_PHYS(x)		((vm_paddr_t)(x) & ~DMAP_MIN_ADDRESS)
+#define	PHYS_TO_DMAP(x)		((vm_offset_t)(x) + DMAP_MIN_ADDRESS)
+#define	DMAP_TO_PHYS(x)		((vm_paddr_t)(x) - DMAP_MIN_ADDRESS)
 
 /* initial pagein size of beginning of executable file */
 #ifndef VM_INITIAL_PAGEIN

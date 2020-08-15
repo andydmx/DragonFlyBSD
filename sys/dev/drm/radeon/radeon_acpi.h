@@ -19,7 +19,6 @@
  * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
  * OTHER DEALINGS IN THE SOFTWARE.
  *
- * $FreeBSD: head/sys/dev/drm2/radeon/radeon_acpi.h 254885 2013-08-25 19:37:15Z dumbbell $
  */
 
 #ifndef RADEON_ACPI_H
@@ -98,6 +97,7 @@ void radeon_atif_handler(struct radeon_device *rdev, UINT32 type);
 #       define ATIF_SET_PANEL_EXPANSION_MODE_IN_CMOS_SUPPORTED    (1 << 7)
 #       define ATIF_TEMPERATURE_CHANGE_NOTIFICATION_SUPPORTED     (1 << 12)
 #       define ATIF_GET_GRAPHICS_DEVICE_TYPES_SUPPORTED           (1 << 14)
+#       define ATIF_GET_EXTERNAL_GPU_INFORMATION_SUPPORTED        (1 << 20)
 #define ATIF_FUNCTION_GET_SYSTEM_PARAMETERS                        0x1
 /* ARG0: ATIF_FUNCTION_GET_SYSTEM_PARAMETERS
  * ARG1: none
@@ -252,6 +252,17 @@ void radeon_atif_handler(struct radeon_device *rdev, UINT32 type);
 #       define ATIF_XGP_PORT                                       (1 << 1)
 #       define ATIF_VGA_ENABLED_GRAPHICS_DEVICE                    (1 << 2)
 #       define ATIF_XGP_PORT_IN_DOCK                               (1 << 3)
+#define ATIF_FUNCTION_GET_EXTERNAL_GPU_INFORMATION                 0x15
+/* ARG0: ATIF_FUNCTION_GET_EXTERNAL_GPU_INFORMATION
+ * ARG1: none
+ * OUTPUT:
+ * WORD  - number of reported external gfx devices
+ * WORD  - device structure size in bytes (excludes device size field)
+ * WORD  - flags         \
+ * WORD  - bus number    / repeated structure
+ */
+/* flags */
+#       define ATIF_EXTERNAL_GRAPHICS_PORT                         (1 << 0)
 
 /* ATPX */
 #define ATPX_FUNCTION_VERIFY_INTERFACE                             0x0
@@ -292,6 +303,8 @@ void radeon_atif_handler(struct radeon_device *rdev, UINT32 type);
 #       define ATPX_FIXED_NOT_SUPPORTED                            (1 << 9)
 #       define ATPX_DYNAMIC_DGPU_POWER_OFF_SUPPORTED               (1 << 10)
 #       define ATPX_DGPU_REQ_POWER_FOR_DISPLAYS                    (1 << 11)
+#       define ATPX_DGPU_CAN_DRIVE_DISPLAYS                        (1 << 12)
+#       define ATPX_MS_HYBRID_GFX_SUPPORTED                        (1 << 14)
 #define ATPX_FUNCTION_POWER_CONTROL                                0x2
 /* ARG0: ATPX_FUNCTION_POWER_CONTROL
  * ARG1:

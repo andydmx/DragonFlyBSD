@@ -21,9 +21,10 @@
  * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
  * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
  * THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- *
- * $FreeBSD: head/sys/net80211/ieee80211_crypto_ccmp.c 193840 2009-06-09 16:32:07Z sam $
  */
+
+#include <sys/cdefs.h>
+__FBSDID("$FreeBSD$");
 
 /*
  * IEEE 802.11i AES-CCMP crypto support.
@@ -44,9 +45,9 @@
 #include <sys/socket.h>
 
 #include <net/if.h>
+#include <net/if_var.h>
 #include <net/if_media.h>
 #include <net/ethernet.h>
-#include <net/route.h>
 
 #include <netproto/802_11/ieee80211_var.h>
 
@@ -63,7 +64,8 @@ struct ccmp_ctx {
 static	void *ccmp_attach(struct ieee80211vap *, struct ieee80211_key *);
 static	void ccmp_detach(struct ieee80211_key *);
 static	int ccmp_setkey(struct ieee80211_key *);
-static	int ccmp_encap(struct ieee80211_key *k, struct mbuf *, uint8_t keyid);
+static	void ccmp_setiv(struct ieee80211_key *, uint8_t *);
+static	int ccmp_encap(struct ieee80211_key *, struct mbuf *);
 static	int ccmp_decap(struct ieee80211_key *, struct mbuf *, int);
 static	int ccmp_enmic(struct ieee80211_key *, struct mbuf *, int);
 static	int ccmp_demic(struct ieee80211_key *, struct mbuf *, int);
@@ -78,6 +80,7 @@ static const struct ieee80211_cipher ccmp = {
 	.ic_attach	= ccmp_attach,
 	.ic_detach	= ccmp_detach,
 	.ic_setkey	= ccmp_setkey,
+	.ic_setiv	= ccmp_setiv,
 	.ic_encap	= ccmp_encap,
 	.ic_decap	= ccmp_decap,
 	.ic_enmic	= ccmp_enmic,
@@ -96,8 +99,13 @@ ccmp_attach(struct ieee80211vap *vap, struct ieee80211_key *k)
 {
 	struct ccmp_ctx *ctx;
 
+#if defined(__DragonFly__)
 	ctx = (struct ccmp_ctx *) kmalloc(sizeof(struct ccmp_ctx),
 		M_80211_CRYPTO, M_INTWAIT | M_ZERO);
+#else
+	ctx = (struct ccmp_ctx *) IEEE80211_MALLOC(sizeof(struct ccmp_ctx),
+		M_80211_CRYPTO, IEEE80211_M_NOWAIT | IEEE80211_M_ZERO);
+#endif
 	if (ctx == NULL) {
 		vap->iv_stats.is_crypto_nomem++;
 		return NULL;
@@ -113,7 +121,7 @@ ccmp_detach(struct ieee80211_key *k)
 {
 	struct ccmp_ctx *ctx = k->wk_private;
 
-	kfree(ctx, M_80211_CRYPTO);
+	IEEE80211_FREE(ctx, M_80211_CRYPTO);
 	KASSERT(nrefs > 0, ("imbalanced attach/detach"));
 	nrefs--;			/* NB: we assume caller locking */
 }
@@ -134,11 +142,31 @@ ccmp_setkey(struct ieee80211_key *k)
 	return 1;
 }
 
+static void
+ccmp_setiv(struct ieee80211_key *k, uint8_t *ivp)
+{
+	struct ccmp_ctx *ctx = k->wk_private;
+	struct ieee80211vap *vap = ctx->cc_vap;
+	uint8_t keyid;
+
+	keyid = ieee80211_crypto_get_keyid(vap, k) << 6;
+
+	k->wk_keytsc++;
+	ivp[0] = k->wk_keytsc >> 0;		/* PN0 */
+	ivp[1] = k->wk_keytsc >> 8;		/* PN1 */
+	ivp[2] = 0;				/* Reserved */
+	ivp[3] = keyid | IEEE80211_WEP_EXTIV;	/* KeyID | ExtID */
+	ivp[4] = k->wk_keytsc >> 16;		/* PN2 */
+	ivp[5] = k->wk_keytsc >> 24;		/* PN3 */
+	ivp[6] = k->wk_keytsc >> 32;		/* PN4 */
+	ivp[7] = k->wk_keytsc >> 40;		/* PN5 */
+}
+
 /*
  * Add privacy headers appropriate for the specified key.
  */
 static int
-ccmp_encap(struct ieee80211_key *k, struct mbuf *m, uint8_t keyid)
+ccmp_encap(struct ieee80211_key *k, struct mbuf *m)
 {
 	struct ccmp_ctx *ctx = k->wk_private;
 	struct ieee80211com *ic = ctx->cc_ic;
@@ -150,25 +178,17 @@ ccmp_encap(struct ieee80211_key *k, struct mbuf *m, uint8_t keyid)
 	/*
 	 * Copy down 802.11 header and add the IV, KeyID, and ExtIV.
 	 */
-	M_PREPEND(m, ccmp.ic_header, MB_DONTWAIT);
+	M_PREPEND(m, ccmp.ic_header, M_NOWAIT);
 	if (m == NULL)
 		return 0;
 	ivp = mtod(m, uint8_t *);
-	ovbcopy(ivp + ccmp.ic_header, ivp, hdrlen);
+	bcopy(ivp + ccmp.ic_header, ivp, hdrlen);
 	ivp += hdrlen;
 
-	k->wk_keytsc++;		/* XXX wrap at 48 bits */
-	ivp[0] = k->wk_keytsc >> 0;		/* PN0 */
-	ivp[1] = k->wk_keytsc >> 8;		/* PN1 */
-	ivp[2] = 0;				/* Reserved */
-	ivp[3] = keyid | IEEE80211_WEP_EXTIV;	/* KeyID | ExtID */
-	ivp[4] = k->wk_keytsc >> 16;		/* PN2 */
-	ivp[5] = k->wk_keytsc >> 24;		/* PN3 */
-	ivp[6] = k->wk_keytsc >> 32;		/* PN4 */
-	ivp[7] = k->wk_keytsc >> 40;		/* PN5 */
+	ccmp_setiv(k, ivp);
 
 	/*
-	 * Finally, do software encrypt if neeed.
+	 * Finally, do software encrypt if needed.
 	 */
 	if ((k->wk_flags & IEEE80211_KEY_SWENCRYPT) &&
 	    !ccmp_encrypt(k, m, hdrlen))
@@ -226,7 +246,8 @@ ccmp_decap(struct ieee80211_key *k, struct mbuf *m, int hdrlen)
 	}
 	tid = ieee80211_gettid(wh);
 	pn = READ_6(ivp[0], ivp[1], ivp[4], ivp[5], ivp[6], ivp[7]);
-	if (pn <= k->wk_keyrsc[tid]) {
+	if (pn <= k->wk_keyrsc[tid] &&
+	    (k->wk_flags & IEEE80211_KEY_NOREPLAY) == 0) {
 		/*
 		 * Replay violation.
 		 */
@@ -249,7 +270,7 @@ ccmp_decap(struct ieee80211_key *k, struct mbuf *m, int hdrlen)
 	/*
 	 * Copy up 802.11 header and strip crypto bits.
 	 */
-	ovbcopy(mtod(m, void *), mtod(m, uint8_t *) + ccmp.ic_header, hdrlen);
+	bcopy(mtod(m, void *), mtod(m, uint8_t *) + ccmp.ic_header, hdrlen);
 	m_adj(m, ccmp.ic_header);
 	m_adj(m, -ccmp.ic_trailer);
 
@@ -600,7 +621,7 @@ ccmp_decrypt(struct ieee80211_key *key, u_int64_t pn, struct mbuf *m, int hdrlen
 			space_next = len > space ? len - space : 0;
 			KASSERT(m->m_len >= space_next,
 				("not enough data in following buffer, "
-				"m_len %u need %u", m->m_len, space_next));
+				"m_len %u need %u\n", m->m_len, space_next));
 
 			xor_block(b+space, pos_next, space_next);
 			CCMP_DECRYPT(i, b, b0, pos, a, space);

@@ -41,6 +41,7 @@
 
 #include <sys/param.h>
 #include <sys/systm.h>
+#include <sys/uio.h>
 #include <sys/kernel.h>
 #include <sys/fcntl.h>
 #include <sys/stat.h>
@@ -89,7 +90,6 @@ static int ufs_markatime (struct vop_markatime_args *);
 static int ufs_missingop (struct vop_generic_args *ap);
 static int ufs_mkdir (struct vop_old_mkdir_args *);
 static int ufs_mknod (struct vop_old_mknod_args *);
-static int ufs_mmap (struct vop_mmap_args *);
 static int ufs_print (struct vop_print_args *);
 static int ufs_readdir (struct vop_readdir_args *);
 static int ufs_readlink (struct vop_readlink_args *);
@@ -110,22 +110,6 @@ static int filt_ufsvnode (struct knote *kn, long hint);
 static void filt_ufsdetach (struct knote *kn);
 static int ufs_kqfilter (struct vop_kqfilter_args *ap);
 
-union _qcvt {
-	int64_t qcvt;
-	int32_t val[2];
-};
-#define SETHIGH(q, h) { \
-	union _qcvt tmp; \
-	tmp.qcvt = (q); \
-	tmp.val[_QUAD_HIGHWORD] = (h); \
-	(q) = tmp.qcvt; \
-}
-#define SETLOW(q, l) { \
-	union _qcvt tmp; \
-	tmp.qcvt = (q); \
-	tmp.val[_QUAD_LOWWORD] = (l); \
-	(q) = tmp.qcvt; \
-}
 #define VN_KNOTE(vp, b) \
 	KNOTE(&vp->v_pollinfo.vpi_kqinfo.ki_note, (b))
 
@@ -156,20 +140,35 @@ ufs_itimes(struct vnode *vp)
 		ip->i_flag |= IN_LAZYMOD;
 	else
 		ip->i_flag |= IN_MODIFIED;
+
 	if ((vp->v_mount->mnt_flag & MNT_RDONLY) == 0) {
 		vfs_timestamp(&ts);
 		if (ip->i_flag & IN_ACCESS) {
-			ip->i_atime = ts.tv_sec;
+			ip->i_atime = (uint32_t)ts.tv_sec;
+			ip->i_atime_ext = ts.tv_sec >> 32;
 			ip->i_atimensec = ts.tv_nsec;
 		}
-		if (ip->i_flag & IN_UPDATE) {
-			ip->i_mtime = ts.tv_sec;
-			ip->i_mtimensec = ts.tv_nsec;
-			ip->i_modrev++;
-		}
 		if (ip->i_flag & IN_CHANGE) {
-			ip->i_ctime = ts.tv_sec;
+			ip->i_ctime = (uint32_t)ts.tv_sec;
+			ip->i_ctime_ext = ts.tv_sec >> 32;
 			ip->i_ctimensec = ts.tv_nsec;
+		}
+		if (ip->i_flag & IN_UPDATE) {
+			if (ip->i_flag & IN_NOCOPYWRITE) {
+				if (vp->v_flag & VLASTWRITETS) {
+					ip->i_mtime = (uint32_t)
+						vp->v_lastwrite_ts.tv_sec;
+					ip->i_mtime_ext =
+						vp->v_lastwrite_ts.tv_sec >> 32;
+					ip->i_mtimensec =
+						vp->v_lastwrite_ts.tv_nsec;
+				}
+			} else {
+				ip->i_mtime = (uint32_t)ts.tv_sec;
+				ip->i_mtime_ext = ts.tv_sec >> 32;
+				ip->i_mtimensec = ts.tv_nsec;
+			}
+			ip->i_modrev++;
 		}
 	}
 	ip->i_flag &= ~(IN_ACCESS | IN_CHANGE | IN_UPDATE);
@@ -322,7 +321,7 @@ ufs_getattr(struct vop_getattr_args *ap)
 	/*
 	 * Copy from inode table
 	 */
-	vap->va_fsid = dev2udev(ip->i_dev);
+	vap->va_fsid = devid_from_dev(ip->i_dev);
 	vap->va_fileid = ip->i_number;
 	vap->va_mode = ip->i_mode & ~IFMT;
 	vap->va_nlink = VFSTOUFS(vp->v_mount)->um_i_effnlink_valid ?
@@ -332,11 +331,14 @@ ufs_getattr(struct vop_getattr_args *ap)
 	vap->va_rmajor = umajor(ip->i_rdev);
 	vap->va_rminor = uminor(ip->i_rdev);
 	vap->va_size = ip->i_din.di_size;
-	vap->va_atime.tv_sec = ip->i_atime;
+	vap->va_atime.tv_sec =
+		(time_t)(ip->i_atime | ((uint64_t)ip->i_atime_ext << 32));
 	vap->va_atime.tv_nsec = ip->i_atimensec;
-	vap->va_mtime.tv_sec = ip->i_mtime;
+	vap->va_mtime.tv_sec =
+		(time_t)(ip->i_mtime | ((uint64_t)ip->i_mtime_ext << 32));
 	vap->va_mtime.tv_nsec = ip->i_mtimensec;
-	vap->va_ctime.tv_sec = ip->i_ctime;
+	vap->va_ctime.tv_sec =
+		(time_t)(ip->i_ctime | ((uint64_t)ip->i_ctime_ext << 32));
 	vap->va_ctime.tv_nsec = ip->i_ctimensec;
 	vap->va_flags = ip->i_flags;
 	vap->va_gen = ip->i_gen;
@@ -396,11 +398,13 @@ ufs_setattr(struct vop_setattr_args *ap)
 			return (error);
 		/*
 		 * Note that a root chflags becomes a user chflags when
-		 * we are jailed, unless the jail.chflags_allowed sysctl
+		 * we are jailed, unless the jail vfs_chflags sysctl
 		 * is set.
 		 */
-		if (cred->cr_uid == 0 && 
-		    (!jailed(cred) || jail_chflags_allowed)) {
+		if (cred->cr_uid == 0 &&
+		    (!jailed(cred) ||
+			PRISON_CAP_ISSET(cred->cr_prison->pr_caps,
+			    PRISON_CAP_VFS_CHFLAGS))) {
 			if ((ip->i_flags
 			    & (SF_NOUNLINK | SF_IMMUTABLE | SF_APPEND)) &&
 			    securelevel > 0)
@@ -464,12 +468,15 @@ ufs_setattr(struct vop_setattr_args *ap)
 			ip->i_flag |= IN_CHANGE | IN_UPDATE;
 		ufs_itimes(vp);
 		if (vap->va_atime.tv_sec != VNOVAL) {
-			ip->i_atime = vap->va_atime.tv_sec;
+			ip->i_atime = (uint32_t)vap->va_atime.tv_sec;
+			ip->i_atime_ext = vap->va_atime.tv_sec >> 32;
 			ip->i_atimensec = vap->va_atime.tv_nsec;
 		}
 		if (vap->va_mtime.tv_sec != VNOVAL) {
-			ip->i_mtime = vap->va_mtime.tv_sec;
+			ip->i_mtime = (uint32_t)vap->va_mtime.tv_sec;
+			ip->i_mtime_ext = vap->va_mtime.tv_sec >> 32;
 			ip->i_mtimensec = vap->va_mtime.tv_nsec;
+			vclrflags(vp, VLASTWRITETS);
 		}
 		error = ffs_update(vp, 0);
 		if (error)
@@ -619,21 +626,6 @@ good:
 }
 
 /*
- * Mmap a file
- *
- * NB Currently unsupported.
- *
- * ufs_mmap(struct vnode *a_vp, int a_fflags, struct ucred *a_cred)
- */
-/* ARGSUSED */
-static
-int
-ufs_mmap(struct vop_mmap_args *ap)
-{
-	return (EINVAL);
-}
-
-/*
  * ufs_remove(struct vnode *a_dvp, struct vnode *a_vp,
  *	      struct componentname *a_cnp)
  */
@@ -755,7 +747,7 @@ ufs_whiteout(struct vop_old_whiteout_args *ap)
 			panic("ufs_whiteout: old format filesystem");
 #endif
 
-		newdir.d_ino = WINO;
+		newdir.d_ino = UFS_WINO;
 		newdir.d_namlen = cnp->cn_namelen;
 		bcopy(cnp->cn_nameptr, newdir.d_name, (unsigned)cnp->cn_namelen + 1);
 		newdir.d_type = DT_WHT;
@@ -1934,7 +1926,6 @@ ufs_vinit(struct mount *mntp, struct vnode **vpp)
 {
 	struct inode *ip;
 	struct vnode *vp;
-	struct timeval tv;
 
 	vp = *vpp;
 	ip = VTOI(vp);
@@ -1968,14 +1959,12 @@ ufs_vinit(struct mount *mntp, struct vnode **vpp)
 
 	}
 
-	if (ip->i_number == ROOTINO)
+	if (ip->i_number == UFS_ROOTINO)
 		vsetflags(vp, VROOT);
 	/*
 	 * Initialize modrev times
 	 */
-	getmicrouptime(&tv);
-	SETHIGH(ip->i_modrev, tv.tv_sec);
-	SETLOW(ip->i_modrev, tv.tv_usec * 4294);
+	ip->i_modrev = init_va_filerev();
 	*vpp = vp;
 	return (0);
 }
@@ -2059,8 +2048,7 @@ ufs_makeinode(int mode, struct vnode *dvp, struct vnode **vpp,
 	}
 #endif
 #endif	/* !SUIDDIR */
-	ip->i_din.di_spare[0] = 0;
-	ip->i_din.di_spare[1] = 0;
+	ip->i_din.di_spare7E = 0;
 	ip->i_flag |= IN_ACCESS | IN_CHANGE | IN_UPDATE;
 	ip->i_mode = mode;
 	tvp->v_type = IFTOVT(mode);	/* Rest init'd in getnewvnode(). */
@@ -2236,7 +2224,6 @@ static struct vop_ops ufs_vnode_vops = {
 	.vop_old_link =		ufs_link,
 	.vop_old_mkdir =	ufs_mkdir,
 	.vop_old_mknod =	ufs_mknod,
-	.vop_mmap =		ufs_mmap,
 	.vop_open =		vop_stdopen,
 	.vop_pathconf =		vop_stdpathconf,
 	.vop_kqfilter =		ufs_kqfilter,

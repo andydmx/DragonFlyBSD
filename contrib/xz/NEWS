@@ -2,6 +2,449 @@
 XZ Utils Release Notes
 ======================
 
+5.2.5 (2020-03-17)
+
+    * liblzma:
+
+        - Fixed several C99/C11 conformance bugs. Now the code is clean
+          under gcc/clang -fsanitize=undefined. Some of these changes
+          might have a negative effect on performance with old GCC
+          versions or compilers other than GCC and Clang. The configure
+          option --enable-unsafe-type-punning can be used to (mostly)
+          restore the old behavior but it shouldn't normally be used.
+
+        - Improved API documentation of lzma_properties_decode().
+
+        - Added a very minor encoder speed optimization.
+
+    * xz:
+
+        - Fixed a crash in "xz -dcfv not_an_xz_file". All four options
+          were required to trigger it. The crash occurred in the
+          progress indicator code when xz was in passthru mode where
+          xz works like "cat".
+
+        - Fixed an integer overflow with 32-bit off_t. It could happen
+          when decompressing a file that has a long run of zero bytes
+          which xz would try to write as a sparse file. Since the build
+          system enables large file support by default, off_t is
+          normally 64-bit even on 32-bit systems.
+
+        - Fixes for --flush-timeout:
+            * Fix semi-busy-waiting.
+            * Avoid unneeded flushes when no new input has arrived
+              since the previous flush was completed.
+
+        - Added a special case for 32-bit xz: If --memlimit-compress is
+          used to specify a limit that exceeds 4020 MiB, the limit will
+          be set to 4020 MiB. The values "0" and "max" aren't affected
+          by this and neither is decompression. This hack can be
+          helpful when a 32-bit xz has access to 4 GiB address space
+          but the specified memlimit exceeds 4 GiB. This can happen
+          e.g. with some scripts.
+
+        - Capsicum sandbox is now enabled by default where available
+          (FreeBSD >= 10). The sandbox debug messages (xz -vv) were
+          removed since they seemed to be more annoying than useful.
+
+        - DOS build now requires DJGPP 2.05 instead of 2.04beta.
+          A workaround for a locale problem with DJGPP 2.05 was added.
+
+    * xzgrep and other scripts:
+
+        - Added a configure option --enable-path-for-scripts=PREFIX.
+          It is disabled by default except on Solaris where the default
+          is /usr/xpg4/bin. See INSTALL for details.
+
+        - Added a workaround for a POSIX shell detection problem on
+          Solaris.
+
+    * Build systems:
+
+        - Added preliminary build instructions for z/OS. See INSTALL
+          section 1.2.9.
+
+        - Experimental CMake support was added. It should work to build
+          static liblzma on a few operating systems. It may or may not
+          work to build shared liblzma. On some platforms it can build
+          xz and xzdec too but those are only for testing. See the
+          comment in the beginning of CMakeLists.txt for details.
+
+        - Visual Studio project files were updated.
+          WindowsTargetPlatformVersion was removed from VS2017 files
+          and set to "10.0" in the added VS2019 files. In the future
+          the VS project files will be removed when CMake support is
+          good enough.
+
+        - New #defines in config.h: HAVE___BUILTIN_ASSUME_ALIGNED,
+          HAVE___BUILTIN_BSWAPXX, and TUKLIB_USE_UNSAFE_TYPE_PUNNING.
+
+        - autogen.sh has a new optional dependency on po4a and a new
+          option --no-po4a to skip that step. This matters only if one
+          wants to remake the build files. po4a is used to update the
+          translated man pages but as long as the man pages haven't
+          been modified, there's nothing to update and one can use
+          --no-po4a to avoid the dependency on po4a.
+
+    * Translations:
+
+        - XZ Utils translations are now handled by the Translation
+          Project: https://translationproject.org/domain/xz.html
+
+        - All man pages are now included in German too.
+
+        - New xz translations: Brazilian Portuguese, Finnish,
+          Hungarian, Chinese (simplified), Chinese (traditional),
+          and Danish (partial translation)
+
+        - Updated xz translations: French, German, Italian, and Polish
+
+        - Unfortunately a few new xz translations weren't included due
+          to technical problems like too long lines in --help output or
+          misaligned column headings in tables. In the future, many of
+          these strings will be split and e.g. the table column
+          alignment will be handled in software. This should make the
+          strings easier to translate.
+
+
+5.2.4 (2018-04-29)
+
+    * liblzma:
+
+        - Allow 0 as memory usage limit instead of returning
+          LZMA_PROG_ERROR. Now 0 is treated as if 1 byte was specified,
+          which effectively is the same as 0.
+
+        - Use "noexcept" keyword instead of "throw()" in the public
+          headers when a C++11 (or newer standard) compiler is used.
+
+        - Added a portability fix for recent Intel C Compilers.
+
+        - Microsoft Visual Studio build files have been moved under
+          windows/vs2013 and windows/vs2017.
+
+    * xz:
+
+        - Fix "xz --list --robot missing_or_bad_file.xz" which would
+          try to print an uninitialized string and thus produce garbage
+          output. Since the exit status is non-zero, most uses of such
+          a command won't try to interpret the garbage output.
+
+        - "xz --list foo.xz" could print "Internal error (bug)" in a
+          corner case where a specific memory usage limit had been set.
+
+
+5.2.3 (2016-12-30)
+
+    * xz:
+
+        - Always close a file before trying to delete it to avoid
+          problems on some operating system and file system combinations.
+
+        - Fixed copying of file timestamps on Windows.
+
+        - Added experimental (disabled by default) sandbox support using
+          Capsicum (FreeBSD >= 10). See --enable-sandbox in INSTALL.
+
+    * C99/C11 conformance fixes to liblzma. The issues affected at least
+      some builds using link-time optimizations.
+
+    * Fixed bugs in the rarely-used function lzma_index_dup().
+
+    * Use of external SHA-256 code is now disabled by default.
+      It can still be enabled by passing --enable-external-sha256
+      to configure. The reasons to disable it by default (see INSTALL
+      for more details):
+
+        - Some OS-specific SHA-256 implementations conflict with
+          OpenSSL and cause problems in programs that link against both
+          liblzma and libcrypto. At least FreeBSD 10 and MINIX 3.3.0
+          are affected.
+
+        - The internal SHA-256 is faster than the SHA-256 code in
+          some operating systems.
+
+    * Changed CPU core count detection to use sched_getaffinity() on
+      GNU/Linux and GNU/kFreeBSD.
+
+    * Fixes to the build-system and xz to make xz buildable even when
+      encoders, decoders, or threading have been disabled from libilzma
+      using configure options. These fixes added two new #defines to
+      config.h: HAVE_ENCODERS and HAVE_DECODERS.
+
+
+5.2.2 (2015-09-29)
+
+    * Fixed bugs in QNX-specific code.
+
+    * Omitted the use of pipe2() even if it is available to avoid
+      portability issues with some old Linux and glibc combinations.
+
+    * Updated German translation.
+
+    * Added project files to build static and shared liblzma (not the
+      whole XZ Utils) with Visual Studio 2013 update 2 or later.
+
+    * Documented that threaded decompression hasn't been implemented
+      yet. A 5.2.0 NEWS entry describing multi-threading support had
+      incorrectly said "decompression" when it should have said
+      "compression".
+
+
+5.2.1 (2015-02-26)
+
+    * Fixed a compression-ratio regression in fast mode of LZMA1 and
+      LZMA2. The bug is present in 5.1.4beta and 5.2.0 releases.
+
+    * Fixed a portability problem in xz that affected at least OpenBSD.
+
+    * Fixed xzdiff to be compatible with FreeBSD's mktemp which differs
+      from most other mktemp implementations.
+
+    * Changed CPU core count detection to use cpuset_getaffinity() on
+      FreeBSD.
+
+
+5.2.0 (2014-12-21)
+
+    Since 5.1.4beta:
+
+    * All fixes from 5.0.8
+
+    * liblzma: Fixed lzma_stream_encoder_mt_memusage() when a preset
+      was used.
+
+    * xzdiff: If mktemp isn't installed, mkdir will be used as
+      a fallback to create a temporary directory. Installing mktemp
+      is still recommended.
+
+    * Updated French, German, Italian, Polish, and Vietnamese
+      translations.
+
+    Summary of fixes and new features added in the 5.1.x development
+    releases:
+
+    * liblzma:
+
+        - Added support for multi-threaded compression. See the
+          lzma_mt structure, lzma_stream_encoder_mt(), and
+          lzma_stream_encoder_mt_memusage() in <lzma/container.h>,
+          lzma_get_progress() in <lzma/base.h>, and lzma_cputhreads()
+          in <lzma/hardware.h> for details.
+
+        - Made the uses of lzma_allocator const correct.
+
+        - Added lzma_block_uncomp_encode() to create uncompressed
+          .xz Blocks using LZMA2 uncompressed chunks.
+
+        - Added support for LZMA_IGNORE_CHECK.
+
+        - A few speed optimizations were made.
+
+        - Added support for symbol versioning. It is enabled by default
+          on GNU/Linux, other GNU-based systems, and FreeBSD.
+
+        - liblzma (not the whole XZ Utils) should now be buildable
+          with MSVC 2013 update 2 or later using windows/config.h.
+
+    * xz:
+
+        - Fixed a race condition in the signal handling. It was
+          possible that e.g. the first SIGINT didn't make xz exit
+          if reading or writing blocked and one had bad luck. The fix
+          is non-trivial, so as of writing it is unknown if it will be
+          backported to the v5.0 branch.
+
+        - Multi-threaded compression can be enabled with the
+          --threads (-T) option.
+          [Fixed: This originally said "decompression".]
+
+        - New command line options in xz: --single-stream,
+          --block-size=SIZE, --block-list=SIZES,
+          --flush-timeout=TIMEOUT, and --ignore-check.
+
+        - xz -lvv now shows the minimum xz version that is required to
+          decompress the file. Currently it is 5.0.0 for all supported
+          .xz files except files with empty LZMA2 streams require 5.0.2.
+
+    * xzdiff and xzgrep now support .lzo files if lzop is installed.
+      The .tzo suffix is also recognized as a shorthand for .tar.lzo.
+
+
+5.1.4beta (2014-09-14)
+
+    * All fixes from 5.0.6
+
+    * liblzma: Fixed the use of presets in threaded encoder
+      initialization.
+
+    * xz --block-list and --block-size can now be used together
+      in single-threaded mode. Previously the combination only
+      worked in multi-threaded mode.
+
+    * Added support for LZMA_IGNORE_CHECK to liblzma and made it
+      available in xz as --ignore-check.
+
+    * liblzma speed optimizations:
+
+        - Initialization of a new LZMA1 or LZMA2 encoder has been
+          optimized. (The speed of reinitializing an already-allocated
+          encoder isn't affected.) This helps when compressing many
+          small buffers with lzma_stream_buffer_encode() and other
+          similar situations where an already-allocated encoder state
+          isn't reused. This speed-up is visible in xz too if one
+          compresses many small files one at a time instead running xz
+          once and giving all files as command-line arguments.
+
+        - Buffer comparisons are now much faster when unaligned access
+          is allowed (configured with --enable-unaligned-access). This
+          speeds up encoding significantly. There is arch-specific code
+          for 32-bit and 64-bit x86 (32-bit needs SSE2 for the best
+          results and there's no run-time CPU detection for now).
+          For other archs there is only generic code which probably
+          isn't as optimal as arch-specific solutions could be.
+
+        - A few speed optimizations were made to the SHA-256 code.
+          (Note that the builtin SHA-256 code isn't used on all
+          operating systems.)
+
+    * liblzma can now be built with MSVC 2013 update 2 or later
+      using windows/config.h.
+
+    * Vietnamese translation was added.
+
+
+5.1.3alpha (2013-10-26)
+
+    * All fixes from 5.0.5
+
+    * liblzma:
+
+        - Fixed a deadlock in the threaded encoder.
+
+        - Made the uses of lzma_allocator const correct.
+
+        - Added lzma_block_uncomp_encode() to create uncompressed
+          .xz Blocks using LZMA2 uncompressed chunks.
+
+        - Added support for native threads on Windows and the ability
+          to detect the number of CPU cores.
+
+    * xz:
+
+        - Fixed a race condition in the signal handling. It was
+          possible that e.g. the first SIGINT didn't make xz exit
+          if reading or writing blocked and one had bad luck. The fix
+          is non-trivial, so as of writing it is unknown if it will be
+          backported to the v5.0 branch.
+
+        - Made the progress indicator work correctly in threaded mode.
+
+        - Threaded encoder now works together with --block-list=SIZES.
+
+        - Added preliminary support for --flush-timeout=TIMEOUT.
+          It can be useful for (somewhat) real-time streaming. For
+          now the decompression side has to be done with something
+          else than the xz tool due to how xz does buffering, but this
+          should be fixed.
+
+
+5.1.2alpha (2012-07-04)
+
+    * All fixes from 5.0.3 and 5.0.4
+
+    * liblzma:
+
+        - Fixed a deadlock and an invalid free() in the threaded encoder.
+
+        - Added support for symbol versioning. It is enabled by default
+          on GNU/Linux, other GNU-based systems, and FreeBSD.
+
+        - Use SHA-256 implementation from the operating system if one is
+          available in libc, libmd, or libutil. liblzma won't use e.g.
+          OpenSSL or libgcrypt to avoid introducing new dependencies.
+
+        - Fixed liblzma.pc for static linking.
+
+        - Fixed a few portability bugs.
+
+    * xz --decompress --single-stream now fixes the input position after
+      successful decompression. Now the following works:
+
+          echo foo | xz > foo.xz
+          echo bar | xz >> foo.xz
+          ( xz -dc --single-stream ; xz -dc --single-stream ) < foo.xz
+
+      Note that it doesn't work if the input is not seekable
+      or if there is Stream Padding between the concatenated
+      .xz Streams.
+
+    * xz -lvv now shows the minimum xz version that is required to
+      decompress the file. Currently it is 5.0.0 for all supported .xz
+      files except files with empty LZMA2 streams require 5.0.2.
+
+    * Added an *incomplete* implementation of --block-list=SIZES to xz.
+      It only works correctly in single-threaded mode and when
+      --block-size isn't used at the same time. --block-list allows
+      specifying the sizes of Blocks which can be useful e.g. when
+      creating files for random-access reading.
+
+
+5.1.1alpha (2011-04-12)
+
+    * All fixes from 5.0.2
+
+    * liblzma fixes that will also be included in 5.0.3:
+
+        - A memory leak was fixed.
+
+        - lzma_stream_buffer_encode() no longer creates an empty .xz
+          Block if encoding an empty buffer. Such an empty Block with
+          LZMA2 data would trigger a bug in 5.0.1 and older (see the
+          first bullet point in 5.0.2 notes). When releasing 5.0.2,
+          I thought that no encoder creates this kind of files but
+          I was wrong.
+
+        - Validate function arguments better in a few functions. Most
+          importantly, specifying an unsupported integrity check to
+          lzma_stream_buffer_encode() no longer creates a corrupt .xz
+          file. Probably no application tries to do that, so this
+          shouldn't be a big problem in practice.
+
+        - Document that lzma_block_buffer_encode(),
+          lzma_easy_buffer_encode(), lzma_stream_encoder(), and
+          lzma_stream_buffer_encode() may return LZMA_UNSUPPORTED_CHECK.
+
+        - The return values of the _memusage() functions are now
+          documented better.
+
+    * Support for multithreaded compression was added using the simplest
+      method, which splits the input data into blocks and compresses
+      them independently. Other methods will be added in the future.
+      The current method has room for improvement, e.g. it is possible
+      to reduce the memory usage.
+
+    * Added the options --single-stream and --block-size=SIZE to xz.
+
+    * xzdiff and xzgrep now support .lzo files if lzop is installed.
+      The .tzo suffix is also recognized as a shorthand for .tar.lzo.
+
+    * Support for short 8.3 filenames under DOS was added to xz. It is
+      experimental and may change before it gets into a stable release.
+
+
+5.0.8 (2014-12-21)
+
+    * Fixed an old bug in xzgrep that affected OpenBSD and probably
+      a few other operating systems too.
+
+    * Updated French and German translations.
+
+    * Added support for detecting the amount of RAM on AmigaOS/AROS.
+
+    * Minor build system updates.
+
+
 5.0.7 (2014-09-20)
 
     * Fix regressions introduced in 5.0.6:

@@ -18,8 +18,8 @@ BINOWN=	root
 BINGRP=	network
 M4FLAGS=
 
-LDADD= -lcrypt -lmd -lutil -lz
-DPADD=	${LIBCRYPT} ${LIBMD} ${LIBUTIL} ${LIBZ}
+LDADD= -lcrypt -lutil -lz
+DPADD=	${LIBCRYPT} ${LIBUTIL} ${LIBZ}
 
 .SUFFIXES: .8 .8.m4
 
@@ -54,20 +54,21 @@ CFLAGS+=-DNOSUID
 SRCS+=	id.c
 .endif
 
-.if !exists(${.CURDIR}/../../secure) || defined(NO_CRYPT) || defined(NO_OPENSSL) || defined(NODES)
+.if defined(NODES)
 CFLAGS+=-DNODES
 .else
-SRCS+=	chap_ms.c mppe.c
-LDADD+= -lcrypto
-DPADD+= ${LIBCRYPTO}
+SRCS+=		chap_ms.c mppe.c
 .endif
 
 .if defined(NORADIUS)
 CFLAGS+=-DNORADIUS
 .else
 SRCS+=	radius.c
-LDADD+=	-lradius
-DPADD+= ${LIBRADIUS}
+.PATH: ${.CURDIR}/libradius
+SRCS+=	radlib.c
+FLAGS_GROUPS+=	radius
+radius_FLAGS=	-I${.CURDIR}/libradius -DWITH_SSL
+radius_FLAGS_FILES= radius.c radlib.c
 .endif
 
 .if defined(WANT_NETGRAPH7)
@@ -85,5 +86,12 @@ CFLAGS+=-DEXPERIMENTAL_NETGRAPH
 SRCS+=	netgraph.c
 .endif
 .endif
+
+NO_STRICT_ALIASING=
+
+CFLAGS+=	${PRIVATELIB_CFLAGS}
+DPADD+=		${LIBCRYPTO}
+LDADD+=		-lprivate_crypto
+LDFLAGS+=	${PRIVATELIB_LDFLAGS}
 
 .include <bsd.prog.mk>

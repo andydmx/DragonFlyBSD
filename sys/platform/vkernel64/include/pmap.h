@@ -14,11 +14,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -75,9 +71,9 @@
 #define NKPML4E		1		/* number of kernel PML4 slots */
 #define NKPDPE		128		/* number of kernel PDP slots */
 
-#define	NUPML4E		(NPML4EPG/2)	/* number of userland PML4 pages */
-#define	NUPDPE		(NUPML4E*NPDPEPG)/* number of userland PDP pages */
-#define	NUPDE		(NUPDPE*NPDEPG)	/* number of userland PD entries */
+#define	NUPDP_TOTAL	(NPML4EPG/2)		/* total PDP pages */
+#define	NUPD_TOTAL	(NUPDP_TOTAL*NPDPEPG)	/* total PD pages */
+#define	NUPT_TOTAL	(NUPD_TOTAL*NPDEPG)	/* total PT pages */
 
 #define	NDMPML4E	1		/* number of dmap PML4 slots */
 #define	NDMPDPE		NPTEPG		/* number of dmap PDPE slots */
@@ -85,13 +81,22 @@
 /*
  * The *PML4I values control the layout of virtual memory
  */
-#define	PML4PML4I	(NPML4EPG/2)	/* Index of recursive pml4 mapping */
+#define	PML4PML4I	NUPDP_TOTAL	/* Index of recursive pml4 mapping */
+#define NUPML4E		NUPDP_TOTAL	/* for vmparam.h */
 
+
+/*
+ * Currently no tests available (see vm/vm_page.c)
+ */
+#define MD_PAGE_FREEABLE(m)	1
 
 #ifndef LOCORE
 
 #ifndef _SYS_TYPES_H_
 #include <sys/types.h>
+#endif
+#ifndef _SYS_CPUMASK_H_
+#include <sys/cpumask.h>
 #endif
 #ifndef _SYS_QUEUE_H_
 #include <sys/queue.h>
@@ -114,8 +119,6 @@
 
 #ifdef _KERNEL
 
-vm_paddr_t pmap_kextract(vm_offset_t);
-
 /*
  * XXX
  */
@@ -132,6 +135,10 @@ vm_paddr_t pmap_kextract(vm_offset_t);
 struct pv_entry;
 struct vm_page;
 struct vm_object;
+
+struct pv_entry_rb_tree;
+RB_PROTOTYPE2(pv_entry_rb_tree, pv_entry, pv_entry,
+	      pv_entry_compare, vm_offset_t);
 
 struct md_page {
 	int pv_list_count;
@@ -159,8 +166,7 @@ struct pmap {
 	vpte_t			pm_pdirpte;	/* pte mapping phys page */
 	struct vm_object	*pm_pteobj;	/* Container for pte's */
 	TAILQ_ENTRY(pmap)	pm_pmnode;	/* list of pmaps */
-	TAILQ_HEAD(,pv_entry)	pm_pvlist;	/* list of mappings in pmap */
-	TAILQ_HEAD(,pv_entry)	pm_pvlist_free;	/* free mappings */
+	RB_HEAD(pv_entry_rb_tree, pv_entry) pm_pvroot;
 	int			pm_count;	/* reference count */
 	cpulock_t		pm_active_lock; /* interlock */
 	cpumask_t		pm_active;	/* active on cpus */
@@ -169,10 +175,11 @@ struct pmap {
 	struct	vm_page		*pm_ptphint;	/* pmap ptp hint */
 	int			pm_generation;	/* detect pvlist deletions */
 	struct spinlock		pm_spin;
-	struct lwkt_token	pm_token;
 };
 
-#define pmap_resident_count(pmap) (pmap)->pm_stats.resident_count
+#define pmap_resident_count(pmap) ((pmap)->pm_stats.resident_count)
+#define pmap_resident_tlnw_count(pmap) ((pmap)->pm_stats.resident_count - \
+					(pmap)->pm_stats.wired_count)
 
 typedef struct pmap	*pmap_t;
 
@@ -188,7 +195,7 @@ typedef struct pv_entry {
 	pmap_t		pv_pmap;	/* pmap where mapping lies */
 	vm_offset_t	pv_va;		/* virtual address for mapping */
 	TAILQ_ENTRY(pv_entry)	pv_list;
-	TAILQ_ENTRY(pv_entry)	pv_plist;
+	RB_ENTRY(pv_entry)	pv_entry;
 	struct vm_page	*pv_ptem;	/* VM page for pte */
 } *pv_entry_t;
 

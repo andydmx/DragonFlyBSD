@@ -34,6 +34,7 @@ MAN=	accept_filter.9 \
 	config_intrhook.9 \
 	contigmalloc.9 \
 	copy.9 \
+	CPUMASK.9 \
 	crit_enter.9 \
 	crypto.9 \
 	DB_COMMAND.9 \
@@ -78,7 +79,8 @@ MAN=	accept_filter.9 \
 	devtoname.9 \
 	driver.9 \
 	DRIVER_MODULE.9 \
-	dsched.9 \
+	efirt.9 \
+	errno.9 \
 	EVENTHANDLER.9 \
 	extattr.9 \
 	fetch.9 \
@@ -113,9 +115,10 @@ MAN=	accept_filter.9 \
 	kobj.9 \
 	kprintf.9 \
 	ksignal.9 \
+	kstrdup.9 \
 	ktr.9 \
 	lock.9 \
-        locking.9 \
+	locking.9 \
 	lwbuf.9 \
 	make_autoclone_dev.9 \
 	make_dev.9 \
@@ -140,10 +143,8 @@ MAN=	accept_filter.9 \
 	pfind.9 \
 	pgfind.9 \
 	physio.9 \
-	posix4.9 \
 	priv.9 \
 	prop_copyin_ioctl.9 \
-	putter.9 \
 	resettodr.9 \
 	rman.9 \
 	rtalloc.9 \
@@ -250,9 +251,7 @@ MLINKS+=atomic.9 atomic_add.9 \
 	atomic.9 atomic_set.9 \
 	atomic.9 atomic_subtract.9 \
 	atomic.9 atomic_store.9
-MLINKS+=bios.9 bios32.9 \
-	bios.9 bios32_SDlookup.9 \
-	bios.9 BIOS_PADDRTOVADDR.9 \
+MLINKS+=bios.9 BIOS_PADDRTOVADDR.9 \
 	bios.9 bios_sigsearch.9 \
 	bios.9 BIOS_VADDRTOPADDR.9
 MLINKS+=buf.9 bp.9
@@ -264,6 +263,7 @@ MLINKS+=bus_dma.9 busdma.9 \
 	bus_dma.9 bus_dmamap_create.9 \
 	bus_dma.9 bus_dmamap_destroy.9 \
 	bus_dma.9 bus_dmamap_load.9 \
+	bus_dma.9 bus_dmamap_load_ccb.9 \
 	bus_dma.9 bus_dmamap_load_mbuf.9 \
 	bus_dma.9 bus_dmamap_load_mbuf_defrag.9 \
 	bus_dma.9 bus_dmamap_load_mbuf_segment.9 \
@@ -369,19 +369,26 @@ MLINKS+=byteorder.9 be16dec.9 \
 	byteorder.9 le64enc.9 \
 	byteorder.9 le64toh.9
 MLINKS+=callout.9 callout_active.9 \
+	callout.9 callout_cancel.9 \
 	callout.9 callout_deactivate.9 \
+	callout.9 callout_drain.9 \
 	callout.9 callout_init.9 \
+	callout.9 callout_init_lk.9 \
 	callout.9 callout_init_mp.9 \
 	callout.9 callout_pending.9 \
 	callout.9 callout_reset.9 \
+	callout.9 callout_reset_bycpu.9 \
 	callout.9 callout_stop.9 \
-	callout.9 callout_stop_sync.9 \
-	callout.9 timeout.9 \
-	callout.9 untimeout.9
+	callout.9 callout_stop_async.9 \
+	callout.9 callout_terminate.9
 MLINKS+=condvar.9 cv_broadcast.9 \
 	condvar.9 cv_broadcastpri.9 \
 	condvar.9 cv_destroy.9 \
 	condvar.9 cv_init.9 \
+	condvar.9 cv_mtx_timedwait.9 \
+	condvar.9 cv_mtx_timedwait_sig.9 \
+	condvar.9 cv_mtx_wait.9 \
+	condvar.9 cv_mtx_wait_sig.9 \
 	condvar.9 cv_signal.9 \
 	condvar.9 cv_timedwait.9 \
 	condvar.9 cv_timedwait_sig.9 \
@@ -396,6 +403,37 @@ MLINKS+=copy.9 copyin.9 \
 	copy.9 copyout.9 \
 	copy.9 copyout_nofault.9 \
 	copy.9 copystr.9
+MLINKS+=CPUMASK.9 ATOMIC_CPUMASK_COPY.9 \
+	CPUMASK.9 ATOMIC_CPUMASK_NANDBIT.9 \
+	CPUMASK.9 ATOMIC_CPUMASK_NANDMASK.9 \
+	CPUMASK.9 ATOMIC_CPUMASK_ORBIT.9 \
+	CPUMASK.9 ATOMIC_CPUMASK_ORMASK.9 \
+	CPUMASK.9 ATOMIC_CPUMASK_TESTANDCLR.9 \
+	CPUMASK.9 ATOMIC_CPUMASK_TESTANDSET.9 \
+	CPUMASK.9 BSFCPUMASK.9 \
+	CPUMASK.9 BSRCPUMASK.9 \
+	CPUMASK.9 CPUMASK_ADDR.9 \
+	CPUMASK.9 CPUMASK_ANDBIT.9 \
+	CPUMASK.9 CPUMASK_ANDMASK.9 \
+	CPUMASK.9 CPUMASK_ASSALLONES.9 \
+	CPUMASK.9 CPUMASK_ASSBIT.9 \
+	CPUMASK.9 CPUMASK_ASSBMASK.9 \
+	CPUMASK.9 CPUMASK_ASSNBMASK.9 \
+	CPUMASK.9 CPUMASK_ASSZERO.9 \
+	CPUMASK.9 CPUMASK_CMPMASKEQ.9 \
+	CPUMASK.9 CPUMASK_CMPMASKNEQ.9 \
+	CPUMASK.9 CPUMASK_ISUP.9 \
+	CPUMASK.9 CPUMASK_LOWMASK.9 \
+	CPUMASK.9 CPUMASK_NANDBIT.9 \
+	CPUMASK.9 CPUMASK_NANDMASK.9 \
+	CPUMASK.9 CPUMASK_ORBIT.9 \
+	CPUMASK.9 CPUMASK_ORMASK.9 \
+	CPUMASK.9 CPUMASK_SIMPLE.9 \
+	CPUMASK.9 CPUMASK_TESTBIT.9 \
+	CPUMASK.9 CPUMASK_TESTMASK.9 \
+	CPUMASK.9 CPUMASK_TESTNZERO.9 \
+	CPUMASK.9 CPUMASK_TESTZERO.9 \
+	CPUMASK.9 CPUMASK_XORMASK.9
 MLINKS+=crit_enter.9 crit_enter_gd.9 \
 	crit_enter.9 crit_enter_id.9 \
 	crit_enter.9 crit_exit.9 \
@@ -418,7 +456,8 @@ MLINKS+=crypto.9 crypto_dispatch.9 \
 	crypto.9 crypto_unblock.9 \
 	crypto.9 crypto_unregister.9 \
 	crypto.9 crypto_unregister_all.9
-MLINKS+=DB_COMMAND.9 DB_SHOW_COMMAND.9
+MLINKS+=DB_COMMAND.9 DB_COMMAND_FLAG.9 \
+	DB_COMMAND.9 DB_SHOW_COMMAND.9
 MLINKS+=devclass_add_driver.9 devclass_delete_driver.9 \
 	devclass_add_driver.9 devclass_find_driver.9
 MLINKS+=device_add_child.9 device_add_child_ordered.9
@@ -440,25 +479,13 @@ MLINKS+=devstat.9 devicestat.9 \
 	devstat.9 devstat_remove_entry.9 \
 	devstat.9 devstat_start_transaction.9
 MLINKS+=DRIVER_MODULE.9 DRIVER_MODULE_ORDERED.9
-MLINKS+=dsched.9 dsched_cancel_bio.9 \
-	dsched.9 dsched_debug.9 \
-	dsched.9 DSCHED_DISK_CTX_LOCK.9 \
-	dsched.9 dsched_disk_ctx_ref.9 \
-	dsched.9 DSCHED_DISK_CTX_UNLOCK.9 \
-	dsched.9 dsched_disk_ctx_unref.9 \
-	dsched.9 dsched_get_bio_dp.9 \
-	dsched.9 dsched_get_bio_priv.9 \
-	dsched.9 dsched_get_disk_priv.9 \
-	dsched.9 dsched_new_policy_thread_tdio.9 \
-	dsched.9 DSCHED_POLICY_MODULE.9 \
-	dsched.9 dsched_register.9 \
-	dsched.9 dsched_strategy_async.9 \
-	dsched.9 dsched_strategy_raw.9 \
-	dsched.9 DSCHED_THREAD_IO_LOCK.9 \
-	dsched.9 dsched_thread_io_ref.9 \
-	dsched.9 DSCHED_THREAD_IO_UNLOCK.9 \
-	dsched.9 dsched_thread_io_unref.9 \
-	dsched.9 dsched_unregister.9
+MLINKS+=efirt.9 efi_get_table.9 \
+	efirt.9 efi_get_time.9 \
+	efirt.9 efi_reset_system.9 \
+	efirt.9 efi_set_time.9 \
+	efirt.9 efi_var_get.9 \
+	efirt.9 efi_var_nextname.9 \
+	efirt.9 efi_var_set.9
 MLINKS+=EVENTHANDLER.9 EVENTHANDLER_DECLARE.9 \
 	EVENTHANDLER.9 EVENTHANDLER_DEREGISTER.9 \
 	EVENTHANDLER.9 eventhandler_deregister.9 \
@@ -467,8 +494,10 @@ MLINKS+=EVENTHANDLER.9 EVENTHANDLER_DECLARE.9 \
 	EVENTHANDLER.9 EVENTHANDLER_REGISTER.9 \
 	EVENTHANDLER.9 eventhandler_register.9
 MLINKS+=fetch.9 fubyte.9 \
-	fetch.9 fusword.9 \
-	fetch.9 fuword.9
+	fetch.9 fuword32.9 \
+	fetch.9 fuword64.9 \
+	fetch.9 fuwordadd32.9 \
+	fetch.9 fuwordadd64.9
 MLINKS+=firmware.9 firmware_get.9 \
 	firmware.9 firmware_put.9 \
 	firmware.9 firmware_register.9 \
@@ -582,14 +611,11 @@ MLINKS+=kenv.9 kfreeenv.9 \
 	kenv.9 kunsetenv.9
 MLINKS+=kernacc.9 useracc.9
 MLINKS+=kmalloc.9 kfree.9 \
-	kmalloc.9 kmalloc_cachealign.9 \
 	kmalloc.9 kmalloc_raise_limit.9 \
 	kmalloc.9 krealloc.9 \
 	kmalloc.9 MALLOC_DECLARE.9 \
 	kmalloc.9 MALLOC_DEFINE.9
 MLINKS+=kobj.9 DEFINE_CLASS.9 \
-	kobj.9 kobj_class_compile.9 \
-	kobj.9 kobj_class_free.9 \
 	kobj.9 kobj_create.9 \
 	kobj.9 kobj_delete.9 \
 	kobj.9 kobj_init.9
@@ -604,17 +630,17 @@ MLINKS+=kprintf.9 krateprintf.9 \
 	kprintf.9 uprintf.9
 MLINKS+=ksignal.9 gsignal.9 \
 	ksignal.9 pgsignal.9
+MLINKS+=kstrdup.9 kstrndup.9
 MLINKS+=ktr.9 KTR_COND_LOG.9 \
 	ktr.9 KTR_INFO.9 \
 	ktr.9 KTR_INFO_MASTER.9 \
 	ktr.9 KTR_INFO_MASTER_EXTERN.9 \
 	ktr.9 KTR_LOG.9
 MLINKS+=kether_ntoa.9 kether_aton.9
-MLINKS+=lock.9 lockcount.9 \
-	lock.9 lockcountnb.9 \
-	lock.9 lockinit.9 \
+MLINKS+=lock.9 lockinit.9 \
 	lock.9 lockmgr.9 \
 	lock.9 lockmgr_printinfo.9 \
+	lock.9 lockmgr_try.9 \
 	lock.9 lockowned.9 \
 	lock.9 lockstatus.9 \
 	lock.9 lockuninit.9
@@ -626,13 +652,13 @@ MLINKS+=lwbuf.9 lwbuf_alloc.9 \
 MLINKS+=make_autoclone_dev.9 destroy_autoclone_dev.9 \
 	make_autoclone_dev.9 DEVFS_CLONE_BITMAP.9 \
 	make_autoclone_dev.9 devfs_clone_bitmap_chk.9 \
-	make_autoclone_dev.9 devfs_clone_bitmap_fff.9 \
 	make_autoclone_dev.9 devfs_clone_bitmap_get.9 \
 	make_autoclone_dev.9 devfs_clone_bitmap_init.9 \
 	make_autoclone_dev.9 devfs_clone_bitmap_put.9 \
 	make_autoclone_dev.9 devfs_clone_bitmap_set.9 \
 	make_autoclone_dev.9 devfs_clone_bitmap_uninit.9 \
-	make_autoclone_dev.9 DEVFS_DECLARE_CLONE_BITMAP.9
+	make_autoclone_dev.9 DEVFS_DECLARE_CLONE_BITMAP.9 \
+	make_autoclone_dev.9 DEVFS_DEFINE_CLONE_BITMAP.9
 MLINKS+=make_dev.9 destroy_dev.9 \
 	make_dev.9 destroy_only_dev.9 \
 	make_dev.9 devfs_scan_callback.9 \
@@ -736,7 +762,6 @@ MLINKS+=nlookup.9 naccess.9 \
 	nlookup.9 nlookup_init_raw.9 \
 	nlookup.9 nlookup_init_root.9 \
 	nlookup.9 nlookup_mp.9 \
-	nlookup.9 nlookup_set_cred.9 \
 	nlookup.9 nlookup_simple.9 \
 	nlookup.9 nlookup_zero.9 \
 	nlookup.9 nreadsymlink.9
@@ -774,7 +799,6 @@ MLINKS+=pfil.9 pfil_add_hook.9 \
 MLINKS+=pfind.9 zpfind.9
 MLINKS+=physio.9 physread.9 \
 	physio.9 physwrite.9
-MLINKS+=posix4.9 p1003_1b.9
 MLINKS+=priv.9 priv_check.9 \
 	priv.9 priv_check_cred.9
 MLINKS+=prop_copyin_ioctl.9 prop_array_copyin.9 \
@@ -888,33 +912,53 @@ MLINKS+=spinlock.9 spin_init.9 \
 	spinlock.9 spin_unlock_quick.9 \
 	spinlock.9 spin_pool_lock.9 \
 	spinlock.9 spin_pool_unlock.9
-MLINKS+=store.9 casuword.9 \
+MLINKS+=store.9 casu32.9 \
+	store.9 casu64.9 \
 	store.9 subyte.9 \
-	store.9 susword.9 \
-	store.9 suword.9 \
-	store.9 suword32.9
+	store.9 suword32.9 \
+	store.9 suword64.9
 MLINKS+=syscall.9 syscalls.master.5
-MLINKS+=sysctl.9 SYSCTL_DECL.9 \
+MLINKS+=sysctl.9 SYSCTL_BIT32.9 \
+	sysctl.9 SYSCTL_BIT64.9 \
+	sysctl.9 SYSCTL_DECL.9 \
 	sysctl.9 SYSCTL_INT.9 \
 	sysctl.9 SYSCTL_LONG.9 \
 	sysctl.9 SYSCTL_NODE.9 \
 	sysctl.9 SYSCTL_OPAQUE.9 \
 	sysctl.9 SYSCTL_PROC.9 \
 	sysctl.9 SYSCTL_QUAD.9 \
+	sysctl.9 SYSCTL_S8.9 \
+	sysctl.9 SYSCTL_S16.9 \
+	sysctl.9 SYSCTL_S32.9 \
+	sysctl.9 SYSCTL_S64.9 \
 	sysctl.9 SYSCTL_STRING.9 \
 	sysctl.9 SYSCTL_STRUCT.9 \
+	sysctl.9 SYSCTL_U8.9 \
+	sysctl.9 SYSCTL_U16.9 \
+	sysctl.9 SYSCTL_U32.9 \
+	sysctl.9 SYSCTL_U64.9 \
 	sysctl.9 SYSCTL_UINT.9 \
 	sysctl.9 SYSCTL_ULONG.9 \
 	sysctl.9 SYSCTL_UQUAD.9
-MLINKS+=sysctl_add_oid.9 SYSCTL_ADD_INT.9 \
+MLINKS+=sysctl_add_oid.9 SYSCTL_ADD_BIT32.9 \
+	sysctl_add_oid.9 SYSCTL_ADD_BIT64.9 \
+	sysctl_add_oid.9 SYSCTL_ADD_INT.9 \
 	sysctl_add_oid.9 SYSCTL_ADD_LONG.9 \
 	sysctl_add_oid.9 SYSCTL_ADD_NODE.9 \
 	sysctl_add_oid.9 SYSCTL_ADD_OID.9 \
 	sysctl_add_oid.9 SYSCTL_ADD_OPAQUE.9 \
 	sysctl_add_oid.9 SYSCTL_ADD_PROC.9 \
 	sysctl_add_oid.9 SYSCTL_ADD_QUAD.9 \
+	sysctl_add_oid.9 SYSCTL_ADD_S8.9 \
+	sysctl_add_oid.9 SYSCTL_ADD_S16.9 \
+	sysctl_add_oid.9 SYSCTL_ADD_S32.9 \
+	sysctl_add_oid.9 SYSCTL_ADD_S64.9 \
 	sysctl_add_oid.9 SYSCTL_ADD_STRING.9 \
 	sysctl_add_oid.9 SYSCTL_ADD_STRUCT.9 \
+	sysctl_add_oid.9 SYSCTL_ADD_U8.9 \
+	sysctl_add_oid.9 SYSCTL_ADD_U16.9 \
+	sysctl_add_oid.9 SYSCTL_ADD_U32.9 \
+	sysctl_add_oid.9 SYSCTL_ADD_U64.9 \
 	sysctl_add_oid.9 SYSCTL_ADD_UINT.9 \
 	sysctl_add_oid.9 SYSCTL_ADD_ULONG.9 \
 	sysctl_add_oid.9 SYSCTL_ADD_UQUAD.9 \
@@ -1017,6 +1061,8 @@ MLINKS+=usbdi.9 usb_fifo_alloc_buffer.9 \
 	usbdi.9 usbd_xfer_status.9
 MLINKS+=vcount.9 count_dev.9
 MLINKS+=vhold.9 vdrop.9
+MLINKS+=vn_lock.9 vn_islocked.9 \
+	vn_lock.9 vn_unlock.9
 MLINKS+=VOP_ATTRIB.9 VOP_GETATTR.9 \
 	VOP_ATTRIB.9 VOP_SETATTR.9
 MLINKS+=VOP_GETPAGES.9 VOP_PUTPAGES.9

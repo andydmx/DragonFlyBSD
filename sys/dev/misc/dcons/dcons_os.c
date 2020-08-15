@@ -37,10 +37,6 @@
  */
 
 #include <sys/param.h>
-#if __FreeBSD_version >= 502122
-#include <sys/kdb.h>
-#include <gdb/gdb.h>
-#endif
 #include <sys/kernel.h>
 #include <sys/module.h>
 #include <sys/systm.h>
@@ -49,10 +45,10 @@
 #include <sys/cons.h>
 #include <sys/consio.h>
 #include <sys/tty.h>
+#include <sys/ttydefaults.h>	/* for TTYDEF_* */
 #include <sys/malloc.h>
 #include <sys/proc.h>
 #include <sys/priv.h>
-#include <sys/thread2.h>
 #include <sys/ucred.h>
 #include <sys/bus.h>
 
@@ -122,17 +118,8 @@ static int drv_init = 0;
 static struct callout dcons_callout;
 struct dcons_buf *dcons_buf;		/* for local dconschat */
 
-#ifdef __DragonFly__
 #define DEV	cdev_t
 #define THREAD	d_thread_t
-#elif __FreeBSD_version < 500000
-#define DEV	cdev_t
-#define THREAD	struct proc
-#else
-#define DEV	struct cdev *
-#define THREAD	struct thread
-#endif
-
 
 static void	dcons_tty_start(struct tty *);
 static int	dcons_tty_param(struct tty *, struct termios *);
@@ -147,41 +134,15 @@ static cn_checkc_t 	dcons_cncheckc;
 static cn_putc_t	dcons_cnputc;
 
 CONS_DRIVER(dcons, dcons_cnprobe, dcons_cninit, dcons_cninit_fini,
-	    NULL, dcons_cngetc, dcons_cncheckc, dcons_cnputc, NULL);
+	    NULL, dcons_cngetc, dcons_cncheckc, dcons_cnputc, NULL, NULL);
 
-#if __FreeBSD_version >= 502122
-static gdb_probe_f dcons_dbg_probe;
-static gdb_init_f dcons_dbg_init;
-static gdb_term_f dcons_dbg_term;
-static gdb_getc_f dcons_dbg_getc;
-static gdb_checkc_f dcons_dbg_checkc;
-static gdb_putc_f dcons_dbg_putc;
-
-GDB_DBGPORT(dcons, dcons_dbg_probe, dcons_dbg_init, dcons_dbg_term,
-    dcons_dbg_checkc, dcons_dbg_getc, dcons_dbg_putc);
-
-extern struct gdb_dbgport *gdb_cur;
-#endif
-
-#if (KDB || DDB) && ALT_BREAK_TO_DEBUGGER
+#if defined(DDB) && defined(ALT_BREAK_TO_DEBUGGER)
 static int
 dcons_check_break(struct dcons_softc *dc, int c)
 {
 	if (c < 0)
 		return (c);
 
-	lwkt_gettoken(&tty_token);
-#if __FreeBSD_version >= 502122
-	if (kdb_alt_break(c, &dc->brk_state)) {
-		if ((dc->flags & DC_GDB) != 0) {
-			if (gdb_cur == &dcons_gdb_dbgport) {
-				kdb_dbbe_select("gdb");
-				breakpoint();
-			}
-		} else
-			breakpoint();
-	}
-#else
 	switch (dc->brk_state) {
 	case STATE1:
 		if (c == KEY_TILDE)
@@ -201,8 +162,6 @@ dcons_check_break(struct dcons_softc *dc, int c)
 	}
 	if (c == KEY_CR)
 		dc->brk_state = STATE1;
-#endif
-	lwkt_reltoken(&tty_token);
 	return (c);
 }
 #else
@@ -214,7 +173,6 @@ dcons_os_checkc(struct dcons_softc *dc)
 {
 	int c;
 
-	lwkt_gettoken(&tty_token);
 	if (dg.dma_tag != NULL)
 		bus_dmamap_sync(dg.dma_tag, dg.dma_map, BUS_DMASYNC_POSTREAD);
   
@@ -223,7 +181,6 @@ dcons_os_checkc(struct dcons_softc *dc)
 	if (dg.dma_tag != NULL)
 		bus_dmamap_sync(dg.dma_tag, dg.dma_map, BUS_DMASYNC_PREREAD);
 
-	lwkt_reltoken(&tty_token);
 	return (c);
 }
 
@@ -259,8 +216,8 @@ dcons_open(struct dev_open_args *ap)
 	if (unit != 0)
 		return (ENXIO);
 
-	lwkt_gettoken(&tty_token);
-	tp = dev->si_tty = ttymalloc(dev->si_tty);
+	tp = ttymalloc(&dev->si_tty);
+	lwkt_gettoken(&tp->t_token);
 	tp->t_oproc = dcons_tty_start;
 	tp->t_param = dcons_tty_param;
 	tp->t_stop = nottystop;
@@ -268,7 +225,6 @@ dcons_open(struct dev_open_args *ap)
 
 	error = 0;
 
-	crit_enter();
 	if ((tp->t_state & TS_ISOPEN) == 0) {
 		tp->t_state |= TS_CARR_ON;
 		ttychars(tp);
@@ -279,18 +235,14 @@ dcons_open(struct dev_open_args *ap)
 		tp->t_ispeed = tp->t_ospeed = TTYDEF_SPEED;
 		ttsetwater(tp);
 	} else if ((tp->t_state & TS_XCLUDE) && priv_check_cred(ap->a_cred, PRIV_ROOT, 0)) {
-		crit_exit();
-		lwkt_reltoken(&tty_token);
+		lwkt_reltoken(&tp->t_token);
+
 		return (EBUSY);
 	}
-	crit_exit();
 
-#if __FreeBSD_version < 502113
 	error = (*linesw[tp->t_line].l_open)(dev, tp);
-#else
-	error = ttyld_open(tp, dev);
-#endif
-	lwkt_reltoken(&tty_token);
+	lwkt_reltoken(&tp->t_token);
+
 	return (error);
 }
 
@@ -305,13 +257,13 @@ dcons_close(struct dev_close_args *ap)
 	if (unit != 0)
 		return (ENXIO);
 
-	lwkt_gettoken(&tty_token);
 	tp = dev->si_tty;
+	lwkt_gettoken(&tp->t_token);
 	if (tp->t_state & TS_ISOPEN) {
 		(*linesw[tp->t_line].l_close)(tp, ap->a_fflag);
 		ttyclose(tp);
 	}
-	lwkt_reltoken(&tty_token);
+	lwkt_reltoken(&tp->t_token);
 
 	return (0);
 }
@@ -328,32 +280,32 @@ dcons_ioctl(struct dev_ioctl_args *ap)
 	if (unit != 0)
 		return (ENXIO);
 
-	lwkt_gettoken(&tty_token);
 	tp = dev->si_tty;
+	lwkt_gettoken(&tp->t_token);
 	error = (*linesw[tp->t_line].l_ioctl)(tp, ap->a_cmd, ap->a_data, ap->a_fflag, ap->a_cred);
 	if (error != ENOIOCTL) {
-		lwkt_reltoken(&tty_token);
+		lwkt_reltoken(&tp->t_token);
 		return (error);
 	}
 
 	error = ttioctl(tp, ap->a_cmd, ap->a_data, ap->a_fflag);
 	if (error != ENOIOCTL) {
-		lwkt_reltoken(&tty_token);
+		lwkt_reltoken(&tp->t_token);
 		return (error);
 	}
 
-	lwkt_reltoken(&tty_token);
+	lwkt_reltoken(&tp->t_token);
 	return (ENOTTY);
 }
 
 static int
 dcons_tty_param(struct tty *tp, struct termios *t)
 {
-	lwkt_gettoken(&tty_token);
+	lwkt_gettoken(&tp->t_token);
 	tp->t_ispeed = t->c_ispeed;
 	tp->t_ospeed = t->c_ospeed;
 	tp->t_cflag = t->c_cflag;
-	lwkt_reltoken(&tty_token);
+	lwkt_reltoken(&tp->t_token);
 	return 0;
 }
 
@@ -362,13 +314,11 @@ dcons_tty_start(struct tty *tp)
 {
 	struct dcons_softc *dc;
 
-	lwkt_gettoken(&tty_token);
+	lwkt_gettoken(&tp->t_token);
 	dc = (struct dcons_softc *)tp->t_dev->si_drv1;
-	crit_enter();
 	if (tp->t_state & (TS_TIMEOUT | TS_TTSTOP)) {
 		ttwwakeup(tp);
-		crit_exit();
-		lwkt_reltoken(&tty_token);
+		lwkt_reltoken(&tp->t_token);
 		return;
 	}
 
@@ -378,46 +328,36 @@ dcons_tty_start(struct tty *tp)
 	tp->t_state &= ~TS_BUSY;
 
 	ttwwakeup(tp);
-	crit_exit();
-	lwkt_reltoken(&tty_token);
+	lwkt_reltoken(&tp->t_token);
 }
 
 static void
-dcons_timeout(void *v)
+dcons_timeout(void *dummy __unused)
 {
-	struct	tty *tp;
+	struct tty *tp;
 	struct dcons_softc *dc;
 	int i, c, polltime;
 
-	lwkt_gettoken(&tty_token);
 	for (i = 0; i < DCONS_NPORT; i ++) {
 		dc = &sc[i];
 		tp = ((DEV)dc->dev)->si_tty;
-		while ((c = dcons_os_checkc(dc)) != -1)
+		lwkt_gettoken(&tp->t_token);
+		while ((c = dcons_os_checkc(dc)) != -1) {
 			if (tp->t_state & TS_ISOPEN)
-#if __FreeBSD_version < 502113
 				(*linesw[tp->t_line].l_rint)(c, tp);
-#else
-				ttyld_rint(tp, c);
-#endif
+		}
+		lwkt_reltoken(&tp->t_token);
 	}
 	polltime = hz / poll_hz;
 	if (polltime < 1)
 		polltime = 1;
-	callout_reset(&dcons_callout, polltime, dcons_timeout, tp);
-	lwkt_reltoken(&tty_token);
+	callout_reset(&dcons_callout, polltime, dcons_timeout, NULL);
 }
 
 static void
 dcons_cnprobe(struct consdev *cp)
 {
-#ifdef __DragonFly__
 	cp->cn_probegood = 1;
-#elif __FreeBSD_version >= 501109
-	ksprintf(cp->cn_name, "dcons");
-#else
-	cp->cn_dev = makedev(CDEV_MAJOR, DCONS_CON);
-#endif
 #if DCONS_FORCE_CONSOLE
 	cp->cn_pri = CN_REMOTE;
 #else
@@ -429,7 +369,7 @@ static void
 dcons_cninit(struct consdev *cp)
 {
 	dcons_drv_init(0);
-#if CONS_NODEV
+#ifdef CONS_NODEV
 	cp->cn_arg
 #else
 	cp->cn_private
@@ -444,7 +384,7 @@ dcons_cninit_fini(struct consdev *cp)
 			      UID_ROOT, GID_WHEEL, 0600, "dcons");
 }
 
-#if CONS_NODEV
+#ifdef CONS_NODEV
 static int
 dcons_cngetc(struct consdev *cp)
 {
@@ -546,7 +486,7 @@ dcons_drv_init(int stage)
 ok:
 	dcons_buf = dg.buf;
 
-#if DDB && DCONS_FORCE_GDB
+#if defined(DDB) && DCONS_FORCE_GDB
 	if (gdb_tab == NULL) {
 		gdb_tab = &dcons_consdev;
 		dcons_consdev.cn_gdbprivate = &sc[DCONS_GDB];
@@ -557,9 +497,6 @@ ok:
 	return 0;
 }
 
-/*
- * NOTE: Must be called with tty_token held
- */
 static int
 dcons_attach_port(int port, char *name, int flags)
 {
@@ -567,17 +504,14 @@ dcons_attach_port(int port, char *name, int flags)
 	struct tty *tp;
 	DEV dev;
 
-	ASSERT_LWKT_TOKEN_HELD(&tty_token);
 	dc = &sc[port];
 	dc->flags = flags;
-	dev = make_dev(&dcons_ops, port, UID_ROOT, GID_WHEEL, 0600, "%s",
-	    name);
+	dev = make_dev(&dcons_ops, port, UID_ROOT, GID_WHEEL, 0600,
+		       "%s", name);
 	dc->dev = (void *)dev;
-	tp = ttymalloc(NULL);
-
 	dev->si_drv1 = (void *)dc;
-	dev->si_tty = tp;
 
+	tp = ttymalloc(&dev->si_tty);
 	tp->t_oproc = dcons_tty_start;
 	tp->t_param = dcons_tty_param;
 	tp->t_stop = nottystop;
@@ -586,22 +520,14 @@ dcons_attach_port(int port, char *name, int flags)
 	return(0);
 }
 
-/*
- * NOTE: Must be called with tty_token held
- */
 static int
 dcons_attach(void)
 {
 	int polltime;
 
-	ASSERT_LWKT_TOKEN_HELD(&tty_token);
 	dcons_attach_port(DCONS_CON, "dcons", 0);
 	dcons_attach_port(DCONS_GDB, "dgdb", DC_GDB);
-#if __FreeBSD_version < 500000
 	callout_init_mp(&dcons_callout);
-#else
-	callout_init(&dcons_callout, 0);
-#endif
 	polltime = hz / poll_hz;
 	if (polltime < 1)
 		polltime = 1;
@@ -609,29 +535,21 @@ dcons_attach(void)
 	return(0);
 }
 
-/*
- * NOTE: Must be called with tty_token held
- */
 static int
 dcons_detach(int port)
 {
 	struct	tty *tp;
 	struct dcons_softc *dc;
 
-	ASSERT_LWKT_TOKEN_HELD(&tty_token);
 	dc = &sc[port];
 
 	tp = ((DEV)dc->dev)->si_tty;
+	lwkt_gettoken(&tp->t_token);
 
 	if (tp->t_state & TS_ISOPEN) {
 		kprintf("dcons: still opened\n");
-#if __FreeBSD_version < 502113
 		(*linesw[tp->t_line].l_close)(tp, 0);
 		ttyclose(tp);
-#else
-		ttyld_close(tp, 0);
-		tty_close(tp);
-#endif
 	}
 	/* XXX
 	 * must wait until all device are closed.
@@ -641,6 +559,7 @@ dcons_detach(int port)
 #else
 	tsleep((void *)dc, PWAIT, "dcodtc", hz/4);
 #endif
+	lwkt_reltoken(&tp->t_token);
 	destroy_dev(dc->dev);
 
 	return(0);
@@ -653,12 +572,11 @@ dcons_modevent(module_t mode, int type, void *data)
 {
 	int err = 0, ret;
 
-	lwkt_gettoken(&tty_token);
 	switch (type) {
 	case MOD_LOAD:
 		ret = dcons_drv_init(1);
 		dcons_attach();
-#if __FreeBSD_version >= 500000
+#if 0 /* XXX __FreeBSD_version >= 500000 */
 		if (ret == 0) {
 			dcons_cnprobe(&dcons_consdev);
 			dcons_cninit(&dcons_consdev);
@@ -669,17 +587,15 @@ dcons_modevent(module_t mode, int type, void *data)
 	case MOD_UNLOAD:
 		kprintf("dcons: unload\n");
 		callout_stop(&dcons_callout);
-#if __FreeBSD_version < 502122
-#if DDB && DCONS_FORCE_GDB
-#if CONS_NODEV
+#if defined(DDB) && DCONS_FORCE_GDB
+#ifdef CONS_NODEV
 		gdb_arg = NULL;
 #else
 		if (gdb_tab == &dcons_consdev)
 			gdb_tab = NULL;
 #endif
 #endif
-#endif
-#if __FreeBSD_version >= 500000
+#if 0 /* XXX __FreeBSD_version >= 500000 */
 		cnremove(&dcons_consdev);
 #endif
 		dcons_detach(DCONS_CON);
@@ -696,50 +612,8 @@ dcons_modevent(module_t mode, int type, void *data)
 		err = EOPNOTSUPP;
 		break;
 	}
-	lwkt_reltoken(&tty_token);
 	return(err);
 }
-
-#if __FreeBSD_version >= 502122
-/* Debugger interface */
-
-static int
-dcons_dbg_probe(void)
-{
-	return(DCONS_FORCE_GDB);
-}
-
-static void
-dcons_dbg_init(void)
-{
-}
-
-static void
-dcons_dbg_term(void)
-{
-}
-
-static void
-dcons_dbg_putc(int c)
-{
-	struct dcons_softc *dc = &sc[DCONS_GDB];
-	dcons_os_putc(dc, c);
-}
-
-static int
-dcons_dbg_checkc(void)
-{
-	struct dcons_softc *dc = &sc[DCONS_GDB];
-	return (dcons_os_checkc(dc));
-}
-
-static int
-dcons_dbg_getc(void)
-{
-	struct dcons_softc *dc = &sc[DCONS_GDB];
-	return (dcons_os_getc(dc));
-}
-#endif
 
 DEV_MODULE(dcons, dcons_modevent, NULL);
 MODULE_VERSION(dcons, DCONS_VERSION);

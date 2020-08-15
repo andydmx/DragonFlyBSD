@@ -1,6 +1,6 @@
 #
-# XXX MISSING: cdce rue smsc uhso usie
+# XXX MISSING: smsc
 
-SUBDIR=	aue axe axge cue ipheth kue mos udav uether urndis
+SUBDIR=	aue axe axge cdce cue ipheth kue mos udav uether urndis
 
 .include <bsd.subdir.mk>

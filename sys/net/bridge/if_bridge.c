@@ -111,71 +111,72 @@
  *
  *      CPU0           CPU1         CPU2          CPU3
  *
- *                               tcp_thread2
+ *                                 netisr2
  *                                    |
  *                                alloc nmsg
  *                    snd nmsg        |
  *                    w/o rtinfo      |
- *      ifnet0<-----------------------+
+ *     netisr0<-----------------------+
  *        |                           :
  *    lookup dst                      :
  *   rtnode exists?(Y)free nmsg       :
  *        |(N)                        :
- *        |
- *  alloc rtinfo
- *  alloc rtnode
- * install rtnode
- *        |
- *        +---------->ifnet1
- *        : fwd nmsg    |
- *        : w/ rtinfo   |
- *        :             |
- *        :             |
- *                 alloc rtnode
- *               (w/ nmsg's rtinfo)
- *                install rtnode
- *                      |
- *                      +---------->ifnet2
- *                      : fwd nmsg    |
- *                      : w/ rtinfo   |
- *                      :             |
- *                      :         same as ifnet1
+ *        |                           :
+ *  alloc rtinfo                      :
+ *  alloc rtnode                      :
+ * install rtnode                     :
+ *        |                           :
+ *        +---------->netisr1         :
+ *        : fwd nmsg     |            :
+ *        : w/ rtinfo    |            :
+ *        :              |            :
+ *        :              |            :
+ *                  alloc rtnode      :
+ *                (w/ nmsg's rtinfo)  :
+ *                 install rtnode     :
+ *                       |            :
+ *                       +----------->|
+ *                       : fwd nmsg   |
+ *                       : w/ rtinfo  |
+ *                       :            |
+ *                       :     same as netisr1
  *                                    |
- *                                    +---------->ifnet3
- *                                    : fwd nmsg    |
- *                                    : w/ rtinfo   |
- *                                    :             |
- *                                    :         same as ifnet1
+ *                                    +---------->netisr3
+ *                                    : fwd nmsg     |
+ *                                    : w/ rtinfo    |
+ *                                    :              |
+ *                                    :       same as netisr1
  *                                               free nmsg
- *                                                  :
- *                                                  :
+ *                                                   :
+ *                                                   :
  *
- * The netmsgs forwarded between protocol threads and ifnet threads are
- * allocated with (M_WAITOK|M_NULLOK), so it will not fail under most
- * cases (route information is too precious to be not installed :).
- * Since multiple threads may try to install route information for the
- * same dst eaddr, we look up route information in ifnet0.  However, this
- * looking up only need to be performed on ifnet0, which is the start
- * point of the route information installation process.
+ * The netmsgs forwarded between netisr2 are allocated with
+ * (M_WAITOK|M_NULLOK), so it will not fail under most cases (route
+ * information is too precious to be not installed :).  Since multiple
+ * netisrs may try to install route information for the same dst eaddr,
+ * we look up route information in netisr0.  However, this looking up
+ * only need to be performed on netisr0, which is the start point of
+ * the route information installation process.
  *
  *
  * Bridge route information deleting/flushing:
  *
- *  CPU0            CPU1             CPU2             CPU3
+ *  CPU0            CPU1              CPU2             CPU3
  *
  * netisr0
- *   |
- * find suitable rtnodes,
- * mark their rtinfo dead
- *   |
- *   | domsg <------------------------------------------+
- *   |                                                  | replymsg
- *   |                                                  |
- *   V     fwdmsg           fwdmsg           fwdmsg     |
- * ifnet0 --------> ifnet1 --------> ifnet2 --------> ifnet3
- * delete rtnodes   delete rtnodes   delete rtnodes   delete rtnodes
- * w/ dead rtinfo   w/ dead rtinfo   w/ dead rtinfo   w/ dead rtinfo
- *                                                    free dead rtinfos
+ *    |
+ *  find suitable rtnodes,
+ *  mark their rtinfo dead
+ *    |
+ *    | domsg <-------------------------------------------+
+ *    : delete rtnodes                                    | replymsg
+ *    : w/ dead rtinfo                                    |
+ *    :                                                   |
+ *    :  fwdmsg             fwdmsg            fwdmsg      |
+ *    :----------> netisr1 --------> netisr2 --------> netisr3
+ *              delete rtnodes    delete rtnodes    delete rtnodes
+ *              w/ dead rtinfo    w/ dead rtinfo    w/ dead rtinfo
+ *                                                 free dead rtinfos
  *
  * All deleting/flushing operations are serialized by netisr0, so each
  * operation only reaps the route information marked dead by itself.
@@ -183,11 +184,12 @@
  *
  * Bridge route information adding/deleting/flushing:
  * Since all operation is serialized by the fixed message flow between
- * ifnet threads, it is not possible to create corrupted per-cpu route
+ * netisrs, it is not possible to create corrupted per-cpu route
  * information.
  *
  *
  *
+ * XXX This no longer applies.
  * Percpu member interface list iteration with blocking operation:
  * Since one bridge could only delete one member interface at a time and
  * the deleted member interface is not freed after netmsg_service_sync(),
@@ -278,7 +280,7 @@
  * Maximum number of addresses to cache.
  */
 #ifndef BRIDGE_RTABLE_MAX
-#define	BRIDGE_RTABLE_MAX		100
+#define	BRIDGE_RTABLE_MAX		4096
 #endif
 
 /*
@@ -360,7 +362,7 @@ extern  struct ifnet *(*bridge_interface_p)(void *if_bridge);
 
 static int	bridge_rtable_prune_period = BRIDGE_RTABLE_PRUNE_PERIOD;
 
-static int	bridge_clone_create(struct if_clone *, int, caddr_t);
+static int	bridge_clone_create(struct if_clone *, int, caddr_t, caddr_t);
 static int	bridge_clone_destroy(struct ifnet *);
 
 static int	bridge_ioctl(struct ifnet *, u_long, caddr_t, struct ucred *);
@@ -644,7 +646,8 @@ DECLARE_MODULE(if_bridge, bridge_mod, SI_SUB_PSEUDO, SI_ORDER_ANY);
  *	Create a new bridge instance.
  */
 static int
-bridge_clone_create(struct if_clone *ifc, int unit, caddr_t param __unused)
+bridge_clone_create(struct if_clone *ifc, int unit,
+		    caddr_t params __unused, caddr_t data __unused)
 {
 	struct bridge_softc *sc;
 	struct ifnet *ifp;
@@ -665,20 +668,20 @@ bridge_clone_create(struct if_clone *ifc, int unit, caddr_t param __unused)
 	/* Initialize our routing table. */
 	bridge_rtable_init(sc);
 
-	callout_init(&sc->sc_brcallout);
+	callout_init_mp(&sc->sc_brcallout);
 	netmsg_init(&sc->sc_brtimemsg, NULL, &netisr_adone_rport,
 		    MSGF_DROPABLE, bridge_timer_handler);
 	sc->sc_brtimemsg.lmsg.u.ms_resultp = sc;
 
-	callout_init(&sc->sc_bstpcallout);
+	callout_init_mp(&sc->sc_bstpcallout);
 	netmsg_init(&sc->sc_bstptimemsg, NULL, &netisr_adone_rport,
 		    MSGF_DROPABLE, bstp_tick_handler);
 	sc->sc_bstptimemsg.lmsg.u.ms_resultp = sc;
 
 	/* Initialize per-cpu member iface lists */
-	sc->sc_iflists = kmalloc(sizeof(*sc->sc_iflists) * ncpus,
+	sc->sc_iflists = kmalloc(sizeof(*sc->sc_iflists) * netisr_ncpus,
 				 M_DEVBUF, M_WAITOK);
-	for (cpu = 0; cpu < ncpus; ++cpu)
+	for (cpu = 0; cpu < netisr_ncpus; ++cpu)
 		TAILQ_INIT(&sc->sc_iflists[cpu]);
 
 	TAILQ_INIT(&sc->sc_spanlist);
@@ -1158,7 +1161,7 @@ bridge_ioctl_add(struct bridge_softc *sc, void *arg)
 	bifp = sc->sc_ifp;
 	ASSERT_IFNET_SERIALIZED_ALL(bifp);
 
-	ifs = ifunit(req->ifbr_ifsname);
+	ifs = ifunit_netisr(req->ifbr_ifsname);
 	if (ifs == NULL)
 		return (ENOENT);
 
@@ -1734,7 +1737,7 @@ bridge_ioctl_addspan(struct bridge_softc *sc, void *arg)
 	struct ifnet *ifs;
 	struct bridge_ifinfo *bif_info;
 
-	ifs = ifunit(req->ifbr_ifsname);
+	ifs = ifunit_netisr(req->ifbr_ifsname);
 	if (ifs == NULL)
 		return (ENOENT);
 
@@ -1781,7 +1784,7 @@ bridge_ioctl_delspan(struct bridge_softc *sc, void *arg)
 	struct bridge_iflist *bif;
 	struct ifnet *ifs;
 
-	ifs = ifunit(req->ifbr_ifsname);
+	ifs = ifunit_netisr(req->ifbr_ifsname);
 	if (ifs == NULL)
 		return (ENOENT);
 
@@ -2101,6 +2104,7 @@ bridge_output(struct ifnet *ifp, struct mbuf *m)
 	int alt_priority;
 
 	ASSERT_IFNET_NOT_SERIALIZED_ALL(ifp);
+	ASSERT_NETISR_NCPUS(mycpuid);
 	mbuftrackid(m, 65);
 
 	/*
@@ -2137,7 +2141,7 @@ bridge_output(struct ifnet *ifp, struct mbuf *m)
 
 	/*
 	 * If the packet is a multicast, or we don't know a better way to
-	 * get there, send to all interfaces.
+	 * get there, send to all interfaces except the originating one.
 	 */
 	if (ETHER_IS_MULTICAST(eh->ether_dhost))
 		dst_if = NULL;
@@ -2155,7 +2159,7 @@ bridge_output(struct ifnet *ifp, struct mbuf *m)
 		alt_if = NULL;
 		alt_priority = 0;
 		TAILQ_FOREACH_MUTABLE(bif, &sc->sc_iflists[mycpuid],
-				     bif_next, nbif) {
+				      bif_next, nbif) {
 			dst_if = bif->bif_ifp;
 
 			if ((dst_if->if_flags & IFF_RUNNING) == 0)
@@ -2219,7 +2223,7 @@ bridge_output(struct ifnet *ifp, struct mbuf *m)
 				used = 1;
 				mc = m;
 			} else {
-				mc = m_copypacket(m, MB_DONTWAIT);
+				mc = m_copypacket(m, M_NOWAIT);
 				if (mc == NULL) {
 					IFNET_STAT_INC(bifp, oerrors, 1);
 					continue;
@@ -2277,7 +2281,7 @@ sendunicast:
  *
  * Without this the ARP code will supply bridge member interfaces
  * for the is-at which makes it difficult the bridge to fail-over
- * interfaces (amoung other things).
+ * interfaces (among other things).
  */
 static struct ifnet *
 bridge_interface(void *if_bridge)
@@ -2298,6 +2302,7 @@ bridge_start(struct ifnet *ifp, struct ifaltq_subque *ifsq)
 
 	ASSERT_ALTQ_SQ_DEFAULT(ifp, ifsq);
 	ASSERT_ALTQ_SQ_SERIALIZED_HW(ifsq);
+	ASSERT_NETISR_NCPUS(mycpuid);
 
 	ifsq_set_oactive(ifsq);
 	for (;;) {
@@ -2526,6 +2531,7 @@ bridge_input(struct ifnet *ifp, struct mbuf *m)
 	struct mbuf *mc, *mc2;
 
 	ASSERT_IFNET_NOT_SERIALIZED_ALL(ifp);
+	ASSERT_NETISR_NCPUS(mycpuid);
 	mbuftrackid(m, 67);
 
 	/*
@@ -2627,11 +2633,27 @@ bridge_input(struct ifnet *ifp, struct mbuf *m)
 		);
 	}
 
+	/*
+	 * If the packet is for us, set the packets source as the
+	 * bridge, and return the packet back to ifnet.if_input for
+	 * local processing.
+	 */
 	if (memcmp(eh->ether_dhost, IF_LLADDR(bifp), ETHER_ADDR_LEN) == 0) {
 		/*
-		 * If the packet is for us, set the packets source as the
-		 * bridge, and return the packet back to ifnet.if_input for
-		 * local processing.
+		 * We must still record the source interface in our
+		 * addr cache, otherwise our bridge won't know where
+		 * to send responses and will broadcast them.
+		 */
+		bif = bridge_lookup_member_if(sc, ifp);
+		if ((bif->bif_flags & IFBIF_LEARNING) &&
+		    ((bif->bif_flags & IFBIF_STP) == 0 ||
+		     bif->bif_state != BSTP_IFSTATE_BLOCKING)) {
+			bridge_rtupdate(sc, eh->ether_shost,
+					ifp, IFBAF_DYNAMIC);
+		}
+
+		/*
+		 * Perform pfil hooks.
 		 */
 		m->m_pkthdr.fw_flags &= ~BRIDGE_MBUF_TAGGED;
 		KASSERT(bifp->if_bridge == NULL,
@@ -2648,6 +2670,11 @@ bridge_input(struct ifnet *ifp, struct mbuf *m)
 					goto out;
 			}
 		}
+
+		/*
+		 * Set new_ifp and skip to the end.  This will trigger code
+		 * to reinput the packet and run it into our stack.
+		 */
 		new_ifp = bifp;
 		goto out;
 	}
@@ -2715,7 +2742,7 @@ bridge_input(struct ifnet *ifp, struct mbuf *m)
 		 * for bridge processing; return the original packet for
 		 * local processing.
 		 */
-		mc = m_dup(m, MB_DONTWAIT);
+		mc = m_dup(m, M_NOWAIT);
 		if (mc == NULL)
 			goto out;
 
@@ -2737,7 +2764,7 @@ bridge_input(struct ifnet *ifp, struct mbuf *m)
 		 */
 		KASSERT(bifp->if_bridge == NULL,
 			("loop created in bridge_input"));
-		mc2 = m_dup(m, MB_DONTWAIT);
+		mc2 = m_dup(m, M_NOWAIT);
 #ifdef notyet
 		if (mc2 != NULL) {
 			/* Keep the layer3 header aligned */
@@ -2847,6 +2874,8 @@ bridge_input(struct ifnet *ifp, struct mbuf *m)
 	 * Perform the bridge forwarding function, but disallow bridging
 	 * to interfaces in the blocking state if the packet came in on
 	 * an interface in the blocking state.
+	 *
+	 * (bridge_forward also updates the addr cache).
 	 */
 	bridge_forward(sc, m);
 	m = NULL;
@@ -2931,7 +2960,7 @@ bridge_start_bcast(struct bridge_softc *sc, struct mbuf *m)
 			mc = m;
 			used = 1;
 		} else {
-			mc = m_copypacket(m, MB_DONTWAIT);
+			mc = m_copypacket(m, M_NOWAIT);
 			if (mc == NULL) {
 				IFNET_STAT_INC(bifp, oerrors, 1);
 				continue;
@@ -3064,7 +3093,7 @@ bridge_broadcast(struct bridge_softc *sc, struct ifnet *src_if,
 			mc = m;
 			used = 1;
 		} else {
-			mc = m_copypacket(m, MB_DONTWAIT);
+			mc = m_copypacket(m, M_NOWAIT);
 			if (mc == NULL) {
 				IFNET_STAT_INC(sc->sc_ifp, oerrors, 1);
 				continue;
@@ -3129,7 +3158,7 @@ bridge_span(struct bridge_softc *sc, struct mbuf *m)
 		if ((dst_if->if_flags & IFF_RUNNING) == 0)
 			continue;
 
-		mc = m_copypacket(m, MB_DONTWAIT);
+		mc = m_copypacket(m, M_NOWAIT);
 		if (mc == NULL) {
 			IFNET_STAT_INC(sc->sc_ifp, oerrors, 1);
 			continue;
@@ -3143,7 +3172,7 @@ bridge_span(struct bridge_softc *sc, struct mbuf *m)
 static void
 bridge_rtmsg_sync_handler(netmsg_t msg)
 {
-	ifnet_forwardmsg(&msg->lmsg, mycpuid + 1);
+	netisr_forwardmsg(&msg->base, mycpuid + 1);
 }
 
 static void
@@ -3153,9 +3182,10 @@ bridge_rtmsg_sync(struct bridge_softc *sc)
 
 	ASSERT_IFNET_NOT_SERIALIZED_ALL(sc->sc_ifp);
 
+	/* XXX use netmsg_service_sync */
 	netmsg_init(&msg, NULL, &curthread->td_msgport,
 		    0, bridge_rtmsg_sync_handler);
-	ifnet_domsg(&msg.lmsg, 0);
+	netisr_domsg(&msg, 0);
 }
 
 static __inline void
@@ -3224,6 +3254,7 @@ bridge_rtinstall_oncpu(struct bridge_softc *sc, const uint8_t *dst,
 		      M_WAITOK | M_ZERO);
 	memcpy(brt->brt_addr, dst, ETHER_ADDR_LEN);
 	brt->brt_info = bri;
+	atomic_add_int(&bri->bri_refs, 1);
 
 	bridge_rtnode_insert(sc, brt);
 	return 0;
@@ -3241,15 +3272,15 @@ bridge_rtinstall_handler(netmsg_t msg)
 				       &brmsg->br_rtinfo);
 	if (error) {
 		KKASSERT(mycpuid == 0 && brmsg->br_rtinfo == NULL);
-		lwkt_replymsg(&brmsg->base.lmsg, error);
+		netisr_replymsg(&brmsg->base, error);
 		return;
 	} else if (brmsg->br_rtinfo == NULL) {
 		/* rtnode already exists for 'dst' */
 		KKASSERT(mycpuid == 0);
-		lwkt_replymsg(&brmsg->base.lmsg, 0);
+		netisr_replymsg(&brmsg->base, 0);
 		return;
 	}
-	ifnet_forwardmsg(&brmsg->base.lmsg, mycpuid + 1);
+	netisr_forwardmsg(&brmsg->base, mycpuid + 1);
 }
 
 /*
@@ -3286,7 +3317,7 @@ bridge_rtupdate(struct bridge_softc *sc, const uint8_t *dst,
 		brmsg->br_softc = sc;
 		brmsg->br_rtinfo = NULL;
 
-		ifnet_sendmsg(&brmsg->base.lmsg, 0);
+		netisr_sendmsg(&brmsg->base, 0);
 		return 0;
 	}
 	bridge_rtinfo_update(brt->brt_info, dst_if, 0, flags,
@@ -3311,7 +3342,7 @@ bridge_rtsaddr(struct bridge_softc *sc, const uint8_t *dst,
 	brmsg.br_softc = sc;
 	brmsg.br_rtinfo = NULL;
 
-	return ifnet_domsg(&brmsg.base.lmsg, 0);
+	return netisr_domsg(&brmsg.base, 0);
 }
 
 /*
@@ -3339,7 +3370,7 @@ bridge_rtreap_handler(netmsg_t msg)
 		if (brt->brt_info->bri_dead)
 			bridge_rtnode_destroy(sc, brt);
 	}
-	ifnet_forwardmsg(&msg->lmsg, mycpuid + 1);
+	netisr_forwardmsg(&msg->base, mycpuid + 1);
 }
 
 static void
@@ -3353,7 +3384,7 @@ bridge_rtreap(struct bridge_softc *sc)
 		    0, bridge_rtreap_handler);
 	msg.lmsg.u.ms_resultp = sc;
 
-	ifnet_domsg(&msg.lmsg, 0);
+	netisr_domsg(&msg, 0);
 }
 
 static void
@@ -3367,7 +3398,7 @@ bridge_rtreap_async(struct bridge_softc *sc)
 		    0, bridge_rtreap_handler);
 	msg->lmsg.u.ms_resultp = sc;
 
-	ifnet_sendmsg(&msg->lmsg, 0);
+	netisr_sendmsg(msg, 0);
 }
 
 /*
@@ -3604,9 +3635,9 @@ bridge_rtable_init(struct bridge_softc *sc)
 	/*
 	 * Initialize per-cpu hash tables
 	 */
-	sc->sc_rthashs = kmalloc(sizeof(*sc->sc_rthashs) * ncpus,
+	sc->sc_rthashs = kmalloc(sizeof(*sc->sc_rthashs) * netisr_ncpus,
 				 M_DEVBUF, M_WAITOK);
-	for (cpu = 0; cpu < ncpus; ++cpu) {
+	for (cpu = 0; cpu < netisr_ncpus; ++cpu) {
 		int i;
 
 		sc->sc_rthashs[cpu] =
@@ -3621,9 +3652,10 @@ bridge_rtable_init(struct bridge_softc *sc)
 	/*
 	 * Initialize per-cpu lists
 	 */
-	sc->sc_rtlists = kmalloc(sizeof(struct bridge_rtnode_head) * ncpus,
-				 M_DEVBUF, M_WAITOK);
-	for (cpu = 0; cpu < ncpus; ++cpu)
+	sc->sc_rtlists =
+	    kmalloc(sizeof(struct bridge_rtnode_head) * netisr_ncpus,
+	    M_DEVBUF, M_WAITOK);
+	for (cpu = 0; cpu < netisr_ncpus; ++cpu)
 		LIST_INIT(&sc->sc_rtlists[cpu]);
 }
 
@@ -3640,7 +3672,7 @@ bridge_rtable_fini(struct bridge_softc *sc)
 	/*
 	 * Free per-cpu hash tables
 	 */
-	for (cpu = 0; cpu < ncpus; ++cpu)
+	for (cpu = 0; cpu < netisr_ncpus; ++cpu)
 		kfree(sc->sc_rthashs[cpu], M_DEVBUF);
 	kfree(sc->sc_rthashs, M_DEVBUF);
 
@@ -3779,12 +3811,22 @@ out:
 static void
 bridge_rtnode_destroy(struct bridge_softc *sc, struct bridge_rtnode *brt)
 {
+	struct bridge_rtinfo *bri;
+
 	LIST_REMOVE(brt, brt_hash);
 	LIST_REMOVE(brt, brt_list);
 
-	if (mycpuid + 1 == ncpus) {
+	bri = brt->brt_info;
+
+	/*
+	 * The bri_dead flag can be set asynchronously and catch some gc's
+	 * in the middle, don't free bri until all references have actually
+	 * gone away.
+	 */
+	if (atomic_fetchadd_int(&bri->bri_refs, -1) == 1) {
 		/* Free rtinfo associated with rtnode on the last cpu */
-		kfree(brt->brt_info, M_DEVBUF);
+		kfree(bri, M_DEVBUF);
+		brt->brt_info = NULL;	/* safety */
 	}
 	kfree(brt, M_DEVBUF);
 
@@ -4033,13 +4075,13 @@ bridge_pfil(struct mbuf **mp, struct ifnet *bifp, struct ifnet *ifp, int dir)
 	 * Finally, put everything back the way it was and return
 	 */
 	if (snap) {
-		M_PREPEND(*mp, sizeof(struct llc), MB_DONTWAIT);
+		M_PREPEND(*mp, sizeof(struct llc), M_NOWAIT);
 		if (*mp == NULL)
 			return (error);
 		bcopy(&llc1, mtod(*mp, caddr_t), sizeof(struct llc));
 	}
 
-	M_PREPEND(*mp, ETHER_HDR_LEN, MB_DONTWAIT);
+	M_PREPEND(*mp, ETHER_HDR_LEN, M_NOWAIT);
 	if (*mp == NULL)
 		return (error);
 	bcopy(&eh2, mtod(*mp, caddr_t), ETHER_HDR_LEN);
@@ -4242,7 +4284,7 @@ bridge_fragment(struct ifnet *ifp, struct mbuf *m, struct ether_header *eh,
 	for (m0 = m; m0; m0 = m0->m_nextpkt) {
 		if (error == 0) {
 			if (snap) {
-				M_PREPEND(m0, sizeof(struct llc), MB_DONTWAIT);
+				M_PREPEND(m0, sizeof(struct llc), M_NOWAIT);
 				if (m0 == NULL) {
 					error = ENOBUFS;
 					continue;
@@ -4250,7 +4292,7 @@ bridge_fragment(struct ifnet *ifp, struct mbuf *m, struct ether_header *eh,
 				bcopy(llc, mtod(m0, caddr_t),
 				    sizeof(struct llc));
 			}
-			M_PREPEND(m0, ETHER_HDR_LEN, MB_DONTWAIT);
+			M_PREPEND(m0, ETHER_HDR_LEN, M_NOWAIT);
 			if (m0 == NULL) {
 				error = ENOBUFS;
 				continue;
@@ -4395,7 +4437,7 @@ bridge_add_bif_handler(netmsg_t msg)
 
 	TAILQ_INSERT_HEAD(&sc->sc_iflists[mycpuid], bif, bif_next);
 
-	ifnet_forwardmsg(&amsg->base.lmsg, mycpuid + 1);
+	netisr_forwardmsg(&amsg->base, mycpuid + 1);
 }
 
 static void
@@ -4412,7 +4454,7 @@ bridge_add_bif(struct bridge_softc *sc, struct bridge_ifinfo *bif_info,
 	amsg.br_bif_info = bif_info;
 	amsg.br_bif_ifp = ifp;
 
-	ifnet_domsg(&amsg.base.lmsg, 0);
+	netisr_domsg(&amsg.base, 0);
 }
 
 static void
@@ -4438,7 +4480,7 @@ bridge_del_bif_handler(netmsg_t msg)
 	/* Save the removed bif for later freeing */
 	TAILQ_INSERT_HEAD(dmsg->br_bif_list, bif, bif_next);
 
-	ifnet_forwardmsg(&dmsg->base.lmsg, mycpuid + 1);
+	netisr_forwardmsg(&dmsg->base, mycpuid + 1);
 }
 
 static void
@@ -4455,5 +4497,5 @@ bridge_del_bif(struct bridge_softc *sc, struct bridge_ifinfo *bif_info,
 	dmsg.br_bif_info = bif_info;
 	dmsg.br_bif_list = saved_bifs;
 
-	ifnet_domsg(&dmsg.base.lmsg, 0);
+	netisr_domsg(&dmsg.base, 0);
 }

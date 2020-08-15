@@ -28,7 +28,7 @@
 .\"     @(#)mount.8	8.8 (Berkeley) 6/16/94
 .\" $FreeBSD: src/sbin/mount/mount.8,v 1.31.2.12 2003/02/23 21:17:42 trhodes Exp $
 .\"
-.Dd October 7, 2011
+.Dd May 15, 2016
 .Dt MOUNT 8
 .Os
 .Sh NAME
@@ -55,7 +55,8 @@ utility calls the
 .Xr mount 2
 system call to prepare and graft a
 .Ar "special device"
-or the remote node (rhost:path) on to the file system tree at the point
+or the remote node (rhost:path) or a HAMMER2 label (@label) on to the
+file system tree at the point
 .Ar node .
 If either
 .Ar special
@@ -107,7 +108,7 @@ Options are specified with a
 flag followed by a comma separated string of options.
 If a
 .Dq no
-prefix is added or removed from a option name, then meaning is negated.
+prefix is added or removed from an option name, then meaning is negated.
 In case of conflicting options being specified, the rightmost option
 takes effect.
 The following options are available:
@@ -121,6 +122,11 @@ This is a
 flag to set,
 and should not be used unless you are prepared to recreate the file
 system should your system crash.
+.It Cm automounted
+This flag indicates that the file system was mounted by
+.Xr automountd 8 .
+Automounted file systems are automatically unmounted by
+.Xr autounmountd 8 .
 .It Cm current
 When used with the
 .Fl u
@@ -220,13 +226,6 @@ for more information.
 The same as
 .Fl u ;
 indicate that the status of an already mounted file system should be changed.
-.It Cm union
-Causes the namespace at the mount point to appear as the union
-of the mounted filesystem root and the existing directory.
-Lookups will be done in the mounted filesystem first.
-If those operations fail due to a non-existent file the underlying
-directory is then accessed.
-All creates are done in the mounted filesystem.
 .It Cm ignore
 Will be ignored by
 .Xr df 1 .
@@ -403,26 +402,26 @@ have permission to load the module.
 .Xr devtab 5 ,
 .Xr fstab 5 ,
 .Xr UFS 5 ,
+.Xr automount 8 ,
+.Xr automountd 8 ,
+.Xr autounmountd 8 ,
 .Xr kldload 8 ,
 .Xr mount_cd9660 8 ,
 .Xr mount_devfs 8 ,
 .Xr mount_ext2fs 8 ,
-.Xr mount_fdesc 8 ,
 .Xr mount_hammer 8 ,
+.Xr mount_hammer2 8 ,
 .Xr mount_hpfs 8 ,
-.Xr mount_linprocfs 8 ,
 .Xr mount_mfs 8 ,
 .Xr mount_msdos 8 ,
 .Xr mount_nfs 8 ,
 .Xr mount_ntfs 8 ,
 .Xr mount_null 8 ,
-.Xr mount_portal 8 ,
 .Xr mount_procfs 8 ,
 .Xr mount_smbfs 8 ,
 .Xr mount_std 8 ,
 .Xr mount_tmpfs 8 ,
 .Xr mount_udf 8 ,
-.Xr mount_union 8 ,
 .Xr sysctl 8 ,
 .Xr umount 8
 .Sh HISTORY

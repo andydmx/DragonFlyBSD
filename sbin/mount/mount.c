@@ -108,7 +108,7 @@ restart_mountd(void)
 		return;
 	}
 	/* We have mountd(8) PID in mountdpid varible, let's signal it. */
-	if (kill(mountdpid, SIGHUP) == -1)
+	if (kill(mountdpid, SIGUSR1) == -1)
 		err(1, "signal mountd");
 }
 
@@ -278,6 +278,10 @@ main(int argc, char **argv)
 		 * If the spec is not a file and contains a ':' then assume
 		 * NFS.
 		 *
+		 * If the spec is not a file and contains a '@' then assume
+		 * HAMMER2.  Note that there may not be a raw device
+		 * specified in this situation.
+		 *
 		 * If the spec is a cdev attempt to extract the fstype from
 		 * the label.
 		 *
@@ -287,6 +291,9 @@ main(int argc, char **argv)
 			if (strpbrk(argv[0], ":") != NULL &&
 			    access(argv[0], 0) == -1) {
 				vfstype = "nfs";
+			} else if (strpbrk(argv[0], "@") != NULL &&
+				   access(argv[0], 0) == -1) {
+				vfstype = "hammer2";
 			} else {
 				checkdisklabel(argv[0], &vfstype);
 			}
@@ -380,11 +387,6 @@ mountfs(const char *vfstype, const char *spec, const char *name, int flags,
 	char *argv0;
 	char execname[MAXPATHLEN + 1];
 	char mntpath[MAXPATHLEN];
-
-#if __GNUC__
-	(void)&optbuf;
-	(void)&name;
-#endif
 
 	/* resolve the mountpoint with realpath(3) */
 	checkpath(name, mntpath);
@@ -697,13 +699,13 @@ usage(void)
 static void
 printdefvals(const struct statfs *ent)
 {
-        if (strcmp(ent->f_fstypename, "ufs") == 0) {
-                if (strcmp(ent->f_mntonname, "/") == 0)
-                        printf("\t1 1\n");
-                else
-                        printf("\t2 2\n");
-        } else {
-                printf("\t0 0\n");
+	if (strcmp(ent->f_fstypename, "ufs") == 0) {
+		if (strcmp(ent->f_mntonname, "/") == 0)
+			printf("\t1 1\n");
+		else
+			printf("\t2 2\n");
+	} else {
+		printf("\t0 0\n");
 	}
 }
 
@@ -750,7 +752,6 @@ flags2opts(int flags)
 	if (flags & MNT_NOEXEC)		res = catopt(res, "noexec");
 	if (flags & MNT_NOSUID)		res = catopt(res, "nosuid");
 	if (flags & MNT_NODEV)		res = catopt(res, "nodev");
-	if (flags & MNT_UNION)		res = catopt(res, "union");
 	if (flags & MNT_ASYNC)		res = catopt(res, "async");
 	if (flags & MNT_NOATIME)	res = catopt(res, "noatime");
 	if (flags & MNT_NOCLUSTERR)	res = catopt(res, "noclusterr");

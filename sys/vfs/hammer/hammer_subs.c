@@ -1,13 +1,13 @@
 /*
  * Copyright (c) 2007-2011 The DragonFly Project.  All rights reserved.
- * 
+ *
  * This code is derived from software contributed to The DragonFly Project
  * by Matthew Dillon <dillon@backplane.com>
- * 
+ *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
  * are met:
- * 
+ *
  * 1. Redistributions of source code must retain the above copyright
  *    notice, this list of conditions and the following disclaimer.
  * 2. Redistributions in binary form must reproduce the above copyright
@@ -17,7 +17,7 @@
  * 3. Neither the name of The DragonFly Project nor the names of its
  *    contributors may be used to endorse or promote products derived
  *    from this software without specific, prior written permission.
- * 
+ *
  * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
  * ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
  * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
@@ -36,7 +36,6 @@
  */
 
 #include "hammer.h"
-#include <sys/dirent.h>
 
 void
 hammer_lock_ex_ident(struct hammer_lock *lock, const char *ident)
@@ -62,8 +61,7 @@ hammer_lock_ex_ident(struct hammer_lock *lock, const char *ident)
 				break;
 		} else {
 			if (hammer_debug_locks) {
-				kprintf("hammer_lock_ex: held by %p\n",
-					lock->lowner);
+				hdkprintf("held by %p\n", lock->lowner);
 			}
 			nlv = lv | HAMMER_LOCKF_WANTED;
 			++hammer_contention_count;
@@ -71,7 +69,7 @@ hammer_lock_ex_ident(struct hammer_lock *lock, const char *ident)
 			if (atomic_cmpset_int(&lock->lockval, lv, nlv)) {
 				tsleep(&lock->lockval, PINTERLOCKED, ident, 0);
 				if (hammer_debug_locks)
-					kprintf("hammer_lock_ex: try again\n");
+					hdkprintf("try again\n");
 			}
 		}
 	}
@@ -223,11 +221,11 @@ hammer_lock_upgrade(struct hammer_lock *lock, int shcount)
 			}
 		} else if (lv & HAMMER_LOCKF_EXCLUSIVE) {
 			if (lock->lowner != curthread)
-				panic("hammer_lock_upgrade: illegal state");
+				hpanic("illegal state");
 			error = 0;
 			break;
 		} else if ((lv & ~HAMMER_LOCKF_WANTED) == 0) {
-			panic("hammer_lock_upgrade: lock is not held");
+			hpanic("lock is not held");
 			/* NOT REACHED */
 			error = EDEADLK;
 			break;
@@ -298,7 +296,7 @@ hammer_unlock(struct hammer_lock *lock)
 				break;
 			}
 		} else {
-			panic("hammer_unlock: lock %p is not held", lock);
+			hpanic("lock %p is not held", lock);
 		}
 	}
 }
@@ -316,7 +314,7 @@ hammer_lock_status(struct hammer_lock *lock)
 		return(1);
 	else if (lv)
 		return(-1);
-	panic("hammer_lock_status: lock must be held: %p", lock);
+	hpanic("lock must be held: %p", lock);
 }
 
 /*
@@ -390,16 +388,16 @@ hammer_rel(struct hammer_lock *lock)
  * hammer_ref_interlock() bumps the ref-count and conditionally acquires
  * the interlock for 0->1 transitions or if the CHECK is found to be set.
  *
- * This case will return TRUE, the interlock will be held, and the CHECK
+ * This case will return 1, the interlock will be held, and the CHECK
  * bit also set.  Other threads attempting to ref will see the CHECK bit
  * and block until we clean up.
  *
- * FALSE is returned for transitions other than 0->1 when the CHECK bit
+ * 0 is returned for transitions other than 0->1 when the CHECK bit
  * is not found to be set, or if the function loses the race with another
  * thread.
  *
- * TRUE is only returned to one thread and the others will block.
- * Effectively a TRUE indicator means 'someone transitioned 0->1
+ * 1 is only returned to one thread and the others will block.
+ * Effectively a 1 indicator means 'someone transitioned 0->1
  * and you are the first guy to successfully lock it after that, so you
  * need to check'.  Due to races the ref-count may be greater than 1 upon
  * return.
@@ -489,7 +487,7 @@ hammer_ref_interlock(struct hammer_lock *lock)
  *
  * NOTE that CHECK will never be found set when the ref-count is 0.
  *
- * TRUE is always returned to match the API for hammer_ref_interlock().
+ * 1 is always returned to match the API for hammer_ref_interlock().
  * This function returns with one ref, the lock held, and the CHECK bit set.
  */
 int
@@ -502,8 +500,7 @@ hammer_ref_interlock_true(struct hammer_lock *lock)
 		lv = lock->refs;
 
 		if (lv) {
-			panic("hammer_ref_interlock_true: bad lock %p %08x",
-			      lock, lock->refs);
+			hpanic("bad lock %p %08x", lock, lock->refs);
 		}
 		nlv = 1 | HAMMER_REFS_LOCKED | HAMMER_REFS_CHECK;
 		if (atomic_cmpset_int(&lock->refs, lv, nlv)) {
@@ -541,16 +538,16 @@ hammer_ref_interlock_done(struct hammer_lock *lock)
  * acquire the lock in tandem with a 1->0 transition.  CHECK is
  * not used.
  *
- * TRUE is returned on 1->0 transitions with the lock held on return
- * and FALSE is returned otherwise with the lock not held.
+ * 1 is returned on 1->0 transitions with the lock held on return
+ * and 0 is returned otherwise with the lock not held.
  *
  * It is important to note that the refs are not stable and may
- * increase while we hold the lock, the TRUE indication only means
+ * increase while we hold the lock, the 1 indication only means
  * that we transitioned 1->0, not necessarily that we stayed at 0.
  *
  * Another thread bumping refs while we hold the lock will set CHECK,
  * causing one of the competing hammer_ref_interlock() calls to
- * return TRUE after we release our lock.
+ * return 1 after we release our lock.
  *
  * MPSAFE
  */
@@ -640,7 +637,7 @@ hammer_rel_interlock_done(struct hammer_lock *lock, int orig_locked __unused)
 /*
  * Acquire the interlock on lock->refs.
  *
- * Return TRUE if CHECK is currently set.  Note that CHECK will not
+ * Return 1 if CHECK is currently set.  Note that CHECK will not
  * be set if the reference count is 0, but can get set if this function
  * is preceeded by, say, hammer_ref(), or through races with other
  * threads.  The return value allows the caller to use the same logic
@@ -781,30 +778,30 @@ hammer_sync_unlock(hammer_transaction_t trans)
 /*
  * Misc
  */
-u_int32_t
-hammer_to_unix_xid(uuid_t *uuid)
+uint32_t
+hammer_to_unix_xid(hammer_uuid_t *uuid)
 {
-	return(*(u_int32_t *)&uuid->node[2]);
+	return(*(uint32_t *)&uuid->node[2]);
 }
 
 void
-hammer_guid_to_uuid(uuid_t *uuid, u_int32_t guid)
+hammer_guid_to_uuid(hammer_uuid_t *uuid, uint32_t guid)
 {
 	bzero(uuid, sizeof(*uuid));
-	*(u_int32_t *)&uuid->node[2] = guid;
+	*(uint32_t *)&uuid->node[2] = guid;
 }
 
 void
-hammer_time_to_timespec(u_int64_t xtime, struct timespec *ts)
+hammer_time_to_timespec(uint64_t xtime, struct timespec *ts)
 {
 	ts->tv_sec = (unsigned long)(xtime / 1000000);
 	ts->tv_nsec = (unsigned int)(xtime % 1000000) * 1000L;
 }
 
-u_int64_t
+uint64_t
 hammer_timespec_to_time(struct timespec *ts)
 {
-	u_int64_t xtime;
+	uint64_t xtime;
 
 	xtime = (unsigned)(ts->tv_nsec / 1000) +
 		(unsigned long)ts->tv_sec * 1000000ULL;
@@ -816,7 +813,7 @@ hammer_timespec_to_time(struct timespec *ts)
  * Convert a HAMMER filesystem object type to a vnode type
  */
 enum vtype
-hammer_get_vnode_type(u_int8_t obj_type)
+hammer_get_vnode_type(uint8_t obj_type)
 {
 	switch(obj_type) {
 	case HAMMER_OBJTYPE_DIRECTORY:
@@ -842,7 +839,7 @@ hammer_get_vnode_type(u_int8_t obj_type)
 }
 
 int
-hammer_get_dtype(u_int8_t obj_type)
+hammer_get_dtype(uint8_t obj_type)
 {
 	switch(obj_type) {
 	case HAMMER_OBJTYPE_DIRECTORY:
@@ -867,7 +864,7 @@ hammer_get_dtype(u_int8_t obj_type)
 	/* not reached */
 }
 
-u_int8_t
+uint8_t
 hammer_get_obj_type(enum vtype vtype)
 {
 	switch(vtype) {
@@ -944,8 +941,8 @@ hammer_nohistory(hammer_inode_t ip)
  * artificial directory entries such as "." and "..".
  */
 int64_t
-hammer_directory_namekey(hammer_inode_t dip, const void *name, int len,
-			 u_int32_t *max_iterationsp)
+hammer_direntry_namekey(hammer_inode_t dip, const void *name, int len,
+			 uint32_t *max_iterationsp)
 {
 	const char *aname = name;
 	int32_t crcx;
@@ -1021,8 +1018,8 @@ hammer_directory_namekey(hammer_inode_t dip, const void *name, int len,
 		if ((key & 0xFFFFFFFF00000000LL) == 0)
 			key |= 0x100000000LL;
 		if (hammer_debug_general & 0x0400) {
-			kprintf("namekey2: 0x%016llx %*.*s\n",
-				(long long)key, len, len, aname);
+			hdkprintf("0x%016jx %*.*s\n",
+				(intmax_t)key, len, len, aname);
 		}
 		*max_iterationsp = 0x00FFFFFF;
 		break;
@@ -1031,7 +1028,7 @@ hammer_directory_namekey(hammer_inode_t dip, const void *name, int len,
 	default:
 		key = 0;			/* compiler warning */
 		*max_iterationsp = 1;		/* sanity */
-		panic("hammer_directory_namekey: bad algorithm %p", dip);
+		hpanic("bad algorithm %p", dip);
 		break;
 	}
 	return(key);
@@ -1046,10 +1043,10 @@ hammer_directory_namekey(hammer_inode_t dip, const void *name, int len,
  */
 int
 hammer_str_to_tid(const char *str, int *ispfsp,
-		  hammer_tid_t *tidp, u_int32_t *localizationp)
+		  hammer_tid_t *tidp, uint32_t *localizationp)
 {
 	hammer_tid_t tid;
-	u_int32_t localization;
+	uint32_t localization;
 	char *ptr;
 	int ispfs;
 	int n;
@@ -1073,7 +1070,7 @@ hammer_str_to_tid(const char *str, int *ispfsp,
 	 */
 	str = ptr;
 	if (*str == ':') {
-		localization = strtoul(str + 1, &ptr, 10) << 16;
+		localization = pfs_to_lo(strtoul(str + 1, &ptr, 10));
 		if (ptr - str != 6)
 			return(EINVAL);
 		str = ptr;
@@ -1092,107 +1089,6 @@ hammer_str_to_tid(const char *str, int *ispfsp,
 	*localizationp = localization;
 	*ispfsp = ispfs;
 	return(0);
-}
-
-void
-hammer_crc_set_blockmap(hammer_blockmap_t blockmap)
-{
-	blockmap->entry_crc = crc32(blockmap, HAMMER_BLOCKMAP_CRCSIZE);
-}
-
-void
-hammer_crc_set_volume(hammer_volume_ondisk_t ondisk)
-{
-	ondisk->vol_crc = crc32(ondisk, HAMMER_VOL_CRCSIZE1) ^
-			  crc32(&ondisk->vol_crc + 1, HAMMER_VOL_CRCSIZE2);
-}
-
-int
-hammer_crc_test_blockmap(hammer_blockmap_t blockmap)
-{
-	hammer_crc_t crc;
-
-	crc = crc32(blockmap, HAMMER_BLOCKMAP_CRCSIZE);
-	return (blockmap->entry_crc == crc);
-}
-
-int
-hammer_crc_test_volume(hammer_volume_ondisk_t ondisk)
-{
-	hammer_crc_t crc;
-
-	crc = crc32(ondisk, HAMMER_VOL_CRCSIZE1) ^
-	      crc32(&ondisk->vol_crc + 1, HAMMER_VOL_CRCSIZE2);
-	return (ondisk->vol_crc == crc);
-}
-
-int
-hammer_crc_test_btree(hammer_node_ondisk_t ondisk)
-{
-	hammer_crc_t crc;
-
-	crc = crc32(&ondisk->crc + 1, HAMMER_BTREE_CRCSIZE);
-	return (ondisk->crc == crc);
-}
-
-/*
- * Test or set the leaf->data_crc field.  Deal with any special cases given
- * a generic B-Tree leaf element and its data.
- *
- * NOTE: Inode-data: the atime and mtime fields are not CRCd, allowing them
- *       to be updated in-place.
- */
-int
-hammer_crc_test_leaf(void *data, hammer_btree_leaf_elm_t leaf)
-{
-	hammer_crc_t crc;
-
-	if (leaf->data_len == 0) {
-		crc = 0;
-	} else {
-		switch(leaf->base.rec_type) {
-		case HAMMER_RECTYPE_INODE:
-			if (leaf->data_len != sizeof(struct hammer_inode_data))
-				return(0);
-			crc = crc32(data, HAMMER_INODE_CRCSIZE);
-			break;
-		default:
-			crc = crc32(data, leaf->data_len);
-			break;
-		}
-	}
-	return (leaf->data_crc == crc);
-}
-
-void
-hammer_crc_set_leaf(void *data, hammer_btree_leaf_elm_t leaf)
-{
-	if (leaf->data_len == 0) {
-		leaf->data_crc = 0;
-	} else {
-		switch(leaf->base.rec_type) {
-		case HAMMER_RECTYPE_INODE:
-			KKASSERT(leaf->data_len ==
-				  sizeof(struct hammer_inode_data));
-			leaf->data_crc = crc32(data, HAMMER_INODE_CRCSIZE);
-			break;
-		default:
-			leaf->data_crc = crc32(data, leaf->data_len);
-			break;
-		}
-	}
-}
-
-void
-hkprintf(const char *ctl, ...)
-{
-	__va_list va;
-
-	if (hammer_debug_debug) {
-		__va_start(va, ctl);
-		kvprintf(ctl, va);
-		__va_end(va);
-	}
 }
 
 /*
@@ -1218,7 +1114,7 @@ hammer_blockoff(int64_t file_offset)
 
 /*
  * Return the demarkation point between the two offsets where
- * the block size changes. 
+ * the block size changes.
  */
 int64_t
 hammer_blockdemarc(int64_t file_offset1, int64_t file_offset2)
@@ -1228,16 +1124,16 @@ hammer_blockdemarc(int64_t file_offset1, int64_t file_offset2)
 			return(file_offset2);
 		return(HAMMER_XDEMARC);
 	}
-	panic("hammer_blockdemarc: illegal range %lld %lld",
-	      (long long)file_offset1, (long long)file_offset2);
+	hpanic("illegal range %jd %jd",
+	      (intmax_t)file_offset1, (intmax_t)file_offset2);
 }
 
-udev_t
-hammer_fsid_to_udev(uuid_t *uuid)
+dev_t
+hammer_fsid_to_udev(hammer_uuid_t *uuid)
 {
-	u_int32_t crc;
+	uint32_t crc;
 
 	crc = crc32(uuid, sizeof(*uuid));
-	return((udev_t)crc);
+	return((dev_t)crc);
 }
 

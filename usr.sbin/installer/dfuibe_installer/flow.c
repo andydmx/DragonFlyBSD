@@ -40,6 +40,7 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <unistd.h>
 #include <string.h>
 
 #ifdef ENABLE_NLS
@@ -77,6 +78,9 @@ extern int _nl_msg_cat_cntr;
 
 void (*state)(struct i_fn_args *) = NULL;
 int do_reboot;
+int use_hammer;		/* 0=UFS 1=HAMMER 2=HAMMER2 */
+int use_uefi;
+int during_install;
 
 /*** STATES ***/
 
@@ -196,7 +200,7 @@ state_welcome(struct i_fn_args *a)
 	    OPERATING_SYSTEM_NAME, OPERATING_SYSTEM_NAME, OPERATING_SYSTEM_URL,
 	    OPERATING_SYSTEM_NAME, OPERATING_SYSTEM_NAME);
 
-	if (!a->booted_from_livecd) {
+	if ((a->flags & I_BOOTED_LIVECD) == 0) {
 		state = state_welcome_system;
 		return;
 	}
@@ -214,7 +218,7 @@ state_welcome(struct i_fn_args *a)
 	    NULL
 	);
 
-	if (a->upgrade_menu_toggle) {
+	if (a->flags & I_UPGRADE_TOOGLE) {
 		snprintf(msg_buf[0], sizeof(msg_buf[0]),
 		    _("Upgrade a FreeBSD 4.X system to %s"),
 		    OPERATING_SYSTEM_NAME);
@@ -392,18 +396,22 @@ state_configure_menu(struct i_fn_args *a)
 
 	if (during_install == 0) {
 		switch (dfui_be_present_dialog(a->c, _("Select file system"),
-		    _("HAMMER|UFS|Return to Welcome Menu"),
+		    _("HAMMER2|HAMMER1|UFS|Return to Welcome Menu"),
 		    _("Please select the file system installed on the disk.\n\n")))
 		{
 		case 1:
-			/* HAMMER */
-			use_hammer = 1;
+			/* HAMMER2 (first menu item is the default) */
+			use_hammer = 2;
 			break;
 		case 2:
+			/* HAMMER1 */
+			use_hammer = 1;
+			break;
+		case 3:
 			/* UFS */
 			use_hammer = 0;
 			break;
-		case 3:
+		case 4:
 			state = state_welcome;
 			return;
 			/* NOTREACHED */
@@ -781,7 +789,10 @@ state_diskutil_menu(struct i_fn_args *a)
 		if (strcmp(dfui_response_get_action_id(r), "format_hdd") == 0) {
 			storage_set_selected_disk(a->s, NULL);
 			storage_set_selected_slice(a->s, NULL);
-			fn_format_disk(a);
+			if (use_uefi)
+				fn_format_disk_uefi(a);
+			else
+				fn_format_disk_mbr(a);
 		} else if (strcmp(dfui_response_get_action_id(r), "wipe_start_of_disk") == 0) {
 			fn_wipe_start_of_disk(a);
 		} else if (strcmp(dfui_response_get_action_id(r), "wipe_start_of_slice") == 0) {
@@ -921,7 +932,7 @@ state_begin_install(struct i_fn_args *a)
 			inform(a->c, _("Errors occurred while probing "
 			    "the system for its storage capabilities."));
 		}
-		state = state_select_disk;
+		state = state_ask_uefi;
 	} else if (strcmp(dfui_response_get_action_id(r), "livecd") == 0) {
 		state = NULL;
 	} else if (strcmp(dfui_response_get_action_id(r), "cancel") == 0) {
@@ -930,6 +941,38 @@ state_begin_install(struct i_fn_args *a)
 
 	dfui_form_free(f);
 	dfui_response_free(r);
+}
+
+/*
+ * state_ask_uefi: ask the user if they want a UEFI installation
+ */
+void
+state_ask_uefi(struct i_fn_args *a)
+{
+	use_uefi = 0;
+
+	switch (dfui_be_present_dialog(a->c, _("UEFI or legacy BIOS?"),
+	    _("UEFI|Legacy BIOS|Return to Begin Installation"),
+	    _("Do you wish to set up %s for a UEFI or legacy BIOS system?"),
+	    OPERATING_SYSTEM_NAME))
+	{
+	case 1:
+		/* UEFI */
+		use_uefi = 1;
+		break;
+	case 2:
+		/* MBR */
+		break;
+	case 3:
+		state = state_begin_install;
+		return;
+		/* NOTREACHED */
+		break;
+	default:
+		abort_backend();
+		break;
+	}
+	state = state_select_disk;
 }
 
 /*
@@ -985,20 +1028,27 @@ state_ask_fs(struct i_fn_args *a)
 	use_hammer = 0;
 
 	switch (dfui_be_present_dialog(a->c, _("Select file system"),
-	    _("Use HAMMER|Use UFS|Return to Select Disk"),
+	    _("Use HAMMER2|Use HAMMER1|Use UFS|Return to Select Disk"),
 	    _("Please select the file system you want to use with %s.\n\n"
-	      "HAMMER is the new %s file system.  UFS is the traditional BSD file system."),
+	      "HAMMER2 is the recommended %s file system.  "
+	      "HAMMER1 is the previous %s file system.  "
+	      "UFS is the traditional BSD file system."),
+	    OPERATING_SYSTEM_NAME,
 	    OPERATING_SYSTEM_NAME,
 	    OPERATING_SYSTEM_NAME))
 	{
 	case 1:
-		/* HAMMER */
-		use_hammer = 1;
+		/* HAMMER2 (first menu item is the default) */
+		use_hammer = 2;
 		break;
 	case 2:
-		/* UFS */
+		/* HAMMER1 */
+		use_hammer = 1;
 		break;
 	case 3:
+		/* UFS */
+		break;
+	case 4:
 		state = state_select_disk;
 		return;
 		/* NOTREACHED */
@@ -1017,6 +1067,17 @@ state_ask_fs(struct i_fn_args *a)
 void
 state_format_disk(struct i_fn_args *a)
 {
+
+	if (use_uefi) {
+		fn_format_disk_uefi(a);
+		if (a->result)
+			state = state_ask_fs;
+		else
+			state = state_select_disk;
+		return;
+	}
+
+	/* XXX Using part of the disk is only supported for MBR installs */
 	switch (dfui_be_present_dialog(a->c, _("How Much Disk?"),
 	    _("Use Entire Disk|Use Part of Disk|Return to Select Disk"),
 	    _("Select how much of this disk you want to use for %s.\n\n%s"),
@@ -1032,7 +1093,7 @@ state_format_disk(struct i_fn_args *a)
 			}
 		}
 
-		fn_format_disk(a);
+		fn_format_disk_mbr(a);
 		if (a->result)
 			state = state_ask_fs;
 		else
@@ -1156,16 +1217,26 @@ state_create_subpartitions(struct i_fn_args *a)
 	command_add(cmds, "%s%s if=/dev/zero of=/dev/%s bs=32k count=16",
 	    a->os_root, cmd_name(a, "DD"),
 	    slice_get_device_name(storage_get_selected_slice(a->s)));
-	command_add(cmds, "%s%s -B -r -w %s auto",
+	command_add(cmds, "%s%s -B -r -w %s",
 	    a->os_root, cmd_name(a, "DISKLABEL64"),
 	    slice_get_device_name(storage_get_selected_slice(a->s)));
 	commands_execute(a, cmds);
 	commands_free(cmds);
 
-	if (use_hammer)
-		fn_create_subpartitions_hammer(a);
-	else
+	/*
+	 * Create subpartitions and filesystems
+	 */
+	switch(use_hammer) {
+	case 1:
+		fn_create_subpartitions_hammer(FS_HAMMER, a);
+		break;
+	case 2:
+		fn_create_subpartitions_hammer(FS_HAMMER2, a);
+		break;
+	default:
 		fn_create_subpartitions_ufs(a);
+		break;
+	}
 
 	if (a->result) {
 		state = state_install_os;
@@ -1218,8 +1289,12 @@ state_install_os(struct i_fn_args *a)
 		state = state_create_subpartitions;
 	} else {
 		fn_install_os(a);
-		if (a->result)
-			state = state_install_bootstrap;
+		if (a->result) {
+			if (use_uefi)
+				state = state_finish_install;
+			else
+				state = state_install_bootstrap;
+		}
 	}
 
 	dfui_form_free(f);
@@ -1452,25 +1527,25 @@ state_setup_remote_installation_server(struct i_fn_args *a)
 
 int
 flow(int transport, char *rendezvous, char *os_root,
-     int booted_from_livecd __unused, int upgrade_menu_toggle __unused)
+     int flags __unused)
 {
 	struct i_fn_args *a;
 
 	rc_conf = config_vars_new();
 
 	if ((a = i_fn_args_new(os_root, DEFAULT_INSTALLER_TEMP,
-			       transport, rendezvous)) == NULL) {
+			       DEFAULT_CMDNAMES_FILE, transport,
+			       rendezvous)) == NULL) {
 		return(0);
 	}
 
 	/*
 	 * XXX We can't handle this yet.
 	 *
-	   a->booted_from_livecd = booted_from_livecd;
-	   a->upgrade_menu_toggle = upgrade_menu_toggle;
+	   a->flags |= I_BOOTED_LIVECD;
+	   a->flags |= I_UPGRADE_TOOGLE;
 	*/
-	a->booted_from_livecd = 1;
-	a->upgrade_menu_toggle = 0;
+	a->flags |= I_BOOTED_LIVECD;
 
 	/*
 	 * Execute the state machine here.  The global function pointer

@@ -2,7 +2,7 @@
  * Copyright (c) 2000-2003,2005 by Solar Designer.  See LICENSE.
  */
 
-#ifdef __FreeBSD__
+#if defined(__FreeBSD__) || defined(__DragonFly__)
 /* For vsnprintf(3) */
 #define _XOPEN_SOURCE 600
 #else
@@ -169,7 +169,7 @@ static int converse(pam_handle_t *pamh, int style, l_const char *text,
 
 	pmsg = &msg;
 	msg.msg_style = style;
-	msg.msg = text;
+	msg.msg = (char *)text;
 
 	return conv->conv(1, (lo_const struct pam_message **)&pmsg, resp,
 	    conv->appdata_ptr);
@@ -217,6 +217,7 @@ static int check_max(params_t *params, pam_handle_t *pamh, const char *newpass)
 
 static int check_pass(struct passwd *pw, const char *pass)
 {
+	char *cryptpw;
 #ifdef HAVE_SHADOW
 	struct spwd *spw;
 	const char *hash;
@@ -236,13 +237,13 @@ static int check_pass(struct passwd *pw, const char *pass)
 #else
 		hash = crypt(pass, spw->sp_pwdp);
 #endif
-		retval = strcmp(hash, spw->sp_pwdp) ? -1 : 0;
+		retval = (hash == NULL || strcmp(hash, spw->sp_pwdp)) ? -1 : 0;
 		memset(spw->sp_pwdp, 0, strlen(spw->sp_pwdp));
 		return retval;
 	}
 #endif
-
-	return strcmp(crypt(pass, pw->pw_passwd), pw->pw_passwd) ? -1 : 0;
+	cryptpw = crypt(pass, pw->pw_passwd);
+	return (cryptpw == NULL || strcmp(cryptpw, pw->pw_passwd)) ? -1 : 0;
 }
 
 static int am_root(pam_handle_t *pamh)

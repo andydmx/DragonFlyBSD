@@ -59,6 +59,7 @@ hammer_ioc_rebalance(hammer_transaction_t trans, hammer_inode_t ip,
 	hammer_btree_leaf_elm_t elm;
 	int error;
 	int seq;
+	uint32_t key_end_localization;
 
 	if ((rebal->key_beg.localization | rebal->key_end.localization) &
 	    HAMMER_LOCALIZE_PSEUDOFS_MASK) {
@@ -76,9 +77,21 @@ hammer_ioc_rebalance(hammer_transaction_t trans, hammer_inode_t ip,
 	if (rebal->saturation > HAMMER_BTREE_INT_ELMS)
 		rebal->saturation = HAMMER_BTREE_INT_ELMS;
 
+	/*
+	 * Ioctl caller has only set localization type to rebalance.
+	 * Initialize cursor key localization with ip localization.
+	 */
 	rebal->key_cur = rebal->key_beg;
 	rebal->key_cur.localization &= HAMMER_LOCALIZE_MASK;
-	rebal->key_cur.localization += ip->obj_localization;
+	if (rebal->allpfs == 0)
+		rebal->key_cur.localization |= ip->obj_localization;
+
+	key_end_localization = rebal->key_end.localization;
+	key_end_localization &= HAMMER_LOCALIZE_MASK;
+	if (rebal->allpfs == 0)
+		key_end_localization |= ip->obj_localization;
+	else
+		key_end_localization |= pfs_to_lo(HAMMER_MAX_PFSID);
 
 	hammer_btree_lcache_init(trans->hmp, &lcache, 2);
 
@@ -95,8 +108,7 @@ retry:
 	}
 	cursor.key_beg = rebal->key_cur;
 	cursor.key_end = rebal->key_end;
-	cursor.key_end.localization &= HAMMER_LOCALIZE_MASK;
-	cursor.key_end.localization += ip->obj_localization;
+	cursor.key_end.localization = key_end_localization;
 	cursor.flags |= HAMMER_CURSOR_END_INCLUSIVE;
 	cursor.flags |= HAMMER_CURSOR_BACKEND;
 
@@ -123,6 +135,14 @@ retry:
 			hammer_unlock_cursor(&cursor);
 			vm_wait_nominal();
 			hammer_lock_cursor(&cursor);
+		}
+
+		/*
+		 * Filesystem went read-only during rebalancing
+		 */
+		if (trans->hmp->ronly) {
+			error = EROFS;
+			break;
 		}
 
 		/*
@@ -245,7 +265,7 @@ failed:
  */
 static int
 rebalance_node(struct hammer_ioc_rebalance *rebal, hammer_cursor_t cursor,
-	       struct hammer_node_lock *lcache)
+	       hammer_node_lock_t lcache)
 {
 	struct hammer_node_lock lockroot;
 	hammer_node_lock_t base_item;
@@ -254,7 +274,7 @@ rebalance_node(struct hammer_ioc_rebalance *rebal, hammer_cursor_t cursor,
 	hammer_btree_elm_t elm;
 	hammer_node_t node;
 	hammer_tid_t tid;
-	u_int8_t type1 __debugvar;
+	uint8_t type1 __debugvar;
 	int base_count;
 	int root_count;
 	int avg_elms;
@@ -302,15 +322,15 @@ rebalance_node(struct hammer_ioc_rebalance *rebal, hammer_cursor_t cursor,
 	 * avg_elms to also calculate as 0.
 	 */
 	if (hammer_debug_general & 0x1000)
-		kprintf("lockroot %p count %d\n", &lockroot, lockroot.count);
+		hdkprintf("lockroot %p count %d\n", &lockroot, lockroot.count);
 	count = 0;
 	TAILQ_FOREACH(item, &lockroot.list, entry) {
 		if (hammer_debug_general & 0x1000)
-			kprintf("add count %d\n", item->count);
+			hdkprintf("add count %d\n", item->count);
 		count += item->count;
 		KKASSERT(item->node->ondisk->type == type1);
 	}
-	avg_elms = (count + (lockroot.count - 1)) / lockroot.count;
+	avg_elms = howmany(count, lockroot.count);
 	KKASSERT(avg_elms >= 0);
 
 	/*
@@ -323,8 +343,8 @@ rebalance_node(struct hammer_ioc_rebalance *rebal, hammer_cursor_t cursor,
 	 * but that is ok.
 	 */
 	if (count && avg_elms < rebal->saturation) {
-		n = (count + (rebal->saturation - 1)) / rebal->saturation;
-		avg_elms = (count + (n - 1)) / n;
+		n = howmany(count, rebal->saturation);
+		avg_elms = howmany(count, n);
 	}
 
 	/*
@@ -509,15 +529,14 @@ rebalance_closeout(hammer_node_lock_t base_item, int base_count,
 	hammer_node_lock_t parent;
 	hammer_btree_elm_t base_elm;
 	hammer_btree_elm_t rbound_elm;
-	u_int8_t save;
+	uint8_t save;
 
 	/*
 	 * Update the count.  NOTE:  base_count can be 0 for the
 	 * degenerate leaf case.
 	 */
 	if (hammer_debug_general & 0x1000) {
-		kprintf("rebalance_closeout %016llx:",
-			(long long)base_item->node->node_offset);
+		hdkprintf("%016jx:", (intmax_t)base_item->node->node_offset);
 	}
 	if (base_item->copy->count != base_count) {
 		base_item->flags |= HAMMER_NODE_LOCK_UPDATED;

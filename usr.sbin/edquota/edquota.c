@@ -39,12 +39,12 @@
  */
 #include <sys/param.h>
 #include <sys/stat.h>
-#include <sys/file.h>
 #include <sys/wait.h>
 #include <vfs/ufs/quota.h>
 #include <ctype.h>
 #include <err.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <fstab.h>
 #include <grp.h>
 #include <pwd.h>
@@ -706,15 +706,19 @@ cvtstoa(time_t secs)
 
 	if (secs % (24 * 60 * 60) == 0) {
 		secs /= 24 * 60 * 60;
-		sprintf(buf, "%ld day%s", (long)secs, secs == 1 ? "" : "s");
+		sprintf(buf, "%ju day%s", (uintmax_t)secs,
+		    secs == 1 ? "" : "s");
 	} else if (secs % (60 * 60) == 0) {
 		secs /= 60 * 60;
-		sprintf(buf, "%ld hour%s", (long)secs, secs == 1 ? "" : "s");
+		sprintf(buf, "%ju hour%s", (uintmax_t)secs,
+		    secs == 1 ? "" : "s");
 	} else if (secs % 60 == 0) {
 		secs /= 60;
-		sprintf(buf, "%ld minute%s", (long)secs, secs == 1 ? "" : "s");
+		sprintf(buf, "%ju minute%s", (uintmax_t)secs,
+		    secs == 1 ? "" : "s");
 	} else
-		sprintf(buf, "%ld second%s", (long)secs, secs == 1 ? "" : "s");
+		sprintf(buf, "%ju second%s", (uintmax_t)secs,
+		    secs == 1 ? "" : "s");
 	return (buf);
 }
 

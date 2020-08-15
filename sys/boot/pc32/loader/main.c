@@ -71,6 +71,7 @@
 
 #include "bootstrap.h"
 #include "libi386/libi386.h"
+#include "libi386/smbios.h"
 #include "btxv86.h"
 
 #define	KARGS_FLAGS_CD		0x1
@@ -111,8 +112,8 @@ static void
 WDEBUG_INIT(void)
 {
     isa_outb(0x3f8+3, 0x83);	/* DLAB + 8N1 */
-    isa_outb(0x3f8+0, (115200 / 9600) & 0xFF);
-    isa_outb(0x3f8+1, (115200 / 9600) >> 8);
+    isa_outb(0x3f8+0, (115200 / 115200) & 0xFF);
+    isa_outb(0x3f8+1, (115200 / 115200) >> 8);
     isa_outb(0x3f8+3, 0x03);	/* 8N1 */
     isa_outb(0x3f8+4, 0x03);	/* RTS+DTR */
     isa_outb(0x3f8+2, 0x01);	/* FIFO_ENABLE */
@@ -173,6 +174,15 @@ main(void)
     bios_getmem();
     memend = (char *)&memend - 0x8000;	/* space for stack (16K) */
     memend = (char *)((uintptr_t)memend & ~(uintptr_t)(0x1000 - 1));
+
+    /*
+     * Steal the heap from high memory.  bios_basemem no longer has
+     * enough space, last failure was the gunzip code for initrd.img
+     * needing > ~32KB of temporary buffer space and we ran out.  again.
+     *
+     * High memory reserves at least ~1MB for the loader.
+     */
+#if 0
     if (memend < (char *)_end) {
 	setheap((void *)_end, PTOV(bios_basemem));
     } else {
@@ -180,6 +190,8 @@ main(void)
 	    memend = (char *)PTOV(bios_basemem);
 	setheap((void *)_end, memend);
     }
+#endif
+    setheap((void *)heapbase, (void *)memtop);
 
     /* 
      * XXX Chicken-and-egg problem; we want to have console output early, 
@@ -240,7 +252,7 @@ main(void)
     biosacpi_detect();
 
     /* detect SMBIOS for future reference */
-    smbios_detect();
+    smbios_detect(NULL);
 
     /* enable EHCI */
     setenv("ehci_load", "YES", 1);
@@ -308,8 +320,7 @@ extract_currdev(void)
 	new_currdev.d_kind.biosdisk.partition = 0;
 	biosdev = -1;
     } else {
-	new_currdev.d_kind.biosdisk.slice = (B_ADAPTOR(initial_bootdev) << 4) +
-					     B_CONTROLLER(initial_bootdev) - 1;
+	new_currdev.d_kind.biosdisk.slice = B_SLICE(initial_bootdev) - 1;
 	new_currdev.d_kind.biosdisk.partition = B_PARTITION(initial_bootdev);
 	biosdev = initial_bootinfo->bi_bios_dev;
 

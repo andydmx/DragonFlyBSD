@@ -31,9 +31,9 @@
  *
  * @(#)sysconf.c	8.2 (Berkeley) 3/20/94
  * $FreeBSD: src/lib/libc/gen/sysconf.c,v 1.26 2008/02/27 05:56:57 wollman Exp $
- * $DragonFly: src/lib/libc/gen/sysconf.c,v 1.5 2008/02/21 12:47:54 hasso Exp $
  */
 
+#include "namespace.h"
 #include <sys/param.h>
 #include <sys/time.h>
 #include <sys/sysctl.h>
@@ -44,8 +44,10 @@
 #include <limits.h>
 #include <paths.h>
 #include <pthread.h>		/* we just need the limits */
+#include <semaphore.h>
 #include <time.h>
 #include <unistd.h>
+#include "un-namespace.h"
 
 #include "../stdlib/atexit.h"
 #include "../stdtime/tzfile.h"
@@ -106,6 +108,8 @@ sysconf(int name)
 			return (-1);
 		}
 		return ((long)rl.rlim_cur);
+	case _SC_SEM_VALUE_MAX:
+		return (SEM_VALUE_MAX);
 	case _SC_STREAM_MAX:
 		if (getrlimit(RLIMIT_NOFILE, &rl) != 0)
 			return (-1);
@@ -286,10 +290,6 @@ do_NAME_MAX:
 		mib[0] = CTL_P1003_1B;
 		mib[1] = CTL_P1003_1B_SEM_NSEMS_MAX;
 		goto yesno;
-	case _SC_SEM_VALUE_MAX:
-		mib[0] = CTL_P1003_1B;
-		mib[1] = CTL_P1003_1B_SEM_VALUE_MAX;
-		goto yesno;
 	case _SC_SIGQUEUE_MAX:
 		mib[0] = CTL_P1003_1B;
 		mib[1] = CTL_P1003_1B_SIGQUEUE_MAX;
@@ -356,11 +356,9 @@ yesno:
 		 * _POSIX_FILE_LOCKING, so we can't answer this one.
 		 */
 #endif
-#if _POSIX_THREAD_SAFE_FUNCTIONS > -1
 	case _SC_GETGR_R_SIZE_MAX:
 	case _SC_GETPW_R_SIZE_MAX:
-#error "somebody needs to implement this"
-#endif
+		return (-1);
 	case _SC_HOST_NAME_MAX:
 		return (MAXHOSTNAMELEN - 1); /* does not include \0 */
 	case _SC_LOGIN_NAME_MAX:
@@ -419,8 +417,14 @@ yesno:
 		return (_POSIX_THREAD_PRIORITY_SCHEDULING);
 	case _SC_THREAD_PROCESS_SHARED:
 		return (_POSIX_THREAD_PROCESS_SHARED);
+	case _SC_THREAD_ROBUST_PRIO_INHERIT:
+		return (_POSIX_THREAD_ROBUST_PRIO_INHERIT);
+	case _SC_THREAD_ROBUST_PRIO_PROTECT:
+		return (_POSIX_THREAD_ROBUST_PRIO_PROTECT);
 	case _SC_THREAD_SAFE_FUNCTIONS:
 		return (_POSIX_THREAD_SAFE_FUNCTIONS);
+	case _SC_THREAD_SPORADIC_SERVER:
+		return (_POSIX_THREAD_SPORADIC_SERVER);
 	case _SC_THREAD_STACK_MIN:
 		return (PTHREAD_STACK_MIN);
 	case _SC_THREAD_THREADS_MAX:
@@ -501,6 +505,54 @@ yesno:
 #else
 		return (_V6_LPBIG_OFFBIG);
 #endif
+	case _SC_V7_ILP32_OFF32:
+#if _V7_ILP32_OFF32 == 0
+		if (sizeof(int) * CHAR_BIT == 32 &&
+		    sizeof(int) == sizeof(long) &&
+		    sizeof(long) == sizeof(void *) &&
+		    sizeof(void *) == sizeof(off_t))
+			return 1;
+		else
+			return -1;
+#else
+		return (_V7_ILP32_OFF32);
+#endif
+	case _SC_V7_ILP32_OFFBIG:
+#if _V7_ILP32_OFFBIG == 0
+		if (sizeof(int) * CHAR_BIT == 32 &&
+		    sizeof(int) == sizeof(long) &&
+		    sizeof(long) == sizeof(void *) &&
+		    sizeof(off_t) * CHAR_BIT >= 64)
+			return 1;
+		else
+			return -1;
+#else
+		return (_V7_ILP32_OFFBIG);
+#endif
+	case _SC_V7_LP64_OFF64:
+#if _V7_LP64_OFF64 == 0
+		if (sizeof(int) * CHAR_BIT == 32 &&
+		    sizeof(long) * CHAR_BIT == 64 &&
+		    sizeof(long) == sizeof(void *) &&
+		    sizeof(void *) == sizeof(off_t))
+			return 1;
+		else
+			return -1;
+#else
+		return (_V7_LP64_OFF64);
+#endif
+	case _SC_V7_LPBIG_OFFBIG:
+#if _V7_LPBIG_OFFBIG == 0
+		if (sizeof(int) * CHAR_BIT >= 32 &&
+		    sizeof(long) * CHAR_BIT >= 64 &&
+		    sizeof(void *) * CHAR_BIT >= 64 &&
+		    sizeof(off_t) * CHAR_BIT >= 64)
+			return 1;
+		else
+			return -1;
+#else
+		return (_V7_LPBIG_OFFBIG);
+#endif
 	case _SC_ATEXIT_MAX:
 		return (ATEXIT_SIZE);
 	case _SC_IOV_MAX:
@@ -541,15 +593,7 @@ yesno:
 		return (_XOPEN_REALTIME_THREADS);
 #endif
 	case _SC_XOPEN_SHM:
-		len = sizeof(lvalue);
-		sverrno = errno;
-		if (sysctlbyname("kern.ipc.shmmin", &lvalue, &len, NULL,
-		    0) == -1) {
-			errno = sverrno;
-			return (-1);
-		}
-		errno = sverrno;
-		return (1);
+		return (_XOPEN_SHM);
 	case _SC_XOPEN_STREAMS:
 		return (_XOPEN_STREAMS);
 	case _SC_XOPEN_UNIX:
@@ -569,10 +613,10 @@ yesno:
 	case _SC_IPV6:
 #if _POSIX_IPV6 == 0
 		sverrno = errno;
-		value = socket(PF_INET6, SOCK_DGRAM, 0);
+		value = _socket(PF_INET6, SOCK_DGRAM, 0);
 		errno = sverrno;
 		if (value >= 0) {
-			close(value);
+			_close(value);
 			return (200112L);
 		} else
 			return (0);
@@ -593,6 +637,9 @@ yesno:
 			return (-1);
 		return (lvalue);
 #endif
+
+	case _SC_LEVEL1_DCACHE_LINESIZE:
+		return (__VM_CACHELINE_SIZE);
 
 	default:
 		errno = EINVAL;

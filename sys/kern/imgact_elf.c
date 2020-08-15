@@ -70,7 +70,7 @@
 #include <sys/ckpt.h>
 
 #define OLD_EI_BRAND	8
-#define truncps(va,ps)	((va) & ~(ps - 1))
+#define truncps(va,ps)	rounddown2(va, ps)
 #define aligned(a,t)	(truncps((u_long)(a), sizeof(t)) == (u_long)(a))
 
 static int __elfN(check_header)(const Elf_Ehdr *hdr);
@@ -93,9 +93,11 @@ static boolean_t check_PT_NOTE(struct image_params *imgp,
     Elf_Brandnote *checknote, int32_t *osrel, const Elf_Phdr * pnote);
 static boolean_t extract_interpreter(struct image_params *imgp,
     const Elf_Phdr *pinterpreter, char *data);
+static u_long pie_base_hint(struct proc *p);
 
 static int elf_legacy_coredump = 0;
 static int __elfN(fallback_brand) = -1;
+static int elf_pie_base_mmap = 0;
 #if defined(__x86_64__)
 SYSCTL_NODE(_kern, OID_AUTO, elf64, CTLFLAG_RW, 0, "");
 SYSCTL_INT(_debug, OID_AUTO, elf64_legacy_coredump, CTLFLAG_RW,
@@ -103,6 +105,10 @@ SYSCTL_INT(_debug, OID_AUTO, elf64_legacy_coredump, CTLFLAG_RW,
 SYSCTL_INT(_kern_elf64, OID_AUTO, fallback_brand, CTLFLAG_RW,
     &elf64_fallback_brand, 0, "ELF64 brand of last resort");
 TUNABLE_INT("kern.elf64.fallback_brand", &elf64_fallback_brand);
+SYSCTL_INT(_kern_elf64, OID_AUTO, pie_base_mmap, CTLFLAG_RW,
+    &elf_pie_base_mmap, 0,
+    "choose a base address for PIE as if it is mapped with mmap()");
+TUNABLE_INT("kern.elf64.pie_base_mmap", &elf_pie_base_mmap);
 #else /* i386 assumed */
 SYSCTL_NODE(_kern, OID_AUTO, elf32, CTLFLAG_RW, 0, "");
 SYSCTL_INT(_debug, OID_AUTO, elf32_legacy_coredump, CTLFLAG_RW,
@@ -110,27 +116,21 @@ SYSCTL_INT(_debug, OID_AUTO, elf32_legacy_coredump, CTLFLAG_RW,
 SYSCTL_INT(_kern_elf32, OID_AUTO, fallback_brand, CTLFLAG_RW,
     &elf32_fallback_brand, 0, "ELF32 brand of last resort");
 TUNABLE_INT("kern.elf32.fallback_brand", &elf32_fallback_brand);
+SYSCTL_INT(_kern_elf32, OID_AUTO, pie_base_mmap, CTLFLAG_RW,
+    &elf_pie_base_mmap, 0,
+    "choose a base address for PIE as if it is mapped with mmap()");
+TUNABLE_INT("kern.elf32.pie_base_mmap", &elf_pie_base_mmap);
 #endif
 
 static Elf_Brandinfo *elf_brand_list[MAX_BRANDS];
 
 static const char DRAGONFLY_ABI_VENDOR[] = "DragonFly";
-static const char FREEBSD_ABI_VENDOR[]   = "FreeBSD";
 
 Elf_Brandnote __elfN(dragonfly_brandnote) = {
 	.hdr.n_namesz	= sizeof(DRAGONFLY_ABI_VENDOR),
 	.hdr.n_descsz	= sizeof(int32_t),
 	.hdr.n_type	= 1,
 	.vendor		= DRAGONFLY_ABI_VENDOR,
-	.flags		= BN_TRANSLATE_OSREL,
-	.trans_osrel	= __elfN(bsd_trans_osrel),
-};
-
-Elf_Brandnote __elfN(freebsd_brandnote) = {
-	.hdr.n_namesz	= sizeof(FREEBSD_ABI_VENDOR),
-	.hdr.n_descsz	= sizeof(int32_t),
-	.hdr.n_type	= 1,
-	.vendor		= FREEBSD_ABI_VENDOR,
 	.flags		= BN_TRANSLATE_OSREL,
 	.trans_osrel	= __elfN(bsd_trans_osrel),
 };
@@ -190,7 +190,7 @@ __elfN(brand_inuse)(Elf_Brandinfo *entry)
 
 	info.rval = FALSE;
 	info.entry = entry;
-	allproc_scan(elf_brand_inuse_callback, &info);
+	allproc_scan(elf_brand_inuse_callback, &info, 0);
 	return (info.rval);
 }
 
@@ -305,12 +305,12 @@ __elfN(load_section)(struct proc *p, struct vmspace *vmspace, struct vnode *vp,
 		vm_map_lock(&vmspace->vm_map);
 		rv = vm_map_insert(&vmspace->vm_map, &count,
 				      object, NULL,
-				      file_addr,	/* file offset */
+				      file_addr, NULL,	/* file offset */
 				      map_addr,		/* virtual start */
 				      map_addr + map_len,/* virtual end */
 				      VM_MAPTYPE_NORMAL,
-				      prot, VM_PROT_ALL,
-				      cow);
+				      VM_SUBSYS_IMGACT,
+				      prot, VM_PROT_ALL, cow);
 		vm_map_unlock(&vmspace->vm_map);
 		vm_map_entry_release(count);
 
@@ -319,8 +319,8 @@ __elfN(load_section)(struct proc *p, struct vmspace *vmspace, struct vnode *vp,
 		 * vm_object_deallocate().
 		 */
 		if (rv != KERN_SUCCESS) {
+			vm_object_deallocate_locked(object);
 			vm_object_drop(object);
-			vm_object_deallocate(object);
 			return (EINVAL);
 		}
 
@@ -347,12 +347,12 @@ __elfN(load_section)(struct proc *p, struct vmspace *vmspace, struct vnode *vp,
 		vm_map_lock(&vmspace->vm_map);
 		rv = vm_map_insert(&vmspace->vm_map, &count,
 					NULL, NULL,
-					0,
+					0, NULL,
 					map_addr,
 					map_addr + map_len,
 					VM_MAPTYPE_NORMAL,
-					VM_PROT_ALL, VM_PROT_ALL,
-					0);
+					VM_SUBSYS_IMGACT,
+					VM_PROT_ALL, VM_PROT_ALL, 0);
 		vm_map_unlock(&vmspace->vm_map);
 		vm_map_entry_release(count);
 		if (rv != KERN_SUCCESS) {
@@ -408,14 +408,14 @@ __elfN(load_file)(struct proc *p, const char *file, u_long *addr, u_long *entry)
 {
 	struct {
 		struct nlookupdata nd;
-		struct vattr attr;
+		struct vattr_lite lva;
 		struct image_params image_params;
 	} *tempdata;
 	const Elf_Ehdr *hdr = NULL;
 	const Elf_Phdr *phdr = NULL;
 	struct nlookupdata *nd;
 	struct vmspace *vmspace = p->p_vmspace;
-	struct vattr *attr;
+	struct vattr_lite *lvap;
 	struct image_params *imgp;
 	struct mount *topmnt;
 	vm_prot_t prot;
@@ -425,14 +425,14 @@ __elfN(load_file)(struct proc *p, const char *file, u_long *addr, u_long *entry)
 
 	tempdata = kmalloc(sizeof(*tempdata), M_TEMP, M_WAITOK);
 	nd = &tempdata->nd;
-	attr = &tempdata->attr;
+	lvap = &tempdata->lva;
 	imgp = &tempdata->image_params;
 
 	/*
 	 * Initialize part of the common data
 	 */
 	imgp->proc = p;
-	imgp->attr = attr;
+	imgp->lvap = lvap;
 	imgp->firstpage = NULL;
 	imgp->image_header = NULL;
 	imgp->vp = NULL;
@@ -610,7 +610,7 @@ __CONCAT(exec_,__elfN(imgact))(struct image_params *imgp)
 	u_long text_size = 0, data_size = 0, total_size = 0;
 	u_long text_addr = 0, data_addr = 0;
 	u_long seg_size, seg_addr;
-	u_long addr, baddr, et_dyn_addr, entry = 0, proghdr = 0;
+	u_long addr, baddr, et_dyn_addr = 0, entry = 0, proghdr = 0;
 	int32_t osrel = 0;
 	int error = 0, i, n;
 	boolean_t failure;
@@ -680,25 +680,25 @@ __CONCAT(exec_,__elfN(imgact))(struct image_params *imgp)
 		uprintf("ELF binary type \"%u\" not known.\n",
 		    hdr->e_ident[EI_OSABI]);
 		if (interp != NULL)
-		        kfree(interp, M_TEMP);
+			kfree(interp, M_TEMP);
 		return (ENOEXEC);
 	}
 	if (hdr->e_type == ET_DYN) {
 		if ((brand_info->flags & BI_CAN_EXEC_DYN) == 0) {
-		        if (interp != NULL)
-		                kfree(interp, M_TEMP);
+			if (interp != NULL)
+				kfree(interp, M_TEMP);
 			return (ENOEXEC);
-                }
+		}
 		/*
-		 * Honour the base load address from the dso if it is
-		 * non-zero for some reason.
+		 * If p_vaddr field of PT_LOAD program header is zero and type of an
+		 * executale is ET_DYN, then it must be a position independent
+		 * executable (PIE). In this case the system needs to pick a base
+		 * address for us. Set et_dyn_addr to non-zero and choose the actual
+		 * address when we are ready.
 		 */
 		if (baddr == 0)
-			et_dyn_addr = ET_DYN_LOAD_ADDR;
-		else
-			et_dyn_addr = 0;
-	} else
-		et_dyn_addr = 0;
+			et_dyn_addr = 1;
+	}
 
 	if (interp != NULL && brand_info->interp_newpath != NULL)
 		newinterp = brand_info->interp_newpath;
@@ -714,6 +714,9 @@ __CONCAT(exec_,__elfN(imgact))(struct image_params *imgp)
 	vsetflags(imgp->vp, VTEXT);
 
 	vmspace = imgp->proc->p_vmspace;
+	/* Choose the base address for dynamic executables if we need to. */
+	if (et_dyn_addr)
+		et_dyn_addr = pie_base_hint(imgp->proc);
 
 	for (i = 0; i < hdr->e_phnum; i++) {
 		switch (phdr[i].p_type) {
@@ -803,9 +806,9 @@ __CONCAT(exec_,__elfN(imgact))(struct image_params *imgp)
 		}
 	}
 
-	vmspace->vm_tsize = text_size >> PAGE_SHIFT;
+	vmspace->vm_tsize = text_size;		/* in bytes */
 	vmspace->vm_taddr = (caddr_t)(uintptr_t)text_addr;
-	vmspace->vm_dsize = data_size >> PAGE_SHIFT;
+	vmspace->vm_dsize = data_size;		/* in bytes */
 	vmspace->vm_daddr = (caddr_t)(uintptr_t)data_addr;
 
 	addr = ELF_RTLD_ADDR(vmspace);
@@ -813,7 +816,6 @@ __CONCAT(exec_,__elfN(imgact))(struct image_params *imgp)
 	imgp->entry_addr = entry;
 
 	imgp->proc->p_sysent = brand_info->sysvec;
-	EVENTHANDLER_INVOKE(process_exec, imgp);
 
 	if (interp != NULL) {
 		int have_interp = FALSE;
@@ -895,7 +897,7 @@ __elfN(dragonfly_fixup)(register_t **stack_base, struct image_params *imgp)
 	imgp->auxargs = NULL;
 
 	base--;
-	suword(base, (long)imgp->args->argc);
+	suword64(base, (long)imgp->args->argc);
 	*stack_base = (register_t *)base;
 	return (0);
 }
@@ -1059,9 +1061,9 @@ cb_put_phdr(vm_map_entry_t entry, void *closure)
 
 	phdr->p_type = PT_LOAD;
 	phdr->p_offset = phc->offset;
-	phdr->p_vaddr = entry->start;
+	phdr->p_vaddr = entry->ba.start;
 	phdr->p_paddr = 0;
-	phdr->p_filesz = phdr->p_memsz = entry->end - entry->start;
+	phdr->p_filesz = phdr->p_memsz = entry->ba.end - entry->ba.start;
 	phdr->p_align = PAGE_SIZE;
 	phdr->p_flags = __elfN(untrans_prot)(entry->protection);
 
@@ -1080,7 +1082,7 @@ cb_size_segment(vm_map_entry_t entry, void *closure)
 	struct sseg_closure *ssc = closure;
 
 	++ssc->count;
-	ssc->vsize += entry->end - entry->start;
+	ssc->vsize += entry->ba.end - entry->ba.start;
 	return (0);
 }
 
@@ -1094,8 +1096,8 @@ cb_fpcount_segment(vm_map_entry_t entry, void *closure)
 	int *count = closure;
 	struct vnode *vp;
 
-	if (entry->object.vm_object->type == OBJT_VNODE) {
-		vp = (struct vnode *)entry->object.vm_object->handle;
+	if (entry->ba.object && entry->ba.object->type == OBJT_VNODE) {
+		vp = (struct vnode *)entry->ba.object->handle;
 		if ((vp->v_flag & VCKPT) && curproc->p_textvp == vp)
 			return (0);
 		++*count;
@@ -1130,8 +1132,8 @@ cb_put_fp(vm_map_entry_t entry, void *closure)
 	 * referencing many prior checkpoint files and that is a bit over
 	 * the top for the purpose of the checkpoint API.
 	 */
-	if (entry->object.vm_object->type == OBJT_VNODE) {
-		vp = (struct vnode *)entry->object.vm_object->handle;
+	if (entry->ba.object && entry->ba.object->type == OBJT_VNODE) {
+		vp = (struct vnode *)entry->ba.object->handle;
 		if ((vp->v_flag & VCKPT) && curproc->p_textvp == vp)
 			return (0);
 		if (vnh == fpc->vnh_max)
@@ -1143,10 +1145,16 @@ cb_put_fp(vm_map_entry_t entry, void *closure)
 		if (error) {
 			char *freepath, *fullpath;
 
+			/*
+			 * This is actually a relatively common occurance,
+			 * so don't spew on the console by default.
+			 */
 			if (vn_fullpath(curproc, vp, &fullpath, &freepath, 0)) {
-				kprintf("Warning: coredump, error %d: cannot store file handle for vnode %p\n", error, vp);
+				if (bootverbose)
+					kprintf("Warning: coredump, error %d: cannot store file handle for vnode %p\n", error, vp);
 			} else {
-				kprintf("Warning: coredump, error %d: cannot store file handle for %s\n", error, fullpath);
+				if (bootverbose)
+					kprintf("Warning: coredump, error %d: cannot store file handle for %s\n", error, fullpath);
 				kfree(freepath, M_TEMP);
 			}
 			error = 0;
@@ -1154,9 +1162,10 @@ cb_put_fp(vm_map_entry_t entry, void *closure)
 
 		phdr->p_type = PT_LOAD;
 		phdr->p_offset = 0;        /* not written to core */
-		phdr->p_vaddr = entry->start;
+		phdr->p_vaddr = entry->ba.start;
 		phdr->p_paddr = 0;
-		phdr->p_filesz = phdr->p_memsz = entry->end - entry->start;
+		phdr->p_filesz = phdr->p_memsz =
+			entry->ba.end - entry->ba.start;
 		phdr->p_align = PAGE_SIZE;
 		phdr->p_flags = 0;
 		if (entry->protection & VM_PROT_READ)
@@ -1183,11 +1192,9 @@ each_segment(struct proc *p, segment_callback func, void *closure, int writable)
 	vm_map_t map = &p->p_vmspace->vm_map;
 	vm_map_entry_t entry;
 
-	for (entry = map->header.next; error == 0 && entry != &map->header;
-	    entry = entry->next) {
+	RB_FOREACH(entry, vm_map_rb_tree, &map->rb_root) {
+		vm_map_backing_t ba;
 		vm_object_t obj;
-		vm_object_t lobj;
-		vm_object_t tobj;
 
 		/*
 		 * Don't dump inaccessible mappings, deal with legacy
@@ -1217,43 +1224,32 @@ each_segment(struct proc *p, segment_callback func, void *closure, int writable)
 			continue;
 		if (entry->maptype != VM_MAPTYPE_NORMAL)
 			continue;
-		if ((obj = entry->object.vm_object) == NULL)
-			continue;
 
 		/*
 		 * Find the bottom-most object, leaving the base object
 		 * and the bottom-most object held (but only one hold
 		 * if they happen to be the same).
 		 */
-		vm_object_hold_shared(obj);
-
-		lobj = obj;
-		while (lobj && (tobj = lobj->backing_object) != NULL) {
-			KKASSERT(tobj != obj);
-			vm_object_hold_shared(tobj);
-			if (tobj == lobj->backing_object) {
-				if (lobj != obj) {
-					vm_object_lock_swap();
-					vm_object_drop(lobj);
-				}
-				lobj = tobj;
-			} else {
-				vm_object_drop(tobj);
-			}
-		}
+		ba = &entry->ba;
+		while (ba->backing_ba)
+			ba = ba->backing_ba;
+		obj = ba->object;
 
 		/*
 		 * The callback only applies to default, swap, or vnode
 		 * objects.  Other types of objects such as memory-mapped
 		 * devices are ignored.
 		 */
-		if (lobj->type == OBJT_DEFAULT || lobj->type == OBJT_SWAP ||
-		    lobj->type == OBJT_VNODE) {
-			error = (*func)(entry, closure);
+		if (obj) {
+			vm_object_hold_shared(obj);
+
+			if (obj->type == OBJT_DEFAULT ||
+			    obj->type == OBJT_SWAP ||
+			    obj->type == OBJT_VNODE) {
+				error = (*func)(entry, closure);
+			}
+			vm_object_drop(obj);
 		}
-		if (lobj != obj)
-			vm_object_drop(lobj);
-		vm_object_drop(obj);
 	}
 	return (error);
 }
@@ -1461,11 +1457,6 @@ elf_putallnotes(struct lwp *corelp, elf_buf_t target, int sig,
 		status->pr_fpregsetsz = sizeof(fpregset_t);
 		status->pr_osreldate = osreldate;
 		status->pr_cursig = sig;
-		/*
-		 * XXX GDB needs unique pr_pid for each LWP and does not
-		 * not support pr_pid==0 but lwp_tid can be 0, so hack unique
-		 * value.
-		 */
 		status->pr_pid = corelp->lwp_tid;
 		fill_regs(corelp, &status->pr_reg);
 		fill_fpregs(corelp, fpregs);
@@ -1563,12 +1554,14 @@ elf_putsigs(struct lwp *lp, elf_buf_t target)
 static int
 elf_putfiles(struct proc *p, elf_buf_t target, struct file *ckfp)
 {
+	thread_t td = curthread;
 	int error = 0;
 	int i;
 	struct ckpt_filehdr *cfh = NULL;
 	struct ckpt_fileinfo *cfi;
 	struct file *fp;	
 	struct vnode *vp;
+
 	/*
 	 * the duplicated loop is gross, but it was the only way
 	 * to eliminate uninitialized variable warnings 
@@ -1581,8 +1574,9 @@ elf_putfiles(struct proc *p, elf_buf_t target, struct file *ckfp)
 	/*
 	 * ignore STDIN/STDERR/STDOUT.
 	 */
+	KKASSERT(td->td_proc == p);
 	for (i = 3; error == 0 && i < p->p_fd->fd_nfiles; i++) {
-		fp = holdfp(p->p_fd, i, -1);
+		fp = holdfp(td, i, -1);
 		if (fp == NULL)
 			continue;
 		/* 
@@ -1643,8 +1637,8 @@ elf_puttextvp(struct proc *p, elf_buf_t target)
 
 	vminfo = target_reserve(target, sizeof(struct ckpt_vminfo), &error);
 	if (vminfo != NULL) {
-		vminfo->cvm_dsize = p->p_vmspace->vm_dsize;
-		vminfo->cvm_tsize = p->p_vmspace->vm_tsize;
+		vminfo->cvm_dsize = btoc(p->p_vmspace->vm_dsize); /* pages */
+		vminfo->cvm_tsize = btoc(p->p_vmspace->vm_tsize); /* pages */
 		vminfo->cvm_daddr = p->p_vmspace->vm_daddr;
 		vminfo->cvm_taddr = p->p_vmspace->vm_taddr;
 	}
@@ -1915,4 +1909,16 @@ __elfN(untrans_prot)(vm_prot_t prot)
 	if (prot & VM_PROT_WRITE)
 		flags |= PF_W;
 	return (flags);
+}
+
+static u_long
+pie_base_hint(struct proc *p)
+{
+	u_long base;
+
+	if (elf_pie_base_mmap)
+		base = vm_map_hint(p, 0, VM_PROT_READ | VM_PROT_EXECUTE);
+	else
+		base = ET_DYN_LOAD_ADDR;
+	return base;
 }

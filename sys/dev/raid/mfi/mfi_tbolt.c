@@ -41,7 +41,6 @@
 #include <sys/conf.h>
 #include <sys/bio.h>
 #include <sys/buf2.h>
-#include <sys/ioccom.h>
 #include <sys/eventhandler.h>
 #include <sys/callout.h>
 #include <sys/uio.h>
@@ -1156,7 +1155,7 @@ mfi_tbolt_send_frame(struct mfi_softc *sc, struct mfi_command *cm)
 
 	if (hdr->cmd == MFI_CMD_PD_SCSI_IO) {
 		/* check for inquiry commands coming from CLI */
-		if (cdb[0] != 0x28 || cdb[0] != 0x2A) {
+		if (cdb[0] != 0x28 && cdb[0] != 0x2A) {
 			if ((req_desc = mfi_tbolt_build_mpt_cmd(sc, cm)) ==
 			    NULL) {
 				device_printf(sc->mfi_dev, "Mapping from MFI "

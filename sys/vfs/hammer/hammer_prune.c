@@ -1,13 +1,13 @@
 /*
  * Copyright (c) 2008 The DragonFly Project.  All rights reserved.
- * 
+ *
  * This code is derived from software contributed to The DragonFly Project
  * by Matthew Dillon <dillon@backplane.com>
- * 
+ *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
  * are met:
- * 
+ *
  * 1. Redistributions of source code must retain the above copyright
  *    notice, this list of conditions and the following disclaimer.
  * 2. Redistributions in binary form must reproduce the above copyright
@@ -17,7 +17,7 @@
  * 3. Neither the name of The DragonFly Project nor the names of its
  *    contributors may be used to endorse or promote products derived
  *    from this software without specific, prior written permission.
- * 
+ *
  * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
  * ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
  * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
@@ -30,7 +30,7 @@
  * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT
  * OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
- * 
+ *
  * $DragonFly: src/sys/vfs/hammer/hammer_prune.c,v 1.19 2008/09/23 21:03:52 dillon Exp $
  */
 
@@ -61,6 +61,8 @@ hammer_ioc_prune(hammer_transaction_t trans, hammer_inode_t ip,
 	int isdir;
 	int elm_array_size;
 	int seq;
+	int64_t bytes;
+	uint32_t key_beg_localization;
 
 	if (prune->nelms < 0 || prune->nelms > HAMMER_MAX_PRUNE_ELMS)
 		return(EINVAL);
@@ -78,9 +80,18 @@ hammer_ioc_prune(hammer_transaction_t trans, hammer_inode_t ip,
 	if ((prune->head.flags & HAMMER_IOC_PRUNE_ALL) && prune->nelms)
 		return(EINVAL);
 
-	prune->key_cur.localization = (prune->key_end.localization &
-					HAMMER_LOCALIZE_MASK) +
-				      ip->obj_localization;
+	/*
+	 * Ioctl caller has only set localization type to prune.
+	 * Initialize cursor key localization with ip localization.
+	 */
+	key_beg_localization = prune->key_beg.localization;
+	key_beg_localization &= HAMMER_LOCALIZE_MASK;
+	key_beg_localization |= ip->obj_localization;
+
+	prune->key_cur.localization = prune->key_end.localization;
+	prune->key_cur.localization &= HAMMER_LOCALIZE_MASK;
+	prune->key_cur.localization |= ip->obj_localization;
+
 	prune->key_cur.obj_id = prune->key_end.obj_id;
 	prune->key_cur.key = HAMMER_MAX_KEY;
 
@@ -105,9 +116,7 @@ retry:
 		hammer_done_cursor(&cursor);
 		goto failed;
 	}
-	cursor.key_beg.localization = (prune->key_beg.localization &
-					HAMMER_LOCALIZE_MASK) +
-				      ip->obj_localization;
+	cursor.key_beg.localization = key_beg_localization;
 	cursor.key_beg.obj_id = prune->key_beg.obj_id;
 	cursor.key_beg.key = HAMMER_MIN_KEY;
 	cursor.key_beg.create_tid = 1;
@@ -145,6 +154,14 @@ retry:
 		prune->key_cur = elm->base;
 
 		/*
+		 * Filesystem went read-only during rebalancing
+		 */
+		if (trans->hmp->ronly) {
+			error = EROFS;
+			break;
+		}
+
+		/*
 		 * Yield to more important tasks
 		 */
 		if ((error = hammer_signal_check(trans->hmp)) != 0)
@@ -154,18 +171,18 @@ retry:
 			prune->stat_oldest_tid = elm->base.create_tid;
 
 		if (hammer_debug_general & 0x0200) {
-			kprintf("check %016llx %016llx cre=%016llx del=%016llx\n",
-					(long long)elm->base.obj_id,
-					(long long)elm->base.key,
-					(long long)elm->base.create_tid,
-					(long long)elm->base.delete_tid);
+			hdkprintf("check %016jx %016jx cre=%016jx del=%016jx\n",
+					(intmax_t)elm->base.obj_id,
+					(intmax_t)elm->base.key,
+					(intmax_t)elm->base.create_tid,
+					(intmax_t)elm->base.delete_tid);
 		}
-				
+
 		if (prune_should_delete(prune, elm)) {
 			if (hammer_debug_general & 0x0200) {
-				kprintf("check %016llx %016llx: DELETE\n",
-					(long long)elm->base.obj_id,
-					(long long)elm->base.key);
+				hdkprintf("check %016jx %016jx: DELETE\n",
+					(intmax_t)elm->base.obj_id,
+					(intmax_t)elm->base.key);
 			}
 
 			/*
@@ -185,7 +202,7 @@ retry:
 							HAMMER_DELETE_DESTROY,
 							cursor.trans->tid,
 							cursor.trans->time32,
-							0, &prune->stat_bytes);
+							0, &bytes);
 			hammer_sync_unlock(trans);
 			if (error)
 				break;
@@ -194,6 +211,7 @@ retry:
 				++prune->stat_dirrecords;
 			else
 				++prune->stat_rawrecords;
+			prune->stat_bytes += bytes;
 
 			/*
 			 * The current record might now be the one after
@@ -209,9 +227,9 @@ retry:
 			prune_check_nlinks(&cursor, elm);
 			cursor.flags |= HAMMER_CURSOR_ATEDISK;
 			if (hammer_debug_general & 0x0100) {
-				kprintf("check %016llx %016llx: SKIP\n",
-					(long long)elm->base.obj_id,
-					(long long)elm->base.key);
+				hdkprintf("check %016jx %016jx: SKIP\n",
+					(intmax_t)elm->base.obj_id,
+					(intmax_t)elm->base.key);
 			}
 		}
 		++prune->stat_scanrecords;
@@ -309,7 +327,7 @@ prune_check_nlinks(hammer_cursor_t cursor, hammer_btree_leaf_elm_t elm)
 		return;
 	if (elm->base.delete_tid != 0)
 		return;
-	if (hammer_btree_extract(cursor, HAMMER_CURSOR_GET_DATA))
+	if (hammer_btree_extract_data(cursor))
 		return;
 	if (cursor->data->inode.nlinks)
 		return;
@@ -320,14 +338,14 @@ prune_check_nlinks(hammer_cursor_t cursor, hammer_btree_leaf_elm_t elm)
 		      0, &error);
 	if (ip) {
 		if (hammer_debug_general & 0x0001) {
-			kprintf("pruning disconnected inode %016llx\n",
-				(long long)elm->base.obj_id);
+			hdkprintf("pruning disconnected inode %016jx\n",
+				(intmax_t)elm->base.obj_id);
 		}
 		hammer_rel_inode(ip, 0);
 		hammer_inode_waitreclaims(cursor->trans);
 	} else {
-		kprintf("unable to prune disconnected inode %016llx\n",
-			(long long)elm->base.obj_id);
+		hkprintf("unable to prune disconnected inode %016jx\n",
+			(intmax_t)elm->base.obj_id);
 	}
 }
 
@@ -335,7 +353,7 @@ prune_check_nlinks(hammer_cursor_t cursor, hammer_btree_leaf_elm_t elm)
 
 /*
  * NOTE: THIS CODE HAS BEEN REMOVED!  Pruning no longer attempts to realign
- *	 adjacent records because it seriously interferes with every 
+ *	 adjacent records because it seriously interferes with every
  *	 mirroring algorithm I could come up with.
  *
  *	 This means that historical accesses beyond the first snapshot
@@ -387,7 +405,7 @@ realign_prune(struct hammer_ioc_prune *prune,
 	if (realign_cre >= 0) {
 		scan = &prune->elms[realign_cre];
 
-		delta = (elm->leaf.base.create_tid - scan->beg_tid) % 
+		delta = (elm->leaf.base.create_tid - scan->beg_tid) %
 			scan->mod_tid;
 		if (delta) {
 			tid = elm->leaf.base.create_tid - delta + scan->mod_tid;
@@ -395,8 +413,7 @@ realign_prune(struct hammer_ioc_prune *prune,
 			/* can EDEADLK */
 			error = hammer_btree_correct_rhb(cursor, tid + 1);
 			if (error == 0) {
-				error = hammer_btree_extract(cursor,
-						     HAMMER_CURSOR_GET_LEAF);
+				error = hammer_btree_extract_leaf(cursor);
 			}
 			if (error == 0) {
 				/* can EDEADLK */
@@ -421,11 +438,10 @@ realign_prune(struct hammer_ioc_prune *prune,
 	if (error == 0 && realign_del >= 0) {
 		scan = &prune->elms[realign_del];
 
-		delta = (elm->leaf.base.delete_tid - scan->beg_tid) % 
+		delta = (elm->leaf.base.delete_tid - scan->beg_tid) %
 			scan->mod_tid;
 		if (delta) {
-			error = hammer_btree_extract(cursor,
-						     HAMMER_CURSOR_GET_LEAF);
+			error = hammer_btree_extract_leaf(cursor);
 			if (error == 0) {
 				hammer_modify_node(cursor->trans, cursor->node,
 					    &elm->leaf.base.delete_tid,

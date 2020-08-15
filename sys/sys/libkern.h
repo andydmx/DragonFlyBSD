@@ -10,11 +10,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -39,7 +35,7 @@
 
 #if !defined(_KERNEL)
 #error "This file should not be included by userland programs."
-#else
+#endif
 
 /*
  * Hacks to prevent conflicts with standard header files
@@ -68,7 +64,7 @@ extern char const	hex2ascii_data[];
  * Number of bytes needed for hexadecimal representation
  * plus trailing \0
  */
-#define HEX_NCPYLEN(s) (s * 3)
+#define	HEX_NCPYLEN(s)	(s * 3)
 
 static __inline int imax(int a, int b) { return (a > b ? a : b); }
 static __inline int imin(int a, int b) { return (a < b ? a : b); }
@@ -94,56 +90,61 @@ static __inline long labs(long a) { return (a < 0 ? -a : a); }
 static __inline quad_t qabs(quad_t a) { return (a < 0 ? -a : a); }
 
 /* Prototypes for non-quad routines. */
-u_int32_t karc4random (void);
-void	karc4rand (void *, size_t);
-int	 bcmp (const void *, const void *, size_t);
-void	*kbsearch (const void *, const void *, size_t,
+uint32_t karc4random(void);
+uint64_t karc4random64(void);
+void	 karc4rand(void *, size_t);
+void	 arc4_init_pcpu(int cpuid);
+int	 bcmp(const void *, const void *, size_t);
+void	*kbsearch(const void *, const void *, size_t,
 		     size_t, int (*)(const void *, const void *));
 #ifndef HAVE_INLINE_FFS
-int	 ffs (int);
+int	 ffs(int);
 #endif
 #ifndef HAVE_INLINE_FFSL
-int	 ffsl (long);
+int	 ffsl(long);
 #endif
 #ifndef	HAVE_INLINE_FLS
-int	 fls (int);
+int	 fls(int);
 #endif
 #ifndef HAVE_INLINE_FLSL
 int	 flsl(long);
 #endif
-int	 locc (int, char *, u_int);
-void	 kqsort (void *base, size_t nmemb, size_t size,
+#ifndef HAVE_INLINE_FLSLL
+int	 flsll(long long);
+#endif
+void	 kqsort(void *base, size_t nmemb, size_t size,
 		    int (*compar)(const void *, const void *));
 void	 kqsort_r(void *base, size_t nmemb, size_t size, void *thunk,
 		    int (*compar)(void *, const void *, const void *));
-u_long	 krandom (void);
-char	*index (const char *, int);
-char	*rindex (const char *, int);
-int	 scanc (u_int, const u_char *, const u_char *, int);
-int	 skpc (int, int, char *);
-void	 skrandom (u_long);
-char	*strcat (char * __restrict, const char * __restrict);
+u_long	 krandom(void);
+char	*index(const char *, int);
+char	*rindex(const char *, int);
+int	 scanc(u_int, const u_char *, const u_char *, int);
+int	 skpc(int, int, char *);
+void	 skrandom(u_long);
+char	*strcat(char * __restrict, const char * __restrict);
 char	*strncat(char * __restrict, const char * __restrict, size_t);
-int	 strcmp (const char *, const char *);
-int	 strcasecmp (const char *, const char *);
-char	*strcpy (char * __restrict, const char * __restrict);
-size_t   strlcat (char *, const char *, size_t);
-size_t   strlcpy (char *, const char *, size_t);
-size_t	 strlen (const char *);
-int	 strncmp (const char *, const char *, size_t);
-int	 strncasecmp (const char *, const char *, size_t);
-char	*strncpy (char * __restrict, const char * __restrict, size_t);
+int	 strcmp(const char *, const char *);
+int	 strcasecmp(const char *, const char *);
+char	*strcpy(char * __restrict, const char * __restrict);
+size_t	 strlcat(char *, const char *, size_t);
+size_t	 strlcpy(char *, const char *, size_t);
+size_t	 strlen(const char *);
+int	 strncmp(const char *, const char *, size_t);
+int	 strncasecmp(const char *, const char *, size_t);
+char	*strncpy(char * __restrict, const char * __restrict, size_t);
+size_t	 strnlen(const char *, size_t);
 char	*strsep(char **, const char *);
 char	*strstr(const char *, const char *);
-int	_kfnmatch(const char *, const char *, int, int);
-void *	memcchr(const void *, int, size_t);
-char *	hexncpy(const u_char *, int, char *, int, const char *);
+int	 _kfnmatch(const char *, const char *, int, int);
+void	*memcchr(const void *, int, size_t);
+char	*hexncpy(const u_char *, int, char *, int, const char *);
 
 /*
  * memset can't be an inline, it is used by gcc-4.x directly.
  */
-void	*memset(void *b, int c, size_t len);
-void	*memmove(void *s1, const void *s2, size_t n);
+/*void	*memset(void *, int, size_t);*/
+/*void	*memmove(void *, const void *, size_t);*/
 
 
 static __inline int
@@ -182,5 +183,4 @@ strrchr(const char *p, int ch)
 #define	FNM_IGNORECASE	FNM_CASEFOLD
 #define	FNM_FILE_NAME	FNM_PATHNAME
 
-#endif	/* _KERNEL */
 #endif	/* !_SYS_LIBKERN_H_ */

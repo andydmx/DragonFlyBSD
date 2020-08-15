@@ -43,32 +43,13 @@
 #include <sys/tree.h>
 #include <sys/syslink_rpc.h>
 #include <sys/proc.h>
-#include <machine/stdarg.h>
-#include <sys/devfs.h>
 #include <sys/dsched.h>
+#include <sys/devfs.h>
+#include <sys/file.h>
 
-#include <sys/thread2.h>
+#include <machine/stdarg.h>
+
 #include <sys/mplock2.h>
-
-static int mpsafe_writes;
-static int mplock_writes;
-static int mpsafe_reads;
-static int mplock_reads;
-static int mpsafe_strategies;
-static int mplock_strategies;
-
-SYSCTL_INT(_kern, OID_AUTO, mpsafe_writes, CTLFLAG_RD, &mpsafe_writes,
-	   0, "mpsafe writes");
-SYSCTL_INT(_kern, OID_AUTO, mplock_writes, CTLFLAG_RD, &mplock_writes,
-	   0, "non-mpsafe writes");
-SYSCTL_INT(_kern, OID_AUTO, mpsafe_reads, CTLFLAG_RD, &mpsafe_reads,
-	   0, "mpsafe reads");
-SYSCTL_INT(_kern, OID_AUTO, mplock_reads, CTLFLAG_RD, &mplock_reads,
-	   0, "non-mpsafe reads");
-SYSCTL_INT(_kern, OID_AUTO, mpsafe_strategies, CTLFLAG_RD, &mpsafe_strategies,
-	   0, "mpsafe strategies");
-SYSCTL_INT(_kern, OID_AUTO, mplock_strategies, CTLFLAG_RD, &mplock_strategies,
-	   0, "non-mpsafe strategies");
 
 /*
  * system link descriptors identify the command in the
@@ -101,6 +82,20 @@ DEVOP_DESC_INIT(clone);
  */
 struct dev_ops dead_dev_ops;
 
+static d_open_t		noopen;
+static d_close_t	noclose;
+static d_read_t		noread;
+static d_write_t	nowrite;
+static d_ioctl_t	noioctl;
+static d_mmap_t		nommap;
+static d_mmap_single_t	nommap_single;
+static d_strategy_t	nostrategy;
+static d_dump_t		nodump;
+static d_psize_t	nopsize;
+static d_kqfilter_t	nokqfilter;
+static d_clone_t	noclone;
+static d_revoke_t	norevoke;
+
 struct dev_ops default_dev_ops = {
 	{ "null" },
 	.d_default = NULL,	/* must be NULL */
@@ -125,6 +120,13 @@ dev_needmplock(cdev_t dev)
 {
     return((dev->si_ops->head.flags & D_MPSAFE) == 0);
 }
+
+static __inline
+int
+dev_nokvabio(cdev_t dev)
+{
+    return((dev->si_ops->head.flags & D_KVABIO) == 0);
+}
     
 /************************************************************************
  *			GENERAL DEVICE API FUNCTIONS			*
@@ -133,7 +135,8 @@ dev_needmplock(cdev_t dev)
  * The MPSAFEness of these depends on dev->si_ops->head.flags
  */
 int
-dev_dopen(cdev_t dev, int oflags, int devtype, struct ucred *cred, struct file *fp)
+dev_dopen(cdev_t dev, int oflags, int devtype, struct ucred *cred,
+	  struct file *fp, struct vnode *vp)
 {
 	struct dev_open_args ap;
 	int needmplock = dev_needmplock(dev);
@@ -145,6 +148,12 @@ dev_dopen(cdev_t dev, int oflags, int devtype, struct ucred *cred, struct file *
 	ap.a_devtype = devtype;
 	ap.a_cred = cred;
 	ap.a_fp = fp;
+	if (ap.a_fp)
+		ap.a_fp->f_data = vp;
+	/*
+	   vref(vp) is being done in vop_stdopen()
+	   If a non-null vp is passed-in, the caller must also issue a vop_stdopen()
+	*/
 
 	if (needmplock)
 		get_mplock();
@@ -188,12 +197,8 @@ dev_dread(cdev_t dev, struct uio *uio, int ioflag, struct file *fp)
 	ap.a_ioflag = ioflag;
 	ap.a_fp = fp;
 
-	if (needmplock) {
+	if (needmplock)
 		get_mplock();
-		++mplock_reads;
-	} else {
-		++mpsafe_reads;
-	}
 	error = dev->si_ops->d_read(&ap);
 	if (needmplock)
 		rel_mplock();
@@ -216,12 +221,8 @@ dev_dwrite(cdev_t dev, struct uio *uio, int ioflag, struct file *fp)
 	ap.a_ioflag = ioflag;
 	ap.a_fp = fp;
 
-	if (needmplock) {
+	if (needmplock)
 		get_mplock();
-		++mplock_writes;
-	} else {
-		++mpsafe_writes;
-	}
 	error = dev->si_ops->d_write(&ap);
 	if (needmplock)
 		rel_mplock();
@@ -253,7 +254,7 @@ dev_dioctl(cdev_t dev, u_long cmd, caddr_t data, int fflag, struct ucred *cred,
 	return (error);
 }
 
-int
+int64_t
 dev_dmmap(cdev_t dev, vm_offset_t offset, int nprot, struct file *fp)
 {
 	struct dev_mmap_args ap;
@@ -351,31 +352,33 @@ dev_dstrategy(cdev_t dev, struct bio *bio)
 {
 	struct dev_strategy_args ap;
 	struct bio_track *track;
+	struct buf *bp = bio->bio_buf;
 	int needmplock = dev_needmplock(dev);
+
+	/*
+	 * If the device doe snot support KVABIO and the buffer is using
+	 * KVABIO, we must synchronize b_data to all cpus before dispatching.
+	 */
+	if (dev_nokvabio(dev) && (bp->b_flags & B_KVABIO))
+		bkvasync_all(bp);
 
 	ap.a_head.a_desc = &dev_strategy_desc;
 	ap.a_head.a_dev = dev;
 	ap.a_bio = bio;
 
 	KKASSERT(bio->bio_track == NULL);
-	KKASSERT(bio->bio_buf->b_cmd != BUF_CMD_DONE);
-	if (bio->bio_buf->b_cmd == BUF_CMD_READ)
-	    track = &dev->si_track_read;
+	KKASSERT(bp->b_cmd != BUF_CMD_DONE);
+	if (bp->b_cmd == BUF_CMD_READ)
+		track = &dev->si_track_read;
 	else
-	    track = &dev->si_track_write;
+		track = &dev->si_track_write;
 	bio_track_ref(track);
 	bio->bio_track = track;
-
-	if (dsched_is_clear_buf_priv(bio->bio_buf))
-		dsched_new_buf(bio->bio_buf);
+	dsched_buf_enter(bp);	/* might stack */
 
 	KKASSERT((bio->bio_flags & BIO_DONE) == 0);
-	if (needmplock) {
+	if (needmplock)
 		get_mplock();
-		++mplock_strategies;
-	} else {
-		++mpsafe_strategies;
-	}
 	(void)dev->si_ops->d_strategy(&ap);
 	if (needmplock)
 		rel_mplock();
@@ -385,7 +388,15 @@ void
 dev_dstrategy_chain(cdev_t dev, struct bio *bio)
 {
 	struct dev_strategy_args ap;
+	struct buf *bp = bio->bio_buf;
 	int needmplock = dev_needmplock(dev);
+
+	/*
+	 * If the device doe snot support KVABIO and the buffer is using
+	 * KVABIO, we must synchronize b_data to all cpus before dispatching.
+	 */
+	if (dev_nokvabio(dev) && (bp->b_flags & B_KVABIO))
+		bkvasync_all(bp);
 
 	ap.a_head.a_desc = &dev_strategy_desc;
 	ap.a_head.a_dev = dev;
@@ -406,7 +417,7 @@ dev_dstrategy_chain(cdev_t dev, struct bio *bio)
  */
 int
 dev_ddump(cdev_t dev, void *virtual, vm_offset_t physical, off_t offset,
-    size_t length)
+	  size_t length)
 {
 	struct dev_dump_args ap;
 	int needmplock = dev_needmplock(dev);
@@ -672,69 +683,69 @@ dev_ops_restore(cdev_t dev, struct dev_ops *oops)
  * Unsupported devswitch functions (e.g. for writing to read-only device).
  * XXX may belong elsewhere.
  */
-int
+static int
 norevoke(struct dev_revoke_args *ap)
 {
 	/* take no action */
 	return(0);
 }
 
-int
+static int
 noclone(struct dev_clone_args *ap)
 {
 	/* take no action */
 	return (0);	/* allow the clone */
 }
 
-int
+static int
 noopen(struct dev_open_args *ap)
 {
 	return (ENODEV);
 }
 
-int
+static int
 noclose(struct dev_close_args *ap)
 {
 	return (ENODEV);
 }
 
-int
+static int
 noread(struct dev_read_args *ap)
 {
 	return (ENODEV);
 }
 
-int
+static int
 nowrite(struct dev_write_args *ap)
 {
 	return (ENODEV);
 }
 
-int
+static int
 noioctl(struct dev_ioctl_args *ap)
 {
 	return (ENODEV);
 }
 
-int
+static int
 nokqfilter(struct dev_kqfilter_args *ap)
 {
 	return (ENODEV);
 }
 
-int
+static int
 nommap(struct dev_mmap_args *ap)
 {
 	return (ENODEV);
 }
 
-int
+static int
 nommap_single(struct dev_mmap_single_args *ap)
 {
 	return (ENODEV);
 }
 
-int
+static int
 nostrategy(struct dev_strategy_args *ap)
 {
 	struct bio *bio = ap->a_bio;
@@ -745,14 +756,14 @@ nostrategy(struct dev_strategy_args *ap)
 	return(0);
 }
 
-int
+static int
 nopsize(struct dev_psize_args *ap)
 {
 	ap->a_result = 0;
 	return(0);
 }
 
-int
+static int
 nodump(struct dev_dump_args *ap)
 {
 	return (ENODEV);

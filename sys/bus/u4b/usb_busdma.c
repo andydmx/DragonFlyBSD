@@ -1,4 +1,4 @@
-/* $FreeBSD$ */
+/* $FreeBSD: head/sys/dev/usb/usb_busdma.c 261505 2014-02-05 08:02:52Z hselasky $ */
 /*-
  * Copyright (c) 2008 Hans Petter Selasky. All rights reserved.
  *
@@ -33,8 +33,6 @@
 #include <sys/bus.h>
 #include <sys/module.h>
 #include <sys/lock.h>
-#include <sys/mutex.h>
-#include <sys/mutex2.h>
 #include <sys/condvar.h>
 #include <sys/sysctl.h>
 #include <sys/unistd.h>
@@ -433,7 +431,7 @@ usb_pc_common_mem_cb(void *arg, bus_dma_segment_t *segs,
 
 	off = 0;
 	pg = pc->page_start;
-	pg->physaddr = segs->ds_addr & ~(USB_PAGE_SIZE - 1);
+	pg->physaddr = rounddown2(segs->ds_addr, USB_PAGE_SIZE);
 	rem = segs->ds_addr & (USB_PAGE_SIZE - 1);
 	pc->page_offset_buf = rem;
 	pc->page_offset_end += rem;
@@ -447,7 +445,7 @@ usb_pc_common_mem_cb(void *arg, bus_dma_segment_t *segs,
 		goto done;
 	}
 #endif
-	while (1) {
+	while (pc->ismultiseg) {
 		off += USB_PAGE_SIZE;
 		if (off >= (segs->ds_len + rem)) {
 			/* page crossing */
@@ -459,7 +457,7 @@ usb_pc_common_mem_cb(void *arg, bus_dma_segment_t *segs,
 				break;
 		}
 		pg++;
-		pg->physaddr = (segs->ds_addr + off) & ~(USB_PAGE_SIZE - 1);
+		pg->physaddr = rounddown2(segs->ds_addr + off, USB_PAGE_SIZE);
 	}
 
 done:

@@ -1,7 +1,7 @@
 .include "${.CURDIR}/../../platform/${MACHINE_PLATFORM}/Makefile.inc"
 
-SUBDIR= ahci aic aic7xxx ccd dm iscsi isp ispfw md mmcsd mpt nata ncv nsp
-SUBDIR+= sbp sdhci sili stg sym trm vn vpo
+SUBDIR= ahci ccd dm iscsi isp md mmcsd mpt nata
+SUBDIR+= nvme sbp sdhci sili sym trm vn vpo
 
 .for dir in ${SUBDIR}
 .if empty(DEV_SUPPORT:Mdisk) && \
@@ -9,5 +9,9 @@ SUBDIR+= sbp sdhci sili stg sym trm vn vpo
 SUBDIR:= ${SUBDIR:N${dir}}
 .endif
 .endfor
+
+# Empty for concurrent build
+#
+SUBDIR_ORDERED=
 
 .include <bsd.subdir.mk>

@@ -10,11 +10,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -66,10 +62,8 @@ typedef union netmsg *netmsg_t;
  * which is used for protocol-protocol and system-protocol communication.
  *
  * A protocol is called through the pr_init entry before any other.
- * Thereafter it is called every 200ms through the pr_fasttimo entry and
- * every 500ms through the pr_slowtimo for timer based actions.
- * The system will call the pr_drain entry if it is low on space and
- * this should throw away any non-critical data.
+ * The system will call the pr_drain entry if it is low on space and this
+ * should throw away any non-critical data.
  *
  * Protocols pass data between themselves as chains of mbufs using
  * the pr_input and pr_output hooks.  Pr_input passes data up (towards
@@ -107,16 +101,16 @@ struct protosw {
 					/* output to protocol (from above) */
 	void	(*pr_ctlinput)(netmsg_t);
 					/* control input (from below) */
+	struct netmsg_pr_ctloutput *(*pr_ctloutmsg)(struct sockopt *);
+					/* allocate netmsg for ctloutput */
 	void	(*pr_ctloutput)(netmsg_t);
 					/* control output (from above) */
-	struct lwkt_port *(*pr_ctlport)(int, struct sockaddr *, void *);
+	struct lwkt_port *(*pr_ctlport)(int, struct sockaddr *, void *, int *);
 
 	/*
 	 * Utility hooks, not called with any particular context.
 	 */
 	void	(*pr_init) (void);	/* initialization hook */
-	void	(*pr_fasttimo) (void);	/* fast timeout (200ms) */
-	void	(*pr_slowtimo) (void);	/* slow timeout (500ms) */
 	void	(*pr_drain) (void);	/* flush any excess space possible */
 
 	struct	pr_usrreqs *pr_usrreqs;	/* messaged requests to proto thread */
@@ -143,7 +137,7 @@ struct protosw {
 #define	PR_RIGHTS	0x10		/* passes capabilities */
 #define	PR_IMPLOPCL	0x20		/* implied open/close */
 #define	PR_LASTHDR	0x40		/* enforce ipsec policy; last header */
-#define	PR_ADDR_OPT	0x80		/* allow addresses during delivery */
+#define	PR_UNUSED07	0x80		/* was: allow addresses during delivery (SCTP) */
 #define PR_MPSAFE	0x0100		/* protocal is MPSAFE */
 #define PR_SYNC_PORT	0x0200		/* synchronous port (no proto thrds) */
 #define PR_ASYNC_SEND	0x0400		/* async pru_send */
@@ -289,6 +283,8 @@ struct pr_usrreqs {
 	int	(*pru_preconnect) (struct socket *so,
 				      const struct sockaddr *addr,
 				      struct thread *td);
+	int	(*pru_preattach) (struct socket *so,
+				      int, struct pru_attach_info *);
 };
 
 typedef int (*pru_sosend_fn_t) (struct socket *so, struct sockaddr *addr,
@@ -316,7 +312,7 @@ int	pru_soreceive_notsupp(struct socket *so,
 
 struct lwkt_port *cpu0_soport(struct socket *, struct sockaddr *,
 			      struct mbuf **);
-struct lwkt_port *cpu0_ctlport(int, struct sockaddr *, void *);
+struct lwkt_port *cpu0_ctlport(int, struct sockaddr *, void *, int *);
 
 #endif /* _KERNEL || _KERNEL_STRUCTURES */
 
@@ -395,6 +391,7 @@ const char *prcorequests[] = {
 #ifdef _KERNEL
 
 void	kpfctlinput (int, struct sockaddr *);
+void	kpfctlinput_direct (int, struct sockaddr *);
 void	kpfctlinput2 (int, struct sockaddr *, void *);
 struct protosw *pffindproto (int family, int protocol, int type);
 struct protosw *pffindtype (int family, int type);

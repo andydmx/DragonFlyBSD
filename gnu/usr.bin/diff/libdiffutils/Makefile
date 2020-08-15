@@ -10,14 +10,16 @@ CFLAGS+=	-I${CONTRIBDIR} -I${.CURDIR} -I${.OBJDIR}
 CFLAGS+=	-DHAVE_CONFIG_H
 
 SRCS=	allocator.c \
-	areadlink.o \
-	binary-io.o \
-	bitrotate.o \
+	areadlink.c \
+	argmatch.c \
+	binary-io.c \
+	bitrotate.c \
 	c-ctype.c \
 	c-stack.c \
 	c-strcasecmp.c \
 	c-strncasecmp.c \
-	careadlinkat.o \
+	careadlinkat.c \
+	cloexec.c \
 	dirname.c \
 	basename.c \
 	dirname-lgpl.c \
@@ -30,6 +32,7 @@ SRCS=	allocator.c \
 	filenamecat.c \
 	filenamecat-lgpl.c \
 	freopen-safer.c \
+	getprogname.c \
 	gettime.c \
 	hard-locale.c \
 	hash.c \
@@ -46,13 +49,13 @@ SRCS=	allocator.c \
 	mbslen.c \
 	mbsstr.c \
 	mbuiter.c \
+	nstrftime.c \
 	progname.c \
 	propername.c \
 	quotearg.c \
 	sh-quote.c \
 	sig-handler.c \
 	stat-time.c \
-	strftime.c \
 	striconv.c \
 	strnlen1.c \
 	system-quote.c \
@@ -87,15 +90,25 @@ SRCS=	allocator.c \
 	error.c \
 	fcntl.c \
 	fnmatch.c \
+	freopen.c \
 	getopt.c \
 	getopt1.c \
+	localtime-buffer.c \
+	mktime.c \
 	printf-args.c \
 	printf-parse.c \
+	rawmemchr.c \
 	regex.c \
-	secure_getenv.c \
 	strerror.c \
 	strerror-override.c \
-	vasnprintf.c \
-	wcwidth.c
+	time_rz.c \
+	timegm.c \
+	vasnprintf.c
+
+# sources that produces empty objects
+#SRCS+=	\
+	fd-hook.c \
+	unistd.c \
+	wctype-h.c
 
 .include <bsd.lib.mk>

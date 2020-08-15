@@ -15,11 +15,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -37,7 +33,6 @@
  *
  *	@(#)conf.h	8.5 (Berkeley) 1/9/95
  * $FreeBSD: src/sys/sys/conf.h,v 1.103.2.6 2002/03/11 01:14:55 dd Exp $
- * $DragonFly: src/sys/sys/conf.h,v 1.18 2007/05/09 00:53:35 dillon Exp $
  */
 
 #ifndef _SYS_CONF_H_
@@ -61,8 +56,7 @@
 #include <sys/event.h>
 #endif
 #include <libprop/proplib.h>
-
-#define SPECNAMELEN	63
+#include <sys/param.h>
 
 struct tty;
 struct disk;
@@ -182,7 +176,7 @@ void ldisc_deregister (int);
  * Swap device table
  */
 struct swdevt {
-	udev_t	sw_dev;			/* For quasibogus swapdev reporting */
+	dev_t	sw_dev;			/* For quasibogus swapdev reporting */
 	int	sw_flags;
 	int	sw_nblks;		/* Number of swap blocks on device */
 	int	sw_nused;		/* swap blocks used on device */
@@ -222,15 +216,11 @@ DECLARE_MODULE(name, name##_mod, SI_SUB_DRIVERS, SI_ORDER_MIDDLE)
 int	count_dev (cdev_t dev);
 void	destroy_dev (cdev_t dev);
 void	release_dev (cdev_t dev);
-cdev_t	get_dev (int x, int y);
 cdev_t	reference_dev (cdev_t dev);
-struct dev_ops *devsw (cdev_t dev);
 const char *devtoname (cdev_t dev);
-void	freedev (cdev_t dev);
 int	iszerodev (cdev_t dev);
 
 int	lminor (cdev_t dev);
-void	setconf (void);
 cdev_t	kgetdiskbyname(const char *name);
 int	dev_is_good(cdev_t dev);
 

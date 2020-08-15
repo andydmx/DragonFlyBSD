@@ -32,9 +32,9 @@
  */
 
 #include <sys/param.h>
-#include <sys/file.h>
 #include <sys/protosw.h>
 #include <sys/socket.h>
+#include <sys/sysctl.h>
 
 #include <netinet/in.h>
 
@@ -43,6 +43,7 @@
 #include <ctype.h>
 #include <err.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <kvm.h>
 #include <limits.h>
 #include <netdb.h>
@@ -105,37 +106,31 @@ static struct nlist nl[] = {
 	{ .n_name = "_ip6stat" },
 #define N_ICMP6STAT	24
 	{ .n_name = "_icmp6stat" },
-#define N_IPSECSTAT	25
-	{ .n_name = "_ipsecstat" },
-#define N_IPSEC6STAT	26
-	{ .n_name = "_ipsec6stat" },
-#define N_PIM6STAT	27
+#define N_PIM6STAT	25
 	{ .n_name = "_pim6stat" },
-#define N_MRT6PROTO	28
+#define N_MRT6PROTO	26
 	{ .n_name = "_ip6_mrtproto" },
-#define N_MRT6STAT	29
+#define N_MRT6STAT	27
 	{ .n_name = "_mrt6stat" },
-#define N_MF6CTABLE	30
+#define N_MF6CTABLE	28
 	{ .n_name = "_mf6ctable" },
-#define N_MIF6TABLE	31
+#define N_MIF6TABLE	29
 	{ .n_name = "_mif6table" },
-#define N_PFKEYSTAT	32
-	{ .n_name = "_pfkeystat" },
-#define N_MBSTAT	33
+#define N_MBSTAT	30
 	{ .n_name = "_mbstat" },
-#define N_MBTYPES	34
+#define N_MBTYPES	31
 	{ .n_name = "_mbtypes" },
-#define N_NMBCLUSTERS	35
+#define N_NMBCLUSTERS	32
 	{ .n_name = "_nmbclusters" },
-#define N_NMBUFS	36
+#define N_NMBUFS	33
 	{ .n_name = "_nmbufs" },
-#define	N_RTTRASH	37
+#define	N_RTTRASH	34
 	{ .n_name = "_rttrash" },
-#define	N_NCPUS		38
+#define	N_NCPUS		35
 	{ .n_name = "_ncpus" },
-#define	N_CARPSTAT	39
+#define	N_CARPSTAT	36
 	{ .n_name = "_carpstats" },
-#define N_NMBJCLUSTERS	40
+#define N_NMBJCLUSTERS	37
 	{ .n_name = "_nmbjclusters" },
 	{ .n_name = NULL },
 };
@@ -164,10 +159,6 @@ struct protox {
 	  icmp_stats,	NULL,		"icmp",	IPPROTO_ICMP },
 	{ -1,		-1,		1,	protopr,
 	  igmp_stats,	NULL,		"igmp",	IPPROTO_IGMP },
-#ifdef IPSEC
-	{ -1,		N_IPSECSTAT,	1,	0,
-	  ipsec_stats,	NULL,		"ipsec",	0},
-#endif
         { -1,           N_CARPSTAT,     1,      0,
           carp_stats,   NULL,           "carp",         0},
 	{ -1,		-1,		0,	0,
@@ -184,10 +175,6 @@ struct protox ip6protox[] = {
 	  ip6_stats,	ip6_ifstats,	"ip6",	IPPROTO_RAW },
 	{ -1,		N_ICMP6STAT,	1,	protopr,
 	  icmp6_stats,	icmp6_ifstats,	"icmp6",IPPROTO_ICMPV6 },
-#ifdef IPSEC
-	{ -1,		N_IPSEC6STAT,	1,	0,
-	  ipsec_stats,	NULL,		"ipsec6",0 },
-#endif
 #ifdef notyet
 	{ -1,		N_PIM6STAT,	1,	0,
 	  pim6_stats,	NULL,		"pim6",	0 },
@@ -201,15 +188,6 @@ struct protox ip6protox[] = {
 };
 #endif /*INET6*/
 
-#ifdef IPSEC
-struct protox pfkeyprotox[] = {
-	{ -1,		N_PFKEYSTAT,	1,	0,
-	  pfkey_stats,	NULL,		"pfkey", 0 },
-	{ -1,		-1,		0,	0,
-	  0,		NULL,		0,	0 }
-};
-#endif
-
 struct protox netgraphprotox[] = {
 	{ N_NGSOCKS,	-1,		1,	netgraphprotopr,
 	  NULL,		NULL,		"ctrl",	0 },
@@ -219,31 +197,10 @@ struct protox netgraphprotox[] = {
 	  0,		NULL,		NULL,	0 }
 };
 
-#ifdef ISO
-struct protox isoprotox[] = {
-	{ ISO_TP,	N_TPSTAT,	1,	iso_protopr,
-	  tp_stats,	NULL,		"tp" },
-	{ N_CLTP,	N_CLTPSTAT,	1,	iso_protopr,
-	  cltp_stats,	NULL,		"cltp" },
-	{ -1,		N_CLNPSTAT,	1,	 0,
-	  clnp_stats,	NULL,		"clnp"},
-	{ -1,		N_ESISSTAT,	1,	 0,
-	  esis_stats,	NULL,		"esis"},
-	{ -1,		-1,		0,	0,
-	  0,		NULL,		0 }
-};
-#endif
-
 struct protox *protoprotox[] = {
 					 protox,
 #ifdef INET6
 					 ip6protox,
-#endif
-#ifdef IPSEC
-					 pfkeyprotox,
-#endif
-#ifdef ISO
-					 isoprotox, 
 #endif
 					 NULL };
 
@@ -261,6 +218,7 @@ int	bflag;		/* show i/f total bytes in/out */
 int	cpuflag = -1;	/* dump route table from specific cpu */
 int	dflag;		/* show i/f dropped packets */
 int	gflag;		/* show group (multicast) routing or stats */
+int	hflag;		/* show counters in human readable format */
 int	iflag;		/* show interfaces */
 int	Lflag;		/* show size of listen queues */
 int	mflag;		/* show memory stats */
@@ -288,10 +246,11 @@ main(int argc, char **argv)
 	struct protox *tp = NULL;  /* for printing cblocks & stats */
 	int ch;
 	int n;
+	size_t nsz;
 
 	af = AF_UNSPEC;
 
-	while ((ch = getopt(argc, argv, "Aabc:df:gI:iLlM:mN:nPp:rSsBtuWw:z")) != -1)
+	while ((ch = getopt(argc, argv, "Aabc:df:ghI:iLlM:mN:nPp:rSsBtuWw:z")) != -1)
 		switch(ch) {
 		case 'A':
 			Aflag = 1;
@@ -303,11 +262,13 @@ main(int argc, char **argv)
 			bflag = 1;
 			break;
 		case 'c':
-			kread(0, 0, 0);
-			kread(nl[N_NCPUS].n_value, (char *)&n, sizeof(n));
+			nsz = sizeof(n);
+			sysctlbyname("net.netisr.ncpus", &n, &nsz, NULL, 0);
 			cpuflag = strtol(optarg, NULL, 0);
-			if (cpuflag < 0 || cpuflag >= n)
-			    errx(1, "cpu %d does not exist", cpuflag);
+			if (cpuflag < 0 || cpuflag >= n) {
+				errx(1, "cpu%d does not have network data",
+				    cpuflag);
+			}
 			break;
 		case 'd':
 			dflag = 1;
@@ -319,19 +280,11 @@ main(int argc, char **argv)
 			else if (strcmp(optarg, "inet6") == 0)
 				af = AF_INET6;
 #endif /*INET6*/
-#ifdef INET6
-			else if (strcmp(optarg, "pfkey") == 0)
-				af = PF_KEY;
-#endif /*INET6*/
 			else if (strcmp(optarg, "unix") == 0)
 				af = AF_UNIX;
 			else if (strcmp(optarg, "ng") == 0
 			    || strcmp(optarg, "netgraph") == 0)
 				af = AF_NETGRAPH;
-#ifdef ISO
-			else if (strcmp(optarg, "iso") == 0)
-				af = AF_ISO;
-#endif
 			else if (strcmp(optarg, "link") == 0)
 				af = AF_LINK;
 			else if (strcmp(optarg, "mpls") == 0)
@@ -342,6 +295,9 @@ main(int argc, char **argv)
 			break;
 		case 'g':
 			gflag = 1;
+			break;
+		case 'h':
+			hflag = 1;
 			break;
 		case 'I': {
 			char *cp;
@@ -518,19 +474,9 @@ main(int argc, char **argv)
 		for (tp = ip6protox; tp->pr_name; tp++)
 			printproto(tp, tp->pr_name, nl[N_NCPUS].n_value);
 #endif /*INET6*/
-#ifdef IPSEC
-	if (af == PF_KEY || af == AF_UNSPEC)
-		for (tp = pfkeyprotox; tp->pr_name; tp++)
-			printproto(tp, tp->pr_name, nl[N_NCPUS].n_value);
-#endif /*IPSEC*/
 	if (af == AF_NETGRAPH || af == AF_UNSPEC)
 		for (tp = netgraphprotox; tp->pr_name; tp++)
 			printproto(tp, tp->pr_name, nl[N_NCPUS].n_value);
-#ifdef ISO
-	if (af == AF_ISO || af == AF_UNSPEC)
-		for (tp = isoprotox; tp->pr_name; tp++)
-			printproto(tp, tp->pr_name, nl[N_NCPUS].n_value);
-#endif
 	if ((af == AF_UNIX || af == AF_UNSPEC) && !Lflag && !sflag)
 		unixpr();
 	exit(0);
@@ -685,9 +631,9 @@ usage(void)
 	(void)fprintf(stderr, "%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n",
 "usage: netstat [-AaLnPSW] [-c cpu] [-f protocol_family | -p protocol]\n"
 "               [-M core] [-N system]",
-"       netstat -i | -I interface [-aBbdnt] [-f address_family]\n"
+"       netstat -i | -I interface [-aBbdhnt] [-f address_family]\n"
 "               [-M core] [-N system]",
-"       netstat -w wait [-I interface] [-d] [-M core] [-N system]",
+"       netstat -w wait [-I interface] [-dh] [-M core] [-N system]",
 "       netstat -s [-s] [-z] [-f protocol_family | -p protocol] [-M core]",
 "       netstat -i | -I interface -s [-f protocol_family | -p protocol]\n"
 "               [-M core] [-N system]",

@@ -52,16 +52,16 @@
 #include <netsmb/smb_conn.h>
 #include <netsmb/smb_lib.h>
 
-#include <fs/smbfs/smbfs.h>
+#include <vfs/smbfs/smbfs.h>
 
-#include "mntopts.h"
+#include <mntopts.h>
 
 static char mount_point[MAXPATHLEN + 1];
-static void usage(void);
+static void usage(void) __dead2;
 
 static struct mntopt mopts[] = {
 	MOPT_STDOPTS,
-	{ NULL, 0, 0, 0 }
+	MOPT_NULL
 };
 
 

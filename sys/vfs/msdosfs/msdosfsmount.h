@@ -1,8 +1,9 @@
-/* $FreeBSD: src/sys/msdosfs/msdosfsmount.h,v 1.20.2.2 2000/10/27 09:45:07 bde Exp $ */
-/* $DragonFly: src/sys/vfs/msdosfs/msdosfsmount.h,v 1.9 2007/08/08 00:23:40 swildner Exp $ */
+/* $FreeBSD$ */
 /*	$NetBSD: msdosfsmount.h,v 1.17 1997/11/17 15:37:07 ws Exp $	*/
 
 /*-
+ * SPDX-License-Identifier: BSD-4-Clause
+ *
  * Copyright (C) 1994, 1995, 1997 Wolfgang Solfrank.
  * Copyright (C) 1994, 1995, 1997 TooLs GmbH.
  * All rights reserved.
@@ -33,7 +34,7 @@
  * OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF
  * ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
-/*
+/*-
  * Written by Paul Popelka (paulp@uts.amdahl.com)
  *
  * You can do anything you want with this software, just don't say you wrote
@@ -60,19 +61,25 @@ MALLOC_DECLARE(M_MSDOSFSMNT);
 #endif
 #include <sys/iconv.h>
 #if defined(_KERNEL) || defined(_KERNEL_STRUCTURES)
+
+#define msdosfs_iconv msdos_iconv
+
 /*
- * Layout of the mount control block for a msdos file system.
+ * Layout of the mount control block for a MSDOSFS filesystem.
  */
 struct msdosfsmount {
 	struct mount *pm_mountp;/* vfs mount struct for this fs */
-	cdev_t pm_dev;		/* block special device mounted */
 	uid_t pm_uid;		/* uid to set as owner of the files */
 	gid_t pm_gid;		/* gid to set as owner of the files */
-	mode_t pm_mask;		/* mask to and with file protection bits */
-	struct vnode *pm_devvp;	/* vnode for block device mntd */
+	mode_t pm_mask;		/* mask to and with file protection bits
+				   for files */
+	mode_t pm_dirmask;	/* mask to and with file protection bits
+				   for directories */
+	struct vnode *pm_devvp;	/* vnode for character device mounted */
+	cdev_t pm_dev;		/* character device mounted */
 	struct bpb50 pm_bpb;	/* BIOS parameter blk for this fs */
 	u_long pm_BlkPerSec;	/* How many DEV_BSIZE blocks fit inside a physical sector */
-	u_long pm_FATsecs;	/* actual number of fat sectors */
+	u_long pm_FATsecs;	/* actual number of FAT sectors */
 	u_long pm_fatblk;	/* block # of first FAT */
 	u_long pm_rootdirblk;	/* block # (cluster # for FAT32) of root directory number */
 	u_long pm_rootdirsize;	/* size in blocks (not clusters) */
@@ -84,22 +91,21 @@ struct msdosfsmount {
 	u_long pm_bnshift;	/* shift file offset right this amount to get a block number */
 	u_long pm_bpcluster;	/* bytes per cluster */
 	u_long pm_fmod;		/* ~0 if fs is modified, this can rollover to 0	*/
-	u_long pm_fatblocksize;	/* size of fat blocks in bytes */
-	u_long pm_fatblocksec;	/* size of fat blocks in sectors */
-	u_long pm_fatsize;	/* size of fat in bytes */
-	u_int32_t pm_fatmask;	/* mask to use for fat numbers */
+	u_long pm_fatblocksize;	/* size of FAT blocks in bytes */
+	u_long pm_fatblocksec;	/* size of FAT blocks in sectors */
+	uint32_t pm_fatmask;	/* mask to use for FAT numbers */
 	u_long pm_fsinfo;	/* fsinfo block number */
-	u_long pm_nxtfree;	/* next free cluster in fsinfo block */
-	u_int pm_fatmult;	/* these 2 values are used in fat */
+	u_long pm_nxtfree;	/* next place to search for a free cluster */
+	u_int pm_fatmult;	/* these 2 values are used in FAT */
 	u_int pm_fatdiv;	/*	offset computation */
-	u_int pm_curfat;	/* current fat for FAT32 (0 otherwise) */
+	u_int pm_curfat;	/* current FAT for FAT32 (0 otherwise) */
 	u_int *pm_inusemap;	/* ptr to bitmap of in-use clusters */
 	u_int pm_flags;		/* see below */
 	struct netexport pm_export;	/* export information */
-	void *pm_u2w;  /* Local->Unicode handle */
-	void *pm_w2u;  /* Unicode->Local handle */
-	void *pm_d2u;  /* DOS->local handle */
-	void *pm_u2d;  /* Local->DOS handle */
+	void *pm_u2w;	/* Local->Unicode iconv handle */
+	void *pm_w2u;	/* Unicode->Local iconv handle */
+	void *pm_u2d;	/* Unicode->DOS iconv handle */
+	void *pm_d2u;	/* DOS->Local iconv handle */
 };
 /* Byte offset in FAT on filesystem pmp, cluster cn */
 #define	FATOFS(pmp, cn)	((cn) * (pmp)->pm_fatmult / (pmp)->pm_fatdiv)
@@ -162,47 +168,32 @@ struct msdosfsmount {
 	(de_cn2bn(pmp, de_cluster((pmp), (off))))
 
 /*
- * Convert a logical cluster number to file offset.  This typically 
- * represents a logical cluster number relative to a file, not relative
- * to the device.
+ * Convert a logical cluster number to file offset.
  */
 #define	de_cn2off(pmp, cn) \
 	((cn) << (pmp)->pm_cnshift)
 
 /*
- * Convert a device block number to a file offset.  
+ * Convert a device block number to a file offset.
  */
 #define	de_bn2off(pmp, bn) \
 	((bn) << (pmp)->pm_bnshift)
 
 /*
  * Convert a device block number to a 64 bit offset, used for getblk(),
- * bread(), etc.
+ * bread(), etc.  These are DragonFly specific macros.
  */
-#define	de_bntodoff(pmp, bn) \
+#define	de_bn2doff(pmp, bn) \
 	((off_t)(bn) << (pmp)->pm_bnshift)
 
 #define	de_cn2doff(pmp, cn) \
 	((off_t)(cn) << (pmp)->pm_cnshift)
 
-#define de_off2bn(pmp, off) \
-	((daddr_t)((off) >> (pmp)->pm_bnshift))
-
-#define de_off2cn(pmp, off) \
-	((daddr_t)((off) >> (pmp)->pm_cnshift))
-
 /*
- * Map an on-disk cluster number into a device relative block number or 
- * a device relative offset.   This is different from a logical cluster
- * number.  The cluster numbers stored on-disk are not relative to block 0
- * on the disk.
+ * Map a cluster number into a filesystem relative block number.
  */
-#define xcntodoff(pmp, cn) \
-	de_bntodoff(pmp, xcntobn(pmp, cn))
-
-#define	xcntobn(pmp, cn) \
+#define	cntobn(pmp, cn) \
 	(de_cn2bn((pmp), (cn)-CLUST_FIRST) + (pmp)->pm_firstcluster)
-
 
 /*
  * Calculate block number for directory entry in root dir, offset dirofs
@@ -217,23 +208,13 @@ struct msdosfsmount {
 #define	detobn(pmp, dirclu, dirofs) \
 	((dirclu) == MSDOSFSROOT \
 	 ? roottobn((pmp), (dirofs)) \
-	 : xcntobn((pmp), (dirclu)))
+	 : cntobn((pmp), (dirclu)))
 
-/*
- * Calculate fsinfo block size
- */
-#define	fsi_size(pmp) \
-	(1024 << ((pmp)->pm_BlkPerSec >> 2))
+#define	MSDOSFS_LOCK_MP(pmp)
+#define	MSDOSFS_UNLOCK_MP(pmp)
+#define	MSDOSFS_ASSERT_MP_LOCKED(pmp)
 
 #endif /* _KERNEL || _KERNEL_STRUCTURES */
-
-#ifdef _KERNEL
-
-int msdosfs_init (struct vfsconf *vfsp);
-int msdosfs_uninit (struct vfsconf *vfsp);
-int msdosfs_mountroot (void);
-
-#endif
 
 /*
  *  Arguments to mount MSDOS filesystems.
@@ -243,11 +224,11 @@ struct msdosfs_args {
 	struct	export_args export;	/* network export information */
 	uid_t	uid;		/* uid that owns msdosfs files */
 	gid_t	gid;		/* gid that owns msdosfs files */
-	mode_t	mask;		/* mask to be applied for msdosfs perms */
+	mode_t	mask;		/* file mask to be applied for msdosfs perms */
 	int	flags;		/* see below */
-	int magic;		/* version number */
-        char cs_local[ICONV_CSNMAXLEN];
-        char cs_dos[ICONV_CSNMAXLEN];
+	char cs_local[ICONV_CSNMAXLEN];
+	char cs_dos[ICONV_CSNMAXLEN];
+	mode_t	dirmask;	/* dir  mask to be applied for msdosfs perms */
 };
 
 /*
@@ -256,16 +237,27 @@ struct msdosfs_args {
 #define	MSDOSFSMNT_SHORTNAME	1	/* Force old DOS short names only */
 #define	MSDOSFSMNT_LONGNAME	2	/* Force Win'95 long names */
 #define	MSDOSFSMNT_NOWIN95	4	/* Completely ignore Win95 entries */
-#define MSDOSFSMNT_KICONV     0x10    /* Local->Unicode and local<->DOS   */
-					/* tables loaded                    */
+#define	MSDOSFSMNT_KICONV	0x10    /* Use libiconv to convert chars */
 /* All flags above: */
 #define	MSDOSFSMNT_MNTOPT \
 	(MSDOSFSMNT_SHORTNAME|MSDOSFSMNT_LONGNAME|MSDOSFSMNT_NOWIN95 \
-	 /*|MSDOSFSMNT_GEMDOSFS*/|MSDOSFSMNT_KICONV)
+	 |MSDOSFSMNT_KICONV)
 #define	MSDOSFSMNT_RONLY	0x80000000	/* mounted read-only	*/
 #define	MSDOSFSMNT_WAITONFAT	0x40000000	/* mounted synchronous	*/
 #define	MSDOSFS_FATMIRROR	0x20000000	/* FAT is mirrored */
+#define	MSDOSFS_FSIMOD		0x01000000
 
 #define MSDOSFS_ARGSMAGIC	0xe4eff300
+
+#ifdef MSDOSFS_DEBUG
+#define mprintf(fmt, ...)	kprintf(fmt, ## __VA_ARGS__)
+#else
+#define mprintf(fmt, ...)
+#endif
+
+#define ASSERT_VOP_ELOCKED(vp, str)	KASSERT(vn_islocked(vp), (str))
+#define ASSERT_VOP_LOCKED(vp, str)	KASSERT(vn_islocked(vp), (str))
+
+#define DOINGASYNC(vp)	(((vp)->v_mount->mnt_kern_flag & MNT_ASYNC) != 0)
 
 #endif /* !_MSDOSFS_MSDOSFSMOUNT_H_ */

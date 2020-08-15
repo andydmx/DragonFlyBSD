@@ -44,6 +44,7 @@
 #include <sys/module.h>
 #include <sys/kernel.h>
 #include <sys/bus.h>
+#include <sys/malloc.h>	/* for M_NOWAIT */
 #include <sys/mbuf.h>
 #include <sys/rman.h>
 #include <sys/socket.h>
@@ -55,6 +56,7 @@
 #include <sys/random.h>
 #include <sys/firmware.h>
 #include <sys/systm.h>
+#include <sys/priv.h>
 #include <sys/proc.h>
 
 #include <bus/pci/pcireg.h>
@@ -81,7 +83,6 @@
 
 #include <netinet/udp.h>
 #include <netinet/tcp.h>
-#include <netinet/sctp.h>
 #if 0 /* XXX swildner: LRO */
 #include <netinet/tcp_lro.h>
 #endif
@@ -885,9 +886,6 @@ typedef struct oce_softc {
 	uint16_t qnq_debug_event;
 	uint16_t qnqid;
 	uint16_t pvid;
-
-	struct sysctl_ctx_list sysctl_ctx;
-	struct sysctl_oid *sysctl_tree;
 
 } OCE_SOFTC, *POCE_SOFTC;
 

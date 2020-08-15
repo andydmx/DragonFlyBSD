@@ -89,7 +89,7 @@ SLIST_HEAD(, lagg_softc) lagg_list;	/* list of laggs */
 static struct lock	lagg_list_lock;
 eventhandler_tag	lagg_detach_cookie = NULL;
 
-static int	lagg_clone_create(struct if_clone *, int, caddr_t);
+static int	lagg_clone_create(struct if_clone *, int, caddr_t, caddr_t);
 static int	lagg_clone_destroy(struct ifnet *);
 static const char *    laggname = "lagg";
 struct if_clone lagg_cloner = IF_CLONE_INITIALIZER("lagg",
@@ -105,7 +105,7 @@ static int	lagg_port_create(struct lagg_softc *, struct ifnet *);
 static int	lagg_port_destroy(struct lagg_port *, int);
 static void	lagg_input(struct ifnet *, struct mbuf *);
 static void	lagg_linkstate(struct lagg_softc *);
-#if XXX
+#if 0 /* XXX */
 static void	lagg_port_state(struct ifnet *, int);
 #endif
 static int	lagg_port_ioctl(struct ifnet *, u_long, caddr_t, struct ucred *cr);
@@ -129,7 +129,7 @@ static void	lagg_start_dispatch(netmsg_t msg);
 /* Not needed?
 static int      lagg_output(struct ifnet *ifp, struct mbuf *m);
 */
-#if XXX
+#if 0 /* XXX */
 static int	lagg_transmit(struct ifnet *, struct mbuf *);
 static void	lagg_qflush(struct ifnet *);
 #endif
@@ -222,7 +222,6 @@ lagg_modevent(module_t mod, int type, void *data)
 	case MOD_UNLOAD:
 		EVENTHANDLER_DEREGISTER(ifnet_departure_event,
 		    lagg_detach_cookie);
-		if_clone_detach(&lagg_cloner);
 		lagg_input_p = NULL;
 		if_clone_detach(&lagg_cloner);
 		lockuninit(&lagg_list_lock);
@@ -249,7 +248,7 @@ MODULE_VERSION(if_lagg, 1);
 static void
 lagg_register_vlan(void *arg, struct ifnet *ifp, u_int16_t vtag)
 {
-#if XXX
+#if 0 /* XXX */
         struct lagg_softc       *sc = ifp->if_softc;
         struct lagg_port        *lp;
 
@@ -283,7 +282,7 @@ lagg_unregister_vlan(void *arg, struct ifnet *ifp, u_int16_t vtag)
 
         LAGG_RLOCK(sc);
         if (!SLIST_EMPTY(&sc->sc_ports)) {
-#if XXX
+#if 0 /* XXX */
                 SLIST_FOREACH(lp, &sc->sc_ports, lp_entries)
                         EVENTHANDLER_INVOKE(vlan_unconfig, lp->lp_ifp);
 #endif
@@ -292,7 +291,8 @@ lagg_unregister_vlan(void *arg, struct ifnet *ifp, u_int16_t vtag)
 }
 
 static int
-lagg_clone_create(struct if_clone *ifc, int unit, caddr_t params __unused)
+lagg_clone_create(struct if_clone *ifc, int unit,
+		  caddr_t params __unused, caddr_t data __unused)
 {
 	struct lagg_softc *sc;
 	struct ifnet *ifp;
@@ -357,8 +357,7 @@ lagg_clone_create(struct if_clone *ifc, int unit, caddr_t params __unused)
 	 * This uses the callout lock rather than the rmlock; one can't
 	 * hold said rmlock during SWI.
 	 */
-	callout_init(&sc->sc_callout);
-	/*, &sc->sc_call_lock, 0); */
+	callout_init_lk(&sc->sc_callout, &sc->sc_call_lock);
 
 	/* Initialise pseudo media types */
 	ifmedia_init(&sc->sc_media, 0, lagg_media_change,
@@ -368,7 +367,7 @@ lagg_clone_create(struct if_clone *ifc, int unit, caddr_t params __unused)
 
 	if_initname(ifp, laggname, unit);
 	ifp->if_softc = sc;
-#if XXX
+#if 0 /* XXX */
 	ifp->if_transmit = lagg_transmit;
 	ifp->if_qflush = lagg_qflush;
 #endif
@@ -382,7 +381,7 @@ lagg_clone_create(struct if_clone *ifc, int unit, caddr_t params __unused)
 	ifq_set_ready(&ifp->if_snd);
 	ifp->if_hdrlen = ETHER_HDR_LEN;
 
-#if XXX
+#if 0 /* XXX */
 	ifp->if_capenable = ifp->if_capabilities = IFCAP_HWSTATS;
 #endif
 	/*
@@ -433,7 +432,8 @@ lagg_clone_destroy(struct ifnet *ifp)
 	sysctl_ctx_free(&sc->ctx);
 	ifmedia_removeall(&sc->sc_media);
 	ether_ifdetach(ifp);
-	if_free(ifp);
+	/* This ifp is part of lagg_softc, don't free it! */
+	/* if_free(ifp); */
 
 	/* This grabs sc_callout_mtx, serialising it correctly */
 	callout_drain(&sc->sc_callout);
@@ -819,6 +819,8 @@ lagg_port_ioctl(struct ifnet *ifp, u_long cmd, caddr_t data, struct ucred *cr)
 	struct lagg_port *lp = NULL;
 	int error = 0;
 
+	ASSERT_IFNET_SERIALIZED_ALL(ifp);
+
 	/* Should be checked by the caller */
 	if (ifp->if_type != IFT_IEEE8023ADLAG ||
 	    (lp = ifp->if_lagg) == NULL || (sc = lp->lp_softc) == NULL)
@@ -826,11 +828,25 @@ lagg_port_ioctl(struct ifnet *ifp, u_long cmd, caddr_t data, struct ucred *cr)
 
 	switch (cmd) {
 	case SIOCGLAGGPORT:
-		if (rp->rp_portname[0] == '\0' ||
-		    ifunit(rp->rp_portname) != ifp) {
+		if (rp->rp_portname[0] == '\0') {
 			error = EINVAL;
 			break;
 		}
+
+		/*
+		 * Release ifp serializers before ifnet_lock
+		 * to prevent lock order reversal.
+		 */
+		ifnet_deserialize_all(ifp);
+		ifnet_lock();
+		if (ifunit(rp->rp_portname) != ifp) {
+			ifnet_unlock();
+			ifnet_serialize_all(ifp);
+			error = EINVAL;
+			break;
+		}
+		ifnet_unlock();
+		ifnet_serialize_all(ifp);
 
 		LAGG_RLOCK(sc);
 		if ((lp = ifp->if_lagg) == NULL || lp->lp_softc != sc) {
@@ -913,7 +929,7 @@ lagg_port_ifdetach(void *arg __unused, struct ifnet *ifp)
 
 	if ((lp = ifp->if_lagg) == NULL)
 		return;
-#if XXX
+#if 0 /* XXX */
 	/* If the ifnet is just being renamed, don't do anything. */
 	if (ifp->if_flags & IFF_RENAMING)
 		return;
@@ -1091,8 +1107,7 @@ lagg_ioctl(struct ifnet *ifp, u_long cmd, caddr_t data, struct ucred *cr)
 			LAGG_WUNLOCK(sc);
 			break;
 		}
-		for (int i = 0; i < (sizeof(lagg_protos) /
-		    sizeof(lagg_protos[0])); i++) {
+		for (int i = 0; i < (NELEM(lagg_protos)); i++) {
 			if (lagg_protos[i].ti_proto == ra->ra_proto) {
 				if (sc->sc_ifflags & IFF_DEBUG)
 					kprintf("%s: using proto %u\n",
@@ -1125,8 +1140,16 @@ lagg_ioctl(struct ifnet *ifp, u_long cmd, caddr_t data, struct ucred *cr)
 		LAGG_WUNLOCK(sc);
 		break;
 	case SIOCGLAGGPORT:
+		/*
+		 * Release ifp serializers before ifnet_lock
+		 * to prevent lock order reversal.
+		 */
+		ifnet_deserialize_all(ifp);
+		ifnet_lock();
 		if (rp->rp_portname[0] == '\0' ||
 		    (tpif = ifunit(rp->rp_portname)) == NULL) {
+			ifnet_unlock();
+			ifnet_serialize_all(ifp);
 			error = EINVAL;
 			break;
 		}
@@ -1136,31 +1159,53 @@ lagg_ioctl(struct ifnet *ifp, u_long cmd, caddr_t data, struct ucred *cr)
 		    lp->lp_softc != sc) {
 			error = ENOENT;
 			LAGG_RUNLOCK(sc);
+			ifnet_unlock();
+			ifnet_serialize_all(ifp);
 			break;
 		}
 
 		lagg_port2req(lp, rp);
 		LAGG_RUNLOCK(sc);
+		ifnet_unlock();
+		ifnet_serialize_all(ifp);
 		break;
 	case SIOCSLAGGPORT:
 		error = priv_check(td, PRIV_NET_LAGG);
 		if (error)
 			break;
+		/*
+		 * Release ifp serializers before ifnet_lock
+		 * to prevent lock order reversal.
+		 */
+		ifnet_deserialize_all(ifp);
+		ifnet_lock();
 		if (rp->rp_portname[0] == '\0' ||
 		    (tpif = ifunit(rp->rp_portname)) == NULL) {
+			ifnet_unlock();
+			ifnet_serialize_all(ifp);
 			error = EINVAL;
 			break;
 		}
 		LAGG_WLOCK(sc);
 		error = lagg_port_create(sc, tpif);
 		LAGG_WUNLOCK(sc);
+		ifnet_unlock();
+		ifnet_serialize_all(ifp);
 		break;
 	case SIOCSLAGGDELPORT:
 		error = priv_check(td, PRIV_NET_LAGG);
 		if (error)
 			break;
+		/*
+		 * Release ifp serializers before ifnet_lock
+		 * to prevent lock order reversal.
+		 */
+		ifnet_deserialize_all(ifp);
+		ifnet_lock();
 		if (rp->rp_portname[0] == '\0' ||
 		    (tpif = ifunit(rp->rp_portname)) == NULL) {
+			ifnet_unlock();
+			ifnet_serialize_all(ifp);
 			error = EINVAL;
 			break;
 		}
@@ -1170,11 +1215,15 @@ lagg_ioctl(struct ifnet *ifp, u_long cmd, caddr_t data, struct ucred *cr)
 		    lp->lp_softc != sc) {
 			error = ENOENT;
 			LAGG_WUNLOCK(sc);
+			ifnet_unlock();
+			ifnet_serialize_all(ifp);
 			break;
 		}
 
 		error = lagg_port_destroy(lp, 1);
 		LAGG_WUNLOCK(sc);
+		ifnet_unlock();
+		ifnet_serialize_all(ifp);
 		break;
 	case SIOCSIFFLAGS:
 		/* Set flags on ports too */
@@ -1346,7 +1395,7 @@ lagg_setflags(struct lagg_port *lp, int status)
 }
 
 
-#ifdef XXX /* not needed? */
+#if 0 /* XXX not needed? */
 static int
 lagg_output(struct ifnet *ifp, struct mbuf *m)
 {
@@ -1381,7 +1430,7 @@ lagg_output(struct ifnet *ifp, struct mbuf *m)
 }
 #endif
 
-#ifdef XXX
+#if 0 /* XXX */
 /*
  * The ifp->if_qflush entry point for lagg(4) is no-op.
  */
@@ -1487,7 +1536,7 @@ lagg_linkstate(struct lagg_softc *sc)
 	}
 }
 
-#if XXX
+#if 0 /* XXX */
 static void
 lagg_port_state(struct ifnet *ifp, int state)
 {
@@ -1631,7 +1680,7 @@ lagg_hashmbuf(struct lagg_softc *sc, struct mbuf *m, uint32_t key)
 	}
 
 	/* Special handling for encapsulating VLAN frames */
-#if XXX
+#if 0 /* XXX */
 	if ((m->m_flags & M_VLANTAG) && (sc->sc_flags & LAGG_F_HASHL2)) {
 		p = hash32_buf(&m->m_pkthdr.ether_vtag,
 		    sizeof(m->m_pkthdr.ether_vtag), p);
@@ -1664,7 +1713,6 @@ lagg_hashmbuf(struct lagg_softc *sc, struct mbuf *m, uint32_t key)
 		switch (ip->ip_p) {
 			case IPPROTO_TCP:
 			case IPPROTO_UDP:
-			case IPPROTO_SCTP:
 				iphlen = ip->ip_hl << 2;
 				if (iphlen < sizeof(*ip))
 					break;
@@ -2117,7 +2165,7 @@ static void
 lagg_callout(void *arg)
 {
 	struct lagg_softc *sc = (struct lagg_softc *)arg;
-#if XXX
+#if 0 /* XXX */
 	struct ifnet *ifp = sc->sc_ifp;
 
 	ifp->if_ipackets = counter_u64_fetch(sc->sc_ipackets);

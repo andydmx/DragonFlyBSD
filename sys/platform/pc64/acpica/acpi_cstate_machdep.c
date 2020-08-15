@@ -72,7 +72,7 @@ acpi_cst_md_cx_setup(struct acpi_cst_cx *cx)
 		/*
 		 * No optimization for non-Intel CPUs so far.
 		 *
-		 * Hardware fixed resouce is not supported for
+		 * Hardware fixed resource is not supported for
 		 * C1+ state yet.
 		 */
 		if (cx->type == ACPI_STATE_C1 &&
@@ -104,9 +104,10 @@ acpi_cst_md_cx_setup(struct acpi_cst_cx *cx)
 	}
 
 	if (cx->type >= ACPI_STATE_C3) {
-		if (CPUID_TO_FAMILY(cpu_id) > 0xf ||
-		    (CPUID_TO_FAMILY(cpu_id) == 0x6 &&
-		     CPUID_TO_MODEL(cpu_id) >= 0xf)) {
+		if ((CPUID_TO_FAMILY(cpu_id) > 0xf ||
+		     (CPUID_TO_FAMILY(cpu_id) == 0x6 &&
+		      CPUID_TO_MODEL(cpu_id) >= 0xf)) &&
+		    !acpi_cst_force_bmarb) {
 			/*
 			 * Pentium dual-core, Core 2 and beyond do not
 			 * need any additional activities to enter C3(+).
@@ -127,6 +128,7 @@ static int
 acpi_cst_cx_mwait_setup(struct acpi_cst_cx *cx)
 {
 	uint32_t eax_hint;
+	int error;
 
 	if (bootverbose) {
 		kprintf("C%d: BitWidth(vendor) %d, BitOffset(class) %d, "
@@ -158,19 +160,36 @@ acpi_cst_cx_mwait_setup(struct acpi_cst_cx *cx)
 
 	if (!cpu_mwait_hint_valid(eax_hint)) {
 		kprintf("C%d: invalid mwait hint 0x%08x\n", cx->type, eax_hint);
-		return EINVAL;
+		error = EINVAL;
+		goto done;
 	}
 
 	cx->md_arg0 = eax_hint;
 	cx->enter = acpi_cst_cx_mwait_enter;
+	error = 0;
 
-	if ((cx->gas.AccessWidth & ACPI_GAS_INTEL_ARG1_BM_STS) == 0) {
+done:
+	if ((cx->gas.AccessWidth & ACPI_GAS_INTEL_ARG1_BM_STS) == 0 &&
+	    !acpi_cst_force_bmsts) {
 		cpu_mwait_cx_no_bmsts();
 		if (cx->type >= ACPI_STATE_C3)
 			cx->flags &= ~ACPI_CST_CX_FLAG_BM_STS;
 	}
 
-	return 0;
+	if (cx->type < ACPI_STATE_C3 && MWAIT_EAX_TO_CX(eax_hint) >= 3) {
+		/*
+		 * If BIOS maps shallow ACPI C-state (<C3) to deep CPU
+		 * specific C-state (>=C3), it implies no bus mastering
+		 * operations are needed before entering deep CPU specific
+		 * C-states.
+		 */
+		if (!acpi_cst_force_bmsts)
+			cpu_mwait_cx_no_bmsts();
+		if (!acpi_cst_force_bmarb)
+			cpu_mwait_cx_no_bmarb();
+	}
+
+	return error;
 }
 
 static void

@@ -53,9 +53,9 @@
 #include <sys/mbuf.h>
 #include <sys/syslog.h>
 #include <sys/eventhandler.h>
-#include <sys/mutex2.h>
 #include <sys/devfs.h>
 #include <sys/udev.h>
+#include <sys/objcache.h>
 
 #include <bus/cam/cam.h>
 #include <dev/disk/iscsi/initiator/iscsi.h>
@@ -410,7 +410,7 @@ i_ping(struct cdev *dev)
  | low level I/O
  */
 static int
-i_setsoc(isc_session_t *sp, int fd, struct thread *td)
+i_setsoc(isc_session_t *sp, int fd, thread_t td)
 {
      int error = 0;
      struct file *fp;
@@ -424,7 +424,7 @@ i_setsoc(isc_session_t *sp, int fd, struct thread *td)
 
      debug_called(8);
 
-     if ((error = holdsock(td->td_proc->p_fd, fd, &fp)) == 0) {
+     if ((error = holdsock(td, fd, &fp)) == 0) {
 	  sp->soc = fp->f_data;
 	  sp->fp = fp;
 	  isc_start_receiver(sp);
@@ -910,7 +910,7 @@ iscsi_rootconf(void)
 	kprintf("** iscsi_rootconf **\n");
 }
 
-SYSINIT(cpu_rootconf1, SI_SUB_ROOT_CONF, SI_ORDER_FIRST, iscsi_rootconf, NULL)
+SYSINIT(cpu_rootconf1, SI_SUB_ROOT_CONF, SI_ORDER_FIRST, iscsi_rootconf, NULL);
 #endif
 
 DECLARE_MODULE(iscsi_initiator, iscsi_mod, SI_SUB_DRIVERS, SI_ORDER_MIDDLE);

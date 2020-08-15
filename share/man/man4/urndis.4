@@ -29,7 +29,7 @@
 .\"
 .\" $FreeBSD: head/share/man/man4/urndis.4 264731 2014-04-21 16:35:19Z gjb $
 .\"
-.Dd July 7, 2014
+.Dd November 16, 2018
 .Dt URNDIS 4
 .Os
 .Sh NAME
@@ -45,6 +45,7 @@ kernel configuration file:
 .Cd "device ohci"
 .Cd "device xhci"
 .Cd "device usb"
+.Cd "device uether"
 .Cd "device urndis"
 .Ed
 .Pp
@@ -70,6 +71,8 @@ For more information on configuring this device, see
 .Xr ifconfig 8 .
 .Sh SEE ALSO
 .Xr arp 4 ,
+.Xr cdce 4 ,
+.Xr ipheth 4 ,
 .Xr netintro 4 ,
 .Xr usb 4 ,
 .Xr ifconfig 8

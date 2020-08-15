@@ -3,7 +3,6 @@
  */
 
 DF306.0 {
-	__fe_dfl_env;
 	tgamma;
 	acos;
 	acosf;
@@ -108,20 +107,11 @@ DF306.0 {
 	fmin;
 	fminf;
 	fminl;
-	frexp;
 	frexpf;
 	frexpl;
 	ilogb;
 	ilogbf;
 	ilogbl;
-	__isfinite;
-	__isfinitef;
-	__isfinitel;
-	isnanf;
-	__isnanl;
-	__isnormal;
-	__isnormalf;
-	__isnormall;
 	llrint;
 	llrintf;
 	llround;
@@ -161,9 +151,6 @@ DF306.0 {
 	scalbnf;
 	ldexpf;
 	ldexpl;
-	__signbit;
-	__signbitf;
-	__signbitl;
 	signgam;
 	significand;
 	significandf;
@@ -212,18 +199,11 @@ DF306.0 {
 	cproj;
 	cprojf;
 	cprojl;
-	__isnanf;
 	cbrtl;
 	cexp;
 	cexpf;
 	log2;
 	log2f;
-	feclearexcept;
-	fegetexceptflag;
-	fetestexcept;
-	fegetround;
-	fesetround;
-	fesetenv;
 	acoshl;
 	asinhl;
 	atanhl;
@@ -257,6 +237,25 @@ DF306.0 {
 	log1pl;
 	log2l;
 	logl;
+	/*
+	 * Erroneously versioned in libm previously.
+	 * These functions are only available in this version now for
+	 * backwards compatibility reasons (implemented with __sym_compat())
+	 *
+	 * frexp;
+	 * isnanf;
+	 * __isfinite;
+	 * __isfinitef;
+	 * __isfinitel;
+	 * __isnanf;
+	 * __isnanl;
+	 * __isnormal;
+	 * __isnormalf;
+	 * __isnormall;
+	 * __signbit;
+	 * __signbitf;
+	 * __signbitl;
+	 */
 };
 
 /*
@@ -264,12 +263,62 @@ DF306.0 {
  */
 
 DF306.1 {
+	/*
+	 * These old versions are implemented with __sym_compat()
+	 * coshl;
+	 * erfcl;
+	 * erfl;
+	 * lgammal;
+	 * sinhl;
+	 * tanhl;
+	 * tgammal;
+	 * powl;
+	 */
+};
+
+/*
+ * Implemented in 4.1-dev branch
+ */
+
+DF402.0 {
+	cacosl;
+	casinl;
+	catanl;
+	ccoshl;
+	ccosl;
 	coshl;
+	csinl;
+	csinhl;
+	ctanl;
+	ctanhl;
+	cexpl;
+	clog;
+	clogf;
+	clogl;
+	cpow;
+	cpowf;
+	cpowl;
 	erfcl;
 	erfl;
 	lgammal;
-	powl;
 	sinhl;
 	tanhl;
+};
+
+/*
+ * Implemented in 4.3-dev branch
+ */
+
+DF404.0 {
+	powl;
 	tgammal;
+	catanhl;
+	casinhl;
+	cacoshl;
+};
+
+DF508.0 {
+	sincos;
+	sincosf;
+	sincosl;
 };

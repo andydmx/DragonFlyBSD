@@ -10,11 +10,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -37,51 +33,27 @@
 #ifndef _NET_IF_H_
 #define	_NET_IF_H_
 
-#ifndef _SYS_TYPES_H_
-#include <sys/types.h>
-#endif
-#ifndef _SYS_TIME_H_
-#include <sys/time.h>
-#endif
-#ifndef _SYS_SOCKET_H_
-#include <sys/socket.h>
-#endif
+#include <sys/cdefs.h>
 
-#ifdef _KERNEL
-
-#ifndef _SYS_QUEUE_H_
-#include <sys/queue.h>
-#endif
-
-#endif
-
+#if __BSD_VISIBLE
 /*
- * Values for if_link_state.
+ * <net/if.h> does not depend on <sys/time.h> on most other systems.  This
+ * helps userland compatibility.  (struct timeval ifi_lastchange)
  */
-#define	LINK_STATE_UNKNOWN	0	/* link invalid/unknown */
-#define	LINK_STATE_DOWN		1	/* link is down */
-#define	LINK_STATE_UP		2	/* link is up */
-#define	LINK_STATE_IS_UP(_s)	((_s) >= LINK_STATE_UP)
-
-struct ifnet;
+#include <sys/socket.h>
+#ifndef _KERNEL
+#include <sys/time.h>
+#endif /* !_KERNEL */
+#endif /* __BSD_VISIBLE */
 
 /*
  * Length of interface external name, including terminating '\0'.
  * Note: this is the same size as a generic device's external name.
  */
-#define		IFNAMSIZ	16
-#define		IF_NAMESIZE	IFNAMSIZ
+#define		IF_NAMESIZE	16
+#if __BSD_VISIBLE
+#define		IFNAMSIZ	IF_NAMESIZE
 #define		IF_MAXUNIT	0x7fff		/* if_unit is 15bits */
-
-/*
- * Structure used to query names of interface cloners.
- * XXX should be moved to net/if_clone.h
- */
-struct if_clonereq {
-	int	ifcr_total;		/* total cloners (out) */
-	int	ifcr_count;		/* room for this many in user buffer */
-	char	*ifcr_buffer;		/* buffer for cloner names */
-};
 
 /*
  * Structure describing information about an interface
@@ -112,7 +84,7 @@ struct if_data {
 	u_long	ifi_iqdrops;		/* dropped on input, this interface */
 	u_long	ifi_noproto;		/* destined for unsupported protocol */
 	u_long	ifi_hwassist;		/* HW offload capabilities */
-	u_long	ifi_unused;		/* XXX was ifi_xmittiming */
+	u_long	ifi_oqdrops;		/* dropped on input, this interface */
 	struct	timeval ifi_lastchange;	/* time of last administrative change */
 };
 
@@ -136,22 +108,31 @@ struct if_data {
 #define	IFF_POLLING_COMPAT 0x10000	/* was interface is in polling mode */
 #define	IFF_PPROMISC	0x20000		/* user-requested promisc mode */
 #define	IFF_MONITOR	0x40000		/* user-requested monitor mode */
-#define IFF_STATICARP	0x80000		/* static ARP */
-#define IFF_NPOLLING	0x100000	/* interface is in polling mode */
+#define	IFF_STATICARP	0x80000		/* static ARP */
+#define	IFF_NPOLLING	0x100000	/* interface is in polling mode */
+#define	IFF_IDIRECT	0x200000	/* direct input */
 
 /* flags set internally only: */
 #define	IFF_CANTCHANGE \
 	(IFF_BROADCAST|IFF_POINTOPOINT|IFF_RUNNING|IFF_OACTIVE_COMPAT|\
 	 IFF_SIMPLEX|IFF_MULTICAST|IFF_ALLMULTI|IFF_SMART|IFF_POLLING_COMPAT|\
-	 IFF_NPOLLING)
+	 IFF_NPOLLING|IFF_IDIRECT)
 
 #ifndef _KERNEL
 /*
  * User space compat
  */
-#define IFF_OACTIVE	IFF_OACTIVE_COMPAT
-#define IFF_POLLING	IFF_POLLING_COMPAT
+#define	IFF_OACTIVE	IFF_OACTIVE_COMPAT
+#define	IFF_POLLING	IFF_POLLING_COMPAT
 #endif
+
+/*
+ * Values for if_link_state.
+ */
+#define	LINK_STATE_UNKNOWN	0	/* link invalid/unknown */
+#define	LINK_STATE_DOWN		1	/* link is down */
+#define	LINK_STATE_UP		2	/* link is up */
+#define	LINK_STATE_IS_UP(_s)	((_s) >= LINK_STATE_UP)
 
 /*
  * Some convenience macros used for setting ifi_baudrate.
@@ -162,19 +143,19 @@ struct if_data {
 #define	IF_Gbps(x)	(IF_Mbps((x) * 1000))	/* gigabits/sec. */
 
 /* Capabilities that interfaces can advertise. */
-#define IFCAP_RXCSUM		0x00001 /* can offload checksum on RX */
-#define IFCAP_TXCSUM		0x00002 /* can offload checksum on TX */
-#define IFCAP_NETCONS		0x00004 /* can be a network console */
-#define IFCAP_VLAN_MTU		0x00008	/* VLAN-compatible MTU */
-#define IFCAP_VLAN_HWTAGGING	0x00010	/* hardware VLAN tag support */
-#define IFCAP_JUMBO_MTU		0x00020	/* 9000 byte MTU support */
-#define IFCAP_RSS		0x00040	/* Receive Side Scaling for IPv4 */
-#define IFCAP_VLAN_HWCSUM	0x00080	/* can do IFCAP_HWCSUM on VLANs */
-#define IFCAP_TSO4		0x00100	/* can offload TCP segmentation */
-#define IFCAP_TSO		IFCAP_TSO4
-#define IFCAP_TSO6		0x00200	/* can offload TCP6 segmentation */
+#define	IFCAP_RXCSUM		0x00001 /* can offload checksum on RX */
+#define	IFCAP_TXCSUM		0x00002 /* can offload checksum on TX */
+#define	IFCAP_NETCONS		0x00004 /* can be a network console */
+#define	IFCAP_VLAN_MTU		0x00008	/* VLAN-compatible MTU */
+#define	IFCAP_VLAN_HWTAGGING	0x00010	/* hardware VLAN tag support */
+#define	IFCAP_JUMBO_MTU		0x00020	/* 9000 byte MTU support */
+#define	IFCAP_RSS		0x00040	/* Receive Side Scaling for IPv4 */
+#define	IFCAP_VLAN_HWCSUM	0x00080	/* can do IFCAP_HWCSUM on VLANs */
+#define	IFCAP_TSO4		0x00100	/* can offload TCP segmentation */
+#define	IFCAP_TSO		IFCAP_TSO4
+#define	IFCAP_TSO6		0x00200	/* can offload TCP6 segmentation */
 
-#define IFCAP_HWCSUM	(IFCAP_RXCSUM | IFCAP_TXCSUM)
+#define	IFCAP_HWCSUM	(IFCAP_RXCSUM | IFCAP_TXCSUM)
 
 
 #define	IFQ_MAXLEN	250
@@ -188,9 +169,9 @@ struct if_msghdr {
 	u_short	ifm_msglen;	/* to skip over non-understood messages */
 	u_char	ifm_version;	/* future binary compatibility */
 	u_char	ifm_type;	/* message type */
-	int	ifm_addrs;	/* like rtm_addrs */
-	int	ifm_flags;	/* value of if_flags */
 	u_short	ifm_index;	/* index for associated ifp */
+	int	ifm_flags;	/* value of if_flags */
+	int	ifm_addrs;	/* like rtm_addrs */
 	struct	if_data ifm_data;/* statistics and other data about if */
 };
 
@@ -202,9 +183,10 @@ struct ifa_msghdr {
 	u_short	ifam_msglen;	/* to skip over non-understood messages */
 	u_char	ifam_version;	/* future binary compatibility */
 	u_char	ifam_type;	/* message type */
-	int	ifam_addrs;	/* like rtm_addrs */
-	int	ifam_flags;	/* value of ifa_flags */
 	u_short	ifam_index;	/* index for associated ifp */
+	int	ifam_flags;	/* value of ifa_flags */
+	int	ifam_addrs;	/* like rtm_addrs */
+	int	ifam_addrflags;	/* family specific address flags */
 	int	ifam_metric;	/* value of ifa_metric */
 };
 
@@ -216,9 +198,9 @@ struct ifma_msghdr {
 	u_short	ifmam_msglen;	/* to skip over non-understood messages */
 	u_char	ifmam_version;	/* future binary compatibility */
 	u_char	ifmam_type;	/* message type */
-	int	ifmam_addrs;	/* like rtm_addrs */
-	int	ifmam_flags;	/* value of ifa_flags */
 	u_short	ifmam_index;	/* index for associated ifp */
+	int	ifmam_flags;	/* value of ifa_flags */
+	int	ifmam_addrs;	/* like rtm_addrs */
 };
 
 /*
@@ -266,14 +248,14 @@ struct	ifreq {
 #define	ifr_flagshigh	ifr_ifru.ifru_flags[1]	/* flags (high 16 bits) */
 #define	ifr_metric	ifr_ifru.ifru_metric	/* metric */
 #define	ifr_mtu		ifr_ifru.ifru_mtu	/* mtu */
-#define ifr_phys	ifr_ifru.ifru_phys	/* physical wire */
-#define ifr_media	ifr_ifru.ifru_media	/* physical media */
+#define	ifr_phys	ifr_ifru.ifru_phys	/* physical wire */
+#define	ifr_media	ifr_ifru.ifru_media	/* physical media */
 #define	ifr_data	ifr_ifru.ifru_data	/* for use by interface */
 #define	ifr_reqcap	ifr_ifru.ifru_cap[0]	/* requested capabilities */
 #define	ifr_curcap	ifr_ifru.ifru_cap[1]	/* current capabilities */
 #define	ifr_index	ifr_ifru.ifru_index	/* interface index */
-#define ifr_pollcpu	ifr_ifru.ifru_pollcpu	/* deprecated */
-#define ifr_tsolen	ifr_ifru.ifru_tsolen	/* max TSO length */
+#define	ifr_pollcpu	ifr_ifru.ifru_pollcpu	/* deprecated */
+#define	ifr_tsolen	ifr_ifru.ifru_tsolen	/* max TSO length */
 };
 
 #define	_SIZEOF_ADDR_IFREQ(ifr) \
@@ -344,8 +326,8 @@ struct	ifconf {
 
 struct ifg_req {
 	union {
-		char			 ifgrqu_group[IFNAMSIZ];
-		char			 ifgrqu_member[IFNAMSIZ];
+		char	ifgrqu_group[IFNAMSIZ];
+		char	ifgrqu_member[IFNAMSIZ];
 	} ifgrq_ifgrqu;
 #define	ifgrq_group	ifgrq_ifgrqu.ifgrqu_group
 #define	ifgrq_member	ifgrq_ifgrqu.ifgrqu_member
@@ -361,8 +343,8 @@ struct ifgroupreq {
 		char	ifgru_group[IFNAMSIZ];
 		struct	ifg_req *ifgru_groups;
 	} ifgr_ifgru;
-#define ifgr_group	ifgr_ifgru.ifgru_group
-#define ifgr_groups	ifgr_ifgru.ifgru_groups
+#define	ifgr_group	ifgr_ifgru.ifgru_group
+#define	ifgr_groups	ifgr_ifgru.ifgru_groups
 };
 
 /*
@@ -376,29 +358,19 @@ struct if_laddrreq {
 	struct	sockaddr_storage addr;   /* in/out */
 	struct	sockaddr_storage dstaddr; /* out */
 };
+#endif /* __BSD_VISIBLE */
 
 #ifndef _KERNEL
 struct if_nameindex {
-	u_int	 if_index;	/* 1, 2, ... */
-	char	*if_name;	/* null terminated name: "lnc0", ... */
+	unsigned int	 if_index;	/* 1, 2, ... */
+	char		*if_name;	/* null terminated name: "lnc0", ... */
 };
 
 __BEGIN_DECLS
-u_int	 if_nametoindex (const char *);
-char	*if_indextoname(u_int, char *);
-struct	 if_nameindex *if_nameindex (void);
-void	 if_freenameindex (struct if_nameindex *);
+unsigned int	 if_nametoindex(const char *);
+char		*if_indextoname(unsigned int, char *);
+struct if_nameindex *if_nameindex(void);
+void		 if_freenameindex(struct if_nameindex *);
 __END_DECLS
-#endif
-
-#ifdef _KERNEL
-struct thread;
-struct ucred;
-
-int	prison_if (struct ucred *cred, struct sockaddr *sa);
-
-/* XXX - this should go away soon. */
-#include <net/if_var.h>
-#endif
-
+#endif /* !_KERNEL */
 #endif /* !_NET_IF_H_ */

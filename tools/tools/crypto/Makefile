@@ -26,14 +26,17 @@
 #
 
 ALL=	cryptotest cryptokeytest cryptostats \
-	ubsecstats hifnstats ipsecstats
+	ubsecstats hifnstats
 BINDIR=	/usr/local/bin
+PRIVATELIB_LDFLAGS?= -rpath /lib/priv:/usr/lib/priv -L /usr/lib/priv
 
 all:	${ALL}
 
 # program to test asymmetric crypto functions
 cryptokeytest: cryptokeytest.c
-	${CC} -o cryptokeytest cryptokeytest.c -lcrypto
+	${CC} -o cryptokeytest cryptokeytest.c \
+	 -rpath /usr/lib/priv ${PRIVATELIB_LDFLAGS} \
+	 -lprivate_crypto
 
 # program to dump statistics kept by the core crypto code
 cryptostats: cryptostats.c
@@ -51,10 +54,6 @@ hifnstats: hifnstats.c
 #safestats: safestats.c
 #	${CC} -o safestats safestats.c
 #
-# program to print statistics kept by fast ipsec
-ipsecstats: ipsecstats.c
-	${CC} -o ipsecstats ipsecstats.c
-
 clean:
 	rm -f ${ALL} core a.out
 

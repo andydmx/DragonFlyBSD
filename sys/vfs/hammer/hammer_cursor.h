@@ -1,13 +1,13 @@
 /*
  * Copyright (c) 2007 The DragonFly Project.  All rights reserved.
- * 
+ *
  * This code is derived from software contributed to The DragonFly Project
  * by Matthew Dillon <dillon@backplane.com>
- * 
+ *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
  * are met:
- * 
+ *
  * 1. Redistributions of source code must retain the above copyright
  *    notice, this list of conditions and the following disclaimer.
  * 2. Redistributions in binary form must reproduce the above copyright
@@ -17,7 +17,7 @@
  * 3. Neither the name of The DragonFly Project nor the names of its
  *    contributors may be used to endorse or promote products derived
  *    from this software without specific, prior written permission.
- * 
+ *
  * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
  * ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
  * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
@@ -30,15 +30,16 @@
  * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT
  * OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
- * 
+ *
  * $DragonFly: src/sys/vfs/hammer/hammer_cursor.h,v 1.26 2008/08/06 15:38:58 dillon Exp $
  */
 
-struct hammer_cmirror;
+#ifndef VFS_HAMMER_CURSOR_H_
+#define VFS_HAMMER_CURSOR_H_
 
 /*
  * The hammer_cursor structure is the primary in-memory management structure
- * for B-Tree operations.  
+ * for B-Tree operations.
  *
  * The most important issue to make note of is that a hammer_cursor is a
  * tracking structure.  Any active hammer_cursor structure will be linked into
@@ -49,7 +50,7 @@ struct hammer_cmirror;
  * The cursor module maintains a shared lock on cursor->node and
  * cursor->parent.
  */
-struct hammer_cursor {
+typedef struct hammer_cursor {
 	/*
 	 * Parent B-Tree node, current B-Tree node, and related element
 	 * indices.
@@ -79,8 +80,8 @@ struct hammer_cursor {
 
 	/*
 	 * Pointer to the current node's bounds.  Typically points to the
-	 * appropriate boundary elements in the parent or points to bounds
-	 * stored in the cluster.  The right-boundary is range-exclusive.
+	 * appropriate boundary elements in the parent.
+	 * The right-boundary is range-exclusive.
 	 */
 	hammer_base_elm_t left_bound;
 	hammer_base_elm_t right_bound;
@@ -99,9 +100,9 @@ struct hammer_cursor {
 	 * can be NULL when data and/or record is not, typically indicating
 	 * information referenced via an in-memory record.
 	 */
-	struct hammer_buffer *data_buffer;	/* extended data */
-	struct hammer_btree_leaf_elm *leaf;
-	union hammer_data_ondisk *data;
+	hammer_buffer_t data_buffer;	/* extended data */
+	hammer_btree_leaf_elm_t leaf;
+	hammer_data_ondisk_t data;
 
 	/*
 	 * Iteration and extraction control variables
@@ -112,13 +113,11 @@ struct hammer_cursor {
 	/*
 	 * Merged in-memory/on-disk iterations also use these fields.
 	 */
-	struct hammer_inode *ip;
-	struct hammer_record *iprec;
-};
+	hammer_inode_t ip;
+	hammer_record_t iprec;
+} *hammer_cursor_t;
 
-typedef struct hammer_cursor *hammer_cursor_t;
-
-#define HAMMER_CURSOR_GET_LEAF		0x0001
+#define HAMMER_CURSOR_GET_LEAF		0x0001  /* not used */
 #define HAMMER_CURSOR_GET_DATA		0x0002
 #define HAMMER_CURSOR_BACKEND		0x0004	/* cursor run by backend */
 #define HAMMER_CURSOR_INSERT		0x0008	/* adjust for insert */
@@ -172,3 +171,4 @@ struct hammer_cmirror {
 #define hammer_cursor_ondisk(cursor)		\
 			((cursor)->leaf != &(cursor)->iprec->leaf)
 
+#endif /* !VFS_HAMMER_CURSOR_H_ */

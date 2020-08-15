@@ -1,11 +1,6 @@
 # This file tells config what files go into building a kernel,
 # files marked standard are always included.
 #
-crypto/blowfish/bf_enc.c		optional	ipsec ipsec_esp
-crypto/des/des_enc.c			optional	ipsec ipsec_esp
-crypto/des/des_ecb.c			optional	netsmbcrypto
-crypto/des/des_enc.c			optional	netsmbcrypto
-crypto/des/des_setkey.c			optional	netsmbcrypto
 crypto/blowfish/bf_enc.c		optional	crypto
 crypto/des/des_enc.c			optional	crypto
 crypto/des/des_ecb.c			optional	crypto
@@ -17,11 +12,10 @@ vfs/smbfs/smbfs_smb.c		optional	smbfs
 vfs/smbfs/smbfs_subr.c		optional	smbfs
 vfs/smbfs/smbfs_vfsops.c	optional	smbfs
 vfs/smbfs/smbfs_vnops.c		optional	smbfs
-cpu/x86_64/misc/atomic.c	standard				\
-	compile-with	"${CC} -c ${CFLAGS} ${DEFINED_PROF:S/^$/-fomit-frame-pointer/} ${.IMPSRC}"
+cpu/x86_64/misc/cputimer_tsc.c	standard
 platform/vkernel64/x86_64/autoconf.c	standard
 platform/vkernel64/x86_64/mp.c		standard			\
-	compile-with	"${CC} -c -pthread ${CFLAGS} -I/usr/include ${.IMPSRC}"
+	compile-with	"${NORMAL_C} -pthread -I/usr/include ${WERROR}"
 #
 # DDB XXX
 cpu/x86_64/misc/elf_machdep.c		standard

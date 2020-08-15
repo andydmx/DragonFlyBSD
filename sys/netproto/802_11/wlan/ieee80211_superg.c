@@ -21,26 +21,30 @@
  * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
  * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
  * THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- *
- * $FreeBSD: head/sys/net80211/ieee80211_superg.c 193115 2009-05-30 20:11:23Z sam $
  */
+
+#include <sys/cdefs.h>
+__FBSDID("$FreeBSD$");
 
 #include "opt_wlan.h"
 
+#ifdef	IEEE80211_SUPPORT_SUPERG
+
 #include <sys/param.h>
-#include <sys/systm.h> 
-#include <sys/mbuf.h>   
+#include <sys/systm.h>
+#include <sys/malloc.h>
+#include <sys/mbuf.h>
 #include <sys/kernel.h>
 #include <sys/endian.h>
 
 #include <sys/socket.h>
- 
-#include <net/bpf.h>
-#include <net/ethernet.h>
-#include <net/route.h>
+
 #include <net/if.h>
+#include <net/if_var.h>
 #include <net/if_llc.h>
 #include <net/if_media.h>
+#include <net/bpf.h>
+#include <net/ethernet.h>
 
 #include <netproto/802_11/ieee80211_var.h>
 #include <netproto/802_11/ieee80211_input.h>
@@ -84,7 +88,7 @@
 	memcpy(dst, src, sizeof(struct ether_header))
 
 static	int ieee80211_ffppsmin = 2;	/* pps threshold for ff aggregation */
-SYSCTL_INT(_net_wlan, OID_AUTO, ffppsmin, CTLTYPE_INT | CTLFLAG_RW,
+SYSCTL_INT(_net_wlan, OID_AUTO, ffppsmin, CTLFLAG_RW,
 	&ieee80211_ffppsmin, 0, "min packet rate before fast-frame staging");
 static	int ieee80211_ffagemax = -1;	/* max time frames held on stage q */
 SYSCTL_PROC(_net_wlan, OID_AUTO, ffagemax, CTLTYPE_INT | CTLFLAG_RW,
@@ -96,25 +100,35 @@ ieee80211_superg_attach(struct ieee80211com *ic)
 {
 	struct ieee80211_superg *sg;
 
-	if (ic->ic_caps & IEEE80211_C_FF) {
-		sg = (struct ieee80211_superg *) kmalloc(
-		     sizeof(struct ieee80211_superg), M_80211_VAP,
-		     M_INTWAIT | M_ZERO);
-		if (sg == NULL) {
-			kprintf("%s: cannot allocate SuperG state block\n",
-			    __func__);
-			return;
-		}
-		ic->ic_superg = sg;
+#if defined(__DragonFly__)
+	sg = (struct ieee80211_superg *) kmalloc(
+		sizeof(struct ieee80211_superg), M_80211_VAP,
+		M_INTWAIT | M_ZERO);
+#else
+	sg = (struct ieee80211_superg *) IEEE80211_MALLOC(
+		sizeof(struct ieee80211_superg), M_80211_VAP,
+		IEEE80211_M_NOWAIT | IEEE80211_M_ZERO);
+#endif
+	if (sg == NULL) {
+		kprintf("%s: cannot allocate SuperG state block\n",
+		    __func__);
+		return;
 	}
-	ieee80211_ffagemax = msecs_to_ticks(150);
+	ic->ic_superg = sg;
+
+	/*
+	 * Default to not being so aggressive for FF/AMSDU
+	 * aging, otherwise we may hold a frame around
+	 * for way too long before we expire it out.
+	 */
+	ieee80211_ffagemax = msecs_to_ticks(2);
 }
 
 void
 ieee80211_superg_detach(struct ieee80211com *ic)
 {
 	if (ic->ic_superg != NULL) {
-		kfree(ic->ic_superg, M_80211_VAP);
+		IEEE80211_FREE(ic->ic_superg, M_80211_VAP);
 		ic->ic_superg = NULL;
 	}
 }
@@ -165,7 +179,7 @@ ieee80211_add_ath(uint8_t *frm, uint8_t caps, ieee80211_keyix defkeyix)
 		ath->ath_defkeyix[0] = 0xff;
 		ath->ath_defkeyix[1] = 0x7f;
 	}
-	return frm + sizeof(info); 
+	return frm + sizeof(info);
 }
 #undef ATH_OUI_BYTES
 
@@ -188,7 +202,7 @@ ieee80211_parse_ath(struct ieee80211_node *ni, uint8_t *ie)
 		(const struct ieee80211_ath_ie *) ie;
 
 	ni->ni_ath_flags = ath->ath_capability;
-	ni->ni_ath_defkeyix = LE_READ_2(&ath->ath_defkeyix);
+	ni->ni_ath_defkeyix = le16dec(&ath->ath_defkeyix);
 }
 
 int
@@ -209,7 +223,7 @@ ieee80211_parse_athparams(struct ieee80211_node *ni, uint8_t *frm,
 	}
 	ath = (const struct ieee80211_ath_ie *)frm;
 	capschanged = (ni->ni_ath_flags != ath->ath_capability);
-	defkeyix = LE_READ_2(ath->ath_defkeyix);
+	defkeyix = le16dec(ath->ath_defkeyix);
 	if (capschanged || defkeyix != ni->ni_ath_defkeyix) {
 		ni->ni_ath_flags = ath->ath_capability;
 		ni->ni_ath_defkeyix = defkeyix;
@@ -226,7 +240,7 @@ ieee80211_parse_athparams(struct ieee80211_node *ni, uint8_t *frm,
 		 */
 		newflags = curflags = vap->iv_ic->ic_bsschan->ic_flags;
 		/* NB: BOOST is not in ic_flags, so get it from the ie */
-		if (ath->ath_capability & ATHEROS_CAP_BOOST) 
+		if (ath->ath_capability & ATHEROS_CAP_BOOST)
 			newflags |= IEEE80211_CHAN_TURBO;
 		else
 			newflags &= ~IEEE80211_CHAN_TURBO;
@@ -299,7 +313,7 @@ ieee80211_ff_decap(struct ieee80211_node *ni, struct mbuf *m)
 		vap->iv_stats.is_ff_tooshort++;
 		return NULL;
 	}
-	n = m_split(m, framelen, MB_DONTWAIT);
+	n = m_split(m, framelen, M_NOWAIT);
 	if (n == NULL) {
 		IEEE80211_DISCARD_MAC(vap, IEEE80211_MSG_ANY,
 		    ni->ni_macaddr, "fast-frame",
@@ -328,43 +342,6 @@ ieee80211_ff_decap(struct ieee80211_node *ni, struct mbuf *m)
 }
 
 /*
- * Do Ethernet-LLC encapsulation for each payload in a fast frame
- * tunnel encapsulation.  The frame is assumed to have an Ethernet
- * header at the front that must be stripped before prepending the
- * LLC followed by the Ethernet header passed in (with an Ethernet
- * type that specifies the payload size).
- */
-static struct mbuf *
-ff_encap1(struct ieee80211vap *vap, struct mbuf *m,
-	const struct ether_header *eh)
-{
-	struct llc *llc;
-	uint16_t payload;
-
-	/* XXX optimize by combining m_adj+M_PREPEND */
-	m_adj(m, sizeof(struct ether_header) - sizeof(struct llc));
-	llc = mtod(m, struct llc *);
-	llc->llc_dsap = llc->llc_ssap = LLC_SNAP_LSAP;
-	llc->llc_control = LLC_UI;
-	llc->llc_snap.org_code[0] = 0;
-	llc->llc_snap.org_code[1] = 0;
-	llc->llc_snap.org_code[2] = 0;
-	llc->llc_snap.ether_type = eh->ether_type;
-	payload = m->m_pkthdr.len;		/* NB: w/o Ethernet header */
-
-	M_PREPEND(m, sizeof(struct ether_header), MB_DONTWAIT);
-	if (m == NULL) {		/* XXX cannot happen */
-		IEEE80211_DPRINTF(vap, IEEE80211_MSG_SUPERG,
-			"%s: no space for ether_header\n", __func__);
-		vap->iv_stats.is_tx_nobuf++;
-		return NULL;
-	}
-	ETHER_HEADER_COPY(mtod(m, void *), eh);
-	mtod(m, struct ether_header *)->ether_type = htons(payload);
-	return m;
-}
-
-/*
  * Fast frame encapsulation.  There must be two packets
  * chained with m_nextpkt.  We do header adjustment for
  * each, add the tunnel encapsulation, and then concatenate
@@ -387,16 +364,15 @@ ieee80211_ff_encap(struct ieee80211vap *vap, struct mbuf *m1, int hdrspace,
 		goto bad;
 	}
 	m1->m_nextpkt = NULL;
+
 	/*
-	 * Include fast frame headers in adjusting header layout.
+	 * Adjust to include 802.11 header requirement.
 	 */
 	KASSERT(m1->m_len >= sizeof(eh1), ("no ethernet header!"));
 	ETHER_HEADER_COPY(&eh1, mtod(m1, caddr_t));
-	m1 = ieee80211_mbuf_adjust(vap,
-		hdrspace + sizeof(struct llc) + sizeof(uint32_t) + 2 +
-		    sizeof(struct ether_header),
-		key, m1);
+	m1 = ieee80211_mbuf_adjust(vap, hdrspace, key, m1);
 	if (m1 == NULL) {
+		kprintf("%s: failed initial mbuf_adjust\n", __func__);
 		/* NB: ieee80211_mbuf_adjust handles msgs+statistics */
 		m_freem(m2);
 		goto bad;
@@ -404,17 +380,15 @@ ieee80211_ff_encap(struct ieee80211vap *vap, struct mbuf *m1, int hdrspace,
 
 	/*
 	 * Copy second frame's Ethernet header out of line
-	 * and adjust for encapsulation headers.  Note that
-	 * we make room for padding in case there isn't room
+	 * and adjust for possible padding in case there isn't room
 	 * at the end of first frame.
 	 */
 	KASSERT(m2->m_len >= sizeof(eh2), ("no ethernet header!"));
 	ETHER_HEADER_COPY(&eh2, mtod(m2, caddr_t));
-	m2 = ieee80211_mbuf_adjust(vap,
-		ATH_FF_MAX_HDR_PAD + sizeof(struct ether_header),
-		NULL, m2);
+	m2 = ieee80211_mbuf_adjust(vap, 4, NULL, m2);
 	if (m2 == NULL) {
 		/* NB: ieee80211_mbuf_adjust handles msgs+statistics */
+		kprintf("%s: failed second \n", __func__);
 		goto bad;
 	}
 
@@ -422,10 +396,10 @@ ieee80211_ff_encap(struct ieee80211vap *vap, struct mbuf *m1, int hdrspace,
 	 * Now do tunnel encapsulation.  First, each
 	 * frame gets a standard encapsulation.
 	 */
-	m1 = ff_encap1(vap, m1, &eh1);
+	m1 = ieee80211_ff_encap1(vap, m1, &eh1);
 	if (m1 == NULL)
 		goto bad;
-	m2 = ff_encap1(vap, m2, &eh2);
+	m2 = ieee80211_ff_encap1(vap, m2, &eh2);
 	if (m2 == NULL)
 		goto bad;
 
@@ -452,15 +426,14 @@ ieee80211_ff_encap(struct ieee80211vap *vap, struct mbuf *m1, int hdrspace,
 	}
 
 	/*
-	 * Now, stick 'em together and prepend the tunnel headers;
-	 * first the Atheros tunnel header (all zero for now) and
-	 * then a special fast frame LLC.
+	 * A-MSDU's are just appended; the "I'm A-MSDU!" bit is in the
+	 * QoS header.
 	 *
 	 * XXX optimize by prepending together
 	 */
 	m->m_next = m2;			/* NB: last mbuf from above */
 	m1->m_pkthdr.len += m2->m_pkthdr.len;
-	M_PREPEND(m1, sizeof(uint32_t)+2, MB_DONTWAIT);
+	M_PREPEND(m1, sizeof(uint32_t)+2, M_NOWAIT);
 	if (m1 == NULL) {		/* XXX cannot happen */
 		IEEE80211_DPRINTF(vap, IEEE80211_MSG_SUPERG,
 		    "%s: no space for tunnel header\n", __func__);
@@ -469,7 +442,7 @@ ieee80211_ff_encap(struct ieee80211vap *vap, struct mbuf *m1, int hdrspace,
 	}
 	memset(mtod(m1, void *), 0, sizeof(uint32_t)+2);
 
-	M_PREPEND(m1, sizeof(struct llc), MB_DONTWAIT);
+	M_PREPEND(m1, sizeof(struct llc), M_NOWAIT);
 	if (m1 == NULL) {		/* XXX cannot happen */
 		IEEE80211_DPRINTF(vap, IEEE80211_MSG_SUPERG,
 		    "%s: no space for llc header\n", __func__);
@@ -488,6 +461,7 @@ ieee80211_ff_encap(struct ieee80211vap *vap, struct mbuf *m1, int hdrspace,
 
 	return m1;
 bad:
+	vap->iv_stats.is_ff_encapfail++;
 	if (m1 != NULL)
 		m_freem(m1);
 	if (m2 != NULL)
@@ -495,25 +469,131 @@ bad:
 	return NULL;
 }
 
+/*
+ * A-MSDU encapsulation.
+ *
+ * This assumes just two frames for now, since we're borrowing the
+ * same queuing code and infrastructure as fast-frames.
+ *
+ * There must be two packets chained with m_nextpkt.
+ * We do header adjustment for each, and then concatenate the mbuf chains
+ * to form a single frame for transmission.
+ */
+struct mbuf *
+ieee80211_amsdu_encap(struct ieee80211vap *vap, struct mbuf *m1, int hdrspace,
+	struct ieee80211_key *key)
+{
+	struct mbuf *m2;
+	struct ether_header eh1, eh2;
+	struct mbuf *m;
+	int pad;
+
+	m2 = m1->m_nextpkt;
+	if (m2 == NULL) {
+		IEEE80211_DPRINTF(vap, IEEE80211_MSG_SUPERG,
+		    "%s: only one frame\n", __func__);
+		goto bad;
+	}
+	m1->m_nextpkt = NULL;
+
+	/*
+	 * Include A-MSDU header in adjusting header layout.
+	 */
+	KASSERT(m1->m_len >= sizeof(eh1), ("no ethernet header!"));
+	ETHER_HEADER_COPY(&eh1, mtod(m1, caddr_t));
+	m1 = ieee80211_mbuf_adjust(vap,
+		hdrspace + sizeof(struct llc) + sizeof(uint32_t) +
+		    sizeof(struct ether_header),
+		key, m1);
+	if (m1 == NULL) {
+		/* NB: ieee80211_mbuf_adjust handles msgs+statistics */
+		m_freem(m2);
+		goto bad;
+	}
+
+	/*
+	 * Copy second frame's Ethernet header out of line
+	 * and adjust for encapsulation headers.  Note that
+	 * we make room for padding in case there isn't room
+	 * at the end of first frame.
+	 */
+	KASSERT(m2->m_len >= sizeof(eh2), ("no ethernet header!"));
+	ETHER_HEADER_COPY(&eh2, mtod(m2, caddr_t));
+	m2 = ieee80211_mbuf_adjust(vap, 4, NULL, m2);
+	if (m2 == NULL) {
+		/* NB: ieee80211_mbuf_adjust handles msgs+statistics */
+		goto bad;
+	}
+
+	/*
+	 * Now do tunnel encapsulation.  First, each
+	 * frame gets a standard encapsulation.
+	 */
+	m1 = ieee80211_ff_encap1(vap, m1, &eh1);
+	if (m1 == NULL)
+		goto bad;
+	m2 = ieee80211_ff_encap1(vap, m2, &eh2);
+	if (m2 == NULL)
+		goto bad;
+
+	/*
+	 * Pad leading frame to a 4-byte boundary.  If there
+	 * is space at the end of the first frame, put it
+	 * there; otherwise prepend to the front of the second
+	 * frame.  We know doing the second will always work
+	 * because we reserve space above.  We prefer appending
+	 * as this typically has better DMA alignment properties.
+	 */
+	for (m = m1; m->m_next != NULL; m = m->m_next)
+		;
+	pad = roundup2(m1->m_pkthdr.len, 4) - m1->m_pkthdr.len;
+	if (pad) {
+		if (M_TRAILINGSPACE(m) < pad) {		/* prepend to second */
+			m2->m_data -= pad;
+			m2->m_len += pad;
+			m2->m_pkthdr.len += pad;
+		} else {				/* append to first */
+			m->m_len += pad;
+			m1->m_pkthdr.len += pad;
+		}
+	}
+
+	/*
+	 * Now, stick 'em together.
+	 */
+	m->m_next = m2;			/* NB: last mbuf from above */
+	m1->m_pkthdr.len += m2->m_pkthdr.len;
+
+	vap->iv_stats.is_amsdu_encap++;
+
+	return m1;
+bad:
+	vap->iv_stats.is_amsdu_encapfail++;
+	if (m1 != NULL)
+		m_freem(m1);
+	if (m2 != NULL)
+		m_freem(m2);
+	return NULL;
+}
+
+
 static void
 ff_transmit(struct ieee80211_node *ni, struct mbuf *m)
 {
 	struct ieee80211vap *vap = ni->ni_vap;
+	struct ieee80211com *ic = ni->ni_ic;
 	int error;
+
+	IEEE80211_TX_LOCK_ASSERT(vap->iv_ic);
 
 	/* encap and xmit */
 	m = ieee80211_encap(vap, ni, m);
 	if (m != NULL) {
 		struct ifnet *ifp = vap->iv_ifp;
-		struct ifnet *parent = ni->ni_ic->ic_ifp;
 
-		error = ieee80211_handoff(parent, m);
-		if (error != 0) {
-			/* NB: IFQ_HANDOFF reclaims mbuf */
-			ieee80211_free_node(ni);
-		} else {
-			IFNET_STAT_INC(ifp, opackets, 1);
-		}
+		error = ieee80211_parent_xmitpkt(ic, m);
+		if (!error)
+			if_inc_counter(ifp, IFCOUNTER_OPACKETS, 1);
 	} else
 		ieee80211_free_node(ni);
 }
@@ -547,42 +627,57 @@ ff_flush(struct mbuf *head, struct mbuf *last)
 
 /*
  * Age frames on the staging queue.
+ *
+ * This is called without the comlock held, but it does all its work
+ * behind the comlock.  Because of this, it's possible that the
+ * staging queue will be serviced between the function which called
+ * it and now; thus simply checking that the queue has work in it
+ * may fail.
+ *
+ * See PR kern/174283 for more details.
  */
 void
 ieee80211_ff_age(struct ieee80211com *ic, struct ieee80211_stageq *sq,
     int quanta)
 {
-	struct ieee80211_superg *sg = ic->ic_superg;
 	struct mbuf *m, *head;
 	struct ieee80211_node *ni;
-	struct ieee80211_tx_ampdu *tap;
 
+#if 0
 	KASSERT(sq->head != NULL, ("stageq empty"));
+#endif
 
+	IEEE80211_LOCK(ic);
 	head = sq->head;
 	while ((m = sq->head) != NULL && M_AGE_GET(m) < quanta) {
-		/* clear tap ref to frame */
+		int tid = WME_AC_TO_TID(M_WME_GETAC(m));
+
+		/* clear staging ref to frame */
 		ni = (struct ieee80211_node *) m->m_pkthdr.rcvif;
-		tap = &ni->ni_tx_ampdu[M_WME_GETAC(m)];
-		KASSERT(tap->txa_private == m, ("staging queue empty"));
-		tap->txa_private = NULL;
+		KASSERT(ni->ni_tx_superg[tid] == m, ("staging queue empty"));
+		ni->ni_tx_superg[tid] = NULL;
 
 		sq->head = m->m_nextpkt;
 		sq->depth--;
-		sg->ff_stageqdepth--;
 	}
 	if (m == NULL)
 		sq->tail = NULL;
 	else
 		M_AGE_SUB(m, quanta);
+	IEEE80211_UNLOCK(ic);
 
+	IEEE80211_TX_LOCK(ic);
 	ff_flush(head, m);
+	IEEE80211_TX_UNLOCK(ic);
 }
 
 static void
-stageq_add(struct ieee80211_stageq *sq, struct mbuf *m)
+stageq_add(struct ieee80211com *ic, struct ieee80211_stageq *sq, struct mbuf *m)
 {
 	int age = ieee80211_ffagemax;
+
+	IEEE80211_LOCK_ASSERT(ic);
+
 	if (sq->tail != NULL) {
 		sq->tail->m_nextpkt = m;
 		age -= M_AGE_GET(sq->head);
@@ -596,9 +691,11 @@ stageq_add(struct ieee80211_stageq *sq, struct mbuf *m)
 }
 
 static void
-stageq_remove(struct ieee80211_stageq *sq, struct mbuf *mstaged)
+stageq_remove(struct ieee80211com *ic, struct ieee80211_stageq *sq, struct mbuf *mstaged)
 {
 	struct mbuf *m, *mprev;
+
+	IEEE80211_LOCK_ASSERT(ic);
 
 	mprev = NULL;
 	for (m = sq->head; m != NULL; m = m->m_nextpkt) {
@@ -624,6 +721,7 @@ ff_approx_txtime(struct ieee80211_node *ni,
 	struct ieee80211com *ic = ni->ni_ic;
 	struct ieee80211vap *vap = ni->ni_vap;
 	uint32_t framelen;
+	uint32_t frame_time;
 
 	/*
 	 * Approximate the frame length to be transmitted. A swag to add
@@ -640,7 +738,21 @@ ff_approx_txtime(struct ieee80211_node *ni,
 		framelen += 24;
 	if (m2 != NULL)
 		framelen += m2->m_pkthdr.len;
-	return ieee80211_compute_duration(ic->ic_rt, framelen, ni->ni_txrate, 0);
+
+	/*
+	 * For now, we assume non-shortgi, 20MHz, just because I want to
+	 * at least test 802.11n.
+	 */
+	if (ni->ni_txrate & IEEE80211_RATE_MCS)
+		frame_time = ieee80211_compute_duration_ht(framelen,
+		    ni->ni_txrate,
+		    IEEE80211_HT_RC_2_STREAMS(ni->ni_txrate),
+		    0, /* isht40 */
+		    0); /* isshortgi */
+	else
+		frame_time = ieee80211_compute_duration(ic->ic_rt, framelen,
+			    ni->ni_txrate, 0);
+	return (frame_time);
 }
 
 /*
@@ -660,6 +772,8 @@ ieee80211_ff_check(struct ieee80211_node *ni, struct mbuf *m)
 	struct mbuf *mstaged;
 	uint32_t txtime, limit;
 
+	IEEE80211_TX_UNLOCK_ASSERT(ic);
+
 	/*
 	 * Check if the supplied frame can be aggregated.
 	 *
@@ -667,8 +781,14 @@ ieee80211_ff_check(struct ieee80211_node *ni, struct mbuf *m)
 	 *     Do 802.1x EAPOL frames proceed in the clear? Then they couldn't
 	 *     be aggregated with other types of frames when encryption is on?
 	 */
-	tap = &ni->ni_tx_ampdu[pri];
-	mstaged = tap->txa_private;		/* NB: we reuse AMPDU state */
+	IEEE80211_LOCK(ic);
+	tap = &ni->ni_tx_ampdu[WME_AC_TO_TID(pri)];
+	mstaged = ni->ni_tx_superg[WME_AC_TO_TID(pri)];
+	/* XXX NOTE: reusing packet counter state from A-MPDU */
+	/*
+	 * XXX NOTE: this means we're double-counting; it should just
+	 * be done in ieee80211_output.c once for both superg and A-MPDU.
+	 */
 	ieee80211_txampdu_count_packet(tap);
 
 	/*
@@ -679,6 +799,7 @@ ieee80211_ff_check(struct ieee80211_node *ni, struct mbuf *m)
 	if (vap->iv_opmode != IEEE80211_M_STA &&
 	    ETHER_IS_MULTICAST(mtod(m, struct ether_header *)->ether_dhost)) {
 		/* XXX flush staged frame? */
+		IEEE80211_UNLOCK(ic);
 		return m;
 	}
 	/*
@@ -687,6 +808,7 @@ ieee80211_ff_check(struct ieee80211_node *ni, struct mbuf *m)
 	 */
 	if (mstaged == NULL &&
 	    ieee80211_txampdu_getpps(tap) < ieee80211_ffppsmin) {
+		IEEE80211_UNLOCK(ic);
 		return m;
 	}
 	sq = &sg->ff_stageq[pri];
@@ -706,15 +828,18 @@ ieee80211_ff_check(struct ieee80211_node *ni, struct mbuf *m)
 		    "%s: txtime %u exceeds txop limit %u\n",
 		    __func__, txtime, limit);
 
-		tap->txa_private = NULL;
+		ni->ni_tx_superg[WME_AC_TO_TID(pri)] = NULL;
 		if (mstaged != NULL)
-			stageq_remove(sq, mstaged);
+			stageq_remove(ic, sq, mstaged);
+		IEEE80211_UNLOCK(ic);
 
 		if (mstaged != NULL) {
+			IEEE80211_TX_LOCK(ic);
 			IEEE80211_NOTE(vap, IEEE80211_MSG_SUPERG, ni,
 			    "%s: flush staged frame", __func__);
 			/* encap and xmit */
 			ff_transmit(ni, mstaged);
+			IEEE80211_TX_UNLOCK(ic);
 		}
 		return m;		/* NB: original frame */
 	}
@@ -726,8 +851,9 @@ ieee80211_ff_check(struct ieee80211_node *ni, struct mbuf *m)
 	 * hold their node reference.
 	 */
 	if (mstaged != NULL) {
-		tap->txa_private = NULL;
-		stageq_remove(sq, mstaged);
+		ni->ni_tx_superg[WME_AC_TO_TID(pri)] = NULL;
+		stageq_remove(ic, sq, mstaged);
+		IEEE80211_UNLOCK(ic);
 
 		IEEE80211_NOTE(vap, IEEE80211_MSG_SUPERG, ni,
 		    "%s: aggregate fast-frame", __func__);
@@ -743,18 +869,43 @@ ieee80211_ff_check(struct ieee80211_node *ni, struct mbuf *m)
 		mstaged->m_nextpkt = m;
 		mstaged->m_flags |= M_FF; /* NB: mark for encap work */
 	} else {
-		KASSERT(tap->txa_private == NULL,
-		    ("txa_private %p", tap->txa_private));
-		tap->txa_private = m;
+		KASSERT(ni->ni_tx_superg[WME_AC_TO_TID(pri)]== NULL,
+		    ("ni_tx_superg[]: %p",
+		    ni->ni_tx_superg[WME_AC_TO_TID(pri)]));
+		ni->ni_tx_superg[WME_AC_TO_TID(pri)] = m;
 
-		stageq_add(sq, m);
-		sg->ff_stageqdepth++;
+		stageq_add(ic, sq, m);
+		IEEE80211_UNLOCK(ic);
 
 		IEEE80211_NOTE(vap, IEEE80211_MSG_SUPERG, ni,
 		    "%s: stage frame, %u queued", __func__, sq->depth);
 		/* NB: mstaged is NULL */
 	}
 	return mstaged;
+}
+
+struct mbuf *
+ieee80211_amsdu_check(struct ieee80211_node *ni, struct mbuf *m)
+{
+	/*
+	 * XXX TODO: actually enforce the node support
+	 * and HTCAP requirements for the maximum A-MSDU
+	 * size.
+	 */
+
+	/* First: software A-MSDU transmit? */
+	if (! ieee80211_amsdu_tx_ok(ni))
+		return (m);
+
+	/* Next - EAPOL? Nope, don't aggregate; we don't QoS encap them */
+	if (m->m_flags & (M_EAPOL | M_MCAST | M_BCAST))
+		return (m);
+
+	/* Next - needs to be a data frame, non-broadcast, etc */
+	if (ETHER_IS_MULTICAST(mtod(m, struct ether_header *)->ether_dhost))
+		return (m);
+
+	return (ieee80211_ff_check(ni, m));
 }
 
 void
@@ -773,25 +924,40 @@ ieee80211_ff_node_cleanup(struct ieee80211_node *ni)
 {
 	struct ieee80211com *ic = ni->ni_ic;
 	struct ieee80211_superg *sg = ic->ic_superg;
-	struct ieee80211_tx_ampdu *tap;
-	struct mbuf *m, *head;
-	int ac;
+	struct mbuf *m, *next_m, *head;
+	int tid;
 
+	IEEE80211_LOCK(ic);
 	head = NULL;
-	for (ac = 0; ac < WME_NUM_AC; ac++) {
-		tap = &ni->ni_tx_ampdu[ac];
-		m = tap->txa_private;
+	for (tid = 0; tid < WME_NUM_TID; tid++) {
+		int ac = TID_TO_WME_AC(tid);
+		/*
+		 * XXX Initialise the packet counter.
+		 *
+		 * This may be double-work for 11n stations;
+		 * but without it we never setup things.
+		 */
+		ieee80211_txampdu_init_pps(&ni->ni_tx_ampdu[tid]);
+		m = ni->ni_tx_superg[tid];
 		if (m != NULL) {
-			tap->txa_private = NULL;
-			stageq_remove(&sg->ff_stageq[ac], m);
+			ni->ni_tx_superg[tid] = NULL;
+			stageq_remove(ic, &sg->ff_stageq[ac], m);
 			m->m_nextpkt = head;
 			head = m;
 		}
 	}
+	IEEE80211_UNLOCK(ic);
 
-	for (m = head; m != NULL; m = m->m_nextpkt) {
+	/*
+	 * Free mbufs, taking care to not dereference the mbuf after
+	 * we free it (hence grabbing m_nextpkt before we free it.)
+	 */
+	m = head;
+	while (m != NULL) {
+		next_m = m->m_nextpkt;
 		m_freem(m);
 		ieee80211_free_node(ni);
+		m = next_m;
 	}
 }
 
@@ -888,3 +1054,5 @@ superg_ioctl_set80211(struct ieee80211vap *vap, struct ieee80211req *ireq)
 	return 0;
 }
 IEEE80211_IOCTL_SET(superg, superg_ioctl_set80211);
+
+#endif	/* IEEE80211_SUPPORT_SUPERG */

@@ -43,11 +43,16 @@
 #include <vm/vm.h>
 #include <vm/pmap.h>
 
+extern int i8254_cputimer_disable;
+
+static int tsc_ignore_cpuid = 0;
+TUNABLE_INT("hw.tsc_ignore_cpuid", &tsc_ignore_cpuid);
+
 static int	hw_instruction_sse;
 SYSCTL_INT(_hw, OID_AUTO, instruction_sse, CTLFLAG_RD,
     &hw_instruction_sse, 0, "SIMD/MMX2 instructions available in CPU");
 
-int	cpu;			/* Are we 386, 386sx, 486, etc? */
+int	cpu_type;		/* XXX CPU_CLAWHAMMER */
 u_int	cpu_feature;		/* Feature flags */
 u_int	cpu_feature2;		/* Feature flags */
 u_int	amd_feature;		/* AMD feature flags */
@@ -66,6 +71,9 @@ u_int	cpu_xsave;		/* AVX enabled by OS*/
 u_int	cpu_mxcsr_mask;		/* Valid bits in mxcsr */
 u_int	cpu_clflush_line_size = 32;	/* Default CLFLUSH line size */
 u_int	cpu_stdext_feature;
+u_int	cpu_stdext_feature2;
+u_int	cpu_stdext_feature3;
+u_long	cpu_ia32_arch_caps;
 u_int	cpu_thermal_feature;
 u_int	cpu_mwait_feature;
 u_int	cpu_mwait_extemu;
@@ -149,6 +157,51 @@ init_via(void)
 	}
 }
 
+static enum vmm_guest_type
+detect_vmm(void)
+{
+	enum vmm_guest_type guest;
+	char vendor[16];
+
+	/*
+	 * [RFC] CPUID usage for interaction between Hypervisors and Linux.
+	 * http://lkml.org/lkml/2008/10/1/246
+	 *
+	 * KB1009458: Mechanisms to determine if software is running in
+	 * a VMware virtual machine
+	 * http://kb.vmware.com/kb/1009458
+	 */
+	if (cpu_feature2 & CPUID2_VMM) {
+		u_int regs[4];
+
+		do_cpuid(0x40000000, regs);
+		((u_int *)&vendor)[0] = regs[1];
+		((u_int *)&vendor)[1] = regs[2];
+		((u_int *)&vendor)[2] = regs[3];
+		vendor[12] = '\0';
+		if (regs[0] >= 0x40000000) {
+			memcpy(vmm_vendor, vendor, 13);
+			if (strcmp(vmm_vendor, "VMwareVMware") == 0)
+				return VMM_GUEST_VMWARE;
+			else if (strcmp(vmm_vendor, "Microsoft Hv") == 0)
+				return VMM_GUEST_HYPERV;
+			else if (strcmp(vmm_vendor, "KVMKVMKVM") == 0)
+				return VMM_GUEST_KVM;
+		} else if (regs[0] == 0) {
+			/* Also detect old KVM versions with regs[0] == 0 */
+			if (strcmp(vendor, "KVMKVMKVM") == 0) {
+				memcpy(vmm_vendor, vendor, 13);
+				return VMM_GUEST_KVM;
+			}
+		}
+	}
+
+	guest = detect_virtual();
+	if (guest == VMM_GUEST_NONE && (cpu_feature2 & CPUID2_VMM))
+		guest = VMM_GUEST_UNKNOWN;
+	return guest;
+}
+
 /*
  * Initialize CPU control registers
  */
@@ -157,7 +210,9 @@ initializecpu(int cpu)
 {
 	uint64_t msr;
 
-	/*Check for FXSR and SSE support and enable if available.*/
+	/*
+	 * Check for FXSR and SSE support and enable if available
+	 */
 	if ((cpu_feature & CPUID_XMM) && (cpu_feature & CPUID_FXSR)) {
 		load_cr4(rcr4() | CR4_FXSR | CR4_XMM);
 		cpu_fxsr = hw_instruction_sse = 1;
@@ -165,9 +220,7 @@ initializecpu(int cpu)
 
 	if (cpu == 0) {
 		/* Check if we are running in a hypervisor. */
-		vmm_guest = detect_virtual();
-		if (vmm_guest == VMM_GUEST_NONE && (cpu_feature2 & CPUID2_VMM))
-			vmm_guest = VMM_GUEST_UNKNOWN;
+		vmm_guest = detect_vmm();
 	}
 
 #if !defined(CPU_DISABLE_AVX)
@@ -210,12 +263,58 @@ initializecpu(int cpu)
 			}
 			break;
 		}
+
+		/*
+		 * BIOS may fail to set InitApicIdCpuIdLo to 1 as it should
+		 * per BKDG.  So, do it here or otherwise some tools could
+		 * be confused by Initial Local APIC ID reported with
+		 * CPUID Function 1 in EBX.
+		 */
+		if (CPUID_TO_FAMILY(cpu_id) == 0x10) {
+			if ((cpu_feature2 & CPUID2_VMM) == 0) {
+				msr = rdmsr(0xc001001f);
+				msr |= (uint64_t)1 << 54;
+				wrmsr(0xc001001f, msr);
+			}
+		}
+
+		/*
+		 * BIOS may configure Family 10h processors to convert
+		 * WC+ cache type to CD.  That can hurt performance of
+		 * guest VMs using nested paging.
+		 *
+		 * The relevant MSR bit is not documented in the BKDG,
+		 * the fix is borrowed from Linux.
+		 */
+		if (CPUID_TO_FAMILY(cpu_id) == 0x10) {
+			if ((cpu_feature2 & CPUID2_VMM) == 0) {
+				msr = rdmsr(0xc001102a);
+				msr &= ~((uint64_t)1 << 24);
+				wrmsr(0xc001102a, msr);
+			}
+		}
+
+		/*
+		 * Work around Erratum 793: Specific Combination of Writes
+		 * to Write Combined Memory Types and Locked Instructions
+		 * May Cause Core Hang.  See Revision Guide for AMD Family
+		 * 16h Models 00h-0Fh Processors, revision 3.04 or later,
+		 * publication 51810.
+		 */
+		if (CPUID_TO_FAMILY(cpu_id) == 0x16 &&
+		    CPUID_TO_MODEL(cpu_id) <= 0xf) {
+			if ((cpu_feature2 & CPUID2_VMM) == 0) {
+				msr = rdmsr(0xc0011020);
+				msr |= (uint64_t)1 << 15;
+				wrmsr(0xc0011020, msr);
+			}
+		}
 	}
 
 	if ((amd_feature & AMDID_NX) != 0) {
 		msr = rdmsr(MSR_EFER) | EFER_NXE;
 		wrmsr(MSR_EFER, msr);
-#if JG
+#if 0 /* JG */
 		pg_nx = PG_NX;
 #endif
 	}
@@ -232,4 +331,72 @@ initializecpu(int cpu)
 		    ((hw_clflush_enable == -1) && vmm_guest))
 			cpu_feature &= ~CPUID_CLFSH;
 	}
+
+	/* Set TSC_AUX register to the cpuid, for using rdtscp in userland. */
+	if ((amd_feature & AMDID_RDTSCP) != 0)
+		wrmsr(MSR_TSCAUX, cpu);
 }
+
+/*
+ * This method should be at least as good as calibrating the TSC based on the
+ * HPET timer, since the HPET runs with the core crystal clock apparently.
+ */
+static void
+detect_tsc_frequency(void)
+{
+	int cpu_family, cpu_model;
+	u_int regs[4];
+	uint64_t crystal = 0;
+
+	cpu_model = CPUID_TO_MODEL(cpu_id);
+	cpu_family = CPUID_TO_FAMILY(cpu_id);
+
+	if (cpu_vendor_id != CPU_VENDOR_INTEL)
+		return;
+
+	if (cpu_high < 0x15)
+		return;
+
+	do_cpuid(0x15, regs);
+	if (regs[0] == 0 || regs[1] == 0)
+		return;
+
+	if (regs[2] == 0) {
+		/* For some families the SDM contains the core crystal clock. */
+		if (cpu_family == 0x6) {
+			switch (cpu_model) {
+			case 0x55:	/* Xeon Scalable */
+				crystal = 25000000;	/* 25 MHz */
+				break;
+			/* Skylake */
+			case 0x4e:
+			case 0x5e:
+			/* Kabylake/Coffeelake */
+			case 0x8e:
+			case 0x9e:
+				crystal = 24000000;	/* 24 MHz */
+				break;
+			case 0x5c:	/* Goldmont Atom */
+				crystal = 19200000;	/* 19.2 MHz */
+				break;
+			default:
+				break;
+			}
+		}
+	} else {
+		crystal = regs[2];
+	}
+
+	if (crystal == 0)
+		return;
+
+	kprintf("TSC crystal clock: %ju Hz, TSC/crystal ratio: %u/%u\n",
+	    crystal, regs[1], regs[0]);
+
+	if (tsc_ignore_cpuid == 0) {
+		tsc_frequency = (crystal * regs[1]) / regs[0];
+		i8254_cputimer_disable = 1;
+	}
+}
+
+TIMECOUNTER_INIT(cpuid_tsc_frequency, detect_tsc_frequency);

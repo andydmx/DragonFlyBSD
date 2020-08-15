@@ -30,7 +30,7 @@
  * $FreeBSD: src/crypto/telnet/telnetd/utility.c,v 1.5.2.4 2002/04/13 10:59:09 markm Exp $
  */
 
-#ifdef __FreeBSD__
+#if defined(__FreeBSD__) || defined(__DragonFly__)
 #include <locale.h>
 #include <sys/utsname.h>
 #endif
@@ -44,6 +44,8 @@
 #ifdef	ENCRYPTION
 #include <libtelnet/encrypt.h>
 #endif
+
+extern char	line[16];
 
 /*
  * utility functions performing io related tasks
@@ -315,7 +317,7 @@ netflush(void)
 
 
 void
-fatal(int f, const char *msg)
+fatalmsg(int f, const char *msg)
 {
 	char buf[BUFSIZ];
 
@@ -341,7 +343,7 @@ fatalperror(int f, const char *msg)
 	char buf[BUFSIZ];
 
 	(void) snprintf(buf, sizeof(buf), "%s: %s", msg, strerror(errno));
-	fatal(f, buf);
+	fatalmsg(f, buf);
 }
 
 char editedhost[32];
@@ -400,7 +402,7 @@ putchr(int cc)
 	*putlocation++ = cc;
 }
 
-#ifdef __FreeBSD__
+#if defined(__FreeBSD__) || defined(__DragonFly__)
 static char fmtstr[] = { "%+" };
 #else
 static char fmtstr[] = { "%l:%M%P on %A, %d %B %Y" };
@@ -412,7 +414,7 @@ putf(char *cp, char *where)
 	char *slash;
 	time_t t;
 	char db[100];
-#ifdef __FreeBSD__
+#if defined(__FreeBSD__) || defined(__DragonFly__)
 	static struct utsname kerninfo;
 
 	if (!*kerninfo.sysname)
@@ -450,7 +452,7 @@ putf(char *cp, char *where)
 			break;
 
 		case 'd':
-#ifdef __FreeBSD__
+#if defined(__FreeBSD__) || defined(__DragonFly__)
 			setlocale(LC_TIME, "");
 #endif
 			(void)time(&t);
@@ -458,7 +460,7 @@ putf(char *cp, char *where)
 			putstr(db);
 			break;
 
-#ifdef __FreeBSD__
+#if defined(__FreeBSD__) || defined(__DragonFly__)
 		case 's':
 			putstr(kerninfo.sysname);
 			break;

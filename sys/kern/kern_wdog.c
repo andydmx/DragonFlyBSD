@@ -36,7 +36,7 @@
 #include <sys/kernel.h>
 #include <sys/systm.h>
 #include <sys/malloc.h>
-#include <sys/sysproto.h>
+#include <sys/sysmsg.h>
 #include <sys/spinlock2.h>
 #include <sys/conf.h>
 #include <sys/device.h>
@@ -101,9 +101,10 @@ wdog_reset_all(void *unused)
 		if (period < min_period)
 			min_period = period;
 	}
-	if (wdog_auto_enable)
-		callout_reset(&wdog_callout, min_period * hz / 2, wdog_reset_all, NULL);
-
+	if (wdog_auto_enable) {
+		callout_reset(&wdog_callout, min_period * hz / 2,
+			      wdog_reset_all, NULL);
+	}
 	wdog_auto_period = min_period;
 
 done:
@@ -219,8 +220,8 @@ wdog_init(void)
 static void
 wdog_uninit(void)
 {
-	callout_stop(&wdog_callout);
-	callout_deactivate(&wdog_callout);
+	callout_cancel(&wdog_callout);
+	callout_terminate(&wdog_callout);
 	dev_ops_remove_all(&wdog_ops);
 	spin_uninit(&wdogmtx);
 }

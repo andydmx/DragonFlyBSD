@@ -1,10 +1,16 @@
-DF306.0 {
+DF404.0 {
+    __fpending;
+    __srget;
+    __stderrp;
+    __stdinp;
+    __stdoutp;
+    __swbuf;
+    _flockfile_debug;
     asprintf;
     asprintf_l;
     clearerr;
     clearerr_unlocked;
     dprintf;
-    f_prealloc;
     fclose;
     fcloseall;
     fcookie;
@@ -21,6 +27,7 @@ DF306.0 {
     fgetwc;
     fgetwc_l;
     fgetwln;
+    fgetwln_l;
     fgetws;
     fgetws_l;
     fileno;
@@ -68,9 +75,6 @@ DF306.0 {
     getwchar;
     getwchar_l;
     mkdtemp;
-    mktemp;
-    mkostemp;
-    mkostemps;
     mkstemp;
     mkstemps;
     mktemp;
@@ -148,14 +152,26 @@ DF306.0 {
     wscanf_l;
 };
 
+DF406.0 {
+    mkostemp;
+    mkostemps;
+};
+
+DF508.0 {
+    gets_s;
+};
+
+DF510.0 {
+    fparseln;
+};
+
 DFprivate_1.0 {
     __fcloseall;
-    __fgetwc_unlock;
+    __fflush;
+    __fgetwc_mbs;
     __find_arguments;
     __find_warguments;
-    __fflush;
-    __fpending;
-    __fputwc_unlock;
+    __fputwc;
     __fread;
     __freedtoa;
     __lowercase_hex;
@@ -196,17 +212,13 @@ DFprivate_1.0 {
     __sread;
     __sreadahead;
     __srefill;
-    __srget;
     __sseek;
-    __stderrp;
-    __stdinp;
-    __stdoutp;
     __svfscanf;
-    __swbuf;
     __swhatbuf;
     __swrite;
     __swsetup;
     __ungetc;
+    __ungetwc;
     __uppercase_hex;
     __use_xprintf;
     __vfprintf;
@@ -217,8 +229,8 @@ DFprivate_1.0 {
     _cleanup;
     _fcookie;
     _flockfile;
-    _flockfile_debug;
     _flockfile_debug_stub;
+    _fseeko;
     _ftello;
     _ftrylockfile;
     _funlockfile;

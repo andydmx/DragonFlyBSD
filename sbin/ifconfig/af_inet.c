@@ -29,60 +29,88 @@
  * $FreeBSD: src/sbin/ifconfig/af_inet.c,v 1.2 2005/06/16 19:37:09 ume Exp $
  */
 
+#include <sys/param.h>
 #include <sys/types.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <net/if.h>
-#include <net/route.h>		/* for RTX_IFA */
+#include <net/if_var.h>		/* for struct ifaddr */
+#include <netinet/in.h>
+#include <netinet/in_var.h>
+#include <arpa/inet.h>
+#include <netdb.h>
 
 #include <err.h>
+#include <ifaddrs.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
-#include <netinet/in.h>
-#include <net/if_var.h>		/* for struct ifaddr */
-#include <netinet/in_var.h>
-#include <arpa/inet.h>
-#include <netdb.h>
-
 #include "ifconfig.h"
 
 static struct ifaliasreq in_addreq;
 static struct ifreq in_ridreq;
+static char addr_buf[NI_MAXHOST];  /* for getnameinfo() */
 
 static void
-in_status(int s __unused, const struct rt_addrinfo * info)
+in_status(int s __unused, const struct ifaddrs *ifa)
 {
 	struct sockaddr_in *sin, null_sin;
-	
+	int error, n_flags;
+
 	memset(&null_sin, 0, sizeof(null_sin));
 
-	sin = (struct sockaddr_in *)info->rti_info[RTAX_IFA];
+	sin = (struct sockaddr_in *)ifa->ifa_addr;
 	if (sin == NULL)
 		return;
 
-	printf("\tinet %s ", inet_ntoa(sin->sin_addr));
+	if (f_addr != NULL && strcmp(f_addr, "fqdn") == 0)
+		n_flags = 0;
+	else if (f_addr != NULL && strcmp(f_addr, "host") == 0)
+		n_flags = NI_NOFQDN;
+	else
+		n_flags = NI_NUMERICHOST;
 
-	if (flags & IFF_POINTOPOINT) {
-		/* note RTAX_BRD overlap with IFF_BROADCAST */
-		sin = (struct sockaddr_in *)info->rti_info[RTAX_BRD];
-		if (!sin)
+	error = getnameinfo((struct sockaddr *)sin, sin->sin_len, addr_buf,
+			    sizeof(addr_buf), NULL, 0, n_flags);
+	if (error != 0)
+		inet_ntop(AF_INET, &sin->sin_addr, addr_buf, sizeof(addr_buf));
+
+	printf("\tinet %s", addr_buf);
+
+	if (ifa->ifa_flags & IFF_POINTOPOINT) {
+		sin = (struct sockaddr_in *)ifa->ifa_dstaddr;
+		if (sin == NULL)
 			sin = &null_sin;
-		printf("--> %s ", inet_ntoa(sin->sin_addr));
+		printf(" --> %s", inet_ntoa(sin->sin_addr));
 	}
 
-	sin = (struct sockaddr_in *)info->rti_info[RTAX_NETMASK];
-	if (!sin)
+	sin = (struct sockaddr_in *)ifa->ifa_netmask;
+	if (sin == NULL)
 		sin = &null_sin;
-	printf("netmask 0x%lx ", (unsigned long)ntohl(sin->sin_addr.s_addr));
+	if (f_inet != NULL && strcmp(f_inet, "cidr") == 0) {
+		int cidr = 32;
+		unsigned long smask = ntohl(sin->sin_addr.s_addr);
 
-	if (flags & IFF_BROADCAST) {
-		/* note RTAX_BRD overlap with IFF_POINTOPOINT */
-		sin = (struct sockaddr_in *)info->rti_info[RTAX_BRD];
-		if (sin && sin->sin_addr.s_addr != 0)
-			printf("broadcast %s", inet_ntoa(sin->sin_addr));
+		while ((smask & 1) == 0) {
+			smask >>= 1;
+			cidr--;
+			if (cidr == 0)
+				break;
+		}
+		printf("/%d", cidr);
+	} else if (f_inet != NULL && strcmp(f_inet, "dotted") == 0) {
+		printf(" netmask %s", inet_ntoa(sin->sin_addr));
+	} else {
+		printf(" netmask 0x%lx",
+			(unsigned long)ntohl(sin->sin_addr.s_addr));
+	}
+
+	if (ifa->ifa_flags & IFF_BROADCAST) {
+		sin = (struct sockaddr_in *)ifa->ifa_broadaddr;
+		if (sin != NULL && sin->sin_addr.s_addr != 0)
+			printf(" broadcast %s", inet_ntoa(sin->sin_addr));
 	}
 	putchar('\n');
 }
@@ -119,16 +147,15 @@ in_getaddr(const char *s, int which)
 				errx(1, "%s: bad value", s);
 			}
 			min->sin_len = sizeof(*min);
-			min->sin_addr.s_addr = htonl(~((1LL << (32 - masklen)) - 1) & 
-				              0xffffffff);
+			min->sin_addr.s_addr = htonl(rounddown2(0xffffffff, 1LL << (32 - masklen)));
 		}
 	}
 
 	if (inet_aton(s, &sin->sin_addr))
 		return;
 	if ((hp = gethostbyname(s)) != NULL)
-		bcopy(hp->h_addr, (char *)&sin->sin_addr, 
-		    MIN(hp->h_length, sizeof(sin->sin_addr)));
+		bcopy(hp->h_addr, (char *)&sin->sin_addr,
+		      MIN((size_t)hp->h_length, sizeof(sin->sin_addr)));
 	else if ((np = getnetbyname(s)) != NULL)
 		sin->sin_addr = inet_makeaddr(np->n_net, INADDR_ANY);
 	else
@@ -144,7 +171,7 @@ in_status_tunnel(int s)
 	const struct sockaddr *sa = (const struct sockaddr *) &ifr.ifr_addr;
 
 	memset(&ifr, 0, sizeof(ifr));
-	strncpy(ifr.ifr_name, name, IFNAMSIZ);
+	strlcpy(ifr.ifr_name, name, IFNAMSIZ);
 
 	if (ioctl(s, SIOCGIFPSRCADDR, (caddr_t)&ifr) < 0)
 		return;
@@ -169,7 +196,7 @@ in_set_tunnel(int s, struct addrinfo *srcres, struct addrinfo *dstres)
 	struct ifaliasreq addreq;
 
 	memset(&addreq, 0, sizeof(addreq));
-	strncpy(addreq.ifra_name, name, IFNAMSIZ);
+	strlcpy(addreq.ifra_name, name, IFNAMSIZ);
 	memcpy(&addreq.ifra_addr, srcres->ai_addr, srcres->ai_addr->sa_len);
 	memcpy(&addreq.ifra_dstaddr, dstres->ai_addr, dstres->ai_addr->sa_len);
 

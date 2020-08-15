@@ -1,5 +1,7 @@
 #! /bin/sh
 #
+# SPDX-License-Identifier: BSD-3-Clause
+#
 # Copyright (c) 1992, 1993
 #	The Regents of the University of California.  All rights reserved.
 #
@@ -11,11 +13,7 @@
 # 2. Redistributions in binary form must reproduce the above copyright
 #    notice, this list of conditions and the following disclaimer in the
 #    documentation and/or other materials provided with the distribution.
-# 3. All advertising materials mentioning features or use of this software
-#    must display the following acknowledgement:
-#	This product includes software developed by the University of
-#	California, Berkeley and its contributors.
-# 4. Neither the name of the University nor the names of its contributors
+# 3. Neither the name of the University nor the names of its contributors
 #    may be used to endorse or promote products derived from this software
 #    without specific prior written permission.
 #
@@ -32,8 +30,7 @@
 # SUCH DAMAGE.
 #
 #	@(#)systags.sh	8.1 (Berkeley) 6/10/93
-# $FreeBSD: src/sys/conf/systags.sh,v 1.7 1999/08/28 00:41:02 peter Exp $
-# $DragonFly: src/sys/conf/systags.sh,v 1.3 2006/10/22 16:09:19 dillon Exp $
+# $FreeBSD: head/sys/conf/systags.sh 326023 2017-11-20 19:43:44Z pfg $
 #
 # systags.sh - construct a system tags file using dependence relations
 #	in a .depend file
@@ -41,8 +38,8 @@
 # First written May 16, 1992 by Van Jacobson, Lawrence Berkeley Laboratory.
 
 rm -f tags tags.tmp tags.cfiles tags.sfiles tags.hfiles
-MACHINE=`uname -m`
-sed -e "s, machine/, ../../arch/$MACHINE/include/,g" \
+MACHINE=`uname -m | sed "s,x86_,pc,g"`
+sed -e "s, machine/, ../../platform/$MACHINE/include/,g" \
 	-e 's,[a-z][^/    ]*/\.\./,,g' .depend | awk '{
 		for (i = 1; i <= NF; ++i) {
 			t = substr($i, length($i) - 1)

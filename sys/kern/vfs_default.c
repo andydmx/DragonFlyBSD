@@ -49,7 +49,6 @@
 #include <sys/unistd.h>
 #include <sys/vnode.h>
 #include <sys/namei.h>
-#include <sys/nlookup.h>
 #include <sys/mountctl.h>
 #include <sys/vfs_quota.h>
 
@@ -79,6 +78,7 @@ struct vop_ops default_vnode_vops = {
 	.vop_old_lookup		= vop_nolookup,
 	.vop_open		= vop_stdopen,
 	.vop_close		= vop_stdclose,
+	.vop_getattr_lite	= vop_stdgetattr_lite,
 	.vop_pathconf		= vop_stdpathconf,
 	.vop_readlink		= (void *)vop_einval,
 	.vop_reallocblks	= (void *)vop_eopnotsupp,
@@ -1115,14 +1115,11 @@ vop_stdpathconf(struct vop_pathconf_args *ap)
 	int error = 0;
 
 	switch (ap->a_name) {
+	case _PC_CHOWN_RESTRICTED:
+		*ap->a_retval = _POSIX_CHOWN_RESTRICTED;
+		break;
 	case _PC_LINK_MAX:
 		*ap->a_retval = LINK_MAX;
-		break;
-	case _PC_NAME_MAX:
-		*ap->a_retval = NAME_MAX;
-		break;
-	case _PC_PATH_MAX:
-		*ap->a_retval = PATH_MAX;
 		break;
 	case _PC_MAX_CANON:
 		*ap->a_retval = MAX_CANON;
@@ -1130,14 +1127,17 @@ vop_stdpathconf(struct vop_pathconf_args *ap)
 	case _PC_MAX_INPUT:
 		*ap->a_retval = MAX_INPUT;
 		break;
-	case _PC_PIPE_BUF:
-		*ap->a_retval = PIPE_BUF;
-		break;
-	case _PC_CHOWN_RESTRICTED:
-		*ap->a_retval = 1;
+	case _PC_NAME_MAX:
+		*ap->a_retval = NAME_MAX;
 		break;
 	case _PC_NO_TRUNC:
-		*ap->a_retval = 1;
+		*ap->a_retval = _POSIX_NO_TRUNC;
+		break;
+	case _PC_PATH_MAX:
+		*ap->a_retval = PATH_MAX;
+		break;
+	case _PC_PIPE_BUF:
+		*ap->a_retval = PIPE_BUF;
 		break;
 	case _PC_VDISABLE:
 		*ap->a_retval = _POSIX_VDISABLE;
@@ -1171,7 +1171,8 @@ vop_stdopen(struct vop_open_args *ap)
 			fp->f_type = DTYPE_VNODE;
 			break;
 		}
-		fp->f_flag = ap->a_mode & FMASK;
+		/* retain flags not to be copied */
+		fp->f_flag = (fp->f_flag & ~FMASK) | (ap->a_mode & FMASK);
 		fp->f_ops = &vnode_fileops;
 		fp->f_data = vp;
 		vref(vp);
@@ -1189,6 +1190,10 @@ vop_stdopen(struct vop_open_args *ap)
  * (struct vnode *a_vp, int a_fflag)
  *
  * a_fflag: note, 'F' modes, e.g. FREAD, FWRITE.  same as a_mode in stdopen?
+ *
+ * v_lastwrite_ts is used to record the timestamp that should be used to
+ * set the file mtime for any asynchronously flushed pages modified via
+ * mmap(), which can occur after the last close().
  */
 int
 vop_stdclose(struct vop_close_args *ap)
@@ -1206,6 +1211,32 @@ vop_stdclose(struct vop_close_args *ap)
 	}
 	atomic_add_int(&vp->v_opencount, -1);
 	return (0);
+}
+
+/*
+ * Standard getattr_lite
+ *
+ * Just calls getattr
+ */
+int
+vop_stdgetattr_lite(struct vop_getattr_lite_args *ap)
+{
+	struct vattr va;
+	struct vattr_lite *lvap;
+	int error;
+
+	error = VOP_GETATTR(ap->a_vp, &va);
+	if (__predict_true(error == 0)) {
+		lvap = ap->a_lvap;
+		lvap->va_type = va.va_type;
+		lvap->va_nlink = va.va_nlink;
+		lvap->va_mode = va.va_mode;
+		lvap->va_uid = va.va_uid;
+		lvap->va_gid = va.va_gid;
+		lvap->va_size = va.va_size;
+		lvap->va_flags = va.va_flags;
+	}
+	return error;
 }
 
 /*
@@ -1237,7 +1268,7 @@ vop_stdputpages(struct vop_putpages_args *ap)
 	if ((mp = ap->a_vp->v_mount) != NULL) {
 		error = vnode_pager_generic_putpages(
 				ap->a_vp, ap->a_m, ap->a_count,
-				ap->a_sync, ap->a_rtvals);
+				ap->a_flags, ap->a_rtvals);
 	} else {
 		error = VM_PAGER_BAD;
 	}
@@ -1480,6 +1511,14 @@ vfs_stdncpgen_set(struct mount *mp, struct namecache *ncp)
 int
 vfs_stdncpgen_test(struct mount *mp, struct namecache *ncp)
 {
+	return 0;
+}
+
+int
+vfs_stdmodifying(struct mount *mp)
+{
+	if (mp->mnt_flag & MNT_RDONLY)
+		return EROFS;
 	return 0;
 }
 /* end of vfs default ops */

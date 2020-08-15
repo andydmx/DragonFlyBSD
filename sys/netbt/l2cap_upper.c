@@ -33,6 +33,7 @@
 
 #include <sys/param.h>
 #include <sys/kernel.h>
+#include <sys/malloc.h>
 #include <sys/mbuf.h>
 #include <sys/proc.h>
 #include <sys/queue.h>
@@ -382,7 +383,7 @@ l2cap_send(struct l2cap_channel *chan, struct mbuf *m)
 		plen, chan->lc_lcid, chan->lc_pending);
 
 	/* Encapsulate with B-Frame */
-	M_PREPEND(m, sizeof(l2cap_hdr_t), MB_DONTWAIT);
+	M_PREPEND(m, sizeof(l2cap_hdr_t), M_NOWAIT);
 	if (m == NULL)
 		return ENOMEM;
 

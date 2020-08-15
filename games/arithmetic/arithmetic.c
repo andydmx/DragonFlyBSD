@@ -32,7 +32,6 @@
  * @(#) Copyright (c) 1989, 1993 The Regents of the University of California.  All rights reserved.
  * @(#)arithmetic.c	8.1 (Berkeley) 5/31/93
  * $FreeBSD: src/games/arithmetic/arithmetic.c,v 1.10 1999/12/12 06:40:28 billf Exp $
- * $DragonFly: src/games/arithmetic/arithmetic.c,v 1.4 2005/04/24 15:31:30 liamfoy Exp $
  */
 
 /*
@@ -72,21 +71,21 @@
 #include <time.h>
 #include <unistd.h>
 
-int getrandom(int, int, int);
-void intr(int);
-int opnum(int);
-void penalise(int, int, int);
-int problem(void);
-void showstats(void);
-static void usage(void);
+static int getrandom(int, int, int);
+static void intr(int) __dead2;
+static int opnum(int);
+static void penalise(int, int, int);
+static int problem(void);
+static void showstats(void);
+static void usage(void) __dead2;
 
-const char keylist[] = "+-x/";
-const char defaultkeys[] = "+-";
-const char *keys = defaultkeys;
-int nkeys = sizeof(defaultkeys) - 1;
-int rangemax = 10;
-int nright, nwrong;
-time_t qtime;
+static const char keylist[] = "+-x/";
+static const char defaultkeys[] = "+-";
+static const char *keys = defaultkeys;
+static int nkeys = sizeof(defaultkeys) - 1;
+static int rangemax = 10;
+static int nright, nwrong;
+static time_t qtime;
 #define	NQUESTS	20
 
 /*
@@ -111,7 +110,7 @@ main(int argc, char *argv[])
 
 			for (p = keys = optarg; *p; ++p)
 				if (!index(keylist, *p)) {
-					(void)fprintf(stderr,
+					fprintf(stderr,
 					    "arithmetic: unknown key.\n");
 					exit(1);
 				}
@@ -120,7 +119,7 @@ main(int argc, char *argv[])
 		}
 		case 'r':
 			if ((rangemax = atoi(optarg)) <= 0) {
-				(void)fprintf(stderr,
+				fprintf(stderr,
 				    "arithmetic: invalid range.\n");
 				exit(1);
 			}
@@ -135,7 +134,7 @@ main(int argc, char *argv[])
 	/* Seed the random-number generator. */
 	srandomdev();
 
-	(void)signal(SIGINT, intr);
+	signal(SIGINT, intr);
 
 	/* Now ask the questions. */
 	for (;;) {
@@ -148,7 +147,7 @@ main(int argc, char *argv[])
 }
 
 /* Handle interrupt character.  Print score and exit. */
-void
+static void
 intr(__unused int sig)
 {
 	showstats();
@@ -156,17 +155,17 @@ intr(__unused int sig)
 }
 
 /* Print score.  Original `arithmetic' had a delay after printing it. */
-void
+static void
 showstats(void)
 {
 	if (nright + nwrong > 0) {
-		(void)printf("\n\nRights %d; Wrongs %d; Score %d%%",
+		printf("\n\nRights %d; Wrongs %d; Score %d%%",
 		    nright, nwrong, (int)(100L * nright / (nright + nwrong)));
 		if (nright > 0)
-	(void)printf("\nTotal time %ld seconds; %.1f seconds per problem\n\n",
+	printf("\nTotal time %ld seconds; %.1f seconds per problem\n\n",
 			    (long)qtime, (float)qtime / nright);
 	}
-	(void)printf("\n");
+	printf("\n");
 }
 
 /*
@@ -177,7 +176,7 @@ showstats(void)
  * answer causes the numbers in the problem to be penalised, so that they are
  * more likely to appear in subsequent problems.
  */
-int
+static int
 problem(void)
 {
 	char *p;
@@ -220,9 +219,9 @@ retry:
 	if (result < 0 || left < 0)
 		goto retry;
 
-	(void)printf("%d %c %d =   ", left, op, right);
-	(void)fflush(stdout);
-	(void)time(&start);
+	printf("%d %c %d =   ", left, op, right);
+	fflush(stdout);
+	time(&start);
 
 	/*
 	 * Keep looping until the correct answer is given, or until EOF or
@@ -230,21 +229,21 @@ retry:
 	 */
 	for (;;) {
 		if (!fgets(line, sizeof(line), stdin)) {
-			(void)printf("\n");
+			printf("\n");
 			return(EOF);
 		}
 		for (p = line; *p && isspace(*p); ++p);
 		if (!isdigit(*p)) {
-			(void)printf("Please type a number.\n");
+			printf("Please type a number.\n");
 			continue;
 		}
 		if (atoi(p) == result) {
-			(void)printf("Right!\n");
+			printf("Right!\n");
 			++nright;
 			break;
 		}
 		/* Wrong answer; penalise and ask again. */
-		(void)printf("What?\n");
+		printf("What?\n");
 		++nwrong;
 		penalise(right, op, 1);
 		if (op == 'x' || op == '+')
@@ -260,7 +259,7 @@ retry:
 	 * the time you are not charged for a partially elapsed second at the
 	 * end.
 	 */
-	(void)time(&finish);
+	time(&finish);
 	qtime += finish - start;
 	return(0);
 }
@@ -279,8 +278,8 @@ retry:
  * penalties themselves.
  */
 
-int penalty[sizeof(keylist) - 1][2];
-struct penalty {
+static int penalty[sizeof(keylist) - 1][2];
+static struct penalty {
 	int value, penalty;	/* Penalised value and its penalty. */
 	struct penalty *next;
 } *penlist[sizeof(keylist) - 1][2];
@@ -292,7 +291,7 @@ struct penalty {
  * operand number `operand' (0 or 1).  If we run out of memory, we just
  * forget about the penalty (how likely is this, anyway?).
  */
-void
+static void
 penalise(int value, int op, int operand)
 {
 	struct penalty *p;
@@ -312,7 +311,7 @@ penalise(int value, int op, int operand)
  * as a value, or represents a position in the penalty list.  If the latter,
  * we find the corresponding value and return that, decreasing its penalty.
  */
-int
+static int
 getrandom(int maxval, int op, int operand)
 {
 	int value;
@@ -339,7 +338,7 @@ getrandom(int maxval, int op, int operand)
 			penalty[op][operand]--;
 			if (--(p->penalty) <= 0) {
 				p = p->next;
-				(void)free((char *)*pp);
+				free((char *)*pp);
 				*pp = p;
 			}
 			return(value);
@@ -351,19 +350,19 @@ getrandom(int maxval, int op, int operand)
 	 * correspond to the actual sum of penalties in the list.  Provide an
 	 * obscure message.
 	 */
-	(void)fprintf(stderr, "arithmetic: bug: inconsistent penalties\n");
+	fprintf(stderr, "arithmetic: bug: inconsistent penalties\n");
 	exit(1);
 	/* NOTREACHED */
 }
 
 /* Return an index for the character op, which is one of [+-x/]. */
-int
+static int
 opnum(int op)
 {
 	char *p;
 
 	if (op == 0 || (p = index(keylist, op)) == NULL) {
-		(void)fprintf(stderr,
+		fprintf(stderr,
 		    "arithmetic: bug: op %c not in keylist %s\n", op, keylist);
 		exit(1);
 	}
@@ -374,6 +373,6 @@ opnum(int op)
 static void
 usage(void)
 {
-	(void)fprintf(stderr, "usage: arithmetic [-o +-x/] [-r range]\n");
+	fprintf(stderr, "usage: arithmetic [-o +-x/] [-r range]\n");
 	exit(1);
 }

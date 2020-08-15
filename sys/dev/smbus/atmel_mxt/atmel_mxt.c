@@ -148,12 +148,12 @@
 #include <sys/param.h>
 #include <sys/systm.h>
 #include <sys/device.h>
+#include <sys/malloc.h>
 #include <sys/module.h>
 #include <sys/bus.h>
 #include <sys/conf.h>
 #include <sys/uio.h>
 #include <sys/fcntl.h>
-/*#include <sys/input.h>*/
 #include <sys/vnode.h>
 #include <sys/sysctl.h>
 #include <sys/event.h>
@@ -164,8 +164,6 @@
 #include "atmel_mxt.h"
 
 #include "smbus_if.h"
-#include "bus_if.h"
-#include "device_if.h"
 
 struct elopacket {
 	uint8_t	sync;
@@ -270,6 +268,9 @@ SYSCTL_INT(_debug, OID_AUTO, atmel_mxt_norm_freq, CTLFLAG_RW,
 static int atmel_mxt_minpressure = 16;
 SYSCTL_INT(_debug, OID_AUTO, atmel_mxt_minpressure, CTLFLAG_RW,
 		&atmel_mxt_minpressure, 0, "");
+static int atmel_mxt_reset = 0;
+SYSCTL_INT(_debug, OID_AUTO, atmel_mxt_reset, CTLFLAG_RW,
+		&atmel_mxt_reset, 0, "");
 
 /*
  * Run a calibration command every N seconds only when idle.  0 to disable.
@@ -299,6 +300,7 @@ static int mxt_read_object(atmel_mxt_softc_t *sc, struct mxt_object *obj,
 			void *rbuf, int rbytes);
 static int mxt_write_object_off(atmel_mxt_softc_t *sc, struct mxt_object *obj,
 			int offset, uint8_t val);
+static void atmel_reset_device(atmel_mxt_softc_t *sc);
 
 static
 const char *
@@ -431,6 +433,8 @@ done:
 		if (probe) {
 			kfree(sc->core.buf, M_DEVBUF);
 			sc->core.buf = NULL;
+		} else {
+			atmel_reset_device(sc);
 		}
 		return 0;
 	}
@@ -930,6 +934,14 @@ atmel_mxt_poll_thread(void *arg)
 			sc->last_calibrate_tick = ticks - 1000 * hz;
 
 		/*
+		 * Reset if requested
+		 */
+		if (atmel_mxt_reset) {
+			atmel_mxt_reset = 0;
+			atmel_reset_device(sc);
+		}
+
+		/*
 		 * Automatically calibrate when the touchpad has been
 		 * idle atmel_mxt_autocalibrate seconds, and recalibrate
 		 * on the same interval while it remains idle.
@@ -961,6 +973,15 @@ atmel_mxt_poll_thread(void *arg)
 	}
 	sc->poll_td = NULL;
 	wakeup(&sc->poll_td);
+}
+
+static
+void
+atmel_reset_device(atmel_mxt_softc_t *sc)
+{
+	int dummy;
+	mxt_write_object_off(sc, sc->cmdprocobj, MXT_CMDPROC_RESET_OFF, 1);
+	tsleep(&dummy, 0, "atmel_reset", hz * 2);
 }
 
 /*

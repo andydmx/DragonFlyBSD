@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2011-2014 The DragonFly Project.  All rights reserved.
+ * Copyright (c) 2011-2018 The DragonFly Project.  All rights reserved.
  *
  * This code is derived from software contributed to The DragonFly Project
  * by Matthew Dillon <dillon@dragonflybsd.org>
@@ -45,23 +45,22 @@
 /*
  * Mount-wide locks
  */
-
 void
-hammer2_mount_exlock(hammer2_mount_t *hmp)
+hammer2_dev_exlock(hammer2_dev_t *hmp)
 {
-	ccms_thread_lock(&hmp->vchain.core.cst, CCMS_STATE_EXCLUSIVE);
+	hammer2_mtx_ex(&hmp->vchain.lock);
 }
 
 void
-hammer2_mount_shlock(hammer2_mount_t *hmp)
+hammer2_dev_shlock(hammer2_dev_t *hmp)
 {
-	ccms_thread_lock(&hmp->vchain.core.cst, CCMS_STATE_SHARED);
+	hammer2_mtx_sh(&hmp->vchain.lock);
 }
 
 void
-hammer2_mount_unlock(hammer2_mount_t *hmp)
+hammer2_dev_unlock(hammer2_dev_t *hmp)
 {
-	ccms_thread_unlock(&hmp->vchain.core.cst);
+	hammer2_mtx_unlock(&hmp->vchain.lock);
 }
 
 /*
@@ -70,13 +69,8 @@ hammer2_mount_unlock(hammer2_mount_t *hmp)
  * ip must be locked sh/ex.
  */
 int
-hammer2_get_dtype(const hammer2_inode_data_t *ipdata)
+hammer2_get_dtype(uint8_t type)
 {
-	uint8_t type;
-
-	if ((type = ipdata->type) == HAMMER2_OBJTYPE_HARDLINK)
-		type = ipdata->target_type;
-
 	switch(type) {
 	case HAMMER2_OBJTYPE_UNKNOWN:
 		return (DT_UNKNOWN);
@@ -92,8 +86,6 @@ hammer2_get_dtype(const hammer2_inode_data_t *ipdata)
 		return (DT_BLK);
 	case HAMMER2_OBJTYPE_SOFTLINK:
 		return (DT_LNK);
-	case HAMMER2_OBJTYPE_HARDLINK:	/* (never directly associated w/vp) */
-		return (DT_UNKNOWN);
 	case HAMMER2_OBJTYPE_SOCKET:
 		return (DT_SOCK);
 	case HAMMER2_OBJTYPE_WHITEOUT:	/* not supported */
@@ -108,9 +100,9 @@ hammer2_get_dtype(const hammer2_inode_data_t *ipdata)
  * Return the directory entry type for an inode
  */
 int
-hammer2_get_vtype(const hammer2_inode_data_t *ipdata)
+hammer2_get_vtype(uint8_t type)
 {
-	switch(ipdata->type) {
+	switch(type) {
 	case HAMMER2_OBJTYPE_UNKNOWN:
 		return (VBAD);
 	case HAMMER2_OBJTYPE_DIRECTORY:
@@ -125,8 +117,6 @@ hammer2_get_vtype(const hammer2_inode_data_t *ipdata)
 		return (VBLK);
 	case HAMMER2_OBJTYPE_SOFTLINK:
 		return (VLNK);
-	case HAMMER2_OBJTYPE_HARDLINK:	/* XXX */
-		return (VBAD);
 	case HAMMER2_OBJTYPE_SOCKET:
 		return (VSOCK);
 	case HAMMER2_OBJTYPE_WHITEOUT:	/* not supported */
@@ -137,7 +127,7 @@ hammer2_get_vtype(const hammer2_inode_data_t *ipdata)
 	/* not reached */
 }
 
-u_int8_t
+uint8_t
 hammer2_get_obj_type(enum vtype vtype)
 {
 	switch(vtype) {
@@ -165,16 +155,16 @@ hammer2_get_obj_type(enum vtype vtype)
  * Convert a hammer2 64-bit time to a timespec.
  */
 void
-hammer2_time_to_timespec(u_int64_t xtime, struct timespec *ts)
+hammer2_time_to_timespec(uint64_t xtime, struct timespec *ts)
 {
 	ts->tv_sec = (unsigned long)(xtime / 1000000);
 	ts->tv_nsec = (unsigned int)(xtime % 1000000) * 1000L;
 }
 
-u_int64_t
+uint64_t
 hammer2_timespec_to_time(const struct timespec *ts)
 {
-	u_int64_t xtime;
+	uint64_t xtime;
 
 	xtime = (unsigned)(ts->tv_nsec / 1000) +
 		(unsigned long)ts->tv_sec * 1000000ULL;
@@ -184,17 +174,17 @@ hammer2_timespec_to_time(const struct timespec *ts)
 /*
  * Convert a uuid to a unix uid or gid
  */
-u_int32_t
+uint32_t
 hammer2_to_unix_xid(const uuid_t *uuid)
 {
-	return(*(const u_int32_t *)&uuid->node[2]);
+	return(*(const uint32_t *)&uuid->node[2]);
 }
 
 void
-hammer2_guid_to_uuid(uuid_t *uuid, u_int32_t guid)
+hammer2_guid_to_uuid(uuid_t *uuid, uint32_t guid)
 {
 	bzero(uuid, sizeof(*uuid));
-	*(u_int32_t *)&uuid->node[2] = guid;
+	*(uint32_t *)&uuid->node[2] = guid;
 }
 
 /*
@@ -295,13 +285,19 @@ hammer2_allocsize(size_t bytes)
 #endif
 
 /*
- * Convert bytes to radix with no limitations
+ * Convert bytes to radix with no limitations.
+ *
+ * 0 bytes is special-cased to a radix of zero (which would normally
+ * translate to (1 << 0) == 1).
  */
 int
 hammer2_getradix(size_t bytes)
 {
 	int radix;
 
+	/*
+	 * Optimize the iteration by pre-checking commonly used radii.
+	 */
 	if (bytes == HAMMER2_PBUFSIZE)
 		radix = HAMMER2_PBUFRADIX;
 	else if (bytes >= HAMMER2_LBUFSIZE)
@@ -311,51 +307,30 @@ hammer2_getradix(size_t bytes)
 	else
 		radix = 0;
 
+	/*
+	 * Iterate as needed.  Note that bytes == 0 is expected to return
+	 * a radix of 0 as a special case.
+	 */
 	while (((size_t)1 << radix) < bytes)
 		++radix;
 	return (radix);
 }
 
 /*
- * ip must be locked sh/ex
- *
- * Use 16KB logical buffers for file blocks <= 1MB and 64KB logical buffers
- * otherwise.  The write code may utilize smaller device buffers when
- * compressing or handling the EOF case, but is not able to coalesce smaller
- * logical buffers into larger device buffers.
- *
- * For now this means that even large files will have a bunch of 16KB blocks
- * at the beginning of the file.  On the plus side this tends to cause small
- * files to cluster together in the freemap.
+ * The logical block size is currently always PBUFSIZE.
  */
 int
 hammer2_calc_logical(hammer2_inode_t *ip, hammer2_off_t uoff,
 		     hammer2_key_t *lbasep, hammer2_key_t *leofp)
 {
-#if 0
-	if (uoff < (hammer2_off_t)1024 * 1024) {
-		if (lbasep)
-			*lbasep = uoff & ~HAMMER2_LBUFMASK64;
-		if (leofp) {
-			if (ip->size > (hammer2_key_t)1024 * 1024)
-				*leofp = (hammer2_key_t)1024 * 1024;
-			else
-				*leofp = (ip->size + HAMMER2_LBUFMASK64) &
-					 ~HAMMER2_LBUFMASK64;
-		}
-		return (HAMMER2_LBUFSIZE);
-	} else {
-#endif
-		if (lbasep)
-			*lbasep = uoff & ~HAMMER2_PBUFMASK64;
-		if (leofp) {
-			*leofp = (ip->size + HAMMER2_PBUFMASK64) &
-				 ~HAMMER2_PBUFMASK64;
-		}
-		return (HAMMER2_PBUFSIZE);
-#if 0
+	KKASSERT(ip->flags & HAMMER2_INODE_METAGOOD);
+	if (lbasep)
+		*lbasep = uoff & ~HAMMER2_PBUFMASK64;
+	if (leofp) {
+		*leofp = (ip->meta.size + HAMMER2_PBUFMASK64) &
+			 ~HAMMER2_PBUFMASK64;
 	}
-#endif
+	return (HAMMER2_PBUFSIZE);
 }
 
 /*
@@ -366,20 +341,19 @@ hammer2_calc_logical(hammer2_inode_t *ip, hammer2_off_t uoff,
  * Returns 0 if the requested base offset is beyond the file EOF.
  */
 int
-hammer2_calc_physical(hammer2_inode_t *ip,
-		      const hammer2_inode_data_t *ipdata,
-		      hammer2_key_t lbase)
+hammer2_calc_physical(hammer2_inode_t *ip, hammer2_key_t lbase)
 {
 	int lblksize;
 	int pblksize;
 	int eofbytes;
 
+	KKASSERT(ip->flags & HAMMER2_INODE_METAGOOD);
 	lblksize = hammer2_calc_logical(ip, lbase, NULL, NULL);
-	if (lbase + lblksize <= ipdata->size)
+	if (lbase + lblksize <= ip->meta.size)
 		return (lblksize);
-	if (lbase >= ipdata->size)
+	if (lbase >= ip->meta.size)
 		return (0);
-	eofbytes = (int)(ipdata->size - lbase);
+	eofbytes = (int)(ip->meta.size - lbase);
 	pblksize = lblksize;
 	while (pblksize >= eofbytes && pblksize >= HAMMER2_ALLOC_MIN)
 		pblksize >>= 1;
@@ -391,10 +365,10 @@ hammer2_calc_physical(hammer2_inode_t *ip,
 void
 hammer2_update_time(uint64_t *timep)
 {
-	struct timeval tv;
+	struct timespec ts;
 
-	getmicrotime(&tv);
-	*timep = (unsigned long)tv.tv_sec * 1000000 + tv.tv_usec;
+	vfs_timestamp(&ts);
+	*timep = (unsigned long)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
 }
 
 void
@@ -406,6 +380,7 @@ hammer2_adjreadcounter(hammer2_blockref_t *bref, size_t bytes)
 	case HAMMER2_BREF_TYPE_DATA:
 		counterp = &hammer2_iod_file_read;
 		break;
+	case HAMMER2_BREF_TYPE_DIRENT:
 	case HAMMER2_BREF_TYPE_INODE:
 		counterp = &hammer2_iod_meta_read;
 		break;
@@ -421,4 +396,100 @@ hammer2_adjreadcounter(hammer2_blockref_t *bref, size_t bytes)
 		break;
 	}
 	*counterp += bytes;
+}
+
+/*
+ * Check for pending signal to allow interruption.  This function will
+ * return immediately if the calling thread is a kernel thread and not
+ * a user thread.
+ */
+int
+hammer2_signal_check(time_t *timep)
+{
+	thread_t td = curthread;
+	int error = 0;
+
+	if (td->td_lwp) {
+		lwkt_user_yield();
+		if (*timep != time_second) {
+			*timep = time_second;
+			if (CURSIG_NOBLOCK(curthread->td_lwp) != 0)
+				error = HAMMER2_ERROR_ABORTED;
+		}
+	} else {
+		lwkt_yield();
+	}
+	return error;
+}
+
+const char *
+hammer2_error_str(int error)
+{
+	if (error & HAMMER2_ERROR_EIO)
+		return("I/O Error");
+	if (error & HAMMER2_ERROR_CHECK)
+		return("Check Error");
+	if (error & HAMMER2_ERROR_INCOMPLETE)
+		return("Cluster Quorum Error");
+	if (error & HAMMER2_ERROR_DEPTH)
+		return("Chain Depth Error");
+	if (error & HAMMER2_ERROR_BADBREF)
+		return("Bad Blockref Error");
+	if (error & HAMMER2_ERROR_ENOSPC)
+		return("No Space on Device");
+	if (error & HAMMER2_ERROR_ENOENT)
+		return("Entry Not Found");
+	if (error & HAMMER2_ERROR_ENOTEMPTY)
+		return("Directory Not Empty");
+	if (error & HAMMER2_ERROR_EAGAIN)
+		return("EAGAIN");
+	if (error & HAMMER2_ERROR_ENOTDIR)
+		return("Not a Directory");
+	if (error & HAMMER2_ERROR_EISDIR)
+		return("Is a Directory");
+	if (error & HAMMER2_ERROR_EINPROGRESS)
+		return("Operation in Progress");
+	if (error & HAMMER2_ERROR_ABORTED)
+		return("Operation Aborted");
+	if (error & HAMMER2_ERROR_EOF)
+		return("Operation Complete");
+	if (error & HAMMER2_ERROR_EINVAL)
+		return("Invalid Operation");
+	if (error & HAMMER2_ERROR_EEXIST)
+		return("Object Exists");
+	if (error & HAMMER2_ERROR_EDEADLK)
+		return("Deadlock Detected");
+	if (error & HAMMER2_ERROR_ESRCH)
+		return("Object Not Found");
+	if (error & HAMMER2_ERROR_ETIMEDOUT)
+		return("Timeout");
+	return("Unknown Error");
+}
+
+const char *
+hammer2_bref_type_str(hammer2_blockref_t *bref)
+{
+	switch(bref->type) {
+	case HAMMER2_BREF_TYPE_EMPTY:
+		return("Unknown-zero'd field");
+	case HAMMER2_BREF_TYPE_INODE:
+		return("Inode");
+	case HAMMER2_BREF_TYPE_INDIRECT:
+		return("Indirect-Block");
+	case HAMMER2_BREF_TYPE_DATA:
+		return("Data-Block");
+	case HAMMER2_BREF_TYPE_DIRENT:
+		return("Directory-Entry");
+	case HAMMER2_BREF_TYPE_FREEMAP_NODE:
+		return("Freemap-Node");
+	case HAMMER2_BREF_TYPE_FREEMAP_LEAF:
+		return("Freemap-Leaf");
+	case HAMMER2_BREF_TYPE_FREEMAP:
+		return("Freemap-Header");
+	case HAMMER2_BREF_TYPE_VOLUME:
+		return("Volume-Header");
+	default:
+		break;
+	}
+	return("Unknown");
 }

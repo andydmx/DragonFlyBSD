@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2011-2014 The DragonFly Project.  All rights reserved.
+ * Copyright (c) 2011-2018 The DragonFly Project.  All rights reserved.
  *
  * This code is derived from software contributed to The DragonFly Project
  * by Matthew Dillon <dillon@dragonflybsd.org>
@@ -43,191 +43,506 @@
 
 #define INODE_DEBUG	0
 
-static void hammer2_inode_move_to_hidden(hammer2_trans_t *trans,
-					 hammer2_cluster_t **cparentp,
-					 hammer2_cluster_t **clusterp,
-					 hammer2_tid_t inum);
-
 RB_GENERATE2(hammer2_inode_tree, hammer2_inode, rbnode, hammer2_inode_cmp,
-	     hammer2_tid_t, inum);
+	     hammer2_tid_t, meta.inum);
 
 int
 hammer2_inode_cmp(hammer2_inode_t *ip1, hammer2_inode_t *ip2)
 {
-	if (ip1->inum < ip2->inum)
+	if (ip1->meta.inum < ip2->meta.inum)
 		return(-1);
-	if (ip1->inum > ip2->inum)
+	if (ip1->meta.inum > ip2->meta.inum)
 		return(1);
 	return(0);
 }
 
+static __inline
+void
+hammer2_knote(struct vnode *vp, int flags)
+{
+	if (flags)
+		KNOTE(&vp->v_pollinfo.vpi_kqinfo.ki_note, flags);
+}
+
 /*
- * HAMMER2 inode locks
+ * Caller holds pmp->list_spin and the inode should be locked.  Merge ip
+ * with the specified depend.
  *
- * HAMMER2 offers shared locks and exclusive locks on inodes.
+ * If the ip is on SYNCQ it stays there and (void *)-1 is returned, indicating
+ * that successive calls must ensure the ip is on a pass2 depend (or they are
+ * all SYNCQ).  If the passed-in depend is not NULL and not (void *)-1 then
+ * we can set pass2 on it and return.
+ *
+ * If the ip is not on SYNCQ it is merged with the passed-in depend, creating
+ * a self-depend if necessary, and depend->pass2 is set according
+ * to the PASS2 flag.  SIDEQ is set.
+ */
+static __noinline
+hammer2_depend_t *
+hammer2_inode_setdepend_locked(hammer2_inode_t *ip, hammer2_depend_t *depend)
+{
+	hammer2_pfs_t *pmp = ip->pmp;
+	hammer2_depend_t *dtmp;
+	hammer2_inode_t *iptmp;
+
+	/*
+	 * If ip is SYNCQ its entry is used for the syncq list and it will
+	 * no longer be associated with a dependency.  Merging this status
+	 * with a passed-in depend implies PASS2.
+	 */
+	if (ip->flags & HAMMER2_INODE_SYNCQ) {
+		if (depend == (void *)-1 ||
+		    depend == NULL) {
+			return ((void *)-1);
+		}
+		depend->pass2 = 1;
+		hammer2_trans_setflags(pmp, HAMMER2_TRANS_RESCAN);
+
+		return depend;
+	}
+
+	/*
+	 * If ip is already SIDEQ, merge ip->depend into the passed-in depend.
+	 * If it is not, associate the ip with the passed-in depend, creating
+	 * a single-entry dependency using depend_static if necessary.
+	 *
+	 * NOTE: The use of ip->depend_static always requires that the
+	 *	 specific ip containing the structure is part of that
+	 *	 particular depend_static's dependency group.
+	 */
+	if (ip->flags & HAMMER2_INODE_SIDEQ) {
+		/*
+		 * Merge ip->depend with the passed-in depend.  If the
+		 * passed-in depend is not a special case, all ips associated
+		 * with ip->depend (including the original ip) must be moved
+		 * to the passed-in depend.
+		 */
+		if (depend == NULL) {
+			depend = ip->depend;
+		} else if (depend == (void *)-1) {
+			depend = ip->depend;
+			depend->pass2 = 1;
+		} else if (depend != ip->depend) {
+#ifdef INVARIANTS
+			int sanitychk = 0;
+#endif
+			dtmp = ip->depend;
+			while ((iptmp = TAILQ_FIRST(&dtmp->sideq)) != NULL) {
+#ifdef INVARIANTS
+				if (iptmp == ip)
+					sanitychk = 1;
+#endif
+				TAILQ_REMOVE(&dtmp->sideq, iptmp, entry);
+				TAILQ_INSERT_TAIL(&depend->sideq, iptmp, entry);
+				iptmp->depend = depend;
+			}
+			KKASSERT(sanitychk == 1);
+			depend->count += dtmp->count;
+			depend->pass2 |= dtmp->pass2;
+			TAILQ_REMOVE(&pmp->depq, dtmp, entry);
+			dtmp->count = 0;
+			dtmp->pass2 = 0;
+		}
+	} else {
+		/*
+		 * Add ip to the sideq, creating a self-dependency if
+		 * necessary.
+		 */
+		hammer2_inode_ref(ip);
+		atomic_set_int(&ip->flags, HAMMER2_INODE_SIDEQ);
+		if (depend == NULL) {
+			depend = &ip->depend_static;
+			TAILQ_INSERT_TAIL(&pmp->depq, depend, entry);
+		} else if (depend == (void *)-1) {
+			depend = &ip->depend_static;
+			depend->pass2 = 1;
+			TAILQ_INSERT_TAIL(&pmp->depq, depend, entry);
+		} /* else add ip to passed-in depend */
+		TAILQ_INSERT_TAIL(&depend->sideq, ip, entry);
+		ip->depend = depend;
+		++depend->count;
+		++pmp->sideq_count;
+	}
+
+	if (ip->flags & HAMMER2_INODE_SYNCQ_PASS2)
+		depend->pass2 = 1;
+	if (depend->pass2)
+		hammer2_trans_setflags(pmp, HAMMER2_TRANS_RESCAN);
+
+	return depend;
+}
+
+/*
+ * Put a solo inode on the SIDEQ (meaning that its dirty).  This can also
+ * occur from inode_lock4() and inode_depend().
+ *
+ * Caller must pass-in a locked inode.
+ */
+void
+hammer2_inode_delayed_sideq(hammer2_inode_t *ip)
+{
+	hammer2_pfs_t *pmp = ip->pmp;
+
+	/*
+	 * Optimize case to avoid pmp spinlock.
+	 */
+	if ((ip->flags & (HAMMER2_INODE_SYNCQ | HAMMER2_INODE_SIDEQ)) == 0) {
+		hammer2_spin_ex(&pmp->list_spin);
+		hammer2_inode_setdepend_locked(ip, NULL);
+		hammer2_spin_unex(&pmp->list_spin);
+	}
+}
+
+/*
+ * Lock an inode, with SYNCQ semantics.
+ *
+ * HAMMER2 offers shared and exclusive locks on inodes.  Pass a mask of
+ * flags for options:
+ *
+ *	- pass HAMMER2_RESOLVE_SHARED if a shared lock is desired.  The
+ *	  inode locking function will automatically set the RDONLY flag.
+ *	  shared locks are not subject to SYNCQ semantics, exclusive locks
+ *	  are.
+ *
+ *	- pass HAMMER2_RESOLVE_ALWAYS if you need the inode's meta-data.
+ *	  Most front-end inode locks do.
+ *
+ *	- pass HAMMER2_RESOLVE_NEVER if you do not want to require that
+ *	  the inode data be resolved.  This is used by the syncthr because
+ *	  it can run on an unresolved/out-of-sync cluster, and also by the
+ *	  vnode reclamation code to avoid unnecessary I/O (particularly when
+ *	  disposing of hundreds of thousands of cached vnodes).
+ *
+ * This function, along with lock4, has SYNCQ semantics.  If the inode being
+ * locked is on the SYNCQ, that is it has been staged by the syncer, we must
+ * block until the operation is complete (even if we can lock the inode).  In
+ * order to reduce the stall time, we re-order the inode to the front of the
+ * pmp->syncq prior to blocking.  This reordering VERY significantly improves
+ * performance.
  *
  * The inode locking function locks the inode itself, resolves any stale
  * chains in the inode's cluster, and allocates a fresh copy of the
- * cluster with 1 ref and all the underlying chains locked.  Duplication
- * races are handled by this function.
+ * cluster with 1 ref and all the underlying chains locked.
  *
  * ip->cluster will be stable while the inode is locked.
  *
  * NOTE: We don't combine the inode/chain lock because putting away an
  *       inode would otherwise confuse multiple lock holders of the inode.
- *
- * NOTE: In-memory inodes always point to hardlink targets (the actual file),
- *	 and never point to a hardlink pointer.
  */
-hammer2_cluster_t *
-hammer2_inode_lock_ex(hammer2_inode_t *ip)
+void
+hammer2_inode_lock(hammer2_inode_t *ip, int how)
 {
-	const hammer2_inode_data_t *ripdata;
-	hammer2_cluster_t *cluster;
-	hammer2_chain_t *chain;
-	int i;
+	hammer2_pfs_t *pmp;
 
 	hammer2_inode_ref(ip);
-	ccms_thread_lock(&ip->topo_cst, CCMS_STATE_EXCLUSIVE);
-	cluster = hammer2_cluster_copy(&ip->cluster,
-				       HAMMER2_CLUSTER_COPY_NOCHAINS);
+	pmp = ip->pmp;
 
-	ip->cluster.focus = NULL;
-	cluster->focus = NULL;
+	/* 
+	 * Inode structure mutex - Shared lock
+	 */
+	if (how & HAMMER2_RESOLVE_SHARED) {
+		hammer2_mtx_sh(&ip->lock);
+		return;
+	}
 
-	for (i = 0; i < cluster->nchains; ++i) {
-		chain = ip->cluster.array[i];
-		if (chain == NULL) {
-			kprintf("inode_lock: %p: missing chain\n", ip);
+	/*
+	 * Inode structure mutex - Exclusive lock
+	 *
+	 * An exclusive lock (if not recursive) must wait for inodes on
+	 * SYNCQ to flush first, to ensure that meta-data dependencies such
+	 * as the nlink count and related directory entries are not split
+	 * across flushes.
+	 *
+	 * If the vnode is locked by the current thread it must be unlocked
+	 * across the tsleep() to avoid a deadlock.
+	 */
+	hammer2_mtx_ex(&ip->lock);
+	if (hammer2_mtx_refs(&ip->lock) > 1)
+		return;
+	while ((ip->flags & HAMMER2_INODE_SYNCQ) && pmp) {
+		hammer2_spin_ex(&pmp->list_spin);
+		if (ip->flags & HAMMER2_INODE_SYNCQ) {
+			tsleep_interlock(&ip->flags, 0);
+			atomic_set_int(&ip->flags, HAMMER2_INODE_SYNCQ_WAKEUP);
+			TAILQ_REMOVE(&pmp->syncq, ip, entry);
+			TAILQ_INSERT_HEAD(&pmp->syncq, ip, entry);
+			hammer2_spin_unex(&pmp->list_spin);
+			hammer2_mtx_unlock(&ip->lock);
+			tsleep(&ip->flags, PINTERLOCKED, "h2sync", 0);
+			hammer2_mtx_ex(&ip->lock);
 			continue;
 		}
-
-		hammer2_chain_lock(chain, HAMMER2_RESOLVE_ALWAYS);
-		cluster->array[i] = chain;
-		if (cluster->focus == NULL)
-			cluster->focus = chain;
-		if (ip->cluster.focus == NULL)
-			ip->cluster.focus = chain;
+		hammer2_spin_unex(&pmp->list_spin);
+		break;
 	}
-
-	/*
-	 * Returned cluster must resolve hardlink pointers
-	 */
-	ripdata = &hammer2_cluster_rdata(cluster)->ipdata;
-	KKASSERT(ripdata->type != HAMMER2_OBJTYPE_HARDLINK);
-	/*
-	if (ripdata->type == HAMMER2_OBJTYPE_HARDLINK &&
-	    (cluster->focus->flags & HAMMER2_CHAIN_DELETED) == 0) {
-		error = hammer2_hardlink_find(ip->pip, NULL, cluster);
-		KKASSERT(error == 0);
-	}
-	*/
-
-	return (cluster);
 }
 
+/*
+ * Exclusively lock up to four inodes, in order, with SYNCQ semantics.
+ * ip1 and ip2 must not be NULL.  ip3 and ip4 may be NULL, but if ip3 is
+ * NULL then ip4 must also be NULL.
+ *
+ * This creates a dependency between up to four inodes.
+ */
 void
-hammer2_inode_unlock_ex(hammer2_inode_t *ip, hammer2_cluster_t *cluster)
+hammer2_inode_lock4(hammer2_inode_t *ip1, hammer2_inode_t *ip2,
+		    hammer2_inode_t *ip3, hammer2_inode_t *ip4)
 {
-	if (cluster)
-		hammer2_cluster_unlock(cluster);
-	ccms_thread_unlock(&ip->topo_cst);
+	hammer2_inode_t *ips[4];
+	hammer2_inode_t *iptmp;
+	hammer2_inode_t *ipslp;
+	hammer2_depend_t *depend;
+	hammer2_pfs_t *pmp;
+	size_t count;
+	size_t i;
+
+	pmp = ip1->pmp;			/* may be NULL */
+	KKASSERT(pmp == ip2->pmp);
+
+	ips[0] = ip1;
+	ips[1] = ip2;
+	if (ip3 == NULL) {
+		count = 2;
+	} else if (ip4 == NULL) {
+		count = 3;
+		ips[2] = ip3;
+		KKASSERT(pmp == ip3->pmp);
+	} else {
+		count = 4;
+		ips[2] = ip3;
+		ips[3] = ip4;
+		KKASSERT(pmp == ip3->pmp);
+		KKASSERT(pmp == ip4->pmp);
+	}
+
+	for (i = 0; i < count; ++i)
+		hammer2_inode_ref(ips[i]);
+
+restart:
+	/*
+	 * Lock the inodes in order
+	 */
+	for (i = 0; i < count; ++i) {
+		hammer2_mtx_ex(&ips[i]->lock);
+	}
+
+	/*
+	 * Associate dependencies, record the first inode found on SYNCQ
+	 * (operation is allowed to proceed for inodes on PASS2) for our
+	 * sleep operation, this inode is theoretically the last one sync'd
+	 * in the sequence.
+	 *
+	 * All inodes found on SYNCQ are moved to the head of the syncq
+	 * to reduce stalls.
+	 */
+	hammer2_spin_ex(&pmp->list_spin);
+	depend = NULL;
+	ipslp = NULL;
+	for (i = 0; i < count; ++i) {
+		iptmp = ips[i];
+		depend = hammer2_inode_setdepend_locked(iptmp, depend);
+		if (iptmp->flags & HAMMER2_INODE_SYNCQ) {
+			TAILQ_REMOVE(&pmp->syncq, iptmp, entry);
+			TAILQ_INSERT_HEAD(&pmp->syncq, iptmp, entry);
+			if (ipslp == NULL)
+				ipslp = iptmp;
+		}
+	}
+	hammer2_spin_unex(&pmp->list_spin);
+
+	/*
+	 * Block and retry if any of the inodes are on SYNCQ.  It is
+	 * important that we allow the operation to proceed in the
+	 * PASS2 case, to avoid deadlocking against the vnode.
+	 */
+	if (ipslp) {
+		for (i = 0; i < count; ++i)
+			hammer2_mtx_unlock(&ips[i]->lock);
+		tsleep(&ipslp->flags, 0, "h2sync", 2);
+		goto restart;
+	}
+}
+
+/*
+ * Release an inode lock.  If another thread is blocked on SYNCQ_WAKEUP
+ * we wake them up.
+ */
+void
+hammer2_inode_unlock(hammer2_inode_t *ip)
+{
+	if (ip->flags & HAMMER2_INODE_SYNCQ_WAKEUP) {
+		atomic_clear_int(&ip->flags, HAMMER2_INODE_SYNCQ_WAKEUP);
+		hammer2_mtx_unlock(&ip->lock);
+		wakeup(&ip->flags);
+	} else {
+		hammer2_mtx_unlock(&ip->lock);
+	}
 	hammer2_inode_drop(ip);
 }
 
 /*
- * NOTE: We don't combine the inode/chain lock because putting away an
- *       inode would otherwise confuse multiple lock holders of the inode.
+ * If either ip1 or ip2 have been tapped by the syncer, make sure that both
+ * are.  This ensure that dependencies (e.g. dirent-v-inode) are synced
+ * together.  For dirent-v-inode depends, pass the dirent as ip1.
  *
- *	 Shared locks are especially sensitive to having too many shared
- *	 lock counts (from the same thread) on certain paths which might
- *	 need to upgrade them.  Only one count of a shared lock can be
- *	 upgraded.
+ * If neither ip1 or ip2 have been tapped by the syncer, merge them into a
+ * single dependency.  Dependencies are entered into pmp->depq.  This
+ * effectively flags the inodes SIDEQ.
+ *
+ * Both ip1 and ip2 must be locked by the caller.  This also ensures
+ * that we can't race the end of the syncer's queue run.
  */
-hammer2_cluster_t *
-hammer2_inode_lock_sh(hammer2_inode_t *ip)
+void
+hammer2_inode_depend(hammer2_inode_t *ip1, hammer2_inode_t *ip2)
 {
-	const hammer2_inode_data_t *ripdata;
-	hammer2_cluster_t *cluster;
+	hammer2_pfs_t *pmp;
+	hammer2_depend_t *depend;
+
+	pmp = ip1->pmp;
+	hammer2_spin_ex(&pmp->list_spin);
+	depend = hammer2_inode_setdepend_locked(ip1, NULL);
+	depend = hammer2_inode_setdepend_locked(ip2, depend);
+	hammer2_spin_unex(&pmp->list_spin);
+}
+
+/*
+ * Select a chain out of an inode's cluster and lock it.
+ *
+ * The inode does not have to be locked.
+ */
+hammer2_chain_t *
+hammer2_inode_chain(hammer2_inode_t *ip, int clindex, int how)
+{
 	hammer2_chain_t *chain;
-	int i;
+	hammer2_cluster_t *cluster;
 
-	hammer2_inode_ref(ip);
-	cluster = hammer2_cluster_copy(&ip->cluster,
-				       HAMMER2_CLUSTER_COPY_NOCHAINS);
-	ccms_thread_lock(&ip->topo_cst, CCMS_STATE_SHARED);
+	hammer2_spin_sh(&ip->cluster_spin);
+	cluster = &ip->cluster;
+	if (clindex >= cluster->nchains)
+		chain = NULL;
+	else
+		chain = cluster->array[clindex].chain;
+	if (chain) {
+		hammer2_chain_ref(chain);
+		hammer2_spin_unsh(&ip->cluster_spin);
+		hammer2_chain_lock(chain, how);
+	} else {
+		hammer2_spin_unsh(&ip->cluster_spin);
+	}
+	return chain;
+}
 
-	cluster->focus = NULL;
+hammer2_chain_t *
+hammer2_inode_chain_and_parent(hammer2_inode_t *ip, int clindex,
+			       hammer2_chain_t **parentp, int how)
+{
+	hammer2_chain_t *chain;
+	hammer2_chain_t *parent;
 
-	for (i = 0; i < cluster->nchains; ++i) {
-		chain = ip->cluster.array[i];
-
-		if (chain == NULL) {
-			kprintf("inode_lock: %p: missing chain\n", ip);
-			continue;
+	for (;;) {
+		hammer2_spin_sh(&ip->cluster_spin);
+		if (clindex >= ip->cluster.nchains)
+			chain = NULL;
+		else
+			chain = ip->cluster.array[clindex].chain;
+		if (chain) {
+			hammer2_chain_ref(chain);
+			hammer2_spin_unsh(&ip->cluster_spin);
+			hammer2_chain_lock(chain, how);
+		} else {
+			hammer2_spin_unsh(&ip->cluster_spin);
 		}
 
-		hammer2_chain_lock(chain, HAMMER2_RESOLVE_ALWAYS |
-					  HAMMER2_RESOLVE_SHARED);
-		cluster->array[i] = chain;
-		if (cluster->focus == NULL)
-			cluster->focus = chain;
-	}
+		/*
+		 * Get parent, lock order must be (parent, chain).
+		 */
+		parent = chain->parent;
+		if (parent) {
+			hammer2_chain_ref(parent);
+			hammer2_chain_unlock(chain);
+			hammer2_chain_lock(parent, how);
+			hammer2_chain_lock(chain, how);
+		}
+		if (ip->cluster.array[clindex].chain == chain &&
+		    chain->parent == parent) {
+			break;
+		}
 
-	/*
-	 * Returned cluster must resolve hardlink pointers
-	 */
-	ripdata = &hammer2_cluster_rdata(cluster)->ipdata;
-	KKASSERT(ripdata->type != HAMMER2_OBJTYPE_HARDLINK);
-	/*
-	if (ripdata->type == HAMMER2_OBJTYPE_HARDLINK &&
-	    (cluster->focus->flags & HAMMER2_CHAIN_DELETED) == 0) {
-		error = hammer2_hardlink_find(ip->pip, NULL, cluster);
-		KKASSERT(error == 0);
+		/*
+		 * Retry
+		 */
+		hammer2_chain_unlock(chain);
+		hammer2_chain_drop(chain);
+		if (parent) {
+			hammer2_chain_unlock(parent);
+			hammer2_chain_drop(parent);
+		}
 	}
-	*/
+	*parentp = parent;
 
-	return (cluster);
+	return chain;
 }
 
-void
-hammer2_inode_unlock_sh(hammer2_inode_t *ip, hammer2_cluster_t *cluster)
-{
-	if (cluster)
-		hammer2_cluster_unlock(cluster);
-	ccms_thread_unlock(&ip->topo_cst);
-	hammer2_inode_drop(ip);
-}
-
-ccms_state_t
+/*
+ * Temporarily release a lock held shared or exclusive.  Caller must
+ * hold the lock shared or exclusive on call and lock will be released
+ * on return.
+ *
+ * Restore a lock that was temporarily released.
+ */
+hammer2_mtx_state_t
 hammer2_inode_lock_temp_release(hammer2_inode_t *ip)
 {
-	return(ccms_thread_lock_temp_release(&ip->topo_cst));
+	return hammer2_mtx_temp_release(&ip->lock);
 }
 
 void
-hammer2_inode_lock_temp_restore(hammer2_inode_t *ip, ccms_state_t ostate)
+hammer2_inode_lock_temp_restore(hammer2_inode_t *ip, hammer2_mtx_state_t ostate)
 {
-	ccms_thread_lock_temp_restore(&ip->topo_cst, ostate);
+	hammer2_mtx_temp_restore(&ip->lock, ostate);
 }
 
-ccms_state_t
+/*
+ * Upgrade a shared inode lock to exclusive and return.  If the inode lock
+ * is already held exclusively this is a NOP.
+ *
+ * The caller MUST hold the inode lock either shared or exclusive on call
+ * and will own the lock exclusively on return.
+ *
+ * Returns non-zero if the lock was already exclusive prior to the upgrade.
+ */
+int
 hammer2_inode_lock_upgrade(hammer2_inode_t *ip)
 {
-	return(ccms_thread_lock_upgrade(&ip->topo_cst));
+	int wasexclusive;
+
+	if (mtx_islocked_ex(&ip->lock)) {
+		wasexclusive = 1;
+	} else {
+		hammer2_mtx_unlock(&ip->lock);
+		hammer2_mtx_ex(&ip->lock);
+		wasexclusive = 0;
+	}
+	return wasexclusive;
 }
 
+/*
+ * Downgrade an inode lock from exclusive to shared only if the inode
+ * lock was previously shared.  If the inode lock was previously exclusive,
+ * this is a NOP.
+ */
 void
-hammer2_inode_lock_downgrade(hammer2_inode_t *ip, ccms_state_t ostate)
+hammer2_inode_lock_downgrade(hammer2_inode_t *ip, int wasexclusive)
 {
-	ccms_thread_lock_downgrade(&ip->topo_cst, ostate);
+	if (wasexclusive == 0)
+		hammer2_mtx_downgrade(&ip->lock);
 }
 
 /*
  * Lookup an inode by inode number
  */
 hammer2_inode_t *
-hammer2_inode_lookup(hammer2_pfsmount_t *pmp, hammer2_tid_t inum)
+hammer2_inode_lookup(hammer2_pfs_t *pmp, hammer2_tid_t inum)
 {
 	hammer2_inode_t *ip;
 
@@ -235,11 +550,11 @@ hammer2_inode_lookup(hammer2_pfsmount_t *pmp, hammer2_tid_t inum)
 	if (pmp->spmp_hmp) {
 		ip = NULL;
 	} else {
-		spin_lock(&pmp->inum_spin);
+		hammer2_spin_ex(&pmp->inum_spin);
 		ip = RB_LOOKUP(hammer2_inode_tree, &pmp->inum_tree, inum);
 		if (ip)
 			hammer2_inode_ref(ip);
-		spin_unlock(&pmp->inum_spin);
+		hammer2_spin_unex(&pmp->inum_spin);
 	}
 	return(ip);
 }
@@ -254,6 +569,10 @@ void
 hammer2_inode_ref(hammer2_inode_t *ip)
 {
 	atomic_add_int(&ip->refs, 1);
+	if (hammer2_debug & 0x80000) {
+		kprintf("INODE+1 %p (%d->%d)\n", ip, ip->refs - 1, ip->refs);
+		print_backtrace(8);
+	}
 }
 
 /*
@@ -263,34 +582,39 @@ hammer2_inode_ref(hammer2_inode_t *ip)
 void
 hammer2_inode_drop(hammer2_inode_t *ip)
 {
-	hammer2_pfsmount_t *pmp;
-	hammer2_inode_t *pip;
+	hammer2_pfs_t *pmp;
 	u_int refs;
 
 	while (ip) {
+		if (hammer2_debug & 0x80000) {
+			kprintf("INODE-1 %p (%d->%d)\n",
+				ip, ip->refs, ip->refs - 1);
+			print_backtrace(8);
+		}
 		refs = ip->refs;
 		cpu_ccfence();
 		if (refs == 1) {
 			/*
 			 * Transition to zero, must interlock with
 			 * the inode inumber lookup tree (if applicable).
+			 * It should not be possible for anyone to race
+			 * the transition to 0.
 			 */
 			pmp = ip->pmp;
 			KKASSERT(pmp);
-			spin_lock(&pmp->inum_spin);
+			hammer2_spin_ex(&pmp->inum_spin);
 
 			if (atomic_cmpset_int(&ip->refs, 1, 0)) {
-				KKASSERT(ip->topo_cst.count == 0);
+				KKASSERT(hammer2_mtx_refs(&ip->lock) == 0);
 				if (ip->flags & HAMMER2_INODE_ONRBTREE) {
 					atomic_clear_int(&ip->flags,
 						     HAMMER2_INODE_ONRBTREE);
 					RB_REMOVE(hammer2_inode_tree,
 						  &pmp->inum_tree, ip);
+					--pmp->inum_count;
 				}
-				spin_unlock(&pmp->inum_spin);
+				hammer2_spin_unex(&pmp->inum_spin);
 
-				pip = ip->pip;
-				ip->pip = NULL;
 				ip->pmp = NULL;
 
 				/*
@@ -299,17 +623,11 @@ hammer2_inode_drop(hammer2_inode_t *ip)
 				 */
 				hammer2_inode_repoint(ip, NULL, NULL);
 
-				/*
-				 * We have to drop pip (if non-NULL) to
-				 * dispose of our implied reference from
-				 * ip->pip.  We can simply loop on it.
-				 */
 				kfree(ip, pmp->minode);
 				atomic_add_long(&pmp->inmem_inodes, -1);
-				ip = pip;
-				/* continue with pip (can be NULL) */
+				ip = NULL;	/* will terminate loop */
 			} else {
-				spin_unlock(&ip->pmp->inum_spin);
+				hammer2_spin_unex(&ip->pmp->inum_spin);
 			}
 		} else {
 			/*
@@ -325,24 +643,22 @@ hammer2_inode_drop(hammer2_inode_t *ip)
  * Get the vnode associated with the given inode, allocating the vnode if
  * necessary.  The vnode will be returned exclusively locked.
  *
+ * *errorp is set to a UNIX error, not a HAMMER2 error.
+ *
  * The caller must lock the inode (shared or exclusive).
  *
  * Great care must be taken to avoid deadlocks and vnode acquisition/reclaim
  * races.
  */
 struct vnode *
-hammer2_igetv(hammer2_inode_t *ip, hammer2_cluster_t *cparent, int *errorp)
+hammer2_igetv(hammer2_inode_t *ip, int *errorp)
 {
-	const hammer2_inode_data_t *ripdata;
-	hammer2_pfsmount_t *pmp;
+	hammer2_pfs_t *pmp;
 	struct vnode *vp;
-	ccms_state_t ostate;
 
 	pmp = ip->pmp;
 	KKASSERT(pmp != NULL);
 	*errorp = 0;
-
-	ripdata = &hammer2_cluster_rdata(cparent)->ipdata;
 
 	for (;;) {
 		/*
@@ -351,6 +667,8 @@ hammer2_igetv(hammer2_inode_t *ip, hammer2_cluster_t *cparent, int *errorp)
 		 * inode must be unlocked during the vget() to avoid a
 		 * deadlock against a reclaim.
 		 */
+		int wasexclusive;
+
 		vp = ip->vp;
 		if (vp) {
 			/*
@@ -361,6 +679,8 @@ hammer2_igetv(hammer2_inode_t *ip, hammer2_cluster_t *cparent, int *errorp)
 			 * vget().  The vget() can still fail if we lost
 			 * a reclaim race on the vnode.
 			 */
+			hammer2_mtx_state_t ostate;
+
 			vhold(vp);
 			ostate = hammer2_inode_lock_temp_release(ip);
 			if (vget(vp, LK_EXCLUSIVE)) {
@@ -397,50 +717,64 @@ hammer2_igetv(hammer2_inode_t *ip, hammer2_cluster_t *cparent, int *errorp)
 		/*
 		 * Lock the inode and check for an allocation race.
 		 */
-		ostate = hammer2_inode_lock_upgrade(ip);
+		wasexclusive = hammer2_inode_lock_upgrade(ip);
 		if (ip->vp != NULL) {
 			vp->v_type = VBAD;
 			vx_put(vp);
-			hammer2_inode_lock_downgrade(ip, ostate);
+			hammer2_inode_lock_downgrade(ip, wasexclusive);
 			continue;
 		}
 
-		switch (ripdata->type) {
+		switch (ip->meta.type) {
 		case HAMMER2_OBJTYPE_DIRECTORY:
 			vp->v_type = VDIR;
 			break;
 		case HAMMER2_OBJTYPE_REGFILE:
+			/*
+			 * Regular file must use buffer cache I/O
+			 * (VKVABIO cpu sync semantics supported)
+			 */
 			vp->v_type = VREG;
-			vinitvmio(vp, ripdata->size,
+			vsetflags(vp, VKVABIO);
+			vinitvmio(vp, ip->meta.size,
 				  HAMMER2_LBUFSIZE,
-				  (int)ripdata->size & HAMMER2_LBUFMASK);
+				  (int)ip->meta.size & HAMMER2_LBUFMASK);
 			break;
 		case HAMMER2_OBJTYPE_SOFTLINK:
 			/*
 			 * XXX for now we are using the generic file_read
 			 * and file_write code so we need a buffer cache
 			 * association.
+			 *
+			 * (VKVABIO cpu sync semantics supported)
 			 */
 			vp->v_type = VLNK;
-			vinitvmio(vp, ripdata->size,
+			vsetflags(vp, VKVABIO);
+			vinitvmio(vp, ip->meta.size,
 				  HAMMER2_LBUFSIZE,
-				  (int)ripdata->size & HAMMER2_LBUFMASK);
+				  (int)ip->meta.size & HAMMER2_LBUFMASK);
 			break;
 		case HAMMER2_OBJTYPE_CDEV:
 			vp->v_type = VCHR;
 			/* fall through */
 		case HAMMER2_OBJTYPE_BDEV:
 			vp->v_ops = &pmp->mp->mnt_vn_spec_ops;
-			if (ripdata->type != HAMMER2_OBJTYPE_CDEV)
+			if (ip->meta.type != HAMMER2_OBJTYPE_CDEV)
 				vp->v_type = VBLK;
-			addaliasu(vp, ripdata->rmajor, ripdata->rminor);
+			addaliasu(vp,
+				  ip->meta.rmajor,
+				  ip->meta.rminor);
 			break;
 		case HAMMER2_OBJTYPE_FIFO:
 			vp->v_type = VFIFO;
 			vp->v_ops = &pmp->mp->mnt_vn_fifo_ops;
 			break;
+		case HAMMER2_OBJTYPE_SOCKET:
+			vp->v_type = VSOCK;
+			break;
 		default:
-			panic("hammer2: unhandled objtype %d", ripdata->type);
+			panic("hammer2: unhandled objtype %d",
+			      ip->meta.type);
 			break;
 		}
 
@@ -450,7 +784,8 @@ hammer2_igetv(hammer2_inode_t *ip, hammer2_cluster_t *cparent, int *errorp)
 		vp->v_data = ip;
 		ip->vp = vp;
 		hammer2_inode_ref(ip);		/* vp association */
-		hammer2_inode_lock_downgrade(ip, ostate);
+		hammer2_inode_lock_downgrade(ip, wasexclusive);
+		vx_downgrade(vp);
 		break;
 	}
 
@@ -465,41 +800,73 @@ hammer2_igetv(hammer2_inode_t *ip, hammer2_cluster_t *cparent, int *errorp)
 }
 
 /*
- * Returns the inode associated with the passed-in cluster, creating the
- * inode if necessary and synchronizing it to the passed-in cluster otherwise.
+ * XXX this API needs a rewrite.  It needs to be split into a
+ * hammer2_inode_alloc() and hammer2_inode_build() to allow us to get
+ * rid of the inode/chain lock reversal fudge.
  *
- * The passed-in chain must be locked and will remain locked on return.
+ * Returns the inode associated with the passed-in cluster, allocating a new
+ * hammer2_inode structure if necessary, then synchronizing it to the passed
+ * xop cluster.  When synchronizing, if idx >= 0, only cluster index (idx)
+ * is synchronized.  Otherwise the whole cluster is synchronized.  inum will
+ * be extracted from the passed-in xop and the inum argument will be ignored.
+ *
+ * If xop is passed as NULL then a new hammer2_inode is allocated with the
+ * specified inum, and returned.   For normal inodes, the inode will be
+ * indexed in memory and if it already exists the existing ip will be
+ * returned instead of allocating a new one.  The superroot and PFS inodes
+ * are not indexed in memory.
+ *
+ * The passed-in cluster must be locked and will remain locked on return.
  * The returned inode will be locked and the caller may dispose of both
- * via hammer2_inode_unlock_ex().  However, if the caller needs to resolve
- * a hardlink it must ref/unlock/relock/drop the inode.
+ * via hammer2_inode_unlock() + hammer2_inode_drop().  However, if the caller
+ * needs to resolve a hardlink it must ref/unlock/relock/drop the inode.
  *
  * The hammer2_inode structure regulates the interface between the high level
  * kernel VNOPS API and the filesystem backend (the chains).
+ *
+ * On return the inode is locked with the supplied cluster.
  */
 hammer2_inode_t *
-hammer2_inode_get(hammer2_pfsmount_t *pmp, hammer2_inode_t *dip,
-		  hammer2_cluster_t *cluster)
+hammer2_inode_get(hammer2_pfs_t *pmp, hammer2_xop_head_t *xop,
+		  hammer2_tid_t inum, int idx)
 {
 	hammer2_inode_t *nip;
 	const hammer2_inode_data_t *iptmp;
 	const hammer2_inode_data_t *nipdata;
 
-	KKASSERT(hammer2_cluster_type(cluster) == HAMMER2_BREF_TYPE_INODE);
+	KKASSERT(xop == NULL ||
+		 hammer2_cluster_type(&xop->cluster) ==
+		 HAMMER2_BREF_TYPE_INODE);
 	KKASSERT(pmp);
 
 	/*
 	 * Interlocked lookup/ref of the inode.  This code is only needed
 	 * when looking up inodes with nlinks != 0 (TODO: optimize out
 	 * otherwise and test for duplicates).
+	 *
+	 * Cluster can be NULL during the initial pfs allocation.
 	 */
+	if (xop) {
+		iptmp = &hammer2_xop_gdata(xop)->ipdata;
+		inum = iptmp->meta.inum;
+		hammer2_xop_pdata(xop);
+	}
 again:
-	for (;;) {
-		iptmp = &hammer2_cluster_rdata(cluster)->ipdata;
-		nip = hammer2_inode_lookup(pmp, iptmp->inum);
-		if (nip == NULL)
-			break;
-
-		ccms_thread_lock(&nip->topo_cst, CCMS_STATE_EXCLUSIVE);
+	nip = hammer2_inode_lookup(pmp, inum);
+	if (nip) {
+		/*
+		 * We may have to unhold the cluster to avoid a deadlock
+		 * against vnlru (and possibly other XOPs).
+		 */
+		if (xop) {
+			if (hammer2_mtx_ex_try(&nip->lock) != 0) {
+				hammer2_cluster_unhold(&xop->cluster);
+				hammer2_mtx_ex(&nip->lock);
+				hammer2_cluster_rehold(&xop->cluster);
+			}
+		} else {
+			hammer2_mtx_ex(&nip->lock);
+		}
 
 		/*
 		 * Handle SMP race (not applicable to the super-root spmp
@@ -507,50 +874,60 @@ again:
 		 */
 		if (pmp->spmp_hmp == NULL &&
 		    (nip->flags & HAMMER2_INODE_ONRBTREE) == 0) {
-			ccms_thread_unlock(&nip->topo_cst);
+			hammer2_mtx_unlock(&nip->lock);
 			hammer2_inode_drop(nip);
-			continue;
+			goto again;
 		}
-		hammer2_inode_repoint(nip, NULL, cluster);
+		if (xop) {
+			if (idx >= 0)
+				hammer2_inode_repoint_one(nip, &xop->cluster,
+							  idx);
+			else
+				hammer2_inode_repoint(nip, NULL, &xop->cluster);
+		}
 		return nip;
 	}
 
 	/*
-	 * We couldn't find the inode number, create a new inode.
+	 * We couldn't find the inode number, create a new inode and try to
+	 * insert it, handle insertion races.
 	 */
 	nip = kmalloc(sizeof(*nip), pmp->minode, M_WAITOK | M_ZERO);
+	spin_init(&nip->cluster_spin, "h2clspin");
 	atomic_add_long(&pmp->inmem_inodes, 1);
-	hammer2_pfs_memory_inc(pmp);
-	hammer2_pfs_memory_wakeup(pmp);
 	if (pmp->spmp_hmp)
 		nip->flags = HAMMER2_INODE_SROOT;
 
 	/*
-	 * Initialize nip's cluster
+	 * Initialize nip's cluster.  A cluster is provided for normal
+	 * inodes but typically not for the super-root or PFS inodes.
 	 */
 	nip->cluster.refs = 1;
 	nip->cluster.pmp = pmp;
 	nip->cluster.flags |= HAMMER2_CLUSTER_INODE;
-	hammer2_cluster_replace(&nip->cluster, cluster);
-
-	nipdata = &hammer2_cluster_rdata(cluster)->ipdata;
-	nip->inum = nipdata->inum;
-	nip->size = nipdata->size;
-	nip->mtime = nipdata->mtime;
-	hammer2_inode_repoint(nip, NULL, cluster);
-	nip->pip = dip;				/* can be NULL */
-	if (dip)
-		hammer2_inode_ref(dip);	/* ref dip for nip->pip */
+	if (xop) {
+		nipdata = &hammer2_xop_gdata(xop)->ipdata;
+		nip->meta = nipdata->meta;
+		hammer2_xop_pdata(xop);
+		atomic_set_int(&nip->flags, HAMMER2_INODE_METAGOOD);
+		hammer2_inode_repoint(nip, NULL, &xop->cluster);
+	} else {
+		nip->meta.inum = inum;		/* PFS inum is always 1 XXX */
+		/* mtime will be updated when a cluster is available */
+		atomic_set_int(&nip->flags, HAMMER2_INODE_METAGOOD);	/*XXX*/
+	}
 
 	nip->pmp = pmp;
 
 	/*
 	 * ref and lock on nip gives it state compatible to after a
-	 * hammer2_inode_lock_ex() call.
+	 * hammer2_inode_lock() call.
 	 */
 	nip->refs = 1;
-	ccms_cst_init(&nip->topo_cst, &nip->cluster);
-	ccms_thread_lock(&nip->topo_cst, CCMS_STATE_EXCLUSIVE);
+	hammer2_mtx_init(&nip->lock, "h2inode");
+	hammer2_mtx_init(&nip->truncate_lock, "h2trunc");
+	hammer2_mtx_ex(&nip->lock);
+	TAILQ_INIT(&nip->depend_static.sideq);
 	/* combination of thread lock and chain lock == inode lock */
 
 	/*
@@ -558,57 +935,46 @@ again:
 	 * get.  Undo all the work and try again.
 	 */
 	if (pmp->spmp_hmp == NULL) {
-		spin_lock(&pmp->inum_spin);
+		hammer2_spin_ex(&pmp->inum_spin);
 		if (RB_INSERT(hammer2_inode_tree, &pmp->inum_tree, nip)) {
-			spin_unlock(&pmp->inum_spin);
-			ccms_thread_unlock(&nip->topo_cst);
+			hammer2_spin_unex(&pmp->inum_spin);
+			hammer2_mtx_unlock(&nip->lock);
 			hammer2_inode_drop(nip);
 			goto again;
 		}
 		atomic_set_int(&nip->flags, HAMMER2_INODE_ONRBTREE);
-		spin_unlock(&pmp->inum_spin);
+		++pmp->inum_count;
+		hammer2_spin_unex(&pmp->inum_spin);
 	}
-
 	return (nip);
 }
 
 /*
- * Create a new inode in the specified directory using the vattr to
- * figure out the type of inode.
+ * Create a PFS inode under the superroot.  This function will create the
+ * inode, its media chains, and also insert it into the media.
  *
- * If no error occurs the new inode with its cluster locked is returned in
- * *nipp, otherwise an error is returned and *nipp is set to NULL.
- *
- * If vap and/or cred are NULL the related fields are not set and the
- * inode type defaults to a directory.  This is used when creating PFSs
- * under the super-root, so the inode number is set to 1 in this case.
- *
- * dip is not locked on entry.
- *
- * NOTE: When used to create a snapshot, the inode is temporarily associated
- *	 with the super-root spmp. XXX should pass new pmp for snapshot.
+ * Caller must be in a flush transaction because we are inserting the inode
+ * onto the media.
  */
 hammer2_inode_t *
-hammer2_inode_create(hammer2_trans_t *trans, hammer2_inode_t *dip,
-		     struct vattr *vap, struct ucred *cred,
+hammer2_inode_create_pfs(hammer2_pfs_t *spmp,
 		     const uint8_t *name, size_t name_len,
-		     hammer2_cluster_t **clusterp, int *errorp)
+		     int *errorp)
 {
-	const hammer2_inode_data_t *dipdata;
-	hammer2_inode_data_t *nipdata;
-	hammer2_cluster_t *cluster;
-	hammer2_cluster_t *cparent;
+	hammer2_xop_create_t *xop;
+	hammer2_inode_t *pip;
 	hammer2_inode_t *nip;
-	hammer2_key_t key_dummy;
-	hammer2_key_t lhc;
 	int error;
-	uid_t xuid;
-	uuid_t dip_uid;
-	uuid_t dip_gid;
-	uint32_t dip_mode;
-	uint8_t dip_comp_algo;
-	uint8_t dip_check_algo;
-	int ddflag;
+	uuid_t pip_uid;
+	uuid_t pip_gid;
+	uint32_t pip_mode;
+	uint8_t pip_comp_algo;
+	uint8_t pip_check_algo;
+	hammer2_tid_t pip_inum;
+	hammer2_key_t lhc;
+
+	pip = spmp->iroot;
+	nip = NULL;
 
 	lhc = hammer2_dirhash(name, name_len);
 	*errorp = 0;
@@ -618,66 +984,100 @@ hammer2_inode_create(hammer2_trans_t *trans, hammer2_inode_t *dip,
 	 * entry in.  At the same time check for key collisions
 	 * and iterate until we don't get one.
 	 *
-	 * NOTE: hidden inodes do not have iterators.
+	 * Lock the directory exclusively for now to guarantee that
+	 * we can find an unused lhc for the name.  Due to collisions,
+	 * two different creates can end up with the same lhc so we
+	 * cannot depend on the OS to prevent the collision.
 	 */
-retry:
-	cparent = hammer2_inode_lock_ex(dip);
-	dipdata = &hammer2_cluster_rdata(cparent)->ipdata;
-	dip_uid = dipdata->uid;
-	dip_gid = dipdata->gid;
-	dip_mode = dipdata->mode;
-	dip_comp_algo = dipdata->comp_algo;
-	dip_check_algo = dipdata->check_algo;
+	hammer2_inode_lock(pip, 0);
 
-	error = 0;
-	while (error == 0) {
-		cluster = hammer2_cluster_lookup(cparent, &key_dummy,
-						 lhc, lhc, 0, &ddflag);
-		if (cluster == NULL)
-			break;
-		if ((lhc & HAMMER2_DIRHASH_VISIBLE) == 0)
-			error = ENOSPC;
-		if ((lhc & HAMMER2_DIRHASH_LOMASK) == HAMMER2_DIRHASH_LOMASK)
-			error = ENOSPC;
-		hammer2_cluster_unlock(cluster);
-		cluster = NULL;
-		++lhc;
+	pip_uid = pip->meta.uid;
+	pip_gid = pip->meta.gid;
+	pip_mode = pip->meta.mode;
+	pip_comp_algo = pip->meta.comp_algo;
+	pip_check_algo = pip->meta.check_algo;
+	pip_inum = (pip == pip->pmp->iroot) ? 1 : pip->meta.inum;
+
+	/*
+	 * Locate an unused key in the collision space.
+	 */
+	{
+		hammer2_xop_scanlhc_t *sxop;
+		hammer2_key_t lhcbase;
+
+		lhcbase = lhc;
+		sxop = hammer2_xop_alloc(pip, HAMMER2_XOP_MODIFYING);
+		sxop->lhc = lhc;
+		hammer2_xop_start(&sxop->head, &hammer2_scanlhc_desc);
+		while ((error = hammer2_xop_collect(&sxop->head, 0)) == 0) {
+			if (lhc != sxop->head.cluster.focus->bref.key)
+				break;
+			++lhc;
+		}
+		hammer2_xop_retire(&sxop->head, HAMMER2_XOPMASK_VOP);
+
+		if (error) {
+			if (error != HAMMER2_ERROR_ENOENT)
+				goto done2;
+			++lhc;
+			error = 0;
+		}
+		if ((lhcbase ^ lhc) & ~HAMMER2_DIRHASH_LOMASK) {
+			error = HAMMER2_ERROR_ENOSPC;
+			goto done2;
+		}
 	}
 
-	if (error == 0) {
-		error = hammer2_cluster_create(trans, cparent, &cluster,
-					     lhc, 0,
-					     HAMMER2_BREF_TYPE_INODE,
-					     HAMMER2_INODE_BYTES,
-					     0);
+	/*
+	 * Create the inode with the lhc as the key.
+	 */
+	xop = hammer2_xop_alloc(pip, HAMMER2_XOP_MODIFYING);
+	xop->lhc = lhc;
+	xop->flags = HAMMER2_INSERT_PFSROOT;
+	bzero(&xop->meta, sizeof(xop->meta));
+
+	xop->meta.type = HAMMER2_OBJTYPE_DIRECTORY;
+	xop->meta.inum = 1;
+	xop->meta.iparent = pip_inum;
+
+	/* Inherit parent's inode compression mode. */
+	xop->meta.comp_algo = pip_comp_algo;
+	xop->meta.check_algo = pip_check_algo;
+	xop->meta.version = HAMMER2_INODE_VERSION_ONE;
+	hammer2_update_time(&xop->meta.ctime);
+	xop->meta.mtime = xop->meta.ctime;
+	xop->meta.mode = 0755;
+	xop->meta.nlinks = 1;
+
+	/*
+	 * Regular files and softlinks allow a small amount of data to be
+	 * directly embedded in the inode.  This flag will be cleared if
+	 * the size is extended past the embedded limit.
+	 */
+	if (xop->meta.type == HAMMER2_OBJTYPE_REGFILE ||
+	    xop->meta.type == HAMMER2_OBJTYPE_SOFTLINK) {
+		xop->meta.op_flags |= HAMMER2_OPFLAG_DIRECTDATA;
 	}
+	hammer2_xop_setname(&xop->head, name, name_len);
+	xop->meta.name_len = name_len;
+	xop->meta.name_key = lhc;
+	KKASSERT(name_len < HAMMER2_INODE_MAXNAME);
+
+	hammer2_xop_start(&xop->head, &hammer2_inode_create_desc);
+
+	error = hammer2_xop_collect(&xop->head, 0);
 #if INODE_DEBUG
-	kprintf("CREATE INODE %*.*s chain=%p\n",
-		(int)name_len, (int)name_len, name,
-		(cluster ? cluster->focus : NULL));
+	kprintf("CREATE INODE %*.*s\n",
+		(int)name_len, (int)name_len, name);
 #endif
 
-	/*
-	 * Cleanup and handle retries.
-	 */
-	if (error == EAGAIN) {
-		hammer2_cluster_ref(cparent);
-		hammer2_inode_unlock_ex(dip, cparent);
-		hammer2_cluster_wait(cparent);
-		hammer2_cluster_drop(cparent);
-		goto retry;
-	}
-	hammer2_inode_unlock_ex(dip, cparent);
-	cparent = NULL;
-
 	if (error) {
-		KKASSERT(cluster == NULL);
 		*errorp = error;
-		return (NULL);
+		goto done;
 	}
 
 	/*
-	 * Set up the new inode.
+	 * Set up the new inode if not a hardlink pointer.
 	 *
 	 * NOTE: *_get() integrates chain's lock into the inode lock.
 	 *
@@ -687,384 +1087,279 @@ retry:
 	 *
 	 * NOTE: nipdata will have chain's blockset data.
 	 */
-	KKASSERT(cluster->focus->flags & HAMMER2_CHAIN_MODIFIED);
-	nipdata = &hammer2_cluster_wdata(cluster)->ipdata;
-	nipdata->inum = trans->inode_tid;
-	hammer2_cluster_modsync(cluster);
-	nip = hammer2_inode_get(dip->pmp, dip, cluster);
-	nipdata = &hammer2_cluster_wdata(cluster)->ipdata;
+	nip = hammer2_inode_get(pip->pmp, &xop->head, -1, -1);
+	nip->comp_heuristic = 0;
+done:
+	hammer2_xop_retire(&xop->head, HAMMER2_XOPMASK_VOP);
+done2:
+	hammer2_inode_unlock(pip);
 
-	if (vap) {
-		KKASSERT(trans->inodes_created == 0);
-		nipdata->type = hammer2_get_obj_type(vap->va_type);
-		nipdata->inum = trans->inode_tid;
-		++trans->inodes_created;
+	return (nip);
+}
 
-		switch (nipdata->type) {
-		case HAMMER2_OBJTYPE_CDEV:
-		case HAMMER2_OBJTYPE_BDEV:
-			nipdata->rmajor = vap->va_rmajor;
-			nipdata->rminor = vap->va_rminor;
-			break;
-		default:
-			break;
-		}
-	} else {
-		nipdata->type = HAMMER2_OBJTYPE_DIRECTORY;
-		nipdata->inum = 1;
+/*
+ * Create a new, normal inode.  This function will create the inode,
+ * the media chains, but will not insert the chains onto the media topology
+ * (doing so would require a flush transaction and cause long stalls).
+ *
+ * Caller must be in a normal transaction.
+ */
+hammer2_inode_t *
+hammer2_inode_create_normal(hammer2_inode_t *pip,
+			    struct vattr *vap, struct ucred *cred,
+			    hammer2_key_t inum, int *errorp)
+{
+	hammer2_xop_create_t *xop;
+	hammer2_inode_t *dip;
+	hammer2_inode_t *nip;
+	int error;
+	uid_t xuid;
+	uuid_t pip_uid;
+	uuid_t pip_gid;
+	uint32_t pip_mode;
+	uint8_t pip_comp_algo;
+	uint8_t pip_check_algo;
+	hammer2_tid_t pip_inum;
+	uint8_t type;
+
+	dip = pip->pmp->iroot;
+	KKASSERT(dip != NULL);
+
+	*errorp = 0;
+
+	/*hammer2_inode_lock(dip, 0);*/
+
+	pip_uid = pip->meta.uid;
+	pip_gid = pip->meta.gid;
+	pip_mode = pip->meta.mode;
+	pip_comp_algo = pip->meta.comp_algo;
+	pip_check_algo = pip->meta.check_algo;
+	pip_inum = (pip == pip->pmp->iroot) ? 1 : pip->meta.inum;
+
+	/*
+	 * Create the in-memory hammer2_inode structure for the specified
+	 * inode.
+	 */
+	nip = hammer2_inode_get(dip->pmp, NULL, inum, -1);
+	nip->comp_heuristic = 0;
+	KKASSERT((nip->flags & HAMMER2_INODE_CREATING) == 0 &&
+		 nip->cluster.nchains == 0);
+	atomic_set_int(&nip->flags, HAMMER2_INODE_CREATING);
+
+	/*
+	 * Setup the inode meta-data
+	 */
+	nip->meta.type = hammer2_get_obj_type(vap->va_type);
+
+	switch (nip->meta.type) {
+	case HAMMER2_OBJTYPE_CDEV:
+	case HAMMER2_OBJTYPE_BDEV:
+		nip->meta.rmajor = vap->va_rmajor;
+		nip->meta.rminor = vap->va_rminor;
+		break;
+	default:
+		break;
 	}
+	type = nip->meta.type;
+
+	KKASSERT(nip->meta.inum == inum);
+	nip->meta.iparent = pip_inum;
 	
 	/* Inherit parent's inode compression mode. */
-	nip->comp_heuristic = 0;
-	nipdata->comp_algo = dip_comp_algo;
-	nipdata->check_algo = dip_check_algo;
-	nipdata->version = HAMMER2_INODE_VERSION_ONE;
-	hammer2_update_time(&nipdata->ctime);
-	nipdata->mtime = nipdata->ctime;
-	if (vap)
-		nipdata->mode = vap->va_mode;
-	nipdata->nlinks = 1;
-	if (vap) {
-		if (dip && dip->pmp) {
-			xuid = hammer2_to_unix_xid(&dip_uid);
-			xuid = vop_helper_create_uid(dip->pmp->mp,
-						     dip_mode,
-						     xuid,
-						     cred,
-						     &vap->va_mode);
-		} else {
-			/* super-root has no dip and/or pmp */
-			xuid = 0;
-		}
-		if (vap->va_vaflags & VA_UID_UUID_VALID)
-			nipdata->uid = vap->va_uid_uuid;
-		else if (vap->va_uid != (uid_t)VNOVAL)
-			hammer2_guid_to_uuid(&nipdata->uid, vap->va_uid);
-		else
-			hammer2_guid_to_uuid(&nipdata->uid, xuid);
+	nip->meta.comp_algo = pip_comp_algo;
+	nip->meta.check_algo = pip_check_algo;
+	nip->meta.version = HAMMER2_INODE_VERSION_ONE;
+	hammer2_update_time(&nip->meta.ctime);
+	nip->meta.mtime = nip->meta.ctime;
+	nip->meta.mode = vap->va_mode;
+	nip->meta.nlinks = 1;
 
-		if (vap->va_vaflags & VA_GID_UUID_VALID)
-			nipdata->gid = vap->va_gid_uuid;
-		else if (vap->va_gid != (gid_t)VNOVAL)
-			hammer2_guid_to_uuid(&nipdata->gid, vap->va_gid);
-		else if (dip)
-			nipdata->gid = dip_gid;
-	}
+	xuid = hammer2_to_unix_xid(&pip_uid);
+	xuid = vop_helper_create_uid(dip->pmp->mp, pip_mode,
+				     xuid, cred,
+				     &vap->va_mode);
+	if (vap->va_vaflags & VA_UID_UUID_VALID)
+		nip->meta.uid = vap->va_uid_uuid;
+	else if (vap->va_uid != (uid_t)VNOVAL)
+		hammer2_guid_to_uuid(&nip->meta.uid, vap->va_uid);
+	else
+		hammer2_guid_to_uuid(&nip->meta.uid, xuid);
+
+	if (vap->va_vaflags & VA_GID_UUID_VALID)
+		nip->meta.gid = vap->va_gid_uuid;
+	else if (vap->va_gid != (gid_t)VNOVAL)
+		hammer2_guid_to_uuid(&nip->meta.gid, vap->va_gid);
+	else
+		nip->meta.gid = pip_gid;
 
 	/*
 	 * Regular files and softlinks allow a small amount of data to be
 	 * directly embedded in the inode.  This flag will be cleared if
 	 * the size is extended past the embedded limit.
 	 */
-	if (nipdata->type == HAMMER2_OBJTYPE_REGFILE ||
-	    nipdata->type == HAMMER2_OBJTYPE_SOFTLINK) {
-		nipdata->op_flags |= HAMMER2_OPFLAG_DIRECTDATA;
+	if (nip->meta.type == HAMMER2_OBJTYPE_REGFILE ||
+	    nip->meta.type == HAMMER2_OBJTYPE_SOFTLINK) {
+		nip->meta.op_flags |= HAMMER2_OPFLAG_DIRECTDATA;
 	}
 
-	KKASSERT(name_len < HAMMER2_INODE_MAXNAME);
-	bcopy(name, nipdata->filename, name_len);
-	nipdata->name_key = lhc;
-	nipdata->name_len = name_len;
-	hammer2_cluster_modsync(cluster);
-	*clusterp = cluster;
+	/*
+	 * Create the inode using (inum) as the key.  Pass pip for
+	 * method inheritance.
+	 */
+	xop = hammer2_xop_alloc(pip, HAMMER2_XOP_MODIFYING);
+	xop->lhc = inum;
+	xop->flags = 0;
+	xop->meta = nip->meta;
+	KKASSERT(vap);
+
+	xop->meta.name_len = hammer2_xop_setname_inum(&xop->head, inum);
+	xop->meta.name_key = inum;
+	nip->meta.name_len = xop->meta.name_len;
+	nip->meta.name_key = xop->meta.name_key;
+	hammer2_inode_modify(nip);
+
+	/*
+	 * Create the inode media chains but leave them detached.  We are
+	 * not in a flush transaction so we can't mess with media topology
+	 * above normal inodes (i.e. the index of the inodes themselves).
+	 *
+	 * We've already set the INODE_CREATING flag.  The inode's media
+	 * chains will be inserted onto the media topology on the next
+	 * filesystem sync.
+	 */
+	hammer2_xop_start(&xop->head, &hammer2_inode_create_det_desc);
+
+	error = hammer2_xop_collect(&xop->head, 0);
+#if INODE_DEBUG
+	kprintf("create inode type %d error %d\n", nip->meta.type, error);
+#endif
+
+	if (error) {
+		*errorp = error;
+		goto done;
+	}
+
+	/*
+	 * Associate the media chains created by the backend with the
+	 * frontend inode.
+	 */
+	hammer2_inode_repoint(nip, NULL, &xop->head.cluster);
+done:
+	hammer2_xop_retire(&xop->head, HAMMER2_XOPMASK_VOP);
+	/*hammer2_inode_unlock(dip);*/
 
 	return (nip);
 }
 
 /*
- * The cluster has been removed from the original directory and replaced
- * with a hardlink pointer.  Move the cluster to the specified parent
- * directory, change the filename to "0xINODENUMBER", and adjust the key.
- * The cluster becomes our invisible hardlink target.
+ * Create a directory entry under dip with the specified name, inode number,
+ * and OBJTYPE (type).
  *
- * The original cluster must be deleted on entry.
+ * This returns a UNIX errno code, not a HAMMER2_ERROR_* code.
+ *
+ * Caller must hold dip locked.
  */
-static
-void
-hammer2_hardlink_shiftup(hammer2_trans_t *trans, hammer2_cluster_t *cluster,
-			hammer2_inode_t *dip, hammer2_cluster_t *dcluster,
-			int nlinks, int *errorp)
+int
+hammer2_dirent_create(hammer2_inode_t *dip, const char *name, size_t name_len,
+		      hammer2_key_t inum, uint8_t type)
 {
-	const hammer2_inode_data_t *iptmp;
-	hammer2_inode_data_t *nipdata;
-	hammer2_cluster_t *xcluster;
-	hammer2_key_t key_dummy;
+	hammer2_xop_mkdirent_t *xop;
 	hammer2_key_t lhc;
-	hammer2_blockref_t bref;
-	int ddflag;
+	int error;
 
-	iptmp = &hammer2_cluster_rdata(cluster)->ipdata;
-	lhc = iptmp->inum;
-	KKASSERT((lhc & HAMMER2_DIRHASH_VISIBLE) == 0);
+	lhc = 0;
+	error = 0;
+
+	KKASSERT(name != NULL);
+	lhc = hammer2_dirhash(name, name_len);
 
 	/*
 	 * Locate the inode or indirect block to create the new
-	 * entry in.  lhc represents the inode number so there is
-	 * no collision iteration.
+	 * entry in.  At the same time check for key collisions
+	 * and iterate until we don't get one.
 	 *
-	 * There should be no key collisions with invisible inode keys.
-	 *
-	 * WARNING! Must use inode_lock_ex() on dip to handle a stale
-	 *	    dip->cluster cache.
+	 * Lock the directory exclusively for now to guarantee that
+	 * we can find an unused lhc for the name.  Due to collisions,
+	 * two different creates can end up with the same lhc so we
+	 * cannot depend on the OS to prevent the collision.
 	 */
-	*errorp = 0;
-	xcluster = hammer2_cluster_lookup(dcluster, &key_dummy,
-				      lhc, lhc, 0, &ddflag);
-	if (xcluster) {
-		kprintf("X3 chain %p dip %p dchain %p dip->chain %p\n",
-			xcluster->focus, dip, dcluster->focus,
-			dip->cluster.focus);
-		hammer2_cluster_unlock(xcluster);
-		xcluster = NULL;
-		*errorp = ENOSPC;
-#if 0
-		Debugger("X3");
-#endif
-	}
+	hammer2_inode_modify(dip);
 
 	/*
-	 * Handle the error case
+	 * If name specified, locate an unused key in the collision space.
+	 * Otherwise use the passed-in lhc directly.
 	 */
-	if (*errorp) {
-		panic("error2");
-		KKASSERT(xcluster == NULL);
-		return;
-	}
+	{
+		hammer2_xop_scanlhc_t *sxop;
+		hammer2_key_t lhcbase;
 
-	/*
-	 * Use xcluster as a placeholder for (lhc).  Duplicate cluster to the
-	 * same target bref as xcluster and then delete xcluster.  The
-	 * duplication occurs after xcluster in flush order even though
-	 * xcluster is deleted after the duplication. XXX
-	 *
-	 * WARNING! Duplications (to a different parent) can cause indirect
-	 *	    blocks to be inserted, refactor xcluster.
-	 *
-	 * WARNING! Only key and keybits is extracted from a passed-in bref.
-	 */
-	hammer2_cluster_bref(cluster, &bref);
-	bref.key = lhc;			/* invisible dir entry key */
-	bref.keybits = 0;
-	hammer2_cluster_rename(trans, &bref, dcluster, cluster, 0);
-
-	/*
-	 * cluster is now 'live' again.. adjust the filename.
-	 *
-	 * Directory entries are inodes but this is a hidden hardlink
-	 * target.  The name isn't used but to ease debugging give it
-	 * a name after its inode number.
-	 */
-	hammer2_cluster_modify(trans, cluster, 0);
-	nipdata = &hammer2_cluster_wdata(cluster)->ipdata;
-	ksnprintf(nipdata->filename, sizeof(nipdata->filename),
-		  "0x%016jx", (intmax_t)nipdata->inum);
-	nipdata->name_len = strlen(nipdata->filename);
-	nipdata->name_key = lhc;
-	nipdata->nlinks += nlinks;
-	hammer2_cluster_modsync(cluster);
-}
-
-/*
- * Connect the target inode represented by (cluster) to the media topology
- * at (dip, name, len).  The caller can pass a rough *chainp, this function
- * will issue lookup()s to position the parent chain properly for the
- * chain insertion.
- *
- * If hlink is TRUE this function creates an OBJTYPE_HARDLINK directory
- * entry instead of connecting (cluster).
- *
- * If hlink is FALSE this function expects (cluster) to be unparented.
- */
-int
-hammer2_inode_connect(hammer2_trans_t *trans,
-		      hammer2_cluster_t **clusterp, int hlink,
-		      hammer2_inode_t *dip, hammer2_cluster_t *dcluster,
-		      const uint8_t *name, size_t name_len,
-		      hammer2_key_t lhc)
-{
-	hammer2_inode_data_t *wipdata;
-	hammer2_cluster_t *ocluster;
-	hammer2_cluster_t *ncluster;
-	hammer2_key_t key_dummy;
-	int ddflag;
-	int error;
-
-	/*
-	 * Since ocluster is either disconnected from the topology or
-	 * represents a hardlink terminus which is always a parent of or
-	 * equal to dip, we should be able to safely lock dip->chain for
-	 * our setup.
-	 *
-	 * WARNING! Must use inode_lock_ex() on dip to handle a stale
-	 *	    dip->cluster.
-	 *
-	 * If name is non-NULL we calculate lhc, else we use the passed-in
-	 * lhc.
-	 */
-	ocluster = *clusterp;
-
-	if (name) {
-		lhc = hammer2_dirhash(name, name_len);
-
-		/*
-		 * Locate the inode or indirect block to create the new
-		 * entry in.  At the same time check for key collisions
-		 * and iterate until we don't get one.
-		 */
-		error = 0;
-		while (error == 0) {
-			ncluster = hammer2_cluster_lookup(dcluster, &key_dummy,
-						      lhc, lhc,
-						      0, &ddflag);
-			if (ncluster == NULL)
+		lhcbase = lhc;
+		sxop = hammer2_xop_alloc(dip, HAMMER2_XOP_MODIFYING);
+		sxop->lhc = lhc;
+		hammer2_xop_start(&sxop->head, &hammer2_scanlhc_desc);
+		while ((error = hammer2_xop_collect(&sxop->head, 0)) == 0) {
+			if (lhc != sxop->head.cluster.focus->bref.key)
 				break;
-			if ((lhc & HAMMER2_DIRHASH_LOMASK) ==
-			    HAMMER2_DIRHASH_LOMASK) {
-				error = ENOSPC;
-			}
-			hammer2_cluster_unlock(ncluster);
-			ncluster = NULL;
 			++lhc;
 		}
-	} else {
-		/*
-		 * Reconnect to specific key (used when moving
-		 * unlinked-but-open files into the hidden directory).
-		 */
-		ncluster = hammer2_cluster_lookup(dcluster, &key_dummy,
-						  lhc, lhc,
-						  0, &ddflag);
-		KKASSERT(ncluster == NULL);
-	}
+		hammer2_xop_retire(&sxop->head, HAMMER2_XOPMASK_VOP);
 
-	if (error == 0) {
-		if (hlink) {
-			/*
-			 * Hardlink pointer needed, create totally fresh
-			 * directory entry.
-			 *
-			 * We must refactor ocluster because it might have
-			 * been shifted into an indirect cluster by the
-			 * create.
-			 */
-			KKASSERT(ncluster == NULL);
-			error = hammer2_cluster_create(trans,
-						       dcluster, &ncluster,
-						       lhc, 0,
-						       HAMMER2_BREF_TYPE_INODE,
-						       HAMMER2_INODE_BYTES,
-						       0);
-		} else {
-			/*
-			 * Reconnect the original cluster under the new name.
-			 * Original cluster must have already been deleted by
-			 * teh caller.
-			 *
-			 * WARNING! Can cause held-over clusters to require a
-			 *	    refactor.  Fortunately we have none (our
-			 *	    locked clusters are passed into and
-			 *	    modified by the call).
-			 */
-			ncluster = ocluster;
-			ocluster = NULL;
-			error = hammer2_cluster_create(trans,
-						       dcluster, &ncluster,
-						       lhc, 0,
-						       HAMMER2_BREF_TYPE_INODE,
-						       HAMMER2_INODE_BYTES,
-						       0);
+		if (error) {
+			if (error != HAMMER2_ERROR_ENOENT)
+				goto done2;
+			++lhc;
+			error = 0;
+		}
+		if ((lhcbase ^ lhc) & ~HAMMER2_DIRHASH_LOMASK) {
+			error = HAMMER2_ERROR_ENOSPC;
+			goto done2;
 		}
 	}
 
 	/*
-	 * Unlock stuff.
+	 * Create the directory entry with the lhc as the key.
 	 */
-	KKASSERT(error != EAGAIN);
+	xop = hammer2_xop_alloc(dip, HAMMER2_XOP_MODIFYING);
+	xop->lhc = lhc;
+	bzero(&xop->dirent, sizeof(xop->dirent));
+	xop->dirent.inum = inum;
+	xop->dirent.type = type;
+	xop->dirent.namlen = name_len;
 
-	/*
-	 * ncluster should be NULL on error, leave ocluster
-	 * (ocluster == *clusterp) alone.
-	 */
-	if (error) {
-		KKASSERT(ncluster == NULL);
-		return (error);
-	}
+	KKASSERT(name_len < HAMMER2_INODE_MAXNAME);
+	hammer2_xop_setname(&xop->head, name, name_len);
 
-	/*
-	 * Directory entries are inodes so if the name has changed we have
-	 * to update the inode.
-	 *
-	 * When creating an OBJTYPE_HARDLINK entry remember to unlock the
-	 * cluster, the caller will access the hardlink via the actual hardlink
-	 * target file and not the hardlink pointer entry, so we must still
-	 * return ocluster.
-	 */
-	if (hlink && hammer2_hardlink_enable >= 0) {
-		/*
-		 * Create the HARDLINK pointer.  oip represents the hardlink
-		 * target in this situation.
-		 *
-		 * We will return ocluster (the hardlink target).
-		 */
-		hammer2_cluster_modify(trans, ncluster, 0);
-		KKASSERT(name_len < HAMMER2_INODE_MAXNAME);
-		wipdata = &hammer2_cluster_wdata(ncluster)->ipdata;
-		bcopy(name, wipdata->filename, name_len);
-		wipdata->name_key = lhc;
-		wipdata->name_len = name_len;
-		wipdata->target_type =
-				hammer2_cluster_rdata(ocluster)->ipdata.type;
-		wipdata->type = HAMMER2_OBJTYPE_HARDLINK;
-		wipdata->inum = hammer2_cluster_rdata(ocluster)->ipdata.inum;
-		wipdata->version = HAMMER2_INODE_VERSION_ONE;
-		wipdata->nlinks = 1;
-		wipdata->op_flags = HAMMER2_OPFLAG_DIRECTDATA;
-		hammer2_cluster_modsync(ncluster);
-		hammer2_cluster_unlock(ncluster);
-		ncluster = ocluster;
-		ocluster = NULL;
-	} else {
-		/*
-		 * ncluster is a duplicate of ocluster at the new location.
-		 * We must fixup the name stored in the inode data.
-		 * The bref key has already been adjusted by inode_connect().
-		 */
-		hammer2_cluster_modify(trans, ncluster, 0);
-		wipdata = &hammer2_cluster_wdata(ncluster)->ipdata;
+	hammer2_xop_start(&xop->head, &hammer2_inode_mkdirent_desc);
 
-		KKASSERT(name_len < HAMMER2_INODE_MAXNAME);
-		bcopy(name, wipdata->filename, name_len);
-		wipdata->name_key = lhc;
-		wipdata->name_len = name_len;
-		wipdata->nlinks = 1;
-		hammer2_cluster_modsync(ncluster);
-	}
+	error = hammer2_xop_collect(&xop->head, 0);
 
-	/*
-	 * We are replacing ocluster with ncluster, unlock ocluster.  In the
-	 * case where ocluster is left unchanged the code above sets
-	 * ncluster to ocluster and ocluster to NULL, resulting in a NOP here.
-	 */
-	if (ocluster)
-		hammer2_cluster_unlock(ocluster);
-	*clusterp = ncluster;
+	hammer2_xop_retire(&xop->head, HAMMER2_XOPMASK_VOP);
+done2:
+	error = hammer2_error_to_errno(error);
 
-	return (0);
+	return error;
 }
 
 /*
- * Repoint ip->cluster's chains to cluster's chains.  Caller must hold
- * the inode exclusively locked.  cluster may be NULL to clean out any
- * chains in ip->cluster.
+ * Repoint ip->cluster's chains to cluster's chains and fixup the default
+ * focus.  All items, valid or invalid, are repointed.  hammer2_xop_start()
+ * filters out invalid or non-matching elements.
+ *
+ * Caller must hold the inode and cluster exclusive locked, if not NULL,
+ * must also be locked.
+ *
+ * Cluster may be NULL to clean out any chains in ip->cluster.
  */
 void
 hammer2_inode_repoint(hammer2_inode_t *ip, hammer2_inode_t *pip,
 		      hammer2_cluster_t *cluster)
 {
+	hammer2_chain_t *dropch[HAMMER2_MAXCLUSTER];
 	hammer2_chain_t *ochain;
 	hammer2_chain_t *nchain;
-	hammer2_inode_t *opip;
 	int i;
+
+	bzero(dropch, sizeof(dropch));
 
 	/*
 	 * Replace chains in ip->cluster with chains from cluster and
@@ -1073,16 +1368,17 @@ hammer2_inode_repoint(hammer2_inode_t *ip, hammer2_inode_t *pip,
 	 * NOTE: nchain and/or ochain can be NULL due to gaps
 	 *	 in the cluster arrays.
 	 */
-	ip->cluster.focus = NULL;
+	hammer2_spin_ex(&ip->cluster_spin);
 	for (i = 0; cluster && i < cluster->nchains; ++i) {
-		nchain = cluster->array[i];
+		/*
+		 * Do not replace elements which are the same.  Also handle
+		 * element count discrepancies.
+		 */
+		nchain = cluster->array[i].chain;
 		if (i < ip->cluster.nchains) {
-			ochain = ip->cluster.array[i];
-			if (ochain == nchain) {
-				if (ip->cluster.focus == NULL)
-					ip->cluster.focus = nchain;
+			ochain = ip->cluster.array[i].chain;
+			if (ochain == nchain)
 				continue;
-			}
 		} else {
 			ochain = NULL;
 		}
@@ -1090,857 +1386,360 @@ hammer2_inode_repoint(hammer2_inode_t *ip, hammer2_inode_t *pip,
 		/*
 		 * Make adjustments
 		 */
-		ip->cluster.array[i] = nchain;
-		if (ip->cluster.focus == NULL)
-			ip->cluster.focus = nchain;
+		ip->cluster.array[i].chain = nchain;
+		ip->cluster.array[i].flags &= ~HAMMER2_CITEM_INVALID;
+		ip->cluster.array[i].flags |= cluster->array[i].flags &
+					      HAMMER2_CITEM_INVALID;
 		if (nchain)
 			hammer2_chain_ref(nchain);
-		if (ochain)
-			hammer2_chain_drop(ochain);
+		dropch[i] = ochain;
 	}
 
 	/*
 	 * Release any left-over chains in ip->cluster.
 	 */
 	while (i < ip->cluster.nchains) {
-		nchain = ip->cluster.array[i];
+		nchain = ip->cluster.array[i].chain;
 		if (nchain) {
-			ip->cluster.array[i] = NULL;
-			hammer2_chain_drop(nchain);
+			ip->cluster.array[i].chain = NULL;
+			ip->cluster.array[i].flags |= HAMMER2_CITEM_INVALID;
 		}
+		dropch[i] = nchain;
 		++i;
 	}
-	ip->cluster.nchains = cluster ? cluster->nchains : 0;
 
 	/*
-	 * Repoint ip->pip if requested (non-NULL pip).
+	 * Fixup fields.  Note that the inode-embedded cluster is never
+	 * directly locked.
 	 */
-	if (pip && ip->pip != pip) {
-		opip = ip->pip;
-		hammer2_inode_ref(pip);
-		ip->pip = pip;
-		if (opip)
-			hammer2_inode_drop(opip);
+	if (cluster) {
+		ip->cluster.nchains = cluster->nchains;
+		ip->cluster.focus = cluster->focus;
+		ip->cluster.flags = cluster->flags & ~HAMMER2_CLUSTER_LOCKED;
+	} else {
+		ip->cluster.nchains = 0;
+		ip->cluster.focus = NULL;
+		ip->cluster.flags &= ~HAMMER2_CLUSTER_ZFLAGS;
+	}
+
+	hammer2_spin_unex(&ip->cluster_spin);
+
+	/*
+	 * Cleanup outside of spinlock
+	 */
+	while (--i >= 0) {
+		if (dropch[i])
+			hammer2_chain_drop(dropch[i]);
 	}
 }
 
 /*
- * Unlink the file from the specified directory inode.  The directory inode
- * does not need to be locked.
+ * Repoint a single element from the cluster to the ip.  Used by the
+ * synchronization threads to piecemeal update inodes.  Does not change
+ * focus and requires inode to be re-locked to clean-up flags (XXX).
+ */
+void
+hammer2_inode_repoint_one(hammer2_inode_t *ip, hammer2_cluster_t *cluster,
+			  int idx)
+{
+	hammer2_chain_t *ochain;
+	hammer2_chain_t *nchain;
+	int i;
+
+	hammer2_spin_ex(&ip->cluster_spin);
+	KKASSERT(idx < cluster->nchains);
+	if (idx < ip->cluster.nchains) {
+		ochain = ip->cluster.array[idx].chain;
+		nchain = cluster->array[idx].chain;
+	} else {
+		ochain = NULL;
+		nchain = cluster->array[idx].chain;
+		for (i = ip->cluster.nchains; i <= idx; ++i) {
+			bzero(&ip->cluster.array[i],
+			      sizeof(ip->cluster.array[i]));
+			ip->cluster.array[i].flags |= HAMMER2_CITEM_INVALID;
+		}
+		ip->cluster.nchains = idx + 1;
+	}
+	if (ochain != nchain) {
+		/*
+		 * Make adjustments.
+		 */
+		ip->cluster.array[idx].chain = nchain;
+		ip->cluster.array[idx].flags &= ~HAMMER2_CITEM_INVALID;
+		ip->cluster.array[idx].flags |= cluster->array[idx].flags &
+						HAMMER2_CITEM_INVALID;
+	}
+	hammer2_spin_unex(&ip->cluster_spin);
+	if (ochain != nchain) {
+		if (nchain)
+			hammer2_chain_ref(nchain);
+		if (ochain)
+			hammer2_chain_drop(ochain);
+	}
+}
+
+/*
+ * Called with a locked inode to finish unlinking an inode after xop_unlink
+ * had been run.  This function is responsible for decrementing nlinks.
  *
- * isdir determines whether a directory/non-directory check should be made.
- * No check is made if isdir is set to -1.
+ * We don't bother decrementing nlinks if the file is not open and this was
+ * the last link.
  *
- * isopen specifies whether special unlink-with-open-descriptor handling
- * must be performed.  If set to -1 the caller is deleting a PFS and we
- * check whether the chain is mounted or not (chain->pmp != NULL).  1 is
- * implied if it is mounted.
+ * If the inode is a hardlink target it's chain has not yet been deleted,
+ * otherwise it's chain has been deleted.
  *
- * If isopen is 1 and nlinks drops to 0 this function must move the chain
- * to a special hidden directory until last-close occurs on the file.
- *
- * NOTE!  The underlying file can still be active with open descriptors
- *	  or if the chain is being manually held (e.g. for rename).
- *
- *	  The caller is responsible for fixing up ip->chain if e.g. a
- *	  rename occurs (see chain_duplicate()).
- *
- * NOTE!  The chain is not deleted if it is moved to the hidden directory,
- *	  but otherwise will be deleted.
+ * If isopen then any prior deletion was not permanent and the inode is
+ * left intact with nlinks == 0;
  */
 int
-hammer2_unlink_file(hammer2_trans_t *trans, hammer2_inode_t *dip,
-		    const uint8_t *name, size_t name_len,
-		    int isdir, int *hlinkp, struct nchandle *nch,
-		    int nlinks)
+hammer2_inode_unlink_finisher(hammer2_inode_t *ip, int isopen)
 {
-	const hammer2_inode_data_t *ripdata;
-	hammer2_inode_data_t *wipdata;
-	hammer2_cluster_t *cparent;
-	hammer2_cluster_t *hcluster;
-	hammer2_cluster_t *hparent;
-	hammer2_cluster_t *cluster;
-	hammer2_cluster_t *dparent;
-	hammer2_cluster_t *dcluster;
-	hammer2_key_t key_dummy;
-	hammer2_key_t key_next;
-	hammer2_key_t lhc;
+	hammer2_pfs_t *pmp;
 	int error;
-	int ddflag;
-	int hlink;
-	uint8_t type;
 
-	error = 0;
-	hlink = 0;
-	hcluster = NULL;
-	hparent = NULL;
-	lhc = hammer2_dirhash(name, name_len);
-
-again:
-	/*
-	 * Search for the filename in the directory
-	 */
-	cparent = hammer2_inode_lock_ex(dip);
-	cluster = hammer2_cluster_lookup(cparent, &key_next,
-				     lhc, lhc + HAMMER2_DIRHASH_LOMASK,
-				     0, &ddflag);
-	while (cluster) {
-		if (hammer2_cluster_type(cluster) == HAMMER2_BREF_TYPE_INODE) {
-			ripdata = &hammer2_cluster_rdata(cluster)->ipdata;
-			if (ripdata->name_len == name_len &&
-			    bcmp(ripdata->filename, name, name_len) == 0) {
-				break;
-			}
-		}
-		cluster = hammer2_cluster_next(cparent, cluster, &key_next,
-					       key_next,
-					       lhc + HAMMER2_DIRHASH_LOMASK,
-					       0);
-	}
-	hammer2_inode_unlock_ex(dip, NULL);	/* retain cparent */
+	pmp = ip->pmp;
 
 	/*
-	 * Not found or wrong type (isdir < 0 disables the type check).
-	 * If a hardlink pointer, type checks use the hardlink target.
+	 * Decrement nlinks.  If this is the last link and the file is
+	 * not open we can just delete the inode and not bother dropping
+	 * nlinks to 0 (avoiding unnecessary block updates).
 	 */
-	if (cluster == NULL) {
-		error = ENOENT;
-		goto done;
-	}
-	ripdata = &hammer2_cluster_rdata(cluster)->ipdata;
-	type = ripdata->type;
-	if (type == HAMMER2_OBJTYPE_HARDLINK) {
-		hlink = 1;
-		type = ripdata->target_type;
+	if (ip->meta.nlinks == 1) {
+		atomic_set_int(&ip->flags, HAMMER2_INODE_ISUNLINKED);
+		if (isopen == 0)
+			goto killit;
 	}
 
-	if (type == HAMMER2_OBJTYPE_DIRECTORY && isdir == 0) {
-		error = ENOTDIR;
-		goto done;
-	}
-	if (type != HAMMER2_OBJTYPE_DIRECTORY && isdir >= 1) {
-		error = EISDIR;
-		goto done;
-	}
+	hammer2_inode_modify(ip);
+	--ip->meta.nlinks;
+	if ((int64_t)ip->meta.nlinks < 0)
+		ip->meta.nlinks = 0;	/* safety */
 
 	/*
-	 * Hardlink must be resolved.  We can't hold the parent locked
-	 * while we do this or we could deadlock.  The physical file will
-	 * be located at or above the current directory.
-	 *
-	 * We loop to reacquire the hardlink origination.
-	 *
-	 * NOTE: hammer2_hardlink_find() will locate the hardlink target,
-	 *	 returning a modified hparent and hcluster.
+	 * If nlinks is not zero we are done.  However, this should only be
+	 * possible with a hardlink target.  If the inode is an embedded
+	 * hardlink nlinks should have dropped to zero, warn and proceed
+	 * with the next step.
 	 */
-	if (ripdata->type == HAMMER2_OBJTYPE_HARDLINK) {
-		if (hcluster == NULL) {
-			hcluster = cluster;
-			cluster = NULL;	/* safety */
-			hammer2_cluster_unlock(cparent);
-			cparent = NULL; /* safety */
-			ripdata = NULL;	/* safety (associated w/cparent) */
-			error = hammer2_hardlink_find(dip, &hparent, hcluster);
-
-			/*
-			 * If we couldn't find the hardlink target then some
-			 * parent directory containing the hardlink pointer
-			 * probably got renamed to above the original target,
-			 * a case not yet handled by H2.
-			 */
-			if (error) {
-				kprintf("H2 unlink_file: hardlink target for "
-					"\"%s\" not found\n",
-					name);
-				kprintf("(likely due to known directory "
-					"rename bug)\n");
-				goto done;
-			}
-			goto again;
-		}
+	if (ip->meta.nlinks) {
+		if ((ip->meta.name_key & HAMMER2_DIRHASH_VISIBLE) == 0)
+			return 0;
+		kprintf("hammer2_inode_unlink: nlinks was not 0 (%jd)\n",
+			(intmax_t)ip->meta.nlinks);
+		return 0;
 	}
+
+	if (ip->vp)
+		hammer2_knote(ip->vp, NOTE_DELETE);
 
 	/*
-	 * If this is a directory the directory must be empty.  However, if
-	 * isdir < 0 we are doing a rename and the directory does not have
-	 * to be empty, and if isdir > 1 we are deleting a PFS/snapshot
-	 * and the directory does not have to be empty.
+	 * nlinks is now an implied zero, delete the inode if not open.
+	 * We avoid unnecessary media updates by not bothering to actually
+	 * decrement nlinks for the 1->0 transition
 	 *
-	 * NOTE: We check the full key range here which covers both visible
-	 *	 and invisible entries.  Theoretically there should be no
-	 *	 invisible (hardlink target) entries if there are no visible
-	 *	 entries.
+	 * Put the inode on the sideq to ensure that any disconnected chains
+	 * get properly flushed (so they can be freed).  Defer the deletion
+	 * to the sync code, doing it now will desynchronize the inode from
+	 * related directory entries (which is bad).
+	 *
+	 * NOTE: killit can be reached without modifying the inode, so
+	 *	 make sure that it is on the SIDEQ.
 	 */
-	if (type == HAMMER2_OBJTYPE_DIRECTORY && isdir == 1) {
-		dparent = hammer2_cluster_lookup_init(cluster, 0);
-		dcluster = hammer2_cluster_lookup(dparent, &key_dummy,
-					          0, (hammer2_key_t)-1,
-					          HAMMER2_LOOKUP_NODATA,
-						  &ddflag);
-		if (dcluster) {
-			hammer2_cluster_unlock(dcluster);
-			hammer2_cluster_lookup_done(dparent);
-			error = ENOTEMPTY;
-			goto done;
-		}
-		hammer2_cluster_lookup_done(dparent);
-		dparent = NULL;
-		/* dcluster NULL */
-	}
+	if (isopen == 0) {
+#if 0
+		hammer2_xop_destroy_t *xop;
+#endif
 
-	/*
-	 * If this was a hardlink then (cparent, cluster) is the hardlink
-	 * pointer, which we can simply destroy outright.  Discard the
-	 * clusters and replace with the hardlink target.
-	 */
-	if (hcluster) {
-		hammer2_cluster_delete(trans, cparent, cluster,
-				       HAMMER2_DELETE_PERMANENT);
-		hammer2_cluster_unlock(cparent);
-		hammer2_cluster_unlock(cluster);
-		cparent = hparent;
-		cluster = hcluster;
-		hparent = NULL;
-		hcluster = NULL;
+killit:
+		atomic_set_int(&ip->flags, HAMMER2_INODE_DELETING);
+		hammer2_inode_delayed_sideq(ip);
+#if 0
+		xop = hammer2_xop_alloc(ip, HAMMER2_XOP_MODIFYING);
+		hammer2_xop_start(&xop->head, &hammer2_inode_destroy_desc);
+		error = hammer2_xop_collect(&xop->head, 0);
+		hammer2_xop_retire(&xop->head, HAMMER2_XOPMASK_VOP);
+#endif
 	}
-
-	/*
-	 * This leaves us with the hardlink target or non-hardlinked file
-	 * or directory in (cparent, cluster).
-	 *
-	 * Delete the target when nlinks reaches 0 with special handling
-	 * if (isopen) is set.
-	 *
-	 * NOTE! In DragonFly the vnops function calls cache_unlink() after
-	 *	 calling us here to clean out the namecache association,
-	 *	 (which does not represent a ref for the open-test), and to
-	 *	 force finalization of the vnode if/when the last ref gets
-	 *	 dropped.
-	 *
-	 * NOTE! Files are unlinked by rename and then relinked.  nch will be
-	 *	 passed as NULL in this situation.  hammer2_inode_connect()
-	 *	 will bump nlinks.
-	 */
-	KKASSERT(cluster != NULL);
-	hammer2_cluster_modify(trans, cluster, 0);
-	wipdata = &hammer2_cluster_wdata(cluster)->ipdata;
-	ripdata = wipdata;
-	wipdata->nlinks += nlinks;
-	if ((int64_t)wipdata->nlinks < 0) {	/* XXX debugging */
-		wipdata->nlinks = 0;
-	}
-	hammer2_cluster_modsync(cluster);
-
-	if (wipdata->nlinks == 0) {
-		/*
-		 * Target nlinks has reached 0, file now unlinked (but may
-		 * still be open).
-		 */
-		/* XXX need interlock if mounted
-		if ((cluster->focus->flags & HAMMER2_CHAIN_PFSROOT) &&
-		    cluster->pmp) {
-			error = EINVAL;
-			kprintf("hammer2: PFS \"%s\" cannot be deleted "
-				"while still mounted\n",
-				wipdata->filename);
-			goto done;
-		}
-		*/
-		if (nch && cache_isopen(nch)) {
-			hammer2_inode_move_to_hidden(trans, &cparent, &cluster,
-						     wipdata->inum);
-		} else {
-			/*
-			 * This won't get everything if a vnode is still
-			 * present, but the cache_unlink() call the caller
-			 * makes will.
-			 */
-			hammer2_cluster_delete(trans, cparent, cluster,
-					       HAMMER2_DELETE_PERMANENT);
-		}
-	} else if (hlink == 0) {
-		/*
-		 * In this situation a normal non-hardlinked file (which can
-		 * only have nlinks == 1) still has a non-zero nlinks, the
-		 * caller must be doing a RENAME operation and so is passing
-		 * a nlinks adjustment of 0, and only wishes to remove file
-		 * in order to be able to reconnect it under a different name.
-		 *
-		 * In this situation we do a non-permanent deletion of the
-		 * chain in order to allow the file to be reconnected in
-		 * a different location.
-		 */
-		KKASSERT(nlinks == 0);
-		hammer2_cluster_delete(trans, cparent, cluster, 0);
-	}
-	error = 0;
-done:
-	if (cparent)
-		hammer2_cluster_unlock(cparent);
-	if (cluster)
-		hammer2_cluster_unlock(cluster);
-	if (hparent)
-		hammer2_cluster_unlock(hparent);
-	if (hcluster)
-		hammer2_cluster_unlock(hcluster);
-	if (hlinkp)
-		*hlinkp = hlink;
+	error = 0;	/* XXX */
 
 	return error;
 }
 
 /*
- * This is called from the mount code to initialize pmp->ihidden
+ * Mark an inode as being modified, meaning that the caller will modify
+ * ip->meta.
+ *
+ * If a vnode is present we set the vnode dirty and the nominal filesystem
+ * sync will also handle synchronizing the inode meta-data.  If no vnode
+ * is present we must ensure that the inode is on pmp->sideq.
+ *
+ * NOTE: We must always queue the inode to the sideq.  This allows H2 to
+ *	 shortcut vsyncscan() and flush inodes and their related vnodes
+ *	 in a two stages.  H2 still calls vfsync() for each vnode.
+ *
+ * NOTE: No mtid (modify_tid) is passed into this routine.  The caller is
+ *	 only modifying the in-memory inode.  A modify_tid is synchronized
+ *	 later when the inode gets flushed.
+ *
+ * NOTE: As an exception to the general rule, the inode MAY be locked
+ *	 shared for this particular call.
  */
 void
-hammer2_inode_install_hidden(hammer2_pfsmount_t *pmp)
+hammer2_inode_modify(hammer2_inode_t *ip)
 {
-	hammer2_trans_t trans;
-	hammer2_cluster_t *cparent;
-	hammer2_cluster_t *cluster;
-	hammer2_cluster_t *scan;
-	const hammer2_inode_data_t *ripdata;
-	hammer2_inode_data_t *wipdata;
-	hammer2_key_t key_dummy;
-	hammer2_key_t key_next;
-	int ddflag;
-	int error;
-	int count;
-	int dip_check_algo;
-	int dip_comp_algo;
-
-	if (pmp->ihidden)
-		return;
-
-	/*
-	 * Find the hidden directory
-	 */
-	bzero(&key_dummy, sizeof(key_dummy));
-	hammer2_trans_init(&trans, pmp, 0);
-
-	/*
-	 * Setup for lookup, retrieve iroot's check and compression
-	 * algorithm request which was likely generated by newfs_hammer2.
-	 *
-	 * The check/comp fields will probably never be used since inodes
-	 * are renamed into the hidden directory and not created relative to
-	 * the hidden directory, chain creation inherits from bref.methods,
-	 * and data chains inherit from their respective file inode *_algo
-	 * fields.
-	 */
-	cparent = hammer2_inode_lock_ex(pmp->iroot);
-	ripdata = &hammer2_cluster_rdata(cparent)->ipdata;
-	dip_check_algo = ripdata->check_algo;
-	dip_comp_algo = ripdata->comp_algo;
-	ripdata = NULL;
-
-	cluster = hammer2_cluster_lookup(cparent, &key_dummy,
-					 HAMMER2_INODE_HIDDENDIR,
-					 HAMMER2_INODE_HIDDENDIR,
-					 0, &ddflag);
-	if (cluster) {
-		pmp->ihidden = hammer2_inode_get(pmp, pmp->iroot, cluster);
-		hammer2_inode_ref(pmp->ihidden);
-
-		/*
-		 * Remove any unlinked files which were left open as-of
-		 * any system crash.
-		 *
-		 * Don't pass NODATA, we need the inode data so the delete
-		 * can do proper statistics updates.
-		 */
-		count = 0;
-		scan = hammer2_cluster_lookup(cluster, &key_next,
-					      0, HAMMER2_TID_MAX,
-					      0, &ddflag);
-		while (scan) {
-			if (hammer2_cluster_type(scan) ==
-			    HAMMER2_BREF_TYPE_INODE) {
-				hammer2_cluster_delete(&trans, cluster, scan,
-						   HAMMER2_DELETE_PERMANENT);
-				++count;
-			}
-			scan = hammer2_cluster_next(cluster, scan, &key_next,
-						    0, HAMMER2_TID_MAX, 0);
-		}
-
-		hammer2_inode_unlock_ex(pmp->ihidden, cluster);
-		hammer2_inode_unlock_ex(pmp->iroot, cparent);
-		hammer2_trans_done(&trans);
-		kprintf("hammer2: PFS loaded hidden dir, "
-			"removed %d dead entries\n", count);
-		return;
-	}
-
-	/*
-	 * Create the hidden directory
-	 */
-	error = hammer2_cluster_create(&trans, cparent, &cluster,
-				       HAMMER2_INODE_HIDDENDIR, 0,
-				       HAMMER2_BREF_TYPE_INODE,
-				       HAMMER2_INODE_BYTES,
-				       0);
-	hammer2_inode_unlock_ex(pmp->iroot, cparent);
-
-	hammer2_cluster_modify(&trans, cluster, 0);
-	wipdata = &hammer2_cluster_wdata(cluster)->ipdata;
-	wipdata->type = HAMMER2_OBJTYPE_DIRECTORY;
-	wipdata->inum = HAMMER2_INODE_HIDDENDIR;
-	wipdata->nlinks = 1;
-	wipdata->comp_algo = dip_comp_algo;
-	wipdata->check_algo = dip_check_algo;
-	hammer2_cluster_modsync(cluster);
-	kprintf("hammer2: PFS root missing hidden directory, creating\n");
-
-	pmp->ihidden = hammer2_inode_get(pmp, pmp->iroot, cluster);
-	hammer2_inode_ref(pmp->ihidden);
-	hammer2_inode_unlock_ex(pmp->ihidden, cluster);
-	hammer2_trans_done(&trans);
-}
-
-/*
- * If an open file is unlinked H2 needs to retain the file in the topology
- * to ensure that its backing store is not recovered by the bulk free scan.
- * This also allows us to avoid having to special-case the CHAIN_DELETED flag.
- *
- * To do this the file is moved to a hidden directory in the PFS root and
- * renamed.  The hidden directory must be created if it does not exist.
- */
-static
-void
-hammer2_inode_move_to_hidden(hammer2_trans_t *trans,
-			     hammer2_cluster_t **cparentp,
-			     hammer2_cluster_t **clusterp,
-			     hammer2_tid_t inum)
-{
-	hammer2_cluster_t *dcluster;
-	hammer2_pfsmount_t *pmp;
-	int error;
-
-	pmp = (*clusterp)->pmp;
-	KKASSERT(pmp != NULL);
-	KKASSERT(pmp->ihidden != NULL);
-
-	hammer2_cluster_delete(trans, *cparentp, *clusterp, 0);
-	dcluster = hammer2_inode_lock_ex(pmp->ihidden);
-	error = hammer2_inode_connect(trans, clusterp, 0,
-				      pmp->ihidden, dcluster,
-				      NULL, 0, inum);
-	hammer2_inode_unlock_ex(pmp->ihidden, dcluster);
-	KKASSERT(error == 0);
-}
-
-/*
- * Given an exclusively locked inode and cluster we consolidate the cluster
- * for hardlink creation, adding (nlinks) to the file's link count and
- * potentially relocating the inode to (cdip) which is a parent directory
- * common to both the current location of the inode and the intended new
- * hardlink.
- *
- * Replaces (*clusterp) if consolidation occurred, unlocking the old cluster
- * and returning a new locked cluster.
- *
- * NOTE!  This function will also replace ip->cluster.
- */
-int
-hammer2_hardlink_consolidate(hammer2_trans_t *trans,
-			     hammer2_inode_t *ip,
-			     hammer2_cluster_t **clusterp,
-			     hammer2_inode_t *cdip,
-			     hammer2_cluster_t *cdcluster,
-			     int nlinks)
-{
-	const hammer2_inode_data_t *ripdata;
-	hammer2_inode_data_t *wipdata;
-	hammer2_cluster_t *cluster;
-	hammer2_cluster_t *cparent;
-	int error;
-
-	cluster = *clusterp;
-	ripdata = &hammer2_cluster_rdata(cluster)->ipdata;
-	if (nlinks == 0 &&			/* no hardlink needed */
-	    (ripdata->name_key & HAMMER2_DIRHASH_VISIBLE)) {
-		return (0);
-	}
-
-	if (hammer2_hardlink_enable == 0) {	/* disallow hardlinks */
-		hammer2_cluster_unlock(cluster);
-		*clusterp = NULL;
-		return (ENOTSUP);
-	}
-
-	cparent = NULL;
-
-	/*
-	 * If no change in the hardlink's target directory is required and
-	 * this is already a hardlink target, all we need to do is adjust
-	 * the link count.
-	 */
-	ripdata = &hammer2_cluster_rdata(cluster)->ipdata;
-	if (cdip == ip->pip &&
-	    (ripdata->name_key & HAMMER2_DIRHASH_VISIBLE) == 0) {
-		if (nlinks) {
-			hammer2_cluster_modify(trans, cluster, 0);
-			wipdata = &hammer2_cluster_wdata(cluster)->ipdata;
-			wipdata->nlinks += nlinks;
-			hammer2_cluster_modsync(cluster);
-			ripdata = wipdata;
-		}
-		error = 0;
-		goto done;
-	}
-
-	/*
-	 * Cluster is the real inode.  The originating directory is locked
-	 * by the caller so we can manipulate it without worrying about races
-	 * against other lookups.
-	 *
-	 * If cluster is visible we need to delete it from the current
-	 * location and create a hardlink pointer in its place.  If it is
-	 * not visible we need only delete it.  Then later cluster will be
-	 * renamed to a parent directory and converted (if necessary) to
-	 * a hidden inode (via shiftup).
-	 *
-	 * NOTE! We must hold cparent locked through the delete/create/rename
-	 *	 operation to ensure that other threads block resolving to
-	 *	 the same hardlink, otherwise the other threads may not see
-	 *	 the hardlink.
-	 */
-	KKASSERT((cluster->focus->flags & HAMMER2_CHAIN_DELETED) == 0);
-	cparent = hammer2_cluster_parent(cluster);
-
-	hammer2_cluster_delete(trans, cparent, cluster, 0);
-
-	ripdata = &hammer2_cluster_rdata(cluster)->ipdata;
-	KKASSERT(ripdata->type != HAMMER2_OBJTYPE_HARDLINK);
-	if (ripdata->name_key & HAMMER2_DIRHASH_VISIBLE) {
-		hammer2_cluster_t *ncluster;
-		hammer2_key_t lhc;
-
-		ncluster = NULL;
-		lhc = cluster->focus->bref.key;
-		error = hammer2_cluster_create(trans, cparent, &ncluster,
-					     lhc, 0,
-					     HAMMER2_BREF_TYPE_INODE,
-					     HAMMER2_INODE_BYTES,
-					     0);
-		hammer2_cluster_modify(trans, ncluster, 0);
-		wipdata = &hammer2_cluster_wdata(ncluster)->ipdata;
-
-		/* wipdata->comp_algo = ripdata->comp_algo; */
-		wipdata->comp_algo = 0;
-		wipdata->check_algo = 0;
-		wipdata->version = HAMMER2_INODE_VERSION_ONE;
-		wipdata->inum = ripdata->inum;
-		wipdata->target_type = ripdata->type;
-		wipdata->type = HAMMER2_OBJTYPE_HARDLINK;
-		wipdata->uflags = 0;
-		wipdata->rmajor = 0;
-		wipdata->rminor = 0;
-		wipdata->ctime = 0;
-		wipdata->mtime = 0;
-		wipdata->atime = 0;
-		wipdata->btime = 0;
-		bzero(&wipdata->uid, sizeof(wipdata->uid));
-		bzero(&wipdata->gid, sizeof(wipdata->gid));
-		wipdata->op_flags = HAMMER2_OPFLAG_DIRECTDATA;
-		wipdata->cap_flags = 0;
-		wipdata->mode = 0;
-		wipdata->size = 0;
-		wipdata->nlinks = 1;
-		wipdata->iparent = 0;	/* XXX */
-		wipdata->pfs_type = 0;
-		wipdata->pfs_inum = 0;
-		bzero(&wipdata->pfs_clid, sizeof(wipdata->pfs_clid));
-		bzero(&wipdata->pfs_fsid, sizeof(wipdata->pfs_fsid));
-		wipdata->data_quota = 0;
-		wipdata->data_count = 0;
-		wipdata->inode_quota = 0;
-		wipdata->inode_count = 0;
-		wipdata->attr_tid = 0;
-		wipdata->dirent_tid = 0;
-		bzero(&wipdata->u, sizeof(wipdata->u));
-		bcopy(ripdata->filename, wipdata->filename, ripdata->name_len);
-		wipdata->name_key = ncluster->focus->bref.key;
-		wipdata->name_len = ripdata->name_len;
-		/* XXX transaction ids */
-		hammer2_cluster_modsync(ncluster);
-		hammer2_cluster_unlock(ncluster);
-	}
-	ripdata = wipdata;
-
-	/*
-	 * cluster represents the hardlink target and is now flagged deleted.
-	 * duplicate it to the parent directory and adjust nlinks.
-	 *
-	 * WARNING! The shiftup() call can cause ncluster to be moved into
-	 *	    an indirect block, and our ncluster will wind up pointing
-	 *	    to the older/original version.
-	 */
-	KKASSERT(cluster->focus->flags & HAMMER2_CHAIN_DELETED);
-	hammer2_hardlink_shiftup(trans, cluster, cdip, cdcluster,
-				 nlinks, &error);
-
-	if (error == 0)
-		hammer2_inode_repoint(ip, cdip, cluster);
-
-done:
-	/*
-	 * Cleanup, cluster/ncluster already dealt with.
-	 *
-	 * Return the shifted cluster in *clusterp.
-	 */
-	if (cparent)
-		hammer2_cluster_unlock(cparent);
-	*clusterp = cluster;
-
-	return (error);
-}
-
-/*
- * If (*ochainp) is non-NULL it points to the forward OBJTYPE_HARDLINK
- * inode while (*chainp) points to the resolved (hidden hardlink
- * target) inode.  In this situation when nlinks is 1 we wish to
- * deconsolidate the hardlink, moving it back to the directory that now
- * represents the only remaining link.
- */
-int
-hammer2_hardlink_deconsolidate(hammer2_trans_t *trans,
-			       hammer2_inode_t *dip,
-			       hammer2_chain_t **chainp,
-			       hammer2_chain_t **ochainp)
-{
-	if (*ochainp == NULL)
-		return (0);
-	/* XXX */
-	return (0);
-}
-
-/*
- * The caller presents a locked cluster with an obj_type of
- * HAMMER2_OBJTYPE_HARDLINK.  This routine will locate and replace the
- * cluster with the target hardlink, also locked.
- *
- * If cparentp is not NULL a locked cluster representing the hardlink's
- * parent is also returned.
- *
- * If we are unable to locate the hardlink target EIO is returned and
- * (*cparentp) is set to NULL.  The passed-in cluster still needs to be
- * unlocked by the caller but will be degenerate... not have any chains.
- */
-int
-hammer2_hardlink_find(hammer2_inode_t *dip,
-		      hammer2_cluster_t **cparentp, hammer2_cluster_t *cluster)
-{
-	const hammer2_inode_data_t *ipdata;
-	hammer2_cluster_t *cparent;
-	hammer2_cluster_t *rcluster;
-	hammer2_inode_t *ip;
-	hammer2_inode_t *pip;
-	hammer2_key_t key_dummy;
-	hammer2_key_t lhc;
-	int ddflag;
-
-	pip = dip;
-	hammer2_inode_ref(pip);		/* for loop */
-
-	/*
-	 * Locate the hardlink.  pip is referenced and not locked.
-	 */
-	ipdata = &hammer2_cluster_rdata(cluster)->ipdata;
-	lhc = ipdata->inum;
-
-	/*
-	 * We don't need the cluster's chains, but we need to retain the
-	 * cluster structure itself so we can load the hardlink search
-	 * result into it.
-	 */
-	KKASSERT(cluster->refs == 1);
-	atomic_add_int(&cluster->refs, 1);
-	hammer2_cluster_unlock(cluster);	/* hack */
-	cluster->nchains = 0;			/* hack */
-
-	rcluster = NULL;
-	cparent = NULL;
-
-	while ((ip = pip) != NULL) {
-		cparent = hammer2_inode_lock_ex(ip);
-		hammer2_inode_drop(ip);			/* loop */
-		KKASSERT(hammer2_cluster_type(cparent) ==
-			 HAMMER2_BREF_TYPE_INODE);
-		rcluster = hammer2_cluster_lookup(cparent, &key_dummy,
-					     lhc, lhc, 0, &ddflag);
-		if (rcluster)
-			break;
-		hammer2_cluster_lookup_done(cparent);	/* discard parent */
-		cparent = NULL;				/* safety */
-		pip = ip->pip;		/* safe, ip held locked */
-		if (pip)
-			hammer2_inode_ref(pip);		/* loop */
-		hammer2_inode_unlock_ex(ip, NULL);
-	}
-
-	/*
-	 * chain is locked, ip is locked.  Unlock ip, return the locked
-	 * chain.  *ipp is already set w/a ref count and not locked.
-	 *
-	 * (cparent is already unlocked).
-	 */
-	if (rcluster) {
-		hammer2_cluster_replace(cluster, rcluster);
-		hammer2_cluster_drop(rcluster);
-		if (cparentp) {
-			*cparentp = cparent;
-			hammer2_inode_unlock_ex(ip, NULL);
-		} else {
-			hammer2_inode_unlock_ex(ip, cparent);
-		}
-		return (0);
-	} else {
-		if (cparentp)
-			*cparentp = NULL;
-		if (ip)
-			hammer2_inode_unlock_ex(ip, cparent);
-		return (EIO);
-	}
-}
-
-/*
- * Find the directory common to both fdip and tdip.
- *
- * Returns a held but not locked inode.  Caller typically locks the inode,
- * and when through unlocks AND drops it.
- */
-hammer2_inode_t *
-hammer2_inode_common_parent(hammer2_inode_t *fdip, hammer2_inode_t *tdip)
-{
-	hammer2_inode_t *scan1;
-	hammer2_inode_t *scan2;
-
-	/*
-	 * We used to have a depth field but it complicated matters too
-	 * much for directory renames.  So now its ugly.  Check for
-	 * simple cases before giving up and doing it the expensive way.
-	 *
-	 * XXX need a bottom-up topology stability lock
-	 */
-	if (fdip == tdip || fdip == tdip->pip) {
-		hammer2_inode_ref(fdip);
-		return(fdip);
-	}
-	if (fdip->pip == tdip) {
-		hammer2_inode_ref(tdip);
-		return(tdip);
-	}
-
-	/*
-	 * XXX not MPSAFE
-	 */
-	for (scan1 = fdip; scan1->pmp == fdip->pmp; scan1 = scan1->pip) {
-		scan2 = tdip;
-		while (scan2->pmp == tdip->pmp) {
-			if (scan1 == scan2) {
-				hammer2_inode_ref(scan1);
-				return(scan1);
-			}
-			scan2 = scan2->pip;
-			if (scan2 == NULL)
-				break;
-		}
-	}
-	panic("hammer2_inode_common_parent: no common parent %p %p\n",
-	      fdip, tdip);
-	/* NOT REACHED */
-	return(NULL);
+	atomic_set_int(&ip->flags, HAMMER2_INODE_MODIFIED);
+	if (ip->vp)
+		vsetisdirty(ip->vp);
+	if (ip->pmp && (ip->flags & HAMMER2_INODE_NOSIDEQ) == 0)
+		hammer2_inode_delayed_sideq(ip);
 }
 
 /*
  * Synchronize the inode's frontend state with the chain state prior
- * to any explicit flush of the inode or any strategy write call.
+ * to any explicit flush of the inode or any strategy write call.  This
+ * does not flush the inode's chain or its sub-topology to media (higher
+ * level layers are responsible for doing that).
  *
- * Called with a locked inode.
+ * Called with a locked inode inside a normal transaction.
+ *
+ * inode must be locked.
  */
-void
-hammer2_inode_fsync(hammer2_trans_t *trans, hammer2_inode_t *ip, 
-		    hammer2_cluster_t *cparent)
+int
+hammer2_inode_chain_sync(hammer2_inode_t *ip)
 {
-	const hammer2_inode_data_t *ripdata;
-	hammer2_inode_data_t *wipdata;
-	hammer2_cluster_t *dparent;
-	hammer2_cluster_t *cluster;
-	hammer2_key_t lbase;
-	hammer2_key_t key_next;
-	int dosync = 0;
-	int ddflag;
+	int error;
 
-	ripdata = &hammer2_cluster_rdata(cparent)->ipdata;    /* target file */
+	error = 0;
+	if (ip->flags & (HAMMER2_INODE_RESIZED | HAMMER2_INODE_MODIFIED)) {
+		hammer2_xop_fsync_t *xop;
 
-	if (ip->flags & HAMMER2_INODE_MTIME) {
-		wipdata = hammer2_cluster_modify_ip(trans, ip, cparent, 0);
-		atomic_clear_int(&ip->flags, HAMMER2_INODE_MTIME);
-		wipdata->mtime = ip->mtime;
-		dosync = 1;
-		ripdata = wipdata;
-	}
-	if ((ip->flags & HAMMER2_INODE_RESIZED) && ip->size < ripdata->size) {
-		wipdata = hammer2_cluster_modify_ip(trans, ip, cparent, 0);
-		wipdata->size = ip->size;
-		dosync = 1;
-		ripdata = wipdata;
-		atomic_clear_int(&ip->flags, HAMMER2_INODE_RESIZED);
-
-		/*
-		 * We must delete any chains beyond the EOF.  The chain
-		 * straddling the EOF will be pending in the bioq.
-		 */
-		lbase = (ripdata->size + HAMMER2_PBUFMASK64) &
-			~HAMMER2_PBUFMASK64;
-		dparent = hammer2_cluster_lookup_init(&ip->cluster, 0);
-		cluster = hammer2_cluster_lookup(dparent, &key_next,
-					         lbase, (hammer2_key_t)-1,
-						 HAMMER2_LOOKUP_NODATA,
-						 &ddflag);
-		while (cluster) {
-			/*
-			 * Degenerate embedded case, nothing to loop on
-			 */
-			switch (hammer2_cluster_type(cluster)) {
-			case HAMMER2_BREF_TYPE_INODE:
-				hammer2_cluster_unlock(cluster);
-				cluster = NULL;
-				break;
-			case HAMMER2_BREF_TYPE_DATA:
-				hammer2_cluster_delete(trans, dparent, cluster,
-						   HAMMER2_DELETE_PERMANENT);
-				/* fall through */
-			default:
-				cluster = hammer2_cluster_next(dparent, cluster,
-						   &key_next,
-						   key_next, (hammer2_key_t)-1,
-						   HAMMER2_LOOKUP_NODATA);
-				break;
+		xop = hammer2_xop_alloc(ip, HAMMER2_XOP_MODIFYING);
+		xop->clear_directdata = 0;
+		if (ip->flags & HAMMER2_INODE_RESIZED) {
+			if ((ip->meta.op_flags & HAMMER2_OPFLAG_DIRECTDATA) &&
+			    ip->meta.size > HAMMER2_EMBEDDED_BYTES) {
+				ip->meta.op_flags &= ~HAMMER2_OPFLAG_DIRECTDATA;
+				xop->clear_directdata = 1;
 			}
+			xop->osize = ip->osize;
+		} else {
+			xop->osize = ip->meta.size;	/* safety */
 		}
-		hammer2_cluster_lookup_done(dparent);
-	} else
-	if ((ip->flags & HAMMER2_INODE_RESIZED) && ip->size > ripdata->size) {
-		wipdata = hammer2_cluster_modify_ip(trans, ip, cparent, 0);
-		wipdata->size = ip->size;
-		atomic_clear_int(&ip->flags, HAMMER2_INODE_RESIZED);
+		xop->ipflags = ip->flags;
+		xop->meta = ip->meta;
 
-		/*
-		 * When resizing larger we may not have any direct-data
-		 * available.
-		 */
-		if ((wipdata->op_flags & HAMMER2_OPFLAG_DIRECTDATA) &&
-		    ip->size > HAMMER2_EMBEDDED_BYTES) {
-			wipdata->op_flags &= ~HAMMER2_OPFLAG_DIRECTDATA;
-			bzero(&wipdata->u.blockset,
-			      sizeof(wipdata->u.blockset));
+		atomic_clear_int(&ip->flags, HAMMER2_INODE_RESIZED |
+					     HAMMER2_INODE_MODIFIED);
+		hammer2_xop_start(&xop->head, &hammer2_inode_chain_sync_desc);
+		error = hammer2_xop_collect(&xop->head, 0);
+		hammer2_xop_retire(&xop->head, HAMMER2_XOPMASK_VOP);
+		if (error == HAMMER2_ERROR_ENOENT)
+			error = 0;
+		if (error) {
+			kprintf("hammer2: unable to fsync inode %p\n", ip);
+			/*
+			atomic_set_int(&ip->flags,
+				       xop->ipflags & (HAMMER2_INODE_RESIZED |
+						       HAMMER2_INODE_MODIFIED));
+			*/
+			/* XXX return error somehow? */
 		}
-		dosync = 1;
-		ripdata = wipdata;
 	}
-	if (dosync)
-		hammer2_cluster_modsync(cparent);
+	return error;
+}
+
+/*
+ * When an inode is flagged INODE_CREATING its chains have not actually
+ * been inserting into the on-media tree yet.
+ */
+int
+hammer2_inode_chain_ins(hammer2_inode_t *ip)
+{
+	int error;
+
+	error = 0;
+	if (ip->flags & HAMMER2_INODE_CREATING) {
+		hammer2_xop_create_t *xop;
+
+		atomic_clear_int(&ip->flags, HAMMER2_INODE_CREATING);
+		xop = hammer2_xop_alloc(ip, HAMMER2_XOP_MODIFYING);
+		xop->lhc = ip->meta.inum;
+		xop->flags = 0;
+		hammer2_xop_start(&xop->head, &hammer2_inode_create_ins_desc);
+		error = hammer2_xop_collect(&xop->head, 0);
+		hammer2_xop_retire(&xop->head, HAMMER2_XOPMASK_VOP);
+		if (error == HAMMER2_ERROR_ENOENT)
+			error = 0;
+		if (error) {
+			kprintf("hammer2: backend unable to "
+				"insert inode %p %ld\n", ip, ip->meta.inum);
+			/* XXX return error somehow? */
+		}
+	}
+	return error;
+}
+
+/*
+ * When an inode is flagged INODE_DELETING it has been deleted (no directory
+ * entry or open refs are left, though as an optimization H2 might leave
+ * nlinks == 1 to avoid unnecessary block updates).  The backend flush then
+ * needs to actually remove it from the topology.
+ *
+ * NOTE: backend flush must still sync and flush the deleted inode to clean
+ *	 out related chains.
+ *
+ * NOTE: We must clear not only INODE_DELETING, but also INODE_ISUNLINKED
+ *	 to prevent the vnode reclaim code from trying to delete it twice.
+ */
+int
+hammer2_inode_chain_des(hammer2_inode_t *ip)
+{
+	int error;
+
+	error = 0;
+	if (ip->flags & HAMMER2_INODE_DELETING) {
+		hammer2_xop_destroy_t *xop;
+
+		atomic_clear_int(&ip->flags, HAMMER2_INODE_DELETING |
+					     HAMMER2_INODE_ISUNLINKED);
+		xop = hammer2_xop_alloc(ip, HAMMER2_XOP_MODIFYING);
+		hammer2_xop_start(&xop->head, &hammer2_inode_destroy_desc);
+		error = hammer2_xop_collect(&xop->head, 0);
+		hammer2_xop_retire(&xop->head, HAMMER2_XOPMASK_VOP);
+
+		if (error == HAMMER2_ERROR_ENOENT)
+			error = 0;
+		if (error) {
+			kprintf("hammer2: backend unable to "
+				"delete inode %p %ld\n", ip, ip->meta.inum);
+			/* XXX return error somehow? */
+		}
+	}
+	return error;
+}
+
+/*
+ * Flushes the inode's chain and its sub-topology to media.  Interlocks
+ * HAMMER2_INODE_DIRTYDATA by clearing it prior to the flush.  Any strategy
+ * function creating or modifying a chain under this inode will re-set the
+ * flag.
+ *
+ * inode must be locked.
+ */
+int
+hammer2_inode_chain_flush(hammer2_inode_t *ip, int flags)
+{
+	hammer2_xop_fsync_t *xop;
+	int error;
+
+	atomic_clear_int(&ip->flags, HAMMER2_INODE_DIRTYDATA);
+	xop = hammer2_xop_alloc(ip, HAMMER2_XOP_MODIFYING | flags);
+	hammer2_xop_start(&xop->head, &hammer2_inode_flush_desc);
+	error = hammer2_xop_collect(&xop->head, HAMMER2_XOP_COLLECT_WAITALL);
+	hammer2_xop_retire(&xop->head, HAMMER2_XOPMASK_VOP);
+	if (error == HAMMER2_ERROR_ENOENT)
+		error = 0;
+
+	return error;
 }

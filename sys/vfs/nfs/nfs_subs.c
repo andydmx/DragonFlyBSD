@@ -46,15 +46,16 @@
 #include <sys/mount.h>
 #include <sys/vnode.h>
 #include <sys/nlookup.h>
-#include <sys/namei.h>
 #include <sys/mbuf.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/malloc.h>
 #include <sys/sysent.h>
 #include <sys/syscall.h>
+#include <sys/sysmsg.h>
 #include <sys/conf.h>
 #include <sys/objcache.h>
+#include <sys/jail.h>
 
 #include <vm/vm.h>
 #include <vm/vm_object.h>
@@ -543,9 +544,6 @@ static short *nfsrv_v3errmap[] = {
 
 #endif /* NFS_NOSERVER */
 
-struct nfssvc_args;
-extern int sys_nfssvc(struct proc *, struct nfssvc_args *, int *);
-
 /*
  * This needs to return a monotonically increasing or close to monotonically
  * increasing result, otherwise the write gathering queues won't work 
@@ -566,7 +564,7 @@ nfs_curusec(void)
 int
 nfs_init(struct vfsconf *vfsp)
 {
-	callout_init(&nfs_timer_handle);
+	callout_init_mp(&nfs_timer_handle);
 	nfsmount_objcache = objcache_create_simple(M_NFSMOUNT, sizeof(struct nfsmount));
 
 	nfs_mount_type = vfsp->vfc_typenum;
@@ -606,12 +604,14 @@ nfs_init(struct vfsconf *vfsp)
 	 */
 	nfs_timer_callout(0);
 
+#if 1 /* XXX this isn't really needed */
 	nfs_prev_nfssvc_sy_narg = sysent[SYS_nfssvc].sy_narg;
 	sysent[SYS_nfssvc].sy_narg = 2;
+#endif
 	nfs_prev_nfssvc_sy_call = sysent[SYS_nfssvc].sy_call;
 	sysent[SYS_nfssvc].sy_call = (sy_call_t *)sys_nfssvc;
 
-	nfs_pbuf_freecnt = nswbuf / 2 + 1;
+	nfs_pbuf_freecnt = nswbuf_kva / 2 + 1;
 
 	return (0);
 }
@@ -623,6 +623,11 @@ nfs_uninit(struct vfsconf *vfsp)
 	nfs_mount_type = -1;
 	sysent[SYS_nfssvc].sy_narg = nfs_prev_nfssvc_sy_narg;
 	sysent[SYS_nfssvc].sy_call = nfs_prev_nfssvc_sy_call;
+	nfs_nhdestroy();			/* Destroy the nfsnode table */
+#ifndef NFS_NOSERVER
+	nfsrv_destroycache();		/* Destroy the server request cache */
+#endif
+	objcache_destroy(nfsmount_objcache);
 	return (0);
 }
 
@@ -657,7 +662,7 @@ nfs_loadattrcache(struct vnode *vp, struct mbuf **mdp, caddr_t *dposp,
 	caddr_t cp2;
 	int error = 0;
 	int rmajor, rminor;
-	udev_t rdev;
+	dev_t rdev;
 	struct mbuf *md;
 	enum vtype vtyp;
 	u_short vmode;
@@ -707,7 +712,7 @@ nfs_loadattrcache(struct vnode *vp, struct mbuf **mdp, caddr_t *dposp,
 		/*
 		 * Really ugly NFSv2 kludge.
 		 */
-		if (vtyp == VCHR && rdev == (udev_t)0xffffffff)
+		if (vtyp == VCHR && rdev == (dev_t)0xffffffff)
 			vtyp = VFIFO;
 	}
 
@@ -1220,9 +1225,12 @@ nfsrv_fhtovp(fhandle_t *fhp, int lockflag,
 	if (mp == NULL)
 		return (ESTALE);
 	error = VFS_CHECKEXP(mp, nam, &exflags, &credanon);
-	if (error)
+	if (error) {
+		mount_drop(mp);
 		return (error); 
+	}
 	error = VFS_FHTOVP(mp, NULL, &fhp->fh_fid, vpp);
+	mount_drop(mp);
 	if (error)
 		return (ESTALE);
 #ifdef MNT_EXNORESPORT
@@ -1445,7 +1453,7 @@ nfs_clearcommit_callback(struct mount *mp, struct vnode *vp,
 static int
 nfs_clearcommit_bp(struct buf *bp, void *data __unused)
 {
-	if (BUF_REFCNT(bp) == 0 &&
+	if (BUF_LOCKINUSE(bp) == 0 &&
 	    (bp->b_flags & (B_DELWRI | B_NEEDCOMMIT))
 	     == (B_DELWRI | B_NEEDCOMMIT)) {
 		bp->b_flags &= ~(B_NEEDCOMMIT | B_CLUSTEROK);
@@ -1519,3 +1527,45 @@ nfsrv_setcred(struct ucred *incred, struct ucred *outcred)
 	nfsrvw_sort(outcred->cr_groups, outcred->cr_ngroups);
 }
 #endif /* NFS_NOSERVER */
+
+/*
+ * Hold a ucred in nfs_node.  Discard prison information, otherwise
+ * prisons might stick around indefinitely due to NFS node caching.
+ */
+struct ucred *
+nfs_crhold(struct ucred *cred)
+{
+	if (cred) {
+		if (cred->cr_prison) {
+			cred = crdup(cred);
+			prison_free(cred->cr_prison);
+			cred->cr_prison = NULL;
+		} else {
+			cred = crhold(cred);
+		}
+	}
+	return cred;
+}
+
+/*
+ * Return whether two ucreds are the same insofar as NFS cares about.
+ */
+int
+nfs_crsame(struct ucred *cr1, struct ucred *cr2)
+{
+	if (cr1 != cr2) {
+		if (cr1 == NULL || cr2 == NULL)
+			return (cr1 == cr2);
+		if (cr1->cr_uid != cr2->cr_uid ||
+		    cr1->cr_ruid != cr2->cr_ruid ||
+		    cr1->cr_rgid != cr2->cr_rgid ||
+		    cr1->cr_ngroups != cr2->cr_ngroups) {
+			return 0;
+		}
+		if (bcmp(cr1->cr_groups, cr2->cr_groups,
+			 cr1->cr_ngroups * sizeof(cr1->cr_groups[0])) != 0) {
+			return 0;
+		}
+	}
+	return 1;
+}

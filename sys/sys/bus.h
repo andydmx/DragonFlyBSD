@@ -53,7 +53,7 @@
 /*
  * Forward declarations
  */
-typedef struct device		*device_t;
+typedef struct bsd_device	*device_t;
 typedef struct kobj_class	driver_t;
 typedef struct devclass		*devclass_t;
 #define	device_method_t		kobj_method_t
@@ -106,6 +106,7 @@ struct u_device {
  * NOTE: INTR_FAST is no longer supported, all device interrupts are threaded
  *	 now.  Only clock interrupts are 'fast'.
  */
+#define	INTR_HIFREQ	0x0040	/* high frequency interrupt */
 #define	INTR_CLOCK	0x0080	/* (was INTR_FAST) */
 #define	INTR_EXCL	0x0100
 #define	INTR_MPSAFE	0x0200
@@ -244,6 +245,7 @@ struct resource_list *
 int     bus_generic_config_intr(device_t, device_t, int, enum intr_trigger,
 					enum intr_polarity);
 int	bus_generic_attach(device_t dev);
+int	bus_generic_attach_gpri(device_t dev, u_int gpri);
 int	bus_generic_child_present(device_t dev, device_t child);
 int	bus_generic_deactivate_resource(device_t dev, device_t child, int type,
 					int rid, struct resource *r);
@@ -382,7 +384,9 @@ int	device_is_quiet(device_t dev);
 int	device_print_prettyname(device_t dev);
 int	device_printf(device_t dev, const char *, ...) __printflike(2, 3);
 int	device_probe_and_attach(device_t dev);
+int	device_probe_and_attach_gpri(device_t dev, u_int gpri);
 int	device_probe_child(device_t dev, device_t child);
+int	device_probe_child_gpri(device_t dev, device_t child, u_int gpri);
 void	device_quiet(device_t dev);
 void	device_set_desc(device_t dev, const char* desc);
 void	device_set_desc_copy(device_t dev, const char* desc);
@@ -396,6 +400,8 @@ int	device_shutdown(device_t dev);
 void	device_unbusy(device_t dev);
 void	device_verbose(device_t dev);
 int	device_getenv_int(device_t dev, const char *knob, int def);
+void	device_getenv_string(device_t dev, const char *knob,
+	    char * __restrict data, int dlen, const char * __restrict def);
 
 /*
  * Access functions for devclass.

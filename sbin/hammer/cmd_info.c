@@ -32,10 +32,11 @@
  * SUCH DAMAGE.
  *
  */
-#include <libhammer.h>
-#include <libutil.h>
 
 #include "hammer.h"
+
+#include <libutil.h>
+#include <libhammer.h>
 
 void show_info(char *path);
 static double percent(int64_t value, int64_t total);
@@ -54,6 +55,8 @@ hammer_cmd_info(char **av, int ac)
                         show_info(*av);
                         --ac;
                         ++av;
+			if (ac)
+				printf("\n");
                 }
 	} else {
 		mntsize = getmntinfo(&stfsbuf, MNT_NOWAIT);
@@ -65,121 +68,174 @@ hammer_cmd_info(char **av, int ac)
 					if (first)
 						first = 0;
 					else
-						fprintf(stdout, "\n");
+						printf("\n");
 					show_info(path);
 				}
 			}
+			if (first)
+				printf("No mounted HAMMER filesystems found\n");
 		} else {
-			fprintf(stdout, "No mounted filesystems found\n");
+			printf("No mounted filesystems found\n");
 		}
 	}
+}
+
+/*
+ * This is an adhoc function which exists only because libhammer can't
+ * properly handle variety of errors.
+ */
+static
+void
+__test_if_hammer_or_abort(const char *path)
+{
+	struct hammer_ioc_info info;
+	int fd;
+
+	fd = open(path, O_RDONLY);
+	if (fd < 0) {
+		err(1, "Failed to open %s", path);
+		/* not reached */
+	}
+
+	/*
+	 * This ioctl never fails as long as fd is for HAMMER filesystem,
+	 * thus we can assume path isn't in HAMMER if this fails.
+	 */
+	if (ioctl(fd, HAMMERIOC_GET_INFO, &info) < 0) {
+		err(1, "%s is probably not a HAMMER filesystem", path);
+		/* not reached */
+	}
+
+	close(fd);
 }
 
 void
 show_info(char *path)
 {
-	libhammer_volinfo_t hvi;
+	libhammer_fsinfo_t fip;
 	libhammer_pfsinfo_t pi, pi_first;
+	struct hammer_ioc_volume_list ioc;
 	int64_t	    usedbigblocks;
 	int64_t	    usedbytes, rsvbytes;
 	int64_t	    totalbytes, freebytes;
 	char	    *fsid;
 	char	    buf[6];
+	char	    rootvol[MAXPATHLEN];
+	int i;
 
 	fsid = NULL;
 	usedbigblocks = 0;
 
 	usedbytes = totalbytes = rsvbytes = freebytes = 0;
 
-	hvi = libhammer_get_volinfo(path);
-	if (hvi == NULL) {
-		perror("libhammer_get_volinfo");
-		exit(EXIT_FAILURE);
+	/* Need to do this before libhammer gets involved */
+	__test_if_hammer_or_abort(path);
+
+	fip = libhammer_get_fsinfo(path);
+	if (fip == NULL) {
+		errx(1, "Failed to get filesystem info");
+		/* not reached */
 	}
 
 	/* Find out the UUID strings */
-	uuid_to_string(&hvi->vol_fsid, &fsid, NULL);
+	hammer_uuid_to_string(&fip->vol_fsid, &fsid);
+
+	/* Get the volume paths */
+	if (hammer_fs_to_vol(path, &ioc) == -1) {
+		errx(1, "Failed to get volume paths");
+		/* not reached */
+	}
+
+	/* Get the root volume path */
+	if (hammer_fs_to_rootvol(path, rootvol, sizeof(rootvol)) == -1) {
+		errx(1, "Failed to get root volume path");
+		/* not reached */
+	}
 
 	/* Volume information */
-	fprintf(stdout, "Volume identification\n");
-	fprintf(stdout, "\tLabel               %s\n", hvi->vol_name);
-	fprintf(stdout, "\tNo. Volumes         %d\n", hvi->nvolumes);
-	fprintf(stdout, "\tFSID                %s\n", fsid);
-	fprintf(stdout, "\tHAMMER Version      %d\n", hvi->version);
+	printf("Volume identification\n");
+	printf("\tLabel               %s\n", fip->vol_name);
+	printf("\tNo. Volumes         %d\n", fip->nvolumes);
+	printf("\tHAMMER Volumes      ");
+	for (i = 0; i < ioc.nvols; i++) {
+		printf("%s", ioc.vols[i].device_name);
+		if (i != ioc.nvols - 1)
+			printf(":");
+	}
+	printf("\n");
+	printf("\tRoot Volume         %s\n", rootvol);
+	printf("\tFSID                %s\n", fsid);
+	printf("\tHAMMER Version      %d\n", fip->version);
 
-	/* Big blocks information */
-	usedbigblocks = hvi->bigblocks - hvi->freebigblocks;
+	/* Big-blocks information */
+	usedbigblocks = fip->bigblocks - fip->freebigblocks;
 
-	fprintf(stdout, "Big block information\n");
-	fprintf(stdout, "\tTotal      %10jd\n", (intmax_t)hvi->bigblocks);
-	fprintf(stdout, "\tUsed       %10jd (%.2lf%%)\n"
-			"\tReserved   %10jd (%.2lf%%)\n"
-			"\tFree       %10jd (%.2lf%%)\n",
-			(intmax_t)usedbigblocks,
-			percent(usedbigblocks, hvi->bigblocks),
-			(intmax_t)hvi->rsvbigblocks,
-			percent(hvi->rsvbigblocks, hvi->bigblocks),
-			(intmax_t)(hvi->freebigblocks - hvi->rsvbigblocks),
-			percent(hvi->freebigblocks - hvi->rsvbigblocks,
-				hvi->bigblocks));
-	fprintf(stdout, "Space information\n");
+	printf("Big-block information\n");
+	printf("\tTotal      %10jd\n", (intmax_t)fip->bigblocks);
+	printf("\tUsed       %10jd (%.2lf%%)\n"
+	       "\tReserved   %10jd (%.2lf%%)\n"
+	       "\tFree       %10jd (%.2lf%%)\n",
+		(intmax_t)usedbigblocks,
+		percent(usedbigblocks, fip->bigblocks),
+		(intmax_t)fip->rsvbigblocks,
+		percent(fip->rsvbigblocks, fip->bigblocks),
+		(intmax_t)(fip->freebigblocks - fip->rsvbigblocks),
+		percent(fip->freebigblocks - fip->rsvbigblocks, fip->bigblocks));
+	printf("Space information\n");
 
 	/* Space information */
-	totalbytes = (hvi->bigblocks << HAMMER_LARGEBLOCK_BITS);
-	usedbytes = (usedbigblocks << HAMMER_LARGEBLOCK_BITS);
-	rsvbytes = (hvi->rsvbigblocks << HAMMER_LARGEBLOCK_BITS);
-	freebytes = ((hvi->freebigblocks - hvi->rsvbigblocks)
-	    << HAMMER_LARGEBLOCK_BITS);
+	totalbytes = (fip->bigblocks << HAMMER_BIGBLOCK_BITS);
+	usedbytes = (usedbigblocks << HAMMER_BIGBLOCK_BITS);
+	rsvbytes = (fip->rsvbigblocks << HAMMER_BIGBLOCK_BITS);
+	freebytes = ((fip->freebigblocks - fip->rsvbigblocks)
+	    << HAMMER_BIGBLOCK_BITS);
 
-	fprintf(stdout, "\tNo. Inodes %10jd\n", (intmax_t)hvi->inodes);
+	printf("\tNo. Inodes %10jd\n", (intmax_t)fip->inodes);
 	humanize_number(buf, sizeof(buf)  - (totalbytes < 0 ? 0 : 1),
 	    totalbytes, "", HN_AUTOSCALE, HN_DECIMAL | HN_NOSPACE | HN_B);
-	fprintf(stdout, "\tTotal size     %6s (%jd bytes)\n",
+	printf("\tTotal size     %6s (%jd bytes)\n",
 	    buf, (intmax_t)totalbytes);
 
 	humanize_number(buf, sizeof(buf)  - (usedbytes < 0 ? 0 : 1),
 	    usedbytes, "", HN_AUTOSCALE, HN_DECIMAL | HN_NOSPACE | HN_B);
-	fprintf(stdout, "\tUsed           %6s (%.2lf%%)\n", buf,
+	printf("\tUsed           %6s (%.2lf%%)\n", buf,
 	    percent(usedbytes, totalbytes));
 
 	humanize_number(buf, sizeof(buf)  - (rsvbytes < 0 ? 0 : 1),
 	    rsvbytes, "", HN_AUTOSCALE, HN_DECIMAL | HN_NOSPACE | HN_B);
-	fprintf(stdout, "\tReserved       %6s (%.2lf%%)\n", buf,
+	printf("\tReserved       %6s (%.2lf%%)\n", buf,
 	    percent(rsvbytes, totalbytes));
 
 	humanize_number(buf, sizeof(buf)  - (freebytes < 0 ? 0 : 1),
 	    freebytes, "", HN_AUTOSCALE, HN_DECIMAL | HN_NOSPACE | HN_B);
-	fprintf(stdout, "\tFree           %6s (%.2lf%%)\n", buf,
+	printf("\tFree           %6s (%.2lf%%)\n", buf,
 	    percent(freebytes, totalbytes));
 
 	/* Pseudo-filesystem information */
-	fprintf(stdout, "PFS information\n");
-	fprintf(stdout, "\tPFS ID  Mode    Snaps  Mounted on\n");
+	printf("PFS information\n");
+	printf("\t  PFS#  Mode    Snaps\n");
 
 	/* Iterate all the PFSs found */
-	pi_first = libhammer_get_first_pfs(hvi);
+	pi_first = libhammer_get_first_pfs(fip);
 	for (pi = pi_first; pi != NULL; pi = libhammer_get_next_pfs(pi)) {
-		fprintf(stdout, "\t%6d  %-6s",
+		printf("\t%6d  %-6s",
 		    pi->pfs_id, (pi->ismaster ? "MASTER" : "SLAVE"));
 
 		snprintf(buf, 6, "%d", pi->snapcount);
-		fprintf(stdout, " %6s  ", (pi->head.error && pi->snapcount == 0) ? "-" : buf);
-
-		if (pi->mountedon)
-			fprintf(stdout, "%s", pi->mountedon);
-		else
-			fprintf(stdout, "not mounted");
-
-		fprintf(stdout, "\n");
+		printf(" %6s", (pi->head.error && pi->snapcount == 0) ? "-" : buf);
+		if (pi->pfs_id == HAMMER_ROOT_PFSID)
+			printf(" (root PFS)");
+		printf("\n");
 	}
 
 	free(fsid);
 
-	libhammer_free_volinfo(hvi);
+	libhammer_free_fsinfo(fip);
 
 }
 
-static double
+static
+double
 percent(int64_t value, int64_t total)
 {
 	/* Avoid divide-by-zero */

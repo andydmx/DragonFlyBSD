@@ -27,13 +27,13 @@
 .\"
 .\"     @(#)pipe.2	8.1 (Berkeley) 6/4/93
 .\" $FreeBSD: src/lib/libc/sys/pipe.2,v 1.13.2.5 2001/12/14 18:34:01 ru Exp $
-.\" $DragonFly: src/lib/libc/sys/pipe.2,v 1.2 2003/06/17 04:26:47 dillon Exp $
 .\"
 .Dd June 4, 1993
 .Dt PIPE 2
 .Os
 .Sh NAME
-.Nm pipe
+.Nm pipe ,
+.Nm pipe2
 .Nd create descriptor pair for interprocess communication
 .Sh LIBRARY
 .Lb libc
@@ -41,6 +41,8 @@
 .In unistd.h
 .Ft int
 .Fn pipe "int *fildes"
+.Ft int
+.Fn pipe2 "int fildes[2]" "int flags"
 .Sh DESCRIPTION
 The
 .Fn pipe
@@ -51,11 +53,34 @@ which is an object allowing
 bidirectional data flow,
 and allocates a pair of file descriptors.
 .Pp
+The
+.Fn pipe2
+system call allows control over the attributes of the file descriptors
+via the
+.Fa flags
+argument.
+Values for
+.Fa flags
+are constructed by a bitwise-inclusive OR of flags from the following
+list, defined in
+.In fcntl.h :
+.Bl -tag -width ".Dv O_NONBLOCK"
+.It Dv O_CLOEXEC
+Set the close-on-exec flag for the new file descriptors.
+.It Dv O_NONBLOCK
+Set the non-blocking flag for the ends of the pipe.
+.El
+.Pp
+If the
+.Fa flags
+argument is 0, the behavior is identical to a call to
+.Fn pipe .
+.Pp
 By convention, the first descriptor is normally used as the
 .Em read end
 of the pipe,
 and the second is normally the
-.Em write end  ,
+.Em write end ,
 so that data written to
 .Fa fildes[1]
 appears on (i.e., can be read from)
@@ -89,7 +114,9 @@ pipe in one direction.
 .Sh ERRORS
 The
 .Fn pipe
-call will fail if:
+and
+.Fn pipe2
+system calls will fail if:
 .Bl -tag -width Er
 .It Bq Er EMFILE
 Too many descriptors are active.
@@ -100,6 +127,16 @@ The
 .Fa fildes
 buffer is in an invalid area of the process's address
 space.
+.El
+.Pp
+The
+.Fn pipe2
+system call will also fail if:
+.Bl -tag -width Er
+.It Bq Er EINVAL
+The
+.Fa flags
+argument is invalid.
 .El
 .Sh SEE ALSO
 .Xr sh 1 ,

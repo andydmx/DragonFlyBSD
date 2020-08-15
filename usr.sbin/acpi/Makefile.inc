@@ -14,7 +14,8 @@ CFLAGS+=	\
 		-I${SYSDIR}/${ACPICA_DIR}/compiler	\
 		-I${SYSDIR}
 
-WARNS?=		2
+WARNS?=		3
+NO_STRICT_ALIASING=
 
 .if exists(${.CURDIR}/../../Makefile.inc)
 .include "${.CURDIR}/../../Makefile.inc"

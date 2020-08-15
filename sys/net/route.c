@@ -77,6 +77,7 @@
 #include <sys/thread.h>
 
 #include <net/if.h>
+#include <net/if_var.h>
 #include <net/route.h>
 #include <net/netisr.h>
 
@@ -92,7 +93,7 @@
 #include <netproto/mpls/mpls.h>
 #endif
 
-static struct rtstatistics rtstatistics_percpu[MAXCPU];
+static struct rtstatistics rtstatistics_percpu[MAXCPU] __cachealign;
 #define rtstat	rtstatistics_percpu[mycpuid]
 
 struct radix_node_head *rt_tables[MAXCPU][AF_MAX+1];
@@ -115,12 +116,8 @@ SYSCTL_NODE(_net, OID_AUTO, route, CTLFLAG_RW, 0, "Routing");
 #ifdef ROUTE_DEBUG
 static int route_debug = 1;
 SYSCTL_INT(_net_route, OID_AUTO, route_debug, CTLFLAG_RW,
-           &route_debug, 0, "");
+	   &route_debug, 0, "");
 #endif
-
-int route_assert_owner_access = 1;
-SYSCTL_INT(_net_route, OID_AUTO, assert_owner_access, CTLFLAG_RW,
-           &route_assert_owner_access, 0, "");
 
 u_long route_kmalloc_limit = 0;
 TUNABLE_ULONG("net.route.kmalloc_limit", &route_kmalloc_limit);
@@ -135,13 +132,13 @@ route_init(void)
 {
 	int cpu;
 
-	for (cpu = 0; cpu < ncpus; ++cpu)
+	if (route_kmalloc_limit)
+		kmalloc_raise_limit(M_RTABLE, route_kmalloc_limit);
+
+	for (cpu = 0; cpu < netisr_ncpus; ++cpu)
 		bzero(&rtstatistics_percpu[cpu], sizeof(struct rtstatistics));
 	rn_init();      /* initialize all zeroes, all ones, mask table */
 	rtable_init();	/* call dom_rtattach() on each cpu */
-
-	if (route_kmalloc_limit)
-		kmalloc_raise_limit(M_RTABLE, route_kmalloc_limit);
 }
 
 static void
@@ -150,14 +147,16 @@ rtable_init_oncpu(netmsg_t msg)
 	struct domain *dom;
 	int cpu = mycpuid;
 
+	ASSERT_NETISR_NCPUS(cpu);
+
 	SLIST_FOREACH(dom, &domains, dom_next) {
 		if (dom->dom_rtattach) {
 			dom->dom_rtattach(
 				(void **)&rt_tables[cpu][dom->dom_family],
-			        dom->dom_rtoffset);
+				dom->dom_rtoffset);
 		}
 	}
-	ifnet_forwardmsg(&msg->lmsg, cpu + 1);
+	netisr_forwardmsg(&msg->base, cpu + 1);
 }
 
 static void
@@ -166,7 +165,7 @@ rtable_init(void)
 	struct netmsg_base msg;
 
 	netmsg_init(&msg, NULL, &curthread->td_msgport, 0, rtable_init_oncpu);
-	ifnet_domsg(&msg.lmsg, 0);
+	netisr_domsg_global(&msg);
 }
 
 /*
@@ -177,7 +176,7 @@ sysctl_rtstatistics(SYSCTL_HANDLER_ARGS)
 {
 	int cpu, error = 0;
 
-	for (cpu = 0; cpu < ncpus; ++cpu) {
+	for (cpu = 0; cpu < netisr_ncpus; ++cpu) {
 		if ((error = SYSCTL_OUT(req, &rtstatistics_percpu[cpu],
 					sizeof(struct rtstatistics))))
 				break;
@@ -221,7 +220,7 @@ rtalloc_ign(struct route *ro, u_long ignoreflags)
 		rtfree(ro->ro_rt);
 		ro->ro_rt = NULL;
 	}
-	ro->ro_rt = _rtlookup(&ro->ro_dst, RTL_REPORTMSG, ignoreflags);
+	ro->ro_rt = _rtlookup(&ro->ro_dst, ignoreflags);
 }
 
 /*
@@ -234,10 +233,12 @@ rtalloc_ign(struct route *ro, u_long ignoreflags)
  * Any route returned has its reference count incremented.
  */
 struct rtentry *
-_rtlookup(struct sockaddr *dst, boolean_t generate_report, u_long ignore)
+_rtlookup(struct sockaddr *dst, u_long ignore)
 {
 	struct radix_node_head *rnh = rt_tables[mycpuid][dst->sa_family];
 	struct rtentry *rt;
+
+	ASSERT_NETISR_NCPUS(mycpuid);
 
 	if (rnh == NULL)
 		goto unreach;
@@ -260,18 +261,12 @@ _rtlookup(struct sockaddr *dst, boolean_t generate_report, u_long ignore)
 		error = rtrequest(RTM_RESOLVE, dst, NULL, NULL, 0,
 				  &clonedroute);	/* clone the route */
 		if (error != 0) {	/* cloning failed */
-			if (generate_report)
-				rt_dstmsg(RTM_MISS, dst, error);
+			rt_dstmsg(RTM_MISS, dst, error);
 			rt->rt_refcnt++;
 			return (rt);	/* return the uncloned route */
 		}
-		if (generate_report) {
-			if (clonedroute->rt_flags & RTF_XRESOLVE)
-				rt_dstmsg(RTM_RESOLVE, dst, 0);
-			else
-				rt_rtmsg(RTM_ADD, clonedroute,
-					 clonedroute->rt_ifp, 0);
-		}
+		if (clonedroute->rt_flags & RTF_XRESOLVE)
+			rt_dstmsg(RTM_RESOLVE, dst, 0);
 		return (clonedroute);	/* return cloned route */
 	}
 
@@ -283,24 +278,15 @@ _rtlookup(struct sockaddr *dst, boolean_t generate_report, u_long ignore)
 
 unreach:
 	rtstat.rts_unreach++;
-	if (generate_report)
-		rt_dstmsg(RTM_MISS, dst, 0);
+	rt_dstmsg(RTM_MISS, dst, 0);
 	return (NULL);
 }
 
 void
 rtfree(struct rtentry *rt)
 {
-	if (rt->rt_cpuid == mycpuid)
-		rtfree_oncpu(rt);
-	else
-		rtfree_remote(rt);
-}
 
-void
-rtfree_oncpu(struct rtentry *rt)
-{
-	KKASSERT(rt->rt_cpuid == mycpuid);
+	ASSERT_NETISR_NCPUS(rt->rt_cpuid);
 	KASSERT(rt->rt_refcnt > 0, ("rtfree: rt_refcnt %ld", rt->rt_refcnt));
 
 	--rt->rt_refcnt;
@@ -323,41 +309,35 @@ rtfree_oncpu(struct rtentry *rt)
 }
 
 static void
-rtfree_remote_dispatch(netmsg_t msg)
+rtfree_async_dispatch(netmsg_t msg)
 {
-	struct lwkt_msg *lmsg = &msg->lmsg;
-	struct rtentry *rt = lmsg->u.ms_resultp;
+	struct rtentry *rt = msg->lmsg.u.ms_resultp;
 
-	rtfree_oncpu(rt);
-	lwkt_replymsg(lmsg, 0);
+	rtfree(rt);
+	netisr_replymsg(&msg->base, 0);
 }
 
 void
-rtfree_remote(struct rtentry *rt)
+rtfree_async(struct rtentry *rt)
 {
 	struct netmsg_base *msg;
-	struct lwkt_msg *lmsg;
 
-	KKASSERT(rt->rt_cpuid != mycpuid);
-
-	if (route_assert_owner_access) {
-		panic("rt remote free rt_cpuid %d, mycpuid %d",
-		      rt->rt_cpuid, mycpuid);
-	} else {
-		kprintf("rt remote free rt_cpuid %d, mycpuid %d\n",
-			rt->rt_cpuid, mycpuid);
-		print_backtrace(-1);
+	if (IN_NETISR_NCPUS(rt->rt_cpuid)) {
+		rtfree(rt);
+		return;
 	}
 
-	msg = kmalloc(sizeof(*msg), M_LWKTMSG, M_INTWAIT);
-	netmsg_init(msg, NULL, &netisr_afree_rport, 0, rtfree_remote_dispatch);
-	lmsg = &msg->lmsg;
-	lmsg->u.ms_resultp = rt;
+	KASSERT(rt->rt_refcnt > 0,
+	    ("rtfree_async: rt_refcnt %ld", rt->rt_refcnt));
 
-	lwkt_sendmsg(netisr_cpuport(rt->rt_cpuid), lmsg);
+	msg = kmalloc(sizeof(*msg), M_LWKTMSG, M_INTWAIT);
+	netmsg_init(msg, NULL, &netisr_afree_rport, 0, rtfree_async_dispatch);
+	msg->lmsg.u.ms_resultp = rt;
+
+	netisr_sendmsg(msg, rt->rt_cpuid);
 }
 
-static int
+int
 rtredirect_oncpu(struct sockaddr *dst, struct sockaddr *gateway,
 		 struct sockaddr *netmask, int flags, struct sockaddr *src)
 {
@@ -366,6 +346,8 @@ rtredirect_oncpu(struct sockaddr *dst, struct sockaddr *gateway,
 	struct ifaddr *ifa;
 	u_long *stat = NULL;
 	int error;
+
+	ASSERT_NETISR_NCPUS(mycpuid);
 
 	/* verify the gateway is directly reachable */
 	if ((ifa = ifa_ifwithnet(gateway)) == NULL) {
@@ -440,8 +422,9 @@ create:
 		flags |= RTF_MODIFIED;
 
 		/* We only need to report rtmsg on CPU0 */
-		rt_setgate(rt, rt_key(rt), gateway,
-			   mycpuid == 0 ? RTL_REPORTMSG : RTL_DONTREPORT);
+		rt_setgate(rt, rt_key(rt), gateway);
+		if (mycpuid == 0)
+			rt_rtmsg(RTM_CHANGE, rt, rt->rt_ifp, 0);
 		error = 0;
 		stat = &rtstat.rts_newgateway;
 	}
@@ -472,8 +455,6 @@ struct netmsg_rtredirect {
  * destination to go through the given gateway.
  * Normally called as a result of a routing redirect
  * message from the network layer.
- *
- * N.B.: must be called at splnet
  */
 void
 rtredirect(struct sockaddr *dst, struct sockaddr *gateway,
@@ -490,7 +471,8 @@ rtredirect(struct sockaddr *dst, struct sockaddr *gateway,
 	msg.netmask = netmask;
 	msg.flags = flags;
 	msg.src = src;
-	error = rt_domsg_global(&msg.base);
+	error = netisr_domsg_global(&msg.base);
+
 	bzero(&rtinfo, sizeof(struct rt_addrinfo));
 	rtinfo.rti_info[RTAX_DST] = dst;
 	rtinfo.rti_info[RTAX_GATEWAY] = gateway;
@@ -503,15 +485,10 @@ static void
 rtredirect_msghandler(netmsg_t msg)
 {
 	struct netmsg_rtredirect *rmsg = (void *)msg;
-	int nextcpu;
 
 	rtredirect_oncpu(rmsg->dst, rmsg->gateway, rmsg->netmask,
 			 rmsg->flags, rmsg->src);
-	nextcpu = mycpuid + 1;
-	if (nextcpu < ncpus)
-		lwkt_forwardmsg(netisr_cpuport(nextcpu), &msg->lmsg);
-	else
-		lwkt_replymsg(&msg->lmsg, 0);
+	netisr_forwardmsg(&msg->base, mycpuid + 1);
 }
 
 /*
@@ -688,8 +665,8 @@ int
 rtrequest1_global(int req, struct rt_addrinfo *rtinfo,
     rtrequest1_callback_func_t callback, void *arg, boolean_t req_prio)
 {
-	int error, flags = 0;
 	struct netmsg_rtq msg;
+	int flags = 0;
 
 	if (req_prio)
 		flags = MSGF_PRIORITY;
@@ -700,8 +677,7 @@ rtrequest1_global(int req, struct rt_addrinfo *rtinfo,
 	msg.rtinfo = rtinfo;
 	msg.callback = callback;
 	msg.arg = arg;
-	error = rt_domsg_global(&msg.base);
-	return (error);
+	return (netisr_domsg_global(&msg.base));
 }
 
 /*
@@ -715,7 +691,6 @@ rtrequest1_msghandler(netmsg_t msg)
 	struct netmsg_rtq *rmsg = (void *)msg;
 	struct rt_addrinfo rtinfo;
 	struct rtentry *rt = NULL;
-	int nextcpu;
 	int error;
 
 	/*
@@ -741,17 +716,16 @@ rtrequest1_msghandler(netmsg_t msg)
 	if (rmsg->base.lmsg.ms_error < 0 || error == 0)
 		rmsg->base.lmsg.ms_error = error;
 
-	nextcpu = mycpuid + 1;
 	if (error && rmsg->req != RTM_DELETE) {
 		if (mycpuid != 0) {
-			panic("rtrequest1_msghandler: rtrequest table "
-			      "error was cpu%d, err %d\n", mycpuid, error);
+			panic("rtrequest1_msghandler: rtrequest table req %d, "
+			    "failed on cpu%d, error %d\n",
+			    rmsg->req, mycpuid, error);
 		}
-		lwkt_replymsg(&rmsg->base.lmsg, error);
-	} else if (nextcpu < ncpus) {
-		lwkt_forwardmsg(netisr_cpuport(nextcpu), &rmsg->base.lmsg);
+		netisr_replymsg(&rmsg->base, error);
 	} else {
-		lwkt_replymsg(&rmsg->base.lmsg, rmsg->base.lmsg.ms_error);
+		netisr_forwardmsg_error(&rmsg->base, mycpuid + 1,
+		    rmsg->base.lmsg.ms_error);
 	}
 }
 
@@ -764,8 +738,9 @@ rtrequest1(int req, struct rt_addrinfo *rtinfo, struct rtentry **ret_nrt)
 	struct radix_node_head *rnh;
 	struct ifaddr *ifa;
 	struct sockaddr *ndst;
-	boolean_t reportmsg;
 	int error = 0;
+
+	ASSERT_NETISR_NCPUS(mycpuid);
 
 #define gotoerr(x) { error = x ; goto bad; }
 
@@ -854,6 +829,9 @@ rtrequest1(int req, struct rt_addrinfo *rtinfo, struct rtentry **ret_nrt)
 		if (ret_nrt == NULL || (rt = *ret_nrt) == NULL)
 			gotoerr(EINVAL);
 
+		if (!(rt->rt_ifp->if_flags & IFF_UP))
+			gotoerr(ENETDOWN);
+
 		KASSERT(rt->rt_cpuid == mycpuid,
 		    ("rt resolve rt_cpuid %d, mycpuid %d",
 		     rt->rt_cpuid, mycpuid));
@@ -891,18 +869,7 @@ makeroute:
 		rt->rt_flags = RTF_UP | rtinfo->rti_flags;
 		rt->rt_cpuid = mycpuid;
 
-		if (mycpuid != 0 && req == RTM_ADD) {
-			/* For RTM_ADD, we have already sent rtmsg on CPU0. */
-			reportmsg = RTL_DONTREPORT;
-		} else {
-			/*
-			 * For RTM_ADD, we only send rtmsg on CPU0.
-			 * For RTM_RESOLVE, we always send rtmsg. XXX
-			 */
-			reportmsg = RTL_REPORTMSG;
-		}
-		error = rt_setgate(rt, dst, rtinfo->rti_info[RTAX_GATEWAY],
-				   reportmsg);
+		error = rt_setgate(rt, dst, rtinfo->rti_info[RTAX_GATEWAY]);
 		if (error != 0) {
 			Free(rt);
 			gotoerr(error);
@@ -955,6 +922,8 @@ makeroute:
 				}
 			}
 		}
+		/* NOTE: rt_ifa may have been changed */
+		ifa = rt->rt_ifa;
 
 		/*
 		 * If it still failed to go into the tree,
@@ -1014,6 +983,19 @@ makeroute:
 		 * increasing the number of references by one.
 		 */
 		if (ret_nrt != NULL) {
+			rt->rt_refcnt++;
+			*ret_nrt = rt;
+		}
+		break;
+	case RTM_GET:
+		/* Get the item from the tree. */
+		rn = rnh->rnh_lookup((char *)rtinfo->rti_info[RTAX_DST],
+				     (char *)rtinfo->rti_info[RTAX_NETMASK],
+				      rnh);
+		if (rn == NULL)
+			gotoerr(ESRCH);
+		if (ret_nrt != NULL) {
+			rt = (struct rtentry *)rn;
 			rt->rt_refcnt++;
 			*ret_nrt = rt;
 		}
@@ -1156,13 +1138,14 @@ rt_fixchange(struct radix_node *rn, void *vp)
 }
 
 int
-rt_setgate(struct rtentry *rt0, struct sockaddr *dst, struct sockaddr *gate,
-	   boolean_t generate_report)
+rt_setgate(struct rtentry *rt0, struct sockaddr *dst, struct sockaddr *gate)
 {
 	char *space, *oldspace;
 	int dlen = RT_ROUNDUP(dst->sa_len), glen = RT_ROUNDUP(gate->sa_len);
 	struct rtentry *rt = rt0;
 	struct radix_node_head *rnh = rt_tables[mycpuid][dst->sa_family];
+
+	ASSERT_NETISR_NCPUS(mycpuid);
 
 	/*
 	 * A host route with the destination equal to the gateway
@@ -1238,8 +1221,7 @@ rt_setgate(struct rtentry *rt0, struct sockaddr *dst, struct sockaddr *gate,
 		 *
 		 * This breaks TTCP for hosts outside the gateway!  XXX JH
 		 */
-		rt->rt_gwroute = _rtlookup(gate, generate_report,
-					   RTF_PRCLONING);
+		rt->rt_gwroute = _rtlookup(gate, RTF_PRCLONING);
 		if (rt->rt_gwroute == rt) {
 			rt->rt_gwroute = NULL;
 			--rt->rt_refcnt;
@@ -1290,6 +1272,8 @@ rt_llroute(struct sockaddr *dst, struct rtentry *rt0, struct rtentry **drt)
 {
 	struct rtentry *up_rt, *rt;
 
+	ASSERT_NETISR_NCPUS(mycpuid);
+
 	if (!(rt0->rt_flags & RTF_UP)) {
 		up_rt = rtlookup(dst);
 		if (up_rt == NULL)
@@ -1317,6 +1301,37 @@ rt_llroute(struct sockaddr *dst, struct rtentry *rt0, struct rtentry **drt)
 		return (rt->rt_flags & RTF_HOST ?  EHOSTDOWN : EHOSTUNREACH);
 	*drt = rt;
 	return 0;
+}
+
+struct rt_purgecloned_arg {
+	struct ifnet	*ifp;
+	int		family;
+};
+
+static int
+rt_purgecloned_callback(struct radix_node *rn, void *xap)
+{
+	struct rtentry *rt = (struct rtentry *)rn;
+	struct rt_purgecloned_arg *arg = xap;
+
+	if (rt->rt_ifp == arg->ifp && rt->rt_flags & RTF_WASCLONED)
+		rtrequest(RTM_DELETE, rt_key(rt), NULL, rt_mask(rt), 0, NULL);
+	return 0;
+}
+
+void
+rt_purgecloned(struct ifnet *ifp, int af)
+{
+	struct radix_node_head *rnh;
+	struct rt_purgecloned_arg arg = {
+		.ifp = ifp,
+		.family = af,
+	};
+
+	ASSERT_NETISR0;
+
+	if ((rnh = rt_tables[mycpuid][af]) != NULL)
+		rnh->rnh_walktree(rnh, rt_purgecloned_callback, &arg);
 }
 
 static int
@@ -1425,10 +1440,10 @@ rt_addrinfo_print(int cmd, struct rt_addrinfo *rti)
 }
 
 void
-sockaddr_print(struct sockaddr *sa)
+sockaddr_print(const struct sockaddr *sa)
 {
-	struct sockaddr_in *sa4;
-	struct sockaddr_in6 *sa6;
+	const struct sockaddr_in *sa4;
+	const struct sockaddr_in6 *sa6;
 	int len;
 	int i;
 
@@ -1445,7 +1460,7 @@ sockaddr_print(struct sockaddr *sa)
 	default:
 		switch(sa->sa_family) {
 		case AF_INET:
-			sa4 = (struct sockaddr_in *)sa;
+			sa4 = (const struct sockaddr_in *)sa;
 			kprintf("INET %d %d.%d.%d.%d",
 				ntohs(sa4->sin_port),
 				(ntohl(sa4->sin_addr.s_addr) >> 24) & 255,
@@ -1455,17 +1470,17 @@ sockaddr_print(struct sockaddr *sa)
 			);
 			break;
 		case AF_INET6:
-			sa6 = (struct sockaddr_in6 *)sa;
+			sa6 = (const struct sockaddr_in6 *)sa;
 			kprintf("INET6 %d %04x:%04x%04x:%04x:%04x:%04x:%04x:%04x",
 				ntohs(sa6->sin6_port),
-				sa6->sin6_addr.s6_addr16[0],
-				sa6->sin6_addr.s6_addr16[1],
-				sa6->sin6_addr.s6_addr16[2],
-				sa6->sin6_addr.s6_addr16[3],
-				sa6->sin6_addr.s6_addr16[4],
-				sa6->sin6_addr.s6_addr16[5],
-				sa6->sin6_addr.s6_addr16[6],
-				sa6->sin6_addr.s6_addr16[7]
+				ntohs(sa6->sin6_addr.s6_addr16[0]),
+				ntohs(sa6->sin6_addr.s6_addr16[1]),
+				ntohs(sa6->sin6_addr.s6_addr16[2]),
+				ntohs(sa6->sin6_addr.s6_addr16[3]),
+				ntohs(sa6->sin6_addr.s6_addr16[4]),
+				ntohs(sa6->sin6_addr.s6_addr16[5]),
+				ntohs(sa6->sin6_addr.s6_addr16[6]),
+				ntohs(sa6->sin6_addr.s6_addr16[7])
 			);
 			break;
 		default:
@@ -1498,6 +1513,8 @@ rtinit(struct ifaddr *ifa, int cmd, int flags)
 	struct rt_addrinfo rtinfo;
 	int error;
 
+	ASSERT_NETISR0;
+
 	if (flags & RTF_HOST) {
 		dst = ifa->ifa_dstaddr;
 		netmask = NULL;
@@ -1517,7 +1534,7 @@ rtinit(struct ifaddr *ifa, int cmd, int flags)
 		 * (Assuming we have a mask)
 		 */
 		if (netmask != NULL) {
-			m = m_get(MB_DONTWAIT, MT_SONAME);
+			m = m_get(M_NOWAIT, MT_SONAME);
 			if (m == NULL)
 				return (ENOBUFS);
 			mbuftrackid(m, 34);
@@ -1574,11 +1591,8 @@ rtinit_rtrequest_callback(int cmd, int error,
 	struct ifaddr *ifa = arg;
 
 	if (error == 0 && rt) {
-		if (mycpuid == 0) {
-			++rt->rt_refcnt;
+		if (mycpuid == 0)
 			rt_newaddrmsg(cmd, ifa, error, rt);
-			--rt->rt_refcnt;
-		}
 		if (cmd == RTM_DELETE) {
 			if (rt->rt_refcnt == 0) {
 				++rt->rt_refcnt;
@@ -1616,7 +1630,7 @@ rtsearch_global(int req, struct rt_addrinfo *rtinfo,
 	msg.arg = arg;
 	msg.exact_match = exact_match;
 	msg.found_cnt = 0;
-	return rt_domsg_global(&msg.base);
+	return (netisr_domsg_global(&msg.base));
 }
 
 static void
@@ -1626,7 +1640,9 @@ rtsearch_msghandler(netmsg_t msg)
 	struct rt_addrinfo rtinfo;
 	struct radix_node_head *rnh;
 	struct rtentry *rt;
-	int nextcpu, error;
+	int error;
+
+	ASSERT_NETISR_NCPUS(mycpuid);
 
 	/*
 	 * Copy the rtinfo.  We need to make sure that the original
@@ -1642,7 +1658,7 @@ rtsearch_msghandler(netmsg_t msg)
 	if ((rnh = rt_tables[mycpuid][rtinfo.rti_dst->sa_family]) == NULL) {
 		if (mycpuid != 0)
 			panic("partially initialized routing tables");
-		lwkt_replymsg(&rmsg->base.lmsg, EAFNOSUPPORT);
+		netisr_replymsg(&rmsg->base, EAFNOSUPPORT);
 		return;
 	}
 
@@ -1684,12 +1700,11 @@ rtsearch_msghandler(netmsg_t msg)
 		rt->rt_refcnt--;
 
 		if (error == EJUSTRETURN) {
-			lwkt_replymsg(&rmsg->base.lmsg, 0);
+			netisr_replymsg(&rmsg->base, 0);
 			return;
 		}
 	}
 
-	nextcpu = mycpuid + 1;
 	if (error) {
 		KKASSERT(rmsg->found_cnt > 0);
 
@@ -1704,15 +1719,13 @@ rtsearch_msghandler(netmsg_t msg)
 			panic("rtsearch_msghandler: unrecoverable error "
 			      "cpu %d", mycpuid);
 		}
-		lwkt_replymsg(&rmsg->base.lmsg, error);
-	} else if (nextcpu < ncpus) {
-		lwkt_forwardmsg(netisr_cpuport(nextcpu), &rmsg->base.lmsg);
+		netisr_replymsg(&rmsg->base, error);
 	} else {
 		if (rmsg->found_cnt == 0) {
-			/* The requested route was never seen ... */
+			/* The requested route has not been seen ... */
 			error = ESRCH;
 		}
-		lwkt_replymsg(&rmsg->base.lmsg, error);
+		netisr_forwardmsg_error(&rmsg->base, mycpuid + 1, error);
 	}
 }
 
@@ -1728,7 +1741,7 @@ rtmask_add_global(struct sockaddr *mask, boolean_t req_prio)
 	    rtmask_add_msghandler);
 	msg.lmsg.u.ms_resultp = mask;
 
-	return rt_domsg_global(&msg);
+	return (netisr_domsg_global(&msg));
 }
 
 struct sockaddr *
@@ -1752,18 +1765,15 @@ _rtmask_lookup(struct sockaddr *mask, boolean_t search)
 static void
 rtmask_add_msghandler(netmsg_t msg)
 {
-	struct lwkt_msg *lmsg = &msg->lmsg;
-	struct sockaddr *mask = lmsg->u.ms_resultp;
-	int error = 0, nextcpu;
+	struct sockaddr *mask = msg->lmsg.u.ms_resultp;
 
-	if (rtmask_lookup(mask) == NULL)
-		error = ENOBUFS;
+	ASSERT_NETISR_NCPUS(mycpuid);
 
-	nextcpu = mycpuid + 1;
-	if (!error && nextcpu < ncpus)
-		lwkt_forwardmsg(netisr_cpuport(nextcpu), lmsg);
-	else
-		lwkt_replymsg(lmsg, error);
+	if (rtmask_lookup(mask) == NULL) {
+		netisr_replymsg(&msg->base, ENOBUFS);
+		return;
+	}
+	netisr_forwardmsg(&msg->base, mycpuid + 1);
 }
 
 /* This must be before ip6_init2(), which is now SI_ORDER_MIDDLE */
@@ -1826,9 +1836,10 @@ rtchange_dispatch(netmsg_t msg)
 	struct netmsg_rtchange *rmsg = (void *)msg;
 	struct radix_node_head *rnh;
 	struct rtchange_arg arg;
-	int nextcpu, cpu;
+	int cpu;
 
 	cpu = mycpuid;
+	ASSERT_NETISR_NCPUS(cpu);
 
 	memset(&arg, 0, sizeof(arg));
 	arg.old_ifa = rmsg->old_ifa;
@@ -1853,11 +1864,7 @@ rtchange_dispatch(netmsg_t msg)
 	if (arg.changed)
 		rmsg->changed = 1;
 
-	nextcpu = cpu + 1;
-	if (nextcpu < ncpus)
-		lwkt_forwardmsg(netisr_cpuport(nextcpu), &rmsg->base.lmsg);
-	else
-		lwkt_replymsg(&rmsg->base.lmsg, 0);
+	netisr_forwardmsg(&rmsg->base, cpu + 1);
 }
 
 int
@@ -1877,7 +1884,7 @@ rtchange(struct ifaddr *old_ifa, struct ifaddr *new_ifa)
 	msg.old_ifa = old_ifa;
 	msg.new_ifa = new_ifa;
 	msg.changed = 0;
-	rt_domsg_global(&msg.base);
+	netisr_domsg_global(&msg.base);
 
 	if (msg.changed) {
 		old_ifa->ifa_flags &= ~IFA_ROUTE;
@@ -1886,11 +1893,4 @@ rtchange(struct ifaddr *old_ifa, struct ifaddr *new_ifa)
 	} else {
 		return ENOENT;
 	}
-}
-
-int
-rt_domsg_global(struct netmsg_base *nmsg)
-{
-	ASSERT_CANDOMSG_NETISR0(curthread);
-	return lwkt_domsg(netisr_cpuport(0), &nmsg->lmsg, 0);
 }

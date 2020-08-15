@@ -62,8 +62,7 @@
 static int	db_output_position = 0;		/* output column */
 static int	db_last_non_space = 0;		/* last non-space character */
 db_expr_t	db_tab_stop_width = 8;		/* how wide are tab stops? */
-#define	NEXT_TAB(i) \
-	((((i) + db_tab_stop_width) / db_tab_stop_width) * db_tab_stop_width)
+#define	NEXT_TAB(i)	rounddown((i) + db_tab_stop_width, db_tab_stop_width)
 db_expr_t	db_max_width = 79;		/* output line width */
 
 static void db_putchar (int c, void *arg);
@@ -184,7 +183,7 @@ db_printf(const char *fmt, ...)
 	__va_list listp;
 
 	__va_start(listp, fmt);
-	kvcprintf (fmt, db_putchar, NULL, db_radix, listp);
+	kvcprintf (fmt, db_putchar, NULL, listp);
 	__va_end(listp);
 /*	DELAY(100000);*/
 }
@@ -192,7 +191,7 @@ db_printf(const char *fmt, ...)
 void
 db_vprintf(const char *fmt, __va_list va)
 {
-	kvcprintf (fmt, db_putchar, NULL, db_radix, va);
+	kvcprintf (fmt, db_putchar, NULL, va);
 /*	DELAY(100000);*/
 }
 
@@ -209,7 +208,7 @@ db_iprintf(const char *fmt,...)
 	while (--i >= 0)
 		db_printf(" ");
 	__va_start(listp, fmt);
-	kvcprintf (fmt, db_putchar, NULL, db_radix, listp);
+	kvcprintf (fmt, db_putchar, NULL, listp);
 	__va_end(listp);
 }
 
@@ -255,6 +254,32 @@ db_more(int *nl)
 }
 
 /*
+ * Replacement for old '%r' kprintf format.
+ */
+void
+db_format_radix(char *buf, size_t bufsiz, quad_t val, int altflag)
+{
+	const char *fmt;
+
+	if (db_radix == 16) {
+		db_format_hex(buf, bufsiz, val, altflag);
+		return;
+	}
+
+	if (db_radix == 8)
+		fmt = altflag ? "-%#qo" : "-%qo";
+	else
+		fmt = altflag ? "-%#qu" : "-%qu";
+
+	if (val < 0)
+		val = -val;
+	else
+		++fmt;
+
+	ksnprintf(buf, bufsiz, fmt, val);
+}
+
+/*
  * Replacement for old '%z' kprintf format.
  */
 void
@@ -286,7 +311,7 @@ kprintf0(const char *fmt, ...)
 	__va_list ap;
 
 	__va_start(ap, fmt);
-	kvcprintf(fmt, PCHAR_, NULL, 10, ap);
+	kvcprintf(fmt, PCHAR_, NULL, ap);
 	__va_end(ap);
 }
 
@@ -296,7 +321,7 @@ PCHAR_(int c, void *dummy __unused)
 	const int COMC_TXWAIT = 0x40000;
 	const int COMPORT = 0x2f8;		/* 0x3f8 COM1, 0x2f8 COM2 */
 	const int LSR_TXRDY = 0x20;
-	const int BAUD = 9600;
+	const int BAUD = 115200;
 	const int com_lsr = 5;
 	const int com_data = 0;
 	int wait;

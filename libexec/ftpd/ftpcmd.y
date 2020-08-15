@@ -10,11 +10,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -32,7 +28,6 @@
  *
  * @(#)ftpcmd.y	8.3 (Berkeley) 4/6/94
  * $FreeBSD: src/libexec/ftpd/ftpcmd.y,v 1.67 2008/12/23 01:23:09 cperciva Exp $
- * $DragonFly: src/libexec/ftpd/ftpcmd.y,v 1.4 2004/06/19 20:36:04 joerg Exp $
  */
 
 /*
@@ -54,7 +49,6 @@
 #include <glob.h>
 #include <libutil.h>
 #include <limits.h>
-#include <md5.h>
 #include <netdb.h>
 #include <pwd.h>
 #include <signal.h>
@@ -601,10 +595,11 @@ cmd
 		}
 	| SITE SP MDFIVE check_login SP pathname CRLF
 		{
+#ifndef NOMD5
 			char p[64], *q;
 
 			if ($4 && $6) {
-				q = MD5File($6, p);
+				q = sitemd5($6, p);
 				if (q != NULL)
 					reply(200, "MD5(%s) = %s", $6, p);
 				else
@@ -612,6 +607,9 @@ cmd
 			}
 			if ($6)
 				free($6);
+#else
+			reply(202, "md5 command disabled.");
+#endif
 		}
 	| SITE SP UMASK check_login CRLF
 		{
@@ -1182,10 +1180,10 @@ lookup(struct tab *p, char *cmd)
 #include <arpa/telnet.h>
 
 /*
- * getline - a hacked up version of fgets to ignore TELNET escape codes.
+ * get_line - a hacked up version of fgets to ignore TELNET escape codes.
  */
 int
-getline(char *s, int n, FILE *iop)
+get_line(char *s, int n, FILE *iop)
 {
 	int c;
 	char *cs;
@@ -1304,7 +1302,7 @@ yylex(void)
 		case CMD:
 			signal(SIGALRM, toolong);
 			alarm(timeout);
-			n = getline(cbuf, sizeof(cbuf)-1, stdin);
+			n = get_line(cbuf, sizeof(cbuf)-1, stdin);
 			if (n == -1) {
 				reply(221, "You could at least say goodbye.");
 				dologout(0);

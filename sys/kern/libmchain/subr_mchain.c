@@ -35,6 +35,7 @@
 #include <sys/kernel.h>
 #include <sys/endian.h>
 #include <sys/errno.h>
+#include <sys/malloc.h>
 #include <sys/mbuf.h>
 #include <sys/module.h>
 #include <sys/uio.h>
@@ -71,8 +72,8 @@ mb_init(struct mbchain *mbp)
 {
 	struct mbuf *m;
 
-	m = m_gethdr(MB_WAIT, MT_DATA);
-	if (m == NULL) 
+	m = m_gethdr(M_WAITOK, MT_DATA);
+	if (m == NULL)
 		return ENOBUFS;
 	m->m_pkthdr.rcvif = NULL;
 	m->m_len = 0;
@@ -117,7 +118,7 @@ mb_fixhdr(struct mbchain *mbp)
  * Check if object of size 'size' fit to the current position and
  * allocate new mbuf if not. Advance pointers and increase length of mbuf(s).
  * Return pointer to the object placeholder or NULL if any error occured.
- * Note: size should be <= MLEN 
+ * Note: size should be <= MLEN
  */
 caddr_t
 mb_reserve(struct mbchain *mbp, int size)
@@ -129,7 +130,7 @@ mb_reserve(struct mbchain *mbp, int size)
 		panic("mb_reserve: size = %d", size);
 	m = mbp->mb_cur;
 	if (mbp->mb_mleft < size) {
-		mn = m_get(MB_WAIT, MT_DATA);
+		mn = m_get(M_WAITOK, MT_DATA);
 		if (mn == NULL)
 			return NULL;
 		mbp->mb_cur = m->m_next = mn;
@@ -207,7 +208,7 @@ mb_put_mem(struct mbchain *mbp, c_caddr_t source, int size, int type)
 	while (size > 0) {
 		if (mleft == 0) {
 			if (m->m_next == NULL) {
-				m->m_next = m_getc(size, MB_WAIT, MT_DATA);
+				m->m_next = m_getc(size, M_WAITOK, MT_DATA);
 				if (m->m_next == NULL)
 					return ENOBUFS;
 			}
@@ -311,8 +312,8 @@ md_init(struct mdchain *mdp)
 {
 	struct mbuf *m;
 
-	m = m_gethdr(MB_WAIT, MT_DATA);
-	if (m == NULL) 
+	m = m_gethdr(M_WAITOK, MT_DATA);
+	if (m == NULL)
 		return ENOBUFS;
 	m->m_pkthdr.rcvif = NULL;
 	m->m_len = 0;
@@ -476,7 +477,7 @@ md_get_mem(struct mdchain *mdp, caddr_t target, int size, int type)
 	int error;
 	u_int count;
 	u_char *s;
-	
+
 	while (size > 0) {
 		if (m == NULL) {
 			MBERROR("incomplete copy\n");
@@ -520,7 +521,7 @@ md_get_mbuf(struct mdchain *mdp, int size, struct mbuf **ret)
 {
 	struct mbuf *m = mdp->md_cur, *rm;
 
-	rm = m_copym(m, mdp->md_pos - mtod(m, u_char*), size, MB_WAIT);
+	rm = m_copym(m, mdp->md_pos - mtod(m, u_char*), size, M_WAITOK);
 	if (rm == NULL)
 		return EBADRPC;
 	md_get_mem(mdp, NULL, size, MB_MZERO);

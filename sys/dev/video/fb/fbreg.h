@@ -24,7 +24,6 @@
  * THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  * $FreeBSD: src/sys/dev/fb/fbreg.h,v 1.6 1999/12/29 04:35:36 peter Exp $
- * $DragonFly: src/sys/dev/video/fb/fbreg.h,v 1.10 2007/08/15 19:31:11 swildner Exp $
  */
 
 #ifndef _DEV_FB_FBREG_H_
@@ -35,23 +34,12 @@
 #define V_MAX_ADAPTERS		8		/* XXX */
 
 /* some macros */
-#if defined(__i386__) || defined(__x86_64__)
-#define bcopy_io(s, d, c)	generic_bcopy((void *)(s), (void *)(d), (c))
-#define bcopy_toio(s, d, c)	generic_bcopy((void *)(s), (void *)(d), (c))
-#define bcopy_fromio(s, d, c)	generic_bcopy((void *)(s), (void *)(d), (c))
+#define bcopy_io(s, d, c)	bcopy((void *)(s), (void *)(d), (c))
+#define bcopy_toio(s, d, c)	bcopy((void *)(s), (void *)(d), (c))
+#define bcopy_fromio(s, d, c)	bcopy((void *)(s), (void *)(d), (c))
 #define bzero_io(d, c)		bzero((void *)(d), (c))
 #define fill_io(p, d, c)	fill((p), (void *)(d), (c))
 #define fillw_io(p, d, c)	fillw((p), (void *)(d), (c))
-void generic_bcopy(const void *s, void *d, size_t c);
-#else /* !__i386__ */
-#define bcopy_io(s, d, c)	memcpy_io((d), (s), (c))
-#define bcopy_toio(s, d, c)	memcpy_toio((d), (void *)(s), (c))
-#define bcopy_fromio(s, d, c)	memcpy_fromio((void *)(d), (s), (c))
-#define bzero_io(d, c)		memset_io((d), 0, (c))
-#define fill_io(p, d, c)	memset_io((d), (p), (c))
-#define fillw(p, d, c)		memsetw((d), (p), (c))
-#define fillw_io(p, d, c)	memsetw_io((d), (p), (c))
-#endif /* !__i386__ */
 
 /* video function table */
 typedef int vi_probe_t(int unit, video_adapter_t **adpp, void *arg, int flags);
@@ -75,10 +63,6 @@ typedef int vi_set_hw_cursor_t(video_adapter_t *adp, int col, int row);
 typedef int vi_set_hw_cursor_shape_t(video_adapter_t *adp, int base,
 				     int height, int celsize, int blink);
 typedef int vi_blank_display_t(video_adapter_t *adp, int mode);
-#define V_DISPLAY_ON		0
-#define V_DISPLAY_STAND_BY	(1<<0)
-#define V_DISPLAY_SUSPEND	(1<<1)
-#define V_DISPLAY_OFF		(1<<2)
 typedef int vi_mmap_t(video_adapter_t *adp, vm_offset_t offset, int prot);
 typedef int vi_ioctl_t(video_adapter_t *adp, u_long cmd, caddr_t data);
 typedef int vi_clear_t(video_adapter_t *adp);
@@ -118,16 +102,16 @@ typedef struct video_switch {
 
 #define save_palette(adp, pal)				\
 	do {						\
-		lwkt_gettoken(&tty_token);		\
+		lwkt_gettoken(&vga_token);		\
 		(*vidsw[(adp)->va_index]->save_palette)((adp), (pal)); \
-		lwkt_reltoken(&tty_token);		\
+		lwkt_reltoken(&vga_token);		\
 	} while (0)
 
 #define load_palette(adp, pal)				\
 	do {						\
-		lwkt_gettoken(&tty_token);		\
+		lwkt_gettoken(&vga_token);		\
 		(*vidsw[(adp)->va_index]->load_palette)((adp), (pal)); \
-		lwkt_reltoken(&tty_token);		\
+		lwkt_reltoken(&vga_token);		\
 	} while (0)
 
 #define get_mode_info(adp, mode, buf)			\
@@ -139,17 +123,17 @@ typedef struct video_switch {
 #if 0 /* XXX conflicts with syscons' set_border() */
 #define set_border(adp, border)				\
 	do {						\
-		lwkt_gettoken(&tty_token);		\
+		lwkt_gettoken(&vga_token);		\
 		(*vidsw[(adp)->va_index]->set_border)((adp), (border)); \
-		lwkt_reltoken(&tty_token);		\
+		lwkt_reltoken(&vga_token);		\
 	} while (0)
 #endif
 
 #define set_origin(adp, o)				\
 	do {						\
-		lwkt_gettoken(&tty_token);		\
+		lwkt_gettoken(&vga_token);		\
 		(*vidsw[(adp)->va_index]->set_win_org)(adp, o); \
-		lwkt_reltoken(&tty_token);		\
+		lwkt_reltoken(&vga_token);		\
 	} while (0)
 
 /* XXX - add more macros */
@@ -165,7 +149,7 @@ typedef struct video_driver {
 	static struct video_driver name##_driver = {	\
 		#name, &sw, config			\
 	};						\
-	DATA_SET(videodriver_set, name##_driver);
+	DATA_SET(videodriver_set, name##_driver)
 
 /* global variables */
 extern struct video_switch **vidsw;

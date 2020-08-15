@@ -1,5 +1,3 @@
-#ifndef _P1003_1B_P1003_1B_H_
-#define _P1003_1B_P1003_1B_H_
 /*-
  * Copyright (c) 1996, 1997, 1998
  *	HD Associates, Inc.  All rights reserved.
@@ -32,19 +30,24 @@
  * SUCH DAMAGE.
  *
  * $FreeBSD: src/sys/posix4/posix4.h,v 1.6 1999/12/27 10:22:09 bde Exp $
- * $DragonFly: src/sys/sys/posix4.h,v 1.8 2007/06/26 19:31:10 dillon Exp $
  */
+
+#ifndef _P1003_1B_P1003_1B_H_
+#define _P1003_1B_P1003_1B_H_
+
+#ifndef _KERNEL
+
+#error "This file should not be included by userland programs."
+
+#else
 
 #include "opt_posix.h"
 
-#include <sys/param.h>
-#include <sys/malloc.h>
 #include <sys/sched.h>
 
+#ifdef MALLOC_DECLARE
 MALLOC_DECLARE(M_P31B);
-
-#define p31b_malloc(SIZE) kmalloc((SIZE), M_P31B, M_WAITOK)
-#define p31b_free(P) kfree((P), M_P31B)
+#endif
 
 struct proc;
 struct lwp;
@@ -53,7 +56,7 @@ void p31b_setcfg (int, int);
 
 #ifdef _KPOSIX_PRIORITY_SCHEDULING
 
-/* 
+/*
  * KSCHED_OP_RW is a vector of read/write flags for each entry indexed
  * by the enum ksched_op.
  *
@@ -99,4 +102,5 @@ int ksched_rr_get_interval(register_t *, struct ksched *,
 
 #endif /* _KPOSIX_PRIORITY_SCHEDULING */
 
-#endif /* _P1003_1B_P1003_1B_H_ */
+#endif /* !_KERNEL */
+#endif /* !_P1003_1B_P1003_1B_H_ */

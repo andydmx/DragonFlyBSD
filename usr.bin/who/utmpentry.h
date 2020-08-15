@@ -29,19 +29,10 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
-#if defined(SUPPORT_UTMPX)
-# include <utmpx.h>
-# define WHO_NAME_LEN		_UTX_USERSIZE
-# define WHO_LINE_LEN		_UTX_LINESIZE
-# define WHO_HOST_LEN		_UTX_HOSTSIZE
-#elif defined(SUPPORT_UTMP)
-# include <utmp.h>
-# define WHO_NAME_LEN		UT_NAMESIZE
-# define WHO_LINE_LEN		UT_LINESIZE
-# define WHO_HOST_LEN		UT_HOSTSIZE
-#else
-# error Either SUPPORT_UTMPX or SUPPORT_UTMP must be defined!
-#endif
+#include <utmpx.h>
+#define WHO_NAME_LEN		_UTX_USERSIZE
+#define WHO_LINE_LEN		_UTX_LINESIZE
+#define WHO_HOST_LEN		_UTX_HOSTSIZE
 
 
 struct utmpentry {
@@ -53,7 +44,7 @@ struct utmpentry {
 	uint16_t term;
 	uint16_t exit;
 	uint16_t sess;
-	uint16_t type;
+	short type;
 	struct utmpentry *next;
 };
 
@@ -63,11 +54,11 @@ extern int etype;
 /*
  * getutentries provides a linked list of struct utmpentry and returns
  * the number of entries. The first argument, if not null, names an 
- * alternate utmp(x) file to look in.
+ * alternate utmpx file to look in.
  *
  * The memory returned by getutentries belongs to getutentries. The
  * list returned (or elements of it) may be returned again later if
- * utmp hasn't changed in the meantime.
+ * utmpx hasn't changed in the meantime.
  *
  * endutentries clears and frees the cached data.
  */

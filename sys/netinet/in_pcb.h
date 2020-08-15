@@ -43,11 +43,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -84,8 +80,6 @@
 #endif
 
 #define	in6pcb		inpcb	/* for KAME src sync over BSD*'s */
-#define	in6p_sp		inp_sp	/* for KAME src sync over BSD*'s */
-struct inpcbpolicy;
 
 /*
  * Common structure pcb for internet protocol implementation.
@@ -138,8 +132,8 @@ struct in_endpoints {
 struct inp_localgroup {
 	LIST_ENTRY(inp_localgroup) il_list;
 	uint16_t	il_lport;
-	u_char		il_vflag;
-	u_char		il_pad;
+	u_char		il_af;		/* AF_INET or AF_INET6 */
+	u_char		il_jailed;	/* jailed lport, else not */
 	uint32_t	il_pad2;
 	union in_dependaddr il_dependladdr;
 #define il_laddr	il_dependladdr.id46_addr.ia46_addr4
@@ -200,12 +194,12 @@ struct inpcb {
 	struct	inpcbinfo *inp_pcbinfo;	/* PCB list info */
 	struct	socket *inp_socket;	/* back pointer to socket */
 					/* list for this PCB's local port */
-	int	inp_flags;		/* generic IP/datagram flags */
+	int		inp_flags;	/* generic IP/datagram flags */
+	uint16_t	inp_hashval;	/* valid iff INP_HASH */
+	uint16_t	inp_pad;	/* explicit padding */
 
-	struct	inpcbpolicy *inp_sp; /* for IPSEC */
-	u_char	inp_vflag;
-#define	INP_IPV4	0x1
-#define	INP_IPV6	0x2
+	void	*inp_unused1;		/* was: for IPSEC */
+	u_char	inp_af;			/* AF_INET or AF_INET6 */
 	u_char	inp_ip_ttl;		/* time to live proto */
 	u_char	inp_ip_p;		/* protocol proto */
 	u_char	inp_ip_minttl;		/* minimum TTL or drop */
@@ -240,7 +234,7 @@ struct inpcb {
 		u_int8_t	inp6_hlim;
 	} inp_depend6;
 	LIST_ENTRY(inpcb) inp_portlist;
-	struct	inpcbportinfo *inp_portinfo;
+	struct	inpcbporthead *inp_porthash;
 	struct	inpcbport *inp_phd;	/* head of this list */
 	inp_gen_t	inp_gencnt;	/* generation count of this instance */
 #define	in6p_faddr	inp_inc.inc6_faddr
@@ -250,7 +244,7 @@ struct inpcb {
 #define	in6p_hops	inp_depend6.inp6_hops	/* default hop limit */
 #define	in6p_ip6_nxt	inp_ip_p
 #define	in6p_flowinfo	inp_flow
-#define	in6p_vflag	inp_vflag
+#define	in6p_af		inp_af
 #define	in6p_options	inp_depend6.inp6_options
 #define	in6p_outputopts	inp_depend6.inp6_outputopts
 #define	in6p_moptions	inp_depend6.inp6_moptions
@@ -294,20 +288,16 @@ struct inpcbport {
 struct lwkt_token;
 
 struct inpcbportinfo {
-	struct  lwkt_token *porttoken;	/* if this inpcbportinfo is shared */
 	struct	inpcbporthead *porthashbase;
-	u_long	porthashmask;
+	u_long	porthashcnt;
 	u_short	offset;
-	u_short	lastport;
-	u_short	lastlow;
-	u_short	lasthi;
 } __cachealign;
 
 struct inpcbinfo {		/* XXX documentation, prefixes */
 	struct	lwkt_token *infotoken;	/* if this inpcbinfo is shared */
 	struct	inpcbhead *hashbase;
 	u_long	hashmask;
-	int	portinfo_mask;
+	int	portinfo_cnt;
 	struct	inpcbportinfo *portinfo;
 	struct 	inpcbport *portsave;	/* port allocation cache */
 	struct	inpcontainerhead *wildcardhashbase;
@@ -325,7 +315,7 @@ struct inpcbinfo {		/* XXX documentation, prefixes */
 #define	INP_PCBCONNHASH(faddr, fport, laddr, lport, mask)		\
     (((faddr) ^ ((faddr) >> 16) ^ (laddr) ^ ntohs((lport) ^ (fport))) & (mask))
 
-#define	INP_PCBPORTHASH(lport, mask)		(ntohs(lport) & (mask))
+#define	INP_PCBPORTHASH(lport, cnt)		(ntohs(lport) % (cnt))
 
 #define	INP_PCBWILDCARDHASH(lport, mask)	(ntohs(lport) & (mask))
 
@@ -341,14 +331,12 @@ struct inpcbinfo {		/* XXX documentation, prefixes */
 #define	INP_ANONPORT		0x40	/* port chosen for user */
 #define	INP_RECVIF		0x80	/* receive incoming interface */
 #define	INP_MTUDISC		0x100	/* user can do MTU discovery */
-#define	INP_FAITH		0x200	/* accept FAITH'ed connections */
 #define	INP_WILDCARD		0x400	/* wildcard match */
 #define INP_FLAG_PROTO2		0x800	/* protocol specific */
 #define	INP_CONNECTED		0x1000	/* exact match */
 #define	INP_FLAG_PROTO1		0x2000	/* protocol specific */
 #define INP_PLACEMARKER		0x4000	/* skip this pcb, its a placemarker */
-
-#define IN6P_IPV6_V6ONLY	0x008000 /* restrict AF_INET6 socket for v6 */
+#define INP_HASH		0x8000	/* inp_hashval is valid */
 
 #define	IN6P_PKTINFO		0x010000 /* receive IP6 dst and I/F */
 #define	IN6P_HOPLIMIT		0x020000 /* receive hoplimit */
@@ -384,7 +372,6 @@ struct inpcbinfo {		/* XXX documentation, prefixes */
 #define	IN6P_ANONPORT		INP_ANONPORT
 #define	IN6P_RECVIF		INP_RECVIF
 #define	IN6P_MTUDISC		INP_MTUDISC
-#define	IN6P_FAITH		INP_FAITH
 #define	IN6P_CONTROLOPTS INP_CONTROLOPTS
 	/*
 	 * socket AF version is {newer than,or include}
@@ -416,32 +403,36 @@ struct baddynamicports {
 
 
 #define	INP_SOCKAF(so) so->so_proto->pr_domain->dom_family
-
 #define	INP_CHECK_SOCKAF(so, af)	(INP_SOCKAF(so) == af)
+
+#define INP_ISIPV6(inp)			((inp)->inp_af == AF_INET6)
+#define INP_ISIPV4(inp)			((inp)->inp_af == AF_INET)
 
 #ifdef _KERNEL
 
-#define GET_PORT_TOKEN(portinfo) \
+static __inline struct inpcbporthead *
+in_pcbporthash_head(struct inpcbportinfo *portinfo, u_short lport)
+{
+	return &portinfo->porthashbase[
+	    INP_PCBPORTHASH(lport, portinfo->porthashcnt)];
+}
+
+#define GET_PORTHASH_TOKEN(porthashhead) \
 do { \
-	if ((portinfo)->porttoken) \
-		lwkt_gettoken((portinfo)->porttoken); \
+	lwkt_getpooltoken((porthashhead)); \
 } while (0)
 
-#define REL_PORT_TOKEN(portinfo) \
+#define REL_PORTHASH_TOKEN(porthashhead) \
 do { \
-	if ((portinfo)->porttoken) \
-		lwkt_reltoken((portinfo)->porttoken); \
+	lwkt_relpooltoken((porthashhead)); \
 } while (0)
 
 #ifdef INVARIANTS
-#define ASSERT_PORT_TOKEN_HELD(portinfo) \
-do { \
-	if ((portinfo)->porttoken) \
-		ASSERT_LWKT_TOKEN_HELD((portinfo)->porttoken); \
-} while (0)
-#else	/* !INVARIANTS */
-#define ASSERT_PORT_TOKEN_HELD(portinfo)
-#endif	/* INVARIANTS */
+#define ASSERT_PORTHASH_TOKEN_HELD(pcbhashhead) \
+	ASSERT_LWKT_TOKEN_HELD(lwkt_token_pool_lookup((pcbhashhead)))
+#else
+#define ASSERT_PORTHASH_TOKEN_HELD(pcbhashhead)
+#endif
 
 #define GET_PCBINFO_TOKEN(pcbinfo) \
 do { \
@@ -487,12 +478,15 @@ extern int	ipport_hilastauto;
 union netmsg;
 struct xinpcb;
 
+typedef	void	(*inp_notify_t)(struct inpcb *, int);
+
 void	in_pcbportrange(u_short *, u_short *, u_short, u_short);
 void	in_pcbpurgeif0 (struct inpcbinfo *, struct ifnet *);
 void	in_losing (struct inpcb *);
 void	in_rtchange (struct inpcb *, int);
 void	in_pcbinfo_init (struct inpcbinfo *, int, boolean_t);
-void	in_pcbportinfo_init (struct inpcbportinfo *, int, boolean_t, u_short);
+void	in_pcbportinfo_init (struct inpcbportinfo *, int, u_short);
+void	in_pcbportinfo_set(struct inpcbinfo *, struct inpcbportinfo *, int);
 int	in_pcballoc (struct socket *, struct inpcbinfo *);
 void	in_pcbunlink (struct inpcb *, struct inpcbinfo *);
 void	in_pcbunlink_flags (struct inpcb *, struct inpcbinfo *, int);
@@ -509,15 +503,13 @@ void	in_pcbdisconnect (struct inpcb *);
 void	in_pcbinswildcardhash(struct inpcb *inp);
 void	in_pcbinswildcardhash_oncpu(struct inpcb *, struct inpcbinfo *);
 void	in_pcbinsconnhash(struct inpcb *inp);
-void	in_pcbinsporthash (struct inpcbportinfo *, struct inpcb *);
+void	in_pcbinsporthash(struct inpcbporthead *, struct inpcb *);
 void	in_pcbinsporthash_lport (struct inpcb *);
+void	in_pcbremporthash (struct inpcb *);
 int	in_pcbladdr (struct inpcb *, struct sockaddr *,
 	    struct sockaddr_in **, struct thread *);
 int	in_pcbladdr_find (struct inpcb *, struct sockaddr *,
 	    struct sockaddr_in **, struct thread *, int);
-struct inpcb *
-	in_pcblookup_local (struct inpcbportinfo *, struct in_addr, u_int, int,
-			    struct ucred *);
 struct inpcb *
 	in_pcblookup_hash (struct inpcbinfo *,
 			       struct in_addr, u_int, struct in_addr, u_int,
@@ -527,10 +519,9 @@ struct inpcb *
 			       struct in_addr, u_int, struct in_addr, u_int,
 			       boolean_t, struct ifnet *, const struct mbuf *);
 void	in_pcbnotifyall (struct inpcbinfo *, struct in_addr,
-	    int, void (*)(struct inpcb *, int));
+	    int, inp_notify_t);
 int	in_setpeeraddr (struct socket *so, struct sockaddr **nam);
 void	in_setpeeraddr_dispatch(union netmsg *);
-int	in_setsockaddr (struct socket *so, struct sockaddr **nam);
 void	in_setsockaddr_dispatch(netmsg_t msg);
 int	in_baddynamic(u_int16_t, u_int16_t);
 void	in_pcbremwildcardhash(struct inpcb *inp);
@@ -544,13 +535,13 @@ struct inpcb *
 void	in_pcbglobalinit(void);
 void	in_pcbresetroute(struct inpcb *);
 
-int	in_pcblist_global(SYSCTL_HANDLER_ARGS);
-int	in_pcblist_global_ncpus2(SYSCTL_HANDLER_ARGS);
+int	in_pcblist_range(SYSCTL_HANDLER_ARGS);
+int	in_pcblist_ncpus(SYSCTL_HANDLER_ARGS);
 
 struct inpcb *
-	in_pcbmarker(int cpuid);
+	in_pcbmarker(void);
 struct inpcontainer *
-	in_pcbcontainer_marker(int cpuid);
+	in_pcbcontainer_marker(void);
 
 #endif /* _KERNEL */
 

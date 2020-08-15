@@ -10,11 +10,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -32,7 +28,6 @@
  *
  *	@(#)externs.h	8.3 (Berkeley) 5/30/95
  *	$FreeBSD: src/crypto/telnet/telnet/externs.h,v 1.4.2.2 2002/04/13 10:59:08 markm Exp $
- *	$DragonFly: src/crypto/telnet/telnet/externs.h,v 1.2 2003/06/17 04:24:37 dillon Exp $
  */
 
 #ifndef	BSD
@@ -58,7 +53,7 @@
 #include <errno.h>
 #ifdef	USE_TERMIO
 # ifndef	VINTR
-#  include <sys/termios.h>
+#  include <termios.h>
 # endif
 # define termio termios
 #endif
@@ -71,14 +66,6 @@ typedef unsigned char cc_t;
 #endif
 
 #include <string.h>
-
-#if defined(IPSEC)
-#include <netinet6/ipsec.h>
-#if defined(IPSEC_POLICY_IPSEC)
-extern char *ipsec_policy_in;
-extern char *ipsec_policy_out;
-#endif
-#endif
 
 #ifndef	_POSIX_VDISABLE
 # ifdef sun
@@ -120,7 +107,7 @@ extern int
     netdata,		/* Print out network data flow */
     prettydump,		/* Print "netdata" output in user readable format */
     termdata,		/* Print out terminal data flow */
-    debug,		/* Debug level */
+    telnet_debug,	/* Debug level */
     doaddrlookup,	/* do a reverse lookup? */
     clienteof;		/* Client received EOF */
 
@@ -233,8 +220,8 @@ extern void
     command(int, const char *, int),
     Dump(char, unsigned char *, int),
     env_init(void),
-    Exit(int),
-    ExitString(const char *, int),
+    Exit(int) __dead2,
+    ExitString(const char *, int) __dead2,
     init_network(void),
     init_sys(void),
     init_telnet(void),
@@ -243,7 +230,7 @@ extern void
     optionstatus(void),
     printoption(const char *, int, int),
     printsub(char, unsigned char *, int),
-    quit(void),
+    quit(void) __dead2,
     sendabort(void),
     sendbrk(void),
     sendeof(void),

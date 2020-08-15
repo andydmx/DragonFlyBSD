@@ -242,14 +242,6 @@ amr_attach(struct amr_softc *sc)
     /*
      * Setup sysctls.
      */
-    sysctl_ctx_init(&sc->amr_sysctl_ctx);
-    sc->amr_sysctl_tree = SYSCTL_ADD_NODE(&sc->amr_sysctl_ctx,
-	SYSCTL_STATIC_CHILDREN(_hw), OID_AUTO,
-	device_get_nameunit(sc->amr_dev), CTLFLAG_RD, 0, "");
-    if (sc->amr_sysctl_tree == NULL) {
-	device_printf(sc->amr_dev, "can't add sysctl node\n");
-	return (EINVAL);
-    }
     amr_init_sysctl(sc);
 
     /*
@@ -354,21 +346,19 @@ amr_startup(void *arg)
 static void
 amr_init_sysctl(struct amr_softc *sc)
 {
+    struct sysctl_ctx_list *ctx = device_get_sysctl_ctx(sc->amr_dev);
+    struct sysctl_oid *tree = device_get_sysctl_tree(sc->amr_dev);
 
-    SYSCTL_ADD_INT(&sc->amr_sysctl_ctx,
-	SYSCTL_CHILDREN(sc->amr_sysctl_tree),
+    SYSCTL_ADD_INT(ctx, SYSCTL_CHILDREN(tree),
 	OID_AUTO, "allow_volume_configure", CTLFLAG_RW, &sc->amr_allow_vol_config, 0,
 	"");
-    SYSCTL_ADD_INT(&sc->amr_sysctl_ctx,
-	SYSCTL_CHILDREN(sc->amr_sysctl_tree),
+    SYSCTL_ADD_INT(ctx, SYSCTL_CHILDREN(tree),
 	OID_AUTO, "nextslot", CTLFLAG_RD, &sc->amr_nextslot, 0,
 	"");
-    SYSCTL_ADD_INT(&sc->amr_sysctl_ctx,
-	SYSCTL_CHILDREN(sc->amr_sysctl_tree),
+    SYSCTL_ADD_INT(ctx, SYSCTL_CHILDREN(tree),
 	OID_AUTO, "busyslots", CTLFLAG_RD, &sc->amr_busyslots, 0,
 	"");
-    SYSCTL_ADD_INT(&sc->amr_sysctl_ctx,
-	SYSCTL_CHILDREN(sc->amr_sysctl_tree),
+    SYSCTL_ADD_INT(ctx, SYSCTL_CHILDREN(tree),
 	OID_AUTO, "maxio", CTLFLAG_RD, &sc->amr_maxio, 0,
 	"");
 }
@@ -404,9 +394,6 @@ amr_free(struct amr_softc *sc)
     if (mtx_initialized(&sc->amr_list_lock))
 	mtx_destroy(&sc->amr_list_lock);
 #endif
-
-    if (sc->amr_sysctl_tree != NULL)
-	    sysctl_ctx_free(&sc->amr_sysctl_ctx);
 
     lockuninit(&sc->amr_hw_lock);
     lockuninit(&sc->amr_list_lock);
@@ -522,7 +509,7 @@ amr_ioctl_buffer_length(unsigned long len)
     return (len);
 }
 
-int
+static int
 amr_linux_ioctl_int(struct cdev *dev, u_long cmd, caddr_t addr, int32_t flag,
     struct sysmsg *sm)
 {
@@ -1033,6 +1020,7 @@ amr_enquiry(struct amr_softc *sc, size_t bufsize, u_int8_t cmd, u_int8_t cmdsub,
 
     debug_called(1);
 
+    *status = 0;	/* avoid gcc warnings */
     error = 1;
     result = NULL;
     

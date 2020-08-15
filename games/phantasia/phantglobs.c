@@ -1,12 +1,10 @@
+/*	$NetBSD: phantglobs.c,v 1.6 2009/08/31 08:27:16 dholland Exp $	*/
+
 /*
  * phantglobs.c - globals for Phantasia
- *
- * $DragonFly: src/games/phantasia/phantglobs.c,v 1.3 2005/05/31 00:06:26 swildner Exp $
  */
 
 #include "include.h"
-
-double	drandom(void);
 
 double	Circle;		/* which circle player is in			*/
 double	Shield;		/* force field thrown up in monster battle	*/
@@ -41,10 +39,10 @@ struct	monster	Curmonster;/* stats for current monster			*/
 
 struct	energyvoid Enrgyvoid;/* energy void buffer			*/
 
-struct	charstats *Statptr;/* pointer into Stattable[]			*/
+const struct	charstats *Statptr;/* pointer into Stattable[]		*/
 
 /* lookup table for character type dependent statistics */
-struct	charstats Stattable[7] = {
+const struct	charstats Stattable[7] = {
 	{
 	/* MAGIC USER */
 	/* max brains, max mana, weakness, gold tote, ring duration */
@@ -117,7 +115,7 @@ struct	charstats Stattable[7] = {
 };
 
 /* menu of items for purchase */
-struct menuitem	Menu[] = {
+const struct menuitem	Menu[] = {
 	{"Mana", 1},
 	{"Shield", 5},
 	{"Book", 200},
@@ -138,7 +136,7 @@ char	Databuf[SZ_DATABUF];	/* a place to read data into		*/
 const char	Illcmd[] = "Illegal command.\n";
 const char	Illmove[] = "Too far.\n";
 const char	Illspell[] = "Illegal spell.\n";
-const char	Nomana[] = "Not enought mana for that spell.\n";
+const char	Nomana[] = "Not enough mana for that spell.\n";
 const char	Somebetter[] = "But you already have something better.\n";
 const char	Nobetter[] = "That's no better than what you already have.\n";
 

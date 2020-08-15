@@ -37,15 +37,17 @@
 #include <unistd.h>
 
 #ifndef CCVER_DEFAULT
-#define CCVER_DEFAULT "gcc47"
+#define CCVER_DEFAULT "gcc80"
 #endif
 
 #ifndef BINUTILSVER_DEFAULT
-#define	BINUTILSVER_DEFAULT "binutils224"
+#define	BINUTILSVER_DEFAULT "binutils227"
 #endif
 
-#define LINKER_DEFAULT "ld.bfd"
+#define LINKER_BFD     "ld.bfd"
 #define LINKER_GOLD    "ld.gold"
+#define LINKER_DEFAULT LINKER_GOLD
+#define LINKER_ALT     LINKER_BFD
 
 #ifndef OBJFORMAT_PATH_DEFAULT
 #define OBJFORMAT_PATH_DEFAULT ""
@@ -78,6 +80,8 @@ static struct command commands[] = {
 	{"c++filt",		BINUTILS},
 	{"elfedit",		BINUTILS},
 	{"gprof",       	BINUTILS},
+	{"ld.bfd",       	BINUTILS},
+	{"ld.gold",       	BINUTILS},
 	{"nm",			BINUTILS},
 	{"objcopy",		BINUTILS},
 	{"objdump",		BINUTILS},
@@ -86,7 +90,6 @@ static struct command commands[] = {
 	{"size",		BINUTILS},
 	{"strings",		BINUTILS},
 	{"strip",		BINUTILS},
-	{"incremental-dump",	BINUTILS},
 	{"objformat",		OBJFORMAT},
 	{"",			-1}
 };
@@ -94,13 +97,13 @@ static struct command commands[] = {
 int
 main(int argc, char **argv)
 {
-	char ld_orig[] = LINKER_DEFAULT;
-	char ld_gold[] = LINKER_GOLD;
+	char ld_def[] = LINKER_DEFAULT;
+	char ld_alt[] = LINKER_ALT;
 	struct command *cmds;
 	char objformat[32];
 	char *path, *chunk;
 	char *cmd, *newcmd = NULL;
-	char *ldcmd = ld_orig;
+	char *ldcmd = ld_def;
 	const char *objformat_path;
 	const char *ccver;
 	const char *buver;
@@ -149,8 +152,8 @@ main(int argc, char **argv)
 			if (buver == NULL)
 			    buver = BINUTILSVER_DEFAULT;
 			ldver = getenv("LDVER");
-			if ((ldver != NULL) && (strcmp(ldver, ld_gold) == 0))
-			    ldcmd = ld_gold;
+			if ((ldver != NULL) && (strcmp(ldver, ld_alt) == 0))
+			    ldcmd = ld_alt;
 			base_path = "/usr/libexec";
 			use_objformat = 1;
 			env_value = buver;

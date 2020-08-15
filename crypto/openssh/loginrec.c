@@ -150,9 +150,13 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/socket.h>
+#ifdef HAVE_SYS_TIME_H
+# include <sys/time.h>
+#endif
 
 #include <netinet/in.h>
 
+#include <stdlib.h>
 #include <errno.h>
 #include <fcntl.h>
 #ifdef HAVE_PATHS_H
@@ -160,12 +164,13 @@
 #endif
 #include <pwd.h>
 #include <stdarg.h>
+#include <stdio.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
 
 #include "xmalloc.h"
-#include "key.h"
+#include "sshkey.h"
 #include "hostfile.h"
 #include "ssh.h"
 #include "loginrec.h"
@@ -174,21 +179,18 @@
 #include "packet.h"
 #include "canohost.h"
 #include "auth.h"
-#include "buffer.h"
+#include "sshbuf.h"
+#include "ssherr.h"
 
 #ifdef HAVE_UTIL_H
 # include <util.h>
-#endif
-
-#ifdef HAVE_LIBUTIL_H
-# include <libutil.h>
 #endif
 
 /**
  ** prototypes for helper functions in this file
  **/
 
-#if HAVE_UTMP_H
+#ifdef HAVE_UTMP_H
 void set_utmp_time(struct logininfo *li, struct utmp *ut);
 void construct_utmp(struct logininfo *li, struct utmp *ut);
 #endif
@@ -211,7 +213,7 @@ int utmpx_get_entry(struct logininfo *li);
 int wtmp_get_entry(struct logininfo *li);
 int wtmpx_get_entry(struct logininfo *li);
 
-extern Buffer loginmsg;
+extern struct sshbuf *loginmsg;
 
 /* pick the shortest string */
 #define MIN_SIZEOF(s1,s2) (sizeof(s1) < sizeof(s2) ? sizeof(s1) : sizeof(s2))
@@ -314,16 +316,19 @@ login_get_lastlog(struct logininfo *li, const uid_t uid)
 		fatal("%s: Cannot find account for uid %ld", __func__,
 		    (long)uid);
 
-	/* No MIN_SIZEOF here - we absolutely *must not* truncate the
-	 * username (XXX - so check for trunc!) */
-	strlcpy(li->username, pw->pw_name, sizeof(li->username));
+	if (strlcpy(li->username, pw->pw_name, sizeof(li->username)) >=
+	    sizeof(li->username)) {
+		error("%s: username too long (%lu > max %lu)", __func__,
+		    (unsigned long)strlen(pw->pw_name),
+		    (unsigned long)sizeof(li->username) - 1);
+		return NULL;
+	}
 
 	if (getlast_entry(li))
 		return (li);
 	else
 		return (NULL);
 }
-
 
 /*
  * login_alloc_entry(int, char*, char*, char*)    - Allocate and initialise
@@ -351,7 +356,7 @@ logininfo *login_alloc_entry(pid_t pid, const char *username,
 void
 login_free_entry(struct logininfo *li)
 {
-	xfree(li);
+	free(li);
 }
 
 
@@ -464,7 +469,7 @@ login_write(struct logininfo *li)
 #ifdef CUSTOM_SYS_AUTH_RECORD_LOGIN
 	if (li->type == LTYPE_LOGIN &&
 	    !sys_auth_record_login(li->username,li->hostname,li->line,
-	    &loginmsg))
+	    loginmsg))
 		logit("Writing login record failed for %s", li->username);
 #endif
 #ifdef SSH_AUDIT_EVENTS
@@ -661,15 +666,9 @@ construct_utmp(struct logininfo *li,
 	switch (li->type) {
 	case LTYPE_LOGIN:
 		ut->ut_type = USER_PROCESS;
-#ifdef _UNICOS
-		cray_set_tmpdir(ut);
-#endif
 		break;
 	case LTYPE_LOGOUT:
 		ut->ut_type = DEAD_PROCESS;
-#ifdef _UNICOS
-		cray_retain_utmp(ut, li->pid);
-#endif
 		break;
 	}
 # endif
@@ -694,8 +693,8 @@ construct_utmp(struct logininfo *li,
 	strncpy(ut->ut_name, li->username,
 	    MIN_SIZEOF(ut->ut_name, li->username));
 # ifdef HAVE_HOST_IN_UTMP
-	realhostname_sa(ut->ut_host, sizeof ut->ut_host,
-	    &li->hostaddr.sa, li->hostaddr.sa.sa_len);
+	strncpy(ut->ut_host, li->hostname,
+	    MIN_SIZEOF(ut->ut_host, li->hostname));
 # endif
 # ifdef HAVE_ADDR_IN_UTMP
 	/* this is just a 32-bit IP address */
@@ -788,12 +787,12 @@ construct_utmpx(struct logininfo *li, struct utmpx *utx)
 	/* this is just a 128-bit IPv6 address */
 	if (li->hostaddr.sa.sa_family == AF_INET6) {
 		sa6 = ((struct sockaddr_in6 *)&li->hostaddr.sa);
-		memcpy(ut->ut_addr_v6, sa6->sin6_addr.s6_addr, 16);
+		memcpy(utx->ut_addr_v6, sa6->sin6_addr.s6_addr, 16);
 		if (IN6_IS_ADDR_V4MAPPED(&sa6->sin6_addr)) {
-			ut->ut_addr_v6[0] = ut->ut_addr_v6[3];
-			ut->ut_addr_v6[1] = 0;
-			ut->ut_addr_v6[2] = 0;
-			ut->ut_addr_v6[3] = 0;
+			utx->ut_addr_v6[0] = utx->ut_addr_v6[3];
+			utx->ut_addr_v6[1] = 0;
+			utx->ut_addr_v6[2] = 0;
+			utx->ut_addr_v6[3] = 0;
 		}
 	}
 # endif
@@ -1656,7 +1655,7 @@ utmpx_get_entry(struct logininfo *li)
    */
 
 void
-record_failed_login(const char *username, const char *hostname,
+record_failed_login(struct ssh *ssh, const char *username, const char *hostname,
     const char *ttyn)
 {
 	int fd;
@@ -1699,8 +1698,8 @@ record_failed_login(const char *username, const char *hostname,
 	/* strncpy because we don't necessarily want nul termination */
 	strncpy(ut.ut_host, hostname, sizeof(ut.ut_host));
 
-	if (packet_connection_is_on_socket() &&
-	    getpeername(packet_get_connection_in(),
+	if (ssh_packet_connection_is_on_socket(ssh) &&
+	    getpeername(ssh_packet_get_connection_in(ssh),
 	    (struct sockaddr *)&from, &fromlen) == 0) {
 		ipv64_normalise_mapped(&from, &fromlen);
 		if (from.ss_family == AF_INET) {

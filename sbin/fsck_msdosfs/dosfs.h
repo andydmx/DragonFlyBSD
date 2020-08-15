@@ -1,4 +1,6 @@
-/*
+/*-
+ * SPDX-License-Identifier: BSD-2-Clause-FreeBSD
+ *
  * Copyright (C) 1995, 1996, 1997 Wolfgang Solfrank
  * Copyright (c) 1995 Martin Husemann
  * Some structure declaration borrowed from Paul Popelka
@@ -12,13 +14,6 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by Martin Husemann
- *	and Wolfgang Solfrank.
- * 4. Neither the name of the University nor the names of its contributors
- *    may be used to endorse or promote products derived from this software
- *    without specific prior written permission.
  *
  * THIS SOFTWARE IS PROVIDED BY THE AUTHORS ``AS IS'' AND ANY EXPRESS OR
  * IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
@@ -31,43 +26,44 @@
  * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
  * THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *	$NetBSD: dosfs.h,v 1.4 1997/01/03 14:32:48 ws Exp $
- * $FreeBSD: src/sbin/fsck_msdosfs/dosfs.h,v 1.1.2.1 2001/08/01 05:47:56 obrien Exp $
- * $DragonFly: src/sbin/fsck_msdosfs/dosfs.h,v 1.2 2003/06/17 04:27:32 dillon Exp $
+ * $FreeBSD$
  */
 
 #ifndef DOSFS_H
 #define DOSFS_H
 
-#define DOSBOOTBLOCKSIZE 512
+/* support 4Kn disk reads */
+#define DOSBOOTBLOCKSIZE_REAL 512
+#define DOSBOOTBLOCKSIZE 4096
 
-typedef	u_int32_t	cl_t;	/* type holding a cluster number */
+typedef	uint32_t	cl_t;	/* type holding a cluster number */
 
 /*
  * architecture independent description of all the info stored in a
  * FAT boot block.
  */
 struct bootblock {
-	u_int	BytesPerSec;		/* bytes per sector */
-	u_int	SecPerClust;		/* sectors per cluster */
-	u_int	ResSectors;		/* number of reserved sectors */
-	u_int	FATs;			/* number of FATs */
-	u_int	RootDirEnts;		/* number of root directory entries */
-	u_int	Media;			/* media descriptor */
-	u_int	FATsmall;		/* number of sectors per FAT */
+	u_int	bpbBytesPerSec;		/* bytes per sector */
+	u_int	bpbSecPerClust;		/* sectors per cluster */
+	u_int	bpbResSectors;		/* number of reserved sectors */
+	u_int	bpbFATs;		/* number of bpbFATs */
+	u_int	bpbRootDirEnts;		/* number of root directory entries */
+	uint32_t bpbSectors;		/* total number of sectors */
+	u_int	bpbMedia;		/* media descriptor */
+	u_int	bpbFATsmall;		/* number of sectors per FAT */
 	u_int	SecPerTrack;		/* sectors per track */
-	u_int	Heads;			/* number of heads */
-	u_int32_t Sectors;		/* total number of sectors */
-	u_int32_t HiddenSecs;		/* # of hidden sectors */
-	u_int32_t HugeSectors;		/* # of sectors if bpbSectors == 0 */
-	u_int	FSInfo;			/* FSInfo sector */
-	u_int	Backup;			/* Backup of Bootblocks */
-	cl_t	RootCl;			/* Start of Root Directory */
+	u_int	bpbHeads;		/* number of heads */
+	uint32_t bpbHiddenSecs;		/* # of hidden sectors */
+	uint32_t bpbHugeSectors;	/* # of sectors if bpbbpbSectors == 0 */
+	cl_t	bpbRootClust;		/* Start of Root Directory */
+	u_int	bpbFSInfo;		/* FSInfo sector */
+	u_int	bpbBackup;		/* Backup of Bootblocks */
 	cl_t	FSFree;			/* Number of free clusters acc. FSInfo */
 	cl_t	FSNext;			/* Next free cluster acc. FSInfo */
 
 	/* and some more calculated values */
 	u_int	flags;			/* some flags: */
-#define	FAT32		1		/* this is a FAT32 filesystem */
+#define	FAT32		1		/* this is a FAT32 file system */
 					/*
 					 * Maybe, we should separate out
 					 * various parts of FAT32?	XXX
@@ -75,10 +71,10 @@ struct bootblock {
 	int	ValidFat;		/* valid fat if FAT32 non-mirrored */
 	cl_t	ClustMask;		/* mask for entries in FAT */
 	cl_t	NumClusters;		/* # of entries in a FAT */
-	u_int32_t NumSectors;		/* how many sectors are there */
-	u_int32_t FATsecs;		/* how many sectors are in FAT */
-	u_int32_t NumFatEntries;	/* how many entries really are there */
-	u_int	ClusterOffset;		/* at what sector would sector 0 start */
+	uint32_t NumSectors;		/* how many sectors are there */
+	uint32_t FATsecs;		/* how many sectors are in FAT */
+	uint32_t NumFatEntries;		/* how many entries really are there */
+	u_int	FirstCluster;		/* at what sector is Cluster CLUST_FIRST */
 	u_int	ClusterSize;		/* Cluster size in bytes */
 
 	/* Now some statistics: */
@@ -87,19 +83,13 @@ struct bootblock {
 	u_int	NumBad;			/* # of bad clusters */
 };
 
-struct fatEntry {
-	cl_t	next;			/* pointer to next cluster */
-	cl_t	head;			/* pointer to start of chain */
-	u_int32_t length;		/* number of clusters on chain */
-	int	flags;			/* see below */
-};
-
 #define	CLUST_FREE	0		/* 0 means cluster is free */
 #define	CLUST_FIRST	2		/* 2 is the minimum valid cluster number */
 #define	CLUST_RSRVD	0xfffffff6	/* start of reserved clusters */
 #define	CLUST_BAD	0xfffffff7	/* a cluster with a defect */
 #define	CLUST_EOFS	0xfffffff8	/* start of EOF indicators */
 #define	CLUST_EOF	0xffffffff	/* standard value for last cluster */
+#define	CLUST_DEAD	0xfdeadc0d	/* error encountered */
 
 /*
  * Masks for cluster values
@@ -107,8 +97,6 @@ struct fatEntry {
 #define	CLUST12_MASK	0xfff
 #define	CLUST16_MASK	0xffff
 #define	CLUST32_MASK	0xfffffff
-
-#define	FAT_USED	1		/* This fat chain is used in a file */
 
 #define	DOSLONGNAMELEN	256		/* long name maximal length */
 #define LRFIRST		0x40		/* first long name record */
@@ -127,7 +115,7 @@ struct dosDirEntry {
 	char lname[DOSLONGNAMELEN];	/* real name */
 	uint flags;			/* attributes */
 	cl_t head;			/* cluster no */
-	u_int32_t size;			/* filesize in bytes */
+	uint32_t size;			/* filesize in bytes */
 	uint fsckflags;			/* flags during fsck */
 };
 /* Flags in fsckflags: */

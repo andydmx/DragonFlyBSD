@@ -1,4 +1,66 @@
 
+* Need backend synchronization / serialization when the frontend detaches
+  a XOP.  modify_tid tests won't be enough, the backend may wind up executing
+  the XOP out of order after the detach.
+
+* xop_start - only start synchronized elements
+
+* See if we can remove hammer2_inode_repoint()
+
+* FIXME - logical buffer associated with write-in-progress on backend
+  disappears once the cluster validates, even if more backend nodes
+  are in progress.
+
+* FIXME - backend ops need per-node transactions using spmp to protect
+  against flush.
+
+* FIXME - modifying backend ops are not currently validating the cluster.
+  That probably needs to be done by the frontend in hammer2_xop_start()
+
+* modify_tid handling probably broken w/ the XOP code for the moment.
+
+* embedded transactions in XOPs - interlock early completion
+
+* remove current incarnation of EAGAIN
+
+* mtx locks should not track td_locks count?.  They can be acquired by one
+  thread and released by another.  Need API function for exclusive locks.
+
+* Convert xops and hammer2_update_spans() from cluster back into chain calls
+
+* syncthr leaves inode locks for entire sync, which is wrong.
+
+* recovery scan vs unmount.  At the moment an unmount does its flushes,
+  and if successful the freemap will be fully up-to-date, but the mount
+  code doesn't know that and the last flush batch will probably match
+  the PFS root mirror_tid.  If it was a large cpdup the (unnecessary)
+  recovery pass at mount time can be extensive.  Add a CLEAN flag to the
+  volume header to optimize out the unnecessary recovery pass.
+
+* More complex transaction sequencing and flush merging.  Right now it is
+  all serialized against flushes.
+
+* adding new pfs - freeze and force remaster
+
+* removing a pfs - freeze and force remaster
+
+* bulkfree - sync between passes and enforce serialization of operation
+
+* bulkfree - signal check, allow interrupt
+
+* bulkfree - sub-passes when kernel memory block isn't large enough
+
+* bulkfree - limit kernel memory allocation for bmap space
+
+* bulkfree - must include any detached vnodes in scan so open unlinked files
+	     are not ripped out from under the system.
+
+* bulkfree - must include all volume headers in scan so they can be used
+	     for recovery or automatic snapshot retrieval.
+
+* bulkfree - snapshot duplicate sub-tree cache and tests needed to reduce
+	     unnecessary re-scans.
+
 * Currently the check code (bref.methods / crc, sha, etc) is being checked
   every single blasted time a chain is locked, even if the underlying buffer
   was previously checked for that chain.  This needs an optimization to

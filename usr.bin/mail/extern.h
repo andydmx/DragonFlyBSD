@@ -10,11 +10,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -33,7 +29,6 @@
  *	@(#)extern.h	8.2 (Berkeley) 4/20/95 
  *
  * $FreeBSD: src/usr.bin/mail/extern.h,v 1.3.6.3 2003/01/06 05:46:03 mikeh Exp $
- * $DragonFly: src/usr.bin/mail/extern.h,v 1.6 2004/09/07 22:42:26 joerg Exp $
  */
 
 struct name *cat(struct name *, struct name *);
@@ -89,14 +84,14 @@ int	 append(struct message *, FILE *);
 int	 argcount(char **);
 void	 assign(const char *, const char *);
 int	 bangexp(char *, size_t);
-void	 brokpipe(int);
+void	 brokpipe(int) __dead2;
 int	 charcount(char *, int);
 int	 check(int, int);
 void	 clob1(int);
 int	 clobber(char **);
 void	 close_all_files(void);
 int	 cmatch(char *, char *);
-void	 collhup(int);
+void	 collhup(int) __dead2;
 void	 collint(int);
 void	 collstop(int);
 void	 commands(void);
@@ -137,9 +132,9 @@ int	 getrawlist(char [], char **, int);
 int	 getuserid(char []);
 int	 grabh(struct header *, int);
 int	 group(char **);
-void	 hangup(int);
+void	 hangup(int) __dead2;
 int	 hash(const char *);
-void	 hdrstop(int);
+void	 hdrstop(int) __dead2;
 int	 headers(int *);
 int	 help(void);
 void	 holdsigs(void);
@@ -150,7 +145,7 @@ int	 ignore1(char *[], struct ignoretab *, const char *);
 int	 igshow(struct ignoretab *, const char *);
 int	 inc(void *);
 int	 incfile(void);
-void	 intr(int);
+void	 intr(int) __dead2;
 int	 isdate(char []);
 int	 isdir(char []);
 int	 isfileaddr(char *);
@@ -234,8 +229,8 @@ int	 swrite(char []);
 void	 tinit(void);
 int	 top(int *);
 void	 touch(struct message *);
-void	 ttyint(int);
-void	 ttystop(int);
+void	 ttyint(int) __dead2;
+void	 ttystop(int) __dead2;
 int	 type(int *);
 int	 type1(int *, int, int);
 int	 undelete_messages(int *);

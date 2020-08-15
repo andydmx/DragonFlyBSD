@@ -38,7 +38,6 @@
 #include "opt_ddb.h"
 #include "opt_ddb_trace.h"
 #include "opt_panic.h"
-#include "opt_show_busybufs.h"
 #include "use_gpio.h"
 
 #include <sys/param.h>
@@ -62,9 +61,10 @@
 #include <sys/sysctl.h>
 #include <sys/vkernel.h>
 #include <sys/conf.h>
-#include <sys/sysproto.h>
+#include <sys/sysmsg.h>
 #include <sys/device.h>
 #include <sys/cons.h>
+#include <sys/kbio.h>
 #include <sys/shm.h>
 #include <sys/kern_syscall.h>
 #include <vm/vm_map.h>
@@ -83,8 +83,13 @@
 
 #include <sys/signalvar.h>
 
+#if defined(WDOG_DISABLE_ON_PANIC)
 #include <sys/wdog.h>
+#endif
+#include <dev/acpica/acpi_pvpanic/panic_notifier.h>
+#if (NGPIO > 0) && defined(ERROR_LED_ON_PANIC)
 #include <dev/misc/gpio/gpio.h>
+#endif
 
 #ifndef PANIC_REBOOT_WAIT_TIME
 #define PANIC_REBOOT_WAIT_TIME 15 /* default to 15 seconds */
@@ -128,14 +133,14 @@ SYSCTL_NODE(_kern, OID_AUTO, shutdown, CTLFLAG_RW, 0, "Shutdown environment");
  */
 const char *panicstr;
 
-int dumping;				/* system is dumping */
+__read_mostly int dumping;		/* system is dumping */
 static struct dumperinfo dumper;	/* selected dumper */
 
-globaldata_t panic_cpu_gd;		/* which cpu took the panic */
+__read_frequently globaldata_t panic_cpu_gd;	/* used in lock assertion */
 struct lwkt_tokref panic_tokens[LWKT_MAXTOKENS];
 int panic_tokens_count;
 
-int bootverbose = 0;			/* note: assignment to force non-bss */
+__read_mostly int bootverbose = 0;	/* note: assignment to force non-bss */
 SYSCTL_INT(_debug, OID_AUTO, bootverbose, CTLFLAG_RW,
 	   &bootverbose, 0, "Verbose kernel messages");
 
@@ -164,7 +169,7 @@ shutdown_conf(void *unused)
 	EVENTHANDLER_REGISTER(shutdown_final, shutdown_reset, NULL, SHUTDOWN_PRI_LAST + 200);
 }
 
-SYSINIT(shutdown_conf, SI_BOOT2_MACHDEP, SI_ORDER_ANY, shutdown_conf, NULL)
+SYSINIT(shutdown_conf, SI_BOOT2_MACHDEP, SI_ORDER_ANY, shutdown_conf, NULL);
 
 /* ARGSUSED */
 
@@ -174,7 +179,7 @@ SYSINIT(shutdown_conf, SI_BOOT2_MACHDEP, SI_ORDER_ANY, shutdown_conf, NULL)
  * MPALMOSTSAFE
  */
 int
-sys_reboot(struct reboot_args *uap)
+sys_reboot(struct sysmsg *sysmsg, const struct reboot_args *uap)
 {
 	struct thread *td = curthread;
 	int error;
@@ -208,8 +213,8 @@ shutdown_nice(int howto)
 	return;
 }
 static int	waittime = -1;
-struct pcb dumppcb;
-struct thread *dumpthread;
+struct pcb	dumppcb;
+struct thread	*dumpthread;
 
 static void
 print_uptime(void)
@@ -301,25 +306,49 @@ boot(int howto)
 	 */
 	if (!cold && (howto & RB_NOSYNC) == 0 && waittime < 0) {
 		int iter, nbusy, pbusy;
+		int zcount;
 
 		waittime = 0;
+		zcount = 0;
 		kprintf("\nsyncing disks... ");
 
-		sys_sync(NULL);	/* YYY was sync(&proc0, NULL). why proc0 ? */
+		sys_sync(NULL, NULL);
 
 		/*
-		 * With soft updates, some buffers that are
-		 * written will be remarked as dirty until other
-		 * buffers are written.
+		 * With soft updates, some buffers that are written will be
+		 * remarked as dirty until other buffers are written.
+		 *
+		 * sys_sync() usually runs asynchronously, to give us a
+		 * better chance of syncing the rest of the filesystems when
+		 * one or more of them are stuck.
 		 */
-		for (iter = pbusy = 0; iter < 20; iter++) {
-			nbusy = scan_all_buffers(shutdown_busycount1, NULL);
-			if (nbusy == 0)
-				break;
+		for (iter = pbusy = 0; iter < 20 + zcount; iter++) {
+			if (iter <= 10)
+				nbusy = scan_all_buffers(shutdown_busycount1,
+							 &iter);
+			else
+				nbusy = scan_all_buffers(shutdown_busycount2,
+							 &iter);
 			kprintf("%d ", nbusy);
-			if (nbusy < pbusy)
-				iter = 0;
+			if (nbusy == 0) {
+				if (++zcount == 3)
+					break;
+			} else {
+				zcount = 0;
+			}
+
+			/*
+			 * There could be a lot to sync, only allow iter to
+			 * proceed while there is progress.
+			 */
+			if (nbusy < pbusy) {
+				if (iter > 10)
+					iter = 10;
+				else
+					iter = 0;
+			}
 			pbusy = nbusy;
+
 			/*
 			 * XXX:
 			 * Process soft update work queue if buffers don't sync
@@ -328,16 +357,12 @@ boot(int howto)
 			if (iter > 5)
 				bio_ops_sync(NULL);
  
-			sys_sync(NULL); /* YYY was sync(&proc0, NULL). why proc0 ? */
+			sys_sync(NULL, NULL);
 			tsleep(boot, 0, "shutdn", hz * iter / 20 + 1);
 		}
 		kprintf("\n");
-		/*
-		 * Count only busy local buffers to prevent forcing 
-		 * a fsck if we're just a client of a wedged NFS server
-		 */
-		nbusy = scan_all_buffers(shutdown_busycount2, NULL);
-		if (nbusy) {
+
+		if (zcount < 3) {
 			/*
 			 * Failed to sync all blocks. Indicate this and don't
 			 * unmount filesystems (thus forcing an fsck on reboot).
@@ -350,11 +375,12 @@ boot(int howto)
 			tsleep(boot, 0, "shutdn", hz * 5 + 1);
 		} else {
 			kprintf("done\n");
+
 			/*
 			 * Unmount filesystems
 			 */
 			if (panicstr == NULL)
-				vfs_unmountall();
+				vfs_unmountall(1);
 		}
 		tsleep(boot, 0, "shutdn", hz / 10 + 1);
 	}
@@ -389,13 +415,13 @@ boot(int howto)
  *	We ignore TMPFS mounts in this pass.
  */
 static int
-shutdown_busycount1(struct buf *bp, void *info)
+shutdown_busycount1(struct buf *bp, void *info __unused)
 {
 	struct vnode *vp;
 
 	if ((vp = bp->b_vp) != NULL && vp->v_tag == VT_TMPFS)
 		return (0);
-	if ((bp->b_flags & B_INVAL) == 0 && BUF_REFCNT(bp) > 0)
+	if ((bp->b_flags & B_INVAL) == 0 && BUF_LOCKINUSE(bp))
 		return(1);
 	if ((bp->b_flags & (B_DELWRI | B_INVAL)) == B_DELWRI)
 		return (1);
@@ -411,6 +437,8 @@ static int
 shutdown_busycount2(struct buf *bp, void *info)
 {
 	struct vnode *vp;
+	int *iterp = info;
+	const char *mpath;
 
 	/*
 	 * Ignore tmpfs and nfs mounts
@@ -429,7 +457,7 @@ shutdown_busycount2(struct buf *bp, void *info)
 	/*
 	 * Only count buffers stuck on I/O, ignore everything else
 	 */
-	if (((bp->b_flags & B_INVAL) == 0 && BUF_REFCNT(bp)) ||
+	if (((bp->b_flags & B_INVAL) == 0 && BUF_LOCKINUSE(bp)) ||
 	    ((bp->b_flags & (B_DELWRI|B_INVAL)) == B_DELWRI)) {
 		/*
 		 * Only count buffers undergoing write I/O
@@ -439,13 +467,19 @@ shutdown_busycount2(struct buf *bp, void *info)
 		    bio_track_active(&bp->b_vp->v_track_write) == 0) {
 			return (0);
 		}
-#if defined(SHOW_BUSYBUFS) || defined(DIAGNOSTIC)
-		kprintf(
-	    "%p dev:?, flags:%08x, loffset:%jd, doffset:%jd\n",
-		    bp, 
-		    bp->b_flags, (intmax_t)bp->b_loffset,
-		    (intmax_t)bp->b_bio2.bio_offset);
-#endif
+		if (*iterp > 15) {
+			mpath = "?";
+			if (bp->b_vp->v_mount)
+				mpath = bp->b_vp->v_mount->mnt_stat.f_mntonname;
+
+			kprintf("%p on %s, flags:%08x, loffset:%jd, "
+				"doffset:%jd\n",
+				bp,
+				mpath,
+				bp->b_flags,
+				(intmax_t)bp->b_loffset,
+				(intmax_t)bp->b_bio2.bio_offset);
+		}
 		return(1);
 	}
 	return(0);
@@ -464,6 +498,7 @@ shutdown_halt(void *junk, int howto)
 		cpu_halt();
 #else
 		kprintf("Please press any key to reboot.\n\n");
+		cnpoll(TRUE);
 		switch (cngetc()) {
 		case -1:		/* No console, just die */
 			cpu_halt();
@@ -484,6 +519,7 @@ static void
 shutdown_panic(void *junk, int howto)
 {
 	int loop;
+	int c;
 
 	if (howto & RB_DUMP) {
 		if (PANIC_REBOOT_WAIT_TIME != 0) {
@@ -495,7 +531,8 @@ shutdown_panic(void *junk, int howto)
 				     loop > 0; --loop) {
 					DELAY(1000 * 100); /* 1/10th second */
 					/* Did user type a key? */
-					if (cncheckc() != -1)
+					c = cncheckc();
+					if (c != -1 && c != NOKEY)
 						break;
 				}
 				if (!loop)
@@ -560,6 +597,8 @@ shutdown_cleanup_proc(struct proc *p)
 		vrele(p->p_textvp);
 		p->p_textvp = NULL;
 	}
+	if (p->p_textnch.ncp)
+		cache_drop(&p->p_textnch);
 	vm = p->p_vmspace;
 	if (vm != NULL) {
 		pmap_remove_pages(vmspace_pmap(vm),
@@ -616,6 +655,7 @@ setdumpdev(cdev_t dev)
 
 	if (dev == NULL) {
 		disk_dumpconf(NULL, 0/*off*/);
+		dumpdev = NULL;
 		return (0);
 	}
 
@@ -627,11 +667,13 @@ setdumpdev(cdev_t dev)
 	 */
 	doopen = (dev->si_sysref.refcnt == 1);
 	if (doopen) {
-		error = dev_dopen(dev, FREAD, S_IFCHR, proc0.p_ucred, NULL);
+		error = dev_dopen(dev, FREAD, S_IFCHR, proc0.p_ucred, NULL, NULL);
 		if (error)
 			return (error);
 	}
 	error = disk_dumpconf(dev, 1/*on*/);
+	if (error == 0)
+		dumpdev = dev;
 
 	return error;
 }
@@ -668,23 +710,38 @@ dump_conf(void *dummy)
 		dumpdev = NULL;
 }
 
-SYSINIT(dump_conf, SI_SUB_DUMP_CONF, SI_ORDER_FIRST, dump_conf, NULL)
+SYSINIT(dump_conf, SI_SUB_DUMP_CONF, SI_ORDER_FIRST, dump_conf, NULL);
 
 static int
 sysctl_kern_dumpdev(SYSCTL_HANDLER_ARGS)
 {
 	int error;
-	udev_t ndumpdev;
+	dev_t ndumpdev;
 
-	ndumpdev = dev2udev(dumpdev);
+	ndumpdev = devid_from_dev(dumpdev);
 	error = sysctl_handle_opaque(oidp, &ndumpdev, sizeof ndumpdev, req);
 	if (error == 0 && req->newptr != NULL)
-		error = setdumpdev(udev2dev(ndumpdev, 0));
+		error = setdumpdev(dev_from_devid(ndumpdev, 0));
 	return (error);
 }
 
 SYSCTL_PROC(_kern, KERN_DUMPDEV, dumpdev, CTLTYPE_OPAQUE|CTLFLAG_RW,
 	0, sizeof dumpdev, sysctl_kern_dumpdev, "T,udev_t", "");
+
+static struct panicerinfo *panic_notifier;
+
+int
+set_panic_notifier(struct panicerinfo *info)
+{
+	if (info == NULL)
+		panic_notifier = NULL;
+	else if (panic_notifier != NULL)
+		return 1;
+	else
+		panic_notifier = info;
+
+	return 0;
+}
 
 /*
  * Panic is called on unresolvable fatal errors.  It prints "panic: mesg",
@@ -789,6 +846,8 @@ panic(const char *fmt, ...)
 	if (panicstr == fmt)
 		panicstr = buf;
 	__va_end(ap);
+	if (panic_notifier != NULL)
+		panic_notifier->notifier(panic_notifier->arg);
 	kprintf("panic: %s\n", buf);
 	/* two separate prints in case of an unmapped page and trap */
 	kprintf("cpuid = %d\n", mycpu->gd_cpuid);
@@ -802,13 +861,24 @@ panic(const char *fmt, ...)
 #endif
 
 	/*
+	 * Make sure kgdb knows who we are, there won't be a stoppcbs[]
+	 * entry since our cpu wasn't stopped.
+	 */
+	savectx(&dumppcb);
+	dumpthread = curthread;
+
+	/*
 	 * Enter the debugger or fall through & dump.  Entering the
 	 * debugger will stop cpus.  If not entering the debugger stop
 	 * cpus here.
+	 *
+	 * Limit the trace history to leave more panic data on a
+	 * potentially row-limited console.
 	 */
+
 #if defined(DDB)
 	if (newpanic && trace_on_panic)
-		print_backtrace(-1);
+		print_backtrace(6);
 	if (debugger_on_panic)
 		Debugger("panic");
 	else
@@ -894,8 +964,8 @@ void
 dumpsys(void)
 {
 #if defined (_KERNEL_VIRTUAL)
-	/* VKERNELs don't support dumps */
-	kprintf("VKERNEL doesn't support dumps\n");
+	/* vkernels don't support dumps */
+	kprintf("vkernels don't support dumps\n");
 	return;
 #endif
 	/*
@@ -913,7 +983,7 @@ dumpsys(void)
 	}
 }
 
-int dump_stop_usertds = 0;
+__read_frequently int dump_stop_usertds = 0;
 
 static
 void

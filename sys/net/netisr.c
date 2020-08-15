@@ -55,8 +55,10 @@
 #include <sys/thread2.h>
 #include <sys/msgport2.h>
 #include <net/netmsg2.h>
-#include <sys/mplock2.h>
 
+#include <vm/vm_extern.h>
+
+static void netmsg_service_port_init(lwkt_port_t);
 static void netmsg_service_loop(void *arg);
 static void netisr_hashfn0(struct mbuf **mp, int hoff);
 static void netisr_nohashck(struct mbuf *, const struct pktinfo *);
@@ -66,10 +68,18 @@ struct netmsg_port_registration {
 	lwkt_port_t	npr_port;
 };
 
-struct netmsg_rollup {
-	TAILQ_ENTRY(netmsg_rollup) ru_entry;
+struct netisr_rollup {
+	TAILQ_ENTRY(netisr_rollup) ru_entry;
 	netisr_ru_t	ru_func;
 	int		ru_prio;
+	void		*ru_key;
+};
+
+struct netmsg_rollup {
+	struct netmsg_base	base;
+	netisr_ru_t		func;
+	int			prio;
+	void			*key;
 };
 
 struct netmsg_barrier {
@@ -86,12 +96,22 @@ struct netisr_barrier {
 	int			br_isset;
 };
 
+struct netisr_data {
+	struct thread		thread;
+#ifdef INVARIANTS
+	void			*netlastfunc;
+#endif
+	TAILQ_HEAD(, netisr_rollup) netrulist;
+};
+
+static struct netisr_data	*netisr_data[MAXCPU];
+
 static struct netisr netisrs[NETISR_MAX];
 static TAILQ_HEAD(,netmsg_port_registration) netreglist;
-static TAILQ_HEAD(,netmsg_rollup) netrulist;
 
 /* Per-CPU thread to handle any protocol.  */
-struct thread netisr_cpu[MAXCPU];
+struct thread *netisr_threads[MAXCPU];
+
 lwkt_port netisr_afree_rport;
 lwkt_port netisr_afree_free_so_rport;
 lwkt_port netisr_adone_rport;
@@ -101,10 +121,15 @@ lwkt_port netisr_sync_port;
 static int (*netmsg_fwd_port_fn)(lwkt_port_t, lwkt_msg_t);
 
 SYSCTL_NODE(_net, OID_AUTO, netisr, CTLFLAG_RW, 0, "netisr");
-static int netisr_rollup_limit = 32;
+
+__read_frequently static int netisr_rollup_limit = 32;
 SYSCTL_INT(_net_netisr, OID_AUTO, rollup_limit, CTLFLAG_RW,
 	&netisr_rollup_limit, 0, "Message to process before rollup");
 
+__read_frequently int netisr_ncpus;
+TUNABLE_INT("net.netisr.ncpus", &netisr_ncpus);
+SYSCTL_INT(_net_netisr, OID_AUTO, ncpus, CTLFLAG_RD,
+	&netisr_ncpus, 0, "# of CPUs to handle network messages");
 
 /*
  * netisr_afree_rport replymsg function, only used to handle async
@@ -177,19 +202,32 @@ netisr_init(void)
 {
 	int i;
 
+	if (netisr_ncpus <= 0 || netisr_ncpus > ncpus) {
+		/* Default. */
+		netisr_ncpus = ncpus;
+	}
+	if (netisr_ncpus > NETISR_CPUMAX)
+		netisr_ncpus = NETISR_CPUMAX;
+
 	TAILQ_INIT(&netreglist);
-	TAILQ_INIT(&netrulist);
 
 	/*
 	 * Create default per-cpu threads for generic protocol handling.
 	 */
 	for (i = 0; i < ncpus; ++i) {
-		lwkt_create(netmsg_service_loop, NULL, NULL,
-			    &netisr_cpu[i],
-			    TDF_NOSTART|TDF_FORCE_SPINPORT|TDF_FIXEDCPU,
-			    i, "netisr_cpu %d", i);
-		netmsg_service_port_init(&netisr_cpu[i].td_msgport);
-		lwkt_schedule(&netisr_cpu[i]);
+		struct netisr_data *nd;
+
+		nd = (void *)kmem_alloc3(&kernel_map, sizeof(*nd),
+		    VM_SUBSYS_GD, KM_CPU(i));
+		memset(nd, 0, sizeof(*nd));
+		TAILQ_INIT(&nd->netrulist);
+		netisr_data[i] = nd;
+
+		lwkt_create(netmsg_service_loop, NULL, &netisr_threads[i],
+		    &nd->thread, TDF_NOSTART|TDF_FORCE_SPINPORT|TDF_FIXEDCPU,
+		    i, "netisr %d", i);
+		netmsg_service_port_init(&netisr_threads[i]->td_msgport);
+		lwkt_schedule(netisr_threads[i]);
 	}
 
 	/*
@@ -210,7 +248,6 @@ netisr_init(void)
 	 */
 	lwkt_initport_putonly(&netisr_sync_port, netmsg_sync_putport);
 }
-
 SYSINIT(netisr, SI_SUB_PRE_DRIVERS, SI_ORDER_FIRST, netisr_init, NULL);
 
 /*
@@ -218,7 +255,7 @@ SYSINIT(netisr, SI_SUB_PRE_DRIVERS, SI_ORDER_FIRST, netisr_init, NULL);
  * registers the port for synchronous cleanup operations such as when an
  * ifnet is being destroyed.  There is no deregistration API yet.
  */
-void
+static void
 netmsg_service_port_init(lwkt_port_t port)
 {
 	struct netmsg_port_registration *reg;
@@ -281,14 +318,16 @@ netmsg_sync_handler(netmsg_t msg)
 static void
 netmsg_service_loop(void *arg)
 {
-	struct netmsg_rollup *ru;
 	netmsg_base_t msg;
 	thread_t td = curthread;
 	int limit;
+	struct netisr_data *nd = netisr_data[mycpuid];
 
 	td->td_type = TD_TYPE_NETISR;
 
 	while ((msg = lwkt_waitport(&td->td_msgport, 0))) {
+		struct netisr_rollup *ru;
+
 		/*
 		 * Run up to 512 pending netmsgs.
 		 */
@@ -325,6 +364,9 @@ netmsg_service_loop(void *arg)
 				/*
 				 * We are on the correct port, dispatch it.
 				 */
+#ifdef INVARIANTS
+				nd->netlastfunc = msg->nm_dispatch;
+#endif
 				msg->nm_dispatch((netmsg_t)msg);
 			}
 			if (--limit == 0)
@@ -335,7 +377,7 @@ netmsg_service_loop(void *arg)
 		 * Run all registered rollup functions for this cpu
 		 * (e.g. tcp_willblock()).
 		 */
-		TAILQ_FOREACH(ru, &netrulist, ru_entry)
+		TAILQ_FOREACH(ru, &nd->netrulist, ru_entry)
 			ru->ru_func();
 	}
 }
@@ -460,8 +502,7 @@ netisr_characterize(int num, struct mbuf **mp, int hoff)
 
 	if (num < 0 || num >= NETISR_MAX) {
 		if (num == NETISR_MAX) {
-			m->m_flags |= M_HASH;
-			m->m_pkthdr.hash = 0;
+			m_sethash(m, 0);
 			return;
 		}
 		panic("Bad isr %d", num);
@@ -522,25 +563,83 @@ netisr_register_hashcheck(int num, netisr_hashck_t hashck)
 	ni->ni_hashck = hashck;
 }
 
-void
-netisr_register_rollup(netisr_ru_t ru_func, int prio)
+static void
+netisr_register_rollup_dispatch(netmsg_t nmsg)
 {
-	struct netmsg_rollup *new_ru, *ru;
+	struct netmsg_rollup *nm = (struct netmsg_rollup *)nmsg;
+	int cpuid = mycpuid;
+	struct netisr_data *nd = netisr_data[cpuid];
+	struct netisr_rollup *new_ru, *ru;
 
 	new_ru = kmalloc(sizeof(*new_ru), M_TEMP, M_WAITOK|M_ZERO);
-	new_ru->ru_func = ru_func;
-	new_ru->ru_prio = prio;
+	new_ru->ru_func = nm->func;
+	new_ru->ru_prio = nm->prio;
 
 	/*
 	 * Higher priority "rollup" appears first
 	 */
-	TAILQ_FOREACH(ru, &netrulist, ru_entry) {
+	TAILQ_FOREACH(ru, &nd->netrulist, ru_entry) {
 		if (ru->ru_prio < new_ru->ru_prio) {
 			TAILQ_INSERT_BEFORE(ru, new_ru, ru_entry);
-			return;
+			goto done;
 		}
 	}
-	TAILQ_INSERT_TAIL(&netrulist, new_ru, ru_entry);
+	TAILQ_INSERT_TAIL(&nd->netrulist, new_ru, ru_entry);
+done:
+	if (cpuid == 0)
+		nm->key = new_ru;
+	KKASSERT(nm->key != NULL);
+	new_ru->ru_key = nm->key;
+
+	netisr_forwardmsg_all(&nm->base, cpuid + 1);
+}
+
+struct netisr_rollup *
+netisr_register_rollup(netisr_ru_t func, int prio)
+{
+	struct netmsg_rollup nm;
+
+	netmsg_init(&nm.base, NULL, &curthread->td_msgport, MSGF_PRIORITY,
+	    netisr_register_rollup_dispatch);
+	nm.func = func;
+	nm.prio = prio;
+	nm.key = NULL;
+	netisr_domsg_global(&nm.base);
+
+	KKASSERT(nm.key != NULL);
+	return (nm.key);
+}
+
+static void
+netisr_unregister_rollup_dispatch(netmsg_t nmsg)
+{
+	struct netmsg_rollup *nm = (struct netmsg_rollup *)nmsg;
+	int cpuid = mycpuid;
+	struct netisr_data *nd = netisr_data[cpuid];
+	struct netisr_rollup *ru;
+
+	TAILQ_FOREACH(ru, &nd->netrulist, ru_entry) {
+		if (ru->ru_key == nm->key)
+			break;
+	}
+	if (ru == NULL)
+		panic("netisr: no rullup for %p", nm->key);
+
+	TAILQ_REMOVE(&nd->netrulist, ru, ru_entry);
+	kfree(ru, M_TEMP);
+
+	netisr_forwardmsg_all(&nm->base, cpuid + 1);
+}
+
+void
+netisr_unregister_rollup(struct netisr_rollup *key)
+{
+	struct netmsg_rollup nm;
+
+	netmsg_init(&nm.base, NULL, &curthread->td_msgport, MSGF_PRIORITY,
+	    netisr_unregister_rollup_dispatch);
+	nm.key = key;
+	netisr_domsg_global(&nm.base);
 }
 
 /*
@@ -548,9 +647,10 @@ netisr_register_rollup(netisr_ru_t ru_func, int prio)
  */
 lwkt_port_t
 cpu0_ctlport(int cmd __unused, struct sockaddr *sa __unused,
-	     void *extra __unused)
+    void *extra __unused, int *cpuid)
 {
-	return (&netisr_cpu[0].td_msgport);
+	*cpuid = 0;
+	return netisr_cpuport(*cpuid);
 }
 
 /*
@@ -563,10 +663,8 @@ cpu0_ctlport(int cmd __unused, struct sockaddr *sa __unused,
 static void
 netisr_hashfn0(struct mbuf **mp, int hoff __unused)
 {
-	struct mbuf *m = *mp;
 
-	m->m_flags |= M_HASH;
-	m->m_pkthdr.hash = 0;
+	m_sethash(*mp, 0);
 }
 
 /*
@@ -586,7 +684,7 @@ schednetisr_remote(void *data)
 {
 	int num = (int)(intptr_t)data;
 	struct netisr *ni = &netisrs[num];
-	lwkt_port_t port = &netisr_cpu[0].td_msgport;
+	lwkt_port_t port = &netisr_threads[0]->td_msgport;
 	netmsg_base_t pmsg;
 
 	pmsg = &netisrs[num].ni_netmsg;
@@ -653,7 +751,7 @@ netisr_barrier_set(struct netisr_barrier *br)
 	volatile cpumask_t other_cpumask;
 	int i, cur_cpuid;
 
-	KKASSERT(&curthread->td_msgport == netisr_cpuport(0));
+	ASSERT_NETISR0;
 	KKASSERT(!br->br_isset);
 
 	other_cpumask = mycpu->gd_other_cpus;
@@ -702,7 +800,7 @@ netisr_barrier_rem(struct netisr_barrier *br)
 {
 	int i, cur_cpuid;
 
-	KKASSERT(&curthread->td_msgport == netisr_cpuport(0));
+	ASSERT_NETISR0;
 	KKASSERT(br->br_isset);
 
 	cur_cpuid = mycpuid;

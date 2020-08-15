@@ -2,7 +2,8 @@
 LEVEL1=	1 2 3 4 5 6 7 8 9 A E L M N P Q X a b c d e f g h i j k l m n o \
 	p q r s t u v w x z
 
-ENTRY=	1/1178 \
+TERMINFO_ENTRIES=	\
+        1/1178 \
 	1/1730-lm \
 	2/2621 \
 	2/2621-wl \
@@ -1770,7 +1771,6 @@ ENTRY=	1/1178 \
 	s/screen-bce.gnome \
 	s/screen-bce.konsole \
 	s/screen-bce.linux \
-	s/screen-bce.mlterm \
 	s/screen-bce.mrxvt \
 	s/screen-bce.rxvt \
 	s/screen-bce.xterm-new \
@@ -1798,6 +1798,9 @@ ENTRY=	1/1178 \
 	s/soroc120 \
 	s/soroc140 \
 	s/spinwriter \
+	s/st \
+	s/st-16color \
+	s/st-256color \
 	s/st52 \
 	s/st52-color \
 	s/st52-m \
@@ -1920,6 +1923,8 @@ ENTRY=	1/1178 \
 	t/ti931 \
 	t/ti_ansi \
 	t/tkterm \
+	t/tmux \
+	t/tmux-256color \
 	t/tn1200 \
 	t/tn300 \
 	t/trs16 \

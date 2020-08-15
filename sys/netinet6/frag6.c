@@ -1,5 +1,4 @@
 /*	$FreeBSD: src/sys/netinet6/frag6.c,v 1.2.2.6 2002/04/28 05:40:26 suz Exp $	*/
-/*	$DragonFly: src/sys/netinet6/frag6.c,v 1.12 2008/01/05 14:02:40 swildner Exp $	*/
 /*	$KAME: frag6.c,v 1.33 2002/01/07 11:34:48 kjc Exp $	*/
 
 /*
@@ -46,6 +45,8 @@
 
 #include <net/if.h>
 #include <net/route.h>
+#include <net/netisr2.h>
+#include <net/netmsg2.h>
 
 #include <netinet/in.h>
 #include <netinet/in_var.h>
@@ -54,6 +55,8 @@
 #include <netinet/icmp6.h>
 
 #include <net/net_osdep.h>
+
+#define FRAG6_SLOWTIMO		(hz / PR_SLOWHZ)
 
 /*
  * Define it to get a correct behavior on per-interface statistics.
@@ -67,14 +70,23 @@ static void frag6_deq (struct ip6asfrag *);
 static void frag6_insque (struct ip6q *, struct ip6q *);
 static void frag6_remque (struct ip6q *);
 static void frag6_freef (struct ip6q *);
+static void frag6_slowtimo_dispatch (netmsg_t);
+static void frag6_slowtimo (void *);
+static void frag6_drain_dispatch (netmsg_t);
 
 /* XXX we eventually need splreass6, or some real semaphore */
 int frag6_doing_reass;
 u_int frag6_nfragpackets;
+u_int frag6_nfrags;
 struct	ip6q ip6q;	/* ip6 reassemble queue */
 
 /* FreeBSD tweak */
 MALLOC_DEFINE(M_FTABLE, "fragment", "fragment reassembly header");
+
+static struct callout		frag6_slowtimo_ch;
+static struct netmsg_base	frag6_slowtimo_nmsg;
+static struct netmsg_base	frag6_drain_nmsg;
+static volatile int		frag6_draining;
 
 /*
  * Initialise reassembly queue and fragment identifier.
@@ -85,6 +97,7 @@ frag6_init(void)
 	struct timeval tv;
 
 	ip6_maxfragpackets = nmbclusters / 4;
+	ip6_maxfrags = nmbclusters / 4;
 
 	/*
 	 * in many cases, random() here does NOT return random number
@@ -93,6 +106,16 @@ frag6_init(void)
 	microtime(&tv);
 	ip6_id = krandom() ^ tv.tv_usec;
 	ip6q.ip6q_next = ip6q.ip6q_prev = &ip6q;
+
+	netmsg_init(&frag6_drain_nmsg, NULL, &netisr_adone_rport,
+	    MSGF_PRIORITY, frag6_drain_dispatch);
+
+	callout_init_mp(&frag6_slowtimo_ch);
+	netmsg_init(&frag6_slowtimo_nmsg, NULL, &netisr_adone_rport,
+	    MSGF_PRIORITY, frag6_slowtimo_dispatch);
+
+	callout_reset_bycpu(&frag6_slowtimo_ch, FRAG6_SLOWTIMO,
+	    frag6_slowtimo, NULL, 0);
 }
 
 /*
@@ -209,6 +232,16 @@ frag6_input(struct mbuf **mp, int *offp, int proto)
 
 	frag6_doing_reass = 1;
 
+	/*
+	 * Enforce upper bound on number of fragments.
+	 * If maxfrag is 0, never accept fragments.
+	 * If maxfrag is -1, accept all fragments without limitation.
+	 */
+	if (ip6_maxfrags < 0)
+		;
+	else if (frag6_nfrags >= (u_int)ip6_maxfrags)
+		goto dropfrag;
+
 	for (q6 = ip6q.ip6q_next; q6 != &ip6q; q6 = q6->ip6q_next)
 		if (ip6f->ip6f_ident == q6->ip6q_ident &&
 		    IN6_ARE_ADDR_EQUAL(&ip6->ip6_src, &q6->ip6q_src) &&
@@ -250,6 +283,7 @@ frag6_input(struct mbuf **mp, int *offp, int proto)
 		q6->ip6q_src	= ip6->ip6_src;
 		q6->ip6q_dst	= ip6->ip6_dst;
 		q6->ip6q_unfrglen = -1;	/* The 1st fragment has not arrived. */
+		q6->ip6q_nfrag = 0;
 	}
 
 	/*
@@ -378,6 +412,8 @@ insert:
 	 * the most recently active fragmented packet.
 	 */
 	frag6_enq(ip6af, af6->ip6af_up);
+	frag6_nfrags++;
+	q6->ip6q_nfrag++;
 #if 0 /* xxx */
 	if (q6 != ip6q.ip6q_next) {
 		frag6_remque(q6);
@@ -432,14 +468,15 @@ insert:
 	 * Delete frag6 header with as a few cost as possible.
 	 */
 	if (offset < m->m_len) {
-		ovbcopy((caddr_t)ip6, (caddr_t)ip6 + sizeof(struct ip6_frag),
-			offset);
+		bcopy((caddr_t)ip6, (caddr_t)ip6 + sizeof(struct ip6_frag),
+		      offset);
 		m->m_data += sizeof(struct ip6_frag);
 		m->m_len -= sizeof(struct ip6_frag);
 	} else {
 		/* this comes with no copy if the boundary is on cluster */
-		if ((t = m_split(m, offset, MB_DONTWAIT)) == NULL) {
+		if ((t = m_split(m, offset, M_NOWAIT)) == NULL) {
 			frag6_remque(q6);
+			frag6_nfrags -= q6->ip6q_nfrag;
 			kfree(q6, M_FTABLE);
 			frag6_nfragpackets--;
 			goto dropfrag;
@@ -457,6 +494,7 @@ insert:
 	}
 
 	frag6_remque(q6);
+	frag6_nfrags -= q6->ip6q_nfrag;
 	kfree(q6, M_FTABLE);
 	frag6_nfragpackets--;
 
@@ -495,7 +533,7 @@ dropfrag:
  * Free a fragment reassembly header and all
  * associated datagrams.
  */
-void
+static void
 frag6_freef(struct ip6q *q6)
 {
 	struct ip6asfrag *af6, *down6;
@@ -528,6 +566,7 @@ frag6_freef(struct ip6q *q6)
 		kfree(af6, M_FTABLE);
 	}
 	frag6_remque(q6);
+	frag6_nfrags -= q6->ip6q_nfrag;
 	kfree(q6, M_FTABLE);
 	frag6_nfragpackets--;
 }
@@ -536,7 +575,7 @@ frag6_freef(struct ip6q *q6)
  * Put an ip fragment on a reassembly chain.
  * Like insque, but pointers in middle of structure.
  */
-void
+static void
 frag6_enq(struct ip6asfrag *af6, struct ip6asfrag *up6)
 {
 	af6->ip6af_up = up6;
@@ -548,14 +587,14 @@ frag6_enq(struct ip6asfrag *af6, struct ip6asfrag *up6)
 /*
  * To frag6_enq as remque is to insque.
  */
-void
+static void
 frag6_deq(struct ip6asfrag *af6)
 {
 	af6->ip6af_up->ip6af_down = af6->ip6af_down;
 	af6->ip6af_down->ip6af_up = af6->ip6af_up;
 }
 
-void
+static void
 frag6_insque(struct ip6q *new, struct ip6q *old)
 {
 	new->ip6q_prev = old;
@@ -564,7 +603,7 @@ frag6_insque(struct ip6q *new, struct ip6q *old)
 	old->ip6q_next = new;
 }
 
-void
+static void
 frag6_remque(struct ip6q *p6)
 {
 	p6->ip6q_prev->ip6q_next = p6->ip6q_next;
@@ -576,12 +615,18 @@ frag6_remque(struct ip6q *p6)
  * if a timer expires on a reassembly
  * queue, discard it.
  */
-void
-frag6_slowtimo(void)
+static void
+frag6_slowtimo_dispatch(netmsg_t nmsg)
 {
 	struct ip6q *q6;
 
+	ASSERT_NETISR0;
+
+	/* Reply ASAP. */
 	crit_enter();
+	netisr_replymsg(&nmsg->base, 0);
+	crit_exit();
+
 	frag6_doing_reass = 1;
 	q6 = ip6q.ip6q_next;
 	if (q6)
@@ -622,16 +667,31 @@ frag6_slowtimo(void)
 		ipsrcchk_rt.ro_rt = NULL;
 	}
 #endif
+	callout_reset(&frag6_slowtimo_ch, FRAG6_SLOWTIMO, frag6_slowtimo, NULL);
+}
 
+static void
+frag6_slowtimo(void *dummy __unused)
+{
+	struct netmsg_base *nmsg = &frag6_slowtimo_nmsg;
+
+	KKASSERT(mycpuid == 0);
+
+	crit_enter();
+	if (nmsg->lmsg.ms_flags & MSGF_DONE)
+		netisr_sendmsg_oncpu(nmsg);
 	crit_exit();
 }
 
 /*
  * Drain off all datagram fragments.
  */
-void
-frag6_drain(void)
+static void
+frag6_drain_oncpu(void)
 {
+
+	ASSERT_NETISR0;
+
 	if (frag6_doing_reass)
 		return;
 	while (ip6q.ip6q_next != &ip6q) {
@@ -639,4 +699,50 @@ frag6_drain(void)
 		/* XXX in6_ifstat_inc(ifp, ifs6_reass_fail) */
 		frag6_freef(ip6q.ip6q_next);
 	}
+}
+
+static void
+frag6_drain_dispatch(netmsg_t nmsg)
+{
+
+	ASSERT_NETISR0;
+
+	crit_enter();
+	netisr_replymsg(&nmsg->base, 0);
+	crit_exit();
+
+	frag6_drain_oncpu();
+	frag6_draining = 0;
+}
+
+static void
+frag6_drain_ipi(void *dummy __unused)
+{
+	struct netmsg_base *nmsg = &frag6_drain_nmsg;
+
+	KKASSERT(mycpuid == 0);
+
+	crit_enter();
+	if (nmsg->lmsg.ms_flags & MSGF_DONE)
+		netisr_sendmsg_oncpu(nmsg);
+	crit_exit();
+}
+
+void
+frag6_drain(void)
+{
+
+	if (IN_NETISR(0)) {
+		frag6_drain_oncpu();
+		return;
+	}
+
+	if (!frag6_nfrags || frag6_draining) {
+		/* No fragments or is draining; done. */
+		return;
+	}
+	frag6_draining = 1;
+
+	/* Target cpu0. */
+	lwkt_send_ipiq_bycpu(0, frag6_drain_ipi, NULL);
 }

@@ -21,26 +21,20 @@
  * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
  * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
- *
- * $DragonFly: src/sys/sys/ckpt.h,v 1.11 2007/06/29 23:39:58 dillon Exp $
  */
+
 #ifndef _SYS_CKPT_H_
 #define _SYS_CKPT_H_
 
 #if !defined(_KERNEL) && !defined(_KERNEL_STRUCTURES)
-
 #error "This file should not be included by userland programs."
-
-#else
+#endif
 
 #ifndef _SYS_TYPES_H_
 #include <sys/types.h>
 #endif
 #ifndef _SYS_MOUNT_H_
 #include <sys/mount.h>
-#endif
-#ifndef _SYS_PROC_H_
-#include <sys/proc.h>
 #endif
 #ifndef _SYS_SIGNALVAR_H_
 #include <sys/signalvar.h>
@@ -55,8 +49,8 @@ struct ckpt_filehdr {
 };
 
 struct ckpt_vminfo {
-	segsz_t		cvm_dsize;
-	segsz_t		cvm_tsize;
+	segsz_t		cvm_dsize;	/* in pages */
+	segsz_t		cvm_tsize;	/* in pages */
 	segsz_t		cvm_reserved1[4];
 	caddr_t		cvm_daddr;
 	caddr_t		cvm_taddr;
@@ -113,5 +107,4 @@ struct vn_hdr {
 #endif	/* DEBUG */
 #endif	/* _KERNEL */
 
-#endif	/* _KERNEL || _KERNEL_STRUCTURES */
 #endif	/* _SYS_CKPT_H_ */

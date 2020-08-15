@@ -28,23 +28,38 @@
  */
 
 /*
- * 6.6 : Stream I/O
+ * Stream I/O
  */
 
 #include "acpi.h"
+#include "accommon.h"
+
+#include <sys/kernel.h>
+#include <sys/sysctl.h>
+
+#include <dev/acpica/acpivar.h>
+
+int acpi_silence_all = 0;
+TUNABLE_INT("debug.acpi.silence_all", &acpi_silence_all);
+SYSCTL_INT(_debug_acpi, OID_AUTO, silence_all, CTLFLAG_RW,
+    &acpi_silence_all, 0, "Silence ACPI messages");
 
 void
 AcpiOsPrintf(const char *Format, ...)
 {
     va_list	ap;
 
-    va_start(ap, Format);
-    kvprintf(Format, ap);
-    va_end(ap);
+    if (acpi_silence_all == 0) {
+	    va_start(ap, Format);
+	    kvprintf(Format, ap);
+	    va_end(ap);
+    }
 }
 
 void
 AcpiOsVprintf(const char *Format, va_list Args)
 {
-    kvprintf(Format, Args);
+    if (acpi_silence_all == 0) {
+	    kvprintf(Format, Args);
+    }
 }

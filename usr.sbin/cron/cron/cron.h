@@ -18,7 +18,6 @@
 /* cron.h - header for vixie's cron
  *
  * $FreeBSD: src/usr.sbin/cron/cron/cron.h,v 1.17 2007/06/17 17:25:53 yar Exp $
- * $DragonFly: src/usr.sbin/cron/cron/cron.h,v 1.6 2008/01/07 14:11:23 matthias Exp $
  *
  * vix 14nov88 [rest of log is in RCS]
  * vix 14jan87 [0 or 7 can be sunday; thanks, mwm@berkeley]
@@ -160,6 +159,8 @@ typedef	struct _entry {
 	gid_t		gid;
 #ifdef LOGIN_CAP
 	char            *class;
+#else
+	char            *unused;
 #endif
 	char		**envp;
 	char		*cmd;
@@ -172,7 +173,7 @@ typedef	struct _entry {
 #define	DOM_STAR	0x01
 #define	DOW_STAR	0x02
 #define	WHEN_REBOOT	0x04
-#define	RUN_AT	0x08
+#define	RUN_AT		0x08
 #define	NOT_UNTIL	0x10
 	time_t	lastrun;
 } entry;
@@ -212,7 +213,7 @@ void		set_cron_uid(void),
 		free_entry(entry *),
 		acquire_daemonlock(int),
 		skip_comments(FILE *),
-		log_it(char *, int, char *, char *),
+		log_it(char *, int, char *, const char *),
 		log_close(void);
 
 int		job_runqueue(void),
@@ -237,7 +238,7 @@ char		*env_get(char *, char **),
 user		*load_user(int, struct passwd *, char *),
 		*find_user(cron_db *, char *);
 
-entry		*load_entry(FILE *, void (*)(),
+entry		*load_entry(FILE *, void (*)(const char *),
 				 struct passwd *, char **);
 
 FILE		*cron_popen(char *, char *, entry *);

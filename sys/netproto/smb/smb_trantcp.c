@@ -473,15 +473,14 @@ smb_nbst_connect(struct smb_vc *vcp, struct sockaddr *sap, struct thread *td)
 	if (error)
 		return error;
 	getnanotime(&ts2);
-	timespecsub(&ts2, &ts1);
+	timespecsub(&ts2, &ts1, &ts2);
 	if (ts2.tv_sec == 0) {
 		ts2.tv_sec = 1;
 		ts2.tv_nsec = 0;
 	}
-	nbp->nbp_timo = ts2;
-	timespecadd(&nbp->nbp_timo, &ts2);
-	timespecadd(&nbp->nbp_timo, &ts2);
-	timespecadd(&nbp->nbp_timo, &ts2);	/*  * 4 */
+	timespecadd(&ts2, &ts2, &nbp->nbp_timo);
+	timespecadd(&nbp->nbp_timo, &ts2, &nbp->nbp_timo);
+	timespecadd(&nbp->nbp_timo, &ts2, &nbp->nbp_timo);	/*  * 4 */
 	error = nbssn_rq_request(nbp, td);
 	if (error)
 		smb_nbst_disconnect(vcp, td);
@@ -518,7 +517,7 @@ smb_nbst_send(struct smb_vc *vcp, struct mbuf *m0, struct thread *td)
 		error = ENOTCONN;
 		goto abort;
 	}
-	M_PREPEND(m0, 4, MB_TRYWAIT);
+	M_PREPEND(m0, 4, M_WAITOK);
 	if (m0 == NULL)
 		return ENOBUFS;
 	nb_sethdr(m0, NB_SSN_MESSAGE, m_fixhdr(m0) - 4);

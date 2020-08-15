@@ -49,6 +49,8 @@ char devstat_errbuf[DEVSTAT_ERRBUF_SIZE];
  */
 struct devstat_match_table match_table[] = {
 	{"da",		DEVSTAT_TYPE_DIRECT,	DEVSTAT_MATCH_TYPE},
+	{"nvme",	DEVSTAT_TYPE_DIRECT,	DEVSTAT_MATCH_TYPE},
+	{"xa",		DEVSTAT_TYPE_DIRECT,	DEVSTAT_MATCH_TYPE},
 	{"cd",		DEVSTAT_TYPE_CDROM,	DEVSTAT_MATCH_TYPE},
 	{"scsi",	DEVSTAT_TYPE_IF_SCSI,	DEVSTAT_MATCH_IF},
 	{"ide",		DEVSTAT_TYPE_IF_IDE,	DEVSTAT_MATCH_IF},
@@ -561,12 +563,6 @@ selectdevs(struct device_selection **dev_select, int *num_selected,
 				case DS_SELECT_REMOVE:
 					(*dev_select)[i].selected = 0;
 					(*num_selected)--;
-					/*
-					 * This isn't passed back out, we
-					 * just use it to keep track of
-					 * how many devices we've removed.
-					 */
-					num_dev_selections--;
 					break;
 				}
 				break;
@@ -607,18 +603,14 @@ selectdevs(struct device_selection **dev_select, int *num_selected,
 			  && ((devices[j].device_type & DEVSTAT_TYPE_MASK) ==
 			        (matches[i].device_type & DEVSTAT_TYPE_MASK))
 			  &&(((matches[i].match_fields & DEVSTAT_MATCH_PASS)!=0)
-			   || (((matches[i].match_fields & 
-				DEVSTAT_MATCH_PASS) == 0)
-			    && ((devices[j].device_type &
+			   || (((devices[j].device_type &
 			        DEVSTAT_TYPE_PASS) == 0)))
 			  && (--num_match_categories == 0)) 
 			 || (((matches[i].match_fields & DEVSTAT_MATCH_IF) != 0)
 			  && ((devices[j].device_type & DEVSTAT_TYPE_IF_MASK) ==
 			        (matches[i].device_type & DEVSTAT_TYPE_IF_MASK))
 			  &&(((matches[i].match_fields & DEVSTAT_MATCH_PASS)!=0)
-			   || (((matches[i].match_fields &
-				DEVSTAT_MATCH_PASS) == 0)
-			    && ((devices[j].device_type & 
+			   || (((devices[j].device_type &
 				DEVSTAT_TYPE_PASS) == 0)))
 			  && (--num_match_categories == 0))
 			 || (((matches[i].match_fields & DEVSTAT_MATCH_PASS)!=0)

@@ -10,11 +10,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -40,23 +36,26 @@
 #include <sys/cdefs.h>
 #include <sys/_null.h>
 #include <sys/types.h>
-
-#if __BSD_VISIBLE
-#ifndef _RUNE_T_DECLARED
-typedef	__rune_t	rune_t;
-#define	_RUNE_T_DECLARED
-#endif
+#ifndef __cplusplus
+#include <machine/wchar.h>		/* for ___wchar_t */
 #endif
 
 #ifndef _SIZE_T_DECLARED
-typedef	__size_t	size_t;
+typedef	__size_t	size_t;		/* _GCC_SIZE_T OK */
 #define	_SIZE_T_DECLARED
 #endif
 
 #ifndef	__cplusplus
 #ifndef _WCHAR_T_DECLARED
-typedef	__wchar_t	wchar_t;
+typedef	___wchar_t	wchar_t;	/* _GCC_WCHAR_T OK */
 #define	_WCHAR_T_DECLARED
+#endif
+#endif
+
+#if __EXT1_VISIBLE
+#ifndef _ERRNO_T_DECLARED
+typedef	int		errno_t;
+#define	_ERRNO_T_DECLARED
 #endif
 #endif
 
@@ -81,7 +80,7 @@ __BEGIN_DECLS
 #endif
 extern int __mb_cur_max;
 extern int ___mb_cur_max(void);
-#define	MB_CUR_MAX	(___mb_cur_max())
+#define	MB_CUR_MAX	((size_t)___mb_cur_max())
 
 void	 abort(void) __dead2;
 /* void	 abort2(const char *, int, void **) __dead2; */
@@ -94,7 +93,7 @@ int	 atoi(const char *);
 long	 atol(const char *);
 void	*bsearch(const void *, const void *, size_t,
 		 size_t, int (*)(const void *, const void *));
-void	*calloc(size_t, size_t) __heedresult;
+void	*calloc(size_t, size_t) __alloc_size2(1, 2) __malloclike __heedresult;
 div_t	 div(int, int) __pure2;
 void	 exit(int) __dead2;
 void	 free(void *);
@@ -103,14 +102,13 @@ char	*getenv(const char *);
 long	 labs(long) __pure2;
 #endif
 ldiv_t	 ldiv(long, long) __pure2;
-void	*malloc(size_t) __heedresult;
-int	 posix_memalign(void **, size_t, size_t);
+void	*malloc(size_t) __malloclike __heedresult __alloc_size(1);
 int	 mblen(const char *, size_t);
 size_t	 mbstowcs(wchar_t * __restrict , const char * __restrict, size_t);
 int	 mbtowc(wchar_t * __restrict, const char * __restrict, size_t);
 void	 qsort(void *, size_t, size_t, int (*)(const void *, const void *));
 int	 rand(void);
-void	*realloc(void *, size_t) __heedresult;
+void	*realloc(void *, size_t) __heedresult __alloc_size(2);
 void	 srand(unsigned);
 double	 strtod(const char * __restrict, char ** __restrict);
 float	 strtof(const char * __restrict, char ** __restrict);
@@ -137,7 +135,7 @@ size_t	 wcstombs(char * __restrict, const wchar_t * __restrict, size_t);
  *
  * (The only other extension made by C99 in this header is _Exit().)
  */
-#if __ISO_C_VISIBLE >= 1999
+#if __ISO_C_VISIBLE >= 1999 || defined(__cplusplus)
 #ifdef __LONG_LONG_SUPPORTED
 /* LONGLONG */
 typedef struct {
@@ -165,18 +163,29 @@ void	 _Exit(int) __dead2;
 #endif /* __ISO_C_VISIBLE >= 1999 */
 
 /*
- * Extensions made by POSIX relative to C.  We don't know yet which edition
- * of POSIX made these extensions, so assume they've always been there until
- * research can be done.
+ * C11 functions.
  */
-#if __POSIX_VISIBLE /* >= ??? */
-/*int	 posix_memalign(void **, size_t, size_t); (ADV) */
+#if __ISO_C_VISIBLE >= 2011 || (defined(__cplusplus) && __cplusplus >= 201103L)
+void	*aligned_alloc(size_t, size_t) __malloclike __heedresult
+	    __alloc_align(1) __alloc_size(2);
+int	at_quick_exit(void (*)(void));	/* extra extern case for __cplusplus? */
+void	quick_exit(int) __dead2;
+#endif /* __ISO_C_VISIBLE >= 2011 */
+
+/*
+ * Extensions made by POSIX relative to C.
+ */
+#if __POSIX_VISIBLE >= 199506
 int	 rand_r(unsigned *);			/* (TSF) */
+#endif
+#if __POSIX_VISIBLE >= 200112
+int	 posix_memalign(void **, size_t, size_t) __nonnull(1); /* (ADV) */
 int	 setenv(const char *, const char *, int);
 int	 unsetenv(const char *);
 #endif
 
 #if __POSIX_VISIBLE >= 200809 || __XSI_VISIBLE
+int	 getsubopt(char **, char *const *, char **);
 #ifndef _MKDTEMP_DECLARED
 char	*mkdtemp(char *);
 #define	_MKDTEMP_DECLARED
@@ -197,20 +206,25 @@ int	 mkstemp(char *);
 /* XXX XSI requires pollution from <sys/wait.h> here.  We'd rather not. */
 long	 a64l(const char *);
 double	 drand48(void);
-/* char	*ecvt(double, int, int * __restrict, int * __restrict); */
 double	 erand48(unsigned short[3]);
-/* char	*fcvt(double, int, int * __restrict, int * __restrict); */
-/* char	*gcvt(double, int, int * __restrict, int * __restrict); */
-int	 getsubopt(char **, char *const *, char **);
+#if 0
+#if __BSD_VISIBLE || (__XSI_VISIBLE && __XSI_VISIBLE < 700)
+char	*ecvt(double, int, int * __restrict, int * __restrict);	/* LEGACY */
+char	*fcvt(double, int, int * __restrict, int * __restrict);	/* LEGACY */
+char	*gcvt(double, int, int * __restrict, int * __restrict);	/* LEGACY */
+#endif
+#endif
 int	 grantpt(int);
 char	*initstate(unsigned long /* XSI requires u_int */, char *, long);
 long	 jrand48(unsigned short[3]);
 char	*l64a(long);
 void	 lcong48(unsigned short[7]);
 long	 lrand48(void);
-#if !defined(_MKTEMP_DECLARED) && (__BSD_VISIBLE || __XSI_VISIBLE <= 600)
-char	*mktemp(char *);
+#if __BSD_VISIBLE || (__XSI_VISIBLE && __XSI_VISIBLE < 700)
+#if !defined(_MKTEMP_DECLARED)
+char	*mktemp(char *);					/* LEGACY */
 #define	_MKTEMP_DECLARED
+#endif
 #endif
 long	 mrand48(void);
 long	 nrand48(unsigned short[3]);
@@ -236,17 +250,13 @@ extern void (*_malloc_message)(const char *, const char *, const char *,
 /*
  * The alloca() function can't be implemented in C, and on some
  * platforms it can't be implemented at all as a callable function.
- * The GNU C compiler provides a built-in alloca() which we can use;
- * in all other cases, provide a prototype, mainly to pacify various
- * incarnations of lint.  On platforms where alloca() is not in libc,
- * programs which use it will fail to link when compiled with non-GNU
- * compilers.
+ * The GNU C compiler provides a built-in alloca() which we can use.
+ * On platforms where alloca() is not in libc, programs which use it
+ * will fail to link when compiled with non-GNU compilers.
  */
 #if __GNUC__ >= 2 || defined(__INTEL_COMPILER)
 #undef  alloca	/* some GNU bits try to get cute and define this on their own */
 #define alloca(sz) __builtin_alloca(sz)
-#elif defined(lint)
-void	*alloca(size_t);
 #endif
 
 __uint32_t
@@ -275,6 +285,7 @@ char	*devname(dev_t, mode_t);
 char	*devname_r(dev_t, mode_t, char *, size_t);
 char	*fdevname(int);
 int	 fdevname_r(int, char *, size_t);
+void	 freezero(void *, size_t);
 int	 getloadavg(double [], int);
 const char *
 	 getprogname(void);
@@ -282,17 +293,27 @@ const char *
 int	 heapsort(void *, size_t, size_t, int (*)(const void *, const void *));
 int	 l64a_r(long, char *, int);
 int	 mergesort(void *, size_t, size_t, int (*)(const void *, const void *));
+int	 mkostemp(char *, int);
+int	 mkostemps(char *, int, int);
 void	 qsort_r(void *, size_t, size_t, void *,
 		 int (*)(void *, const void *, const void *));
 int	 radixsort(const unsigned char **, int, const unsigned char *,
 		   unsigned int);
-void    *reallocf(void *, size_t) __heedresult;
+void	*reallocarray(void *, size_t, size_t) __heedresult __alloc_size2(2, 3);
+void	*recallocarray(void *, size_t, size_t, size_t) __heedresult
+	    __alloc_size2(3, 4);
+void	*reallocf(void *, size_t) __heedresult __alloc_size(2);
 int	 rpmatch(const char *);
 void	 setprogname(const char *);
 int	 sradixsort(const unsigned char **, int, const unsigned char *,
 		    unsigned int);
 void	 sranddev(void);
 void	 srandomdev(void);
+long long
+	 strsuftoll(const char *, const char *, long long, long long);
+long long
+	 strsuftollx(const char *, const char *, long long, long long, char *,
+	    size_t);
 long long
 	 strtonum(const char *, long long, long long, const char **);
 
@@ -307,16 +328,18 @@ __uint64_t
 extern char *suboptarg;			/* getsubopt(3) external variable */
 #endif /* __BSD_VISIBLE */
 
-/*
- * C11 functions.
- */
-#if __ISO_C_VISIBLE >= 2011 || __cplusplus >= 201103L || __BSD_VISIBLE
-int 	at_quick_exit(void (*func)(void));
-_Noreturn void
-	quick_exit(int);
-void	*aligned_alloc(size_t, size_t) __heedresult;
-#endif /* __ISO_C_VISIBLE >= 2011 */
-
+#if __EXT1_VISIBLE
+/* K.3.6 */
+typedef	void (*constraint_handler_t)(const char * __restrict,
+    void * __restrict, errno_t);
+/* K.3.6.1.1 */
+constraint_handler_t set_constraint_handler_s(constraint_handler_t handler);
+/* K.3.6.1.2 */
+_Noreturn void abort_handler_s(const char * __restrict, void * __restrict,
+    errno_t);
+/* K3.6.1.3 */
+void ignore_handler_s(const char * __restrict, void * __restrict, errno_t);
+#endif /* __EXT1_VISIBLE */
 __END_DECLS
 
 #endif /* !_STDLIB_H_ */

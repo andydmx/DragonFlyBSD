@@ -10,7 +10,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -28,7 +28,6 @@
  *
  *	@(#)syslog.h	8.1 (Berkeley) 6/2/93
  * $FreeBSD: src/sys/sys/syslog.h,v 1.27 2009/03/14 19:07:25 das Exp $
- * $DragonFly: src/sys/sys/syslog.h,v 1.5 2006/12/23 00:27:03 swildner Exp $
  */
 
 #ifndef _SYS_SYSLOG_H_
@@ -175,19 +174,19 @@ CODE facilitynames[] = {
 #define	LOG_NOWAIT	0x10	/* don't wait for console forks: DEPRECATED */
 #define	LOG_PERROR	0x20	/* log to stderr as well */
 
-#ifdef _KERNEL
+#ifndef _KERNEL
 
-#else /* not _KERNEL */
-
-/*
- * Don't use va_list in the vsyslog() prototype.   Va_list is typedef'd in two
- * places (<machine/varargs.h> and <machine/stdarg.h>), so if we include one
- * of them here we may collide with the utility's includes.  It's unreasonable
- * for utilities to have to include one of them to include syslog.h, so we get
- * __va_list from <sys/types.h> and use it.
- */
 #include <sys/cdefs.h>
-#include <sys/types.h>
+
+#if __BSD_VISIBLE
+/*
+ * Don't use va_list in the vsyslog() prototype. Va_list is typedef'd in
+ * <stdarg.h>, so if we include it here we may collide with the utility's
+ * includes. It's unreasonable for utilities to have to include it to
+ * include syslog.h, so we get __va_list from <machine/stdarg.h> and use it.
+ */
+#include <machine/stdarg.h>
+#endif
 
 __BEGIN_DECLS
 void	closelog(void);

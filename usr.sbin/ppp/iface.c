@@ -648,12 +648,14 @@ iface_Show(struct cmdargs const *arg)
 #endif
   struct in_addr mask;
 
+  mask.s_addr = 0;	/* avoid gcc warnings */
+
   current = iface_Create(iface->name);
   flags = iface->flags = current->flags;
   iface_Destroy(current);
 
   prompt_Printf(arg->prompt, "%s (idx %d) <", iface->name, iface->index);
-  for (f = 0; f < sizeof if_flags / sizeof if_flags[0]; f++)
+  for (f = 0; f < NELEM(if_flags); f++)
     if ((if_flags[f].flag & flags)) {
       prompt_Printf(arg->prompt, "%s%s", flags == iface->flags ? "" : ",",
                     if_flags[f].value);

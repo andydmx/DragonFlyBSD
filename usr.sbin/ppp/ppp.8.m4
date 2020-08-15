@@ -27,7 +27,7 @@ changecom(,)dnl
 .\"
 .\" $FreeBSD: src/usr.sbin/ppp/ppp.8.m4,v 1.301.2.1 2002/09/01 02:12:31 brian Exp $
 .\"
-.Dd August 6, 2009
+.Dd October 10, 2019
 .Dt PPP 8
 .Os
 .Sh NAME
@@ -43,16 +43,8 @@ changecom(,)dnl
 .Sh DESCRIPTION
 This is a user process
 .Em PPP
-software package.
-Normally,
-.Em PPP
-is implemented as a part of the kernel (e.g., as managed by
-.Xr pppd 8 )
-and it's thus somewhat hard to debug and/or modify its behaviour.
-However, in this implementation
-.Em PPP
-is done as a user process with the help of the
-tunnel device driver (tun).
+software package with the help of the tunnel device driver
+.Xr ( tun 4 ) .
 .Pp
 The
 .Fl nat
@@ -296,8 +288,8 @@ allows authentication information to be stored in a central or
 distributed database along with various per-user framed connection
 characteristics.
 ifdef({LOCALRAD},{},{If
-.Xr libradius 3
-is available at compile time,
+.Em RADIUS
+support was enabled at compile time,
 .Nm
 will use it to make
 .Em RADIUS
@@ -430,7 +422,7 @@ When you first run
 you may need to deal with some initial configuration details.
 .Bl -bullet
 .It
-Your kernel must {include} a tunnel device (the GENERIC kernel includes
+Your kernel must {include} a tunnel device (the X86_64_GENERIC kernel includes
 one by default).
 If it doesn't, or if you require more than one tun
 interface, you'll need to rebuild your kernel with the following line in
@@ -2661,7 +2653,7 @@ program.
 Note: There is a problem negotiating
 .Ar deflate
 capabilities with
-.Xr pppd 8
+.Nm pppd
 - a
 .Em PPP
 implementation available under many operating systems.
@@ -2694,7 +2686,7 @@ Default: Disabled and Denied.
 This is a variance of the
 .Ar deflate
 option, allowing negotiation with the
-.Xr pppd 8
+.Nm pppd
 program.
 Refer to the
 .Ar deflate
@@ -2829,7 +2821,7 @@ acts as the authenticatee with both protocols
 the protocols are used alternately in response to challenges.
 .Pp
 Note: If only LANMan is enabled,
-.Xr pppd 8
+.Nm pppd
 (version 2.3.5) misbehaves when acting as authenticatee.
 It provides both
 the NT and the LANMan answers, but also suggests that only the NT answer
@@ -3119,10 +3111,10 @@ Normally, when a user is authenticated using PAP or CHAP, and when
 .Nm
 is running in
 .Fl direct
-mode, an entry is made in the utmp and wtmp files for that user.
+mode, an entry is made in the utmpx and wtmpx files for that user.
 Disabling this option will tell
 .Nm
-not to make any utmp or wtmp entries.
+not to make any utmpx or wtmpx entries.
 This is usually only necessary if
 you require the user to both login and authenticate themselves.
 .El
@@ -3558,7 +3550,7 @@ This is replaced with the bundle uptime in HH:MM:SS format.
 This is replaced with the username that has been authenticated with PAP or
 CHAP.
 Normally, this variable is assigned only in -direct mode.
-This value is available irrespective of whether utmp logging is enabled.
+This value is available irrespective of whether utmpx logging is enabled.
 .It Li VERSION
 This is replaced with the current version number of
 .Nm .
@@ -5209,8 +5201,7 @@ are executed.
 .It set radius Op Ar config-file
 This command enables RADIUS support (if it's compiled in).
 .Ar config-file
-refers to the radius client configuration file as described in
-.Xr radius.conf 5 .
+refers to the radius client configuration file.
 If PAP, CHAP, MSCHAP or MSCHAPv2 are
 .Dq enable Ns No d ,
 .Nm
@@ -5236,7 +5227,7 @@ The peer IP address is set to the given value.
 The tun interface netmask is set to the given value.
 .It RAD_FRAMED_MTU
 If the given MTU is less than the peers MRU as agreed during LCP
-negotiation, *and* it is less that any configured MTU (see the
+negotiation, *and* it is less than any configured MTU (see the
 .Dq set mru
 command), the tun interface MTU is set to the given value.
 .It RAD_FRAMED_COMPRESSION
@@ -5345,14 +5336,14 @@ encryption.
 .It RAD_MICROSOFT_MS_MPPE_RECV_KEY
 If this
 .Dv RAD_VENDOR_MICROSOFT
-vendor specific attribute is supplied, it's value is used as the master
+vendor specific attribute is supplied, its value is used as the master
 key for decryption of incoming data.  When clients are authenticated using
 MSCHAPv2, the RADIUS server MUST provide this attribute if inbound MPPE is
 to function.
 .It RAD_MICROSOFT_MS_MPPE_SEND_KEY
 If this
 .Dv RAD_VENDOR_MICROSOFT
-vendor specific attribute is supplied, it's value is used as the master
+vendor specific attribute is supplied, its value is used as the master
 key for encryption of outgoing data.  When clients are authenticated using
 MSCHAPv2, the RADIUS server MUST provide this attribute if outbound MPPE is
 to function.
@@ -5818,8 +5809,6 @@ This socket is used to pass links between different instances of
 .Xr kldload 2 ,
 ifdef({LOCALNAT},{},{.Xr libalias 3 ,
 })dnl
-ifdef({LOCALRAD},{},{.Xr libradius 3 ,
-})dnl
 .Xr syslog 3 ,
 .Xr uucplock 3 ,
 .Xr netgraph 4 ,
@@ -5828,7 +5817,6 @@ ifdef({LOCALRAD},{},{.Xr libradius 3 ,
 .Xr group 5 ,
 .Xr passwd 5 ,
 .Xr protocols 5 ,
-.Xr radius.conf 5 ,
 .Xr resolv.conf 5 ,
 .Xr syslog.conf 5 ,
 .Xr adduser 8 ,
@@ -5839,7 +5827,6 @@ ifdef({LOCALRAD},{},{.Xr libradius 3 ,
 .Xr named 8 ,
 .Xr ping 8 ,
 .Xr pppctl 8 ,
-.Xr pppd 8 ,
 .Xr pppoe 8 ,
 .Xr route 8 ,
 .Xr sshd 8 ,

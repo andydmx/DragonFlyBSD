@@ -32,8 +32,7 @@
  * SUCH DAMAGE.
  */
 
-#include <sys/types.h>
-#include <sys/syslimits.h>
+#include <sys/param.h>
 #include <sys/ioctl.h>
 #include <sys/device.h>
 #include <sys/queue.h>
@@ -129,7 +128,7 @@ static const struct devtype devtypes[] = {
 	{ NULL, 0 }
 };
 
-int
+void
 syntax_error(const char *fmt, ...)
 {
 	char buf[1024];
@@ -138,8 +137,8 @@ syntax_error(const char *fmt, ...)
 	va_start(ap, fmt);
 	vsnprintf(buf, sizeof(buf), fmt, ap);
 	va_end(ap);
-	errx(1, "%s: syntax error on line %d: %s\n",file_stack[line_stack_depth],
-			line_stack[line_stack_depth], buf);
+	errx(1, "%s: syntax error on line %d: %s\n",
+	    file_stack[line_stack_depth], line_stack[line_stack_depth], buf);
 }
 
 static int
@@ -904,7 +903,7 @@ int main(int argc, char *argv[])
 			err(1, "could not stat specified configuration file %s", config_name);
 
 		if (config_name[0] == '/')
-			chdir(dirname(config_name));
+			chdir(dirname(strdup(config_name)));
 
 		read_config(config_name, RULES_FILE);
 	}

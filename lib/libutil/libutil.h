@@ -62,20 +62,15 @@ struct pidfh;
 struct sockaddr;
 struct termios;
 struct winsize;
-struct utmp;
 struct utmpx;
 
 __BEGIN_DECLS
 char	*auth_getval(const char *_name);
-void	login(struct utmp *);
 void	loginx(const struct utmpx *);
 int	login_tty(int);
-int	logout(const char *);
 int	logoutx(const char *, int, int);
-void	logwtmp(const char *, const char *, const char *);
 void	logwtmpx(const char *, const char *, const char *, int, int);
 void	trimdomain(char *, int);
-int	expand_number(const char *_buf, uint64_t *_num);
 int	flopen(const char *_path, int _flags, ...);
 int	forkpty(int *_amaster, char *_name,
 	    struct termios *_termp, struct winsize *_winp);
@@ -105,9 +100,6 @@ properties
 	properties_read(int fd);
 int	realhostname(char *, size_t, const struct in_addr *);
 int	realhostname_sa(char *, size_t, struct sockaddr *, int);
-#ifdef _STDIO_H_	/* avoid adding new includes */
-char   *fparseln(FILE *, size_t *, size_t *, const char[3], int);
-#endif
 
 #ifdef _PWD_H_
 int	pw_copy(int _ffd, int _tfd, const struct passwd *_pw,
@@ -161,13 +153,6 @@ int		easprintf(char ** __restrict, const char * __restrict, ...)
 		__printflike(2, 3);
 __END_DECLS
 
-/* fparseln(3) */
-#define	FPARSELN_UNESCESC	0x01
-#define	FPARSELN_UNESCCONT	0x02
-#define	FPARSELN_UNESCCOMM	0x04
-#define	FPARSELN_UNESCREST	0x08
-#define	FPARSELN_UNESCALL	0x0f
-
 /* Flags for hexdump(3). */
 #define	HD_COLUMN_MASK		0xff
 #define	HD_DELIM_MASK		0xff00
@@ -181,6 +166,7 @@ __END_DECLS
 #define	HN_B			0x04
 #define	HN_DIVISOR_1000		0x08
 #define	HN_IEC_PREFIXES		0x10
+#define HN_FRACTIONAL		0x20
 
 /* Values for humanize_number(3)'s scale parameter. */
 #define	HN_GETSCALE		0x10

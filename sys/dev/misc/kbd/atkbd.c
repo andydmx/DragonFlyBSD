@@ -42,16 +42,6 @@
 #include <sys/malloc.h>
 #include <sys/thread2.h>
 
-#ifdef __i386__
-#include <machine/md_var.h>
-#include <machine/psl.h>
-#include <machine/vm86.h>
-#include <machine/pc/bios.h>
-
-#include <vm/vm.h>
-#include <vm/pmap.h>
-#endif /* __i386__ */
-
 #include <sys/kbio.h>
 #include "kbdreg.h"
 #include "atkbdreg.h"
@@ -424,8 +414,8 @@ atkbd_init(int unit, keyboard_t **kbdp, void *arg, int flags)
 	if (!KBD_IS_INITIALIZED(kbd) && !(flags & KB_CONF_PROBE_ONLY)) {
 		kbd->kb_config = flags & ~KB_CONF_PROBE_ONLY;
 		if (!KBD_HAS_DEVICE(kbd)
-	    	    && init_keyboard(state->kbdc, &kbd->kb_type, kbd->kb_config)
-	    	    && (kbd->kb_config & KB_CONF_FAIL_IF_NO_KBD)) {
+		    && init_keyboard(state->kbdc, &kbd->kb_type, kbd->kb_config)
+		    && (kbd->kb_config & KB_CONF_FAIL_IF_NO_KBD)) {
 			return ENXIO;
 		}
 		atkbd_ioctl(kbd, KDSETLED, (caddr_t)&state->ks_state);
@@ -642,62 +632,62 @@ next_code:
 			keycode = 0x5A;
 			break;
 		case 0x35:	/* keypad divide key */
-	    		keycode = 0x5B;
-	    		break;
+			keycode = 0x5B;
+			break;
 		case 0x37:	/* print scrn key */
-	    		keycode = 0x5C;
-	    		break;
+			keycode = 0x5C;
+			break;
 		case 0x38:	/* right alt key (alt gr) */
-	    		keycode = 0x5D;
-	    		break;
+			keycode = 0x5D;
+			break;
 		case 0x46:	/* ctrl-pause/break on AT 101 (see below) */
 			keycode = 0x68;
-	    		break;
+			break;
 		case 0x47:	/* grey home key */
-	    		keycode = 0x5E;
-	    		break;
+			keycode = 0x5E;
+			break;
 		case 0x48:	/* grey up arrow key */
-	    		keycode = 0x5F;
-	    		break;
+			keycode = 0x5F;
+			break;
 		case 0x49:	/* grey page up key */
-	    		keycode = 0x60;
-	    		break;
+			keycode = 0x60;
+			break;
 		case 0x4B:	/* grey left arrow key */
-	    		keycode = 0x61;
-	    		break;
+			keycode = 0x61;
+			break;
 		case 0x4D:	/* grey right arrow key */
-	    		keycode = 0x62;
-	    		break;
+			keycode = 0x62;
+			break;
 		case 0x4F:	/* grey end key */
-	    		keycode = 0x63;
-	    		break;
+			keycode = 0x63;
+			break;
 		case 0x50:	/* grey down arrow key */
-	    		keycode = 0x64;
-	    		break;
+			keycode = 0x64;
+			break;
 		case 0x51:	/* grey page down key */
-	    		keycode = 0x65;
-	    		break;
+			keycode = 0x65;
+			break;
 		case 0x52:	/* grey insert key */
-	    		keycode = 0x66;
-	    		break;
+			keycode = 0x66;
+			break;
 		case 0x53:	/* grey delete key */
-	    		keycode = 0x67;
-	    		break;
+			keycode = 0x67;
+			break;
 		/* the following 3 are only used on the MS "Natural" keyboard */
 		case 0x5b:	/* left Window key */
-	    		keycode = 0x69;
-	    		break;
+			keycode = 0x69;
+			break;
 		case 0x5c:	/* right Window key */
-	    		keycode = 0x6a;
-	    		break;
+			keycode = 0x6a;
+			break;
 		case 0x5d:	/* menu key */
-	    		keycode = 0x6b;
-	    		break;
+			keycode = 0x6b;
+			break;
 		default:	/* ignore everything else */
-	    		goto next_code;
+			goto next_code;
 		}
 		break;
-    	case 0xE1:	/* 0xE1 prefix */
+	case 0xE1:	/* 0xE1 prefix */
 		/* 
 		 * The pause/break key on the 101 keyboard produces:
 		 * E1-1D-45 E1-9D-C5
@@ -706,10 +696,10 @@ next_code:
 		 */
 		state->ks_prefix = 0;
 		if (keycode == 0x1D)
-	    		state->ks_prefix = 0x1D;
+			state->ks_prefix = 0x1D;
 		goto next_code;
 		/* NOT REACHED */
-    	case 0x1D:	/* pause / break */
+	case 0x1D:	/* pause / break */
 		state->ks_prefix = 0;
 		if (keycode != 0x45)
 			goto next_code;
@@ -721,7 +711,7 @@ next_code:
 		switch (keycode) {
 		case 0x37:	/* *(numpad)/print screen */
 			if (state->ks_flags & SHIFTS)
-	    			keycode = 0x5c;	/* print screen */
+				keycode = 0x5c;	/* print screen */
 			break;
 		case 0x45:	/* num lock/pause */
 			if (state->ks_flags & CTLS)
@@ -923,18 +913,6 @@ atkbd_ioctl(keyboard_t *kbd, u_long cmd, caddr_t arg)
 		}
 		return error;
 
-	case KDSETRAD:		/* set keyboard repeat rate (old interface) */
-		crit_exit();
-		if (!KBD_HAS_DEVICE(kbd)) {
-			return 0;
-		}
-		error = write_kbd(state->kbdc, KBDC_SET_TYPEMATIC, *(int *)arg);
-		if (error == 0) {
-			kbd->kb_delay1 = typematic_delay(*(int *)arg);
-			kbd->kb_delay2 = typematic_rate(*(int *)arg);
-		}
-		return error;
-
 	case PIO_KEYMAP:	/* set keyboard translation table */
 	case PIO_KEYMAPENT:	/* set keyboard translation table entry */
 	case PIO_DEADKEYMAP:	/* set accent key translation table */
@@ -1019,34 +997,7 @@ atkbd_poll(keyboard_t *kbd, int on)
 static int
 get_typematic(keyboard_t *kbd)
 {
-#ifdef __i386__
-	/*
-	 * Only some systems allow us to retrieve the keyboard repeat 
-	 * rate previously set via the BIOS...
-	 */
-	struct vm86frame vmf;
-	u_int32_t p;
-
-	bzero(&vmf, sizeof(vmf));
-	vmf.vmf_ax = 0xc000;
-	vm86_intcall(0x15, &vmf);
-	if ((vmf.vmf_eflags & PSL_C) || vmf.vmf_ah)
-		return ENODEV;
-        p = BIOS_PADDRTOVADDR(((u_int32_t)vmf.vmf_es << 4) + vmf.vmf_bx);
-	if ((readb(p + 6) & 0x40) == 0)	/* int 16, function 0x09 supported? */
-		return ENODEV;
-	vmf.vmf_ax = 0x0900;
-	vm86_intcall(0x16, &vmf);
-	if ((vmf.vmf_al & 0x08) == 0)	/* int 16, function 0x0306 supported? */
-		return ENODEV;
-	vmf.vmf_ax = 0x0306;
-	vm86_intcall(0x16, &vmf);
-	kbd->kb_delay1 = typematic_delay(vmf.vmf_bh << 5);
-	kbd->kb_delay2 = typematic_rate(vmf.vmf_bl);
-	return 0;
-#else
 	return ENODEV;
-#endif /* __i386__ */
 }
 
 static int

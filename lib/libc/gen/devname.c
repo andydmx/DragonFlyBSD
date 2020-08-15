@@ -10,11 +10,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -31,22 +27,25 @@
  * SUCH DAMAGE.
  *
  * $FreeBSD: src/lib/libc/gen/devname.c,v 1.2.2.2 2001/07/31 20:10:19 tmm Exp $
- * $DragonFly: src/lib/libc/gen/devname.c,v 1.6 2005/04/26 16:59:56 joerg Exp $
  *
  * @(#)devname.c	8.2 (Berkeley) 4/29/95
  */
 
+#include "namespace.h"
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/param.h>
 #include <sys/sysctl.h>
 
-#include <db.h>
 #include <err.h>
 #include <fcntl.h>
 #include <paths.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "un-namespace.h"
+
+#include <db.h>
 
 #define DEVNAME_DEVFS_COMPAT 1
 
@@ -64,7 +63,7 @@ xdevname(dev_t dev, mode_t type)
 
 	if (!db && !failure &&
 	    !(db = dbopen(_PATH_DEVDB, O_RDONLY, 0, DB_HASH, NULL))) {
-		warn("warning: %s", _PATH_DEVDB);
+		_warn("warning: %s", _PATH_DEVDB);
 		failure = 1;
 	}
 	if (failure)
@@ -114,7 +113,7 @@ devname_r(dev_t dev, mode_t type, char *buf, size_t len)
 char *
 devname(dev_t dev, mode_t type)
 {
-	static char buf[30];	 /* XXX: pick up from <sys/conf.h> */
+	static char buf[MAXPATHLEN];
 
 	strlcpy(buf, devname_r(dev, type, buf, sizeof(buf)), sizeof(buf));
 

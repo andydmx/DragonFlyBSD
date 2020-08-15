@@ -7,6 +7,13 @@
 
 CFLAGS+=${COPTS} ${DEBUG_FLAGS}
 
+.if defined(CRUNCH_CFLAGS)
+CFLAGS+=${CRUNCH_CFLAGS}
+.endif
+
+PRIVATELIB_CFLAGS?=	-I${_SHLIBDIRPREFIX}/usr/include/priv
+PRIVATELIB_LDFLAGS?=	-rpath /lib/priv -L ${_SHLIBDIRPREFIX}/usr/lib/priv
+
 .if !defined(DEBUG_FLAGS)
 STRIP?=	-s
 .endif
@@ -19,8 +26,6 @@ LDFLAGS+= -static
 PROG=	${PROG_CXX}
 .endif
 
-.include <bsd.patch.mk>
-
 .if defined(PROG)
 .if defined(SRCS)
 
@@ -30,7 +35,9 @@ OBJCLIBS?= -lobjc
 LDADD+=	${OBJCLIBS}
 .endif
 
-OBJS+=  ${SRCS:N*.h:N*.patch:R:S/$/.o/g}
+.if !empty(SRCS)
+OBJS+=  ${SRCS:N*.h:R:S/$/.o/g}
+.endif
 
 .if !target(${PROG})
 ${PROG}: ${OBJS}
@@ -98,7 +105,7 @@ _INSTALLFLAGS:=	${INSTALLFLAGS}
 _INSTALLFLAGS:=	${_INSTALLFLAGS${ie}}
 .endfor
 
-.if !target(realinstall)
+.if !target(realinstall) && !defined(INTERNALPROG)
 realinstall: _proginstall
 .ORDER: beforeinstall _proginstall
 _proginstall:
@@ -111,11 +118,7 @@ _proginstall:
 	    ${_INSTALLFLAGS} ${PROG} ${DESTDIR}${BINDIR}
 .endif
 .endif
-.if defined(HIDEGAME)
-	(cd ${DESTDIR}${ORIGBINDIR}; ${LN} -fs dm ${PROG}; \
-	    chown -h ${BINOWN}:${ORIGBINGRP} ${PROG})
-.endif
-.endif # !target(realinstall)
+.endif # !target(realinstall) && !defined(INTERNALPROG)
 
 .if defined(SCRIPTS) && !empty(SCRIPTS)
 realinstall: _scriptsinstall

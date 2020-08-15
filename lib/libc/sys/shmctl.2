@@ -25,7 +25,7 @@
 .\"
 .\" $FreeBSD: src/lib/libc/sys/shmctl.2,v 1.9.2.4 2001/12/14 18:34:01 ru Exp $
 .\"
-.Dd January 4, 2014
+.Dd September 12, 2019
 .Dt SHMCTL 2
 .Os
 .Sh NAME
@@ -71,21 +71,27 @@ or
 .Fa shm_perm.cuid ,
 or it must have superuser privileges.
 .It Dv IPC_RMID
-Removes the segment from the system.  The removal will not take
+Removes the segment from the system.
+The removal will not take
 effect until all processes having attached the segment have exited;
-however, once the IPC_RMID operation has taken place, no further
-processes will be allowed to attach the segment.  For the operation
+however, once the
+.Dv IPC_RMID
+operation has taken place, no further
+processes will be allowed to attach the segment.
+For the operation
 to succeed, the calling process's effective uid must match
 .Fa shm_perm.uid
 or
 .Fa shm_perm.cuid ,
 or the process must have superuser privileges.
 .\" .It Dv SHM_LOCK
-.\" Locks the segment in memory.  The calling process must have
-.\" superuser privileges. Not implemented in FreeBSD.
+.\" Locks the segment in memory.
+.\" The calling process must have superuser privileges.
+.\" Not implemented in FreeBSD.
 .\" .It Dv SHM_UNLOCK
-.\" Unlocks the segment from memory.  The calling process must
-.\" have superuser privileges.  Not implemented in FreeBSD.
+.\" Unlocks the segment from memory.
+.\" The calling process must have superuser privileges.
+.\" Not implemented in FreeBSD.
 .El
 .Pp
 The
@@ -110,6 +116,13 @@ struct shmid_ds {
     void           *shm_internal; /* sysv stupidity */
 };
 .Ed
+.Pp
+The
+.Vt ipc_perm
+structure used inside the
+.Vt shmid_ds
+structure is defined in
+.In sys/ipc.h .
 .Sh RETURN VALUES
 .Rv -std shmctl
 .Sh ENVIRONMENT

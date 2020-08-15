@@ -191,6 +191,9 @@
 #define EM_FC_PAUSE_TIME		1000
 #define EM_EEPROM_APME			0x400;
 
+#define PCICFG_DESC_RING_STATUS		0xe4
+#define FLUSH_DESC_REQUIRED		0x100
+
 /*
  * TDBA/RDBA should be aligned on 16 byte boundary. But TDLEN/RDLEN should be
  * multiple of 128 bytes. So we align TDBA/RDBA on 128 byte boundary. This will
@@ -198,7 +201,8 @@
  */
 #define EM_DBA_ALIGN			128
 
-#define SPEED_MODE_BIT			(1 << 21) /* On PCI-E MACs only */
+#define TARC_SPEED_MODE_BIT		(1 << 21) /* On PCI-E MACs only */
+#define TARC_ERRATA_BIT			(1 << 26) /* Note from errata on 82574 */
 
 /* PCI Config defines */
 #define EM_BAR_TYPE(v)			((v) & EM_BAR_TYPE_MASK)
@@ -255,6 +259,7 @@ struct adapter {
 #define EM_FLAG_HW_CTRL		0x0008
 #define EM_FLAG_TSO		0x0010
 #define EM_FLAG_TSO_PULLEX	0x0020
+#define EM_FLAG_GEN2		0x0040
 
 	/* DragonFly operating-system-specific structures. */
 	struct e1000_osdep	osdep;
@@ -316,6 +321,11 @@ struct adapter {
 	bus_dma_tag_t		txtag;		/* dma tag for tx */
 	int			spare_tx_desc;
 	int			oact_tx_desc;
+	int			tx_nmbuf;
+	int			tx_running;
+#define EM_TX_RUNNING		100
+#define EM_TX_RUNNING_DEC	25
+	struct callout		tx_gc_timer;
 
 	/* Saved csum offloading context information */
 	int			csum_flags;
@@ -393,6 +403,8 @@ struct adapter {
 	struct mbuf		*fmp;
 	struct mbuf		*lmp;
 
+	int			ifm_flowctrl;
+
 	/* Misc stats maintained by the driver */
 	unsigned long		dropped_pkts;
 	unsigned long		mbuf_alloc_failed;
@@ -406,10 +418,7 @@ struct adapter {
 	unsigned long		rx_irq;
 	unsigned long		tx_irq;
 	unsigned long		link_irq;
-
-	/* sysctl tree glue */
-	struct sysctl_ctx_list	sysctl_ctx;
-	struct sysctl_oid	*sysctl_tree;
+	unsigned long		tx_gc;
 
 	/* 82547 workaround */
 	uint32_t		tx_fifo_size;

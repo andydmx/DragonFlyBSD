@@ -381,9 +381,6 @@ struct aac_softc
 							 * task */
 	struct intr_config_hook	aac_ich;
 
-	struct sysctl_ctx_list	aac_sysctl_ctx;
-	struct sysctl_oid	*aac_sysctl_tree;
-
 	/* management interface */
 	struct cdev *aac_dev_t;
 	struct lock		aac_aifq_lock;
@@ -589,7 +586,7 @@ aac_remove_ ## name (struct aac_command *cm)				\
 	TAILQ_REMOVE(&cm->cm_sc->aac_ ## name, cm, cm_link);		\
 	cm->cm_flags &= ~AAC_ON_ ## index;				\
 	AACQ_REMOVE(cm->cm_sc, index);					\
-}									\
+}
 
 AACQ_COMMAND_QUEUE(free, AACQ_FREE);
 AACQ_COMMAND_QUEUE(ready, AACQ_READY);

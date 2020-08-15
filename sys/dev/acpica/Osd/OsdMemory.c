@@ -29,7 +29,7 @@
  */
 
 /*
- * 6.2 : Memory Management
+ * Memory Management
  */
 
 #include "acpi.h"
@@ -62,6 +62,12 @@ void *
 AcpiOsAllocate(ACPI_SIZE Size)
 {
     return (kmalloc(Size, M_ACPICA, M_INTWAIT));
+}
+
+void *
+AcpiOsAllocateZeroed(ACPI_SIZE Size)
+{
+    return (kmalloc(Size, M_ACPICA, M_INTWAIT | M_ZERO));
 }
 
 void

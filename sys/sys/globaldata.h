@@ -1,13 +1,13 @@
 /*
  * Copyright (c) 2003-2011 The DragonFly Project.  All rights reserved.
- * 
+ *
  * This code is derived from software contributed to The DragonFly Project
  * by Matthew Dillon <dillon@backplane.com>
- * 
+ *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
  * are met:
- * 
+ *
  * 1. Redistributions of source code must retain the above copyright
  *    notice, this list of conditions and the following disclaimer.
  * 2. Redistributions in binary form must reproduce the above copyright
@@ -17,7 +17,7 @@
  * 3. Neither the name of The DragonFly Project nor the names of its
  *    contributors may be used to endorse or promote products derived
  *    from this software without specific, prior written permission.
- * 
+ *
  * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
  * ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
  * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
@@ -30,7 +30,7 @@
  * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT
  * OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
- * 
+ *
  * Copyright (c) Peter Wemm <peter@netplex.com.au> All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -60,30 +60,37 @@
 
 #if defined(_KERNEL) || defined(_KERNEL_STRUCTURES)
 
-#ifndef _SYS_STDINT_H_
-#include <sys/stdint.h>	/* __int types */
-#endif
 #ifndef _SYS_TIME_H_
-#include <sys/time.h>	/* struct timeval */
+#include <sys/time.h>		/* struct timeval */
 #endif
 #ifndef _SYS_VMMETER_H_
-#include <sys/vmmeter.h> /* struct vmmeter */
+#include <sys/vmmeter.h>	/* struct vmmeter, pcpu vmstats adj */
 #endif
 #ifndef _SYS_THREAD_H_
-#include <sys/thread.h>	/* struct thread */
+#include <sys/thread.h>		/* struct thread */
 #endif
 #ifndef _SYS_SLABALLOC_H_
-#include <sys/slaballoc.h> /* SLGlobalData */
+#include <sys/slaballoc.h>	/* SLGlobalData */
 #endif
 #ifndef _SYS_SYSTIMER_H_
-#include <sys/systimer.h> /* fine-grained system timers */
+#include <sys/systimer.h>	/* fine-grained system timers */
 #endif
 #ifndef _SYS_NCHSTATS_H_
 #include <sys/nchstats.h>
 #endif
 #ifndef _SYS_SYSID_H_
-#include <sys/sysid.h>	  /* sysid_t */
+#include <sys/sysid.h>		/* sysid_t */
 #endif
+#ifndef _SYS_CALLOUT_H_
+#include <sys/callout.h>
+#endif
+#ifndef _SYS_INDEFINITE_H_
+#include <sys/indefinite.h>
+#endif
+#ifndef _SYS_LOCK_H_
+#include <sys/lock.h>
+#endif
+#include <machine/stdint.h>
 
 /*
  * This structure maps out the global data that needs to be kept on a
@@ -113,7 +120,7 @@
  */
 
 struct sysmsg;
-struct tslpentry;
+struct tslpque;
 struct privatespace;
 struct vm_map_entry;
 struct spinlock;
@@ -167,15 +174,32 @@ struct globaldata {
 	struct systimer	*gd_systimer_inprog;	/* in-progress systimer */
 	int		gd_timer_running;
 	u_int		gd_idle_repeat;		/* repeated switches to idle */
-	int		gd_ireserved[7];
+	int		gd_quick_color;		/* page-coloring helper */
+	int		gd_cachedvnodes;	/* accum across all cpus */
+	int		gd_rand_incr;		/* random pcpu incrementor */
+	int		gd_activevnodes;	/* accum across all cpus */
+	int		gd_inactivevnodes;	/* accum across all cpus */
+	int		gd_ireserved[2];
 	const char	*gd_infomsg;		/* debugging */
 	struct lwkt_tokref gd_handoff;		/* hand-off tokref */
 	void		*gd_delayed_wakeup[2];
 	void		*gd_sample_pc;		/* sample program ctr/tr */
-	void		*gd_reserved_pcpu_mmap; /* future */
+	uint64_t	gd_anoninum;		/* anonymous inode (pipes) */
 	uint64_t	gd_forkid;		/* per-cpu unique inc ncpus */
-	uint64_t	gd_reserved64[4];
-	void		*gd_preserved[4];	/* future fields */
+	void		*gd_sample_sp;		/* sample stack pointer */
+	uint64_t	gd_cpumask_simple;
+	uint64_t	gd_cpumask_offset;
+	struct vmstats	gd_vmstats;		/* pcpu local copy of vmstats */
+	struct vmstats	gd_vmstats_adj;		/* pcpu adj for vmstats */
+	struct callout	gd_loadav_callout;	/* loadavg calc */
+	struct callout	gd_schedcpu_callout;	/* scheduler/stats */
+	indefinite_info_t gd_indefinite;	/* scheduler cpu-bound */
+	uint32_t	gd_loadav_nrunnable;	/* pcpu lwps nrunnable */
+	uint32_t	gd_reserved32[1];
+	struct lock	gd_sysctllock;		/* sysctl topology lock */
+	uintptr_t	gd_debug1;
+	uintptr_t	gd_debug2;
+	void		*gd_preserved[2];	/* future fields */
 	/* extended by <machine/globaldata.h> */
 };
 
@@ -192,6 +216,7 @@ typedef struct globaldata *globaldata_t;
 #define RQB_RUNNING		8	/* 0100 */
 #define RQB_SPINNING		9	/* 0200 */
 #define RQB_QUICKRET		10	/* 0400 */
+#define RQB_KQUEUE		11	/* 0800 (only used by vkernel) */
 
 #define RQF_IPIQ		(1 << RQB_IPIQ)
 #define RQF_INTPEND		(1 << RQB_INTPEND)
@@ -203,16 +228,18 @@ typedef struct globaldata *globaldata_t;
 #define RQF_RUNNING		(1 << RQB_RUNNING)
 #define RQF_SPINNING		(1 << RQB_SPINNING)
 #define RQF_QUICKRET		(1 << RQB_QUICKRET)
+#define RQF_KQUEUE		(1 << RQB_KQUEUE)
 
 #define RQF_AST_MASK		(RQF_AST_OWEUPC|RQF_AST_SIGNAL|\
 				RQF_AST_USER_RESCHED|RQF_AST_LWKT_RESCHED)
-#define RQF_IDLECHECK_MASK	(RQF_IPIQ|RQF_INTPEND|RQF_TIMER)
+#define RQF_IDLECHECK_MASK	(RQF_IPIQ|RQF_INTPEND|RQF_TIMER|RQF_KQUEUE)
 #define RQF_IDLECHECK_WK_MASK	(RQF_IDLECHECK_MASK|RQF_AST_LWKT_RESCHED)
 
 /*
  * globaldata flags
  */
 #define GDF_KPRINTF		0x0001	/* kprintf() reentrancy */
+#define GDF_VIRTUSER		0x0002	/* used by vmm & vkernel */
 
 #endif
 

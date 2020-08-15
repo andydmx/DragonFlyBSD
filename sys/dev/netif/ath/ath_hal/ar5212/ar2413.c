@@ -250,6 +250,9 @@ GetLowerUpperIndex(int16_t v, const uint16_t *lp, uint16_t listSize,
 	const uint16_t *ep = lp+listSize;
 	const uint16_t *tp;
 
+	*vlo = 0;	/* avoid gcc warnings */
+	*vhi = 0;	/* avoid gcc warnings */
+
 	/*
 	 * Check first and last elements for out-of-bounds conditions.
 	 */
@@ -367,9 +370,9 @@ ar2413getGainBoundariesAndPdadcsForPowers(struct ath_hal *ah, uint16_t channel,
 	 * change pwr_I_0 to signed 5-bits.
 	 */
 	int16_t Pmin_t2[MAX_NUM_PDGAINS_PER_CHANNEL];
-	/* to accomodate -ve power levels later on. */
+	/* to accommodate -ve power levels later on. */
 	int16_t Pmax_t2[MAX_NUM_PDGAINS_PER_CHANNEL];
-	/* to accomodate -ve power levels later on */
+	/* to accommodate -ve power levels later on */
 	uint16_t numVpd = 0;
 	uint16_t Vpd_step;
 	int16_t tmpVal ; 
